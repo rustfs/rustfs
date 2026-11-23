@@ -18,8 +18,8 @@ use crate::app::storage_api::bucket_usecase::access::{
 use crate::app::storage_api::bucket_usecase::contract::list::{ListObjectVersionsInfo, ListObjectsV2Info, ListOperations as _};
 use crate::app::storage_api::bucket_usecase::{ECStore, StorageObjectInfo as ObjectInfo};
 use crate::app::storage_api::multipart_usecase::contract::multipart::{ListMultipartsInfo, MultipartInfo};
-use crate::app::storage_api::s3::{S3Error, S3ErrorCode, S3Result};
 use crate::error::ApiError;
+use rustfs_s3_types::{S3Error, S3ErrorCode, S3Result};
 use std::collections::HashSet;
 use std::sync::Arc;
 use uuid::Uuid;
@@ -70,12 +70,12 @@ pub(crate) struct ListMultipartUploadsRequest<'a> {
 fn table_list_scan_limit_error() -> S3Error {
     S3Error::with_message(
         S3ErrorCode::SlowDown,
-        "Table listing exceeded the protected scan limit; retry with a narrower prefix".to_string(),
+        "Table listing exceeded the protected scan limit; retry with a narrower prefix",
     )
 }
 
 fn invalid_table_list_cursor() -> S3Error {
-    S3Error::with_message(S3ErrorCode::InvalidArgument, "Invalid table listing continuation token".to_string())
+    S3Error::with_message(S3ErrorCode::InvalidArgument, "Invalid table listing continuation token")
 }
 
 fn list_objects_v2_operation(incl_deleted: bool) -> &'static str {

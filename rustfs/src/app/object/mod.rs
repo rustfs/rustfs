@@ -94,8 +94,6 @@ use super::storage_api::object_usecase::object_cache::GetObjectBodySource;
 #[cfg(test)]
 use super::storage_api::object_usecase::object_cache::lookup_get_object_body_cache_hook;
 use super::storage_api::object_usecase::object_cache::{GetObjectBodyCacheHookLookup, get_object_body_cache_plaintext_len};
-#[cfg(test)]
-use super::storage_api::object_usecase::object_utils::to_s3s_etag;
 use super::storage_api::object_usecase::options::{
     copy_dst_opts_with_replication_authorization, copy_src_opts, del_opts_with_versioning, extract_metadata,
     extract_metadata_from_mime_with_object_name, filter_object_metadata, get_content_sha256_with_query, get_opts,
@@ -187,8 +185,6 @@ use rustfs_utils::http::{
 use rustfs_utils::path::{encode_dir_object, is_dir_object, path_join_buf};
 use rustfs_utils::retry::{DEFAULT_RETRY_CAP, DEFAULT_RETRY_UNIT, MAX_JITTER, RetryTimer};
 use rustfs_zip::{ArchiveLimits, CompressionFormat, ZipError};
-#[cfg(test)]
-use s3s::{S3Request, S3Response};
 
 /// Remove replication history owned by another source object before a local
 /// object-creation decision is made. Compatibility keys are case-insensitive,
@@ -240,8 +236,6 @@ pub(crate) use native_body::{BodyChunks, FrameTrailers, upload_frame_reader};
 pub(crate) use put_input::{PutObjectWriteInput, PutObjectWriteOutput};
 pub(crate) mod request_body;
 mod restore;
-#[cfg(test)]
-mod s3s_compat;
 pub(crate) mod shared;
 #[cfg(test)]
 mod test_support;

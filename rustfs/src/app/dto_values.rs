@@ -16,14 +16,14 @@
 //!
 //! Responsible for: the bucket name, object key, timestamp, owner and stored-configuration
 //! conversions a use case needs to build a gateway output from what the store returned, under the
-//! rule in [`crate::app`]; and [`seam_error`], the one answer for a value the s3s compatibility
-//! seam refused.
+//! rule in [`crate::app`].
 //! NOT responsible for: validating names a client sends (the edge that accepted the request did),
 //! or deciding what a use case lists.
 //! Upstream: the use cases in `crate::app`. Downstream: `rustfs_gateway_types`.
 
 use super::storage_api::bucket_usecase::bucket::utils::{BucketConfigXml, serialize};
 use super::storage_api::bucket_usecase::s3_api::bucket::{RUSTFS_OWNER_DISPLAY_NAME, RUSTFS_OWNER_ID};
+#[cfg(test)]
 use rustfs_gateway_types::compat::{ConversionError, NameRefusal};
 use rustfs_gateway_types::dto::Owner;
 use rustfs_gateway_types::{BucketName, ETag, NamePolicy, NameValidator, ObjectKey, Stricter, Timestamp};
@@ -63,7 +63,7 @@ pub(crate) fn stored_bucket_name(name: &str) -> S3Result<BucketName> {
     })
 }
 
-/// What a legacy edge answers when the s3s compatibility seam refuses a value of an admitted request.
+/// The legacy error expected by compatibility tests when the s3s seam refuses an admitted value.
 ///
 /// - An object key below the gateway's key floor (empty, over 1024 bytes, a NUL) is refused as
 ///   `validate_object_key` refuses one: `400 InvalidArgument`, with a fixed message. An edge whose
@@ -71,6 +71,7 @@ pub(crate) fn stored_bucket_name(name: &str) -> S3Result<BucketName> {
 /// - A bucket name below the bucket floor is a server fault: s3s admits only `[a-z0-9.-]{3,63}`,
 ///   which the floor always accepts, so no bucket a request names reaches it.
 /// - Any other refusal is a value the gateway shape cannot hold: a server fault.
+#[cfg(test)]
 pub(crate) fn seam_error(error: ConversionError) -> S3Error {
     match error.name_kind() {
         Some(NameRefusal::ObjectKey) => S3Error::with_message(S3ErrorCode::InvalidArgument, "Invalid object key"),
@@ -117,7 +118,7 @@ pub(crate) fn owner() -> Owner {
 /// The entity tag the store holds, as an answer carries it: every answer that carries a stored tag
 /// converts it here, and none drops, rewrites or refuses one.
 ///
-/// It reads the stored spelling exactly as the legacy edge always has (`to_s3s_etag`): `W/"…"` is
+/// It reads the stored spelling exactly as the legacy edge always has: `W/"…"` is
 /// a weak tag and one surrounding quote pair is the store's spelling of a strong one; the tag
 /// inside is kept byte for byte, so the legacy stack's answer does not change. A weak tag whose
 /// inside the gateway's reader refuses or rewrites cannot stay weak (the gateway has no lossless
@@ -323,31 +324,30 @@ mod tests {
     /// Stored tag spellings retain their expected forms across conversions and renderers.
     #[test]
     fn a_stored_tag_is_answered_as_main_answers_it_on_both_edges() {
-        use crate::app::storage_api::object_usecase::object_utils::to_s3s_etag;
         use rustfs_gateway_types::EtagRender;
         use rustfs_gateway_types::compat::s3s_5761ddfe::leaf::etag_to_s3s;
 
-        // Stored spelling, legacy header, gateway header, and XML text.
-        let rows: [(&str, &str, &str, &str); 11] = [
-            ("abc", r#""abc""#, r#""abc""#, r#""abc""#),
-            (r#""abc""#, r#""abc""#, r#""abc""#, r#""abc""#),
-            (r#"W/"abc""#, r#"W/"abc""#, r#"W/"abc""#, r#""abc""#),
-            ("abc-3", r#""abc-3""#, r#""abc-3""#, r#""abc-3""#),
-            (r#""""#, r#""""#, r#""""#, r#""""#),
-            ("", r#""""#, r#""""#, r#""""#),
-            ("W/abc", r#""W/abc""#, r#""W/abc""#, r#""W/abc""#),
-            ("a&b", r#""a&b""#, r#""a&b""#, r#""a&b""#),
-            (r#""abc"#, r#"""abc""#, r#""\"abc""#, r#"""abc""#),
-            (r#"""abc"""#, r#"""abc"""#, r#""\"abc\"""#, r#"""abc"""#),
-            (r#"w/"abc""#, r#""w/"abc"""#, r#""w/\"abc\"""#, r#""w/"abc"""#),
+        // Stored spelling, opaque value, weakness, legacy header, gateway header, and XML text.
+        let rows = [
+            ("abc", "abc", false, r#""abc""#, r#""abc""#, r#""abc""#),
+            (r#""abc""#, "abc", false, r#""abc""#, r#""abc""#, r#""abc""#),
+            (r#"W/"abc""#, "abc", true, r#"W/"abc""#, r#"W/"abc""#, r#""abc""#),
+            ("abc-3", "abc-3", false, r#""abc-3""#, r#""abc-3""#, r#""abc-3""#),
+            (r#""""#, "", false, r#""""#, r#""""#, r#""""#),
+            ("", "", false, r#""""#, r#""""#, r#""""#),
+            ("W/abc", "W/abc", false, r#""W/abc""#, r#""W/abc""#, r#""W/abc""#),
+            ("a&b", "a&b", false, r#""a&b""#, r#""a&b""#, r#""a&b""#),
+            (r#""abc"#, "\"abc", false, r#"""abc""#, r#""\"abc""#, r#"""abc""#),
+            (r#"""abc"""#, "\"abc\"", false, r#"""abc"""#, r#""\"abc\"""#, r#"""abc"""#),
+            (r#"w/"abc""#, "w/\"abc\"", false, r#""w/"abc"""#, r#""w/\"abc\"""#, r#""w/"abc"""#),
         ];
         // Every row is checked before the test fails, so one run names every row that differs.
         let mut differing = Vec::new();
-        for (stored, main_header, gateway_header, xml) in rows {
+        for (stored, opaque, weak, main_header, gateway_header, xml) in rows {
             let etag = stored_etag(stored);
-            let legacy = to_s3s_etag(stored);
+            let legacy = etag_to_s3s(&etag);
             let answered = (
-                etag_to_s3s(&etag) == legacy,
+                legacy.value() == opaque && legacy.as_weak().is_some() == weak,
                 legacy.to_http_header().is_ok_and(|header| header == main_header),
                 etag.render(EtagRender::HeaderQuoted) == gateway_header,
                 etag.render(EtagRender::XmlQuoted) == xml,

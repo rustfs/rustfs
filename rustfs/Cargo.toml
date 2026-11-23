@@ -384,7 +384,6 @@ pin-project-lite.workspace = true
 parking_lot = { workspace = true }
 rust-embed = { workspace = true, features = ["interpolate-folder-path"] }
 s3s = { workspace = true, features = ["minio"] }
-s3s-sigv4 = { workspace = true }
 shadow-rs = { workspace = true, default-features = false, features = ["build", "metadata"] }
 sysinfo = { workspace = true, features = ["multithread"] }
 thiserror = { workspace = true }
@@ -426,6 +425,7 @@ rustfs-targets = { workspace = true, features = ["test-support"] }
 uuid = { workspace = true, features = ["v4", "v5", "fast-rng", "macro-diagnostics"] }
 rustfs-iam = { workspace = true, features = ["test-util"] }
 rustfs-sse = { workspace = true, features = ["test-util"] }
+s3s-sigv4 = { workspace = true }
 serial_test = { workspace = true }
 tempfile = { workspace = true }
 aws-config = { workspace = true }

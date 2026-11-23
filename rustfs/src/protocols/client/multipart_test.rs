@@ -187,19 +187,20 @@ fn multipart_complete_projection_matches_original_parts_and_conditions() {
 
 #[test]
 fn multipart_completion_projection_preserves_original_escaped_tags() {
-    for (opaque, weak) in [("abc", false), ("a&b<c", false), ("a\"b", true)] {
+    for (opaque, weak, expected) in [
+        ("abc", false, "abc"),
+        ("a&b<c", false, "a&amp;b&lt;c"),
+        ("a\"b", true, "a&quot;b"),
+    ] {
         let input = dto::CompleteMultipartUploadOutput {
             e_tag: Some(if weak { ETag::new_weak(opaque) } else { ETag::new(opaque) }.expect("tag")),
             ..Default::default()
         };
-        let mut legacy =
-            compat::generated::ops::complete_multipart_upload::output_to_s3s(input.clone()).expect("original output");
-        let stored = if weak { format!("W/\"{opaque}\"") } else { opaque.to_owned() };
-        legacy.e_tag = Some(crate::app::storage_api::object_utils::to_s3s_xml_etag(&stored));
-        let expected = compat::generated::ops::complete_multipart_upload::output_from_s3s(legacy).expect("original answer");
-        let actual = complete_multipart_output(input).expect("owned answer");
-        let tag = |value: Option<ETag>| value.map(|value| (value.opaque_tag().to_owned(), value.is_weak()));
-        assert_eq!(tag(actual.e_tag), tag(expected.e_tag));
+        let tag = complete_multipart_output(input)
+            .expect("completion output")
+            .e_tag
+            .expect("ETag");
+        assert_eq!((tag.opaque_tag(), tag.is_weak()), (expected, weak));
     }
 }
 
@@ -255,28 +256,55 @@ fn multipart_refusals_match_original_client_errors() {
 
 #[test]
 fn multipart_completion_projection_preserves_header_only_field_behavior() {
-    let output = dto::CompleteMultipartUploadOutput {
-        checksum_header_xxhash3: Some("AAAAAAAAAAA=".into()),
-        sse_customer_algorithm: Some("AES256".into()),
-        sse_customer_key_md5: Some("digest".into()),
-        ..Default::default()
-    };
-    let output = complete_multipart_output(output).expect("header fields remain valid");
-    assert!(output.checksum_header_xxhash3.is_none());
-    assert!(output.sse_customer_algorithm.is_none());
-    assert!(output.sse_customer_key_md5.is_none());
-    let error = complete_multipart_output(dto::CompleteMultipartUploadOutput {
-        sse_customer_algorithm: Some("bad\nvalue".into()),
-        ..Default::default()
-    })
-    .expect_err("invalid original response header");
-    assert_eq!(error.code(), &S3ErrorCode::InternalError);
-    assert!(
-        error
-            .message()
-            .expect("message")
-            .contains("x-amz-server-side-encryption-customer-algorithm: not a header value")
-    );
+    let headers = [
+        "x-amz-checksum-md5",
+        "x-amz-checksum-sha512",
+        "x-amz-checksum-xxhash3",
+        "x-amz-checksum-xxhash64",
+        "x-amz-checksum-xxhash128",
+        "x-amz-server-side-encryption-customer-algorithm",
+        "x-amz-server-side-encryption-customer-key-md5",
+    ];
+    for first_invalid in 0..=headers.len() {
+        let valid = ["md5", "sha512", "AAAAAAAAAAA=", "xxhash64", "xxhash128", "AES256", "digest"];
+        let value = |index: usize| Some(if index < first_invalid { valid[index] } else { "bad\nvalue" }.to_owned());
+        let output = dto::CompleteMultipartUploadOutput {
+            checksum_header_md5: value(0),
+            checksum_header_sha512: value(1),
+            checksum_header_xxhash3: value(2),
+            checksum_header_xxhash64: value(3),
+            checksum_header_xxhash128: value(4),
+            sse_customer_algorithm: value(5),
+            sse_customer_key_md5: value(6),
+            ..Default::default()
+        };
+        let result = complete_multipart_output(output);
+        if let Some(header) = headers.get(first_invalid) {
+            let error = result.expect_err("invalid response header");
+            assert_eq!(error.code(), &S3ErrorCode::InternalError);
+            assert_eq!(
+                error.message(),
+                Some(format!("failed to convert through the gateway compatibility seam: {header}: not a header value").as_str())
+            );
+            assert_eq!(error.status_code(), Some(http::StatusCode::INTERNAL_SERVER_ERROR));
+            assert!(error.headers().is_none());
+            assert!(std::error::Error::source(&error).is_none());
+        } else {
+            let output = result.expect("valid response headers");
+            assert_eq!(
+                [
+                    output.checksum_header_md5,
+                    output.checksum_header_sha512,
+                    output.checksum_header_xxhash3,
+                    output.checksum_header_xxhash64,
+                    output.checksum_header_xxhash128,
+                    output.sse_customer_algorithm,
+                    output.sse_customer_key_md5
+                ],
+                [const { None }; 7]
+            );
+        }
+    }
 }
 
 #[test]

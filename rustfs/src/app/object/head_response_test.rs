@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Regression tests for the HeadObject response facts and their HTTP and legacy projections.
+//! Regression tests for the HeadObject response facts and their HTTP projection.
 //! The existing completion probe exposes the AuditEntry before asynchronous delivery.
 
 use super::*;
@@ -20,60 +20,68 @@ use crate::app::test_seams::{head_envelope, head_object_input};
 use http::Method;
 
 #[test]
-fn head_stored_etag_facts_and_legacy_projection_preserve_spelling() {
+fn head_stored_etag_facts_and_http_projection_preserve_spelling() {
     head_stored_etag_facts_preserve_spelling();
-    head_legacy_etag_projection_preserves_spelling();
+    head_etag_http_projection_preserves_spelling();
 }
 
 #[test]
 fn head_stored_etag_facts_preserve_spelling() {
-    for raw in [
-        "abc",
-        "\"abc\"",
-        "W/\"abc\"",
-        "W/\"\"",
-        "\"\"",
-        "",
-        "*",
-        " abc ",
-        "abc_def",
-        "a&b",
-        "\"a&b\"",
-        "\"a b\"",
-        "\"a\\b\"",
-        "\"a\"b\"",
-        "w/\"abc\"",
-        "\"abc",
-        "W/abc",
-        "a\rb",
-        "a\nb",
-        "a\0b",
-        "é",
+    for (raw, opaque, weak) in [
+        ("abc", "abc", false),
+        ("\"abc\"", "abc", false),
+        ("W/\"abc\"", "abc", true),
+        ("W/\"\"", "", true),
+        ("\"\"", "", false),
+        ("", "", false),
+        ("*", "*", false),
+        (" abc ", " abc ", false),
+        ("abc_def", "abc_def", false),
+        ("a&b", "a&b", false),
+        ("\"a&b\"", "a&b", false),
+        ("\"a b\"", "a b", false),
+        ("\"a\\b\"", "a\\b", false),
+        ("\"a\"b\"", "a\"b", false),
+        ("w/\"abc\"", "w/\"abc\"", false),
+        ("\"abc", "\"abc", false),
+        ("W/abc", "W/abc", false),
+        ("a\rb", "a\rb", false),
+        ("a\nb", "a\nb", false),
+        ("a\0b", "a\0b", false),
+        ("é", "é", false),
+        ("6af8d12c0c74b78094884349f3c8a079", "6af8d12c0c74b78094884349f3c8a079", false),
+        ("\"6af8d12c0c74b78094884349f3c8a079\"", "6af8d12c0c74b78094884349f3c8a079", false),
+        ("W/\"6af8d12c0c74b78094884349f3c8a079\"", "6af8d12c0c74b78094884349f3c8a079", true),
+        ("\"incomplete", "\"incomplete", false),
+        ("incomplete\"", "incomplete\"", false),
+        ("W/\"incomplete", "incomplete", true),
     ] {
-        let expected = to_s3s_etag(raw);
         let fact = ResponseEtag::from_stored(raw);
-        assert_eq!(fact.opaque, expected.value(), "{raw:?}");
-        assert_eq!(fact.weak, expected.as_weak().is_some(), "{raw:?}");
+        assert_eq!(fact.opaque, opaque, "{raw:?}");
+        assert_eq!(fact.weak, weak, "{raw:?}");
     }
 }
 
 #[test]
-fn head_legacy_etag_projection_preserves_spelling() {
-    for weak in [false, true] {
-        for opaque in ["", "abc", "a\\b", "a\"b", "a\rb", "é"] {
+fn head_etag_http_projection_preserves_spelling() {
+    for (opaque, strong, weak) in [
+        ("", Some(&b"\"\""[..]), Some(&b"W/\"\""[..])),
+        ("abc", Some(&b"\"abc\""[..]), Some(&b"W/\"abc\""[..])),
+        ("a\\b", Some(&b"\"a\\b\""[..]), Some(&b"W/\"a\\b\""[..])),
+        ("a\"b", Some(&b"\"a\"b\""[..]), Some(&b"W/\"a\"b\""[..])),
+        ("a\rb", None, None),
+        ("é", Some(&b"\"\xc3\xa9\""[..]), Some(&b"W/\"\xc3\xa9\""[..])),
+    ] {
+        for (weak, expected) in [(false, strong), (true, weak)] {
             let fact = ResponseEtag {
                 opaque: opaque.to_owned(),
                 weak,
             };
-            let output = HeadObjectOutputFacts {
-                dto: gateway_dto::HeadObjectOutput::default(),
-                etag: Some(fact),
+            let actual = fact.to_http_header();
+            match expected {
+                Some(bytes) => assert_eq!(actual.unwrap().as_bytes(), bytes, "{opaque:?}, weak={weak}"),
+                None => assert!(actual.is_err(), "{opaque:?}, weak={weak}"),
             }
-            .into_s3s()
-            .unwrap();
-            let tag = output.e_tag.expect("legacy typed caller keeps the fact");
-            assert_eq!(tag.value(), opaque);
-            assert_eq!(tag.as_weak().is_some(), weak);
         }
     }
 }
@@ -105,11 +113,16 @@ fn head_proxy_etag_mapping_matches_the_legacy_parser() {
             .build();
         let facts = DefaultObjectUsecase::proxy_sdk_head_output(sdk);
         assert!(facts.dto.e_tag.is_none(), "ETag is carried as a response fact");
-        assert_eq!(facts.into_s3s().unwrap().e_tag, expected, "{raw:?}");
+        assert_eq!(
+            facts.etag.as_ref().map(|tag| (tag.opaque.as_str(), tag.weak)),
+            expected.as_ref().map(|tag| (tag.value(), tag.as_weak().is_some())),
+            "{raw:?}"
+        );
     }
     let absent =
         DefaultObjectUsecase::proxy_sdk_head_output(aws_sdk_s3::operation::head_object::HeadObjectOutput::builder().build());
-    assert!(absent.into_s3s().unwrap().e_tag.is_none());
+    assert!(absent.etag.is_none());
+    assert!(absent.dto.e_tag.is_none());
 }
 
 #[derive(Clone, Copy)]
@@ -263,14 +276,9 @@ fn head_etag_wire_and_audit(stack: Option<&'static str>, rows: &'static [HeadEta
                     let internal = crate::app::test_seams::head_object_gateway(&usecase, envelope, input)
                         .await
                         .expect("unencoded HEAD response");
-                    let typed = internal
-                        .output
-                        .into_s3s()
-                        .expect("legacy response projection")
-                        .e_tag
-                        .expect("internal caller retains the ETag");
-                    assert_eq!(typed.value(), row.opaque, "{}", row.stored);
-                    assert_eq!(typed.as_weak().is_some(), row.weak, "{}", row.stored);
+                    let fact = internal.output.etag.expect("internal caller retains the ETag");
+                    assert_eq!(fact.opaque, row.opaque, "{}", row.stored);
+                    assert_eq!(fact.weak, row.weak, "{}", row.stored);
                     expected_audits.push((Some("s3:HeadObject".to_owned()), Some("success".to_owned()), Some(200)));
                     probe.wait_for(index * 3 + 1, 0).await;
                     for conditional in [false, true] {
