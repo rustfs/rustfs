@@ -17,13 +17,14 @@
 use super::*;
 #[cfg(test)]
 use crate::app::storage_api::s3::dto::ObjectLockRetentionMode;
-use crate::app::storage_api::s3::dto::{ChecksumAlgorithm, ServerSideEncryption};
 #[cfg(test)]
 use crate::app::storage_api::s3::dto::{ObjectLockLegalHoldStatus, ObjectLockMode, Timestamp};
 use crate::app::storage_api::s3::{S3Error, S3ErrorCode, S3Result, StdError, s3_error};
 use crate::on_demand_migration::{OdmStateError, PolicyConfig, SourceErrorPolicy, SourceHead};
+use rustfs_gateway_types::ChecksumAlgorithm;
 use rustfs_s3_client::constants::{X_AMZ_DELETE_MARKER, X_AMZ_VERSION_ID};
 use rustfs_s3_types::{S3Result as OwnedResult, s3_error as owned_error};
+use rustfs_utils::http::headers::AMZ_ENCRYPTION_KMS;
 
 pub(super) const RUSTFS_EXPECTED_CURRENT_VERSION_ID: &str = "x-rustfs-expected-current-version-id";
 
@@ -364,10 +365,7 @@ pub(super) fn resolve_bucket_default_sse(
     };
 
     let effective_sse = requested_sse.or_else(|| bucket_default().map(bucket_default_write_sse));
-    let effective_kms_key_id = if effective_sse
-        .as_ref()
-        .is_some_and(|sse| sse.as_str() == ServerSideEncryption::AWS_KMS)
-    {
+    let effective_kms_key_id = if effective_sse.as_deref() == Some(AMZ_ENCRYPTION_KMS) {
         requested_kms_key_id.or_else(|| bucket_default().and_then(|sse| sse.kms_master_key_id.clone()))
     } else {
         requested_kms_key_id
@@ -619,29 +617,24 @@ pub(super) fn apply_trailing_checksums_native(
     trailing_headers: &Option<rustfs_rio::SharedTrailerSource>,
     checksums: &mut PutObjectChecksums,
 ) {
-    let Some(alg) = algorithm else { return };
-    let Some(trailer) = trailing_headers.as_ref() else { return };
-    let key = match alg {
-        ChecksumAlgorithm::CRC32 => rustfs_rio::ChecksumType::CRC32.key(),
-        ChecksumAlgorithm::CRC32C => rustfs_rio::ChecksumType::CRC32C.key(),
-        ChecksumAlgorithm::SHA1 => rustfs_rio::ChecksumType::SHA1.key(),
-        ChecksumAlgorithm::SHA256 => rustfs_rio::ChecksumType::SHA256.key(),
-        ChecksumAlgorithm::CRC64NVME => rustfs_rio::ChecksumType::CRC64_NVME.key(),
+    let (Some(name), Some(trailer)) = (algorithm, trailing_headers.as_ref()) else {
+        return;
+    };
+    let Some(algorithm) = ChecksumAlgorithm::ALL.iter().find(|algorithm| algorithm.wire_name() == name) else {
+        return;
+    };
+    let slot = match algorithm {
+        ChecksumAlgorithm::Crc32 => &mut checksums.crc32,
+        ChecksumAlgorithm::Crc32c => &mut checksums.crc32c,
+        ChecksumAlgorithm::Sha1 => &mut checksums.sha1,
+        ChecksumAlgorithm::Sha256 => &mut checksums.sha256,
+        ChecksumAlgorithm::Crc64Nvme => &mut checksums.crc64nvme,
         _ => return,
     };
-    let checksum_str = match trailer.lookup(key.unwrap_or_default()) {
-        rustfs_rio::TrailerValue::Pending => return,
-        rustfs_rio::TrailerValue::Missing => None,
-        rustfs_rio::TrailerValue::Present(value) => Some(value),
-    };
-
-    match alg {
-        ChecksumAlgorithm::CRC32 => checksums.crc32 = checksum_str,
-        ChecksumAlgorithm::CRC32C => checksums.crc32c = checksum_str,
-        ChecksumAlgorithm::SHA1 => checksums.sha1 = checksum_str,
-        ChecksumAlgorithm::SHA256 => checksums.sha256 = checksum_str,
-        ChecksumAlgorithm::CRC64NVME => checksums.crc64nvme = checksum_str,
-        _ => (),
+    match trailer.lookup(algorithm.header_name()) {
+        rustfs_rio::TrailerValue::Pending => {}
+        rustfs_rio::TrailerValue::Missing => *slot = None,
+        rustfs_rio::TrailerValue::Present(value) => *slot = Some(value),
     }
 }
 
@@ -1167,6 +1160,7 @@ pub(crate) fn reject_non_wildcard_write_if_none_match(specific_if_none_match: bo
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::app::storage_api::s3::dto::ServerSideEncryption;
     use http::{HeaderMap, HeaderValue};
     use rustfs_gateway_types::persistence::{
         PersistedBucketEncryptionRule as ServerSideEncryptionRule, PersistedEncryptionByDefault as ServerSideEncryptionByDefault,
@@ -1487,6 +1481,84 @@ mod tests {
                 byte_range_to_http_range_spec(range).unwrap_err().code(),
                 &rustfs_s3_types::S3ErrorCode::InvalidRange
             );
+        }
+    }
+
+    #[test]
+    fn trailing_checksums_select_the_exact_algorithm_and_preserve_trailer_state() {
+        use rustfs_rio::{SharedTrailerSource, TrailerSource, TrailerValue};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct Trailer {
+            header: Option<String>,
+            value: TrailerValue,
+            reads: AtomicUsize,
+        }
+
+        impl TrailerSource for Trailer {
+            fn lookup(&self, name: &str) -> TrailerValue {
+                assert_eq!(Some(name), self.header.as_deref());
+                self.reads.fetch_add(1, Ordering::Relaxed);
+                self.value.clone()
+            }
+        }
+
+        let supported = ["CRC32", "CRC32C", "SHA1", "SHA256", "CRC64NVME"];
+        let ignored = [
+            "",
+            "crc32",
+            "Sha256",
+            "UNKNOWN",
+            "MD5",
+            "SHA512",
+            "XXHASH64",
+            "XXHASH3",
+            "XXHASH128",
+        ];
+        for name in supported.into_iter().chain(ignored).map(Some).chain([None]) {
+            let target = supported.iter().position(|&algorithm| Some(algorithm) == name);
+            for value in [
+                TrailerValue::Pending,
+                TrailerValue::Missing,
+                TrailerValue::Present("trailer".into()),
+                TrailerValue::Present(String::new()),
+            ] {
+                let trailer = Arc::new(Trailer {
+                    header: target.map(|slot| format!("x-amz-checksum-{}", supported[slot].to_ascii_lowercase())),
+                    value: value.clone(),
+                    reads: AtomicUsize::new(0),
+                });
+                let source: SharedTrailerSource = trailer.clone();
+                let mut sums = PutObjectChecksums {
+                    crc32: Some("input".into()),
+                    crc32c: Some("input".into()),
+                    sha1: Some("input".into()),
+                    sha256: Some("input".into()),
+                    crc64nvme: Some("input".into()),
+                };
+                apply_trailing_checksums_native(name, &Some(source), &mut sums);
+                assert_eq!(trailer.reads.load(Ordering::Relaxed), usize::from(target.is_some()), "{name:?}");
+
+                let mut expected = [Some("input"); 5];
+                if let Some(slot) = target {
+                    expected[slot] = match &value {
+                        TrailerValue::Pending => Some("input"),
+                        TrailerValue::Missing => None,
+                        TrailerValue::Present(value) => Some(value.as_str()),
+                    };
+                }
+                assert_eq!(
+                    [
+                        sums.crc32.as_deref(),
+                        sums.crc32c.as_deref(),
+                        sums.sha1.as_deref(),
+                        sums.sha256.as_deref(),
+                        sums.crc64nvme.as_deref()
+                    ],
+                    expected,
+                    "{name:?} {value:?}"
+                );
+            }
         }
     }
 

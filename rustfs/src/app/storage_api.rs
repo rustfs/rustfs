@@ -59,6 +59,7 @@ pub(crate) mod s3 {
     pub(crate) use s3s::Body;
     #[cfg(test)]
     pub(crate) use s3s::auth::Credentials;
+    #[cfg(test)]
     pub(crate) use s3s::dto;
     #[cfg(test)]
     pub(crate) use s3s::dto::PutObjectInput;
