@@ -350,7 +350,7 @@ fn degrade_or_fail(
     class: &'static str,
 ) -> S3Result<()> {
     match policy {
-        SourceErrorPolicy::Propagate => Err(odm_source_unavailable_error(class).into()),
+        SourceErrorPolicy::Propagate => Err(odm_source_unavailable_error(class)),
         SourceErrorPolicy::NotFound => {
             merger.disable_source();
             *degraded = true;

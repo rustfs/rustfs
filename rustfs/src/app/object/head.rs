@@ -170,7 +170,7 @@ pub(super) fn odm_head_verdict(lookup: OdmLookup, miss: OdmLocalMiss) -> OdmHead
     let stats = state.stats();
     let unavailable = |error| {
         stats.record_request(OdmOp::Head, OdmOutcome::SourceError);
-        OdmHeadVerdict::Fail(odm_source_error_response(policy, odm_state_error_class(error)).into())
+        OdmHeadVerdict::Fail(odm_source_error_response(policy, odm_state_error_class(error)))
     };
     match &lookup {
         OdmLookup::NegativeCached { .. } => {
@@ -248,11 +248,11 @@ pub(super) async fn odm_head_from_source<S: OdmHeadSource>(
         }
         Err(err @ SourceError::Unsupported(_)) => {
             stats.record_request(OdmOp::Head, OdmOutcome::Unsupported);
-            Err(odm_source_unavailable_error(err.class_label()).into())
+            Err(odm_source_unavailable_error(err.class_label()))
         }
         Err(err) => {
             stats.record_request(OdmOp::Head, OdmOutcome::SourceError);
-            Err(odm_source_error_response(&state.config().policy, err.class_label()).into())
+            Err(odm_source_error_response(&state.config().policy, err.class_label()))
         }
     }
 }
@@ -571,15 +571,12 @@ impl DefaultObjectUsecase {
                         &bucket,
                         &key,
                         &opts,
-                        S3Error::new(S3ErrorCode::NoSuchKey).into(),
+                        S3Error::with_default_message(S3ErrorCode::NoSuchKey),
                     )
-                    .await
-                    .into());
+                    .await);
                 }
                 // Other errors, such as insufficient permissions, still return the original error
-                return Err(enrich_delete_marker_read_error(&store, &bucket, &key, &opts, ApiError::from(err).into())
-                    .await
-                    .into());
+                return Err(enrich_delete_marker_read_error(&store, &bucket, &key, &opts, ApiError::from(err).into()).await);
             }
         };
         if info.delete_marker {
@@ -591,14 +588,17 @@ impl DefaultObjectUsecase {
                 {
                     return Self::finish_on_demand_migration_head(&req, &bucket, helper, result?).await;
                 }
-                return Err(with_delete_marker_read_headers(S3Error::new(S3ErrorCode::NoSuchKey).into(), &info, None).into());
+                return Err(with_delete_marker_read_headers(
+                    S3Error::with_default_message(S3ErrorCode::NoSuchKey),
+                    &info,
+                    None,
+                ));
             }
             return Err(with_delete_marker_read_headers(
-                S3Error::new(S3ErrorCode::MethodNotAllowed).into(),
+                S3Error::with_default_message(S3ErrorCode::MethodNotAllowed),
                 &info,
                 opts.version_id.as_deref(),
-            )
-            .into());
+            ));
         }
         // An authorized replication convergence check only needs etag/size/mtime
         // to compare source and replica; it holds no customer key, so the SSE-C
