@@ -32,6 +32,7 @@ use crate::storage_api::protocols::client::{MultipartStagingOperation, ReqInfo, 
 use http::{HeaderMap, Method};
 use percent_encoding::{AsciiSet, CONTROLS, utf8_percent_encode};
 use rustfs_credentials;
+#[cfg(test)]
 use rustfs_gateway_types::compat::s3s_5761ddfe as gateway_s3s_compat;
 #[cfg(test)]
 use rustfs_gateway_types::compat::s3s_5761ddfe::{leaf::RequestWire, request_context::GatewayRequestContext};
@@ -39,6 +40,7 @@ use rustfs_gateway_types::dto as gateway_dto;
 #[cfg(test)]
 use rustfs_gateway_types::{BucketName, OpaqueString};
 use rustfs_protocols::common::SessionContext;
+use rustfs_protocols::common::client::s3::MultipartRequest;
 #[cfg(feature = "webdav")]
 use rustfs_protocols::common::client::s3::{BucketCapacity, SessionCapacityView};
 use rustfs_protocols::common::gateway::{AuthorizationError, S3Action, is_operation_supported};
@@ -396,9 +398,8 @@ impl ProtocolStorageClient {
                 "protocol server application context is not initialized",
             )
         })?;
-        let (credentials, is_owner) = crate::auth::check_key_valid_with_context("", session.access_key(), Some(context.as_ref()))
-            .await
-            .map_err(rustfs_s3_types::S3Error::from)?;
+        let (credentials, is_owner) =
+            crate::auth::check_key_valid_with_context("", session.access_key(), Some(context.as_ref())).await?;
         let mut envelope =
             self.protocol_authorization_envelope(session, action, bucket, object, listing, (credentials, is_owner))?;
         authorize_request(&mut envelope, protocol_policy_action(action)).await
@@ -785,7 +786,6 @@ impl rustfs_protocols::common::client::s3::StorageBackend for ProtocolStorageCli
         let (credentials, is_owner) =
             crate::auth::check_key_valid_with_context("", session_context.access_key(), Some(context.as_ref()))
                 .await
-                .map_err(rustfs_s3_types::S3Error::from)
                 .map_err(|e| match e.code() {
                     rustfs_s3_types::S3ErrorCode::InvalidAccessKeyId => {
                         rustfs_s3_types::S3Error::new(rustfs_s3_types::S3ErrorCode::AccessDenied)
@@ -1014,9 +1014,10 @@ impl rustfs_protocols::common::client::s3::StorageBackend for ProtocolStorageCli
 
     async fn upload_part(
         &self,
-        input: gateway_dto::UploadPartInput,
+        request: MultipartRequest<gateway_dto::UploadPartInput>,
         credentials: &rustfs_credentials::Credentials,
     ) -> Result<gateway_dto::UploadPartOutput, Self::Error> {
+        let (input, upload_id) = request.into_parts();
         trace!(
             event = EVENT_PROTOCOL_STORAGE_CLIENT_REQUEST,
             component = LOG_COMPONENT_PROTOCOLS,
@@ -1031,8 +1032,6 @@ impl rustfs_protocols::common::client::s3::StorageBackend for ProtocolStorageCli
         let bucket = input.bucket.as_str().to_owned();
         let key = input.key.as_str().to_owned();
         let content_length = input.content_length;
-        // This scalar projection remains until the compatibility seam retires.
-        let upload_id = gateway_s3s_compat::leaf::upload_id_to_s3s(&input.upload_id);
         let part_number = input.part_number.to_string();
         let uri = build_object_uri(
             &bucket,
@@ -1075,9 +1074,10 @@ impl rustfs_protocols::common::client::s3::StorageBackend for ProtocolStorageCli
 
     async fn complete_multipart_upload(
         &self,
-        input: gateway_dto::CompleteMultipartUploadInput,
+        request: MultipartRequest<gateway_dto::CompleteMultipartUploadInput>,
         credentials: &rustfs_credentials::Credentials,
     ) -> Result<gateway_dto::CompleteMultipartUploadOutput, Self::Error> {
+        let (input, upload_id) = request.into_parts();
         trace!(
             event = EVENT_PROTOCOL_STORAGE_CLIENT_REQUEST,
             component = LOG_COMPONENT_PROTOCOLS,
@@ -1090,8 +1090,6 @@ impl rustfs_protocols::common::client::s3::StorageBackend for ProtocolStorageCli
 
         let bucket = input.bucket.as_str().to_owned();
         let key = input.key.as_str().to_owned();
-        // This scalar projection remains until the compatibility seam retires.
-        let upload_id = gateway_s3s_compat::leaf::upload_id_to_s3s(&input.upload_id);
         let input = multipart::complete_multipart_input(input)?;
         let uri = build_object_uri(&bucket, &key, &[("uploadId", Some(upload_id.as_str()))])?;
         let envelope = Self::create_envelope(
@@ -1113,9 +1111,10 @@ impl rustfs_protocols::common::client::s3::StorageBackend for ProtocolStorageCli
 
     async fn abort_multipart_upload(
         &self,
-        input: gateway_dto::AbortMultipartUploadInput,
+        request: MultipartRequest<gateway_dto::AbortMultipartUploadInput>,
         credentials: &rustfs_credentials::Credentials,
     ) -> Result<gateway_dto::AbortMultipartUploadOutput, Self::Error> {
+        let (input, upload_id) = request.into_parts();
         trace!(
             event = EVENT_PROTOCOL_STORAGE_CLIENT_REQUEST,
             component = LOG_COMPONENT_PROTOCOLS,
@@ -1129,8 +1128,6 @@ impl rustfs_protocols::common::client::s3::StorageBackend for ProtocolStorageCli
         let bucket = input.bucket.as_str().to_owned();
         let key = input.key.as_str().to_owned();
         multipart::abort_multipart_input(&input)?;
-        // This scalar projection remains until the compatibility seam retires.
-        let upload_id = gateway_s3s_compat::leaf::upload_id_to_s3s(&input.upload_id);
         let uri = build_object_uri(&bucket, &key, &[("uploadId", Some(upload_id.as_str()))])?;
         let envelope = Self::create_envelope(
             Method::DELETE,
@@ -1153,9 +1150,10 @@ impl rustfs_protocols::common::client::s3::StorageBackend for ProtocolStorageCli
 
     async fn upload_part_copy(
         &self,
-        input: gateway_dto::UploadPartCopyInput,
+        request: MultipartRequest<gateway_dto::UploadPartCopyInput>,
         credentials: &rustfs_credentials::Credentials,
     ) -> Result<gateway_dto::UploadPartCopyOutput, Self::Error> {
+        let input = request.input();
         trace!(
             event = EVENT_PROTOCOL_STORAGE_CLIENT_REQUEST,
             component = LOG_COMPONENT_PROTOCOLS,
@@ -1169,7 +1167,7 @@ impl rustfs_protocols::common::client::s3::StorageBackend for ProtocolStorageCli
 
         let bucket = input.bucket.as_str().to_owned();
         let key = input.key.as_str().to_owned();
-        let (uri, input) = multipart::prepare_upload_part_copy(input)?;
+        let (uri, input) = multipart::prepare_upload_part_copy(request)?;
 
         let envelope = Self::create_envelope(
             Method::PUT,

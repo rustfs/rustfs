@@ -275,7 +275,7 @@ rustfs-gateway-adapter = { workspace = true }
 rustfs-gateway-core = { workspace = true }
 rustfs-gateway-dialect-rustfs-admin = { workspace = true }
 rustfs-gateway-stream = { workspace = true }
-rustfs-gateway-types = { workspace = true, features = ["compat-s3s-rustfs"] }
+rustfs-gateway-types = { workspace = true }
 rustfs-protos = { workspace = true }
 rustfs-rio = { workspace = true }
 rustfs-s3-client = { workspace = true }
@@ -419,6 +419,7 @@ object = { workspace = true, optional = true, features = ["read", "std", "elf"] 
 symbolic-demangle = { version = "=13.9.0", default-features = false, features = ["rust"], optional = true }
 
 [dev-dependencies]
+rustfs-gateway-types = { workspace = true, features = ["compat-s3s-rustfs"] }
 h2.workspace = true
 rustfs-targets = { workspace = true, features = ["test-support"] }
 uuid = { workspace = true, features = ["v4", "v5", "fast-rng", "macro-diagnostics"] }

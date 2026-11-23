@@ -11,7 +11,7 @@ use crate::admin::{
     storage_api::s3::{self, S3Error, S3ErrorCode, S3Result},
 };
 use crate::{
-    auth::{check_key_valid_owned, get_session_token},
+    auth::{check_key_valid_with_context, get_session_token},
     server::ADMIN_PREFIX,
 };
 use http::{HeaderMap, HeaderValue, Method, StatusCode};
@@ -84,7 +84,7 @@ pub(super) async fn owner(
     }
     let context = runtime_sources::app_context_from_envelope(req.envelope())
         .ok_or_else(|| s3::error(S3ErrorCode::InternalError, "application context unavailable"))?;
-    let (credentials, root) = check_key_valid_owned("", signed.access_key(), Some(context.as_ref())).await?;
+    let (credentials, root) = check_key_valid_with_context("", signed.access_key(), Some(context.as_ref())).await?;
     if root || credentials.is_temp() || credentials.is_service_account() {
         return Err(s3::error(S3ErrorCode::AccessDenied, "original user required"));
     }

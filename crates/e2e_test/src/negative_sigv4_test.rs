@@ -269,6 +269,54 @@ fn encode_signed_aws_chunked(signer: &SigV4, headers: &SignedHeaders, decoded: &
     encoded
 }
 
+async fn assert_signature_refusal_preserves_part(
+    client: &aws_sdk_s3::Client,
+    key: &str,
+    upload_id: &str,
+    overwrite: reqwest::RequestBuilder,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let original = b"abc";
+    let uploaded = client
+        .upload_part()
+        .bucket(BUCKET)
+        .key(key)
+        .upload_id(upload_id)
+        .part_number(1)
+        .body(aws_sdk_s3::primitives::ByteStream::from_static(original))
+        .send()
+        .await?;
+    let etag = uploaded.e_tag().ok_or("successful UploadPart omitted ETag")?;
+    assert_eq!(etag.trim_matches('"'), "900150983cd24fb0d6963f7d28e17f72");
+
+    let response = overwrite.send().await?;
+    assert_eq!(response.status().as_u16(), 403);
+    assert_error_code(&response.text().await?, "SignatureDoesNotMatch");
+
+    let listed = client
+        .list_parts()
+        .bucket(BUCKET)
+        .key(key)
+        .upload_id(upload_id)
+        .send()
+        .await?;
+    let [part] = listed.parts() else {
+        panic!("the original part must be the only listed part");
+    };
+    assert_eq!((part.part_number(), part.size(), part.e_tag()), (Some(1), Some(3), Some(etag)));
+    let part = aws_sdk_s3::types::CompletedPart::builder().part_number(1).e_tag(etag).build();
+    client
+        .complete_multipart_upload()
+        .bucket(BUCKET)
+        .key(key)
+        .upload_id(upload_id)
+        .multipart_upload(aws_sdk_s3::types::CompletedMultipartUpload::builder().parts(part).build())
+        .send()
+        .await?;
+    let object = client.get_object().bucket(BUCKET).key(key).send().await?;
+    assert_eq!(object.body.collect().await?.into_bytes().as_ref(), original);
+    Ok(())
+}
+
 /// Exercise decoder failures through both storage publication boundaries.
 #[tokio::test]
 async fn aws_chunked_named_errors_reject_put_and_upload_part() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -371,11 +419,10 @@ async fn aws_chunked_named_errors_reject_put_and_upload_part() -> Result<(), Box
             for (name, value) in extra {
                 request = request.header(name, value);
             }
-            let response = request
-                .body(encoded)
-                .timeout(std::time::Duration::from_secs(20))
-                .send()
-                .await?;
+            let request = request.body(encoded).timeout(std::time::Duration::from_secs(20));
+            let overwrite = (multipart && matches!(case, "signature" | "final-signature"))
+                .then(|| request.try_clone().expect("the request body is held in memory"));
+            let response = request.send().await?;
             let status = response.status().as_u16();
             let body = response.text().await?;
             eprintln!("aws-chunked {case} multipart={multipart}: HTTP {status}, {body}");
@@ -394,17 +441,6 @@ async fn aws_chunked_named_errors_reject_put_and_upload_part() -> Result<(), Box
                     failures.push(format!("{case}: response exposed {private}"));
                 }
             }
-            if let Some(id) = upload_id {
-                let parts = client.list_parts().bucket(BUCKET).key(&key).upload_id(&id).send().await?;
-                assert!(parts.parts().is_empty(), "{case}: rejected UploadPart published a part");
-                client
-                    .abort_multipart_upload()
-                    .bucket(BUCKET)
-                    .key(&key)
-                    .upload_id(id)
-                    .send()
-                    .await?;
-            }
             let absent = client
                 .get_object()
                 .bucket(BUCKET)
@@ -413,6 +449,21 @@ async fn aws_chunked_named_errors_reject_put_and_upload_part() -> Result<(), Box
                 .await
                 .expect_err("a rejected body must not publish an object");
             assert_eq!(absent.as_service_error().and_then(ProvideErrorMetadata::code), Some("NoSuchKey"));
+            if let Some(id) = upload_id {
+                let parts = client.list_parts().bucket(BUCKET).key(&key).upload_id(&id).send().await?;
+                assert!(parts.parts().is_empty(), "{case}: rejected UploadPart published a part");
+                if let Some(overwrite) = overwrite {
+                    assert_signature_refusal_preserves_part(&client, &key, &id, overwrite).await?;
+                    continue;
+                }
+                client
+                    .abort_multipart_upload()
+                    .bucket(BUCKET)
+                    .key(&key)
+                    .upload_id(id)
+                    .send()
+                    .await?;
+            }
         }
     }
     assert!(failures.is_empty(), "{}", failures.join("\n"));

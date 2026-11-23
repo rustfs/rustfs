@@ -3653,9 +3653,11 @@ mod tests {
         }
     }
 
-    #[test]
-    fn archive_error_mapping_preserves_classified_body_errors() {
+    #[tokio::test]
+    async fn archive_error_mapping_preserves_classified_body_errors() {
         use crate::error::{ClientBodyReadTimeout, ServerSideSourceReadError, UploadLimitExceeded};
+        let mut body = rustfs_s3_types::Body::from(bytes::Bytes::from_static(b"abcdef"));
+        let too_large = body.store_all_limited(5).await.expect_err("six bytes exceed the limit");
         for (error, code) in [
             (
                 io::Error::other(ClientBodyReadTimeout {
@@ -3664,10 +3666,7 @@ mod tests {
                 }),
                 S3ErrorCode::RequestTimeout,
             ),
-            (
-                io::Error::other(crate::app::storage_api::s3::BodySizeLimitExceeded { size: 6, limit: 5 }),
-                S3ErrorCode::EntityTooLarge,
-            ),
+            (io::Error::other(too_large), S3ErrorCode::EntityTooLarge),
             (io::Error::other(UploadLimitExceeded { limit: 5 }), S3ErrorCode::EntityTooLarge),
             (
                 io::Error::other(ServerSideSourceReadError::new("CopyObject", io::Error::other("source unavailable"))),
@@ -3705,7 +3704,10 @@ mod tests {
         }
         let displays = Arc::new(AtomicUsize::new(0));
         let error = map_extract_archive_error(io::Error::other(DisplayProbe {
-            source: io::Error::other(UploadStreamError::Sha256Mismatch),
+            source: io::Error::other(rustfs_rio::Sha256Mismatch {
+                expected_sha256: "expected".into(),
+                calculated_sha256: "calculated".into(),
+            }),
             displays: Arc::clone(&displays),
         }));
         assert_eq!(error.code().as_str(), "XAmzContentSHA256Mismatch");

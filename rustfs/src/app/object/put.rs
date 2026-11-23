@@ -3889,7 +3889,10 @@ mod tests {
     #[tokio::test]
     async fn read_small_put_body_maps_upload_stream_sha256_mismatch_to_content_sha256_mismatch() {
         let body = StreamReader::new(futures::stream::iter(vec![Err::<Bytes, std::io::Error>(s3s_body_error_to_io(Box::new(
-            UploadStreamError::Sha256Mismatch,
+            rustfs_rio::Sha256Mismatch {
+                expected_sha256: "expected".into(),
+                calculated_sha256: "calculated".into(),
+            },
         )))]));
 
         let error = read_small_put_body_exact_direct(body, 1)
@@ -3901,7 +3904,10 @@ mod tests {
 
     #[tokio::test]
     async fn read_zero_copy_put_body_maps_upload_stream_sha256_mismatch_to_content_sha256_mismatch() {
-        let body = futures::stream::iter(vec![Err::<Bytes, UploadStreamError>(UploadStreamError::Sha256Mismatch)]);
+        let body = futures::stream::iter([Err::<Bytes, _>(rustfs_rio::Sha256Mismatch {
+            expected_sha256: "expected".into(),
+            calculated_sha256: "calculated".into(),
+        })]);
 
         let error = match read_zero_copy_put_body_exact(body, 1, false).await {
             Ok(_) => panic!("SHA256 mismatch should reject the zero-copy PUT body"),

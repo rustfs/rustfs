@@ -19,7 +19,7 @@ use super::super::{RequestParams, gateway_s3s_compat as compat};
 use super::*;
 use http::{HeaderMap, Method};
 use rustfs_gateway_types::compat::s3s_5761ddfe::leaf::RequestWire;
-use rustfs_protocols::common::client::s3::StorageBackend;
+use rustfs_protocols::common::client::s3::{MultipartRequest, StorageBackend};
 use rustfs_s3_types::{S3Error, S3ErrorCode};
 
 fn create_input() -> dto::CreateMultipartUploadInput {
@@ -125,7 +125,6 @@ fn complete_input() -> dto::CompleteMultipartUploadInput {
     dto::CompleteMultipartUploadInput {
         bucket: rustfs_gateway_types::BucketName::new("multipart-fields").expect("bucket"),
         key: rustfs_gateway_types::ObjectKey::new("key").expect("key"),
-        upload_id: rustfs_gateway_types::UploadIdClaim::from_wire("missing-upload"),
         ..Default::default()
     }
 }
@@ -145,6 +144,7 @@ fn multipart_complete_projection_matches_original_parts_and_conditions() {
     ] {
         let make = || {
             let mut input = complete_input();
+            input.upload_id = rustfs_gateway_types::UploadIdClaim::from_wire("missing-upload");
             input.if_match = condition.map(str::to_owned);
             input.if_none_match = condition.map(str::to_owned);
             input.sse_customer_algorithm = Some(String::new());
@@ -233,19 +233,21 @@ fn multipart_refusals_match_original_client_errors() {
                 input
             };
             let actual = backend
-                .complete_multipart_upload(make(), &root)
+                .complete_multipart_upload(MultipartRequest::complete(make(), "missing-upload"), &root)
                 .await
                 .expect_err("owned refusal");
             assert_ne!(actual.code().as_str(), "", "part {part:?}, condition {condition:?}");
         }
         let error = backend
             .abort_multipart_upload(
-                dto::AbortMultipartUploadInput {
-                    bucket: rustfs_gateway_types::BucketName::new(bucket).expect("bucket"),
-                    key: rustfs_gateway_types::ObjectKey::new("key").expect("key"),
-                    upload_id: rustfs_gateway_types::UploadIdClaim::from_wire("missing-upload"),
-                    ..Default::default()
-                },
+                MultipartRequest::abort(
+                    dto::AbortMultipartUploadInput {
+                        bucket: rustfs_gateway_types::BucketName::new(bucket).expect("bucket"),
+                        key: rustfs_gateway_types::ObjectKey::new("key").expect("key"),
+                        ..Default::default()
+                    },
+                    "missing-upload",
+                ),
                 &root,
             )
             .await
@@ -397,10 +399,12 @@ fn multipart_uses_bound_store_with_a_foreign_ambient_context() {
             let input = dto::AbortMultipartUploadInput {
                 bucket: created.bucket,
                 key: created.key,
-                upload_id: rustfs_gateway_types::UploadIdClaim::from_wire(&created.upload_id),
                 ..Default::default()
             };
-            backend.abort_multipart_upload(input, &root).await.expect("owned bound abort");
+            backend
+                .abort_multipart_upload(MultipartRequest::abort(input, &created.upload_id), &root)
+                .await
+                .expect("owned bound abort");
             assert!(
                 bound
                     .object_store()

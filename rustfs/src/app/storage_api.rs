@@ -59,6 +59,8 @@ pub(crate) mod s3 {
     #[cfg(test)]
     pub(crate) use s3s::Body;
     #[cfg(test)]
+    pub(crate) use s3s::TrailingHeaders;
+    #[cfg(test)]
     pub(crate) use s3s::auth::Credentials;
     #[cfg(test)]
     pub(crate) use s3s::dto;
@@ -81,8 +83,6 @@ pub(crate) mod s3 {
     pub(crate) use s3s::xml;
     #[cfg(test)]
     pub(crate) use s3s::xml::{Serialize as XmlSerialize, Serializer as XmlSerializer};
-    #[cfg(test)]
-    pub(crate) use s3s::{BodySizeLimitExceeded, TrailingHeaders};
     pub(crate) use s3s::{S3Error, S3ErrorCode, S3Result};
     #[cfg(test)]
     pub(crate) use s3s::{S3Request, S3Response};

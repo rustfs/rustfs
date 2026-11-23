@@ -950,11 +950,15 @@ mod tests {
 }
 
 mod upload {
-    use crate::common::{client::s3::StorageBackend, gateway::S3Action, session::SessionContext};
+    use crate::common::{
+        client::s3::{MultipartRequest, StorageBackend},
+        gateway::S3Action,
+        session::SessionContext,
+    };
     use bytes::Bytes;
     use rustfs_gateway_stream::ByteStream;
     use rustfs_gateway_types::dto::*;
-    use rustfs_gateway_types::{BucketName, ObjectKey, UploadIdClaim};
+    use rustfs_gateway_types::{BucketName, ObjectKey};
     use std::{
         sync::{Arc, LazyLock},
         time::Duration,
@@ -1021,7 +1025,7 @@ mod upload {
     struct PendingUpload<S: StorageBackend + 'static> {
         storage: Arc<S>,
         session: SessionContext,
-        input: Option<AbortMultipartUploadInput>,
+        input: Option<MultipartRequest<AbortMultipartUploadInput>>,
     }
 
     impl<S: StorageBackend + 'static> PendingUpload<S> {
@@ -1033,14 +1037,18 @@ mod upload {
         }
     }
 
-    async fn abort_upload<S: StorageBackend>(storage: &S, session: &SessionContext, input: AbortMultipartUploadInput) {
+    async fn abort_upload<S: StorageBackend>(
+        storage: &S,
+        session: &SessionContext,
+        input: MultipartRequest<AbortMultipartUploadInput>,
+    ) {
         let cleanup = async {
             authorize(
                 storage,
                 session,
                 S3Action::AbortMultipartUpload,
-                input.bucket.as_str(),
-                input.key.as_str(),
+                input.input().bucket.as_str(),
+                input.input().key.as_str(),
             )
             .await?;
             storage
@@ -1124,12 +1132,11 @@ mod upload {
         let abort = AbortMultipartUploadInput::builder()
             .bucket(BucketName::new(bucket.to_owned()).map_err(upload_error)?)
             .key(ObjectKey::new(key.to_owned()).map_err(upload_error)?)
-            .upload_id(UploadIdClaim::from_wire(upload_id.clone()))
             .build();
         let mut pending = PendingUpload {
             storage: Arc::clone(&storage),
             session: session.clone(),
-            input: Some(abort),
+            input: Some(MultipartRequest::abort(abort, upload_id.clone())),
         };
 
         let result = async {
@@ -1145,13 +1152,12 @@ mod upload {
                 let input = UploadPartInput::builder()
                     .bucket(BucketName::new(bucket.to_owned()).map_err(upload_error)?)
                     .key(ObjectKey::new(key.to_owned()).map_err(upload_error)?)
-                    .upload_id(UploadIdClaim::from_wire(upload_id.clone()))
                     .part_number(number)
                     .content_length(length)
                     .body(body(part))
                     .build();
                 let output = storage
-                    .upload_part(input, session.credentials())
+                    .upload_part(MultipartRequest::upload_part(input, upload_id.clone()), session.credentials())
                     .await
                     .map_err(upload_error)?;
                 let etag = if output.e_tag == rustfs_gateway_types::ETag::default() {
@@ -1170,11 +1176,10 @@ mod upload {
             let input = CompleteMultipartUploadInput::builder()
                 .bucket(BucketName::new(bucket.to_owned()).map_err(upload_error)?)
                 .key(ObjectKey::new(key.to_owned()).map_err(upload_error)?)
-                .upload_id(UploadIdClaim::from_wire(upload_id))
                 .multipart_upload(CompletedMultipartUpload { parts })
                 .build();
             storage
-                .complete_multipart_upload(input, session.credentials())
+                .complete_multipart_upload(MultipartRequest::complete(input, upload_id), session.credentials())
                 .await
                 .map_err(upload_error)?;
             // No await between a successful commit and disarming cancellation cleanup.
