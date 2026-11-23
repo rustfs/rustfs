@@ -757,7 +757,7 @@ impl DataUsageCache {
             _ => (inline.clone(), None),
         };
         let path = path_join_buf(&[BUCKET_META_PREFIX, name]);
-        let display_progress = timeout(Duration::from_secs(2), async {
+        let display_progress = match timeout(Duration::from_secs(2), async {
             let input = if expected_epoch.is_some() && self.info.scan_identity.is_some() && self.info.name != DATA_USAGE_ROOT {
                 match &encoded {
                     Some(encoded) => encoded.progress_input().await,
@@ -769,8 +769,13 @@ impl DataUsageCache {
             self.prepare_display_progress(store.clone(), expected_epoch, input).await
         })
         .await
-        .ok()
-        .flatten();
+        {
+            Ok(prepared) => prepared,
+            Err(_) => {
+                rustfs_scanner_metrics::metrics::global_metrics().record_scanner_progress_prepare_timeout();
+                None
+            }
+        };
         let primary_save_started = Instant::now();
         Self::save_path_with_retry(
             store.clone(),

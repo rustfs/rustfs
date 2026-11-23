@@ -1573,6 +1573,69 @@ where
         ScannerCyclePendingBuckets::new()
     };
     usage_watch_proofs.retain(|bucket, _| !uncertified_buckets.contains(bucket));
+    let certified_buckets_update = if completed_usage.is_none()
+        && cycle_status != ScannerCycleStatus::Complete
+        && activity_status == ScannerCycleActivityStatus::Unchanged
+        && (!distributed || remote_certification.is_some())
+        && !owner_ctx.is_cancelled()
+    {
+        let baseline = persisted_usage_baseline
+            .as_ref()
+            .and_then(|bytes| serde_json::from_slice::<DataUsageInfo>(bytes).ok());
+        let movement = store.scanner_data_usage_movement_generation().await;
+        let mut layouts = Vec::new();
+        for set in store.all_set_disks() {
+            let source = DataUsageCacheSource::new(set.pool_index, set.set_index);
+            if !expected_sources.contains(&source) {
+                continue;
+            }
+            if let Some(disks) = set.format.erasure.sets.get(set.set_index) {
+                if set.format.id.is_nil() || disks.is_empty() || disks.iter().any(uuid::Uuid::is_nil) {
+                    layouts.clear();
+                    break;
+                }
+                let mut digest = Sha256::new();
+                digest.update(set.format.id.as_bytes());
+                for disk in disks {
+                    digest.update(disk.as_bytes());
+                }
+                layouts.push(rustfs_data_usage::CertifiedBucketsSource {
+                    pool_index: u64::try_from(set.pool_index).unwrap_or(u64::MAX),
+                    set_index: u64::try_from(set.set_index).unwrap_or(u64::MAX),
+                    layout: digest.finalize().into(),
+                });
+            }
+        }
+        layouts.sort_by_key(|source| (source.pool_index, source.set_index));
+        if let (Some(baseline), Some(movement)) = (baseline, movement) {
+            let scope = ScannerSnapshotScope {
+                sources: &expected_sources,
+                buckets: &all_bucket_names,
+                identity: ScannerSnapshotIdentity {
+                    cycle: want_cycle,
+                    leader_epoch,
+                    plan_digest: scan_plan_digest,
+                    coverage_digest: bucket_coverage_digest,
+                    tier_registry_generation: Some(tier_registry_generation),
+                },
+            };
+            certified_buckets_candidate(
+                &results,
+                &scope,
+                &completions,
+                &uncertified_buckets,
+                &baseline,
+                layouts,
+                movement,
+                &tier_registry.names,
+            )
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+    let has_certified_bucket_update = certified_buckets_update.is_some();
     // A verified empty scoped ACK cannot become a whole-generation ACK. Old
     // peers need every bucket freshly completed and no pending responsibility.
     let legacy_ack_allowed = pending_buckets.is_empty()
@@ -1653,6 +1716,9 @@ where
         } else {
             publish_usage_snapshot(&updates, cycle_status, &pending_buckets, data_usage_info).await?
         }
+    } else if let Some(data_usage_info) = certified_buckets_update {
+        send_data_usage_update(&updates, data_usage_info).await?;
+        true
     } else if !owner_ctx.is_cancelled()
         && let Some((data_usage_info, _)) = observational_usage
     {
@@ -1682,6 +1748,7 @@ where
         .with_activity_baseline(activity_before)
         .with_pending_dirty_usage_buckets(pending_buckets.len())
         .with_usage_update_emitted(usage_update_emitted)
+        .with_certified_bucket_update(has_certified_bucket_update)
         .with_partial_bucket_progress(partial_bucket_progress)
         .with_remote_publication_lease_targets(remote_publication_lease_targets)
         .with_remote_dirty_usage_acknowledgements(remote_dirty_usage_acknowledgements)

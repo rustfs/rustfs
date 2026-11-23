@@ -86,7 +86,11 @@ impl<T> AvailableWalkers<T> {
             .enumerate()
             .map(|(index, slot)| {
                 let rank = prefix.clone().chain_update(slot.endpoint.as_bytes()).finalize();
-                (parked(&slot.walker.disk), rank, slot.endpoint.as_str(), index)
+                // Native directory anchors survive executor changes. A local
+                // parked fallback must not outrank the same stable endpoint
+                // on the next leader and restart another physical subtotal.
+                let live_handle_priority = !cfg!(any(target_os = "linux", target_os = "macos")) && parked(&slot.walker.disk);
+                (live_handle_priority, rank, slot.endpoint.as_str(), index)
             })
             .max()
             .map(|(_, _, _, index)| index)?;
@@ -142,7 +146,17 @@ mod tests {
             let parked = first
                 .take_for_bucket(bucket, |disk| *disk == alternative)
                 .expect("parked directory");
-            assert_eq!(parked.endpoint, alternative, "follow a parked stream on a previous fallback disk");
+            if cfg!(any(target_os = "linux", target_os = "macos")) {
+                assert_eq!(
+                    parked.endpoint, another.endpoint,
+                    "a local parked fallback cannot change the stable source after handoff"
+                );
+            } else {
+                assert_eq!(
+                    parked.endpoint, alternative,
+                    "retain live handles where native anchors cannot reopen a directory"
+                );
+            }
             first.release(parked);
             reordered.release(another);
         }

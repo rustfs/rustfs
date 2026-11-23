@@ -1144,6 +1144,9 @@ pub struct Metrics {
     scanner_checkpoint: Mutex<Option<ScannerCheckpointReport>>,
     scanner_checkpoints_persisted: Mutex<BTreeMap<(usize, usize), ScannerPersistedCheckpointReport>>,
     scanner_checkpoint_save_failures: AtomicU64,
+    scanner_progress_prepare_timeouts: AtomicU64,
+    scanner_progress_writes: AtomicU64,
+    scanner_progress_write_failures: AtomicU64,
     scanner_checkpoint_used: AtomicU64,
     scanner_checkpoint_cleared: AtomicU64,
     scanner_checkpoint_ignored: AtomicU64,
@@ -1739,6 +1742,10 @@ pub struct ScannerMetricsReport {
     pub scan_checkpoint_save_failures: u64,
     #[serde(default)]
     pub scan_checkpoint_used: u64,
+    /// Initial/display progress failures do not invalidate a saved checkpoint.
+    pub scan_progress_prepare_timeouts: u64,
+    pub scan_progress_writes: u64,
+    pub scan_progress_write_failures: u64,
     #[serde(default)]
     pub scan_checkpoint_cleared: u64,
     #[serde(default)]
@@ -2358,6 +2365,9 @@ impl Metrics {
             scanner_checkpoint: Mutex::new(None),
             scanner_checkpoints_persisted: Mutex::new(BTreeMap::new()),
             scanner_checkpoint_save_failures: AtomicU64::new(0),
+            scanner_progress_prepare_timeouts: AtomicU64::new(0),
+            scanner_progress_writes: AtomicU64::new(0),
+            scanner_progress_write_failures: AtomicU64::new(0),
             scanner_checkpoint_used: AtomicU64::new(0),
             scanner_checkpoint_cleared: AtomicU64::new(0),
             scanner_checkpoint_ignored: AtomicU64::new(0),
@@ -2716,6 +2726,18 @@ impl Metrics {
     pub fn record_scanner_checkpoint_used(&self) {
         self.scanner_checkpoint_used.fetch_add(1, Ordering::Relaxed);
         self.update_scanner_checkpoint_event(SCANNER_CHECKPOINT_EVENT_USED);
+    }
+
+    pub fn record_scanner_progress_prepare_timeout(&self) {
+        self.scanner_progress_prepare_timeouts.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn record_scanner_progress_write(&self, success: bool) {
+        if success {
+            self.scanner_progress_writes.fetch_add(1, Ordering::Relaxed);
+        } else {
+            self.scanner_progress_write_failures.fetch_add(1, Ordering::Relaxed);
+        }
     }
 
     pub fn record_scanner_checkpoint_cleared(&self) {
@@ -4117,6 +4139,9 @@ impl Metrics {
             .collect();
         m.scan_checkpoint_save_failures = self.scanner_checkpoint_save_failures.load(Ordering::Relaxed);
         m.scan_checkpoint_used = self.scanner_checkpoint_used.load(Ordering::Relaxed);
+        m.scan_progress_prepare_timeouts = self.scanner_progress_prepare_timeouts.load(Ordering::Relaxed);
+        m.scan_progress_writes = self.scanner_progress_writes.load(Ordering::Relaxed);
+        m.scan_progress_write_failures = self.scanner_progress_write_failures.load(Ordering::Relaxed);
         m.scan_checkpoint_cleared = self.scanner_checkpoint_cleared.load(Ordering::Relaxed);
         m.scan_checkpoint_ignored = self.scanner_checkpoint_ignored.load(Ordering::Relaxed);
         m.scan_checkpoint_stale = self.scanner_checkpoint_stale.load(Ordering::Relaxed);

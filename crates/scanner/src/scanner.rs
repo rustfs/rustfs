@@ -23,9 +23,9 @@ use self::heal_info::{
     resolve_background_heal_info_for_cycle, save_background_heal_info_for_epoch, scanner_bitrot_start_for_cycle,
 };
 use crate::data_usage_define::{
-    BACKGROUND_HEAL_INFO_PATH, DATA_USAGE_BLOOM_NAME_PATH, DATA_USAGE_OBJ_NAME_PATH, DATA_USAGE_OBSERVED_OBJ_NAME_PATH,
-    DATA_USAGE_RECOVERY_PATH, DataUsageCache, DataUsageCacheRevision, LEGACY_DATA_USAGE_OBJ_NAME_PATH, read_config_revision,
-    read_config_with_revision,
+    BACKGROUND_HEAL_INFO_PATH, DATA_USAGE_BLOOM_NAME_PATH, DATA_USAGE_CERTIFIED_BUCKETS_OBJ_NAME_PATH, DATA_USAGE_OBJ_NAME_PATH,
+    DATA_USAGE_OBSERVED_OBJ_NAME_PATH, DATA_USAGE_RECOVERY_PATH, DataUsageCache, DataUsageCacheRevision,
+    LEGACY_DATA_USAGE_OBJ_NAME_PATH, read_config_revision, read_config_with_revision,
 };
 use crate::runtime_config::{
     ScannerRuntimeConfig, ScannerRuntimeConfigSource, refresh_scanner_runtime_config_from_global, scanner_bitrot_cycle,
@@ -701,6 +701,7 @@ pub(super) fn scanner_usage_bootstrap_marker(last_update: std::time::SystemTime,
         scanner_epoch,
         usage_snapshot_converged: Some(false),
         usage_snapshot_bootstrap_pending: true,
+        usage_snapshot_rebuild_generation: Some(uuid::Uuid::new_v4().to_string()),
         ..Default::default()
     }
 }
@@ -4153,10 +4154,14 @@ enum ScannerCyclePublicationPlan {
     ProgressOnly,
     Observational,
     Authoritative,
+    CertifiedBuckets,
 }
 
 impl ScannerCyclePublicationPlan {
     fn for_result(result: &ScannerCycleResult) -> Self {
+        if result.has_certified_bucket_update() {
+            return Self::CertifiedBuckets;
+        }
         match (result.has_usage_update(), result.status) {
             (false, _) => Self::ProgressOnly,
             (
@@ -4178,7 +4183,7 @@ impl ScannerCyclePublicationPlan {
     }
 
     fn uses_observational_lease(self) -> bool {
-        self != Self::Authoritative
+        !matches!(self, Self::Authoritative | Self::CertifiedBuckets)
     }
 
     async fn await_leases<T, E, F, Fut>(
@@ -4208,6 +4213,7 @@ impl ScannerCyclePublicationPlan {
                 Self::ProgressOnly => "progress_only",
                 Self::Observational => "observational",
                 Self::Authoritative => "authoritative",
+                Self::CertifiedBuckets => "certified_buckets",
             },
             "Scanner is acquiring peer publication proof"
         );

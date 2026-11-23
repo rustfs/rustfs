@@ -16,7 +16,9 @@
 
 pub mod local_snapshot;
 mod scan_progress;
+mod snapshot_view;
 pub use scan_progress::load_bucket_scan_progress_for_admin;
+pub use snapshot_view::{AdminUsageSnapshot, load_admin_usage_snapshot};
 
 use crate::storage_api_contracts::{
     bucket::{BucketOperations as _, BucketOptions},
@@ -1154,6 +1156,9 @@ fn parse_usage_snapshot(buf: &[u8]) -> Result<DataUsageInfo, Error> {
             e.column()
         ))
     })?;
+    if info.usage_snapshot_certified_buckets.is_some() {
+        return Err(Error::other("completed-bucket sidecar is not a namespace baseline"));
+    }
     reject_admin_usage_projection(&info)?;
     for usage in info.buckets_usage.values_mut() {
         usage.normalize_usage_provenance();

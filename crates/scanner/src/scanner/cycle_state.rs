@@ -2717,9 +2717,12 @@ pub(super) async fn publish_scanner_usage_bootstrap_primary(
         expected_revision: &DataUsageCacheRevision,
         expected_publication_epoch: u64,
         leader_epoch: Option<u64>,
+        initial_bootstrap: bool,
         owns_publication: &(impl Fn() -> bool + Sync),
     ) -> Result<(), ScannerUsageBootstrapPublishError> {
-        let marker = scanner_usage_bootstrap_marker(std::time::SystemTime::now(), leader_epoch);
+        let mut marker = scanner_usage_bootstrap_marker(std::time::SystemTime::now(), leader_epoch);
+        marker.usage_snapshot_initial_bootstrap = initial_bootstrap;
+        marker.usage_snapshot_initial_view_version = initial_bootstrap.then_some(1);
         let data = serde_json::to_vec(&marker).map_err(ScannerUsageBootstrapPublishError::Encode)?;
         let save_result = save_reset_config(
             storeapi.clone(),
@@ -2751,9 +2754,16 @@ pub(super) async fn publish_scanner_usage_bootstrap_primary(
         })
     }
 
-    inner(storeapi, expected_revision, expected_publication_epoch, leader_epoch, &owns_publication)
-        .await
-        .map_err(|err| err.into_scanner_error(context))
+    inner(
+        storeapi,
+        expected_revision,
+        expected_publication_epoch,
+        leader_epoch,
+        matches!(&context, ScannerUsageBootstrapPublishContext::Initial),
+        &owns_publication,
+    )
+    .await
+    .map_err(|err| err.into_scanner_error(context))
 }
 
 pub(super) async fn reset_scanner_usage_state_slots_for_full_rebuild(

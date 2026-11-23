@@ -803,8 +803,11 @@ where
         // Routing keys on the explicit producer mark, not on convergence: a
         // `Complete` cycle with pending buckets is authoritative but not
         // converged, while a vetoed cycle is observational.
-        let observational = data_usage_info.usage_snapshot_observational;
-        let target_path = if observational {
+        let certified_buckets = data_usage_info.usage_snapshot_certified_buckets.is_some();
+        let observational = data_usage_info.usage_snapshot_observational || certified_buckets;
+        let target_path = if certified_buckets {
+            DATA_USAGE_CERTIFIED_BUCKETS_OBJ_NAME_PATH.as_str()
+        } else if observational {
             DATA_USAGE_OBSERVED_OBJ_NAME_PATH.as_str()
         } else {
             DATA_USAGE_OBJ_NAME_PATH.as_str()
@@ -923,7 +926,10 @@ where
             data_usage_info.usage_snapshot_authoritative_baseline = Some(authoritative.snapshot_identity());
         }
 
-        if !data_usage_info.is_complete_bucket_usage_snapshot() && !data_usage_info.is_valid_partial_snapshot() {
+        if !data_usage_info.is_complete_bucket_usage_snapshot()
+            && !data_usage_info.is_valid_partial_snapshot()
+            && !data_usage_info.is_certified_buckets_snapshot()
+        {
             error!(
                 target: "rustfs::scanner",
                 event = EVENT_SCANNER_PERSIST_STATE,
@@ -939,6 +945,107 @@ where
             continue;
         }
 
+        let mut sidecar_baseline = None;
+        if certified_buckets {
+            // A durable barrier precedes the sidecar. Losing that sidecar must
+            // never turn an already completed incarnation into a first scan.
+            let barrier: Result<(), EcstoreError> = async {
+                let (bytes, revision) = read_config_with_revision(storeapi.clone(), DATA_USAGE_OBJ_NAME_PATH.as_str()).await?;
+                let bytes =
+                    bytes.ok_or_else(|| EcstoreError::other("authoritative baseline is unavailable for bucket history"))?;
+                let mut primary: DataUsageInfo =
+                    serde_json::from_slice(&bytes).map_err(|_| EcstoreError::other("invalid bucket-history baseline"))?;
+                if !data_usage_info.certified_buckets_match_baseline(&primary)
+                    || primary.scanner_epoch != data_usage_info.scanner_epoch
+                {
+                    return Err(EcstoreError::other("bucket-history baseline ownership changed"));
+                }
+                let mut changed = false;
+                for (bucket, usage) in &data_usage_info.buckets_usage {
+                    let Some(incarnation) = &usage.bucket_incarnation else { continue };
+                    if primary.usage_snapshot_noninitial_buckets.get(bucket) != Some(incarnation) {
+                        primary
+                            .usage_snapshot_noninitial_buckets
+                            .insert(bucket.clone(), incarnation.clone());
+                        changed = true;
+                    }
+                }
+                if !changed {
+                    return Ok(());
+                }
+                let epoch = expected_publication_epoch
+                    .ok_or_else(|| EcstoreError::other("bucket history requires a publication epoch"))?;
+                if remote_lease_expired(remote_lease_deadline) {
+                    return Err(EcstoreError::other("bucket-history lease expired"));
+                }
+                let scope = storeapi
+                    .scanner_data_usage_publication_commit_scope_with_release_flag(
+                        epoch,
+                        scanner_publication_scope_deadline(data_usage_persist_timeout(), remote_lease_deadline),
+                        remote_lease_tokens.clone(),
+                        Arc::clone(&lease_release_safe),
+                    )
+                    .await;
+                let legacy_admission = if scope.is_none() {
+                    Some(
+                        scanner_publication_admission_for_epoch(storeapi.clone(), epoch)
+                            .await
+                            .ok_or_else(|| EcstoreError::other("bucket-history publication is unavailable"))?,
+                    )
+                } else {
+                    None
+                };
+                let encoded =
+                    Bytes::from(serde_json::to_vec(&primary).map_err(|_| EcstoreError::other("bucket-history encode failed"))?);
+                let saved = crate::save_config_shared_with_preconditions_and_lease_fence_and_scope(
+                    storeapi.clone(),
+                    DATA_USAGE_OBJ_NAME_PATH.as_str(),
+                    encoded,
+                    None,
+                    revision.preconditions(),
+                    scanner_publication_lease_fence.as_deref(),
+                    scope.clone(),
+                )
+                .await;
+                drop(legacy_admission);
+                if let Some(scope) = scope {
+                    if scope.wait_for_completion().await != ScannerPublicationCommitState::Committed {
+                        return Err(EcstoreError::other("bucket history commit was not confirmed"));
+                    }
+                }
+                saved?;
+                Ok(())
+            }
+            .await;
+            if barrier.is_err() {
+                global_metrics().record_scanner_usage_publication("failed", "bucket_history");
+                outcome = DataUsagePersistOutcome::Failed;
+                continue;
+            }
+            match read_config_with_revision(storeapi.clone(), target_path).await {
+                Ok((data, revision)) => {
+                    if let Some(bytes) = &data {
+                        match serde_json::from_slice::<DataUsageInfo>(bytes) {
+                            Ok(previous) if previous.is_certified_buckets_snapshot() => {
+                                data_usage_info.retain_prior_certified_buckets(&previous)
+                            }
+                            _ => {
+                                outcome = DataUsagePersistOutcome::Failed;
+                                continue;
+                            }
+                        }
+                    }
+                    sidecar_baseline = Some(DataUsagePersistBaseline {
+                        data: data.map(Bytes::from),
+                        revision,
+                    });
+                }
+                Err(_) => {
+                    outcome = DataUsagePersistOutcome::Failed;
+                    continue;
+                }
+            }
+        }
         let data = match serde_json::to_vec(&data_usage_info) {
             Ok(data) => data,
             Err(e) => {
@@ -991,7 +1098,9 @@ where
                     }
                 },
             };
-            let baseline = if !observational && cas_retry == 0 {
+            let baseline = if certified_buckets && cas_retry == 0 {
+                sidecar_baseline.take()
+            } else if !observational && cas_retry == 0 {
                 next_baseline.take()
             } else {
                 None

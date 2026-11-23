@@ -740,6 +740,9 @@ impl ValidatedUsageCandidate {
         pending_buckets: &ScannerCyclePendingBuckets,
     ) -> (DataUsageInfo, Option<ScannerPublicationExpectation>) {
         let certified_at = SystemTime::now();
+        if status == ScannerCycleStatus::Complete {
+            self.data.usage_snapshot_initial_view_version = Some(1);
+        }
         for (bucket, usage) in &mut self.data.buckets_usage {
             if usage.usage_value_state == Some(rustfs_data_usage::BucketUsageValueState::Certified) {
                 if status == ScannerCycleStatus::Complete && !pending_buckets.contains(bucket) {
@@ -936,6 +939,103 @@ pub(super) fn completed_usage_candidate(
         },
     );
     candidate
+}
+
+/// Complete bucket rows may be published while another bucket is unfinished.
+/// This is a separate object: it cannot certify a whole namespace or clear an
+/// unfinished bucket's dirty responsibility.
+pub(super) fn certified_buckets_candidate(
+    results: &[DataUsageCache],
+    scope: &ScannerSnapshotScope<'_>,
+    completions: &ScannerBucketCompletions,
+    uncertified: &HashSet<String>,
+    baseline: &DataUsageInfo,
+    sources: Vec<rustfs_data_usage::CertifiedBucketsSource>,
+    movement_generation: u64,
+    tier_names: &[String],
+) -> Option<DataUsageInfo> {
+    if results.len() != scope.sources.len() || sources.len() != scope.sources.len() {
+        return None;
+    }
+    let mut seen = HashSet::new();
+    for result in results {
+        let source = result.info.source?;
+        if !scope.sources.contains(&source)
+            || !seen.insert(source)
+            || result.info.name != DATA_USAGE_ROOT
+            || result.info.cache_key_format != DATA_USAGE_CACHE_KEY_FORMAT
+            || result.info.next_cycle != scope.identity.cycle
+            || result.info.leader_epoch != scope.identity.leader_epoch
+            || result.info.scan_plan_digest != Some(scope.identity.plan_digest)
+            || result.info.scan_coverage_digest != Some(scope.identity.coverage_digest)
+            || result.info.tier_registry_generation != scope.identity.tier_registry_generation
+        {
+            return None;
+        }
+    }
+    let updated_at = SystemTime::now();
+    let mut bucket_incarnations = HashMap::new();
+    let mut buckets_usage = HashMap::new();
+    for bucket in scope.buckets {
+        let Some(incarnation) = certified_bucket_incarnation(results, bucket) else { continue };
+        bucket_incarnations.insert(bucket.clone(), incarnation.to_string());
+        if uncertified.contains(bucket)
+            || peer_certification::bucket_completed_in_all_sources(bucket, scope.sources, completions) != Some(incarnation)
+        {
+            continue;
+        }
+        let mut merged = DataUsageEntry::default();
+        for result in results {
+            let entry = result.checked_flatten(bucket)?;
+            if entry.failed_objects != 0 || !merged.checked_merge(&entry) {
+                return None;
+            }
+        }
+        if !tier_accounting_proof_is_publishable(&merged, scope.identity.tier_registry_generation, tier_names) {
+            return None;
+        }
+        let mut usage = checked_bucket_usage_info(merged)?;
+        usage.bucket_incarnation = Some(incarnation.to_string());
+        usage.certify(rustfs_data_usage::BucketUsageCertification {
+            epoch: scope.identity.leader_epoch,
+            cycle: scope.identity.cycle,
+            certified_at: updated_at,
+        });
+        buckets_usage.insert(bucket.clone(), usage);
+    }
+    if buckets_usage.is_empty() {
+        return None;
+    }
+    // Compatible previously complete values stay available with their original
+    // certificate. They do not acquire this cycle's fresh completion.
+    for (bucket, usage) in &baseline.buckets_usage {
+        if usage.usage_certification.is_some() && usage.bucket_incarnation.as_ref() == bucket_incarnations.get(bucket) {
+            buckets_usage.entry(bucket.clone()).or_insert_with(|| usage.clone());
+        }
+    }
+    let mut data = DataUsageInfo {
+        last_update: Some(updated_at),
+        scanner_epoch: Some(scope.identity.leader_epoch),
+        scanner_cycle: Some(scope.identity.cycle),
+        buckets_count: u64::try_from(buckets_usage.len()).ok()?,
+        buckets_usage,
+        usage_snapshot_partial: true,
+        usage_snapshot_converged: Some(false),
+        usage_snapshot_authoritative_baseline: Some(baseline.snapshot_identity()),
+        usage_snapshot_certified_buckets: Some(rustfs_data_usage::CertifiedBucketsScope {
+            version: 1,
+            baseline: baseline.snapshot_identity(),
+            baseline_initial_bootstrap: baseline.usage_snapshot_initial_bootstrap,
+            baseline_bootstrap_pending: baseline.usage_snapshot_bootstrap_pending,
+            movement_generation,
+            sources,
+            bucket_incarnations,
+            baseline_rebuild_generation: baseline.usage_snapshot_rebuild_generation.clone(),
+        }),
+        ..Default::default()
+    };
+    data.calculate_totals();
+    data.is_certified_buckets_snapshot().then_some(data)
 }
 
 fn tier_accounting_proof_is_publishable(

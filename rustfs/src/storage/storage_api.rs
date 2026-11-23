@@ -502,12 +502,12 @@ pub(crate) mod ecstore_config {
 
 pub(crate) mod ecstore_data_usage {
     pub(crate) use rustfs_ecstore::api::data_usage::{
-        get_bucket_usage_memory, init_compression_total_memory_from_backend, load_admin_data_usage_from_backend_cached,
-        load_admin_data_usage_with_memory_overlay, load_bucket_scan_progress_for_admin, load_bucket_usage_from_backend_cached,
-        load_data_usage_from_backend, lookup_degraded_bucket_usage_baseline, quota_object_size,
-        record_bucket_delete_marker_memory, record_bucket_object_delete_memory, record_bucket_object_version_write_memory,
-        record_bucket_object_write_memory, record_bucket_object_write_unknown_previous_memory,
-        store_compression_total_in_backend,
+        AdminUsageSnapshot, get_bucket_usage_memory, init_compression_total_memory_from_backend,
+        load_admin_data_usage_from_backend_cached, load_admin_data_usage_with_memory_overlay, load_admin_usage_snapshot,
+        load_bucket_scan_progress_for_admin, load_bucket_usage_from_backend_cached, load_data_usage_from_backend,
+        lookup_degraded_bucket_usage_baseline, quota_object_size, record_bucket_delete_marker_memory,
+        record_bucket_object_delete_memory, record_bucket_object_version_write_memory, record_bucket_object_write_memory,
+        record_bucket_object_write_unknown_previous_memory, store_compression_total_in_backend,
     };
     // Test-only observables for the rustfs/backlog#1306 revert detector.
     #[cfg(test)]

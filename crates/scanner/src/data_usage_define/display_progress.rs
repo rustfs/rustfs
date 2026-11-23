@@ -311,11 +311,12 @@ impl DataUsageCache {
         };
         // A diagnostic write failure must not invalidate a durable checkpoint.
         // The next admitted checkpoint retries, with no request-path S3 listing.
-        let _ = timeout(
+        let result = timeout(
             Duration::from_secs(2),
             crate::save_config_with_publication_admission_for_epoch(store, &path, data, revision.preconditions(), epoch),
         )
         .await;
+        rustfs_scanner_metrics::metrics::global_metrics().record_scanner_progress_write(matches!(result, Ok(Ok(_))));
     }
 }
 

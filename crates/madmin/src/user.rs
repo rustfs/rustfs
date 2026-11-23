@@ -450,6 +450,10 @@ pub enum BucketUsageValueState {
 #[derive(Debug, Serialize, Deserialize, Default)]
 pub struct BucketAccessInfo {
     pub name: String,
+    /// Explicit permission to display this incarnation's initial scan values.
+    /// Missing is conservative for older servers and clients.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub initial_scan: Option<bool>,
     /// Display-only accepted scan progress, never a replacement for total usage.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scan_progress: Option<BucketScanProgress>,
