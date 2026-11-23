@@ -1745,15 +1745,21 @@ mod tests {
         iam_cache
             .cache
             .add_or_update_sts_account(&valid.access_key, &UserIdentity::new(valid.clone()), now);
-        for (token, key) in [
-            (valid.session_token.as_str(), valid.access_key.as_str()),
-            ("", root.access_key.as_str()),
-        ] {
-            let (public_cred, public_owner) = check_key_valid_with_context(token, key, Some(&context)).await.unwrap();
-            let (owned_cred, owned_owner) = check_key_valid_owned(token, key, Some(&context)).await.unwrap();
-            assert_eq!(owned_owner, public_owner);
-            assert!(owned_owner);
-            assert!(serde_json::to_value(owned_cred).unwrap() == serde_json::to_value(public_cred).unwrap());
+        for (fixture, expected_claims) in [(&valid, Some(&claims)), (&root, None)] {
+            let token = &fixture.session_token;
+            let key = &fixture.access_key;
+            for (verified, is_owner) in [
+                check_key_valid_with_context(token, key, Some(&context)).await.unwrap(),
+                check_key_valid_owned(token, key, Some(&context)).await.unwrap(),
+            ] {
+                assert!(is_owner);
+                assert!(verified.access_key == fixture.access_key);
+                assert!(verified.secret_key == fixture.secret_key);
+                assert!(verified.session_token == fixture.session_token);
+                assert!(verified.parent_user == fixture.parent_user);
+                assert_eq!(verified.expiration, fixture.expiration);
+                assert!(verified.claims.as_ref() == expected_claims);
+            }
         }
 
         // Seed the state of an issued identity after expiration without sleeping
@@ -1768,20 +1774,45 @@ mod tests {
         service_account.expiration = expired.expiration;
         let mut invalid_key = create_test_credentials();
         invalid_key.secret_key = "short".to_string();
-        for (name, credential, token, expected) in [
-            ("expired", &expired, expired.session_token.as_str(), S3ErrorCode::ExpiredToken),
-            ("expired without token", &expired, "", S3ErrorCode::InvalidRequest),
-            ("expired with wrong token", &expired, "wrong-token", S3ErrorCode::InvalidRequest),
+        for (name, credential, token, expected, message) in [
+            (
+                "expired",
+                &expired,
+                expired.session_token.as_str(),
+                S3ErrorCode::ExpiredToken,
+                "The provided token has expired.",
+            ),
+            ("expired without token", &expired, "", S3ErrorCode::InvalidRequest, "invalid token1"),
+            (
+                "expired with wrong token",
+                &expired,
+                "wrong-token",
+                S3ErrorCode::InvalidRequest,
+                "invalid token3",
+            ),
             (
                 "disabled expired",
                 &disabled,
                 disabled.session_token.as_str(),
                 S3ErrorCode::InvalidAccessKeyId,
+                "check key failed",
             ),
-            ("expired service account", &service_account, "", S3ErrorCode::InvalidRequest),
-            ("active without token", &valid, "", S3ErrorCode::InvalidRequest),
-            ("active with wrong token", &valid, "wrong-token", S3ErrorCode::InvalidRequest),
-            ("invalid key", &invalid_key, "", S3ErrorCode::InvalidRequest),
+            (
+                "expired service account",
+                &service_account,
+                "",
+                S3ErrorCode::InvalidRequest,
+                "check key failed",
+            ),
+            ("active without token", &valid, "", S3ErrorCode::InvalidRequest, "invalid token1"),
+            (
+                "active with wrong token",
+                &valid,
+                "wrong-token",
+                S3ErrorCode::InvalidRequest,
+                "invalid token3",
+            ),
+            ("invalid key", &invalid_key, "", S3ErrorCode::InvalidRequest, "check key failed"),
         ] {
             iam_cache.cache.add_or_update_sts_account(
                 &credential.access_key,
@@ -1794,11 +1825,15 @@ mod tests {
             let owned = check_key_valid_owned(token, &credential.access_key, Some(&context))
                 .await
                 .unwrap_err();
-            assert_eq!(owned.code().as_str(), expected.as_str(), "{name}");
-            assert_eq!(owned.message(), error.message(), "{name}");
-            assert_eq!(owned.status_code(), error.status_code(), "{name}");
-            assert!(owned.source().is_none() && error.source().is_none(), "{name}");
-            assert_eq!(error.code(), &expected, "{name}");
+            for (code, text, status, has_source) in [
+                (error.code().as_str(), error.message(), error.status_code(), error.source().is_some()),
+                (owned.code().as_str(), owned.message(), owned.status_code(), owned.source().is_some()),
+            ] {
+                assert_eq!(code, expected.as_str(), "{name}");
+                assert_eq!(text, Some(message), "{name}");
+                assert_eq!(status, expected.status_code(), "{name}");
+                assert!(!has_source, "{name}");
+            }
             if expected == S3ErrorCode::ExpiredToken {
                 let response = error.to_http_response().expect("serialize the S3 error");
                 assert_eq!(response.status(), http::StatusCode::BAD_REQUEST);
