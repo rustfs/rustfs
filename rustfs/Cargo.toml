@@ -279,7 +279,7 @@ rustfs-gateway-types = { workspace = true }
 rustfs-protos = { workspace = true }
 rustfs-rio = { workspace = true }
 rustfs-s3-client = { workspace = true }
-rustfs-s3-types = { workspace = true, features = ["compat-s3s"] }
+rustfs-s3-types = { workspace = true }
 rustfs-s3-ops = { workspace = true }
 rustfs-security-governance = { workspace = true }
 rustfs-data-usage = { workspace = true }
@@ -382,7 +382,6 @@ percent-encoding = { workspace = true }
 pin-project-lite.workspace = true
 parking_lot = { workspace = true }
 rust-embed = { workspace = true, features = ["interpolate-folder-path"] }
-s3s = { workspace = true, features = ["minio"] }
 shadow-rs = { workspace = true, default-features = false, features = ["build", "metadata"] }
 sysinfo = { workspace = true, features = ["multithread"] }
 thiserror = { workspace = true }
@@ -424,6 +423,8 @@ h2.workspace = true
 rustfs-targets = { workspace = true, features = ["test-support"] }
 uuid = { workspace = true, features = ["v4", "v5", "fast-rng", "macro-diagnostics"] }
 rustfs-iam = { workspace = true, features = ["test-util"] }
+rustfs-s3-types = { workspace = true, features = ["compat-s3s"] }
+s3s = { workspace = true, features = ["minio"] }
 s3s-sigv4 = { workspace = true }
 serial_test = { workspace = true }
 tempfile = { workspace = true }
