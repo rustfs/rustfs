@@ -4504,14 +4504,6 @@ impl DefaultObjectUsecase {
         })
     }
 
-    #[cfg(test)]
-    pub(crate) async fn execute_get_object_from_s3s(
-        &self,
-        request: S3Request<GetObjectInput>,
-    ) -> S3Result<S3Response<GetObjectOutput>> {
-        crate::app::test_seams::get_object(self, request).await
-    }
-
     pub(crate) async fn execute_get_object(
         &self,
         envelope: RequestEnvelope,
@@ -6287,13 +6279,26 @@ mod on_demand_migration_tests {
 mod tests {
     use super::*;
     use crate::app::storage_api::s3::dto::Range;
-    use crate::app::test_seams::{head_envelope, head_object_input};
+    use crate::app::test_seams::{get_envelope, get_object_gateway, get_object_input, head_envelope, head_object_input};
     use http::{HeaderMap, HeaderValue, Method};
     use std::pin::Pin;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
     use std::task::{Context, Poll};
     use tokio::io::{AsyncRead, ReadBuf};
+
+    async fn read_get_body(body: GetObjectBody) -> Bytes {
+        use http_body_util::BodyExt;
+        use rustfs_gateway_stream::Body;
+
+        let body = match body {
+            GetObjectBody::Bytes(bytes) => Body::from_bytes(bytes),
+            GetObjectBody::Stream(stream) => Body::from_stream(stream).expect("valid GET stream"),
+        };
+        let collected = body.collect().await.expect("GET body must be readable");
+        assert!(collected.trailers().is_none(), "unexpected GET response trailers");
+        collected.to_bytes()
+    }
 
     #[tokio::test]
     async fn conditional_reader_scope_keeps_large_futures_off_the_request_stack() {
@@ -6385,23 +6390,19 @@ mod tests {
                 .await
                 .expect("metadata remains readable");
             assert_eq!(resolved.etag.as_deref(), Some(etag));
-            let mut req = build_request(
-                GetObjectInput::builder()
-                    .bucket(bucket.clone())
-                    .key(object.to_owned())
-                    .build()
-                    .expect("GET input"),
-                Method::GET,
-            );
-            req.headers.insert(
+            let mut headers = HeaderMap::new();
+            headers.insert(
                 http::header::IF_NONE_MATCH,
                 HeaderValue::from_str(&format!("W/\"{etag}\"")).expect("ETag header"),
             );
-            let error = usecase
-                .execute_get_object_from_s3s(req)
-                .await
-                .expect_err("matching condition returns 304");
-            assert_eq!(error.code(), &S3ErrorCode::NotModified);
+            let error = get_object_gateway(
+                &usecase,
+                get_envelope(headers, http::Extensions::new()),
+                get_object_input(&bucket, object, None),
+            )
+            .await
+            .expect_err("matching condition returns 304");
+            assert_eq!(error.code(), &rustfs_s3_types::S3ErrorCode::NotModified);
             assert_eq!(error.headers().expect("304 validators")["etag"], format!("\"{etag}\""));
 
             let mut headers = HeaderMap::new();
@@ -6491,37 +6492,23 @@ mod tests {
             .collect();
         put_real_cold_fill_object(&store, &bucket, "object", &payload).await;
         for ranged in [false, true] {
-            let input = GetObjectInput::builder()
-                .bucket(bucket.clone())
-                .key("object".to_owned())
-                .range(ranged.then_some(Range::Int {
-                    first: 10,
-                    last: Some(29),
-                }))
-                .build()
-                .expect("GET input");
-            let mut req = build_request(input, Method::GET);
-            req.headers
-                .insert(http::header::IF_NONE_MATCH, HeaderValue::from_static("\"other\""));
+            let mut input = get_object_input(&bucket, "object", None);
+            let mut headers = HeaderMap::new();
+            headers.insert(http::header::IF_NONE_MATCH, HeaderValue::from_static("\"other\""));
             if ranged {
-                req.headers
-                    .insert(http::header::RANGE, HeaderValue::from_static("bytes=10-29"));
+                input.range = Some(rustfs_gateway_types::RangeSpec::new("bytes=10-29"));
+                headers.insert(http::header::RANGE, HeaderValue::from_static("bytes=10-29"));
             }
-            let mut response = usecase
-                .execute_get_object_from_s3s(req)
+            let response = get_object_gateway(&usecase, get_envelope(headers, http::Extensions::new()), input)
                 .await
                 .expect("unmatched condition serves body");
             let expected = if ranged { &payload[10..30] } else { payload.as_slice() };
             assert_eq!(
-                response.output.content_length,
+                response.output.dto.content_length,
                 Some(i64::try_from(expected.len()).expect("test body length"))
             );
-            assert_eq!(response.output.content_range.as_deref(), ranged.then_some("bytes 10-29/1300000"));
-            let mut body = response.output.body.take().expect("GET body");
-            let mut bytes = Vec::new();
-            while let Some(chunk) = body.next().await {
-                bytes.extend_from_slice(&chunk.expect("body chunk"));
-            }
+            assert_eq!(response.output.dto.content_range.as_deref(), ranged.then_some("bytes 10-29/1300000"));
+            let bytes = read_get_body(response.output.body.expect("GET body")).await;
             assert_eq!(bytes, expected);
         }
     }
@@ -7632,24 +7619,26 @@ mod tests {
             panic!("test must reserve the initial cold-fill producer");
         };
 
-        let input = GetObjectInput::builder()
-            .bucket(bucket)
-            .key(object.to_string())
-            .build()
-            .expect("real cold-fill GET input must build");
-        let mut req = build_request(input, Method::GET);
+        let mut headers = HeaderMap::new();
         let etag = info.etag.expect("real cold-fill test object must have an ETag");
-        req.headers.insert(
+        headers.insert(
             http::header::IF_NONE_MATCH,
             HeaderValue::from_str(&format!("\"{etag}\"")).expect("ETag header must be valid"),
         );
         let usecase = DefaultObjectUsecase::with_context(Some(context));
-        let result = tokio::time::timeout(Duration::from_secs(2), usecase.execute_get_object_from_s3s(req))
-            .await
-            .expect("conditional GET must not wait for the reserved cold-fill session")
-            .expect_err("matching If-None-Match must reject the GET");
+        let result = tokio::time::timeout(
+            Duration::from_secs(2),
+            get_object_gateway(
+                &usecase,
+                get_envelope(headers, http::Extensions::new()),
+                get_object_input(&bucket, object, None),
+            ),
+        )
+        .await
+        .expect("conditional GET must not wait for the reserved cold-fill session")
+        .expect_err("matching If-None-Match must reject the GET");
 
-        assert_eq!(result.code(), &S3ErrorCode::NotModified);
+        assert_eq!(result.code(), &rustfs_s3_types::S3ErrorCode::NotModified);
         assert_eq!(coordinator.global_waiter_count_for_test(), 0);
         drop(producer);
         assert_eq!(coordinator.active_session_count_for_test(), 0);
@@ -7698,25 +7687,27 @@ mod tests {
             .lock()
             .expect("reader-open probe") = Some((key, Arc::clone(&reader_opens)));
         let usecase = DefaultObjectUsecase::with_context(Some(context));
-        let input = GetObjectInput::builder()
-            .bucket(bucket)
-            .key(object.to_owned())
-            .build()
-            .expect("GET input");
         for (header, value, expected) in [
             (
                 http::header::IF_NONE_MATCH,
                 format!("\"{}\"", info.etag.as_deref().expect("ETag")),
-                S3ErrorCode::NotModified,
+                rustfs_s3_types::S3ErrorCode::NotModified,
             ),
-            (http::header::IF_MATCH, "\"other-etag\"".to_owned(), S3ErrorCode::PreconditionFailed),
+            (
+                http::header::IF_MATCH,
+                "\"other-etag\"".to_owned(),
+                rustfs_s3_types::S3ErrorCode::PreconditionFailed,
+            ),
         ] {
-            let mut req = build_request(input.clone(), Method::GET);
-            req.headers.insert(header, HeaderValue::from_str(&value).expect("condition"));
-            let error = usecase
-                .execute_get_object_from_s3s(req)
-                .await
-                .expect_err("terminal condition");
+            let mut headers = HeaderMap::new();
+            headers.insert(header, HeaderValue::from_str(&value).expect("condition"));
+            let error = get_object_gateway(
+                &usecase,
+                get_envelope(headers, http::Extensions::new()),
+                get_object_input(&bucket, object, None),
+            )
+            .await
+            .expect_err("terminal condition");
             assert_eq!(error.code(), &expected);
             assert_eq!(reader_opens.load(Ordering::Relaxed), 0, "no cold-fill body factory call");
             assert_eq!(fills.reservations.load(Ordering::Relaxed), 0, "no cache-fill reservation call");
@@ -7724,14 +7715,14 @@ mod tests {
             assert_eq!(adapter.cold_fill_coordinator().active_session_count_for_test(), 0);
         }
 
-        let mut response = crate::app::test_seams::get_object_method_only(&usecase, input)
-            .await
-            .expect("positive-control GET");
-        let mut body = response.output.body.take().expect("body");
-        let mut actual = Vec::new();
-        while let Some(chunk) = body.next().await {
-            actual.extend_from_slice(&chunk.expect("positive-control chunk"));
-        }
+        let response = get_object_gateway(
+            &usecase,
+            get_envelope(HeaderMap::new(), http::Extensions::new()),
+            get_object_input(&bucket, object, None),
+        )
+        .await
+        .expect("positive-control GET");
+        let actual = read_get_body(response.output.body.expect("body")).await;
         assert_eq!(actual, payload);
         assert!(
             reader_opens.load(Ordering::Relaxed) > 0,
@@ -7860,11 +7851,6 @@ mod tests {
             panic!("test must reserve the initial cold-fill producer");
         };
 
-        let input = GetObjectInput::builder()
-            .bucket(bucket.clone())
-            .key(object.to_string())
-            .build()
-            .expect("real cold-fill GET input must build");
         // The request is intentionally held behind the first producer while a
         // 1.3 MiB replacement write changes its generation. Disable dynamic
         // sizing for this test so runner I/O load cannot consume the five-second
@@ -7876,14 +7862,16 @@ mod tests {
                 ..GetObjectTimeoutPolicy::default()
             },
         );
-        let mut req = build_request(input, Method::GET);
+        let mut headers = HeaderMap::new();
         if let Some(etag) = &condition_etag {
-            req.headers.insert(
+            headers.insert(
                 http::header::IF_NONE_MATCH,
                 HeaderValue::from_str(&format!("\"{etag}\"")).expect("replacement condition"),
             );
         }
-        let request = tokio::spawn(async move { usecase.execute_get_object_from_s3s(req).await });
+        let input = get_object_input(&bucket, object, None);
+        let envelope = get_envelope(headers, http::Extensions::new());
+        let request = tokio::spawn(async move { get_object_gateway(&usecase, envelope, input).await });
         tokio::time::timeout(Duration::from_secs(2), async {
             while coordinator.global_waiter_count_for_test() != 1 {
                 tokio::task::yield_now().await;
@@ -7914,18 +7902,13 @@ mod tests {
             .expect("generation-changing GET task must join");
         if conditional {
             let error = result.expect_err("fallback must recheck the replacement ETag before body access");
-            assert_eq!(error.code(), &S3ErrorCode::NotModified);
+            assert_eq!(error.code(), &rustfs_s3_types::S3ErrorCode::NotModified);
             assert_eq!(coordinator.global_waiter_count_for_test(), 0);
             assert_eq!(coordinator.active_session_count_for_test(), 0);
             return;
         }
-        let mut response = result.expect("generation-changing GET must fall back successfully");
-        let mut response_body = response.output.body.take().expect("GET response must include a body");
-        let mut actual = Vec::with_capacity(changed_body.len());
-        while let Some(chunk) = response_body.next().await {
-            actual.extend_from_slice(&chunk.expect("fallback body chunk must be readable"));
-        }
-
+        let response = result.expect("generation-changing GET must fall back successfully");
+        let actual = read_get_body(response.output.body.expect("GET response must include a body")).await;
         assert_eq!(actual, changed_body);
         assert!(matches!(
             adapter.lookup_body(&initial_plan).await,

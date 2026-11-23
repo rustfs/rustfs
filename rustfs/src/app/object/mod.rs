@@ -183,8 +183,6 @@ use rustfs_utils::http::{
 use rustfs_utils::path::{encode_dir_object, is_dir_object, path_join_buf};
 use rustfs_utils::retry::{DEFAULT_RETRY_CAP, DEFAULT_RETRY_UNIT, MAX_JITTER, RetryTimer};
 use rustfs_zip::{ArchiveLimits, CompressionFormat, ZipError};
-#[cfg(test)]
-use s3s::{S3Request, S3Response};
 
 /// Remove replication history owned by another source object before a local
 /// object-creation decision is made. Compatibility keys are case-insensitive,
