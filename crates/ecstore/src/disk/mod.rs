@@ -121,6 +121,7 @@ use sha2::Digest as _;
 use std::{fmt::Debug, path::PathBuf, sync::Arc, time::Duration};
 use time::OffsetDateTime;
 use tokio::io::{AsyncRead, AsyncWrite};
+use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 /// Independent admission and physical ownership for one disk rename.
@@ -241,6 +242,14 @@ pub enum PoolMetaNativeRecoveryResponse {
 
 pub type DiskStore = Arc<Disk>;
 
+/// Filesystem evidence for a replacement data directory on its expected mount.
+#[derive(Debug)]
+pub struct ReplacementMount {
+    pub canonical_path: PathBuf,
+    pub physical_device_ids: Vec<String>,
+    pub filesystem_identity: String,
+}
+
 pub trait DiskFileWriter: AsyncWrite + Send + Sync + Unpin + std::any::Any {}
 impl<T: AsyncWrite + Send + Sync + Unpin + 'static> DiskFileWriter for T {}
 
@@ -347,6 +356,14 @@ pub enum Disk {
 }
 
 impl Disk {
+    /// Open format metadata through the control transport, including before shard I/O is available.
+    pub(crate) async fn read_format_control(&self, volume: &str, path: &str) -> Result<FileReader> {
+        match self {
+            Self::Local(disk) => disk.read_file(volume, path).await,
+            Self::Remote(disk) => disk.read_format_control(volume, path).await,
+        }
+    }
+
     /// Physical ownership belongs to the node hosting the local attachment.
     pub fn physical_admission(&self) -> Option<Arc<PhysicalDiskBinding>> {
         match self {
@@ -451,7 +468,14 @@ impl Disk {
         transaction: Uuid,
         namespace_owner: Option<Arc<dyn Send + Sync>>,
         work_budget: Option<Arc<crate::object_api::DeleteRecoveryWorkBudget>>,
-    ) -> Result<Option<(DeleteRecoveryJournal, bool, bool)>> {
+    ) -> Result<
+        Option<(
+            DeleteRecoveryJournal,
+            bool,
+            bool,
+            Option<local::delete_recovery::LocalPublishedDeleteState>,
+        )>,
+    > {
         match self {
             Self::Local(disk) => {
                 disk.try_publish_prepared_delete_local(volume, object, transaction, namespace_owner, work_budget)
@@ -461,6 +485,7 @@ impl Disk {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(crate) async fn try_finish_and_finalize_prepared_delete_local(
         &self,
         volume: &str,
@@ -469,6 +494,7 @@ impl Disk {
         journal: &DeleteRecoveryJournal,
         namespace_owner: Option<Arc<dyn Send + Sync>>,
         work_budget: Option<Arc<crate::object_api::DeleteRecoveryWorkBudget>>,
+        published_state: Option<local::delete_recovery::LocalPublishedDeleteState>,
     ) -> Result<bool> {
         match self {
             Self::Local(disk) => {
@@ -479,6 +505,7 @@ impl Disk {
                     journal,
                     namespace_owner,
                     work_budget,
+                    published_state,
                 )
                 .await
             }
@@ -1462,6 +1489,15 @@ impl Disk {
         }
     }
 
+    /// Observe a local wrapper's retirement. Remote handles have their own RPC lifecycle.
+    /// Cancelling the returned child token does not retire the underlying wrapper.
+    pub fn local_retirement_token(&self) -> Option<CancellationToken> {
+        match self {
+            Disk::Local(local_disk) => Some(local_disk.retirement_token()),
+            Disk::Remote(_) => None,
+        }
+    }
+
     pub fn offline_duration_secs(&self) -> Option<u64> {
         match self {
             Disk::Local(local_disk) => local_disk.offline_duration_secs(),
@@ -1582,6 +1618,15 @@ impl Disk {
         match self {
             Disk::Local(local_disk) => local_disk.replacement_mount_lease_root(),
             Disk::Remote(_) => None,
+        }
+    }
+
+    /// Observe the expected mount through the same local disk handle that will
+    /// execute recovery. Call from a blocking context.
+    pub fn replacement_mount(&self, mount_roots: &[PathBuf]) -> Option<ReplacementMount> {
+        match self {
+            Self::Local(disk) => disk.get_disk().replacement_mount(mount_roots),
+            Self::Remote(_) => None,
         }
     }
 

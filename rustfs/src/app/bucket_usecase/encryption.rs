@@ -204,7 +204,6 @@ impl DefaultBucketUsecase {
 mod tests {
     use super::*;
     use crate::app::bucket_usecase::test_support::owned_envelope;
-    use crate::app::storage_api::s3::dto::{self, PutBucketEncryptionInput, ServerSideEncryption};
     use http::Method;
     use rustfs_gateway_types::persistence::{
         PersistedBucketEncryptionConfiguration as ServerSideEncryptionConfiguration,
@@ -277,26 +276,22 @@ mod tests {
     async fn execute_put_bucket_encryption_returns_internal_error_when_store_uninitialized() {
         // A well-formed rule, so the request reaches the store lookup instead
         // of being refused by configuration validation first.
-        let input = PutBucketEncryptionInput::builder()
-            .bucket("test-bucket".to_string())
-            .server_side_encryption_configuration(dto::ServerSideEncryptionConfiguration {
-                rules: vec![dto::ServerSideEncryptionRule {
-                    apply_server_side_encryption_by_default: Some(dto::ServerSideEncryptionByDefault {
-                        sse_algorithm: ServerSideEncryption::from_static(ServerSideEncryption::AES256),
-                        kms_master_key_id: None,
-                    }),
-                    blocked_encryption_types: None,
-                    bucket_key_enabled: None,
-                }],
-            })
-            .build()
-            .unwrap();
-
-        let prepared = crate::storage::persisted_from_s3s(&input.server_side_encryption_configuration);
+        let bucket = "test-bucket";
+        let configuration = gateway_dto::ServerSideEncryptionConfiguration {
+            rules: vec![gateway_dto::ServerSideEncryptionRule {
+                apply_server_side_encryption_by_default: Some(gateway_dto::ServerSideEncryptionByDefault {
+                    sse_algorithm: gateway_dto::SseAlgorithm::AES256,
+                    kms_master_key_id: None,
+                }),
+                ..Default::default()
+            }],
+        };
+        let xml = rustfs_gateway_types::persistence::serialize_bucket_encryption_dto(&configuration).expect("encode SSE-S3");
+        let prepared = rustfs_gateway_types::persistence::parse_bucket_encryption(&xml).expect("parse SSE-S3");
         let usecase = DefaultBucketUsecase::without_context();
 
         let err = usecase
-            .execute_put_bucket_encryption(owned_envelope(Method::PUT), &input.bucket, prepared.map_err(Into::into))
+            .execute_put_bucket_encryption(owned_envelope(Method::PUT), bucket, Ok(prepared))
             .await
             .unwrap_err();
         assert_eq!(err.code(), &S3ErrorCode::InternalError);
@@ -304,7 +299,7 @@ mod tests {
         let err = usecase
             .execute_put_bucket_encryption(
                 owned_envelope(Method::PUT),
-                &input.bucket,
+                bucket,
                 Ok(PersistedBucketEncryptionConfiguration { rules: vec![] }),
             )
             .await

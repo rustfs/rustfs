@@ -69,8 +69,28 @@ multiple-versions = "warn"
 wildcards = "warn"
 highlight = "all"
 
-# Any future crate we want to forbid outright belongs here.
-deny = []
+# Reviewed source locations for scripts/check_s3s_oracles.py. Each entry still
+# requires cfg(test) on the file or on the item using the legacy crate.
+# s3s-oracle: crates/e2e_test/src/access_request_validation_test.rs
+# s3s-oracle: crates/s3-types/src/compat_s3s.rs
+# s3s-oracle: crates/s3-types/src/compat_s3s/call_site_codes.rs
+# s3s-oracle: crates/s3-types/src/error/http_response_tests.rs
+# s3s-oracle: rustfs/src/admin/router.rs
+# s3s-oracle: rustfs/src/app/storage_api.rs
+# s3s-oracle: rustfs/src/auth.rs
+# s3s-oracle: rustfs/src/error.rs
+# s3s-oracle: rustfs/src/protocols/client.rs
+# s3s-oracle: rustfs/src/server/http.rs
+# Only the old-stack comparison crates may have direct edges in this graph,
+# which includes dev dependencies. check_s3s_footprint.sh separately rejects
+# every normal edge, including optional, renamed and transitive dependencies.
+deny = [
+    { name = "s3s", wrappers = ["e2e_test", "rustfs", "rustfs-s3-types"], reason = "legacy test oracles only" },
+    { name = "s3s-sigv4", wrappers = ["e2e_test", "rustfs", "s3s"], reason = "legacy signing oracles only" },
+    { name = "s3s-multipart", wrappers = ["s3s"] },
+    { name = "s3s-rfc2047", wrappers = ["s3s"] },
+    { name = "s3s-sigv2", wrappers = ["s3s"] },
+]
 
 # Crates whose duplicate versions are most worth eliminating, because they
 # touch crypto, parsing, or networking trust boundaries. Not currently a

@@ -48,15 +48,14 @@ use super::storage_api::bucket_usecase::bucket::{
     utils::{BucketConfigXml, serialize},
     versioning_sys::BucketVersioningSys,
 };
-use super::storage_api::bucket_usecase::contract::bucket::{
-    BucketOperations, BucketOptions, DeleteBucketOptions, MakeBucketOptions,
-};
+#[cfg(test)]
+use super::storage_api::bucket_usecase::contract::bucket::DeleteBucketOptions;
+use super::storage_api::bucket_usecase::contract::bucket::{BucketOperations, BucketOptions, MakeBucketOptions};
 use super::storage_api::bucket_usecase::contract::list::{
     ListObjectVersionsInfo as StorageListObjectVersionsInfo, ListObjectsV2Info as StorageListObjectsV2Info,
 };
 use super::storage_api::bucket_usecase::error::StorageError;
 use super::storage_api::bucket_usecase::helper::{OperationHelper, spawn_background_with_context};
-use super::storage_api::bucket_usecase::object_utils::to_s3s_xml_etag;
 use super::storage_api::bucket_usecase::s3_api::bucket::{
     ListObjectVersionsParams, ListObjectsV2Params, encode_list_objects_v2_continuation_token, parse_list_object_versions_params,
     parse_list_objects_v2_params, rustfs_owner,
@@ -999,7 +998,18 @@ mod tests {
             },
         );
 
-        let envelope = RequestEnvelope::from_s3s(&req);
+        // Same facts `RequestEnvelope::from_s3s` copies. Credentials, region, and service stay absent.
+        let envelope = RequestEnvelope::from_parts(
+            crate::app::RequestHead {
+                method: req.method,
+                uri: req.uri,
+                headers: req.headers,
+                credentials: None,
+                region: None,
+                service: None,
+            },
+            req.extensions,
+        );
         assert!(envelope.req_info().expect("req info should be present").is_owner);
     }
 

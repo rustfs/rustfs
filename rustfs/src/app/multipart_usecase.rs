@@ -49,8 +49,6 @@ use super::storage_api::multipart_usecase::io::{DecryptReader, EncryptReader, Ha
 use super::storage_api::multipart_usecase::io::{
     EtagAlgorithm, HashReader, WriteEncryption, WritePlan, compression_metadata_value,
 };
-#[cfg(test)]
-use super::storage_api::multipart_usecase::object_utils::{to_s3s_etag, to_s3s_xml_etag};
 use super::storage_api::multipart_usecase::options::{
     copy_src_opts, extract_metadata_from_mime, get_complete_multipart_upload_opts_with_replication_authorization,
     get_content_sha256_with_query, get_opts, has_replication_retention_update, namespace_reserved_user_metadata,
@@ -70,8 +68,7 @@ use super::storage_api::multipart_usecase::sse::{
     multipart_completion_authorization, sse_decryption, sse_prepare_encryption,
 };
 use super::storage_api::multipart_usecase::{
-    StorageObjectInfo as ObjectInfo, StorageObjectOptions as ObjectOptions, StoragePutObjReader as PutObjReader,
-    validate_new_object_key,
+    StorageObjectOptions as ObjectOptions, StoragePutObjReader as PutObjReader, validate_new_object_key,
 };
 use crate::app::object::{
     ConcurrencyManager, ForegroundWriteAdmission, get_concurrency_manager, put_object_body_read_timeout,
@@ -119,7 +116,6 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::RwLock;
-use tokio_util::io::StreamReader;
 use tracing::{instrument, warn};
 use urlencoding::encode;
 use uuid::Uuid;
@@ -291,20 +287,42 @@ impl DefaultMultipartUsecase {
 /// or completed".
 fn multipart_upload_api_error(err: StorageError) -> S3Error {
     if matches!(err, StorageError::MalformedUploadID(_)) {
-        let mut error = S3Error::new(S3ErrorCode::NoSuchUpload);
-        if let Some(message) = error.code().default_message() {
-            error.set_message(message);
-        }
-        return error;
+        return S3Error::with_default_message(S3ErrorCode::NoSuchUpload);
     }
     ApiError::from(err).into()
+}
+
+#[cfg(test)]
+fn completion_part(number: i32, stored: Option<&str>) -> rustfs_gateway_types::dto::CompletedPart {
+    rustfs_gateway_types::dto::CompletedPart {
+        part_number: number,
+        e_tag: stored.map(crate::app::dto_values::stored_etag),
+        ..Default::default()
+    }
+}
+
+#[cfg(test)]
+fn completion_input(
+    bucket: &str,
+    key: &str,
+    upload_id: &str,
+    parts: Vec<rustfs_gateway_types::dto::CompletedPart>,
+) -> rustfs_gateway_types::dto::CompleteMultipartUploadInput {
+    use rustfs_gateway_types::{BucketName, ObjectKey, UploadIdClaim, dto};
+    dto::CompleteMultipartUploadInput {
+        bucket: BucketName::new(bucket).expect("test bucket"),
+        key: ObjectKey::new(key).expect("test key"),
+        upload_id: UploadIdClaim::from_wire(upload_id),
+        multipart_upload: dto::CompletedMultipartUpload { parts },
+        ..Default::default()
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::test_support::*;
     use super::*;
-    use crate::app::storage_api::s3::dto::{CompleteMultipartUploadInput, CreateMultipartUploadInput, ServerSideEncryption};
+    use crate::app::storage_api::s3::dto::{CreateMultipartUploadInput, ServerSideEncryption};
 
     #[test]
     fn internal_object_info_lookup_opts_drops_http_preconditions() {
@@ -553,27 +571,15 @@ mod tests {
                 )
                 .await
             {
-                Err(error) => crate::app::storage_api::s3::S3Error::from(error),
+                Err(error) => error,
                 Ok(_) => panic!("reserved key must be rejected before accessing storage"),
             };
-            assert_eq!(error.code(), &crate::app::storage_api::s3::S3ErrorCode::InvalidArgument);
+            assert_eq!(error.code(), &rustfs_s3_types::S3ErrorCode::InvalidArgument);
 
-            let complete = CompleteMultipartUploadInput::builder()
-                .bucket("bucket".to_owned())
-                .key(key.to_owned())
-                .upload_id("upload".to_owned())
-                .multipart_upload(Some(CompletedMultipartUpload::default()))
-                .build()
-                .expect("valid complete request DTO");
-            let error =
-                match rustfs_gateway_types::compat::s3s_5761ddfe::generated::ops::complete_multipart_upload::input_from_s3s(
-                    complete,
-                ) {
-                    Err(error) => crate::app::dto_values::seam_error(error),
-                    Ok(input) => Box::pin(make_usecase().execute_complete_multipart_upload(owned_envelope(Method::POST), input))
-                        .await
-                        .expect_err("uploads created before the fix must not publish reserved keys"),
-                };
+            let complete = completion_input("bucket", key, "upload", vec![]);
+            let error = Box::pin(make_usecase().execute_complete_multipart_upload(owned_envelope(Method::POST), complete))
+                .await
+                .expect_err("uploads created before the fix must not publish reserved keys");
             assert_eq!(error.code(), &rustfs_s3_types::S3ErrorCode::InvalidArgument);
         }
     }
@@ -632,10 +638,7 @@ mod tests {
     fn multipart_handlers_reject_another_callers_denied_kms_upload() {
         crate::app::gating_test_env::run_large_stack_test("mpu-kms-current-caller", || async {
             use crate::app::storage_api::s3::S3ErrorCode;
-            use crate::app::storage_api::s3::dto::{
-                CompleteMultipartUploadInput, CompletedMultipartUpload, CompletedPart, CopySource, StreamingBlob,
-                UploadPartCopyInput, UploadPartInput,
-            };
+            use crate::app::storage_api::s3::dto::{StreamingBlob, UploadPartInput};
             use crate::app::storage_api::test::ReqInfo;
             use crate::app::storage_api::test::sse::{
                 RecordingKmsKeyAuthorizer, TestAuthorizationHooks, sse_kms_object_metadata,
@@ -701,42 +704,55 @@ mod tests {
             let error = usecase
                 .execute_upload_part(denied_request(part, authorizer.clone()))
                 .await
-                .expect_err("denied part");
+                .err()
+                .expect("denied part");
             assert_eq!(error.code(), &S3ErrorCode::AccessDenied);
-            let copy = UploadPartCopyInput::builder()
-                .bucket(bucket.clone())
-                .key(key.to_string())
-                .upload_id(upload.upload_id.clone())
-                .part_number(1)
-                .copy_source(CopySource::Bucket {
-                    bucket: bucket.clone().into(),
-                    key: "source".into(),
-                    version_id: None,
-                })
-                .build()
-                .expect("copy");
-            let copy_req = denied_request(copy, authorizer.clone());
+            let copy_request = denied_request((), authorizer.clone());
+            // Same facts `RequestEnvelope::from_s3s` copies. Credentials, region, and service stay absent.
+            let copy_envelope = crate::app::RequestEnvelope::from_parts(
+                crate::app::RequestHead {
+                    method: copy_request.method,
+                    uri: copy_request.uri,
+                    headers: copy_request.headers,
+                    credentials: None,
+                    region: None,
+                    service: None,
+                },
+                copy_request.extensions,
+            );
             let error = usecase
-                .execute_upload_part_copy(copy_req)
+                .execute_upload_part_copy_with_audit(
+                    copy_envelope,
+                    UploadPartCopyWriteInput {
+                        target: UploadPartTarget::Legacy {
+                            bucket: bucket.clone(),
+                            key: key.to_string(),
+                            upload_id: upload.upload_id.clone(),
+                        },
+                        part_number: 1,
+                        copy_source: rustfs_gateway_types::CopySourceValue::Bucket {
+                            bucket: bucket.clone(),
+                            key: "source".to_owned(),
+                            version_id: None,
+                        },
+                        copy_source_range: None,
+                        copy_source_if_match: None,
+                        copy_source_if_none_match: None,
+                        sse_customer_algorithm: None,
+                        sse_customer_key: None,
+                        sse_customer_key_md5: None,
+                        copy_source_sse_customer_algorithm: None,
+                        copy_source_sse_customer_key: None,
+                        copy_source_sse_customer_key_md5: None,
+                    },
+                )
                 .await
-                .expect_err("denied destination copy");
-            assert_eq!(error.code(), &S3ErrorCode::AccessDenied);
-            let complete = CompleteMultipartUploadInput::builder()
-                .bucket(bucket.clone())
-                .key(key.to_string())
-                .upload_id(upload.upload_id.clone())
-                .multipart_upload(Some(CompletedMultipartUpload {
-                    parts: Some(vec![CompletedPart {
-                        part_number: Some(1),
-                        e_tag: Some(crate::app::storage_api::s3::dto::ETag::Strong("etag".to_string())),
-                        ..Default::default()
-                    }]),
-                }))
-                .build()
-                .expect("complete");
-            let complete_req = denied_request(complete, authorizer.clone());
-            let error = usecase
-                .complete_for_s3s_request(complete_req)
+                .err()
+                .expect("denied destination copy");
+            assert_eq!(error.code(), &rustfs_s3_types::S3ErrorCode::AccessDenied);
+            let complete = completion_input(&bucket, key, &upload.upload_id, vec![completion_part(1, Some("etag"))]);
+            let envelope = crate::app::RequestEnvelope::from_s3s(&denied_request((), authorizer.clone()));
+            let error = Box::pin(usecase.execute_complete_multipart_upload(envelope, complete))
                 .await
                 .expect_err("denied completion");
             assert_eq!(error.code(), &rustfs_s3_types::S3ErrorCode::AccessDenied);
@@ -768,25 +784,308 @@ mod tests {
                 )
                 .await
                 .expect("trusted owner completes upload");
-            let replay = CompleteMultipartUploadInput::builder()
-                .bucket(bucket.clone())
-                .key(key.to_string())
-                .upload_id(upload.upload_id)
-                .multipart_upload(Some(CompletedMultipartUpload {
-                    parts: Some(vec![CompletedPart {
-                        part_number: Some(1),
-                        e_tag: Some(crate::app::storage_api::s3::dto::ETag::Strong("guessed-etag".to_string())),
-                        ..Default::default()
-                    }]),
-                }))
-                .build()
-                .expect("replay");
-            let error = usecase
-                .complete_for_s3s_request(denied_request(replay, authorizer.clone()))
+            let replay = completion_input(&bucket, key, &upload.upload_id, vec![completion_part(1, Some("guessed-etag"))]);
+            let envelope = crate::app::RequestEnvelope::from_s3s(&denied_request((), authorizer.clone()));
+            let error = Box::pin(usecase.execute_complete_multipart_upload(envelope, replay))
                 .await
                 .expect_err("replay must authorize before comparing guessed part metadata");
             assert_eq!(error.code(), &rustfs_s3_types::S3ErrorCode::AccessDenied);
             assert_eq!(authorizer.calls().len(), 4);
+        });
+    }
+
+    /// The SSE fields one multipart response carries, each of which becomes a response header.
+    #[derive(Debug, Default, PartialEq, Eq)]
+    struct SseResponseFields {
+        server_side_encryption: Option<String>,
+        ssekms_key_id: Option<String>,
+        sse_customer_algorithm: Option<String>,
+        sse_customer_key_md5: Option<String>,
+    }
+
+    const SSE_HEADER_PREFIX: &str = "x-amz-server-side-encryption";
+
+    /// Runs one upload through CreateMultipartUpload, UploadPart, UploadPartCopy and
+    /// CompleteMultipartUpload and returns the SSE fields of each response, followed by the
+    /// SSE header names of the encoded completion response.
+    async fn multipart_sse_responses(
+        bucket: &str,
+        key: &str,
+        requested_sse: Option<&str>,
+        requested_kms_key_id: Option<&str>,
+        customer_key: Option<(&str, &str)>,
+    ) -> (Vec<(&'static str, SseResponseFields)>, Vec<String>) {
+        use crate::app::storage_api::s3::dto::{StreamingBlob, UploadPartInput};
+        use crate::app::storage_api::test::contract::object::ObjectIO as _;
+        use rustfs_gateway::{Limits, MetaView, OperationCodec, TargetKind, WireRequest};
+
+        let store = crate::app::gating_test_env::shared_gating_ecstore().await;
+        let usecase = DefaultMultipartUsecase::from_global();
+        let source_key = format!("{key}-source");
+        store
+            .put_object(
+                bucket,
+                &source_key,
+                &mut crate::storage::PutObjReader::from_vec(b"copied".to_vec()),
+                &ObjectOptions::default(),
+            )
+            .await
+            .expect("write plaintext copy source");
+        let customer_algorithm = customer_key.map(|_| "AES256".to_string());
+        let customer_key_md5 = customer_key.map(|(_, md5)| md5.to_string());
+        let customer_key = customer_key.map(|(key, _)| key.to_string());
+
+        let create = usecase
+            .execute_create_multipart_upload(
+                owned_envelope(Method::POST),
+                CreateMultipartUploadFields {
+                    bucket: bucket.to_string(),
+                    key: key.to_string(),
+                    metadata: None,
+                    tagging: None,
+                    storage_class: None,
+                    server_side_encryption: requested_sse.map(ToOwned::to_owned),
+                    sse_customer_algorithm: customer_algorithm.clone(),
+                    sse_customer_key: customer_key.clone(),
+                    sse_customer_key_md5: customer_key_md5.clone(),
+                    ssekms_key_id: requested_kms_key_id.map(ToOwned::to_owned),
+                    object_lock_legal_hold_status: None,
+                    object_lock_mode: None,
+                    object_lock_retain_until_date: None,
+                },
+                None,
+            )
+            .await
+            .expect("create multipart upload");
+        let upload_id = create.upload_id;
+
+        let part = usecase
+            .execute_upload_part_with_audit(
+                owned_envelope(Method::PUT),
+                UploadPartWriteInput::from_legacy(
+                    UploadPartInput {
+                        bucket: bucket.to_string(),
+                        key: key.to_string(),
+                        upload_id: upload_id.clone(),
+                        part_number: 1,
+                        content_length: Some(3),
+                        body: Some(StreamingBlob::from(bytes::Bytes::from_static(b"abc"))),
+                        sse_customer_algorithm: customer_algorithm.clone(),
+                        sse_customer_key: customer_key.clone(),
+                        sse_customer_key_md5: customer_key_md5.clone(),
+                        ..Default::default()
+                    },
+                    None,
+                ),
+            )
+            .await
+            .expect("upload part");
+
+        let copy = Box::pin(usecase.execute_upload_part_copy_with_audit(
+            owned_envelope(Method::PUT),
+            UploadPartCopyWriteInput {
+                target: UploadPartTarget::Legacy {
+                    bucket: bucket.to_string(),
+                    key: key.to_string(),
+                    upload_id: upload_id.clone(),
+                },
+                part_number: 2,
+                copy_source: rustfs_gateway_types::CopySourceValue::Bucket {
+                    bucket: bucket.into(),
+                    key: source_key,
+                    version_id: None,
+                },
+                copy_source_range: None,
+                copy_source_if_match: None,
+                copy_source_if_none_match: None,
+                sse_customer_algorithm: customer_algorithm.clone(),
+                sse_customer_key: customer_key.clone(),
+                sse_customer_key_md5: customer_key_md5.clone(),
+                copy_source_sse_customer_algorithm: None,
+                copy_source_sse_customer_key: None,
+                copy_source_sse_customer_key_md5: None,
+            },
+        ))
+        .await
+        .expect("copy part");
+
+        let mut complete_input = completion_input(bucket, key, &upload_id, vec![completion_part(1, part.e_tag.as_deref())]);
+        complete_input.sse_customer_algorithm = customer_algorithm;
+        complete_input.sse_customer_key = customer_key.map(rustfs_gateway_types::SseCustomerKey::new);
+        complete_input.sse_customer_key_md5 = customer_key_md5;
+        let complete = Box::pin(usecase.execute_complete_multipart_upload(owned_envelope(Method::POST), complete_input))
+            .await
+            .expect("complete multipart upload");
+
+        let request = http::Request::builder()
+            .method("POST")
+            .uri("http://localhost/bucket/object")
+            .header("host", "localhost")
+            .body(bytes::Bytes::new())
+            .expect("wire request");
+        let wire = WireRequest::accept(request, &Limits::default()).expect("accepted wire request");
+        let view = MetaView::of(&wire, TargetKind::Object)
+            .expect("object view")
+            .with_rustfs_response_layout();
+        let encoded = rustfs_gateway::dto::CompleteMultipartUpload::encode(complete.clone(), &view, 200)
+            .expect("completion response encodes");
+        let mut completion_sse_headers: Vec<String> = encoded
+            .headers
+            .keys()
+            .map(|name| name.as_str().to_owned())
+            .filter(|name| name.starts_with(SSE_HEADER_PREFIX))
+            .collect();
+        completion_sse_headers.sort();
+
+        let responses = vec![
+            (
+                "CreateMultipartUpload",
+                SseResponseFields {
+                    server_side_encryption: create.server_side_encryption,
+                    ssekms_key_id: create.ssekms_key_id,
+                    sse_customer_algorithm: create.sse_customer_algorithm,
+                    sse_customer_key_md5: create.sse_customer_key_md5,
+                },
+            ),
+            (
+                "UploadPart",
+                SseResponseFields {
+                    server_side_encryption: part.server_side_encryption,
+                    ssekms_key_id: part.ssekms_key_id,
+                    sse_customer_algorithm: part.sse_customer_algorithm,
+                    sse_customer_key_md5: part.sse_customer_key_md5,
+                },
+            ),
+            (
+                "UploadPartCopy",
+                SseResponseFields {
+                    server_side_encryption: copy.server_side_encryption,
+                    ssekms_key_id: copy.ssekms_key_id,
+                    sse_customer_algorithm: copy.sse_customer_algorithm,
+                    sse_customer_key_md5: copy.sse_customer_key_md5,
+                },
+            ),
+            (
+                "CompleteMultipartUpload",
+                SseResponseFields {
+                    server_side_encryption: complete.server_side_encryption.map(|value| value.as_str().to_owned()),
+                    ssekms_key_id: complete.ssekms_key_id,
+                    sse_customer_algorithm: complete.sse_customer_algorithm,
+                    sse_customer_key_md5: complete.sse_customer_key_md5,
+                },
+            ),
+        ];
+        (responses, completion_sse_headers)
+    }
+
+    fn every_multipart_response(expected: impl Fn() -> SseResponseFields) -> Vec<(&'static str, SseResponseFields)> {
+        [
+            "CreateMultipartUpload",
+            "UploadPart",
+            "UploadPartCopy",
+            "CompleteMultipartUpload",
+        ]
+        .into_iter()
+        .map(|operation| (operation, expected()))
+        .collect()
+    }
+
+    // `x-amz-server-side-encryption` names the SSE-S3 or SSE-KMS algorithm. An SSE-C upload
+    // answers with the customer-key headers only, as PutObject, GetObject and HeadObject do.
+    #[test]
+    #[serial_test::serial]
+    fn ssec_multipart_responses_carry_only_the_customer_key_headers() {
+        crate::app::gating_test_env::run_large_stack_test("mpu-ssec-response-headers", || async {
+            let (_store, bucket) =
+                crate::app::gating_test_env::durable_quota_test_bucket("mpu-ssec-response-headers", 16_384).await;
+            let customer_key = "KioqKioqKioqKioqKioqKioqKioqKioqKioqKioqKio=";
+            let customer_key_md5 = "SaaDheEjzuynJH8eW6AEpQ==";
+
+            let (responses, completion_sse_headers) =
+                multipart_sse_responses(&bucket, "customer-encrypted", None, None, Some((customer_key, customer_key_md5))).await;
+
+            assert_eq!(
+                responses,
+                every_multipart_response(|| SseResponseFields {
+                    sse_customer_algorithm: Some("AES256".to_string()),
+                    sse_customer_key_md5: Some(customer_key_md5.to_string()),
+                    ..Default::default()
+                })
+            );
+            assert_eq!(
+                completion_sse_headers,
+                [
+                    "x-amz-server-side-encryption-customer-algorithm",
+                    "x-amz-server-side-encryption-customer-key-md5",
+                ]
+            );
+        });
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn managed_sse_multipart_responses_name_the_managed_algorithm() {
+        crate::app::gating_test_env::run_large_stack_test("mpu-managed-sse-response-headers", || async {
+            use rustfs_kms::types::{CreateKeyRequest, KeyUsage};
+
+            let (_store, bucket) =
+                crate::app::gating_test_env::durable_quota_test_bucket("mpu-managed-sse-response-headers", 16_384).await;
+            let key_dir = tempfile::TempDir::new().expect("local KMS key directory");
+            let manager = crate::app::gating_test_env::shared_gating_ambient().await.kms().handle();
+            let local_kms = || rustfs_kms::KmsConfig::local(key_dir.path().to_path_buf()).with_insecure_development_defaults();
+            manager.reconfigure(local_kms()).await.expect("configure local KMS");
+            let kms_key = manager
+                .get_encryption_service()
+                .await
+                .expect("local KMS encryption service")
+                .create_key(CreateKeyRequest {
+                    key_name: Some("multipart-response-key".to_string()),
+                    key_usage: KeyUsage::EncryptDecrypt,
+                    description: None,
+                    policy: None,
+                    tags: HashMap::new(),
+                    origin: None,
+                })
+                .await
+                .expect("create multipart KMS key");
+            // SSE-S3 names no key, so it wraps its data key under the service default.
+            manager
+                .reconfigure(local_kms().with_default_key(kms_key.key_id.clone()))
+                .await
+                .expect("select the default KMS key");
+
+            let (sse_s3, sse_s3_completion_headers) =
+                multipart_sse_responses(&bucket, "sse-s3-encrypted", Some(ServerSideEncryption::AES256), None, None).await;
+            assert_eq!(
+                sse_s3,
+                every_multipart_response(|| SseResponseFields {
+                    server_side_encryption: Some("AES256".to_string()),
+                    ..Default::default()
+                })
+            );
+            assert_eq!(sse_s3_completion_headers, ["x-amz-server-side-encryption"]);
+
+            let (sse_kms, sse_kms_completion_headers) = multipart_sse_responses(
+                &bucket,
+                "sse-kms-encrypted",
+                Some(ServerSideEncryption::AWS_KMS),
+                Some(&kms_key.key_id),
+                None,
+            )
+            .await;
+            assert_eq!(
+                sse_kms,
+                every_multipart_response(|| SseResponseFields {
+                    server_side_encryption: Some("aws:kms".to_string()),
+                    ssekms_key_id: Some(kms_key.key_id.clone()),
+                    ..Default::default()
+                })
+            );
+            assert_eq!(
+                sse_kms_completion_headers,
+                ["x-amz-server-side-encryption", "x-amz-server-side-encryption-aws-kms-key-id"]
+            );
+            manager.stop().await.expect("stop local KMS");
         });
     }
 }

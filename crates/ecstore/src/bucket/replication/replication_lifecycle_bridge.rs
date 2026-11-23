@@ -89,7 +89,11 @@ impl ReplicationLifecycleBridge {
         }
     }
 
-    pub(crate) async fn schedule_delete(bucket: String, delete_object: DeletedObject) {
+    pub(crate) async fn schedule_delete(
+        bucket: String,
+        delete_object: DeletedObject,
+        notification_bucket_incarnation: Option<uuid::Uuid>,
+    ) {
         #[cfg(test)]
         {
             SCHEDULED_DELETE_OBJECTS
@@ -98,6 +102,7 @@ impl ReplicationLifecycleBridge {
                 .push(delete_object.clone());
         }
         super::replication_pool::schedule_replication_delete(DeletedObjectReplicationInfo {
+            notification_bucket_incarnation,
             delete_object: deleted_object_for_replication(delete_object),
             bucket,
             event_type: REPLICATE_INCOMING_DELETE.to_string(),

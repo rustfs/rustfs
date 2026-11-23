@@ -82,7 +82,9 @@ fn completed_outcome(
         },
     };
     assert_one_outcome(Kind::Completed, outcome, || {
-        completed_usage_candidate(caches, &scope, &[], plan_complete, owner_cancelled)
+        let candidate = completed_usage_candidate(caches, &scope, &[], plan_complete, owner_cancelled);
+        assert_eq!(candidate.as_ref().err().copied().unwrap_or(Outcome::Accepted), outcome);
+        candidate.ok()
     });
 }
 

@@ -288,7 +288,7 @@ pub(crate) async fn authenticate_envelope_credentials(credentials: &RequestCrede
 }
 
 async fn authenticate_request_facts(access_key: &str, session_token: &str) -> S3Result<(Credentials, bool)> {
-    use crate::auth::check_key_valid;
+    use crate::auth::check_key_valid_with_context;
 
     // Log authentication attempt for debugging
     debug!(
@@ -298,7 +298,7 @@ async fn authenticate_request_facts(access_key: &str, session_token: &str) -> S3
     );
 
     // Validate credentials using the core authentication function
-    let result = check_key_valid(session_token, access_key).await;
+    let result = check_key_valid_with_context(session_token, access_key, None).await;
 
     match &result {
         Ok((cred, is_owner)) => {
@@ -312,7 +312,7 @@ async fn authenticate_request_facts(access_key: &str, session_token: &str) -> S3
         }
     }
 
-    result.map_err(Into::into)
+    result
 }
 
 /// Full admin gate over RustFS-owned request facts: authenticate the
@@ -650,6 +650,19 @@ mod tests {
                 ..Default::default()
             }));
             publish_test_app_context(context);
+            let (root, is_owner) = authenticate_request_facts("proxy-test-root", "")
+                .await
+                .expect("root credentials");
+            assert_eq!(root.access_key, "proxy-test-root");
+            assert!(is_owner);
+
+            let error = authenticate_request_facts("proxy-test-root", "unexpected-token")
+                .await
+                .expect_err("the root has no session token");
+            assert_eq!(error.code(), &rustfs_s3_types::S3ErrorCode::InvalidRequest);
+            assert_eq!(error.message(), Some("invalid token2"));
+            assert_eq!(error.status_code(), Some(http::StatusCode::BAD_REQUEST));
+            assert!(error.source().is_none());
             let request = |key: &str, client_ip: Option<&str>, method: http::Method, uri: &str, body: &str| {
                 let mut builder = TestRequest::new(method, uri)
                     .extension(Some(RemoteAddr("10.1.2.3:4567".parse().unwrap())))
@@ -789,6 +802,8 @@ mod tests {
             .expect_err("an envelope without credentials must be rejected");
         assert_eq!(err.code(), &rustfs_s3_types::S3ErrorCode::InvalidRequest);
         assert_eq!(err.message(), Some("get cred failed"));
+        assert_eq!(err.status_code(), Some(http::StatusCode::BAD_REQUEST));
+        assert!(err.source().is_none());
     }
 
     /// KMS scoping rides the object slot with an empty bucket, matching the

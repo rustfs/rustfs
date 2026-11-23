@@ -36,7 +36,16 @@ async fn scan(
     (outcome, budget)
 }
 
+async fn read_display_progress(store: &FixtureStore) -> Option<rustfs_data_usage::BucketScanProgressSource> {
+    match tokio::fs::read(store.root.join("progress")).await {
+        Ok(bytes) => Some(serde_json::from_slice(&bytes).expect("decode independent display progress")),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => panic!("read durable display progress: {error}"),
+    }
+}
+
 async fn save_reload(store: &Arc<FixtureStore>, cache: &DataUsageCache) -> DataUsageCache {
+    let previous = read_display_progress(store).await;
     let revisions = DataUsageCache::default()
         .load_with_revisions(store.clone(), CACHE_NAME)
         .await
@@ -46,6 +55,13 @@ async fn save_reload(store: &Arc<FixtureStore>, cache: &DataUsageCache) -> DataU
         .await
         .expect("save compacted checkpoint through real codec and revision checks");
     let loaded = store.strict_load().await;
+    let restarted_store = FixtureStore::reopen(store.root.clone());
+    let progress = read_display_progress(&restarted_store).await;
+    if let Some(expected) = loaded.display_scan_progress(0) {
+        assert_eq!(progress, Some(expected), "accepted progress survives a cold store reopen");
+    } else {
+        assert_eq!(progress, previous, "unverified legacy coverage must not publish a new sample");
+    }
     assert_eq!(loaded.info.snapshot_complete, cache.info.snapshot_complete);
     assert_eq!(loaded.info.scan_checkpoint, cache.info.scan_checkpoint);
     assert_eq!(loaded.info.scan_identity, cache.info.scan_identity);

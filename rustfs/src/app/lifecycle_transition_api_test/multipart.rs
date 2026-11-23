@@ -16,6 +16,23 @@
 
 use super::common::*;
 use super::*;
+use rustfs_gateway_types::{BucketName, ObjectKey, UploadIdClaim, dto};
+
+fn complete_input(bucket: &str, key: &str, upload_id: &str, etag: Option<&str>) -> dto::CompleteMultipartUploadInput {
+    dto::CompleteMultipartUploadInput {
+        bucket: BucketName::new(bucket).expect("valid test bucket"),
+        key: ObjectKey::new(key).expect("valid test key"),
+        upload_id: UploadIdClaim::from_wire(upload_id),
+        multipart_upload: dto::CompletedMultipartUpload {
+            parts: vec![dto::CompletedPart {
+                part_number: 1,
+                e_tag: etag.map(crate::app::dto_values::stored_etag),
+                ..Default::default()
+            }],
+        },
+        ..Default::default()
+    }
+}
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 #[serial]
@@ -47,23 +64,12 @@ async fn complete_multipart_upload_transitions_immediately_via_usecase() {
         .await
         .expect("Failed to upload multipart part");
 
-    let complete_input = CompleteMultipartUploadInput::builder()
-        .bucket(bucket.clone())
-        .key(object.to_string())
-        .upload_id(upload.upload_id.clone())
-        .multipart_upload(Some(CompletedMultipartUpload {
-            parts: Some(vec![CompletedPart {
-                part_number: Some(1),
-                e_tag: uploaded_part.etag.clone().map(|etag| to_s3s_etag(&etag)),
-                ..Default::default()
-            }]),
-        }))
-        .build()
-        .unwrap();
+    let complete_input = complete_input(&bucket, object, &upload.upload_id, uploaded_part.etag.as_deref());
 
-    let complete_output = Box::pin(usecase.complete_for_s3s_request(build_request(complete_input, Method::POST)))
-        .await
-        .expect("Failed to complete multipart upload through usecase");
+    let complete_output =
+        Box::pin(usecase.execute_complete_multipart_upload(request_envelope(Method::POST, HeaderMap::new()), complete_input))
+            .await
+            .expect("Failed to complete multipart upload through usecase");
     assert!(
         complete_output.version_id.is_some(),
         "versioned CompleteMultipartUpload should return the created version ID"
@@ -125,22 +131,10 @@ async fn compensation_driven_complete_multipart_upload_still_transitions_inner()
         .await
         .expect("Failed to upload multipart part");
 
-    let complete_input = CompleteMultipartUploadInput::builder()
-        .bucket(bucket.clone())
-        .key(object.to_string())
-        .upload_id(upload.upload_id.clone())
-        .multipart_upload(Some(CompletedMultipartUpload {
-            parts: Some(vec![CompletedPart {
-                part_number: Some(1),
-                e_tag: uploaded_part.etag.clone().map(|etag| to_s3s_etag(&etag)),
-                ..Default::default()
-            }]),
-        }))
-        .build()
-        .unwrap();
+    let complete_input = complete_input(&bucket, object, &upload.upload_id, uploaded_part.etag.as_deref());
 
     with_forced_immediate_enqueue_timeout(&backend, || async {
-        Box::pin(usecase.complete_for_s3s_request(build_request(complete_input, Method::POST)))
+        Box::pin(usecase.execute_complete_multipart_upload(request_envelope(Method::POST, HeaderMap::new()), complete_input))
             .await
             .expect("Failed to complete multipart upload through usecase");
     })

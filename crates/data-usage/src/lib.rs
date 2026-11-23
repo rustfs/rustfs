@@ -13,7 +13,9 @@
 // limitations under the License.
 
 pub mod data_usage;
+pub mod scan_progress;
 pub mod usage_observation;
 
 pub use data_usage::*;
+pub use scan_progress::*;
 pub use usage_observation::*;

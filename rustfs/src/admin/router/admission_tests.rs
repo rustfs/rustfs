@@ -221,7 +221,12 @@ fn an_unsigned_amz_header_on_a_sigv4_request_is_refused() {
     forged.insert("x-amz-meta-forged", HeaderValue::from_static("1"));
     let expected = crate::auth::reject_unsigned_amz_headers_on_sigv4_request(&forged, None).expect_err("the rule refuses it");
     let refusal = admit(&router(false), Method::GET, "/rustfs/admin/v3/info", &forged, true).expect_err("refused");
-    assert_eq!(refusal.code(), &S3ErrorCode::from(expected.code().clone()));
+    assert_eq!(refusal.code(), expected.code());
+    assert_eq!(refusal.code(), &S3ErrorCode::AccessDenied);
+    assert_eq!(refusal.status_code(), Some(http::StatusCode::FORBIDDEN));
+    assert_eq!(refusal.message(), Some(crate::auth::UNSIGNED_HEADERS_MESSAGE));
+    assert!(refusal.source().is_none());
+    assert!(refusal.headers().is_none());
 }
 
 #[test]

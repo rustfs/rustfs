@@ -40,12 +40,13 @@ use storage_api::owner::{
     EcstoreReplicationScannerBridge, EcstoreResultType, EcstoreScanGuard, EcstoreSetDisks, EcstoreStorageError, EcstoreStore,
     EcstoreVersioningApi, HTTPPreconditions, HTTPRangeSpec, ObjectIO, ObjectOperations, ObjectToDelete,
     ScannerPublicationCommitScope, ScannerReplicationHealObject, ScannerReplicationHealResult, ScannerReplicationQueueAdmission,
-    ecstore_apply_expiry_rule, ecstore_apply_transition_rule, ecstore_expiry_state_handle, ecstore_get_global_tier_config_mgr,
-    ecstore_get_lifecycle_config, ecstore_get_object_lock_config, ecstore_get_replication_config,
-    ecstore_invalidate_admin_data_usage_snapshot_cache, ecstore_invalidate_data_usage_snapshot_cache, ecstore_is_erasure,
-    ecstore_is_reserved_or_invalid_bucket, ecstore_lifecycle_version_delete_target, ecstore_list_path_raw,
-    ecstore_object_opts_from_object_info, ecstore_path2_bucket_object, ecstore_path2_bucket_object_with_base_path,
-    ecstore_read_config, ecstore_replace_bucket_usage_memory_from_info, ecstore_resolve_object_store_handle, ecstore_save_config,
+    ecstore_apply_expiry_rule, ecstore_apply_transition_rule_with_incarnation, ecstore_expiry_state_handle,
+    ecstore_get_global_tier_config_mgr, ecstore_get_lifecycle_config, ecstore_get_object_lock_config,
+    ecstore_get_replication_config, ecstore_invalidate_admin_data_usage_snapshot_cache,
+    ecstore_invalidate_data_usage_snapshot_cache, ecstore_is_erasure, ecstore_is_reserved_or_invalid_bucket,
+    ecstore_lifecycle_version_delete_target, ecstore_list_path_raw, ecstore_object_opts_from_object_info,
+    ecstore_path2_bucket_object, ecstore_path2_bucket_object_with_base_path, ecstore_read_config,
+    ecstore_replace_bucket_usage_memory_from_info, ecstore_resolve_object_store_handle, ecstore_save_config,
     scanner_replication_config_for_lifecycle_eval,
 };
 #[cfg(test)]
@@ -462,8 +463,13 @@ where
     }
 }
 
-pub(crate) async fn apply_transition_rule(event: &Event, src: &LcEventSrc, oi: &ScannerObjectInfo) -> bool {
-    ecstore_apply_transition_rule(event, src, oi).await
+pub(crate) async fn apply_transition_rule(
+    event: &Event,
+    src: &LcEventSrc,
+    oi: &ScannerObjectInfo,
+    notification_bucket_incarnation: Option<uuid::Uuid>,
+) -> bool {
+    ecstore_apply_transition_rule_with_incarnation(event, src, oi, notification_bucket_incarnation).await
 }
 
 pub(crate) async fn apply_expiry_rule(event: &Event, src: &LcEventSrc, oi: &ScannerObjectInfo) -> bool {
@@ -1020,6 +1026,12 @@ impl<T> ScannerObjectIO for T where
 
 #[async_trait::async_trait]
 pub trait ScannerConfigObjectDelete: Send + Sync + std::fmt::Debug + 'static {
+    /// Shared movement scope for diagnostic samples; absence disables progress
+    /// publication without affecting checkpoint recovery.
+    async fn scanner_data_usage_movement_generation(&self) -> Option<u64> {
+        None
+    }
+
     async fn delete_config_object(
         &self,
         bucket: &str,
@@ -1084,6 +1096,9 @@ impl ScannerDataUsagePublicationAdmission {
 
 #[async_trait::async_trait]
 impl ScannerConfigObjectDelete for ECStore {
+    async fn scanner_data_usage_movement_generation(&self) -> Option<u64> {
+        ECStore::scanner_durable_data_movement_generation(self).await
+    }
     async fn delete_config_object(
         &self,
         bucket: &str,
@@ -1128,6 +1143,9 @@ impl ScannerConfigObjectDelete for ECStore {
 
 #[async_trait::async_trait]
 impl ScannerConfigObjectDelete for SetDisks {
+    async fn scanner_data_usage_movement_generation(&self) -> Option<u64> {
+        SetDisks::scanner_durable_data_movement_generation(self).await
+    }
     async fn delete_config_object(
         &self,
         bucket: &str,

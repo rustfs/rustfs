@@ -18,10 +18,10 @@
 use crate::app::storage_api::request_body::StdError;
 #[cfg(test)]
 use crate::app::storage_api::request_body::{ByteStream, StreamingBlob};
-use bytes::Bytes;
-use futures::Stream;
+use bytes::{Buf, Bytes};
 #[cfg(test)]
 use futures::StreamExt;
+use futures::{Stream, TryStreamExt};
 use http::HeaderMap;
 use http_body::Body as _;
 use parking_lot::Mutex;
@@ -32,6 +32,35 @@ use rustfs_rio::{SharedTrailerSource, TrailerSource, TrailerValue};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
+
+/// StreamReader keeps its last Buf while polling the producer. Release a consumed
+/// frame immediately so a bounded producer can reuse its registration.
+struct UploadFrame(Bytes);
+
+impl Buf for UploadFrame {
+    fn remaining(&self) -> usize {
+        self.0.len()
+    }
+
+    fn chunk(&self) -> &[u8] {
+        &self.0
+    }
+
+    fn advance(&mut self, count: usize) {
+        if count == self.0.len() {
+            self.0 = Bytes::new();
+        } else {
+            self.0.advance(count);
+        }
+    }
+}
+
+pub(crate) fn upload_frame_reader<S>(stream: S) -> impl tokio::io::AsyncRead
+where
+    S: Stream<Item = std::io::Result<Bytes>> + Unpin,
+{
+    tokio_util::io::StreamReader::new(stream.map_ok(UploadFrame))
+}
 
 /// The legacy edge preserves the producer's length hint without enforcing it a second time.
 #[cfg(test)]
@@ -248,6 +277,36 @@ impl<S: Stream<Item = std::io::Result<Bytes>>> PayloadStream for IoPayload<S> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn streaming_put_releases_a_consumed_frame_before_reserving_the_next() {
+        use tokio::io::AsyncReadExt;
+        use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+
+        struct Registered {
+            _lease: OwnedSemaphorePermit,
+        }
+        impl AsRef<[u8]> for Registered {
+            fn as_ref(&self) -> &[u8] {
+                b"abc"
+            }
+        }
+        let slot = Arc::new(Semaphore::new(1));
+        let stream = futures::stream::iter((0..3).map(|_| {
+            let lease = slot.clone().try_acquire_owned().expect("previous frame released");
+            Ok(Bytes::from_owner(Registered { _lease: lease }))
+        }));
+        let mut reader = upload_frame_reader(stream);
+        let mut prefix = [0; 2];
+        reader.read_exact(&mut prefix).await.unwrap();
+        assert_eq!(&prefix, b"ab");
+        assert_eq!(slot.available_permits(), 0);
+        let mut tail = Vec::new();
+        reader.read_to_end(&mut tail).await.unwrap();
+        assert_eq!(tail, b"cabcabc");
+        assert_eq!(slot.available_permits(), 1);
+    }
+
     use crate::app::storage_api::request_body::RemainingLength;
     use std::collections::VecDeque;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -383,6 +442,22 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn sized_io_stream_preserves_chunk_storage_and_remaining_length() {
+        use http_body_util::BodyExt as _;
+
+        let bytes = Bytes::from(vec![1, 2, 3]);
+        let address = bytes.as_ptr();
+        let mut body = from_io_stream_with_length(futures::stream::iter([Ok(bytes), Ok(Bytes::from_static(b"x"))]), Some(4));
+        assert!(body.caps().contains(PayloadCaps::KNOWN_LENGTH));
+        assert_eq!(body.len_hint(), Some(4));
+        let chunk = body.frame().await.unwrap().unwrap().into_data().unwrap();
+        assert_eq!(chunk.as_ptr(), address);
+        assert_eq!(body.len_hint(), Some(1));
+        assert_eq!(body.frame().await.unwrap().unwrap().into_data().unwrap().as_ref(), b"x");
+        assert_eq!(body.len_hint(), Some(0));
+    }
+
     #[derive(Debug)]
     struct InternalProducerFailure;
 
@@ -393,6 +468,26 @@ mod tests {
     }
 
     impl std::error::Error for InternalProducerFailure {}
+
+    #[tokio::test]
+    async fn io_stream_reports_remaining_rdma_bytes_and_preserves_chunks() {
+        use http_body_util::BodyExt as _;
+        let first = Bytes::from_static(b"abc");
+        let last = Bytes::from_static(b"de");
+        for known in [false, true] {
+            let source = futures::stream::iter([Ok(first.clone()), Ok(last.clone())]);
+            let mut body = from_io_stream_with_length(source, known.then_some(5));
+            assert_eq!(body.caps().contains(PayloadCaps::KNOWN_LENGTH), known);
+            for (expected, remaining) in [(&first, 5), (&last, 2)] {
+                assert_eq!(body.len_hint(), known.then_some(remaining));
+                let chunk = body.frame().await.unwrap().unwrap().into_data().unwrap();
+                assert_eq!(&chunk, expected);
+                assert_eq!(chunk.as_ptr(), expected.as_ptr());
+            }
+            assert_eq!(body.len_hint(), known.then_some(0));
+            assert!(body.frame().await.is_none());
+        }
+    }
 
     #[tokio::test]
     async fn internal_producer_error_preserves_io_kind_and_nested_source_after_data() {

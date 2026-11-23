@@ -138,7 +138,7 @@ impl DefaultBucketUsecase {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::app::bucket_usecase::test_support::{build_request, owned_envelope};
+    use crate::app::bucket_usecase::test_support::owned_envelope;
     use crate::app::storage_api::s3::dto::{self, PutBucketTaggingInput, Tag, Tagging};
     use http::Method;
     use rustfs_s3_types::S3ErrorCode;
@@ -208,10 +208,20 @@ mod tests {
                     .tagging(dto::Tagging { tag_set })
                     .build()
                     .unwrap();
-                let mut req = build_request(input, Method::PUT);
-                req.extensions.insert(ReqInfo::default());
-                req.extensions.insert(slot.clone());
-                let mut envelope = RequestEnvelope::from_s3s(&req);
+                let mut extensions = http::Extensions::new();
+                extensions.insert(ReqInfo::default());
+                extensions.insert(slot.clone());
+                let mut envelope = RequestEnvelope::from_parts(
+                    crate::app::RequestHead {
+                        method: Method::PUT,
+                        uri: http::Uri::from_static("/"),
+                        headers: http::HeaderMap::new(),
+                        credentials: None,
+                        region: None,
+                        service: None,
+                    },
+                    extensions,
+                );
                 authorize_bucket_config_mutation(
                     &slot,
                     &mut envelope,
@@ -220,9 +230,7 @@ mod tests {
                 )
                 .await
                 .expect("permission allows tag updates");
-                let result = usecase
-                    .execute_put_bucket_tagging(envelope, &req.input.bucket, persisted)
-                    .await;
+                let result = usecase.execute_put_bucket_tagging(envelope, &input.bucket, persisted).await;
                 if valid {
                     result.expect("valid tags are persisted");
                 } else {

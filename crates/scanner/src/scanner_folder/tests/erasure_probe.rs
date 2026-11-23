@@ -74,7 +74,9 @@ pub(in crate::scanner_folder) async fn ordered_entries(
     }
     let mut entries = Vec::new();
     while let Some(entry) = reader.next_entry().await? {
-        entries.push(entry);
+        // This fixture reorders native entries. Their kernel positions no
+        // longer describe the prefixes delivered to the walker.
+        entries.push(entry.without_anchor());
     }
     // Real entries and file types, with an explicit adversarial order rather
     // than an assumption about the filesystem's enumeration order.
@@ -533,6 +535,32 @@ async fn erasure_candidate_defers_metadata_until_part_classification_finishes() 
 #[tokio::test]
 #[serial]
 async fn erasure_candidate_cancelled_batch_keeps_partial_checkpoint_and_reclassifies_on_resume() {
+    check_candidate_resume(CandidateResume::Legacy, 136).await;
+}
+
+#[tokio::test]
+#[serial]
+async fn erasure_candidate_warm_resume_avoids_rereading_sealed_root() {
+    check_candidate_resume(CandidateResume::Warm, 135).await;
+}
+
+#[cfg(any(unix, windows))]
+#[tokio::test]
+#[serial]
+async fn erasure_candidate_cold_resume_uses_the_validated_sealed_root() {
+    check_candidate_resume(CandidateResume::Cold, 135).await;
+}
+
+enum CandidateResume {
+    Warm,
+    Legacy,
+    #[cfg(any(unix, windows))]
+    Cold,
+}
+
+async fn check_candidate_resume(kind: CandidateResume, expected_io: u64) {
+    use crate::storage_api::owner::EcstoreDiskAPI;
+
     let (mut scanner, root, folder) = candidate_scanner().await;
     let _guard = TestGuard {
         temp_dir: Some(root.clone()),
@@ -596,7 +624,33 @@ async fn erasure_candidate_cancelled_batch_keeps_partial_checkpoint_and_reclassi
         .expect("validated candidate index");
     assert_eq!(index.indexed_entries().expect("index entries").len(), 64);
     let bytes = serde_json::to_vec(&snapshot).expect("serialize partial checkpoint");
-    let reloaded: DataUsageCache = serde_json::from_slice(&bytes).expect("reload partial checkpoint");
+    let mut reloaded: DataUsageCache = serde_json::from_slice(&bytes).expect("reload partial checkpoint");
+    if !matches!(kind, CandidateResume::Warm) {
+        scanner.directory_checkpoints.clear();
+        if matches!(kind, CandidateResume::Legacy) {
+            // A pre-directory-checkpoint writer persisted raw names but no
+            // authenticated physical position or sealed membership manifest.
+            reloaded.info.scan_directory_source = None;
+            reloaded.info.scan_directory_work.clear();
+        } else {
+            for state in &reloaded.info.scan_directory_work {
+                scanner
+                    .directory_checkpoints
+                    .entry(state.parent().to_owned())
+                    .or_default()
+                    .insert(state.endpoint().to_owned(), Arc::new(std::sync::Mutex::new(Some(state.clone()))));
+            }
+        }
+        scanner.local_disk = new_disk(
+            &scanner.local_disk.endpoint(),
+            &DiskOption {
+                cleanup: false,
+                health_check: false,
+            },
+        )
+        .await
+        .expect("reopen cold scanner disk");
+    }
     scanner.old_cache = reloaded.clone();
     scanner.new_cache = reloaded;
     scanner.raw_enumeration_progress.clear();
@@ -615,8 +669,8 @@ async fn erasure_candidate_cancelled_batch_keeps_partial_checkpoint_and_reclassi
     );
     assert_eq!(
         charged_ops(&root),
-        136,
-        "resume recharges actual reads; the raw index is not a filesystem seek"
+        expected_io,
+        "resume charges every physical read, including cold reconstruction of the root"
     );
 }
 
@@ -774,6 +828,7 @@ async fn erasure_candidate_covered_namespace_reuses_totals_after_classification(
         },
     );
     scanner.budget = budget.clone();
+    let before = global_metrics().scan_observation().snapshot();
     scanner
         .scan_folder(
             budget.token(),
@@ -790,6 +845,15 @@ async fn erasure_candidate_covered_namespace_reuses_totals_after_classification(
     assert_eq!(budget.progress(), (0, 1), "only the parent consumes namespace quota");
     assert_eq!(charged_ops(&root), 4, "list both directories once without re-reading covered metadata");
     assert_eq!(scanner.new_cache.find(&folder.name).expect("reused candidate").objects, 1);
+    let observed = global_metrics().scan_observation().snapshot();
+    assert_eq!(
+        observed.cache_reuse["classified_namespace"].count,
+        before.cache_reuse["classified_namespace"].count + 1
+    );
+    assert_eq!(
+        observed.metadata_reads.attempts, before.metadata_reads.attempts,
+        "classification retains the existing zero metadata read path"
+    );
 }
 
 #[tokio::test]
@@ -869,6 +933,7 @@ async fn erasure_candidate_preserves_compacted_namespace_sampling_after_classifi
         },
     );
     scanner.budget = budget.clone();
+    let before = global_metrics().scan_observation().snapshot();
     scanner
         .scan_folder(
             budget.token(),
@@ -889,6 +954,15 @@ async fn erasure_candidate_preserves_compacted_namespace_sampling_after_classifi
         "sampling still requires full current classification, without metadata re-read"
     );
     assert_eq!(scanner.new_cache.find(&folder.name).expect("sampled candidate").objects, 1);
+    let observed = global_metrics().scan_observation().snapshot();
+    assert_eq!(
+        observed.cache_reuse["classified_namespace"].count,
+        before.cache_reuse["classified_namespace"].count + 1
+    );
+    assert_eq!(
+        observed.metadata_reads.attempts, before.metadata_reads.attempts,
+        "classification retains the existing zero metadata read path"
+    );
 }
 
 #[tokio::test]

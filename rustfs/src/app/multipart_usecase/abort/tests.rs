@@ -56,11 +56,20 @@ fn native_abort_requires_current_generation_and_audits_each_result() {
         let opts = ObjectOptions::default();
         let request_context = RequestContext::fallback();
         let request = || {
-            let mut req = build_request((), Method::DELETE);
-            req.uri = format!("/{bucket}/{key}").parse().expect("fixture URI");
-            req.extensions.insert(slot.clone());
-            req.extensions.insert(request_context.clone());
-            RequestEnvelope::from_s3s(&req)
+            let mut extensions = Extensions::new();
+            extensions.insert(slot.clone());
+            extensions.insert(request_context.clone());
+            RequestEnvelope::from_parts(
+                crate::app::RequestHead {
+                    method: Method::DELETE,
+                    uri: format!("/{bucket}/{key}").parse().expect("fixture URI"),
+                    headers: http::HeaderMap::new(),
+                    credentials: None,
+                    region: None,
+                    service: None,
+                },
+                extensions,
+            )
         };
         for name in [&bucket, &other] {
             store

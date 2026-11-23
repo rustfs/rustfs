@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::rules::TargetIdSet;
 use hashbrown::HashMap;
 use jiff::{Timestamp, tz::TimeZone};
 use rustfs_s3_ops::is_object_removed_event;
@@ -170,6 +171,10 @@ pub struct Event {
     pub glacier_event_data: Option<GlacierEventData>,
     /// Information about the source of the event
     pub source: Source,
+    #[serde(skip)]
+    pub(crate) bucket_incarnation_id: Option<uuid::Uuid>,
+    #[serde(skip)]
+    pub(crate) bucket_removed_targets: Option<TargetIdSet>,
 }
 
 impl Event {
@@ -195,6 +200,8 @@ impl Event {
         user_metadata.insert("x-request-time".to_string(), format_timestamp_rfc3339_millis(&Timestamp::now()));
 
         Event {
+            bucket_incarnation_id: None,
+            bucket_removed_targets: None,
             event_version: event_schema_version(event_name).to_string(),
             event_source: "rustfs:s3".to_string(),
             aws_region: "us-east-1".to_string(),
@@ -320,6 +327,8 @@ impl Event {
         };
 
         Self {
+            bucket_incarnation_id: args.bucket_incarnation_id,
+            bucket_removed_targets: args.bucket_removed_targets,
             event_version: event_schema_version(args.event_name).to_string(),
             event_source: "rustfs:s3".to_string(),
             aws_region: args.req_params.get("region").cloned().unwrap_or_default(),
@@ -387,6 +396,10 @@ fn initialize_response_elements(elements: &mut HashMap<String, String>, keys: &[
 
 #[derive(Debug, Clone)]
 pub struct EventArgs {
+    /// Bucket identity established by the producing operation.
+    pub bucket_incarnation_id: Option<uuid::Uuid>,
+    /// Delivery targets captured before a successful bucket removal withdraws its rules.
+    pub bucket_removed_targets: Option<TargetIdSet>,
     pub event_name: EventName,
     pub bucket_name: String,
     pub object: NotifyObjectInfo,
@@ -436,6 +449,8 @@ impl EventArgs {
 /// ```
 #[derive(Debug, Clone, Default)]
 pub struct EventArgsBuilder {
+    bucket_incarnation_id: Option<uuid::Uuid>,
+    bucket_removed_targets: Option<TargetIdSet>,
     event_name: EventName,
     bucket_name: String,
     object: NotifyObjectInfo,
@@ -456,6 +471,18 @@ impl EventArgsBuilder {
             object: object.into(),
             ..Default::default()
         }
+    }
+
+    /// Carries the operation's confirmed bucket identity to event dispatch.
+    pub fn bucket_incarnation_id(mut self, incarnation_id: Option<uuid::Uuid>) -> Self {
+        self.bucket_incarnation_id = incarnation_id;
+        self
+    }
+
+    /// Uses the subscription targets captured before deletion.
+    pub fn bucket_removed_targets(mut self, targets: TargetIdSet) -> Self {
+        self.bucket_removed_targets = Some(targets);
+        self
     }
 
     /// Sets the event name.
@@ -529,6 +556,8 @@ impl EventArgsBuilder {
     /// This method consumes the builder and returns the constructed `EventArgs`.
     pub fn build(self) -> EventArgs {
         EventArgs {
+            bucket_incarnation_id: self.bucket_incarnation_id,
+            bucket_removed_targets: self.bucket_removed_targets,
             event_name: self.event_name,
             bucket_name: self.bucket_name,
             object: self.object,
@@ -823,6 +852,8 @@ mod event_args_tests {
             req_params.insert((*k).to_string(), (*v).to_string());
         }
         EventArgs {
+            bucket_incarnation_id: None,
+            bucket_removed_targets: None,
             event_name: EventName::ObjectRemovedDelete,
             bucket_name: "b".to_string(),
             object: ObjectInfo::default(),

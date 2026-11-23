@@ -150,7 +150,7 @@ impl ObjectMetaUsecase {
 
         // The current target transport carries the updated metadata in a full-object PUT.
         if dsc.replicate_any() {
-            schedule_metadata_replication(object_info.clone(), store.clone(), dsc).await;
+            schedule_metadata_replication(object_info.clone(), store.clone(), dsc, opts.expected_bucket_incarnation_id).await;
         }
 
         let output = PutObjectRetentionOutput {
@@ -246,7 +246,7 @@ mod tests {
         AMZ_OBJECT_LOCK_MODE_LOWER, AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE_LOWER, HashMap, Mode, OffsetDateTime, Rfc3339, S3ErrorCode,
         stored_retention,
     };
-    use rustfs_gateway_types::compat::s3s_5761ddfe::generated::ops::get_object_retention;
+    use rustfs_gateway::{Limits, MetaView, OperationCodec, ResponseBody, TargetKind, WireRequest, dto::GetObjectRetention};
     use rustfs_gateway_types::dto::GetObjectRetentionOutput;
 
     fn stored(retain_until: &str) -> HashMap<String, String> {
@@ -258,6 +258,22 @@ mod tests {
 
     #[test]
     fn retention_response_serialization_preserves_offset_metadata_instant() {
+        #[derive(serde::Deserialize)]
+        #[serde(rename_all = "PascalCase")]
+        struct Retention {
+            mode: String,
+            retain_until_date: String,
+        }
+        let request = http::Request::builder()
+            .method("GET")
+            .uri("/bucket/key?retention")
+            .header("host", "localhost")
+            .body(())
+            .unwrap();
+        let wire = WireRequest::accept(request, &Limits::default()).expect("retention request");
+        let view = MetaView::of(&wire, TargetKind::Object)
+            .expect("object view")
+            .with_rustfs_response_layout();
         for value in [
             "2035-01-02T00:00:00+23:59",
             "2035-01-02T00:00:00-23:59",
@@ -274,18 +290,19 @@ mod tests {
             let returned = OffsetDateTime::parse(&serialized, &Rfc3339).expect("parse wire timestamp");
             let stored_at = OffsetDateTime::parse(value, &Rfc3339).expect("parse stored timestamp");
             assert_eq!(returned.unix_timestamp(), stored_at.unix_timestamp(), "stored date {value}");
-            let output = get_object_retention::output_to_s3s(GetObjectRetentionOutput {
-                retention: Some(retention),
-            })
-            .expect("convert the response");
-            let seam = OffsetDateTime::from(
-                output
-                    .retention
-                    .expect("retention")
-                    .retain_until_date
-                    .expect("stored retention date"),
-            );
-            assert_eq!(seam.unix_timestamp(), stored_at.unix_timestamp(), "stored date {value}");
+            let response = GetObjectRetention::encode(
+                GetObjectRetentionOutput {
+                    retention: Some(retention),
+                },
+                &view,
+                200,
+            )
+            .expect("encode the retention response");
+            let ResponseBody::Complete(xml) = response.body else { panic!("expected retention XML") };
+            let wire: Retention = quick_xml::de::from_reader(xml.as_slice()).expect("retention response XML");
+            assert_eq!(wire.mode, "COMPLIANCE");
+            let date = OffsetDateTime::parse(&wire.retain_until_date, &Rfc3339).expect("wire date");
+            assert_eq!(date, stored_at, "stored date {value}");
         }
     }
 

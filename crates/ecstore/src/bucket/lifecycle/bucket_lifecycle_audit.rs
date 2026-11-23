@@ -51,15 +51,20 @@ impl LcAuditEvent {
     }
 }
 
-pub(crate) fn emit_transition_failed_event(object: ObjectInfo) {
-    emit_lifecycle_event(EventName::ObjectTransitionFailed, object, LIFECYCLE_TRANSITION_USER_AGENT);
+pub(crate) fn emit_transition_failed_event(object: ObjectInfo, incarnation_id: Option<uuid::Uuid>) {
+    emit_lifecycle_event(EventName::ObjectTransitionFailed, object, LIFECYCLE_TRANSITION_USER_AGENT, incarnation_id);
 }
 
-pub(crate) fn emit_transition_complete_event(object: ObjectInfo) {
-    emit_lifecycle_event(EventName::ObjectTransitionComplete, object, LIFECYCLE_TRANSITION_USER_AGENT);
+pub(crate) fn emit_transition_complete_event(object: ObjectInfo, incarnation_id: Option<uuid::Uuid>) {
+    emit_lifecycle_event(
+        EventName::ObjectTransitionComplete,
+        object,
+        LIFECYCLE_TRANSITION_USER_AGENT,
+        incarnation_id,
+    );
 }
 
-pub(crate) fn emit_transitioned_expiration_event(source: &ObjectInfo, deleted: &ObjectInfo) {
+pub(crate) fn emit_transitioned_expiration_event(source: &ObjectInfo, deleted: &ObjectInfo, incarnation_id: uuid::Uuid) {
     let event_name = transitioned_expiration_event_name(source.delete_marker, deleted.delete_marker);
     let object = ObjectInfo {
         bucket: source.bucket.clone(),
@@ -69,12 +74,17 @@ pub(crate) fn emit_transitioned_expiration_event(source: &ObjectInfo, deleted: &
         delete_marker: source.delete_marker,
         ..Default::default()
     };
-    emit_lifecycle_event(event_name, object, LIFECYCLE_EXPIRY_USER_AGENT);
+    emit_lifecycle_event(event_name, object, LIFECYCLE_EXPIRY_USER_AGENT, Some(incarnation_id));
 }
 
-pub(crate) fn emit_non_transitioned_expiration_event(action: IlmAction, source: &ObjectInfo, deleted: ObjectInfo) {
+pub(crate) fn emit_non_transitioned_expiration_event(
+    action: IlmAction,
+    source: &ObjectInfo,
+    deleted: ObjectInfo,
+    incarnation_id: uuid::Uuid,
+) {
     let event_name = non_transitioned_expiration_event_name(action, source.delete_marker, deleted.delete_marker);
-    emit_lifecycle_event(event_name, deleted, LIFECYCLE_EXPIRY_USER_AGENT);
+    emit_lifecycle_event(event_name, deleted, LIFECYCLE_EXPIRY_USER_AGENT, Some(incarnation_id));
 }
 
 /// Emit the lifecycle expiration event for one version removed by the batch
@@ -83,9 +93,15 @@ pub(crate) fn emit_non_transitioned_expiration_event(action: IlmAction, source: 
 /// That path never sent events, so a successful noncurrent-version expiry was
 /// invisible to notification subscribers even though the equivalent
 /// current-version path emits one (backlog#2202).
-pub(crate) fn emit_noncurrent_expiration_event(bucket: &str, target: &ObjectToDelete, deleted: &DeletedObject, failed: bool) {
+pub(crate) fn emit_noncurrent_expiration_event(
+    bucket: &str,
+    target: &ObjectToDelete,
+    deleted: &DeletedObject,
+    failed: bool,
+    incarnation_id: uuid::Uuid,
+) {
     if let Some((event_name, object)) = noncurrent_expiration_event(bucket, target, deleted, failed) {
-        emit_lifecycle_event(event_name, object, LIFECYCLE_EXPIRY_USER_AGENT);
+        emit_lifecycle_event(event_name, object, LIFECYCLE_EXPIRY_USER_AGENT, Some(incarnation_id));
     }
 }
 
@@ -131,9 +147,10 @@ fn noncurrent_expiration_event(
     Some((event_name, object))
 }
 
-fn emit_lifecycle_event(event_name: EventName, object: ObjectInfo, user_agent: &str) {
+fn emit_lifecycle_event(event_name: EventName, object: ObjectInfo, user_agent: &str, incarnation_id: Option<uuid::Uuid>) {
     send_event(EventArgs {
         event_name: event_name.to_string(),
+        bucket_incarnation_id: incarnation_id,
         bucket_name: object.bucket.clone(),
         object,
         user_agent: user_agent.to_string(),

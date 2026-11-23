@@ -22,8 +22,6 @@
 use crate::module_switches::is_audit_module_enabled;
 use crate::storage::authorization::{AuthorizationRequest, req_info_mut};
 use crate::storage::helper::{AuditRequestView, DenialScope, authorization_denial_entry_for_view, spawn_background_with_context};
-#[cfg(test)]
-use crate::storage::helper::{DenialRequest, authorization_denial_entry};
 use crate::storage::request_context::RequestContext;
 use rustfs_audit::{AuditEntry, global::AuditLogger};
 use rustfs_policy::policy::action::Action;
@@ -175,46 +173,24 @@ impl DenialAuditor {
         })
     }
 
-    #[cfg(test)]
-    pub(crate) fn audit<T>(&self, req: &DenialRequest<T>, action: &Action, reason: &'static str, scope: DenialScope) {
-        self.audit_at(req, action, reason, scope, (self.clock)());
-    }
-
-    #[cfg(test)]
-    pub(crate) fn audit_at<T>(
-        &self,
-        req: &DenialRequest<T>,
-        action: &Action,
-        reason: &'static str,
-        scope: DenialScope,
-        now: Instant,
-    ) {
-        self.audit_view_at(&AuditRequestView::legacy(req), now, || {
-            authorization_denial_entry(req, action, reason, scope)
-        });
-    }
-
     /// Audits a denial for a request an owned edge decoded into `view`.
     pub(crate) fn audit_owned(&self, view: &AuditRequestView<'_>, action: &Action, reason: &'static str, scope: DenialScope) {
-        self.audit_view_at(view, (self.clock)(), || authorization_denial_entry_for_view(view, action, reason, scope));
-    }
-
-    fn audit_view_at(&self, req: &AuditRequestView<'_>, now: Instant, build_entry: impl FnOnce() -> AuditEntry) {
+        let now = (self.clock)();
         if !(self.enabled)() {
             return;
         }
-        let anonymous = req.req_info.is_none_or(|info| info.cred.is_none());
+        let anonymous = view.req_info.is_none_or(|info| info.cred.is_none());
         let Admission::Emit { suppressed } = self.limiter.admit(anonymous, now) else {
             return;
         };
-        let mut entry = build_entry();
+        let mut entry = authorization_denial_entry_for_view(view, action, reason, scope);
         if suppressed > 0 {
             entry
                 .tags
                 .get_or_insert_with(Default::default)
                 .insert(SUPPRESSED_DENIALS_TAG.to_string(), Value::from(suppressed));
         }
-        (self.emit)(req.request_context(), entry);
+        (self.emit)(view.request_context(), entry);
     }
 }
 

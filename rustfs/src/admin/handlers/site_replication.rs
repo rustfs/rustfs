@@ -103,6 +103,11 @@ use uuid::Uuid;
 // paths keep resolving while this file keeps only the HTTP handlers.
 pub(crate) use crate::site_replication::*;
 
+mod removal;
+#[cfg(test)]
+mod removal_tests;
+use removal::{SiteRemovalV2CapabilitiesHandler, SiteRemovalV2Handler, SiteRemovalV2PeerHandler, resume_site_removal_v2};
+
 // Serializes peer-join admission (staleness check -> IAM upsert -> state
 // commit) across every node of this site; see admit_peer_join. Never an
 // actual object — only a namespace-lock key, like the repair execution lock.
@@ -493,6 +498,17 @@ pub fn register_site_replication_route(r: &mut S3Router<AdminOperation>) -> std:
             Method::PUT,
             "/v3/site-replication/remove",
             AdminOperation(&SiteReplicationRemoveHandler {}),
+        ),
+        (Method::PUT, "/v3/site-replication/remove-v2", AdminOperation(&SiteRemovalV2Handler)),
+        (
+            Method::GET,
+            "/v3/site-replication/remove-v2/capabilities",
+            AdminOperation(&SiteRemovalV2CapabilitiesHandler),
+        ),
+        (
+            Method::PUT,
+            "/v3/site-replication/peer/remove-v2",
+            AdminOperation(&SiteRemovalV2PeerHandler),
         ),
         (Method::GET, "/v3/site-replication/info", AdminOperation(&SiteReplicationInfoHandler {})),
         (
@@ -1926,8 +1942,7 @@ fn reconcile_site_replication_retry_drain() -> std::pin::Pin<Box<dyn std::future
         }
         match load_site_replication_state().await {
             Ok(state) => {
-                if state.pending_endpoint_refresh.is_some() || state.pending_rotation.is_some() || state.pending_remove.is_some()
-                {
+                if state.pending_endpoint_refresh.is_some() || state.pending_rotation.is_some() || state.removal_pending() {
                     return;
                 }
             }
@@ -1987,6 +2002,14 @@ fn reconcile_site_replication_wiring() -> std::pin::Pin<Box<dyn std::future::Fut
                 // up the round (rustfs/rustfs#5963). The reconcilers below
                 // still skip this round either way: the topology is only
                 // settled once the removal clears, and the next tick sees it.
+                if let Some(pending) = state.pending_remove_v2.as_ref() {
+                    if let Err(err) = resume_site_removal_v2(pending).await {
+                        warn!(event = EVENT_ADMIN_SITE_REPLICATION_STATE, component = LOG_COMPONENT_ADMIN,
+                            subsystem = LOG_SUBSYSTEM_SITE_REPLICATION, result = "decommission_resume_failed",
+                            error = %err, "site replication decommission resume failed");
+                    }
+                    return;
+                }
                 if let Some(pending_remove) = state.pending_remove.clone() {
                     resume_pending_remove(&state, &pending_remove).await;
                     return;
@@ -3041,7 +3064,16 @@ fn merge_add_sites(
     state.name = local_peer.name.clone();
     state.service_account_access_key = service_account_access_key;
     state.service_account_parent = service_account_parent;
-    state.updated_at = Some(OffsetDateTime::now_utc());
+    let now = OffsetDateTime::now_utc();
+    state.updated_at = Some(if !state.remove_v2_receipts.is_empty() {
+        state
+            .updated_at
+            .filter(|previous| *previous >= now)
+            .and_then(|previous| previous.checked_add(time::Duration::nanoseconds(1)))
+            .unwrap_or(now)
+    } else {
+        now
+    });
     state.peers = build_join_peers(&state, &local_peer, sites, replicate_ilm_expiry);
     // Every join must carry the verified identities, including peers that
     // have not joined yet. Fixing only the coordinator after each reply
@@ -3240,7 +3272,8 @@ fn ensure_edit_precondition(
     expected_pending_id: Option<&String>,
     stage: &str,
 ) -> S3Result<()> {
-    if state.updated_at != expected_updated_at
+    if state.pending_remove_v2.is_some()
+        || state.updated_at != expected_updated_at
         || pending_endpoint_refresh(state).as_ref().map(|pending| &pending.id) != expected_pending_id
     {
         return Err(s3_error!(InvalidRequest, "site replication state changed during {stage}"));
@@ -3933,6 +3966,21 @@ fn status_peer_error(peer: &PeerInfo, detail: String) -> SRPeerError {
 }
 
 fn pending_operation_for_state(state: &SiteReplicationState, local_peer: &PeerInfo) -> Option<SRPendingOperation> {
+    if let Some(pending) = &state.pending_remove_v2 {
+        let acked = if pending.commit_decided {
+            &pending.committed_peers
+        } else {
+            &pending.cleaned_peers
+        };
+        return Some(SRPendingOperation {
+            operation: "decommission".to_string(),
+            id: pending.plan.id.clone(),
+            pending_peers: required_removal_peers(&pending.plan).difference(acked).cloned().collect(),
+            acked_peers: acked.iter().cloned().collect(),
+            updated_at: Some(pending.plan.topology_at),
+            api_version: Some(SITE_REPL_API_VERSION.to_string()),
+        });
+    }
     if let Some(pending) = state.pending_remove.as_ref() {
         let pending_peers = pending_remote_peer_ids(&pending.original_peers, local_peer)
             .into_iter()
@@ -4534,13 +4582,18 @@ async fn drive_pending_remove(pending_remove: &PendingRemove, local_peer: &PeerI
         for peer in
             pending_peers_awaiting_notification(&pending_remove.original_peers, local_peer, &pending_remove.acked_deployment_ids)
         {
-            if let Err(err) = PeerAdminRequest::put(
-                &runtime_peer_connection(peer)?,
-                SITE_REPLICATION_PEER_REMOVE_PATH,
-                &pending_remove.service_account_access_key,
-            )
-            .send_with_secret_candidates(&secret_candidates, &pending_remove.req)
-            .await
+            let remove_path = format!(
+                "{SITE_REPLICATION_PEER_REMOVE_PATH}?remove-id={}&remove-at={}",
+                pending_remove.id,
+                pending_remove
+                    .updated_at
+                    .map(|stamp| stamp.unix_timestamp_nanos())
+                    .unwrap_or_default()
+            );
+            if let Err(err) =
+                PeerAdminRequest::put(&runtime_peer_connection(peer)?, &remove_path, &pending_remove.service_account_access_key)
+                    .send_with_secret_candidates(&secret_candidates, &pending_remove.req)
+                    .await
             {
                 let err_detail = summarize_peer_error_detail(&format!("{}: {err}", peer.endpoint));
                 warn!(
@@ -5092,6 +5145,7 @@ fn prune_removed_site_replication_rules(
         return (Some(config), 0);
     }
 
+    let original_role = config.role.clone();
     if replication_target_arn_deployment_id(&config.role)
         .map(|deployment_id| removed_deployment_ids.contains(&deployment_id))
         .unwrap_or(false)
@@ -5105,7 +5159,9 @@ fn prune_removed_site_replication_rules(
             .map(|deployment_id| !removed_deployment_ids.contains(&deployment_id))
             .unwrap_or(true)
     });
-    let removed = original_len.saturating_sub(config.rules.len());
+    let removed = original_len
+        .saturating_sub(config.rules.len())
+        .saturating_add(usize::from(config.role != original_role));
 
     if removed == 0 {
         return (Some(config), 0);
@@ -5164,61 +5220,87 @@ async fn ensure_site_replication_bucket_setup_for_incarnation(bucket: &str, inca
 }
 
 async fn cleanup_removed_site_replication_bucket(bucket: &str, removed_deployment_ids: &HashSet<String>) -> S3Result<usize> {
-    let expected_incarnation_id = metadata_sys::capture_bucket_metadata_incarnation(bucket)
+    let incarnation = metadata_sys::capture_bucket_metadata_incarnation(bucket)
         .await
         .map_err(ApiError::from)?;
-    let _targets_guard = lock_bucket_targets_metadata(bucket).await;
-    let mut removed = 0usize;
-
-    let config = match metadata_sys::get_replication_config(bucket).await {
-        Ok((config, _)) => Some(config),
-        Err(StorageError::ConfigNotFound) => None,
-        Err(err) => return Err(ApiError::from(err).into()),
+    let targets_guard = lock_bucket_targets_metadata(bucket).await;
+    let transaction = metadata_sys::acquire_bucket_metadata_transaction_lock_for_incarnation(bucket, incarnation)
+        .await
+        .map_err(ApiError::from)?;
+    let metadata = metadata_sys::get_config_from_disk(bucket).await.map_err(ApiError::from)?;
+    if metadata.bucket_targets_unreadable()
+        || (!metadata.replication_config_xml.is_empty() && metadata.replication_config.is_none())
+    {
+        return Err(s3_error!(
+            InternalError,
+            "unreadable bucket replication metadata cannot be cleared by decommissioning"
+        ));
+    }
+    let config = metadata.replication_config;
+    let original_targets = metadata.bucket_target_config.unwrap_or_default();
+    let removed_arns = removed_site_replication_rule_arns(config.as_ref(), removed_deployment_ids);
+    let (mut targets, removed_targets) =
+        prune_removed_site_replication_bucket_targets(original_targets.clone(), bucket, removed_deployment_ids, &removed_arns);
+    let (updated_config, removed_rules) = match config {
+        Some(config) => prune_removed_site_replication_rules(config, removed_deployment_ids),
+        None => (None, 0),
     };
-    let removed_rule_arns = removed_site_replication_rule_arns(config.as_ref(), removed_deployment_ids);
-
-    match metadata_sys::list_bucket_targets(bucket).await {
-        Ok(targets) => {
-            let (updated_targets, removed_targets) =
-                prune_removed_site_replication_bucket_targets(targets, bucket, removed_deployment_ids, &removed_rule_arns);
-            if removed_targets > 0 {
-                let json_targets = serde_json::to_vec(&updated_targets).map_err(|e| {
-                    S3Error::with_message(S3ErrorCode::InternalError, format!("serialize bucket targets failed: {e}"))
-                })?;
-                metadata_sys::update_if_incarnation(bucket, BUCKET_TARGETS_FILE, json_targets, expected_incarnation_id)
-                    .await
-                    .map_err(ApiError::from)?;
-                removed = removed.saturating_add(removed_targets);
-            }
-        }
-        Err(StorageError::ConfigNotFound) => {}
-        Err(err) => return Err(ApiError::from(err).into()),
-    }
-
-    if let Some(config) = config {
-        {
-            let (updated_config, removed_rules) = prune_removed_site_replication_rules(config, removed_deployment_ids);
-            if removed_rules > 0 {
-                if let Some(updated_config) = updated_config {
-                    let data = serialize(&updated_config).map_err(|e| {
-                        S3Error::with_message(S3ErrorCode::InternalError, format!("serialize replication failed: {e}"))
-                    })?;
-                    metadata_sys::update_if_incarnation(bucket, BUCKET_REPLICATION_CONFIG, data, expected_incarnation_id)
-                        .await
-                        .map_err(ApiError::from)?;
-                } else {
-                    metadata_sys::delete_if_incarnation(bucket, BUCKET_REPLICATION_CONFIG, expected_incarnation_id)
-                        .await
-                        .map_err(ApiError::from)?;
-                }
-                removed = removed.saturating_add(removed_rules);
+    // A target shared with an operator rule remains operator-owned.
+    if let Some(remaining) = &updated_config {
+        let surviving_arns = remaining.filter_all_replication_target_arns();
+        for target in original_targets.targets.iter() {
+            if surviving_arns.contains(&target.arn) && !targets.targets.iter().any(|kept| kept.arn == target.arn) {
+                targets.targets.push(target.clone());
             }
         }
     }
-
+    // A shared target's operator resync remains live. Persist cancellation before
+    // either config write so a restart cannot resume a site-only target intent.
+    let surviving_arns = updated_config
+        .as_ref()
+        .map(|config| config.filter_all_replication_target_arns())
+        .unwrap_or_default();
+    let mut canceled_arns = removed_arns;
+    canceled_arns.extend(
+        original_targets
+            .targets
+            .iter()
+            .filter(|original| !targets.targets.iter().any(|remaining| remaining.arn == original.arn))
+            .map(|target| target.arn.clone()),
+    );
+    if let Some(pool) = current_replication_pool_handle() {
+        for arn in canceled_arns.iter().filter(|arn| !surviving_arns.contains(arn)) {
+            pool.cancel_bucket_resync_for_removed_target(bucket, arn)
+                .await
+                .map_err(ApiError::from)?;
+        }
+    }
+    if removed_targets > 0 {
+        let data = serde_json::to_vec(&targets).map_err(|_| s3_error!(InternalError, "cannot encode bucket targets"))?;
+        metadata_sys::update_bucket_targets_under_transaction_lock(&transaction, bucket, data)
+            .await
+            .map_err(ApiError::from)?;
+    }
+    if removed_rules > 0 {
+        if let Some(config) = updated_config {
+            let data = serialize(&config).map_err(|_| s3_error!(InternalError, "cannot encode bucket replication rules"))?;
+            metadata_sys::update_under_transaction_lock(&transaction, bucket, BUCKET_REPLICATION_CONFIG, data)
+                .await
+                .map_err(ApiError::from)?;
+        } else {
+            metadata_sys::delete_under_transaction_lock(&transaction, bucket, BUCKET_REPLICATION_CONFIG)
+                .await
+                .map_err(ApiError::from)?;
+        }
+    }
+    drop(transaction);
+    drop(targets_guard);
+    let removed = removed_targets.saturating_add(removed_rules);
     if removed > 0 {
         reload_bucket_metadata_on_peers(bucket, "site_replication_bucket_cleanup", true).await;
     }
+    // Also dirty an idempotent retry after a previous process persisted configuration.
+    rustfs_scanner::record_scanner_maintenance_change(bucket);
     Ok(removed)
 }
 
@@ -5227,9 +5309,8 @@ async fn cleanup_removed_site_replication_buckets(removed_deployment_ids: &HashS
         return Ok(0);
     }
 
-    let Some(store) = current_object_store_handle() else {
-        return Ok(0);
-    };
+    let store =
+        current_object_store_handle().ok_or_else(|| s3_error!(InternalError, "object store is unavailable during cleanup"))?;
     let buckets = store.list_bucket(&BucketOptions::default()).await.map_err(ApiError::from)?;
     let mut removed = 0usize;
 
@@ -5239,6 +5320,13 @@ async fn cleanup_removed_site_replication_buckets(removed_deployment_ids: &HashS
                 removed = removed.saturating_add(bucket_removed);
             }
             Err(err) => {
+                if store
+                    .get_bucket_info(&bucket.name, &BucketOptions::default())
+                    .await
+                    .is_err_and(|error| is_err_bucket_not_found(&error))
+                {
+                    continue;
+                }
                 warn!(
                     event = EVENT_ADMIN_SITE_REPLICATION_STATE,
                     component = LOG_COMPONENT_ADMIN,
@@ -6898,6 +6986,9 @@ fn adopt_add_commit_state(state: &mut SiteReplicationState, next_state: SiteRepl
         resync_status: _,
         pending_rotation: _,
         pending_remove: _,
+        pending_remove_v2: _,
+        remove_v2_receipts: _,
+        removal_v2_fence: _,
         pending_endpoint_refresh: _,
         retry_queue: _,
         iam_deletion_replays: _,
@@ -6974,7 +7065,9 @@ impl Operation for SiteReplicationAddHandler {
         let admission_store = current_object_store_handle()
             .ok_or_else(|| S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()))?;
         let list_store = admission_store.clone();
+        let lifecycle_store = admission_store.clone();
         let (state, edit_generation, local_peer, service_account_secret_key, mut initial_sync_errors, _add_guard) =
+            with_config_object_write_lock(lifecycle_store, SITE_REMOVE_V2_ADMISSION_LOCK.to_string(), move |_guard| async move {
             with_site_replication_bucket_mutation_admission_lock(admission_store, move || async move {
                 // The writer starts before the local bucket snapshot and stays
                 // held through every peer join and the topology commit. A
@@ -6983,7 +7076,10 @@ impl Operation for SiteReplicationAddHandler {
                 // use their internal path and do not acquire this public-
                 // mutation admission lock.
                 let current_state = load_site_replication_state().await?;
-                if pending_endpoint_refresh(&current_state).is_some() {
+                if current_state.pending_remove_v2.is_some() {
+                return Err(s3_error!(InvalidRequest, "durable decommission is pending"));
+            }
+            if pending_endpoint_refresh(&current_state).is_some() {
                     return Err(s3_error!(InvalidRequest, "endpoint target refresh is pending"));
                 }
                 let local_peer = local_peer_at_endpoint(local_endpoint, &current_state);
@@ -7131,7 +7227,7 @@ impl Operation for SiteReplicationAddHandler {
                     .collect::<HashSet<_>>();
                 ensure_add_bucket_set_matches_preflight(&expected_buckets, &present)?;
                 let (state, edit_generation) = update_site_replication_state(move |state| {
-                    if state.updated_at != expected_updated_at || pending_endpoint_refresh(state).is_some() {
+                    if state.updated_at != expected_updated_at || pending_endpoint_refresh(state).is_some() || state.pending_remove_v2.is_some() {
                         return Err(s3_error!(
                             InvalidRequest,
                             "site replication state changed during peer join; the peers may already be joined — re-run replicate add"
@@ -7151,7 +7247,8 @@ impl Operation for SiteReplicationAddHandler {
                     add_in_progress_guard,
                 ))
             })
-            .await?;
+            .await
+            }).await.map_err(|err| S3Error::from(ApiError::from(err)))??;
 
         // The finalize fan-out delivers peer-edit payloads, so it carries the
         // generation allocated in the commit above: the receiving site orders
@@ -7220,51 +7317,61 @@ impl Operation for SiteReplicationRemoveHandler {
         // would starve every bucket-operation hook in the meantime).
         let local_endpoint = site_replication_local_endpoint(req.uri(), req.headers());
         let remove_req: SRRemoveReq = read_site_replication_json(req, "", false).await?;
-        let (pending_remove, local_peer) = {
-            let _bucket_op_guard = SITE_REPLICATION_BUCKET_OP_LOCK.write().await;
-            update_site_replication_state_when_changed(move |state| {
-                let local_peer = local_peer_at_endpoint(local_endpoint, state);
-                if let Some(pending) = pending_endpoint_refresh(state)
-                    && !pending_endpoint_refresh_allows_remove(state, &pending, &local_peer, &remove_req)
-                {
-                    return Err(s3_error!(InvalidRequest, "endpoint target refresh is pending"));
-                }
-                if state.pending_rotation.is_some() {
-                    return Err(s3_error!(InvalidRequest, "service account rotation is pending"));
-                }
+        let admission_store =
+            current_object_store_handle().ok_or_else(|| s3_error!(InternalError, "object store is unavailable"))?;
+        let (pending_remove, local_peer) =
+            with_config_object_write_lock(admission_store, SITE_REMOVE_V2_ADMISSION_LOCK.to_string(), move |_guard| async move {
+                let _bucket_op_guard = SITE_REPLICATION_BUCKET_OP_LOCK.write().await;
+                update_site_replication_state_when_changed(move |state| {
+                    let local_peer = local_peer_at_endpoint(local_endpoint, state);
+                    if let Some(pending) = pending_endpoint_refresh(state)
+                        && !pending_endpoint_refresh_allows_remove(state, &pending, &local_peer, &remove_req)
+                    {
+                        return Err(s3_error!(InvalidRequest, "endpoint target refresh is pending"));
+                    }
+                    if state.pending_rotation.is_some() {
+                        return Err(s3_error!(InvalidRequest, "service account rotation is pending"));
+                    }
 
-                // Resuming: the peers were already told about this pending
-                // removal, so re-persisting the same record buys nothing.
-                if let Some(pending) = state.pending_remove.clone() {
-                    return Ok(StateCommit::Unchanged((pending, local_peer)));
-                }
+                    if state.pending_remove_v2.is_some() {
+                        return Err(s3_error!(InvalidRequest, "durable decommission is pending; resume remove-v2"));
+                    }
+                    // Resuming: the peers were already told about this pending
+                    // removal, so re-persisting the same record buys nothing.
+                    if let Some(pending) = state.pending_remove.clone() {
+                        return Ok(StateCommit::Unchanged((pending, local_peer)));
+                    }
 
-                validate_remove_sites_req(state, &remove_req)?;
-                let service_account_access_key = state.service_account_access_key.clone();
-                let secret_candidates = legacy_site_replicator_state_secret(state).into_iter().collect();
-                let original_peers = state.peers.clone();
-                let mut peer_remove_req = remove_req.clone();
-                peer_remove_req.requesting_dep_id = local_peer.deployment_id.clone();
-                *state = remove_sites(std::mem::take(state), remove_req);
-                // A permitted remove can include the endpoint being edited.
-                // Drop that obsolete journal before recording the removal;
-                // otherwise its resume path would commit the edited peer back
-                // into the topology on the next heavyweight tick.
-                discard_endpoint_refresh_if_target_was_removed(state);
-                let pending = PendingRemove {
-                    id: Uuid::new_v4().to_string(),
-                    req: peer_remove_req,
-                    service_account_access_key,
-                    secret_candidates,
-                    original_peers,
-                    acked_deployment_ids: BTreeSet::new(),
-                    updated_at: state.updated_at,
-                };
-                state.pending_remove = Some(pending.clone());
-                Ok(StateCommit::Changed((pending, local_peer)))
+                    validate_remove_sites_req(state, &remove_req)?;
+                    let removal_at = next_site_removal_timestamp(state, OffsetDateTime::now_utc())?;
+                    let service_account_access_key = state.service_account_access_key.clone();
+                    let secret_candidates = legacy_site_replicator_state_secret(state).into_iter().collect();
+                    let original_peers = state.peers.clone();
+                    let mut peer_remove_req = remove_req.clone();
+                    peer_remove_req.requesting_dep_id = local_peer.deployment_id.clone();
+                    *state = remove_sites(std::mem::take(state), remove_req);
+                    state.updated_at = Some(removal_at);
+                    // A permitted remove can include the endpoint being edited.
+                    // Drop that obsolete journal before recording the removal;
+                    // otherwise its resume path would commit the edited peer back
+                    // into the topology on the next heavyweight tick.
+                    discard_endpoint_refresh_if_target_was_removed(state);
+                    let pending = PendingRemove {
+                        id: Uuid::new_v4().to_string(),
+                        req: peer_remove_req,
+                        service_account_access_key,
+                        secret_candidates,
+                        original_peers,
+                        acked_deployment_ids: BTreeSet::new(),
+                        updated_at: state.updated_at,
+                    };
+                    state.pending_remove = Some(pending.clone());
+                    Ok(StateCommit::Changed((pending, local_peer)))
+                })
+                .await
             })
-            .await?
-        };
+            .await
+            .map_err(|err| S3Error::from(ApiError::from(err)))??;
 
         let (mut peer_errors, complete) = drive_pending_remove(&pending_remove, &local_peer).await?;
         if !complete && peer_errors.is_empty() {
@@ -7392,7 +7499,7 @@ fn ensure_initial_sync_join_current(state: &SiteReplicationState, join_req: &SRP
         || state.updated_at != join_req.updated_at
         || state.service_account_access_key.is_empty()
         || state.service_account_access_key != join_req.svc_acct_access_key
-        || state.pending_remove.is_some()
+        || state.removal_pending()
         || state.pending_rotation.is_some()
         || pending_endpoint_refresh(state).is_some()
     {
@@ -7475,6 +7582,15 @@ where
         move |_write_guard| async move {
             let fresh = load_site_replication_state().await?;
             let fresh_local_peer = local_peer_at_endpoint(local_endpoint.clone(), &fresh);
+            if fresh.pending_remove_v2.is_some() {
+                return Err(s3_error!(InvalidRequest, "durable decommission is pending"));
+            }
+            if !fresh.remove_v2_receipts.is_empty()
+                && !fresh.peers.contains_key(&fresh_local_peer.deployment_id)
+                && !join_req.peers.contains_key(&fresh_local_peer.deployment_id)
+            {
+                return Err(s3_error!(PreconditionFailed, "join does not include this deployment"));
+            }
             if join_request_is_superseded(&fresh, join_req.updated_at) {
                 let peer = fresh
                     .peers
@@ -7488,6 +7604,9 @@ where
 
             let incoming_updated_at = join_req.updated_at;
             update_site_replication_state_when_changed(move |state| {
+                if state.pending_remove_v2.is_some() {
+                    return Err(s3_error!(InvalidRequest, "durable decommission is pending"));
+                }
                 let local_peer = local_peer_at_endpoint(local_endpoint, state);
                 if join_request_is_superseded(state, incoming_updated_at) {
                     let peer = state.peers.get(&local_peer.deployment_id).cloned().unwrap_or(local_peer);
@@ -7696,7 +7815,7 @@ impl Operation for SRPeerBucketOpsHandler {
             .filter(|value| !value.is_empty())
             .cloned()
             .ok_or_else(|| s3_error!(InvalidRequest, "operation is required"))?;
-        if state.pending_remove.is_some()
+        if state.removal_pending()
             || (!state.enabled()
                 && !bootstrap_peer_bucket_operation_allowed(
                     &bucket,
@@ -7852,7 +7971,7 @@ impl Operation for SiteReplicationEditHandler {
         if !incoming.deployment_id.is_empty() || !incoming.endpoint.is_empty() || !incoming.name.is_empty() {
             validate_proposed_peer(&incoming)?;
         }
-        if current_state.pending_rotation.is_some() || current_state.pending_remove.is_some() {
+        if current_state.pending_rotation.is_some() || current_state.removal_pending() {
             return Err(s3_error!(InvalidRequest, "another site replication operation is pending"));
         }
         let persisted_pending = pending_endpoint_refresh(&current_state);
@@ -8187,6 +8306,15 @@ impl Operation for SRPeerEditHandler {
         let outcome = update_site_replication_state_when_changed(move |state| {
             let mut incoming = incoming;
             let local_peer = local_peer_at_endpoint(commit_endpoint, state);
+            if state.pending_remove_v2.is_some() {
+                return Err(s3_error!(InvalidRequest, "durable decommission is pending"));
+            }
+            if !state.remove_v2_receipts.is_empty()
+                && !state.peers.contains_key(&incoming.deployment_id)
+                && !same_identity_endpoint(&incoming.endpoint, &local_peer.endpoint)
+            {
+                return Err(s3_error!(PreconditionFailed, "removed deployments must rejoin through explicit site add"));
+            }
             // The fence is self-reported — the shared service account means
             // the sender cannot be identified — so it is honoured only after
             // the admissibility check, against the same state it will gate.
@@ -8208,7 +8336,7 @@ impl Operation for SRPeerEditHandler {
             {
                 return Ok(StateCommit::Unchanged(PeerEditOutcome::Acked));
             }
-            if endpoint_refresh_requested && (state.pending_rotation.is_some() || state.pending_remove.is_some()) {
+            if endpoint_refresh_requested && (state.pending_rotation.is_some() || state.removal_pending()) {
                 return Ok(StateCommit::Unchanged(PeerEditOutcome::Rejected(
                     "another site replication operation is pending",
                 )));
@@ -8344,10 +8472,25 @@ pub struct SRPeerRemoveHandler {}
 impl Operation for SRPeerRemoveHandler {
     async fn call(&self, req: AdminRequest, _params: Params<'_, '_>) -> S3Result<AdminResponse> {
         validate_site_replication_admin_request(&req, AdminAction::SiteReplicationRemoveAction).await?;
+        let query = query_pairs(req.uri());
+        let remove_id_valid = query.get("remove-id").is_some_and(|id| Uuid::parse_str(id).is_ok());
+        let remove_at = query
+            .get("remove-at")
+            .and_then(|stamp| stamp.parse::<i128>().ok())
+            .and_then(|stamp| OffsetDateTime::from_unix_timestamp_nanos(stamp).ok());
         let remove_req: SRRemoveReq = read_site_replication_json(req, "", false).await?;
         let _lifecycle_guard = SiteReplicationLifecycleGuard::acquire().await?;
         let _bucket_op_guard = SITE_REPLICATION_BUCKET_OP_LOCK.write().await;
         let removed_deployment_ids = update_site_replication_state(move |state| {
+            if state.pending_remove_v2.is_some() {
+                return Err(s3_error!(InvalidRequest, "legacy peer removal cannot cross a durable decommission"));
+            }
+            if let Some(fence) = state.removal_v2_fence
+                && (!remove_id_valid
+                    || remove_at.is_none_or(|stamp| stamp <= fence || state.updated_at.is_some_and(|current| stamp < current)))
+            {
+                return Err(s3_error!(PreconditionFailed, "legacy removal predates the current topology"));
+            }
             if pending_endpoint_refresh(state).is_some() {
                 return Err(s3_error!(InvalidRequest, "endpoint target refresh is pending"));
             }
@@ -8357,6 +8500,9 @@ impl Operation for SRPeerRemoveHandler {
 
             let removed_deployment_ids = removed_deployment_ids_for_remove_req(state, &remove_req);
             *state = remove_sites(std::mem::take(state), remove_req);
+            if state.removal_v2_fence.is_some() {
+                state.updated_at = remove_at;
+            }
             Ok(removed_deployment_ids)
         })
         .await?;
@@ -8552,6 +8698,12 @@ impl Operation for SRStateEditHandler {
         reject_site_replicator_on_public_admin(&cred)?;
         let body: SRStateEditReq = read_site_replication_json(req, "", false).await?;
         update_site_replication_state(move |state| {
+            if state.pending_remove_v2.is_some() {
+                return Err(s3_error!(InvalidRequest, "durable decommission is pending"));
+            }
+            if !state.remove_v2_receipts.is_empty() && body.peers.keys().any(|id| !state.peers.contains_key(id)) {
+                return Err(s3_error!(PreconditionFailed, "removed deployments must rejoin through explicit site add"));
+            }
             *state = apply_state_edit_req(std::mem::take(state), body);
             Ok(())
         })
@@ -8695,7 +8847,7 @@ impl Operation for SRRotateServiceAccountHandler {
             if pending_endpoint_refresh(state).is_some() {
                 return Err(s3_error!(InvalidRequest, "endpoint target refresh is pending"));
             }
-            if state.pending_remove.is_some() {
+            if state.removal_pending() {
                 return Err(s3_error!(InvalidRequest, "site replication remove is pending"));
             }
             let local_peer = local_peer_at_endpoint(local_endpoint, state);
@@ -14342,7 +14494,7 @@ mod tests {
         let (updated, removed) = prune_removed_site_replication_rules(config, &removed_deployment_ids);
         let updated = updated.expect("config should keep non-removed rules");
 
-        assert_eq!(removed, 1);
+        assert_eq!(removed, 2, "the removed legacy role and derived rule are both persisted changes");
         assert!(updated.role.is_empty());
         assert_eq!(updated.rules.len(), 2);
         assert_eq!(updated.rules[0].id.as_deref(), Some("user-managed-rule"));

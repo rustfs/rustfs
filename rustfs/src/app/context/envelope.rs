@@ -196,6 +196,8 @@ pub struct RequestEnvelope {
     verified_sigv4: Option<VerifiedSigV4Request>,
     verified_presigned: Option<VerifiedPresignedRequest>,
     website_read: Option<WebsiteRead>,
+    /// S3 REST reads of the current object condition missing-key responses on ListBucket.
+    pub(in crate::app) check_list_bucket_on_missing_key: bool,
     post_object: Option<PostObjectRequestMarker>,
     gateway_post: bool,
     gateway_post_archive_identity: Option<Arc<()>>,
@@ -249,6 +251,7 @@ impl RequestEnvelope {
             verified_sigv4: extensions.remove(),
             verified_presigned: extensions.remove(),
             website_read: extensions.remove(),
+            check_list_bucket_on_missing_key: false,
             post_object: extensions.remove(),
             gateway_post: false,
             gateway_post_archive_identity: None,
@@ -300,6 +303,7 @@ impl RequestEnvelope {
             verified_sigv4: self.verified_sigv4,
             verified_presigned: self.verified_presigned,
             website_read: self.website_read.clone(),
+            check_list_bucket_on_missing_key: self.check_list_bucket_on_missing_key,
             post_object: self.post_object.clone(),
             gateway_post: self.gateway_post,
             gateway_post_archive_identity: self.gateway_post_archive_identity.clone(),
@@ -800,7 +804,7 @@ pub(crate) async fn authorize_owned_internal_object_request(
 }
 
 fn prepare_owned_authorization(req: &mut RequestEnvelope, action: Action) -> rustfs_s3_types::S3Result<()> {
-    crate::auth::hoist_signed_query_params(&mut req.headers, req.uri.query()).map_err(rustfs_s3_types::S3Error::from)?;
+    crate::auth::hoist_signed_query_params(&mut req.headers, req.uri.query())?;
     require_body_policy_inputs(req, action)
 }
 
@@ -839,6 +843,12 @@ impl RequestEnvelope {
             self.client_info(),
             self.remote_addr(),
             self.request_context(),
+            PendingDeleteBucketGenerationGuard::resolve_generation(
+                self.bucket_generation(),
+                self.pending_delete_bucket_generation(),
+            )
+            .ok()
+            .flatten(),
         )
     }
 }

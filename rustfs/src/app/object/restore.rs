@@ -571,7 +571,7 @@ impl DefaultObjectUsecase {
                 restore_output_path: output.restore_output_path,
             })
         })
-        .map_err(Into::into)
+        .map_err(crate::error::legacy_error_for_test)
     }
 }
 

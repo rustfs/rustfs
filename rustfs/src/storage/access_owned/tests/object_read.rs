@@ -29,6 +29,65 @@ use std::sync::Arc;
 
 #[test]
 #[serial_test::serial]
+fn missing_object_read_permissions_ignore_list_query_conditions() {
+    use crate::storage::authorization::{authorize_bucket_request, authorize_missing_object_disclosure};
+    use crate::storage::req_info::ReqInfo;
+    use rustfs_policy::policy::action::{Action, S3Action};
+
+    crate::app::gating_test_env::run_large_stack_test("object-read-list-conditions", || async {
+        let context = crate::app::gating_test_env::shared_gating_ambient().await;
+        let store = context.object_store();
+        let bucket = format!("read-list-conditions-{}", uuid::Uuid::new_v4().simple());
+        store
+            .make_bucket(&bucket, &MakeBucketOptions::default())
+            .await
+            .expect("create policy fixture bucket");
+        let allow_list_if = |condition| {
+            serde_json::json!({
+                "Effect": "Allow", "Principal": "*", "Action": "s3:ListBucket", "Resource": format!("arn:aws:s3:::{bucket}"),
+                "Condition": {"StringEquals": condition}
+            })
+        };
+        let policy = serde_json::json!({"Version": "2012-10-17", "Statement": [
+            allow_list_if(serde_json::json!({"s3:prefix": "reports/"})),
+            allow_list_if(serde_json::json!({"aws:UserAgent": "fixture-reader"})),
+        ]});
+        store
+            .update_bucket_metadata_config(
+                &bucket,
+                crate::storage::storage_api::ecstore_bucket::metadata::BUCKET_POLICY_CONFIG,
+                serde_json::to_vec(&policy).expect("serialize bucket policy"),
+            )
+            .await
+            .expect("install bucket policy");
+        let slot = ServerContextSlot::new();
+        assert!(slot.install(context));
+        let fixture = |method| request(method).uri("/?prefix=reports/").server_context(&slot);
+        let mut listing = fixture(Method::GET).req_info().build();
+        authorize_bucket_request(&mut listing, &bucket, Action::S3Action(S3Action::ListBucketAction))
+            .await
+            .expect("prefix permits the actual listing");
+        for method in [Method::GET, Method::HEAD] {
+            let info = ReqInfo {
+                bucket: Some(bucket.clone()),
+                object: Some("document".into()),
+                ..Default::default()
+            };
+            let mut read = fixture(method.clone()).extension(info.clone()).build();
+            let error = authorize_missing_object_disclosure(&mut read)
+                .await
+                .expect_err("object reads have no listing prefix");
+            assert_eq!(error.code(), &S3ErrorCode::AccessDenied);
+            let mut read = fixture(method).header("user-agent", "fixture-reader").extension(info).build();
+            authorize_missing_object_disclosure(&mut read)
+                .await
+                .expect("an independent request condition can allow listing");
+        }
+    });
+}
+
+#[test]
+#[serial_test::serial]
 fn head_replication_marker_requires_its_own_permission() {
     crate::app::gating_test_env::run_large_stack_test("head-replica-marker", || async {
         let context = crate::app::gating_test_env::shared_gating_ambient().await;

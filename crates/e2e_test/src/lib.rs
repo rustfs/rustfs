@@ -12,6 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+mod access_request_validation_test;
+
 #[cfg(test)]
 mod storage_metric_ownership_test;
 
@@ -104,6 +106,9 @@ mod replication_target_matrix_test;
 // Data usage regression tests
 #[cfg(test)]
 mod data_usage_test;
+
+#[cfg(test)]
+mod scanner_wide_directory_test;
 
 // KMS-specific test modules
 #[cfg(test)]

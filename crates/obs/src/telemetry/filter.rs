@@ -28,7 +28,7 @@ use tracing_subscriber::{
 use super::http2_ping::HYPER_HTTP2_CLIENT_TARGET;
 
 pub const HTTP_SERVER_LOG_TARGET: &str = "rustfs::server::http";
-const S3_DEPENDENCY_TARGETS: [&str; 2] = ["s3s", "rustfs_gateway"];
+const GATEWAY_TARGET: &str = "rustfs_gateway";
 
 /// Pyroscope emits raw reqwest errors from its background session manager.
 /// Those errors can include the configured endpoint, so they must never reach
@@ -49,9 +49,7 @@ pub(super) fn pyroscope_log_filter() -> FilterFn {
 pub(super) fn s3_dependency_log_filter() -> FilterFn {
     filter_fn(|metadata| {
         !(metadata.is_event()
-            && S3_DEPENDENCY_TARGETS
-                .iter()
-                .any(|target| directive_applies_to_target(target, metadata.target()))
+            && directive_applies_to_target(GATEWAY_TARGET, metadata.target())
             && *metadata.level() > tracing::Level::INFO)
     })
 }
@@ -248,10 +246,8 @@ pub(super) fn build_env_filter(logger_level: &str, default_level: Option<&str>) 
             directives.push((HTTP_SERVER_LOG_TARGET, LevelFilter::WARN));
         }
 
-        for target in S3_DEPENDENCY_TARGETS {
-            if should_demote_target(target, logger_level, default_level, rust_log_env.as_deref()) {
-                directives.push((target, LevelFilter::WARN));
-            }
+        if should_demote_target(GATEWAY_TARGET, logger_level, default_level, rust_log_env.as_deref()) {
+            directives.push((GATEWAY_TARGET, LevelFilter::WARN));
         }
 
         for (crate_name, level) in directives {
@@ -347,7 +343,10 @@ mod tests {
     #[test]
     fn s3_dependency_filter_blocks_verbose_events_despite_explicit_directives() {
         use tracing_subscriber::prelude::*;
-        for directive in ["trace", concat!("trace,", "s3s::service=trace,", "s3s::ops::signature=debug")] {
+        for directive in [
+            "trace",
+            "trace,rustfs_gateway::service=trace,rustfs_gateway::ops::signature=debug",
+        ] {
             let writer = SharedWriter::default();
             let captured = Arc::clone(&writer.0);
             let subscriber = tracing_subscriber::registry()
@@ -361,19 +360,15 @@ mod tests {
                         .with_span_events(tracing_subscriber::fmt::format::FmtSpan::NEW),
                 );
             with_default(subscriber, || {
-                let span = tracing::debug_span!(target: "s3s::service", "safe-operation-span");
+                let span = tracing::debug_span!(target: "rustfs_gateway::service", "safe-operation-span");
                 let _entered = span.enter();
-                tracing::debug!(target: "s3s::service", response = "secret-response", "response dump");
-                tracing::trace!(target: "s3s", response = "secret-trace", "response dump");
-                tracing::debug!(target: "s3s::ops::signature", expected = "secret-signature", "signature mismatch");
-                tracing::debug!(target: "rustfs_gateway::service", "secret-gateway-debug");
-                tracing::trace!(target: "rustfs_gateway", "secret-gateway-trace");
+                tracing::debug!(target: "rustfs_gateway::service", response = "secret-response", "response dump");
+                tracing::trace!(target: "rustfs_gateway", response = "secret-trace", "response dump");
+                tracing::debug!(target: "rustfs_gateway::ops::signature", expected = "secret-signature", "signature mismatch");
                 tracing::info!(target: "rustfs_gateway::service", "visible-gateway-info");
                 tracing::debug!(target: "rustfs_gateway_other", "visible-gateway-neighbor");
-                tracing::info!(target: "s3s::service", "visible-info");
-                tracing::warn!(target: "s3s::service", "visible-warning");
+                tracing::warn!(target: "rustfs_gateway::service", "visible-warning");
                 tracing::debug!(target: "rustfs", "visible-rustfs-debug");
-                tracing::debug!(target: "s3s_other", "visible-other-target");
             });
             let output = String::from_utf8(captured.lock().expect("captured logs").clone()).expect("UTF-8 logs");
             assert!(!output.contains("secret"), "{output}");
@@ -381,10 +376,8 @@ mod tests {
                 "safe-operation-span",
                 "visible-gateway-info",
                 "visible-gateway-neighbor",
-                "visible-info",
                 "visible-warning",
                 "visible-rustfs-debug",
-                "visible-other-target",
             ] {
                 assert!(output.contains(expected), "missing {expected}: {output}");
             }
@@ -463,16 +456,16 @@ mod tests {
     }
 
     #[test]
-    fn test_should_demote_s3s_logs() {
-        assert!(should_demote_target("s3s", "info", None, None));
-        assert!(should_demote_target("s3s", "warn", None, None));
-        assert!(!should_demote_target("s3s", "error", None, None));
-        assert!(!should_demote_target("s3s", "off", None, None));
-        assert!(!should_demote_target("s3s", "info", None, Some("ERROR")));
-        assert!(should_demote_target("s3s", "error", None, Some("WARN")));
-        assert!(!should_demote_target("s3s", "info", None, Some("foo=warn")));
-        assert!(!should_demote_target("s3s", "info", None, Some("s3s=error")));
-        assert!(should_demote_target("s3s", "error", None, Some("WARN,s3s=warn")));
+    fn test_should_demote_gateway_logs() {
+        assert!(should_demote_target("rustfs_gateway", "info", None, None));
+        assert!(should_demote_target("rustfs_gateway", "warn", None, None));
+        assert!(!should_demote_target("rustfs_gateway", "error", None, None));
+        assert!(!should_demote_target("rustfs_gateway", "off", None, None));
+        assert!(!should_demote_target("rustfs_gateway", "info", None, Some("ERROR")));
+        assert!(should_demote_target("rustfs_gateway", "error", None, Some("WARN")));
+        assert!(!should_demote_target("rustfs_gateway", "info", None, Some("foo=warn")));
+        assert!(!should_demote_target("rustfs_gateway", "info", None, Some("rustfs_gateway=error")));
+        assert!(should_demote_target("rustfs_gateway", "error", None, Some("WARN,rustfs_gateway=warn")));
     }
 
     #[test]
@@ -483,7 +476,7 @@ mod tests {
             let filter = build_env_filter("info", None);
             let filter_str = filter.to_string();
 
-            for noisy_crate in ["hyper", "tonic", "h2", "reqwest", "tower", "s3s"] {
+            for noisy_crate in ["hyper", "tonic", "h2", "reqwest", "tower", "rustfs_gateway"] {
                 assert!(
                     filter_str.contains(noisy_crate),
                     "expected EnvFilter to contain suppression directive for `{}`; got `{}`",
@@ -570,15 +563,21 @@ mod tests {
     }
 
     #[test]
-    fn test_build_env_filter_does_not_promote_s3s_above_error() {
+    fn test_build_env_filter_does_not_promote_gateway_above_error() {
         temp_env::with_var("RUST_LOG", Some("ERROR"), || {
             let filter = build_env_filter("info", None).to_string().to_ascii_lowercase();
-            assert!(!filter.contains("s3s=warn"), "s3s must not be promoted above ERROR: {filter}");
+            assert!(
+                !filter.contains("rustfs_gateway=warn"),
+                "gateway must not be promoted above ERROR: {filter}"
+            );
         });
 
         temp_env::with_var("RUST_LOG", Some("foo=warn"), || {
             let filter = build_env_filter("info", None).to_string().to_ascii_lowercase();
-            assert!(!filter.contains("s3s=warn"), "an unrelated target must not enable s3s: {filter}");
+            assert!(
+                !filter.contains("rustfs_gateway=warn"),
+                "an unrelated target must not enable the gateway: {filter}"
+            );
         });
     }
 
@@ -609,30 +608,26 @@ mod tests {
     }
 
     #[test]
-    fn test_production_filter_suppresses_s3s_info_but_keeps_warn() {
+    fn test_production_filter_suppresses_gateway_info_but_keeps_warn() {
         temp_env::with_var("RUST_LOG", None::<&str>, || {
             let output = capture_with_filter(build_env_filter("info", None), || {
-                tracing::info!(target: "s3s::auth", "s3s info must be suppressed");
-                tracing::warn!(target: "s3s::auth", "s3s warning must remain");
                 tracing::info!(target: "rustfs_gateway::service", "gateway info must be suppressed");
                 tracing::warn!(target: "rustfs_gateway::service", "gateway warning must remain");
             });
 
-            assert!(!output.contains("s3s info must be suppressed"), "{output}");
-            assert!(output.contains("s3s warning must remain"), "{output}");
             assert!(!output.contains("gateway info must be suppressed"), "{output}");
             assert!(output.contains("gateway warning must remain"), "{output}");
         });
     }
 
     #[test]
-    fn test_explicit_s3s_target_restores_info_diagnostics() {
-        temp_env::with_var("RUST_LOG", Some("info,s3s=info"), || {
+    fn test_explicit_gateway_target_restores_info_diagnostics() {
+        temp_env::with_var("RUST_LOG", Some("info,rustfs_gateway=info"), || {
             let output = capture_with_filter(build_env_filter("info", None), || {
-                tracing::info!(target: "s3s::auth", "explicit s3s info");
+                tracing::info!(target: "rustfs_gateway::auth", "explicit gateway info");
             });
 
-            assert!(output.contains("explicit s3s info"), "{output}");
+            assert!(output.contains("explicit gateway info"), "{output}");
         });
     }
 

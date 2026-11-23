@@ -294,6 +294,21 @@ pub(crate) fn with_optional_disk_io_context<F: Future>(
     }
 }
 
+#[cfg(test)]
+tokio::task_local! {
+    static TEST_CONTEXT_CLONES: std::sync::atomic::AtomicUsize;
+}
+
+fn clone_context_with_current_resource_unit(context: &DiskIoContext) -> DiskIoContext {
+    #[cfg(test)]
+    let _ = TEST_CONTEXT_CLONES.try_with(|c| c.fetch_add(1, Ordering::Relaxed));
+    let mut cloned = context.clone();
+    if let Ok(unit) = RESOURCE_IO_UNIT.try_with(Clone::clone) {
+        cloned.resource_unit = Some(unit);
+    }
+    cloned
+}
+
 /// An owned commit outlives its waiter. Retain an outer I/O class and physical
 /// ownership, but give admission its own cancellation lifetime. Leave per-disk
 /// scopes to the caller's existing ownership handoff: inheriting their class
@@ -301,19 +316,23 @@ pub(crate) fn with_optional_disk_io_context<F: Future>(
 /// The drive timeout bounds only queued admission; an admitted mutation still
 /// drains to completion. Nested owners retain the original admission deadline.
 pub(crate) fn with_detached_disk_io_context<F: Future>(future: F) -> impl Future<Output = F::Output> {
-    let context = current_disk_io_context()
-        .filter(|context| context.admission.is_none() && context.permit.is_none())
-        .map(|mut context| {
-            context.cancellation = CancellationToken::new();
-            let timeout = super::disk_store::get_max_timeout_duration();
-            if context.class == DiskIoClass::Background
-                && !timeout.is_zero()
-                && let Some(deadline) = Instant::now().checked_add(timeout)
-            {
-                context.admission_deadline = Some(context.admission_deadline.map_or(deadline, |old| old.min(deadline)));
-            }
-            context
-        });
+    let context = DISK_IO_CONTEXT
+        .try_with(|context| {
+            (context.admission.is_none() && context.permit.is_none()).then(|| {
+                let mut context = clone_context_with_current_resource_unit(context);
+                context.cancellation = CancellationToken::new();
+                let timeout = super::disk_store::get_max_timeout_duration();
+                if context.class == DiskIoClass::Background
+                    && !timeout.is_zero()
+                    && let Some(deadline) = Instant::now().checked_add(timeout)
+                {
+                    context.admission_deadline = Some(context.admission_deadline.map_or(deadline, |old| old.min(deadline)));
+                }
+                context
+            })
+        })
+        .ok()
+        .flatten();
     async move {
         match context {
             Some(context) => with_disk_io_context(context, future).await,
@@ -323,34 +342,74 @@ pub(crate) fn with_detached_disk_io_context<F: Future>(future: F) -> impl Future
 }
 
 pub(crate) fn current_disk_io_context() -> Option<DiskIoContext> {
-    DISK_IO_CONTEXT
-        .try_with(|context| {
-            let mut context = context.clone();
-            if let Ok(unit) = RESOURCE_IO_UNIT.try_with(Clone::clone) {
-                context.resource_unit = Some(unit);
-            }
-            context
-        })
-        .ok()
+    DISK_IO_CONTEXT.try_with(clone_context_with_current_resource_unit).ok()
+}
+
+pub(crate) async fn acquire_wrapper_disk_io_permit(admission: &Arc<DiskIoAdmission>) -> io::Result<Option<DiskIoPermit>> {
+    enum WrapperPermitAction {
+        Immediate(Option<DiskIoPermit>),
+        Background(DiskIoContext),
+    }
+
+    let action = match DISK_IO_CONTEXT.try_with(|context| {
+        if let Some(permit) = context.permit.as_ref()
+            && permit.is_for(admission)
+        {
+            return WrapperPermitAction::Immediate(Some(permit.clone()));
+        }
+        if context
+            .admission
+            .as_ref()
+            .is_some_and(|ctx_admission| Arc::ptr_eq(ctx_admission, admission))
+        {
+            return WrapperPermitAction::Immediate(None);
+        }
+        match context.class {
+            DiskIoClass::Foreground => WrapperPermitAction::Immediate(Some(admission.foreground())),
+            DiskIoClass::Background => WrapperPermitAction::Background(clone_context_with_current_resource_unit(context)),
+        }
+    }) {
+        Ok(action) => action,
+        Err(_) => return Ok(Some(admission.foreground())),
+    };
+
+    match action {
+        WrapperPermitAction::Immediate(permit) => Ok(permit),
+        WrapperPermitAction::Background(context) => context.background_permit(admission).await.map(Some),
+    }
 }
 
 /// Acquire one low-level permit only when the current walker explicitly owns a gate.
 /// Ordinary wrapper calls use their outer operation permit instead.
 pub(crate) async fn acquire_context_disk_io_permit() -> io::Result<Option<DiskIoPermit>> {
-    let Some(context) = current_disk_io_context() else {
-        return Ok(None);
-    };
-    let Some(admission) = context.admission.as_ref() else {
-        return Ok(None);
-    };
-    if let Some(permit) = context.permit.as_ref()
-        && permit.is_for(admission)
-    {
-        return Ok(Some(permit.clone()));
+    enum ContextPermitAction {
+        Immediate(Option<DiskIoPermit>),
+        Background(Arc<DiskIoAdmission>, DiskIoContext),
     }
-    match context.class {
-        DiskIoClass::Foreground => Ok(Some(admission.foreground())),
-        DiskIoClass::Background => Ok(Some(context.background_permit(admission).await?)),
+
+    let action = match DISK_IO_CONTEXT.try_with(|context| {
+        let Some(admission) = context.admission.as_ref() else {
+            return ContextPermitAction::Immediate(None);
+        };
+        if let Some(permit) = context.permit.as_ref()
+            && permit.is_for(admission)
+        {
+            return ContextPermitAction::Immediate(Some(permit.clone()));
+        }
+        match context.class {
+            DiskIoClass::Foreground => ContextPermitAction::Immediate(Some(admission.foreground())),
+            DiskIoClass::Background => {
+                ContextPermitAction::Background(Arc::clone(admission), clone_context_with_current_resource_unit(context))
+            }
+        }
+    }) {
+        Ok(action) => action,
+        Err(_) => return Ok(None),
+    };
+
+    match action {
+        ContextPermitAction::Immediate(permit) => Ok(permit),
+        ContextPermitAction::Background(admission, context) => context.background_permit(&admission).await.map(Some),
     }
 }
 
@@ -1272,5 +1331,125 @@ mod tests {
         assert_eq!(admission.foreground_active_for_tests(), 1);
         assert!(tokio::time::timeout(Duration::from_millis(10), worker.0).await.is_err());
         wait_for_foreground_active(&admission, 0).await;
+    }
+
+    #[tokio::test]
+    async fn wrapper_and_context_permit_fast_paths_avoid_context_clones_and_preserve_resource_projection() {
+        use rustfs_concurrency::adaptive::AdaptiveAdmission;
+        use std::num::NonZeroU16;
+        use std::sync::atomic::AtomicUsize;
+
+        TEST_CONTEXT_CLONES
+            .scope(AtomicUsize::new(0), async {
+                let take_clones = || TEST_CONTEXT_CLONES.with(|c| c.swap(0, Ordering::Relaxed));
+                let admission = DiskIoAdmission::new("disk-fast");
+                let other_admission = DiskIoAdmission::new("disk-other");
+
+                // 1. No ambient context: wrapper returns Foreground permit, walker context returns None, 0 clones.
+                let wrapper_p = acquire_wrapper_disk_io_permit(&admission)
+                    .await
+                    .expect("wrapper permit")
+                    .expect("foreground permit");
+                drop(wrapper_p);
+                assert!(acquire_context_disk_io_permit().await.expect("walker permit").is_none());
+                assert_eq!(take_clones(), 0);
+
+                // 2. Foreground context with admission=Some(admission), permit=None:
+                //    - wrapper sees matching admission and returns Ok(None) (walker owns per-step permits)
+                //    - walker acquires a Foreground permit from context.admission
+                //    - 0 context clones.
+                let fg_ctx = DiskIoContext {
+                    class: DiskIoClass::Foreground,
+                    cancellation: CancellationToken::new(),
+                    admission_deadline: None,
+                    admission: Some(admission.clone()),
+                    permit: None,
+                    resource_unit: None,
+                };
+                with_disk_io_context(fg_ctx, async {
+                    assert!(
+                        acquire_wrapper_disk_io_permit(&admission)
+                            .await
+                            .expect("wrapper under walker")
+                            .is_none()
+                    );
+                    let step_p = acquire_context_disk_io_permit()
+                        .await
+                        .expect("walker step")
+                        .expect("walker foreground permit");
+                    assert!(step_p.is_for(&admission));
+                    let other_p = acquire_wrapper_disk_io_permit(&other_admission)
+                        .await
+                        .expect("other disk wrapper")
+                        .expect("other disk foreground permit");
+                    assert!(other_p.is_for(&other_admission));
+                })
+                .await;
+                assert_eq!(take_clones(), 0);
+
+                // 3. Permit-match fast path on both helpers: 0 context clones.
+                let held_permit = admission.foreground();
+                let permit_ctx = DiskIoContext {
+                    class: DiskIoClass::Foreground,
+                    cancellation: CancellationToken::new(),
+                    admission_deadline: None,
+                    admission: Some(admission.clone()),
+                    permit: Some(held_permit),
+                    resource_unit: None,
+                };
+                with_disk_io_context(permit_ctx, async {
+                    let wp = acquire_wrapper_disk_io_permit(&admission)
+                        .await
+                        .expect("wrapper permit match")
+                        .expect("matched permit");
+                    assert!(wp.is_for(&admission));
+                    let cp = acquire_context_disk_io_permit()
+                        .await
+                        .expect("context permit match")
+                        .expect("matched context permit");
+                    assert!(cp.is_for(&admission));
+                })
+                .await;
+                assert_eq!(take_clones(), 0);
+
+                // 4. Background context with inner RESOURCE_IO_UNIT override preserved across with_detached_disk_io_context.
+                let adaptive = AdaptiveAdmission::new(NonZeroU16::new(2).expect("two units"), 2);
+                let outer_unit = adaptive.acquire().await;
+                let inner_unit = adaptive.acquire().await;
+                with_background_disk_io(
+                    CancellationToken::new(),
+                    with_background_resource_unit(outer_unit, async {
+                        with_background_resource_unit(inner_unit, async {
+                            let bg_ctx = DiskIoContext {
+                                class: DiskIoClass::Background,
+                                cancellation: CancellationToken::new(),
+                                admission_deadline: None,
+                                admission: Some(admission.clone()),
+                                permit: None,
+                                resource_unit: None,
+                            };
+                            with_disk_io_context(bg_ctx, async {
+                                let bg_step = acquire_context_disk_io_permit()
+                                    .await
+                                    .expect("background walker step")
+                                    .expect("background walker permit");
+                                assert!(bg_step.is_for(&admission));
+                            })
+                            .await;
+                            assert!(take_clones() >= 1, "background path must clone context with resource unit");
+
+                            let spawned = tokio::spawn(with_detached_disk_io_context(async {
+                                let ctx = current_disk_io_context().expect("detached background context");
+                                assert_eq!(ctx.class, DiskIoClass::Background);
+                                assert!(ctx.resource_unit.is_some(), "inner resource unit must be merged");
+                            }));
+                            spawned.await.expect("detached task joins");
+                        })
+                        .await;
+                    }),
+                )
+                .await;
+            })
+            .await;
     }
 }

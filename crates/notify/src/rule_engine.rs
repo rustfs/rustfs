@@ -19,8 +19,13 @@ use percent_encoding::percent_decode_str;
 use rustfs_s3_types::EventName;
 use rustfs_targets::arn::{ARN, TargetID};
 use starshard::{AsyncShardedHashMap, DEFAULT_SHARDS, SnapshotMode};
-use std::sync::{Arc, RwLock, Weak};
+use std::sync::{
+    Arc, Mutex as StdMutex, RwLock, Weak,
+    atomic::{AtomicBool, Ordering},
+};
+use tokio::sync::{Mutex as AsyncMutex, Notify};
 use tracing::info;
+use uuid::Uuid;
 
 const LOG_COMPONENT_NOTIFY: &str = "notify";
 const LOG_SUBSYSTEM_RULE_ENGINE: &str = "rule_engine";
@@ -46,9 +51,33 @@ pub struct NotifyRuleEngine {
 #[derive(Clone)]
 struct CachedBucketRules {
     metadata: Option<Weak<BucketMetadata>>,
+    incarnation_id: Option<Uuid>,
+    refresh_requested: Arc<AtomicBool>,
+    refresh_state: Arc<RefreshState>,
     // Cache rejected snapshots too, so corrupt persisted routes are not
-    // repeatedly compiled on the event hot path.
-    rules: Option<RulesMap>,
+    // repeatedly compiled on the event hot path. Shared by `Arc` so matching an
+    // event does not clone the whole rule set.
+    rules: Option<Arc<RulesMap>>,
+}
+
+struct RefreshAttempt {
+    completed: Notify,
+    succeeded: AtomicBool,
+}
+
+impl RefreshAttempt {
+    fn new() -> Self {
+        Self {
+            completed: Notify::new(),
+            succeeded: AtomicBool::new(false),
+        }
+    }
+}
+
+#[derive(Default)]
+struct RefreshState {
+    in_flight: AsyncMutex<Option<Arc<RefreshAttempt>>>,
+    requested_incarnation: StdMutex<Option<Uuid>>,
 }
 
 fn rules_from_metadata(metadata: &BucketMetadata) -> Option<RulesMap> {
@@ -79,6 +108,14 @@ fn rules_from_metadata(metadata: &BucketMetadata) -> Option<RulesMap> {
     Some(rules)
 }
 
+/// Compiles removal targets from metadata captured by the fenced native delete.
+/// The snapshot remains authority after the bucket's metadata has been withdrawn.
+pub fn bucket_removed_targets_from_metadata(metadata: &BucketMetadata) -> TargetIdSet {
+    rules_from_metadata(metadata)
+        .map(|rules| rules.match_rules(EventName::BucketRemoved, ""))
+        .unwrap_or_default()
+}
+
 impl NotifyRuleEngine {
     pub fn new() -> Self {
         Self {
@@ -98,7 +135,7 @@ impl NotifyRuleEngine {
         self.metadata_source.read().unwrap_or_else(|err| err.into_inner()).clone()
     }
 
-    pub(crate) fn uses_bucket_metadata_source(&self) -> bool {
+    fn uses_bucket_metadata_source(&self) -> bool {
         self.metadata_source().is_some()
     }
 
@@ -110,31 +147,48 @@ impl NotifyRuleEngine {
                 .iter()
                 .any(|metadata| rules_from_metadata(metadata).is_none_or(|rules| rules.contains_target_id(target_id)));
         }
-        let items = self.bucket_rules_map.iter().await;
-        for (_bucket, rules_map) in items {
-            if rules_map.rules.is_some_and(|rules| rules.contains_target_id(target_id)) {
-                return true;
-            }
-        }
-        false
+        self.bucket_rules_map
+            .iter()
+            .await
+            .into_iter()
+            .any(|(_, snapshot)| snapshot.rules.is_some_and(|rules| rules.contains_target_id(target_id)))
     }
 
     pub async fn set_bucket_rules(&self, bucket: &str, rules_map: RulesMap) {
+        self.publish_bucket_rules(bucket, None, rules_map).await;
+    }
+
+    /// Publishes standalone rules with their optional originating incarnation.
+    /// Store-bound dispatch accepts only the store's metadata snapshots.
+    pub(crate) async fn publish_bucket_rules(&self, bucket: &str, incarnation_id: Option<Uuid>, rules_map: RulesMap) {
         if self.uses_bucket_metadata_source() {
-            // Delayed PUT/startup callbacks cannot override a newer revision or
-            // a same-name replacement. Only published metadata is authoritative.
             return;
         }
         let event_count = rules_map.iter_events().count();
+        let key = bucket.to_owned();
         if rules_map.is_empty() {
-            self.bucket_rules_map.remove(&bucket.to_string()).await;
+            self.bucket_rules_map.remove(&key).await;
         } else {
+            let refresh_state = self
+                .bucket_rules_map
+                .get(&key)
+                .await
+                .map_or_else(|| Arc::new(RefreshState::default()), |current| current.refresh_state);
+            let refresh_requested = self
+                .bucket_rules_map
+                .get(&key)
+                .await
+                .filter(|current| current.incarnation_id == incarnation_id)
+                .map_or_else(|| Arc::new(AtomicBool::new(false)), |current| current.refresh_requested);
             self.bucket_rules_map
                 .insert(
-                    bucket.to_string(),
+                    key,
                     CachedBucketRules {
                         metadata: None,
-                        rules: Some(rules_map),
+                        incarnation_id,
+                        refresh_requested,
+                        refresh_state,
+                        rules: Some(Arc::new(rules_map)),
                     },
                 )
                 .await;
@@ -143,65 +197,83 @@ impl NotifyRuleEngine {
             event = EVENT_NOTIFY_RULES_UPDATED,
             component = LOG_COMPONENT_NOTIFY,
             subsystem = LOG_SUBSYSTEM_RULE_ENGINE,
-            bucket = %bucket,
             state = "updated",
+            bucket = %bucket,
             event_count,
             "notify bucket rules state"
         );
     }
 
-    pub async fn get_bucket_rules(&self, bucket: &str) -> Option<RulesMap> {
+    async fn snapshot_for_bucket(&self, bucket: &str) -> Option<CachedBucketRules> {
         if let Some(source) = self.metadata_source() {
             let metadata = match source.upgrade() {
                 Some(store) => store.get_bucket_metadata(bucket).await.ok(),
                 None => None,
             };
-            return self.rules_for_metadata(bucket, metadata).await;
+            return self.snapshot_for_metadata(bucket, metadata).await;
         }
-        self.bucket_rules_map
-            .get(&bucket.to_string())
-            .await
-            .and_then(|cached| cached.rules)
+        self.bucket_rules_map.get(&bucket.to_owned()).await
     }
 
-    async fn rules_for_metadata(&self, bucket: &str, metadata: Option<Arc<BucketMetadata>>) -> Option<RulesMap> {
+    pub async fn get_bucket_rules(&self, bucket: &str) -> Option<Arc<RulesMap>> {
+        self.snapshot_for_bucket(bucket).await.and_then(|snapshot| snapshot.rules)
+    }
+
+    async fn snapshot_for_metadata(&self, bucket: &str, metadata: Option<Arc<BucketMetadata>>) -> Option<CachedBucketRules> {
         let key = bucket.to_owned();
         let Some(metadata) = metadata else {
             self.bucket_rules_map.remove(&key).await;
             return None;
         };
-        if let Some(cached) = self.bucket_rules_map.get(&key).await
+        let current = self.bucket_rules_map.get(&key).await;
+        if let Some(cached) = &current
             && cached
                 .metadata
                 .as_ref()
                 .is_some_and(|snapshot| Weak::ptr_eq(snapshot, &Arc::downgrade(&metadata)))
         {
-            return cached.rules;
+            return current;
         }
-        // Snapshot identity covers incarnation, revision AND bytes, without
-        // trusting wall-clock ordering. A late compilation may evict a newer
-        // cache entry, but cannot be reused by a reader of a different snapshot.
-        let rules = rules_from_metadata(&metadata);
-        self.bucket_rules_map
-            .insert(
-                key,
-                CachedBucketRules {
-                    metadata: Some(Arc::downgrade(&metadata)),
-                    rules: rules.clone(),
-                },
-            )
-            .await;
-        rules
+        let incarnation_id = (!metadata.bucket_incarnation_id.is_nil()).then_some(metadata.bucket_incarnation_id);
+        let refresh_requested = current
+            .as_ref()
+            .filter(|cached| cached.incarnation_id == incarnation_id)
+            .map_or_else(|| Arc::new(AtomicBool::new(false)), |cached| Arc::clone(&cached.refresh_requested));
+        let refresh_state = current
+            .as_ref()
+            .map_or_else(|| Arc::new(RefreshState::default()), |cached| Arc::clone(&cached.refresh_state));
+        // The same immutable snapshot supplies both the identity and the rules.
+        // A late compilation cannot be reused for a different metadata snapshot.
+        let snapshot = CachedBucketRules {
+            metadata: Some(Arc::downgrade(&metadata)),
+            incarnation_id,
+            refresh_requested,
+            refresh_state,
+            rules: rules_from_metadata(&metadata).map(Arc::new),
+        };
+        self.bucket_rules_map.insert(key, snapshot.clone()).await;
+        Some(snapshot)
+    }
+
+    #[cfg(test)]
+    async fn rules_for_metadata(&self, bucket: &str, metadata: Option<Arc<BucketMetadata>>) -> Option<Arc<RulesMap>> {
+        self.snapshot_for_metadata(bucket, metadata)
+            .await
+            .and_then(|snapshot| snapshot.rules)
     }
 
     pub async fn clear_bucket_rules(&self, bucket: &str) {
-        if self.bucket_rules_map.remove(&bucket.to_string()).await.is_some() {
+        self.withdraw_bucket_rules(bucket).await;
+    }
+
+    pub(crate) async fn withdraw_bucket_rules(&self, bucket: &str) {
+        if self.bucket_rules_map.remove(&bucket.to_owned()).await.is_some() {
             info!(
                 event = EVENT_NOTIFY_RULES_UPDATED,
                 component = LOG_COMPONENT_NOTIFY,
                 subsystem = LOG_SUBSYSTEM_RULE_ENGINE,
-                bucket = %bucket,
                 state = "removed",
+                bucket = %bucket,
                 "notify bucket rules state"
             );
         }
@@ -210,19 +282,111 @@ impl NotifyRuleEngine {
     pub async fn has_subscriber(&self, bucket: &str, event: &EventName) -> bool {
         self.get_bucket_rules(bucket)
             .await
-            .is_some_and(|rules_map| rules_map.has_subscriber(event))
+            .is_some_and(|rules| rules.has_subscriber(event))
     }
 
+    /// Queries the current rules. Event dispatch additionally validates its origin.
     pub async fn match_targets(&self, bucket: &str, event_name: EventName, object_key: &str) -> TargetIdSet {
         self.get_bucket_rules(bucket)
             .await
-            .map_or_else(TargetIdSet::new, |rules_map| {
-                let mut target_ids = rules_map.match_rules(event_name, object_key);
-                if let Some(decoded_key) = decoded_object_key_for_matching(object_key) {
-                    target_ids.extend(rules_map.match_rules(event_name, &decoded_key));
-                }
-                target_ids
+            .map_or_else(TargetIdSet::new, |rules| Self::targets_for_rules(&rules, event_name, object_key))
+    }
+
+    fn match_snapshot(
+        snapshot: &CachedBucketRules,
+        incarnation_id: Option<Uuid>,
+        event_name: EventName,
+        object_key: &str,
+    ) -> TargetIdSet {
+        if snapshot.incarnation_id != incarnation_id || (snapshot.metadata.is_some() && incarnation_id.is_none()) {
+            return TargetIdSet::new();
+        }
+        let Some(rules) = &snapshot.rules else { return TargetIdSet::new() };
+        Self::targets_for_rules(rules, event_name, object_key)
+    }
+
+    fn targets_for_rules(rules: &RulesMap, event_name: EventName, object_key: &str) -> TargetIdSet {
+        let mut targets = rules.match_rules(event_name, object_key);
+        if let Some(decoded_key) = decoded_object_key_for_matching(object_key) {
+            targets.extend(rules.match_rules(event_name, &decoded_key));
+        }
+        targets
+    }
+
+    pub(crate) async fn match_bucket_targets(
+        &self,
+        bucket: &str,
+        incarnation_id: Option<Uuid>,
+        event_name: EventName,
+        object_key: &str,
+    ) -> TargetIdSet {
+        self.snapshot_for_bucket(bucket)
+            .await
+            .map_or_else(TargetIdSet::new, |snapshot| {
+                Self::match_snapshot(&snapshot, incarnation_id, event_name, object_key)
             })
+    }
+
+    /// Allow one targeted reload per installed incarnation, including revisions.
+    #[cfg(test)]
+    pub(crate) async fn request_incarnation_refresh(&self, bucket: &str, incarnation_id: Uuid) -> bool {
+        !incarnation_id.is_nil()
+            && self.bucket_rules_map.get(&bucket.to_owned()).await.is_some_and(|snapshot| {
+                snapshot.incarnation_id.is_some_and(|current| current != incarnation_id)
+                    && !snapshot.refresh_requested.swap(true, Ordering::Relaxed)
+            })
+    }
+
+    pub(crate) async fn refresh_incarnation(&self, bucket: &str, incarnation_id: Uuid) -> bool {
+        let Some(store) = self.metadata_source().and_then(|source| source.upgrade()) else { return false };
+        let Some(snapshot) = self.bucket_rules_map.get(&bucket.to_owned()).await else {
+            return false;
+        };
+        if incarnation_id.is_nil() || snapshot.incarnation_id == Some(incarnation_id) {
+            return false;
+        }
+        let state = snapshot.refresh_state;
+        let (attempt, owner) = {
+            let mut in_flight = state.in_flight.lock().await;
+            if let Some(attempt) = in_flight.as_ref() {
+                (Arc::clone(attempt), false)
+            } else if state
+                .requested_incarnation
+                .lock()
+                .unwrap_or_else(|err| err.into_inner())
+                .as_ref()
+                == Some(&incarnation_id)
+            {
+                return false;
+            } else {
+                let attempt = Arc::new(RefreshAttempt::new());
+                *in_flight = Some(Arc::clone(&attempt));
+                *state.requested_incarnation.lock().unwrap_or_else(|err| err.into_inner()) = Some(incarnation_id);
+                (attempt, true)
+            }
+        };
+
+        if !owner {
+            attempt.completed.notified().await;
+            return attempt.succeeded.load(Ordering::Acquire);
+        }
+
+        let succeeded = crate::storage_api::bucket_metadata::refresh_notify_bucket_metadata(store, bucket).await;
+        attempt.succeeded.store(succeeded, Ordering::Release);
+        {
+            let mut in_flight = state.in_flight.lock().await;
+            if in_flight.as_ref().is_some_and(|current| Arc::ptr_eq(current, &attempt)) {
+                *in_flight = None;
+            }
+            if !succeeded {
+                *state.requested_incarnation.lock().unwrap_or_else(|err| err.into_inner()) = None;
+            }
+        }
+        attempt.completed.notify_waiters();
+        if let Some(snapshot) = self.bucket_rules_map.get(&bucket.to_owned()).await {
+            snapshot.refresh_requested.store(false, Ordering::Release);
+        }
+        succeeded
     }
 }
 
@@ -241,6 +405,74 @@ mod tests {
     use rustfs_targets::arn::TargetID;
     use std::sync::{Arc, Weak};
 
+    #[tokio::test]
+    async fn bucket_rules_route_events_only_with_the_matching_incarnation() {
+        let engine = NotifyRuleEngine::new();
+        let old_id = uuid::Uuid::new_v4();
+        let new_id = uuid::Uuid::new_v4();
+        let old_target = TargetID::new("old".to_string(), "webhook".to_string());
+        let new_target = TargetID::new("new".to_string(), "webhook".to_string());
+        let rules = |target: TargetID| {
+            let mut rules = RulesMap::new();
+            rules.add_rule_config(&[EventName::ObjectCreatedPut], "*".to_owned(), target);
+            rules
+        };
+
+        engine
+            .publish_bucket_rules("bucket", Some(old_id), rules(old_target.clone()))
+            .await;
+        assert!(
+            engine
+                .match_bucket_targets("bucket", Some(old_id), EventName::ObjectCreatedPut, "object")
+                .await
+                .contains(&old_target)
+        );
+        assert!(
+            engine
+                .match_bucket_targets("bucket", Some(new_id), EventName::ObjectCreatedPut, "object")
+                .await
+                .is_empty(),
+            "a peer may still have the old rules"
+        );
+        assert!(engine.request_incarnation_refresh("bucket", new_id).await);
+        assert!(!engine.request_incarnation_refresh("bucket", new_id).await);
+        assert!(
+            engine
+                .match_bucket_targets("bucket", None, EventName::ObjectCreatedPut, "object")
+                .await
+                .is_empty()
+        );
+
+        engine.withdraw_bucket_rules("bucket").await;
+        assert!(
+            engine
+                .match_bucket_targets("bucket", Some(old_id), EventName::ObjectCreatedPut, "object")
+                .await
+                .is_empty()
+        );
+        assert!(
+            engine
+                .match_bucket_targets("bucket", Some(new_id), EventName::ObjectCreatedPut, "object")
+                .await
+                .is_empty()
+        );
+        engine
+            .publish_bucket_rules("bucket", Some(new_id), rules(new_target.clone()))
+            .await;
+        assert!(
+            engine
+                .match_bucket_targets("bucket", Some(old_id), EventName::ObjectCreatedPut, "object")
+                .await
+                .is_empty()
+        );
+        assert!(
+            engine
+                .match_bucket_targets("bucket", Some(new_id), EventName::ObjectCreatedPut, "object")
+                .await
+                .contains(&new_target)
+        );
+    }
+
     fn metadata(target: &str) -> Arc<BucketMetadata> {
         let mut metadata = BucketMetadata::new("bucket");
         metadata.notification_config_xml = format!(
@@ -251,6 +483,36 @@ mod tests {
         metadata.notification_config =
             Some(deserialize_bucket_config(&metadata.notification_config_xml).expect("parse inert notification fixture"));
         Arc::new(metadata)
+    }
+
+    #[tokio::test]
+    async fn metadata_bound_rules_only_match_the_originating_incarnation() {
+        let engine = NotifyRuleEngine::new();
+        let old = metadata("old");
+        let replacement = metadata("replacement");
+        let old_id = old.bucket_incarnation_id;
+        let new_id = replacement.bucket_incarnation_id;
+        for (metadata, accepted, rejected) in [(old, old_id, new_id), (replacement, new_id, old_id)] {
+            let snapshot = engine
+                .snapshot_for_metadata("bucket", Some(metadata))
+                .await
+                .expect("compiled snapshot");
+            assert_eq!(
+                NotifyRuleEngine::match_snapshot(&snapshot, Some(accepted), EventName::ObjectCreatedPut, "object").len(),
+                1
+            );
+            assert!(
+                NotifyRuleEngine::match_snapshot(&snapshot, Some(rejected), EventName::ObjectCreatedPut, "object").is_empty()
+            );
+            assert!(NotifyRuleEngine::match_snapshot(&snapshot, None, EventName::ObjectCreatedPut, "object").is_empty());
+        }
+        let mut legacy = (*metadata("legacy")).clone();
+        legacy.bucket_incarnation_id = uuid::Uuid::nil();
+        let snapshot = engine
+            .snapshot_for_metadata("bucket", Some(Arc::new(legacy)))
+            .await
+            .expect("legacy snapshot");
+        assert!(NotifyRuleEngine::match_snapshot(&snapshot, None, EventName::ObjectCreatedPut, "object").is_empty());
     }
 
     #[tokio::test]
@@ -428,7 +690,7 @@ mod tests {
                 .await
                 .into_iter()
                 .collect::<Vec<_>>(),
-            vec![target_id.clone()]
+            vec![std::sync::Arc::new(target_id.clone())]
         );
 
         engine.clear_bucket_rules("bucket").await;

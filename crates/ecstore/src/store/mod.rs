@@ -410,7 +410,7 @@ async fn enqueue_transition_after_write(
             // transition/expiry already ran for the original commit; the scanner
             // still sees the object if that commit never reached this hook.
             if !oi.multipart_completion_replayed && should_enqueue_transition_immediately(&oi) {
-                enqueue_transition_immediate(&oi, src.clone()).await;
+                enqueue_transition_immediate(&oi, src.clone(), opts.expected_bucket_incarnation_id).await;
                 // Immediate expiry needs the bucket incarnation under the
                 // metadata-transaction lock; a lockless cache PUT leaves expiry
                 // to the scanner.
@@ -1019,6 +1019,16 @@ impl ECStore {
 
     pub fn scanner_data_movement_generation(&self) -> u64 {
         self.ctx.data_movement_generation()
+    }
+
+    /// Derive the cross-node scope from persisted movement metadata, excluding
+    /// local admission/wakeup counters. Writers capture this under their
+    /// movement permit; diagnostic readers validate it before and after I/O.
+    pub async fn scanner_durable_data_movement_generation(&self) -> Option<u64> {
+        let pool_meta = self.pool_meta.read().await.clone();
+        let rebalance_meta = self.rebalance_meta.read().await.clone();
+        let generation = durable_scanner_data_movement_generation(&pool_meta, rebalance_meta.as_ref());
+        (generation != u64::MAX).then_some(generation)
     }
 
     pub fn scanner_data_movement_generation_exhausted(&self) -> bool {

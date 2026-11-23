@@ -436,7 +436,9 @@ impl DefaultMultipartUsecase {
             bucket,
             key,
             upload_id,
-            server_side_encryption: effective_sse,
+            // `x-amz-server-side-encryption` names a managed algorithm; an SSE-C
+            // upload answers with its customer-key headers only.
+            server_side_encryption: effective_sse.filter(|_| sse_customer_algorithm.is_none()),
             sse_customer_algorithm,
             sse_customer_key_md5,
             ssekms_key_id: effective_kms_key_id,
@@ -489,7 +491,8 @@ impl DefaultMultipartUsecase {
         let query_version = req.input.version_id.take();
         let output = self
             .execute_create_multipart_upload(envelope, CreateMultipartUploadFields::from_legacy(req.input), query_version)
-            .await?;
+            .await
+            .map_err(crate::error::legacy_error_for_test)?;
         let mut response = S3Response::new(CreateMultipartUploadOutput {
             bucket: Some(output.bucket),
             key: Some(output.key),
@@ -512,6 +515,21 @@ mod tests {
     use super::super::test_support::*;
     use super::*;
     use crate::app::storage_api::s3::{S3ErrorCode, dto::CreateMultipartUploadInput};
+
+    /// Method, URI, headers, extensions, region, and service. These fixtures leave credentials absent.
+    fn envelope_from_request<T>(req: &crate::app::storage_api::s3::S3Request<T>) -> RequestEnvelope {
+        RequestEnvelope::from_parts(
+            crate::app::RequestHead {
+                method: req.method.clone(),
+                uri: req.uri.clone(),
+                headers: req.headers.clone(),
+                credentials: None,
+                region: req.region.as_ref().map(|region| region.as_str().to_owned()),
+                service: req.service.clone(),
+            },
+            req.extensions.clone(),
+        )
+    }
 
     #[tokio::test]
     async fn create_multipart_baseline_legacy_direct() {
@@ -553,7 +571,7 @@ mod tests {
                 )
                 .await
             {
-                Err(error) => crate::app::storage_api::s3::S3Error::from(error),
+                Err(error) => error,
                 Ok(_) => panic!("direct fixture does not create an upload"),
             };
             assert_eq!(
@@ -601,10 +619,10 @@ mod tests {
             .execute_create_multipart_upload(owned_envelope(Method::POST), CreateMultipartUploadFields::from_legacy(input), None)
             .await
         {
-            Err(error) => crate::app::storage_api::s3::S3Error::from(error),
+            Err(error) => error,
             Ok(_) => panic!("invalid storage class must be rejected"),
         };
-        assert_eq!(err.code(), &S3ErrorCode::InvalidStorageClass);
+        assert_eq!(err.code(), &rustfs_s3_types::S3ErrorCode::InvalidStorageClass);
     }
 
     #[test]
@@ -648,17 +666,28 @@ mod tests {
             .key("object".to_string())
             .build()
             .expect("create multipart request should build");
-        let mut request = build_request(input, Method::POST);
-        insert_header(&mut request.headers, SUFFIX_SOURCE_REPLICATION_REQUEST, "true");
-        request
-            .headers
-            .insert(rustfs_utils::http::REPLICATION_SSEC_ALGORITHM_HEADER, HeaderValue::from_static("AES256"));
-        request.extensions.insert(crate::storage::req_info::ReqInfo {
+        // Same facts `envelope_from_request` copies from `build_request`. Credentials, region, and service stay absent.
+        let mut headers = HeaderMap::new();
+        insert_header(&mut headers, SUFFIX_SOURCE_REPLICATION_REQUEST, "true");
+        headers.insert(rustfs_utils::http::REPLICATION_SSEC_ALGORITHM_HEADER, HeaderValue::from_static("AES256"));
+        let mut extensions = Extensions::new();
+        extensions.insert(crate::storage::req_info::ReqInfo {
             replication_request_authorized: true,
             ..Default::default()
         });
-
-        let result = usecase.execute_create_multipart_upload_from_s3s(request).await;
+        let envelope = RequestEnvelope::from_parts(
+            crate::app::RequestHead {
+                method: Method::POST,
+                uri: http::Uri::from_static("/"),
+                headers,
+                credentials: None,
+                region: None,
+                service: None,
+            },
+            extensions,
+        );
+        let fields = CreateMultipartUploadFields::from_legacy(input);
+        let result = usecase.execute_create_multipart_upload(envelope, fields, None).await;
         assert!(
             store
                 .list_multipart_uploads(&bucket, "", None, None, None, 100)
@@ -667,8 +696,11 @@ mod tests {
                 .uploads
                 .is_empty()
         );
-        let err = result.expect_err("quota-enabled ciphertext multipart replication must be refused");
-        assert_eq!(err.code(), &S3ErrorCode::InvalidRequest);
+        let err = match result {
+            Err(error) => error,
+            Ok(_) => panic!("quota-enabled ciphertext multipart replication must be refused"),
+        };
+        assert_eq!(err.code(), &rustfs_s3_types::S3ErrorCode::InvalidRequest);
         assert_eq!(
             err.message(),
             Some("SSE-C ciphertext replication is unavailable for quota-enabled buckets")
@@ -718,7 +750,10 @@ mod tests {
                     enforced: true,
                     authorizer: authorizer.clone(),
                 });
-                let result = usecase.execute_create_multipart_upload_from_s3s(req).await;
+                let envelope = envelope_from_request(&req);
+                let query_version = req.input.version_id.take();
+                let fields = CreateMultipartUploadFields::from_legacy(req.input);
+                let result = usecase.execute_create_multipart_upload(envelope, fields, query_version).await;
                 let uploads = store
                     .list_multipart_uploads(&bucket, "", None, None, None, 100)
                     .await
@@ -727,11 +762,15 @@ mod tests {
                 assert_eq!(uploads.len(), usize::from(allowed));
                 assert_eq!(authorizer.calls(), [(KmsAction::GenerateDataKeyAction, key_id.to_owned())]);
                 if allowed {
-                    let output = result.expect("KMS authorizes the selected key").output;
-                    assert_eq!(output.upload_id.as_deref(), Some(uploads[0].upload_id.as_str()));
+                    let Ok(output) = result else {
+                        panic!("KMS authorizes the selected key");
+                    };
+                    assert_eq!(output.upload_id.as_str(), uploads[0].upload_id.as_str());
                 } else {
-                    let error = result.expect_err("KMS denied the selected key");
-                    assert_eq!(error.code(), &S3ErrorCode::AccessDenied);
+                    let Err(error) = result else {
+                        panic!("KMS denied the selected key");
+                    };
+                    assert_eq!(error.code(), &rustfs_s3_types::S3ErrorCode::AccessDenied);
                 }
             }
             kms.stop().await.expect("stop test KMS");
@@ -773,16 +812,28 @@ mod tests {
             assert!(slot.install(context));
             let bucket = format!("create-multipart-{}", Uuid::new_v4().simple());
             let other = format!("create-multipart-{}", Uuid::new_v4().simple());
-            let request = |bucket: &str| {
-                let input = CreateMultipartUploadInput {
-                    bucket: bucket.to_owned(),
+            let make_request = |target_bucket: &str| {
+                let mut input = CreateMultipartUploadInput {
+                    bucket: target_bucket.to_owned(),
                     key: "object".to_owned(),
                     ..Default::default()
                 };
-                let mut request = build_request(input, Method::POST);
-                request.uri = format!("/{bucket}/object?uploads").parse().expect("fixture URI");
-                request.extensions.insert(slot.clone());
-                request
+                let mut extensions = Extensions::new();
+                extensions.insert(slot.clone());
+                let envelope = RequestEnvelope::from_parts(
+                    crate::app::RequestHead {
+                        method: Method::POST,
+                        uri: format!("/{target_bucket}/object?uploads").parse().expect("fixture URI"),
+                        headers: http::HeaderMap::new(),
+                        credentials: None,
+                        region: None,
+                        service: None,
+                    },
+                    extensions,
+                );
+                let query_version = input.version_id.take();
+                let fields = CreateMultipartUploadFields::from_legacy(input);
+                (envelope, fields, query_version)
             };
             for name in [&bucket, &other] {
                 store
@@ -790,14 +841,6 @@ mod tests {
                     .await
                     .expect("create bucket");
             }
-
-            let make_request = |target_bucket: &str| {
-                let mut req = request(target_bucket);
-                let envelope = RequestEnvelope::from_s3s(&req);
-                let query_version = req.input.version_id.take();
-                let fields = CreateMultipartUploadFields::from_legacy(req.input);
-                (envelope, fields, query_version)
-            };
 
             let (mut stale_env, stale_fields, stale_ver) = make_request(&bucket);
             let guard = load_bucket_generation_from_store(&store, &stale_env, &bucket)

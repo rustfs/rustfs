@@ -943,10 +943,15 @@ pub(crate) static ERR_TIER_NOT_FOUND: AdminErrorRef = AdminErrorRef(|| &ecstore_
 pub(crate) static ERR_TIER_RESERVED_NAME: AdminErrorRef = AdminErrorRef(|| &ecstore_tier::tier_handlers::ERR_TIER_RESERVED_NAME);
 
 pub(crate) mod data_usage {
+    pub(crate) use crate::storage::storage_api::ecstore_data_usage::verified_account_bucket_usage;
     use std::sync::Arc;
 
-    pub(crate) async fn apply_bucket_usage_memory_overlay(data_usage_info: &mut rustfs_data_usage::DataUsageInfo) {
-        crate::storage::storage_api::ecstore_data_usage::apply_bucket_usage_memory_overlay(data_usage_info).await;
+    pub(crate) async fn load_bucket_scan_progress_for_admin(
+        store: Arc<crate::storage::storage_api::ECStore>,
+        buckets: &[String],
+        baseline: &rustfs_data_usage::DataUsageInfo,
+    ) -> std::collections::HashMap<String, rustfs_data_usage::BucketScanProgress> {
+        crate::storage::storage_api::ecstore_data_usage::load_bucket_scan_progress_for_admin(store, buckets, baseline).await
     }
 
     pub(crate) async fn load_data_usage_from_backend(
@@ -959,6 +964,12 @@ pub(crate) mod data_usage {
         store: Arc<crate::storage::storage_api::ECStore>,
     ) -> Result<rustfs_data_usage::DataUsageInfo, crate::storage::storage_api::StorageError> {
         crate::storage::storage_api::ecstore_data_usage::load_admin_data_usage_from_backend_cached(store).await
+    }
+
+    pub(crate) async fn load_admin_data_usage_with_memory_overlay(
+        store: Arc<crate::storage::storage_api::ECStore>,
+    ) -> Result<rustfs_data_usage::DataUsageInfo, crate::storage::storage_api::StorageError> {
+        crate::storage::storage_api::ecstore_data_usage::load_admin_data_usage_with_memory_overlay(store).await
     }
 }
 

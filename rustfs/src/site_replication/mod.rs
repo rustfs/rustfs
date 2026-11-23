@@ -29,6 +29,7 @@ pub(crate) mod identity;
 pub(crate) mod state_lock;
 
 pub(crate) mod hooks;
+pub(crate) mod removal;
 pub(crate) mod repair;
 pub(crate) mod retry;
 pub(crate) mod state;
@@ -38,6 +39,7 @@ pub(crate) mod transport;
 mod tests;
 
 pub(crate) use self::hooks::*;
+pub(crate) use self::removal::*;
 pub(crate) use self::repair::*;
 pub(crate) use self::retry::*;
 pub(crate) use self::state::*;

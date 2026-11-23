@@ -195,7 +195,8 @@ async fn assert_body_timeout_storage_lifecycle(part_size: usize, partial_size: u
             let error = tokio::time::timeout(Duration::from_secs(10), upload_future)
                 .await
                 .expect("inline cleanup must complete")
-                .expect_err("stalled part");
+                .err()
+                .expect("stalled part");
             assert_eq!(
                 error.code(),
                 &S3ErrorCode::RequestTimeout,
@@ -225,7 +226,7 @@ async fn assert_body_timeout_storage_lifecycle(part_size: usize, partial_size: u
                 .await
                 .expect("foreground and capped staging permits must be released")
                 .expect("same-number retry");
-            old_etag = retry.output.e_tag.map(|etag| etag.value().to_owned());
+            old_etag = retry.e_tag;
         }
         let parts = store
             .list_object_parts(&bucket, "object", &upload.upload_id, None, 1000, &ObjectOptions::default())
@@ -352,10 +353,11 @@ fn presigned_part_checksum_survives_completion_and_rejects_bad_retry() {
                 let result = usecase.execute_upload_part(req).await;
                 if payload == b"abc" {
                     let response = result.expect("hoisted SHA256 part must be accepted");
-                    assert_eq!(response.output.checksum_sha256.as_deref(), Some(checksum));
-                    etag = response.output.e_tag.map(|etag| etag.value().to_owned());
+                    assert_eq!(response.checksum_sha256.as_deref(), Some(checksum));
+                    etag = response.e_tag;
                 } else {
-                    assert_eq!(*result.unwrap_err().code(), S3ErrorCode::BadDigest);
+                    let error = result.err().expect("bad checksum must fail");
+                    assert_eq!(*error.code(), S3ErrorCode::BadDigest);
                 }
             }
             store
