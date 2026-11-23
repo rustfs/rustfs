@@ -22,10 +22,10 @@ use crate::app::RequestEnvelope;
 use crate::app::storage_api::s3::dto::{PutObjectInput, ServerSideEncryption, StorageClass, StreamingBlob};
 #[cfg(test)]
 use crate::app::storage_api::s3::stream::ByteStream;
-use crate::app::storage_api::s3::{S3Error, S3ErrorCode, S3Result, StdError, s3_error};
 use futures::FutureExt;
 use rustfs_gateway_stream::Body as NativeBody;
 use rustfs_rio::SharedTrailerSource;
+use rustfs_s3_types::{S3Error, S3ErrorCode, S3Result, StdError};
 
 use crate::auth::{RUSTFS_MAX_CONTENT_LENGTH_QUERY, parse_presigned_put_max_content_length};
 use crate::error::UploadLimitExceeded;
@@ -124,22 +124,22 @@ fn resolve_put_object_authoritative_size(headers: &HeaderMap, content_length: Op
     let decoded_content_length = decoded_content_length_from_headers(headers)?;
     let aws_chunked = request_uses_aws_chunked(headers) || request_body_is_aws_chunked_framed(headers);
     let size = match (aws_chunked, decoded_content_length, content_length) {
-        (true, Some(decoded), _) => decoded,
+        (true, Some(decoded), _) => Some(decoded),
         // Declared aws-chunked without a streaming payload: the body is not framed (the auth
         // layer only de-frames STREAMING-* payloads, which always carry a decoded length), so
         // the wire Content-Length is the real object size.
-        (true, None, Some(raw)) if !request_body_is_aws_chunked_framed(headers) => raw,
-        (true, None, _) => return Err(s3_error!(UnexpectedContent)),
-        (false, _, Some(raw)) => raw,
-        (false, Some(decoded), None) => decoded,
-        (false, None, None) => return Err(s3_error!(UnexpectedContent)),
+        (true, None, raw) if !request_body_is_aws_chunked_framed(headers) => raw,
+        (true, None, _) => None,
+        (false, decoded, raw) => raw.or(decoded),
     };
 
-    if size < 0 {
-        return Err(s3_error!(UnexpectedContent));
-    }
-
-    Ok(size)
+    size.filter(|&size| size >= 0).ok_or_else(|| {
+        let mut error = S3Error::new(S3ErrorCode::UnexpectedContent);
+        if let Some(message) = error.code().default_message() {
+            error.set_message(message);
+        }
+        error
+    })
 }
 
 /// Reject a declared upload length above the single-request ceiling
@@ -148,8 +148,6 @@ fn resolve_put_object_authoritative_size(headers: &HeaderMap, content_length: Op
 /// Applies to `PutObject` and `UploadPart`. A negative or unknown length is
 /// left to the caller's existing validation.
 pub(crate) fn reject_oversize_single_upload(size: i64) -> rustfs_s3_types::S3Result<()> {
-    use rustfs_s3_types::{S3Error, S3ErrorCode};
-
     if u64::try_from(size).is_ok_and(|size| size > rustfs_config::MAX_SINGLE_PUT_OBJECT_SIZE) {
         return Err(S3Error::with_message(
             S3ErrorCode::EntityTooLarge,
@@ -1073,7 +1071,7 @@ impl PutObjectOrigin<'_> {
 
     fn apply_bucket_generation_guard(&self, bucket: &str, opts: &mut ObjectOptions) -> S3Result<()> {
         match self {
-            Self::S3 { req, .. } => apply_bucket_generation_guard(*req, bucket, opts).map_err(Into::into),
+            Self::S3 { req, .. } => apply_bucket_generation_guard(*req, bucket, opts),
             Self::Internal {
                 expected_bucket_incarnation_id,
                 ..
@@ -1293,7 +1291,6 @@ impl DefaultObjectUsecase {
         envelope: RequestEnvelope,
         input: PutObjectWriteInput,
     ) -> rustfs_s3_types::S3Result<PutObjectWriteOutput> {
-        use rustfs_s3_types::{S3Error, S3ErrorCode};
         let start_time = std::time::Instant::now();
         let put_stage_metrics_enabled = rustfs_io_metrics::put_stage_metrics_enabled();
 
@@ -1591,7 +1588,6 @@ impl DefaultObjectUsecase {
         frame_trailers: Option<Arc<super::native_body::FrameTrailers>>,
         start_time: Instant,
     ) -> rustfs_s3_types::S3Result<PutObjectCommitted> {
-        use rustfs_s3_types::{S3Error, S3ErrorCode};
         let put_stage_metrics_enabled = rustfs_io_metrics::put_stage_metrics_enabled();
         let PutObjectWriteRequest {
             bucket,
@@ -2610,6 +2606,7 @@ mod tests {
 
     use super::*;
     use crate::app::storage_api::s3::dto::ObjectLockRetentionMode;
+    use crate::app::storage_api::s3::{S3Error, S3ErrorCode, S3Result};
     use crate::app::test_seams::{
         get_envelope, get_object_gateway, get_object_input, head_envelope, head_object_input, read_get_body,
     };
@@ -3086,7 +3083,7 @@ mod tests {
             duplicate_headers.append(header_name.clone(), HeaderValue::from_static("65536"));
             duplicate_headers.append(header_name.clone(), HeaderValue::from_static("262144"));
             let duplicate_error = extract_ec_block_size_hint(&duplicate_headers, None).expect_err("duplicate header");
-            assert_eq!(duplicate_error.code(), &S3ErrorCode::InvalidArgument);
+            assert_eq!(duplicate_error.code(), &OwnedS3ErrorCode::InvalidArgument);
 
             let duplicate_metadata = HashMap::from([
                 (EC_BLOCK_SIZE_HINT_METADATA_KEY.to_string(), "65536".to_string()),
@@ -3094,12 +3091,12 @@ mod tests {
             ]);
             let metadata_error = extract_ec_block_size_hint(&HeaderMap::new(), Some(&duplicate_metadata))
                 .expect_err("case-variant metadata names");
-            assert_eq!(metadata_error.code(), &S3ErrorCode::InvalidArgument);
+            assert_eq!(metadata_error.code(), &OwnedS3ErrorCode::InvalidArgument);
 
             let mut malformed_headers = HeaderMap::new();
             malformed_headers.insert(header_name, HeaderValue::from_static("65_536"));
             let malformed_error = extract_ec_block_size_hint(&malformed_headers, None).expect_err("malformed value");
-            assert_eq!(malformed_error.code(), &S3ErrorCode::InvalidArgument);
+            assert_eq!(malformed_error.code(), &OwnedS3ErrorCode::InvalidArgument);
         });
 
         temp_env::with_vars(
@@ -4733,12 +4730,12 @@ mod tests {
         let headers = streaming_headers(None);
         let err = resolve_put_object_authoritative_size(&headers, Some(1088))
             .expect_err("framed upload without decoded length must be rejected");
-        assert_eq!(err.code(), &S3ErrorCode::UnexpectedContent);
+        assert_eq!(err.code(), &OwnedS3ErrorCode::UnexpectedContent);
 
         // ... even when the wire Content-Length is also absent.
         let err =
             resolve_put_object_authoritative_size(&headers, None).expect_err("framed upload without any length must be rejected");
-        assert_eq!(err.code(), &S3ErrorCode::UnexpectedContent);
+        assert_eq!(err.code(), &OwnedS3ErrorCode::UnexpectedContent);
     }
 
     #[test]
@@ -4762,7 +4759,7 @@ mod tests {
         let headers = aws_chunked_headers(None);
         let err = resolve_put_object_authoritative_size(&headers, None)
             .expect_err("declared-only aws-chunked with no length at all must be rejected");
-        assert_eq!(err.code(), &S3ErrorCode::UnexpectedContent);
+        assert_eq!(err.code(), &OwnedS3ErrorCode::UnexpectedContent);
     }
 
     #[test]
@@ -4788,7 +4785,9 @@ mod tests {
     fn authoritative_size_rejects_unknown_length() {
         let headers = HeaderMap::new();
         let err = resolve_put_object_authoritative_size(&headers, None).expect_err("no length information must be rejected");
-        assert_eq!(err.code(), &S3ErrorCode::UnexpectedContent);
+        assert_eq!(err.code(), &OwnedS3ErrorCode::UnexpectedContent);
+        assert_eq!(err.message(), Some("This request does not support content."));
+        assert_eq!(err.status_code(), Some(http::StatusCode::BAD_REQUEST));
     }
 
     #[test]
@@ -4797,12 +4796,12 @@ mod tests {
         let headers = aws_chunked_headers(Some("-1"));
         let err =
             resolve_put_object_authoritative_size(&headers, Some(64)).expect_err("negative decoded length must be rejected");
-        assert_eq!(err.code(), &S3ErrorCode::UnexpectedContent);
+        assert_eq!(err.code(), &OwnedS3ErrorCode::UnexpectedContent);
 
         let plain = HeaderMap::new();
         let err =
             resolve_put_object_authoritative_size(&plain, Some(-100)).expect_err("negative Content-Length must be rejected");
-        assert_eq!(err.code(), &S3ErrorCode::UnexpectedContent);
+        assert_eq!(err.code(), &OwnedS3ErrorCode::UnexpectedContent);
     }
 
     #[test]
