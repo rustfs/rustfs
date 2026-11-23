@@ -1583,6 +1583,61 @@ fn remote_scanner_capability_probes_are_grouped_by_peer() {
 }
 
 #[test]
+fn scanner_single_bucket_coverage_survives_publication_epoch_changes() {
+    let bucket = BucketInfo {
+        name: "photos".into(),
+        ..Default::default()
+    };
+    let source = DataUsageCacheSource::new(0, 0);
+    let identity = crate::DataUsageScanIdentity {
+        version: 1,
+        bucket_incarnation: uuid::Uuid::from_u128(1),
+        set_layout: TEST_PLAN_DIGEST,
+        publication_epoch: 1,
+        tier_registry_generation: 2,
+        scan_mode: HealScanMode::Normal,
+    };
+    let digest = |identity| scanner_single_bucket_coverage_digest(&bucket, source, Some(identity), TEST_COVERAGE_DIGEST);
+    let baseline = digest(identity);
+    assert_eq!(
+        baseline,
+        digest(crate::DataUsageScanIdentity {
+            publication_epoch: 99,
+            ..identity
+        })
+    );
+    for changed in [
+        crate::DataUsageScanIdentity { version: 2, ..identity },
+        crate::DataUsageScanIdentity {
+            bucket_incarnation: uuid::Uuid::from_u128(2),
+            ..identity
+        },
+        crate::DataUsageScanIdentity {
+            set_layout: TEST_COVERAGE_DIGEST,
+            ..identity
+        },
+        crate::DataUsageScanIdentity {
+            tier_registry_generation: 3,
+            ..identity
+        },
+        crate::DataUsageScanIdentity {
+            scan_mode: HealScanMode::Deep,
+            ..identity
+        },
+    ] {
+        assert_ne!(baseline, digest(changed), "a changed checkpoint scope must still require new coverage");
+    }
+    assert_ne!(
+        baseline,
+        scanner_single_bucket_coverage_digest(&bucket, DataUsageCacheSource::new(0, 1), Some(identity), TEST_COVERAGE_DIGEST)
+    );
+    assert_ne!(
+        baseline,
+        scanner_single_bucket_coverage_digest(&bucket, source, Some(identity), TEST_PLAN_DIGEST)
+    );
+}
+
+#[test]
 fn scanner_bucket_plan_digest_is_order_independent_and_membership_sensitive() {
     let activity_digest = [4; 32];
     let buckets = vec![

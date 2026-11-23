@@ -1080,23 +1080,31 @@ pub(crate) fn scanner_bucket_plan_digest(buckets: &[BucketInfo], activity_digest
     DataUsageScanPlanDigest(hasher.finalize().into())
 }
 
-fn scanner_single_bucket_coverage_digest(
+pub(crate) fn scanner_single_bucket_coverage_digest(
     bucket: &BucketInfo,
     source: DataUsageCacheSource,
     identity: Option<crate::DataUsageScanIdentity>,
     activity: DataUsageScanPlanDigest,
 ) -> DataUsageScanPlanDigest {
     let mut hasher = Sha256::new();
-    hasher.update(b"scanner-single-bucket-coverage-v2");
+    hasher.update(b"scanner-single-bucket-coverage-v3");
     hasher.update(scanner_bucket_plan_digest(std::slice::from_ref(bucket), activity.0).0);
     hasher.update(u64::try_from(source.pool_index).unwrap_or(u64::MAX).to_be_bytes());
     hasher.update(u64::try_from(source.set_index).unwrap_or(u64::MAX).to_be_bytes());
     if let Some(identity) = identity {
         hasher.update([1]);
+        // Match the stable scope used to admit a durable checkpoint. The
+        // process-local publication epoch still fences cache commits, but
+        // cannot make a safely adopted traversal require another full sweep.
+        hasher.update(identity.version.to_be_bytes());
         hasher.update(identity.bucket_incarnation.as_bytes());
         hasher.update(identity.set_layout.0);
-        hasher.update(identity.publication_epoch.to_be_bytes());
         hasher.update(identity.tier_registry_generation.to_be_bytes());
+        hasher.update([match identity.scan_mode {
+            HealScanMode::Unknown => 0,
+            HealScanMode::Normal => 1,
+            HealScanMode::Deep => 2,
+        }]);
     } else {
         // The legacy scan path still rebuilds when no durable identity exists.
         hasher.update([0]);

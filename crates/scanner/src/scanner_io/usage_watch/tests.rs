@@ -218,6 +218,38 @@ fn watch_structure_and_renewal_survive_a_change_of_local_node() {
     let renewed = accept_watch_observations(&request, &second_routes, responses(&proof), Some(&proof), structure, now, now)
         .expect("new local node renews every original producer token");
     assert_eq!(renewed.start.digest(), proof.digest());
+    let identity = crate::DataUsageScanIdentity {
+        version: 1,
+        bucket_incarnation: proof.bucket_incarnation,
+        set_layout: structure,
+        publication_epoch: 1,
+        tier_registry_generation: 0,
+        scan_mode: HealScanMode::Normal,
+    };
+    let bucket = BucketInfo {
+        name: proof.bucket.clone(),
+        ..Default::default()
+    };
+    let source = DataUsageCacheSource::new(0, 0);
+    let coverage = |identity, proof: &ScannerUsageWatchProof| {
+        scanner_single_bucket_coverage_digest(
+            &bucket,
+            source,
+            Some(identity),
+            scanner_bucket_work_digest(proof.digest(), HealScanMode::Normal, false),
+        )
+    };
+    assert_eq!(
+        coverage(identity, &proof),
+        coverage(
+            crate::DataUsageScanIdentity {
+                publication_epoch: 99,
+                ..identity
+            },
+            &renewed.start
+        ),
+        "changing the local coordinator and its publication epoch must preserve watched bucket coverage"
+    );
 }
 
 #[tokio::test]

@@ -1064,8 +1064,13 @@ pub struct ScannerDataUsagePublicationAdmission {
 impl ScannerDataUsagePublicationAdmission {
     #[cfg(test)]
     pub(crate) fn unfenced() -> Self {
+        Self::unfenced_at_epoch(0)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn unfenced_at_epoch(epoch: u64) -> Self {
         Self {
-            epoch: 0,
+            epoch,
             _read_guard: None,
         }
     }

@@ -455,19 +455,31 @@ async fn display_progress_survives_process_restarts_leader_changes_and_repeated_
             .expect("explicit child round")
             .parse()
             .expect("numeric round");
-        let store = FixtureStore::reopen(root.join("cache"));
+        let store = FixtureStore::reopen_at_epoch(root.join("cache"), round + 1);
         let mut cache = DataUsageCache::default();
         let revisions = cache
             .load_with_revisions(store.clone(), CACHE_NAME)
             .await
             .expect("cold shared checkpoint load");
-        let identity = cache.info.scan_identity.expect("durable bucket identity");
+        let identity = crate::DataUsageScanIdentity {
+            publication_epoch: round + 1,
+            ..cache.info.scan_identity.expect("durable bucket identity")
+        };
+        let coverage = crate::scanner_io::scanner_single_bucket_coverage_digest(
+            &crate::storage_api::scanner_io::BucketInfo {
+                name: "bucket".into(),
+                ..Default::default()
+            },
+            crate::DataUsageCacheSource::new(0, 0),
+            Some(identity),
+            crate::DataUsageScanPlanDigest([31; 32]),
+        );
         let prepared = cache.prepare_bucket_checkpoint(
             "bucket",
             round + 2,
             round + 1,
             crate::DataUsageCacheSource::new(0, 0),
-            crate::DataUsageScanPlanDigest([31; 32]),
+            coverage,
             identity,
         );
         if round > 0 {
@@ -497,7 +509,7 @@ async fn display_progress_survives_process_restarts_leader_changes_and_repeated_
             )
             .await;
         step.outcome
-            .save_with_revisions_for_epoch(store, CACHE_NAME, &revisions, 0)
+            .save_with_revisions_for_epoch(store, CACHE_NAME, &revisions, identity.publication_epoch)
             .await
             .expect("commit checkpoint and display progress");
         let bytes = tokio::fs::read(root.join("cache/progress"))
@@ -676,6 +688,19 @@ async fn cold_linked_prefixes_resume_their_own_replica_coverage() {
     // recover that disk's linked tree as well as its complete child coverage.
     for round in 0..(2 * 40_usize.div_ceil(6) + 1) {
         let (root, peer) = if round < 12 && round % 2 == 0 { (&a, &b) } else { (&b, &a) };
+        let identity = crate::DataUsageScanIdentity {
+            publication_epoch: u64::try_from(round).expect("bounded round") + 10,
+            ..cache.info.scan_identity.expect("retained bucket identity")
+        };
+        cache.prepare_bucket_checkpoint(
+            "bucket",
+            u64::try_from(round).expect("bounded cycle") + 2,
+            u64::try_from(round).expect("bounded epoch") + 1,
+            crate::DataUsageCacheSource::new(0, 0),
+            crate::DataUsageScanPlanDigest([31; 32]),
+            identity,
+        );
+        cache.info.skip_healing = true;
         let previous_source = cache.info.scan_directory_source.clone();
         let before = cache.durable_scan_progress();
         let result = scan_one_replica_round(root, Some(peer), cache, config).await;

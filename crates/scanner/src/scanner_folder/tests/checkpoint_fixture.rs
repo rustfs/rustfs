@@ -51,6 +51,7 @@ pub(super) struct FixtureStore {
     root: std::path::PathBuf,
     _owned_root: Option<tempfile::TempDir>,
     reject_save: AtomicBool,
+    publication_epoch: u64,
 }
 
 impl FixtureStore {
@@ -60,15 +61,21 @@ impl FixtureStore {
             root: root.path().to_path_buf(),
             _owned_root: Some(root),
             reject_save: AtomicBool::new(false),
+            publication_epoch: 0,
         })
     }
 
     pub(super) fn reopen(root: std::path::PathBuf) -> Arc<Self> {
+        Self::reopen_at_epoch(root, 0)
+    }
+
+    pub(super) fn reopen_at_epoch(root: std::path::PathBuf, publication_epoch: u64) -> Arc<Self> {
         assert!(root.is_dir(), "reopen only an existing checkpoint fixture directory");
         Arc::new(Self {
             root,
             _owned_root: None,
             reject_save: AtomicBool::new(false),
+            publication_epoch,
         })
     }
 
@@ -170,7 +177,7 @@ impl crate::ScannerConfigObjectDelete for FixtureStore {
     }
 
     async fn scanner_data_usage_publication_admission(&self) -> Option<crate::ScannerDataUsagePublicationAdmission> {
-        Some(crate::ScannerDataUsagePublicationAdmission::unfenced())
+        Some(crate::ScannerDataUsagePublicationAdmission::unfenced_at_epoch(self.publication_epoch))
     }
 }
 
