@@ -3087,14 +3087,14 @@ mod tests {
                 "{}{corrupt_key}.json",
                 *rustfs_iam::store::object::IAM_CONFIG_POLICY_DB_SERVICE_ACCOUNTS_PREFIX
             );
-            crate::admin::storage_api::save_admin_config(
+            crate::admin::storage_api::config::save_admin_config(
                 object_store.clone(),
                 &corrupt_identity_path,
                 b"{corrupt-service-account".to_vec(),
             )
             .await
             .expect("seed corrupt service account identity");
-            crate::admin::storage_api::save_admin_config(
+            crate::admin::storage_api::config::save_admin_config(
                 object_store.clone(),
                 &corrupt_policy_path,
                 br#"{"version":1,"policy":"readwrite"}"#.to_vec(),
@@ -3144,7 +3144,7 @@ mod tests {
                 "corrupt service account identity must be removed by unrestricted admin delete"
             );
             assert!(
-                crate::admin::storage_api::read_admin_config(object_store, &corrupt_policy_path)
+                crate::admin::storage_api::config::read_admin_config(object_store, &corrupt_policy_path)
                     .await
                     .is_err(),
                 "corrupt service account mapped policy must be removed by unrestricted admin delete"
