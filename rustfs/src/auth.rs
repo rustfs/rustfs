@@ -786,6 +786,11 @@ fn query_may_carry_user_metadata(query: &str) -> bool {
 /// rejected rather than stored: the read path rebuilds them as header fields,
 /// where a control character would fail every `HeadObject` of that object.
 pub fn hoist_signed_query_params(headers: &mut HeaderMap, query: Option<&str>) -> S3Result<()> {
+    // RUSTFS_COMPAT_TODO(backlog-2734): Preserve the public error type until the legacy auth API retires.
+    hoist_signed_query_params_owned(headers, query).map_err(S3Error::from)
+}
+
+pub(crate) fn hoist_signed_query_params_owned(headers: &mut HeaderMap, query: Option<&str>) -> OwnedResult<()> {
     let Some(query) = query else {
         return Ok(());
     };
@@ -839,9 +844,9 @@ pub fn hoist_signed_query_params(headers: &mut HeaderMap, query: Option<&str>) -
         return Ok(());
     }
     if duplicate {
-        return Err(S3Error::with_message(
-            S3ErrorCode::InvalidArgument,
-            "Duplicate x-amz request parameters in the request query string".to_owned(),
+        return Err(owned_error!(
+            InvalidArgument,
+            "Duplicate x-amz request parameters in the request query string"
         ));
     }
 
@@ -849,15 +854,10 @@ pub fn hoist_signed_query_params(headers: &mut HeaderMap, query: Option<&str>) -
         // The read path rebuilds `x-amz-meta-<key>` as a header name and the
         // value as a header value (s3s `add_opt_metadata`); anything that could
         // not have arrived as a header would 500 every Head/Get of the object.
-        let header_name = HeaderName::from_bytes(name.as_bytes()).map_err(|_| {
-            S3Error::with_message(S3ErrorCode::InvalidArgument, "Invalid x-amz request parameter name".to_owned())
-        })?;
-        let header_value = HeaderValue::from_bytes(value.as_bytes()).map_err(|_| {
-            S3Error::with_message(
-                S3ErrorCode::InvalidArgument,
-                "x-amz request parameter values must be valid HTTP header values".to_owned(),
-            )
-        })?;
+        let header_name = HeaderName::from_bytes(name.as_bytes())
+            .map_err(|_| owned_error!(InvalidArgument, "Invalid x-amz request parameter name"))?;
+        let header_value = HeaderValue::from_bytes(value.as_bytes())
+            .map_err(|_| owned_error!(InvalidArgument, "x-amz request parameter values must be valid HTTP header values"))?;
         if headers.contains_key(&header_name) {
             continue;
         }
@@ -1374,6 +1374,44 @@ mod tests {
     use std::collections::HashMap;
     use std::sync::Arc;
     use time::OffsetDateTime;
+
+    #[test]
+    fn signed_metadata_hoist_preserves_errors_and_headers() {
+        for (query, message, applied) in [
+            (
+                "x-amz-meta-a=1&X-Amz-Meta-A=2",
+                "Duplicate x-amz request parameters in the request query string",
+                false,
+            ),
+            ("x-amz-meta-a=1&x-amz-meta-b%20c=2", "Invalid x-amz request parameter name", true),
+            (
+                "x-amz-meta-a=1&x-amz-meta-b=%0A",
+                "x-amz request parameter values must be valid HTTP header values",
+                true,
+            ),
+        ] {
+            let mut headers = HeaderMap::new();
+            headers.insert(http::header::AUTHORIZATION, HeaderValue::from_static(SIGN_V4_ALGORITHM));
+            let mut expected = headers.clone();
+            if applied {
+                expected.insert("x-amz-meta-a", HeaderValue::from_static("1"));
+            }
+            let mut public_headers = headers.clone();
+            let public_error = hoist_signed_query_params(&mut public_headers, Some(query)).unwrap_err();
+            assert_eq!(public_headers, expected);
+            assert_eq!(public_error.code(), &S3ErrorCode::InvalidArgument);
+            assert_eq!(public_error.status_code(), Some(http::StatusCode::BAD_REQUEST));
+            assert_eq!(public_error.message(), Some(message));
+            assert!(public_error.source().is_none());
+
+            let error = hoist_signed_query_params_owned(&mut headers, Some(query)).unwrap_err();
+            assert_eq!(headers, expected);
+            assert_eq!(error.code(), &rustfs_s3_types::S3ErrorCode::InvalidArgument);
+            assert_eq!(error.status_code(), Some(http::StatusCode::BAD_REQUEST));
+            assert_eq!(error.message(), Some(message));
+            assert!(error.source().is_none());
+        }
+    }
 
     struct ContextIam {
         handle: Arc<IamSys<ObjectStore>>,

@@ -232,7 +232,7 @@ pub(crate) async fn authorize_request<R: AuthorizationRequest + ?Sized>(req: &mu
     // the handler read request properties, so every operation sees one request
     // shape (rustfs/rustfs#9142).
     let query = req.uri().query().map(str::to_owned);
-    crate::auth::hoist_signed_query_params(req.headers_mut(), query.as_deref())?;
+    crate::auth::hoist_signed_query_params_owned(req.headers_mut(), query.as_deref())?;
     let internal_object_authorization = req.internal_object_authorization();
     authorize_request_core(req, action, None, internal_object_authorization).await
 }
