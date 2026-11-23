@@ -168,6 +168,12 @@ pub(crate) mod protocols {
 }
 
 pub(crate) mod server {
+    #[cfg(test)]
+    pub(crate) mod gateway_stack {
+        pub(crate) use crate::storage::storage_api::contract::multipart::PartInfo;
+        pub(crate) use crate::storage::storage_api::ecstore_bucket::metadata_sys::get_object_lock_config;
+    }
+
     pub(crate) mod event {
         pub(crate) mod contract {
             #[cfg(test)]

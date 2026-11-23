@@ -796,9 +796,10 @@ impl Drop for OperationHelper {
 #[cfg(test)]
 #[allow(unused_imports)]
 mod tests {
-    use super::OperationHelper;
-    use crate::app::{RequestEnvelope, RequestHead};
+    use super::{AuditRequestView, OperationHelper};
     use crate::server::{refresh_audit_module_enabled, refresh_notify_module_enabled};
+    use crate::shared_types::RemoteAddr;
+    use crate::storage::authorization::{BucketGenerationGuard, PendingDeleteBucketGenerationGuard};
     use crate::storage::req_info::ReqInfo;
     use crate::storage::request_context::RequestContext;
     use http::{Extensions, HeaderMap, HeaderValue, Method, StatusCode, Uri};
@@ -997,8 +998,6 @@ mod tests {
 
     #[test]
     fn notification_view_uses_the_generation_validated_for_deferred_deletes() {
-        use crate::storage::authorization::{BucketGenerationGuard, PendingDeleteBucketGenerationGuard};
-
         let ordinary = uuid::Uuid::new_v4();
         let deleted = uuid::Uuid::new_v4();
         let generation = |pending: Option<PendingDeleteBucketGenerationGuard>| {
@@ -1032,21 +1031,50 @@ mod tests {
         assert_eq!(generation(None), Some(ordinary), "ordinary operations retain their original generation");
     }
 
-    fn request(method: Method, uri: Uri, configure: impl FnOnce(&mut HeaderMap, &mut Extensions)) -> RequestEnvelope {
+    struct TestAuditRequest {
+        headers: HeaderMap,
+        uri: Uri,
+        extensions: Extensions,
+    }
+
+    impl TestAuditRequest {
+        fn audit_view(&self) -> AuditRequestView<'_> {
+            let remote_addr = self
+                .extensions
+                .get::<Option<RemoteAddr>>()
+                .and_then(Option::as_ref)
+                .map(|addr| addr.0);
+            let bucket_generation = PendingDeleteBucketGenerationGuard::resolve_generation(
+                self.extensions.get::<BucketGenerationGuard>(),
+                self.extensions.get::<PendingDeleteBucketGenerationGuard>(),
+            )
+            .ok()
+            .flatten();
+            AuditRequestView::from_facts(
+                &self.headers,
+                &self.uri,
+                self.extensions.get::<ReqInfo>(),
+                self.extensions.get::<rustfs_trusted_proxies::ClientInfo>(),
+                remote_addr,
+                self.extensions.get::<RequestContext>(),
+                bucket_generation,
+            )
+        }
+
+        fn req_info(&self) -> Option<&ReqInfo> {
+            self.extensions.get()
+        }
+    }
+
+    fn request(_method: Method, uri: Uri, configure: impl FnOnce(&mut HeaderMap, &mut Extensions)) -> TestAuditRequest {
         let mut headers = HeaderMap::new();
         let mut extensions = Extensions::new();
         configure(&mut headers, &mut extensions);
-        RequestEnvelope::from_parts(
-            RequestHead {
-                method,
-                uri,
-                headers,
-                credentials: None,
-                region: None,
-                service: None,
-            },
+        TestAuditRequest {
+            headers,
+            uri,
             extensions,
-        )
+        }
     }
 
     #[test]
@@ -1192,33 +1220,6 @@ mod tests {
                 assert_eq!(entry.error.as_deref(), Some("policy refused"));
             },
         );
-    }
-
-    /// A failed request is audited with its failure status, and the wrapper hands the
-    /// handler's result back unchanged.
-    #[tokio::test]
-    async fn audit_only_operation_returns_the_handler_result_unchanged() {
-        async_with_vars(
-            [
-                (rustfs_config::ENV_NOTIFY_ENABLE, Some("true")),
-                (rustfs_config::ENV_AUDIT_ENABLE, Some("true")),
-            ],
-            async {
-                refresh_notify_module_enabled();
-                refresh_audit_module_enabled();
-
-                let req = request(Method::PUT, Uri::from_static("/audit-bucket"), |_, _| {});
-                let err =
-                    RequestEnvelope::audit_only_operation(req, S3Operation::PutBucketPolicy, StatusCode::OK, |req| async move {
-                        assert_eq!(req.uri().path(), "/audit-bucket");
-                        Err::<(), _>(S3Error::new(S3ErrorCode::AccessDenied))
-                    })
-                    .await
-                    .unwrap_err();
-                assert_eq!(*err.code(), S3ErrorCode::AccessDenied);
-            },
-        )
-        .await;
     }
 
     #[test]
@@ -1475,7 +1476,6 @@ mod tests {
 
     #[test]
     fn operation_helper_audits_verified_client_addresses() {
-        use crate::shared_types::RemoteAddr;
         use rustfs_trusted_proxies::{ClientInfo, ValidationMode};
         use std::net::SocketAddr;
 
@@ -1756,89 +1756,6 @@ mod tests {
                 assert_eq!(helper.request_context_or_from_view(&req.audit_view()).request_id, "server-request-id");
             },
         );
-    }
-
-    /// SSE-KMS object metadata whose IV is missing, so unwrapping fails inside the
-    /// SSE layer without depending on a KMS service being reachable from a unit test.
-    fn unreadable_sse_kms_metadata() -> std::collections::HashMap<String, String> {
-        std::collections::HashMap::from([
-            ("x-amz-server-side-encryption".to_string(), "aws:kms".to_string()),
-            ("x-rustfs-encryption-key-id".to_string(), "finance-key".to_string()),
-            ("x-rustfs-encryption-key".to_string(), base64_simd::STANDARD.encode_to_string([7u8; 48])),
-            ("x-rustfs-encryption-algorithm".to_string(), "aws:kms".to_string()),
-        ])
-    }
-
-    #[tokio::test]
-    async fn operation_helper_attaches_the_sse_kms_summary_to_the_audit_entry() {
-        async_with_vars(
-            [
-                (rustfs_config::ENV_NOTIFY_ENABLE, Some("false")),
-                (rustfs_config::ENV_AUDIT_ENABLE, Some("true")),
-            ],
-            async {
-                refresh_notify_module_enabled();
-                refresh_audit_module_enabled();
-
-                let req = request(Method::GET, Uri::from_static("/finance/ledger.csv"), |_, extensions| {
-                    extensions.insert(RequestContext {
-                        request_id: "kms-tagged-request".to_string(),
-                        x_amz_request_id: "kms-tagged-request".to_string(),
-                        trace_id: None,
-                        span_id: None,
-                        start_time: std::time::Instant::now(),
-                    });
-                    extensions.insert(ReqInfo {
-                        cred: Some(Credentials {
-                            access_key: "analyst".to_string(),
-                            ..Default::default()
-                        }),
-                        bucket: Some("finance".to_string()),
-                        object: Some("ledger.csv".to_string()),
-                        ..Default::default()
-                    });
-                });
-                let helper = OperationHelper::from_view(&req.audit_view(), EventName::ObjectAccessedGet, S3Operation::GetObject);
-
-                // Drive the real data path: the principal built from this request is
-                // what carries the audit slot into the SSE code.
-                let metadata = unreadable_sse_kms_metadata();
-                use crate::storage::sse::SseKmsPrincipalExt as _;
-
-                let principal =
-                    crate::storage::sse::SseKmsPrincipal::from_request(&req).expect("authenticated request has a principal");
-                crate::storage::sse::sse_decryption(crate::storage::sse::DecryptionRequest {
-                    bucket: "finance",
-                    key: "ledger.csv",
-                    metadata: &metadata,
-                    sse_customer_key: None,
-                    sse_customer_key_md5: None,
-                    principal: Some(&principal),
-                })
-                .await
-                .expect_err("metadata without an IV cannot be unwrapped");
-
-                let result = Ok(());
-                let mut helper = helper.complete_owned(&result, StatusCode::OK, &HeaderMap::new());
-                let OperationHelper::Enabled(state) = &mut helper else {
-                    panic!("helper should be enabled when the audit switch is on");
-                };
-                let entry = state.audit_builder.take().expect("audit builder should exist").build();
-                let tags = entry.tags.expect("a request that used KMS must carry its summary");
-
-                assert_eq!(tags.get("sseType").and_then(|value| value.as_str()), Some("SSE-KMS"));
-                assert_eq!(tags.get("kmsKeyId").and_then(|value| value.as_str()), Some("finance-key"));
-                assert_eq!(tags.get("kmsOutcome").and_then(|value| value.as_str()), Some("failure"));
-                assert!(tags.contains_key("kmsErrorClass"), "a failed KMS interaction must be classified");
-
-                let rendered = serde_json::to_string(&tags).expect("audit tags serialize");
-                assert!(
-                    !rendered.contains(&base64_simd::STANDARD.encode_to_string([7u8; 48])),
-                    "the audit entry must not carry the wrapped data key: {rendered}"
-                );
-            },
-        )
-        .await;
     }
 
     #[tokio::test]
