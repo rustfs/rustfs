@@ -4471,7 +4471,18 @@ mod tests {
             let mut request = build_request(input, Method::POST);
             request.extensions.insert(PostObjectRequestMarker);
             request.headers.insert(AMZ_SNOWBALL_EXTRACT, HeaderValue::from_static("true"));
-            let mut envelope = RequestEnvelope::from_s3s(&request);
+            // Same facts `RequestEnvelope::from_s3s` copies. Credentials, region, and service stay absent.
+            let mut envelope = RequestEnvelope::from_parts(
+                crate::app::RequestHead {
+                    method: request.method.clone(),
+                    uri: request.uri.clone(),
+                    headers: request.headers.clone(),
+                    credentials: None,
+                    region: None,
+                    service: None,
+                },
+                request.extensions.clone(),
+            );
             assert!(!envelope.is_gateway_post(), "legacy provenance must remain distinct");
             envelope.mark_gateway_post();
             assert!(envelope.fork_for_authorization().is_gateway_post());
