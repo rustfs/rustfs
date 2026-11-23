@@ -924,7 +924,9 @@ mod tests {
             .body(bytes::Bytes::new())
             .expect("wire request");
         let wire = WireRequest::accept(request, &Limits::default()).expect("accepted wire request");
-        let view = MetaView::of(&wire, TargetKind::Object).expect("object view");
+        let view = MetaView::of(&wire, TargetKind::Object)
+            .expect("object view")
+            .with_rustfs_response_layout();
         let encoded = rustfs_gateway::dto::CompleteMultipartUpload::encode(complete.clone(), &view, 200)
             .expect("completion response encodes");
         let mut completion_sse_headers: Vec<String> = encoded

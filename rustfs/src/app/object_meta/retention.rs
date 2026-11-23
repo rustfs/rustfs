@@ -271,7 +271,9 @@ mod tests {
             .body(())
             .unwrap();
         let wire = WireRequest::accept(request, &Limits::default()).expect("retention request");
-        let view = MetaView::of(&wire, TargetKind::Object).expect("object view");
+        let view = MetaView::of(&wire, TargetKind::Object)
+            .expect("object view")
+            .with_rustfs_response_layout();
         for value in [
             "2035-01-02T00:00:00+23:59",
             "2035-01-02T00:00:00-23:59",
