@@ -968,7 +968,7 @@ mod tests {
         usecase
             .execute_copy_object_owned(copy_envelope(HeaderMap::new()), input)
             .await
-            .map_err(Into::into)
+            .map_err(crate::error::legacy_error_for_test)
     }
     use crate::app::storage_api::s3::S3ErrorCode;
     use crate::app::storage_api::s3::dto::ServerSideEncryption;

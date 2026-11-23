@@ -23,8 +23,6 @@
 
 use super::storage_api::bucket_usecase::bucket::utils::{BucketConfigXml, serialize};
 use super::storage_api::bucket_usecase::s3_api::bucket::{RUSTFS_OWNER_DISPLAY_NAME, RUSTFS_OWNER_ID};
-#[cfg(test)]
-use rustfs_gateway_types::compat::{ConversionError, NameRefusal};
 use rustfs_gateway_types::dto::Owner;
 use rustfs_gateway_types::{BucketName, ETag, NamePolicy, NameValidator, ObjectKey, Stricter, Timestamp};
 use rustfs_s3_types::{S3Error, S3ErrorCode, S3Result};
@@ -61,25 +59,6 @@ pub(crate) fn stored_bucket_name(name: &str) -> S3Result<BucketName> {
             format!("a stored bucket name the gateway cannot represent: {rejection}"),
         )
     })
-}
-
-/// The legacy error expected by compatibility tests when the s3s seam refuses an admitted value.
-///
-/// - An object key below the gateway's key floor (empty, over 1024 bytes, a NUL) is refused as
-///   `validate_object_key` refuses one: `400 InvalidArgument`, with a fixed message. An edge whose
-///   legacy answer names the key runs `validate_object_key` before the seam.
-/// - A bucket name below the bucket floor is a server fault: s3s admits only `[a-z0-9.-]{3,63}`,
-///   which the floor always accepts, so no bucket a request names reaches it.
-/// - Any other refusal is a value the gateway shape cannot hold: a server fault.
-#[cfg(test)]
-pub(crate) fn seam_error(error: ConversionError) -> S3Error {
-    match error.name_kind() {
-        Some(NameRefusal::ObjectKey) => S3Error::with_message(S3ErrorCode::InvalidArgument, "Invalid object key"),
-        Some(NameRefusal::BucketName) | None => S3Error::with_message(
-            S3ErrorCode::InternalError,
-            format!("failed to convert through the gateway compatibility seam: {error}"),
-        ),
-    }
 }
 
 /// The object key the store returned, as an answer carries it.
@@ -248,24 +227,13 @@ mod tests {
     }
 
     #[test]
-    fn a_seam_refusal_is_answered_as_the_legacy_edge_answers_it() {
-        use crate::app::storage_api::s3::dto::{HeadBucketInput, HeadObjectInput};
-        use rustfs_gateway_types::compat::s3s_5761ddfe::generated::ops::{head_bucket, head_object};
-
-        let input = HeadObjectInput::builder()
-            .bucket("bucket".into())
-            .key("a\u{0}b".into())
-            .build()
-            .unwrap();
-        let key = head_object::input_from_s3s(input).expect_err("a NUL is below the key floor");
-        assert_eq!(seam_error(key).code(), &S3ErrorCode::InvalidArgument);
-
-        let input = HeadBucketInput::builder().bucket("a/b".into()).build().unwrap();
-        let bucket = head_bucket::input_from_s3s(input).expect_err("a separator is below the bucket floor");
-        assert_eq!(seam_error(bucket).code(), &S3ErrorCode::InternalError);
-
-        let input = HeadBucketInput::builder().bucket("sthree-x".into()).build().unwrap();
-        assert!(head_bucket::input_from_s3s(input).is_ok(), "a name the floor admits crosses the seam");
+    fn object_requests_reject_nul_and_stored_bucket_names_follow_the_gateway_floor() {
+        let key = crate::app::storage_api::object_usecase::validate_object_key("a\0b", "HeadObject")
+            .expect_err("a NUL is not a valid object key");
+        assert_eq!(key.code(), &S3ErrorCode::InvalidArgument);
+        let bucket = stored_bucket_name("a/b").expect_err("a separator is below the bucket floor");
+        assert_eq!(bucket.code(), &S3ErrorCode::InternalError);
+        assert_eq!(stored_bucket_name("sthree-x").expect("admitted name").as_str(), "sthree-x");
     }
 
     /// Keys at both length bounds, with every character up to U+02FF in one position, a leading or
@@ -325,7 +293,6 @@ mod tests {
     #[test]
     fn a_stored_tag_is_answered_as_main_answers_it_on_both_edges() {
         use rustfs_gateway_types::EtagRender;
-        use rustfs_gateway_types::compat::s3s_5761ddfe::leaf::etag_to_s3s;
 
         // Stored spelling, opaque value, weakness, legacy header, gateway header, and XML text.
         let rows = [
@@ -345,10 +312,13 @@ mod tests {
         let mut differing = Vec::new();
         for (stored, opaque, weak, main_header, gateway_header, xml) in rows {
             let etag = stored_etag(stored);
-            let legacy = etag_to_s3s(&etag);
+            let header_fact = crate::app::object::ResponseEtag {
+                opaque: etag.opaque_tag().to_owned(),
+                weak: etag.is_weak(),
+            };
             let answered = (
-                legacy.value() == opaque && legacy.as_weak().is_some() == weak,
-                legacy.to_http_header().is_ok_and(|header| header == main_header),
+                etag.opaque_tag() == opaque && etag.is_weak() == weak,
+                header_fact.to_http_header().is_ok_and(|header| header == main_header),
                 etag.render(EtagRender::HeaderQuoted) == gateway_header,
                 etag.render(EtagRender::XmlQuoted) == xml,
             );
@@ -356,7 +326,7 @@ mod tests {
                 differing.push((stored, answered));
             }
         }
-        assert!(differing.is_empty(), "(legacy edge, main header, gateway header, XML): {differing:?}");
+        assert!(differing.is_empty(), "(stored tag, object header, gateway header, XML): {differing:?}");
     }
 
     #[test]

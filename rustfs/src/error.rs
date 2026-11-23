@@ -716,11 +716,91 @@ impl From<ApiError> for rustfs_s3_types::S3Error {
     }
 }
 
+/// Carry an owned refusal into a fixture that invokes the pinned transport.
+#[cfg(test)]
+pub(crate) fn legacy_error_for_test(error: rustfs_s3_types::S3Error) -> s3s::S3Error {
+    let parts = error.into_parts();
+    let code = match parts.code {
+        S3ErrorCode::Custom(name) => s3s::S3ErrorCode::Custom(name.into_owned().into()),
+        named => {
+            let Ok(code) = named.as_str().parse();
+            code
+        }
+    };
+    let mut legacy = s3s::S3Error::new(code);
+    if let Some(message) = parts.message {
+        legacy.set_message(message);
+    }
+    if let Some(id) = parts.request_id {
+        legacy.set_request_id(id);
+    }
+    if let Some(status) = parts.status {
+        legacy.set_status_code(status);
+    }
+    if let Some(headers) = parts.headers {
+        legacy.set_headers(headers);
+    }
+    if let Some(source) = parts.source {
+        legacy.set_source(source);
+    }
+    legacy
+}
+
+/// Preserve fields and the borrowed cause chain when a historical fixture yields a refusal.
+#[cfg(test)]
+pub(crate) fn owned_error_for_test(error: s3s::S3Error) -> rustfs_s3_types::S3Error {
+    // The pinned error lends its cause through an inherent method only.
+    #[derive(Debug)]
+    struct LegacyCause(s3s::S3Error);
+
+    impl std::fmt::Display for LegacyCause {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            match self.0.source() {
+                Some(cause) => std::fmt::Display::fmt(cause, f),
+                None => std::fmt::Display::fmt(&self.0, f),
+            }
+        }
+    }
+
+    impl std::error::Error for LegacyCause {
+        fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+            self.0.source().map(|source| source as &dyn std::error::Error)
+        }
+    }
+
+    let code = match error.code() {
+        s3s::S3ErrorCode::Custom(name) => S3ErrorCode::Custom(name.to_string().into()),
+        named => {
+            let Ok(code) = named.as_str().parse();
+            code
+        }
+    };
+    let mut owned = rustfs_s3_types::S3Error::new(code);
+    if let Some(message) = error.message() {
+        owned.set_message(message.to_owned());
+    }
+    if let Some(id) = error.request_id() {
+        owned.set_request_id(id);
+    }
+    if let Some(status) = error.status_code()
+        && Some(status) != owned.status_code()
+    {
+        owned.set_status_code(status);
+    }
+    if let Some(headers) = error.headers() {
+        owned.set_headers(headers.clone());
+    }
+    if error.source().is_some() {
+        owned.set_source(Box::new(LegacyCause(error)));
+    }
+    owned
+}
+
 /// Project the native error into the pinned wire oracle.
 #[cfg(test)]
 impl From<ApiError> for s3s::S3Error {
     fn from(err: ApiError) -> Self {
-        rustfs_s3_types::S3Error::from(err).into()
+        legacy_error_for_test(rustfs_s3_types::S3Error::from(err))
     }
 }
 
@@ -1064,7 +1144,7 @@ mod tests {
                     code: code.clone(),
                     source: Some(Box::new(source)),
                 });
-                assert_eq!(error.code(), &code.clone().into());
+                assert_eq!(error.code().as_str(), code.as_str());
                 let source = error.source().expect("preserve wrapped lock timeout");
                 assert!(error_chain_has_type::<LockError>(source));
                 let response = error.to_http_response().expect("serialize wrapped timeout");
@@ -1383,10 +1463,10 @@ mod tests {
         assert_eq!(error.request_id(), Some("server-owned-request"));
         assert!(std::error::Error::source(&error).unwrap().is::<StorageError>());
 
-        let legacy = S3Error::from(error);
+        let legacy = super::legacy_error_for_test(error);
         assert!(legacy.source().unwrap().is::<StorageError>());
         assert!(std::error::Error::source(&legacy).is_none());
-        assert_eq!(super::ApiErrorDiagnostic::from_error(&OwnedS3Error::from(legacy)), before);
+        assert_eq!(super::ApiErrorDiagnostic::from_error(&super::owned_error_for_test(legacy)), before);
 
         let error: OwnedS3Error = ApiError::from(StorageError::Io(IoError::other(StorageError::ErasureReadQuorum))).into();
         assert_eq!(
@@ -2296,7 +2376,7 @@ mod tests {
         assert!(owned.headers().is_none());
         assert!(owned.source().is_some_and(|source| source.is::<IoError>()));
 
-        let legacy = S3Error::from(owned);
+        let legacy = super::legacy_error_for_test(owned);
         assert!(matches!(legacy.code(), LegacyS3ErrorCode::Custom(name) if name == "InvalidRequest"));
         assert_eq!(legacy.status_code(), None);
         assert_eq!(legacy.message(), Some("custom refusal"));

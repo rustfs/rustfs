@@ -10546,7 +10546,6 @@ dependencies = [
  "percent-encoding",
  "rustfs-gateway-stream",
  "rustfs-gateway-xml",
- "s3s",
  "sha1 0.11.0",
  "sha2 0.11.1",
  "time",

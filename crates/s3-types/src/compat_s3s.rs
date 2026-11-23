@@ -12,34 +12,16 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! The legacy edge between RustFS's S3 error and body types and the s3s ones.
-//!
-//! Responsible for: the `From` conversions in both directions (errors field by
-//! field; bodies frame by frame, keeping errors and the size hint), and the
-//! parity tests that pin this crate's statuses, parsing and body length
-//! reporting to the pinned s3s revision, which the tests use as an oracle.
-//! Not responsible for: anything the s3s-facing `impl S3` does with the result,
-//! the default messages s3s attaches to a bare code (restored by s3s's own
-//! constructor on the way out, never stored here), or read limits: a limit
-//! armed on an s3s body (`set_limit`) keeps applying inside the wrapped body,
-//! and our `Body` carries none, so none is armed on the way back.
-//! Upstream: `legacy_s3s`, the s3s package under the name the edge knows it
-//! by. Downstream: `rustfs` with the `compat-s3s` feature.
-//! DELETE BY T4.2 (rustfs/backlog#2784).
-//!
-//! Footprint note: `scripts/check_s3s_footprint.sh` counts files whose Rust
-//! paths name the s3s crate directly. This file reaches s3s through the
-//! renamed dependency, so that counter does not see it. The rename is stated here and
-//! in the PR rather than hidden; the edge whitelist of T0.6
-//! (rustfs/backlog#2741) is expected to list this file explicitly.
+#![cfg(test)]
+
+//! Test-only conversions for differential checks against the pinned S3 stack.
 
 use crate::{Body, Region, S3Error, S3ErrorCode};
 use std::borrow::Cow;
 use std::fmt;
 
 // Bodies cross the legacy edge as opaque frame streams: nothing is buffered,
-// and errors and the size hint pass through untouched. DELETE BY T4.2
-// (rustfs/backlog#2784) with the rest of this file.
+// and errors and the size hint pass through untouched.
 impl From<legacy_s3s::Body> for Body {
     fn from(body: legacy_s3s::Body) -> Self {
         Self::from_http_body(body)
@@ -133,28 +115,25 @@ impl From<S3Error> for legacy_s3s::S3Error {
     }
 }
 
-impl S3Error {
-    /// An error wrapped with its original cause can retain response fields the caller did not override.
-    pub(super) fn into_http_response_parts(self) -> crate::S3ErrorParts {
-        let mut parts = self.into_parts();
-        let original = parts
-            .source
-            .as_deref()
-            .and_then(|source| source.downcast_ref::<LegacyCause>())
-            .map(|cause| &cause.0)
-            .filter(|error| error.code() == &parts.code.clone().into());
-        if let Some(original) = original {
-            parts.message = parts
-                .message
-                .or_else(|| original.message().map(|text| Cow::Owned(text.to_owned())));
-            parts.request_id = parts.request_id.or_else(|| original.request_id().map(str::to_owned));
-            parts.status = parts.status.or_else(|| original.status_code());
-            parts.headers = parts.headers.or_else(|| original.headers().cloned());
-        } else if parts.message.is_none() {
-            parts.message = parts.code.default_message().map(Cow::Borrowed);
-        }
-        parts
-    }
+/// A converted error's original fields survive when its code did not change.
+pub(super) fn restore_http_response_parts(parts: &mut crate::S3ErrorParts) -> bool {
+    let Some(original) = parts
+        .source
+        .as_deref()
+        .and_then(|source| source.downcast_ref::<LegacyCause>())
+        .map(|cause| &cause.0)
+        .filter(|error| error.code() == &parts.code.clone().into())
+    else {
+        return false;
+    };
+    parts.message = parts
+        .message
+        .take()
+        .or_else(|| original.message().map(|text| Cow::Owned(text.to_owned())));
+    parts.request_id = parts.request_id.take().or_else(|| original.request_id().map(str::to_owned));
+    parts.status = parts.status.or_else(|| original.status_code());
+    parts.headers = parts.headers.take().or_else(|| original.headers().cloned());
+    true
 }
 
 impl From<legacy_s3s::S3Error> for S3Error {
@@ -858,5 +837,4 @@ mod tests {
     }
 }
 
-#[cfg(test)]
 mod call_site_codes;

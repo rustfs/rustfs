@@ -549,7 +549,9 @@ impl DefaultMultipartUsecase {
     ) -> crate::app::storage_api::s3::S3Result<UploadPartWriteOutput> {
         let envelope = RequestEnvelope::from_s3s(&req);
         let input = UploadPartWriteInput::from_legacy(req.input, req.trailing_headers);
-        self.execute_upload_part_with_audit(envelope, input).await.map_err(Into::into)
+        self.execute_upload_part_with_audit(envelope, input)
+            .await
+            .map_err(crate::error::legacy_error_for_test)
     }
 }
 
@@ -734,10 +736,10 @@ mod tests {
             .execute_upload_part_with_audit(owned_envelope(Method::PUT), UploadPartWriteInput::from_legacy(input, None))
             .await
         {
-            Err(error) => crate::app::storage_api::s3::S3Error::from(error),
+            Err(error) => error,
             Ok(_) => panic!("missing body must be rejected"),
         };
-        assert_eq!(err.code(), &LegacyErrorCode::IncompleteBody);
+        assert_eq!(err.code(), &rustfs_s3_types::S3ErrorCode::IncompleteBody);
     }
 
     /// issue #7596: a part whose declared length exceeds the 5 GiB
@@ -762,14 +764,18 @@ mod tests {
                 .execute_upload_part_with_audit(owned_envelope(Method::PUT), UploadPartWriteInput::from_legacy(input, None))
                 .await
             {
-                Err(error) => crate::app::storage_api::s3::S3Error::from(error),
+                Err(error) => error,
                 Ok(_) => panic!("declared part must be rejected"),
             };
             if expect_too_large {
-                assert_eq!(err.code(), &LegacyErrorCode::EntityTooLarge, "declared {declared}");
+                assert_eq!(err.code(), &rustfs_s3_types::S3ErrorCode::EntityTooLarge, "declared {declared}");
                 assert_eq!(polls.load(std::sync::atomic::Ordering::SeqCst), 0, "body must not be polled");
             } else {
-                assert_ne!(err.code(), &LegacyErrorCode::EntityTooLarge, "declared {declared} must pass admission");
+                assert_ne!(
+                    err.code(),
+                    &rustfs_s3_types::S3ErrorCode::EntityTooLarge,
+                    "declared {declared} must pass admission"
+                );
             }
         }
     }
@@ -788,10 +794,10 @@ mod tests {
                 .execute_upload_part_with_audit(owned_envelope(Method::PUT), UploadPartWriteInput::from_legacy(input, None))
                 .await
             {
-                Err(error) => crate::app::storage_api::s3::S3Error::from(error),
+                Err(error) => error,
                 Ok(_) => panic!("invalid part number must be rejected"),
             };
-            assert_eq!(err.code(), &LegacyErrorCode::InvalidArgument);
+            assert_eq!(err.code(), &rustfs_s3_types::S3ErrorCode::InvalidArgument);
             assert_eq!(err.message(), Some("partNumber must be between 1 and 10000"));
         }
     }
@@ -978,10 +984,10 @@ mod tests {
             .execute_upload_part_with_audit(owned_envelope(Method::PUT), UploadPartWriteInput::from_legacy(input, None))
             .await
         {
-            Err(error) => crate::app::storage_api::s3::S3Error::from(error),
+            Err(error) => error,
             Ok(_) => panic!("full foreground write admission should reject before body ingest"),
         };
-        assert_eq!(err.code(), &LegacyErrorCode::SlowDown);
+        assert_eq!(err.code(), &rustfs_s3_types::S3ErrorCode::SlowDown);
         drop(held);
     }
 

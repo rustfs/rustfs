@@ -142,8 +142,8 @@ rustfs-gateway.workspace = true
 rustfs-gateway-types.workspace = true
 rustfs-gateway-stream.workspace = true
 serde-value.workspace = true
-s3s = { workspace = true, features = ["minio"] }
-s3s-sigv4.workspace = true
+s3s = { git = "https://github.com/s3s-project/s3s", rev = "5761ddfe4c509fcac87e3b99fd5bd9e176b442c0", features = ["minio"] }
+s3s-sigv4 = { git = "https://github.com/s3s-project/s3s", rev = "5761ddfe4c509fcac87e3b99fd5bd9e176b442c0" }
 url.workspace = true
 async-compression = { workspace = true, features = ["tokio", "bzip2", "lz4", "xz"] }
 aws-config = { workspace = true }

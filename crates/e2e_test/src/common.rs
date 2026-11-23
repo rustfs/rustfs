@@ -1035,8 +1035,7 @@ pub async fn execute_awscurl(
 
 /// `POST` with SigV4 `--service sts` and explicit `Content-Type: application/x-www-form-urlencoded`.
 ///
-/// RustFS `AssumeRole` is handled on `POST /` by the admin router; `is_match` requires this
-/// content type so s3s routes to the custom handler instead of `Unknown operation`.
+/// RustFS uses this content type to recognize an STS query on `POST /`.
 pub async fn awscurl_post_sts_form_urlencoded(
     url: &str,
     body: &str,

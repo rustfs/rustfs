@@ -418,14 +418,13 @@ object = { workspace = true, optional = true, features = ["read", "std", "elf"] 
 symbolic-demangle = { version = "=13.9.0", default-features = false, features = ["rust"], optional = true }
 
 [dev-dependencies]
-rustfs-gateway-types = { workspace = true, features = ["compat-s3s-rustfs"] }
 h2.workspace = true
 rustfs-targets = { workspace = true, features = ["test-support"] }
 uuid = { workspace = true, features = ["v4", "v5", "fast-rng", "macro-diagnostics"] }
 rustfs-iam = { workspace = true, features = ["test-util"] }
-rustfs-s3-types = { workspace = true, features = ["compat-s3s"] }
-s3s = { workspace = true, features = ["minio"] }
-s3s-sigv4 = { workspace = true }
+rustfs-s3-types = { workspace = true, features = ["http-response"] }
+s3s = { git = "https://github.com/s3s-project/s3s", rev = "5761ddfe4c509fcac87e3b99fd5bd9e176b442c0", features = ["minio"] }
+s3s-sigv4 = { git = "https://github.com/s3s-project/s3s", rev = "5761ddfe4c509fcac87e3b99fd5bd9e176b442c0" }
 serial_test = { workspace = true }
 tempfile = { workspace = true }
 aws-config = { workspace = true }

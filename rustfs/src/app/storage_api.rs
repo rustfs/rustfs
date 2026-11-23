@@ -62,12 +62,10 @@ pub(crate) mod s3 {
         BucketLocationConstraint, CreateBucketConfiguration, CreateBucketInput, CreateMultipartUploadInput, DeleteObjectInput,
         ObjectLockRetention,
     };
-    pub(crate) use s3s::dto::{ListObjectsInput, StreamingBlob};
-    pub(crate) use s3s::dto::{ListObjectsV2Input, ListObjectsV2Output};
+    pub(crate) use s3s::dto::StreamingBlob;
     pub(crate) use s3s::stream;
     pub(crate) use s3s::stream::upload_stream::UploadStreamError;
     pub(crate) use s3s::xml;
-    pub(crate) use s3s::xml::{Serialize as XmlSerialize, Serializer as XmlSerializer};
     pub(crate) use s3s::{S3Error, S3ErrorCode, S3Result};
     pub(crate) use s3s::{S3Request, S3Response};
 }
@@ -1758,8 +1756,6 @@ pub(crate) mod bucket_usecase {
         }
     }
 
-    #[cfg(test)]
-    pub(crate) use super::s3;
     pub(crate) use super::{access, bucket, error, helper, request_context, s3_api, sse};
     pub(crate) use crate::storage::storage_api::{
         ECStore, StorageObjectInfo, StorageObjectOptions, get_validated_store, validate_list_object_unordered_with_delimiter,

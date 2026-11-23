@@ -219,8 +219,7 @@ fn native_copy_part_rejects_unproved_owner_without_changing_parts() {
                     assert_eq!(result.as_ref().err().map(|error| error.code().as_str()), expected, "{mode:?}");
                     assert_eq!(LOOKUP.with(|(calls, _)| calls.get()), 1, "{mode:?}");
                     if expected == Some("NoSuchUpload") {
-                        let Err(error) = result else { panic!("expected missing upload") };
-                        let actual: crate::app::storage_api::s3::S3Error = error.into();
+                        let Err(actual) = result else { panic!("expected missing upload") };
                         let facts = (
                             actual.code().as_str().to_owned(),
                             actual.status_code().map(|status| status.as_u16()),
@@ -232,11 +231,10 @@ fn native_copy_part_rejects_unproved_owner_without_changing_parts() {
                             absence_facts = Some(facts);
                         }
                     } else if matches!(mode, LookupResult::Outage) {
-                        let Err(error) = result else { panic!("expected read quorum failure") };
-                        let actual: crate::app::storage_api::s3::S3Error = error.into();
+                        let Err(actual) = result else { panic!("expected read quorum failure") };
                         let expected: crate::app::storage_api::s3::S3Error =
                             ApiError::from(StorageError::ErasureReadQuorum).into();
-                        assert_eq!(actual.code(), expected.code());
+                        assert_eq!(actual.code().as_str(), expected.code().as_str());
                         assert_eq!(actual.status_code(), expected.status_code());
                         assert_eq!(actual.message(), expected.message());
                         assert!(

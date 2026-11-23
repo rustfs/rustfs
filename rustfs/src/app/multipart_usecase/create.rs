@@ -491,7 +491,8 @@ impl DefaultMultipartUsecase {
         let query_version = req.input.version_id.take();
         let output = self
             .execute_create_multipart_upload(envelope, CreateMultipartUploadFields::from_legacy(req.input), query_version)
-            .await?;
+            .await
+            .map_err(crate::error::legacy_error_for_test)?;
         let mut response = S3Response::new(CreateMultipartUploadOutput {
             bucket: Some(output.bucket),
             key: Some(output.key),
@@ -570,7 +571,7 @@ mod tests {
                 )
                 .await
             {
-                Err(error) => crate::app::storage_api::s3::S3Error::from(error),
+                Err(error) => error,
                 Ok(_) => panic!("direct fixture does not create an upload"),
             };
             assert_eq!(
@@ -618,10 +619,10 @@ mod tests {
             .execute_create_multipart_upload(owned_envelope(Method::POST), CreateMultipartUploadFields::from_legacy(input), None)
             .await
         {
-            Err(error) => crate::app::storage_api::s3::S3Error::from(error),
+            Err(error) => error,
             Ok(_) => panic!("invalid storage class must be rejected"),
         };
-        assert_eq!(err.code(), &S3ErrorCode::InvalidStorageClass);
+        assert_eq!(err.code(), &rustfs_s3_types::S3ErrorCode::InvalidStorageClass);
     }
 
     #[test]
@@ -688,10 +689,10 @@ mod tests {
                 .is_empty()
         );
         let err = match result {
-            Err(error) => crate::app::storage_api::s3::S3Error::from(error),
+            Err(error) => error,
             Ok(_) => panic!("quota-enabled ciphertext multipart replication must be refused"),
         };
-        assert_eq!(err.code(), &S3ErrorCode::InvalidRequest);
+        assert_eq!(err.code(), &rustfs_s3_types::S3ErrorCode::InvalidRequest);
         assert_eq!(
             err.message(),
             Some("SSE-C ciphertext replication is unavailable for quota-enabled buckets")
@@ -761,8 +762,7 @@ mod tests {
                     let Err(error) = result else {
                         panic!("KMS denied the selected key");
                     };
-                    let error = crate::app::storage_api::s3::S3Error::from(error);
-                    assert_eq!(error.code(), &S3ErrorCode::AccessDenied);
+                    assert_eq!(error.code(), &rustfs_s3_types::S3ErrorCode::AccessDenied);
                 }
             }
             kms.stop().await.expect("stop test KMS");
