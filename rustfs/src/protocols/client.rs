@@ -2732,6 +2732,32 @@ mod listing_tests {
         );
         assert_eq!(current.buckets[0].creation_date.subsec_nanos(), 123000000);
     }
+
+    /// Same facts `RequestEnvelope::from_s3s` copies: method, URI, headers, extensions, region, service, and credentials.
+    #[cfg(any(feature = "webdav", feature = "sftp"))]
+    fn envelope_from_legacy_listing_request<T>(req: &S3Request<T>) -> crate::app::RequestEnvelope {
+        let credentials = req.credentials.as_ref().map(|credentials| {
+            let session_token = crate::auth::get_session_token(&req.uri, &req.headers).map(str::to_owned);
+            crate::app::RequestCredentials::new(
+                credentials.access_key.clone(),
+                credentials.secret_key.expose().to_owned(),
+                session_token.clone(),
+            )
+            .unwrap_or_else(|_| crate::app::RequestCredentials::without_secret_key(credentials.access_key.clone(), session_token))
+        });
+        crate::app::RequestEnvelope::from_parts(
+            crate::app::RequestHead {
+                method: req.method.clone(),
+                uri: req.uri.clone(),
+                headers: req.headers.clone(),
+                credentials,
+                region: req.region.as_ref().map(|region| region.as_str().to_owned()),
+                service: req.service.clone(),
+            },
+            req.extensions.clone(),
+        )
+    }
+
     #[cfg(any(feature = "webdav", feature = "sftp"))]
     #[test]
     fn protocol_listing_session_credential_projection_matches_legacy() {
@@ -2767,7 +2793,7 @@ mod listing_tests {
                 )
                 .expect("legacy request");
                 legacy.headers = headers.clone();
-                let legacy = crate::app::RequestEnvelope::from_s3s(&legacy);
+                let legacy = envelope_from_legacy_listing_request(&legacy);
                 let current =
                     session_list_buckets_envelope(ServerContextSlot::new(), &session, &headers, true, credentials, false);
                 let legacy = legacy.credentials().expect("legacy credentials");
