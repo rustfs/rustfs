@@ -171,7 +171,7 @@ fn upload_part_refusals_match_original_without_persisting_parts() {
                 .parts;
             let actual_audit = audit_facts(&probe);
             let new_polls = new_polls.load(Ordering::Relaxed);
-            let refusal = actual.err().expect("expected upload refusal");
+            let refusal = actual.expect_err("expected upload refusal");
             if case == "missing-upload" {
                 assert_eq!(refusal.code(), &S3ErrorCode::NoSuchUpload);
                 assert_eq!(refusal.status_code(), Some(http::StatusCode::NOT_FOUND));
