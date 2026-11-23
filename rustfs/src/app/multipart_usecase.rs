@@ -721,7 +721,19 @@ mod tests {
                 .err()
                 .expect("denied part");
             assert_eq!(error.code(), &S3ErrorCode::AccessDenied);
-            let copy_envelope = crate::app::RequestEnvelope::from_s3s(&denied_request((), authorizer.clone()));
+            let copy_request = denied_request((), authorizer.clone());
+            // Same facts `RequestEnvelope::from_s3s` copies. Credentials, region, and service stay absent.
+            let copy_envelope = crate::app::RequestEnvelope::from_parts(
+                crate::app::RequestHead {
+                    method: copy_request.method,
+                    uri: copy_request.uri,
+                    headers: copy_request.headers,
+                    credentials: None,
+                    region: None,
+                    service: None,
+                },
+                copy_request.extensions,
+            );
             let error = usecase
                 .execute_upload_part_copy_with_audit(
                     copy_envelope,
