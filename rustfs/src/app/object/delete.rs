@@ -19,9 +19,8 @@ use super::*;
 use crate::app::RequestEnvelope;
 use crate::app::storage_api::object_usecase::DeleteObjectCondition;
 use crate::app::storage_api::object_usecase::access::AuthorizationRequest as _;
-use crate::app::storage_api::s3::{S3ErrorCode, s3_error};
 use rustfs_gateway_types::dto as gateway_dto;
-use rustfs_s3_types::S3Result;
+use rustfs_s3_types::{S3ErrorCode, S3Result};
 use std::borrow::Cow;
 use std::collections::{BTreeMap, HashSet};
 
@@ -353,9 +352,13 @@ async fn replica_delete_fanout_state(
     replica_delete_fanout_state_from_config(config, replication_source, version_id, &site_peer_deployment_ids)
 }
 
-fn validate_undo_delete_version(expected: Option<&str>, requested: Option<&str>) -> crate::app::storage_api::s3::S3Result<()> {
+fn validate_undo_delete_version(expected: Option<&str>, requested: Option<&str>) -> S3Result<()> {
     if expected.is_some() && expected != requested {
-        return Err(s3_error!(PreconditionFailed));
+        let mut error = rustfs_s3_types::s3_error!(PreconditionFailed);
+        if let Some(message) = error.code().default_message() {
+            error.set_message(message);
+        }
+        return Err(error);
     }
     Ok(())
 }
@@ -2848,17 +2851,15 @@ mod tests {
     fn undo_delete_requires_version_id_to_match_expected_current() {
         let expected = Uuid::new_v4().to_string();
         assert!(validate_undo_delete_version(Some(&expected), Some(&expected)).is_ok());
-        assert_eq!(
-            validate_undo_delete_version(Some(&expected), Some(&Uuid::new_v4().to_string()))
-                .unwrap_err()
-                .code(),
-            &S3ErrorCode::PreconditionFailed
-        );
-        assert_eq!(
-            validate_undo_delete_version(Some(&expected), None).unwrap_err().code(),
-            &S3ErrorCode::PreconditionFailed
-        );
+        let different = Uuid::new_v4().to_string();
+        for requested in [Some(different.as_str()), None] {
+            let error = validate_undo_delete_version(Some(&expected), requested).unwrap_err();
+            assert_eq!(error.code(), &S3ErrorCode::PreconditionFailed);
+            assert_eq!(error.message(), Some("At least one of the preconditions you specified did not hold."));
+            assert_eq!(error.status_code(), Some(http::StatusCode::PRECONDITION_FAILED));
+        }
         assert!(validate_undo_delete_version(None, None).is_ok());
+        assert!(validate_undo_delete_version(None, Some(&expected)).is_ok());
     }
 
     #[tokio::test]
