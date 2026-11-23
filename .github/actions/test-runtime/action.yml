@@ -6,9 +6,8 @@ runs:
     - name: Install runtime tools
       shell: bash
       run: |
-        # These runners have no IPv6 route to the Git PPA inherited from the image.
-        sudo apt-get -o Acquire::ForceIPv4=true update
-        sudo apt-get -o Acquire::ForceIPv4=true install -y libssl-dev ripgrep
+        sudo apt-get update
+        sudo apt-get install -y libssl-dev ripgrep
     - name: Install Rust toolchain
       uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
     - name: Install cargo-nextest

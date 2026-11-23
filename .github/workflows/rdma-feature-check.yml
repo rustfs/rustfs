@@ -1,7 +1,10 @@
 name: S3-over-RDMA feature check
 
-# Compile the optional RDMA features independently. The cuObject tests link
-# the NVIDIA SDK and exercise the host-side behavior on a CPU runner.
+# The `nixl` and `cuobject` features are off in every other build, so the code
+# behind them is compiled nowhere else. This job compiles the `nixl` half on
+# Linux and runs rustfs-nixl's unit tests; nixl-sys builds through its stub
+# fallback, so no NIXL SDK is needed.
+# The cuObject half needs the NVIDIA cuObject SDK and is not compiled here.
 # Not a required check and not part of the `Test and Lint` aggregate.
 
 on:
@@ -9,7 +12,6 @@ on:
     paths:
       - "crates/nixl/**"
       - "crates/cuobject/**"
-      - "crates/cuobject-sys/**"
       - "rustfs/src/storage/rpc/nixl*"
       - "rustfs/src/app/object/cuobject.rs"
       - "rustfs/src/app/object/get.rs"
@@ -68,42 +70,9 @@ jobs:
       - name: Run the rustfs-nixl unit tests
         run: cargo test --locked -p rustfs-nixl --features sys
 
-  cuobject-check:
-    name: cuObject server SDK and unit tests
-    runs-on: ubuntu-24.04
-    timeout-minutes: 60
-    steps:
-      - uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7
-        with:
-          persist-credentials: false
-      - uses: ./.github/actions/setup
-        with:
-          rust-version: stable
-          cache-shared-key: ci-feat-cuobject
-          cache-save-if: 'false'
-          install-build-packaging-tools: 'false'
-      - name: Check the cuObject crates without the NVIDIA SDK
-        run: cargo check --locked -p rustfs-cuobject -p rustfs-cuobject-sys
-      - name: Install the NVIDIA server SDK
-        working-directory: ${{ runner.temp }}
-        run: |
-          sudo apt-get update
-          sudo apt-get install --no-install-recommends -y libibverbs-dev librdmacm-dev
-          repo=https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64
-          for pkg in libcuobjserver libcuobjserver-dev; do
-            curl --fail --location --retry 3 "$repo/${pkg}_2.1.0.101-1_amd64.deb" -o "$pkg.deb"
-          done
-          sha256sum --check <<'DIGESTS'
-          39e6271118717e8e726233ae5ac29ee3b83e335e1fbe96b097bb458a4a52393a  libcuobjserver.deb
-          73d4f187e58b784c7cf64633d7e76c2ac59dea5b475fd981cc6897c34cb9876f  libcuobjserver-dev.deb
-          DIGESTS
-          sudo dpkg -i libcuobjserver.deb libcuobjserver-dev.deb
-      - name: Test the server bridge
-        run: cargo test --locked -p rustfs-cuobject --features server
-
   alert-on-failure:
     name: Alert on scheduled failure
-    needs: [nixl-check, cuobject-check]
+    needs: [nixl-check]
     # Only scheduled runs open or update the tracking issue; pull-request and
     # manual runs stay quiet.
     if: always() && github.event_name == 'schedule' && contains(needs.*.result, 'failure')
