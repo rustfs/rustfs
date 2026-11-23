@@ -15,13 +15,17 @@
 //! The S3 error carrier shared by every RustFS crate.
 //!
 //! Responsible for: `S3Error` and its accessor contract, `S3Result`, `StdError`,
-//! `S3ErrorParts`, and the `s3_error` macro.
+//! `S3ErrorParts`, the `s3_error` macro, and the legacy-compatible HTTP response.
 //! Not responsible for: the code set and its statuses (`code.rs`), s3s
-//! conversions (`crate::compat_s3s`), or rendering an error onto the wire.
+//! conversions (`crate::compat_s3s`), or the gateway listener's rendering policy.
 //! Upstream: `http`. Downstream: every crate that raises S3 errors; the legacy
 //! edge converts through `compat_s3s`, the gateway edge through `into_parts`.
 
 mod code;
+#[cfg(any(test, feature = "compat-s3s"))]
+mod http_response;
+#[cfg(test)]
+mod http_response_tests;
 
 use http::{HeaderMap, StatusCode};
 use std::borrow::Cow;

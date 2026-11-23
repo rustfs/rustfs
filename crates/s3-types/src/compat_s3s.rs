@@ -134,12 +134,26 @@ impl From<S3Error> for legacy_s3s::S3Error {
 }
 
 impl S3Error {
-    /// The pinned legacy serializer's XML response. Call sites stay on this type.
-    /// DELETE BY T4.2 with the rest of this file.
-    pub fn to_http_response(self) -> Result<http::Response<crate::Body>, Self> {
-        let response = legacy_s3s::S3Error::from(self).to_http_response().map_err(Self::from)?;
-        let (parts, body) = response.into_parts();
-        Ok(http::Response::from_parts(parts, crate::Body::from(body)))
+    /// An error wrapped with its original cause can retain response fields the caller did not override.
+    pub(super) fn into_http_response_parts(self) -> crate::S3ErrorParts {
+        let mut parts = self.into_parts();
+        let original = parts
+            .source
+            .as_deref()
+            .and_then(|source| source.downcast_ref::<LegacyCause>())
+            .map(|cause| &cause.0)
+            .filter(|error| error.code() == &parts.code.clone().into());
+        if let Some(original) = original {
+            parts.message = parts
+                .message
+                .or_else(|| original.message().map(|text| Cow::Owned(text.to_owned())));
+            parts.request_id = parts.request_id.or_else(|| original.request_id().map(str::to_owned));
+            parts.status = parts.status.or_else(|| original.status_code());
+            parts.headers = parts.headers.or_else(|| original.headers().cloned());
+        } else if parts.message.is_none() {
+            parts.message = parts.code.default_message().map(Cow::Borrowed);
+        }
+        parts
     }
 }
 

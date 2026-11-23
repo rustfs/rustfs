@@ -36,7 +36,7 @@ default = []
 # (rustfs/backlog#2734). Off by default; the runtime dependency tree of this
 # crate carries no s3s unless a consumer asks.
 # DELETE BY T4.2 (rustfs/backlog#2784) together with src/compat_s3s.rs.
-compat-s3s = ["dep:legacy-s3s"]
+compat-s3s = ["dep:legacy-s3s", "dep:quick-xml"]
 hotpath = []
 hotpath-alloc = ["hotpath"]
 hotpath-cpu = ["hotpath"]
@@ -48,6 +48,7 @@ http = { workspace = true }
 http-body = { workspace = true }
 http-body-util = { workspace = true }
 pin-project-lite = { workspace = true }
+quick-xml = { workspace = true, optional = true }
 # The s3s package under the name the legacy edge knows it by. Only
 # src/compat_s3s.rs may use it; see that file's header for the footprint note.
 legacy-s3s = { workspace = true, optional = true }
@@ -55,6 +56,7 @@ serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true, features = ["raw_value"] }
 
 [dev-dependencies]
+quick-xml = { workspace = true }
 # Oracle for the parity tests in src/compat_s3s.rs; never a normal dependency.
 legacy-s3s = { workspace = true }
 # The HTTP/1.1 server those parity tests compare bodies through, byte for byte.

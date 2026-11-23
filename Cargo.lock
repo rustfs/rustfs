@@ -11340,6 +11340,7 @@ dependencies = [
  "hyper",
  "hyper-util",
  "pin-project-lite",
+ "quick-xml 0.42.0",
  "s3s",
  "serde",
  "serde_json",
