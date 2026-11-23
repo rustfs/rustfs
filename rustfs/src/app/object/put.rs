@@ -2619,8 +2619,10 @@ mod tests {
     }
 
     use super::*;
-    use crate::app::storage_api::s3::dto::{GetObjectInput, ObjectLockRetentionMode};
-    use crate::app::test_seams::{head_envelope, head_object_input};
+    use crate::app::storage_api::s3::dto::ObjectLockRetentionMode;
+    use crate::app::test_seams::{
+        get_envelope, get_object_gateway, get_object_input, head_envelope, head_object_input, read_get_body,
+    };
     use futures::StreamExt;
     use http::{HeaderMap, HeaderName, HeaderValue, Method};
     use rustfs_gateway_types::SseCustomerKey;
@@ -3250,14 +3252,11 @@ mod tests {
             Arc::clone(&metadata_entered),
             Arc::clone(&metadata_resume),
         );
-        let metadata_input = GetObjectInput::builder()
-            .bucket(bucket.clone())
-            .key(object.to_string())
-            .build()
-            .expect("metadata GET input must build");
+        let metadata_input = get_object_input(&bucket, object, None);
         let metadata_usecase = DefaultObjectUsecase::with_context(Some(Arc::clone(&context)));
-        let metadata_get =
-            tokio::spawn(async move { crate::app::test_seams::get_object_method_only(&metadata_usecase, metadata_input).await });
+        let metadata_get = tokio::spawn(async move {
+            get_object_gateway(&metadata_usecase, get_envelope(HeaderMap::new(), http::Extensions::new()), metadata_input).await
+        });
         tokio::time::timeout(Duration::from_secs(2), metadata_entered.wait())
             .await
             .expect("GET must enter the bucket metadata stage");
@@ -3279,13 +3278,11 @@ mod tests {
             .get_write_lock(Duration::from_secs(5))
             .await
             .expect("read test namespace lock must be held");
-        let get_input = GetObjectInput::builder()
-            .bucket(bucket.clone())
-            .key(object.to_string())
-            .build()
-            .expect("GET input must build");
+        let get_input = get_object_input(&bucket, object, None);
         let get_usecase = DefaultObjectUsecase::with_context(Some(Arc::clone(&context)));
-        let get = tokio::spawn(async move { crate::app::test_seams::get_object_method_only(&get_usecase, get_input).await });
+        let get = tokio::spawn(async move {
+            get_object_gateway(&get_usecase, get_envelope(HeaderMap::new(), http::Extensions::new()), get_input).await
+        });
         tokio::time::timeout(Duration::from_secs(2), async {
             while !object_traffic_health.read_storage_stalled_for_test() {
                 tokio::task::yield_now().await;
@@ -4917,27 +4914,24 @@ mod tests {
             assert_eq!(head.output.dto.sse_customer_algorithm.as_deref(), Some("AES256"));
             assert_eq!(head.output.dto.sse_customer_key_md5.as_deref(), Some(key_md5.as_str()));
 
-            let get_input = GetObjectInput::builder()
-                .bucket(bucket.clone())
-                .key("ledger.csv".to_string())
-                .sse_customer_algorithm(Some("AES256".to_string()))
-                .sse_customer_key(Some(encoded_key))
-                .sse_customer_key_md5(Some(key_md5.clone()))
-                .build()
-                .expect("SSE-C GET input must build");
-            let mut get_request = build_request(get_input, Method::GET);
-            get_request.headers = read_headers;
-            let get = Box::pin(crate::app::test_seams::get_object(&usecase, get_request))
-                .await
-                .expect("matching SSE-C key must authorize GET");
-            assert_eq!(get.output.server_side_encryption, None);
-            assert_eq!(get.output.sse_customer_algorithm.as_deref(), Some("AES256"));
-            assert_eq!(get.output.sse_customer_key_md5.as_deref(), Some(key_md5.as_str()));
-            let mut body = get.output.body.expect("SSE-C GET must include the decrypted body");
-            let mut plaintext = Vec::new();
-            while let Some(chunk) = body.next().await {
-                plaintext.extend_from_slice(&chunk.expect("SSE-C body must decrypt completely"));
-            }
+            let get_input = rustfs_gateway_types::dto::GetObjectInput {
+                sse_customer_algorithm: Some("AES256".to_owned()),
+                sse_customer_key: Some(SseCustomerKey::new(encoded_key)),
+                sse_customer_key_md5: Some(key_md5.clone()),
+                ..get_object_input(&bucket, "ledger.csv", None)
+            };
+            let get = Box::pin(get_object_gateway(
+                &usecase,
+                get_envelope(read_headers, http::Extensions::new()),
+                get_input,
+            ))
+            .await
+            .expect("matching SSE-C key must authorize GET");
+            assert_eq!(get.output.dto.server_side_encryption, None);
+            assert_eq!(get.output.dto.sse_customer_algorithm.as_deref(), Some("AES256"));
+            assert_eq!(get.output.dto.sse_customer_key_md5.as_deref(), Some(key_md5.as_str()));
+            let body = get.output.body.expect("SSE-C GET must include the decrypted body");
+            let plaintext = read_get_body(body).await;
             assert_eq!(plaintext, payload, "header classification must preserve the complete decrypted payload");
 
             let stored = store

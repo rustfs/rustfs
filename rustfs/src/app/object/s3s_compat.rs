@@ -19,16 +19,15 @@
 
 #[cfg(test)]
 use crate::app::object_usecase::HeadObjectOutputFacts;
-use crate::app::object_usecase::{GetObjectBody, GetObjectFields, GetObjectOutputFacts};
+use crate::app::object_usecase::{GetObjectBody, GetObjectOutputFacts};
 use rustfs_gateway_stream::{BoxPayloadStream, PayloadRead, StreamError, StreamErrorKind};
-use rustfs_gateway_types::ByteRange;
 use rustfs_gateway_types::compat::ConversionError;
 use rustfs_gateway_types::compat::s3s_5761ddfe::generated::ops::get_object;
 #[cfg(test)]
 use rustfs_gateway_types::compat::s3s_5761ddfe::generated::ops::head_object;
 #[cfg(test)]
 use s3s::dto::HeadObjectOutput;
-use s3s::dto::{ETag, GetObjectInput, GetObjectOutput, Range, StreamingBlob};
+use s3s::dto::{ETag, GetObjectOutput, StreamingBlob};
 use std::pin::Pin;
 use std::sync::{Mutex, PoisonError};
 use std::task::{Context, Poll};
@@ -45,24 +44,6 @@ impl HeadObjectOutputFacts {
             }
         });
         Ok(output)
-    }
-}
-
-impl GetObjectFields {
-    pub(crate) fn from_s3s(input: GetObjectInput) -> Self {
-        Self {
-            bucket: input.bucket,
-            key: input.key,
-            version_id: input.version_id,
-            part_number: input.part_number,
-            range: input.range.map(|range| match range {
-                Range::Int { first, last: Some(last) } => ByteRange::FromTo { first, last },
-                Range::Int { first, last: None } => ByteRange::From { first },
-                Range::Suffix { length } => ByteRange::Suffix { length },
-            }),
-            sse_customer_key: input.sse_customer_key,
-            sse_customer_key_md5: input.sse_customer_key_md5,
-        }
     }
 }
 

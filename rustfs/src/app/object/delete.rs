@@ -1862,8 +1862,9 @@ mod tests {
     }
 
     use super::*;
-    use crate::app::storage_api::s3::dto::GetObjectInput;
-    use crate::app::test_seams::{head_envelope, head_object_gateway, head_object_input};
+    use crate::app::test_seams::{
+        get_envelope, get_object_gateway, get_object_input, head_envelope, head_object_gateway, head_object_input, read_get_body,
+    };
     use http::{HeaderMap, HeaderValue, Method};
     use rustfs_gateway_types::dto::Status;
     use rustfs_gateway_types::persistence::{
@@ -2246,16 +2247,12 @@ mod tests {
 
                     for explicit in [false, true] {
                         let requested_version = explicit.then(|| marker_id.clone());
-                        let get = GetObjectInput::builder()
-                            .bucket(bucket.clone())
-                            .key(key.to_string())
-                            .version_id(requested_version.clone())
-                            .build()
-                            .expect("GET request");
+                        let get = get_object_input(&bucket, key, requested_version.clone());
                         let head = head_object_input(&bucket, key, requested_version);
-                        let get_error = crate::app::test_seams::get_object_method_only(&usecase, get)
-                            .await
-                            .expect_err("marker GET");
+                        let get_error =
+                            get_object_gateway(&usecase, get_envelope(HeaderMap::new(), http::Extensions::new()), get)
+                                .await
+                                .expect_err("marker GET");
                         let head_error =
                             head_object_gateway(&usecase, head_envelope(HeaderMap::new(), http::Extensions::new()), head)
                                 .await
@@ -2305,22 +2302,13 @@ mod tests {
                     }
 
                     let original_id = original.version_id.expect("historical version id").to_string();
-                    let get = GetObjectInput::builder()
-                        .bucket(bucket.clone())
-                        .key(key.to_string())
-                        .version_id(Some(original_id.clone()))
-                        .build()
-                        .expect("historical GET request");
-                    let response = crate::app::test_seams::get_object_method_only(&usecase, get)
+                    let get = get_object_input(&bucket, key, Some(original_id.clone()));
+                    let response = get_object_gateway(&usecase, get_envelope(HeaderMap::new(), http::Extensions::new()), get)
                         .await
                         .expect("historical GET");
                     assert!(!response.headers.contains_key("x-amz-delete-marker"));
-                    let mut body = response.output.body.expect("historical body");
-                    let mut actual = Vec::new();
-                    while let Some(chunk) = body.next().await {
-                        actual.extend_from_slice(&chunk.expect("historical data remains readable"));
-                    }
-                    assert_eq!(actual, payload);
+                    let body = response.output.body.expect("historical body");
+                    assert_eq!(read_get_body(body).await.as_ref(), payload);
                     let head = head_object_input(&bucket, key, Some(original_id.clone()));
                     let response = head_object_gateway(&usecase, head_envelope(HeaderMap::new(), http::Extensions::new()), head)
                         .await
@@ -2330,16 +2318,12 @@ mod tests {
                     assert!(!response.headers.contains_key("x-amz-delete-marker"));
 
                     for (absent_key, version) in [("missing", None), (key, Some(Uuid::new_v4().to_string()))] {
-                        let get = GetObjectInput::builder()
-                            .bucket(bucket.clone())
-                            .key(absent_key.to_string())
-                            .version_id(version.clone())
-                            .build()
-                            .expect("missing GET request");
+                        let get = get_object_input(&bucket, absent_key, version.clone());
                         let head = head_object_input(&bucket, absent_key, version);
-                        let get_error = crate::app::test_seams::get_object_method_only(&usecase, get)
-                            .await
-                            .expect_err("missing GET");
+                        let get_error =
+                            get_object_gateway(&usecase, get_envelope(HeaderMap::new(), http::Extensions::new()), get)
+                                .await
+                                .expect_err("missing GET");
                         let head_error =
                             head_object_gateway(&usecase, head_envelope(HeaderMap::new(), http::Extensions::new()), head)
                                 .await
@@ -2425,16 +2409,12 @@ mod tests {
                     assert!(marker.delete_marker);
                     let marker_id = delete_response_version_id(marker.version_id, false).expect("marker has a version identity");
                     assert_eq!(marker_id == "null", suspended);
-                    let get = GetObjectInput::builder()
-                        .bucket(bucket.clone())
-                        .key(key.to_string())
-                        .version_id(Some(marker_id.clone()))
-                        .build()
-                        .unwrap();
-                    let get_err = Box::pin(crate::app::test_seams::get_object_method_only(&usecase, get))
-                        .await
-                        .expect_err("GET of a marker remains forbidden");
-                    assert_eq!(get_err.code(), &S3ErrorCode::MethodNotAllowed);
+                    let get = get_object_input(&bucket, key, Some(marker_id.clone()));
+                    let get_err =
+                        Box::pin(get_object_gateway(&usecase, get_envelope(HeaderMap::new(), http::Extensions::new()), get))
+                            .await
+                            .expect_err("GET of a marker remains forbidden");
+                    assert_eq!(get_err.code(), &rustfs_s3_types::S3ErrorCode::MethodNotAllowed);
                     let head = head_object_input(&bucket, key, Some(marker_id.clone()));
                     let head_err = Box::pin(head_object_gateway(
                         &usecase,
@@ -2502,34 +2482,26 @@ mod tests {
                     assert_eq!(remaining.version_id, original.version_id);
                     assert!(!remaining.delete_marker);
                     assert_eq!(remaining.size, payload.len() as i64);
-                    let removed = GetObjectInput::builder()
-                        .bucket(bucket.clone())
-                        .key(key.to_string())
-                        .version_id(Some(marker_id))
-                        .build()
-                        .unwrap();
-                    let missing = Box::pin(crate::app::test_seams::get_object_method_only(&usecase, removed))
-                        .await
-                        .expect_err("the marker version must actually be gone");
+                    let removed = get_object_input(&bucket, key, Some(marker_id));
+                    let missing = Box::pin(get_object_gateway(
+                        &usecase,
+                        get_envelope(HeaderMap::new(), http::Extensions::new()),
+                        removed,
+                    ))
+                    .await
+                    .expect_err("the marker version must actually be gone");
                     assert_eq!(
                         missing.code(),
-                        &S3ErrorCode::NoSuchVersion,
+                        &rustfs_s3_types::S3ErrorCode::NoSuchVersion,
                         "pool_count={pool_count} suspended={suspended} batch={batch}: removed marker lookup returned {missing:?}"
                     );
-                    let get = GetObjectInput::builder()
-                        .bucket(bucket.clone())
-                        .key(key.to_string())
-                        .build()
-                        .unwrap();
-                    let response = Box::pin(crate::app::test_seams::get_object_method_only(&usecase, get))
-                        .await
-                        .expect("GET restores the historical payload");
-                    let mut body = response.output.body.expect("GET body");
-                    let mut actual = Vec::new();
-                    while let Some(chunk) = body.next().await {
-                        actual.extend_from_slice(&chunk.expect("historical data remains readable"));
-                    }
-                    assert_eq!(actual, payload);
+                    let get = get_object_input(&bucket, key, None);
+                    let response =
+                        Box::pin(get_object_gateway(&usecase, get_envelope(HeaderMap::new(), http::Extensions::new()), get))
+                            .await
+                            .expect("GET restores the historical payload");
+                    let body = response.output.body.expect("GET body");
+                    assert_eq!(read_get_body(body).await.as_ref(), payload);
                 }
             }
         });

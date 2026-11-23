@@ -30,7 +30,7 @@ use crate::app::storage_api::object_usecase::object_cache::{
 #[cfg(test)]
 use crate::app::storage_api::s3::Body;
 #[cfg(test)]
-use crate::app::storage_api::s3::dto::{GetObjectInput, GetObjectOutput, StreamingBlob};
+use crate::app::storage_api::s3::dto::{GetObjectOutput, StreamingBlob};
 use crate::app::storage_api::s3::header::X_AMZ_RESTORE;
 #[cfg(test)]
 use crate::app::storage_api::s3::stream::ByteStream;
@@ -6262,8 +6262,9 @@ mod on_demand_migration_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::app::storage_api::s3::dto::Range;
-    use crate::app::test_seams::{get_envelope, get_object_gateway, get_object_input, head_envelope, head_object_input};
+    use crate::app::test_seams::{
+        get_envelope, get_object_gateway, get_object_input, head_envelope, head_object_input, read_get_body,
+    };
     use http::{HeaderMap, HeaderValue, Method};
     use std::pin::Pin;
     use std::sync::Arc;
@@ -6271,34 +6272,28 @@ mod tests {
     use std::task::{Context, Poll};
     use tokio::io::{AsyncRead, ReadBuf};
 
-    async fn read_get_body(body: GetObjectBody) -> Bytes {
-        use http_body_util::BodyExt;
+    fn get_http_body(body: GetObjectBody) -> rustfs_gateway_stream::Body {
         use rustfs_gateway_stream::Body;
-
-        let body = match body {
+        match body {
             GetObjectBody::Bytes(bytes) => Body::from_bytes(bytes),
             GetObjectBody::Stream(stream) => Body::from_stream(stream).expect("valid GET stream"),
-        };
-        let collected = body.collect().await.expect("GET body must be readable");
-        assert!(collected.trailers().is_none(), "unexpected GET response trailers");
-        collected.to_bytes()
+        }
     }
 
     #[tokio::test]
     async fn conditional_reader_scope_keeps_large_futures_off_the_request_stack() {
-        let mut req = build_request(GetObjectInput::default(), Method::GET);
+        let input = GetObjectFields::from(gateway_dto::GetObjectInput::default());
         for conditional in [false, true] {
+            let mut headers = HeaderMap::new();
             if conditional {
-                req.headers
-                    .insert(http::header::IF_NONE_MATCH, HeaderValue::from_static("\"etag\""));
+                headers.insert(http::header::IF_NONE_MATCH, HeaderValue::from_static("\"etag\""));
             }
             let payload = [0u8; 64 * 1024];
             let read = async move {
                 std::hint::black_box(payload);
                 std::future::ready(()).await;
             };
-            let envelope = RequestEnvelope::from_s3s(&req);
-            let input = GetObjectFields::from_s3s(req.input.clone());
+            let envelope = get_envelope(headers, http::Extensions::new());
             let read = DefaultObjectUsecase::with_get_object_conditions(&envelope, &input, None, read);
             assert!(
                 std::mem::size_of_val(&read) < 2048,
@@ -6404,21 +6399,19 @@ mod tests {
             assert_eq!(error.code(), &rustfs_s3_types::S3ErrorCode::NotModified);
             assert_eq!(error.headers().expect("HEAD validators")["etag"], format!("\"{etag}\""));
 
-            let input = GetObjectInput::builder()
-                .bucket(bucket.clone())
-                .key(object.to_owned())
-                .build()
-                .expect("GET input");
-            if let Ok(mut response) = crate::app::test_seams::get_object_method_only(&usecase, input).await {
-                let mut body = response.output.body.take().expect("body for damaged GET");
-                let mut failed = false;
-                while let Some(chunk) = body.next().await {
-                    if chunk.is_err() {
-                        failed = true;
-                        break;
+            let input = get_object_input(&bucket, object, None);
+            if let Ok(response) =
+                get_object_gateway(&usecase, get_envelope(HeaderMap::new(), http::Extensions::new()), input).await
+            {
+                use http_body_util::BodyExt;
+                let mut body = get_http_body(response.output.body.expect("body for damaged GET"));
+                loop {
+                    match body.frame().await {
+                        Some(Ok(frame)) => assert!(frame.is_data(), "unexpected GET response trailers"),
+                        Some(Err(_)) => break,
+                        None => panic!("ordinary GET must still reject damaged data"),
                     }
                 }
-                assert!(failed, "ordinary GET must still reject damaged data");
             }
         }
     }
@@ -6434,19 +6427,11 @@ mod tests {
             "AES256".to_owned(),
         )])
         .into();
-        let mut req = build_request(
-            GetObjectInput::builder()
-                .bucket("bucket".to_owned())
-                .key("key".to_owned())
-                .build()
-                .expect("GET input"),
-            Method::GET,
-        );
-        req.headers
-            .insert(http::header::IF_NONE_MATCH, HeaderValue::from_static("\"abc\""));
+        let mut headers = HeaderMap::new();
+        headers.insert(http::header::IF_NONE_MATCH, HeaderValue::from_static("\"abc\""));
         let error = DefaultObjectUsecase::validate_get_object_before_body(
-            &RequestEnvelope::from_s3s(&req),
-            &GetObjectFields::from_s3s(req.input),
+            &get_envelope(headers, http::Extensions::new()),
+            &get_object_input("bucket", "key", None).into(),
             "bucket",
             "key",
             None,
@@ -7768,23 +7753,21 @@ mod tests {
             .get_or_init(|| Mutex::new(None))
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some((cache_key, Arc::clone(&reader_opens)));
-        let input = GetObjectInput::builder()
-            .bucket(bucket)
-            .key(object.to_string())
-            .build()
-            .expect("real cold-fill rejection GET input must build");
+        let input = get_object_input(&bucket, object, None);
         let usecase = DefaultObjectUsecase::with_context(Some(context));
-        let result =
-            tokio::time::timeout(Duration::from_secs(2), crate::app::test_seams::get_object_method_only(&usecase, input))
-                .await
-                .expect("rejected real GET must not wait for a cold-fill session")
-                .expect_err("rejected real GET must return an S3 error");
+        let result = tokio::time::timeout(
+            Duration::from_secs(2),
+            get_object_gateway(&usecase, get_envelope(HeaderMap::new(), http::Extensions::new()), input),
+        )
+        .await
+        .expect("rejected real GET must not wait for a cold-fill session")
+        .expect_err("rejected real GET must return an S3 error");
         *COLD_FILL_READER_OPEN_PROBE
             .get_or_init(|| Mutex::new(None))
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
 
-        assert_eq!(result.code(), &S3ErrorCode::SlowDown);
+        assert_eq!(result.code(), &rustfs_s3_types::S3ErrorCode::SlowDown);
         assert_eq!(reader_opens.load(Ordering::Relaxed), 0, "rejected GET must not open its body reader");
         assert_eq!(coordinator.active_session_count_for_test(), held_producers.len());
         drop(held_producers);
@@ -9936,39 +9919,36 @@ mod tests {
         assert!(version_dirs > 0, "the multipart object must have at least one version data directory");
         assert_eq!(deleted, version_dirs * 2);
 
-        let input = GetObjectInput::builder()
-            .bucket(bucket)
-            .key(object.to_string())
-            .build()
-            .expect("resume failure-path GET input must build");
+        let input = get_object_input(&bucket, object, None);
         let usecase = DefaultObjectUsecase::with_context(Some(context));
         let attempts_before = GET_OBJECT_RESUME_ATTEMPTS_FOR_TEST.load(Ordering::Relaxed);
-        let mut response = crate::app::test_seams::get_object_method_only(&usecase, input)
+        use http_body_util::BodyExt;
+        let response = get_object_gateway(&usecase, get_envelope(HeaderMap::new(), http::Extensions::new()), input)
             .await
             .expect("the GET commits a response; the body fails mid-stream");
-        let mut response_body = response.output.body.take().expect("GET response must include a body");
+        let mut response_body = get_http_body(response.output.body.expect("GET response must include a body"));
         let mut collected = Vec::new();
-        let mut stream_error = None;
-        while let Some(chunk) = response_body.next().await {
-            match chunk {
-                Ok(bytes) => collected.extend_from_slice(&bytes),
-                Err(error) => {
-                    stream_error = Some(error);
-                    break;
-                }
+        let stream_error = loop {
+            match response_body
+                .frame()
+                .await
+                .expect("the body stream must fail at the missing part")
+            {
+                Ok(frame) => collected.extend_from_slice(&frame.into_data().expect("object data frame")),
+                Err(error) => break error,
             }
-        }
+        };
+        assert!(response_body.frame().await.is_none(), "the failed body must be terminal");
 
         assert_eq!(
             collected,
             &body[..part_size],
             "only the first part can be delivered before the object data vanishes"
         );
-        assert_original_trigger_error(
-            stream_error
-                .as_deref()
-                .expect("the body stream must fail at the missing part"),
-        );
+        let rustfs_gateway_stream::StreamErrorKind::Upstream(source) = stream_error.kind() else {
+            panic!("the gateway stream must preserve the original storage error: {stream_error:?}");
+        };
+        assert_original_trigger_error(source.as_ref());
         let attempts = GET_OBJECT_RESUME_ATTEMPTS_FOR_TEST.load(Ordering::Relaxed) - attempts_before;
         assert_eq!(
             attempts,
@@ -10029,20 +10009,13 @@ mod tests {
         let source_pool = 0;
         let target_pool = 1;
 
-        let input = GetObjectInput::builder()
-            .bucket(bucket.clone())
-            .key(object.to_string())
-            .build()
-            .expect("multi-pool resume GET input must build");
+        let input = get_object_input(&bucket, object, None);
         let usecase = DefaultObjectUsecase::with_context(Some(context));
-        let mut response = crate::app::test_seams::get_object_method_only(&usecase, input)
+        use http_body_util::BodyExt;
+        let response = get_object_gateway(&usecase, get_envelope(HeaderMap::new(), http::Extensions::new()), input)
             .await
             .expect("multi-pool GET must commit its response");
-        let mut response_body = response
-            .output
-            .body
-            .take()
-            .expect("multi-pool GET response must include a body");
+        let mut response_body = get_http_body(response.output.body.expect("multi-pool GET response must include a body"));
 
         // Open the source reader before publishing the relocated object. Build
         // each replica outside the bucket and rename it into place atomically so
@@ -10093,9 +10066,9 @@ mod tests {
 
         let attempts_before = GET_OBJECT_RESUME_ATTEMPTS_FOR_TEST.load(Ordering::Relaxed);
         let mut collected = Vec::new();
-        while let Some(chunk) = response_body.next().await {
-            match chunk {
-                Ok(chunk) => collected.extend_from_slice(&chunk),
+        while let Some(frame) = response_body.frame().await {
+            match frame {
+                Ok(frame) => collected.extend_from_slice(&frame.into_data().expect("object data frame")),
                 Err(err) => panic!(
                     "relocated GET from pool {source_pool} must resume from pool {target_pool} after {} attempts: {err:?}",
                     GET_OBJECT_RESUME_ATTEMPTS_FOR_TEST.load(Ordering::Relaxed) - attempts_before
@@ -12294,19 +12267,19 @@ mod tests {
 
     #[tokio::test]
     async fn execute_get_object_rejects_zero_part_number() {
-        let input = GetObjectInput::builder()
-            .bucket("test-bucket".to_string())
-            .key("test-key".to_string())
-            .part_number(Some(0))
-            .build()
-            .unwrap();
+        let mut input = get_object_input("test-bucket", "test-key", None);
+        input.part_number = Some(0);
 
         let usecase = DefaultObjectUsecase::without_context();
 
-        let err = Box::pin(crate::app::test_seams::get_object_method_only(&usecase, input))
-            .await
-            .unwrap_err();
-        assert_eq!(err.code(), &S3ErrorCode::InvalidArgument);
+        let err = Box::pin(get_object_gateway(
+            &usecase,
+            get_envelope(HeaderMap::new(), http::Extensions::new()),
+            input,
+        ))
+        .await
+        .unwrap_err();
+        assert_eq!(err.code(), &rustfs_s3_types::S3ErrorCode::InvalidArgument);
     }
 
     #[test]
@@ -12375,20 +12348,20 @@ mod tests {
 
     #[tokio::test]
     async fn execute_get_object_rejects_range_with_part_number() {
-        let input = GetObjectInput::builder()
-            .bucket("test-bucket".to_string())
-            .key("test-key".to_string())
-            .part_number(Some(1))
-            .range(Some(Range::Int { first: 0, last: Some(1) }))
-            .build()
-            .unwrap();
+        let mut input = get_object_input("test-bucket", "test-key", None);
+        input.part_number = Some(1);
+        input.range = Some(rustfs_gateway_types::RangeSpec::new("bytes=0-1"));
 
         let usecase = DefaultObjectUsecase::without_context();
 
-        let err = Box::pin(crate::app::test_seams::get_object_method_only(&usecase, input))
-            .await
-            .unwrap_err();
-        assert_eq!(err.code(), &S3ErrorCode::InvalidArgument);
+        let err = Box::pin(get_object_gateway(
+            &usecase,
+            get_envelope(HeaderMap::new(), http::Extensions::new()),
+            input,
+        ))
+        .await
+        .unwrap_err();
+        assert_eq!(err.code(), &rustfs_s3_types::S3ErrorCode::InvalidArgument);
     }
 }
 
