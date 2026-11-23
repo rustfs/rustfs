@@ -15,7 +15,6 @@
 //! Bucket configuration mutation tests over the shared use case and durable metadata.
 
 use super::*;
-use crate::app::bucket_usecase::test_support::build_request;
 use crate::app::gating_test_env::{run_large_stack_test, shared_gating_ambient};
 use crate::app::runtime_sources::ServerContextSlot;
 use crate::app::storage_api::bucket_usecase::helper::MutationCompletionProbe;
@@ -163,10 +162,9 @@ async fn check_mutation(config: Config, stale: bool, write: bool) {
         .expect("create bucket");
     let server = ServerContextSlot::new();
     assert!(server.install(Arc::clone(&context)));
-    let mut request = build_request((), if write { Method::PUT } else { Method::DELETE });
-    request.uri = format!("/{bucket}?{subresource}").parse().expect("request URI");
-    request.extensions.insert(Arc::clone(&server));
-    request.extensions.insert(ReqInfo {
+    let mut extensions = http::Extensions::new();
+    extensions.insert(Arc::clone(&server));
+    extensions.insert(ReqInfo {
         cred: Some(Credentials {
             access_key: "config-delete-owner".to_owned(),
             ..Default::default()
@@ -174,14 +172,24 @@ async fn check_mutation(config: Config, stale: bool, write: bool) {
         is_owner: true,
         ..Default::default()
     });
-    request.extensions.insert(request_context::RequestContext {
+    extensions.insert(request_context::RequestContext {
         request_id: "bucket-config-delete".to_owned(),
         x_amz_request_id: "bucket-config-delete".to_owned(),
         trace_id: None,
         span_id: None,
         start_time: std::time::Instant::now(),
     });
-    let mut envelope = RequestEnvelope::from_s3s(&request);
+    let mut envelope = RequestEnvelope::from_parts(
+        crate::app::RequestHead {
+            method: if write { Method::PUT } else { Method::DELETE },
+            uri: format!("/{bucket}?{subresource}").parse().expect("request URI"),
+            headers: http::HeaderMap::new(),
+            credentials: None,
+            region: None,
+            service: None,
+        },
+        extensions,
+    );
     authorize_bucket_config_mutation(&server, &mut envelope, &bucket, Action::S3Action(action))
         .await
         .expect("capture authorized bucket incarnation");
