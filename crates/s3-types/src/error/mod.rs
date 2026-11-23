@@ -81,6 +81,14 @@ impl S3Error {
         }))
     }
 
+    /// An error carrying the standard S3 message when its code defines one.
+    pub fn with_default_message(code: S3ErrorCode) -> Self {
+        let message = code.default_message();
+        let mut error = Self::new(code);
+        error.0.message = message.map(Cow::Borrowed);
+        error
+    }
+
     /// An error with a message.
     pub fn with_message(code: S3ErrorCode, message: impl Into<Cow<'static, str>>) -> Self {
         let mut error = Self::new(code);
