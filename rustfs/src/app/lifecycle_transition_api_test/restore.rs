@@ -16,23 +16,30 @@
 
 use super::common::*;
 use super::*;
+use crate::app::storage_api::object_usecase::bucket::RestoreRequest;
+use rustfs_gateway_types::dto::RestoreObjectOutput;
+use rustfs_s3_types::{S3ErrorCode, S3Result};
 
 const RESTORE_SUSPENDED_WAIT_TIMEOUT: Duration = Duration::from_secs(15);
+
+async fn restore_for_one_day(usecase: &DefaultObjectUsecase, bucket: &str, key: &str) -> S3Result<RestoreObjectOutput> {
+    Box::pin(usecase.execute_restore_object_owned(
+        request_envelope(Method::POST, HeaderMap::new()),
+        bucket.to_owned(),
+        key.to_owned(),
+        None,
+        Some(RestoreRequest {
+            days: Some(1),
+            ..Default::default()
+        }),
+    ))
+    .await
+}
 
 async fn suspend_test_bucket(bucket: &str) {
     DefaultBucketUsecase::from_global()
         .execute_put_bucket_versioning(
-            crate::app::RequestEnvelope::from_parts(
-                crate::app::RequestHead {
-                    method: Method::PUT,
-                    uri: Uri::from_static("/"),
-                    headers: HeaderMap::new(),
-                    credentials: None,
-                    region: None,
-                    service: None,
-                },
-                Extensions::new(),
-            ),
+            request_envelope(Method::PUT, HeaderMap::new()),
             bucket,
             Ok(rustfs_gateway_types::persistence::PersistedVersioningConfiguration {
                 status: Some("Suspended".to_owned()),
@@ -147,25 +154,7 @@ async fn restore_object_usecase_reports_ongoing_conflict() {
     backend.clear_op_log().await;
     let get_barrier = backend.arm_get_barrier().await;
 
-    let restore_request = || RestoreRequest {
-        days: Some(1),
-        description: None,
-        glacier_job_parameters: None,
-        output_location: None,
-        select_parameters: None,
-        tier: None,
-        type_: None,
-    };
-    let restore_input = || {
-        RestoreObjectInput::builder()
-            .bucket(bucket.clone())
-            .key(object.to_string())
-            .restore_request(Some(restore_request()))
-            .build()
-            .unwrap()
-    };
-
-    Box::pin(usecase.execute_restore_object(build_request(restore_input(), Method::POST)))
+    restore_for_one_day(&usecase, &bucket, object)
         .await
         .expect("restore request should be accepted");
 
@@ -184,7 +173,7 @@ async fn restore_object_usecase_reports_ongoing_conflict() {
     );
 
     // A second restore while one is in flight is rejected.
-    let err = Box::pin(usecase.execute_restore_object(build_request(restore_input(), Method::POST)))
+    let err = restore_for_one_day(&usecase, &bucket, object)
         .await
         .expect_err("a second restore while one is ongoing must be rejected");
     assert_eq!(
@@ -233,30 +222,10 @@ async fn restore_object_usecase_recovers_cancelled_post_commit_generation_inner(
     backend.clear_op_log().await;
     let tier_gets_before_restore = backend.get_count().await;
 
-    let restore_input = || {
-        RestoreObjectInput::builder()
-            .bucket(bucket.clone())
-            .key(object.to_string())
-            .restore_request(Some(RestoreRequest {
-                days: Some(1),
-                description: None,
-                glacier_job_parameters: None,
-                output_location: None,
-                select_parameters: None,
-                tier: None,
-                type_: None,
-            }))
-            .build()
-            .expect("restore request should build")
-    };
-
     let commit_barrier = crate::app::object::RestoreStatusCommitBarrier::install(bucket.as_str(), object);
-    let first_input = restore_input();
-    let first = tokio::spawn(async move {
-        DefaultObjectUsecase::from_global()
-            .execute_restore_object(build_request(first_input, Method::POST))
-            .await
-    });
+    let request_bucket = bucket.clone();
+    let first =
+        tokio::spawn(async move { restore_for_one_day(&DefaultObjectUsecase::from_global(), &request_bucket, object).await });
     commit_barrier.wait_until_paused().await;
 
     first.abort();
@@ -279,8 +248,7 @@ async fn restore_object_usecase_recovers_cancelled_post_commit_generation_inner(
             .expect("recoverable generations must persist a non-nil operation id");
     assert!(!orphaned_operation_id.is_nil());
 
-    DefaultObjectUsecase::from_global()
-        .execute_restore_object(build_request(restore_input(), Method::POST))
+    restore_for_one_day(&DefaultObjectUsecase::from_global(), &bucket, object)
         .await
         .expect("a new POST must supersede the committed generation whose worker lock was released");
 
@@ -342,27 +310,9 @@ async fn restore_object_usecase_completes_suspended_null_version_in_place_inner(
     let tier_gets_before_restore = backend.get_count().await;
     let get_barrier = backend.arm_get_barrier().await;
 
-    Box::pin(
-        usecase.execute_restore_object(build_request(
-            RestoreObjectInput::builder()
-                .bucket(bucket.clone())
-                .key(object.to_string())
-                .restore_request(Some(RestoreRequest {
-                    days: Some(1),
-                    description: None,
-                    glacier_job_parameters: None,
-                    output_location: None,
-                    select_parameters: None,
-                    tier: None,
-                    type_: None,
-                }))
-                .build()
-                .expect("restore request should build"),
-            Method::POST,
-        )),
-    )
-    .await
-    .expect("suspended null-version restore should be accepted");
+    restore_for_one_day(&usecase, &bucket, object)
+        .await
+        .expect("suspended null-version restore should be accepted");
 
     get_barrier.wait_until_paused().await;
     get_barrier.release();
@@ -421,30 +371,12 @@ async fn restore_object_usecase_accepts_exactly_one_of_two_concurrent_restores()
 
     let tier_gets_before_restore = backend.get_count().await;
 
-    let restore_input = || {
-        RestoreObjectInput::builder()
-            .bucket(bucket.clone())
-            .key(object.to_string())
-            .restore_request(Some(RestoreRequest {
-                days: Some(1),
-                description: None,
-                glacier_job_parameters: None,
-                output_location: None,
-                select_parameters: None,
-                tier: None,
-                type_: None,
-            }))
-            .build()
-            .unwrap()
-    };
-    let spawn_restore = |input: RestoreObjectInput| {
-        tokio::spawn(async move {
-            let usecase = DefaultObjectUsecase::from_global();
-            Box::pin(usecase.execute_restore_object(build_request(input, Method::POST))).await
-        })
+    let spawn_restore = || {
+        let bucket = bucket.clone();
+        tokio::spawn(async move { restore_for_one_day(&DefaultObjectUsecase::from_global(), &bucket, object).await })
     };
 
-    let (first, second) = tokio::join!(spawn_restore(restore_input()), spawn_restore(restore_input()));
+    let (first, second) = tokio::join!(spawn_restore(), spawn_restore());
     let results = [
         first.expect("first concurrent restore task panicked"),
         second.expect("second concurrent restore task panicked"),

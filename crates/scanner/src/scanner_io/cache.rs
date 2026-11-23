@@ -13,7 +13,7 @@
 // limitations under the License.
 use super::*;
 /// scanner cache locks and the cache snapshot persist/publish path.
-use crate::data_usage_define::clone_cache_value;
+use crate::data_usage_define::{DataUsageCacheBaselineRevisions, clone_cache_value};
 use crate::{ScannerConfigObjectDelete, ScannerObjectIO};
 use rustfs_scanner_metrics::usage_candidate::{
     ScannerUsageCandidateKind as CandidateKind, ScannerUsageCandidateOutcome as CandidateOutcome,
@@ -862,6 +862,7 @@ pub(super) fn completed_data_usage_info(
     cancelled: bool,
 ) -> Option<(DataUsageInfo, SystemTime)> {
     completed_usage_candidate(results, scope, tier_registry_names, bucket_plan_complete, cancelled)
+        .ok()
         .map(|candidate| (candidate.data, candidate.last_update))
 }
 
@@ -880,7 +881,7 @@ pub(super) fn completed_usage_candidate(
     tier_registry_names: &[String],
     bucket_plan_complete: bool,
     cancelled: bool,
-) -> Option<ValidatedUsageCandidate> {
+) -> std::result::Result<ValidatedUsageCandidate, CandidateOutcome> {
     let candidate: std::result::Result<ValidatedUsageCandidate, CandidateOutcome> = (|| {
         if !bucket_plan_complete {
             return Err(CandidateOutcome::InventoryIncomplete);
@@ -1004,7 +1005,7 @@ pub(super) fn completed_usage_candidate(
             Err(outcome) => *outcome,
         },
     );
-    candidate.ok()
+    candidate
 }
 
 fn tier_accounting_proof_is_publishable(
@@ -1570,7 +1571,7 @@ pub(super) async fn persist_and_publish_cache_snapshot(
     store: Arc<SetDisks>,
     updates: &mpsc::Sender<DataUsageCache>,
     mut cache_snapshot: DataUsageCache,
-    initial_revisions: Option<&DataUsageCacheRevisions>,
+    initial_revisions: Option<&DataUsageCacheBaselineRevisions>,
     cache_cycle_floor: &AtomicU64,
     expected_publication_epoch: u64,
 ) -> Option<SystemTime> {
@@ -1612,7 +1613,10 @@ pub(super) async fn persist_and_publish_cache_snapshot(
     };
 
     let mut persisted = DataUsageCache::default();
-    let revisions = match persisted.load_with_revisions(store.clone(), DATA_USAGE_CACHE_NAME).await {
+    let current_baseline = match persisted
+        .load_with_baseline_revisions(store.clone(), DATA_USAGE_CACHE_NAME)
+        .await
+    {
         Ok(revisions) => revisions,
         Err(err) => {
             error!(
@@ -1634,6 +1638,7 @@ pub(super) async fn persist_and_publish_cache_snapshot(
             return None;
         }
     };
+    let revisions = current_baseline.revisions();
     let Some(scan_plan_digest) = cache_snapshot.info.scan_plan_digest else {
         log_missing_set_snapshot_metadata(&store, &cache_snapshot.info, "plan_digest");
         return None;
@@ -1697,9 +1702,9 @@ pub(super) async fn persist_and_publish_cache_snapshot(
     {
         cache_snapshot = persisted;
     } else {
-        // A later execution may have completed while this scan was walking.
-        // Only replace the cache revision from which this scan started.
-        if initial_revisions != Some(&revisions) {
+        // Another execution must not advance the baseline. A backup catching
+        // up to the same decoded primary changes no baseline content.
+        if !initial_revisions.is_some_and(|initial| current_baseline.permits_unchanged_baseline_since(initial)) {
             warn!(
                 target: "rustfs::scanner::io",
                 event = EVENT_SCANNER_CACHE_PERSIST_STATE,
@@ -1741,7 +1746,7 @@ pub(super) async fn persist_and_publish_cache_snapshot(
             .save_with_revisions_for_epoch(
                 store.clone(),
                 DATA_USAGE_CACHE_NAME,
-                &revisions,
+                revisions,
                 expected_publication_epoch,
                 CancellationToken::new(),
             )

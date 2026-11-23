@@ -28,7 +28,7 @@ pub mod diagnostic {
 }
 
 pub mod admin {
-    pub use crate::diagnostics::admin_server_info::{get_local_server_property, get_server_info};
+    pub use crate::diagnostics::admin_server_info::{get_local_server_property, get_server_info, get_server_info_with_inventory};
 }
 
 pub mod bitrot {
@@ -72,10 +72,11 @@ pub mod bucket {
                 ExpiryState, LifecycleOps, ManualTransitionCancelCheck, ManualTransitionProgressSink,
                 ManualTransitionQueueSnapshot, ManualTransitionRunExecution, ManualTransitionRunOptions,
                 ManualTransitionRunReport, RestoreRequestOps, TransitionState, TransitionedObject, apply_expiry_rule,
-                apply_transition_rule, enqueue_expiry_for_existing_objects, enqueue_transition_for_existing_objects,
-                enqueue_transition_for_existing_objects_scoped, enqueue_transition_for_existing_objects_scoped_with_cancel,
-                enqueue_transition_immediate, expire_transitioned_object, get_global_expiry_state, get_global_transition_state,
-                init_background_expiry, lifecycle_version_delete_target, manual_transition_queue_snapshot, post_restore_opts,
+                apply_transition_rule, apply_transition_rule_with_incarnation, enqueue_expiry_for_existing_objects,
+                enqueue_transition_for_existing_objects, enqueue_transition_for_existing_objects_scoped,
+                enqueue_transition_for_existing_objects_scoped_with_cancel, enqueue_transition_immediate,
+                expire_transitioned_object, get_global_expiry_state, get_global_transition_state, init_background_expiry,
+                lifecycle_version_delete_target, manual_transition_queue_snapshot, post_restore_opts,
                 run_stale_multipart_upload_cleanup_once, validate_transition_tier,
             };
         }
@@ -348,7 +349,7 @@ pub mod bucket {
 
     pub mod utils {
         pub use crate::bucket::utils::{
-            BucketConfigXml, BucketConfigXmlError, check_bucket_and_object_names, check_list_objs_args,
+            BucketConfigXml, BucketConfigXmlError, check_bucket_and_object_names, check_list_objs_args, check_object_args,
             check_object_name_for_length_and_slash, check_valid_bucket_name_strict, deserialize, has_bad_path_component,
             has_xml_invalid_control_characters, is_meta_bucketname, is_valid_object_prefix, serialize,
         };
@@ -454,13 +455,13 @@ pub mod data_usage {
         DATA_USAGE_CACHE_NAME, apply_bucket_usage_memory_overlay, compute_bucket_usage,
         init_compression_total_memory_from_backend, invalidate_admin_data_usage_snapshot_cache,
         invalidate_data_usage_snapshot_cache, live_bucket_usage_computations, load_admin_data_usage_from_backend_cached,
-        load_bucket_usage_from_backend_cached, load_compression_total_from_memory, load_data_usage_from_backend,
-        load_data_usage_from_backend_cached, quota_object_size, record_bucket_delete_marker_memory,
+        load_admin_data_usage_with_memory_overlay, load_bucket_usage_from_backend_cached, load_compression_total_from_memory,
+        load_data_usage_from_backend, load_data_usage_from_backend_cached, quota_object_size, record_bucket_delete_marker_memory,
         record_bucket_object_delete_memory, record_bucket_object_version_write_memory, record_bucket_object_write_memory,
         record_bucket_object_write_unknown_previous_memory, record_compression_total_memory,
         refresh_bucket_usage_from_object_layer, refresh_versioned_bucket_usage_from_object_layer,
         remove_bucket_usage_from_backend, replace_bucket_usage_memory_from_info, store_compression_total_in_backend,
-        store_data_usage_in_backend,
+        store_data_usage_in_backend, verified_account_bucket_usage,
     };
     pub use crate::data_usage::{get_bucket_usage_memory, lookup_degraded_bucket_usage_baseline};
 }
@@ -469,6 +470,7 @@ pub mod disk {
     pub use crate::cluster::rpc::background_pipe::{BackgroundPipeReader, BackgroundPipeWriter, background_pipe};
     pub use crate::cluster::rpc::background_reader_stream::BackgroundReaderStream;
     pub use crate::disk::BOUNDED_DELETE_PREPARE_PROTOCOL_VERSION;
+    pub use crate::disk::ReplacementMount;
     pub use crate::disk::background_memory::BackgroundEncodeBuffer;
     pub use crate::disk::disk_store::get_object_disk_read_timeout;
     #[cfg(feature = "test-util")]

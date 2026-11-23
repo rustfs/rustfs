@@ -201,7 +201,12 @@ pub(super) fn request_body_is_aws_chunked_framed(headers: &HeaderMap) -> bool {
 /// Map a bucket-quota checker outcome onto the S3 admission result.
 ///
 /// Hard is the only supported quota type, so a checker fault (bucket-config read, config parse, or usage lookup) must fail closed rather than admit the write: allowing it would silently bypass a configured hard quota. The no-quota happy path never reaches the error arm — `QuotaChecker::check_quota` returns `Ok(allowed)` via the zero-extra-I/O fast path when no quota is configured, so failing closed here cannot penalise buckets without a quota. A bucket admitted by the durable reservation ledger never reaches it for an unavailable usage lookup either: the checker reports that usage as absent (`current_usage = None`) and the ledger settles admission at commit (rustfs/backlog#2904); only the snapshot protocol still fails closed on it. A fault surfaces as a retryable `ServiceUnavailable` and is counted; the client-facing message stays generic so internal config/usage details are not leaked.
-pub(crate) fn map_quota_check_outcome(bucket: &str, outcome: Result<QuotaCheckResult, QuotaError>) -> S3Result<QuotaCheckResult> {
+pub(crate) fn map_quota_check_outcome(
+    bucket: &str,
+    outcome: Result<QuotaCheckResult, QuotaError>,
+) -> rustfs_s3_types::S3Result<QuotaCheckResult> {
+    use rustfs_s3_types::{S3Error, S3ErrorCode};
+
     match outcome {
         Ok(result) if !result.allowed => Err(S3Error::with_message(
             S3ErrorCode::InvalidRequest,
@@ -542,8 +547,8 @@ mod deadlock_request_guard_tests {
     }
 }
 
-pub(super) async fn maybe_enqueue_transition_immediate(obj_info: &ObjectInfo, src: LcEventSrc) {
-    enqueue_transition_immediate(obj_info, src).await;
+pub(super) async fn maybe_enqueue_transition_immediate(obj_info: &ObjectInfo, src: LcEventSrc, incarnation: Option<uuid::Uuid>) {
+    enqueue_transition_immediate(obj_info, src, incarnation).await;
 }
 
 /// Inject additional-checksum response headers (XXHash3/64/128, SHA-512) that s3s
@@ -2208,7 +2213,8 @@ mod tests {
     #[test]
     fn quota_admission_rejects_over_limit() {
         let err = map_quota_check_outcome("bucket", Ok(quota_result(false))).expect_err("an over-limit result rejects the write");
-        assert_eq!(err.code(), &S3ErrorCode::InvalidRequest);
+        assert_eq!(err.code(), &rustfs_s3_types::S3ErrorCode::InvalidRequest);
+        assert_eq!(err.message(), Some("Bucket quota exceeded. Current usage: 1024 bytes, limit: 2048 bytes"));
     }
 
     #[test]
@@ -2237,7 +2243,8 @@ mod tests {
             }),
         )
         .expect_err("a checker fault must fail closed");
-        assert_eq!(err.code(), &S3ErrorCode::ServiceUnavailable);
+        assert_eq!(err.code(), &rustfs_s3_types::S3ErrorCode::ServiceUnavailable);
+        assert_eq!(err.message(), Some("Bucket quota check temporarily unavailable, please retry"));
     }
 
     #[test]
@@ -2269,7 +2276,8 @@ mod tests {
             }),
         )
         .expect_err("unknown authoritative usage must not admit a snapshot-protocol write");
-        assert_eq!(err.code(), &S3ErrorCode::ServiceUnavailable);
+        assert_eq!(err.code(), &rustfs_s3_types::S3ErrorCode::ServiceUnavailable);
+        assert_eq!(err.message(), Some("Bucket quota check temporarily unavailable, please retry"));
     }
 
     /// rustfs/backlog#2904: a durable-quota check whose scanner usage is

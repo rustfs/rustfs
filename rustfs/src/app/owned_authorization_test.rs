@@ -17,7 +17,6 @@
 //! entry and condition values. These live in the app layer because the
 //! envelope (and its impl of the storage facts trait) belongs here.
 
-use crate::app::RequestEnvelope;
 use crate::app::storage_api::context::MultipartStagingOperation;
 use crate::app::storage_api::owned_parity::parity_test_support as support;
 use crate::app::storage_api::owned_parity::{DenialAuditor, DenialRateLimiter};
@@ -30,6 +29,7 @@ use crate::app::storage_api::s3::{
     BucketLocationConstraint, CreateBucketConfiguration, CreateBucketInput, CreateMultipartUploadInput, DeleteObjectInput,
     ObjectLockRetention, PutObjectInput, S3Error, S3ErrorCode, S3Request,
 };
+use crate::app::{RequestEnvelope, RequestHead};
 use crate::auth::facts::{AuthzPrincipal, AuthzTarget};
 use crate::storage::storage_api::contract::bucket::{BucketOperations as _, MakeBucketOptions};
 use crate::storage::storage_api::contract::object::{ObjectIO as _, ObjectOperations as _};
@@ -80,13 +80,26 @@ fn ensure_req_info<T>(req: &mut S3Request<T>) {
     req.extensions.insert(ReqInfo::default());
 }
 
+fn denial_envelope(method: Method, uri: Uri, extensions: Extensions) -> RequestEnvelope {
+    RequestEnvelope::from_parts(
+        RequestHead {
+            method,
+            uri,
+            headers: HeaderMap::new(),
+            credentials: None,
+            region: None,
+            service: None,
+        },
+        extensions,
+    )
+}
+
 #[test]
-fn owned_and_legacy_denials_share_audit_fields_and_rate_limit() {
+fn authenticated_denials_preserve_audit_fields_across_the_burst() {
     use crate::app::storage_api::owned_parity::DenialScope;
     use crate::app::storage_api::owned_parity::ReqInfo;
     use crate::app::storage_api::owned_parity::RequestContext;
-    use crate::app::storage_api::s3::S3Request;
-    use http::{Extensions, HeaderMap, Method, Uri};
+    use http::{Extensions, Method, Uri};
     use rustfs_credentials::Credentials;
     use rustfs_policy::policy::action::{Action, S3Action};
     use std::sync::{Arc, Mutex};
@@ -102,18 +115,8 @@ fn owned_and_legacy_denials_share_audit_fields_and_rate_limit() {
         },
     )
     .with_clock(move || now);
-    let mut req = S3Request {
-        input: (),
-        method: Method::GET,
-        uri: Uri::from_static("/uri-bucket/uri-object"),
-        headers: HeaderMap::new(),
-        extensions: Extensions::new(),
-        credentials: None,
-        region: None,
-        service: None,
-        trailing_headers: None,
-    };
-    req.extensions.insert(ReqInfo {
+    let mut extensions = Extensions::new();
+    extensions.insert(ReqInfo {
         cred: Some(Credentials {
             access_key: "audit-user".to_string(),
             ..Default::default()
@@ -129,11 +132,11 @@ fn owned_and_legacy_denials_share_audit_fields_and_rate_limit() {
         }),
         ..Default::default()
     });
-    let envelope = crate::app::RequestEnvelope::from_s3s(&req);
+    let envelope = denial_envelope(Method::GET, Uri::from_static("/uri-bucket/uri-object"), extensions);
     let action = Action::S3Action(S3Action::GetObjectAction);
-    auditor.audit(&req, &action, "denied", DenialScope::Request);
-    auditor.audit_owned(&envelope.audit_view(), &action, "denied", DenialScope::Request);
-    auditor.audit_owned(&envelope.audit_view(), &action, "denied", DenialScope::Request);
+    for _ in 0..3 {
+        auditor.audit_owned(&envelope.audit_view(), &action, "denied", DenialScope::Request);
+    }
 
     let entries = captured.lock().unwrap();
     assert_eq!(entries.len(), 2);
@@ -147,13 +150,12 @@ fn owned_and_legacy_denials_share_audit_fields_and_rate_limit() {
 }
 
 #[test]
-fn owned_and_legacy_denials_preserve_context_and_address_precedence() {
+fn denials_preserve_context_and_address_precedence() {
     use crate::app::storage_api::owned_parity::ReqInfo;
     use crate::app::storage_api::owned_parity::RequestContext;
-    use crate::app::storage_api::owned_parity::{DenialScope, authorization_denial_entry, authorization_denial_entry_for_view};
-    use crate::app::storage_api::s3::S3Request;
+    use crate::app::storage_api::owned_parity::{DenialScope, authorization_denial_entry_for_view};
     use crate::shared_types::RemoteAddr;
-    use http::{Extensions, HeaderMap, Method, Uri};
+    use http::{Extensions, Method, Uri};
     use rustfs_policy::policy::action::{Action, S3Action};
     use rustfs_trusted_proxies::ClientInfo;
     use std::net::SocketAddr;
@@ -166,57 +168,42 @@ fn owned_and_legacy_denials_preserve_context_and_address_precedence() {
         span_id: None,
         start_time: now,
     };
-    let mut req = S3Request {
-        input: (),
-        method: Method::GET,
-        uri: Uri::from_static("/uri-bucket/uri-object"),
-        headers: HeaderMap::new(),
-        extensions: Extensions::new(),
-        credentials: None,
-        region: None,
-        service: None,
-        trailing_headers: None,
-    };
-    req.extensions.insert(ReqInfo {
+    let mut extensions = Extensions::new();
+    extensions.insert(ReqInfo {
         bucket: Some(String::new()),
         object: Some(String::new()),
         request_context: Some(context("nested")),
         ..Default::default()
     });
-    req.extensions.insert(context("direct"));
-    req.extensions
-        .insert(Some(RemoteAddr("192.0.2.2:9000".parse::<SocketAddr>().unwrap())));
-    req.extensions.insert(ClientInfo::direct("198.51.100.7:443".parse().unwrap()));
+    extensions.insert(context("direct"));
+    extensions.insert(Some(RemoteAddr("192.0.2.2:9000".parse::<SocketAddr>().unwrap())));
+    extensions.insert(ClientInfo::direct("198.51.100.7:443".parse().unwrap()));
     let action = Action::S3Action(S3Action::GetObjectAction);
 
     for (client_present, expected_host) in [(true, "198.51.100.7"), (false, "192.0.2.2")] {
         if !client_present {
-            req.extensions.remove::<ClientInfo>();
-            req.extensions.remove::<RequestContext>();
+            extensions.remove::<ClientInfo>();
+            extensions.remove::<RequestContext>();
         }
-        let envelope = crate::app::RequestEnvelope::from_s3s(&req);
+        let envelope = denial_envelope(Method::GET, Uri::from_static("/uri-bucket/uri-object"), extensions.clone());
         let expected_id = if client_present { "direct" } else { "nested" };
-        let legacy = authorization_denial_entry(&req, &action, "denied", DenialScope::Request);
-        let owned = authorization_denial_entry_for_view(&envelope.audit_view(), &action, "denied", DenialScope::Request);
-        for entry in [legacy, owned] {
-            assert_eq!(
-                (
-                    entry.request_id.as_deref(),
-                    entry.remote_host.as_deref(),
-                    entry.api.bucket.as_deref(),
-                    entry.api.object.as_deref()
-                ),
-                (Some(expected_id), Some(expected_host), Some("uri-bucket"), Some("uri-object")),
-            );
-        }
+        let entry = authorization_denial_entry_for_view(&envelope.audit_view(), &action, "denied", DenialScope::Request);
+        assert_eq!(
+            (
+                entry.request_id.as_deref(),
+                entry.remote_host.as_deref(),
+                entry.api.bucket.as_deref(),
+                entry.api.object.as_deref()
+            ),
+            (Some(expected_id), Some(expected_host), Some("uri-bucket"), Some("uri-object")),
+        );
     }
 }
 
 #[test]
-fn anonymous_owned_and_legacy_denials_share_limit_and_bulk_scope() {
+fn anonymous_denials_preserve_bulk_scope_across_a_refill() {
     use crate::app::storage_api::owned_parity::DenialScope;
-    use crate::app::storage_api::s3::S3Request;
-    use http::{Extensions, HeaderMap, Method, Uri};
+    use http::{Extensions, Method, Uri};
     use rustfs_policy::policy::action::{Action, S3Action};
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
@@ -224,6 +211,8 @@ fn anonymous_owned_and_legacy_denials_share_limit_and_bulk_scope() {
     let now = Instant::now();
     let captured = Arc::new(Mutex::new(Vec::new()));
     let sink = Arc::clone(&captured);
+    let clock = Arc::new(Mutex::new(now));
+    let audit_clock = Arc::clone(&clock);
     let auditor = DenialAuditor::new(
         DenialRateLimiter::new(2, 1, now),
         || true,
@@ -231,22 +220,13 @@ fn anonymous_owned_and_legacy_denials_share_limit_and_bulk_scope() {
             sink.lock().unwrap().push((context, entry));
         },
     )
-    .with_clock(move || now + Duration::from_secs(1));
-    let req = S3Request {
-        input: (),
-        method: Method::POST,
-        uri: Uri::from_static("/bucket/key"),
-        headers: HeaderMap::new(),
-        extensions: Extensions::new(),
-        credentials: None,
-        region: None,
-        service: None,
-        trailing_headers: None,
-    };
-    let envelope = crate::app::RequestEnvelope::from_s3s(&req);
+    .with_clock(move || *audit_clock.lock().unwrap());
+    let envelope = denial_envelope(Method::POST, Uri::from_static("/bucket/key"), Extensions::new());
     let action = Action::S3Action(S3Action::DeleteObjectAction);
-    auditor.audit_at(&req, &action, "denied", DenialScope::Keys(3), now);
-    auditor.audit_at(&req, &action, "denied", DenialScope::Keys(3), now);
+    for _ in 0..2 {
+        auditor.audit_owned(&envelope.audit_view(), &action, "denied", DenialScope::Keys(3));
+    }
+    *clock.lock().unwrap() = now + Duration::from_secs(1);
     auditor.audit_owned(&envelope.audit_view(), &action, "denied", DenialScope::Keys(3));
 
     let entries = captured.lock().unwrap();
@@ -1995,4 +1975,57 @@ async fn owned_and_legacy_write_checks_hand_on_the_same_decision_and_state() {
         }
     }
     assert!(mismatches.is_empty(), "write check mismatches:\n{}", mismatches.join("\n"));
+}
+
+#[tokio::test]
+#[serial]
+async fn metadata_mutation_authorization_binds_to_the_server_bucket() {
+    use crate::app::RequestHead;
+    use crate::app::storage_api::object_usecase::{StorageObjectOptions, access::apply_bucket_generation_guard};
+    use crate::app::storage_api::owned_parity::{
+        authorize_delete_object_tagging, authorize_put_object_acl, authorize_put_object_tagging,
+    };
+    let (_dirs, store, slot, _user, owner) = decision_world().await;
+    let identity = store.bucket_incarnation_id(PRIVATE).await.expect("server bucket identity");
+    let request = |method| {
+        let mut extensions = Extensions::new();
+        extensions.insert(Arc::clone(&slot));
+        extensions.insert(ReqInfo {
+            cred: Some(owner.clone()),
+            is_owner: true,
+            bucket: Some(PRIVATE.to_string()),
+            object: Some("allowed".to_string()),
+            ..Default::default()
+        });
+        RequestEnvelope::from_parts(
+            RequestHead {
+                method,
+                uri: Uri::from_static("/parity-private/allowed"),
+                headers: HeaderMap::new(),
+                credentials: None,
+                region: None,
+                service: None,
+            },
+            extensions,
+        )
+    };
+
+    let mut put_tagging = request(Method::PUT);
+    authorize_put_object_tagging(&mut put_tagging, &slot, PRIVATE, "allowed", None, RequestedObjectTags(vec![]))
+        .await
+        .expect("authorize PutObjectTagging");
+    let mut delete_tagging = request(Method::DELETE);
+    authorize_delete_object_tagging(&mut delete_tagging, &slot, PRIVATE, "allowed", None)
+        .await
+        .expect("authorize DeleteObjectTagging");
+    let mut put_acl = request(Method::PUT);
+    authorize_put_object_acl(&mut put_acl, &slot, PRIVATE, "allowed", None)
+        .await
+        .expect("authorize PutObjectAcl");
+
+    for request in [&put_tagging, &delete_tagging, &put_acl] {
+        let mut options = StorageObjectOptions::default();
+        apply_bucket_generation_guard(request, PRIVATE, &mut options).expect("bucket generation guard");
+        assert_eq!(options.expected_bucket_incarnation_id, Some(identity));
+    }
 }

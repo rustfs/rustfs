@@ -24,17 +24,12 @@ pin_project! {
         #[pin]
         pub inner: R,
         remaining: i64,
-        scratch: Vec<u8>,
     }
 }
 
 impl<R> HardLimitReader<R> {
     pub fn new(inner: R, limit: i64) -> Self {
-        HardLimitReader {
-            inner,
-            remaining: limit,
-            scratch: Vec::new(),
-        }
+        HardLimitReader { inner, remaining: limit }
     }
 }
 
@@ -79,14 +74,25 @@ where
                 Poll::Ready(Ok(())) => buf.filled().len() - before,
             }
         } else {
-            this.scratch.resize(allowed, 0);
-            let mut scratch_buf = ReadBuf::new(&mut this.scratch[..allowed]);
-            match this.inner.as_mut().poll_read(cx, &mut scratch_buf) {
+            let mut limited = buf.take(allowed);
+            let limited_ptr = limited.filled().as_ptr();
+            match this.inner.as_mut().poll_read(cx, &mut limited) {
                 Poll::Pending => return Poll::Pending,
                 Poll::Ready(Err(err)) => return Poll::Ready(Err(err)),
                 Poll::Ready(Ok(())) => {
-                    let read = scratch_buf.filled().len();
-                    buf.put_slice(scratch_buf.filled());
+                    if limited.filled().as_ptr() != limited_ptr || limited.capacity() != allowed {
+                        return Poll::Ready(Err(Error::other("inner AsyncRead replaced ReadBuf")));
+                    }
+                    let read = limited.filled().len();
+                    let init = limited.initialized().len();
+                    // SAFETY: `limited` was verified above to still point to the exact `allowed`-byte
+                    // prefix of `buf`'s unfilled tail, and `limited` started with `initialized == 0`,
+                    // so `init` bytes of that tail were initialized during `poll_read`.
+                    #[allow(unsafe_code)]
+                    unsafe {
+                        buf.assume_init(init);
+                    }
+                    buf.advance(read);
                     read
                 }
             }
@@ -247,5 +253,32 @@ mod tests {
 
         assert_eq!(out, b"abc");
         assert!(err.to_string().contains("more bytes than specified"));
+    }
+
+    #[tokio::test]
+    async fn test_hardlimit_reader_rejects_inner_reader_that_replaces_read_buf() {
+        struct SwappingReader;
+
+        impl AsyncRead for SwappingReader {
+            fn poll_read(self: Pin<&mut Self>, _cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<Result<()>> {
+                let leaked: &'static mut [u8] = Box::leak(Box::new([0xaa; 16]));
+                let mut replacement = ReadBuf::new(leaked);
+                replacement.put_slice(&[1, 2, 3]);
+                *buf = replacement;
+                Poll::Ready(Ok(()))
+            }
+        }
+
+        let mut reader = HardLimitReader::new(SwappingReader, 3);
+        let mut uninit = [std::mem::MaybeUninit::<u8>::uninit(); 8];
+        let mut buf = ReadBuf::uninit(&mut uninit);
+
+        let err = std::future::poll_fn(|cx| Pin::new(&mut reader).poll_read(cx, &mut buf))
+            .await
+            .expect_err("replacing ReadBuf must be rejected");
+        assert_eq!(err.kind(), std::io::ErrorKind::Other);
+        assert!(err.to_string().contains("replaced ReadBuf"));
+        assert_eq!(buf.filled().len(), 0);
+        assert_eq!(buf.initialized().len(), 0);
     }
 }

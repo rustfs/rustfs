@@ -23,6 +23,7 @@ members = [
     "crates/connect-symbol-catalog", # Release-only CPU profile symbol catalog generator
     "crates/credentials", # Credential management system
     "crates/crypto", # Cryptography and security features
+    "crates/cuobject-sys", # Native NVIDIA cuObject server SDK bindings
     "crates/cuobject", # NVIDIA cuObject S3-over-RDMA staging and transfers (optional)
     "crates/nixl", # NIXL/UCX S3-over-RDMA server side (optional)
     "crates/ecstore", # Erasure coding storage implementation
@@ -109,6 +110,7 @@ rustfs-concurrency = { path = "./crates/concurrency", version = "1.0.5" }
 rustfs-credentials = { path = "crates/credentials", version = "1.0.5" }
 rustfs-crypto = { path = "crates/crypto", version = "1.0.5" }
 rustfs-cuobject = { path = "crates/cuobject", version = "1.0.5" }
+rustfs-cuobject-sys = { path = "crates/cuobject-sys", version = "1.0.5" }
 rustfs-nixl = { path = "crates/nixl", version = "1.0.5" }
 rustfs-ecstore = { path = "crates/ecstore", version = "1.0.5" }
 rustfs-filemeta = { path = "crates/filemeta", version = "1.0.5" }
@@ -154,16 +156,16 @@ rustfs-zip = { path = "./crates/zip", version = "1.0.5" }
 # engine crates move onto from s3s (rustfs/backlog#2745). The one pin of the
 # gateway in this workspace; no crate may enable a `compat-s3s*` feature except
 # the s3s-facing edge of the rustfs binary.
-rustfs-gateway-types = { git = "https://github.com/rustfs/gateway.git", rev = "60dcd2a55713dbcc9dbd6e165922e1a0df4473d7", version = "0.42.0", default-features = false }
-rustfs-gateway-stream = { git = "https://github.com/rustfs/gateway.git", rev = "60dcd2a55713dbcc9dbd6e165922e1a0df4473d7", version = "0.2.0", default-features = false }
+rustfs-gateway-types = { git = "https://github.com/rustfs/gateway.git", rev = "810c39fa41347ea27d1b1310201b3f941f0e3310", version = "0.42.0", default-features = false }
+rustfs-gateway-stream = { git = "https://github.com/rustfs/gateway.git", rev = "810c39fa41347ea27d1b1310201b3f941f0e3310", version = "0.2.0", default-features = false }
 # The gateway framework itself, consumed for its extension traits by the ring-2
 # adapter. `default-features = false` keeps the `server` feature, and with it the
 # server crate, out of the build.
-rustfs-gateway = { git = "https://github.com/rustfs/gateway.git", rev = "60dcd2a55713dbcc9dbd6e165922e1a0df4473d7", version = "0.66.0", default-features = false }
+rustfs-gateway = { git = "https://github.com/rustfs/gateway.git", rev = "810c39fa41347ea27d1b1310201b3f941f0e3310", version = "0.66.0", default-features = false }
 # Test-only: builds the `EffectiveHost` a host-resolution test queries with.
-rustfs-gateway-http = { git = "https://github.com/rustfs/gateway.git", rev = "60dcd2a55713dbcc9dbd6e165922e1a0df4473d7", default-features = false }
-rustfs-gateway-core = { git = "https://github.com/rustfs/gateway.git", rev = "60dcd2a55713dbcc9dbd6e165922e1a0df4473d7", version = "0.63.0", default-features = false }
-rustfs-gateway-dialect-rustfs-admin = { git = "https://github.com/rustfs/gateway.git", rev = "60dcd2a55713dbcc9dbd6e165922e1a0df4473d7", version = "0.13.0", default-features = false }
+rustfs-gateway-http = { git = "https://github.com/rustfs/gateway.git", rev = "810c39fa41347ea27d1b1310201b3f941f0e3310", default-features = false }
+rustfs-gateway-core = { git = "https://github.com/rustfs/gateway.git", rev = "810c39fa41347ea27d1b1310201b3f941f0e3310", version = "0.63.0", default-features = false }
+rustfs-gateway-dialect-rustfs-admin = { git = "https://github.com/rustfs/gateway.git", rev = "810c39fa41347ea27d1b1310201b3f941f0e3310", version = "0.13.0", default-features = false }
 
 # Async Runtime and Networking
 async-channel = "2.5.0"
@@ -315,7 +317,8 @@ hostname = "0.4.2"
 ipnetwork = { version = "0.21.1" }
 lazy_static = "1.5.1"
 libc = "0.2.191"
-cuobject = { version = "0.1.0", default-features = false }
+cxx = "1"
+cxx-build = "1"
 libsystemd = "0.7.2"
 local-ip-address = "0.6.13"
 log = "0.4"

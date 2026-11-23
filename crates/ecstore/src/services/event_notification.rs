@@ -82,6 +82,8 @@ impl EventNotifier {
 
 #[derive(Debug, Default)]
 pub struct EventArgs {
+    /// Bucket instance verified by storage when producing this event.
+    pub bucket_incarnation_id: Option<uuid::Uuid>,
     pub event_name: String,
     pub bucket_name: String,
     pub object: ObjectInfo,
@@ -135,6 +137,7 @@ pub(crate) mod test_recorder {
     #[derive(Clone, Debug)]
     pub(crate) struct RecordedEvent {
         pub(crate) event_name: String,
+        pub(crate) bucket_incarnation_id: Option<Uuid>,
         pub(crate) bucket: String,
         pub(crate) object: String,
         pub(crate) version_id: Option<Uuid>,
@@ -154,6 +157,7 @@ pub(crate) mod test_recorder {
                 register_event_dispatch_hook(|args| {
                     recorded().lock().unwrap_or_else(|err| err.into_inner()).push(RecordedEvent {
                         event_name: args.event_name,
+                        bucket_incarnation_id: args.bucket_incarnation_id,
                         bucket: args.bucket_name,
                         object: args.object.name,
                         version_id: args.object.version_id,

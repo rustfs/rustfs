@@ -208,11 +208,11 @@ fn classify_bucket_notification_lookup(
     }
 }
 
-/// Apply one bucket's persisted notification rules. An unreadable config is
+/// Validate one bucket's persisted notification rules. An unreadable config is
 /// isolated to its bucket and does not abort setup for the other buckets.
 /// Metadata-bound server dispatch independently suppresses external delivery
 /// for unreadable snapshots rather than retaining an old subscription.
-async fn apply_bucket_notification_configuration(bucket: &str, region: &str) -> Result<bool, NotificationError> {
+async fn validate_bucket_notification_configuration(bucket: &str, region: &str) -> Result<bool, NotificationError> {
     match classify_bucket_notification_lookup(bucket, get_bucket_notification_config(bucket).await)? {
         BucketNotificationLookup::Unreadable => Ok(false),
         BucketNotificationLookup::Configured(cfg) => {
@@ -231,7 +231,7 @@ async fn apply_bucket_notification_configuration(bucket: &str, region: &str) -> 
             let event_rules =
                 notification_config_to_event_rules(cfg).map_err(|err| NotificationError::BucketNotification(err.to_string()))?;
             current_notify_interface()
-                .add_event_specific_rules(bucket, region, &event_rules)
+                .validate_event_specific_rules(bucket, region, &event_rules)
                 .await?;
             Ok(true)
         }
@@ -244,15 +244,15 @@ async fn apply_bucket_notification_configuration(bucket: &str, region: &str) -> 
                 bucket = %bucket,
                 "Bucket notification configuration not found"
             );
-            current_notify_interface().clear_bucket_notification_rules(bucket).await?;
             Ok(false)
         }
     }
 }
 
-/// Add existing bucket notification configurations to the global notifier system.
+/// Validate existing bucket notification configurations against the global notifier system.
 /// This function retrieves notification configurations for each bucket
-/// and registers the corresponding event rules with the notifier system.
+/// and validates the corresponding event rules with the notifier system.
+/// Store-owned metadata snapshots independently control rule publication and withdrawal.
 ///  It processes queue, topic, and lambda configurations and maps them to event rules.
 ///  # Arguments
 /// * `buckets` - A vector of bucket names to process
@@ -260,7 +260,7 @@ async fn apply_bucket_notification_configuration(bucket: &str, region: &str) -> 
 pub async fn add_bucket_notification_configuration(buckets: Vec<String>) {
     let region = notification_region();
     for bucket in buckets.iter() {
-        if let Err(err) = apply_bucket_notification_configuration(bucket, region.as_str()).await {
+        if let Err(err) = validate_bucket_notification_configuration(bucket, region.as_str()).await {
             let err = s3_error!(InternalError, "Failed to add rules: {err}");
             error!(
                 target: "rustfs::init",
@@ -290,7 +290,7 @@ pub(crate) async fn reconcile_persisted_bucket_notification_configurations(
     let mut configured_bucket_count = 0;
 
     for bucket in bucket_infos {
-        if apply_bucket_notification_configuration(&bucket.name, region.as_str()).await? {
+        if validate_bucket_notification_configuration(&bucket.name, region.as_str()).await? {
             configured_bucket_count += 1;
         }
     }

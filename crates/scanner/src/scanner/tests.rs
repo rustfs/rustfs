@@ -52,9 +52,11 @@ const TEST_DEFAULT_SCANNER_CYCLE_SECS: u64 = 24 * 60 * 60;
 mod cycle_budget_publication;
 pub(super) mod cycle_persist_failure;
 mod gate_self_heal;
+mod paged_checkpoint;
 mod quota_reset_preservation;
 
 mod recovery_control;
+mod restore_deadline;
 mod scoped_ack_publication;
 mod wakeup_metrics;
 
@@ -567,6 +569,72 @@ async fn scanner_cycle_lock_fence_bounds_uncooperative_shutdown() {
 }
 
 #[tokio::test(start_paused = true)]
+async fn cluster_scanner_records_a_budget_deadline_before_the_first_worker_poll() {
+    let metrics = rustfs_scanner_metrics::metrics::Metrics::new();
+    let ctx = CancellationToken::new();
+    let budget = ScannerCycleBudget::new(
+        &ctx,
+        ScannerCycleBudgetConfig {
+            max_duration: Some(Duration::from_secs(1)),
+            ..Default::default()
+        },
+    );
+    budget.wait_for_stop().await;
+    advance(SCANNER_LOCK_LOSS_SHUTDOWN_TIMEOUT + Duration::from_secs(1)).await;
+    let worker = std::future::poll_fn(|_| panic!("expired drain must win before polling the worker"));
+    let wait = await_observed_scanner_cycle(&metrics, 9, 40, &ctx, &budget, worker, std::future::pending()).await;
+    assert_eq!(wait, ScannerCycleWaitOutcome::Deadline { worker_stopped: false });
+    let attempt = metrics
+        .scanner_node_observation()
+        .await
+        .last_attempt
+        .expect("dropped attempt");
+    assert_eq!(
+        (attempt.epoch, attempt.cycle, attempt.result, attempt.partial_reason),
+        (9, 40, "partial", Some("runtime"))
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn cluster_scanner_records_lock_loss_cancellation_and_cooperative_completion() {
+    let metrics = rustfs_scanner_metrics::metrics::Metrics::new();
+    let ctx = CancellationToken::new();
+    let budget = ScannerCycleBudget::new(&ctx, Default::default());
+    let wait = await_observed_scanner_cycle(&metrics, 9, 40, &ctx, &budget, std::future::pending(), std::future::ready(())).await;
+    assert_eq!(wait, ScannerCycleWaitOutcome::LockLost);
+    let attempt = metrics.scanner_node_observation().await.last_attempt.expect("lost lock");
+    assert_eq!(attempt.result, "lock_lost");
+    assert!(attempt.duration >= SCANNER_LOCK_LOSS_SHUTDOWN_TIMEOUT);
+
+    let ctx = CancellationToken::new();
+    let budget = ScannerCycleBudget::new(&ctx, Default::default());
+    ctx.cancel();
+    let wait = await_observed_scanner_cycle(&metrics, 9, 41, &ctx, &budget, std::future::pending(), std::future::pending()).await;
+    assert_eq!(wait, ScannerCycleWaitOutcome::Cancelled);
+    assert_eq!(
+        metrics
+            .scanner_node_observation()
+            .await
+            .last_attempt
+            .expect("cancelled attempt")
+            .result,
+        "cancelled"
+    );
+
+    let ctx = CancellationToken::new();
+    let budget = ScannerCycleBudget::new(&ctx, Default::default());
+    let worker = std::future::ready(ScannerCycleOutcome::Completed);
+    let wait = await_observed_scanner_cycle(&metrics, 9, 42, &ctx, &budget, worker, std::future::ready(())).await;
+    assert_eq!(wait, ScannerCycleWaitOutcome::LockLost);
+    let attempt = metrics
+        .scanner_node_observation()
+        .await
+        .last_attempt
+        .expect("cooperative result");
+    assert_eq!((attempt.cycle, attempt.result), (42, "success"));
+}
+
+#[tokio::test(start_paused = true)]
 async fn cycle_budget_fences_late_writer_after_timeout() {
     let cycle_ctx = CancellationToken::new();
     let budget = ScannerCycleBudget::new(
@@ -773,7 +841,8 @@ async fn cycle_budget_deadline_handler_fences_and_releases_guard() {
     );
     budget.mark_cycle_state_persisted();
 
-    handle_scanner_cycle_deadline(
+    let service_cohort = Arc::new(StdMutex::new(ScannerServiceCohort::default()));
+    let continuation = handle_scanner_cycle_deadline(
         &ctx,
         store.clone(),
         ScannerCycleDeadlineState {
@@ -781,12 +850,24 @@ async fn cycle_budget_deadline_handler_fences_and_releases_guard() {
             cycle_revision: &mut cycle_revision,
             leader_epoch: &mut leader_epoch,
             cycle_budget: &budget,
+            service_cohort: service_cohort.clone(),
             allow_bootstrap_pending: false,
         },
         true,
         &mut guard,
     )
-    .await;
+    .await
+    .expect("a fully drained and fenced deadline retains the live cohort across supervisor iterations");
+    assert!(Arc::ptr_eq(&continuation.cohort, &service_cohort));
+    assert!(continuation.matches_claim(&cycle_revision, 3));
+    assert!(
+        !continuation.matches_claim(&cycle_revision, 4),
+        "an intervening owner ends the continuation"
+    );
+    assert!(
+        !continuation.matches_claim(&DataUsageCacheRevision::Missing, 3),
+        "a replaced cursor ends the continuation"
+    );
 
     assert!(guard.is_released());
     assert_eq!(leader_epoch, 2, "deadline handler should claim the next epoch");
@@ -989,6 +1070,7 @@ struct MemoryConfigStore {
     insert_after_gets: Mutex<HashMap<String, Vec<u8>>>,
     read_errors: Mutex<HashMap<String, EcstoreError>>,
     delayed_gets: Mutex<HashMap<String, Duration>>,
+    checkpoint_page_delay_ms: AtomicUsize,
     non_regular_objects: Mutex<HashSet<String>>,
     fail_put_number: Mutex<HashMap<String, usize>>,
     /// Fail every put whose number is at least the stored value.
@@ -1000,6 +1082,7 @@ struct MemoryConfigStore {
     cancel_after_successful_puts: Mutex<HashMap<String, (usize, CancellationToken)>>,
     replace_after_successful_puts: Mutex<HashMap<String, (usize, Vec<u8>)>>,
     error_after_commit_deletes: Mutex<HashSet<String>>,
+    fail_prefix_deletes: AtomicBool,
     cancel_after_deletes: Mutex<HashMap<String, CancellationToken>>,
     pause_next_publication_admission: Mutex<Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>>,
     put_counts: Mutex<HashMap<String, usize>>,
@@ -1046,6 +1129,17 @@ impl crate::storage_api::scanner_io::ObjectIO for MemoryConfigStore {
             .await
             .push(crate::storage_api::ecstore_diagnostic::current_read_version_entry_source());
         let key = memory_config_key(bucket, object);
+        let _serial_page_read = if object.contains(".pages/") {
+            restore_deadline::admit_page(object).await
+        } else {
+            None
+        };
+        if object.contains(".pages/") {
+            let delay = self.checkpoint_page_delay_ms.load(Ordering::Relaxed);
+            if delay != 0 {
+                tokio::time::sleep(Duration::from_millis(delay as u64)).await;
+            }
+        }
         if let Some(error) = self.read_errors.lock().await.get(&key).cloned() {
             return Err(error);
         }
@@ -1632,6 +1726,94 @@ async fn run_data_scanner_cycle_publishes_activity_for_owner_lifetime() {
     ));
     assert!(!global_metrics().report().await.current_cycle_active);
 
+    global_metrics().set_cycle(None).await;
+}
+
+#[tokio::test]
+#[serial]
+async fn single_drive_cycle_persists_usage_and_advances_with_healing_marker() {
+    use crate::scanner_io::{clear_dirty_usage_buckets_for_tests, tests::wait_for_namespace_commit_tails};
+    use crate::storage_api::scan::{HEALING_MARKER_PATH, MakeBucketOptions};
+
+    clear_dirty_usage_buckets_for_tests();
+    let temp_dir = tempfile::tempdir().expect("scanner cycle test directory should be created");
+    let store = setup_scanner_cycle_store_at_path_with_layout(temp_dir.path(), true, 1, 1, 1).await;
+    let bucket = "marked-drive-bucket";
+    store
+        .make_bucket(bucket, &MakeBucketOptions::default())
+        .await
+        .expect("fixture bucket should be created");
+    let mut reader = PutObjReader::from_vec(vec![7; 16]);
+    store
+        .put_object(bucket, "object", &mut reader, &ObjectOptions::default())
+        .await
+        .expect("fixture object should persist");
+    wait_for_namespace_commit_tails(store.as_ref()).await;
+
+    let marker = temp_dir
+        .path()
+        .join("pool0/disk0")
+        .join(RUSTFS_META_BUCKET)
+        .join(HEALING_MARKER_PATH);
+    let marker_contents = b"leftover marker";
+    tokio::fs::write(&marker, marker_contents)
+        .await
+        .expect("fixture healing marker should persist");
+    let set = &store.pools[0].disk_set[0];
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while !set.get_online_disks_with_healing(true).await.1 {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .expect("disk info should observe the marker after its cache expires");
+
+    let ctx = CancellationToken::new();
+    let mut cycle_info = CurrentCycle {
+        next: 1,
+        ..Default::default()
+    };
+    let mut revision = DataUsageCacheRevision::Missing;
+    let leader_epoch = 11;
+    let outcome = tokio::time::timeout(
+        Duration::from_secs(60),
+        run_data_scanner_cycle(&ctx, &store, &mut cycle_info, &mut revision, leader_epoch),
+    )
+    .await
+    .expect("scanner cycle should finish");
+    assert!(
+        matches!(
+            outcome,
+            ScannerCycleOutcome::Completed | ScannerCycleOutcome::CompletedWithPendingMaintenance
+        ),
+        "unexpected cycle outcome: {outcome:?}",
+    );
+
+    let mut set_snapshot = DataUsageCache::default();
+    set_snapshot
+        .load_with_revisions(Arc::clone(set), DATA_USAGE_CACHE_NAME)
+        .await
+        .expect("set usage snapshot should be readable");
+    assert!(set_snapshot.info.snapshot_complete);
+    assert_eq!(set_snapshot.info.next_cycle, 1);
+
+    let usage = read_config(store.clone(), DATA_USAGE_OBJ_NAME_PATH.as_str())
+        .await
+        .expect("global usage snapshot should be durable");
+    let usage: DataUsageInfo = serde_json::from_slice(&usage).expect("global usage snapshot should decode");
+    assert!(usage.usage_snapshot_complete);
+    assert!(usage.last_update.is_some());
+    assert_eq!(usage.buckets_usage[bucket].objects_count, 1);
+
+    let persisted_cycle = read_config(store.clone(), DATA_USAGE_BLOOM_NAME_PATH.as_str())
+        .await
+        .expect("scanner cycle cursor should be durable");
+    let (persisted_cycle, persisted_epoch) =
+        decode_scanner_cycle_state(&persisted_cycle).expect("scanner cycle cursor should decode");
+    assert_eq!(persisted_epoch, leader_epoch);
+    assert_eq!(persisted_cycle.next, 2);
+    assert_eq!(tokio::fs::read(marker).await.expect("healing marker should remain"), marker_contents);
+    clear_dirty_usage_buckets_for_tests();
     global_metrics().set_cycle(None).await;
 }
 
@@ -5003,6 +5185,15 @@ impl crate::ScannerConfigObjectDelete for MemoryConfigStore {
     async fn delete_config_object(&self, bucket: &str, object: &str, opts: ObjectOptions) -> EcstoreResult<ObjectInfo> {
         let key = memory_config_key(bucket, object);
         let mut objects = self.objects.lock().await;
+        if opts.delete_prefix && !opts.delete_prefix_object {
+            if self.fail_prefix_deletes.load(Ordering::Relaxed) {
+                return Err(EcstoreError::other("injected prefix deletion failure"));
+            }
+            assert!(opts.http_preconditions.is_none(), "fixture prefix deletion cannot condition one object");
+            objects.retain(|object, _| !object.starts_with(&key));
+            self.revisions.lock().await.retain(|object, _| !object.starts_with(&key));
+            return Ok(ObjectInfo::default());
+        }
         if !objects.contains_key(&key) {
             return Err(EcstoreError::FileNotFound);
         }
@@ -8947,7 +9138,7 @@ fn clean_idle_backoff_grows_to_cap() {
 }
 
 #[test]
-fn superseded_retry_backoff_grows_caps_and_resets_after_convergence() {
+fn retry_backoff_grows_caps_and_resets_after_convergence() {
     let mut backoff = ScannerRetryBackoff::default();
     assert_eq!(backoff.retry_interval(Duration::from_secs(24 * 60 * 60)), None);
 
@@ -8971,7 +9162,7 @@ fn superseded_retry_backoff_grows_caps_and_resets_after_convergence() {
 }
 
 #[test]
-fn superseded_retry_backoff_respects_a_faster_configured_cycle() {
+fn retry_backoff_respects_a_faster_configured_cycle() {
     let mut backoff = ScannerRetryBackoff::default();
     backoff.record_retryable_cycle(true);
 
@@ -8983,7 +9174,7 @@ fn superseded_retry_backoff_respects_a_faster_configured_cycle() {
 }
 
 #[test]
-fn superseded_retry_backoff_grows_from_the_default_cycle() {
+fn retry_backoff_grows_from_the_default_cycle() {
     let mut backoff = ScannerRetryBackoff::default();
     // The first race after a write burst retries in seconds, not a whole
     // cycle, while repeated supersedes still climb toward the cap.
@@ -9003,7 +9194,7 @@ fn superseded_retry_preserves_explicit_cycle_cadence() {
         ..Default::default()
     };
     assert_eq!(
-        scanner_superseded_retry_interval(backoff, &default_config, ScannerMaintenanceFeatures::default()),
+        scanner_superseded_retry_interval(backoff, &default_config),
         Some(SCANNER_RETRY_BASE_INTERVAL),
         "the default adaptive cadence must retain fast convergence"
     );
@@ -9013,24 +9204,24 @@ fn superseded_retry_preserves_explicit_cycle_cadence() {
         ScannerRuntimeConfigSource::Config,
         ScannerRuntimeConfigSource::ScannerCompatConfig,
     ] {
-        let runtime_config = ScannerRuntimeConfig {
-            cycle_interval: Duration::from_secs(6 * 60 * 60),
-            cycle_interval_source: source,
-            ..Default::default()
-        };
-
-        for features in [
-            ScannerMaintenanceFeatures::default(),
-            ScannerMaintenanceFeatures {
-                lifecycle: true,
+        for cycle_secs in [1, 3, 600, 6 * 60 * 60] {
+            let runtime_config = ScannerRuntimeConfig {
+                cycle_interval: Duration::from_secs(cycle_secs),
+                cycle_interval_source: source,
                 ..Default::default()
-            },
-        ] {
-            assert_eq!(
-                scanner_superseded_retry_interval(backoff, &runtime_config, features),
-                Some(runtime_config.cycle_interval),
-                "{source:?} cycle cadence must not be shortened by convergence retries"
-            );
+            };
+            let mut backoff = ScannerRetryBackoff::default();
+            assert_eq!(scanner_superseded_retry_interval(backoff, &runtime_config), None);
+            for _ in 0..40 {
+                backoff.record_retryable_cycle(true);
+                assert_eq!(
+                    scanner_superseded_retry_interval(backoff, &runtime_config),
+                    Some(runtime_config.cycle_interval),
+                    "{source:?} cycle cadence must hold throughout convergence retries"
+                );
+            }
+            backoff.record_retryable_cycle(false);
+            assert_eq!(scanner_superseded_retry_interval(backoff, &runtime_config), None);
         }
     }
 }
@@ -9051,7 +9242,7 @@ fn superseded_retry_does_not_delay_required_maintenance() {
     for consecutive_cycles in 1..=12 {
         backoff.record_retryable_cycle(true);
         assert_eq!(
-            scanner_superseded_retry_interval(backoff, &config, features),
+            scanner_superseded_retry_interval(backoff, &config),
             Some(config.cycle_interval),
             "superseded cycle {consecutive_cycles} must preserve regular maintenance"
         );
@@ -9137,19 +9328,50 @@ fn scope_fallback_retry_preserves_explicit_and_fast_cycle_cadence() {
 }
 
 #[test]
-fn superseded_retry_only_caps_regular_maintenance() {
+fn superseded_retry_caps_at_the_default_cycle_and_resets_after_convergence() {
     let config = ScannerRuntimeConfig {
         cycle_interval: Duration::from_secs(60),
         ..Default::default()
     };
     let mut backoff = ScannerRetryBackoff::default();
-    for _ in 0..6 {
+    assert_eq!(scanner_superseded_retry_interval(backoff, &config), None);
+    for expected in [5, 10, 20, 40, 60, 60, 60, 60] {
+        backoff.record_retryable_cycle(true);
+        assert_eq!(scanner_superseded_retry_interval(backoff, &config), Some(Duration::from_secs(expected)));
+    }
+    backoff.consecutive_cycles = u32::MAX;
+    assert_eq!(scanner_superseded_retry_interval(backoff, &config), Some(config.cycle_interval));
+    backoff.record_retryable_cycle(true);
+    assert_eq!(scanner_superseded_retry_interval(backoff, &config), Some(config.cycle_interval));
+    backoff.record_retryable_cycle(false);
+    assert_eq!(scanner_superseded_retry_interval(backoff, &config), None);
+}
+
+#[test]
+fn superseded_retry_caps_fast_cycles_without_changing_the_generic_retry_cap() {
+    let mut backoff = ScannerRetryBackoff::default();
+    for _ in 0..40 {
         backoff.record_retryable_cycle(true);
     }
     assert_eq!(
-        scanner_superseded_retry_interval(backoff, &config, ScannerMaintenanceFeatures::default()),
-        Some(Duration::from_secs(160)),
+        backoff.retry_interval(Duration::from_secs(60)),
+        Some(Duration::from_secs(30 * 60)),
+        "deferred and transient retries must retain the generic cap"
     );
+    for cycle_secs in [0, 1, 3, 60, 6 * 60 * 60] {
+        let config = ScannerRuntimeConfig {
+            cycle_interval: Duration::from_secs(cycle_secs),
+            ..Default::default()
+        };
+        assert_eq!(
+            scanner_superseded_retry_interval(backoff, &config),
+            Some(Duration::from_secs(cycle_secs.max(1))),
+        );
+    }
+}
+
+#[test]
+fn superseded_retry_timer_keeps_required_maintenance_full_scans() {
     for features in [
         ScannerMaintenanceFeatures {
             lifecycle: true,
@@ -9164,28 +9386,23 @@ fn superseded_retry_only_caps_regular_maintenance() {
             ..Default::default()
         },
     ] {
-        assert_eq!(scanner_superseded_retry_interval(backoff, &config, features), Some(config.cycle_interval));
-        assert_eq!(scanner_superseded_retry_interval(ScannerRetryBackoff::default(), &config, features), None);
+        assert!(features.requires_full_scan(Some(7), 7, ScannerCycleWakeReason::Timer, true));
     }
 }
 
 #[tokio::test(start_paused = true)]
 #[serial]
-async fn superseded_maintenance_wait_keeps_convergence_fencing() {
+async fn superseded_retry_wait_keeps_convergence_fencing_at_the_default_cycle() {
     crate::scanner_io::clear_dirty_usage_buckets_for_tests();
     let config = ScannerRuntimeConfig {
         cycle_interval: Duration::from_secs(60),
-        ..Default::default()
-    };
-    let features = ScannerMaintenanceFeatures {
-        lifecycle: true,
         ..Default::default()
     };
     let mut backoff = ScannerRetryBackoff::default();
     for _ in 0..12 {
         backoff.record_retryable_cycle(true);
     }
-    let interval = scanner_superseded_retry_interval(backoff, &config, features);
+    let interval = scanner_superseded_retry_interval(backoff, &config);
     assert_eq!(interval, Some(config.cycle_interval));
     let generations = ScannerCycleObservedGenerations::for_wait(
         &config,
@@ -9200,19 +9417,28 @@ async fn superseded_maintenance_wait_keeps_convergence_fencing() {
     let mut seen = Some(BTreeMap::from([("node-2".to_string(), scanner_node_activity("epoch-a", 7, 3))]));
     let changed = BTreeMap::from([("node-2".to_string(), scanner_node_activity("epoch-a", 8, 3))]);
     let started = tokio::time::Instant::now();
-    let reason = wait_for_next_scanner_cycle_with_activity(
+    let mut wait = Box::pin(wait_for_next_scanner_cycle_with_activity(
         &ctx,
-        interval.expect("maintenance must retain its convergence interval"),
+        interval.expect("superseded retry must retain its convergence interval"),
         Some(Duration::from_secs(1)),
         &mut seen,
         generations,
         || false,
         || std::future::ready(Ok(changed.clone())),
-    )
-    .await;
+    ));
+    assert!(matches!(futures::poll!(&mut wait), Poll::Pending));
+    crate::scanner_io::record_dirty_usage_bucket("photos");
+    assert!(matches!(futures::poll!(&mut wait), Poll::Pending));
+    for _ in 0..3 {
+        tokio::time::advance(Duration::from_secs(15)).await;
+        crate::scanner_io::record_dirty_usage_bucket("photos");
+        assert!(matches!(futures::poll!(&mut wait), Poll::Pending));
+    }
+    let reason = wait.await;
     assert_eq!(reason, ScannerCycleWakeReason::Timer);
     assert_eq!(started.elapsed(), config.cycle_interval);
     assert_eq!(seen, Some(changed));
+    crate::scanner_io::clear_dirty_usage_buckets_for_tests();
 }
 
 #[test]

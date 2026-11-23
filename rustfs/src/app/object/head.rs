@@ -93,6 +93,23 @@ pub(crate) struct HeadObjectFields {
     pub(crate) sse_customer_key_md5: Option<String>,
 }
 
+impl From<gateway_dto::HeadObjectInput> for HeadObjectFields {
+    fn from(input: gateway_dto::HeadObjectInput) -> Self {
+        Self {
+            bucket: input.bucket.as_str().to_owned(),
+            key: input.key.as_str().to_owned(),
+            version_id: input.version_id,
+            part_number: input.part_number,
+            range: input.range.and_then(|range| match RangeParse::parse(range.as_str()) {
+                RangeParse::One(range) => Some(range),
+                _ => None,
+            }),
+            sse_customer_key: input.sse_customer_key.map(|key| key.expose_secret().to_owned()),
+            sse_customer_key_md5: input.sse_customer_key_md5,
+        }
+    }
+}
+
 /// Whether the caller asked for the tag set itself (`x-amz-tagging-directive: ACCESS`).
 fn tagging_directive_is_access(headers: &http::HeaderMap) -> bool {
     headers
@@ -237,18 +254,6 @@ pub(super) async fn odm_head_from_source<S: OdmHeadSource>(
             stats.record_request(OdmOp::Head, OdmOutcome::SourceError);
             Err(odm_source_error_response(&state.config().policy, err.class_label()).into())
         }
-    }
-}
-
-#[cfg(test)]
-impl DefaultObjectUsecase {
-    async fn execute_head_object_from_s3s(
-        &self,
-        req: crate::app::storage_api::s3::S3Request<crate::app::storage_api::s3::dto::HeadObjectInput>,
-    ) -> crate::app::storage_api::s3::S3Result<
-        crate::app::storage_api::s3::S3Response<crate::app::storage_api::s3::dto::HeadObjectOutput>,
-    > {
-        crate::app::test_seams::head_object(self, req).await
     }
 }
 
@@ -456,22 +461,7 @@ impl DefaultObjectUsecase {
         envelope: RequestEnvelope,
         input: gateway_dto::HeadObjectInput,
     ) -> S3Result<Answered<HeadObjectOutputFacts>> {
-        self.execute_head_object_fields(
-            envelope,
-            HeadObjectFields {
-                bucket: input.bucket.as_str().to_owned(),
-                key: input.key.as_str().to_owned(),
-                version_id: input.version_id,
-                part_number: input.part_number,
-                range: input.range.and_then(|range| match RangeParse::parse(range.as_str()) {
-                    RangeParse::One(range) => Some(range),
-                    _ => None,
-                }),
-                sse_customer_key: input.sse_customer_key.map(|key| key.expose_secret().to_owned()),
-                sse_customer_key_md5: input.sse_customer_key_md5,
-            },
-        )
-        .await
+        self.execute_head_object_fields(envelope, input.into()).await
     }
 
     #[instrument(level = "debug", skip(self, req, input))]
@@ -1235,14 +1225,17 @@ mod tests {
         assert_eq!(err.code().as_str(), "NoSuchKey");
     }
 
-    pub(super) fn head_input(bucket: &str, key: &str, version_id: Option<String>) -> S3Request<HeadObjectInput> {
-        let input = HeadObjectInput::builder()
+    fn head_object_input(bucket: &str, key: &str, version_id: Option<String>) -> HeadObjectInput {
+        HeadObjectInput::builder()
             .bucket(bucket.to_string())
             .key(key.to_string())
             .version_id(version_id)
             .build()
-            .unwrap();
-        build_request(input, Method::HEAD)
+            .unwrap()
+    }
+
+    pub(super) fn head_input(bucket: &str, key: &str, version_id: Option<String>) -> S3Request<HeadObjectInput> {
+        build_request(head_object_input(bucket, key, version_id), Method::HEAD)
     }
 
     #[test]
@@ -1422,18 +1415,23 @@ mod tests {
         let state = sys.state(&bucket).expect("bucket runtime installed");
 
         // Local hit: served locally, the runtime is never entered.
-        let response = Box::pin(usecase.execute_head_object_from_s3s(head_input(&bucket, "present", None)))
-            .await
-            .expect("local object is served");
+        let response = Box::pin(crate::app::test_seams::head_object_method_only(
+            &usecase,
+            head_object_input(&bucket, "present", None),
+        ))
+        .await
+        .expect("local object is served");
         assert_eq!(response.output.content_length, Some(7));
         assert!(response.headers.get(ON_DEMAND_MIGRATION_HEADER).is_none());
         assert_no_head_traffic(&state);
 
         // HEAD ?versionId on a missing object never consults the runtime.
-        let err =
-            Box::pin(usecase.execute_head_object_from_s3s(head_input(&bucket, "missing", Some(Uuid::new_v4().to_string()))))
-                .await
-                .expect_err("missing version");
+        let err = Box::pin(crate::app::test_seams::head_object_method_only(
+            &usecase,
+            head_object_input(&bucket, "missing", Some(Uuid::new_v4().to_string())),
+        ))
+        .await
+        .expect_err("missing version");
         assert_eq!(err.code().as_str(), "NoSuchKey");
         assert_no_head_traffic(&state);
 
@@ -1448,9 +1446,12 @@ mod tests {
         assert_no_head_traffic(&state);
 
         // A plain miss reaches the runtime; local_only answers 404 there.
-        let err = Box::pin(usecase.execute_head_object_from_s3s(head_input(&bucket, "missing", None)))
-            .await
-            .expect_err("missing object");
+        let err = Box::pin(crate::app::test_seams::head_object_method_only(
+            &usecase,
+            head_object_input(&bucket, "missing", None),
+        ))
+        .await
+        .expect_err("missing object");
         assert_eq!(err.code().as_str(), "NoSuchKey");
         assert_eq!(head_count(&state, OdmOutcome::Filtered), 1);
 
@@ -1466,9 +1467,12 @@ mod tests {
             )
             .await
             .expect("write delete marker");
-        let err = Box::pin(usecase.execute_head_object_from_s3s(head_input(&bucket, "present", None)))
-            .await
-            .expect_err("delete marker hides the object");
+        let err = Box::pin(crate::app::test_seams::head_object_method_only(
+            &usecase,
+            head_object_input(&bucket, "present", None),
+        ))
+        .await
+        .expect_err("delete marker hides the object");
         assert_eq!(err.code().as_str(), "NoSuchKey");
         assert_eq!(
             head_count(&state, OdmOutcome::Filtered),
@@ -1483,9 +1487,12 @@ mod tests {
             Some(&cfg),
         )
         .await;
-        let err = Box::pin(usecase.execute_head_object_from_s3s(head_input(&bucket, "present", None)))
-            .await
-            .expect_err("local_only still answers 404");
+        let err = Box::pin(crate::app::test_seams::head_object_method_only(
+            &usecase,
+            head_object_input(&bucket, "present", None),
+        ))
+        .await
+        .expect_err("local_only still answers 404");
         assert_eq!(err.code().as_str(), "NoSuchKey");
         assert_eq!(head_count(&state, OdmOutcome::Filtered), 2, "overridden delete marker is a miss");
 
@@ -1496,9 +1503,12 @@ mod tests {
             .await
             .expect("create plain bucket");
         assert!(sys.state(&plain).is_none());
-        let err = Box::pin(usecase.execute_head_object_from_s3s(head_input(&plain, "missing", None)))
-            .await
-            .expect_err("missing object");
+        let err = Box::pin(crate::app::test_seams::head_object_method_only(
+            &usecase,
+            head_object_input(&plain, "missing", None),
+        ))
+        .await
+        .expect_err("missing object");
         assert_eq!(err.code().as_str(), "NoSuchKey");
 
         sys.remove(&bucket);
@@ -1514,10 +1524,9 @@ mod tests {
             .build()
             .unwrap();
 
-        let req = build_request(input, Method::HEAD);
         let usecase = DefaultObjectUsecase::without_context();
 
-        let err = Box::pin(crate::app::test_seams::head_object(&usecase, req))
+        let err = Box::pin(crate::app::test_seams::head_object_method_only(&usecase, input))
             .await
             .unwrap_err();
         assert_eq!(err.code().as_str(), "InvalidArgument");

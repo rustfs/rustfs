@@ -38,7 +38,7 @@ use super::storage_api::storage::{
     ObjectIO as _, ObjectOperations as _, StorageAdminApi,
 };
 use super::{
-    DiskError, DiskStore, ECStore, HealDiskExt as _, StorageError, local_disk_map_read,
+    DiskError, DiskStore, ECStore, HealDiskExt as _, StorageError,
     resume::{ReplacementRecoveryCandidate, ReplacementTargetIdentity, merge_replacement_recovery_candidate},
 };
 pub use super::{HealObjectInfo, HealObjectOptions, HealPutObjReader};
@@ -2457,9 +2457,13 @@ impl HealStorageAPI for ECStoreHealStorage {
     }
 
     async fn replacement_target_identities(&self, targets: &[String]) -> Result<Vec<ReplacementTargetIdentity>> {
-        super::replacement_readiness::auto_replacement_target_identities(targets)
+        let error = || Error::ReplacementTargetNotReady("replacement target is not a stable mounted disk".to_string());
+        super::replacement_readiness::ReplacementTargets::open(targets)
             .await
-            .ok_or_else(|| Error::ReplacementTargetNotReady("replacement target is not a stable mounted disk".to_string()))
+            .ok_or_else(error)?
+            .identities()
+            .await
+            .ok_or_else(error)
     }
 
     async fn replacement_targets_ready_for_retry(
@@ -2468,25 +2472,14 @@ impl HealStorageAPI for ECStoreHealStorage {
         targets: &[String],
         expected_identities: &[ReplacementTargetIdentity],
     ) -> Result<bool> {
-        let identities = match self.replacement_target_identities(targets).await {
-            Ok(identities) => identities,
-            Err(_) => return Ok(false),
+        let Some(targets) = super::replacement_readiness::ReplacementTargets::open(targets).await else {
+            return Ok(false);
         };
-        if identities != expected_identities {
+        if targets.identities().await.as_deref() != Some(expected_identities) {
             return Ok(false);
         }
 
-        let local_disks = local_disk_map_read()
-            .await
-            .values()
-            .flatten()
-            .filter(|disk| disk.endpoint().is_local)
-            .cloned()
-            .collect::<Vec<_>>();
-        for target in targets {
-            let Some(disk) = local_disks.iter().find(|disk| disk.endpoint().to_string() == *target) else {
-                return Ok(false);
-            };
+        for disk in targets.disks {
             let endpoint = disk.endpoint();
             if crate::heal::utils::format_set_disk_id_from_i32(endpoint.pool_idx, endpoint.set_idx).as_deref()
                 != Some(set_disk_id)

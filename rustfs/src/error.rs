@@ -196,7 +196,11 @@ impl std::fmt::Display for ClientBodyReadTimeout {
     }
 }
 
-impl std::error::Error for ClientBodyReadTimeout {}
+impl std::error::Error for ClientBodyReadTimeout {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&rustfs_gateway::HostBodyReadTimeout)
+    }
+}
 
 /// Marks a server-side object/source reader failure that must not be reported as
 /// a malformed client request body.

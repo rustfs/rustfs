@@ -475,11 +475,8 @@ impl DefaultMultipartUsecase {
                 }
             };
             write_plan = write_plan.with_encryption(ssec_write);
-            (
-                Some(ssec_material.server_side_encryption),
-                ssec_material.kms_key_id,
-                mp_info.user_defined.clone(),
-            )
+            // An SSE-C part answers with its customer-key headers only.
+            (None, None, mp_info.user_defined.clone())
         } else if let Some(server_side_encryption) = server_side_encryption {
             // Reuse the destination envelope after authorizing this caller against
             // its pinned key above. The source read is separately authorized.

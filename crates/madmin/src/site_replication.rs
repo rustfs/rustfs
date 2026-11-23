@@ -1237,6 +1237,38 @@ pub struct SRRemoveReq {
     pub remove_all: bool,
 }
 
+/// Explicit decommissioning request. The v2 route never falls back to legacy removal.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SRRemoveV2Req {
+    pub mode: String,
+    #[serde(default)]
+    pub sites: Vec<String>,
+    #[serde(default)]
+    pub all: bool,
+    #[serde(default)]
+    pub decommissioned_sites: Vec<String>,
+    #[serde(default)]
+    pub operation_id: Option<String>,
+    #[serde(default)]
+    pub preflight_token: Option<String>,
+}
+
+/// Decommissioning progress; completion describes configuration cleanup, not an empty bucket.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SRRemoveV2Status {
+    pub contract_version: u32,
+    pub operation_id: String,
+    pub status: String,
+    pub preflight_token: String,
+    pub removed_deployment_ids: Vec<String>,
+    pub decommissioned_deployment_ids: Vec<String>,
+    pub pending_peers: Vec<String>,
+    pub local_cleanup_complete: bool,
+    pub errors: Vec<String>,
+}
+
 fn deserialize_vec_null_default<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
 where
     D: serde::Deserializer<'de>,
