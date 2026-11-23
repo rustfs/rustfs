@@ -430,6 +430,20 @@ async fn authorize_request_with_facts<R: AuthorizationRequest + ?Sized>(
         .await?;
         let bucket_name = bucket.as_str();
 
+        let check_explicit_iam_deny = matches!(
+            action,
+            Action::S3Action(
+                S3Action::DeleteObjectAction
+                    | S3Action::DeleteObjectVersionAction
+                    | S3Action::ForceDeleteBucketAction
+                    | S3Action::ForceDeleteObjectAction
+                    | S3Action::ListBucketAction
+                    | S3Action::ListBucketVersionsAction
+                    | S3Action::BypassGovernanceRetentionAction
+                    | S3Action::ReplicateDeleteAction
+            )
+        ) && prepared.combined_policy_for_view().is_some();
+
         let probe_bucket_policy = if req.permission_probe() && !bucket.is_empty() {
             match store.get_bucket_policy(&bucket).await {
                 Ok((policy, _)) => Some(policy),
@@ -477,26 +491,14 @@ async fn authorize_request_with_facts<R: AuthorizationRequest + ?Sized>(
                 } else {
                     Some(is_owner)
                 };
-                let deletion_deny_known = if matches!(
-                    action,
-                    Action::S3Action(
-                        S3Action::DeleteObjectAction
-                            | S3Action::DeleteObjectVersionAction
-                            | S3Action::ForceDeleteBucketAction
-                            | S3Action::ForceDeleteObjectAction
-                            | S3Action::ListBucketVersionsAction
-                            | S3Action::BypassGovernanceRetentionAction
-                            | S3Action::ReplicateDeleteAction
-                    )
-                ) && prepared.combined_policy_for_view().is_some()
-                {
+                let iam_deny_known_absent = if check_explicit_iam_deny {
                     let mut deny_args = args.clone();
                     deny_args.deny_only = true;
                     prepared.probe_decision(&deny_args).await == Some(true)
                 } else {
                     true
                 };
-                if !prepared.permits_bucket_policy_probe_fallback() || fallback != Some(true) || !deletion_deny_known {
+                if !prepared.permits_bucket_policy_probe_fallback() || fallback != Some(true) || !iam_deny_known_absent {
                     return Err(rustfs_s3_types::s3_error!(NotImplemented, "permission query lacks operation facts"));
                 }
             }
@@ -559,23 +561,8 @@ async fn authorize_request_with_facts<R: AuthorizationRequest + ?Sized>(
                 .try_eval_prepared(&prepared, &final_args)
                 .await
                 .map_err(iam_authorization_error)?;
-            if !allowed
-                && matches!(
-                    action,
-                    Action::S3Action(
-                        S3Action::DeleteObjectAction
-                            | S3Action::DeleteObjectVersionAction
-                            | S3Action::ForceDeleteBucketAction
-                            | S3Action::ForceDeleteObjectAction
-                            | S3Action::ListBucketVersionsAction
-                            | S3Action::BypassGovernanceRetentionAction
-                            | S3Action::ReplicateDeleteAction
-                    )
-                )
-                && prepared.combined_policy_for_view().is_some()
-            {
-                // Bucket policy Allow may supplement an implicit IAM denial,
-                // but must not override an explicit deletion-policy Deny.
+            if !allowed && check_explicit_iam_deny {
+                // Only an implicit IAM denial may fall back to a bucket policy Allow.
                 final_args.deny_only = true;
                 if !iam_store
                     .try_eval_prepared(&prepared, &final_args)
