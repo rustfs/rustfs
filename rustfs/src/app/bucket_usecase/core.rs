@@ -17,7 +17,7 @@
 use super::*;
 use crate::app::storage_api::bucket_usecase::access::requested_bucket_force_delete;
 use crate::app::storage_api::s3::S3Error;
-use crate::app::storage_api::s3::region::Region;
+use rustfs_s3_types::Region;
 
 /// Whether `CreateBucket` may record `location`: the server's own region, or
 /// one of the further regions listed after it in `RUSTFS_REGION`. `location`
@@ -262,26 +262,20 @@ impl DefaultBucketUsecase {
         // same-name make while it waits for repair coordination.
         let operation_bucket = bucket.clone();
         let operation_store = store.clone();
-        with_site_replication_bucket_mutation_lock(store, &bucket, move || async move {
+        let removed_targets = with_site_replication_bucket_mutation_lock(store, &bucket, move || async move {
             let intent = prepare_site_replication_delete_bucket(&operation_bucket, force).await?;
             let delete_result = operation_store
-                .delete_bucket(
-                    &operation_bucket,
-                    &DeleteBucketOptions {
-                        force,
-                        ..Default::default()
-                    },
-                )
+                .delete_bucket_with_notification(&operation_bucket, force)
                 .await;
             match delete_result {
-                Ok(()) => {
+                Ok(notification) => {
                     crate::storage::invalidate_bucket_validation_cache(&operation_bucket);
                     if let Some(intent) = intent
                         && let Err(err) = commit_site_replication_delete_bucket(&intent).await
                     {
                         warn!(bucket = %operation_bucket, error = ?err, "site replication delete bucket hook failed");
                     }
-                    Ok::<(), S3Error>(())
+                    Ok::<_, S3Error>(notification)
                 }
                 Err(err) => {
                     if let Some(intent) = intent {
@@ -306,6 +300,17 @@ impl DefaultBucketUsecase {
         // Notify peers to drop their cached metadata for the now-deleted bucket.
         notify_bucket_metadata_delete(bucket, envelope.request_context().cloned());
 
+        let (incarnation, targets) = removed_targets
+            .map(|metadata| {
+                (
+                    Some(metadata.bucket_incarnation_id),
+                    rustfs_notify::bucket_removed_targets_from_metadata(&metadata),
+                )
+            })
+            .unwrap_or_default();
+        let helper = helper
+            .with_bucket_incarnation_id(incarnation)
+            .with_bucket_removed_targets(targets);
         let result = Ok(gateway_dto::DeleteBucketOutput::default());
         let _ = helper.complete_owned(&result, StatusCode::OK, &http::HeaderMap::new());
         result
@@ -366,7 +371,7 @@ impl DefaultBucketUsecase {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::app::bucket_usecase::test_support::{build_request, build_request_with_req_info, s3_op_total};
+    use crate::app::bucket_usecase::test_support::{owned_envelope, s3_op_total};
     use http::Method;
 
     #[test]
@@ -398,12 +403,26 @@ mod tests {
     }
 
     /// The envelope of a request whose access phase installed `req_info`, or none.
+    /// Method PUT, URI `/`, empty headers, and that extension only.
     fn envelope(req_info: Option<ReqInfo>) -> RequestEnvelope {
-        let req = match req_info {
-            Some(req_info) => build_request_with_req_info((), Method::PUT, req_info),
-            None => build_request((), Method::PUT),
-        };
-        RequestEnvelope::from_s3s(&req)
+        match req_info {
+            Some(req_info) => {
+                let mut extensions = http::Extensions::new();
+                extensions.insert(req_info);
+                RequestEnvelope::from_parts(
+                    crate::app::RequestHead {
+                        method: Method::PUT,
+                        uri: http::Uri::from_static("/"),
+                        headers: http::HeaderMap::new(),
+                        credentials: None,
+                        region: None,
+                        service: None,
+                    },
+                    extensions,
+                )
+            }
+            None => owned_envelope(Method::PUT),
+        }
     }
 
     #[test]

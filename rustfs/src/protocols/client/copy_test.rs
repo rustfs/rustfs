@@ -89,33 +89,11 @@ fn protocol_copy_runtime_contract() {
         }
         let slot = crate::runtime_sources::ServerContextSlot::new();
         assert!(slot.install(target.clone()));
-        let client = ProtocolStorageClient::new(FS::with_server_ctx(slot));
+        let client = ProtocolStorageClient::new(slot);
         // Prove that the observer can distinguish zero, one and an edge increment.
         assert_eq!(count(), 0);
         rustfs_io_metrics::record_s3_op(rustfs_s3_ops::S3Operation::CopyObject);
         assert_eq!(count(), 1);
-        let mut old_input = input();
-        old_input.key = rustfs_gateway_types::ObjectKey::new("legacy-control".to_owned()).expect("legacy control key");
-        let old_input = legacy_input(old_input).expect("legacy input");
-        let before = count();
-        client
-            .fs
-            .copy_object(
-                ProtocolStorageClient::create_request(
-                    old_input,
-                    Method::PUT,
-                    build_object_uri("copy-target", "legacy-control", &[]).expect("legacy URI"),
-                    RequestParams {
-                        bucket: Some("copy-target".into()),
-                        object: Some("legacy-control".into()),
-                        credentials: &root,
-                    },
-                )
-                .expect("legacy request"),
-            )
-            .await
-            .expect("legacy copy control");
-        assert_eq!(count() - before, 1);
 
         let mut rows = Vec::new();
         for case in [
@@ -185,14 +163,14 @@ fn protocol_copy_runtime_contract() {
             rows.push(serde_json::json!({"case":case,"result":result,"count":count()-before}));
         }
         let before = count();
-        let fallback = ProtocolStorageClient::new(FS::with_server_ctx(crate::runtime_sources::ServerContextSlot::new()));
+        let fallback = ProtocolStorageClient::new(crate::runtime_sources::ServerContextSlot::new());
         let fallback = outcome(fallback.copy_object(input(), &root).await);
         let present = |context: std::sync::Arc<crate::runtime_sources::AppContext>| {
             let root = root.clone();
             async move {
                 let slot = crate::runtime_sources::ServerContextSlot::new();
                 assert!(slot.install(context));
-                let client = ProtocolStorageClient::new(FS::with_server_ctx(slot));
+                let client = ProtocolStorageClient::new(slot);
                 match client.get_object("copy-target", "destination", &root, None).await {
                     Ok(output) => Ok(output
                         .body

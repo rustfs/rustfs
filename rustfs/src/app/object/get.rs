@@ -404,6 +404,7 @@ struct GetObjectStrategyContext {
 struct GetObjectOutputContext {
     output: GetObjectOutputFacts,
     event_info: Option<ObjectInfo>,
+    effective_ec_block_size: Option<usize>,
     response_content_length: i64,
     optimal_buffer_size: usize,
     extra_checksum_headers: Vec<(&'static str, String)>,
@@ -928,6 +929,7 @@ pin_project! {
     struct GetObjectReaderStream<R> {
         #[pin]
         reader: Option<R>,
+        primed_byte: Option<u8>,
         capacity: usize,
         strategy: &'static str,
         buffer_source: &'static str,
@@ -992,6 +994,7 @@ where
         }
         Self {
             reader: Some(reader),
+            primed_byte: None,
             capacity,
             strategy,
             buffer_source,
@@ -1436,9 +1439,14 @@ where
             Some(reader) => reader,
             None => return Poll::Ready(None),
         };
-        let read_capacity = (*this.capacity).min(*this.remaining);
-        let mut buf = BytesMut::with_capacity(read_capacity);
-        let poll_read = poll_read_buf(reader, cx, &mut buf);
+        let (poll_read, buf) = if let Some(byte) = this.primed_byte.take() {
+            (Poll::Ready(Ok(1)), BytesMut::from(&[byte][..]))
+        } else {
+            let read_capacity = (*this.capacity).min(*this.remaining);
+            let mut buf = BytesMut::with_capacity(read_capacity);
+            let poll_read = poll_read_buf(reader, cx, &mut buf);
+            (poll_read, buf)
+        };
 
         let result: Poll<Option<Self::Item>> = match poll_read {
             Poll::Ready(Ok(bytes_read)) if bytes_read > 0 => {
@@ -2513,19 +2521,21 @@ impl DefaultObjectUsecase {
             lifecycle,
             resume,
         );
-        let mut prefix = [0_u8; 1];
-        let prefix_len = if expected == 0 {
-            0
+        let primed_byte = if expected == 0 {
+            None
         } else {
+            let mut prefix = [0_u8; 1];
             reader
                 .read_exact(&mut prefix)
                 .await
                 .map_err(|error| map_get_object_reader_error(StorageError::from(error)))?;
-            1
+            Some(prefix[0])
         };
-        let reader = std::io::Cursor::new(prefix).take(prefix_len).chain(reader);
-        let stream = GetObjectReaderStream::new(reader, stream_buffer_size, expected, stream_strategy.as_str(), buffer_source)
-            .with_diagnostics(bucket, key, request_id);
+        let mut stream =
+            GetObjectReaderStream::new(reader, stream_buffer_size, expected, stream_strategy.as_str(), buffer_source)
+                .with_diagnostics(bucket, key, request_id);
+        // Keep the preflight byte in the stream until the transport asks for it.
+        stream.primed_byte = primed_byte;
         let blob = GetObjectBody::Stream(Box::pin(stream));
         if let Some(handoff_start) = handoff_start {
             rustfs_io_metrics::record_get_object_response_handoff(
@@ -2601,8 +2611,9 @@ impl DefaultObjectUsecase {
             };
             return Err(with_delete_marker_read_headers(S3Error::new(code), info, input.version_id.as_deref()));
         }
-        let result =
-            check_preconditions(envelope.headers(), info).and_then(|()| Self::validate_get_object_part_number(part_number, info));
+        let result = check_preconditions(envelope.headers(), info)
+            .map_err(S3Error::from)
+            .and_then(|()| Self::validate_get_object_part_number(part_number, info));
         if result.is_err() {
             let principal = SseKmsPrincipal::from_request(envelope);
             crate::storage::sse::validate_conditional_read(
@@ -4065,6 +4076,7 @@ impl DefaultObjectUsecase {
         method: &hyper::Method,
         headers: &HeaderMap,
         event_info: Option<ObjectInfo>,
+        effective_ec_block_size: Option<usize>,
         version_id_for_event: String,
         output: GetObjectOutputFacts,
         extra_checksum_headers: Vec<(&'static str, String)>,
@@ -4082,6 +4094,11 @@ impl DefaultObjectUsecase {
         // Emit XXHash3/64/128 and SHA-512 checksums that GetObjectOutput cannot
         // carry (#1257). This is the download-side integrity path AWS SDKs verify.
         inject_additional_checksum_headers(&mut response.headers, &extra_checksum_headers);
+        if let Some(block_size) = effective_ec_block_size
+            && let Ok(value) = HeaderValue::from_str(&block_size.to_string())
+        {
+            response.headers.insert(EC_BLOCK_SIZE_RESPONSE_HEADER, value);
+        }
         record_get_object_s3_handler_stage_duration(GET_OBJECT_STAGE_RESPONSE_HEADER_INJECT, header_inject_start);
         let result = Ok(response);
         let event_complete_start = rustfs_io_metrics::get_stage_metrics_enabled().then(std::time::Instant::now);
@@ -4129,6 +4146,7 @@ impl DefaultObjectUsecase {
     where
         F: FnOnce(&ObjectInfo) -> Option<GetObjectResumeControl<DynReader>>,
     {
+        let effective_ec_block_size = info.effective_ec_block_size();
         let strategy_start = rustfs_io_metrics::get_stage_metrics_enabled().then(std::time::Instant::now);
         let strategy = self.finalize_get_object_strategy(
             manager,
@@ -4299,6 +4317,7 @@ impl DefaultObjectUsecase {
         Ok(GetObjectOutputContext {
             output,
             event_info,
+            effective_ec_block_size,
             response_content_length,
             optimal_buffer_size,
             extra_checksum_headers: {
@@ -4454,7 +4473,7 @@ impl DefaultObjectUsecase {
         let expected_incarnation = match odm_read_generation(envelope, bucket) {
             Ok(Some(incarnation)) => incarnation,
             Ok(None) => return None,
-            Err(err) => return Some(OdmGetOutcome::Respond(Err(err))),
+            Err(err) => return Some(OdmGetOutcome::Respond(Err(err.into()))),
         };
         match store.bucket_incarnation_id(bucket).await {
             Ok(current) if current == expected_incarnation => {}
@@ -4493,7 +4512,6 @@ impl DefaultObjectUsecase {
         crate::app::test_seams::get_object(self, request).await
     }
 
-    #[cfg(feature = "gateway-stack")]
     pub(crate) async fn execute_get_object(
         &self,
         envelope: RequestEnvelope,
@@ -4569,7 +4587,6 @@ impl DefaultObjectUsecase {
             },
         };
         let mut response = read_answer(&input.bucket, envelope.method(), envelope.headers(), output).await;
-        inject_accept_ranges_header(&mut response.headers);
         if ranged {
             response.status = Some(StatusCode::PARTIAL_CONTENT);
         }
@@ -4773,7 +4790,6 @@ impl DefaultObjectUsecase {
                     }
                     lifecycle.finish_ok();
                     let mut response = read_answer(&bucket, envelope.method(), envelope.headers(), *output).await;
-                    inject_accept_ranges_header(&mut response.headers);
                     mark_on_demand_migration_response(&mut response.headers);
                     let result = Ok(response);
                     complete_read(helper.version_id(version_id_for_event), &result);
@@ -4917,6 +4933,7 @@ impl DefaultObjectUsecase {
         let GetObjectOutputContext {
             output,
             event_info,
+            effective_ec_block_size,
             response_content_length,
             optimal_buffer_size,
             extra_checksum_headers,
@@ -4938,6 +4955,7 @@ impl DefaultObjectUsecase {
             envelope.method(),
             envelope.headers(),
             event_info,
+            effective_ec_block_size,
             version_id_for_event,
             output,
             extra_checksum_headers,
@@ -6265,7 +6283,8 @@ mod on_demand_migration_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::app::storage_api::s3::dto::{HeadObjectInput, Range};
+    use crate::app::storage_api::s3::dto::Range;
+    use crate::app::test_seams::{head_envelope, head_object_input};
     use http::{HeaderMap, HeaderValue, Method};
     use std::pin::Pin;
     use std::sync::Arc;
@@ -6382,33 +6401,27 @@ mod tests {
             assert_eq!(error.code(), &S3ErrorCode::NotModified);
             assert_eq!(error.headers().expect("304 validators")["etag"], format!("\"{etag}\""));
 
-            let mut req = build_request(
-                HeadObjectInput::builder()
-                    .bucket(bucket.clone())
-                    .key(object.to_owned())
-                    .build()
-                    .expect("HEAD input"),
-                Method::HEAD,
-            );
-            req.headers.insert(
+            let mut headers = HeaderMap::new();
+            headers.insert(
                 http::header::IF_NONE_MATCH,
                 HeaderValue::from_str(&format!("\"{etag}\"")).expect("ETag header"),
             );
-            let error = crate::app::test_seams::head_object(&usecase, req)
-                .await
-                .expect_err("conditional HEAD returns 304");
-            assert_eq!(error.code(), &S3ErrorCode::NotModified);
+            let error = crate::app::test_seams::head_object_gateway(
+                &usecase,
+                head_envelope(headers, http::Extensions::new()),
+                head_object_input(&bucket, object, None),
+            )
+            .await
+            .expect_err("conditional HEAD returns 304");
+            assert_eq!(error.code(), &rustfs_s3_types::S3ErrorCode::NotModified);
             assert_eq!(error.headers().expect("HEAD validators")["etag"], format!("\"{etag}\""));
 
-            let req = build_request(
-                GetObjectInput::builder()
-                    .bucket(bucket.clone())
-                    .key(object.to_owned())
-                    .build()
-                    .expect("GET input"),
-                Method::GET,
-            );
-            if let Ok(mut response) = usecase.execute_get_object_from_s3s(req).await {
+            let input = GetObjectInput::builder()
+                .bucket(bucket.clone())
+                .key(object.to_owned())
+                .build()
+                .expect("GET input");
+            if let Ok(mut response) = crate::app::test_seams::get_object_method_only(&usecase, input).await {
                 let mut body = response.output.body.take().expect("body for damaged GET");
                 let mut failed = false;
                 while let Some(chunk) = body.next().await {
@@ -6521,14 +6534,26 @@ mod tests {
 
     #[tokio::test]
     async fn finalize_get_object_response_injects_accept_ranges_header() {
-        let req = build_request(GetObjectInput::default(), Method::GET);
-        let helper = OperationHelper::new(&req, EventName::ObjectAccessedGet, S3Operation::GetObject).suppress_event();
+        let envelope = RequestEnvelope::from_parts(
+            crate::app::RequestHead {
+                method: Method::GET,
+                uri: http::Uri::from_static("/"),
+                headers: HeaderMap::new(),
+                credentials: None,
+                region: None,
+                service: None,
+            },
+            http::Extensions::new(),
+        );
+        let helper = OperationHelper::from_view(&envelope.audit_view(), EventName::ObjectAccessedGet, S3Operation::GetObject)
+            .suppress_event();
         let response = DefaultObjectUsecase::finalize_get_object_response(
             helper,
             "bucket",
-            &req.method,
-            &req.headers,
+            envelope.method(),
+            envelope.headers(),
             None,
+            Some(262_144),
             String::new(),
             GetObjectOutputFacts::default(),
             Vec::new(),
@@ -6537,6 +6562,7 @@ mod tests {
         .expect("finalize response");
 
         assert_eq!(response.headers.get(http::header::ACCEPT_RANGES).unwrap(), ACCEPT_RANGES_BYTES);
+        assert_eq!(response.headers.get(EC_BLOCK_SIZE_RESPONSE_HEADER).unwrap(), "262144");
     }
 
     #[test]
@@ -7695,8 +7721,7 @@ mod tests {
             assert_eq!(adapter.cold_fill_coordinator().active_session_count_for_test(), 0);
         }
 
-        let mut response = usecase
-            .execute_get_object_from_s3s(build_request(input, Method::GET))
+        let mut response = crate::app::test_seams::get_object_method_only(&usecase, input)
             .await
             .expect("positive-control GET");
         let mut body = response.output.body.take().expect("body");
@@ -7771,13 +7796,11 @@ mod tests {
             .build()
             .expect("real cold-fill rejection GET input must build");
         let usecase = DefaultObjectUsecase::with_context(Some(context));
-        let result = tokio::time::timeout(
-            Duration::from_secs(2),
-            usecase.execute_get_object_from_s3s(build_request(input, Method::GET)),
-        )
-        .await
-        .expect("rejected real GET must not wait for a cold-fill session")
-        .expect_err("rejected real GET must return an S3 error");
+        let result =
+            tokio::time::timeout(Duration::from_secs(2), crate::app::test_seams::get_object_method_only(&usecase, input))
+                .await
+                .expect("rejected real GET must not wait for a cold-fill session")
+                .expect_err("rejected real GET must return an S3 error");
         *COLD_FILL_READER_OPEN_PROBE
             .get_or_init(|| Mutex::new(None))
             .lock()
@@ -8999,7 +9022,7 @@ mod tests {
         let error = result.expect_err("a read quorum failure before the first byte must reject response construction");
         assert_eq!(error.code(), &S3ErrorCode::Custom("SlowDownRead".into()));
         assert_eq!(error.status_code(), Some(StatusCode::SERVICE_UNAVAILABLE));
-        assert_eq!(error.message(), Some("Resource requested is unreadable, please reduce your request rate"));
+        assert_eq!(error.message(), Some("The object could not be read from storage."));
     }
 
     #[tokio::test]
@@ -9026,7 +9049,20 @@ mod tests {
             .expect("the first byte should be available before response handoff");
 
             assert_eq!(reads.load(AtomicOrdering::Relaxed), 1, "response construction must prime one byte");
-            let mut received = Vec::new();
+            let first = body
+                .next()
+                .await
+                .expect("the primed byte should be present")
+                .expect("the first chunk should be readable");
+            assert_eq!(&first[..], b"h");
+            let first = first.try_into_mut().expect("the first chunk should own its buffer");
+            assert!(first.capacity() < 5, "the preflight byte must not reserve the remaining body capacity");
+            assert_eq!(
+                reads.load(AtomicOrdering::Relaxed),
+                1,
+                "emitting the primed byte must not poll storage again"
+            );
+            let mut received = first.to_vec();
             while let Some(chunk) = body.next().await {
                 received.extend_from_slice(&chunk.expect("the primed body should remain readable"));
             }
@@ -9937,8 +9973,7 @@ mod tests {
             .expect("resume failure-path GET input must build");
         let usecase = DefaultObjectUsecase::with_context(Some(context));
         let attempts_before = GET_OBJECT_RESUME_ATTEMPTS_FOR_TEST.load(Ordering::Relaxed);
-        let mut response = usecase
-            .execute_get_object_from_s3s(build_request(input, Method::GET))
+        let mut response = crate::app::test_seams::get_object_method_only(&usecase, input)
             .await
             .expect("the GET commits a response; the body fails mid-stream");
         let mut response_body = response.output.body.take().expect("GET response must include a body");
@@ -10030,8 +10065,7 @@ mod tests {
             .build()
             .expect("multi-pool resume GET input must build");
         let usecase = DefaultObjectUsecase::with_context(Some(context));
-        let mut response = usecase
-            .execute_get_object_from_s3s(build_request(input, Method::GET))
+        let mut response = crate::app::test_seams::get_object_method_only(&usecase, input)
             .await
             .expect("multi-pool GET must commit its response");
         let mut response_body = response
@@ -12210,18 +12244,23 @@ mod tests {
                 ..Default::default()
             };
 
-            let input = GetObjectInput::builder()
-                .bucket("test-bucket".to_string())
-                .key("path/raw".to_string())
-                .build()
-                .unwrap();
-            let req = build_request(input, Method::GET);
+            let envelope = RequestEnvelope::from_parts(
+                crate::app::RequestHead {
+                    method: Method::GET,
+                    uri: http::Uri::from_static("/"),
+                    headers: HeaderMap::new(),
+                    credentials: None,
+                    region: None,
+                    service: None,
+                },
+                http::Extensions::new(),
+            );
             let usecase = DefaultObjectUsecase::without_context();
             let queue_status = concurrency::IoQueueStatus::default();
 
             let context = usecase
                 .build_get_object_output_context(
-                    &RequestEnvelope::from_s3s(&req),
+                    &envelope,
                     #[cfg(all(any(feature = "cuobject", feature = "nixl"), target_os = "linux"))]
                     None,
                     get_concurrency_manager(),
@@ -12292,10 +12331,11 @@ mod tests {
             .build()
             .unwrap();
 
-        let req = build_request(input, Method::GET);
         let usecase = DefaultObjectUsecase::without_context();
 
-        let err = Box::pin(usecase.execute_get_object_from_s3s(req)).await.unwrap_err();
+        let err = Box::pin(crate::app::test_seams::get_object_method_only(&usecase, input))
+            .await
+            .unwrap_err();
         assert_eq!(err.code(), &S3ErrorCode::InvalidArgument);
     }
 
@@ -12303,7 +12343,7 @@ mod tests {
     fn parse_get_object_part_number_rejects_above_s3_max() {
         let err = parse_part_number_i32_to_usize(Some(10001), "GET").expect_err("partNumber above S3 max must fail");
 
-        assert_eq!(err.code(), &S3ErrorCode::InvalidArgument);
+        assert_eq!(err.code(), &rustfs_s3_types::S3ErrorCode::InvalidArgument);
         assert_eq!(err.message(), Some("GET: partNumber must be between 1 and 10000"));
     }
 
@@ -12373,10 +12413,11 @@ mod tests {
             .build()
             .unwrap();
 
-        let req = build_request(input, Method::GET);
         let usecase = DefaultObjectUsecase::without_context();
 
-        let err = Box::pin(usecase.execute_get_object_from_s3s(req)).await.unwrap_err();
+        let err = Box::pin(crate::app::test_seams::get_object_method_only(&usecase, input))
+            .await
+            .unwrap_err();
         assert_eq!(err.code(), &S3ErrorCode::InvalidArgument);
     }
 }

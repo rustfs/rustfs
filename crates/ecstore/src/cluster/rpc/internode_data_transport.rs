@@ -294,6 +294,11 @@ pub struct NsScannerCapabilityRequest {
 /// in `crates/ecstore/docs/internode-transport/`.
 #[async_trait]
 pub trait InternodeDataTransport: Send + Sync + std::fmt::Debug {
+    /// Whether shard reads must declare a nonzero byte limit.
+    fn requires_bounded_reads(&self) -> bool {
+        false
+    }
+
     async fn open_read(&self, request: ReadStreamRequest) -> Result<FileReader>;
     async fn open_read_fresh(&self, request: ReadStreamRequest) -> Result<FileReader> {
         self.open_read(request).await
@@ -2744,8 +2749,6 @@ mod tests {
 
         for configured in KNOWN_INTERNODE_DATA_TRANSPORT_BACKENDS {
             let transport = build_internode_data_transport(Some(configured)).unwrap();
-            // NIXL builds everywhere and serves reads over TCP/HTTP until a node
-            // installs its receive pool; every other known name is the TCP transport.
             let expected = if *configured == INTERNODE_DATA_TRANSPORT_NIXL {
                 INTERNODE_DATA_TRANSPORT_NIXL
             } else {

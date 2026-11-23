@@ -104,8 +104,12 @@ pub(crate) mod crate_boundary {
 }
 
 pub(crate) mod object_store {
-    pub(crate) use super::storage_contracts::{HTTPPreconditions, ListOperations, ObjectInfoOrErr, ObjectOperations};
+    pub(crate) use super::storage_contracts::{
+        HTTPPreconditions, ListOperations, NamespaceLocking, ObjectInfoOrErr, ObjectOperations,
+    };
     pub(crate) use rustfs_ecstore::api::config::com::read_config_preserve_empty_with_metadata_opts;
+    pub(crate) use rustfs_ecstore::api::object::WriteCommitGuard;
+    pub(crate) use rustfs_ecstore::api::set_disk::get_lock_acquire_timeout;
 }
 
 pub(crate) mod runtime {

@@ -17,11 +17,11 @@ use super::{
     GetObjectFileInfo, GetObjectMetadataCacheCapability, GetObjectMetadataCacheEntry, GetObjectMetadataCacheGeneration,
     GetObjectMetadataCacheKey, GetObjectMetadataCacheLookupKey, GetObjectReadPolicy, HashAlgorithm, LOG_COMPONENT_ECSTORE,
     LOG_SUBSYSTEM_SET_DISK, OBJECT_OP_IGNORED_ERRS, ObjectInfo, ObjectOptions, RUSTFS_META_BUCKET, ReadOptions, Result, SetDisks,
-    StorageError, adaptive_duplex_buffer_size, build_get_codec_streaming_decode_engine, build_inline_bitrot_readers,
-    collect_inline_data_shard_fileinfos_by_index, debug, error, get_codec_streaming_metrics_path,
-    get_codec_streaming_multipart_max_parts, get_object_read_policy, is_codec_streaming_multipart_enabled,
-    is_multipart_reader_setup_prefetch_enabled, object_fits_single_block, part_checksum_algorithm, reduce_read_quorum_errs,
-    to_object_err, try_read_inline_data_shards_direct, warn,
+    StorageError, adaptive_duplex_buffer_size, build_get_codec_streaming_decode_engine,
+    build_inline_bitrot_readers_from_refs_with_frame_size, collect_inline_data_shard_fileinfos_by_index, debug, error,
+    get_codec_streaming_metrics_path, get_codec_streaming_multipart_max_parts, get_object_read_policy,
+    is_codec_streaming_multipart_enabled, is_multipart_reader_setup_prefetch_enabled, object_fits_single_block,
+    part_checksum_algorithm, reduce_read_quorum_errs, to_object_err, try_read_inline_data_shards_direct, warn,
 };
 use crate::diagnostics::get::{
     GET_DIRECT_MEMORY_SUBPATH_DISK_DATA_BLOCKS, GET_DIRECT_MEMORY_SUBPATH_INLINE_BUFFERED, GET_METADATA_CACHE_DECISION_HIT,
@@ -148,16 +148,17 @@ use super::core::io_primitives::{
     BitrotReaderSetup, BitrotReaderSetupAttribution, BitrotReaderSetupMode, DeferredReaderReopener, EVENT_SET_DISK_READ,
     GetCodecStreamingReaderBuildOutcome, MetadataCacheLookup, ObjectBitrotReader, ReadRepairAdmissionSubmitter,
     ReadRepairHealSubmission, SLOW_OBJECT_READ_LOG_THRESHOLD, codec_streaming_reader_setup_fallback_reason,
-    create_bitrot_readers_until_quorum_with_preference, create_data_block_bitrot_readers, resolved_read_repair_version_id,
-    send_read_repair_heal_request, shard_read_costs_for_disks, submit_read_repair_heal, submit_read_repair_heal_with_submitter,
+    create_bitrot_readers_until_quorum_with_preference_and_frame_size, create_data_block_bitrot_readers_with_frame_size,
+    resolved_read_repair_version_id, send_read_repair_heal_request, shard_read_costs_for_disks, submit_read_repair_heal,
+    submit_read_repair_heal_with_submitter,
 };
 #[cfg(test)]
 use super::core::io_primitives::{
     ENV_RUSTFS_GET_CODEC_STREAMING_DATA_BLOCKS_FIRST_READER_SETUP, ENV_RUSTFS_GET_DATA_BLOCKS_FIRST_READER_SETUP,
     MultipartCodecStreamingReader, ReadRepairAdmissionFuture, ReadRepairAdmissionOutcome, collect_read_multiple_results,
     collect_read_parts_results, create_bitrot_readers_until_quorum, create_bitrot_readers_until_quorum_all_shards,
-    release_read_repair_heal_reservation, reserve_read_repair_heal, resolve_read_part_from_responses, shard_read_cost_for_disk,
-    shard_read_cost_for_endpoint,
+    create_bitrot_readers_until_quorum_with_preference, release_read_repair_heal_reservation, reserve_read_repair_heal,
+    resolve_read_part_from_responses, shard_read_cost_for_disk, shard_read_cost_for_endpoint,
 };
 #[cfg(test)]
 use super::core::metadata_quorum::{MetadataEarlyStopDecision, MetadataQuorumAccumulator};
@@ -1406,7 +1407,11 @@ impl SetDisks {
         object: &str,
         opts: &ObjectOptions,
     ) -> (ObjectInfo, FileInfo, usize, Option<StorageError>) {
-        let snapshot = match self.get_object_fileinfo(bucket, object, opts, false, false).await {
+        // Unversioned/latest-version deletes discard `parts_metadata` and
+        // `op_online_disks`, and `latest_early_stop_decision` requires write
+        // quorum agreement with zero conflicts, NotFound, or hard errors.
+        let allow_early_stop = opts.version_id.as_deref().is_none_or(str::is_empty);
+        let snapshot = match self.get_object_fileinfo(bucket, object, opts, false, allow_early_stop).await {
             Ok(snapshot) => snapshot,
             Err(e) => return (ObjectInfo::default(), FileInfo::default(), 0, Some(e)),
         };
@@ -1475,6 +1480,7 @@ impl SetDisks {
         }
 
         let erasure = erasure_cache.get_for_file_info(fi)?;
+        let frame_size = read_frame_size_for_file_info(fi, &erasure)?;
 
         let checksum_algo = part_checksum_algorithm(fi, part.number);
         let read_length = erasure.shard_file_offset(0, object_size, object_size);
@@ -1491,13 +1497,13 @@ impl SetDisks {
             };
 
             let reader_setup_stage_start = Instant::now();
-            let mut readers = build_inline_bitrot_readers(
-                data_files.iter().copied(),
-                data_files.len(),
+            let mut readers = build_inline_bitrot_readers_from_refs_with_frame_size(
+                &data_files,
                 bucket,
                 object,
                 read_length,
                 erasure.shard_size(),
+                frame_size,
                 &checksum_algo,
                 skip_verify_bitrot,
             )
@@ -1550,7 +1556,7 @@ impl SetDisks {
         let use_mmap_read = object_mmap_read_enabled();
 
         let reader_setup_stage_start = Instant::now();
-        let mut reader_setup = create_data_block_bitrot_readers(
+        let mut reader_setup = create_data_block_bitrot_readers_with_frame_size(
             &files,
             &disks,
             bucket,
@@ -1559,6 +1565,7 @@ impl SetDisks {
             0,
             read_length,
             erasure.shard_size(),
+            frame_size,
             checksum_algo,
             skip_verify_bitrot,
             use_mmap_read,
@@ -1710,6 +1717,7 @@ impl SetDisks {
         );
 
         let erasure = erasure_cache.get_for_file_info(&fi)?;
+        let frame_size = read_frame_size_for_file_info(&fi, &erasure)?;
 
         let part_indices: Vec<usize> = (part_index..=last_part_index).collect();
         debug!(bucket, object, ?part_indices, "Multipart part indices to stream");
@@ -1722,6 +1730,39 @@ impl SetDisks {
         let use_mmap_read = object_mmap_read_enabled();
         let files = Arc::new(files);
         let disks = Arc::new(disks);
+
+        // A small Range GET only needs the authenticated q-aligned slice that
+        // contains each requested data-shard segment. Permit one complete
+        // logical block as well as a single physical shard: the 64 KiB layout
+        // has 32 KiB shards, so a normal 64 KiB range otherwise bypasses the
+        // bounded reader and reopens parity on the legacy path.
+        if frame_size != erasure.shard_size() && length > 0 && length <= erasure.block_size {
+            return Self::read_quantized_range(
+                bucket,
+                object,
+                writer,
+                &fi,
+                files.as_ref(),
+                disks.as_ref(),
+                &erasure,
+                frame_size,
+                length,
+                part_index,
+                last_part_index,
+                part_offset,
+                skip_verify_bitrot,
+                suppress_read_repair,
+                prefer_data_blocks_first_reader_setup,
+                require_reconstruction_surplus,
+                pool_index,
+                set_index,
+                metrics_path,
+                metrics_object_class,
+                metrics_size_bucket,
+            )
+            .await;
+        }
+
         let prefetch_enabled = multipart_reader_setup_prefetch_enabled(get_object_read_policy());
         let mut prefetched: Option<(usize, PrefetchedReaderSetup)> = None;
 
@@ -1774,6 +1815,7 @@ impl SetDisks {
                 part_number,
                 read_offset,
                 read_length,
+                frame_size,
                 checksum_algo,
             };
             let mut setup_result = None;
@@ -1829,6 +1871,7 @@ impl SetDisks {
                     part_number: next_number,
                     read_offset: 0,
                     read_length: erasure.shard_file_offset(0, next_length, next_size),
+                    frame_size,
                     checksum_algo: part_checksum_algorithm(&fi, next_number),
                 };
                 let files = Arc::clone(&files);
@@ -2011,7 +2054,9 @@ impl SetDisks {
                 error: err,
                 exact_quorum,
                 repair,
+                ..
             } = erasure
+                .clone()
                 .decode_with_stripe_handles_and_reopeners_with_diagnostics(
                     writer,
                     readers,
@@ -2145,6 +2190,284 @@ impl SetDisks {
             );
         }
 
+        Ok(())
+    }
+    /// Read a small q-enabled range one data-shard segment at a time. Each setup
+    /// opens the same q-aligned logical slice on every shard, so Reed-Solomon sees
+    /// equal-length vectors while the caller receives only the requested bytes.
+    #[allow(clippy::too_many_arguments)]
+    async fn read_quantized_range<W>(
+        bucket: &str,
+        object: &str,
+        writer: &mut W,
+        fi: &FileInfo,
+        files: &[FileInfo],
+        disks: &[Option<DiskStore>],
+        erasure: &coding::Erasure,
+        frame_size: usize,
+        length: usize,
+        part_index: usize,
+        last_part_index: usize,
+        mut part_offset: usize,
+        skip_verify_bitrot: bool,
+        suppress_read_repair: bool,
+        prefer_data_blocks_first_reader_setup: bool,
+        require_reconstruction_surplus: bool,
+        pool_index: usize,
+        set_index: usize,
+        metrics_path: &'static str,
+        metrics_object_class: &'static str,
+        metrics_size_bucket: &'static str,
+    ) -> Result<()>
+    where
+        W: AsyncWrite + Send + Sync + Unpin + 'static,
+    {
+        let logical_shard_size = erasure.shard_size();
+        if frame_size == 0
+            || logical_shard_size == 0
+            || erasure.block_size == 0
+            || erasure.data_shards == 0
+            || !logical_shard_size.is_multiple_of(frame_size)
+        {
+            return Err(Error::other("invalid EC read quantum geometry"));
+        }
+
+        let use_mmap_read = object_mmap_read_enabled();
+        let quantum_label = quantized_range_quantum_label(frame_size);
+        rustfs_io_metrics::record_get_object_quantized_range_request(
+            metrics_path,
+            metrics_object_class,
+            metrics_size_bucket,
+            quantum_label,
+            u64::try_from(length).unwrap_or(u64::MAX),
+        );
+        let mut total_read = 0usize;
+        for current_part in part_index..=last_part_index {
+            if total_read == length {
+                break;
+            }
+
+            let part_number = fi.parts[current_part].number;
+            let part_size = fi.parts[current_part].size;
+            let part_remaining = quantized_part_remaining(part_size, part_offset)?;
+            let part_length = part_remaining.min(length - total_read);
+            let mut segment_offset = part_offset;
+            let mut segment_remaining = part_length;
+
+            while segment_remaining > 0 {
+                rustfs_io_metrics::record_get_object_quantized_range_segment(
+                    metrics_path,
+                    metrics_object_class,
+                    metrics_size_bucket,
+                    quantum_label,
+                );
+                let block_index = segment_offset / erasure.block_size;
+                let within_block = segment_offset % erasure.block_size;
+                let block_data_start = block_index
+                    .checked_mul(erasure.block_size)
+                    .ok_or_else(|| Error::other("EC read quantum block offset overflows"))?;
+                if block_data_start >= part_size {
+                    return Err(Error::other("EC read quantum block offset exceeds part size"));
+                }
+                let block_data_len = (part_size - block_data_start).min(erasure.block_size);
+                let block_shard_size = coding::calc_shard_size(block_data_len, erasure.data_shards);
+                if block_shard_size == 0 {
+                    return Err(Error::other("EC read quantum block has zero shard length"));
+                }
+                let shard_index = within_block / block_shard_size;
+                if shard_index >= erasure.data_shards {
+                    return Err(Error::other("EC read quantum data shard index is out of range"));
+                }
+                let within_shard = within_block % block_shard_size;
+                let block_remaining = erasure.block_size - within_block;
+                if within_shard >= block_shard_size {
+                    return Err(Error::other("EC read quantum shard offset exceeds encoded block"));
+                }
+                let shard_remaining = block_shard_size - within_shard;
+                let block_data_remaining = block_data_len - within_block;
+                let block_segment_length = segment_remaining.min(block_data_remaining);
+                let read_full_block = shard_index == 0 && within_shard < frame_size && block_segment_length > shard_remaining;
+                let (segment_length, read_shard_size, read_offset, output_offset) = if read_full_block {
+                    // A range that begins in the first q-frame of shard 0 and
+                    // crosses into shard 1 already requires all frames of
+                    // shard 0. Group its data-shard segments into one decode so
+                    // we do not reopen the block's shards a second time.
+                    let read_offset = block_index
+                        .checked_mul(logical_shard_size)
+                        .ok_or_else(|| Error::other("EC read quantum offset overflows"))?;
+                    (block_segment_length, block_shard_size, read_offset, within_block)
+                } else {
+                    let segment_length = segment_remaining.min(block_remaining).min(shard_remaining);
+                    if segment_length == 0 {
+                        return Err(Error::other("EC read quantum segment is empty"));
+                    }
+
+                    let q_base = (within_shard / frame_size) * frame_size;
+                    let relative_offset = within_shard - q_base;
+                    let covered = relative_offset
+                        .checked_add(segment_length)
+                        .ok_or_else(|| Error::other("EC read quantum segment overflows"))?;
+                    let frame_count = covered.div_ceil(frame_size);
+                    let frame_aligned_size = frame_count
+                        .checked_mul(frame_size)
+                        .ok_or_else(|| Error::other("EC read quantum frame size overflows"))?;
+                    let read_shard_size = frame_aligned_size.min(block_shard_size - q_base);
+                    let read_offset = block_index
+                        .checked_mul(logical_shard_size)
+                        .and_then(|base| base.checked_add(q_base))
+                        .ok_or_else(|| Error::other("EC read quantum offset overflows"))?;
+                    let output_offset = shard_index
+                        .checked_mul(read_shard_size)
+                        .and_then(|base| base.checked_add(relative_offset))
+                        .ok_or_else(|| Error::other("EC read quantum output offset overflows"))?;
+                    (segment_length, read_shard_size, read_offset, output_offset)
+                };
+
+                let spec = PartReaderSetupSpec {
+                    integrity: fi.parts[current_part].integrity.clone(),
+                    part_number,
+                    read_offset,
+                    read_length: read_shard_size,
+                    frame_size,
+                    checksum_algo: part_checksum_algorithm(fi, part_number),
+                };
+                let (reader_setup, reader_setup_elapsed) = setup_multipart_part_readers(
+                    files,
+                    disks,
+                    bucket,
+                    object,
+                    spec,
+                    logical_shard_size,
+                    erasure.data_shards,
+                    erasure.parity_shards,
+                    skip_verify_bitrot,
+                    use_mmap_read,
+                    prefer_data_blocks_first_reader_setup,
+                    metrics_path,
+                    metrics_object_class,
+                    metrics_size_bucket,
+                )
+                .await;
+                rustfs_io_metrics::record_get_object_quantized_range_reader_setup(
+                    metrics_path,
+                    metrics_object_class,
+                    metrics_size_bucket,
+                    quantum_label,
+                );
+                rustfs_io_metrics::record_get_object_shard_reader_setup_duration(reader_setup_elapsed.as_secs_f64());
+                rustfs_io_metrics::record_get_object_stage_duration_by_size(
+                    metrics_path,
+                    GET_STAGE_READER_SETUP,
+                    metrics_object_class,
+                    metrics_size_bucket,
+                    reader_setup_elapsed.as_secs_f64(),
+                );
+
+                let available_shards = reader_setup.available_shards();
+                if available_shards < erasure.data_shards {
+                    return Err(DiskError::ErasureReadQuorum.into());
+                }
+
+                let quorum_window_bytes = read_shard_size
+                    .saturating_mul(available_shards)
+                    .try_into()
+                    .unwrap_or(u64::MAX);
+                rustfs_io_metrics::record_get_object_quantized_range_quorum_window_bytes(
+                    metrics_path,
+                    metrics_object_class,
+                    metrics_size_bucket,
+                    quantum_label,
+                    quorum_window_bytes,
+                );
+
+                let missing_shards = reader_setup.completed_failed_shards();
+                if !suppress_read_repair && missing_shards > 0 && available_shards >= erasure.data_shards {
+                    let version_id = fi.version_id.as_ref().map(ToString::to_string);
+                    submit_read_repair_heal(
+                        bucket,
+                        object,
+                        version_id.as_deref(),
+                        pool_index,
+                        set_index,
+                        Some(part_number),
+                        "missing_shards",
+                    )
+                    .await;
+                }
+
+                let unattempted_data_shards = !reader_setup.data_shards_attempted(erasure.data_shards);
+                let read_costs = coding::decode::should_collect_shard_read_costs().then(|| shard_read_costs_for_disks(disks));
+                let readers = reader_setup.readers;
+                let deferred_stripe_handles = reader_setup.deferred_stripe_handles;
+                let deferred_reopeners = reader_setup.deferred_reopeners;
+                let outcome = erasure
+                    .clone()
+                    .decode_quantized_range_with_stripe_handles_and_reopeners(
+                        writer,
+                        readers,
+                        output_offset,
+                        segment_length,
+                        read_shard_size,
+                        read_costs,
+                        deferred_stripe_handles,
+                        deferred_reopeners,
+                        !skip_verify_bitrot
+                            && !require_reconstruction_surplus
+                            && part_checksum_algorithm(fi, part_number).size() > 0,
+                    )
+                    .await;
+                rustfs_io_metrics::record_get_object_quantized_range_frames(
+                    metrics_path,
+                    metrics_object_class,
+                    metrics_size_bucket,
+                    quantum_label,
+                    u64::try_from(outcome.frame_count).unwrap_or(u64::MAX),
+                );
+                rustfs_io_metrics::record_get_object_quantized_range_read_dispatches(
+                    metrics_path,
+                    metrics_object_class,
+                    metrics_size_bucket,
+                    quantum_label,
+                    u64::try_from(outcome.read_dispatch_count).unwrap_or(u64::MAX),
+                );
+                let mut repair_needed = outcome.repair.needed(!unattempted_data_shards);
+                if require_reconstruction_surplus && outcome.exact_quorum && outcome.error.is_none() {
+                    return Err(Error::other("two-phase read completed with exact reconstruction quorum"));
+                }
+                if let Some(error) = outcome.error {
+                    let disk_error: DiskError = error.into();
+                    let mut has_error = true;
+                    if outcome.written == segment_length {
+                        let should_enqueue_heal = matches!(disk_error, DiskError::FileCorrupt)
+                            || (matches!(disk_error, DiskError::FileNotFound) && !unattempted_data_shards);
+                        if should_enqueue_heal {
+                            repair_needed = true;
+                            has_error = false;
+                        }
+                    }
+                    if has_error {
+                        return Err(disk_error.into());
+                    }
+                }
+                if outcome.written != segment_length {
+                    return Err(Error::other("quantized range returned fewer bytes than requested"));
+                }
+                if !suppress_read_repair && repair_needed {
+                    DecodeReadRepairContext::new(bucket, object, fi.version_id, pool_index, set_index, part_number, false)
+                        .submit()
+                        .await;
+                }
+
+                total_read += segment_length;
+                segment_offset += segment_length;
+                segment_remaining -= segment_length;
+            }
+            part_offset = 0;
+        }
+
+        if total_read != length {
+            return Err(StorageError::LessData);
+        }
         Ok(())
     }
 
@@ -2426,6 +2749,7 @@ impl SetDisks {
         if part_length > part_size {
             return Err(Error::other("codec streaming reader part length exceeds part size"));
         }
+        let frame_size = read_frame_size_for_file_info(fi, erasure)?;
         let checksum_algo = part_checksum_algorithm(fi, part_number);
         let use_mmap_read = object_mmap_read_enabled();
         let till_offset = erasure.shard_file_offset(part_offset, part_length, part_size);
@@ -2441,7 +2765,7 @@ impl SetDisks {
         });
         let reader_setup_stage_start = get_stage_timer_if_enabled(stage_metrics_enabled);
         let read_costs = coding::decode::should_collect_shard_read_costs().then(|| shard_read_costs_for_disks(disks));
-        let mut reader_setup = create_bitrot_readers_until_quorum_with_preference(
+        let mut reader_setup = create_bitrot_readers_until_quorum_with_preference_and_frame_size(
             files,
             disks,
             bucket,
@@ -2450,6 +2774,7 @@ impl SetDisks {
             read_offset,
             read_length,
             erasure.shard_size(),
+            frame_size,
             checksum_algo,
             skip_verify_bitrot,
             use_mmap_read,
@@ -2712,7 +3037,57 @@ struct PartReaderSetupSpec {
     part_number: usize,
     read_offset: usize,
     read_length: usize,
+    frame_size: usize,
     checksum_algo: HashAlgorithm,
+}
+
+/// Resolve the physical authenticated frame size for a persisted object while
+/// keeping the original EC layout geometry for offsets and reconstruction.
+pub(in crate::set_disk) fn read_frame_size_for_file_info(fi: &FileInfo, erasure: &coding::Erasure) -> Result<usize> {
+    let Some(quantum) =
+        crate::object_api::persisted_ec_read_quantum(&fi.metadata, erasure.block_size, erasure.data_shards, erasure.shard_size())
+            .map_err(|error| Error::other(error.to_string()))?
+    else {
+        return Ok(erasure.shard_size());
+    };
+
+    if erasure.uses_legacy_codec() {
+        return Err(Error::other("EC read quantum marker is unsupported for legacy erasure objects"));
+    }
+    if fi.parts.iter().any(|part| part.integrity.is_some()) {
+        return Err(Error::other("EC read quantum marker cannot be combined with protected shard integrity"));
+    }
+    Ok(quantum)
+}
+
+fn quantized_range_quantum_label(frame_size: usize) -> &'static str {
+    const Q_4KIB: usize = 4 * 1024;
+    const Q_8KIB: usize = 8 * 1024;
+    const Q_16KIB: usize = 16 * 1024;
+    const Q_32KIB: usize = 32 * 1024;
+    const Q_64KIB: usize = 64 * 1024;
+    const Q_128KIB: usize = 128 * 1024;
+    const Q_256KIB: usize = 256 * 1024;
+    const Q_512KIB: usize = 512 * 1024;
+    const Q_1MIB: usize = 1024 * 1024;
+    match frame_size {
+        Q_4KIB => "4kib",
+        Q_8KIB => "8kib",
+        Q_16KIB => "16kib",
+        Q_32KIB => "32kib",
+        Q_64KIB => "64kib",
+        Q_128KIB => "128kib",
+        Q_256KIB => "256kib",
+        Q_512KIB => "512kib",
+        Q_1MIB => "1mib",
+        _ => "other",
+    }
+}
+
+fn quantized_part_remaining(part_size: usize, part_offset: usize) -> Result<usize> {
+    part_size
+        .checked_sub(part_offset)
+        .ok_or_else(|| Error::other("EC read quantum part offset exceeds part size"))
 }
 
 fn multipart_reader_setup_prefetch_enabled(policy: GetObjectReadPolicy) -> bool {
@@ -2840,7 +3215,7 @@ async fn setup_multipart_part_readers(
     metrics_size_bucket: &'static str,
 ) -> (BitrotReaderSetup, Duration) {
     let started = Instant::now();
-    let mut setup = create_bitrot_readers_until_quorum_with_preference(
+    let mut setup = create_bitrot_readers_until_quorum_with_preference_and_frame_size(
         files,
         disks,
         bucket,
@@ -2849,6 +3224,7 @@ async fn setup_multipart_part_readers(
         spec.read_offset,
         spec.read_length,
         shard_size,
+        spec.frame_size,
         spec.checksum_algo,
         skip_verify_bitrot,
         use_mmap_read,
@@ -6264,6 +6640,135 @@ mod metadata_cache_tests {
             "freshly inserted entry should be retrievable"
         );
     }
+
+    #[tokio::test]
+    #[serial(metadata_cache_publish_barrier, body_cache_hook)]
+    async fn get_object_info_fileinfo_and_quorum_early_stops_at_write_quorum_and_preserves_explicit_version_fanout() {
+        use crate::object_api::WriteCompletion;
+        use crate::set_disk::core::io_primitives::disk_call_counters;
+        use crate::storage_api_contracts::bucket::{BucketOperations, MakeBucketOptions};
+
+        temp_env::async_with_vars(
+            [
+                ("RUSTFS_GET_METADATA_EARLY_STOP_ENABLE", Some("true")),
+                ("RUSTFS_GET_METADATA_EARLY_STOP_BOUNDED_FANOUT", Some("true")),
+                ("RUSTFS_GET_METADATA_VERSION_EARLY_STOP_ENABLE", Some("true")),
+            ],
+            async {
+                let ctx = Arc::new(crate::runtime::instance::InstanceContext::new());
+                ctx.update_erasure_type(crate::layout::endpoints::SetupType::Erasure).await;
+                let (dirs, set) = crate::ecstore_validation_blackbox::make_local_set_disks_with_ctx(8, 4, ctx).await;
+                let bucket = "delete-preflight-early-stop";
+                let object = "delete-preflight.bin";
+                set.make_bucket(bucket, &MakeBucketOptions::default())
+                    .await
+                    .expect("create bucket");
+                let committed = set
+                    .put_object(
+                        bucket,
+                        object,
+                        &mut PutObjReader::from_vec(vec![0x42; 4096]),
+                        &ObjectOptions {
+                            write_completion: WriteCompletion::TailDrained,
+                            ..Default::default()
+                        },
+                    )
+                    .await
+                    .expect("commit 8 shards");
+                set.invalidate_get_object_metadata_cache(bucket, object).await;
+
+                for version_id in [None, Some(String::new())] {
+                    let calls = disk_call_counters::observe(object);
+                    let opts = ObjectOptions {
+                        version_id,
+                        ..Default::default()
+                    };
+                    let (oi, fi, write_quorum, err) = set.get_object_info_fileinfo_and_quorum(bucket, object, &opts).await;
+                    assert!(err.is_none(), "healthy preflight read must succeed: {err:?}");
+                    assert_eq!(write_quorum, 5);
+                    assert_eq!(oi.etag, committed.etag);
+                    assert_eq!(fi.size, 4096);
+                    assert_eq!(
+                        calls.total(disk_call_counters::KIND_READ_VERSION),
+                        5,
+                        "healthy unversioned/latest delete preflight must early-stop at write quorum (5/8)"
+                    );
+                    assert!(
+                        set.cached_get_object_fileinfo(bucket, object).await.is_none(),
+                        "delete preflight read_data=false early-stop must not populate metadata cache"
+                    );
+                }
+
+                // Remove xl.meta on 3 drives so any 5-drive initial subset sees FileNotFound and expands fanout,
+                // while the remaining 5 drives still satisfy write quorum.
+                for dir in &dirs[..3] {
+                    std::fs::remove_file(dir.path().join(bucket).join(object).join("xl.meta")).expect("remove drive xl.meta");
+                }
+                let calls = disk_call_counters::observe(object);
+                let (oi_degraded, fi_degraded, quorum_degraded, err_degraded) = set
+                    .get_object_info_fileinfo_and_quorum(bucket, object, &ObjectOptions::default())
+                    .await;
+                assert!(err_degraded.is_none(), "5/8 surviving drives must still succeed: {err_degraded:?}");
+                assert_eq!(quorum_degraded, 5);
+                assert_eq!(oi_degraded.etag, committed.etag);
+                assert_eq!(fi_degraded.size, 4096);
+                assert!(
+                    calls.total(disk_call_counters::KIND_READ_VERSION) > 5,
+                    "missing shard in initial subset must expand fanout beyond write quorum"
+                );
+
+                // Explicit versionId on a 6+2 set with RUSTFS_GET_METADATA_VERSION_EARLY_STOP_ENABLE=true
+                // must keep full 8-drive fanout rather than stopping at 4/8.
+                let ctx62 = Arc::new(crate::runtime::instance::InstanceContext::new());
+                ctx62.update_erasure_type(crate::layout::endpoints::SetupType::Erasure).await;
+                let (_dirs62, set62) = crate::ecstore_validation_blackbox::make_local_set_disks_with_ctx(8, 2, ctx62).await;
+                let v_bucket = "delete-preflight-62";
+                let v_object = "delete-preflight-versioned.bin";
+                set62
+                    .make_bucket(
+                        v_bucket,
+                        &MakeBucketOptions {
+                            versioning_enabled: true,
+                            ..Default::default()
+                        },
+                    )
+                    .await
+                    .expect("create versioned 6+2 bucket");
+                let v_vid = Uuid::new_v4().to_string();
+                let v_committed = set62
+                    .put_object(
+                        v_bucket,
+                        v_object,
+                        &mut PutObjReader::from_vec(vec![0x24; 4096]),
+                        &ObjectOptions {
+                            versioned: true,
+                            version_id: Some(v_vid.clone()),
+                            write_completion: WriteCompletion::TailDrained,
+                            ..Default::default()
+                        },
+                    )
+                    .await
+                    .expect("commit versioned 6+2 object");
+                set62.invalidate_get_object_metadata_cache(v_bucket, v_object).await;
+                let v_calls = disk_call_counters::observe(v_object);
+                let v_opts = ObjectOptions {
+                    versioned: true,
+                    version_id: Some(v_vid),
+                    ..Default::default()
+                };
+                let (v_oi, _v_fi, v_quorum, v_err) = set62.get_object_info_fileinfo_and_quorum(v_bucket, v_object, &v_opts).await;
+                assert!(v_err.is_none(), "explicit-version preflight on 6+2 must succeed: {v_err:?}");
+                assert_eq!(v_quorum, 6);
+                assert_eq!(v_oi.etag, v_committed.etag);
+                assert_eq!(
+                    v_calls.total(disk_call_counters::KIND_READ_VERSION),
+                    8,
+                    "explicit-version delete preflight must keep full fanout even when version early-stop is enabled"
+                );
+            },
+        )
+        .await;
+    }
 }
 
 #[cfg(test)]
@@ -6290,6 +6795,54 @@ mod tests {
             metadata_quorum_outcome(&StorageError::Io(std::io::Error::other("disk unavailable"))),
             "unavailable"
         );
+    }
+
+    #[test]
+    fn quantized_part_remaining_rejects_offsets_past_part_end() {
+        assert_eq!(quantized_part_remaining(1024, 768).expect("valid part offset"), 256);
+        assert!(quantized_part_remaining(1024, 1025).is_err());
+    }
+
+    #[tokio::test]
+    async fn quantized_range_preserves_typed_quorum_and_short_read_errors() {
+        let erasure = coding::Erasure::new(2, 2, 64 * 1024);
+        let disks = vec![None; erasure.total_shard_count()];
+        for (part_size, expected) in [(1, StorageError::ErasureReadQuorum), (0, StorageError::LessData)] {
+            let mut fi = FileInfo::new(CODEC_STREAMING_TEST_OBJECT, 2, 2);
+            fi.size = 1;
+            fi.erasure.block_size = erasure.block_size;
+            fi.erasure.distribution = (1..=erasure.total_shard_count()).collect();
+            fi.add_object_part(1, "fixture-etag".to_string(), part_size, None, 1, None, None);
+            let files = vec![fi.clone(); erasure.total_shard_count()];
+            let mut output = Vec::new();
+            let error = SetDisks::read_quantized_range(
+                CODEC_STREAMING_TEST_BUCKET,
+                CODEC_STREAMING_TEST_OBJECT,
+                &mut output,
+                &fi,
+                &files,
+                &disks,
+                &erasure,
+                16 * 1024,
+                1,
+                0,
+                0,
+                0,
+                false,
+                true,
+                true,
+                false,
+                0,
+                0,
+                GET_OBJECT_PATH_SET_DISK,
+                "plain",
+                "small",
+            )
+            .await
+            .expect_err("unreadable quantized range must fail");
+            assert_eq!(error, expected);
+            assert!(output.is_empty());
+        }
     }
 
     fn capture_read_repair_submitter(
@@ -6400,6 +6953,227 @@ mod tests {
             disks.push(Some(disk));
         }
         (dirs, disks)
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn quantized_range_preserves_frame_shard_block_and_odd_tail_boundaries() {
+        const BLOCK_SIZE: usize = 64 * 1024;
+        const FRAME_SIZE: usize = 16 * 1024;
+        const TAIL_SIZE: usize = 17_409;
+        let payload: Vec<u8> = (0..BLOCK_SIZE + TAIL_SIZE)
+            .map(|index| u8::try_from(index % 251).expect("fixture byte fits u8"))
+            .collect();
+        let erasure = coding::Erasure::new(2, 2, BLOCK_SIZE);
+        let mut encoded = vec![Vec::new(); erasure.total_shard_count()];
+        for block in payload.chunks(BLOCK_SIZE) {
+            for (index, shard) in erasure
+                .encode_data(block)
+                .expect("fixture block encodes")
+                .into_iter()
+                .enumerate()
+            {
+                let mut writer = BitrotWriter::new(Vec::new(), FRAME_SIZE, HashAlgorithm::HighwayHash256S);
+                for frame in shard.chunks(FRAME_SIZE) {
+                    writer.write(frame).await.expect("fixture frame writes");
+                }
+                encoded[index].extend(writer.into_inner());
+            }
+        }
+        let mut fi = FileInfo::new(CODEC_STREAMING_TEST_OBJECT, 2, 2);
+        fi.volume = CODEC_STREAMING_TEST_BUCKET.to_string();
+        fi.size = i64::try_from(payload.len()).expect("fixture size fits i64");
+        fi.erasure.block_size = BLOCK_SIZE;
+        fi.erasure.distribution = (1..=erasure.total_shard_count()).collect();
+        crate::object_api::insert_ec_read_quantum(&mut fi.metadata, FRAME_SIZE);
+        fi.add_object_part(1, "fixture-etag".to_string(), payload.len(), None, fi.size, None, None);
+        let files: Vec<FileInfo> = encoded
+            .iter()
+            .enumerate()
+            .map(|(index, bytes)| {
+                let mut file = fi.clone();
+                file.erasure.index = index + 1;
+                file.data = Some(Bytes::copy_from_slice(bytes));
+                file
+            })
+            .collect();
+        let (_dirs, disks) = local_test_disks(erasure.total_shard_count(), CODEC_STREAMING_TEST_BUCKET).await;
+
+        for damage in ["healthy", "corrupt-tail", "missing-data"] {
+            let mut files = files.clone();
+            let mut disks = disks.clone();
+            if damage == "corrupt-tail" {
+                let mut bytes = files[0].data.take().expect("tail shard fixture").to_vec();
+                *bytes.last_mut().expect("odd tail byte") ^= 0x80;
+                files[0].data = Some(Bytes::from(bytes));
+            } else if damage == "missing-data" {
+                disks[0] = None;
+            }
+            for (offset, length) in [
+                (3, 29),
+                (FRAME_SIZE - 3, 9),
+                (erasure.shard_size() - 3, 9),
+                (BLOCK_SIZE - 3, 9),
+                (BLOCK_SIZE + TAIL_SIZE.div_ceil(2) - 3, 9),
+                (BLOCK_SIZE, TAIL_SIZE),
+                (payload.len() - 7, 7),
+                (0, payload.len()),
+            ] {
+                let mut output = Vec::new();
+                SetDisks::get_object_with_fileinfo(
+                    CODEC_STREAMING_TEST_BUCKET,
+                    CODEC_STREAMING_TEST_OBJECT,
+                    Arc::new(ErasureCache::new()),
+                    offset,
+                    i64::try_from(length).expect("range length fits i64"),
+                    &mut output,
+                    fi.clone(),
+                    files.clone(),
+                    &disks,
+                    0,
+                    0,
+                    false,
+                    true,
+                    true,
+                    false,
+                    GET_OBJECT_PATH_SET_DISK,
+                    "plain",
+                    "small",
+                )
+                .await
+                .unwrap_or_else(|error| panic!("{damage}, offset={offset}, length={length}: range must recover: {error}"));
+                assert_eq!(
+                    output,
+                    payload[offset..offset + length],
+                    "{damage}, offset={offset}, length={length}: frame/shard/block/tail order must stay exact"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn quantized_range_direct_memory_and_cross_shard_header_offset_coalesce() {
+        const BLOCK_SIZE: usize = 64 * 1024;
+        const FRAME_SIZE: usize = 16 * 1024;
+        let payload: Vec<u8> = (0..BLOCK_SIZE)
+            .map(|index| u8::try_from(index % 251).expect("fixture byte fits u8"))
+            .collect();
+        let erasure = coding::Erasure::new(2, 2, BLOCK_SIZE);
+        let mut encoded = vec![Vec::new(); erasure.total_shard_count()];
+        for (index, shard) in erasure
+            .encode_data(&payload)
+            .expect("fixture block encodes")
+            .into_iter()
+            .enumerate()
+        {
+            let mut writer = BitrotWriter::new(Vec::new(), FRAME_SIZE, HashAlgorithm::HighwayHash256S);
+            for frame in shard.chunks(FRAME_SIZE) {
+                writer.write(frame).await.expect("fixture frame writes");
+            }
+            encoded[index].extend(writer.into_inner());
+        }
+
+        let mut fi = FileInfo::new(CODEC_STREAMING_TEST_OBJECT, 2, 2);
+        fi.volume = CODEC_STREAMING_TEST_BUCKET.to_string();
+        fi.name = CODEC_STREAMING_TEST_OBJECT.to_string();
+        fi.size = i64::try_from(payload.len()).expect("fixture size fits i64");
+        fi.is_latest = true;
+        fi.version_id = Some(Uuid::nil());
+        fi.data_dir = Some(Uuid::nil());
+        fi.mod_time = Some(time::OffsetDateTime::UNIX_EPOCH);
+        fi.metadata.insert("etag".to_string(), "fixture-etag".to_string());
+        fi.erasure.block_size = BLOCK_SIZE;
+        fi.erasure.distribution = (1..=erasure.total_shard_count()).collect();
+        crate::object_api::insert_ec_read_quantum(&mut fi.metadata, FRAME_SIZE);
+        fi.add_object_part(1, "fixture-etag".to_string(), payload.len(), fi.mod_time, fi.size, None, None);
+        fi.set_inline_data();
+
+        let files: Vec<FileInfo> = encoded
+            .iter()
+            .enumerate()
+            .map(|(index, bytes)| {
+                let mut file = fi.clone();
+                file.erasure.index = index + 1;
+                file.data = Some(Bytes::copy_from_slice(bytes));
+                file
+            })
+            .collect();
+        let head_fi = files[0].clone();
+        let (_dirs, disks) = local_test_disks(erasure.total_shard_count(), CODEC_STREAMING_TEST_BUCKET).await;
+
+        let body = SetDisks::try_get_object_direct_data_shards_with_fileinfo(
+            CODEC_STREAMING_TEST_BUCKET,
+            CODEC_STREAMING_TEST_OBJECT,
+            Arc::new(ErasureCache::new()),
+            &head_fi,
+            &files,
+            &disks,
+            false,
+            "plain",
+            "small",
+        )
+        .await
+        .expect("bounded-quantum direct-memory read should not error")
+        .expect("healthy bounded-quantum single-block object should use direct-memory fast path");
+        assert_eq!(body.as_ref(), payload.as_slice());
+
+        let mut corrupted_files = files.clone();
+        let mut shard0 = corrupted_files[0].data.take().expect("shard 0 fixture").to_vec();
+        *shard0.last_mut().expect("second frame byte") ^= 0x80;
+        corrupted_files[0].data = Some(Bytes::from(shard0));
+        let corrupted_head = corrupted_files[0].clone();
+        let fallback = SetDisks::try_get_object_direct_data_shards_with_fileinfo(
+            CODEC_STREAMING_TEST_BUCKET,
+            CODEC_STREAMING_TEST_OBJECT,
+            Arc::new(ErasureCache::new()),
+            &corrupted_head,
+            &corrupted_files,
+            &disks,
+            false,
+            "plain",
+            "small",
+        )
+        .await
+        .expect("corrupted bounded-quantum direct-memory read should return Ok(None) for parity fallback");
+        assert!(fallback.is_none(), "corrupted second frame must fail closed in direct-memory path");
+
+        // A 32 KiB Range GET starting at offset 4 (skipping a 4-byte framing header)
+        // starts in the first q-frame of shard 0 and crosses into shard 1. It must
+        // coalesce into 1 quantized block decode instead of opening the shards twice.
+        let calls = crate::set_disk::disk_call_counters::observe(CODEC_STREAMING_TEST_OBJECT);
+        let mut range_out = Vec::new();
+        SetDisks::read_quantized_range(
+            CODEC_STREAMING_TEST_BUCKET,
+            CODEC_STREAMING_TEST_OBJECT,
+            &mut range_out,
+            &fi,
+            &files,
+            &disks,
+            &erasure,
+            FRAME_SIZE,
+            32 * 1024,
+            0,
+            0,
+            4,
+            false,
+            true,
+            true,
+            false,
+            0,
+            0,
+            GET_OBJECT_PATH_SET_DISK,
+            "plain",
+            "small",
+        )
+        .await
+        .expect("coalesced cross-shard range read must succeed");
+        assert_eq!(range_out, payload[4..4 + 32 * 1024]);
+        assert_eq!(
+            calls.total(crate::set_disk::disk_call_counters::KIND_INLINE_SHARD_OPEN),
+            2,
+            "cross-shard range starting in frame 0 of shard 0 must open each data shard only once"
+        );
     }
 
     #[test]
@@ -9242,6 +10016,80 @@ mod tests {
 
     #[tokio::test]
     #[serial]
+    async fn nixl_shard_not_found_triggers_repair_after_reconstruction() {
+        use crate::cluster::rpc::nixl_internode::{
+            READ_FILE_NIXL_PATH,
+            read_test_support::{nixl_reader, read_peer},
+        };
+        use crate::io_support::bitrot::ShardReader;
+        use std::io::Cursor;
+        for (status, marker, body, missing) in [
+            ("404 Not Found", Some(rustfs_rio::INTERNODE_FILE_NOT_FOUND), "missing", true),
+            ("404 Not Found", None, "file not found", true),
+            ("404 Not Found", None, "internode rpc route not found", false),
+            ("404 Not Found", Some("unknown"), "file not found", false),
+            ("503 Service Unavailable", None, "file not found", false),
+        ] {
+            let header = marker
+                .map(|value| format!("{}: {value}\r\n", rustfs_rio::INTERNODE_DISK_ERROR_HEADER))
+                .unwrap_or_default();
+            let response = format!(
+                "HTTP/1.1 {status}\r\n{header}Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            let (endpoint, peer) = read_peer(response.into_bytes()).await;
+            let payload = b"abcdefgh";
+            let erasure = coding::Erasure::new(1, 1, payload.len());
+            let algo = HashAlgorithm::HighwayHash256S;
+            let shards = erasure.encode_data(payload).expect("encode data and parity");
+            let mut writer = coding::BitrotWriter::new(Cursor::new(Vec::new()), erasure.shard_size(), algo.clone());
+            writer.write(&shards[1]).await.expect("encode healthy parity");
+            let parity = ShardReader::InMemory(Cursor::new(Bytes::from(writer.into_inner().into_inner())));
+            let remote = ShardReader::Chunked(nixl_reader(&endpoint, erasure.shard_size() + algo.size()));
+            let readers = [remote, parity]
+                .into_iter()
+                .map(|reader| Some(coding::BitrotReader::new(reader, erasure.shard_size(), algo.clone(), false)))
+                .collect();
+            CAPTURED_READ_REPAIR_CALLS.store(0, Ordering::Relaxed);
+            let mut context = DecodeReadRepairContext::new(&Uuid::new_v4().to_string(), "object", None, 0, 0, 1, false);
+            context.submitter = capture_read_repair_submitter;
+            let mut reader = build_legacy_per_part_fallback_reader(
+                erasure,
+                readers,
+                Vec::new(),
+                Vec::new(),
+                None,
+                0,
+                payload.len(),
+                payload.len(),
+                Some((context, true)),
+            );
+            let mut output = Vec::new();
+            reader
+                .read_to_end(&mut output)
+                .await
+                .expect("read reconstructed part through EOF");
+            assert_eq!(output, payload);
+            assert_eq!(peer.await.expect("NIXL peer").path(), READ_FILE_NIXL_PATH);
+            if missing {
+                tokio::time::timeout(Duration::from_secs(5), async {
+                    while CAPTURED_READ_REPAIR_CALLS.load(Ordering::Relaxed) == 0 {
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .expect("submit missing shard for repair");
+            }
+            assert_eq!(
+                CAPTURED_READ_REPAIR_CALLS.load(Ordering::Relaxed),
+                usize::from(missing),
+                "{status} {marker:?} {body}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    #[serial]
     async fn legacy_per_part_fallback_preserves_repair_evidence() {
         CAPTURED_READ_REPAIR_CALLS.store(0, Ordering::Relaxed);
         let erasure = coding::Erasure::new(2, 2, 64);
@@ -11043,7 +11891,12 @@ mod dangling_read_tests {
                 object,
                 &mut source,
                 &ObjectOptions::default(),
-                &ObjectOptions::default(),
+                &ObjectOptions {
+                    object_lock_config_snapshot: Some(Arc::new(crate::object_api::ObjectLockConfigSnapshot::new(
+                        crate::bucket::metadata_sys::ObjectLockConfigState::ConfirmedAbsent,
+                    ))),
+                    ..Default::default()
+                },
             )
             .await
             .expect("a CopyObject source without a version id must resolve like a latest GET");

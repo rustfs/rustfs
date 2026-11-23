@@ -37,7 +37,6 @@ use crate::app::storage_api::object_usecase::helper::OperationHelper;
 use crate::app::storage_api::object_usecase::options::get_opts;
 use crate::app::storage_api::object_usecase::{StorageObjectOptions as ObjectOptions, parse_object_lock_retention_native};
 use crate::error::ApiError;
-#[cfg(any(feature = "gateway-stack", test))]
 use rustfs_gateway_types::dto::GetObjectRetentionInput;
 use rustfs_gateway_types::dto::{GetObjectRetentionOutput, Mode, ObjectLockRetention};
 use rustfs_gateway_types::dto::{PutObjectRetentionOutput, RequestCharged};
@@ -133,7 +132,7 @@ impl ObjectMetaUsecase {
         let mut eval_metadata = parse_object_lock_retention_native(retention)?;
         if dsc.replicate_any() {
             insert_str(&mut eval_metadata, SUFFIX_REPLICATION_GENERATION, Uuid::new_v4().to_string());
-            insert_str(&mut eval_metadata, SUFFIX_REPLICATION_TIMESTAMP, jiff::Zoned::now().to_string());
+            insert_str(&mut eval_metadata, SUFFIX_REPLICATION_TIMESTAMP, jiff::ZonedDateTime::now().to_string());
             insert_str(&mut eval_metadata, SUFFIX_REPLICATION_STATUS, dsc.pending_status().unwrap_or_default());
         }
         opts.eval_metadata = Some(eval_metadata);
@@ -151,7 +150,7 @@ impl ObjectMetaUsecase {
 
         // The current target transport carries the updated metadata in a full-object PUT.
         if dsc.replicate_any() {
-            schedule_metadata_replication(object_info.clone(), store.clone(), dsc).await;
+            schedule_metadata_replication(object_info.clone(), store.clone(), dsc, opts.expected_bucket_incarnation_id).await;
         }
 
         let output = PutObjectRetentionOutput {
@@ -178,7 +177,6 @@ impl ObjectMetaUsecase {
     /// `MethodNotAllowed` for a Veeam SOSAPI system object; `InternalError` before the store is up,
     /// when the object cannot be read, or for a stored date outside the answerable range; the
     /// Object Lock refusal of a bucket without Object Lock.
-    #[cfg(any(feature = "gateway-stack", test))]
     pub async fn execute_get_object_retention(
         &self,
         envelope: RequestEnvelope,
@@ -267,22 +265,27 @@ mod tests {
         ] {
             let retention = stored_retention(&stored(value)).expect("representable retention instant");
             assert_eq!(retention.mode.as_ref().expect("mode").as_str(), "COMPLIANCE");
+            // The response codec writes RetainUntilDate as ISO 8601.
+            let serialized = retention
+                .retain_until_date
+                .expect("stored retention date")
+                .render(rustfs_gateway_types::TimestampFormat::Iso8601)
+                .expect("serialize the response timestamp");
+            let returned = OffsetDateTime::parse(&serialized, &Rfc3339).expect("parse wire timestamp");
+            let stored_at = OffsetDateTime::parse(value, &Rfc3339).expect("parse stored timestamp");
+            assert_eq!(returned.unix_timestamp(), stored_at.unix_timestamp(), "stored date {value}");
             let output = get_object_retention::output_to_s3s(GetObjectRetentionOutput {
                 retention: Some(retention),
             })
             .expect("convert the response");
-            let mut serialized = Vec::new();
-            output
-                .retention
-                .expect("retention")
-                .retain_until_date
-                .expect("stored retention date")
-                .format(s3s::dto::TimestampFormat::DateTime, &mut serialized)
-                .expect("serialize the response timestamp");
-            let serialized = String::from_utf8(serialized).expect("UTF-8 timestamp");
-            let returned = OffsetDateTime::parse(&serialized, &Rfc3339).expect("parse wire timestamp");
-            let stored = OffsetDateTime::parse(value, &Rfc3339).expect("parse stored timestamp");
-            assert_eq!(returned.unix_timestamp(), stored.unix_timestamp(), "stored date {value}");
+            let seam = OffsetDateTime::from(
+                output
+                    .retention
+                    .expect("retention")
+                    .retain_until_date
+                    .expect("stored retention date"),
+            );
+            assert_eq!(seam.unix_timestamp(), stored_at.unix_timestamp(), "stored date {value}");
         }
     }
 

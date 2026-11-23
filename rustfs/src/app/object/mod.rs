@@ -79,8 +79,6 @@ use super::storage_api::object_usecase::data_usage::{
     record_bucket_object_write_unknown_previous_memory,
 };
 use super::storage_api::object_usecase::deadlock_detector;
-#[cfg(test)]
-use super::storage_api::object_usecase::ecfs::FS;
 use super::storage_api::object_usecase::error::{
     Error as EcstoreError, StorageError, is_err_bucket_not_found, is_err_object_not_found, is_err_version_not_found,
 };
@@ -118,6 +116,10 @@ use super::storage_api::object_usecase::sse::{
 };
 use super::storage_api::object_usecase::storage_class as storageclass;
 use super::storage_api::object_usecase::timeout_wrapper::{GetObjectTimeoutPolicy, RequestTimeoutWrapper};
+pub(crate) use super::storage_api::object_usecase::{
+    DEFAULT_EC_BLOCK_SIZE, EC_BLOCK_SIZE_HINT_INTERNAL_SUFFIX, EC_BLOCK_SIZE_HINT_METADATA_KEY, EC_BLOCK_SIZE_HINT_REASON_HEADER,
+    EC_BLOCK_SIZE_HINT_STATUS_HEADER, EC_BLOCK_SIZE_RESPONSE_HEADER, EcBlockSizeHintOutcome, resolve_ec_block_size_hint,
+};
 use super::storage_api::object_usecase::{ECStore, OldCurrentSize};
 use super::storage_api::object_usecase::{
     RFC1123, check_preconditions, parse_object_lock_legal_hold_native, parse_object_lock_retention_native,
@@ -179,17 +181,8 @@ use rustfs_utils::http::{
 use rustfs_utils::path::{encode_dir_object, is_dir_object, path_join_buf};
 use rustfs_utils::retry::{DEFAULT_RETRY_CAP, DEFAULT_RETRY_UNIT, MAX_JITTER, RetryTimer};
 use rustfs_zip::{ArchiveLimits, CompressionFormat, ZipError};
-use s3s::{S3Error, S3ErrorCode, S3Result};
 #[cfg(test)]
 use s3s::{S3Request, S3Response};
-
-fn object_s3_error(code: S3ErrorCode, message: impl Into<std::borrow::Cow<'static, str>>) -> S3Error {
-    S3Error::with_message(code, message)
-}
-
-fn object_s3_error_default(code: S3ErrorCode) -> S3Error {
-    S3Error::new(code)
-}
 
 /// Remove replication history owned by another source object before a local
 /// object-creation decision is made. Compatibility keys are case-insensitive,
@@ -226,19 +219,23 @@ mod get;
 mod get_response;
 pub(crate) use get_response::{GetObjectBody, GetObjectFields, GetObjectOutputFacts};
 mod head;
-#[cfg(feature = "gateway-stack")]
 pub(crate) use head::ResponseEtag;
 pub(crate) use head::{HeadObjectFields, HeadObjectOutputFacts};
 mod internal_put;
 mod native_body;
 mod on_demand_migration_put;
+pub(crate) mod post_body;
+pub(crate) mod post_headers;
 mod put;
 mod put_input;
+#[cfg(test)]
 pub(crate) use native_body::from_legacy as legacy_put_body;
-pub(crate) use native_body::{BodyChunks, FrameTrailers};
+pub(crate) use native_body::{BodyChunks, FrameTrailers, upload_frame_reader};
 pub(crate) use put_input::{PutObjectWriteInput, PutObjectWriteOutput};
 pub(crate) mod request_body;
 mod restore;
+#[cfg(test)]
+mod s3s_compat;
 pub(crate) mod shared;
 #[cfg(test)]
 mod test_support;
@@ -378,7 +375,12 @@ impl DefaultObjectUsecase {
             .unwrap_or_else(|| RustFSBufferConfig::default().base_config.default_unknown)
     }
 
-    async fn check_bucket_quota(&self, bucket: &str, op: QuotaOperation, size: u64) -> S3Result<Option<QuotaCheckResult>> {
+    async fn check_bucket_quota(
+        &self,
+        bucket: &str,
+        op: QuotaOperation,
+        size: u64,
+    ) -> rustfs_s3_types::S3Result<Option<QuotaCheckResult>> {
         let Some(metadata_sys) = self.bucket_metadata_sys() else {
             return Ok(None);
         };

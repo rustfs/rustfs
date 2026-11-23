@@ -75,7 +75,8 @@ use super::storage_api::ecstore_object::{
     ReadEncryptionMode, ReadEncryptionRequest,
 };
 use crate::runtime_sources::current_kms_runtime_service_manager;
-use crate::storage::access::{AuthorizationRequest, request_context_from_req, resource_free_condition_values};
+use crate::storage::authorization::resource_free_condition_values;
+use crate::storage::authorization::{AuthorizationRequest, request_context_from_req};
 use crate::storage::storage_api::runtime_sources_consumer::runtime_sources;
 #[cfg(feature = "rio-v2")]
 use aes_gcm::aead::Payload;
@@ -98,8 +99,8 @@ use rustfs_config::{DEFAULT_KMS_ENFORCE_SSE_KEY_POLICY, ENV_RUSTFS_KMS_ENFORCE_S
 use rustfs_kms::{DataKey, KmsUnavailableError, is_data_key_envelope, types::ObjectEncryptionContext};
 use rustfs_policy::policy::Args;
 use rustfs_policy::policy::action::{Action, KmsAction};
+use rustfs_s3_types::S3ErrorCode;
 use rustfs_utils::{get_env_bool, get_env_opt_str};
-use s3s::S3ErrorCode;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 #[cfg(feature = "rio-v2")]
@@ -166,11 +167,17 @@ use rustfs_utils::http::headers::{
 #[cfg(test)]
 use rustfs_utils::http::headers::{AMZ_SERVER_SIDE_ENCRYPTION, AMZ_SERVER_SIDE_ENCRYPTION_KMS_ID};
 use rustfs_utils::path::path_join_buf;
-use s3s::header::{
-    X_AMZ_SERVER_SIDE_ENCRYPTION, X_AMZ_SERVER_SIDE_ENCRYPTION_AWS_KMS_KEY_ID, X_AMZ_SERVER_SIDE_ENCRYPTION_CONTEXT,
-    X_AMZ_SERVER_SIDE_ENCRYPTION_CUSTOMER_ALGORITHM, X_AMZ_SERVER_SIDE_ENCRYPTION_CUSTOMER_KEY_MD5,
-};
 use std::borrow::Cow;
+
+// The same header names s3s publishes. Owned so this module does not import s3s.
+const X_AMZ_SERVER_SIDE_ENCRYPTION: HeaderName = HeaderName::from_static("x-amz-server-side-encryption");
+const X_AMZ_SERVER_SIDE_ENCRYPTION_AWS_KMS_KEY_ID: HeaderName =
+    HeaderName::from_static("x-amz-server-side-encryption-aws-kms-key-id");
+const X_AMZ_SERVER_SIDE_ENCRYPTION_CONTEXT: HeaderName = HeaderName::from_static("x-amz-server-side-encryption-context");
+const X_AMZ_SERVER_SIDE_ENCRYPTION_CUSTOMER_ALGORITHM: HeaderName =
+    HeaderName::from_static("x-amz-server-side-encryption-customer-algorithm");
+const X_AMZ_SERVER_SIDE_ENCRYPTION_CUSTOMER_KEY_MD5: HeaderName =
+    HeaderName::from_static("x-amz-server-side-encryption-customer-key-md5");
 
 // ============================================================================
 // High-Level SSE Configuration
@@ -4693,20 +4700,20 @@ pub(crate) mod tests {
 
     #[test]
     fn anonymous_s3_request_builds_kms_principal() {
-        let mut request = s3s::S3Request {
-            input: (),
-            method: http::Method::GET,
-            uri: http::Uri::from_static("/bucket/object"),
-            headers: http::HeaderMap::new(),
-            extensions: http::Extensions::new(),
-            credentials: None,
-            region: None,
-            service: None,
-            trailing_headers: None,
-        };
-        request.extensions.insert(crate::storage::access::ReqInfo::default());
-
-        let principal = SseKmsPrincipal::from_request(&request).expect("S3-boundary request should build a principal");
+        let mut extensions = http::Extensions::new();
+        extensions.insert(crate::storage::req_info::ReqInfo::default());
+        let envelope = crate::app::RequestEnvelope::from_parts(
+            crate::app::RequestHead {
+                method: http::Method::GET,
+                uri: http::Uri::from_static("/bucket/object"),
+                headers: http::HeaderMap::new(),
+                credentials: None,
+                region: None,
+                service: None,
+            },
+            extensions,
+        );
+        let principal = SseKmsPrincipal::from_request(&envelope).expect("S3-boundary request should build a principal");
 
         assert!(principal.account.is_empty());
         assert!(principal.groups.is_none());
@@ -4973,9 +4980,9 @@ pub(crate) mod tests {
     use http::{HeaderMap, HeaderValue};
     use rustfs_kms::types::ObjectEncryptionContext;
     use rustfs_rio::{DecryptReader, EncryptReader};
+    use rustfs_s3_types::S3ErrorCode;
     use rustfs_utils::http::headers::AMZ_SERVER_SIDE_ENCRYPTION_KMS_CONTEXT;
     use rustfs_utils::http::headers::{AMZ_ENCRYPTION_AES, AMZ_ENCRYPTION_KMS};
-    use s3s::S3ErrorCode;
     use std::collections::HashMap;
     use std::sync::{Arc, OnceLock};
     use temp_env::async_with_vars;
@@ -8524,7 +8531,7 @@ pub(crate) mod tests {
         let err = map_get_object_reader_error(StorageError::other(resolution_error));
         assert_eq!(err.code, S3ErrorCode::Custom(crate::error::KMS_KEY_NOT_FOUND_ERROR_CODE.into()));
         assert_eq!(err.message, "KMS key not found: finance-key");
-        let s3_error = s3s::S3Error::from(err);
+        let s3_error = rustfs_s3_types::S3Error::from(err);
         assert_eq!(s3_error.status_code(), Some(http::StatusCode::BAD_REQUEST));
 
         let denied = map_get_object_reader_error(StorageError::other(super::EncryptionResolutionError::new(
@@ -8545,7 +8552,7 @@ pub(crate) mod tests {
         let err = map_get_object_reader_error(StorageError::PartMissingOrCorrupt);
 
         assert_eq!(err.code, S3ErrorCode::Custom("SlowDownRead".into()));
-        assert_eq!(err.message, "Resource requested is unreadable, please reduce your request rate");
+        assert_eq!(err.message, "The object could not be read from storage.");
     }
 
     #[test]

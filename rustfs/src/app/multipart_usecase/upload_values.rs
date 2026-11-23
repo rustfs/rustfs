@@ -16,7 +16,6 @@
 
 use crate::app::object::FrameTrailers;
 use rustfs_gateway_stream::Body;
-#[cfg(any(feature = "gateway-stack", test))]
 use rustfs_gateway_types::{BucketName, ObjectKey, UploadIdClaim};
 use rustfs_rio::SharedTrailerSource;
 use std::sync::Arc;
@@ -27,7 +26,6 @@ pub(crate) enum UploadPartTarget {
         key: String,
         upload_id: String,
     },
-    #[cfg(any(feature = "gateway-stack", test))]
     Gateway {
         bucket: BucketName,
         key: ObjectKey,
@@ -39,7 +37,6 @@ impl UploadPartTarget {
     pub(super) fn resource(&self) -> (&str, &str) {
         match self {
             Self::Legacy { bucket, key, .. } => (bucket, key),
-            #[cfg(any(feature = "gateway-stack", test))]
             Self::Gateway { bucket, key, .. } => (bucket.as_str(), key.as_str()),
         }
     }

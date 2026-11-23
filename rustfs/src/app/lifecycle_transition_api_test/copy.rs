@@ -16,7 +16,29 @@
 
 use super::common::*;
 use super::*;
+use crate::app::object_usecase::{CopyObjectWriteInput, PutObjectWriteInput};
 use crate::app::test_seams;
+use rustfs_gateway_types::CopySourceValue;
+use rustfs_s3_types::S3ErrorCode;
+
+fn copy_input(
+    src_bucket: &str,
+    src_key: &str,
+    src_version: Option<String>,
+    dst_bucket: &str,
+    dst_key: &str,
+) -> CopyObjectWriteInput {
+    CopyObjectWriteInput {
+        bucket: dst_bucket.to_owned(),
+        key: dst_key.to_owned(),
+        copy_source: Some(CopySourceValue::Bucket {
+            bucket: src_bucket.to_owned(),
+            key: src_key.to_owned(),
+            version_id: src_version,
+        }),
+        ..Default::default()
+    }
+}
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 #[serial]
@@ -44,33 +66,22 @@ async fn copy_object_if_none_match_existing_destination_returns_precondition_fai
     let dst_etag = dst_info.etag.expect("destination object should have an ETag");
     let initial_versions = live_object_version_count(&ecstore, dst_bucket.as_str(), dst_object).await;
 
-    for (condition, expected_code) in [
-        (ETagCondition::Any, S3ErrorCode::PreconditionFailed),
-        (ETagCondition::ETag(ETag::Strong(dst_etag)), S3ErrorCode::NotImplemented),
-        (
-            ETagCondition::ETag(ETag::Strong("different-etag".to_string())),
-            S3ErrorCode::NotImplemented,
-        ),
+    for (header, expected_code) in [
+        (HeaderValue::from_static("*"), S3ErrorCode::PreconditionFailed),
+        (HeaderValue::from_str(&format!(r#""{dst_etag}""#)).unwrap(), S3ErrorCode::NotImplemented),
+        (HeaderValue::from_static(r#""different-etag""#), S3ErrorCode::NotImplemented),
     ] {
-        let header = condition.to_http_header().expect("conditional COPY header should encode");
-        // Cover header-only callers and the DTO-plus-header shape of parsed HTTP requests.
-        for if_none_match in [None, Some(condition)] {
-            let has_dto = if_none_match.is_some();
-            let copy_input = CopyObjectInput::builder()
-                .copy_source(CopySource::Bucket {
-                    bucket: src_bucket.clone().into(),
-                    key: src_object.to_string().into(),
-                    version_id: None,
-                })
-                .bucket(dst_bucket.clone())
-                .key(dst_object.to_string())
-                .if_none_match(if_none_match)
-                .build()
-                .expect("conditional COPY input should build");
-            let mut req = build_request(copy_input, Method::PUT);
-            req.headers.insert(IF_NONE_MATCH, header.clone());
+        // Cover header-only callers and the decoded condition supplied by the gateway.
+        for has_dto in [false, true] {
+            let input = CopyObjectWriteInput {
+                specific_if_none_match: has_dto && header != "*",
+                ..copy_input(&src_bucket, src_object, None, &dst_bucket, dst_object)
+            };
+            let mut headers = HeaderMap::new();
+            headers.insert(IF_NONE_MATCH, header.clone());
+            let req = request_envelope(Method::PUT, headers);
 
-            let err = Box::pin(usecase.execute_copy_object(req))
+            let err = Box::pin(usecase.execute_copy_object_owned(req, input))
                 .await
                 .expect_err("conditional COPY must reject the replacement");
             assert_eq!(err.code(), &expected_code, "header={header:?}, has_dto={has_dto}");
@@ -93,64 +104,48 @@ async fn copy_object_if_none_match_existing_destination_returns_precondition_fai
 #[ignore = "global-state object-version integration test: runs serialized in the CI ILM Integration (serial) lane"]
 async fn undo_copy_requires_the_observed_current_version() {
     let (_disk_paths, ecstore) = setup_test_env().await;
-    let fs = FS::new();
     let usecase = DefaultObjectUsecase::from_global();
     let bucket = format!("test-undo-copy-{}", &Uuid::new_v4().simple().to_string()[..8]);
     let object = "test/object.txt";
     create_test_bucket(&ecstore, bucket.as_str()).await;
 
-    let put = |payload: &'static [u8]| {
-        PutObjectInput::builder()
-            .bucket(bucket.clone())
-            .key(object.to_string())
-            .body(Some(streaming_blob_from_bytes(payload)))
-            .content_length(Some(payload.len() as i64))
-            .build()
-            .unwrap()
-    };
-    let original = Box::pin(test_seams::put_object(&usecase, &fs, build_request(put(b"original"), Method::PUT)))
-        .await
-        .expect("initial version should be written")
-        .output
-        .version_id
-        .expect("versioned PUT should return a version ID");
-    let observed_current = Box::pin(test_seams::put_object(&usecase, &fs, build_request(put(b"replacement"), Method::PUT)))
-        .await
-        .expect("replacement version should be written")
-        .output
-        .version_id
-        .expect("versioned PUT should return a version ID");
+    let put = |payload: &'static [u8]| put_input(&bucket, object, Bytes::from_static(payload));
+    let original = Box::pin(test_seams::put_object(
+        &usecase,
+        request_envelope(Method::PUT, HeaderMap::new()),
+        put(b"original"),
+    ))
+    .await
+    .expect("initial version should be written")
+    .version_id
+    .expect("versioned PUT should return a version ID");
+    let observed_current = Box::pin(test_seams::put_object(
+        &usecase,
+        request_envelope(Method::PUT, HeaderMap::new()),
+        put(b"replacement"),
+    ))
+    .await
+    .expect("replacement version should be written")
+    .version_id
+    .expect("versioned PUT should return a version ID");
 
-    let copy = || {
-        CopyObjectInput::builder()
-            .copy_source(CopySource::Bucket {
-                bucket: bucket.clone().into(),
-                key: object.to_string().into(),
-                version_id: Some(original.clone().into()),
-            })
-            .bucket(bucket.clone())
-            .key(object.to_string())
-            .build()
-            .unwrap()
-    };
-    let mut stale_req = build_request(copy(), Method::PUT);
-    stale_req.headers.insert(
+    let copy = || copy_input(&bucket, object, Some(original.clone()), &bucket, object);
+    let mut stale_headers = HeaderMap::new();
+    stale_headers.insert(
         RUSTFS_EXPECTED_CURRENT_VERSION_ID,
         HeaderValue::from_str(&Uuid::new_v4().to_string()).unwrap(),
     );
     let versions_before = live_object_version_count(&ecstore, bucket.as_str(), object).await;
-    let err = Box::pin(usecase.execute_copy_object(stale_req))
+    let err = Box::pin(usecase.execute_copy_object_owned(request_envelope(Method::PUT, stale_headers), copy()))
         .await
         .expect_err("stale destination must fail");
     assert_eq!(err.code(), &S3ErrorCode::PreconditionFailed);
     assert_eq!(live_object_version_count(&ecstore, bucket.as_str(), object).await, versions_before);
     assert_eq!(read_object_bytes(&ecstore, bucket.as_str(), object).await, b"replacement");
 
-    let mut matching_req = build_request(copy(), Method::PUT);
-    matching_req
-        .headers
-        .insert(RUSTFS_EXPECTED_CURRENT_VERSION_ID, HeaderValue::from_str(&observed_current).unwrap());
-    Box::pin(usecase.execute_copy_object(matching_req))
+    let mut matching_headers = HeaderMap::new();
+    matching_headers.insert(RUSTFS_EXPECTED_CURRENT_VERSION_ID, HeaderValue::from_str(&observed_current).unwrap());
+    Box::pin(usecase.execute_copy_object_owned(request_envelope(Method::PUT, matching_headers), copy()))
         .await
         .expect("matching destination version should permit undo copy");
     assert_eq!(read_object_bytes(&ecstore, bucket.as_str(), object).await, b"original");
@@ -166,29 +161,26 @@ async fn undo_copy_serializes_a_concurrent_put_until_after_commit() {
     let object = "test/object.txt";
     create_test_bucket(&ecstore, bucket.as_str()).await;
 
-    let put = |payload: &'static [u8]| {
-        PutObjectInput::builder()
-            .bucket(bucket.clone())
-            .key(object.to_string())
-            .body(Some(streaming_blob_from_bytes(payload)))
-            .content_length(Some(payload.len() as i64))
-            .build()
-            .unwrap()
-    };
-    let fs = FS::new();
+    let put = |payload: &'static [u8]| put_input(&bucket, object, Bytes::from_static(payload));
     let usecase = DefaultObjectUsecase::from_global();
-    let original = Box::pin(test_seams::put_object(&usecase, &fs, build_request(put(b"original"), Method::PUT)))
-        .await
-        .expect("original should be written")
-        .output
-        .version_id
-        .expect("original should be versioned");
-    let observed = Box::pin(test_seams::put_object(&usecase, &fs, build_request(put(b"observed"), Method::PUT)))
-        .await
-        .expect("observed should be written")
-        .output
-        .version_id
-        .expect("observed should be versioned");
+    let original = Box::pin(test_seams::put_object(
+        &usecase,
+        request_envelope(Method::PUT, HeaderMap::new()),
+        put(b"original"),
+    ))
+    .await
+    .expect("original should be written")
+    .version_id
+    .expect("original should be versioned");
+    let observed = Box::pin(test_seams::put_object(
+        &usecase,
+        request_envelope(Method::PUT, HeaderMap::new()),
+        put(b"observed"),
+    ))
+    .await
+    .expect("observed should be written")
+    .version_id
+    .expect("observed should be versioned");
     let encoded_object = encode_dir_object(object);
     let lock = ecstore
         .new_ns_lock(bucket.as_str(), &encoded_object)
@@ -199,39 +191,19 @@ async fn undo_copy_serializes_a_concurrent_put_until_after_commit() {
         .await
         .expect("test should acquire blocker");
 
-    let mut undo_req = build_request(
-        CopyObjectInput::builder()
-            .copy_source(CopySource::Bucket {
-                bucket: bucket.clone().into(),
-                key: object.to_string().into(),
-                version_id: Some(original.into()),
-            })
-            .bucket(bucket.clone())
-            .key(object.to_string())
-            .build()
-            .unwrap(),
-        Method::PUT,
-    );
-    undo_req
-        .headers
-        .insert(RUSTFS_EXPECTED_CURRENT_VERSION_ID, HeaderValue::from_str(&observed).unwrap());
+    let undo_input = copy_input(&bucket, object, Some(original), &bucket, object);
+    let mut undo_headers = HeaderMap::new();
+    undo_headers.insert(RUSTFS_EXPECTED_CURRENT_VERSION_ID, HeaderValue::from_str(&observed).unwrap());
 
     let undo = tokio::spawn(async move {
         let usecase = DefaultObjectUsecase::from_global();
-        Box::pin(usecase.execute_copy_object(undo_req)).await
+        Box::pin(usecase.execute_copy_object_owned(request_envelope(Method::PUT, undo_headers), undo_input)).await
     });
     tokio::task::yield_now().await;
-    let put = PutObjectInput::builder()
-        .bucket(bucket.clone())
-        .key(object.to_string())
-        .body(Some(streaming_blob_from_bytes(b"concurrent")))
-        .content_length(Some(10))
-        .build()
-        .unwrap();
+    let put = put_input(&bucket, object, Bytes::from_static(b"concurrent"));
     let concurrent_put = tokio::spawn(async move {
-        let fs = FS::new();
         let usecase = DefaultObjectUsecase::from_global();
-        Box::pin(test_seams::put_object(&usecase, &fs, build_request(put, Method::PUT))).await
+        Box::pin(test_seams::put_object(&usecase, request_envelope(Method::PUT, HeaderMap::new()), put)).await
     });
 
     drop(blocker);
@@ -249,7 +221,6 @@ async fn undo_copy_serializes_a_concurrent_put_until_after_commit() {
 #[ignore = "global-state ILM integration test: runs serialized in the CI ILM Integration (serial) lane, see ci.yml test-ilm-integration-serial and rustfs/backlog#1148 (ilm-1)"]
 async fn copy_object_allows_new_version_for_locked_destination_but_blocks_explicit_overwrite() {
     let (_disk_paths, ecstore) = setup_test_env().await;
-    let fs = FS::new();
     let usecase = DefaultObjectUsecase::from_global();
 
     let bucket = format!("test-copy-object-lock-{}", &Uuid::new_v4().simple().to_string()[..8]);
@@ -264,20 +235,20 @@ async fn copy_object_allows_new_version_for_locked_destination_but_blocks_explic
         .expect("Failed to enable object lock for bucket");
     let _ = upload_test_object(&ecstore, bucket.as_str(), src_object, source_payload).await;
 
-    let retain_until = Timestamp::from(time::OffsetDateTime::now_utc().saturating_add(time::Duration::days(1)));
-    let locked_input = PutObjectInput::builder()
-        .bucket(bucket.clone())
-        .key(dst_object.to_string())
-        .body(Some(streaming_blob_from_bytes(locked_payload)))
-        .content_length(Some(locked_payload.len() as i64))
-        .object_lock_mode(Some(ObjectLockMode::from_static(ObjectLockMode::COMPLIANCE)))
-        .object_lock_retain_until_date(Some(retain_until))
-        .build()
-        .unwrap();
+    let retain_until = time::OffsetDateTime::now_utc().saturating_add(time::Duration::days(1));
+    let locked_input = PutObjectWriteInput {
+        object_lock_mode: Some("COMPLIANCE".to_owned()),
+        object_lock_retain_until_date: Some(retain_until),
+        ..put_input(&bucket, dst_object, Bytes::from_static(locked_payload))
+    };
 
-    Box::pin(test_seams::put_object(&usecase, &fs, build_request(locked_input, Method::PUT)))
-        .await
-        .expect("Failed to upload locked destination object");
+    Box::pin(test_seams::put_object(
+        &usecase,
+        request_envelope(Method::PUT, HeaderMap::new()),
+        locked_input,
+    ))
+    .await
+    .expect("Failed to upload locked destination object");
 
     let locked_info = ecstore
         .get_object_info(bucket.as_str(), dst_object, &ObjectOptions::default())
@@ -288,22 +259,12 @@ async fn copy_object_allows_new_version_for_locked_destination_but_blocks_explic
         .expect("locked destination should have a version ID")
         .to_string();
 
-    let copy_input = CopyObjectInput::builder()
-        .copy_source(CopySource::Bucket {
-            bucket: bucket.clone().into(),
-            key: src_object.to_string().into(),
-            version_id: None,
-        })
-        .bucket(bucket.clone())
-        .key(dst_object.to_string())
-        .build()
-        .unwrap();
+    let input = copy_input(&bucket, src_object, None, &bucket, dst_object);
 
-    let copy_output = Box::pin(usecase.execute_copy_object(build_request(copy_input, Method::PUT)))
+    let copy_output = Box::pin(usecase.execute_copy_object_owned(request_envelope(Method::PUT, HeaderMap::new()), input))
         .await
         .expect("CopyObject should create a new version over a locked current version");
     let copied_version_id = copy_output
-        .output
         .version_id
         .expect("versioned CopyObject should return the created version ID");
 
@@ -311,21 +272,15 @@ async fn copy_object_allows_new_version_for_locked_destination_but_blocks_explic
     assert_eq!(read_object_bytes(&ecstore, bucket.as_str(), dst_object).await, source_payload);
     assert_eq!(live_object_version_count(&ecstore, bucket.as_str(), dst_object).await, 2);
 
-    let explicit_overwrite_input = CopyObjectInput::builder()
-        .copy_source(CopySource::Bucket {
-            bucket: bucket.clone().into(),
-            key: src_object.to_string().into(),
-            version_id: None,
-        })
-        .bucket(bucket.clone())
-        .key(dst_object.to_string())
-        .version_id(Some(locked_version_id))
-        .build()
-        .unwrap();
+    let explicit_overwrite_input = CopyObjectWriteInput {
+        version_id: Some(locked_version_id),
+        ..copy_input(&bucket, src_object, None, &bucket, dst_object)
+    };
 
-    let err = Box::pin(usecase.execute_copy_object(build_request(explicit_overwrite_input, Method::PUT)))
-        .await
-        .expect_err("explicit CopyObject overwrite of a locked version should be blocked");
+    let err =
+        Box::pin(usecase.execute_copy_object_owned(request_envelope(Method::PUT, HeaderMap::new()), explicit_overwrite_input))
+            .await
+            .expect_err("explicit CopyObject overwrite of a locked version should be blocked");
 
     assert_eq!(err.code(), &S3ErrorCode::InvalidArgument);
     assert_eq!(
@@ -353,39 +308,21 @@ async fn concurrent_reverse_copy_object_does_not_deadlock_with_reader_locks() {
         let _ = upload_test_object(&ecstore, bucket.as_str(), object_a, &payload_a).await;
         let _ = upload_test_object(&ecstore, bucket.as_str(), object_b, &payload_b).await;
 
-        let a_to_b_input = CopyObjectInput::builder()
-            .copy_source(CopySource::Bucket {
-                bucket: bucket.clone().into(),
-                key: object_a.to_string().into(),
-                version_id: None,
-            })
-            .bucket(bucket.clone())
-            .key(object_b.to_string())
-            .build()
-            .unwrap();
-        let b_to_a_input = CopyObjectInput::builder()
-            .copy_source(CopySource::Bucket {
-                bucket: bucket.clone().into(),
-                key: object_b.to_string().into(),
-                version_id: None,
-            })
-            .bucket(bucket.clone())
-            .key(object_a.to_string())
-            .build()
-            .unwrap();
+        let a_to_b_input = copy_input(&bucket, object_a, None, &bucket, object_b);
+        let b_to_a_input = copy_input(&bucket, object_b, None, &bucket, object_a);
 
         let start = Arc::new(Barrier::new(3));
         let start_a = start.clone();
         let a_to_b = tokio::spawn(async move {
             start_a.wait().await;
             let usecase = DefaultObjectUsecase::from_global();
-            Box::pin(usecase.execute_copy_object(build_request(a_to_b_input, Method::PUT))).await
+            Box::pin(usecase.execute_copy_object_owned(request_envelope(Method::PUT, HeaderMap::new()), a_to_b_input)).await
         });
         let start_b = start.clone();
         let b_to_a = tokio::spawn(async move {
             start_b.wait().await;
             let usecase = DefaultObjectUsecase::from_global();
-            Box::pin(usecase.execute_copy_object(build_request(b_to_a_input, Method::PUT))).await
+            Box::pin(usecase.execute_copy_object_owned(request_envelope(Method::PUT, HeaderMap::new()), b_to_a_input)).await
         });
 
         start.wait().await;
@@ -422,7 +359,6 @@ async fn concurrent_reverse_copy_object_does_not_deadlock_with_reader_locks() {
 #[ignore = "global-state ILM integration test: runs serialized in the CI ILM Integration (serial) lane, see ci.yml test-ilm-integration-serial and rustfs/backlog#1148 (ilm-1)"]
 async fn put_and_copy_object_transition_immediately_via_usecases() {
     let (_disk_paths, ecstore) = setup_test_env().await;
-    let fs = FS::new();
     let usecase = DefaultObjectUsecase::from_global();
 
     let tier_name = format!("COLDTIER{}", &Uuid::new_v4().simple().to_string()[..8]).to_uppercase();
@@ -437,17 +373,15 @@ async fn put_and_copy_object_transition_immediately_via_usecases() {
         .await
         .expect("Failed to set lifecycle configuration");
 
-    let put_input = PutObjectInput::builder()
-        .bucket(put_bucket.clone())
-        .key(put_object.to_string())
-        .body(Some(streaming_blob_from_bytes(put_payload)))
-        .content_length(Some(put_payload.len() as i64))
-        .build()
-        .unwrap();
+    let put_input = put_input(&put_bucket, put_object, Bytes::from_static(put_payload));
 
-    Box::pin(test_seams::put_object(&usecase, &fs, build_request(put_input, Method::PUT)))
-        .await
-        .expect("Failed to put object through usecase");
+    Box::pin(test_seams::put_object(
+        &usecase,
+        request_envelope(Method::PUT, HeaderMap::new()),
+        put_input,
+    ))
+    .await
+    .expect("Failed to put object through usecase");
 
     let put_info = wait_for_transition(&ecstore, put_bucket.as_str(), put_object, TRANSITION_WAIT_TIMEOUT)
         .await
@@ -470,18 +404,9 @@ async fn put_and_copy_object_transition_immediately_via_usecases() {
         .expect("Failed to set destination lifecycle configuration");
     let _ = upload_test_object(&ecstore, src_bucket.as_str(), src_object, copy_payload).await;
 
-    let copy_input = CopyObjectInput::builder()
-        .copy_source(CopySource::Bucket {
-            bucket: src_bucket.clone().into(),
-            key: src_object.to_string().into(),
-            version_id: None,
-        })
-        .bucket(dst_bucket.clone())
-        .key(dst_object.to_string())
-        .build()
-        .unwrap();
+    let input = copy_input(&src_bucket, src_object, None, &dst_bucket, dst_object);
 
-    Box::pin(usecase.execute_copy_object(build_request(copy_input, Method::PUT)))
+    Box::pin(usecase.execute_copy_object_owned(request_envelope(Method::PUT, HeaderMap::new()), input))
         .await
         .expect("Failed to copy object through usecase");
 
@@ -517,19 +442,10 @@ async fn compensation_driven_copy_still_completes_transition() {
         .expect("Failed to set destination lifecycle configuration");
     let _ = upload_test_object(&ecstore, src_bucket.as_str(), src_object, payload).await;
 
-    let copy_input = CopyObjectInput::builder()
-        .copy_source(CopySource::Bucket {
-            bucket: src_bucket.clone().into(),
-            key: src_object.to_string().into(),
-            version_id: None,
-        })
-        .bucket(dst_bucket.clone())
-        .key(dst_object.to_string())
-        .build()
-        .unwrap();
+    let input = copy_input(&src_bucket, src_object, None, &dst_bucket, dst_object);
 
     with_forced_immediate_enqueue_timeout(&backend, || async {
-        Box::pin(usecase.execute_copy_object(build_request(copy_input, Method::PUT)))
+        Box::pin(usecase.execute_copy_object_owned(request_envelope(Method::PUT, HeaderMap::new()), input))
             .await
             .expect("Failed to copy object through usecase");
     })
@@ -606,17 +522,8 @@ async fn copy_object_computes_replication_decision_and_strips_stale_status() {
 
     MUST_REPLICATE_OBJECT_CALLS.store(0, Ordering::SeqCst);
 
-    let copy_input = CopyObjectInput::builder()
-        .copy_source(CopySource::Bucket {
-            bucket: bucket.clone().into(),
-            key: src_object.into(),
-            version_id: None,
-        })
-        .bucket(bucket.clone())
-        .key(dst_object.to_string())
-        .build()
-        .unwrap();
-    Box::pin(usecase.execute_copy_object(build_request(copy_input, Method::PUT)))
+    let input = copy_input(&bucket, src_object, None, &bucket, dst_object);
+    Box::pin(usecase.execute_copy_object_owned(request_envelope(Method::PUT, HeaderMap::new()), input))
         .await
         .expect("Failed to copy object through usecase");
 

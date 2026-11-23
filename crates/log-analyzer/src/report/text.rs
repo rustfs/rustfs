@@ -17,6 +17,7 @@
 use super::{human_bytes, human_duration, parse_percentage};
 use crate::analyze::AnalysisReport;
 use crate::rules::Finding;
+use crate::time::Rfc3339;
 use std::io;
 
 const HEAVY_RULE: &str = "════════════════════════════════════════";
@@ -26,9 +27,9 @@ pub(super) fn render(report: &AnalysisReport, w: &mut dyn io::Write) -> io::Resu
     writeln!(w, "RustFS 日志诊断报告")?;
     writeln!(w, "{HEAVY_RULE}")?;
 
-    match report.summary.time_range {
+    match report.summary.time_range.as_ref() {
         Some((first, last)) => {
-            let span = human_duration(last.signed_duration_since(first).num_seconds());
+            let span = human_duration(last.duration_since(first).as_secs());
             writeln!(w, "时间范围   {} → {}   ({span})", first.to_rfc3339(), last.to_rfc3339())?;
         }
         None => writeln!(w, "时间范围   (无带时间戳的事件)")?,
@@ -157,7 +158,7 @@ fn render_finding(finding: &Finding, counts: &std::collections::HashMap<&str, u6
         finding.count,
         nodes
     )?;
-    if let (Some(first), Some(last)) = (finding.first_seen, finding.last_seen) {
+    if let (Some(first), Some(last)) = (finding.first_seen.as_ref(), finding.last_seen.as_ref()) {
         writeln!(w, "    首次 {}   末次 {}", first.to_rfc3339(), last.to_rfc3339())?;
     }
     if !finding.caused.is_empty() {
@@ -180,7 +181,10 @@ fn render_finding(finding: &Finding, counts: &std::collections::HashMap<&str, u6
         writeln!(w, "    证据: {field} = {}{overflow}", shown.join(", "))?;
     }
     for sample in &finding.samples {
-        let ts = sample.timestamp.map_or_else(|| "(无时间戳)".to_string(), |t| t.to_rfc3339());
+        let ts = sample
+            .timestamp
+            .as_ref()
+            .map_or_else(|| "(无时间戳)".to_string(), |t| t.to_rfc3339());
         let node = sample.node.as_deref().unwrap_or("-");
         writeln!(w, "    样本: {ts} {node} {}:{}", sample.source.file, sample.source.line)?;
         writeln!(w, "          {}", sample.message)?;

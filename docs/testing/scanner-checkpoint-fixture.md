@@ -64,7 +64,7 @@ A coverage receipt binds the completed traversal frontier to its scope, starting
 
 The Normal-to-Deep regression holds the mutation plan fixed, changes metadata in a previously visited prefix, and verifies that the real Deep disk-scan entry point reads that prefix again. It also checks that a complete Normal cache cannot satisfy the Deep `Current` path. The fixture disables heal side effects; it proves traversal re-entry, not actual bitrot detection or repair. Additional tests cover map round-trips, stale identities, existing-but-uncovered cursors, coverage gaps, and per-instance metadata ownership.
 
-This fixture bounds object processing after directory enumeration. It does not prove fixed-budget enumeration of arbitrarily wide directories or real process-restart convergence. Those gates require a storage-owned resumable enumeration capability, including its initial construction cost; a readdir offset, an in-memory iterator or a last-name filter is not that capability.
+The independent `wide_directory_runtime_budget_reaches_eof` regression charges virtual time for every physical directory read, including replay and EOF, and checks exact object and byte totals across capped rounds. The `paged_checkpoint` tests exercise immutable page reuse, interrupted root commits, stale writers and cold restoration. The process-level regression in [the E2E crate](../../crates/e2e_test/src/scanner_wide_directory_test.rs) seeds objects through S3, restarts the server after a partial save, and checks the certified admin usage against a paginated S3 listing using the same scanner budget on both boots.
 
 For every saved partial cache, the fixture also passes its progress through the production authenticated remote terminal-frame writer and stream consumer. A remote partial result must remain partial even when its progress reports visited objects. This covers the return-frame contract; it does not execute the remote RPC server, distributed locks, EC quorum persistence, mixed-version peers, process crashes, or fsync durability. The file backend models revision preconditions and persistence errors, not a concurrent object store.
 
@@ -85,3 +85,8 @@ RUST_MIN_STACK=4194304 cargo test -p rustfs-ecstore --lib segment_observation_eq
 ```
 
 [W19](https://github.com/rustfs/backlog/issues/2272) remains open for trustworthy producer coverage, source/incarnation binding, and production shadow observations. No production stream, durable journal, runtime feature switch, scan skipping, or performance claim is introduced here. No restart/gap detection or restart-safe production coverage is established, and the revision-aware file backend does not prove EC publication durability.
+
+
+## Whole-cycle read-only restart regression
+
+`scanner_io::tests::checkpoint_coverage_identity::checkpoint_small_budget_accumulates_across_process_restarts` runs real scanner/store workers in fresh OS processes against four buckets. Every scan keeps the same two-object budget and must publish exact per-bucket totals within 40 rounds. Separate cases inject a write into an already completed bucket before global publication, then either cleanly stop the writer or leave its running marker behind. Both must expire checkpoint continuity and eventually include the extra object; accepting the old total as converged fails the test. This is a local storage regression, separate from whole-daemon multi-node and physical-device acceptance.

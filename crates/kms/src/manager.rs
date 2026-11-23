@@ -28,7 +28,7 @@ use crate::types::{
     MAX_PENDING_DELETION_WINDOW_DAYS, MIN_PENDING_DELETION_WINDOW_DAYS, OperationContext, RewrapDataKeyRequest,
     RewrapDataKeyResponse, RotationDueReason,
 };
-use jiff::Zoned;
+use jiff::ZonedDateTime;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -335,7 +335,7 @@ impl KmsManager {
         let mut result = self.backend.list_keys(request).await;
         if let Ok(response) = result.as_mut() {
             let rotates = self.backend.capabilities().rotate;
-            let now = Zoned::now();
+            let now = ZonedDateTime::now();
             for key in &mut response.keys {
                 self.apply_rotation_readiness(key, rotates, &now);
             }
@@ -351,7 +351,7 @@ impl KmsManager {
     /// about what "overdue" means, and so a backend that cannot rotate is never
     /// the one deciding whether it should. Nothing consults the verdict before
     /// encrypting or decrypting: a key reported as due keeps serving traffic.
-    fn apply_rotation_readiness(&self, key: &mut KeyInfo, backend_rotates: bool, now: &Zoned) {
+    fn apply_rotation_readiness(&self, key: &mut KeyInfo, backend_rotates: bool, now: &ZonedDateTime) {
         if !backend_rotates {
             // Reported, not silently omitted: an operator chasing an overdue key
             // needs to know the answer is "this backend cannot rotate at all",
@@ -699,7 +699,7 @@ mod tests {
     use crate::error::KmsError;
     use crate::types::{KeyMetadata, KeySpec, KeyState, KeyStatus, KeyUsage};
     use async_trait::async_trait;
-    use jiff::Zoned;
+    use jiff::ZonedDateTime;
     use std::collections::HashMap;
     use std::sync::Mutex;
     use std::time::Duration;
@@ -764,7 +764,7 @@ mod tests {
                 key_state: KeyState::Enabled,
                 key_usage: KeyUsage::EncryptDecrypt,
                 description: None,
-                creation_date: Zoned::now(),
+                creation_date: ZonedDateTime::now(),
                 deletion_date: None,
                 origin: "RUSTFS_KMS".to_string(),
                 key_manager: "RUSTFS".to_string(),
@@ -1810,7 +1810,7 @@ mod tests {
         manager
     }
 
-    fn aged_key(rotated_at: Option<Zoned>, created_at: Zoned) -> KeyInfo {
+    fn aged_key(rotated_at: Option<ZonedDateTime>, created_at: ZonedDateTime) -> KeyInfo {
         KeyInfo {
             key_id: "key-a".to_string(),
             description: None,
@@ -1833,7 +1833,7 @@ mod tests {
     /// a backend that cannot rotate is never told to rotate.
     #[test]
     fn rotation_readiness_reports_but_never_asks_the_impossible() {
-        let now = Zoned::now();
+        let now = ZonedDateTime::now();
         let long_ago = &now - jiff::Span::new().days(400);
         let recently = &now - jiff::Span::new().hours(1);
         let day = Duration::from_secs(86_400);
@@ -1887,13 +1887,13 @@ mod tests {
     /// independently of the age policy and reported under its own reason.
     #[test]
     fn rotation_readiness_reports_an_exhausted_wrap_budget() {
-        let now = Zoned::now();
+        let now = ZonedDateTime::now();
         let recently = &now - jiff::Span::new().hours(1);
         let long_ago = &now - jiff::Span::new().days(400);
         let day = Duration::from_secs(86_400);
         let budget = 2_000_000;
 
-        let with_wraps = |manager: &KmsManager, wraps: Option<u64>, rotated_at: Option<Zoned>| {
+        let with_wraps = |manager: &KmsManager, wraps: Option<u64>, rotated_at: Option<ZonedDateTime>| {
             let mut key = aged_key(rotated_at, recently.clone());
             key.wrap_budget_reserved = wraps;
             manager.apply_rotation_readiness(&mut key, true, &now);

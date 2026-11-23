@@ -161,6 +161,34 @@ impl Policy {
         policy.validate()?;
         Ok(policy)
     }
+
+    /// Encode an IAM policy for public export with AWS lifecycle action names.
+    /// The ordinary serializer retains the RustFS spellings for storage and older peers.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the policy cannot be serialized.
+    pub fn to_export_value(&self) -> serde_json::Result<Value> {
+        let mut document = serde_json::to_value(self)?;
+        if let Some(statements) = document["Statement"].as_array_mut() {
+            for statement in statements {
+                for field in ["Action", "NotAction"] {
+                    let Some(actions) = statement.get_mut(field).and_then(Value::as_array_mut) else {
+                        continue;
+                    };
+                    for action in actions {
+                        let name = match action.as_str() {
+                            Some("s3:GetBucketLifecycle") => "s3:GetLifecycleConfiguration",
+                            Some("s3:PutBucketLifecycle") => "s3:PutLifecycleConfiguration",
+                            _ => continue,
+                        };
+                        *action = Value::from(name);
+                    }
+                }
+            }
+        }
+        Ok(document)
+    }
 }
 
 impl Validator for Policy {
@@ -3588,6 +3616,123 @@ mod test {
     }
 
     #[tokio::test]
+    async fn bucket_policy_many_variable_values_do_not_suppress_explicit_deny() {
+        use crate::policy::action::{Action, S3Action};
+        use crate::policy::function::key_name::KeyName;
+
+        let policy: BucketPolicy = serde_json::from_str(r#"{
+          "Version":"2012-10-17",
+          "Statement":[
+            {"Effect":"Allow","Principal":{"AWS":"*"},"Action":"s3:GetObject","Resource":"arn:aws:s3:::bucket/*"},
+            {"Effect":"Deny","Principal":{"AWS":"*"},"Action":"s3:GetObject","Resource":"arn:aws:s3:::bucket/${aws:username}/${aws:username}/*"}
+          ]
+        }"#).expect("parse bucket policy");
+        let key = KeyName::COMMON_KEYS
+            .iter()
+            .find(|key| key.var_name() == "${aws:username}")
+            .expect("username key")
+            .name()
+            .to_owned();
+        let conditions = HashMap::from([(key, (0..33).map(|index| format!("user-{index}")).collect())]);
+        let groups = None;
+        let mut args = BucketPolicyArgs {
+            account: "requester",
+            groups: &groups,
+            action: Action::S3Action(S3Action::GetObjectAction),
+            bucket: "bucket",
+            conditions: &conditions,
+            is_owner: false,
+            object: "user-32/user-31/object",
+        };
+        assert!(!policy.is_allowed(&args).await, "matching explicit Deny must survive a large expansion");
+        args.object = "user-32/not-listed/object";
+        assert!(policy.is_allowed(&args).await, "unmatched resources still follow the Allow statement");
+    }
+
+    #[tokio::test]
+    async fn unresolved_bucket_resource_never_broadens_allow_or_suppresses_deny() {
+        use crate::policy::action::{Action, S3Action};
+        let not_resource_allow: BucketPolicy = serde_json::from_str(r#"{
+          "Version":"2012-10-17", "Statement":[
+            {"Effect":"Allow","Principal":{"AWS":"*"},"Action":"s3:GetObject","NotResource":"arn:aws:s3:::bucket/${aws:username}/*"}
+          ]
+        }"#).expect("parse NotResource policy");
+        let resource_deny: BucketPolicy = serde_json::from_str(
+            r#"{
+          "Version":"2012-10-17", "Statement":[
+            {"Effect":"Allow","Principal":{"AWS":"*"},"Action":"s3:GetObject","Resource":"arn:aws:s3:::bucket/*"},
+            {"Effect":"Deny","Principal":{"AWS":"*"},"Action":"s3:GetObject","Resource":"arn:aws:s3:::bucket/${aws:username}/*"}
+          ]
+        }"#,
+        )
+        .expect("parse Deny policy");
+        let groups = None;
+        let conditions = HashMap::new();
+        let args = BucketPolicyArgs {
+            account: "anonymous",
+            groups: &groups,
+            action: Action::S3Action(S3Action::GetObjectAction),
+            bucket: "bucket",
+            conditions: &conditions,
+            is_owner: false,
+            object: "private/file",
+        };
+        assert!(
+            !not_resource_allow.is_allowed(&args).await,
+            "unresolved NotResource must not grant access"
+        );
+        assert!(!resource_deny.is_allowed(&args).await, "unresolved Resource must not suppress a Deny");
+    }
+
+    #[tokio::test]
+    async fn unresolved_identity_and_kms_resources_fail_closed() -> Result<()> {
+        use crate::policy::action::{Action, KmsAction, S3Action};
+        let conditions = HashMap::new();
+        let claims = HashMap::new();
+        for (action, not_resource, broad, resource) in [
+            (
+                "s3:GetObject",
+                "arn:aws:s3:::bucket/${aws:userid}/*",
+                "arn:aws:s3:::bucket/*",
+                "arn:aws:s3:::bucket/${aws:userid}/*",
+            ),
+            (
+                "kms:DescribeKey",
+                "arn:aws:kms:::key/${aws:userid}",
+                "arn:aws:kms:::key/*",
+                "arn:aws:kms:::key/${aws:userid}",
+            ),
+        ] {
+            let allow = format!(
+                r#"{{"Version":"2012-10-17","Statement":[{{"Effect":"Allow","Action":"{action}","NotResource":"{not_resource}"}}]}}"#
+            );
+            let deny = format!(
+                r#"{{"Version":"2012-10-17","Statement":[{{"Effect":"Allow","Action":"{action}","Resource":"{broad}"}},{{"Effect":"Deny","Action":"{action}","Resource":"{resource}"}}]}}"#
+            );
+            let allow = Policy::parse_config(allow.as_bytes())?;
+            let deny = Policy::parse_config(deny.as_bytes())?;
+            let args = if action.starts_with("kms:") {
+                kms_args(Action::KmsAction(KmsAction::DescribeKeyAction), "private", &conditions, &claims)
+            } else {
+                Args {
+                    account: "alice",
+                    groups: &None,
+                    action: Action::S3Action(S3Action::GetObjectAction),
+                    bucket: "bucket",
+                    conditions: &conditions,
+                    is_owner: false,
+                    object: "private/file",
+                    claims: &claims,
+                    deny_only: false,
+                }
+            };
+            assert!(!allow.is_allowed(&args).await, "unresolved {action} NotResource must not grant access");
+            assert!(!deny.is_allowed(&args).await, "unresolved {action} Resource must not suppress a Deny");
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn test_bucket_policy_needs_existing_object_tag_narrows_by_principal() {
         use crate::policy::BucketPolicyArgs;
         use crate::policy::action::{Action, S3Action};
@@ -4010,6 +4155,101 @@ mod test {
                 }
             }
         }
+    }
+
+    #[tokio::test]
+    async fn lifecycle_action_aliases_preserve_policy_semantics() {
+        let policy_aws = Policy::parse_config(
+            br#"{"Version":"2012-10-17","Statement":[
+                {"Effect":"Allow","Action":["s3:GetLifecycleConfiguration","s3:PutLifecycleConfiguration"],"Resource":"arn:aws:s3:::bucket"}
+            ]}"#,
+        )
+        .expect("policy with AWS lifecycle action names parses");
+        let serialized_aws = policy_aws.to_export_value().expect("export lifecycle policy (AWS input)");
+        assert_eq!(
+            serialized_aws["Statement"][0]["Action"],
+            serde_json::json!(["s3:GetLifecycleConfiguration", "s3:PutLifecycleConfiguration"])
+        );
+
+        let policy_legacy = Policy::parse_config(
+            br#"{"Version":"2012-10-17","Statement":[
+                {"Effect":"Allow","Action":["s3:GetBucketLifecycle","s3:PutBucketLifecycle"],"Resource":"arn:aws:s3:::bucket"}
+            ]}"#,
+        )
+        .expect("policy with legacy lifecycle action names parses");
+        let serialized_legacy = policy_legacy
+            .to_export_value()
+            .expect("export lifecycle policy (legacy input)");
+        assert_eq!(
+            serialized_legacy["Statement"][0]["Action"],
+            serde_json::json!(["s3:GetLifecycleConfiguration", "s3:PutLifecycleConfiguration"])
+        );
+
+        let stored =
+            serde_json::to_value(crate::policy::PolicyDoc::new(policy_aws.clone())).expect("serialize stored IAM policy");
+        assert_eq!(
+            stored["Policy"]["Statement"][0]["Action"],
+            serde_json::json!(["s3:GetBucketLifecycle", "s3:PutBucketLifecycle"])
+        );
+
+        let get = Args {
+            account: "user",
+            groups: &None,
+            action: Action::S3Action(S3Action::GetBucketLifecycleAction),
+            bucket: "bucket",
+            conditions: &HashMap::new(),
+            is_owner: false,
+            object: "",
+            claims: &HashMap::new(),
+            deny_only: false,
+        };
+        let put = Args {
+            action: Action::S3Action(S3Action::PutBucketLifecycleAction),
+            ..get.clone()
+        };
+        assert!(policy_aws.is_allowed(&get).await);
+        assert!(policy_aws.is_allowed(&put).await);
+        assert!(policy_legacy.is_allowed(&get).await);
+        assert!(policy_legacy.is_allowed(&put).await);
+
+        let denied_legacy_allow_aws_deny = Policy::parse_config(
+            br#"{"Version":"2012-10-17","Statement":[
+                {"Effect":"Allow","Action":["s3:GetBucketLifecycle","s3:PutBucketLifecycle"],"Resource":"arn:aws:s3:::bucket"},
+                {"Effect":"Deny","Action":"s3:PutLifecycleConfiguration","Resource":"arn:aws:s3:::bucket"}
+            ]}"#,
+        )
+        .expect("policy mixing legacy allow and AWS deny parses");
+        assert!(denied_legacy_allow_aws_deny.is_allowed(&get).await);
+        assert!(!denied_legacy_allow_aws_deny.is_allowed(&put).await);
+
+        let denied_aws_allow_legacy_deny = Policy::parse_config(
+            br#"{"Version":"2012-10-17","Statement":[
+                {"Effect":"Allow","Action":["s3:GetLifecycleConfiguration","s3:PutLifecycleConfiguration"],"Resource":"arn:aws:s3:::bucket"},
+                {"Effect":"Deny","Action":"s3:PutBucketLifecycle","Resource":"arn:aws:s3:::bucket"}
+            ]}"#,
+        )
+        .expect("policy mixing AWS allow and legacy deny parses");
+        assert!(denied_aws_allow_legacy_deny.is_allowed(&get).await);
+        assert!(!denied_aws_allow_legacy_deny.is_allowed(&put).await);
+    }
+
+    #[test]
+    fn lifecycle_policy_export_rewrites_not_action_only() {
+        let policy = Policy::parse_config(
+            br#"{"Version":"2012-10-17","Statement":[
+                {"Sid":"s3:GetBucketLifecycle","Effect":"Deny","NotAction":["s3:GetBucketLifecycle","s3:ListBucket"],"Resource":"arn:aws:s3:::bucket"}
+            ]}"#,
+        )
+        .expect("NotAction policy parses");
+
+        let exported = policy.to_export_value().expect("export NotAction policy");
+        let statement = &exported["Statement"][0];
+        assert_eq!(
+            statement["NotAction"],
+            serde_json::json!(["s3:GetLifecycleConfiguration", "s3:ListBucket"])
+        );
+        assert_eq!(statement["Sid"], "s3:GetBucketLifecycle");
+        assert!(statement.get("Action").is_none());
     }
 
     #[tokio::test]

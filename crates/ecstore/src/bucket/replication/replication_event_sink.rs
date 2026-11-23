@@ -13,6 +13,8 @@
 // limitations under the License.
 
 pub(crate) use crate::services::event_notification::EventArgs;
+#[cfg(test)]
+pub(crate) use crate::services::event_notification::test_recorder;
 
 use super::runtime_boundary;
 

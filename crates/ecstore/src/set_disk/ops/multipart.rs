@@ -49,7 +49,9 @@ use super::super::{
     resolve_write_layout, restore_commit_operation_id_from_metadata, restore_operation_id_from_metadata,
     should_persist_encryption_original_size, strip_internal_multipart_metadata, to_object_err, warn,
 };
-use super::bitrot_self_verify::{BitrotSelfVerifyTarget, drop_failed_writer_disks, verify_written_bitrot_shards};
+use super::bitrot_self_verify::{
+    BitrotSelfVerifyTarget, WrittenBitrotShards, drop_failed_writer_disks, verify_written_bitrot_shards,
+};
 #[cfg(test)]
 use super::object::old_data_cleanup_receipt_path;
 use super::object::{
@@ -123,14 +125,14 @@ async fn create_part_writers(
     disks: &[Option<DiskStore>],
     path: &str,
     length: i64,
-    shard_size: usize,
+    frame_size: usize,
 ) -> (Vec<Option<BitrotWriterWrapper>>, Vec<Option<DiskError>>) {
     join_all(disks.iter().map(|disk| async move {
         let Some(disk) = disk else {
             return (None, Some(DiskError::DiskNotFound));
         };
         #[cfg(test)]
-        if let Some(result) = multipart_writer_test_hook::create_writer(disk, path, length, shard_size).await {
+        if let Some(result) = multipart_writer_test_hook::create_writer(disk, path, length, frame_size).await {
             return match result {
                 Ok(writer) => (Some(writer), None),
                 Err(error) => (None, Some(error)),
@@ -143,7 +145,7 @@ async fn create_part_writers(
             RUSTFS_META_TMP_BUCKET,
             path,
             length,
-            shard_size,
+            frame_size,
             HashAlgorithm::HighwayHash256S,
         )
         .await
@@ -1054,7 +1056,7 @@ async fn multipart_upload_paths_on_disk(disk: DiskStore, bucket: &str, root_pref
         return Ok(upload_dirs
             .into_iter()
             .filter_map(|upload_dir| {
-                let upload_dir = upload_dir.trim_end_matches('/');
+                let upload_dir = upload_dir.strip_suffix('/')?;
                 multipart_upload_leaf_is_safe(upload_dir).then(|| format!("{root_prefix}/{upload_dir}"))
             })
             .collect());
@@ -1102,7 +1104,7 @@ async fn multipart_upload_paths_on_disk(disk: DiskStore, bucket: &str, root_pref
         let (sha_dir, upload_dirs) = listed_upload_dirs?;
         upload_paths.reserve(upload_dirs.len());
         upload_paths.extend(upload_dirs.into_iter().filter_map(|upload_dir| {
-            let upload_dir = upload_dir.trim_end_matches('/');
+            let upload_dir = upload_dir.strip_suffix('/')?;
             multipart_upload_leaf_is_safe(upload_dir).then(|| format!("{sha_dir}/{upload_dir}"))
         }));
     }
@@ -1151,6 +1153,10 @@ impl SetDisks {
             upload_id: upload_id.to_owned(),
             user_defined: {
                 strip_internal_multipart_metadata(&mut fi.metadata);
+                rustfs_utils::http::metadata_compat::remove_str(
+                    &mut fi.metadata,
+                    crate::object_api::EC_READ_QUANTUM_INFO_INTERNAL_SUFFIX,
+                );
                 fi.metadata.clone()
             },
             ..Default::default()
@@ -2562,6 +2568,9 @@ impl SetDisks {
         opts: &ObjectOptions,
     ) -> Result<ObjectInfo> {
         Self::validate_completed_multipart_publication(bucket, object, upload_id, &completed)?;
+        if opts.restore_copyback {
+            require_multipart_restore_target(opts, completed.version_id)?;
+        }
         if let Some(publication) = publication_identity(&completed)? {
             confirm_target(disks, &publication, &self.multipart_proof_verification_context()).await?;
         }
@@ -2783,14 +2792,18 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
         // it is reacquired for the short final rename, so Complete/Abort are
         // not blocked behind a slow body upload.
         let _capped_staging_guard = if multipart_size_limit.is_some() {
+            let semaphore = capped_multipart_staging_semaphore(&upload_id_path);
+            let permit = if opts.multipart_copy_source_locked {
+                semaphore.try_acquire_owned().map_err(|_| Error::SlowDown)?
+            } else {
+                semaphore
+                    .acquire_owned()
+                    .await
+                    .map_err(|_| Error::other("capped multipart staging semaphore closed"))?
+            };
             Some(CappedMultipartStagingGuard {
                 upload_id_path: upload_id_path.clone(),
-                permit: Some(
-                    capped_multipart_staging_semaphore(&upload_id_path)
-                        .acquire_owned()
-                        .await
-                        .map_err(|_| Error::other("capped multipart staging semaphore closed"))?,
-                ),
+                permit: Some(permit),
             })
         } else {
             None
@@ -2819,13 +2832,21 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
             let erasure =
                 Arc::new(coding::Erasure::try_new(fi.erasure.data_blocks, fi.erasure.parity_blocks, fi.erasure.block_size)
                     .map_err(Error::from)?);
+            let frame_size = crate::object_api::persisted_ec_read_quantum(
+                &fi.metadata,
+                erasure.block_size,
+                erasure.data_shards,
+                erasure.shard_size(),
+            )
+            .map_err(|error| Error::other(error.to_string()))?
+            .unwrap_or_else(|| erasure.shard_size());
             let writer_setup_stage_start = rustfs_io_metrics::put_stage_metrics_enabled().then(Instant::now);
 
             let (mut writers, errors) = create_part_writers(
                 &shuffle_disks,
                 &tmp_part_path,
                 erasure.shard_file_size(data.size()),
-                erasure.shard_size(),
+                frame_size,
             )
             .await;
 
@@ -3003,16 +3024,14 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
                     .map_err(|_| Error::other("put_object_part shard size overflows usize"))?;
                 verify_written_bitrot_shards(
                     &shuffle_disks,
-                    None,
+                    WrittenBitrotShards::Staged { directory: &tmp_part, layout: &fi.erasure, part_size: w_size },
                     BitrotSelfVerifyTarget {
                         operation: "put_object_part",
                         bucket,
                         object,
                         part_number: Some(part_id),
-                        volume: RUSTFS_META_TMP_BUCKET,
-                        path: &tmp_part_path,
                         logical_shard_size,
-                        shard_size: erasure.shard_size(),
+                        shard_size: frame_size,
                         write_quorum,
                     },
                 )
@@ -3276,6 +3295,10 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
             user_defined: {
                 let mut metadata = fi.metadata.clone();
                 strip_internal_multipart_metadata(&mut metadata);
+                rustfs_utils::http::metadata_compat::remove_str(
+                    &mut metadata,
+                    crate::object_api::EC_READ_QUANTUM_INFO_INTERNAL_SUFFIX,
+                );
                 metadata
             },
             ..Default::default()
@@ -3453,8 +3476,10 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
         let disks = self.get_disks_internal().await;
 
         let mut user_defined = opts.user_defined.clone();
+        let requested_ec_block_size = crate::object_api::take_ec_block_size_hint(&mut user_defined);
         strip_native_controls(&mut user_defined);
         rustfs_utils::http::remove_str(&mut user_defined, SUFFIX_INLINE_DATA);
+        rustfs_utils::http::metadata_compat::remove_str(&mut user_defined, crate::object_api::EC_BLOCK_SIZE_INFO_INTERNAL_SUFFIX);
         rustfs_filemeta::shard_integrity::clear_integrity_metadata(&mut user_defined);
         if protect_upload {
             rustfs_utils::http::insert_str(
@@ -3500,6 +3525,20 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
         )?;
 
         let mut fi = FileInfo::new([bucket, object].join("/").as_str(), data_drives, parity_drives);
+        if let Some(block_size) = requested_ec_block_size {
+            fi.erasure.block_size = block_size;
+        }
+
+        if !protect_upload && crate::object_api::ec_read_quantum_write_enabled() {
+            let erasure = coding::Erasure::try_new(fi.erasure.data_blocks, fi.erasure.parity_blocks, fi.erasure.block_size)
+                .map_err(Error::from)?;
+            if let Some(frame_size) =
+                crate::object_api::select_ec_read_quantum(fi.erasure.block_size, erasure.data_shards, erasure.shard_size())
+                && frame_size != erasure.shard_size()
+            {
+                crate::object_api::insert_ec_read_quantum(&mut user_defined, frame_size);
+            }
+        }
 
         fi.version_id = if let Some(vid) = &opts.version_id {
             Some(Uuid::parse_str(vid)?)
@@ -3573,7 +3612,7 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
 
         let upload_id = runtime_sources::deployment_upload_id(&upload_uuid);
 
-        let upload_path = Self::get_multipart_upload_dir(bucket, object, upload_uuid.as_str(), opts.data_movement);
+        let upload_path = Self::get_multipart_upload_dir(bucket, object, &upload_id, opts.data_movement);
 
         #[cfg(any(test, feature = "test-util"))]
         pause_multipart_commit(bucket, object, MultipartCommitPause::NewUploadBeforeLockLost).await;
@@ -3622,6 +3661,9 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
             upload_id,
             checksum_algo: user_defined.get(rustfs_rio::RUSTFS_MULTIPART_CHECKSUM).cloned(),
             checksum_type: user_defined.get(rustfs_rio::RUSTFS_MULTIPART_CHECKSUM_TYPE).cloned(),
+            effective_ec_block_size: Some(
+                u64::try_from(fi.erasure.block_size).map_err(|_| Error::other("invalid EC block size"))?,
+            ),
         })
     }
 
@@ -3754,6 +3796,15 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
             .await?;
 
         let expected_restore_operation_id = restore_commit_operation_id_from_metadata(&opts.user_defined)?;
+        if opts.restore_copyback
+            && !crate::bucket::utils::is_meta_bucketname(bucket)
+            && opts
+                .object_lock_config_snapshot
+                .as_deref()
+                .is_none_or(|snapshot| matches!(snapshot.state(), ObjectLockConfigState::Fabricated))
+        {
+            return Err(Error::other("multipart restore requires an authoritative Object Lock snapshot"));
+        }
         let (mut fi, mut files_metas) = match self
             .check_upload_id_exists_with_opts(bucket, object, upload_id, true, opts)
             .await
@@ -3973,7 +4024,9 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
         // completion in a versioned bucket gets a concrete version.
         let replicated_null_version = fi.version_id.is_none_or(|version_id| version_id.is_nil())
             && (opts.replication_request || opts.delete_marker_replication_status() == ReplicationStatusType::Replica);
-        if opts.versioned && replicated_null_version {
+        if opts.restore_copyback {
+            require_multipart_restore_target(opts, fi.version_id)?;
+        } else if opts.versioned && replicated_null_version {
             fi.version_id = Some(Uuid::nil());
         } else if opts.versioned {
             fi.version_id = Some(match fi.version_id.filter(|version_id| !version_id.is_nil()) {
@@ -4050,9 +4103,27 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
 
             checksum_type = rustfs_rio::ChecksumType::from_string_with_obj_type(cs, ct);
             if let Some(want) = opts.want_checksum.as_ref()
-                && !want.checksum_type.is(checksum_type)
+                && (want.checksum_type.base() != checksum_type.base()
+                    || (want.checksum_type.is(rustfs_rio::ChecksumType::FULL_OBJECT) && !checksum_type.full_object_requested()))
             {
-                return Err(Error::other(format!("checksum type mismatch, got {:?}, want {:?}", want, checksum_type)));
+                debug!(
+                    target: "rustfs_ecstore::set_disk",
+                    event = EVENT_SET_DISK_MULTIPART,
+                    component = LOG_COMPONENT_ECSTORE,
+                    subsystem = LOG_SUBSYSTEM_SET_DISK,
+                    result = "checksum_type_mismatch",
+                    op = "complete_multipart_upload",
+                    bucket = %bucket,
+                    object = %object,
+                    upload_id = %upload_id,
+                    want = %want.checksum_type,
+                    got = %checksum_type,
+                    "Set disk multipart completion checksum algorithm mismatch"
+                );
+                return Err(Error::other(rustfs_rio::ChecksumMismatch {
+                    want: want.checksum_type.to_string(),
+                    got: checksum_type.to_string(),
+                }));
             }
         }
 
@@ -4275,25 +4346,52 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
         }
         if let Some(wtcs) = opts.want_checksum.as_ref() {
             if checksum_type.full_object_requested() {
-                if wtcs.encoded != checksum.encoded {
-                    error!(
-                        "complete_multipart_upload checksum mismatch want={}, got={}",
-                        wtcs.encoded, checksum.encoded
+                // A wire `-N` suffix (including `-0`) sets MULTIPART without INCLUDES_MULTIPART;
+                // stored multipart records carry both flags and are not suffixed claims.
+                let has_part_suffix = wtcs.want_parts != 0
+                    || (wtcs.checksum_type.is(rustfs_rio::ChecksumType::MULTIPART)
+                        && !wtcs.checksum_type.is(rustfs_rio::ChecksumType::INCLUDES_MULTIPART));
+                if (!wtcs.encoded.is_empty() && wtcs.encoded != checksum.encoded) || has_part_suffix {
+                    let want = if has_part_suffix {
+                        format!("{}-{}", wtcs.encoded, wtcs.want_parts)
+                    } else {
+                        wtcs.encoded.clone()
+                    };
+                    debug!(
+                        target: "rustfs_ecstore::set_disk",
+                        event = EVENT_SET_DISK_MULTIPART,
+                        component = LOG_COMPONENT_ECSTORE,
+                        subsystem = LOG_SUBSYSTEM_SET_DISK,
+                        result = "checksum_mismatch",
+                        op = "complete_multipart_upload",
+                        bucket = %bucket,
+                        object = %object,
+                        upload_id = %upload_id,
+                        want = %want,
+                        got = %checksum.encoded,
+                        "Set disk multipart full-object checksum mismatch"
                     );
-                    return Err(Error::other(format!(
-                        "complete_multipart_upload checksum mismatch want={}, got={}",
-                        wtcs.encoded, checksum.encoded
-                    )));
+                    return Err(Error::other(rustfs_rio::ChecksumMismatch {
+                        want,
+                        got: checksum.encoded,
+                    }));
                 }
             } else if let Err(err) = wtcs.matches(&checksum_combined, uploaded_parts.len() as i32) {
-                error!(
-                    "complete_multipart_upload checksum matches failed want={}, got={}, err={}",
-                    wtcs.encoded, checksum.encoded, err
+                debug!(
+                    target: "rustfs_ecstore::set_disk",
+                    event = EVENT_SET_DISK_MULTIPART,
+                    component = LOG_COMPONENT_ECSTORE,
+                    subsystem = LOG_SUBSYSTEM_SET_DISK,
+                    result = "checksum_mismatch",
+                    op = "complete_multipart_upload",
+                    bucket = %bucket,
+                    object = %object,
+                    upload_id = %upload_id,
+                    want = %err.want,
+                    got = %err.got,
+                    "Set disk multipart composite checksum mismatch"
                 );
-                return Err(Error::other(format!(
-                    "complete_multipart_upload checksum matches failed want={}, got={}",
-                    wtcs.encoded, checksum.encoded
-                )));
+                return Err(Error::other(err));
             }
         }
 
@@ -4588,19 +4686,18 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
         )
         .await?;
 
-        if !opts.versioned
+        if (opts.restore_copyback || !opts.versioned)
             && !crate::bucket::utils::is_meta_bucketname(bucket)
             && let Some(snapshot) = opts.object_lock_config_snapshot.as_deref()
             && !matches!(snapshot.state(), ObjectLockConfigState::ConfirmedAbsent)
         {
-            // Completion replaces the null version, not necessarily the latest
-            // version inspected by the request-level Object Lock check.
+            // Check the physical replacement, not necessarily the latest version.
             let current = self
                 .get_object_info(
                     bucket,
                     object,
                     &ObjectOptions {
-                        version_id: Some(Uuid::nil().to_string()),
+                        version_id: Some(fi.version_id.unwrap_or_default().to_string()),
                         no_lock: true,
                         metadata_cache_safe: false,
                         versioned: opts.versioned,
@@ -4616,8 +4713,8 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
                     }
                 }
                 // A null delete marker has no protected payload to replace.
-                Err(StorageError::MethodNotAllowed) => {}
-                Err(err) if is_err_object_not_found(&err) || is_err_version_not_found(&err) => {}
+                Err(StorageError::MethodNotAllowed) if !opts.restore_copyback => {}
+                Err(err) if !opts.restore_copyback && (is_err_object_not_found(&err) || is_err_version_not_found(&err)) => {}
                 Err(err) => return Err(err),
             }
         }
@@ -5232,6 +5329,16 @@ fn preserves_staged_encrypted_etag_proof(fi: &FileInfo, opts: &ObjectOptions, re
         && get_consistent_str(&fi.metadata, rustfs_utils::http::SUFFIX_OPAQUE_ENCRYPTED_ETAG) == Some("v1")
 }
 
+// A missing ID on disk denotes the null version, but a missing request ID
+// means "latest" and cannot authorize publication to a particular version.
+fn require_multipart_restore_target(opts: &ObjectOptions, physical: Option<Uuid>) -> Result<()> {
+    let selected = opts.version_id.as_deref().ok_or(StorageError::PreconditionFailed)?;
+    if Uuid::parse_str(selected)? != physical.unwrap_or_default() {
+        return Err(StorageError::PreconditionFailed);
+    }
+    Ok(())
+}
+
 /// Final ETag for a completed multipart object. An authorized replication
 /// request preserves the source ETag so the replication HEAD comparison
 /// converges even when the source ETag is not derivable from the uploaded
@@ -5328,6 +5435,48 @@ mod tests {
     };
     use tempfile::TempDir;
     use tokio::sync::{Notify, RwLock};
+
+    #[tokio::test]
+    async fn multipart_upload_persists_block_size_for_later_parts_and_completion() {
+        use crate::storage_api_contracts::multipart::MultipartOperations as _;
+
+        let (_temp_dirs, disks, set_disks) = hermetic_set_disks(4).await;
+        let bucket = "ec-block-size-multipart";
+        for disk in &disks {
+            disk.make_volume(bucket).await.expect("bucket volume should be created");
+        }
+
+        let mut create_opts = ObjectOptions::default();
+        create_opts
+            .user_defined
+            .insert(crate::object_api::EC_BLOCK_SIZE_HINT_INTERNAL_KEY.to_string(), "65536".to_string());
+        let upload = set_disks
+            .new_multipart_upload(bucket, "object", &create_opts)
+            .await
+            .expect("multipart upload should be created");
+        assert_eq!(upload.effective_ec_block_size, Some(65_536));
+
+        let mut part_reader = PutObjReader::from_vec(vec![0x61; 5 * 1024 * 1024]);
+        let part = set_disks
+            .put_object_part(bucket, "object", &upload.upload_id, 1, &mut part_reader, &ObjectOptions::default())
+            .await
+            .expect("part must use the block size persisted at upload creation");
+        let completed = set_disks
+            .complete_multipart_upload(
+                bucket,
+                "object",
+                &upload.upload_id,
+                vec![CompletePart {
+                    part_num: 1,
+                    etag: part.etag.clone(),
+                    ..Default::default()
+                }],
+                &ObjectOptions::default(),
+            )
+            .await
+            .expect("upload should complete using its stored layout");
+        assert_eq!(completed.effective_ec_block_size(), Some(65_536));
+    }
 
     #[tokio::test]
     async fn multipart_writer_setup_opens_disks_concurrently_and_preserves_error_slots() {
@@ -8903,6 +9052,18 @@ mod tests {
         });
         let input = tokio_util::io::StreamReader::new(stream);
         let mut reader = PutObjReader::new(HashReader::from_stream(input, 512, 512, None, None, false).expect("part reader"));
+        let copy_options = ObjectOptions {
+            multipart_copy_source_locked: true,
+            ..Default::default()
+        };
+        let refused = tokio::time::timeout(
+            Duration::from_secs(10),
+            set_disks.put_object_part(bucket, object, &upload.upload_id, 1, &mut reader, &copy_options),
+        )
+        .await
+        .expect("source-locked copy must not queue");
+        assert!(matches!(refused, Err(Error::SlowDown)));
+        assert_eq!(polls.load(Ordering::Relaxed), 0);
         let task = tokio::spawn(async move {
             set_disks
                 .put_object_part(bucket, object, &upload.upload_id, 1, &mut reader, &ObjectOptions::default())
@@ -12819,7 +12980,15 @@ mod tests {
         }
 
         let healthy = set_disks
-            .new_multipart_upload(bucket, "healthy/object.bin", &ObjectOptions::default())
+            .new_multipart_upload(
+                bucket,
+                "healthy/object.bin",
+                &ObjectOptions {
+                    // Keep the source time historical but distinct from the absent-time sentinel.
+                    mod_time: Some(OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(1)),
+                    ..Default::default()
+                },
+            )
             .await
             .expect("healthy multipart upload should be created");
         set_disks
@@ -14860,6 +15029,66 @@ mod tests {
                 completed.version_id.is_some_and(|version_id| version_id.is_nil()),
                 "suspended completion must publish a null-version object internally"
             );
+        }
+
+        #[tokio::test]
+        #[serial]
+        async fn multipart_restore_preserves_explicit_target_across_versioning_modes() {
+            let (_temp_dirs, disk_stores, set_disks) = hermetic_set_disks(4).await;
+            let bucket = "restore-target-bucket";
+            make_bucket_on_all(&disk_stores, bucket).await;
+            for (index, (versioned, selected)) in [
+                (true, Uuid::nil()),
+                (true, Uuid::new_v4()),
+                (false, Uuid::nil()),
+                (false, Uuid::new_v4()),
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                let object = format!("object-{index}");
+                let create_opts = ObjectOptions {
+                    versioned,
+                    version_suspended: !versioned,
+                    version_id: Some(selected.to_string()),
+                    ..Default::default()
+                };
+                let (upload, parts) =
+                    stage_upload_with_create_opts(&set_disks, bucket, &object, b"copy-back", &create_opts).await;
+                let mut complete_opts = ObjectOptions {
+                    restore_copyback: true,
+                    ..create_opts
+                };
+                assert!(
+                    set_disks
+                        .clone()
+                        .complete_multipart_upload(bucket, &object, &upload, parts.clone(), &complete_opts)
+                        .await
+                        .is_err()
+                );
+                complete_opts.object_lock_config_snapshot =
+                    Some(Arc::new(ObjectLockConfigSnapshot::new(ObjectLockConfigState::ConfirmedAbsent)));
+                complete_opts.version_id = Some(Uuid::new_v4().to_string());
+                assert!(matches!(
+                    set_disks
+                        .clone()
+                        .complete_multipart_upload(bucket, &object, &upload, parts.clone(), &complete_opts)
+                        .await,
+                    Err(StorageError::PreconditionFailed)
+                ));
+                complete_opts.version_id = Some(selected.to_string());
+                let result = set_disks
+                    .clone()
+                    .complete_multipart_upload(bucket, &object, &upload, parts, &complete_opts)
+                    .await
+                    .expect("publish to staged version");
+                assert_eq!(result.version_id, Some(selected));
+                let stored = set_disks
+                    .get_object_info(bucket, &object, &complete_opts)
+                    .await
+                    .expect("read exact version");
+                assert_eq!(stored.version_id, Some(selected));
+            }
         }
 
         /// Read the whole committed object back; returns `(body, etag)`. The full
@@ -17785,5 +18014,286 @@ mod tests {
             Some(full_object.encoded.as_str()),
             "legacy records must keep returning their stored checksum value"
         );
+    }
+
+    fn unwrap_checksum_mismatch(err: Error) -> rustfs_rio::ChecksumMismatch {
+        match err {
+            Error::Io(io_err) => io_err
+                .get_ref()
+                .and_then(|source| source.downcast_ref::<rustfs_rio::ChecksumMismatch>())
+                .cloned()
+                .unwrap_or_else(|| panic!("expected ChecksumMismatch, got Io({io_err:?})")),
+            other => panic!("expected ChecksumMismatch Io error, got {other:?}"),
+        }
+    }
+
+    async fn stage_checksummed_multipart_upload(
+        set_disks: &Arc<SetDisks>,
+        bucket: &str,
+        object: &str,
+        create_checksum_type: Option<rustfs_rio::ChecksumType>,
+        parts: &[&[u8]],
+    ) -> (String, Vec<CompletePart>, Vec<rustfs_rio::Checksum>) {
+        let create_opts = ObjectOptions {
+            want_checksum: create_checksum_type.map(|checksum_type| rustfs_rio::Checksum {
+                checksum_type,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let upload = set_disks
+            .new_multipart_upload(bucket, object, &create_opts)
+            .await
+            .expect("multipart upload should be created");
+        let mut complete_parts = Vec::with_capacity(parts.len());
+        let mut part_checksums = Vec::with_capacity(parts.len());
+        for (index, bytes) in parts.iter().enumerate() {
+            let len = i64::try_from(bytes.len()).expect("test payload length fits i64");
+            let mut hash_reader = HashReader::from_stream(Cursor::new(bytes.to_vec()), len, len, None, None, false)
+                .expect("hash reader should be constructed");
+            let part_checksum = create_checksum_type.map(|ty| {
+                let checksum = rustfs_rio::Checksum::new_from_data(ty.base(), bytes).expect("part checksum");
+                hash_reader
+                    .add_non_trailing_checksum(Some(checksum.clone()), false)
+                    .expect("attach part checksum");
+                checksum
+            });
+            let mut reader = PutObjReader::new(hash_reader);
+            let part = set_disks
+                .put_object_part(bucket, object, &upload.upload_id, index + 1, &mut reader, &create_opts)
+                .await
+                .expect("uploading part should succeed");
+            let mut complete_part = CompletePart {
+                part_num: part.part_num,
+                etag: part.etag,
+                ..Default::default()
+            };
+            if let (Some(ty), Some(cs)) = (create_checksum_type, part_checksum) {
+                match ty.base() {
+                    rustfs_rio::ChecksumType::SHA256 => complete_part.checksum_sha256 = Some(cs.encoded.clone()),
+                    rustfs_rio::ChecksumType::CRC32 => complete_part.checksum_crc32 = Some(cs.encoded.clone()),
+                    other => panic!("unsupported test checksum type {other:?}"),
+                }
+                part_checksums.push(cs);
+            }
+            complete_parts.push(complete_part);
+        }
+        (upload.upload_id, complete_parts, part_checksums)
+    }
+
+    #[tokio::test]
+    async fn complete_multipart_upload_returns_checksum_mismatch_for_invalid_composite_and_preserves_upload_issue_9272() {
+        let (_dirs, disks, set) = hermetic_set_disks(4).await;
+        let bucket = "complete-checksum-composite-9272";
+        let object = "object";
+        make_bucket_on_all(&disks, bucket).await;
+
+        let part1 = vec![0x61_u8; 5 * 1024 * 1024];
+        let part2 = b"part-two-payload";
+        let (upload_id, parts, part_checksums) =
+            stage_checksummed_multipart_upload(&set, bucket, object, Some(rustfs_rio::ChecksumType::SHA256), &[&part1, part2])
+                .await;
+
+        let whole_payload: Vec<u8> = part1.iter().chain(part2.iter()).copied().collect();
+        let whole_sha256 =
+            rustfs_rio::Checksum::new_from_data(rustfs_rio::ChecksumType::SHA256, &whole_payload).expect("whole object sha256");
+
+        let mut combined = Vec::new();
+        for cs in &part_checksums {
+            combined.extend_from_slice(&cs.raw);
+        }
+        let composite_base =
+            rustfs_rio::Checksum::new_from_data(rustfs_rio::ChecksumType::SHA256, &combined).expect("composite sha256");
+        let wrong_part_count =
+            rustfs_rio::Checksum::new_with_type(rustfs_rio::ChecksumType::SHA256, &format!("{}-3", composite_base.encoded))
+                .expect("wrong part count checksum");
+        let wrong_algorithm =
+            rustfs_rio::Checksum::new_from_data(rustfs_rio::ChecksumType::CRC32, b"part").expect("crc32 checksum");
+
+        for (label, bad_checksum) in [
+            ("whole-object sha256", whole_sha256),
+            ("wrong composite part count", wrong_part_count),
+            ("mismatched algorithm", wrong_algorithm),
+        ] {
+            let err = set
+                .clone()
+                .complete_multipart_upload(
+                    bucket,
+                    object,
+                    &upload_id,
+                    parts.clone(),
+                    &ObjectOptions {
+                        want_checksum: Some(bad_checksum),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect_err(label);
+            let _mismatch = unwrap_checksum_mismatch(err);
+
+            let info_err = set
+                .get_object_info(bucket, object, &ObjectOptions::default())
+                .await
+                .expect_err("failed completion must not publish object");
+            assert!(is_err_object_not_found(&info_err), "{label}: got {info_err:?}");
+            assert!(
+                set.get_multipart_info(bucket, object, &upload_id, &ObjectOptions::default())
+                    .await
+                    .is_ok(),
+                "{label}: upload must remain active after rejected completion"
+            );
+        }
+
+        let matching_composite =
+            rustfs_rio::Checksum::new_with_type(rustfs_rio::ChecksumType::SHA256, &format!("{}-2", composite_base.encoded))
+                .expect("matching composite checksum");
+        let completed = set
+            .clone()
+            .complete_multipart_upload(
+                bucket,
+                object,
+                &upload_id,
+                parts,
+                &ObjectOptions {
+                    want_checksum: Some(matching_composite),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("matching composite checksum should complete");
+        assert_eq!(completed.size, i64::try_from(whole_payload.len()).expect("test payload length fits i64"));
+    }
+
+    #[tokio::test]
+    async fn complete_multipart_upload_returns_checksum_mismatch_for_full_object_and_unconfigured_uploads_issue_9272() {
+        let (_dirs, disks, set) = hermetic_set_disks(4).await;
+        let bucket = "complete-checksum-full-object-9272";
+        make_bucket_on_all(&disks, bucket).await;
+
+        let full_object_type = rustfs_rio::ChecksumType::from_string_with_obj_type("CRC32", "FULL_OBJECT");
+        let payload = b"full-object-part-payload";
+        let (full_upload_id, full_parts, _) =
+            stage_checksummed_multipart_upload(&set, bucket, "full-obj", Some(full_object_type), &[payload]).await;
+
+        let right_crc32 = rustfs_rio::Checksum::new_from_data(rustfs_rio::ChecksumType::CRC32, payload).expect("right crc32");
+        let wrong_crc32 =
+            rustfs_rio::Checksum::new_from_data(rustfs_rio::ChecksumType::CRC32, b"different-payload").expect("wrong crc32");
+        let suffixed_crc32 = |parts| {
+            rustfs_rio::Checksum::new_with_type(full_object_type, &format!("{}-{parts}", right_crc32.encoded))
+                .expect("suffixed crc32")
+        };
+
+        for (label, bad_checksum) in [
+            ("wrong value", wrong_crc32),
+            ("composite suffix on FULL_OBJECT", suffixed_crc32(1)),
+            ("zero-part suffix on FULL_OBJECT", suffixed_crc32(0)),
+        ] {
+            let err = set
+                .clone()
+                .complete_multipart_upload(
+                    bucket,
+                    "full-obj",
+                    &full_upload_id,
+                    full_parts.clone(),
+                    &ObjectOptions {
+                        want_checksum: Some(bad_checksum),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect_err(label);
+            let _mismatch = unwrap_checksum_mismatch(err);
+        }
+
+        // Omitting the optional x-amz-checksum-type header passes a bare CRC32 checksum_type.
+        let bare_right_crc32 =
+            rustfs_rio::Checksum::new_with_type(rustfs_rio::ChecksumType::CRC32, &right_crc32.encoded).expect("bare crc32");
+        let completed_full = set
+            .clone()
+            .complete_multipart_upload(
+                bucket,
+                "full-obj",
+                &full_upload_id,
+                full_parts,
+                &ObjectOptions {
+                    want_checksum: Some(bare_right_crc32),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("matching full-object CRC32 without optional checksum-type flag should succeed");
+        assert_eq!(completed_full.size, i64::try_from(payload.len()).expect("test payload length fits i64"));
+
+        // A stored multipart record carries MULTIPART | INCLUDES_MULTIPART with no wire suffix;
+        // a matching value in that shape must still complete a FULL_OBJECT upload.
+        let (internal_upload_id, internal_parts, _) =
+            stage_checksummed_multipart_upload(&set, bucket, "full-obj-internal", Some(full_object_type), &[payload]).await;
+        let mut internal_type = full_object_type;
+        internal_type
+            .merge(rustfs_rio::ChecksumType::MULTIPART)
+            .merge(rustfs_rio::ChecksumType::INCLUDES_MULTIPART);
+        let stored_record_crc32 = rustfs_rio::Checksum {
+            checksum_type: internal_type,
+            encoded: right_crc32.encoded.clone(),
+            raw: right_crc32.raw.clone(),
+            want_parts: 0,
+        };
+        let completed_internal = set
+            .clone()
+            .complete_multipart_upload(
+                bucket,
+                "full-obj-internal",
+                &internal_upload_id,
+                internal_parts,
+                &ObjectOptions {
+                    want_checksum: Some(stored_record_crc32),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("matching stored-record FULL_OBJECT checksum should complete");
+        assert_eq!(
+            completed_internal.size,
+            i64::try_from(payload.len()).expect("test payload length fits i64")
+        );
+
+        let (plain_upload_id, plain_parts, _) =
+            stage_checksummed_multipart_upload(&set, bucket, "plain-obj", None, &[payload]).await;
+        let payload_sha256 =
+            rustfs_rio::Checksum::new_from_data(rustfs_rio::ChecksumType::SHA256, payload).expect("payload sha256");
+        let unconfigured_err = set
+            .clone()
+            .complete_multipart_upload(
+                bucket,
+                "plain-obj",
+                &plain_upload_id,
+                plain_parts.clone(),
+                &ObjectOptions {
+                    want_checksum: Some(payload_sha256),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect_err("unconfigured upload with mismatched digest must fail with ChecksumMismatch");
+        let _mismatch = unwrap_checksum_mismatch(unconfigured_err);
+
+        // Legacy stack compatibility (pinned by embedded_gateway_stack_test): an unconfigured
+        // upload compares want_checksum against the empty combined part-digest buffer.
+        let empty_crc32 = rustfs_rio::Checksum::new_from_data(rustfs_rio::ChecksumType::CRC32, b"").expect("empty crc32");
+        let completed_plain = set
+            .clone()
+            .complete_multipart_upload(
+                bucket,
+                "plain-obj",
+                &plain_upload_id,
+                plain_parts,
+                &ObjectOptions {
+                    want_checksum: Some(empty_crc32),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("unconfigured upload with empty-buffer CRC32 should preserve legacy compatibility");
+        assert_eq!(completed_plain.size, i64::try_from(payload.len()).expect("test payload length fits i64"));
     }
 }

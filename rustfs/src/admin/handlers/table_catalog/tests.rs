@@ -77,37 +77,6 @@ fn table_catalog_handler_request(context: Arc<AppContext>, access_key: &str, sec
     load_table_request_builder(context, access_key, secret_key).build()
 }
 
-/// Converts a legacy request the way the admin router edge does, without its body.
-fn legacy_request_view(req: &s3s::S3Request<s3s::Body>) -> AdminRequest {
-    AdminRequest::new(RequestEnvelope::from_s3s(req), Body::empty())
-}
-
-/// Builds a legacy request to exercise conversion into the owned request.
-fn legacy_table_catalog_handler_request(
-    context: Arc<AppContext>,
-    access_key: &str,
-    secret_key: &str,
-) -> s3s::S3Request<s3s::Body> {
-    let slot = ServerContextSlot::new();
-    assert!(slot.install(context));
-    let mut extensions = http::Extensions::new();
-    extensions.insert(slot);
-    s3s::S3Request {
-        input: s3s::Body::empty(),
-        method: Method::GET,
-        uri: LOAD_TABLE_URI.parse().expect("load table URI"),
-        headers: HeaderMap::new(),
-        extensions,
-        credentials: Some(s3s::auth::Credentials {
-            access_key: access_key.to_string(),
-            secret_key: s3s::auth::SecretKey::from(secret_key.to_string()),
-        }),
-        region: None,
-        service: None,
-        trailing_headers: None,
-    }
-}
-
 fn with_access_delegation(request: TestRequest, values: &[&str]) -> AdminRequest {
     values
         .iter()
@@ -181,15 +150,13 @@ async fn call_catalog_backup_prepare_handler(request: AdminRequest) -> S3Result<
     PrepareTableCatalogBackupObjectHandler {}.call(request, matched.params).await
 }
 
-/// Calls the disable handler with a request converted the same way the admin router edge converts it.
-async fn call_disable_table_bucket_handler(request: s3s::S3Request<s3s::Body>) -> S3Result<AdminResponse> {
+async fn call_disable_table_bucket_handler(request: AdminRequest) -> S3Result<AdminResponse> {
     let mut router = matchit::Router::new();
     router.insert("/iceberg/v1/buckets/{warehouse}", ()).unwrap();
     router.insert("/_iceberg/v1/buckets/{warehouse}", ()).unwrap();
-    let path = request.uri.path().to_string();
+    let path = request.uri().path().to_string();
     let matched = router.at(&path).unwrap();
-    let owned = AdminRequest::new(RequestEnvelope::from_s3s(&request), request.input.into());
-    DisableTableBucketHandler {}.call(owned, matched.params).await
+    DisableTableBucketHandler {}.call(request, matched.params).await
 }
 
 async fn call_maintenance_worker_handler(request: AdminRequest) -> S3Result<AdminResponse> {
@@ -1261,7 +1228,16 @@ async fn table_storage_credentials_are_rejected_by_catalog_authentication() {
             }
             let mut credential = get_new_credentials_with_metadata(&claims, root_secret).expect("sign a temporary credential");
             credential.parent_user = parent.to_string();
-            iam.set_temp_user(&credential.access_key, &credential, None)
+            // A regular parent's sessions must carry its durable STS generation, so publish
+            // through the parent-bound path instead of storing an unversioned session.
+            let parent_secret = if parent == root_key { root_secret } else { parent_secret };
+            let authenticated_parent = rustfs_credentials::Credentials {
+                access_key: parent.to_string(),
+                secret_key: parent_secret.to_string(),
+                status: "on".to_string(),
+                ..Default::default()
+            };
+            iam.set_temp_user_from_parent(&credential, &authenticated_parent)
                 .await
                 .expect("store temporary credential");
             let request = load_table_request_builder(context.clone(), &credential.access_key, &credential.secret_key)
@@ -1358,14 +1334,11 @@ async fn warehouse_location_claim_checks_request_identity_and_relocation() {
         ..Default::default()
     }));
     // Exercise the actual owned internal authorization path, including its temporary target.
-    let legacy = legacy_table_catalog_handler_request(context.clone(), access_key, secret_key);
-    let mut owned = legacy_request_view(&legacy);
+    let mut owned = table_catalog_handler_request(context.clone(), access_key, secret_key);
     let principal = table_catalog_request_principal(&owned).await.expect("resolve principal");
-    // Both request boundaries retain the effective region and the authenticated principal.
+    // The owned request keeps the region it was given. An already installed region wins.
+    // Copying a legacy s3s region into the envelope is covered by from_s3s_copies_every_named_extension.
     {
-        let mut legacy_region = legacy_table_catalog_handler_request(context.clone(), access_key, secret_key);
-        legacy_region.region = Some("eu-west-1".parse().expect("valid legacy region"));
-        let legacy_request = legacy_request_view(&legacy_region);
         let owned_request = load_table_request_builder(context.clone(), access_key, secret_key)
             .region(Some("eu-west-1".to_owned()))
             .build();
@@ -1378,7 +1351,6 @@ async fn warehouse_location_claim_checks_request_identity_and_relocation() {
             })
             .build();
         for (mut request, expected_region, expected_bucket) in [
-            (legacy_request, "eu-west-1", None),
             (owned_request, "eu-west-1", None),
             (preserved_request, "ap-south-1", Some("original-bucket")),
         ] {
@@ -1421,11 +1393,9 @@ async fn warehouse_location_claim_checks_request_identity_and_relocation() {
     // The exact-key check selects internal-object mode: a request header the object
     // write does not apply (a malformed x-amz-tagging) must not reach the decision,
     // while the ordinary owned entry point still evaluates it and rejects it.
-    let mut tagged = legacy_table_catalog_handler_request(context.clone(), access_key, secret_key);
-    tagged
-        .headers
-        .insert("x-amz-tagging", http::HeaderValue::from_static("classification=%ZZ"));
-    let mut tagged = legacy_request_view(&tagged);
+    let mut tagged = load_table_request_builder(context.clone(), access_key, secret_key)
+        .header("x-amz-tagging", "classification=%ZZ")
+        .build();
     install_table_catalog_s3_request_info(&mut tagged, &principal).expect("install authorization context");
     authorize_table_catalog_s3_actions(&mut tagged, "warehouse", "owned/writable", &[S3Action::PutObjectAction])
         .await
@@ -1446,8 +1416,7 @@ async fn warehouse_location_claim_checks_request_identity_and_relocation() {
         .await;
     objects.seed_object("warehouse", "shared/denied", b"unchanged".to_vec()).await;
     let backend = || {
-        let legacy = legacy_table_catalog_handler_request(context.clone(), access_key, secret_key);
-        let mut request = legacy_request_view(&legacy);
+        let mut request = table_catalog_handler_request(context.clone(), access_key, secret_key);
         install_table_catalog_s3_request_info(&mut request, &principal).expect("install authorization context");
         TableCommitObjectBackend::for_request(objects.clone(), request)
     };
@@ -1579,7 +1548,7 @@ async fn warehouse_location_claim_checks_request_identity_and_relocation() {
     ] {
         let backend = TableCommitObjectBackend::for_request(
             TestTableCatalogObjectBackend::default(),
-            legacy_request_view(&legacy_table_catalog_handler_request(context.clone(), access_key, secret_key)),
+            table_catalog_handler_request(context.clone(), access_key, secret_key),
         );
         let mut target = metadata.clone();
         target["location"] = serde_json::json!(location);
@@ -11576,7 +11545,7 @@ fn manifest_rewrite_metadata_bytes(bytes: Vec<u8>, case: &str) -> Vec<u8> {
         }
         data_fields.sort_by_key(|(name, _)| field_order.iter().position(|field| field == name).unwrap());
     }
-    let schema = apache_avro::Schema::parse(&schema_json).unwrap();
+    let schema = apache_avro::Schema::parse(schema_json).unwrap();
     let mut writer = apache_avro::Writer::new(&schema, Vec::new()).unwrap();
     for (key, value) in metadata {
         writer.add_user_metadata(key, value).unwrap();
@@ -18341,10 +18310,13 @@ async fn cleanup_empty_table_bucket_handler_enforces_request_object_permissions(
             let metadata_objects =
                 create_dropped_empty_tables_for_cleanup(&catalog, &backend, object_store.as_ref(), &bucket, 2).await;
             let request = |prefix: &str| {
-                let mut request = legacy_table_catalog_handler_request(context.clone(), access_key, secret_key);
-                request.method = Method::DELETE;
-                request.uri = format!("{prefix}/v1/buckets/{bucket}?cleanup=true").parse().unwrap();
-                request
+                table_catalog_request_builder(
+                    context.clone(),
+                    Some((access_key, secret_key)),
+                    Method::DELETE,
+                    &format!("{prefix}/v1/buckets/{bucket}?cleanup=true"),
+                )
+                .build()
             };
             let object_resource = format!("arn:aws:s3:::{bucket}/*");
             let first_metadata_resource = format!("arn:aws:s3:::{bucket}/{}", metadata_objects[0]);

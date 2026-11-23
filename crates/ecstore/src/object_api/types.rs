@@ -1218,6 +1218,8 @@ impl std::fmt::Debug for GetObjectSink {
 
 #[derive(Default, Clone)]
 pub struct ObjectOptions {
+    /// Part copies retain source locks and cannot queue for capped upload staging.
+    pub multipart_copy_source_locked: bool,
     #[doc(hidden)]
     pub delete_recovery_work_budget: Option<Arc<DeleteRecoveryWorkBudget>>,
     /// Caller-provided destination for a GET body: when set, the legacy
@@ -1232,6 +1234,9 @@ pub struct ObjectOptions {
     pub mod_time: Option<OffsetDateTime>,
     pub part_number: Option<usize>,
 
+    /// Exact logical versions authorized under the recursive delete bucket write lock.
+    /// An empty request plan must not dispatch any disk mutation. Never serialized.
+    pub recursive_delete_targets: Option<Arc<[(String, Uuid)]>>,
     pub delete_prefix: bool,
     pub delete_prefix_object: bool,
     pub version_id: Option<String>,
@@ -1254,6 +1259,11 @@ pub struct ObjectOptions {
     pub expected_current_version_id: Option<String>,
     /// Persisted bucket incarnation observed before authorization.
     pub expected_bucket_incarnation_id: Option<Uuid>,
+    /// Bucket incarnation that was admitted for an externally visible event.
+    /// This is kept separate from the storage fence because recovered work may
+    /// be allowed to commit while its notification provenance remains unknown.
+    #[doc(hidden)]
+    pub notification_bucket_incarnation_id: Option<Uuid>,
     pub no_lock: bool,
     /// Require complete participant observations for internal multipart size decisions.
     /// This transient flag is never derived from client input or stored on disk.
@@ -1855,6 +1865,12 @@ pub struct ObjectInfo {
     pub multipart_completion_replayed: bool,
     /// Previous current version's size observed during `rename_data` commit.
     pub backfilled_old_current_size: Option<crate::disk::OldCurrentSize>,
+    /// Persisted EC block size of a local version, projected from its erasure
+    /// layout for response headers. It is deliberately not part of
+    /// `user_defined`: every writer that turns `user_defined` back into stored
+    /// metadata would otherwise persist it. Read it through
+    /// [`ObjectInfo::effective_ec_block_size`].
+    pub ec_block_size: Option<usize>,
 }
 
 impl Default for ObjectInfo {
@@ -1898,6 +1914,7 @@ impl Default for ObjectInfo {
             checksum: None,
             multipart_completion_replayed: false,
             backfilled_old_current_size: None,
+            ec_block_size: None,
         }
     }
 }
@@ -1942,12 +1959,19 @@ impl Clone for ObjectInfo {
             checksum: self.checksum.clone(),
             multipart_completion_replayed: self.multipart_completion_replayed,
             backfilled_old_current_size: self.backfilled_old_current_size,
+            ec_block_size: self.ec_block_size,
             expires: self.expires,
         }
     }
 }
 
 impl ObjectInfo {
+    /// Return the persisted EC block size exposed by the response-side
+    /// projection.  Callers must not infer this value from request metadata.
+    pub fn effective_ec_block_size(&self) -> Option<usize> {
+        self.ec_block_size
+    }
+
     pub(crate) fn shard_integrity_write_mode(&self) -> ShardIntegrityWriteMode {
         // Any declaration requires protection. Malformed declarations remain
         // errors in the source reader and must never select the legacy path.
@@ -2261,9 +2285,10 @@ impl ObjectInfo {
 
         let inlined = fi.inline_data();
         let free_version = fi.tier_free_version();
+        let is_remote = fi.is_remote();
         let metadata = std::mem::take(&mut fi.metadata);
         let parts = std::mem::take(&mut fi.parts);
-        Self::from_file_info_parts(&fi, inlined, free_version, metadata, parts, bucket, object, version_id)
+        Self::from_file_info_parts(&fi, inlined, free_version, is_remote, metadata, parts, bucket, object, version_id)
     }
 
     pub(crate) fn from_file_info_with_version_id(
@@ -2276,6 +2301,7 @@ impl ObjectInfo {
             fi,
             fi.inline_data(),
             fi.tier_free_version(),
+            fi.is_remote(),
             fi.metadata.clone(),
             fi.parts.clone(),
             bucket,
@@ -2289,6 +2315,7 @@ impl ObjectInfo {
         fi: &FileInfo,
         inlined: bool,
         free_version: bool,
+        is_remote: bool,
         mut metadata: HashMap<String, String>,
         parts: Vec<ObjectPartInfo>,
         bucket: &str,
@@ -2364,6 +2391,13 @@ impl ObjectInfo {
         };
 
         clean_metadata(&mut metadata);
+        // The frame quantum is a storage-layout detail. Keep it in
+        // FileInfo for the reader, but never expose the internal marker as
+        // ordinary S3 metadata.
+        rustfs_utils::http::metadata_compat::remove_str(&mut metadata, crate::object_api::EC_READ_QUANTUM_INFO_INTERNAL_SUFFIX);
+        // Earlier metadata-only writes could persist the response projection.
+        rustfs_utils::http::metadata_compat::remove_str(&mut metadata, crate::object_api::EC_BLOCK_SIZE_INFO_INTERNAL_SUFFIX);
+        let ec_block_size = (!fi.deleted && !is_remote && fi.erasure.block_size > 0).then_some(fi.erasure.block_size);
 
         let storage_class = Some(
             storageclass::effective_class(
@@ -2423,6 +2457,7 @@ impl ObjectInfo {
             version_purge_status_internal,
             version_purge_status,
             replication_decision,
+            ec_block_size,
             ..Default::default()
         }
     }
@@ -3335,6 +3370,60 @@ mod tests {
         let info = ObjectInfo::from_file_info_with_version_id(&fi, "bucket", "object", None);
 
         assert_eq!(info.version_id, None, "a normalized absent version must not be rewritten to nil");
+    }
+
+    #[test]
+    fn from_file_info_projects_persisted_ec_block_size_for_responses() {
+        let mut fi = FileInfo::new("bucket/object", 4, 2);
+        fi.size = 1;
+        fi.erasure.block_size = 64 * 1024;
+        rustfs_utils::http::metadata_compat::insert_str(
+            &mut fi.metadata,
+            crate::object_api::EC_BLOCK_SIZE_INFO_INTERNAL_SUFFIX,
+            "1".into(),
+        );
+
+        let info = ObjectInfo::from_file_info(&fi, "bucket", "object", false);
+
+        assert_eq!(info.effective_ec_block_size(), Some(64 * 1024));
+        for key in ["x-rustfs-internal-ec-block-size", "x-minio-internal-ec-block-size"] {
+            assert!(
+                !info.user_defined.contains_key(key),
+                "the projection must not enter metadata that writers persist: {key}"
+            );
+        }
+
+        fi.erasure.block_size = 131_072;
+        let info = ObjectInfo::from_file_info(&fi, "bucket", "object", false);
+        assert_eq!(info.effective_ec_block_size(), Some(131_072));
+
+        fi.transition_status = rustfs_filemeta::TRANSITION_COMPLETE.to_string();
+        let info = ObjectInfo::from_file_info(&fi, "bucket", "remote-object", false);
+        assert_eq!(info.effective_ec_block_size(), None);
+    }
+
+    #[test]
+    fn from_owned_file_info_preserves_restored_ec_block_size_projection() {
+        let mut fi = FileInfo::new("bucket/object", 4, 2);
+        fi.size = 1;
+        fi.erasure.block_size = 64 * 1024;
+        fi.transition_status = rustfs_filemeta::TRANSITION_COMPLETE.to_string();
+        let restore = rustfs_filemeta::RestoreStatus {
+            is_restore_in_progress: Some(false),
+            restore_expiry_date: Some(OffsetDateTime::now_utc() + time::Duration::days(1)),
+        };
+        fi.metadata.insert(metadata_keys::RESTORE.to_string(), restore.to_string());
+        assert!(!fi.is_remote(), "the restored source has a local copy");
+
+        let borrowed = ObjectInfo::from_file_info(&fi, "bucket", "object", false);
+        let owned = ObjectInfo::from_owned_file_info(fi, "bucket", "object", false);
+
+        assert_eq!(owned.effective_ec_block_size(), Some(64 * 1024));
+        assert_eq!(borrowed.effective_ec_block_size(), Some(64 * 1024));
+        assert_eq!(owned.user_defined, borrowed.user_defined);
+        for key in ["x-rustfs-internal-ec-block-size", "x-minio-internal-ec-block-size"] {
+            assert!(!owned.user_defined.contains_key(key), "{key}");
+        }
     }
 
     #[test]

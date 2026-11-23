@@ -90,15 +90,6 @@ pub trait NotifyInterface: Send + Sync {
         region: &str,
         event_rules: &[(Vec<EventName>, String, String, Vec<TargetID>)],
     ) -> Result<(), NotificationError>;
-
-    async fn add_event_specific_rules(
-        &self,
-        bucket_name: &str,
-        region: &str,
-        event_rules: &[(Vec<EventName>, String, String, Vec<TargetID>)],
-    ) -> Result<(), NotificationError>;
-
-    async fn clear_bucket_notification_rules(&self, bucket_name: &str) -> Result<(), NotificationError>;
 }
 
 /// Notification system handle interface for admin peer orchestration.
@@ -204,12 +195,12 @@ pub trait ActionCredentialInterface: Send + Sync {
 
 /// Region interface for application-layer use-cases.
 pub trait RegionInterface: Send + Sync {
-    fn get(&self) -> Option<s3s::region::Region>;
+    fn get(&self) -> Option<rustfs_s3_types::Region>;
 
     /// Further regions accepted as a bucket `LocationConstraint` besides
     /// [`Self::get`]; none unless the instance was started with a
     /// comma-separated region list.
-    fn additional(&self) -> Vec<s3s::region::Region> {
+    fn additional(&self) -> Vec<rustfs_s3_types::Region> {
         Vec::new()
     }
 }

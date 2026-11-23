@@ -40,6 +40,7 @@ fn scan_options(scan_mode: HealScanMode) -> ScannerDiskScanOptions {
         scan_mode,
         prefix_scan_scope: None,
         checkpoint_tx: None,
+        local_stop: None,
     }
 }
 
@@ -623,7 +624,7 @@ async fn checkpoint_fixture_existing_uncovered_cursor_cannot_skip_to_complete() 
             cache.info.scan_coverage_receipt.as_mut().expect("receipt").through = "bucket/z-stale".into();
         }
         cache
-            .save_with_revisions_for_epoch(store.clone(), CACHE_NAME, &revisions, 0)
+            .save_with_revisions_for_epoch(store.clone(), CACHE_NAME, &revisions, 0, CancellationToken::new())
             .await
             .expect("persist corrupted existing cursor");
         let mut loaded = store.strict_load().await;
@@ -663,7 +664,7 @@ async fn checkpoint_fixture_existing_uncovered_cursor_cannot_skip_to_complete() 
         assert_eq!(cache.checked_flatten("bucket/b-pending").expect("revisited prefix").size, 7);
         assert!(!cache.info.snapshot_complete);
         cache
-            .save_with_revisions_for_epoch(store.clone(), CACHE_NAME, &revisions, 0)
+            .save_with_revisions_for_epoch(store.clone(), CACHE_NAME, &revisions, 0, CancellationToken::new())
             .await
             .expect("persist verified partial");
         assert!(!store.strict_load().await.info.snapshot_complete);
@@ -827,7 +828,7 @@ async fn check_complete_sampling_resumption(resume_mode: HealScanMode) {
         .await
         .expect("fixture revision");
     cache
-        .save_with_revisions_for_epoch(store.clone(), CACHE_NAME, &revisions, 0)
+        .save_with_revisions_for_epoch(store.clone(), CACHE_NAME, &revisions, 0, CancellationToken::new())
         .await
         .expect("persist sampling partial");
     if resume_mode == HealScanMode::Deep {
@@ -876,7 +877,7 @@ async fn check_complete_sampling_resumption(resume_mode: HealScanMode) {
             assert_eq!(cache.find("bucket/prefix/0000").expect("Deep revisits earlier prefix").size, 7);
         }
         cache
-            .save_with_revisions_for_epoch(store.clone(), CACHE_NAME, &revisions, 0)
+            .save_with_revisions_for_epoch(store.clone(), CACHE_NAME, &revisions, 0, CancellationToken::new())
             .await
             .expect("save bounded recovery");
         if complete {
@@ -964,6 +965,7 @@ async fn run_hot_bucket_certification(advance_epoch: bool, logs: &CapturedLogs) 
                 tier_registry_generation: Some(identity.tier_registry_generation),
                 checkpoint_identity: Some(identity),
                 checkpoint_plan_digest: None,
+                completed_checkpoint_cycle_floor: None,
             },
         );
         cache.info.skip_healing = true;
@@ -995,7 +997,7 @@ async fn run_hot_bucket_certification(advance_epoch: bool, logs: &CapturedLogs) 
         };
         assert_eq!(budget.budget_elapsed(), max_objects.is_some(), "round {round} budget");
         cache
-            .save_with_revisions_for_epoch(store.clone(), CACHE_NAME, &revisions, 0)
+            .save_with_revisions_for_epoch(store.clone(), CACHE_NAME, &revisions, 0, CancellationToken::new())
             .await
             .expect("save hot bucket sweep");
         let saved = store.strict_load().await;
@@ -1129,7 +1131,7 @@ async fn checkpoint_admission_log_capture_survives_another_future_dispatcher() {
     }
 }
 
-async fn write_checkpoint_object(root: &std::path::Path, object: &str, versions: &[(Option<Uuid>, i64)]) {
+pub(super) async fn write_checkpoint_object(root: &std::path::Path, object: &str, versions: &[(Option<Uuid>, i64)]) {
     let mut metadata = FileMeta::new();
     for (index, (version_id, size)) in versions.iter().enumerate() {
         let mut info = FileInfo::new(object, 4, 2);
@@ -1209,7 +1211,7 @@ pub(super) async fn scan_budgeted_metadata_repair_tail() -> DataUsageCache {
         assert!(!cache.info.skip_healing);
         assert!(!cache.info.snapshot_complete);
         cache
-            .save_with_revisions_for_epoch(store.clone(), CACHE_NAME, &revisions, 0)
+            .save_with_revisions_for_epoch(store.clone(), CACHE_NAME, &revisions, 0, CancellationToken::new())
             .await
             .expect("persist scanner repair obligation with CAS");
         let saved = store.strict_load().await;
@@ -1282,6 +1284,7 @@ where
                 tier_registry_generation: None,
                 checkpoint_identity: Some(identity),
                 checkpoint_plan_digest: None,
+                completed_checkpoint_cycle_floor: None,
             },
         );
         let prepared = retained(&cache);
@@ -1307,6 +1310,7 @@ where
                     scan_mode: HealScanMode::Normal,
                     prefix_scan_scope: None,
                     checkpoint_tx: None,
+                    local_stop: None,
                 },
             )
             .await
@@ -1318,7 +1322,7 @@ where
         assert_eq!(budget.reason(), Some(crate::scanner_budget::ScannerCycleBudgetReason::Objects));
         let scanned = retained(&cache);
         cache
-            .save_with_revisions_for_epoch(store.clone(), CACHE_NAME, &revisions, 0)
+            .save_with_revisions_for_epoch(store.clone(), CACHE_NAME, &revisions, 0, CancellationToken::new())
             .await
             .expect("persist partial checkpoint");
         let mut loaded = DataUsageCache::default();
@@ -1357,14 +1361,14 @@ where
         .await
         .expect("read durable checkpoint bytes");
     let epoch_error = loaded
-        .save_with_revisions_for_epoch(store.clone(), CACHE_NAME, &revisions, 1)
+        .save_with_revisions_for_epoch(store.clone(), CACHE_NAME, &revisions, 1, CancellationToken::new())
         .await
         .expect_err("stale publication epoch must reject persistence");
     assert!(epoch_error.to_string().contains(crate::SCANNER_PUBLICATION_EPOCH_CHANGED));
     store.reject_save.store(true, Ordering::SeqCst);
     loaded.info.next_cycle += 1;
     loaded
-        .save_with_revisions_for_epoch(store.clone(), CACHE_NAME, &revisions, 0)
+        .save_with_revisions_for_epoch(store.clone(), CACHE_NAME, &revisions, 0, CancellationToken::new())
         .await
         .expect_err("injected save failure must not report durable progress");
     assert_eq!(
@@ -1390,6 +1394,7 @@ where
                 scan_mode: HealScanMode::Normal,
                 prefix_scan_scope: None,
                 checkpoint_tx: None,
+                local_stop: None,
             },
         )
         .await;
@@ -1422,6 +1427,7 @@ where
                 tier_registry_generation: Some(identity.tier_registry_generation),
                 checkpoint_identity: Some(identity),
                 checkpoint_plan_digest: None,
+                completed_checkpoint_cycle_floor: None,
             },
         );
         cache.info.skip_healing = true;
@@ -1452,7 +1458,7 @@ where
             ScannerDiskScanOutcome::NamespaceNotFound(_) => panic!("fixture namespace exists"),
         };
         cache
-            .save_with_revisions_for_epoch(store.clone(), CACHE_NAME, &revisions, 0)
+            .save_with_revisions_for_epoch(store.clone(), CACHE_NAME, &revisions, 0, CancellationToken::new())
             .await
             .expect("save each bounded sweep");
         let saved = store.strict_load().await;

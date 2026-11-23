@@ -20,7 +20,8 @@ use crate::ingest::{IngestReport, SkipReason};
 use crate::model::{EventKind, LogEvent, LogLevel, ParseStats};
 use crate::redact;
 use crate::rules::{Finding, FindingsCollector, RuleEngine, Severity};
-use chrono::{DateTime, Duration, FixedOffset, Utc};
+use crate::time::Rfc3339;
+use jiff::{SignedDuration, ZonedDateTime};
 use regex::Regex;
 use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -35,9 +36,9 @@ const BUCKET_WIDTHS_MIN: [i64; 6] = [1, 5, 15, 60, 360, 1440];
 #[derive(Debug, Clone)]
 pub struct AnalyzeOptions {
     /// Keep events at/after this time. Timestamp-less events always pass.
-    pub since: Option<DateTime<FixedOffset>>,
+    pub since: Option<ZonedDateTime>,
     /// Keep events at/before this time. Timestamp-less events always pass.
-    pub until: Option<DateTime<FixedOffset>>,
+    pub until: Option<ZonedDateTime>,
     /// Drop events below this level; level-less events always pass.
     pub min_level: Option<LogLevel>,
     pub max_samples: usize,
@@ -64,7 +65,7 @@ pub struct Summary {
     pub events_after_filter: u64,
     /// "ERROR" -> n, …, "no_level" -> n.
     pub level_counts: BTreeMap<String, u64>,
-    pub time_range: Option<(DateTime<FixedOffset>, DateTime<FixedOffset>)>,
+    pub time_range: Option<(ZonedDateTime, ZonedDateTime)>,
     pub nodes: Vec<String>,
     pub parse: ParseStats,
     pub files_parsed: u64,
@@ -88,7 +89,7 @@ pub struct UnmatchedCluster {
 #[derive(Debug, Clone, Serialize)]
 pub struct TimeBucket {
     /// Bucket start, normalized to UTC.
-    pub start: DateTime<Utc>,
+    pub start: ZonedDateTime,
     pub error: u64,
     pub warn: u64,
     pub other: u64,
@@ -105,8 +106,8 @@ pub struct TimelineAnomaly {
     /// Involved node labels (node_ranges_disjoint); empty otherwise.
     pub nodes: Vec<String>,
     /// Gap boundaries in UTC (log_gap); null otherwise.
-    pub gap_start: Option<DateTime<Utc>>,
-    pub gap_end: Option<DateTime<Utc>>,
+    pub gap_start: Option<ZonedDateTime>,
+    pub gap_end: Option<ZonedDateTime>,
     /// log_gap only: a startup-class finding begins within 5min after the gap.
     pub restart_evidence: bool,
 }
@@ -129,7 +130,7 @@ pub struct AnalysisReport {
 }
 
 /// (min ts, max ts, timestamped event count) for one node label.
-type NodeRange = (DateTime<FixedOffset>, DateTime<FixedOffset>, u64);
+type NodeRange = (ZonedDateTime, ZonedDateTime, u64);
 
 #[derive(Default)]
 struct BucketCounts {
@@ -154,7 +155,7 @@ pub struct Analyzer {
     events_total: u64,
     events_after_filter: u64,
     level_counts: BTreeMap<String, u64>,
-    time_range: Option<(DateTime<FixedOffset>, DateTime<FixedOffset>)>,
+    time_range: Option<(ZonedDateTime, ZonedDateTime)>,
     nodes: BTreeSet<String>,
     offsets: BTreeSet<String>,
     /// node label -> (min ts, max ts, timestamped event count); feeds the
@@ -189,8 +190,9 @@ impl Analyzer {
     pub fn observe(&mut self, mut event: LogEvent) {
         self.events_total += 1;
 
-        if let Some(ts) = event.timestamp
-            && (self.opts.since.is_some_and(|since| ts < since) || self.opts.until.is_some_and(|until| ts > until))
+        if let Some(ts) = event.timestamp.as_ref()
+            && (self.opts.since.as_ref().is_some_and(|since| ts < since)
+                || self.opts.until.as_ref().is_some_and(|until| ts > until))
         {
             return;
         }
@@ -217,23 +219,26 @@ impl Analyzer {
             self.nodes.insert(node.to_string());
         }
 
-        if let Some(ts) = event.timestamp {
-            self.time_range = Some(match self.time_range {
-                None => (ts, ts),
-                Some((first, last)) => (first.min(ts), last.max(ts)),
+        if let Some(ts) = event.timestamp.clone() {
+            self.time_range = Some(match self.time_range.take() {
+                None => (ts.clone(), ts.clone()),
+                Some((first, last)) => (first.min(ts.clone()), last.max(ts.clone())),
             });
             self.offsets.insert(format_offset(&ts));
             if let Some(node) = event.node.as_deref() {
                 self.node_ranges
                     .entry(node.to_string())
                     .and_modify(|(min, max, count)| {
-                        *min = (*min).min(ts);
-                        *max = (*max).max(ts);
+                        *min = min.clone().min(ts.clone());
+                        *max = max.clone().max(ts.clone());
                         *count += 1;
                     })
-                    .or_insert((ts, ts, 1));
+                    .or_insert((ts.clone(), ts.clone(), 1));
             }
-            let bucket = self.minute_buckets.entry(ts.timestamp().div_euclid(60)).or_default();
+            let bucket = self
+                .minute_buckets
+                .entry(ts.timestamp().as_second().div_euclid(60))
+                .or_default();
             match event.level {
                 Some(LogLevel::Error) => bucket.error += 1,
                 Some(LogLevel::Warn) => bucket.warn += 1,
@@ -356,8 +361,8 @@ impl Analyzer {
     }
 }
 
-fn format_offset(ts: &DateTime<FixedOffset>) -> String {
-    let seconds = ts.offset().local_minus_utc();
+fn format_offset(ts: &ZonedDateTime) -> String {
+    let seconds = crate::time::offset_seconds(ts);
     if seconds == 0 {
         return "Z".to_string();
     }
@@ -390,7 +395,7 @@ fn merge_timeline(minute_buckets: &BTreeMap<i64, BucketCounts>) -> (Vec<TimeBuck
     let buckets = merged
         .into_iter()
         .map(|(slot, counts)| TimeBucket {
-            start: DateTime::<Utc>::from_timestamp(slot * width * 60, 0).expect("valid timestamp"),
+            start: crate::time::utc_from_unix(slot * width * 60),
             error: counts.error,
             warn: counts.warn,
             other: counts.other,
@@ -471,13 +476,13 @@ fn detect_timeline_anomalies(
     // span of at least max(15min, 3x display bucket width), then activity
     // again — the shape of a process restart or hang.
     let threshold = (3 * bucket_width_min).max(15);
-    let startup_after_gap = |gap_end: DateTime<Utc>| {
+    let startup_after_gap = |gap_end: &ZonedDateTime| {
         findings.iter().chain(low_confidence).find_map(|f| {
             if !STARTUP_RULE_IDS.contains(&f.rule_id.as_str()) {
                 return None;
             }
-            let first = f.first_seen?.with_timezone(&Utc);
-            (first >= gap_end && first <= gap_end + Duration::minutes(5)).then(|| f.rule_id.clone())
+            let first = f.first_seen.as_ref()?;
+            (first >= gap_end && first <= gap_end + SignedDuration::from_mins(5)).then(|| f.rule_id.clone())
         })
     };
     let minutes: Vec<i64> = minute_buckets.keys().copied().collect();
@@ -490,9 +495,9 @@ fn detect_timeline_anomalies(
             continue;
         }
         if run_len >= 3 && delta > threshold {
-            let gap_start = DateTime::<Utc>::from_timestamp((prev + 1) * 60, 0).expect("valid timestamp");
-            let gap_end = DateTime::<Utc>::from_timestamp(next * 60, 0).expect("valid timestamp");
-            let restart = startup_after_gap(gap_end);
+            let gap_start = crate::time::utc_from_unix((prev + 1) * 60);
+            let gap_end = crate::time::utc_from_unix(next * 60);
+            let restart = startup_after_gap(&gap_end);
             let span = human_duration_minutes(delta - 1);
             let message = match &restart {
                 Some(rule_id) => format!(
@@ -545,7 +550,7 @@ fn collapse_findings(findings: &mut [Finding]) {
     let index_of: HashMap<String, usize> = findings.iter().enumerate().map(|(i, f)| (f.rule_id.clone(), i)).collect();
     // Among several qualifying roots pick the earliest first_seen;
     // timestamp-less roots come last, rule id breaks remaining ties.
-    let root_key = |f: &Finding| (f.first_seen.is_none(), f.first_seen, f.rule_id.clone());
+    let root_key = |f: &Finding| (f.first_seen.is_none(), f.first_seen.clone(), f.rule_id.clone());
 
     let mut chosen: Vec<Option<usize>> = vec![None; findings.len()];
     for (i, symptom) in findings.iter().enumerate() {
@@ -555,10 +560,10 @@ fn collapse_findings(findings: &mut [Finding]) {
                 continue;
             }
             let root = &findings[r];
-            let qualifies = match (root.first_seen, symptom.first_seen) {
+            let qualifies = match (root.first_seen.as_ref(), symptom.first_seen.as_ref()) {
                 (Some(root_first), Some(symptom_first)) => {
-                    root_first <= symptom_first + Duration::minutes(5)
-                        && root.last_seen.unwrap_or(root_first) >= symptom_first - Duration::minutes(30)
+                    root_first <= symptom_first + SignedDuration::from_mins(5)
+                        && root.last_seen.as_ref().unwrap_or(root_first) >= symptom_first - SignedDuration::from_mins(30)
                 }
                 _ => true,
             };
@@ -699,7 +704,7 @@ mod tests {
 
     fn event(message: &str, level: Option<LogLevel>, ts: Option<&str>) -> LogEvent {
         LogEvent {
-            timestamp: ts.map(|t| DateTime::parse_from_rfc3339(t).expect("ts")),
+            timestamp: ts.map(|t| crate::time::parse_rfc3339(t).expect("ts")),
             level,
             target: Some("rustfs::server::http".to_string()),
             message: message.to_string(),
@@ -815,8 +820,8 @@ mod tests {
         assert_eq!(gaps.len(), 1, "{:?}", report.timeline_anomalies);
         assert!(gaps[0].restart_evidence, "startup-fatal right after the gap: {:?}", gaps[0]);
         assert!(gaps[0].message.contains("重启证据"));
-        assert_eq!(gaps[0].gap_start.expect("start").to_rfc3339(), "2026-07-15T03:04:00+00:00");
-        assert_eq!(gaps[0].gap_end.expect("end").to_rfc3339(), "2026-07-15T03:44:00+00:00");
+        assert_eq!(gaps[0].gap_start.as_ref().expect("start").to_rfc3339(), "2026-07-15T03:04:00+00:00");
+        assert_eq!(gaps[0].gap_end.as_ref().expect("end").to_rfc3339(), "2026-07-15T03:44:00+00:00");
 
         // Same hole but no startup finding afterwards: still a gap, no upgrade.
         let mut a = analyzer(AnalyzeOptions::default());
@@ -1011,7 +1016,7 @@ mod tests {
     #[test]
     fn since_until_filters_timestamped_events_only() {
         let mut a = analyzer(AnalyzeOptions {
-            since: Some(DateTime::parse_from_rfc3339("2026-07-15T03:00:00+08:00").expect("ts")),
+            since: Some(crate::time::parse_rfc3339("2026-07-15T03:00:00+08:00").expect("ts")),
             ..Default::default()
         });
         a.observe(event("Disk full", Some(LogLevel::Error), Some("2026-07-15T02:00:00+08:00")));

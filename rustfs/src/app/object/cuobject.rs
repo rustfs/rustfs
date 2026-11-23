@@ -27,7 +27,6 @@ use crate::app::storage_api::object_usecase::runtime::get_global_endpoints_opt;
 #[cfg(not(feature = "nixl"))]
 use crate::app::storage_api::object_usecase::runtime::global_rustfs_port;
 use bytes::Bytes;
-use futures::Stream;
 use http::HeaderMap;
 use rustfs_config::{
     DEFAULT_ERASURE_SHARD_BYTES, DEFAULT_RUSTFS_CUOBJECT_GET_FANOUT, DEFAULT_RUSTFS_CUOBJECT_GET_FANOUT_BUDGET,
@@ -56,9 +55,8 @@ pub(crate) mod transport {
     };
 }
 use crate::app::storage_api::object_usecase::rdma::{RegisteredSlabArena, ShardBuf, ShardEmitter, install_shard_arena};
-use crate::app::storage_api::s3::dto::StreamingBlob;
-use crate::app::storage_api::s3::stream::{ByteStream, RemainingLength};
-use crate::app::storage_api::s3::{S3Error, S3ErrorCode, S3Result, StdError};
+use crate::app::storage_api::s3::{S3Error, S3ErrorCode, S3Result};
+use rustfs_gateway_stream::Body;
 use rustfs_utils::{get_env_bool, get_env_opt_str, get_env_u64, get_env_usize};
 use std::collections::VecDeque;
 use std::io;
@@ -780,126 +778,83 @@ pub(crate) async fn serve_get_over_rdma(
     Ok(moved)
 }
 
-/// Request body of a cuObject PUT: the object bytes are RDMA-read from the
-/// client's buffer into staging, one chunk ahead of the consumer, and handed
-/// to the normal PUT pipeline as an ordinary byte stream.
-struct RdmaPutBody {
-    inner: Pin<Box<dyn Stream<Item = Result<Bytes, StdError>> + Send + Sync + 'static>>,
-    remaining: usize,
-}
-
-impl Stream for RdmaPutBody {
-    type Item = Result<Bytes, StdError>;
-
-    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        let next = self.inner.as_mut().poll_next(cx);
-        if let Poll::Ready(Some(Ok(bytes))) = &next {
-            self.remaining = self.remaining.saturating_sub(bytes.len());
-        }
-        next
-    }
-
-    fn size_hint(&self) -> (usize, Option<usize>) {
-        (self.remaining, Some(self.remaining))
-    }
-}
-
-impl ByteStream for RdmaPutBody {
-    fn remaining_length(&self) -> RemainingLength {
-        RemainingLength::new_exact(self.remaining)
-    }
-}
-
 type StagedRead = JoinHandle<Result<StagingChunk, CuObjectError>>;
 
-/// The staged bytes of `chunk`: with `zero_copy`, a `Bytes` that owns the
-/// chunk (it returns to the pool when the last clone drops), otherwise a copy.
-#[cfg(feature = "nixl")]
-fn staged_bytes(chunk: StagingChunk, zero_copy: bool) -> io::Result<Bytes> {
-    if zero_copy {
-        return Ok(Bytes::from_owner(chunk));
+struct PutReads {
+    server: Arc<CuObjectServer>,
+    object: String,
+    token: RdmaToken,
+    next_offset: u64,
+    read_ahead: usize,
+    pending: VecDeque<StagedRead>,
+}
+
+impl PutReads {
+    fn enqueue(&mut self, chunk: StagingChunk) {
+        let offset = self.next_offset;
+        let len = (self.token.buffer_len - offset).min(self.server.chunk_bytes() as u64) as usize;
+        self.next_offset += len as u64;
+        let server = Arc::clone(&self.server);
+        let object = self.object.clone();
+        let token = self.token.clone();
+        self.pending.push_back(tokio::spawn(async move {
+            server.read_from_client_owned(&object, &token, offset, len, chunk).await
+        }));
     }
-    Ok(Bytes::copy_from_slice(chunk.staged().map_err(io::Error::other)?))
-}
 
-/// The staged bytes of `chunk`, copied (the cuObject chunk is not a byte owner).
-#[cfg(not(feature = "nixl"))]
-fn staged_bytes(chunk: StagingChunk, _zero_copy: bool) -> io::Result<Bytes> {
-    Ok(Bytes::copy_from_slice(chunk.staged().map_err(io::Error::other)?))
-}
+    // Reserve in offset order. Later reads can use available slots but never
+    // hold staging memory ahead of an earlier range that still needs a slot.
+    fn prefetch(&mut self) {
+        while self.pending.len() < self.read_ahead && self.next_offset < self.token.buffer_len {
+            let Some(chunk) = self.server.try_reserve() else { break };
+            self.enqueue(chunk);
+        }
+    }
 
-fn spawn_staged_read(server: &Arc<CuObjectServer>, object: &str, token: &RdmaToken, offset: u64, len: usize) -> StagedRead {
-    let server = Arc::clone(server);
-    let object = object.to_owned();
-    let token = token.clone();
-    tokio::spawn(async move {
-        let chunk = server.reserve(STAGING_RESERVE_TIMEOUT).await?;
-        server.read_from_client_owned(&object, &token, offset, len, chunk).await
-    })
+    async fn next(&mut self) -> io::Result<Option<StagingChunk>> {
+        if self.pending.is_empty() && self.next_offset < self.token.buffer_len {
+            let chunk = self.server.reserve(STAGING_RESERVE_TIMEOUT).await.map_err(io::Error::other)?;
+            self.enqueue(chunk);
+        }
+        self.prefetch();
+        let Some(read) = self.pending.pop_front() else { return Ok(None) };
+        let wait_started = rustfs_io_metrics::put_stage_timer();
+        let chunk = read
+            .await
+            .map_err(|error| io::Error::other(format!("rdma put read task: {error}")))?
+            .map_err(|error| io::Error::other(format!("rdma put read: {error}")))?;
+        rustfs_io_metrics::record_put_object_stage_duration_from("rdma_put_body_wait", wait_started);
+        Ok(Some(chunk))
+    }
 }
 
 /// Builds the streaming body for a PUT whose bytes live in the client's RDMA
 /// buffer (`x-amz-rdma-token`, empty HTTP body). The object length is the
 /// token's buffer length. Returns the body and that length.
 ///
-/// With `zero_copy` the body's chunks are the staging chunks themselves, so a
-/// consumer that keeps a chunk keeps it out of the pool: only callers whose
-/// body is consumed and dropped with the request (UploadPart) may set it.
-/// PutObject may hand its body to the object data cache, so it copies.
-pub(crate) fn rdma_put_body(bucket: &str, key: &str, token: &RdmaToken, zero_copy: bool) -> S3Result<(StreamingBlob, u64)> {
+/// Each completed frame owns its staging chunk until the consumer releases it.
+pub(crate) fn rdma_put_body(bucket: &str, key: &str, token: &RdmaToken) -> S3Result<(Body, u64)> {
     let service = SERVICE
         .get()
         .ok_or_else(|| S3Error::with_message(S3ErrorCode::NotImplemented, "rdma put is not enabled"))?;
     let server = Arc::clone(service.pick());
     let read_ahead = service.put_read_ahead;
     let total = token.buffer_len;
-    let chunk_bytes = server.chunk_bytes();
-    let object = format!("{bucket}/{key}");
-    let token = token.clone();
-    // Keep `read_ahead` RDMA reads in flight, so the reads of the following
-    // chunks overlap the consumer's work on this one. The first ones start
-    // now, overlapping the request's setup.
-    let fill = move |server: &Arc<CuObjectServer>,
-                     object: &str,
-                     token: &RdmaToken,
-                     pending: &mut VecDeque<StagedRead>,
-                     next_offset: &mut u64| {
-        while pending.len() < read_ahead && *next_offset < total {
-            let len = usize::try_from((total - *next_offset).min(chunk_bytes as u64)).unwrap_or(chunk_bytes);
-            pending.push_back(spawn_staged_read(server, object, token, *next_offset, len));
-            *next_offset += len as u64;
-        }
+    let length = usize::try_from(total).map_err(|_| S3Error::with_message(S3ErrorCode::EntityTooLarge, "rdma put too large"))?;
+    let mut reads = PutReads {
+        server,
+        object: format!("{bucket}/{key}"),
+        token: token.clone(),
+        next_offset: 0,
+        read_ahead,
+        pending: VecDeque::new(),
     };
-    let mut pending = VecDeque::with_capacity(read_ahead);
-    let mut next_offset = 0u64;
-    fill(&server, &object, &token, &mut pending, &mut next_offset);
-    // State: (reads in flight in offset order, offset of the next read to start).
-    let stream = futures::stream::try_unfold((pending, next_offset), move |(mut pending, mut next_offset)| {
-        let server = Arc::clone(&server);
-        let object = object.clone();
-        let token = token.clone();
-        async move {
-            fill(&server, &object, &token, &mut pending, &mut next_offset);
-            let Some(read) = pending.pop_front() else {
-                return Ok(None);
-            };
-            let wait_started = rustfs_io_metrics::put_stage_timer();
-            let chunk = read
-                .await
-                .map_err(|error| io::Error::other(format!("rdma put read task: {error}")))?
-                .map_err(|error| io::Error::other(format!("rdma put read: {error}")))?;
-            rustfs_io_metrics::record_put_object_stage_duration_from("rdma_put_body_wait", wait_started);
-            let bytes = staged_bytes(chunk, zero_copy)?;
-            Ok::<_, io::Error>(Some((bytes, (pending, next_offset))))
-        }
+    reads.prefetch();
+    let stream = futures::stream::try_unfold(reads, move |mut reads| async move {
+        let Some(chunk) = reads.next().await? else { return Ok(None) };
+        Ok::<_, io::Error>(Some((Bytes::from_owner(chunk), reads)))
     });
-    let stream = futures::TryStreamExt::map_err(stream, |error: io::Error| -> StdError { Box::new(error) });
-    let body = RdmaPutBody {
-        inner: Box::pin(stream),
-        remaining: usize::try_from(total)
-            .map_err(|_| S3Error::with_message(S3ErrorCode::EntityTooLarge, "rdma put too large"))?,
-    };
-    Ok((StreamingBlob::new(body), total))
+    Ok((super::native_body::from_io_stream_with_length(stream, Some(length)), total))
 }
 
 /// State shared by the segment writers of one RDMA GET: the server, the

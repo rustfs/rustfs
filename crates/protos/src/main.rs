@@ -69,6 +69,7 @@ fn main() -> Result<(), AnyError> {
         // Their hand-written Debug implementations redact the complete payload.
         .skip_debug([
             ".node_service.RenameDataResponse",
+            ".node_service.RenameDataBatchResult",
             ".node_service.RecoverMultipartSourceRequest",
             ".node_service.RecoverMultipartSourceResponse",
         ])

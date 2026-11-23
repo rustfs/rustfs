@@ -25,9 +25,9 @@ use crate::storage::storage_api::rpc_consumer::node_service::{CollectMetricsOpts
 use crate::storage::storage_api::rpc_consumer::node_service::{
     DiskStore, ECStore, Error, KMS_SIGNAL_SUBSYSTEM, LocalPeerS3Client, PEER_RESTDRY_RUN, PEER_RESTSIGNAL, PEER_RESTSUB_SYS,
     RemoteBackgroundIo, SCANNER_ACTIVITY_LEGACY_PROTOCOL_VERSION, SCANNER_ACTIVITY_PREVIOUS_PROTOCOL_VERSION,
-    SCANNER_ACTIVITY_V6_PROTOCOL_VERSION, SCANNER_PUBLICATION_LEASE_TTL_MS, SERVICE_SIGNAL_REFRESH_CONFIG,
-    SERVICE_SIGNAL_RELOAD_DYNAMIC, StorageDiskRpcExt as _, StorageResult, all_local_disk_path, find_local_disk_by_ref_for_rpc,
-    reload_transition_tier_config, with_remote_background_io,
+    SCANNER_ACTIVITY_V6_PROTOCOL_VERSION, SCANNER_ACTIVITY_V7_PROTOCOL_VERSION, SCANNER_PUBLICATION_LEASE_TTL_MS,
+    SERVICE_SIGNAL_REFRESH_CONFIG, SERVICE_SIGNAL_RELOAD_DYNAMIC, StorageDiskRpcExt as _, StorageResult, all_local_disk_path,
+    find_local_disk_by_ref_for_rpc, reload_transition_tier_config, with_remote_background_io,
 };
 use crate::storage::storage_api::runtime_sources_consumer::{EndpointServerPools, ServerContextSlot, runtime_sources};
 use crate::storage::storage_api::{
@@ -323,6 +323,7 @@ fn scanner_activity_response(
 ) -> ScannerActivityResponse {
     ScannerActivityResponse {
         instance_id: rustfs_scanner::scanner_activity_epoch().to_string(),
+        checkpoint_instance_id: Some(rustfs_scanner::scanner_checkpoint_instance_id().to_owned()),
         namespace_generation,
         maintenance_generation: rustfs_scanner::scanner_maintenance_generation(),
         protocol_version: rustfs_scanner::SCANNER_ACTIVITY_PROTOCOL_VERSION,
@@ -379,8 +380,31 @@ fn scanner_activity_response_v7(
     publication_blocked: bool,
 ) -> ScannerActivityResponse {
     let mut response = scanner_activity_response(namespace_generation, topology_digest, data_movement_active, dirty_usage);
+    response.protocol_version = SCANNER_ACTIVITY_V7_PROTOCOL_VERSION;
+    response.checkpoint_instance_id = None;
     response.movement_generation = Some(movement_generation);
     response.publication_blocked = Some(publication_blocked);
+    response
+}
+
+fn scanner_activity_response_v8(
+    namespace_generation: u64,
+    topology_digest: [u8; 32],
+    data_movement_active: bool,
+    dirty_usage: rustfs_scanner::ScannerDirtyUsageState,
+    movement_generation: u64,
+    publication_blocked: bool,
+) -> ScannerActivityResponse {
+    let mut response = scanner_activity_response_v7(
+        namespace_generation,
+        topology_digest,
+        data_movement_active,
+        dirty_usage,
+        movement_generation,
+        publication_blocked,
+    );
+    response.protocol_version = rustfs_scanner::SCANNER_ACTIVITY_PROTOCOL_VERSION;
+    response.checkpoint_instance_id = Some(rustfs_scanner::scanner_checkpoint_instance_id().to_owned());
     response
 }
 
@@ -390,6 +414,7 @@ fn previous_scanner_activity_response(
     data_movement_active: bool,
 ) -> ScannerActivityResponse {
     ScannerActivityResponse {
+        checkpoint_instance_id: None,
         instance_id: rustfs_scanner::scanner_activity_epoch().to_string(),
         namespace_generation,
         maintenance_generation: rustfs_scanner::scanner_maintenance_generation(),
@@ -406,6 +431,7 @@ fn previous_scanner_activity_response(
 
 fn legacy_scanner_activity_response(namespace_generation: u64) -> ScannerActivityResponse {
     ScannerActivityResponse {
+        checkpoint_instance_id: None,
         instance_id: rustfs_scanner::scanner_activity_epoch().to_string(),
         namespace_generation,
         maintenance_generation: rustfs_scanner::scanner_maintenance_generation(),
@@ -427,6 +453,7 @@ fn v6_scanner_activity_response(
     dirty_usage: rustfs_scanner::ScannerDirtyUsageState,
 ) -> ScannerActivityResponse {
     ScannerActivityResponse {
+        checkpoint_instance_id: None,
         instance_id: rustfs_scanner::scanner_activity_epoch().to_string(),
         namespace_generation,
         maintenance_generation: rustfs_scanner::scanner_maintenance_generation(),
@@ -605,6 +632,7 @@ struct QuotaTopologyCacheEntry {
     fingerprint: String,
 }
 
+#[derive(Clone)]
 enum LocalMutationTarget {
     Ready(Arc<ECStore>),
     Bootstrap(BootstrapLocalTarget),
@@ -1927,6 +1955,19 @@ impl Node for NodeService {
         self.handle_rename_data(request, false, false, false).await
     }
 
+    type RenameDataBatchStream = ResponseStream<RenameDataBatchResult>;
+    async fn rename_data_batch(
+        &self,
+        request: Request<RenameDataBatchRequest>,
+    ) -> Result<Response<Self::RenameDataBatchStream>, Status> {
+        if !rustfs_utils::get_env_bool("RUSTFS_EXPERIMENTAL_RENAME_STREAM_BATCH", false) {
+            // The feature gate is checked before authentication or mutation so
+            // mixed-version clients may safely use call-level UNIMPLEMENTED.
+            return Err(unimplemented_rpc("rename_data_batch"));
+        }
+        self.handle_rename_data_batch(request).await
+    }
+
     async fn rename_multipart_data(&self, request: Request<RenameDataRequest>) -> Result<Response<RenameDataResponse>, Status> {
         self.handle_rename_data(request, false, false, true).await
     }
@@ -2710,7 +2751,9 @@ impl Node for NodeService {
                     return Err(Status::invalid_argument("scanner activity protocol v4 cannot acknowledge dirty usage"));
                 }
             }
-            SCANNER_ACTIVITY_V6_PROTOCOL_VERSION | rustfs_scanner::SCANNER_ACTIVITY_PROTOCOL_VERSION => {
+            SCANNER_ACTIVITY_V6_PROTOCOL_VERSION
+            | SCANNER_ACTIVITY_V7_PROTOCOL_VERSION
+            | rustfs_scanner::SCANNER_ACTIVITY_PROTOCOL_VERSION => {
                 let canonical = rustfs_protos::canonical_scanner_activity_request_body(request.get_ref())
                     .map_err(|_| Status::invalid_argument("scanner activity request is too large to authenticate"))?;
                 verify_tonic_canonical_body_digest(&request, &canonical)
@@ -2768,7 +2811,15 @@ impl Node for NodeService {
                 data_movement_active,
                 rustfs_scanner::scanner_dirty_usage_state(),
             ),
-            rustfs_scanner::SCANNER_ACTIVITY_PROTOCOL_VERSION => scanner_activity_response_v7(
+            SCANNER_ACTIVITY_V7_PROTOCOL_VERSION => scanner_activity_response_v7(
+                namespace_generation,
+                topology_digest,
+                data_movement_active,
+                rustfs_scanner::scanner_dirty_usage_state(),
+                movement_generation,
+                publication_blocked || store.scanner_data_movement_generation_exhausted(),
+            ),
+            rustfs_scanner::SCANNER_ACTIVITY_PROTOCOL_VERSION => scanner_activity_response_v8(
                 namespace_generation,
                 topology_digest,
                 data_movement_active,
@@ -2789,8 +2840,11 @@ impl Node for NodeService {
             SCANNER_ACTIVITY_V6_PROTOCOL_VERSION => {
                 rustfs_protos::canonical_scanner_activity_response_body(&challenge, &response)
             }
-            rustfs_scanner::SCANNER_ACTIVITY_PROTOCOL_VERSION => {
+            SCANNER_ACTIVITY_V7_PROTOCOL_VERSION => {
                 rustfs_protos::canonical_scanner_activity_v7_response_body(&challenge, &response)
+            }
+            rustfs_scanner::SCANNER_ACTIVITY_PROTOCOL_VERSION => {
+                rustfs_protos::canonical_scanner_activity_v8_response_body(&challenge, &response)
             }
             version => {
                 return Err(Status::internal(format!(
@@ -3443,7 +3497,7 @@ mod tests {
         is_rebalance_start_fleet_proof_retryable, legacy_scanner_activity_response, make_heal_control_server,
         make_heal_control_server_with_cache, make_server, make_server_for_context, make_tier_mutation_control_server_for_context,
         previous_scanner_activity_response, remove_heal_control_replay, retry_rebalance_start_fleet_proof,
-        scanner_activity_response_v7, start_decommission_failure_response, stop_rebalance_response,
+        scanner_activity_response_v7, scanner_activity_response_v8, start_decommission_failure_response, stop_rebalance_response,
         validate_admin_heal_control_start,
     };
     use crate::storage::rpc::node_service::heal::heal_topology_fingerprint;
@@ -3489,13 +3543,13 @@ mod tests {
         MakeVolumeRequest, MakeVolumesRequest, MrfLifecycleRequest, Mss, PingRequest, PoolMetaNativeRecoveryRequest,
         PreparePartTransactionRequest, ReadAllRequest, ReadAtRequest, ReadMultipleRequest, ReadVersionRequest, ReadXlRequest,
         RecoverDeleteTransactionRequest, RecoverMultipartSourceRequest, ReloadPoolMetaRequest,
-        ReloadSiteReplicationConfigRequest, RenameDataRequest, RenameFileRequest, RenamePartRequest, ScannerActivityRequest,
-        ScannerDirtyUsageSnapshotRequest, ScannerPublicationLeaseReleaseRequest, ScannerPublicationLeaseRequest,
-        ServerInfoRequest, SettlePartTransactionRequest, SignalServiceRequest, SnapshotLeaseReleaseRequest,
-        SnapshotLeaseRenewRequest, SnapshotLeaseRequest, StartDecommissionRequest, StartProfilingRequest, StatVolumeRequest,
-        StopRebalanceRequest, TierMutationAbortRequest, TierMutationFailureClass, TierMutationPeerState,
-        TierMutationPrepareRequest, UpdateMetacacheListingRequest, UpdateMetadataRequest, VerifyFileRequest, WriteAllRequest,
-        WriteFormatControlRequest, WriteMetadataRequest, WriteRequest,
+        ReloadSiteReplicationConfigRequest, RenameDataBatchItem, RenameDataBatchRequest, RenameDataRequest, RenameFileRequest,
+        RenamePartRequest, ScannerActivityRequest, ScannerDirtyUsageSnapshotRequest, ScannerPublicationLeaseReleaseRequest,
+        ScannerPublicationLeaseRequest, ServerInfoRequest, SettlePartTransactionRequest, SignalServiceRequest,
+        SnapshotLeaseReleaseRequest, SnapshotLeaseRenewRequest, SnapshotLeaseRequest, StartDecommissionRequest,
+        StartProfilingRequest, StatVolumeRequest, StopRebalanceRequest, TierMutationAbortRequest, TierMutationFailureClass,
+        TierMutationPeerState, TierMutationPrepareRequest, UpdateMetacacheListingRequest, UpdateMetadataRequest,
+        VerifyFileRequest, WriteAllRequest, WriteFormatControlRequest, WriteMetadataRequest, WriteRequest,
         heal_control_service_client::HealControlServiceClient,
         heal_control_service_server::{HealControlService as _, HealControlServiceServer},
         node_service_client::NodeServiceClient,
@@ -3513,8 +3567,9 @@ mod tests {
     use tonic::{Request, Response, Status};
     use uuid::Uuid;
 
-    const DISK_MUTATION_RPC_METHODS: [&str; 35] = [
+    const DISK_MUTATION_RPC_METHODS: [&str; 36] = [
         "renamedata",
+        "renamedatabatch",
         "renamemultipartdata",
         "recovermultipartsource",
         "renamedataatincarnation",
@@ -3579,6 +3634,41 @@ mod tests {
         }
         assert!(!policies.is_empty(), "NodeService must declare RPC methods");
         policies
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn rename_data_batch_requires_explicit_enable_and_body_digest() {
+        let request = || {
+            Request::new(RenameDataBatchRequest {
+                src_volume: "src".to_owned(),
+                src_path: "object".to_owned(),
+                dst_volume: "dst".to_owned(),
+                dst_path: "object".to_owned(),
+                items: vec![RenameDataBatchItem {
+                    item_index: 0,
+                    disk: "disk".to_owned(),
+                    file_info_msgpack: vec![0x80].into(),
+                }],
+            })
+        };
+
+        temp_env::async_with_vars([("RUSTFS_EXPERIMENTAL_RENAME_STREAM_BATCH", Some("false"))], async {
+            let error = match make_server().rename_data_batch(request()).await {
+                Err(error) => error,
+                Ok(_) => panic!("disabled batch must be unimplemented"),
+            };
+            assert_eq!(error.code(), tonic::Code::Unimplemented);
+        })
+        .await;
+        temp_env::async_with_vars([("RUSTFS_EXPERIMENTAL_RENAME_STREAM_BATCH", Some("true"))], async {
+            let error = match make_server().rename_data_batch(request()).await {
+                Err(error) => error,
+                Ok(_) => panic!("unsigned batch must fail closed"),
+            };
+            assert_eq!(error.code(), tonic::Code::PermissionDenied);
+        })
+        .await;
     }
 
     #[test]
@@ -5370,6 +5460,7 @@ mod tests {
     /// realistic across these copy-pasted call sites and are otherwise invisible to the digestless
     /// fail-open tests.
     #[tokio::test]
+    #[serial_test::serial]
     async fn every_mutating_handler_enforces_its_body_digest() {
         let service = make_server();
         let disk = "http://node-a:9000/data/rustfs0".to_string();
@@ -5425,6 +5516,48 @@ mod tests {
                 );
             }};
         }
+
+        temp_env::async_with_vars([("RUSTFS_EXPERIMENTAL_RENAME_STREAM_BATCH", Some("true"))], async {
+            assert!(covered_methods.insert(normalized_rpc_method("rename_data_batch")));
+            let message = RenameDataBatchRequest {
+                src_volume: "src".into(),
+                src_path: "sp".into(),
+                dst_volume: "dst".into(),
+                dst_path: "dp".into(),
+                items: vec![RenameDataBatchItem {
+                    item_index: 0,
+                    disk: disk.clone(),
+                    file_info_msgpack: vec![0x80].into(),
+                }],
+            };
+
+            let mut ok = Request::new(message.clone());
+            let body = rustfs_protos::canonical_rename_data_batch_request_body(ok.get_ref())
+                .expect("canonical batch body should encode");
+            set_tonic_canonical_body_digest(&mut ok, &body).expect("batch digest metadata should encode");
+            mark_v2_authenticated(&mut ok);
+            if let Err(status) = service.rename_data_batch(ok).await {
+                assert_ne!(
+                    status.code(),
+                    tonic::Code::PermissionDenied,
+                    "rename_data_batch: a correctly body-bound request must pass the digest gate",
+                );
+            }
+
+            let mut bad = Request::new(message);
+            set_tonic_canonical_body_digest(&mut bad, b"unrelated-canonical-body").expect("batch digest metadata should encode");
+            mark_v2_authenticated(&mut bad);
+            let error = match service.rename_data_batch(bad).await {
+                Err(error) => error,
+                Ok(_) => panic!("rename_data_batch: a tampered body must be rejected"),
+            };
+            assert_eq!(
+                error.code(),
+                tonic::Code::PermissionDenied,
+                "rename_data_batch must fail closed on a body-digest mismatch",
+            );
+        })
+        .await;
 
         assert_gated!(
             rename_data,
@@ -11349,6 +11482,32 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cluster_scanner_rpc_returns_compact_node_sample() {
+        let service = create_test_node_service();
+        let request = GetMetricsRequest {
+            metric_type: rmp_serde::to_vec(&MetricType::SCANNER_SUMMARY)
+                .expect("encode scanner selector")
+                .into(),
+            opts: rmp_serde::to_vec(&CollectMetricsOpts::default())
+                .expect("encode empty filters")
+                .into(),
+        };
+        let response = service
+            .get_metrics(Request::new(request))
+            .await
+            .expect("GetMetrics")
+            .into_inner();
+        assert!(response.success);
+        let sample: rustfs_madmin::metrics::RealtimeMetrics =
+            rmp_serde::from_slice(&response.realtime_metrics).expect("named reply");
+        assert!(sample.scanner_node.is_some());
+        assert!(
+            sample.aggregated.scanner.is_none(),
+            "peer probe excludes the full scanner report and paths"
+        );
+    }
+
+    #[tokio::test]
     async fn test_get_metrics_round_trip() {
         let service = create_test_node_service();
         let metric_type = MetricType::DISK;
@@ -12544,7 +12703,7 @@ mod tests {
 
     #[test]
     fn test_scanner_activity_response_uses_process_epoch_and_generations() {
-        let response = scanner_activity_response_v7(
+        let response = scanner_activity_response_v8(
             17,
             [7; 32],
             true,
@@ -12557,6 +12716,10 @@ mod tests {
         );
 
         assert_eq!(response.instance_id, rustfs_scanner::scanner_activity_epoch());
+        assert_eq!(
+            response.checkpoint_instance_id.as_deref(),
+            Some(rustfs_scanner::scanner_checkpoint_instance_id())
+        );
         assert_eq!(response.namespace_generation, 17);
         assert_eq!(response.maintenance_generation, rustfs_scanner::scanner_maintenance_generation());
         assert_eq!(response.protocol_version, rustfs_scanner::SCANNER_ACTIVITY_PROTOCOL_VERSION);
@@ -12566,6 +12729,24 @@ mod tests {
         assert!(response.dirty_usage_pending);
         assert_eq!(response.movement_generation, Some(23));
         assert_eq!(response.publication_blocked, Some(true));
+    }
+
+    #[test]
+    fn test_scanner_activity_v7_response_omits_checkpoint_continuity() {
+        let response = scanner_activity_response_v7(
+            17,
+            [7; 32],
+            false,
+            rustfs_scanner::ScannerDirtyUsageState {
+                generation: 0,
+                pending: false,
+            },
+            23,
+            false,
+        );
+        assert_eq!(response.protocol_version, 7);
+        assert_eq!(response.checkpoint_instance_id, None);
+        assert_eq!(response.movement_generation, Some(23));
     }
 
     #[test]

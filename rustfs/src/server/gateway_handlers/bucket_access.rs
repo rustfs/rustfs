@@ -22,7 +22,8 @@ use crate::runtime_sources::AppContext;
 use crate::storage_api::server::http::access::authorize_bucket_request;
 use rustfs_gateway::{Req, Resp, dto};
 use rustfs_gateway_types::persistence::{
-    parse_notification, parse_versioning, serialize_notification_dto, serialize_versioning_dto,
+    PersistedNotificationConfiguration, parse_notification, parse_versioning, serialize_notification_dto,
+    serialize_versioning_dto,
 };
 use rustfs_policy::policy::action::{Action, S3Action};
 use rustfs_s3_ops::S3Operation;
@@ -47,7 +48,7 @@ impl Served for dto::GetBucketVersioning {
 
     async fn authorize(envelope: &mut RequestEnvelope, request: &Req<Self>) -> S3Result<()> {
         let action = Action::S3Action(S3Action::GetBucketVersioningAction);
-        Ok(authorize_bucket_request(envelope, request.input().bucket.as_str(), action).await?)
+        authorize_bucket_request(envelope, request.input().bucket.as_str(), action).await
     }
 
     async fn execute(context: Option<Arc<AppContext>>, _envelope: RequestEnvelope, request: Req<Self>) -> S3Result<Resp<Self>> {
@@ -115,7 +116,7 @@ impl Served for dto::GetBucketPolicy {
 
     async fn authorize(envelope: &mut RequestEnvelope, request: &Req<Self>) -> S3Result<()> {
         let action = Action::S3Action(S3Action::GetBucketPolicyAction);
-        Ok(authorize_bucket_request(envelope, request.input().bucket.as_str(), action).await?)
+        authorize_bucket_request(envelope, request.input().bucket.as_str(), action).await
     }
 
     async fn execute(context: Option<Arc<AppContext>>, _envelope: RequestEnvelope, request: Req<Self>) -> S3Result<Resp<Self>> {
@@ -131,7 +132,7 @@ impl Served for dto::GetBucketPolicyStatus {
 
     async fn authorize(envelope: &mut RequestEnvelope, request: &Req<Self>) -> S3Result<()> {
         let action = Action::S3Action(S3Action::GetBucketPolicyStatusAction);
-        Ok(authorize_bucket_request(envelope, request.input().bucket.as_str(), action).await?)
+        authorize_bucket_request(envelope, request.input().bucket.as_str(), action).await
     }
 
     async fn execute(context: Option<Arc<AppContext>>, envelope: RequestEnvelope, request: Req<Self>) -> S3Result<Resp<Self>> {
@@ -147,7 +148,7 @@ impl Served for dto::GetBucketAcl {
 
     async fn authorize(envelope: &mut RequestEnvelope, request: &Req<Self>) -> S3Result<()> {
         let action = Action::S3Action(S3Action::GetBucketAclAction);
-        Ok(authorize_bucket_request(envelope, request.input().bucket.as_str(), action).await?)
+        authorize_bucket_request(envelope, request.input().bucket.as_str(), action).await
     }
 
     async fn execute(context: Option<Arc<AppContext>>, _envelope: RequestEnvelope, request: Req<Self>) -> S3Result<Resp<Self>> {
@@ -163,7 +164,7 @@ impl Served for dto::PutBucketAcl {
 
     async fn authorize(envelope: &mut RequestEnvelope, request: &Req<Self>) -> S3Result<()> {
         let action = Action::S3Action(S3Action::PutBucketAclAction);
-        Ok(authorize_bucket_request(envelope, request.input().bucket.as_str(), action).await?)
+        authorize_bucket_request(envelope, request.input().bucket.as_str(), action).await
     }
 
     async fn execute(context: Option<Arc<AppContext>>, envelope: RequestEnvelope, request: Req<Self>) -> S3Result<Resp<Self>> {
@@ -180,7 +181,7 @@ impl Served for dto::GetBucketNotificationConfiguration {
 
     async fn authorize(envelope: &mut RequestEnvelope, request: &Req<Self>) -> S3Result<()> {
         let action = Action::S3Action(S3Action::GetBucketNotificationAction);
-        Ok(authorize_bucket_request(envelope, request.input().bucket.as_str(), action).await?)
+        authorize_bucket_request(envelope, request.input().bucket.as_str(), action).await
     }
 
     async fn execute(context: Option<Arc<AppContext>>, _envelope: RequestEnvelope, request: Req<Self>) -> S3Result<Resp<Self>> {
@@ -201,14 +202,20 @@ impl Served for dto::PutBucketNotificationConfiguration {
 
     async fn execute(context: Option<Arc<AppContext>>, envelope: RequestEnvelope, request: Req<Self>) -> S3Result<Resp<Self>> {
         let input = request.into_input();
-        let prepared = parse_notification(&serialize_notification_dto(&input.notification_configuration))
-            .map_err(|err| rustfs_s3_types::s3_error!(MalformedXML, "{err}"));
-        let destinations = notification_destinations(input.notification_configuration);
+        let (destinations, prepared) = prepare_notification_configuration(input.notification_configuration);
         let output = DefaultBucketUsecase::with_context(context)
             .execute_put_bucket_notification_configuration(envelope, input.bucket.as_str(), destinations, prepared)
             .await?;
         Ok(Resp::new(output))
     }
+}
+
+pub(crate) fn prepare_notification_configuration(
+    configuration: dto::NotificationConfiguration,
+) -> (Vec<NotificationDestination>, S3Result<PersistedNotificationConfiguration>) {
+    let prepared = parse_notification(&serialize_notification_dto(&configuration))
+        .map_err(|err| rustfs_s3_types::s3_error!(MalformedXML, "{err}"));
+    (notification_destinations(configuration), prepared)
 }
 
 fn notification_destinations(configuration: dto::NotificationConfiguration) -> Vec<NotificationDestination> {

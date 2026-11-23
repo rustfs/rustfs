@@ -12,7 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::notification_system_subscriber::NotificationSystemSubscriberView;
 use crate::notifier::{EventNotifier, TargetList};
 use crate::services::NotifyServices;
 use crate::{
@@ -182,7 +181,6 @@ impl NotificationSystem {
             rustfs_utils::get_env_usize(ENV_NOTIFY_TARGET_STREAM_CONCURRENCY, DEFAULT_NOTIFY_TARGET_STREAM_CONCURRENCY);
         let (live_event_sender, _) = broadcast::channel(1024);
         let metrics = Arc::new(NotificationMetrics::new());
-        let subscriber_view = Arc::new(NotificationSystemSubscriberView::new());
         let rule_engine = NotifyRuleEngine::new();
         let notifier = Arc::new(EventNotifier::new(metrics.clone(), rule_engine.clone()));
         let target_list = notifier.target_list();
@@ -200,7 +198,6 @@ impl NotificationSystem {
             stream_cancellers,
             concurrency_limiter,
             metrics,
-            subscriber_view,
             live_event_sender,
             live_event_history,
         );
@@ -247,6 +244,16 @@ impl NotificationSystem {
     /// Checks if there are active subscribers for the given bucket and event name.
     pub async fn has_subscriber(&self, bucket: &str, event: &EventName) -> bool {
         self.services.bucket_config_manager.has_subscriber(bucket, event).await
+    }
+
+    /// Binds server dispatch to the store-owned metadata cache. Local writes,
+    /// peer reloads, deletes and periodic metadata refreshes then select rules
+    /// from the same snapshot; delayed name-only rule replacements are ignored
+    /// and clears only evict compiled snapshots. Missing/unreadable metadata or
+    /// a dropped store suppresses external dispatch without falling back to the
+    /// standalone rules. Already queued or in-flight deliveries are not recalled.
+    pub fn bind_bucket_metadata_source(&self, store: &Arc<crate::NotifyStore>) {
+        self.services.bucket_config_manager.bind_bucket_metadata_source(store);
     }
 
     /// Returns true when at least one in-process consumer is subscribed to live events.
@@ -383,9 +390,18 @@ impl NotificationSystem {
         self.services.config_manager.lifecycle().state()
     }
 
-    /// Returns whether the latest accepted lifecycle generation is active.
+    /// Returns whether the latest accepted lifecycle generation has been handed
+    /// to the runtime. A published generation serves admin operations even when
+    /// some targets are quarantined; per-target health is reported by the target
+    /// list, and the reconciler must not rebuild a published generation.
     pub fn runtime_lifecycle_is_converged(&self) -> bool {
         self.services.config_manager.lifecycle().is_converged()
+    }
+
+    /// Returns whether the last published generation activated every configured
+    /// target. Used by the one-shot `initialize` API's strict contract.
+    pub fn runtime_lifecycle_all_targets_activated(&self) -> bool {
+        self.services.config_manager.lifecycle().all_targets_activated()
     }
 
     /// Validates a bucket notification configuration against the runtime targets

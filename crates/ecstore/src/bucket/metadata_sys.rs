@@ -1794,9 +1794,12 @@ async fn get_delete_and_quota_config_from_disk_in(
             if metadata.bucket_incarnation_sidecar && !metadata.bucket_incarnation_id.is_nil() =>
         {
             if let Some(expected) = expiry_policy {
-                let current = ConfigState::of(&metadata.lifecycle_config_xml, &metadata.lifecycle_config)
-                    .require(bucket, BUCKET_LIFECYCLE_CONFIG)?;
-                if !expected.matches_configuration(current) {
+                let raw = &metadata.lifecycle_config_xml;
+                let current = (!raw.is_empty())
+                    .then(|| super::utils::deserialize::<PersistedLifecycleConfiguration>(raw))
+                    .transpose()
+                    .map_err(|_| unreadable_config_error(bucket, BUCKET_LIFECYCLE_CONFIG, raw.len()))?;
+                if !expected.matches_configuration(current.as_ref()) {
                     return Err(Error::PreconditionFailed);
                 }
             }
@@ -1832,7 +1835,9 @@ pub(crate) async fn integrity_migration_metadata_in(
         BucketMetadataAuthority::Authoritative(metadata)
             if metadata.bucket_incarnation_sidecar && !metadata.bucket_incarnation_id.is_nil() =>
         {
-            Ok(metadata)
+            let mut metadata = Arc::unwrap_or_clone(metadata);
+            metadata.parse_all_configs()?;
+            Ok(Arc::new(metadata))
         }
         BucketMetadataAuthority::MissingBucket => Err(Error::BucketNotFound(bucket.to_string())),
         _ => Err(Error::other("migration requires authoritative bucket metadata")),
@@ -2085,6 +2090,74 @@ pub(crate) fn bump_local_meta_mutation_gen() {
     LOCAL_META_MUTATION_GEN.fetch_add(1, std::sync::atomic::Ordering::Release);
 }
 
+/// Bumps `LOCAL_META_MUTATION_GEN` for mutations in `RUSTFS_META_BUCKET` except
+/// known non-authority scanner, data-usage, and shutdown-marker paths.
+///
+/// The classifier is fail-closed: only exact 1-, 2-, or 3-segment paths naming
+/// `unclean-shutdown`, root scanner summary/usage files under `buckets/`, or
+/// per-bucket `.usage-cache.bin[.bkp]` files (with at most one optional trailing
+/// `/<uuid>` data-dir/transaction cleanup segment) skip the generation bump.
+/// All bucket authority files (`.metadata.bin`, `.bucket-incarnation`), bucket
+/// metadata directories (including names ending in `.usage-cache.bin`), and any
+/// other `.rustfs.sys` paths bump `LOCAL_META_MUTATION_GEN`.
+pub(crate) fn maybe_bump_local_meta_mutation_gen_for_path(volume: &str, path: &str) {
+    if volume != crate::disk::RUSTFS_META_BUCKET {
+        return;
+    }
+    if !is_non_authority_meta_bucket_path(path) {
+        bump_local_meta_mutation_gen();
+    }
+}
+
+fn is_non_authority_meta_bucket_path(path: &str) -> bool {
+    let trimmed = path.trim_matches('/');
+    if trimmed.is_empty() {
+        return false;
+    }
+    let normalized = match trimmed.rsplit_once('/') {
+        Some((prefix, tail)) if !prefix.is_empty() && Uuid::parse_str(tail).is_ok() => prefix,
+        _ => trimmed,
+    };
+    if normalized == crate::disk::UNCLEAN_SHUTDOWN_MARKER_PATH {
+        return true;
+    }
+    let Some(rest) = normalized
+        .strip_prefix(crate::disk::BUCKET_META_PREFIX)
+        .and_then(|rest| rest.strip_prefix('/'))
+    else {
+        return false;
+    };
+    if rest.is_empty() {
+        return false;
+    }
+    match rest.split_once('/') {
+        None => {
+            let base = rest.strip_suffix(".bkp").unwrap_or(rest);
+            base == crate::data_usage::DATA_USAGE_CACHE_NAME
+                || matches!(
+                    rest,
+                    ".usage.v2.json"
+                        | ".usage.v2.json.bkp"
+                        | ".usage.v2.json.recovery-pending.json"
+                        | ".usage.observed.json"
+                        | ".usage.json"
+                        | ".usage.json.bkp"
+                        | ".bloomcycle.bin"
+                        | ".compression.json"
+                        | ".background-heal.json"
+                )
+        }
+        Some((bucket, name)) => {
+            !bucket.is_empty()
+                && !bucket.contains('/')
+                && bucket != "."
+                && bucket != ".."
+                && !name.contains('/')
+                && name.strip_suffix(".bkp").unwrap_or(name) == crate::data_usage::DATA_USAGE_CACHE_NAME
+        }
+    }
+}
+
 pub(crate) fn current_local_meta_mutation_gen() -> u64 {
     LOCAL_META_MUTATION_GEN.load(std::sync::atomic::Ordering::Acquire)
 }
@@ -2130,6 +2203,20 @@ pub struct BucketMetadataSys {
     /// then the metadata map. It is only ever taken as the first of those, so
     /// it cannot invert against a path that already holds one of the others.
     lazy_load_locks: Arc<MetadataPublishLockRegistry>,
+    /// Deduplicates concurrent cold-cache loads in
+    /// [`Self::read_authoritative_metadata_from_disk_under_guard`] when
+    /// `can_use_local_authority_cache` is true.
+    ///
+    /// Lock order: caller's bucket lifecycle / metadata-transaction guard ->
+    /// `authority_load_locks` -> disk reads. Separate from `lazy_load_locks`
+    /// (which is acquired before the bucket namespace lock); holders of
+    /// `authority_load_locks` never acquire `lazy_load_locks`,
+    /// `metadata_publish_locks`, or `metadata_map`. If the leader errors or the
+    /// generation moves during the load, queued followers serialize and retry
+    /// under their own held guard.
+    authority_load_locks: Arc<MetadataPublishLockRegistry>,
+    #[cfg(test)]
+    authority_disk_loads: Arc<std::sync::atomic::AtomicUsize>,
     #[cfg(test)]
     lazy_load_lock_probe: Arc<std::sync::atomic::AtomicBool>,
     /// Counts disk loads taken by the lazy `get_config` path, so a test can
@@ -2164,6 +2251,11 @@ impl BucketMetadataSys {
             lazy_load_locks: Arc::new(MetadataPublishLockRegistry {
                 locks: StdMutex::new(HashMap::new()),
             }),
+            authority_load_locks: Arc::new(MetadataPublishLockRegistry {
+                locks: StdMutex::new(HashMap::new()),
+            }),
+            #[cfg(test)]
+            authority_disk_loads: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             #[cfg(test)]
             lazy_load_lock_probe: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             #[cfg(test)]
@@ -2248,6 +2340,7 @@ impl BucketMetadataSys {
         .await?;
         self.publish_if_unchanged(bucket, expected.as_ref(), metadata, persisted, &guard)
             .await
+            .map(|_| ())
     }
 
     #[cfg(test)]
@@ -2284,6 +2377,12 @@ impl BucketMetadataSys {
     /// [`Self::lazy_load_locks`].
     fn lazy_load_lock(&self, bucket: &str) -> Arc<Mutex<MetadataPublishLockState>> {
         Self::bucket_lock_in(&self.lazy_load_locks, bucket)
+    }
+
+    /// Per-bucket gate for cold `local_authority_cache` loads. See
+    /// [`Self::authority_load_locks`].
+    fn authority_load_lock(&self, bucket: &str) -> Arc<Mutex<MetadataPublishLockState>> {
+        Self::bucket_lock_in(&self.authority_load_locks, bucket)
     }
 
     fn bucket_lock_in(registry: &Arc<MetadataPublishLockRegistry>, bucket: &str) -> Arc<Mutex<MetadataPublishLockState>> {
@@ -2545,7 +2644,7 @@ impl BucketMetadataSys {
         metadata: BucketMetadata,
         persisted: bool,
         namespace_guard: &rustfs_lock::NamespaceLockGuard,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         self.revoke_pending_bucket_creation(bucket).await;
         if !persisted {
             let _publish_guard = self
@@ -2558,7 +2657,7 @@ impl BucketMetadataSys {
                 _ => false,
             };
             if !unchanged {
-                return Ok(());
+                return Ok(false);
             }
             let removed = map.remove(bucket).is_some();
             drop(map);
@@ -2569,7 +2668,7 @@ impl BucketMetadataSys {
                 clear_bucket_overrides(bucket);
                 clear_on_demand_migration(bucket);
             }
-            return Ok(());
+            return Ok(true);
         }
         let _publish_guard = self
             .lock_metadata_publish(bucket, namespace_guard, "refreshed bucket metadata publish")
@@ -2582,7 +2681,7 @@ impl BucketMetadataSys {
             _ => false,
         };
         if !unchanged {
-            return Ok(());
+            return Ok(false);
         }
         map.insert(bucket.to_string(), Arc::clone(&metadata));
         drop(map);
@@ -2591,7 +2690,7 @@ impl BucketMetadataSys {
         sync_bucket_target_sys(bucket, &metadata).await;
         sync_bucket_overrides(bucket, &metadata);
         sync_on_demand_migration(bucket, &metadata);
-        Ok(())
+        Ok(true)
     }
 
     pub async fn get(&self, bucket: &str) -> Result<Arc<BucketMetadata>> {
@@ -2605,6 +2704,10 @@ impl BucketMetadataSys {
         } else {
             Err(Error::ConfigNotFound)
         }
+    }
+
+    pub(crate) async fn cached_metadata(&self) -> Vec<Arc<BucketMetadata>> {
+        self.metadata_map.read().await.values().cloned().collect()
     }
 
     pub async fn set(&self, bucket: String, bm: Arc<BucketMetadata>) {
@@ -2871,25 +2974,35 @@ impl BucketMetadataSys {
         namespace_guard: &rustfs_lock::NamespaceLockGuard,
     ) -> Result<()> {
         self.revoke_pending_bucket_creation(bucket).await;
-        let expected = self.metadata_map.read().await.get(bucket).cloned();
         if !self
             .bucket_exists(bucket, namespace_guard, "peer bucket metadata existence check")
             .await?
         {
             return Err(Error::other(PEER_METADATA_NOT_PERSISTED));
         }
-        let (metadata, persisted) = await_bucket_namespace_operation(
-            Some(namespace_guard),
-            bucket,
-            "peer bucket metadata load",
-            load_bucket_metadata_parse_with_presence(self.object_store(), bucket, true),
-        )
-        .await?;
-        if !persisted {
-            return Err(Error::other(PEER_METADATA_NOT_PERSISTED));
+        // A concurrent publication can reject the snapshot we read. Re-read
+        // from storage so a newer committed config does not lose its reload to
+        // an older one that happened to publish first.
+        for _ in 0..3 {
+            let expected = self.metadata_map.read().await.get(bucket).cloned();
+            let (metadata, persisted) = await_bucket_namespace_operation(
+                Some(namespace_guard),
+                bucket,
+                "peer bucket metadata load",
+                load_bucket_metadata_parse_with_presence(self.object_store(), bucket, true),
+            )
+            .await?;
+            if !persisted {
+                return Err(Error::other(PEER_METADATA_NOT_PERSISTED));
+            }
+            if self
+                .publish_if_unchanged(bucket, expected.as_ref(), metadata, true, namespace_guard)
+                .await?
+            {
+                return Ok(());
+            }
         }
-        self.publish_if_unchanged(bucket, expected.as_ref(), metadata, true, namespace_guard)
-            .await
+        Err(Error::other("bucket metadata changed repeatedly during peer reload"))
     }
 
     pub async fn get_config(&self, bucket: &str) -> Result<(Arc<BucketMetadata>, bool)> {
@@ -3466,7 +3579,7 @@ impl BucketMetadataSys {
 
         let store = self.object_store();
         let can_use_local_authority_cache = !store.ctx.lock_manager().is_disabled() && store.all_disks_local_and_online();
-        let gen_before = current_local_meta_mutation_gen();
+        let mut gen_before = current_local_meta_mutation_gen();
         let cached_authority = can_use_local_authority_cache
             .then(|| {
                 self.local_authority_cache
@@ -3490,6 +3603,43 @@ impl BucketMetadataSys {
             }
         }
 
+        let _load_guard = if can_use_local_authority_cache {
+            let load_lock = self.authority_load_lock(bucket);
+            let acquired = Box::pin(await_bucket_namespace_operation(
+                Some(guard),
+                bucket,
+                "bucket metadata authoritative snapshot",
+                async { Ok(load_lock.lock_owned().await) },
+            ))
+            .await?;
+            gen_before = current_local_meta_mutation_gen();
+            let cached_after_lock = self
+                .local_authority_cache
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .get(bucket)
+                .filter(|(cached_gen, _)| *cached_gen == gen_before)
+                .map(|(_, bm)| Arc::clone(bm));
+            if let Some(cached) = cached_after_lock {
+                await_bucket_namespace_operation(
+                    Some(guard),
+                    bucket,
+                    "bucket metadata authoritative snapshot",
+                    std::future::ready(Ok::<_, Error>(())),
+                )
+                .await?;
+                if current_local_meta_mutation_gen() == gen_before && store.all_disks_local_and_online() {
+                    return Ok(BucketMetadataAuthority::Authoritative(cached));
+                }
+            }
+            Some(acquired)
+        } else {
+            None
+        };
+
+        #[cfg(test)]
+        self.authority_disk_loads.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
         let (bucket_info_res, metadata_res) = tokio::join!(
             Box::pin(await_bucket_namespace_operation(
                 Some(guard),
@@ -3508,7 +3658,7 @@ impl BucketMetadataSys {
                 Some(guard),
                 bucket,
                 "bucket metadata authoritative snapshot",
-                load_bucket_metadata_parse_with_presence(Arc::clone(&store), bucket, true),
+                load_bucket_metadata_parse_with_presence(Arc::clone(&store), bucket, false),
             )),
         );
         match bucket_info_res {
@@ -3517,11 +3667,12 @@ impl BucketMetadataSys {
             Err(err) => return Err(err),
         }
 
-        let (metadata, persisted) = metadata_res?;
+        let (mut metadata, persisted) = metadata_res?;
         if persisted && metadata.lock_enabled && !metadata.bucket_creation_committed {
             return Err(Error::ErasureWriteQuorum);
         }
         if persisted {
+            metadata.parse_admission_configs();
             let metadata = Arc::new(metadata);
             if can_use_local_authority_cache
                 && metadata.bucket_incarnation_sidecar
@@ -5754,6 +5905,64 @@ mod tests {
         assert_eq!(tags.tag_set.len(), WRITERS, "every concurrent rewrite must survive: {tags:?}");
     }
 
+    #[tokio::test]
+    async fn notification_snapshots_follow_periodic_refresh_after_lost_peer_signals() {
+        let (dirs, store) = isolated_store_over_temp_disks().await;
+        let writer = BucketMetadataSys::new(store.clone());
+        let peer = Arc::new(RwLock::new(BucketMetadataSys::new(store.clone())));
+        let bucket = "notification-periodic-snapshots";
+        for dir in &dirs {
+            std::fs::create_dir_all(dir.path().join(bucket)).expect("create empty fixture bucket");
+        }
+        let mut original = BucketMetadata::new(bucket);
+        original.notification_config_xml = concat!(
+            "<NotificationConfiguration><QueueConfiguration><Event>s3:ObjectCreated:Put</Event>",
+            "<Queue>arn:rustfs:sqs:us-east-1:inert:webhook</Queue></QueueConfiguration></NotificationConfiguration>"
+        )
+        .as_bytes()
+        .to_vec();
+        original.parse_all_configs().expect("parse inert subscription");
+        writer
+            .persist_new_and_set(original)
+            .await
+            .expect("persist initial subscription");
+        peer.read().await.reload_from_store(bucket).await.expect("prime peer cache");
+        let old = peer.read().await.get(bucket).await.expect("cached original snapshot");
+
+        let mut removed = (*old).clone();
+        removed.notification_config_xml = b"<NotificationConfiguration/>".to_vec();
+        removed.parse_all_configs().expect("parse removed subscription");
+        writer
+            .persist_new_and_set(removed)
+            .await
+            .expect("persist removal without peer callback");
+        assert!(Arc::ptr_eq(&old, &peer.read().await.get(bucket).await.expect("peer remains stale")));
+
+        // Exercise the timer's actual one-pass entry point, not the peer RPC.
+        refresh_buckets_metadata_once(peer.clone()).await;
+        let snapshots = peer.read().await.cached_metadata().await;
+        assert_eq!(snapshots.len(), 1);
+        assert!(!Arc::ptr_eq(&old, &snapshots[0]));
+        assert_eq!(old.bucket_incarnation_id, snapshots[0].bucket_incarnation_id);
+        assert_eq!(snapshots[0].notification_config_xml, b"<NotificationConfiguration/>");
+        assert!(
+            snapshots[0]
+                .notification_config
+                .as_ref()
+                .expect("parsed removal")
+                .behavior()
+                .queue_routes
+                .is_empty()
+        );
+
+        for dir in &dirs {
+            std::fs::remove_dir(dir.path().join(bucket)).expect("remove empty fixture bucket without peer callback");
+        }
+        refresh_buckets_metadata_once(peer.clone()).await;
+        assert!(peer.read().await.cached_metadata().await.is_empty());
+        assert!(peer.read().await.get(bucket).await.is_err());
+    }
+
     /// Pins the peer reload-notification contract (`reload_from_store`, the
     /// LoadBucketMetadata RPC path): only metadata actually read from
     /// persisted storage enters the cache. A load miss errors out and leaves
@@ -6912,5 +7121,166 @@ mod tests {
         .expect("cancelled refresh wait should not sleep until the interval");
 
         assert!(!should_refresh);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn concurrent_authoritative_metadata_loads_singleflight_and_survive_usage_cache_writes() {
+        use std::sync::atomic::Ordering;
+
+        const CHILD: &str = "RUSTFS_TEST_AUTHORITY_SINGLEFLIGHT_CHILD";
+        const TEST: &str =
+            "bucket::metadata_sys::tests::concurrent_authoritative_metadata_loads_singleflight_and_survive_usage_cache_writes";
+
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().expect("test executable"))
+                .args(["--exact", TEST, "--nocapture", "--test-threads=1"])
+                .env(CHILD, "1")
+                .output()
+                .expect("authority singleflight subprocess");
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(output.status.success(), "authority singleflight child failed: {stdout}{stderr}");
+            assert!(
+                stdout.contains("AUTHORITY_SINGLEFLIGHT_OK"),
+                "authority singleflight child must execute all assertions: {stdout}"
+            );
+            return;
+        }
+
+        let (dirs, ecstore) = isolated_store_over_temp_disks().await;
+        init_bucket_metadata_sys(ecstore.clone(), Vec::new()).await;
+        let sys_lock = bucket_metadata_sys_of(&ecstore.ctx).expect("initialized bucket_metadata_sys");
+        let sys = Arc::new(sys_lock.read().await.clone());
+        let bucket = "authority-singleflight-bucket";
+        for dir in &dirs {
+            std::fs::create_dir_all(dir.path().join(bucket)).expect("bucket volume should exist");
+        }
+        sys.persist_new_and_set(BucketMetadata::new(bucket))
+            .await
+            .expect("persist committed bucket metadata and incarnation sidecar");
+        sys.local_authority_cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clear();
+        sys.authority_disk_loads.store(0, Ordering::Relaxed);
+
+        // Hold one leader lock so all 16 waiters queue behind authority_load_lock after missing the cold cache.
+        let held_load_lock = sys.authority_load_lock(bucket);
+        let held_load_guard = held_load_lock.lock_owned().await;
+        let gen_before_burst = current_local_meta_mutation_gen();
+
+        let waiters = 16;
+        let mut handles = Vec::with_capacity(waiters);
+        for _ in 0..waiters {
+            let sys = Arc::clone(&sys);
+            let store = Arc::clone(&ecstore);
+            handles.push(tokio::spawn(async move {
+                let guard = acquire_bucket_metadata_transaction_read_lock_in(&store.ctx, bucket)
+                    .await
+                    .expect("transaction read lock");
+                match sys
+                    .read_authoritative_metadata_from_disk_under_guard(bucket, &guard)
+                    .await
+                    .expect("authoritative read")
+                {
+                    BucketMetadataAuthority::Authoritative(bm) => bm,
+                    _ => panic!("expected Authoritative metadata"),
+                }
+            }));
+        }
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        drop(held_load_guard);
+
+        let mut results = Vec::with_capacity(waiters);
+        for h in handles {
+            results.push(h.await.expect("waiter task joins"));
+        }
+        assert_eq!(
+            current_local_meta_mutation_gen(),
+            gen_before_burst,
+            "generation must stay stable across cold singleflight burst"
+        );
+        assert_eq!(
+            sys.authority_disk_loads.load(Ordering::Relaxed),
+            1,
+            "16 concurrent cold authority reads must collapse into 1 disk load"
+        );
+        for bm in &results[1..] {
+            assert!(Arc::ptr_eq(&results[0], bm), "followers must share the leader's Arc<BucketMetadata>");
+        }
+
+        // Verify real store config writes to non-authority .rustfs.sys paths do NOT bump LOCAL_META_MUTATION_GEN.
+        let gen_before = current_local_meta_mutation_gen();
+        crate::config::com::save_config(ecstore.clone(), "buckets/.usage-cache.bin", b"usage-snapshot".to_vec())
+            .await
+            .expect("save root usage cache");
+        crate::config::com::save_config(ecstore.clone(), "buckets/.usage-cache.bin.bkp", b"usage-snapshot-bkp".to_vec())
+            .await
+            .expect("save root usage cache bkp");
+        assert_eq!(
+            current_local_meta_mutation_gen(),
+            gen_before,
+            "real usage-cache writes must not bump LOCAL_META_MUTATION_GEN"
+        );
+
+        let tx_uuid = Uuid::new_v4();
+        for inert_path in [
+            "unclean-shutdown".to_string(),
+            "buckets/.usage-cache.bin".to_string(),
+            "buckets/.usage-cache.bin.bkp".to_string(),
+            format!("buckets/.usage-cache.bin/{tx_uuid}"),
+            format!("buckets/{bucket}/.usage-cache.bin"),
+            format!("buckets/{bucket}/.usage-cache.bin.bkp"),
+            format!("buckets/{bucket}/.usage-cache.bin.bkp/{tx_uuid}"),
+            "buckets/.usage.v2.json".to_string(),
+            "buckets/.usage.v2.json.bkp".to_string(),
+            "buckets/.usage.v2.json.recovery-pending.json".to_string(),
+            "buckets/.usage.observed.json".to_string(),
+            "buckets/.usage.json".to_string(),
+            "buckets/.usage.json.bkp".to_string(),
+            "buckets/.bloomcycle.bin".to_string(),
+            "buckets/.compression.json".to_string(),
+            "buckets/.background-heal.json".to_string(),
+        ] {
+            maybe_bump_local_meta_mutation_gen_for_path(crate::disk::RUSTFS_META_BUCKET, &inert_path);
+            assert_eq!(
+                current_local_meta_mutation_gen(),
+                gen_before,
+                "inert path {inert_path} must not invalidate local_authority_cache"
+            );
+        }
+
+        // Warm hit after inert writes still performs 0 additional disk loads.
+        let guard = acquire_bucket_metadata_transaction_read_lock_in(&ecstore.ctx, bucket)
+            .await
+            .expect("transaction read lock");
+        let _ = sys
+            .read_authoritative_metadata_from_disk_under_guard(bucket, &guard)
+            .await
+            .expect("warm cached read");
+        assert_eq!(sys.authority_disk_loads.load(Ordering::Relaxed), 1);
+
+        // Negative controls: authority paths and suffix-bearing bucket names MUST bump LOCAL_META_MUTATION_GEN.
+        for authority_path in [
+            format!("buckets/{bucket}/.metadata.bin"),
+            format!("buckets/{bucket}/.bucket-incarnation"),
+            format!("buckets/{bucket}/.metadata.bin/{tx_uuid}"),
+            "buckets/tenant.usage-cache.bin".to_string(),
+            format!("buckets/tenant.usage-cache.bin/{tx_uuid}"),
+            format!("buckets/{bucket}"),
+            "buckets".to_string(),
+            "format.json".to_string(),
+        ] {
+            let before = current_local_meta_mutation_gen();
+            maybe_bump_local_meta_mutation_gen_for_path(crate::disk::RUSTFS_META_BUCKET, &authority_path);
+            assert_eq!(
+                current_local_meta_mutation_gen(),
+                before + 1,
+                "authority path {authority_path} must bump LOCAL_META_MUTATION_GEN"
+            );
+        }
+
+        println!("AUTHORITY_SINGLEFLIGHT_OK");
     }
 }

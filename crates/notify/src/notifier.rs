@@ -15,6 +15,7 @@
 use crate::error::NotificationError;
 use crate::{event::Event, integration::NotificationMetrics, rule_engine::NotifyRuleEngine};
 use rustfs_config::notify::{DEFAULT_NOTIFY_SEND_CONCURRENCY, ENV_NOTIFY_SEND_CONCURRENCY};
+use rustfs_s3_types::EventName;
 use rustfs_targets::Target;
 use rustfs_targets::arn::TargetID;
 use rustfs_targets::target::EntityTarget;
@@ -33,6 +34,7 @@ const EVENT_NOTIFY_DISPATCH_FAILED: &str = "notify_dispatch_failed";
 const EVENT_NOTIFY_DISPATCH_STARTED: &str = "notify_dispatch_started";
 const EVENT_NOTIFY_DISPATCH_COMPLETED: &str = "notify_dispatch_completed";
 const EVENT_NOTIFY_RUNTIME_LIFECYCLE: &str = "notify_runtime_lifecycle";
+const MAX_BUCKET_RULE_REFRESH_ATTEMPTS: usize = 3;
 
 async fn wait_for_dispatch_tasks(handles: Vec<JoinHandle<()>>) {
     for handle in handles {
@@ -245,7 +247,28 @@ impl EventNotifier {
         let object_key = &event.s3.object.key;
         let event_name = event.event_name;
 
-        let target_ids = self.rule_engine.match_targets(bucket_name, event_name, object_key).await;
+        let target_ids = match &event.bucket_removed_targets {
+            Some(targets) if event_name == EventName::BucketRemoved => targets.clone(),
+            _ => {
+                let mut refresh_attempts = 0;
+                let mut reload_succeeded = false;
+                loop {
+                    let targets = self
+                        .rule_engine
+                        .match_bucket_targets(bucket_name, event.bucket_incarnation_id, event_name, object_key)
+                        .await;
+                    if !targets.is_empty() {
+                        break targets;
+                    }
+                    let Some(id) = event.bucket_incarnation_id else { break targets };
+                    if reload_succeeded || refresh_attempts >= MAX_BUCKET_RULE_REFRESH_ATTEMPTS {
+                        break targets;
+                    }
+                    refresh_attempts += 1;
+                    reload_succeeded = self.rule_engine.refresh_incarnation(bucket_name, id).await;
+                }
+            }
+        };
         if target_ids.is_empty() {
             debug!(
                 event = EVENT_NOTIFY_DISPATCH_SKIPPED,
@@ -262,6 +285,16 @@ impl EventNotifier {
         let target_ids_len = target_ids.len();
         let mut deferred_handles = Vec::new();
         let mut direct_handles = Vec::new();
+
+        // The entity carries only event-level fields and every target reads it
+        // without mutation, so build it once and share it across the matched
+        // targets instead of cloning the whole event per target.
+        let entity_target: Arc<EntityTarget<Event>> = Arc::new(EntityTarget {
+            object_name: object_key.to_string(),
+            bucket_name: bucket_name.to_string(),
+            event_name,
+            data: event.as_ref().clone(),
+        });
 
         // A lifecycle writer holds this gate only while handing queue-store
         // ownership from one runtime generation to the next. Taking the read
@@ -286,12 +319,15 @@ impl EventNotifier {
                 // Clone an Arc<Box<dyn Target>> (which is where target_list is stored) to move into an asynchronous task
                 // target_arc is already Arc, clone it for the async task
                 let target_for_task = target_arc.clone();
+                // Resolve the identifier once: `name()`/`id()` each clone the
+                // two Strings inside `TargetID`, and this runs per target per event.
+                let target_id = target_for_task.id();
                 if !target_for_task.is_enabled() {
                     debug!(
                         event = EVENT_NOTIFY_DISPATCH_SKIPPED,
                         component = LOG_COMPONENT_NOTIFY,
                         subsystem = LOG_SUBSYSTEM_DISPATCH,
-                        target_id = %target_for_task.id(),
+                        target_id = %target_id,
                         reason = "target_disabled",
                         "Skipped notify dispatch target"
                     );
@@ -307,24 +343,15 @@ impl EventNotifier {
                     self.send_limiter.clone()
                 };
                 let metrics = self.metrics.clone();
-                let event_clone = event.clone();
-                let target_name_for_task = target_for_task.name(); // Get the name before generating the task
                 debug!(
                     event = EVENT_NOTIFY_DISPATCH_STARTED,
                     component = LOG_COMPONENT_NOTIFY,
                     subsystem = LOG_SUBSYSTEM_DISPATCH,
-                    target_id = %target_for_task.id(),
+                    target_id = %target_id,
                     deferred = is_deferred,
                     "notify dispatch"
                 );
-                // Use cloned data in closures to avoid borrowing conflicts
-                // Create an EntityTarget from the event
-                let entity_target: Arc<EntityTarget<Event>> = Arc::new(EntityTarget {
-                    object_name: object_key.to_string(),
-                    bucket_name: bucket_name.to_string(),
-                    event_name,
-                    data: event_clone.as_ref().clone(),
-                });
+                let entity_target = Arc::clone(&entity_target);
                 let handle = tokio::spawn(async move {
                     let _direct_dispatch_lease = direct_dispatch_lease;
                     let _deferred_dispatch_guard = deferred_dispatch_guard;
@@ -339,7 +366,7 @@ impl EventNotifier {
                                     event = EVENT_NOTIFY_DISPATCH_SKIPPED,
                                     component = LOG_COMPONENT_NOTIFY,
                                     subsystem = LOG_SUBSYSTEM_DISPATCH,
-                                    target_id = %target_name_for_task,
+                                    target_id = %target_id,
                                     reason = "runtime_generation_replaced",
                                     "Skipped pending direct notify dispatch"
                                 );
@@ -357,7 +384,7 @@ impl EventNotifier {
                                 event = EVENT_NOTIFY_DISPATCH_FAILED,
                                 component = LOG_COMPONENT_NOTIFY,
                                 subsystem = LOG_SUBSYSTEM_DISPATCH,
-                                target_id = %target_name_for_task,
+                                target_id = %target_id,
                                 error = %e,
                                 reason = "permit_acquire_failed",
                                 "Failed to acquire notify dispatch permit"
@@ -366,13 +393,13 @@ impl EventNotifier {
                             return;
                         }
                     };
-                    if let Err(e) = target_for_task.save(entity_target.clone()).await {
+                    if let Err(e) = target_for_task.save(entity_target).await {
                         metrics.increment_failed();
                         error!(
                             event = EVENT_NOTIFY_DISPATCH_FAILED,
                             component = LOG_COMPONENT_NOTIFY,
                             subsystem = LOG_SUBSYSTEM_DISPATCH,
-                            target_id = %target_name_for_task,
+                            target_id = %target_id,
                             error = %e,
                             reason = "send_failed",
                             "Failed to dispatch notify event"
@@ -396,7 +423,7 @@ impl EventNotifier {
                             event = EVENT_NOTIFY_DISPATCH_COMPLETED,
                             component = LOG_COMPONENT_NOTIFY,
                             subsystem = LOG_SUBSYSTEM_DISPATCH,
-                            target_id = %target_name_for_task,
+                            target_id = %target_id,
                             deferred = is_deferred,
                             "notify dispatch"
                         );
@@ -1108,6 +1135,53 @@ mod tests {
 
         assert_eq!(enabled_target.save_call_count(), 1);
         assert_eq!(disabled_target.save_call_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn bucket_removal_targets_survive_withdrawal_without_routing_recreated_objects() {
+        let engine = NotifyRuleEngine::new();
+        let notifier = EventNotifier::new(Arc::new(NotificationMetrics::new()), engine.clone());
+        let target = MockTarget::new("removed-bucket", "webhook");
+        let old_id = uuid::Uuid::new_v4();
+        let new_id = uuid::Uuid::new_v4();
+        let mut rules = RulesMap::new();
+        rules.add_rule_config(
+            &[EventName::BucketRemoved, EventName::ObjectCreatedPut],
+            "*".to_owned(),
+            target.target_id(),
+        );
+        engine.publish_bucket_rules("bucket", Some(old_id), rules).await;
+        notifier
+            .target_list()
+            .write()
+            .await
+            .add(Arc::new(target.clone()))
+            .expect("register target");
+
+        let mut metadata = crate::storage_api::bucket_metadata::BucketMetadata::new("bucket");
+        metadata.bucket_incarnation_id = old_id;
+        metadata.notification_config_xml = b"<NotificationConfiguration><QueueConfiguration><Queue>arn:rustfs:sqs:us-east-1:removed-bucket:webhook</Queue><Event>s3:BucketRemoved:*</Event></QueueConfiguration></NotificationConfiguration>".to_vec();
+        metadata.notification_config = Some(
+            crate::storage_api::bucket_metadata::deserialize_bucket_config(&metadata.notification_config_xml)
+                .expect("parse removal subscription"),
+        );
+        let targets = crate::bucket_removed_targets_from_metadata(&metadata);
+        assert!(targets.contains(&target.target_id()));
+        engine.withdraw_bucket_rules("bucket").await;
+
+        let mut removed = Event::new_test_event("bucket", "", EventName::BucketRemoved);
+        removed.bucket_incarnation_id = Some(old_id);
+        removed.bucket_removed_targets = Some(targets);
+        let encoded = serde_json::to_value(&removed).expect("serialize webhook event");
+        assert!(encoded.get("bucketIncarnationId").is_none());
+        assert!(encoded.get("bucketRemovedTargets").is_none());
+        notifier.send(Arc::new(removed)).await;
+        assert_eq!(target.save_call_count(), 1, "the deleted bucket earns its final removal event");
+
+        let mut created = Event::new_test_event("bucket", "fresh.txt", EventName::ObjectCreatedPut);
+        created.bucket_incarnation_id = Some(new_id);
+        notifier.send(Arc::new(created)).await;
+        assert_eq!(target.save_call_count(), 1, "the new bucket has no subscription");
     }
 
     #[tokio::test]

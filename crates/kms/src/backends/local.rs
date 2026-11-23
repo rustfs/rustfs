@@ -35,7 +35,7 @@ use aes_gcm::{
 use argon2::{Algorithm, Argon2, Params, Version};
 use async_trait::async_trait;
 use base64_simd::STANDARD as BASE64;
-use jiff::Zoned;
+use jiff::ZonedDateTime;
 use rand::RngExt;
 use serde::de::{self, IgnoredAny, MapAccess, Visitor};
 use serde::{Deserialize, Serialize};
@@ -582,14 +582,14 @@ struct StoredMasterKey {
     description: Option<String>,
     metadata: HashMap<String, String>,
     #[serde(with = "crate::time_serde::zoned")]
-    created_at: Zoned,
+    created_at: ZonedDateTime,
     #[serde(with = "crate::time_serde::option_zoned")]
-    rotated_at: Option<Zoned>,
+    rotated_at: Option<ZonedDateTime>,
     created_by: Option<String>,
     /// Scheduled deletion deadline; absent on records written before deadline
     /// persistence landed, so it must stay optional for backward compatibility.
     #[serde(default, with = "crate::time_serde::option_zoned")]
-    deletion_date: Option<Zoned>,
+    deletion_date: Option<ZonedDateTime>,
     /// Encrypted key material (32 bytes encoded in base64 for AES-256)
     encrypted_key_material: String,
     /// Nonce used for encryption
@@ -685,10 +685,10 @@ impl<'de> Deserialize<'de> for StoredMasterKey {
         }
 
         #[derive(Deserialize)]
-        struct ZonedValue(#[serde(with = "crate::time_serde::zoned")] Zoned);
+        struct ZonedValue(#[serde(with = "crate::time_serde::zoned")] ZonedDateTime);
 
         #[derive(Deserialize)]
-        struct OptionalZonedValue(#[serde(with = "crate::time_serde::option_zoned")] Option<Zoned>);
+        struct OptionalZonedValue(#[serde(with = "crate::time_serde::option_zoned")] Option<ZonedDateTime>);
 
         struct StoredMasterKeyVisitor;
 
@@ -1556,7 +1556,7 @@ impl LocalKmsClient {
             encrypted_key,
             nonce,
             encryption_context: request.encryption_context.clone(),
-            created_at: Zoned::now(),
+            created_at: ZonedDateTime::now(),
             master_key_version: None,
             context_binding,
         };
@@ -1596,7 +1596,7 @@ impl LocalKmsClient {
             encrypted_key,
             nonce,
             encryption_context: request.encryption_context.clone(),
-            created_at: Zoned::now(),
+            created_at: ZonedDateTime::now(),
             // Local rotation is rejected, so the key has a single material version.
             master_key_version: None,
             context_binding,
@@ -1860,7 +1860,7 @@ impl LocalKmsClient {
         let mut master_key = self.load_master_key(key_id).await?;
         ensure_key_status_permits(key_id, &master_key.status, StateGatedOperation::ScheduleDeletion)?;
         master_key.status = KeyStatus::PendingDeletion;
-        master_key.deletion_date = Some(Zoned::now() + Duration::from_secs(pending_window_days as u64 * 86400));
+        master_key.deletion_date = Some(ZonedDateTime::now() + Duration::from_secs(pending_window_days as u64 * 86400));
 
         // Preserve the existing key material (see enable_key): scheduling deletion must not
         // regenerate the master key, or cancelling the deletion later would recover a key that
@@ -1985,7 +1985,7 @@ impl KmsBackend for LocalKmsBackend {
             key_state: KeyState::Enabled,
             key_usage: request.key_usage,
             description: request.description,
-            creation_date: Zoned::now(),
+            creation_date: ZonedDateTime::now(),
             deletion_date: None,
             origin: "KMS".to_string(),
             key_manager: "CUSTOMER".to_string(),
@@ -2113,7 +2113,7 @@ impl KmsBackend for LocalKmsBackend {
                 Ok((_stored, key_material)) => {
                     let mut tombstone = master_key.clone();
                     tombstone.status = KeyStatus::Deleted;
-                    tombstone.deletion_date = Some(Zoned::now());
+                    tombstone.deletion_date = Some(ZonedDateTime::now());
                     self.client.save_master_key(&tombstone, &key_material).await?;
                 }
                 Err(error) => {
@@ -2136,7 +2136,7 @@ impl KmsBackend for LocalKmsBackend {
                 key_usage: master_key.usage,
                 key_state: KeyState::PendingDeletion, // AWS KMS compatibility
                 creation_date: master_key.created_at,
-                deletion_date: Some(Zoned::now()),
+                deletion_date: Some(ZonedDateTime::now()),
                 key_manager: "CUSTOMER".to_string(),
                 origin: "AWS_KMS".to_string(),
                 tags: master_key.metadata,
@@ -2162,7 +2162,7 @@ impl KmsBackend for LocalKmsBackend {
                 )));
             }
 
-            let deletion_date = Zoned::now() + Duration::from_secs(days as u64 * 86400);
+            let deletion_date = ZonedDateTime::now() + Duration::from_secs(days as u64 * 86400);
             master_key.status = KeyStatus::PendingDeletion;
             master_key.deletion_date = Some(deletion_date.clone());
 
@@ -2317,7 +2317,7 @@ impl KmsBackend for LocalKmsBackend {
             .with_update_key_metadata(true)
     }
 
-    async fn remove_expired_key(&self, key_id: &str, now: &Zoned) -> Result<ExpiredKeyRemoval> {
+    async fn remove_expired_key(&self, key_id: &str, now: &ZonedDateTime) -> Result<ExpiredKeyRemoval> {
         // The per-key write lock serializes this against a concurrent
         // cancellation, closing the check-then-remove race.
         let _write_guard = self.client.lock_key_for_write(key_id).await;
@@ -3088,12 +3088,12 @@ mod tests {
             description: Option<String>,
             metadata: HashMap<String, String>,
             #[serde(with = "crate::time_serde::zoned")]
-            created_at: Zoned,
+            created_at: ZonedDateTime,
             #[serde(with = "crate::time_serde::option_zoned")]
-            rotated_at: Option<Zoned>,
+            rotated_at: Option<ZonedDateTime>,
             created_by: Option<String>,
             #[serde(default, with = "crate::time_serde::option_zoned")]
-            deletion_date: Option<Zoned>,
+            deletion_date: Option<ZonedDateTime>,
             encrypted_key_material: String,
             nonce: Vec<u8>,
             #[serde(default)]
@@ -4284,7 +4284,7 @@ mod tests {
         let (_stored, key_material) = client.decode_stored_key(&key_id).await.expect("decode stored key");
         let mut tombstone = client.load_master_key(&key_id).await.expect("load key");
         tombstone.status = KeyStatus::Deleted;
-        tombstone.deletion_date = Some(Zoned::now());
+        tombstone.deletion_date = Some(ZonedDateTime::now());
         client
             .save_master_key(&tombstone, &key_material)
             .await
@@ -4292,7 +4292,7 @@ mod tests {
 
         // The sweep primitive completes the crashed removal...
         let outcome = backend
-            .remove_expired_key(&key_id, &Zoned::now())
+            .remove_expired_key(&key_id, &ZonedDateTime::now())
             .await
             .expect("tombstone completion");
         assert_eq!(outcome, crate::backends::ExpiredKeyRemoval::Removed);
@@ -4300,7 +4300,7 @@ mod tests {
 
         // ...and stays idempotent once the key is gone.
         let outcome = backend
-            .remove_expired_key(&key_id, &Zoned::now())
+            .remove_expired_key(&key_id, &ZonedDateTime::now())
             .await
             .expect("repeat removal");
         assert_eq!(outcome, crate::backends::ExpiredKeyRemoval::Removed);

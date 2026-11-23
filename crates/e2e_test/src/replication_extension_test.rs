@@ -59,7 +59,6 @@ use rustfs_madmin::{
     AddServiceAccountReq, ListServiceAccountsResp, PeerInfo, PeerSite, ReplicateAddStatus, ReplicateEditStatus,
     ReplicateRemoveStatus, SRRemoveReq, SRResyncOpStatus, SRStatusInfo, SiteReplicationInfo, SyncStatus,
 };
-use s3s::header::{X_AMZ_REPLICATION_STATUS, X_AMZ_TAGGING};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::convert::Infallible;
@@ -78,6 +77,8 @@ use tokio::task::JoinHandle;
 use tokio::task::JoinSet;
 use tokio::time::{Duration, sleep, timeout};
 
+const X_AMZ_REPLICATION_STATUS: http::HeaderName = http::HeaderName::from_static("x-amz-replication-status");
+const X_AMZ_TAGGING: http::HeaderName = http::HeaderName::from_static("x-amz-tagging");
 type TestResult = Result<(), Box<dyn Error + Send + Sync>>;
 type BacklogMetricPoints = Arc<Mutex<BTreeMap<String, BTreeMap<String, (u64, f64)>>>>;
 
@@ -464,7 +465,7 @@ pub(crate) async fn set_replication_target_with_options(
     Ok(arn)
 }
 
-async fn send_set_replication_target_request(
+pub(crate) async fn send_set_replication_target_request(
     source_env: &RustFSTestEnvironment,
     source_bucket: &str,
     update: bool,
@@ -2074,12 +2075,18 @@ fn replication_response_hold() -> (ReplicationResponseHoldRuntime, ReplicationRe
     )
 }
 
+#[derive(Clone)]
+struct ReplicationProxyGate {
+    enabled: watch::Receiver<bool>,
+    blocked_admin_commit_path: Option<&'static str>,
+}
+
 async fn forward_replication_proxy_request(
     request: Request<Incoming>,
     backend_url: &str,
     client: &reqwest::Client,
     request_count: &AtomicU64,
-    mut replication_enabled: watch::Receiver<bool>,
+    mut gate: ReplicationProxyGate,
     mut held_tagging: watch::Receiver<Option<String>>,
     mut response_hold: ReplicationResponseHoldRuntime,
 ) -> Response<Full<bytes::Bytes>> {
@@ -2090,8 +2097,8 @@ async fn forward_replication_proxy_request(
         .is_some_and(|value| value.as_bytes().eq_ignore_ascii_case(b"REPLICA"));
     if is_replication {
         request_count.fetch_add(1, Ordering::Relaxed);
-        while !*replication_enabled.borrow() {
-            if replication_enabled.changed().await.is_err() {
+        while !*gate.enabled.borrow() {
+            if gate.enabled.changed().await.is_err() {
                 return proxy_error_response("replication gate closed");
             }
         }
@@ -2116,6 +2123,12 @@ async fn forward_replication_proxy_request(
         Ok(body) => body.to_bytes(),
         Err(error) => return proxy_error_response(error),
     };
+    if gate.blocked_admin_commit_path == Some(parts.uri.path())
+        && !*gate.enabled.borrow()
+        && serde_json::from_slice::<serde_json::Value>(&body).is_ok_and(|payload| payload["phase"] == "commit")
+    {
+        return proxy_error_response("admin commit blocked by replication gate");
+    }
     let mut forwarded = client.request(parts.method, format!("{backend_url}{path_and_query}"));
     for (name, value) in &parts.headers {
         forwarded = forwarded.header(name, value);
@@ -2152,7 +2165,7 @@ async fn start_replication_counting_proxy(
     tasks: &mut JoinSet<()>,
 ) -> Result<(String, Arc<AtomicU64>, watch::Sender<bool>), Box<dyn Error + Send + Sync>> {
     let (proxy_url, request_count, replication_enabled, _held_tagging, _response_hold) =
-        start_replication_counting_proxy_with_tag_hold(backend_url, tasks).await?;
+        start_replication_counting_proxy_with_tag_hold(backend_url, tasks, None).await?;
     Ok((proxy_url, request_count, replication_enabled))
 }
 
@@ -2160,9 +2173,11 @@ async fn start_replication_counting_proxy(
 /// returned `watch::Sender<Option<String>>` holds `Some(tagging)`, replication
 /// requests whose `x-amz-tagging` equals `tagging` are parked (and still
 /// counted); all other traffic flows. Send `None` to release them.
+/// An optional admin commit path rejects its commit phase while the replication gate is closed.
 async fn start_replication_counting_proxy_with_tag_hold(
     backend_url: &str,
     tasks: &mut JoinSet<()>,
+    blocked_admin_commit_path: Option<&'static str>,
 ) -> Result<
     (
         String,
@@ -2179,6 +2194,10 @@ async fn start_replication_counting_proxy_with_tag_hold(
     let request_count = Arc::new(AtomicU64::new(0));
     let task_request_count = request_count.clone();
     let (replication_enabled, task_replication_enabled) = watch::channel(true);
+    let gate = ReplicationProxyGate {
+        enabled: task_replication_enabled,
+        blocked_admin_commit_path,
+    };
     let (held_tagging, task_held_tagging) = watch::channel(None);
     let (response_hold_runtime, response_hold) = replication_response_hold();
     tasks.spawn(async move {
@@ -2191,7 +2210,7 @@ async fn start_replication_counting_proxy_with_tag_hold(
                     let backend_url = backend_url.clone();
                     let client = client.clone();
                     let request_count = task_request_count.clone();
-                    let replication_enabled = task_replication_enabled.clone();
+                    let gate = gate.clone();
                     let held_tagging = task_held_tagging.clone();
                     let response_hold = response_hold_runtime.clone();
                     connections.spawn(async move {
@@ -2199,7 +2218,7 @@ async fn start_replication_counting_proxy_with_tag_hold(
                             let backend_url = backend_url.clone();
                             let client = client.clone();
                             let request_count = request_count.clone();
-                            let replication_enabled = replication_enabled.clone();
+                            let gate = gate.clone();
                             let held_tagging = held_tagging.clone();
                             let response_hold = response_hold.clone();
                             async move {
@@ -2209,7 +2228,7 @@ async fn start_replication_counting_proxy_with_tag_hold(
                                         &backend_url,
                                         &client,
                                         &request_count,
-                                        replication_enabled,
+                                        gate,
                                         held_tagging,
                                         response_hold,
                                     )
@@ -2249,6 +2268,309 @@ async fn site_replication_remove(
     }
 
     Ok(serde_json::from_slice(&response.bytes().await?)?)
+}
+
+async fn decommission_site_v2(
+    env: &RustFSTestEnvironment,
+    request: &rustfs_madmin::SRRemoveV2Req,
+) -> Result<rustfs_madmin::SRRemoveV2Status, Box<dyn Error + Send + Sync>> {
+    let response = signed_request(
+        http::Method::PUT,
+        &format!("{}/rustfs/admin/v3/site-replication/remove-v2", env.url),
+        &env.access_key,
+        &env.secret_key,
+        Some(serde_json::to_vec(request)?),
+        Some("application/json"),
+    )
+    .await?;
+    if response.status() != StatusCode::OK {
+        return Err(format!("decommission failed: {} {}", response.status(), response.text().await?).into());
+    }
+    Ok(response.json().await?)
+}
+
+#[tokio::test]
+async fn test_site_decommission_dead_peer_recovers_pending_remove_and_bucket_delete() -> Result<(), Box<dyn Error + Send + Sync>>
+{
+    init_logging();
+    let mut source = RustFSTestEnvironment::new().await?;
+    let mut target = RustFSTestEnvironment::new().await?;
+    let mut env = replication_fast_env();
+    env.extend_from_slice(FAST_SCANNER_ENV);
+    env.extend_from_slice(LOOPBACK_REPLICATION_TARGET_ENV);
+    source.start_rustfs_server_with_env(vec![], &env).await?;
+    target.start_rustfs_server_without_cleanup_with_env(&env).await?;
+    let added = site_replication_add(
+        &source,
+        &[
+            PeerSite {
+                name: "survivor".to_string(),
+                endpoint: source.url.clone(),
+                access_key: source.access_key.clone(),
+                secret_key: source.secret_key.clone(),
+                ..Default::default()
+            },
+            PeerSite {
+                name: "retired".to_string(),
+                endpoint: target.url.clone(),
+                access_key: target.access_key.clone(),
+                secret_key: target.secret_key.clone(),
+                ..Default::default()
+            },
+        ],
+    )
+    .await?;
+    assert!(added.success, "{added:?}");
+    let source_client = source.create_s3_client();
+    let target_client = target.create_s3_client();
+    let bucket = "decommission-pending-delete";
+    source_client.create_bucket().bucket(bucket).send().await?;
+    wait_for_bucket_on_target(&target_client, bucket).await?;
+    let version = source_client
+        .put_object()
+        .bucket(bucket)
+        .key("data")
+        .body(ByteStream::from_static(b"decommission data survives until purge"))
+        .send()
+        .await?
+        .version_id
+        .ok_or("site bucket must be versioned")?;
+    wait_for_object_on_target(&target_client, bucket, "data").await?;
+    target.stop_server();
+    source_client
+        .delete_object()
+        .bucket(bucket)
+        .key("data")
+        .version_id(&version)
+        .send()
+        .await?;
+    let blocked = source_client
+        .delete_bucket()
+        .bucket(bucket)
+        .send()
+        .await
+        .expect_err("pending version must block delete");
+    assert_eq!(blocked.code(), Some("BucketNotEmpty"));
+    let legacy = site_replication_remove(
+        &source,
+        &SRRemoveReq {
+            site_names: vec!["retired".to_string()],
+            ..Default::default()
+        },
+    )
+    .await?;
+    assert_eq!(legacy.status, "Partial");
+    assert!(site_replication_info(&source).await?.pending_operation.is_some());
+    let mut request = rustfs_madmin::SRRemoveV2Req {
+        mode: "dry-run".to_string(),
+        sites: vec!["retired".to_string()],
+        ..Default::default()
+    };
+    let preview = decommission_site_v2(&source, &request).await?;
+    assert_eq!(preview.status, "planned");
+    request.mode = "execute".to_string();
+    request.operation_id = Some(preview.operation_id.clone());
+    request.preflight_token = Some(preview.preflight_token);
+    let removed = decommission_site_v2(&source, &request).await?;
+    assert_eq!(removed.status, "success", "{removed:?}");
+    assert_site_replication_bucket_detached(&source, bucket).await?;
+    assert!(site_replication_info(&source).await?.pending_operation.is_none());
+    source.restart_server_preserving_data(vec![], &env).await?;
+    let replay = decommission_site_v2(&source, &request).await?;
+    assert_eq!(replay.status, "success");
+    assert_eq!(replay.operation_id, removed.operation_id);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(120);
+    loop {
+        match source_client.delete_bucket().bucket(bucket).send().await {
+            Ok(_) => break,
+            Err(err) if err.code() == Some("BucketNotEmpty") && tokio::time::Instant::now() < deadline => {
+                tokio::time::sleep(Duration::from_millis(250)).await;
+            }
+            Err(err) => return Err(err.into()),
+        }
+    }
+    assert!(source_client.head_bucket().bucket(bucket).send().await.is_err());
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_site_decommission_preserves_two_live_sites_and_bidirectional_replication()
+-> Result<(), Box<dyn Error + Send + Sync>> {
+    init_logging();
+    let mut a = RustFSTestEnvironment::new().await?;
+    let mut b = RustFSTestEnvironment::new().await?;
+    let mut c = RustFSTestEnvironment::new().await?;
+    let mut env = replication_fast_env();
+    env.extend_from_slice(FAST_SCANNER_ENV);
+    env.extend_from_slice(LOOPBACK_REPLICATION_TARGET_ENV);
+    a.start_rustfs_server_with_env(vec![], &env).await?;
+    b.start_rustfs_server_without_cleanup_with_env(&env).await?;
+    c.start_rustfs_server_without_cleanup_with_env(&env).await?;
+    let mut proxy_tasks = JoinSet::new();
+    let (c_proxy, _, allow_peer_removal, _, _) = start_replication_counting_proxy_with_tag_hold(
+        &c.url,
+        &mut proxy_tasks,
+        Some("/minio/admin/v3/site-replication/peer/remove-v2"),
+    )
+    .await?;
+    let added = site_replication_add(
+        &a,
+        &[
+            PeerSite {
+                name: "a".to_string(),
+                endpoint: a.url.clone(),
+                access_key: a.access_key.clone(),
+                secret_key: a.secret_key.clone(),
+                ..Default::default()
+            },
+            PeerSite {
+                name: "b".to_string(),
+                endpoint: b.url.clone(),
+                access_key: b.access_key.clone(),
+                secret_key: b.secret_key.clone(),
+                ..Default::default()
+            },
+            PeerSite {
+                name: "c".to_string(),
+                endpoint: c.url.clone(),
+                access_key: c.access_key.clone(),
+                secret_key: c.secret_key.clone(),
+                ..Default::default()
+            },
+        ],
+    )
+    .await?;
+    assert!(added.success, "{added:?}");
+    let info = wait_for_site_replication_enabled(&a, 3).await?;
+    let retired_id = info
+        .sites
+        .iter()
+        .find(|peer| peer.name == "b")
+        .ok_or("site b is missing")?
+        .deployment_id
+        .clone();
+    let mut survivor = info
+        .sites
+        .into_iter()
+        .find(|peer| peer.name == "c")
+        .ok_or("site c is missing")?;
+    let survivor_id = survivor.deployment_id.clone();
+    survivor.endpoint = c_proxy;
+    let edited = site_replication_edit(&a, "", &survivor).await?;
+    assert!(edited.success, "{edited:?}");
+    let ca = a.create_s3_client();
+    let cb = b.create_s3_client();
+    let cc = c.create_s3_client();
+    let bucket = "decommission-preserve-live-peers";
+    let operator_bucket = "decommission-operator-target";
+    cc.create_bucket().bucket(operator_bucket).send().await?;
+    enable_bucket_versioning(&c, operator_bucket).await?;
+    ca.create_bucket().bucket(bucket).send().await?;
+    wait_for_bucket_on_target(&cb, bucket).await?;
+    wait_for_bucket_on_target(&cc, bucket).await?;
+    let operator_arn = set_replication_target(&a, bucket, &c, operator_bucket).await?;
+    put_bucket_replication(&a, bucket, &operator_arn).await?;
+    ca.put_object()
+        .bucket(bucket)
+        .key("baseline")
+        .body(ByteStream::from_static(b"baseline"))
+        .send()
+        .await?;
+    wait_for_object_on_target(&cc, bucket, "baseline").await?;
+    wait_for_object_on_target(&cc, operator_bucket, "baseline").await?;
+    let retired_rule_id = format!("site-repl-{retired_id}");
+    let retired_arn = ca
+        .get_bucket_replication()
+        .bucket(bucket)
+        .send()
+        .await?
+        .replication_configuration
+        .ok_or("source bucket replication is missing")?
+        .rules
+        .into_iter()
+        .find(|rule| rule.id.as_deref() == Some(retired_rule_id.as_str()))
+        .and_then(|rule| rule.destination)
+        .ok_or("site b replication rule is missing")?
+        .bucket;
+    b.stop_server();
+    let preview_request = rustfs_madmin::SRRemoveV2Req {
+        mode: "dry-run".to_string(),
+        sites: vec!["b".to_string()],
+        ..Default::default()
+    };
+    let preview = decommission_site_v2(&a, &preview_request).await?;
+    let request = rustfs_madmin::SRRemoveV2Req {
+        mode: "execute".to_string(),
+        operation_id: Some(preview.operation_id.clone()),
+        preflight_token: Some(preview.preflight_token),
+        ..preview_request.clone()
+    };
+    allow_peer_removal.send(false)?;
+    let partial = decommission_site_v2(&a, &request).await?;
+    assert_eq!(partial.status, "Partial", "{partial:?}");
+    assert!(partial.local_cleanup_complete, "{partial:?}");
+    assert_eq!(partial.pending_peers, [survivor_id]);
+    assert!(partial.errors.iter().any(|error| error.contains("admin commit blocked")), "{partial:?}");
+    let prepared = site_replication_info(&c)
+        .await?
+        .pending_operation
+        .ok_or("site c must have prepared")?;
+    assert_eq!(prepared.id, preview.operation_id);
+    a.restart_server_preserving_data(vec![], &env).await?;
+    let restored = decommission_site_v2(&a, &preview_request).await?;
+    assert_eq!(restored.operation_id, preview.operation_id);
+    assert_eq!(restored.status, "Partial", "{restored:?}");
+    assert!(restored.local_cleanup_complete, "{restored:?}");
+    assert_eq!(restored.pending_peers, partial.pending_peers);
+    allow_peer_removal.send(true)?;
+    let result = decommission_site_v2(&a, &request).await?;
+    assert_eq!(result.status, "success", "{result:?}");
+    let ia = site_replication_info(&a).await?;
+    let ic = site_replication_info(&c).await?;
+    assert!(ia.enabled && ic.enabled);
+    assert!(ia.pending_operation.is_none() && ic.pending_operation.is_none());
+    assert_eq!(
+        ia.sites
+            .iter()
+            .map(|peer| peer.deployment_id.clone())
+            .collect::<std::collections::BTreeSet<_>>(),
+        ic.sites.iter().map(|peer| peer.deployment_id.clone()).collect()
+    );
+    assert!(!ia.sites.iter().any(|peer| peer.name == "b"));
+    let targets: Vec<serde_json::Value> = list_replication_targets_request(&a, Some(bucket))
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert!(
+        targets
+            .iter()
+            .any(|target| target["arn"] == operator_arn && target["targetbucket"] == operator_bucket),
+        "operator target {operator_arn} must survive decommission"
+    );
+    assert!(
+        !targets.iter().any(|target| target["arn"] == retired_arn),
+        "retired site target {retired_arn} must be removed"
+    );
+    ca.put_object()
+        .bucket(bucket)
+        .key("a-to-c")
+        .body(ByteStream::from_static(b"a to c survives"))
+        .send()
+        .await?;
+    assert_eq!(wait_for_object_on_target(&cc, bucket, "a-to-c").await?, b"a to c survives");
+    assert_eq!(wait_for_object_on_target(&cc, operator_bucket, "a-to-c").await?, b"a to c survives");
+    cc.put_object()
+        .bucket(bucket)
+        .key("c-to-a")
+        .body(ByteStream::from_static(b"c to a survives"))
+        .send()
+        .await?;
+    assert_eq!(wait_for_object_on_target(&ca, bucket, "c-to-a").await?, b"c to a survives");
+    c.restart_server_preserving_data(vec![], &env).await?;
+    assert!(site_replication_info(&c).await?.pending_operation.is_none());
+    assert_eq!(decommission_site_v2(&a, &request).await?.status, "success");
+    Ok(())
 }
 
 async fn site_replication_state_edit(
@@ -8221,7 +8543,7 @@ async fn test_site_replication_tagging_during_initial_pending_window_converges()
             _site_b_replication_enabled,
             _site_b_held_tagging,
             mut site_b_response_hold,
-        ) = start_replication_counting_proxy_with_tag_hold(&site_b_env.url, &mut proxy_tasks).await?;
+        ) = start_replication_counting_proxy_with_tag_hold(&site_b_env.url, &mut proxy_tasks, None).await?;
 
         let add_status = site_replication_add(
             &site_a_env,
@@ -8478,9 +8800,9 @@ async fn test_site_replication_tagging_lww_converges_active_active_real_dual_nod
 
         let mut proxy_tasks = JoinSet::new();
         let (site_a_proxy, site_a_replication_requests, _site_a_replication_enabled, site_a_held_tagging, _site_a_response_hold) =
-            start_replication_counting_proxy_with_tag_hold(&site_a_env.url, &mut proxy_tasks).await?;
+            start_replication_counting_proxy_with_tag_hold(&site_a_env.url, &mut proxy_tasks, None).await?;
         let (site_b_proxy, site_b_replication_requests, _site_b_replication_enabled, site_b_held_tagging, _site_b_response_hold) =
-            start_replication_counting_proxy_with_tag_hold(&site_b_env.url, &mut proxy_tasks).await?;
+            start_replication_counting_proxy_with_tag_hold(&site_b_env.url, &mut proxy_tasks, None).await?;
 
         let site_a_client = site_a_env.create_s3_client();
         let site_b_client = site_b_env.create_s3_client();

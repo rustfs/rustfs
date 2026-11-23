@@ -410,7 +410,7 @@ async fn enqueue_transition_after_write(
             // transition/expiry already ran for the original commit; the scanner
             // still sees the object if that commit never reached this hook.
             if !oi.multipart_completion_replayed && should_enqueue_transition_immediately(&oi) {
-                enqueue_transition_immediate(&oi, src.clone()).await;
+                enqueue_transition_immediate(&oi, src.clone(), opts.expected_bucket_incarnation_id).await;
                 // Immediate expiry needs the bucket incarnation under the
                 // metadata-transaction lock; a lockless cache PUT leaves expiry
                 // to the scanner.
@@ -469,8 +469,8 @@ pub use peer::external_rpc_disk;
 use peer::init_local_peer;
 pub use peer::{
     BootstrapLocalTarget, all_local_disk, all_local_disk_path, find_local_disk_by_ref, find_local_disk_by_ref_for_rpc,
-    get_disk_infos, init_local_disks, init_local_disks_with_instance_ctx, init_lock_clients, prewarm_local_disk_id_map,
-    prewarm_local_disk_id_map_with_instance_ctx,
+    find_local_disk_by_ref_for_scanner_rpc, get_disk_infos, init_local_disks, init_local_disks_with_instance_ctx,
+    init_lock_clients, prewarm_local_disk_id_map, prewarm_local_disk_id_map_with_instance_ctx,
 };
 
 pub struct ECStore {

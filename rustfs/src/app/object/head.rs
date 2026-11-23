@@ -21,7 +21,6 @@ use crate::app::dto_values::{stored_etag, timestamp};
 use crate::app::storage_api::s3::header::X_AMZ_RESTORE;
 use crate::app::{Answered, RequestEnvelope};
 use rustfs_gateway_types::ByteRange;
-#[cfg(feature = "gateway-stack")]
 use rustfs_gateway_types::RangeParse;
 use rustfs_gateway_types::dto as gateway_dto;
 use rustfs_s3_types::{S3Error, S3ErrorCode, S3Result, s3_error};
@@ -46,6 +45,11 @@ pub(crate) struct ResponseEtag {
 }
 
 impl ResponseEtag {
+    pub(crate) fn to_http_header(&self) -> Result<http::HeaderValue, http::header::InvalidHeaderValue> {
+        let prefix = if self.weak { "W/" } else { "" };
+        http::HeaderValue::from_str(&format!("{prefix}\"{}\"", self.opaque))
+    }
+
     pub(super) fn from_stored(value: &str) -> Self {
         let weak = value.starts_with("W/\"");
         let etag = stored_etag(value);
@@ -89,6 +93,23 @@ pub(crate) struct HeadObjectFields {
     pub(crate) sse_customer_key_md5: Option<String>,
 }
 
+impl From<gateway_dto::HeadObjectInput> for HeadObjectFields {
+    fn from(input: gateway_dto::HeadObjectInput) -> Self {
+        Self {
+            bucket: input.bucket.as_str().to_owned(),
+            key: input.key.as_str().to_owned(),
+            version_id: input.version_id,
+            part_number: input.part_number,
+            range: input.range.and_then(|range| match RangeParse::parse(range.as_str()) {
+                RangeParse::One(range) => Some(range),
+                _ => None,
+            }),
+            sse_customer_key: input.sse_customer_key.map(|key| key.expose_secret().to_owned()),
+            sse_customer_key_md5: input.sse_customer_key_md5,
+        }
+    }
+}
+
 /// Whether the caller asked for the tag set itself (`x-amz-tagging-directive: ACCESS`).
 fn tagging_directive_is_access(headers: &http::HeaderMap) -> bool {
     headers
@@ -104,10 +125,7 @@ async fn head_metadata_action_allowed(req: &RequestEnvelope, action: S3Action) -
     };
     info.suppress_denial_log = true;
     info.suppress_denial_audit = true;
-    match authorize_request(&mut probe, Action::S3Action(action))
-        .await
-        .map_err(S3Error::from)
-    {
+    match authorize_request(&mut probe, Action::S3Action(action)).await {
         Ok(()) => Ok(true),
         Err(err) if err.code() == &S3ErrorCode::AccessDenied => Ok(false),
         Err(err) => Err(err),
@@ -239,18 +257,6 @@ pub(super) async fn odm_head_from_source<S: OdmHeadSource>(
     }
 }
 
-#[cfg(test)]
-impl DefaultObjectUsecase {
-    async fn execute_head_object_from_s3s(
-        &self,
-        req: crate::app::storage_api::s3::S3Request<crate::app::storage_api::s3::dto::HeadObjectInput>,
-    ) -> crate::app::storage_api::s3::S3Result<
-        crate::app::storage_api::s3::S3Response<crate::app::storage_api::s3::dto::HeadObjectOutput>,
-    > {
-        crate::app::test_seams::head_object(self, req).await
-    }
-}
-
 impl DefaultObjectUsecase {
     /// On-demand migration HEAD passthrough (rustfs/backlog#2155): consulted
     /// only after the local lookup and the replication proxy both missed.
@@ -283,7 +289,7 @@ impl DefaultObjectUsecase {
         let expected_incarnation = match odm_read_generation(req, bucket) {
             Ok(Some(incarnation)) => incarnation,
             Ok(None) => return None,
-            Err(err) => return Some(Err(err.into())),
+            Err(err) => return Some(Err(err)),
         };
         match store.bucket_incarnation_id(bucket).await {
             Ok(current) if current == expected_incarnation => {}
@@ -450,28 +456,12 @@ impl DefaultObjectUsecase {
         Ok(response)
     }
 
-    #[cfg(feature = "gateway-stack")]
     pub(crate) async fn execute_head_object(
         &self,
         envelope: RequestEnvelope,
         input: gateway_dto::HeadObjectInput,
     ) -> S3Result<Answered<HeadObjectOutputFacts>> {
-        self.execute_head_object_fields(
-            envelope,
-            HeadObjectFields {
-                bucket: input.bucket.as_str().to_owned(),
-                key: input.key.as_str().to_owned(),
-                version_id: input.version_id,
-                part_number: input.part_number,
-                range: input.range.and_then(|range| match RangeParse::parse(range.as_str()) {
-                    RangeParse::One(range) => Some(range),
-                    _ => None,
-                }),
-                sse_customer_key: input.sse_customer_key.map(|key| key.expose_secret().to_owned()),
-                sse_customer_key_md5: input.sse_customer_key_md5,
-            },
-        )
-        .await
+        self.execute_head_object_fields(envelope, input.into()).await
     }
 
     #[instrument(level = "debug", skip(self, req, input))]
@@ -693,6 +683,7 @@ impl DefaultObjectUsecase {
         } else {
             0
         };
+        let effective_ec_block_size = info.effective_ec_block_size();
         let dto = gateway_dto::HeadObjectOutput {
             content_length: Some(content_length),
             content_type,
@@ -749,6 +740,11 @@ impl DefaultObjectUsecase {
         // Emit additional-checksum headers (XXHash3/64/128, SHA-512) that s3s cannot
         // carry on the typed HeadObjectOutput (#1257).
         inject_additional_checksum_headers(&mut response.headers, &extra_checksum_headers);
+        if let Some(block_size) = effective_ec_block_size
+            && let Ok(value) = HeaderValue::from_str(&block_size.to_string())
+        {
+            response.headers.insert(EC_BLOCK_SIZE_RESPONSE_HEADER, value);
+        }
 
         // Add x-amz-tagging-count header if object has tags
         // Per S3 API spec, this header should be present in HEAD object response when tags exist
@@ -863,13 +859,13 @@ impl DefaultObjectUsecase {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::app::storage_api::s3::dto::Range;
-    use crate::app::storage_api::s3::{S3Request, dto::HeadObjectInput};
+    use crate::app::test_seams::{head_envelope, head_object_gateway, head_object_input};
     use crate::on_demand_migration::{
         BREAKER_FAILURE_THRESHOLD, BreakerState, FilterConfig, OdmStateError, OnDemandMigrationConfig, PathStyle, PolicyConfig,
         Provider, SourceConfig, SourceCredentials, SourceErrorPolicy, TlsConfig,
     };
-    use http::Method;
+    use http::HeaderMap;
+    use rustfs_gateway_types::RangeSpec;
     use std::collections::VecDeque;
     use std::time::SystemTime;
 
@@ -1229,31 +1225,19 @@ mod tests {
         assert_eq!(err.code().as_str(), "NoSuchKey");
     }
 
-    pub(super) fn head_input(bucket: &str, key: &str, version_id: Option<String>) -> S3Request<HeadObjectInput> {
-        let input = HeadObjectInput::builder()
-            .bucket(bucket.to_string())
-            .key(key.to_string())
-            .version_id(version_id)
-            .build()
-            .unwrap();
-        build_request(input, Method::HEAD)
-    }
-
     #[test]
     #[serial_test::serial]
     fn head_response_filters_lock_and_tag_metadata_by_permission() {
         crate::app::gating_test_env::run_large_stack_test("head-metadata-permissions", || async {
             use crate::app::runtime_sources::{AppContext, ServerContextSlot};
             use crate::app::storage_api::test::ReqInfo;
-            use crate::app::storage_api::test::S3Access as _;
+            use crate::app::storage_api::test::authorize_head_object;
             use crate::app::storage_api::test::contract::bucket::{BucketOperations as _, MakeBucketOptions};
-            use crate::app::storage_api::test::ecfs::FS;
             let ambient = crate::app::gating_test_env::shared_gating_ambient().await;
             let store = crate::app::gating_test_env::shared_gating_ecstore().await;
             let context = Arc::new(AppContext::new(store.clone(), ambient.iam(), ambient.kms()));
             let slot = ServerContextSlot::new();
             assert!(slot.install(context.clone()));
-            let fs = FS::with_server_ctx(slot.clone());
             let usecase = DefaultObjectUsecase::with_context(Some(context));
             let bucket = format!("head-metadata-{}", Uuid::new_v4().simple());
             store
@@ -1309,22 +1293,25 @@ mod tests {
                     .unwrap();
                 let version_id = object.version_id.map(|version| version.to_string());
                 for (version, tagging_directive) in [(None, false), (None, true), (version_id, true)] {
-                    let mut req = head_input(&bucket, "protected", version);
+                    let mut headers = HeaderMap::new();
+                    let mut extensions = http::Extensions::new();
                     if tagging_directive {
-                        req.headers
-                            .insert(rustfs_utils::http::AMZ_TAGGING_DIRECTIVE_LOWER, HeaderValue::from_static("ACCESS"));
+                        headers.insert(rustfs_utils::http::AMZ_TAGGING_DIRECTIVE_LOWER, HeaderValue::from_static("ACCESS"));
                     }
-                    req.extensions.insert(ReqInfo::default());
-                    req.extensions.insert(slot.clone());
+                    extensions.insert(ReqInfo::default());
+                    extensions.insert(slot.clone());
                     if replica {
-                        req.headers
-                            .insert("x-rustfs-source-replication-check", HeaderValue::from_static("true"));
+                        headers.insert("x-rustfs-source-replication-check", HeaderValue::from_static("true"));
                     }
-                    fs.head_object(&mut req).await.expect("ordinary HEAD read is permitted");
-                    let response = Box::pin(crate::app::test_seams::head_object(&usecase, req))
+                    let mut envelope = head_envelope(headers, extensions);
+                    authorize_head_object(&slot, &mut envelope, &bucket, "protected", version.as_deref())
+                        .await
+                        .expect("ordinary HEAD read is permitted");
+                    let input = head_object_input(&bucket, "protected", version);
+                    let response = Box::pin(usecase.execute_head_object_fields(envelope, input.into()))
                         .await
                         .expect("HEAD succeeds");
-                    assert_eq!(response.output.content_length, Some(4));
+                    assert_eq!(response.output.dto.content_length, Some(4));
                     for header in [
                         AMZ_TAG_COUNT,
                         AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE_LOWER,
@@ -1415,35 +1402,49 @@ mod tests {
         let state = sys.state(&bucket).expect("bucket runtime installed");
 
         // Local hit: served locally, the runtime is never entered.
-        let response = Box::pin(usecase.execute_head_object_from_s3s(head_input(&bucket, "present", None)))
-            .await
-            .expect("local object is served");
-        assert_eq!(response.output.content_length, Some(7));
+        let response = Box::pin(head_object_gateway(
+            &usecase,
+            head_envelope(HeaderMap::new(), http::Extensions::new()),
+            head_object_input(&bucket, "present", None),
+        ))
+        .await
+        .expect("local object is served");
+        assert_eq!(response.output.dto.content_length, Some(7));
         assert!(response.headers.get(ON_DEMAND_MIGRATION_HEADER).is_none());
         assert_no_head_traffic(&state);
 
         // HEAD ?versionId on a missing object never consults the runtime.
-        let err =
-            Box::pin(usecase.execute_head_object_from_s3s(head_input(&bucket, "missing", Some(Uuid::new_v4().to_string()))))
-                .await
-                .expect_err("missing version");
+        let err = Box::pin(head_object_gateway(
+            &usecase,
+            head_envelope(HeaderMap::new(), http::Extensions::new()),
+            head_object_input(&bucket, "missing", Some(Uuid::new_v4().to_string())),
+        ))
+        .await
+        .expect_err("missing version");
         assert_eq!(err.code().as_str(), "NoSuchKey");
         assert_no_head_traffic(&state);
 
         // The anti-loop marker (any value) keeps the answer local.
-        let mut req = head_input(&bucket, "missing", None);
-        req.headers
-            .insert("x-minio-source-proxy-request", HeaderValue::from_static("false"));
-        let err = Box::pin(crate::app::test_seams::head_object(&usecase, req))
-            .await
-            .expect_err("missing object");
+        let mut headers = HeaderMap::new();
+        headers.insert("x-minio-source-proxy-request", HeaderValue::from_static("false"));
+        let err = Box::pin(head_object_gateway(
+            &usecase,
+            head_envelope(headers, http::Extensions::new()),
+            head_object_input(&bucket, "missing", None),
+        ))
+        .await
+        .expect_err("missing object");
         assert_eq!(err.code().as_str(), "NoSuchKey");
         assert_no_head_traffic(&state);
 
         // A plain miss reaches the runtime; local_only answers 404 there.
-        let err = Box::pin(usecase.execute_head_object_from_s3s(head_input(&bucket, "missing", None)))
-            .await
-            .expect_err("missing object");
+        let err = Box::pin(head_object_gateway(
+            &usecase,
+            head_envelope(HeaderMap::new(), http::Extensions::new()),
+            head_object_input(&bucket, "missing", None),
+        ))
+        .await
+        .expect_err("missing object");
         assert_eq!(err.code().as_str(), "NoSuchKey");
         assert_eq!(head_count(&state, OdmOutcome::Filtered), 1);
 
@@ -1459,9 +1460,13 @@ mod tests {
             )
             .await
             .expect("write delete marker");
-        let err = Box::pin(usecase.execute_head_object_from_s3s(head_input(&bucket, "present", None)))
-            .await
-            .expect_err("delete marker hides the object");
+        let err = Box::pin(head_object_gateway(
+            &usecase,
+            head_envelope(HeaderMap::new(), http::Extensions::new()),
+            head_object_input(&bucket, "present", None),
+        ))
+        .await
+        .expect_err("delete marker hides the object");
         assert_eq!(err.code().as_str(), "NoSuchKey");
         assert_eq!(
             head_count(&state, OdmOutcome::Filtered),
@@ -1476,9 +1481,13 @@ mod tests {
             Some(&cfg),
         )
         .await;
-        let err = Box::pin(usecase.execute_head_object_from_s3s(head_input(&bucket, "present", None)))
-            .await
-            .expect_err("local_only still answers 404");
+        let err = Box::pin(head_object_gateway(
+            &usecase,
+            head_envelope(HeaderMap::new(), http::Extensions::new()),
+            head_object_input(&bucket, "present", None),
+        ))
+        .await
+        .expect_err("local_only still answers 404");
         assert_eq!(err.code().as_str(), "NoSuchKey");
         assert_eq!(head_count(&state, OdmOutcome::Filtered), 2, "overridden delete marker is a miss");
 
@@ -1489,9 +1498,13 @@ mod tests {
             .await
             .expect("create plain bucket");
         assert!(sys.state(&plain).is_none());
-        let err = Box::pin(usecase.execute_head_object_from_s3s(head_input(&plain, "missing", None)))
-            .await
-            .expect_err("missing object");
+        let err = Box::pin(head_object_gateway(
+            &usecase,
+            head_envelope(HeaderMap::new(), http::Extensions::new()),
+            head_object_input(&plain, "missing", None),
+        ))
+        .await
+        .expect_err("missing object");
         assert_eq!(err.code().as_str(), "NoSuchKey");
 
         sys.remove(&bucket);
@@ -1499,20 +1512,21 @@ mod tests {
 
     #[tokio::test]
     async fn execute_head_object_rejects_range_with_part_number() {
-        let input = HeadObjectInput::builder()
-            .bucket("test-bucket".to_string())
-            .key("test-key".to_string())
-            .part_number(Some(1))
-            .range(Some(Range::Int { first: 0, last: Some(1) }))
-            .build()
-            .unwrap();
+        let input = gateway_dto::HeadObjectInput {
+            part_number: Some(1),
+            range: Some(RangeSpec::new("bytes=0-1")),
+            ..head_object_input("test-bucket", "test-key", None)
+        };
 
-        let req = build_request(input, Method::HEAD);
         let usecase = DefaultObjectUsecase::without_context();
 
-        let err = Box::pin(crate::app::test_seams::head_object(&usecase, req))
-            .await
-            .unwrap_err();
+        let err = Box::pin(head_object_gateway(
+            &usecase,
+            head_envelope(HeaderMap::new(), http::Extensions::new()),
+            input,
+        ))
+        .await
+        .unwrap_err();
         assert_eq!(err.code().as_str(), "InvalidArgument");
     }
 }

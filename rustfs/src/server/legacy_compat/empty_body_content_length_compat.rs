@@ -15,16 +15,16 @@
 //! by `server::http::external_service_stack!` (in both the external and the
 //! internode lane) and pinned there by `stack_census`.
 //!
-//! Patches: s3s wants a `Content-Length` before it validates a request, while
-//! some clients omit the header on routes whose request never carries a body.
-//! Introduced in rustfs/rustfs#2888.
-//! Replaced by: a gateway `StageFilter::on_wire` (gateway `docs/middleware.md`,
-//! "Level 2: `StageFilter`"; "The nine RustFS tower patch layers", row 5).
-//! Removed by: T2.12 (rustfs/backlog#2771).
+//! Patches: some clients omit `Content-Length` on admin and console routes whose
+//! request never carries a body, while the handlers behind them validate a
+//! length. Introduced in rustfs/rustfs#2888 for the s3s edge.
+//! The S3 half is gone: the gateway stack leaves the bodies of bodyless S3
+//! operations unread (`server::gateway_stack::tests::legacy_layers`).
+//! The admin and console halves, and the internode lane, stay until their
+//! hosts stop needing a length.
 
 use crate::admin::console::is_console_path;
 use crate::server::is_admin_path;
-use crate::server::layer::ConditionalCorsLayer;
 use http::{HeaderValue, Method, Request as HttpRequest, Response};
 use std::future::Future;
 use std::pin::Pin;
@@ -94,11 +94,7 @@ fn should_force_zero_content_length_for_empty_body_route<B>(req: &HttpRequest<B>
         return false;
     }
 
-    if is_empty_body_console_path(req.method(), req.uri()) {
-        return true;
-    }
-
-    is_empty_body_s3_path(req.method(), req.uri())
+    is_empty_body_console_path(req.method(), req.uri())
 }
 
 fn is_empty_body_admin_path(method: &Method, uri: &http::Uri) -> bool {
@@ -148,10 +144,6 @@ fn is_heal_status_query(path: &str, query: Option<&str>) -> bool {
             .map(|(key, value)| key == "clientToken" && !value.is_empty())
             .unwrap_or(false)
     })
-}
-
-fn is_empty_body_s3_path(method: &Method, uri: &http::Uri) -> bool {
-    matches!(*method, Method::GET | Method::HEAD | Method::DELETE) && ConditionalCorsLayer::is_s3_path(uri.path())
 }
 
 pub(in crate::server) fn is_empty_body_console_path(method: &Method, uri: &http::Uri) -> bool {
@@ -260,7 +252,7 @@ mod tests {
     }
 
     #[test]
-    fn s3_empty_body_get_without_content_length_is_normalized() {
+    fn s3_empty_body_get_without_content_length_is_left_to_the_gateway() {
         let paths = [
             "/?x-id=ListBuckets",
             "/",
@@ -274,21 +266,21 @@ mod tests {
             let request = Request::builder().method(Method::GET).uri(path).body(()).expect("request");
 
             assert!(
-                should_force_zero_content_length_for_empty_body_route(&request),
-                "{path} should force Content-Length: 0"
+                !should_force_zero_content_length_for_empty_body_route(&request),
+                "{path} must pass through unchanged"
             );
         }
     }
 
     #[test]
-    fn s3_empty_body_head_without_content_length_is_normalized() {
+    fn s3_empty_body_head_without_content_length_is_left_to_the_gateway() {
         let request = Request::builder()
             .method(Method::HEAD)
             .uri("/bucket/object.txt")
             .body(())
             .expect("request");
 
-        assert!(should_force_zero_content_length_for_empty_body_route(&request));
+        assert!(!should_force_zero_content_length_for_empty_body_route(&request));
     }
 
     #[test]
@@ -342,8 +334,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn empty_body_layer_inserts_zero_content_length_for_s3_and_console_get() {
-        for path in ["/?x-id=ListBuckets".to_string(), format!("{CONSOLE_PREFIX}/index.html")] {
+    async fn empty_body_layer_inserts_zero_content_length_for_console_get() {
+        for path in [format!("{CONSOLE_PREFIX}/index.html")] {
             let capture = HeaderCaptureService::default();
             let headers = capture.headers();
             let mut service = EmptyBodyContentLengthCompatLayer.layer(capture);
@@ -470,18 +462,18 @@ mod tests {
     }
 
     #[test]
-    fn s3_delete_object_version_without_content_length_is_normalized() {
+    fn s3_delete_object_version_without_content_length_is_left_to_the_gateway() {
         let request = Request::builder()
             .method(Method::DELETE)
             .uri("/bucket/object.txt?versionId=3HL4kqtJlcpXrof3Gj0OmxJnVBH40Nrjfkd")
             .body(())
             .expect("request");
 
-        assert!(should_force_zero_content_length_for_empty_body_route(&request));
+        assert!(!should_force_zero_content_length_for_empty_body_route(&request));
     }
 
     #[tokio::test]
-    async fn empty_body_layer_inserts_zero_content_length_for_s3_delete_object_version() {
+    async fn empty_body_layer_leaves_an_s3_delete_object_version_unchanged() {
         let capture = HeaderCaptureService::default();
         let headers = capture.headers();
         let mut service = EmptyBodyContentLengthCompatLayer.layer(capture);
@@ -494,7 +486,7 @@ mod tests {
         let _ = service.call(request).await.expect("service call");
 
         let headers = headers.lock().expect("captured headers").take().expect("captured headers");
-        assert_eq!(headers.get(http::header::CONTENT_LENGTH).unwrap(), "0");
+        assert!(headers.get(http::header::CONTENT_LENGTH).is_none());
     }
 
     #[tokio::test]
@@ -550,25 +542,25 @@ mod tests {
     }
 
     #[test]
-    fn s3_delete_bucket_without_content_length_is_normalized() {
+    fn s3_delete_bucket_without_content_length_is_left_to_the_gateway() {
         let request = Request::builder()
             .method(Method::DELETE)
             .uri("/bucket")
             .body(())
             .expect("request");
 
-        assert!(should_force_zero_content_length_for_empty_body_route(&request));
+        assert!(!should_force_zero_content_length_for_empty_body_route(&request));
     }
 
     #[test]
-    fn s3_delete_object_without_version_id_is_normalized() {
+    fn s3_delete_object_without_version_id_is_left_to_the_gateway() {
         let request = Request::builder()
             .method(Method::DELETE)
             .uri("/bucket/object")
             .body(())
             .expect("request");
 
-        assert!(should_force_zero_content_length_for_empty_body_route(&request));
+        assert!(!should_force_zero_content_length_for_empty_body_route(&request));
     }
 
     #[test]

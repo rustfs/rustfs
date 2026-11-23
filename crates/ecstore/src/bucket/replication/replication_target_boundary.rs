@@ -197,31 +197,9 @@ impl ReplicationTargetStore {
         BucketTargetSys::get().mark_target_offline(target_client).await
     }
 
-    /// Returns the cached verdict and whether it has outlived its TTL.
-    pub(crate) async fn ssec_passthrough_capability(arn: &str) -> (SsecPassthroughCapability, bool) {
-        BucketTargetSys::get().ssec_passthrough_capability(arn).await
-    }
-
-    pub(crate) async fn record_ssec_passthrough_capability(arn: &str, capability: SsecPassthroughCapability) {
-        BucketTargetSys::get()
-            .record_ssec_passthrough_capability(arn, capability)
-            .await
-    }
-
-    pub(crate) fn version_identity_capability(arn: &str) -> VersionIdentityCapability {
-        BucketTargetSys::get().version_identity_capability(arn)
-    }
-
-    pub(crate) fn record_version_identity_capability(arn: &str, capability: VersionIdentityCapability) {
-        BucketTargetSys::get().record_version_identity_capability(arn, capability)
-    }
-
     #[cfg(test)]
     pub(crate) async fn register_test_target(target_client: &Arc<TargetClient>) {
-        BucketTargetSys::get().arn_remotes_map.write().await.insert(
-            target_client.arn.clone(),
-            crate::bucket::bucket_target_sys::ArnTarget::with_client(target_client.clone()),
-        );
+        BucketTargetSys::get().register_test_client(target_client).await;
     }
 }
 

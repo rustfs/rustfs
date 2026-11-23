@@ -29,6 +29,7 @@ use crate::app::storage_api::object_meta_usecase::{
 };
 use crate::app::storage_api::object_usecase::ECStore;
 use crate::app::storage_api::object_usecase::StorageObjectOptions as ObjectOptions;
+use crate::app::storage_api::object_usecase::access::apply_bucket_generation_guard;
 use crate::app::storage_api::object_usecase::bucket::replication::{must_replicate_metadata, schedule_metadata_replication};
 use crate::app::storage_api::object_usecase::bucket::versioning_sys::BucketVersioningSys;
 use crate::app::storage_api::object_usecase::error::{is_err_object_not_found, is_err_version_not_found};
@@ -38,9 +39,7 @@ use crate::error::ApiError;
 use http::{HeaderMap, StatusCode};
 use metrics::{counter, histogram};
 use rustfs_gateway_types::cors_tagging::PersistedTag;
-#[cfg(feature = "gateway-stack")]
 use rustfs_gateway_types::dto::PutObjectTaggingInput;
-#[cfg(any(feature = "gateway-stack", test))]
 use rustfs_gateway_types::dto::{DeleteObjectTaggingInput, GetObjectTaggingInput};
 use rustfs_gateway_types::dto::{DeleteObjectTaggingOutput, GetObjectTaggingOutput, PutObjectTaggingOutput, Tag};
 use rustfs_s3_ops::S3Operation;
@@ -67,7 +66,6 @@ impl ObjectMetaUsecase {
     /// `MethodNotAllowed` for a Veeam SOSAPI system object or a named delete marker; `NoSuchKey` for
     /// a missing object or a current delete marker; `NoSuchVersion` for a missing named version;
     /// `InvalidArgument` for a malformed version id; `InternalError` before the store is up.
-    #[cfg(any(feature = "gateway-stack", test))]
     pub async fn execute_get_object_tagging(
         &self,
         envelope: RequestEnvelope,
@@ -170,7 +168,6 @@ impl ObjectMetaUsecase {
     ///
     /// Returns `InvalidTag` for an invalid tag set, a refusal for reserved objects, or the
     /// storage error when the tags cannot be written.
-    #[cfg(feature = "gateway-stack")]
     pub async fn execute_put_object_tagging(
         &self,
         envelope: RequestEnvelope,
@@ -208,6 +205,7 @@ impl ObjectMetaUsecase {
         let mut opts = get_opts(bucket, object, version_id.clone(), None, envelope.headers())
             .await
             .map_err(ApiError::from)?;
+        apply_bucket_generation_guard(&envelope, bucket, &mut opts)?;
         let existing = match store.get_object_info(bucket, object, &opts).await {
             Ok(info) => info,
             Err(error) => {
@@ -237,7 +235,7 @@ impl ObjectMetaUsecase {
         if decision.replicate_any() {
             let mut eval_metadata = HashMap::new();
             insert_str(&mut eval_metadata, SUFFIX_REPLICATION_GENERATION, Uuid::new_v4().to_string());
-            insert_str(&mut eval_metadata, SUFFIX_REPLICATION_TIMESTAMP, jiff::Zoned::now().to_string());
+            insert_str(&mut eval_metadata, SUFFIX_REPLICATION_TIMESTAMP, jiff::ZonedDateTime::now().to_string());
             insert_str(
                 &mut eval_metadata,
                 SUFFIX_REPLICATION_STATUS,
@@ -264,7 +262,7 @@ impl ObjectMetaUsecase {
             ApiError::from(error)
         })?;
         if decision.replicate_any() {
-            schedule_metadata_replication(info.clone(), Arc::clone(&store), decision).await;
+            schedule_metadata_replication(info.clone(), Arc::clone(&store), decision, opts.expected_bucket_incarnation_id).await;
         }
         counter!("rustfs_put_object_tagging_success").increment(1);
 
@@ -296,7 +294,6 @@ impl ObjectMetaUsecase {
     ///
     /// `MethodNotAllowed` for a Veeam SOSAPI system object; `InvalidRequest` for a reserved table
     /// catalog object; `InternalError` before the store is up; the store's refusal otherwise.
-    #[cfg(any(feature = "gateway-stack", test))]
     pub async fn execute_delete_object_tagging(
         &self,
         envelope: RequestEnvelope,
@@ -328,6 +325,7 @@ impl ObjectMetaUsecase {
         let mut opts = get_opts(bucket, object, version_id.clone(), None, envelope.headers())
             .await
             .map_err(ApiError::from)?;
+        apply_bucket_generation_guard(&envelope, bucket, &mut opts)?;
         let existing_object_info = match store.get_object_info(bucket, object, &opts).await {
             Ok(info) => info,
             Err(e) => {
@@ -358,7 +356,7 @@ impl ObjectMetaUsecase {
         if dsc.replicate_any() {
             let mut eval_metadata = HashMap::new();
             insert_str(&mut eval_metadata, SUFFIX_REPLICATION_GENERATION, Uuid::new_v4().to_string());
-            insert_str(&mut eval_metadata, SUFFIX_REPLICATION_TIMESTAMP, jiff::Zoned::now().to_string());
+            insert_str(&mut eval_metadata, SUFFIX_REPLICATION_TIMESTAMP, jiff::ZonedDateTime::now().to_string());
             insert_str(&mut eval_metadata, SUFFIX_REPLICATION_STATUS, dsc.pending_status().unwrap_or_default());
             insert_str(
                 &mut eval_metadata,
@@ -388,7 +386,8 @@ impl ObjectMetaUsecase {
             .or_else(|| object_info.version_id.map(|version_id| version_id.to_string()))
             .unwrap_or_default();
         if dsc.replicate_any() {
-            schedule_metadata_replication(object_info.clone(), Arc::clone(&store), dsc).await;
+            schedule_metadata_replication(object_info.clone(), Arc::clone(&store), dsc, opts.expected_bucket_incarnation_id)
+                .await;
         }
         counter!("rustfs_delete_object_tagging_success").increment(1);
         helper = helper.object(object_info).version_id(event_version_id);

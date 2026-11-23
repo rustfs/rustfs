@@ -15,8 +15,8 @@
 //! Regression tests for the HeadObject response facts and their HTTP and legacy projections.
 //! The existing completion probe exposes the AuditEntry before asynchronous delivery.
 
-use super::tests::head_input;
 use super::*;
+use crate::app::test_seams::{head_envelope, head_object_input};
 use http::Method;
 
 #[test]
@@ -214,7 +214,7 @@ const INVALID_HEAD_ETAGS: &[HeadEtagRow] = &[
 fn head_etag_wire_and_audit(stack: Option<&'static str>, rows: &'static [HeadEtagRow]) {
     temp_env::with_vars(
         [
-            ("RUSTFS_S3_STACK", stack),
+            (crate::config::RETIRED_S3_STACK_SELECTOR, stack),
             ("RUSTFS_AUDIT_ENABLE", Some("true")),
             ("RUSTFS_NOTIFY_ENABLE", Some("false")),
         ],
@@ -253,16 +253,22 @@ fn head_etag_wire_and_audit(stack: Option<&'static str>, rows: &'static [HeadEta
                         .expect("store the exact ETag fixture");
                     let stored = store.get_object_info(bucket, &key, &ObjectOptions::default()).await.unwrap();
                     assert_eq!(stored.etag.as_deref(), Some(row.stored), "fixture must reach HEAD unchanged");
-                    let mut request = head_input(bucket, &key, None);
-                    request.extensions.insert(ReqInfo {
+                    let mut envelope = head_envelope(http::HeaderMap::new(), http::Extensions::new());
+                    envelope.install_req_info(ReqInfo {
                         bucket: Some(bucket.to_owned()),
                         object: Some(key.clone()),
                         ..Default::default()
                     });
-                    let internal = crate::app::test_seams::head_object(&usecase, request)
+                    let input = head_object_input(bucket, &key, None);
+                    let internal = crate::app::test_seams::head_object_gateway(&usecase, envelope, input)
                         .await
-                        .expect("unencoded legacy response");
-                    let typed = internal.output.e_tag.expect("internal caller retains the ETag");
+                        .expect("unencoded HEAD response");
+                    let typed = internal
+                        .output
+                        .into_s3s()
+                        .expect("legacy response projection")
+                        .e_tag
+                        .expect("internal caller retains the ETag");
                     assert_eq!(typed.value(), row.opaque, "{}", row.stored);
                     assert_eq!(typed.as_weak().is_some(), row.weak, "{}", row.stored);
                     expected_audits.push((Some("s3:HeadObject".to_owned()), Some("success".to_owned()), Some(200)));
@@ -307,28 +313,14 @@ fn head_etag_wire_and_audit(stack: Option<&'static str>, rows: &'static [HeadEta
 
 #[test]
 #[serial_test::serial]
-fn legacy_head_etag_wire_preserves_typed_values_and_audit() {
+fn gateway_head_etag_wire_preserves_typed_values_and_audit() {
     head_etag_wire_and_audit(None, VALID_HEAD_ETAGS);
 }
 
-#[cfg(feature = "gateway-stack")]
-#[test]
-#[serial_test::serial]
-fn gateway_head_etag_wire_preserves_typed_values_and_audit() {
-    head_etag_wire_and_audit(Some("gateway"), VALID_HEAD_ETAGS);
-}
-
-#[test]
-#[serial_test::serial]
-fn legacy_head_invalid_etag_is_rejected_after_audit() {
-    head_etag_wire_and_audit(None, INVALID_HEAD_ETAGS);
-}
-
-#[cfg(feature = "gateway-stack")]
 #[test]
 #[serial_test::serial]
 fn gateway_head_invalid_etag_is_rejected_after_audit() {
-    head_etag_wire_and_audit(Some("gateway"), INVALID_HEAD_ETAGS);
+    head_etag_wire_and_audit(None, INVALID_HEAD_ETAGS);
 }
 
 async fn head_test_server() -> crate::embedded::RustFSServer {
@@ -372,11 +364,10 @@ async fn head_wire_response(
     http::Response::from_parts(parts, body)
 }
 
-#[cfg(feature = "gateway-stack")]
 #[test]
 #[serial_test::serial]
 fn gateway_head_authorization_uses_the_request_bound_context() {
-    temp_env::with_var("RUSTFS_S3_STACK", Some("gateway"), || {
+    temp_env::with_var(crate::config::RETIRED_S3_STACK_SELECTOR, None::<&str>, || {
         crate::app::gating_test_env::run_large_stack_test("head-gateway-authorization", || async {
             use crate::app::storage_api::test::contract::bucket::{BucketOperations as _, MakeBucketOptions};
             use crate::app::storage_api::test::contract::object::ObjectIO as _;
@@ -430,7 +421,7 @@ fn gateway_head_authorization_uses_the_request_bound_context() {
 }
 
 fn head_conditional_headers_preserve_stored_facts(stack: Option<&'static str>) {
-    temp_env::with_var("RUSTFS_S3_STACK", stack, || {
+    temp_env::with_var(crate::config::RETIRED_S3_STACK_SELECTOR, stack, || {
         crate::app::gating_test_env::run_large_stack_test("head-conditional-headers", || async {
             use crate::app::storage_api::test::contract::bucket::{BucketOperations as _, MakeBucketOptions};
             use crate::app::storage_api::test::contract::object::{ObjectIO as _, ObjectOperations as _};
@@ -504,13 +495,6 @@ fn head_conditional_headers_preserve_stored_facts(stack: Option<&'static str>) {
 
 #[test]
 #[serial_test::serial]
-fn legacy_head_conditional_headers_preserve_stored_facts() {
-    head_conditional_headers_preserve_stored_facts(None);
-}
-
-#[cfg(feature = "gateway-stack")]
-#[test]
-#[serial_test::serial]
 fn gateway_head_conditional_headers_preserve_stored_facts() {
-    head_conditional_headers_preserve_stored_facts(Some("gateway"));
+    head_conditional_headers_preserve_stored_facts(None);
 }

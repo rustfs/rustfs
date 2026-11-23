@@ -138,7 +138,7 @@ impl DefaultBucketUsecase {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::app::bucket_usecase::test_support::build_request;
+    use crate::app::bucket_usecase::test_support::owned_envelope;
     use crate::app::storage_api::s3::dto::{self, PutBucketTaggingInput, Tag, Tagging};
     use http::Method;
     use rustfs_s3_types::S3ErrorCode;
@@ -156,15 +156,14 @@ mod tests {
     fn put_bucket_tagging_rejects_invalid_shapes_before_storage_mutation() {
         crate::app::gating_test_env::run_large_stack_test("bucket-tag-validation", || async {
             use crate::app::runtime_sources::{AppContext, ServerContextSlot};
-            use crate::app::storage_api::s3::S3Access as _;
+            use crate::app::storage_api::owned_parity::authorize_bucket_config_mutation;
             use crate::app::storage_api::test::ReqInfo;
-            use crate::app::storage_api::test::ecfs::FS;
+            use rustfs_policy::policy::action::{Action, S3Action};
             let ambient = crate::app::gating_test_env::shared_gating_ambient().await;
             let store = crate::app::gating_test_env::shared_gating_ecstore().await;
             let context = Arc::new(AppContext::new(store.clone(), ambient.iam(), ambient.kms()));
             let slot = ServerContextSlot::new();
             assert!(slot.install(context.clone()));
-            let fs = FS::with_server_ctx(slot.clone());
             let usecase = DefaultBucketUsecase::with_context(Some(context));
             let bucket = format!("tag-validation-{}", uuid::Uuid::new_v4().simple());
             store.make_bucket(&bucket, &MakeBucketOptions::default()).await.unwrap();
@@ -209,13 +208,29 @@ mod tests {
                     .tagging(dto::Tagging { tag_set })
                     .build()
                     .unwrap();
-                let mut req = build_request(input, Method::PUT);
-                req.extensions.insert(ReqInfo::default());
-                req.extensions.insert(slot.clone());
-                fs.put_bucket_tagging(&mut req).await.expect("permission allows tag updates");
-                let result = usecase
-                    .execute_put_bucket_tagging(RequestEnvelope::from_s3s(&req), &req.input.bucket, persisted)
-                    .await;
+                let mut extensions = http::Extensions::new();
+                extensions.insert(ReqInfo::default());
+                extensions.insert(slot.clone());
+                let mut envelope = RequestEnvelope::from_parts(
+                    crate::app::RequestHead {
+                        method: Method::PUT,
+                        uri: http::Uri::from_static("/"),
+                        headers: http::HeaderMap::new(),
+                        credentials: None,
+                        region: None,
+                        service: None,
+                    },
+                    extensions,
+                );
+                authorize_bucket_config_mutation(
+                    &slot,
+                    &mut envelope,
+                    &bucket,
+                    Action::S3Action(S3Action::PutBucketTaggingAction),
+                )
+                .await
+                .expect("permission allows tag updates");
+                let result = usecase.execute_put_bucket_tagging(envelope, &input.bucket, persisted).await;
                 if valid {
                     result.expect("valid tags are persisted");
                 } else {
@@ -242,11 +257,10 @@ mod tests {
             .build()
             .unwrap();
 
-        let req = build_request(input, Method::PUT);
         let usecase = DefaultBucketUsecase::without_context();
 
         let err = usecase
-            .execute_put_bucket_tagging(RequestEnvelope::from_s3s(&req), &req.input.bucket, PersistedTagging::default())
+            .execute_put_bucket_tagging(owned_envelope(Method::PUT), &input.bucket, PersistedTagging::default())
             .await
             .unwrap_err();
         assert_eq!(err.code(), &S3ErrorCode::InternalError);
@@ -260,7 +274,7 @@ mod tests {
             (vec![tag; MAX_BUCKET_TAGS + 1], "Cannot have more than 50 tags per bucket"),
         ] {
             let err = usecase
-                .execute_put_bucket_tagging(RequestEnvelope::from_s3s(&req), &req.input.bucket, PersistedTagging { tag_set })
+                .execute_put_bucket_tagging(owned_envelope(Method::PUT), &input.bucket, PersistedTagging { tag_set })
                 .await
                 .unwrap_err();
             assert_eq!(err.code(), &S3ErrorCode::InvalidTag);

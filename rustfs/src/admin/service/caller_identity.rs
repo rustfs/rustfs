@@ -87,6 +87,8 @@ pub(crate) enum CredentialMutationDenial {
     ServiceAccount,
     /// A derived credential whose parent could not be determined.
     UnresolvedParent,
+    /// A storage delegation has no account-management authority.
+    TableStorageSession,
 }
 
 impl CredentialMutationDenial {
@@ -97,6 +99,7 @@ impl CredentialMutationDenial {
             }
             Self::FederatedIdentity => "federated identities are managed by their identity provider",
             Self::ServiceAccount => "service account credentials cannot change the credentials of their parent identity",
+            Self::TableStorageSession => "table-scoped storage credentials cannot manage account credentials",
             Self::UnresolvedParent => "the parent identity of this session could not be resolved",
         }
     }
@@ -132,8 +135,7 @@ impl CallerIdentity {
     /// Authenticate the request and resolve who it acts as.
     ///
     /// Authentication only: callers that need an authorization decision must
-    /// still gate on an admin action. Self-service endpoints deliberately do
-    /// not, because every authenticated identity may inspect and manage itself.
+    /// still enforce their action policy and credential eligibility checks.
     pub(crate) async fn resolve_envelope(envelope: &RequestEnvelope) -> S3Result<Self> {
         let Some(input_cred) = envelope.credentials() else {
             return Err(s3::error(S3ErrorCode::InvalidRequest, "authentication required"));
@@ -188,7 +190,7 @@ impl CallerIdentity {
         // root", and an unresolved parent must never fall through to a
         // permissive answer.
         //
-        // These three denials apply to both capabilities: a machine credential
+        // These denials apply to both capabilities: a machine credential
         // must not take over its parent, a federated identity is owned by its
         // IdP, and an unresolvable parent fails closed.
         let shared_denial = if unresolved_parent {
@@ -197,6 +199,11 @@ impl CallerIdentity {
             Some(CredentialMutationDenial::ServiceAccount)
         } else if federated {
             Some(CredentialMutationDenial::FederatedIdentity)
+        } else if ["rustfs:table-bucket", "rustfs:table-id", "rustfs:credential-scope-prefix"]
+            .iter()
+            .any(|claim| credentials.claims_or_empty().contains_key(*claim))
+        {
+            Some(CredentialMutationDenial::TableStorageSession)
         } else {
             None
         };
@@ -264,6 +271,14 @@ impl CallerIdentity {
             Some(denial) => Err(s3::error(S3ErrorCode::InvalidRequest, denial.message())),
         }
     }
+
+    pub(crate) fn ensure_active_mfa_parent(&self, parent: Option<&Credentials>) -> S3Result<()> {
+        if parent.is_some_and(|p| p.access_key == self.access_key && p.is_valid() && !p.is_temp() && !p.is_service_account()) {
+            Ok(())
+        } else {
+            Err(s3::error(S3ErrorCode::AccessDenied, "an active IAM parent is required"))
+        }
+    }
 }
 
 /// Whether the session was minted by an external identity provider.
@@ -328,6 +343,16 @@ mod tests {
             claims: Some(claims),
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn sts_mfa_requires_active_regular_parent() {
+        let caller = CallerIdentity::from_credentials(sts_session("temporary", "parent"), false);
+        let mut parent = long_term("parent");
+        assert!(caller.ensure_active_mfa_parent(Some(&parent)).is_ok());
+        parent.status = "off".to_owned();
+        assert!(caller.ensure_active_mfa_parent(Some(&parent)).is_err());
+        assert!(caller.ensure_active_mfa_parent(None).is_err());
     }
 
     #[test]
@@ -482,6 +507,20 @@ mod tests {
         let caller = CallerIdentity::from_credentials(credentials, false);
 
         assert_eq!(caller.mutation_denial, Some(CredentialMutationDenial::FederatedIdentity));
+    }
+
+    #[test]
+    fn table_storage_sessions_cannot_manage_parent_credentials() {
+        for claim in ["rustfs:table-bucket", "rustfs:table-id", "rustfs:credential-scope-prefix"] {
+            let mut credentials = sts_session("TABLEKEY", "table-owner");
+            credentials.claims = Some(HashMap::from([(claim.to_string(), Value::String("scope".to_string()))]));
+            let caller = CallerIdentity::from_credentials(credentials, false);
+
+            assert_eq!(caller.mutation_denial, Some(CredentialMutationDenial::TableStorageSession));
+            assert!(!caller.mutability().password);
+            assert!(caller.ensure_credential_mutation_allowed().is_err());
+            assert!(caller.ensure_mfa_management_allowed().is_err());
+        }
     }
 
     #[test]

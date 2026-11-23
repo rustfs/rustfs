@@ -39,6 +39,9 @@ use rustfs_s3_ops::S3Operation;
 use rustfs_s3_types::{S3Result, s3_error};
 use std::sync::Arc;
 
+#[cfg(test)]
+mod list_parts_tests;
+
 pub(super) const ROWS: &[OpRow] = &[
     row::<dto::ListObjectsV2>(),
     row::<dto::ListObjects>(),
@@ -232,7 +235,7 @@ impl Served for dto::CreateMultipartUpload {
         let output = DefaultMultipartUsecase::with_context(context)
             .execute_create_multipart_upload(envelope, fields, version)
             .await?;
-        Ok(Resp::new(dto::CreateMultipartUploadOutput {
+        let response = Resp::new(dto::CreateMultipartUploadOutput {
             bucket: input.bucket,
             key: input.key,
             upload_id: output.upload_id,
@@ -243,7 +246,8 @@ impl Served for dto::CreateMultipartUpload {
             checksum_algorithm: output.checksum_algorithm.map(dto::ChecksumAlgorithm::custom),
             checksum_type: output.checksum_type.map(dto::ChecksumType::custom),
             ..Default::default()
-        }))
+        });
+        Ok(response.with_extra_headers(output.response_headers))
     }
 }
 

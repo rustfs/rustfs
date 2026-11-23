@@ -103,8 +103,11 @@ fn use_bytesmut_ingest() -> bool {
 }
 
 fn small_ingest_capacity(erasure: &Erasure, size_hint: usize) -> usize {
-    let data_len = size_hint.min(erasure.block_size);
-    erasure.encoded_capacity_for_data_len(data_len).min(erasure.block_size)
+    if size_hint <= erasure.block_size {
+        erasure.encoded_capacity_for_data_len(size_hint)
+    } else {
+        erasure.block_size
+    }
 }
 
 /// Keeps the encoder producer scoped to its parent future. Tokio detaches a
@@ -3522,12 +3525,24 @@ mod tests {
         assert_eq!(small_ingest_capacity(&erasure, 0), 0);
         assert_eq!(small_ingest_capacity(&erasure, 4 * 1024), 6 * 1024);
         assert_eq!(small_ingest_capacity(&erasure, 16 * 1024), 24 * 1024);
+        assert_eq!(
+            small_ingest_capacity(&erasure, 1024 * 1024),
+            erasure.encoded_capacity_for_data_len(1024 * 1024)
+        );
         assert_eq!(small_ingest_capacity(&erasure, usize::MAX), 1024 * 1024);
 
         let legacy = Erasure::new_with_options(4, 2, 1024 * 1024, true);
         assert_eq!(small_ingest_capacity(&legacy, 4 * 1024), 6 * 1024);
+        assert_eq!(
+            small_ingest_capacity(&legacy, 1024 * 1024),
+            legacy.encoded_capacity_for_data_len(1024 * 1024)
+        );
 
         let high_parity = Erasure::new(4, 12, 1024 * 1024);
+        assert_eq!(
+            small_ingest_capacity(&high_parity, 1024 * 1024),
+            high_parity.encoded_capacity_for_data_len(1024 * 1024)
+        );
         assert_eq!(small_ingest_capacity(&high_parity, usize::MAX), 1024 * 1024);
     }
 

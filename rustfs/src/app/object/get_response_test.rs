@@ -20,6 +20,66 @@ use crate::app::storage_api::s3::dto::Range;
 use crate::app::storage_api::test::ReqInfo;
 use http::Method;
 
+#[test]
+fn website_and_object_lambda_ranges_match_the_legacy_wire_reader() {
+    for value in [
+        "bytes=0-9",
+        "bytes=0-",
+        "bytes=-7",
+        "bytes=-0",
+        "bytes=-",
+        "bytes=-18446744073709551615",
+        "bytes=9223372036854775807-",
+        "bytes=9223372036854775808-",
+        "bytes=0-9223372036854775808",
+        "bytes=-18446744073709551616",
+        "bytes=10-5",
+        "bytes=1-2 ",
+        "bytes=1 -2",
+        "bytes=1-2,3-4",
+        "bytes=-+1",
+        "Bytes=1-2",
+        "bytes=",
+    ] {
+        let expected = Range::parse(value).ok().map(|range| match range {
+            Range::Int { first, last: Some(last) } => rustfs_gateway_types::ByteRange::FromTo { first, last },
+            Range::Int { first, last: None } => rustfs_gateway_types::ByteRange::From { first },
+            Range::Suffix { length } => rustfs_gateway_types::ByteRange::Suffix { length },
+        });
+        assert_eq!(GetObjectFields::parse_range(value), expected, "{value}");
+    }
+}
+
+#[test]
+fn website_and_object_lambda_conditions_match_the_legacy_wire_reader() {
+    // Answers measured on s3s 5761ddfe (`ETagCondition::parse_http_header` and
+    // `Timestamp::parse(HttpDate)`). The owned checks must keep those answers.
+    for (value, accepted) in [
+        (b"*".as_slice(), true),
+        (b"abc-2", true),
+        (b"\"\"", true),
+        (b"W/\"x\"", true),
+        (b"\"a \tb\"", true),
+        (b"\"a\"b\"", true),
+        (b"", false),
+        (b"bad etag", false),
+        (b"w/\"x\"", false),
+        (b"\"\xff\"", false),
+        (b"\"\x7f\"", false),
+        (b"\"x", false),
+    ] {
+        assert_eq!(GetObjectFields::valid_etag_condition(value), accepted, "{value:?}");
+    }
+    for (value, accepted) in [
+        ("Sun, 06 Nov 1994 08:49:37 GMT", true),
+        ("Sunday, 06-Nov-94 08:49:37 GMT", false),
+        ("2025-01-01", false),
+        ("Sun, 32 Nov 1994 08:49:37 GMT", false),
+    ] {
+        assert_eq!(GetObjectFields::valid_date_condition(value), accepted, "{value}");
+    }
+}
+
 fn get_request(input: GetObjectInput) -> S3Request<GetObjectInput> {
     let info = ReqInfo {
         bucket: Some(input.bucket.clone()),
@@ -88,21 +148,14 @@ fn operation_counts() -> std::collections::BTreeMap<&'static str, u64> {
 
 #[test]
 #[serial_test::serial]
-fn get_boundary_legacy() {
-    get_boundary(None);
-}
-
-#[cfg(feature = "gateway-stack")]
-#[test]
-#[serial_test::serial]
 fn get_boundary_gateway() {
-    get_boundary(Some("gateway"));
+    get_boundary(None);
 }
 
 fn get_boundary(stack: Option<&str>) {
     temp_env::with_vars(
         [
-            ("RUSTFS_S3_STACK", stack),
+            (crate::config::RETIRED_S3_STACK_SELECTOR, stack),
             ("RUSTFS_AUDIT_ENABLE", Some("true")),
             ("RUSTFS_SSE_C_REQUIRE_TLS", Some("false")),
         ],
@@ -489,9 +542,23 @@ async fn ssec_wire_contract(usecase: &DefaultObjectUsecase, server: &crate::embe
         .sse_customer_key_md5(Some(digest.clone()))
         .build()
         .unwrap();
-    crate::app::test_seams::put_object(usecase, &FS::new(), build_request(input, Method::PUT))
-        .await
-        .unwrap();
+    {
+        let envelope = crate::app::RequestEnvelope::from_parts(
+            crate::app::RequestHead {
+                method: Method::PUT,
+                uri: http::Uri::from_static("/"),
+                headers: http::HeaderMap::new(),
+                credentials: None,
+                region: None,
+                service: None,
+            },
+            http::Extensions::new(),
+        );
+        let input = crate::app::object_usecase::PutObjectWriteInput::from_legacy(input, None);
+        crate::app::test_seams::put_object(usecase, envelope, input)
+    }
+    .await
+    .unwrap();
     for (case, valid, wrong_key, condition, range) in [
         ("ordinary", true, false, false, false),
         ("missing", false, false, false, false),

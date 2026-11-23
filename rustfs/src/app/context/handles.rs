@@ -191,19 +191,6 @@ impl NotifyInterface for NotifyHandle {
     ) -> Result<(), NotificationError> {
         runtime_sources::validate_event_specific_rules(bucket_name, region, event_rules).await
     }
-
-    async fn add_event_specific_rules(
-        &self,
-        bucket_name: &str,
-        region: &str,
-        event_rules: &[(Vec<EventName>, String, String, Vec<TargetID>)],
-    ) -> Result<(), NotificationError> {
-        runtime_sources::add_event_specific_rules(bucket_name, region, event_rules).await
-    }
-
-    async fn clear_bucket_notification_rules(&self, bucket_name: &str) -> Result<(), NotificationError> {
-        runtime_sources::clear_bucket_notification_rules(bucket_name).await
-    }
 }
 
 /// Default notification system handle adapter.
@@ -409,12 +396,12 @@ impl ActionCredentialInterface for ActionCredentialHandle {
 }
 
 impl RegionInterface for ECStore {
-    fn get(&self) -> Option<s3s::region::Region> {
-        self.region().map(Into::into)
+    fn get(&self) -> Option<rustfs_s3_types::Region> {
+        self.region()
     }
 
-    fn additional(&self) -> Vec<s3s::region::Region> {
-        self.additional_regions().into_iter().map(Into::into).collect()
+    fn additional(&self) -> Vec<rustfs_s3_types::Region> {
+        self.additional_regions()
     }
 }
 
@@ -423,7 +410,7 @@ impl RegionInterface for ECStore {
 pub struct RegionHandle;
 
 impl RegionInterface for RegionHandle {
-    fn get(&self) -> Option<s3s::region::Region> {
+    fn get(&self) -> Option<rustfs_s3_types::Region> {
         runtime_sources::region()
     }
 }

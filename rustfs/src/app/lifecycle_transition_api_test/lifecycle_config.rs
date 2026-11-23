@@ -16,38 +16,34 @@
 
 use super::common::*;
 use super::*;
-use crate::app::storage_api::s3::S3 as _;
+use rustfs_gateway_types::Timestamp;
+use rustfs_gateway_types::dto::{
+    BucketLifecycleConfiguration, DelMarkerExpiration, LifecycleExpiration, LifecycleRule, LifecycleRuleFilter,
+};
+use rustfs_s3_types::S3ErrorCode;
 
 fn expiration_lifecycle_configuration(prefix: &str) -> BucketLifecycleConfiguration {
     BucketLifecycleConfiguration {
         expiry_updated_at: None,
         rules: vec![LifecycleRule {
-            status: ExpirationStatus::from_static(ExpirationStatus::ENABLED),
-            abort_incomplete_multipart_upload: None,
-            del_marker_expiration: None,
+            status: Status::ENABLED,
             expiration: Some(LifecycleExpiration {
-                date: Some(Timestamp::from(
+                date: Some(Timestamp::from_secs(
                     time::OffsetDateTime::now_utc()
                         .replace_time(time::Time::MIDNIGHT)
-                        .saturating_sub(time::Duration::days(1)),
+                        .saturating_sub(time::Duration::days(1))
+                        .unix_timestamp(),
                 )),
                 days: None,
                 expired_object_delete_marker: None,
                 ..Default::default()
             }),
             filter: Some(LifecycleRuleFilter {
-                and: None,
-                object_size_greater_than: None,
-                object_size_less_than: None,
                 prefix: Some(prefix.to_string()),
-                tag: None,
                 ..Default::default()
             }),
             id: Some("expire-existing".to_string()),
-            noncurrent_version_expiration: None,
-            noncurrent_version_transitions: None,
-            prefix: None,
-            transitions: None,
+            ..Default::default()
         }],
     }
 }
@@ -56,9 +52,7 @@ fn expired_object_delete_marker_lifecycle_configuration() -> BucketLifecycleConf
     BucketLifecycleConfiguration {
         expiry_updated_at: None,
         rules: vec![LifecycleRule {
-            status: ExpirationStatus::from_static(ExpirationStatus::ENABLED),
-            abort_incomplete_multipart_upload: None,
-            del_marker_expiration: None,
+            status: Status::ENABLED,
             expiration: Some(LifecycleExpiration {
                 expired_object_delete_marker: Some(true),
                 ..Default::default()
@@ -68,10 +62,7 @@ fn expired_object_delete_marker_lifecycle_configuration() -> BucketLifecycleConf
                 ..Default::default()
             }),
             id: Some("expired-delete-marker".to_string()),
-            noncurrent_version_expiration: None,
-            noncurrent_version_transitions: None,
-            prefix: None,
-            transitions: None,
+            ..Default::default()
         }],
     }
 }
@@ -80,8 +71,7 @@ fn del_marker_expiration_lifecycle_configuration(days: i32) -> BucketLifecycleCo
     BucketLifecycleConfiguration {
         expiry_updated_at: None,
         rules: vec![LifecycleRule {
-            status: ExpirationStatus::from_static(ExpirationStatus::ENABLED),
-            abort_incomplete_multipart_upload: None,
+            status: Status::ENABLED,
             del_marker_expiration: Some(DelMarkerExpiration { days: Some(days) }),
             expiration: Some(LifecycleExpiration {
                 days: Some(30),
@@ -92,10 +82,7 @@ fn del_marker_expiration_lifecycle_configuration(days: i32) -> BucketLifecycleCo
                 ..Default::default()
             }),
             id: Some("del-marker-expiration".to_string()),
-            noncurrent_version_expiration: None,
-            noncurrent_version_transitions: None,
-            prefix: None,
-            transitions: None,
+            ..Default::default()
         }],
     }
 }
@@ -132,18 +119,14 @@ async fn compensation_driven_delete_marker_still_honors_lifecycle_cleanup() {
 
     assert!(backend.contains(&remote_object).await);
 
-    let req = build_request(
-        DeleteObjectInput::builder()
-            .bucket(bucket.clone())
-            .key(object.to_string())
-            .build()
-            .unwrap(),
-        Method::DELETE,
-    );
-
-    Box::pin(usecase.execute_delete_object_from_s3s(req))
-        .await
-        .expect("Failed to issue versioned delete after compensation-driven transition");
+    Box::pin(usecase.execute_delete_object_fields(
+        request_envelope(Method::DELETE, HeaderMap::new()),
+        bucket.clone(),
+        object.to_owned(),
+        None,
+    ))
+    .await
+    .expect("Failed to issue versioned delete after compensation-driven transition");
 
     assert!(
         wait_for_delete_marker(&ecstore, bucket.as_str(), object, TRANSITION_WAIT_TIMEOUT).await,
@@ -154,16 +137,7 @@ async fn compensation_driven_delete_marker_still_honors_lifecycle_cleanup() {
         "delete marker creation should keep the transitioned remote object version"
     );
 
-    let req = build_request(
-        PutBucketLifecycleConfigurationInput::builder()
-            .bucket(bucket.clone())
-            .lifecycle_configuration(Some(expiration_lifecycle_configuration("test/")))
-            .build()
-            .unwrap(),
-        Method::PUT,
-    );
-    FS::new()
-        .put_bucket_lifecycle_configuration(req)
+    put_lifecycle(&bucket, Some(expiration_lifecycle_configuration("test/")), Extensions::new())
         .await
         .expect("Failed to update lifecycle configuration for delete marker cleanup");
 
@@ -190,17 +164,7 @@ async fn put_bucket_lifecycle_configuration_expires_existing_objects() {
     create_test_bucket(&ecstore, bucket.as_str()).await;
     let _ = upload_test_object(&ecstore, bucket.as_str(), object, payload).await;
 
-    let req = build_request(
-        PutBucketLifecycleConfigurationInput::builder()
-            .bucket(bucket.clone())
-            .lifecycle_configuration(Some(expiration_lifecycle_configuration("test/")))
-            .build()
-            .unwrap(),
-        Method::PUT,
-    );
-
-    FS::new()
-        .put_bucket_lifecycle_configuration(req)
+    put_lifecycle(&bucket, Some(expiration_lifecycle_configuration("test/")), Extensions::new())
         .await
         .expect("Failed to update lifecycle configuration");
 
@@ -222,17 +186,7 @@ async fn put_bucket_lifecycle_configuration_allows_expired_delete_marker_on_obje
         .await
         .expect("Failed to enable object lock for bucket");
 
-    let req = build_request(
-        PutBucketLifecycleConfigurationInput::builder()
-            .bucket(bucket.clone())
-            .lifecycle_configuration(Some(expired_object_delete_marker_lifecycle_configuration()))
-            .build()
-            .unwrap(),
-        Method::PUT,
-    );
-
-    FS::new()
-        .put_bucket_lifecycle_configuration(req)
+    put_lifecycle(&bucket, Some(expired_object_delete_marker_lifecycle_configuration()), Extensions::new())
         .await
         .expect("ExpiredObjectDeleteMarker should be accepted on object-lock bucket");
 }
@@ -249,20 +203,9 @@ async fn put_bucket_lifecycle_configuration_rejects_del_marker_expiration_on_obj
         .await
         .expect("Failed to enable object lock for bucket");
 
-    let req = build_request(
-        PutBucketLifecycleConfigurationInput::builder()
-            .bucket(bucket.clone())
-            .lifecycle_configuration(Some(del_marker_expiration_lifecycle_configuration(1)))
-            .build()
-            .unwrap(),
-        Method::PUT,
-    );
-
-    let err: rustfs_s3_types::S3Error = FS::new()
-        .put_bucket_lifecycle_configuration(req)
+    let err = put_lifecycle(&bucket, Some(del_marker_expiration_lifecycle_configuration(1)), Extensions::new())
         .await
-        .expect_err("DelMarkerExpiration must be rejected on object-lock bucket")
-        .into();
+        .expect_err("DelMarkerExpiration must be rejected on object-lock bucket");
     assert_eq!(err.code(), &rustfs_s3_types::S3ErrorCode::InvalidArgument);
     let message = err.message().unwrap_or_default();
     assert!(
@@ -285,20 +228,9 @@ async fn put_bucket_lifecycle_configuration_rejects_zero_day_del_marker_expirati
         .await
         .expect("Failed to enable object lock for bucket");
 
-    let req = build_request(
-        PutBucketLifecycleConfigurationInput::builder()
-            .bucket(bucket.clone())
-            .lifecycle_configuration(Some(del_marker_expiration_lifecycle_configuration(0)))
-            .build()
-            .unwrap(),
-        Method::PUT,
-    );
-
-    let err: rustfs_s3_types::S3Error = FS::new()
-        .put_bucket_lifecycle_configuration(req)
+    let err = put_lifecycle(&bucket, Some(del_marker_expiration_lifecycle_configuration(0)), Extensions::new())
         .await
-        .expect_err("DelMarkerExpiration with zero days must be rejected on object-lock bucket")
-        .into();
+        .expect_err("DelMarkerExpiration with zero days must be rejected on object-lock bucket");
     assert_eq!(err.code(), &rustfs_s3_types::S3ErrorCode::InvalidArgument);
     let message = err.message().unwrap_or_default();
     assert!(
@@ -323,9 +255,7 @@ async fn put_bucket_lifecycle_configuration_rejects_zero_day_expiration() {
     let lifecycle = BucketLifecycleConfiguration {
         expiry_updated_at: None,
         rules: vec![LifecycleRule {
-            status: ExpirationStatus::from_static(ExpirationStatus::ENABLED),
-            abort_incomplete_multipart_upload: None,
-            del_marker_expiration: None,
+            status: Status::ENABLED,
             expiration: Some(LifecycleExpiration {
                 days: Some(0),
                 ..Default::default()
@@ -335,27 +265,13 @@ async fn put_bucket_lifecycle_configuration_rejects_zero_day_expiration() {
                 ..Default::default()
             }),
             id: Some("expire-zero-days".to_string()),
-            noncurrent_version_expiration: None,
-            noncurrent_version_transitions: None,
-            prefix: None,
-            transitions: None,
+            ..Default::default()
         }],
     };
 
-    let req = build_request(
-        PutBucketLifecycleConfigurationInput::builder()
-            .bucket(bucket.clone())
-            .lifecycle_configuration(Some(lifecycle))
-            .build()
-            .unwrap(),
-        Method::PUT,
-    );
-
-    let err: rustfs_s3_types::S3Error = FS::new()
-        .put_bucket_lifecycle_configuration(req)
+    let err = put_lifecycle(&bucket, Some(lifecycle), Extensions::new())
         .await
-        .expect_err("zero-day expiration must be rejected with InvalidArgument")
-        .into();
+        .expect_err("zero-day expiration must be rejected with InvalidArgument");
     assert_eq!(err.code(), &rustfs_s3_types::S3ErrorCode::InvalidArgument);
     let message = err.message().unwrap_or_default();
     assert!(
@@ -370,7 +286,6 @@ async fn put_bucket_lifecycle_configuration_preserves_error_priority() {
     use crate::app::storage_api::bucket_usecase::{error::StorageError, helper::MutationCompletionProbe};
     use crate::app::storage_api::owned_parity::{RequestContext, parity_test_support};
     use crate::app::storage_api::test::{get_global_bucket_metadata_sys, set_bucket_metadata};
-    use crate::storage::s3_compat::lifecycle::lifecycle_configuration_from_s3s;
     use rustfs_s3_ops::S3Operation;
 
     let (_disk_paths, store) = setup_test_env().await;
@@ -387,7 +302,7 @@ async fn put_bucket_lifecycle_configuration_preserves_error_priority() {
     metadata.object_lock_config = None;
     set_bucket_metadata(unreadable.clone(), metadata).await.unwrap();
     let storage_error = metadata_sys::get_object_lock_config(&unreadable).await.unwrap_err();
-    let lookup_error = crate::app::storage_api::s3::S3Error::from(crate::error::ApiError::from(storage_error));
+    let lookup_error = rustfs_s3_types::S3Error::from(crate::error::ApiError::from(storage_error));
     let lookup = lookup_error.message().unwrap();
     assert!(lookup.contains(OBJECT_LOCK_CONFIG) && lookup.contains(&unreadable), "{lookup}");
     assert!(matches!(
@@ -395,27 +310,23 @@ async fn put_bucket_lifecycle_configuration_preserves_error_priority() {
         Err(StorageError::ConfigNotFound)
     ));
 
-    let configuration = |status, bad_date| {
+    let configuration = |status: &'static str, bad_date| {
         let mut configuration = expiration_lifecycle_configuration("dated/");
-        let date = time::macros::datetime!(2099-01-01 00:00 UTC);
-        let date = if bad_date {
-            date.to_offset(time::UtcOffset::from_hms(0, 0, 1).unwrap())
+        let seconds = if bad_date {
+            i64::MAX
         } else {
-            date
+            time::macros::datetime!(2099-01-01 00:00 UTC).unix_timestamp()
         };
-        configuration.rules[0].expiration.as_mut().unwrap().date = Some(Timestamp::from(date));
+        configuration.rules[0].expiration.as_mut().unwrap().date = Some(Timestamp::from_secs(seconds));
         configuration.rules[0].id = None;
         let mut days_rule = del_marker_expiration_lifecycle_configuration(30).rules.remove(0);
         days_rule.id = Some("rule-0".to_owned());
-        days_rule.status = ExpirationStatus::from_static(status);
+        days_rule.status = status.into();
         configuration.rules.push(days_rule);
         configuration
     };
-    let bad_date = lifecycle_configuration_from_s3s(configuration("enabled", true))
-        .unwrap_err()
-        .to_string();
-    assert!(bad_date.contains("offset_second"), "{bad_date}");
-    assert!(lifecycle_configuration_from_s3s(configuration("Disabled", false)).is_ok());
+    // The gateway timestamp can carry seconds outside the persisted date range.
+    let bad_date = time::OffsetDateTime::from_unix_timestamp(i64::MAX).unwrap_err().to_string();
 
     let malformed = "Malformed XML: Rule status must be either Enabled or Disabled";
     let mismatch = "bucket config mutation snapshot does not match request bucket";
@@ -471,31 +382,22 @@ async fn put_bucket_lifecycle_configuration_preserves_error_priority() {
         ),
     ];
 
-    let fs = FS::new();
     let handled_count = || {
         rustfs_io_metrics::s3_op_metrics_snapshot()
             .into_iter()
             .find(|metric| metric.op == S3Operation::PutBucketLifecycleConfiguration.as_str())
             .map_or(0, |metric| metric.total)
     };
-    let request = |bucket: &str, config: Option<(&'static str, bool)>| {
-        let mut request = build_request(
-            PutBucketLifecycleConfigurationInput::builder()
-                .bucket(bucket.to_owned())
-                .lifecycle_configuration(config.map(|(status, bad_date)| configuration(status, bad_date)))
-                .build()
-                .unwrap(),
-            Method::PUT,
-        );
-        request.uri = format!("/{bucket}?lifecycle").parse().unwrap();
-        request.extensions.insert(RequestContext {
+    let request_extensions = || {
+        let mut extensions = Extensions::new();
+        extensions.insert(RequestContext {
             request_id: "lifecycle-priority-context".to_owned(),
             x_amz_request_id: "lifecycle-priority-context".to_owned(),
             trace_id: None,
             span_id: None,
             start_time: std::time::Instant::now(),
         });
-        request
+        extensions
     };
     let assert_audit = |probe: &MutationCompletionProbe| {
         let audits = probe.audits.lock().unwrap();
@@ -505,14 +407,14 @@ async fn put_bucket_lifecycle_configuration_preserves_error_priority() {
     for (name, bucket, config, mismatched_snapshot, code, message) in cases {
         let before = handled_count();
         let probe = MutationCompletionProbe::install(bucket);
-        let mut request = request(bucket, config);
+        let mut extensions = request_extensions();
         if mismatched_snapshot {
-            request
-                .extensions
-                .insert(parity_test_support::bucket_config_mutation(&readable));
+            extensions.insert(parity_test_support::bucket_config_mutation(&readable));
         }
-        let error = fs.put_bucket_lifecycle_configuration(request).await.unwrap_err();
-        assert_eq!(error.code(), &code, "{name}: {error}");
+        let error = put_lifecycle(bucket, config.map(|(status, bad_date)| configuration(status, bad_date)), extensions)
+            .await
+            .unwrap_err();
+        assert_eq!(error.code().as_str(), code.as_str(), "{name}: {error}");
         if let Some(message) = message {
             assert_eq!(error.message(), Some(message), "{name}");
         }
@@ -533,7 +435,7 @@ async fn put_bucket_lifecycle_configuration_preserves_error_priority() {
 
     let before = handled_count();
     let probe = MutationCompletionProbe::install(&readable);
-    fs.put_bucket_lifecycle_configuration(request(&readable, Some(("Disabled", false))))
+    put_lifecycle(&readable, Some(configuration("Disabled", false)), request_extensions())
         .await
         .unwrap();
     assert_audit(&probe);
@@ -546,4 +448,28 @@ async fn put_bucket_lifecycle_configuration_preserves_error_priority() {
     assert_eq!((rules[1].id.as_deref(), rules[1].status.as_str()), (Some("rule-0"), "Disabled"));
     assert_eq!(rules[0].expiration.as_ref().unwrap().date.as_deref(), Some("2099-01-01T00:00:00.000Z"));
     assert_eq!(rules[1].expiration.as_ref().unwrap().days, Some(30));
+}
+
+async fn put_lifecycle(
+    bucket: &str,
+    configuration: Option<BucketLifecycleConfiguration>,
+    extensions: Extensions,
+) -> rustfs_s3_types::S3Result<()> {
+    rustfs_io_metrics::record_s3_op(rustfs_s3_ops::S3Operation::PutBucketLifecycleConfiguration);
+    let envelope = crate::app::RequestEnvelope::from_parts(
+        crate::app::RequestHead {
+            method: Method::PUT,
+            uri: format!("/{bucket}?lifecycle").parse().unwrap(),
+            headers: HeaderMap::new(),
+            credentials: None,
+            region: None,
+            service: None,
+        },
+        extensions,
+    );
+    let prepared = crate::server::prepare_lifecycle_configuration(configuration, None);
+    DefaultBucketUsecase::from_global()
+        .execute_put_bucket_lifecycle_configuration(envelope, bucket, prepared)
+        .await
+        .map(|_| ())
 }

@@ -24,8 +24,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 #[tokio::test]
 async fn execute_abort_multipart_upload_returns_internal_error_when_store_uninitialized() {
-    let request = build_request((), Method::DELETE);
-    let envelope = RequestEnvelope::from_s3s(&request);
+    let envelope = owned_envelope(Method::DELETE);
     let before = s3_op_total(S3Operation::AbortMultipartUpload);
     let target = AbortMultipartUploadTarget::Legacy {
         bucket: "bucket".to_owned(),
@@ -57,11 +56,20 @@ fn native_abort_requires_current_generation_and_audits_each_result() {
         let opts = ObjectOptions::default();
         let request_context = RequestContext::fallback();
         let request = || {
-            let mut req = build_request((), Method::DELETE);
-            req.uri = format!("/{bucket}/{key}").parse().expect("fixture URI");
-            req.extensions.insert(slot.clone());
-            req.extensions.insert(request_context.clone());
-            req
+            let mut extensions = Extensions::new();
+            extensions.insert(slot.clone());
+            extensions.insert(request_context.clone());
+            RequestEnvelope::from_parts(
+                crate::app::RequestHead {
+                    method: Method::DELETE,
+                    uri: format!("/{bucket}/{key}").parse().expect("fixture URI"),
+                    headers: http::HeaderMap::new(),
+                    credentials: None,
+                    region: None,
+                    service: None,
+                },
+                extensions,
+            )
         };
         for name in [&bucket, &other] {
             store
@@ -143,7 +151,7 @@ fn native_abort_requires_current_generation_and_audits_each_result() {
             (wrong, S3ErrorCode::InternalError),
         ] {
             let err = usecase
-                .execute_abort_multipart_upload(RequestEnvelope::from_s3s(&req), Ok(target()))
+                .execute_abort_multipart_upload(req, Ok(target()))
                 .await
                 .expect_err("Abort requires current generation");
             assert_eq!(err.code(), &code);
@@ -162,7 +170,7 @@ fn native_abort_requires_current_generation_and_audits_each_result() {
             .expect("capture current bucket");
         current.install_bucket_generation(captured);
         usecase
-            .execute_abort_multipart_upload(RequestEnvelope::from_s3s(&current), Ok(target()))
+            .execute_abort_multipart_upload(current.fork_for_authorization(), Ok(target()))
             .await
             .expect("current generation allows Abort");
         assert!(matches!(
@@ -182,7 +190,7 @@ fn native_abort_requires_current_generation_and_audits_each_result() {
             .expect("create legacy-path upload");
         usecase
             .execute_abort_multipart_upload(
-                RequestEnvelope::from_s3s(&current),
+                current,
                 Ok(AbortMultipartUploadTarget::Legacy {
                     bucket: bucket.clone(),
                     key: key.to_owned(),

@@ -21,9 +21,7 @@ use super::storage_api::admin_usecase::capacity::{
 };
 use super::storage_api::admin_usecase::contract::StorageAdminApi;
 use super::storage_api::admin_usecase::contract::bucket::{BucketOperations as _, BucketOptions};
-use super::storage_api::admin_usecase::data_usage::{
-    apply_bucket_usage_memory_overlay, load_admin_data_usage_from_backend_cached,
-};
+use super::storage_api::admin_usecase::data_usage::load_admin_data_usage_with_memory_overlay;
 use super::storage_api::admin_usecase::{ECStore, EndpointServerPools};
 use crate::app::runtime_sources::{
     AppContext, current_app_context, current_endpoints_handle, current_object_store_handle_for_context,
@@ -37,7 +35,7 @@ use crate::server::collect_dependency_readiness_report as collect_runtime_depend
 use crate::shared_types::DependencyReadiness;
 use rustfs_data_usage::DataUsageInfo;
 use rustfs_madmin::{InfoMessage, StorageInfo};
-use s3s::S3ErrorCode;
+use rustfs_s3_types::S3ErrorCode;
 use std::collections::HashSet;
 use std::sync::Arc;
 use tracing::{debug, error, info, warn};
@@ -55,10 +53,12 @@ pub const ADMIN_RUNTIME_CAPABILITIES_ROUTE: &str = "/rustfs/admin/v4/runtime/cap
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct QueryServerInfoRequest {
     pub include_pools: bool,
+    pub include_inventory: bool,
 }
 
 pub struct QueryServerInfoResponse {
     pub info: InfoMessage,
+    pub inventory: Option<rustfs_madmin::ClusterInventory>,
 }
 
 impl std::fmt::Debug for QueryServerInfoResponse {
@@ -272,7 +272,7 @@ impl DefaultAdminUsecase {
         info.buckets_usage.retain(|bucket, _| current_buckets.contains(bucket));
         info.bucket_sizes.retain(|bucket, _| current_buckets.contains(bucket));
 
-        if info.buckets_usage.is_empty() && !current_buckets.is_empty() {
+        if info.buckets_usage.is_empty() && !current_buckets.is_empty() && !info.usage_snapshot_admin_projection {
             *info = DataUsageInfo::default();
             return;
         }
@@ -287,19 +287,14 @@ impl DefaultAdminUsecase {
         }
     }
 
-    /// Overlay single-process counts on a persisted snapshot and narrow it
-    /// for display.
-    ///
-    /// Whether the snapshot measured anything is decided before the overlay.
-    /// The overlay clears `usage_snapshot_complete` when it holds counts it
-    /// cannot reconcile with the snapshot, such as writes into a bucket that
-    /// has no verified baseline. That makes the totals unconverged, not the
-    /// scanned buckets unusable; treating it as structural incompleteness
-    /// blanked usage for every bucket for as long as one such bucket kept
-    /// receiving writes, because each write restarts its scanner fence.
-    async fn present_data_usage_snapshot(mut info: DataUsageInfo, buckets: impl IntoIterator<Item = String>) -> DataUsageInfo {
-        let snapshot_measured = info.is_complete_bucket_usage_snapshot() || info.is_valid_partial_snapshot();
-        apply_bucket_usage_memory_overlay(&mut info).await;
+    /// Keep already identity-bound display values without accepting a display
+    /// projection as a persistable or quota-authoritative snapshot.
+    fn present_identity_bound_data_usage_snapshot(
+        mut info: DataUsageInfo,
+        buckets: impl IntoIterator<Item = String>,
+    ) -> DataUsageInfo {
+        let snapshot_measured =
+            info.usage_snapshot_admin_projection || info.is_complete_bucket_usage_snapshot() || info.is_valid_partial_snapshot();
         Self::narrow_data_usage_snapshot_to_measured_buckets(&mut info, snapshot_measured, buckets);
         info
     }
@@ -319,8 +314,8 @@ impl DefaultAdminUsecase {
     }
 
     pub async fn execute_query_server_info(&self, req: QueryServerInfoRequest) -> AdminUsecaseResult<QueryServerInfoResponse> {
-        let info = get_server_info(req.include_pools).await;
-        Ok(QueryServerInfoResponse { info })
+        let (info, inventory) = get_server_info(req.include_pools, req.include_inventory).await;
+        Ok(QueryServerInfoResponse { info, inventory })
     }
 
     pub async fn execute_query_storage_info(&self) -> AdminUsecaseResult<StorageInfo> {
@@ -345,7 +340,7 @@ impl DefaultAdminUsecase {
     /// This path never triggers a live full-version listing
     /// (rustfs/backlog#1306); freshness is owned by the scanner.
     pub(crate) async fn query_data_usage_info_with_store(store: Arc<ECStore>) -> AdminUsecaseResult<DataUsageInfo> {
-        let info = Self::map_data_usage_load_result(load_admin_data_usage_from_backend_cached(store.clone()).await)?;
+        let info = Self::map_data_usage_load_result(load_admin_data_usage_with_memory_overlay(store.clone()).await)?;
         let buckets = store
             .list_bucket(&BucketOptions {
                 cached: true,
@@ -354,7 +349,7 @@ impl DefaultAdminUsecase {
             })
             .await
             .map_err(|_| Self::app_error(S3ErrorCode::InternalError, "list_bucket failed"))?;
-        let mut info = Self::present_data_usage_snapshot(info, buckets.into_iter().map(|bucket| bucket.name)).await;
+        let mut info = Self::present_identity_bound_data_usage_snapshot(info, buckets.into_iter().map(|bucket| bucket.name));
 
         let storage_info = StorageAdminApi::storage_info(store.as_ref()).await;
 
@@ -979,6 +974,52 @@ mod tests {
         assert_eq!(info.buckets_count, 0);
     }
 
+    #[test]
+    fn identity_bound_partial_display_keeps_valid_buckets_and_unknown_state() {
+        use std::collections::HashMap;
+
+        let mut projected = DataUsageInfo {
+            last_update: Some(std::time::SystemTime::UNIX_EPOCH),
+            usage_snapshot_admin_projection: true,
+            usage_snapshot_partial: true,
+            usage_snapshot_converged: Some(false),
+            buckets_count: 1,
+            objects_total_count: 7,
+            objects_total_size: 70,
+            buckets_usage: HashMap::from([(
+                "cold".to_string(),
+                rustfs_data_usage::BucketUsageInfo {
+                    size: 70,
+                    objects_count: 7,
+                    ..Default::default()
+                },
+            )]),
+            bucket_sizes: HashMap::from([("cold".to_string(), 70)]),
+            ..Default::default()
+        };
+        projected = DefaultAdminUsecase::present_identity_bound_data_usage_snapshot(
+            projected,
+            ["cold".to_string(), "recreated".to_string()],
+        );
+        assert_eq!(projected.buckets_usage["cold"].objects_count, 7);
+        assert!(!projected.buckets_usage.contains_key("recreated"));
+        assert_eq!(projected.objects_total_count, 7);
+        assert_eq!(projected.usage_snapshot_converged, Some(false));
+        assert!(!projected.is_complete_bucket_usage_snapshot());
+        assert!(!projected.is_valid_partial_snapshot());
+
+        projected.buckets_usage.clear();
+        projected.bucket_sizes.clear();
+        projected.calculate_totals();
+        projected.buckets_count = 0;
+        let unknown = DefaultAdminUsecase::present_identity_bound_data_usage_snapshot(projected, ["recreated".to_string()]);
+        assert!(unknown.buckets_usage.is_empty());
+        assert!(unknown.usage_snapshot_admin_projection);
+        assert_eq!(unknown.usage_snapshot_converged, Some(false));
+        assert!(!unknown.is_complete_bucket_usage_snapshot());
+        assert_eq!(unknown.last_update, Some(std::time::SystemTime::UNIX_EPOCH));
+    }
+
     /// A write into a bucket without a verified baseline leaves process-local
     /// counts the overlay cannot reconcile, so it clears
     /// `usage_snapshot_complete`. That must flag the response non-converged,
@@ -1009,11 +1050,15 @@ mod tests {
 
         crate::app::storage_api::test::data_usage::record_bucket_object_write_memory(unverified_bucket, None, 1_024).await;
 
-        let info = DefaultAdminUsecase::present_data_usage_snapshot(
+        // Exercise the production overlay, followed by the same identity-bound
+        // presentation function used by the admin query.
+        crate::app::storage_api::test::data_usage::apply_bucket_usage_memory_overlay(&mut persisted).await;
+        persisted.usage_snapshot_admin_projection = true;
+        persisted.usage_snapshot_converged = Some(false);
+        let info = DefaultAdminUsecase::present_identity_bound_data_usage_snapshot(
             persisted,
             [measured_bucket.to_string(), unverified_bucket.to_string()],
-        )
-        .await;
+        );
 
         assert_eq!(
             info.buckets_usage

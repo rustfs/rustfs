@@ -90,7 +90,9 @@ fn remote_credentials(credentials: &Credentials, account_id: &str) -> RemoteCred
         access_key: credentials.access_key.clone(),
         secret_key: credentials.secret_key.clone(),
         session_token: credentials.effective_session_token().map(str::to_string),
-        expiration: credentials.effective_expiration().map(SystemTime::from),
+        expiration: credentials
+            .effective_expiration()
+            .and_then(|timestamp| SystemTime::try_from(timestamp).ok()),
         account_id: account_id.to_string(),
     }
 }
@@ -169,12 +171,14 @@ impl Intercept for HeadObjectTaggingCapture {
 /// (endpoint, bucket, path style, TLS and identity), so a verdict learned
 /// about that service stays valid across the edit.
 fn same_replication_service(edited: &BucketTarget, previous: &BucketTarget) -> bool {
-    let access_key = |target: &BucketTarget| target.credentials.as_ref().map(|credentials| credentials.access_key.clone());
     edited.endpoint == previous.endpoint
         && edited.target_bucket == previous.target_bucket
         && edited.secure == previous.secure
         && edited.path == previous.path
-        && access_key(edited) == access_key(previous)
+        && edited.region == previous.region
+        && edited.skip_tls_verify == previous.skip_tls_verify
+        && edited.ca_cert_pem == previous.ca_cert_pem
+        && edited.credentials == previous.credentials
 }
 
 /// Page size and page budget for [`TargetClient::replica_candidates`].
@@ -198,6 +202,7 @@ fn replication_target_versioning_enabled(versioning: Option<&BucketVersioningSta
 pub struct ArnTarget {
     pub client: Option<Arc<TargetClient>>,
     pub last_refresh: OffsetDateTime,
+    versions: Arc<VersionCapabilities>,
 }
 
 impl Default for ArnTarget {
@@ -205,13 +210,16 @@ impl Default for ArnTarget {
         Self {
             client: None,
             last_refresh: OffsetDateTime::UNIX_EPOCH,
+            versions: Default::default(),
         }
     }
 }
 
+#[cfg(test)]
 impl ArnTarget {
     pub fn with_client(client: Arc<TargetClient>) -> Self {
         Self {
+            versions: client.capabilities.versions.clone(),
             client: Some(client),
             last_refresh: OffsetDateTime::now_utc(),
         }
@@ -222,7 +230,6 @@ impl ArnTarget {
 pub struct ArnErrs {
     pub count: i64,
     pub update_in_progress: bool,
-    pub bucket: String,
 }
 
 /// A single latency sample tagged with the instant it was recorded.
@@ -398,7 +405,7 @@ struct TargetClientBuildProbe {
 }
 
 /// SSE-C passthrough capability verdicts (see the enum's own docs in
-/// `rustfs-replication`) are cached here per target ARN: entries follow the
+/// `rustfs-replication`) are cached on the selected client: entries follow the
 /// `arn_remotes_map` lifecycle (rebuilding or removing a target resets its
 /// capability to `Unknown`) and additionally expire after
 /// [`SSEC_PASSTHROUGH_CAPABILITY_TTL`], after which the next attempt
@@ -407,7 +414,7 @@ struct TargetClientBuildProbe {
 /// replication decision logic.
 pub use crate::bucket::replication::SsecPassthroughCapability;
 /// Version-identity verdicts (see the enum's own docs in
-/// `rustfs-replication`) are cached here per target ARN and follow the same
+/// `rustfs-replication`) are cached on the selected client and follow the same
 /// `arn_remotes_map` lifecycle. They carry no TTL: the verdict is refreshed
 /// by every replication write's response, so it can only go stale on a
 /// target that receives no writes — and a stale `MintsOwn` costs one extra
@@ -433,22 +440,24 @@ struct SsecPassthroughRecord {
     recorded_at: Instant,
 }
 
+/// The outer key is the bucket owning the configuration, never a field from the target payload.
+type BucketArnMap<V> = HashMap<String, HashMap<String, V>>;
+
+#[derive(Debug, Default)]
+pub(crate) struct TargetCapabilities {
+    versions: Arc<VersionCapabilities>,
+    ssec_passthrough: std::sync::RwLock<Option<SsecPassthroughRecord>>,
+}
+
+#[derive(Debug, Default)]
+struct VersionCapabilities {
+    version_identity: std::sync::RwLock<VersionIdentityCapability>,
+    put_version_id_query_rejected: std::sync::atomic::AtomicBool,
+}
+
 #[derive(Debug, Default)]
 pub struct BucketTargetSys {
-    pub arn_remotes_map: Arc<RwLock<HashMap<String, ArnTarget>>>,
-    /// SSE-C passthrough capability verdicts keyed by target ARN. See
-    /// [`SsecPassthroughCapability`]; reset alongside `arn_remotes_map`.
-    ssec_passthrough_map: Arc<RwLock<HashMap<String, SsecPassthroughRecord>>>,
-    /// Version-identity verdicts keyed by target ARN. See
-    /// [`VersionIdentityCapability`]; reset alongside `arn_remotes_map`. A std
-    /// lock (never held across an await) so the replication worker can record
-    /// a verdict from inside its synchronous PUT-response audit.
-    version_identity_map: Arc<std::sync::RwLock<HashMap<String, VersionIdentityCapability>>>,
-    /// Target ARNs whose remote rejected a PUT / CreateMultipartUpload
-    /// `versionId` query with `InvalidArgument`; later requests to the same
-    /// ARN omit the query instead of failing again. Reset alongside
-    /// `version_identity_map` — same lifetime, same reasoning.
-    put_version_id_query_rejected: Arc<std::sync::RwLock<HashSet<String>>>,
+    arn_remotes_map: Arc<RwLock<BucketArnMap<ArnTarget>>>,
     pub targets_map: Arc<RwLock<HashMap<String, Vec<BucketTarget>>>>,
     /// Buckets whose persisted `bucket-targets.json` exists but cannot be
     /// decoded (rustfs/backlog#2282). Written under the bucket's update mutex
@@ -456,10 +465,9 @@ pub struct BucketTargetSys {
     /// configuration surfaces as a typed error instead of an empty target set.
     unreadable_targets: Arc<RwLock<HashSet<String>>>,
     pub h_mutex: Arc<RwLock<HashMap<String, EpHealth>>>,
-    target_h_mutex: Arc<RwLock<HashMap<String, EpHealth>>>,
+    target_h_mutex: Arc<RwLock<BucketArnMap<EpHealth>>>,
     pub hc_client: Arc<HttpClient>,
-    pub a_mutex: Arc<Mutex<HashMap<String, ArnErrs>>>,
-    pub arn_errs_map: Arc<RwLock<HashMap<String, ArnErrs>>>,
+    arn_errs_map: Arc<RwLock<BucketArnMap<ArnErrs>>>,
     target_update_mutexes: Arc<Mutex<HashMap<String, Weak<Mutex<()>>>>>,
     #[cfg(test)]
     target_client_build_probe: Arc<Mutex<Option<TargetClientBuildProbe>>>,
@@ -496,15 +504,11 @@ impl BucketTargetSys {
     fn new() -> Self {
         Self {
             arn_remotes_map: Arc::new(RwLock::new(HashMap::new())),
-            ssec_passthrough_map: Arc::new(RwLock::new(HashMap::new())),
-            version_identity_map: Arc::new(std::sync::RwLock::new(HashMap::new())),
-            put_version_id_query_rejected: Arc::new(std::sync::RwLock::new(HashSet::new())),
             targets_map: Arc::new(RwLock::new(HashMap::new())),
             unreadable_targets: Arc::new(RwLock::new(HashSet::new())),
             h_mutex: Arc::new(RwLock::new(HashMap::new())),
             target_h_mutex: Arc::new(RwLock::new(HashMap::new())),
             hc_client: Arc::new(build_health_check_client()),
-            a_mutex: Arc::new(Mutex::new(HashMap::new())),
             arn_errs_map: Arc::new(RwLock::new(HashMap::new())),
             target_update_mutexes: Arc::new(Mutex::new(HashMap::new())),
             #[cfg(test)]
@@ -581,24 +585,38 @@ impl BucketTargetSys {
         );
     }
 
+    #[cfg(test)]
+    pub(crate) async fn register_test_client(&self, client: &Arc<TargetClient>) {
+        self.arn_remotes_map
+            .write()
+            .await
+            .entry(client.source_bucket.clone())
+            .or_default()
+            .insert(client.arn.clone(), ArnTarget::with_client(client.clone()));
+    }
+
     pub(crate) async fn is_target_offline(&self, target: &Arc<TargetClient>) -> bool {
         // Lock order: arn_remotes_map, then target_h_mutex. A stale client must not
         // read or initialize the health state of its replacement.
         let remotes = self.arn_remotes_map.read().await;
-        let Some(current) = remotes.get(&target.arn).and_then(|remote| remote.client.as_ref()) else {
-            return true;
-        };
-        if !Arc::ptr_eq(current, target) {
+        if !target.is_published_in(&remotes) {
             return true;
         }
         {
             let health_map = self.target_h_mutex.read().await;
-            if let Some(health) = health_map.get(&target.arn) {
+            if let Some(health) = health_map
+                .get(&target.source_bucket)
+                .and_then(|entries| entries.get(&target.arn))
+            {
                 return !health.online;
             }
         }
         let mut health_map = self.target_h_mutex.write().await;
-        let health = health_map.entry(target.arn.clone()).or_insert_with(|| target_health(target));
+        let health = health_map
+            .entry(target.source_bucket.clone())
+            .or_default()
+            .entry(target.arn.clone())
+            .or_insert_with(|| target_health(target));
         !health.online
     }
 
@@ -606,21 +624,25 @@ impl BucketTargetSys {
         // Lock order: arn_remotes_map, then target_h_mutex. Ignore failures reported
         // by a client that has already been replaced.
         let remotes = self.arn_remotes_map.read().await;
-        let Some(current) = remotes.get(&target.arn).and_then(|remote| remote.client.as_ref()) else {
-            return;
-        };
-        if !Arc::ptr_eq(current, target) {
+        if !target.is_published_in(&remotes) {
             return;
         }
         let mut health_map = self.target_h_mutex.write().await;
-        let health = health_map.entry(target.arn.clone()).or_insert_with(|| target_health(target));
+        let health = health_map
+            .entry(target.source_bucket.clone())
+            .or_default()
+            .entry(target.arn.clone())
+            .or_insert_with(|| target_health(target));
         update_endpoint_health(health, false, Duration::from_secs(0), OffsetDateTime::now_utc());
     }
 
     #[cfg(test)]
     async fn init_target_health(&self, target: &TargetClient) {
         let mut health_map = self.target_h_mutex.write().await;
-        health_map.insert(target.arn.clone(), target_health(target));
+        health_map
+            .entry(target.source_bucket.clone())
+            .or_default()
+            .insert(target.arn.clone(), target_health(target));
         drop(health_map);
         self.init_hc(&target.to_url()).await;
     }
@@ -640,6 +662,7 @@ impl BucketTargetSys {
             let remotes = self.arn_remotes_map.read().await;
             remotes
                 .values()
+                .flat_map(HashMap::values)
                 .filter_map(|target| target.client.clone())
                 .collect::<Vec<_>>()
         };
@@ -659,14 +682,15 @@ impl BucketTargetSys {
                 // Lock order: arn_remotes_map, then target_h_mutex. Keeping the remote
                 // read guard prevents a replaced client from receiving stale health.
                 let remotes = self.arn_remotes_map.read().await;
-                let Some(current) = remotes.get(&target.arn).and_then(|remote| remote.client.as_ref()) else {
-                    continue;
-                };
-                if !Arc::ptr_eq(current, &target) {
+                if !target.is_published_in(&remotes) {
                     continue;
                 }
                 let mut health_map = self.target_h_mutex.write().await;
-                let health = health_map.entry(target.arn.clone()).or_insert_with(|| target_health(&target));
+                let health = health_map
+                    .entry(target.source_bucket.clone())
+                    .or_default()
+                    .entry(target.arn.clone())
+                    .or_insert_with(|| target_health(&target));
                 update_endpoint_health(health, online, duration, OffsetDateTime::now_utc());
             }
 
@@ -705,7 +729,7 @@ impl BucketTargetSys {
         health_map.clone()
     }
 
-    async fn target_health_stats(&self) -> HashMap<String, EpHealth> {
+    async fn target_health_stats(&self) -> BucketArnMap<EpHealth> {
         let health_map = self.target_h_mutex.read().await;
         health_map.clone()
     }
@@ -725,7 +749,7 @@ impl BucketTargetSys {
                 Ok(bucket_targets) => {
                     for mut target in bucket_targets.targets {
                         if arn_type.is_empty() || target.target_type.to_string() == arn_type {
-                            if let Some(health) = health_stats.get(&target.arn) {
+                            if let Some(health) = health_stats.get(bucket).and_then(|entries| entries.get(&target.arn)) {
                                 target.total_downtime = health.offline_duration;
                                 target.online = health.online;
                                 target.last_online = health.last_online;
@@ -747,10 +771,10 @@ impl BucketTargetSys {
         }
 
         let targets_map = self.targets_map.read().await;
-        for bucket_targets in targets_map.values() {
+        for (source_bucket, bucket_targets) in targets_map.iter() {
             for mut target in bucket_targets.iter().cloned() {
                 if arn_type.is_empty() || target.target_type.to_string() == arn_type {
-                    if let Some(health) = health_stats.get(&target.arn) {
+                    if let Some(health) = health_stats.get(source_bucket).and_then(|entries| entries.get(&target.arn)) {
                         target.total_downtime = health.offline_duration;
                         target.online = health.online;
                         target.last_online = health.last_online;
@@ -807,115 +831,7 @@ impl BucketTargetSys {
         let update_mutex = self.target_update_mutex(bucket).await;
         let _update_guard = update_mutex.lock().await;
 
-        // Lock order: unreadable_targets, then targets_map, then
-        // arn_remotes_map, then target_h_mutex, then ssec_passthrough_map
-        // (always last; also taken standalone by the capability accessors).
-        self.unreadable_targets.write().await.remove(bucket);
-
-        let mut targets_map = self.targets_map.write().await;
-        let mut arn_remotes_map = self.arn_remotes_map.write().await;
-        let mut health_map = self.target_h_mutex.write().await;
-
-        if let Some(targets) = targets_map.remove(bucket) {
-            let mut ssec_map = self.ssec_passthrough_map.write().await;
-            for target in targets {
-                arn_remotes_map.remove(&target.arn);
-                health_map.remove(&target.arn);
-                ssec_map.remove(&target.arn);
-                self.forget_version_identity_capability(&target.arn);
-                self.forget_put_version_id_query_rejected(&target.arn);
-            }
-        }
-    }
-
-    /// Whether this target ARN is already known to reject a `versionId`
-    /// query on PUT / CreateMultipartUpload.
-    pub fn put_version_id_query_rejected(&self, arn: &str) -> bool {
-        self.put_version_id_query_rejected
-            .read()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .contains(arn)
-    }
-
-    /// Record that this target ARN rejected a `versionId` query on PUT /
-    /// CreateMultipartUpload, so later requests to it omit the query.
-    pub fn record_put_version_id_query_rejected(&self, arn: &str) {
-        self.put_version_id_query_rejected
-            .write()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .insert(arn.to_string());
-    }
-
-    fn forget_put_version_id_query_rejected(&self, arn: &str) {
-        self.put_version_id_query_rejected
-            .write()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .remove(arn);
-    }
-
-    /// Cached version-identity verdict for a target ARN; `Unknown` until a
-    /// replication write or a replication-check VersionFidelity probe judged
-    /// it since the target was built.
-    pub fn version_identity_capability(&self, arn: &str) -> VersionIdentityCapability {
-        self.version_identity_map
-            .read()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .get(arn)
-            .copied()
-            .unwrap_or_default()
-    }
-
-    /// Record a version-identity verdict for a target ARN. Written by the
-    /// replication worker after every PutObject / CompleteMultipartUpload
-    /// response and by the replication-check VersionFidelity phase.
-    pub fn record_version_identity_capability(&self, arn: &str, capability: VersionIdentityCapability) {
-        self.version_identity_map
-            .write()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .insert(arn.to_string(), capability);
-    }
-
-    fn forget_version_identity_capability(&self, arn: &str) {
-        self.version_identity_map
-            .write()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .remove(arn);
-    }
-
-    /// Cached SSE-C passthrough capability for a target ARN, plus whether the
-    /// verdict is older than [`SSEC_PASSTHROUGH_CAPABILITY_TTL`]. `(Unknown,
-    /// false)` when no verdict has been recorded since the target was built.
-    /// Staleness is computed here so the gate policy stays a pure function.
-    pub async fn ssec_passthrough_capability(&self, arn: &str) -> (SsecPassthroughCapability, bool) {
-        match self.ssec_passthrough_map.read().await.get(arn) {
-            Some(record) => (record.capability, record.recorded_at.elapsed() >= SSEC_PASSTHROUGH_CAPABILITY_TTL),
-            None => (SsecPassthroughCapability::Unknown, false),
-        }
-    }
-
-    /// Record an audited SSE-C passthrough verdict for a target ARN. Written by
-    /// the replication worker's HEAD-back audit and by the replication-check
-    /// SsecPassthrough probe phase.
-    pub async fn record_ssec_passthrough_capability(&self, arn: &str, capability: SsecPassthroughCapability) {
-        self.ssec_passthrough_map.write().await.insert(
-            arn.to_string(),
-            SsecPassthroughRecord {
-                capability,
-                recorded_at: Instant::now(),
-            },
-        );
-    }
-
-    /// Test hook: age an existing verdict so TTL expiry is observable without
-    /// waiting out the real window.
-    #[cfg(test)]
-    pub(crate) async fn backdate_ssec_passthrough_capability(&self, arn: &str, age: Duration) {
-        let backdated = Instant::now()
-            .checked_sub(age)
-            .expect("system uptime must exceed the backdate age");
-        if let Some(record) = self.ssec_passthrough_map.write().await.get_mut(arn) {
-            record.recorded_at = backdated;
-        }
+        self.update_all_targets_locked(bucket, None).await;
     }
 
     pub async fn set_target(
@@ -1054,7 +970,10 @@ impl BucketTargetSys {
             && ReplicationTargetConfigBridge::target_is_used_by_rules(&config, arn_str)
         {
             let arn_remotes_map = self.arn_remotes_map.read().await;
-            if arn_remotes_map.get(arn_str).is_some() {
+            if arn_remotes_map
+                .get(bucket)
+                .is_some_and(|entries| entries.contains_key(arn_str))
+            {
                 return Err(BucketTargetError::BucketRemoteRemoveDisallowed {
                     bucket: bucket.to_string(),
                 });
@@ -1073,12 +992,14 @@ impl BucketTargetSys {
         Ok(BucketTargets { targets: new_targets })
     }
 
-    async fn mark_refresh_attempt(&self, arn: &str) {
+    async fn mark_refresh_attempt(&self, bucket: &str, arn: &str) {
         // Rate-limit a failed config fetch as well as a failed client build.
         // A successful rebuild replaces this timestamp during publication.
         self.arn_remotes_map
             .write()
             .await
+            .entry(bucket.to_owned())
+            .or_default()
             .entry(arn.to_string())
             .or_default()
             .last_refresh = OffsetDateTime::now_utc();
@@ -1086,39 +1007,41 @@ impl BucketTargetSys {
 
     pub async fn mark_refresh_in_progress(&self, bucket: &str, arn: &str) {
         let mut arn_errs = self.arn_errs_map.write().await;
-        let err = arn_errs.entry(arn.to_string()).or_insert_with(|| ArnErrs {
-            count: 1,
-            bucket: bucket.to_string(),
-            ..Default::default()
-        });
+        let err = arn_errs
+            .entry(bucket.to_owned())
+            .or_default()
+            .entry(arn.to_string())
+            .or_insert_with(|| ArnErrs {
+                count: 1,
+                ..Default::default()
+            });
         err.update_in_progress = true;
-        err.bucket = bucket.to_string();
     }
 
     pub async fn mark_refresh_done(&self, bucket: &str, arn: &str) {
         let mut arn_errs = self.arn_errs_map.write().await;
-        if let Some(err) = arn_errs.get_mut(arn) {
+        if let Some(err) = arn_errs.get_mut(bucket).and_then(|entries| entries.get_mut(arn)) {
             err.update_in_progress = false;
-            err.bucket = bucket.to_string();
         }
     }
 
-    pub async fn is_reloading_target(&self, _bucket: &str, arn: &str) -> bool {
+    pub async fn is_reloading_target(&self, bucket: &str, arn: &str) -> bool {
         self.arn_errs_map
             .read()
             .await
-            .get(arn)
+            .get(bucket)
+            .and_then(|entries| entries.get(arn))
             .is_some_and(|err| err.update_in_progress)
     }
 
     pub async fn inc_arn_errs(&self, bucket: &str, arn: &str) {
         let mut arn_errs = self.arn_errs_map.write().await;
-        let err = arn_errs.entry(arn.to_string()).or_insert_with(|| ArnErrs {
-            bucket: bucket.to_string(),
-            ..Default::default()
-        });
+        let err = arn_errs
+            .entry(bucket.to_owned())
+            .or_default()
+            .entry(arn.to_string())
+            .or_default();
         err.count += 1;
-        err.bucket = bucket.to_string();
     }
 
     pub async fn get_remote_target_client(&self, bucket: &str, arn: &str) -> Option<Arc<TargetClient>> {
@@ -1126,7 +1049,8 @@ impl BucketTargetSys {
             self.arn_remotes_map
                 .read()
                 .await
-                .get(arn)
+                .get(bucket)
+                .and_then(|entries| entries.get(arn))
                 .map(|target| (target.client.clone(), Some(target.last_refresh)))
                 .unwrap_or((None, None))
         };
@@ -1151,32 +1075,28 @@ impl BucketTargetSys {
         // try-locking keeps the request path non-blocking, is cancellation-safe,
         // and prevents a stale reload from publishing after a credential update.
         let update_mutex = self.target_update_mutex(bucket).await;
-        let Ok(update_guard) = update_mutex.try_lock() else {
+        let Ok(_update_guard) = update_mutex.try_lock() else {
             return None;
         };
-        self.mark_refresh_attempt(arn).await;
+        // A publisher may have filled this entry between the miss and the claim.
+        if let Some(client) = self.get_remote_target_client_by_arn(bucket, arn).await {
+            return Some(client);
+        }
+        self.mark_refresh_attempt(bucket, arn).await;
 
         match get_bucket_targets_config(bucket).await {
             Ok(bucket_targets) => {
                 self.update_all_targets_locked(bucket, Some(&bucket_targets)).await;
+                if let Some(cli) = self.get_remote_target_client_by_arn(bucket, arn).await {
+                    return Some(cli);
+                }
+                // Publishing a fresh snapshot drops placeholders for unconfigured ARNs.
+                self.mark_refresh_attempt(bucket, arn).await;
             }
             Err(e) => {
                 error!("get bucket targets config error:{}", e);
             }
         };
-        drop(update_guard);
-
-        let cli = self
-            .arn_remotes_map
-            .read()
-            .await
-            .get(arn)
-            .and_then(|target| target.client.clone());
-        if let Some(cli) = cli
-            && !cli.credentials_expired_at(jiff::Timestamp::now())
-        {
-            return Some(cli);
-        }
 
         self.inc_arn_errs(bucket, arn).await;
         None
@@ -1215,6 +1135,8 @@ impl BucketTargetSys {
             })?;
 
         Ok(TargetClient {
+            source_bucket: String::new(),
+            capabilities: Default::default(),
             endpoint: spec.endpoint_url(),
             credentials: target.credentials.clone(),
             bucket: target.target_bucket.clone(),
@@ -1252,16 +1174,21 @@ impl BucketTargetSys {
         }
     }
 
-    pub async fn get_remote_target_client_by_arn(&self, _bucket: &str, arn: &str) -> Option<Arc<TargetClient>> {
+    /// Return the source bucket's published, unexpired client without reloading metadata.
+    pub async fn get_remote_target_client_by_arn(&self, bucket: &str, arn: &str) -> Option<Arc<TargetClient>> {
         let arn_remotes_map = self.arn_remotes_map.read().await;
-        arn_remotes_map.get(arn).and_then(|target| target.client.clone())
+        arn_remotes_map
+            .get(bucket)
+            .and_then(|entries| entries.get(arn))
+            .and_then(|target| target.client.clone())
+            .filter(|client| !client.credentials_expired_at(jiff::Timestamp::now()))
     }
 
     pub async fn get_remote_bucket_target_by_arn(&self, bucket: &str, arn: &str) -> Option<BucketTarget> {
         let targets_map = self.targets_map.read().await;
-        targets_map
-            .get(bucket)
-            .and_then(|targets| targets.iter().find(|t| t.arn == arn).cloned())
+        let mut matches = targets_map.get(bucket)?.iter().filter(|target| target.arn == arn);
+        let target = matches.next()?;
+        matches.next().is_none().then(|| target.clone())
     }
 
     pub async fn update_all_targets(&self, bucket: &str, targets: Option<&BucketTargets>) {
@@ -1282,87 +1209,90 @@ impl BucketTargetSys {
 
         let mut clients = Vec::new();
         if let Some(new_targets) = targets {
+            // Equal ARNs in different buckets are valid. Within one snapshot there
+            // is no way to select credentials for a repeated ARN, so fail closed.
+            let mut seen = HashSet::new();
+            let duplicates: HashSet<_> = new_targets
+                .targets
+                .iter()
+                .map(|target| target.arn.as_str())
+                .filter(|arn| !seen.insert(*arn))
+                .collect();
             for target in &new_targets.targets {
-                clients.push((target, self.get_remote_target_client_internal(target).await.map(Arc::new)));
+                let client = if duplicates.contains(target.arn.as_str()) {
+                    Err(BucketTargetError::BucketRemoteArnInvalid {
+                        bucket: bucket.to_owned(),
+                    })
+                } else {
+                    self.get_remote_target_client_internal(target).await
+                };
+                clients.push((target, client));
             }
         }
 
-        // Lock order: unreadable_targets (above), then targets_map, then
-        // arn_remotes_map, then target_h_mutex, then ssec_passthrough_map
-        // (always last; also taken standalone by the capability accessors).
+        // Lock order: targets_map, arn_remotes_map, target_h_mutex, arn_errs_map.
         let mut targets_map = self.targets_map.write().await;
-        let mut arn_remotes_map = self.arn_remotes_map.write().await;
-        let mut health_map = self.target_h_mutex.write().await;
-        // Remove existing targets
-        if let Some(existing_targets) = targets_map.remove(bucket) {
-            let mut ssec_map = self.ssec_passthrough_map.write().await;
-            let unchanged_service: HashMap<&str, &BucketTarget> = targets
-                .map(|new_targets| {
-                    new_targets
-                        .targets
-                        .iter()
-                        .map(|target| (target.arn.as_str(), target))
-                        .collect()
-                })
-                .unwrap_or_default();
-            for target in existing_targets {
-                arn_remotes_map.remove(&target.arn);
-                health_map.remove(&target.arn);
-                // A rebuilt/edited target may point at a different service:
-                // the SSE-C passthrough verdict must be re-audited from Unknown.
-                ssec_map.remove(&target.arn);
-                // The version-identity verdict survives an edit that keeps the
-                // same remote service (a resync start or a bandwidth change
-                // rewrites the entry in place): forgetting it there would make
-                // the very resync that follows re-drive every object as a
-                // duplicate on a target that mints its own version ids.
-                if unchanged_service
-                    .get(target.arn.as_str())
-                    .is_none_or(|edited| !same_replication_service(edited, &target))
-                {
-                    self.forget_version_identity_capability(&target.arn);
-                    self.forget_put_version_id_query_rejected(&target.arn);
-                }
-                self.update_bandwidth_limit(bucket, &target.arn, 0);
-            }
+        let mut remotes = self.arn_remotes_map.write().await;
+        let mut health = self.target_h_mutex.write().await;
+        self.arn_errs_map.write().await.remove(bucket);
+        let old_remotes = remotes.remove(bucket).unwrap_or_default();
+        health.remove(bucket);
+        let old_targets = targets_map.remove(bucket).unwrap_or_default();
+        for target in &old_targets {
+            self.update_bandwidth_limit(bucket, &target.arn, 0);
         }
 
-        // Add new targets
         if let Some(new_targets) = targets
             && !new_targets.is_empty()
         {
-            for (target, client) in clients {
-                // Keep a timestamped placeholder for configured targets whose
-                // client cannot be built. Replication records these attempts as
-                // failed, while the placeholder prevents every object from
-                // triggering another metadata reload/client build for five minutes.
-                arn_remotes_map.insert(
+            let previous: HashMap<_, _> = old_targets.iter().map(|target| (target.arn.as_str(), target)).collect();
+            let bucket_remotes = remotes.entry(bucket.to_owned()).or_default();
+            let bucket_health = health.entry(bucket.to_owned()).or_default();
+            for (target, result) in clients {
+                // Resync and bandwidth edits retain version-addressing knowledge for the
+                // same service and credentials, even through a transient failed build.
+                let previous_versions = previous
+                    .get(target.arn.as_str())
+                    .filter(|old| {
+                        !matches!(&result, Err(BucketTargetError::BucketRemoteArnInvalid { .. }))
+                            && same_replication_service(target, old)
+                    })
+                    .and_then(|_| old_remotes.get(&target.arn))
+                    .map(|entry| entry.versions.clone());
+                let client = match result {
+                    Ok(mut client) => {
+                        client.source_bucket = bucket.to_owned();
+                        if let Some(versions) = &previous_versions {
+                            client.capabilities.versions = versions.clone();
+                        }
+                        bucket_health.insert(target.arn.clone(), target_health(&client));
+                        self.update_bandwidth_limit(bucket, &target.arn, target.bandwidth_limit);
+                        Some(Arc::new(client))
+                    }
+                    Err(err) => {
+                        warn!(
+                            bucket = %bucket,
+                            arn = %target.arn,
+                            endpoint = %target.endpoint,
+                            error = %err,
+                            "replication target client unavailable; objects for this ARN will not replicate"
+                        );
+                        None
+                    }
+                };
+                // Failed builds retain a timestamped placeholder to rate-limit reloads.
+                bucket_remotes.insert(
                     target.arn.clone(),
                     ArnTarget {
-                        client: None,
+                        versions: client
+                            .as_ref()
+                            .map(|client| client.capabilities.versions.clone())
+                            .or(previous_versions)
+                            .unwrap_or_default(),
+                        client,
                         last_refresh: OffsetDateTime::now_utc(),
                     },
                 );
-                match client {
-                    Ok(client) => {
-                        arn_remotes_map.insert(
-                            target.arn.clone(),
-                            ArnTarget {
-                                client: Some(client.clone()),
-                                last_refresh: OffsetDateTime::now_utc(),
-                            },
-                        );
-                        health_map.insert(client.arn.clone(), target_health(&client));
-                        self.update_bandwidth_limit(bucket, &target.arn, target.bandwidth_limit);
-                    }
-                    Err(err) => warn!(
-                        bucket = %bucket,
-                        arn = %target.arn,
-                        endpoint = %target.endpoint,
-                        error = %err,
-                        "replication target client unavailable; objects for this ARN will not replicate"
-                    ),
-                }
             }
             targets_map.insert(bucket.to_string(), new_targets.targets.clone());
         }
@@ -1374,15 +1304,7 @@ impl BucketTargetSys {
             return;
         }
 
-        let Some(config) = &meta.bucket_target_config else {
-            return;
-        };
-
-        if config.is_empty() {
-            return;
-        }
-
-        self.update_all_targets(bucket, Some(config)).await;
+        self.update_all_targets(bucket, meta.bucket_target_config.as_ref()).await;
     }
 
     // getRemoteARN gets existing ARN for an endpoint or generates a new one.
@@ -2038,6 +1960,8 @@ impl TargetRequestTimeouts {
 
 #[derive(Debug)]
 pub struct TargetClient {
+    pub(crate) source_bucket: String,
+    pub(crate) capabilities: TargetCapabilities,
     pub endpoint: String,
     pub credentials: Option<Credentials>,
     pub bucket: String,
@@ -2056,6 +1980,72 @@ pub struct TargetClient {
 }
 
 impl TargetClient {
+    fn is_published_in(self: &Arc<Self>, remotes: &BucketArnMap<ArnTarget>) -> bool {
+        remotes
+            .get(&self.source_bucket)
+            .and_then(|entries| entries.get(&self.arn))
+            .and_then(|entry| entry.client.as_ref())
+            .is_some_and(|current| Arc::ptr_eq(current, self))
+    }
+
+    /// Version addressing learned by this client from the selected remote.
+    pub fn version_identity_capability(&self) -> VersionIdentityCapability {
+        *self
+            .capabilities
+            .versions
+            .version_identity
+            .read()
+            .unwrap_or_else(|err| err.into_inner())
+    }
+
+    /// Record the verdict on the client that performed the audit.
+    pub fn record_version_identity_capability(&self, capability: VersionIdentityCapability) {
+        *self
+            .capabilities
+            .versions
+            .version_identity
+            .write()
+            .unwrap_or_else(|err| err.into_inner()) = capability;
+    }
+
+    fn put_version_id_query_rejected(&self) -> bool {
+        self.capabilities
+            .versions
+            .put_version_id_query_rejected
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    fn record_put_version_id_query_rejected(&self) {
+        self.capabilities
+            .versions
+            .put_version_id_query_rejected
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Cached SSE-C audit and whether its TTL has elapsed; a new client needs an audit.
+    pub fn ssec_passthrough_capability(&self) -> (SsecPassthroughCapability, bool) {
+        self.capabilities
+            .ssec_passthrough
+            .read()
+            .unwrap_or_else(|err| err.into_inner())
+            .as_ref()
+            .map_or((SsecPassthroughCapability::Unknown, false), |record| {
+                (record.capability, record.recorded_at.elapsed() >= SSEC_PASSTHROUGH_CAPABILITY_TTL)
+            })
+    }
+
+    /// Record SSE-C evidence only for the client whose credentials were used.
+    pub fn record_ssec_passthrough_capability(&self, capability: SsecPassthroughCapability) {
+        *self
+            .capabilities
+            .ssec_passthrough
+            .write()
+            .unwrap_or_else(|err| err.into_inner()) = Some(SsecPassthroughRecord {
+            capability,
+            recorded_at: Instant::now(),
+        });
+    }
+
     /// Whether the target is a site-replication peer. Peers share bucket
     /// configuration and IAM, and are required to hold KMS keys under the
     /// same names; an operator-configured target promises neither.
@@ -2448,9 +2438,7 @@ impl TargetClient {
         if !version_id.is_empty() {
             insert_header(&mut headers, SUFFIX_SOURCE_VERSION_ID, &version_id);
         }
-        let api_version_id =
-            resolve_put_api_version_id(&version_id, BucketTargetSys::get().put_version_id_query_rejected(&self.arn))
-                .map(ToOwned::to_owned);
+        let api_version_id = resolve_put_api_version_id(&version_id, self.put_version_id_query_rejected()).map(ToOwned::to_owned);
 
         // A PUT carrying Object Lock parameters must also carry Content-MD5 or
         // an x-amz-checksum-* header on AWS-compatible targets (rustfs#7082).
@@ -2532,7 +2520,7 @@ impl TargetClient {
                     let err = service_err.into_err();
                     let meta = err.meta();
                     if is_put_version_id_query_rejected(meta.code(), meta.message()) {
-                        BucketTargetSys::get().record_put_version_id_query_rejected(&self.arn);
+                        self.record_put_version_id_query_rejected();
                     }
                     let error = match (meta.code(), meta.message()) {
                         (Some(code), Some(message)) => format!("put_object failed: {code}: {message}"),
@@ -2570,9 +2558,7 @@ impl TargetClient {
         let version_id = opts.internal.source_version_id.clone();
         // The remote version of a multipart replication is decided at initiate
         // time; CompleteMultipartUpload does not read a versionId.
-        let api_version_id =
-            resolve_put_api_version_id(&version_id, BucketTargetSys::get().put_version_id_query_rejected(&self.arn))
-                .map(ToOwned::to_owned);
+        let api_version_id = resolve_put_api_version_id(&version_id, self.put_version_id_query_rejected()).map(ToOwned::to_owned);
 
         match self
             .client
@@ -2602,7 +2588,7 @@ impl TargetClient {
                 if let SdkError::ServiceError(service_err) = &e {
                     let meta = service_err.err().meta();
                     if is_put_version_id_query_rejected(meta.code(), meta.message()) {
-                        BucketTargetSys::get().record_put_version_id_query_rejected(&self.arn);
+                        self.record_put_version_id_query_rejected();
                     }
                 }
                 Err(e.into())
@@ -3104,6 +3090,8 @@ mod tests {
             s3_client_for_endpoint_test_with_checksums("https://localhost:443".to_string(), Some(http_client), checksums);
         (
             TargetClient {
+                source_bucket: "bucket".to_owned(),
+                capabilities: Default::default(),
                 endpoint: "https://localhost:443".to_string(),
                 credentials: None,
                 bucket: "target-bucket".to_string(),
@@ -3648,6 +3636,8 @@ mod tests {
         let client = s3_client_for_test(443, Some(http_client));
         (
             TargetClient {
+                source_bucket: "bucket".to_owned(),
+                capabilities: Default::default(),
                 endpoint: "https://localhost:443".to_string(),
                 credentials: None,
                 bucket: "target-bucket".to_string(),
@@ -3962,6 +3952,8 @@ mod tests {
 
     fn target_client_for_test(arn: &str, endpoint: String, client: S3Client) -> Arc<TargetClient> {
         Arc::new(TargetClient {
+            source_bucket: "bucket".to_owned(),
+            capabilities: Default::default(),
             endpoint,
             credentials: None,
             bucket: "target-bucket".to_string(),
@@ -4162,30 +4154,132 @@ mod tests {
         }
     }
 
-    #[test]
-    fn version_identity_verdict_is_per_arn_and_forgotten_with_the_target() {
-        let sys = BucketTargetSys::default();
-        let arn = "arn:rustfs:replication:us-east-1:bucket:identity";
-        assert_eq!(sys.version_identity_capability(arn), VersionIdentityCapability::Unknown);
-        sys.record_version_identity_capability(arn, VersionIdentityCapability::MintsOwn);
-        assert_eq!(sys.version_identity_capability(arn), VersionIdentityCapability::MintsOwn);
-        assert_eq!(sys.version_identity_capability("other"), VersionIdentityCapability::Unknown);
-        // A rebuilt target may point at a different service.
-        sys.forget_version_identity_capability(arn);
-        assert_eq!(sys.version_identity_capability(arn), VersionIdentityCapability::Unknown);
+    fn cache_fixture(arn: &str, identity: &str) -> BucketTarget {
+        BucketTarget {
+            // The owner comes from the metadata lookup, even on older or inconsistent records.
+            source_bucket: "payload-bucket".to_owned(),
+            arn: arn.to_owned(),
+            endpoint: "replica.invalid:9000".to_owned(),
+            target_bucket: "destination".to_owned(),
+            region: "us-east-1".to_owned(),
+            credentials: Some(Credentials {
+                access_key: identity.to_owned(),
+                secret_key: "fixture".to_owned(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
     }
 
-    #[test]
-    fn put_version_id_query_rejection_is_per_arn_and_forgotten_with_the_target() {
+    #[tokio::test]
+    async fn cached_client_lookup_requires_source_bucket_and_arn() {
         let sys = BucketTargetSys::default();
-        let arn = "arn:rustfs:replication:us-east-1:bucket:versionid";
-        assert!(!sys.put_version_id_query_rejected(arn));
-        sys.record_put_version_id_query_rejected(arn);
-        assert!(sys.put_version_id_query_rejected(arn));
-        assert!(!sys.put_version_id_query_rejected("other"));
-        // A rebuilt target may point at a different service.
-        sys.forget_put_version_id_query_rejected(arn);
-        assert!(!sys.put_version_id_query_rejected(arn));
+        let arn = "arn:fixture";
+        let snapshot = BucketTargets {
+            targets: vec![cache_fixture(arn, "first")],
+        };
+        sys.update_all_targets("source", Some(&snapshot)).await;
+        let client = sys.get_remote_target_client("source", arn).await.expect("normal cache hit");
+        let direct = sys
+            .get_remote_target_client_by_arn("source", arn)
+            .await
+            .expect("normal direct lookup");
+        assert!(Arc::ptr_eq(&client, &direct));
+        assert_eq!(client.credentials.as_ref().expect("fixture credentials").access_key, "first");
+        assert!(sys.get_remote_target_client_by_arn("source", "other-arn").await.is_none());
+        assert!(sys.get_remote_target_client_by_arn("payload-bucket", arn).await.is_none());
+        // Hold the absent bucket's reload claim to exercise the miss without a metadata backend.
+        let lock = sys.target_update_mutex("payload-bucket").await;
+        let _guard = lock.lock().await;
+        assert!(sys.get_remote_target_client("payload-bucket", arn).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn shared_arn_reload_and_removal_preserve_other_source_client_and_state() {
+        let sys = BucketTargetSys::default();
+        let arn = "arn:shared";
+        let first = BucketTargets {
+            targets: vec![cache_fixture(arn, "first")],
+        };
+        let second = BucketTargets {
+            targets: vec![cache_fixture(arn, "second")],
+        };
+        sys.update_all_targets("a", Some(&first)).await;
+        sys.update_all_targets("b", Some(&second)).await;
+        let a = sys.get_remote_target_client("a", arn).await.expect("a's client");
+        let b = sys.get_remote_target_client("b", arn).await.expect("b's client");
+        assert_eq!(a.credentials.as_ref().expect("a's identity").access_key, "first");
+        assert_eq!(b.credentials.as_ref().expect("b's identity").access_key, "second");
+        a.record_version_identity_capability(VersionIdentityCapability::MintsOwn);
+        a.record_put_version_id_query_rejected();
+        a.record_ssec_passthrough_capability(SsecPassthroughCapability::Supported);
+        sys.mark_target_offline(&a).await;
+        sys.mark_refresh_in_progress("a", arn).await;
+        assert!(!sys.is_reloading_target("b", arn).await);
+        assert!(!sys.is_target_offline(&b).await);
+        assert_eq!(b.ssec_passthrough_capability(), (SsecPassthroughCapability::Unknown, false));
+        assert_eq!(b.version_identity_capability(), VersionIdentityCapability::Unknown);
+        assert!(!b.put_version_id_query_rejected());
+
+        sys.update_all_targets("a", Some(&first)).await;
+        let rebuilt = sys.get_remote_target_client_by_arn("a", arn).await.expect("rebuilt client");
+        assert!(!Arc::ptr_eq(&a, &rebuilt));
+        assert!(rebuilt.put_version_id_query_rejected());
+        assert_eq!(rebuilt.version_identity_capability(), VersionIdentityCapability::MintsOwn);
+        a.record_ssec_passthrough_capability(SsecPassthroughCapability::Supported);
+        assert_eq!(rebuilt.ssec_passthrough_capability(), (SsecPassthroughCapability::Unknown, false));
+        sys.delete("a").await;
+        assert!(sys.get_remote_target_client_by_arn("a", arn).await.is_none());
+        let survivor = sys.get_remote_target_client("b", arn).await.expect("b survives a's removal");
+        assert!(Arc::ptr_eq(&b, &survivor));
+        assert!(!sys.is_target_offline(&survivor).await);
+    }
+
+    #[tokio::test]
+    async fn failed_client_reload_and_empty_snapshot_only_clear_the_owning_bucket() {
+        let sys = BucketTargetSys::default();
+        let arn = "arn:shared";
+        let mut meta = BucketMetadata::new("a");
+        meta.bucket_target_config = Some(BucketTargets {
+            targets: vec![cache_fixture(arn, "first")],
+        });
+        sys.set("a", &meta).await;
+        let second = BucketTargets {
+            targets: vec![cache_fixture(arn, "second")],
+        };
+        sys.update_all_targets("b", Some(&second)).await;
+        let b = sys
+            .get_remote_target_client_by_arn("b", arn)
+            .await
+            .expect("b's initial client");
+        let mut invalid = cache_fixture(arn, "first");
+        invalid.credentials = None;
+        meta.bucket_target_config = Some(BucketTargets { targets: vec![invalid] });
+        sys.set("a", &meta).await;
+        assert!(sys.get_remote_target_client("a", arn).await.is_none());
+        assert!(Arc::ptr_eq(&b, &sys.get_remote_target_client("b", arn).await.expect("b's cached client")));
+        meta.bucket_target_config = None;
+        sys.set("a", &meta).await;
+        assert!(!sys.arn_remotes_map.read().await.contains_key("a"));
+        assert!(Arc::ptr_eq(
+            &b,
+            &sys.get_remote_target_client_by_arn("b", arn)
+                .await
+                .expect("b remains published")
+        ));
+    }
+
+    #[tokio::test]
+    async fn ambiguous_arn_within_one_snapshot_has_no_replication_client() {
+        let sys = BucketTargetSys::default();
+        let arn = "arn:ambiguous";
+        let snapshot = BucketTargets {
+            targets: vec![cache_fixture(arn, "first"), cache_fixture(arn, "second")],
+        };
+        sys.update_all_targets("source", Some(&snapshot)).await;
+        assert!(sys.get_remote_bucket_target_by_arn("source", arn).await.is_none());
+        assert!(sys.get_remote_target_client_by_arn("source", arn).await.is_none());
+        assert!(sys.get_remote_target_client("source", arn).await.is_none());
     }
 
     #[tokio::test]
@@ -4218,8 +4312,12 @@ mod tests {
             }),
         )
         .await;
-        sys.record_put_version_id_query_rejected(arn);
-        assert!(sys.put_version_id_query_rejected(arn));
+        let client = sys
+            .get_remote_target_client_by_arn("bucket", arn)
+            .await
+            .expect("published client");
+        client.record_put_version_id_query_rejected();
+        assert!(client.put_version_id_query_rejected());
 
         // Same ARN, different endpoint: the update path (not `delete`) is the
         // only thing that runs here, so the reset must come from
@@ -4233,7 +4331,10 @@ mod tests {
         .await;
 
         assert!(
-            !sys.put_version_id_query_rejected(arn),
+            !sys.get_remote_target_client_by_arn("bucket", arn)
+                .await
+                .expect("replacement client")
+                .put_version_id_query_rejected(),
             "editing the target to a different endpoint must forget the stale rejection verdict"
         );
     }
@@ -4285,45 +4386,53 @@ mod tests {
     /// `replication_target_boundary`), so together this proves an Unsupported
     /// target recovers to Supported through the audit once its verdict ages
     /// out — and a stale Supported one is re-proven rather than trusted.
-    #[tokio::test]
-    async fn ssec_passthrough_capability_ttl_expires_and_reaudit_flips_verdict() {
-        let sys = BucketTargetSys::default();
-        let arn = "arn:rustfs:replication:us-east-1:bucket:ssec-ttl";
+    #[test]
+    fn ssec_passthrough_capability_ttl_expires_and_reaudit_flips_verdict() {
+        let (client, _) = header_recording_target_client(Vec::new());
         let expired_age = SSEC_PASSTHROUGH_CAPABILITY_TTL + Duration::from_secs(1);
 
         assert_eq!(
-            sys.ssec_passthrough_capability(arn).await,
+            client.ssec_passthrough_capability(),
             (SsecPassthroughCapability::Unknown, false),
             "an unrecorded target must read Unknown and never expired"
         );
 
-        sys.record_ssec_passthrough_capability(arn, SsecPassthroughCapability::Unsupported)
-            .await;
-        assert_eq!(
-            sys.ssec_passthrough_capability(arn).await,
-            (SsecPassthroughCapability::Unsupported, false)
-        );
+        client.record_ssec_passthrough_capability(SsecPassthroughCapability::Unsupported);
+        assert_eq!(client.ssec_passthrough_capability(), (SsecPassthroughCapability::Unsupported, false));
 
-        sys.backdate_ssec_passthrough_capability(arn, expired_age).await;
+        client
+            .capabilities
+            .ssec_passthrough
+            .write()
+            .expect("capabilities lock")
+            .as_mut()
+            .expect("recorded verdict")
+            .recorded_at -= expired_age;
         assert_eq!(
-            sys.ssec_passthrough_capability(arn).await,
+            client.ssec_passthrough_capability(),
             (SsecPassthroughCapability::Unsupported, true),
             "an aged-out Unsupported verdict must read expired so the gate re-audits"
         );
 
         // The re-audit against an upgraded target records Supported afresh.
-        sys.record_ssec_passthrough_capability(arn, SsecPassthroughCapability::Supported)
-            .await;
+        client.record_ssec_passthrough_capability(SsecPassthroughCapability::Supported);
         assert_eq!(
-            sys.ssec_passthrough_capability(arn).await,
+            client.ssec_passthrough_capability(),
             (SsecPassthroughCapability::Supported, false),
             "a fresh Supported verdict replaces the expired Unsupported one"
         );
 
         // And the fail-open twin: Supported also ages out.
-        sys.backdate_ssec_passthrough_capability(arn, expired_age).await;
+        client
+            .capabilities
+            .ssec_passthrough
+            .write()
+            .expect("capabilities lock")
+            .as_mut()
+            .expect("recorded verdict")
+            .recorded_at -= expired_age;
         assert_eq!(
-            sys.ssec_passthrough_capability(arn).await,
+            client.ssec_passthrough_capability(),
             (SsecPassthroughCapability::Supported, true),
             "an aged-out Supported verdict must read expired so the gate re-proves it"
         );
@@ -4344,10 +4453,7 @@ mod tests {
                     .build(),
             ),
         );
-        sys.arn_remotes_map
-            .write()
-            .await
-            .insert(arn.to_string(), ArnTarget::with_client(client.clone()));
+        sys.register_test_client(&client).await;
         sys.init_target_health(&client).await;
         sys.mark_target_offline(&client).await;
 
@@ -4366,7 +4472,7 @@ mod tests {
         assert_eq!(targets.len(), 1);
         assert!(!targets[0].online);
         assert_eq!(targets[0].offline_count, 1);
-        assert_eq!(sys.target_health_stats().await[arn].endpoint, "remote.example:9443");
+        assert_eq!(sys.target_health_stats().await["bucket"][arn].endpoint, "remote.example:9443");
     }
 
     #[tokio::test]
@@ -4382,14 +4488,8 @@ mod tests {
         let first = target_client_for_test("arn:first", endpoint.clone(), S3Client::from_conf(config()));
         let second = target_client_for_test("arn:second", endpoint.clone(), S3Client::from_conf(config()));
 
-        sys.arn_remotes_map
-            .write()
-            .await
-            .insert(first.arn.clone(), ArnTarget::with_client(first.clone()));
-        sys.arn_remotes_map
-            .write()
-            .await
-            .insert(second.arn.clone(), ArnTarget::with_client(second.clone()));
+        sys.register_test_client(&first).await;
+        sys.register_test_client(&second).await;
         sys.init_target_health(&first).await;
         sys.init_target_health(&second).await;
         sys.mark_target_offline(&first).await;
@@ -4418,10 +4518,7 @@ mod tests {
             "https://current.example:9443".to_string(),
             S3Client::from_conf(config("https://current.example:9443")),
         );
-        sys.arn_remotes_map
-            .write()
-            .await
-            .insert(arn.to_string(), ArnTarget::with_client(current.clone()));
+        sys.register_test_client(&current).await;
         sys.init_target_health(&current).await;
 
         sys.mark_target_offline(&stale).await;
@@ -4456,7 +4553,7 @@ mod tests {
 
         sys.delete("bucket").await;
 
-        assert!(!sys.target_health_stats().await.contains_key(arn));
+        assert!(!sys.target_health_stats().await.contains_key("bucket"));
     }
 
     #[test]
@@ -4985,17 +5082,21 @@ mod tests {
         let cert = generate_simple_self_signed(vec!["localhost".to_string()]).expect("certificate should generate");
         let (port, server) = spawn_https_server(&cert, 2);
         let endpoint = format!("https://localhost:{port}");
-        let strict = target_client_for_test("arn:strict", endpoint.clone(), s3_client_for_test(port, None));
+        let strict_client = s3_client_for_test(port, None);
+        // A failed trust check must consume just one of the two fixture connections.
+        let strict_config = strict_client
+            .config()
+            .to_builder()
+            .retry_config(aws_sdk_s3::config::retry::RetryConfig::disabled())
+            .build();
+        let strict = target_client_for_test("arn:strict", endpoint.clone(), S3Client::from_conf(strict_config));
         let insecure = target_client_for_test(
             "arn:insecure",
             endpoint,
             s3_client_for_test(port, Some(build_insecure_aws_s3_http_client())),
         );
-        {
-            let mut remotes = sys.arn_remotes_map.write().await;
-            remotes.insert(strict.arn.clone(), ArnTarget::with_client(strict.clone()));
-            remotes.insert(insecure.arn.clone(), ArnTarget::with_client(insecure.clone()));
-        }
+        sys.register_test_client(&strict).await;
+        sys.register_test_client(&insecure).await;
 
         sys.heartbeat_once().await;
 
@@ -5010,10 +5111,7 @@ mod tests {
         let (port, accepted, release, server) = spawn_delayed_http_server();
         let endpoint = format!("http://127.0.0.1:{port}");
         let stale = target_client_for_test("arn:replacement", endpoint.clone(), s3_client_for_endpoint_test(endpoint, None));
-        sys.arn_remotes_map
-            .write()
-            .await
-            .insert(stale.arn.clone(), ArnTarget::with_client(stale));
+        sys.register_test_client(&stale).await;
         let heartbeat_sys = sys.clone();
         let heartbeat = tokio::spawn(async move { heartbeat_sys.heartbeat_once().await });
         accepted.await.expect("heartbeat request should reach test server");
@@ -5029,10 +5127,7 @@ mod tests {
                     .build(),
             ),
         );
-        sys.arn_remotes_map
-            .write()
-            .await
-            .insert(replacement.arn.clone(), ArnTarget::with_client(replacement.clone()));
+        sys.register_test_client(&replacement).await;
         sys.init_target_health(&replacement).await;
         release.send(()).expect("stale heartbeat response should be released");
         heartbeat.await.expect("heartbeat should finish");
@@ -5060,19 +5155,21 @@ mod tests {
     async fn target_refresh_attempt_updates_retry_timestamp_and_error_count() {
         let sys = BucketTargetSys::default();
 
-        sys.mark_refresh_attempt("arn:reload").await;
-        let last_refresh = sys.arn_remotes_map.read().await["arn:reload"].last_refresh;
+        sys.mark_refresh_attempt("bucket", "arn:reload").await;
+        let last_refresh = sys.arn_remotes_map.read().await["bucket"]["arn:reload"].last_refresh;
         assert!(OffsetDateTime::now_utc() - last_refresh < Duration::from_secs(5));
 
         sys.inc_arn_errs("bucket", "arn:reload").await;
         sys.inc_arn_errs("bucket", "arn:reload").await;
+        sys.inc_arn_errs("peer-bucket", "arn:reload").await;
         let errors = sys.arn_errs_map.read().await;
-        assert_eq!(errors["arn:reload"].count, 2);
-        assert_eq!(errors["arn:reload"].bucket, "bucket");
+        assert_eq!(errors["bucket"]["arn:reload"].count, 2);
+        assert_eq!(errors["peer-bucket"]["arn:reload"].count, 1);
         drop(errors);
 
         sys.mark_refresh_in_progress("bucket", "arn:reload").await;
         assert!(sys.is_reloading_target("bucket", "arn:reload").await);
+        assert!(!sys.is_reloading_target("peer-bucket", "arn:reload").await);
         sys.mark_refresh_done("bucket", "arn:reload").await;
         assert!(!sys.is_reloading_target("bucket", "arn:reload").await);
         sys.mark_refresh_in_progress("bucket", "arn:reload").await;
@@ -5138,7 +5235,7 @@ mod tests {
         sys.update_all_targets("bucket", Some(&targets)).await;
 
         let remotes = sys.arn_remotes_map.read().await;
-        let placeholder = remotes
+        let placeholder = remotes["bucket"]
             .get("arn:expired")
             .expect("configured target should retain a cache entry");
         assert!(placeholder.client.is_none());
@@ -5175,6 +5272,8 @@ mod tests {
             .get_remote_target_client("bucket", "arn:rotating")
             .await
             .expect("initial client should be published");
+        old_client.record_put_version_id_query_rejected();
+        old_client.record_version_identity_capability(VersionIdentityCapability::MintsOwn);
 
         sys.update_all_targets(
             "bucket",
@@ -5189,6 +5288,8 @@ mod tests {
             .expect("rotated client should be published");
 
         assert!(!Arc::ptr_eq(&old_client, &new_client));
+        assert!(!new_client.put_version_id_query_rejected());
+        assert_eq!(new_client.version_identity_capability(), VersionIdentityCapability::Unknown);
         assert_eq!(
             old_client.credentials.as_ref().and_then(Credentials::effective_session_token),
             Some("old-session-token")

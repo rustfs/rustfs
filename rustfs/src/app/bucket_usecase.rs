@@ -22,7 +22,7 @@ use super::storage_api::bucket_usecase::StorageObjectInfo as ObjectInfo;
 #[cfg(test)]
 use super::storage_api::bucket_usecase::access::ReqInfo;
 use super::storage_api::bucket_usecase::access::{
-    TableDataPlaneListAccess, authorize_request, bucket_config_mutation_incarnation, log_list_buckets_iam_implicit_deny,
+    authorize_request, bucket_config_mutation_incarnation, log_list_buckets_iam_implicit_deny,
     prepare_list_buckets_iam_authorization, prepare_odm_read_generation, req_info_ref,
 };
 #[cfg(test)]
@@ -48,9 +48,9 @@ use super::storage_api::bucket_usecase::bucket::{
     utils::{BucketConfigXml, serialize},
     versioning_sys::BucketVersioningSys,
 };
-use super::storage_api::bucket_usecase::contract::bucket::{
-    BucketOperations, BucketOptions, DeleteBucketOptions, MakeBucketOptions,
-};
+#[cfg(test)]
+use super::storage_api::bucket_usecase::contract::bucket::DeleteBucketOptions;
+use super::storage_api::bucket_usecase::contract::bucket::{BucketOperations, BucketOptions, MakeBucketOptions};
 use super::storage_api::bucket_usecase::contract::list::{
     ListObjectVersionsInfo as StorageListObjectVersionsInfo, ListObjectsV2Info as StorageListObjectsV2Info,
 };
@@ -98,14 +98,13 @@ use rustfs_policy::policy::{
     {BucketPolicy, BucketPolicyArgs, Effect},
 };
 use rustfs_s3_ops::S3Operation;
+use rustfs_s3_types::{Region, S3Error, S3ErrorCode, S3Result};
 use rustfs_targets::{
     EventName,
     arn::{ARN, TargetID, TargetIDError},
 };
 use rustfs_utils::http::get_header;
 use rustfs_utils::obj::extract_user_defined_metadata;
-use s3s::region::Region;
-use s3s::{S3Error, S3ErrorCode, S3Result};
 use std::{
     borrow::Cow,
     collections::{HashMap, HashSet},
@@ -121,7 +120,6 @@ use tracing::{Instrument as _, debug, error, info, instrument, warn};
 mod accelerate;
 mod acl;
 mod core;
-#[cfg(any(test, feature = "gateway-stack"))]
 pub(crate) use self::core::requested_location_constraint;
 mod cors;
 #[cfg(test)]
@@ -511,7 +509,7 @@ impl DefaultBucketUsecase {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::app::bucket_usecase::test_support::{build_request, build_request_with_req_info};
+    use crate::app::bucket_usecase::test_support::{build_request_with_req_info, owned_envelope};
     use crate::app::storage_api::s3::dto::CreateBucketInput;
     use http::Method;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -1001,16 +999,16 @@ mod tests {
             },
         );
 
-        assert!(req_info_ref(&req).expect("req info should be present").is_owner);
+        let envelope = RequestEnvelope::from_s3s(&req);
+        assert!(envelope.req_info().expect("req info should be present").is_owner);
     }
 
     #[tokio::test]
     async fn execute_list_buckets_returns_internal_error_when_store_uninitialized() {
-        let req = build_request((), Method::GET);
         let usecase = DefaultBucketUsecase::without_context();
 
         let err = usecase
-            .execute_list_buckets(RequestEnvelope::from_s3s(&req), gateway_dto::ListBucketsInput::default())
+            .execute_list_buckets(owned_envelope(Method::GET), gateway_dto::ListBucketsInput::default())
             .await
             .unwrap_err();
         assert_eq!(err.code(), &rustfs_s3_types::S3ErrorCode::InternalError);

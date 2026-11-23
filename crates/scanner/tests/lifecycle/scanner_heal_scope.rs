@@ -123,6 +123,7 @@ async fn check_scanner_object_scope() {
                 heal_enabled: true,
                 heal_bitrot: true,
                 debug: false,
+                notification_bucket_incarnation: None,
             };
             disk.get_size_with_tier_names(item, &[]).await.expect("scan original object");
             if let (Some(pool), Some(set), Some(_)) = (pool, set, disk_index) {

@@ -23,33 +23,41 @@
 //! routing a request (the gateway), or any S3 behaviour (the use cases in `crate::app`).
 //! Upstream: the gateway's dispatch. Downstream: `crate::app` use cases.
 //!
-//! An operation is one `impl Served` and one row of `ROWS` in the family file named after its
-//! migration batch, the stem `storage/legacy_edge/` uses for the same operations.
+//! Every operation has one `ROWS` entry. Standard operations implement `Served`; browser POST
+//! uses the gateway’s two-stage PostObject registration.
 
 mod access;
 mod envelope;
 mod error;
 
 mod bucket_access;
+#[cfg(test)]
+pub(crate) use bucket_access::prepare_notification_configuration;
 mod bucket_configs;
 mod bucket_core;
 mod bucket_replication_lifecycle;
 mod lifecycle_input;
+#[cfg(test)]
+pub(crate) use lifecycle_input::prepare_lifecycle_configuration;
 mod listing_multipart;
+pub(crate) mod metadata_listing;
 mod object_commit;
 mod object_meta;
 mod object_misc;
 mod object_read;
 mod object_write;
+#[cfg(test)]
+mod post_archive_diagnostic_tests;
+mod post_object;
 
 #[cfg(test)]
 pub(crate) mod test_support;
 
 pub(super) use self::access::verified_signature;
-pub(super) use self::error::handler_error;
+pub(crate) use self::error::handler_error;
 use crate::app::{Answered, RequestEnvelope};
 use crate::runtime_sources::{AppContext, ServerContextSlot};
-use rustfs_gateway::{Handler, HandlerResult, OperationCodec, Req, Resp, ServiceBuilder};
+use rustfs_gateway::{Handler, HandlerError, HandlerResult, OperationCodec, Req, Resp, ServiceBuilder};
 use rustfs_io_metrics::record_s3_op;
 use rustfs_s3_ops::S3Operation;
 use rustfs_s3_types::S3Result;
@@ -66,14 +74,36 @@ impl GatewayBackend {
         Self { server_ctx }
     }
 
-    /// The fixed sequence: the shared access phase, the operation's own authorization, the count,
-    /// the use case. Nothing is skipped and nothing is reordered per operation.
-    async fn serve<O: Served>(&self, request: Req<O>) -> S3Result<Resp<O>> {
-        let mut envelope = access::admit(&self.server_ctx, request.context()).await?;
-        O::authorize(&mut envelope, &request).await?;
-        record_s3_op(O::METRIC);
-        O::execute(self.server_ctx.app_context(), envelope, request).await
+    /// The fixed sequence: the shared access phase, the operation's own authorization, the SSE
+    /// refusal the gateway deferred, the count, the use case. Nothing is skipped and nothing is
+    /// reordered per operation.
+    async fn serve<O: Served>(&self, request: Req<O>) -> HandlerResult<O> {
+        let mut envelope = access::admit(&self.server_ctx, request.context())
+            .await
+            .map_err(handler_error)?;
+        let authorized = O::authorize(&mut envelope, &request).await;
+        let deferred = request.sse().deferred_refusal().map(|refusal| refusal.error().clone());
+        authorized_then(authorized, deferred, || {
+            record_s3_op(O::METRIC);
+            O::execute(self.server_ctx.app_context(), envelope, request)
+        })
+        .await
     }
+}
+
+/// Runs `execute` only when `authorized` succeeded and the gateway deferred no refusal: a denial
+/// is answered before a refused SSE header, as on legacy RustFS, and a refused request executes
+/// nothing.
+async fn authorized_then<T, Fut: Future<Output = S3Result<T>>>(
+    authorized: S3Result<()>,
+    deferred: Option<HandlerError>,
+    execute: impl FnOnce() -> Fut,
+) -> Result<T, HandlerError> {
+    authorized.map_err(handler_error)?;
+    if let Some(refusal) = deferred {
+        return Err(refusal);
+    }
+    execute().await.map_err(handler_error)
 }
 
 /// One S3 operation the gateway stack serves.
@@ -107,7 +137,7 @@ fn resp<O: Served>(answered: Answered<O::Output>) -> Resp<O> {
 
 impl<O: Served> Handler<O> for GatewayBackend {
     async fn call(&self, request: Req<O>) -> HandlerResult<O> {
-        self.serve(request).await.map_err(handler_error)
+        self.serve(request).await
     }
 }
 
@@ -186,6 +216,49 @@ mod tests {
             known.iter().any(|operation| !serves(OPERATIONS, operation)),
             "the probe needs an unserved operation"
         );
+    }
+
+    fn refusal() -> HandlerError {
+        HandlerError::new(rustfs_gateway_types::ErrorCode::INVALID_REQUEST, "deferred refusal")
+    }
+
+    async fn run(authorized: S3Result<()>, deferred: Option<HandlerError>) -> (Result<u8, HandlerError>, usize) {
+        let executed = std::cell::Cell::new(0);
+        let answer = authorized_then(authorized, deferred, || {
+            executed.set(executed.get() + 1);
+            async { Ok(7) }
+        })
+        .await;
+        (answer, executed.get())
+    }
+
+    #[tokio::test]
+    async fn n_a_denial_is_answered_before_a_deferred_refusal_and_nothing_executes() {
+        let denied = || rustfs_s3_types::s3_error!(AccessDenied, "denied");
+        let (answer, executed) = run(Err(denied()), Some(refusal())).await;
+        assert_eq!(answer, Err(handler_error(denied())));
+        assert_ne!(answer, Err(refusal()));
+        assert_eq!(executed, 0);
+    }
+
+    #[tokio::test]
+    async fn n_an_authorized_request_with_a_deferred_refusal_is_refused_and_never_executes() {
+        let (answer, executed) = run(Ok(()), Some(refusal())).await;
+        assert_eq!(answer, Err(refusal()));
+        assert_eq!(executed, 0);
+    }
+
+    #[tokio::test]
+    async fn n_a_denial_without_a_refusal_is_answered_and_nothing_executes() {
+        let denied = || rustfs_s3_types::s3_error!(AccessDenied, "denied");
+        let (answer, executed) = run(Err(denied()), None).await;
+        assert_eq!(answer, Err(handler_error(denied())));
+        assert_eq!(executed, 0);
+    }
+
+    #[tokio::test]
+    async fn an_authorized_request_without_a_refusal_executes_once() {
+        assert_eq!(run(Ok(()), None).await, (Ok(7), 1));
     }
 
     #[test]

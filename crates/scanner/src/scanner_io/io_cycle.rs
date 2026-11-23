@@ -41,6 +41,48 @@ struct CollectorSlotSummary<'a> {
     source_difference_sample: Option<CollectorSlotSample<'a>>,
 }
 
+impl CollectorSlotSummary<'_> {
+    /// Select one observed blocker. A source emitted in a different slot is valid when the set of sources matches.
+    fn partial_stage(
+        &self,
+        bucket_plan_complete: bool,
+        bucket_scan_status: ScannerBucketScanStatus,
+        dirty_usage_status: DirtyUsageSnapshotStatus,
+        scan_scope_matches: bool,
+        candidate_rejection: Option<rustfs_scanner_metrics::usage_candidate::ScannerUsageCandidateOutcome>,
+    ) -> &'static str {
+        if !bucket_plan_complete {
+            "inventory_incomplete"
+        } else if self.unobserved > 0 {
+            "source_result_missing"
+        } else if bucket_scan_status == ScannerBucketScanStatus::Failed {
+            "bucket_worker_failed"
+        } else if bucket_scan_status == ScannerBucketScanStatus::NamespaceNotFound {
+            "bucket_namespace_not_found"
+        } else if bucket_scan_status == ScannerBucketScanStatus::Partial {
+            "bucket_walk_incomplete"
+        } else if dirty_usage_status == DirtyUsageSnapshotStatus::Unverified {
+            "dirty_generation_unverified"
+        } else if self.missing_source > 0 {
+            "missing_source"
+        } else if self.cycle_mismatch > 0 {
+            "source_cycle_mismatch"
+        } else if self.epoch_mismatch > 0 {
+            "source_epoch_mismatch"
+        } else if self.missing_plan > 0 || self.plan_mismatch > 0 {
+            "source_plan_mismatch"
+        } else if !scan_scope_matches {
+            "source_membership"
+        } else if self.incomplete > 0 {
+            "source_snapshot_incomplete"
+        } else if self.missing_last_update > 0 {
+            "missing_last_update"
+        } else {
+            candidate_rejection.map_or("root_coverage_incomplete", |outcome| outcome.as_label())
+        }
+    }
+}
+
 fn summarize_collector_slots<'a>(
     slots: impl IntoIterator<Item = (usize, DataUsageCacheSource, bool, &'a DataUsageCache)>,
     cycle: u64,
@@ -357,6 +399,7 @@ where
     S: ScannerStorage,
 {
     let default_result = |scope: ScannerBucketScanScope| ScannerBucketScopeResolutionResult {
+        segment_reuse_activation_preflight: None,
         scope,
         remote_dirty_usage_acknowledgements: Vec::new(),
         distributed_segment_invalidation_evidence: None,
@@ -506,7 +549,7 @@ where
         distributed,
         resolution.baseline_proof,
     );
-    default_result(scoped_scan_scope_from_dirty_buckets(
+    let scope = scoped_scan_scope_from_dirty_buckets(
         resolution.requested_scope,
         dirty_buckets,
         (!distributed).then_some(resolution.dirty_usage_snapshot.scopes.as_ref()),
@@ -514,7 +557,11 @@ where
         segment_reuse_activation_preflight.scanner_segment_reuse_activated,
         resolution.all_buckets,
         resolution.baseline_proof,
-    ))
+    );
+    ScannerBucketScopeResolutionResult {
+        segment_reuse_activation_preflight: Some(segment_reuse_activation_preflight),
+        ..default_result(scope)
+    }
 }
 
 /// Runs once between the bucket listing and the dirty-usage snapshot, the
@@ -619,6 +666,14 @@ where
     };
 
     let distributed = store.setup_is_dist_erasure().await;
+    let local_node = if distributed {
+        store
+            .scanner_local_node_name()
+            .filter(|name| !name.is_empty())
+            .ok_or_else(|| Error::other("scanner local member identity is unavailable"))?
+    } else {
+        crate::scanner::LOCAL_SCANNER_ACTIVITY_NODE.to_string()
+    };
     #[cfg(test)]
     let distributed = distributed || peer_observations.is_some();
     let activity_before = match scanner_activity_preflight(
@@ -723,15 +778,23 @@ where
     let activity_before = remote_start
         .as_ref()
         .map_or(activity_before, ScannerRemoteDirtyUsageWindow::activity_for_walk);
-    let structural_scan_plan_digest =
-        scanner_bucket_plan_digest(&all_buckets, crate::scanner::scanner_activity_structural_digest(&activity_before));
+    let structural_scan_plan_digest = scanner_bucket_plan_digest(
+        &all_buckets,
+        crate::scanner::scanner_activity_structural_digest(&activity_before, &local_node),
+    );
     let scan_plan_digest = scanner_bucket_work_digest(structural_scan_plan_digest, scan_mode, requires_full_scan);
     let activity_digest = crate::scanner::scanner_activity_snapshot_digest(&activity_before);
-    let bucket_coverage_digest = scanner_bucket_plan_digest(&all_buckets, activity_digest);
-    // A bucket checkpoint must not be invalidated by another bucket joining
-    // the inventory. The set plan above still binds the complete inventory.
-    let checkpoint_coverage_digest = DataUsageScanPlanDigest(crate::scanner::scanner_activity_coverage_digest(&activity_before));
-    let execution_digest = scanner_bucket_work_digest(bucket_coverage_digest, scan_mode, requires_full_scan);
+    let bucket_coverage_digest = scanner_bucket_plan_digest(
+        &all_buckets,
+        crate::scanner::scanner_activity_bucket_reuse_digest(&activity_before, &local_node),
+    );
+    // A bucket checkpoint must survive unrelated inventory changes.
+    let checkpoint_coverage_digest =
+        DataUsageScanPlanDigest(crate::scanner::scanner_activity_coverage_digest(&activity_before, &local_node));
+    let completed_checkpoint_cycle_floor =
+        completed_checkpoint_cycle_floor(persisted_usage_baseline.as_deref(), &expected_sources, want_cycle, leader_epoch);
+    let execution_digest =
+        scanner_bucket_work_digest(scanner_bucket_plan_digest(&all_buckets, activity_digest), scan_mode, requires_full_scan);
     let dirty_usage_snapshot = Arc::new(snapshot_dirty_usage_buckets_after_listing(&all_buckets, dirty_usage_cutoff));
     let baseline_proof = ScannerCacheBaselineProof {
         authoritative_data: persisted_usage_baseline.as_ref(),
@@ -759,6 +822,9 @@ where
         },
     )
     .await;
+    if let Some(preflight) = scope_resolution.segment_reuse_activation_preflight {
+        preflight.record_observation(ScannerPrefixReuseStage::ScopeResolution);
+    }
     let remote_dirty_usage_acknowledgements = scope_resolution.remote_dirty_usage_acknowledgements;
     let distributed_segment_invalidation_evidence = scope_resolution.distributed_segment_invalidation_evidence;
     let scan_scope = scope_resolution.scope;
@@ -770,8 +836,14 @@ where
         baseline_proof,
         distributed,
     );
-    if let Some(reason) = scope_fallback {
+    if let Some(fallback) = scope_fallback {
+        let reason = fallback.reason;
         global_metrics().record_scanner_scope_fallback(reason.as_str());
+        if let Some(failure) = fallback.baseline_rejection {
+            global_metrics()
+                .scan_observation()
+                .record_baseline_rejection(failure.authoritative, failure.observed);
+        }
         tracing::info!(
             target: "rustfs::scanner::io",
             event = EVENT_SCANNER_SET_STATE,
@@ -785,6 +857,7 @@ where
             "Scanner cycle walks every bucket because its dirty-bucket scope was not admitted"
         );
     }
+    let scope_fallback = scope_fallback.map(|fallback| fallback.reason);
     let segment_invalidation_proof = dirty_usage_producer_evidence(&dirty_usage_snapshot).segment_invalidation_proof();
     #[cfg(test)]
     if let Some(observer) = resolved_scope_observer {
@@ -797,7 +870,9 @@ where
     if all_buckets.is_empty() {
         reset_set_scan_gauges();
         if !bucket_plan_complete {
-            return Ok(ScannerCycleResult::new(ScannerCycleStatus::Incomplete, None).with_publication_epoch(publication_epoch));
+            return Ok(ScannerCycleResult::new(ScannerCycleStatus::Incomplete, None)
+                .with_partial_stage(Some("inventory_incomplete"))
+                .with_publication_epoch(publication_epoch));
         }
         let publication_blocked = store.scanner_data_usage_publication_blocked().await;
         let activity_after = probe_scanner_cycle_activity(
@@ -834,7 +909,9 @@ where
                 tier_registry_generation: Some(tier_registry_generation),
             },
         ) else {
-            return Ok(ScannerCycleResult::new(ScannerCycleStatus::Incomplete, None).with_publication_epoch(publication_epoch));
+            return Ok(ScannerCycleResult::new(ScannerCycleStatus::Incomplete, None)
+                .with_partial_stage(Some("empty_namespace_guard"))
+                .with_publication_epoch(publication_epoch));
         };
         let (empty_usage, publication_expectation) = candidate.prepare(status, &pending_buckets);
         let usage_update_emitted = if should_publish_observational_snapshot(status) {
@@ -843,7 +920,11 @@ where
             publish_usage_snapshot(&updates, status, &pending_buckets, empty_usage).await?
         };
         if !usage_update_emitted {
-            return Ok(ScannerCycleResult::new(status, None).with_publication_epoch(publication_epoch));
+            let partial_stage =
+                (dirty_usage_status == DirtyUsageSnapshotStatus::Unverified).then_some("dirty_generation_unverified");
+            return Ok(ScannerCycleResult::new(status, None)
+                .with_partial_stage(partial_stage)
+                .with_publication_epoch(publication_epoch));
         }
         if status == ScannerCycleStatus::Complete {
             complete_tier_registry_cycle(want_cycle, leader_epoch);
@@ -861,6 +942,7 @@ where
             None,
             false,
         );
+        segment_reuse_activation_preflight.record_observation(ScannerPrefixReuseStage::CycleCompletion);
         return Ok(ScannerCycleResult::new(status, dirty_usage_clear)
             .with_publication_epoch(publication_epoch)
             .with_activity_digest(activity_digest)
@@ -886,7 +968,9 @@ where
             "Scanner set state update detected missing disk sets"
         );
         reset_set_scan_gauges();
-        return Ok(ScannerCycleResult::new(ScannerCycleStatus::Incomplete, None).with_publication_epoch(publication_epoch));
+        return Ok(ScannerCycleResult::new(ScannerCycleStatus::Incomplete, None)
+            .with_partial_stage(Some("source_inventory_empty"))
+            .with_publication_epoch(publication_epoch));
     }
 
     let dispatch_limit = scanner_max_concurrent_set_scans(total_results);
@@ -1014,6 +1098,7 @@ where
                 digest: structural_scan_plan_digest,
                 bucket_coverage_digest,
                 checkpoint_coverage_digest,
+                completed_checkpoint_cycle_floor,
                 requires_full_scan,
                 service_cohort: service_cohort.clone(),
                 execution_digest,
@@ -1207,6 +1292,7 @@ where
         distributed_segment_invalidation_evidence,
         cold_zero_walk_oracle,
     );
+    segment_reuse_activation_preflight.record_observation(ScannerPrefixReuseStage::CycleCompletion);
     let pending_maintenance_work = pending_maintenance_work_for_cycle(&pending_maintenance_work, &results);
     let observed_cycle_floor = cache_cycle_floor.load(Ordering::Acquire);
     let required_cycle_floor = (observed_cycle_floor > want_cycle).then_some(observed_cycle_floor);
@@ -1261,7 +1347,7 @@ where
         remote_certification_attempted,
     );
     let all_bucket_names = all_buckets.iter().map(|bucket| bucket.name.clone()).collect::<Vec<_>>();
-    let mut completed_usage = completed_usage_candidate(
+    let completed_candidate = completed_usage_candidate(
         &results,
         &ScannerSnapshotScope {
             sources: &expected_sources,
@@ -1278,6 +1364,8 @@ where
         bucket_plan_complete,
         owner_ctx.is_cancelled(),
     );
+    let candidate_rejection = completed_candidate.as_ref().err().copied();
+    let mut completed_usage = completed_candidate.ok();
     if let (Some(candidate), Some(baseline)) = (
         completed_usage.as_mut(),
         persisted_usage_baseline
@@ -1308,7 +1396,11 @@ where
         dirty_usage_status,
         activity_status,
     );
-    if cycle_status == ScannerCycleStatus::Incomplete && result.is_ok() && !budget_elapsed && !owner_ctx.is_cancelled() {
+    let partial_stage = if cycle_status == ScannerCycleStatus::Incomplete
+        && result.is_ok()
+        && !budget_elapsed
+        && !owner_ctx.is_cancelled()
+    {
         let slots =
             set_disks
                 .iter()
@@ -1319,6 +1411,35 @@ where
                     (index, DataUsageCacheSource::new(set.pool_index, set.set_index), *observed, snapshot)
                 });
         let summary = summarize_collector_slots(slots, want_cycle, leader_epoch, scan_plan_digest);
+        let mut stage = summary.partial_stage(
+            bucket_plan_complete,
+            bucket_scan_status,
+            dirty_usage_status,
+            scan_scope_matches,
+            candidate_rejection,
+        );
+        // A fully traversed mixed-plan observation needs another certification sweep. Only
+        // attribute the stop to that fence when every uncarried bucket has fresh source evidence.
+        if stage == "bucket_walk_incomplete"
+            && let Some((snapshot, _)) = &observational_usage
+            && partial_buckets.difference(&carried_partial_buckets).all(|bucket| {
+                snapshot
+                    .usage_snapshot_bucket_observations
+                    .get(bucket)
+                    .is_some_and(|observation| {
+                        observation
+                            .sources
+                            .iter()
+                            .all(|source| source.scanner_epoch == leader_epoch && source.scanner_cycle == want_cycle)
+                            && observation
+                                .sources
+                                .iter()
+                                .any(|source| source.started_plan != source.requested_plan)
+                    })
+            })
+        {
+            stage = "mixed_plan_recertification_pending";
+        }
         let sample = summary.sample;
         let source_difference = summary.source_difference_sample;
         let sample_snapshot = sample.filter(|sample| sample.observed).map(|sample| sample.snapshot);
@@ -1328,6 +1449,7 @@ where
             component = LOG_COMPONENT_SCANNER,
             subsystem = LOG_SUBSYSTEM_IO,
             state = "incomplete_cycle_collector_summary",
+            partial_stage = stage,
             cycle = want_cycle,
             leader_epoch,
             configured_sets = set_disks.len(),
@@ -1373,7 +1495,10 @@ where
             sample_snapshot_plan_matches = sample_snapshot.and_then(|snapshot| snapshot.info.scan_plan_digest.map(|plan| plan == scan_plan_digest)),
             "Scanner recorded collector observations for an incomplete cycle"
         );
-    }
+        Some(stage)
+    } else {
+        None
+    };
     // Certification is per bucket: the pending set is read after the
     // guardrail verdict so a bucket written during the walk is reported in
     // the same publication that certifies the others. A bucket whose walk
@@ -1566,6 +1691,7 @@ where
         complete_tier_registry_cycle(want_cycle, leader_epoch);
     }
     Ok(ScannerCycleResult::new(cycle_status, dirty_usage_clear)
+        .with_partial_stage(partial_stage)
         .with_usage_watch_proofs(usage_watch_proofs.into_values().collect())
         .with_usage_watch_retirements(usage_watch_retirements)
         .with_publication_epoch(publication_epoch)

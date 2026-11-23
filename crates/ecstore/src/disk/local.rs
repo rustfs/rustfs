@@ -320,25 +320,72 @@ fn read_all_data_std(
     Ok((bytes, modtime))
 }
 
-fn read_metadata_only_std(opened: std::io::Result<std::fs::File>) -> Result<(Vec<u8>, Option<OffsetDateTime>)> {
-    let mut f = opened.map_err(to_file_error)?;
+fn read_metadata_only_from_reader<R: std::io::Read>(
+    reader: &mut R,
+    size_fn: impl FnOnce(&mut R) -> Result<usize>,
+) -> Result<Vec<u8>> {
+    let mut initial_buf = [0u8; LISTING_META_INITIAL_READ_BYTES];
+    let mut n = 0;
+    let mut reached_eof = false;
 
-    let meta = f.metadata().map_err(to_file_error)?;
-
-    if meta.is_dir() {
-        return Err(Error::FileNotFound);
+    while n < LISTING_META_INITIAL_READ_BYTES {
+        match std::io::Read::read(reader, &mut initial_buf[n..]) {
+            Ok(0) => {
+                reached_eof = true;
+                break;
+            }
+            Ok(read_bytes) => {
+                n += read_bytes;
+                if let Ok((tmp_buf, 1, minor @ 1..=3)) = FileMeta::check_xl2_v1(&initial_buf[..n])
+                    && let Ok((sz, rest)) = FileMeta::read_bytes_header(tmp_buf)
+                {
+                    let header_len = n - rest.len();
+                    let crc_len = if minor >= 2 { 5 } else { 0 };
+                    if let Some(want) = (sz as usize).checked_add(header_len).and_then(|v| v.checked_add(crc_len))
+                        && want <= n
+                    {
+                        return Ok(initial_buf[..want].to_vec());
+                    }
+                }
+            }
+            Err(err) if err.kind() == ErrorKind::Interrupted => continue,
+            #[cfg(unix)]
+            Err(err) if err.raw_os_error() == Some(libc::EISDIR) => {
+                return Err(Error::FileNotFound);
+            }
+            Err(err) => {
+                if err.kind() == ErrorKind::IsADirectory {
+                    return Err(Error::FileNotFound);
+                }
+                return Err(Error::from(rustfs_filemeta::Error::from(err)));
+            }
+        }
     }
 
-    let size = usize::try_from(meta.len()).map_err(Error::other)?;
+    if reached_eof {
+        let mut cursor = std::io::Cursor::new(&initial_buf[..n]);
+        return Ok(read_xl_meta_no_data_sync(&mut cursor, n)?);
+    }
 
-    let data = read_xl_meta_no_data_sync(&mut f, size)?;
+    let size = size_fn(reader)?;
+    let mut chained = std::io::Read::chain(std::io::Cursor::new(&initial_buf[..n]), reader);
+    Ok(read_xl_meta_no_data_sync(&mut chained, size)?)
+}
 
-    let modtime = match meta.modified() {
-        Ok(md) => Some(OffsetDateTime::from(md)),
-        Err(_) => None,
-    };
-
-    Ok((data, modtime))
+fn read_metadata_only_std(opened: std::io::Result<std::fs::File>) -> Result<(Vec<u8>, Option<OffsetDateTime>)> {
+    let mut f = opened.map_err(to_file_error)?;
+    let res = read_metadata_only_from_reader(&mut f, |file| {
+        let meta = file.metadata().map_err(to_file_error)?;
+        if meta.is_dir() {
+            return Err(Error::FileNotFound);
+        }
+        usize::try_from(meta.len()).map_err(Error::other)
+    });
+    #[cfg(not(unix))]
+    if res.is_err() && f.metadata().is_ok_and(|m| m.is_dir()) {
+        return Err(Error::FileNotFound);
+    }
+    Ok((res?, None))
 }
 
 /// Reads the `xl.meta` header/metadata envelope and 5-byte CRC for directory
@@ -869,6 +916,7 @@ struct PreparedPartTxnReceipt {
     meta: Bytes,
     had_old_data: bool,
     had_old_meta: bool,
+    admission: Option<multipart_staging::MultipartSourceAdmission>,
     src_parent_fd: Option<Arc<std::fs::File>>,
     txn_dir_fd: Option<Arc<std::fs::File>>,
     txn_parent_fd: Option<Arc<std::fs::File>>,
@@ -880,6 +928,7 @@ struct PublishedPartTxnReceipt {
     transaction_path: PathBuf,
     had_old_data: bool,
     had_old_meta: bool,
+    admission: Option<multipart_staging::MultipartSourceAdmission>,
     txn_dir_fd: Option<Arc<std::fs::File>>,
     txn_parent_fd: Option<Arc<std::fs::File>>,
 }
@@ -3692,10 +3741,17 @@ pub(crate) fn has_delete_version_test_failpoints() -> bool {
 #[cfg(not(test))]
 pub(crate) fn has_delete_version_test_failpoints() -> bool {
     #[cfg(all(feature = "test-util", not(windows)))]
-    if os::prepared_publication_test_hooks::has_any_hooks() {
-        return true;
+    let prepared_hooks = os::prepared_publication_test_hooks::has_any_hooks();
+    #[cfg(not(all(feature = "test-util", not(windows))))]
+    let prepared_hooks = false;
+    #[cfg(feature = "e2e-test-hooks")]
+    {
+        prepared_hooks || std::env::var_os("RUSTFS_DELETE_RECOVERY_BARRIER_DIR").is_some()
     }
-    cfg!(feature = "e2e-test-hooks") && std::env::var_os("RUSTFS_DELETE_RECOVERY_BARRIER_DIR").is_some()
+    #[cfg(not(feature = "e2e-test-hooks"))]
+    {
+        prepared_hooks
+    }
 }
 
 #[cfg(test)]
@@ -3977,6 +4033,9 @@ enum SyncMode {
     /// fdatasync only the file contents.
     FileOnly,
 }
+
+// Keep 2 MiB of shard data plus up to 128 32-byte hashes in one file buffer.
+const SHARD_FILE_MAX_BUF_SIZE: usize = 2 * 1024 * 1024 + 4096;
 
 #[allow(
     dead_code,
@@ -4326,7 +4385,8 @@ async fn read_dir_entry_batch_with_walk_stall(
 }
 
 impl FileCacheReclaimReader {
-    fn new(inner: File, reclaim_offset: u64, reclaim_len: usize, reclaim_on_drop: bool, read_ahead: usize) -> Self {
+    fn new(mut inner: File, reclaim_offset: u64, reclaim_len: usize, reclaim_on_drop: bool, read_ahead: usize) -> Self {
+        inner.set_max_buf_size(SHARD_FILE_MAX_BUF_SIZE);
         #[cfg(target_os = "macos")]
         if reclaim_on_drop {
             let _ = set_fd_nocache(&inner);
@@ -4830,10 +4890,19 @@ fn open_lazy_local_file_std(
         _ => {
             if let Some(parent) = file_path.parent()
                 && (volume_dir.as_os_str().is_empty() || !volume_dir.starts_with(parent))
-                && let Err(err) = super::fs::create_dir_all_std(parent)
-                && err.kind() != std::io::ErrorKind::AlreadyExists
             {
-                return Err(to_file_error(err));
+                if let Some(grandparent) = parent.parent()
+                    && !volume_dir.as_os_str().is_empty()
+                    && grandparent != volume_dir
+                    && grandparent.parent() == Some(volume_dir)
+                {
+                    let _ = std::fs::create_dir(grandparent);
+                }
+                if let Err(err) = super::fs::create_dir_all_std(parent)
+                    && err.kind() != std::io::ErrorKind::AlreadyExists
+                {
+                    return Err(to_file_error(err));
+                }
             }
             open_opts.open(file_path).map_err(to_file_error)?
         }
@@ -5216,7 +5285,8 @@ impl AsyncWrite for LazyLocalFileWriter {
 
 #[cfg(test)]
 impl FileCacheReclaimWriter {
-    fn new(inner: File, reclaim_len: usize, reclaim_on_shutdown: bool) -> Self {
+    fn new(mut inner: File, reclaim_len: usize, reclaim_on_shutdown: bool) -> Self {
+        inner.set_max_buf_size(SHARD_FILE_MAX_BUF_SIZE);
         #[cfg(target_os = "macos")]
         if reclaim_on_shutdown {
             let _ = set_fd_nocache(&inner);
@@ -5502,6 +5572,16 @@ impl StdBackend {
         &self.root
     }
 
+    fn resolve_bucket_and_object_path(&self, volume: &str, path: &str) -> Result<(PathBuf, PathBuf)> {
+        local_disk_bucket_and_object_path_with_mount_lease(
+            self.io_root(),
+            #[cfg(target_os = "linux")]
+            self.mount_lease.as_deref(),
+            volume,
+            path,
+        )
+    }
+
     async fn open_file(&self, path: impl AsRef<Path>, mode: usize, skip_parent: impl AsRef<Path>) -> Result<File> {
         if mode == O_CREATE | O_WRONLY | O_TRUNC {
             os::record_native_publication(path.as_ref());
@@ -5721,7 +5801,13 @@ impl LocalIoBackend for StdBackend {
                 // Resolve the part path unconditionally: the O_DIRECT branch (large
                 // reads) opens its own aligned descriptor by path even on a cache hit.
                 let path_resolve_start = metrics_enabled.then(StdInstant::now);
-                let file_path = local_disk_object_path(&root, &volume_owned, &path_owned)?;
+                let (volume_dir, file_path) = local_disk_bucket_and_object_path_with_mount_lease(
+                    &root,
+                    #[cfg(target_os = "linux")]
+                    _mount_lease.as_deref(),
+                    &volume_owned,
+                    &path_owned,
+                )?;
                 check_path_length(file_path.to_string_lossy().as_ref())?;
                 let path_resolve_duration = path_resolve_start.map_or(StdDuration::ZERO, |started_at| started_at.elapsed());
 
@@ -5744,7 +5830,6 @@ impl LocalIoBackend for StdBackend {
                     // Measure the volume access probe only — the part-path resolution
                     // above is accounted in `path_resolve_duration` (rustfs/backlog#1801).
                     let access_check_start = metrics_enabled.then(StdInstant::now);
-                    let volume_dir = local_disk_bucket_path(&root, &volume_owned)?;
                     if !skip_access_checks(&volume_owned) {
                         crate::disk::fs::access_std(&volume_dir)
                             .map_err(|e| DiskError::from(to_access_error(e, DiskError::VolumeAccessDenied)))?;
@@ -6160,14 +6245,13 @@ impl LocalIoBackend for StdBackend {
     }
 
     async fn open_read_stream(&self, volume: &str, path: &str, offset: usize, length: usize) -> Result<FileReader> {
-        let volume_dir = local_disk_bucket_path(self.io_root(), volume)?;
+        let (volume_dir, file_path) = self.resolve_bucket_and_object_path(volume, path)?;
         if !skip_access_checks(volume) {
             cached_access(&volume_dir)
                 .await
                 .map_err(|e| to_access_error(e, DiskError::VolumeAccessDenied))?;
         }
 
-        let file_path = local_disk_object_path(self.io_root(), volume, path)?;
         check_path_length(file_path.to_string_lossy().as_ref())?;
 
         if let Some(resources) = current_resource_unit() {
@@ -6208,14 +6292,13 @@ impl LocalIoBackend for StdBackend {
     }
 
     async fn open_full_read(&self, volume: &str, path: &str) -> Result<FileReader> {
-        let volume_dir = local_disk_bucket_path(self.io_root(), volume)?;
+        let (volume_dir, file_path) = self.resolve_bucket_and_object_path(volume, path)?;
         if !skip_access_checks(volume) {
             cached_access(&volume_dir)
                 .await
                 .map_err(|e| to_access_error(e, DiskError::VolumeAccessDenied))?;
         }
 
-        let file_path = local_disk_object_path(self.io_root(), volume, path)?;
         check_path_length(file_path.to_string_lossy().as_ref())?;
 
         if let Some(resources) = current_resource_unit() {
@@ -6235,8 +6318,7 @@ impl LocalIoBackend for StdBackend {
                     WriteMode::TruncateSync { sync_parent_dir, .. } => (true, sync_parent_dir),
                     _ => (false, false),
                 };
-                let volume_dir = local_disk_bucket_path(self.io_root(), volume)?;
-                let file_path = local_disk_object_path(self.io_root(), volume, path)?;
+                let (volume_dir, file_path) = self.resolve_bucket_and_object_path(volume, path)?;
                 check_path_length(file_path.to_string_lossy().as_ref())?;
                 let mut mark_dir_presynced = false;
                 let mut parent_exists = false;
@@ -6306,14 +6388,13 @@ impl LocalIoBackend for StdBackend {
                 )))
             }
             WriteMode::Append => {
-                let volume_dir = local_disk_bucket_path(self.io_root(), volume)?;
+                let (volume_dir, file_path) = self.resolve_bucket_and_object_path(volume, path)?;
                 if !skip_access_checks(volume) {
                     cached_access(&volume_dir)
                         .await
                         .map_err(|e| to_access_error(e, DiskError::VolumeAccessDenied))?;
                 }
 
-                let file_path = local_disk_object_path(self.io_root(), volume, path)?;
                 check_path_length(file_path.to_string_lossy().as_ref())?;
 
                 if let Some(resources) = current_resource_unit() {
@@ -7363,13 +7444,12 @@ fn is_io_uring_unsupported(err: &std::io::Error) -> bool {
 /// they genuinely share; each caller opens the returned path its own way
 /// (buffered vs `O_DIRECT`) and maps the error into its own type.
 #[cfg(target_os = "linux")]
-fn resolve_uring_object_path(root: &Path, volume: &str, path: &str) -> Result<PathBuf> {
-    let volume_dir = local_disk_bucket_path(root, volume)?;
+fn resolve_uring_object_path(root: &Path, mount_lease: Option<&std::fs::File>, volume: &str, path: &str) -> Result<PathBuf> {
+    let (volume_dir, file_path) = local_disk_bucket_and_object_path_with_mount_lease(root, mount_lease, volume, path)?;
     if !skip_access_checks(volume) {
         crate::disk::fs::access_std(&volume_dir)
             .map_err(|e| DiskError::from(to_access_error(e, DiskError::VolumeAccessDenied)))?;
     }
-    let file_path = local_disk_object_path(root, volume, path)?;
     check_path_length(file_path.to_string_lossy().as_ref())?;
     Ok(file_path)
 }
@@ -7809,7 +7889,7 @@ impl UringBackend {
                 let mount_lease = self.inner.mount_lease.clone();
                 let (file, len) = spawn_blocking_with_disk_io_permit(None, move || -> Result<(std::fs::File, u64)> {
                     let _mount_lease = mount_lease;
-                    let file_path = resolve_uring_object_path(&root, &volume_owned, &path_owned)?;
+                    let file_path = resolve_uring_object_path(&root, _mount_lease.as_deref(), &volume_owned, &path_owned)?;
                     let file = std::fs::File::open(&file_path).map_err(DiskError::from)?;
                     let meta = file.metadata().map_err(DiskError::from)?;
                     let end_offset_u64 = u64::try_from(end_offset).map_err(|_| DiskError::FileCorrupt)?;
@@ -7954,8 +8034,8 @@ impl UringBackend {
                     move || -> std::result::Result<(std::fs::File, u64, usize), DirectOpenError> {
                         let _mount_lease = mount_lease;
                         use std::os::unix::fs::OpenOptionsExt;
-                        let file_path =
-                            resolve_uring_object_path(&root, &volume_owned, &path_owned).map_err(DirectOpenError::Disk)?;
+                        let file_path = resolve_uring_object_path(&root, _mount_lease.as_deref(), &volume_owned, &path_owned)
+                            .map_err(DirectOpenError::Disk)?;
                         let file = match std::fs::OpenOptions::new()
                             .read(true)
                             .custom_flags(rustix::fs::OFlags::DIRECT.bits() as i32)
@@ -8263,8 +8343,9 @@ pub struct LocalDisk {
     io_root: PathBuf,
     #[cfg(target_os = "linux")]
     mount_lease: Arc<std::fs::File>,
+    // The descriptor pins this identity even if the configured path is remounted.
     #[cfg(target_os = "linux")]
-    mount_lease_mount_id: Option<u64>,
+    mount_lease_identity: Option<ReplacementMountIdentity>,
     /// Public path for callers that need the configured disk layout. Internal
     /// disk I/O uses `io_format_path`, which is rooted at `mount_lease`.
     pub format_path: PathBuf,
@@ -8464,72 +8545,50 @@ struct ReplacementMountIdentity {
 }
 
 #[cfg(target_os = "linux")]
-fn replacement_mount_identity(metadata: &std::fs::Metadata, mount_id: u64) -> ReplacementMountIdentity {
-    use std::os::unix::fs::MetadataExt as _;
-
-    ReplacementMountIdentity {
-        device: metadata.dev(),
-        inode: metadata.ino(),
-        mount_id,
-    }
-}
-
-#[cfg(target_os = "linux")]
-fn mount_id_for_fd(fd: &std::fs::File) -> Option<u64> {
-    use rustix::fs::{AtFlags, StatxFlags};
-    use std::os::fd::AsRawFd as _;
-
-    rustix::fs::statx(fd, "", AtFlags::EMPTY_PATH, StatxFlags::MNT_ID)
-        .ok()
-        .filter(|statx| StatxFlags::from_bits_retain(statx.stx_mask).contains(StatxFlags::MNT_ID))
-        .map(|statx| statx.stx_mnt_id)
-        .or_else(|| mount_id_from_fdinfo(fd.as_raw_fd()))
-}
-
-#[cfg(target_os = "linux")]
-fn mount_id_for_path(path: &Path) -> Option<u64> {
-    use rustix::fs::{AtFlags, CWD, StatxFlags};
-
-    rustix::fs::statx(CWD, path, AtFlags::empty(), StatxFlags::MNT_ID)
-        .ok()
-        .filter(|statx| StatxFlags::from_bits_retain(statx.stx_mask).contains(StatxFlags::MNT_ID))
-        .map(|statx| statx.stx_mnt_id)
-        .or_else(|| {
-            std::fs::canonicalize(path)
-                .ok()
-                .and_then(|path| mount_id_from_mountinfo(&path))
+fn statx_replacement_mount_identity(
+    dir: impl std::os::fd::AsFd,
+    path: &Path,
+    flags: rustix::fs::AtFlags,
+) -> Option<ReplacementMountIdentity> {
+    use rustix::fs::{FileType, StatxFlags, makedev, statx};
+    let fields = StatxFlags::TYPE | StatxFlags::INO | StatxFlags::MNT_ID;
+    let stat = statx(dir, path, flags, fields).ok()?;
+    (StatxFlags::from_bits_retain(stat.stx_mask).contains(fields) && FileType::from_raw_mode(stat.stx_mode.into()).is_dir())
+        .then_some(ReplacementMountIdentity {
+            device: makedev(stat.stx_dev_major, stat.stx_dev_minor),
+            inode: stat.stx_ino,
+            mount_id: stat.stx_mnt_id,
         })
 }
 
 #[cfg(target_os = "linux")]
-fn mount_id_from_fdinfo(fd: std::os::fd::RawFd) -> Option<u64> {
-    std::fs::read_to_string(format!("/proc/self/fdinfo/{fd}"))
+fn replacement_mount_identity_for_fd(directory: &std::fs::File) -> Option<ReplacementMountIdentity> {
+    statx_replacement_mount_identity(directory, Path::new(""), rustix::fs::AtFlags::EMPTY_PATH)
+        .or_else(|| replacement_mount_identity_from_fdinfo(directory))
+}
+
+#[cfg(target_os = "linux")]
+fn replacement_mount_identity_for_path(path: &Path) -> Option<ReplacementMountIdentity> {
+    use rustix::fs::{AtFlags, CWD, Mode, OFlags, open};
+    statx_replacement_mount_identity(CWD, path, AtFlags::empty()).or_else(|| {
+        let directory = std::fs::File::from(open(path, OFlags::PATH | OFlags::DIRECTORY | OFlags::CLOEXEC, Mode::empty()).ok()?);
+        replacement_mount_identity_from_fdinfo(&directory)
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn replacement_mount_identity_from_fdinfo(directory: &std::fs::File) -> Option<ReplacementMountIdentity> {
+    use std::os::{fd::AsRawFd as _, unix::fs::MetadataExt as _};
+    let fd = directory.as_raw_fd();
+    let mount_id = std::fs::read_to_string(format!("/proc/self/fdinfo/{fd}"))
         .ok()?
         .lines()
-        .find_map(|line| line.strip_prefix("mnt_id:")?.trim().parse().ok())
-}
-
-#[cfg(target_os = "linux")]
-fn mount_id_from_mountinfo(path: &Path) -> Option<u64> {
-    let mountinfo = std::fs::read_to_string("/proc/self/mountinfo").ok()?;
-    mount_id_from_mountinfo_contents(&mountinfo, path)
-}
-
-#[cfg(target_os = "linux")]
-fn mount_id_from_mountinfo_contents(mountinfo: &str, path: &Path) -> Option<u64> {
-    let mountpoint = path
-        .to_string_lossy()
-        .replace('\\', "\\134")
-        .replace('\t', "\\011")
-        .replace('\n', "\\012")
-        .replace(' ', "\\040");
-    mountinfo.lines().find_map(|line| {
-        let mut fields = line.split_whitespace();
-        let mount_id = fields.next()?.parse().ok()?;
-        fields.next()?;
-        fields.next()?;
-        fields.next()?;
-        (fields.next()? == mountpoint).then_some(mount_id)
+        .find_map(|line| line.strip_prefix("mnt_id:")?.trim().parse().ok())?;
+    let metadata = directory.metadata().ok()?;
+    Some(ReplacementMountIdentity {
+        device: metadata.dev(),
+        inode: metadata.ino(),
+        mount_id,
     })
 }
 
@@ -8587,24 +8646,53 @@ impl LocalDisk {
     /// configured endpoint still names the directory held by `mount_lease`.
     pub fn has_replacement_mount_lease(&self) -> bool {
         #[cfg(target_os = "linux")]
-        {
-            let Ok(configured) = std::fs::metadata(self.endpoint.get_file_path()) else {
-                return false;
-            };
-            let Ok(pinned) = self.mount_lease.metadata() else {
-                return false;
-            };
-            let Some(configured_mount_id) = mount_id_for_path(Path::new(&self.endpoint.get_file_path())) else {
-                return false;
-            };
-            let Some(pinned_mount_id) = self.mount_lease_mount_id else {
-                return false;
-            };
-            replacement_mount_identity(&configured, configured_mount_id) == replacement_mount_identity(&pinned, pinned_mount_id)
-        }
+        return self
+            .current_replacement_mount_identity(Path::new(&self.endpoint.get_file_path()))
+            .is_some();
 
         #[cfg(not(target_os = "linux"))]
         false
+    }
+
+    #[cfg(target_os = "linux")]
+    fn current_replacement_mount_identity(&self, configured_path: &Path) -> Option<ReplacementMountIdentity> {
+        let pinned = self.mount_lease_identity?;
+        (replacement_mount_identity_for_path(configured_path)? == pinned).then_some(pinned)
+    }
+
+    pub(super) fn replacement_mount(&self, _mount_roots: &[PathBuf]) -> Option<super::ReplacementMount> {
+        #[cfg(target_os = "linux")]
+        {
+            let configured_path = self.endpoint.get_file_path();
+            let configured_path = Path::new(&configured_path);
+            let canonical_path = std::fs::canonicalize(&self.io_root).ok()?;
+            let expected = _mount_roots
+                .iter()
+                .filter(|root| root.is_absolute() && (configured_path.starts_with(root) || canonical_path.starts_with(root)))
+                .max_by_key(|root| root.components().count())
+                .unwrap_or(&canonical_path);
+            // The expected root must be its own mount boundary. If it is
+            // unmounted, the exposed directory and its parent share a mount ID.
+            if !canonical_path.starts_with(expected) {
+                return None;
+            }
+            // When the configured endpoint is the expected mount root, this
+            // live observation also supplies the mount ID for the boundary.
+            let identity = self.current_replacement_mount_identity(configured_path)?;
+            if (expected != configured_path && replacement_mount_identity_for_path(expected)?.mount_id != identity.mount_id)
+                || replacement_mount_identity_for_path(expected.parent()?)?.mount_id == identity.mount_id
+            {
+                return None;
+            }
+            Some(super::ReplacementMount {
+                canonical_path,
+                physical_device_ids: rustfs_utils::os::get_physical_device_ids(self.io_root.to_str()?).ok()?,
+                filesystem_identity: format!("{}:{}:{}", identity.mount_id, identity.device, identity.inode),
+            })
+        }
+
+        #[cfg(not(target_os = "linux"))]
+        None
     }
 
     /// Return the descriptor-rooted path for the mount instance admitted for
@@ -8660,10 +8748,10 @@ impl LocalDisk {
             PathBuf::from(format!(".rustfs-format-control/{format_device:x}/{}", Uuid::from_bytes(format_file_id)));
 
         #[cfg(target_os = "linux")]
-        let (mount_lease, io_root, mount_lease_mount_id) = (
+        let (mount_lease, io_root, mount_lease_identity) = (
             publication_root.directory().clone(),
             publication_root.io_path().to_path_buf(),
-            mount_id_for_fd(publication_root.directory()),
+            replacement_mount_identity_for_fd(publication_root.directory()),
         );
         #[cfg(not(target_os = "linux"))]
         let io_root = Self::open_mount_lease(&root)?;
@@ -8846,7 +8934,7 @@ impl LocalDisk {
             #[cfg(target_os = "linux")]
             mount_lease: mount_lease.clone(),
             #[cfg(target_os = "linux")]
-            mount_lease_mount_id,
+            mount_lease_identity,
             endpoint: ep.clone(),
             format_path,
             io_format_path,
@@ -9688,7 +9776,7 @@ impl LocalDisk {
     ) -> Result<()> {
         let namespace_owner = self.usage_watch_binding.owner(volume, namespace_owner);
         if volume == RUSTFS_META_BUCKET {
-            crate::bucket::metadata_sys::bump_local_meta_mutation_gen();
+            crate::bucket::metadata_sys::maybe_bump_local_meta_mutation_gen_for_path(volume, path);
         }
         if volume == RUSTFS_META_MULTIPART_BUCKET {
             crate::disk::multipart_source::native_source_protocol(&fi)?;
@@ -9968,7 +10056,7 @@ impl LocalDisk {
         let mut mutation = mutation;
         mutation.namespace_owner = self.usage_watch_binding.owner(volume, mutation.namespace_owner.take());
         if volume == RUSTFS_META_BUCKET {
-            crate::bucket::metadata_sys::bump_local_meta_mutation_gen();
+            crate::bucket::metadata_sys::maybe_bump_local_meta_mutation_gen_for_path(volume, path);
         }
         pool_meta_native::reject_noncanonical_object(&self.root, volume, path)?;
         let DeleteVersionMutation {
@@ -10010,25 +10098,52 @@ impl LocalDisk {
                 .await;
         }
 
-        let (volume_dir, file_path) = self.io_get_bucket_and_object_path(volume, path)?;
-
-        check_path_length(file_path.to_string_lossy().as_ref())?;
-
-        let xl_path = path_join(&[file_path.as_path(), Path::new(STORAGE_FORMAT_FILE)]);
         #[cfg(target_os = "linux")]
-        let object_path = {
+        let (volume_dir, file_path, object_path) = {
+            let (volume_dir, file_path) = build_local_disk_object_path(self.io_root(), volume, path);
+            check_local_disk_object_path_components(self.io_root(), &volume_dir, &file_path)?;
+            check_path_length(file_path.to_string_lossy().as_ref())?;
             let (root_bucket, object_path) = build_local_disk_object_path(&self.root, volume, path);
             check_local_disk_object_path_components(&self.root, &root_bucket, &object_path)?;
-            object_path
+            (volume_dir, file_path, object_path)
         };
         #[cfg(not(target_os = "linux"))]
-        let object_path = self.get_object_path(volume, path)?;
+        let (volume_dir, file_path, object_path) = {
+            let (volume_dir, file_path) = self.io_get_bucket_and_object_path(volume, path)?;
+            check_path_length(file_path.to_string_lossy().as_ref())?;
+            let object_path = self.get_object_path(volume, path)?;
+            (volume_dir, file_path, object_path)
+        };
+
+        let xl_path = path_join(&[file_path.as_path(), Path::new(STORAGE_FORMAT_FILE)]);
+        // Lock ordering: metadata_lock -> volume_lock -> namespace_lock.
+        let metadata_lock = os::lookup_metadata_mutation_lock(&object_path);
         let mut namespace_owner: Option<Arc<dyn Send + Sync>> =
-            Some(os::acquire_metadata_mutation_lease(&object_path, namespace_owner).await);
+            Some(os::acquire_metadata_mutation_lease_with_lock(&metadata_lock, namespace_owner).await);
+        let mut volume_lock_opt = None;
         if opts.recoverable_delete || (opts.undo_write && opts.undo_delete) {
-            let volume_guard = os::disk_volume_mutation_lock(&self.root, volume).read_owned().await;
+            let volume_lock = os::disk_volume_mutation_lock(&self.root, volume);
+            let volume_guard = volume_lock.clone().read_owned().await;
+            volume_lock_opt = Some(volume_lock);
             namespace_owner = Some(Arc::new((namespace_owner, volume_guard)));
         }
+        #[cfg(target_os = "linux")]
+        let preopened_delete_dir = {
+            let fused_eligible = opts.old_data_dir.is_some()
+                && opts.recoverable_delete
+                && !opts.undo_write
+                && opts.expected_delete_marker.is_none()
+                && !pool_meta_native::is_object(&self.root, volume, path)
+                && !has_delete_version_test_failpoints();
+            if fused_eligible {
+                validate_and_open_local_disk_object_dir_at(self.io_root(), &self.mount_lease, &file_path)?
+            } else {
+                reject_local_disk_symlink_components_at(self.io_root(), &self.mount_lease, &file_path)?;
+                delete_recovery::PreopenedDeleteDir::Unopened
+            }
+        };
+        #[cfg(not(target_os = "linux"))]
+        let preopened_delete_dir = delete_recovery::PreopenedDeleteDir::Unopened;
         if pool_meta_native::is_object(&self.root, volume, path) {
             self.check_pool_meta_undo(&mut fi, &opts, &file_path).await?;
         }
@@ -10056,7 +10171,13 @@ impl LocalDisk {
                     &opts,
                     rollback_dir,
                     namespace_owner.clone(),
-                    Some((object_path, volume_dir.clone(), file_path.clone())),
+                    Some(delete_recovery::PrevalidatedDeleteContext {
+                        bucket_path: volume_dir.clone(),
+                        file_path: file_path.clone(),
+                        preopened_dir: preopened_delete_dir,
+                        metadata_lock,
+                        volume_lock: volume_lock_opt,
+                    }),
                 )
                 .await?
         {
@@ -10655,7 +10776,7 @@ impl LocalDisk {
     ) -> Result<()> {
         let namespace_owner = self.usage_watch_binding.owner(volume, namespace_owner);
         if volume == RUSTFS_META_BUCKET {
-            crate::bucket::metadata_sys::bump_local_meta_mutation_gen();
+            crate::bucket::metadata_sys::maybe_bump_local_meta_mutation_gen_for_path(volume, path);
         }
         if let Some((_, gen_str)) = path.rsplit_once(".integrity.")
             && let Ok(generation) = Uuid::parse_str(gen_str)
@@ -11423,6 +11544,20 @@ impl LocalDisk {
         Ok(data)
     }
 
+    fn part_path_resolver(&self) -> impl Fn(&str, &str) -> Result<PathBuf> + Send + use<> {
+        let root = self.io_root().to_owned();
+        #[cfg(target_os = "linux")]
+        let mount_lease = self.mount_lease.clone();
+        move |bucket, key| {
+            let (bucket_path, path) = build_local_disk_object_path(&root, bucket, key);
+            #[cfg(target_os = "linux")]
+            check_local_disk_valid_object_path_at(&root, &mount_lease, &bucket_path, &path)?;
+            #[cfg(not(target_os = "linux"))]
+            check_local_disk_valid_object_path(&root, &bucket_path, &path)?;
+            Ok(path)
+        }
+    }
+
     async fn read_part_metadata(&self, bucket: &str, volume_dir: &Path, path_str: &str) -> Result<ObjectPartInfo> {
         let io_permit = acquire_context_disk_io_permit().await.map_err(DiskError::Io)?;
         let path = Path::new(path_str);
@@ -11435,8 +11570,10 @@ impl LocalDisk {
             .and_then(|v| v.parse::<usize>().ok())
             .unwrap_or_default();
         let parent_str = path.parent().unwrap_or_else(|| Path::new("")).to_string_lossy();
-        let data_path = self.io_get_object_path(bucket, &path_join_buf(&[parent_str.as_ref(), &format!("part.{num}")]))?;
-        let metadata_path = self.io_get_object_path(bucket, path.to_string_lossy().as_ref());
+        let data_key = path_join_buf(&[parent_str.as_ref(), &format!("part.{num}")]);
+        let metadata_key = path_str.to_owned();
+        let volume = bucket.to_owned();
+        let resolve = self.part_path_resolver();
         // A part's existence check, metadata read and decode share one dispatch.
         // Keep open errors unmapped for the existing missing-volume fallback.
         let root = self.publication_root.clone();
@@ -11446,12 +11583,13 @@ impl LocalDisk {
                 error: Some(error),
                 ..Default::default()
             };
+            let data_path = resolve(&volume, &data_key)?;
             if let Err(err) = std::fs::metadata(data_path) {
                 return Ok(Ok(part_error(err.to_string())));
             }
             // Invalid metadata paths remain request errors, but missing data wins
             // first, as it does in the serial reader.
-            let metadata_path = metadata_path?;
+            let metadata_path = resolve(&volume, &metadata_key)?;
             Ok(read_all_data_std(root.open_readonly(&metadata_path))
                 .map(|(data, _)| ObjectPartInfo::unmarshal(&data).unwrap_or_else(|err| part_error(err.to_string()))))
         })
@@ -12459,9 +12597,13 @@ impl LocalDisk {
         // Files written here (format.json, ...) stay where they land — no
         // rename follows — so the new directory entry must be fsynced too.
         // System-critical volumes are pinned to strict by effective_durability;
-        // only the legacy full-off switch (historical semantics) skips this.
-        let durability = effective_durability(volume);
-        let sync = durability.metadata_sync_mode();
+        // A consumed shutdown receipt must never survive a later writer crash,
+        // including when data-shard syncing is disabled.
+        let sync = if volume == RUSTFS_META_BUCKET && path == super::UNCLEAN_SHUTDOWN_MARKER_PATH {
+            SyncMode::FileAndDir
+        } else {
+            effective_durability(volume).metadata_sync_mode()
+        };
         self.write_all_private(volume, path, data, sync, &volume_dir).await?;
 
         Ok(())
@@ -12471,7 +12613,7 @@ impl LocalDisk {
     #[tracing::instrument(level = "trace", skip_all)]
     async fn write_all_private(&self, volume: &str, path: &str, buf: Bytes, sync: SyncMode, skip_parent: &Path) -> Result<()> {
         if volume == RUSTFS_META_BUCKET {
-            crate::bucket::metadata_sys::bump_local_meta_mutation_gen();
+            crate::bucket::metadata_sys::maybe_bump_local_meta_mutation_gen_for_path(volume, path);
         }
         let file_path = self.io_get_object_path(volume, path)?;
         check_path_length(file_path.to_string_lossy().as_ref())?;
@@ -12706,31 +12848,48 @@ impl LocalDisk {
         DiskMetrics::default()
     }
 
-    async fn bitrot_verify(&self, part_path: &PathBuf, part_size: usize, algo: HashAlgorithm, shard_size: usize) -> Result<()> {
+    async fn open_bitrot_reader(&self, part_path: &Path) -> Result<(FileReader, std::fs::Metadata)> {
+        if let Some(resources) = current_resource_unit() {
+            let path = part_path.to_owned();
+            #[cfg(target_os = "linux")]
+            let mount_lease = self.mount_lease.clone();
+            tokio::task::spawn_blocking(move || -> Result<(FileReader, std::fs::Metadata)> {
+                #[cfg(target_os = "linux")]
+                let _mount_lease = mount_lease;
+                #[cfg(test)]
+                run_owned_file_before_open(&path);
+                let file = std::fs::File::open(path).map_err(to_file_error)?;
+                let meta = file.metadata().map_err(to_file_error)?;
+                Ok((Box::new(ResourceFileReader::new(file, resources, None)), meta))
+            })
+            .await
+            .map_err(DiskError::from)?
+        } else {
+            let file = super::fs::open_file(part_path, O_RDONLY).await.map_err(to_file_error)?;
+            let meta = file.metadata().await.map_err(to_file_error)?;
+            Ok((Box::new(file), meta))
+        }
+    }
+
+    async fn bitrot_verify(
+        &self,
+        part_path: &Path,
+        part_size: usize,
+        algo: HashAlgorithm,
+        shard_size: usize,
+        read_stall: Duration,
+    ) -> Result<()> {
         let retry_count = bitrot_size_mismatch_retry_count();
         let retry_delay = bitrot_size_mismatch_retry_delay();
 
         for attempt in 0..=retry_count {
-            let (reader, meta): (FileReader, std::fs::Metadata) = if let Some(resources) = current_resource_unit() {
-                let path = part_path.clone();
-                #[cfg(target_os = "linux")]
-                let mount_lease = self.mount_lease.clone();
-                tokio::task::spawn_blocking(move || -> Result<(FileReader, std::fs::Metadata)> {
-                    #[cfg(target_os = "linux")]
-                    let _mount_lease = mount_lease;
-                    #[cfg(test)]
-                    run_owned_file_before_open(&path);
-                    let file = std::fs::File::open(path).map_err(to_file_error)?;
-                    let meta = file.metadata().map_err(to_file_error)?;
-                    Ok((Box::new(ResourceFileReader::new(file, resources, None)), meta))
-                })
-                .await
-                .map_err(DiskError::from)??
+            let open = self.open_bitrot_reader(part_path);
+            let (reader, meta) = if read_stall.is_zero() {
+                open.await?
             } else {
-                let file = super::fs::open_file(part_path, O_RDONLY).await.map_err(to_file_error)?;
-                let meta = file.metadata().await.map_err(to_file_error)?;
-                (Box::new(file), meta)
+                timeout(read_stall, open).await.map_err(|_| DiskError::Timeout)??
             };
+            let reader = StallTimeoutReader::new(reader, read_stall);
             let file_size = usize::try_from(meta.len()).map_err(|_| DiskError::FileCorrupt)?;
 
             match bitrot_verify(reader, file_size, part_size, algo.clone(), shard_size).await {
@@ -12751,6 +12910,7 @@ impl LocalDisk {
                     );
                     tokio::time::sleep(retry_delay).await;
                 }
+                Err(err) if !read_stall.is_zero() && err.kind() == ErrorKind::TimedOut => return Err(DiskError::Timeout),
                 Err(err) if is_bitrot_verification_error(&err) => return Err(DiskError::FileCorrupt),
                 Err(err) => return Err(to_file_error(err).into()),
             }
@@ -12944,7 +13104,10 @@ impl LocalDisk {
                     let name = entry.trim_end_matches(SLASH_SEPARATOR);
                     let name = decode_dir_object(format!("{}/{}", current, name).as_str());
 
-                    if opts.limit <= 0 || metadata_counts_toward_limit(&metadata) {
+                    if opts.limit <= 0
+                        || (opts.forward_to.as_ref().is_none_or(|marker| &name >= marker)
+                            && metadata_counts_toward_limit(&metadata))
+                    {
                         *objs_returned += 1;
                     }
 
@@ -13214,7 +13377,9 @@ impl LocalDisk {
 
                         meta.metadata = read.bytes;
 
-                        if opts.limit <= 0 || read.counts_toward_limit {
+                        if opts.limit <= 0
+                            || (opts.forward_to.as_ref().is_none_or(|marker| &meta.name >= marker) && read.counts_toward_limit)
+                        {
                             *objs_returned += 1;
                         }
 
@@ -13930,6 +14095,22 @@ fn local_disk_object_path(root: &Path, bucket: &str, key: &str) -> Result<PathBu
     Ok(path)
 }
 
+fn local_disk_bucket_and_object_path_with_mount_lease(
+    root: &Path,
+    #[cfg(target_os = "linux")] mount_lease: Option<&std::fs::File>,
+    bucket: &str,
+    key: &str,
+) -> Result<(PathBuf, PathBuf)> {
+    let (bucket_path, path) = build_local_disk_object_path(root, bucket, key);
+    #[cfg(target_os = "linux")]
+    if let Some(mount_lease) = mount_lease {
+        check_local_disk_valid_object_path_at(root, mount_lease, &bucket_path, &path)?;
+        return Ok((bucket_path, path));
+    }
+    check_local_disk_valid_object_path(root, &bucket_path, &path)?;
+    Ok((bucket_path, path))
+}
+
 #[cfg(not(windows))]
 #[inline]
 fn is_clean_relative_segment(s: &str) -> bool {
@@ -14055,6 +14236,48 @@ fn reject_local_disk_symlink_components_at(root: &Path, root_fd: &std::fs::File,
         Err(LocalDiskPathValidationAtError::InvalidPath) => Err(DiskError::InvalidPath),
         Err(LocalDiskPathValidationAtError::Io(err)) => Err(to_file_error(err).into()),
     }
+}
+
+/// Validate `path` beneath `root_fd` with `RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS`
+/// and open the object directory (`O_RDONLY | O_DIRECTORY | O_CLOEXEC`) in a
+/// single `openat2` syscall when it already exists as a directory.
+///
+/// Must be called after `metadata_mutation_lease` (and `volume_guard` for
+/// recoverable deletes) has been acquired so the returned directory descriptor
+/// cannot reference a pre-lease stale directory inode.
+#[cfg(target_os = "linux")]
+fn validate_and_open_local_disk_object_dir_at(
+    root: &Path,
+    root_fd: &std::fs::File,
+    path: &Path,
+) -> Result<delete_recovery::PreopenedDeleteDir> {
+    use rustix::fs::{Mode, OFlags, ResolveFlags, openat2};
+    use rustix::io::Errno;
+
+    let path = normalize_path_cow(path);
+    let relative = disk_path_strip_prefix_normalized(&path, root)?;
+    if relative.as_os_str().is_empty() {
+        return Ok(delete_recovery::PreopenedDeleteDir::Unopened);
+    }
+    let has_dotdot = rustfs_utils::path::unix_path_has_dotdot_segment(relative.as_os_str().as_encoded_bytes());
+    if !has_dotdot {
+        match openat2(
+            root_fd,
+            relative,
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
+            Mode::empty(),
+            ResolveFlags::BENEATH | ResolveFlags::NO_SYMLINKS,
+        ) {
+            Ok(fd) => {
+                return Ok(delete_recovery::PreopenedDeleteDir::Opened(Arc::new(std::fs::File::from(fd))));
+            }
+            Err(Errno::LOOP | Errno::XDEV) => return Err(DiskError::InvalidPath),
+            Err(Errno::NOENT) => return Ok(delete_recovery::PreopenedDeleteDir::MissingOrNotDir),
+            Err(_) => {}
+        }
+    }
+    reject_local_disk_symlink_components_at(root, root_fd, &path)?;
+    Ok(delete_recovery::PreopenedDeleteDir::Unopened)
 }
 
 #[cfg(target_os = "linux")]
@@ -14720,12 +14943,38 @@ impl LocalDisk {
     }
 }
 
-/// Batch positioned reads for local EC shard files in a single `spawn_blocking`.
+/// Shard windows at least this large are copy-bound: reading them concurrently
+/// beats one serial blocking pass, while smaller windows stay coalesced to save
+/// blocking-pool round trips.
+#[cfg(unix)]
+const LOCAL_BATCH_PARALLEL_MIN_SHARD_BYTES: usize = 512 * 1024;
+
+/// Positioned reads for local EC shard files, returned in request order.
 ///
-/// Collapses per-shard blocking-pool round-trips that dominate warm GET
-/// fan-out on single-node multi-disk topologies.
+/// Small windows share a single `spawn_blocking`, collapsing per-shard
+/// blocking-pool round-trips that dominate warm GET fan-out on single-node
+/// multi-disk topologies. When every window reaches
+/// `LOCAL_BATCH_PARALLEL_MIN_SHARD_BYTES`, each shard gets its own dispatch so
+/// copies and device reads proceed concurrently.
 #[cfg(unix)]
 pub(crate) async fn batch_shard_pread(requests: Vec<(std::path::PathBuf, usize, usize)>) -> Vec<Result<Bytes>> {
+    if requests.len() < 2
+        || requests
+            .iter()
+            .any(|(_, _, length)| *length < LOCAL_BATCH_PARALLEL_MIN_SHARD_BYTES)
+    {
+        return batch_shard_pread_blocking(requests).await;
+    }
+    futures::future::join_all(requests.into_iter().map(|request| batch_shard_pread_blocking(vec![request])))
+        .await
+        .into_iter()
+        .flatten()
+        .collect()
+}
+
+/// Read every request in turn inside one `spawn_blocking`.
+#[cfg(unix)]
+async fn batch_shard_pread_blocking(requests: Vec<(std::path::PathBuf, usize, usize)>) -> Vec<Result<Bytes>> {
     let n = requests.len();
     let metrics = rustfs_io_metrics::LocalBatchReadMetrics::capture();
     let submitted = metrics.as_ref().map(|_| std::time::Instant::now());
@@ -14733,7 +14982,7 @@ pub(crate) async fn batch_shard_pread(requests: Vec<(std::path::PathBuf, usize, 
     let diagnostic = crate::diagnostics::batch_read_diagnostics::Sample::capture();
     tokio::task::spawn_blocking(move || {
         use rustfs_io_metrics::LocalBatchReadStage;
-        use std::os::unix::fs::{FileExt, OpenOptionsExt};
+        use std::os::unix::fs::OpenOptionsExt;
 
         // The disabled build expands directly to the original operation.
         macro_rules! diagnostic_stage {
@@ -14801,25 +15050,48 @@ pub(crate) async fn batch_shard_pread(requests: Vec<(std::path::PathBuf, usize, 
                         metrics.as_deref(),
                         LocalBatchReadStage::Read,
                         || {
-                            if offset == 0 {
-                                use std::io::Read as _;
-                                total = (&file)
-                                    .take(u64::try_from(length).unwrap_or(u64::MAX))
-                                    .read_to_end(&mut buf)
-                                    .map_err(DiskError::from)?;
-                                if total < length {
+                            // Preload the requested window before reading it. Kernel
+                            // readahead is advisory and may still extend past the
+                            // window, so the tail is reclaimed after the read below.
+                            #[cfg(target_os = "linux")]
+                            if let (Ok(start), Ok(len)) = (u64::try_from(offset), u64::try_from(length)) {
+                                let _ = rustix::fs::fadvise(
+                                    &file,
+                                    start,
+                                    std::num::NonZeroU64::new(len),
+                                    rustix::fs::Advice::WillNeed,
+                                );
+                            }
+                            // `with_capacity` reserves exactly `length` bytes, so each
+                            // positioned read fills only the remaining requested span
+                            // without zero-initializing it first.
+                            while total < length {
+                                let position = u64::try_from(offset + total).map_err(|_| DiskError::FileCorrupt)?;
+                                let nbytes = match rustix::io::pread(&file, rustix::buffer::spare_capacity(&mut buf), position) {
+                                    Ok(nbytes) => nbytes,
+                                    Err(rustix::io::Errno::INTR) => continue,
+                                    Err(err) => return Err(DiskError::from(std::io::Error::from(err))),
+                                };
+                                if nbytes == 0 {
                                     return Err(DiskError::FileCorrupt);
                                 }
-                            } else {
-                                buf.resize(length, 0);
-                                while total < length {
-                                    let nbytes = file
-                                        .read_at(&mut buf[total..], u64::try_from(offset + total).unwrap_or(u64::MAX))
-                                        .map_err(DiskError::from)?;
-                                    if nbytes == 0 {
-                                        return Err(DiskError::FileCorrupt);
-                                    }
-                                    total += nbytes;
+                                total += nbytes;
+                            }
+                            // Keep a cold shard window from evicting unrelated data
+                            // when the kernel over-reads. The requested tail page is
+                            // retained because its final bytes may share a page with
+                            // the readahead range.
+                            #[cfg(target_os = "linux")]
+                            if let Ok(page) = mmap_page_size() {
+                                let aligned_end = end
+                                    .checked_add(page.saturating_sub(1))
+                                    .map(|value| value / page * page)
+                                    .unwrap_or(end);
+                                if aligned_end < meta.len()
+                                    && let Some(reclaim_len) = std::num::NonZeroU64::new(meta.len() - aligned_end)
+                                {
+                                    let _ =
+                                        rustix::fs::fadvise(&file, aligned_end, Some(reclaim_len), rustix::fs::Advice::DontNeed);
                                 }
                             }
                             Ok::<_, DiskError>(())
@@ -15426,6 +15698,21 @@ impl DiskAPI for LocalDisk {
         )
         .map_err(DiskError::from)?;
         fi.validate(ValidationMode::RequireErasure)?;
+        let frame_size = crate::object_api::persisted_ec_read_quantum(
+            &fi.metadata,
+            codec_erasure.block_size,
+            codec_erasure.data_shards,
+            codec_erasure.shard_size(),
+        )
+        .map_err(|_| DiskError::FileCorrupt)?
+        .unwrap_or_else(|| codec_erasure.shard_size());
+        // Staged writes wait for this scan before publication. Bound each stalled read
+        // independently so a large shard can keep making progress.
+        let read_stall = if volume == RUSTFS_META_TMP_BUCKET {
+            get_object_disk_read_timeout()
+        } else {
+            Duration::ZERO
+        };
         for (i, part) in fi.parts.iter().enumerate() {
             let checksum_info = erasure.get_checksum_info(part.number);
             let checksum_algo = if fi.uses_legacy_checksum && checksum_info.algorithm == HashAlgorithm::HighwayHash256S {
@@ -15447,10 +15734,14 @@ impl DiskAPI for LocalDisk {
                     &part_path,
                     codec_erasure.shard_file_size(part.size as i64) as usize,
                     checksum_algo,
-                    codec_erasure.shard_size(),
+                    frame_size,
+                    read_stall,
                 )
                 .await
                 .err();
+            if !read_stall.is_zero() && matches!(err, Some(DiskError::Timeout)) {
+                return Err(DiskError::Timeout);
+            }
             resp.results[i] = conv_part_err_to_int(&err);
             if resp.results[i] == CHECK_PART_UNKNOWN
                 && let Some(err) = err
@@ -15487,42 +15778,36 @@ impl DiskAPI for LocalDisk {
     #[tracing::instrument(level = "trace", skip_all)]
     async fn read_parts(&self, bucket: &str, paths: &[String]) -> Result<Vec<ObjectPartInfo>> {
         if bucket == RUSTFS_META_MULTIPART_BUCKET && !paths.is_empty() {
-            let mut cached_parts = Vec::with_capacity(paths.len());
-            let mut all_cached = true;
-            let mut verified_source: Option<(&str, PathBuf)> = None;
-            for path_str in paths {
-                let Some(num) = Path::new(path_str)
-                    .file_name()
-                    .and_then(|v| v.to_str())
-                    .and_then(|v| v.strip_prefix("part."))
-                    .and_then(|v| v.strip_suffix(".meta"))
-                    .and_then(|v| v.parse::<usize>().ok())
-                else {
-                    all_cached = false;
-                    break;
-                };
-                let scope_root = multipart_staging::upload_scope_root(path_str, true);
-                let (source, head_already_verified) = match verified_source.as_ref() {
-                    Some((prev_root, prev_source)) if *prev_root == scope_root => (prev_source, true),
-                    _ => {
-                        let Ok(source) = self.io_get_object_open_path(bucket, scope_root) else {
-                            all_cached = false;
-                            break;
-                        };
-                        verified_source = Some((scope_root, source));
-                        (&verified_source.as_ref().expect("just initialized").1, false)
+            let permit = acquire_context_disk_io_permit().await.map_err(DiskError::Io)?;
+            let resolve = self.part_path_resolver();
+            let keys = paths.to_owned();
+            let cached = spawn_blocking_with_disk_io_permit(permit, move || {
+                let mut parts = Vec::with_capacity(keys.len());
+                let mut verified = None;
+                for key in &keys {
+                    let num = Path::new(key)
+                        .file_name()?
+                        .to_str()?
+                        .strip_prefix("part.")?
+                        .strip_suffix(".meta")?
+                        .parse()
+                        .ok()?;
+                    let scope = multipart_staging::upload_scope_root(key, true);
+                    let same_head = verified.as_ref().is_some_and(|(prev, _)| *prev == scope);
+                    if !same_head {
+                        verified = Some((scope, resolve(RUSTFS_META_MULTIPART_BUCKET, scope).ok()?));
                     }
-                };
-                let Some(part) =
-                    multipart_source_state::get_active_multipart_source_part_with_head(source, num, head_already_verified)
-                else {
-                    all_cached = false;
-                    break;
-                };
-                cached_parts.push(part);
-            }
-            if all_cached {
-                return Ok(cached_parts);
+                    let (_, source) = verified.as_ref()?;
+                    parts.push(multipart_source_state::get_active_multipart_source_part_with_head(
+                        source, num, same_head,
+                    )?);
+                }
+                Some(parts)
+            })
+            .await
+            .map_err(DiskError::from)?;
+            if let Some(parts) = cached {
+                return Ok(parts);
             }
         }
         let volume_dir = self.io_get_bucket_path(bucket)?;
@@ -15645,9 +15930,9 @@ impl DiskAPI for LocalDisk {
         let source_owner = self
             .multipart_source_owner(dst_volume, dst_path, true, false, usage_owner)
             .await?;
-        let admission = self.multipart_source_admission(dst_volume, dst_path, true, false)?;
         let (src_volume_dir, src_file_path) = self.io_get_bucket_and_object_path(src_volume, src_path)?;
         let (dst_volume_dir, dst_file_path) = self.io_get_bucket_and_object_path(dst_volume, dst_path)?;
+        let admission = self.multipart_source_admission_after_validated_part_path(dst_volume, dst_path)?;
         if !skip_access_checks(src_volume) {
             super::fs::access_std(&src_volume_dir).map_err(|err| to_access_error(err, DiskError::VolumeAccessDenied))?;
         }
@@ -15933,29 +16218,10 @@ impl DiskAPI for LocalDisk {
                 };
 
                 let prepare_result = (|| -> std::io::Result<(bool, bool)> {
-                    let old_data_absent = staging_path.join(PART_TRANSACTION_OLD_DATA_ABSENT);
-                    let old_meta_absent = staging_path.join(PART_TRANSACTION_OLD_META_ABSENT);
-                    let had_old_data = snapshot_part_transaction_file(
-                        &dst_file_path,
-                        txn_parent_fd.as_deref(),
-                        &staging_path.join(PART_TRANSACTION_OLD_DATA),
-                        txn_dir_fd.as_deref(),
-                        PART_TRANSACTION_OLD_DATA,
-                        &old_data_absent,
-                        PART_TRANSACTION_OLD_DATA_ABSENT,
-                        None,
-                    )?;
-                    let had_old_meta = snapshot_part_transaction_file(
-                        &dst_meta_path,
-                        txn_parent_fd.as_deref(),
-                        &staging_path.join(PART_TRANSACTION_OLD_META),
-                        txn_dir_fd.as_deref(),
-                        PART_TRANSACTION_OLD_META,
-                        &old_meta_absent,
-                        PART_TRANSACTION_OLD_META_ABSENT,
-                        (!had_old_data).then_some((PART_TRANSACTION_OLD_DATA_ABSENT, old_data_absent.as_path())),
-                    )?;
-
+                    // Create new.meta first inside the private staging directory (which is
+                    // published atomically by rename_in_same_dir_fd below) so absent old-part
+                    // markers can share its immutable inode via linkat instead of allocating
+                    // a second inode with openat(O_CREAT) + close.
                     let new_meta_path = staging_path.join(PART_TRANSACTION_NEW_META);
                     let mut new_meta = create_new_in_dir_fd(txn_dir_fd.as_deref(), PART_TRANSACTION_NEW_META, &new_meta_path)?;
                     std::io::Write::write_all(&mut new_meta, &meta)?;
@@ -15972,6 +16238,30 @@ impl DiskAPI for LocalDisk {
                         PART_TRANSACTION_PUBLISH_META,
                         &staging_path.join(PART_TRANSACTION_PUBLISH_META),
                     );
+
+                    let old_data_absent = staging_path.join(PART_TRANSACTION_OLD_DATA_ABSENT);
+                    let old_meta_absent = staging_path.join(PART_TRANSACTION_OLD_META_ABSENT);
+                    let absent_link_source = Some((PART_TRANSACTION_NEW_META, new_meta_path.as_path()));
+                    let had_old_data = snapshot_part_transaction_file(
+                        &dst_file_path,
+                        txn_parent_fd.as_deref(),
+                        &staging_path.join(PART_TRANSACTION_OLD_DATA),
+                        txn_dir_fd.as_deref(),
+                        PART_TRANSACTION_OLD_DATA,
+                        &old_data_absent,
+                        PART_TRANSACTION_OLD_DATA_ABSENT,
+                        absent_link_source,
+                    )?;
+                    let had_old_meta = snapshot_part_transaction_file(
+                        &dst_meta_path,
+                        txn_parent_fd.as_deref(),
+                        &staging_path.join(PART_TRANSACTION_OLD_META),
+                        txn_dir_fd.as_deref(),
+                        PART_TRANSACTION_OLD_META,
+                        &old_meta_absent,
+                        PART_TRANSACTION_OLD_META_ABSENT,
+                        absent_link_source,
+                    )?;
                     let sync_overwrite_backup = durability.syncs_recovery_protocol_state() && (had_old_data || had_old_meta);
                     if sync_overwrite_backup {
                         os::fsync_directory_handle_std(&staging_path, txn_dir_fd.as_deref())?;
@@ -16011,6 +16301,7 @@ impl DiskAPI for LocalDisk {
                         meta,
                         had_old_data,
                         had_old_meta,
+                        admission,
                         src_parent_fd,
                         txn_dir_fd,
                         txn_parent_fd,
@@ -16038,8 +16329,6 @@ impl DiskAPI for LocalDisk {
     async fn settle_part_transaction(&self, volume: &str, path: &str, action: PartTransactionAction) -> Result<()> {
         let usage_owner = self.usage_watch_binding.owner(volume, None);
         let source_owner = self.multipart_source_owner(volume, path, true, false, usage_owner).await?;
-        let admission = self.multipart_source_admission(volume, path, true, false)?;
-        let admission_source = admission.as_ref().map(|a| a.source().to_path_buf());
         let txn_rel_path = crate::disk::part_transaction_path(path);
         let txn_open_path = self.io_get_object_open_path(volume, &txn_rel_path).ok();
         let cached_published = txn_open_path.as_deref().and_then(take_published_part_txn_receipt);
@@ -16054,6 +16343,7 @@ impl DiskAPI for LocalDisk {
             transaction_path,
             skip_obsolete_read_on_commit,
             cached_old_flags,
+            admission,
             mut txn_dir_fd,
             mut txn_parent_fd,
         ) = match cached_published {
@@ -16063,19 +16353,22 @@ impl DiskAPI for LocalDisk {
                 entry.transaction_path,
                 !entry.had_old_meta,
                 Some((entry.had_old_data, entry.had_old_meta)),
+                entry.admission,
                 entry.txn_dir_fd,
                 entry.txn_parent_fd,
             ),
             None => {
+                let admission = self.multipart_source_admission(volume, path, true, false)?;
                 let (_, current_data_path) = self.io_get_bucket_and_object_path(volume, path)?;
                 let current_meta_path = self.io_get_object_path(volume, &format!("{path}.meta"))?;
                 let transaction_path = self.io_get_object_path(volume, &txn_rel_path)?;
                 for candidate in [&current_data_path, &current_meta_path, &transaction_path] {
                     check_path_length(candidate.to_string_lossy().as_ref())?;
                 }
-                (current_data_path, current_meta_path, transaction_path, false, None, None, None)
+                (current_data_path, current_meta_path, transaction_path, false, None, admission, None, None)
             }
         };
+        let admission_source = admission.as_ref().map(|a| a.source().to_path_buf());
         let durability = effective_durability(volume);
         let sync = durability.syncs_recovery_protocol_state();
         let part_number = current_data_path
@@ -16251,8 +16544,6 @@ impl DiskAPI for LocalDisk {
             .multipart_source_owner(dst_volume, dst_path, true, false, usage_owner)
             .await?;
         multipart_staging::reject_reserved_anchor(dst_path)?;
-        let admission = self.multipart_source_admission(dst_volume, dst_path, true, false)?;
-        let admission_source = admission.as_ref().map(|a| a.source().to_path_buf());
         pool_meta_native::reject_raw_path(&self.root, src_volume, src_path)?;
         pool_meta_native::reject_raw_path(&self.root, dst_volume, dst_path)?;
         let src_is_dir = has_suffix(src_path, SLASH_SEPARATOR);
@@ -16294,6 +16585,7 @@ impl DiskAPI for LocalDisk {
             dst_meta_path,
             transaction_path,
             preverified_meta_and_old_flags,
+            admission,
             mut src_parent_fd,
             txn_dir_fd,
             txn_parent_fd,
@@ -16306,11 +16598,13 @@ impl DiskAPI for LocalDisk {
                 Some(entry.dst_meta_path),
                 Some(entry.transaction_path),
                 Some((entry.had_old_data, entry.had_old_meta)),
+                entry.admission,
                 entry.src_parent_fd,
                 entry.txn_dir_fd,
                 entry.txn_parent_fd,
             ),
             None => {
+                let admission = self.multipart_source_admission(dst_volume, dst_path, true, false)?;
                 let (src_volume_dir, src_file_path) = self.io_get_bucket_and_object_path(src_volume, src_path)?;
                 let (dst_volume_dir, dst_file_path) = self.io_get_bucket_and_object_path(dst_volume, dst_path)?;
                 if !skip_access_checks(src_volume) {
@@ -16343,12 +16637,14 @@ impl DiskAPI for LocalDisk {
                     dst_meta_path,
                     transaction_path,
                     None,
+                    admission,
                     None,
                     None,
                     None,
                 )
             }
         };
+        let admission_source = admission.as_ref().map(|a| a.source().to_path_buf());
 
         // UploadPart is acknowledged once this rename lands, so the part data and
         // its directory entry must be durable before we return. Relaxed keeps the
@@ -16626,6 +16922,7 @@ impl DiskAPI for LocalDisk {
                                 transaction_path: txn_path,
                                 had_old_data,
                                 had_old_meta,
+                                admission,
                                 txn_dir_fd,
                                 txn_parent_fd,
                             },
@@ -17957,10 +18254,13 @@ fn should_read_legacy_inline_part(fi: &FileInfo, storage_class_config: &crate::c
     }
 
     let part = &fi.parts[0];
-    if !usize::try_from(part.actual_size).is_ok_and(|size| size <= fi.erasure.block_size) {
+    if part.size > fi.erasure.block_size || !usize::try_from(part.actual_size).is_ok_and(|size| size <= fi.erasure.block_size) {
         return false;
     }
-    let shard_size = fi.shard_file_size(part.actual_size);
+    let Ok(stored_size) = i64::try_from(part.size) else {
+        return false;
+    };
+    let shard_size = fi.shard_file_size(stored_size.max(part.actual_size));
     let versioned = fi.versioned || fi.version_id.is_some_and(|version_id| !version_id.is_nil());
     storage_class_config.should_inline(shard_size, fi.erasure.data_blocks, versioned)
 }
@@ -18726,6 +19026,8 @@ mod test {
             ec12.shard_file_size(1024 * 1024 + 1) < 128 * 1024,
             "a multi-block external object can still fit the per-shard budget"
         );
+        assert!(!should_read_legacy_inline_part(&ec12, &config));
+        ec12.parts[0].actual_size = 1;
         assert!(!should_read_legacy_inline_part(&ec12, &config));
     }
 
@@ -21644,6 +21946,108 @@ mod test {
     }
 
     #[tokio::test]
+    async fn test_part_transaction_rolls_back_first_time_part_via_absent_markers() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let endpoint = Endpoint::try_from(dir.path().to_str().expect("utf8 path")).expect("endpoint");
+        let disk = LocalDisk::new(&endpoint, false).await.expect("local disk");
+        ensure_test_volume(&disk, "tmp").await;
+        ensure_test_volume(&disk, "bucket").await;
+
+        let payload = Bytes::from_static(b"new data");
+        let meta = Bytes::from(
+            ObjectPartInfo {
+                number: 1,
+                size: payload.len(),
+                ..Default::default()
+            }
+            .marshal_msg()
+            .expect("part metadata"),
+        );
+        disk.write_all("tmp", "upload/part.1", payload)
+            .await
+            .expect("new part should be staged");
+
+        disk.prepare_part_transaction("tmp", "upload/part.1", "bucket", "object/part.1", meta.clone())
+            .await
+            .expect("part transaction should be prepared");
+
+        let txn_rel = crate::disk::part_transaction_path("object/part.1");
+        let txn_dir = disk.io_get_object_open_path("bucket", &txn_rel).expect("txn path");
+        let new_meta_file = txn_dir.join(PART_TRANSACTION_NEW_META);
+        let old_data_absent_file = txn_dir.join(PART_TRANSACTION_OLD_DATA_ABSENT);
+        let old_meta_absent_file = txn_dir.join(PART_TRANSACTION_OLD_META_ABSENT);
+        assert!(new_meta_file.is_file());
+        assert!(old_data_absent_file.is_file());
+        assert!(old_meta_absent_file.is_file());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            let probe_src = dir.path().join("hardlink-probe.src");
+            let probe_dst = dir.path().join("hardlink-probe.dst");
+            std::fs::write(&probe_src, b"probe").expect("write hardlink probe");
+            let hardlink_supported = std::fs::hard_link(&probe_src, &probe_dst).is_ok();
+            let _ = std::fs::remove_file(&probe_dst);
+            let _ = std::fs::remove_file(&probe_src);
+            let new_stat = std::fs::symlink_metadata(&new_meta_file).expect("new.meta stat");
+            let data_absent_stat = std::fs::symlink_metadata(&old_data_absent_file).expect("old.data.absent stat");
+            let meta_absent_stat = std::fs::symlink_metadata(&old_meta_absent_file).expect("old.meta.absent stat");
+            if hardlink_supported {
+                assert_eq!((data_absent_stat.dev(), data_absent_stat.ino()), (new_stat.dev(), new_stat.ino()));
+                assert_eq!((meta_absent_stat.dev(), meta_absent_stat.ino()), (new_stat.dev(), new_stat.ino()));
+                assert_eq!(data_absent_stat.len(), meta.len() as u64);
+                assert_eq!(meta_absent_stat.len(), meta.len() as u64);
+            } else {
+                assert_eq!(data_absent_stat.len(), 0);
+                assert_eq!(meta_absent_stat.len(), 0);
+            }
+        }
+        assert!(
+            disk.read_all("bucket", &format!("{txn_rel}/{PART_TRANSACTION_OLD_META_ABSENT}"))
+                .await
+                .is_ok(),
+            "coordinator recovery reads old.meta.absent to detect first-time part transaction"
+        );
+
+        disk.rename_part("tmp", "upload/part.1", "bucket", "object/part.1", meta.clone())
+            .await
+            .expect("part publication should succeed");
+        disk.settle_part_transaction("bucket", "object/part.1", PartTransactionAction::Rollback)
+            .await
+            .expect("part transaction should roll back");
+
+        assert!(matches!(disk.read_all("bucket", "object/part.1").await, Err(DiskError::FileNotFound)));
+        assert!(matches!(
+            disk.read_all("bucket", "object/part.1.meta").await,
+            Err(DiskError::FileNotFound)
+        ));
+        assert!(!txn_dir.exists());
+
+        // Asymmetric state: old data exists without old metadata.
+        disk.write_all("tmp", "upload/part.1", Bytes::from_static(b"new data 2"))
+            .await
+            .expect("stage replacement part");
+        disk.write_all("bucket", "object/part.1", Bytes::from_static(b"orphan old data"))
+            .await
+            .expect("stage orphan old data");
+        disk.prepare_part_transaction("tmp", "upload/part.1", "bucket", "object/part.1", meta)
+            .await
+            .expect("prepare with old data only");
+        assert!(txn_dir.join(PART_TRANSACTION_OLD_DATA).is_file());
+        assert!(txn_dir.join(PART_TRANSACTION_OLD_META_ABSENT).is_file());
+        disk.settle_part_transaction("bucket", "object/part.1", PartTransactionAction::Rollback)
+            .await
+            .expect("rollback asymmetric part transaction");
+        assert_eq!(
+            disk.read_all("bucket", "object/part.1").await.expect("old data restored"),
+            Bytes::from_static(b"orphan old data")
+        );
+        assert!(matches!(
+            disk.read_all("bucket", "object/part.1.meta").await,
+            Err(DiskError::FileNotFound)
+        ));
+    }
+
+    #[tokio::test]
     async fn shard_integrity_part_transaction_keeps_only_the_settled_generation() {
         use crate::io_support::shard_integrity::IntegrityBuilder;
         use rustfs_filemeta::shard_integrity::IntegrityLayout;
@@ -22359,6 +22763,33 @@ mod test {
         assert!(
             os::fsync_dir_recorder::was_fsynced(&dst_parent),
             "destination parent dir must be fsynced after the commit rename"
+        );
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn shutdown_receipt_is_durable_with_legacy_sync_disabled() {
+        let _mode = durability_mode_override::set(DurabilityMode::LegacyOff);
+        let dir = tempfile::tempdir().expect("shutdown marker disk");
+        let endpoint = Endpoint::try_from(dir.path().to_str().expect("disk path")).expect("local endpoint");
+        let disk = LocalDisk::new(&endpoint, false).await.expect("local disk");
+        ensure_test_volume(&disk, RUSTFS_META_BUCKET).await;
+        disk.write_all(
+            RUSTFS_META_BUCKET,
+            crate::disk::UNCLEAN_SHUTDOWN_MARKER_PATH,
+            Bytes::from_static(b"running"),
+        )
+        .await
+        .expect("consume shutdown receipt");
+        let parent = disk
+            .get_object_path(RUSTFS_META_BUCKET, crate::disk::UNCLEAN_SHUTDOWN_MARKER_PATH)
+            .expect("marker path")
+            .parent()
+            .expect("marker parent")
+            .to_path_buf();
+        assert!(
+            os::fsync_dir_recorder::was_fsynced(&parent),
+            "a stale clean receipt must not reappear after a crash"
         );
     }
 
@@ -30140,6 +30571,55 @@ mod test {
         assert_eq!(err.kind(), ErrorKind::TimedOut);
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn local_read_timeout_reader_renews_deadline_after_progress() {
+        let (mut tx, rx) = tokio::io::duplex(8);
+        let mut reader = StallTimeoutReader::new(rx, Duration::from_secs(10));
+        let producer = async {
+            for byte in b"abc" {
+                tokio::time::sleep(Duration::from_secs(6)).await;
+                tx.write_all(&[*byte]).await.expect("write next byte");
+            }
+            tx.shutdown().await.expect("finish stream");
+        };
+        let mut output = Vec::new();
+        let (_, read) = tokio::join!(producer, reader.read_to_end(&mut output));
+        read.expect("each read made progress within the stall timeout");
+        assert_eq!(output, b"abc");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn local_disk_verify_file_stalled_staged_shard_returns_timeout() {
+        let root = tempfile::tempdir().expect("create disk root");
+        let endpoint = Endpoint::try_from(root.path().to_str().expect("disk path")).expect("disk endpoint");
+        let disk = LocalDisk::new(&endpoint, false).await.expect("create local disk");
+        let path = disk
+            .get_object_path(RUSTFS_META_TMP_BUCKET, "stage/part.1")
+            .expect("staged shard path");
+        std::fs::create_dir_all(path.parent().expect("staging directory")).expect("create staging directory");
+        rustix::fs::mkfifoat(rustix::fs::CWD, &path, rustix::fs::Mode::RUSR | rustix::fs::Mode::WUSR)
+            .expect("create stalled shard");
+        // A FIFO with an open writer reports length zero but never returns EOF.
+        let writer = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .expect("hold FIFO open");
+        let mut fi = FileInfo::new("object", 1, 0);
+        fi.erasure.index = 1;
+        fi.parts.push(ObjectPartInfo {
+            number: 1,
+            ..Default::default()
+        });
+        let result = temp_env::async_with_vars([(rustfs_config::ENV_OBJECT_DISK_READ_TIMEOUT, Some("1"))], async {
+            timeout(Duration::from_secs(8), disk.verify_file(RUSTFS_META_TMP_BUCKET, "stage", &fi)).await
+        })
+        .await;
+        drop(writer);
+        assert!(matches!(result, Ok(Err(DiskError::Timeout))), "stalled verification returned {result:?}");
+    }
+
     #[tokio::test]
     async fn local_read_timeout_reader_with_zero_timeout_stays_pending() {
         let mut reader = StallTimeoutReader::new(PendingTestReader, Duration::ZERO);
@@ -31781,13 +32261,14 @@ mod test {
             Endpoint::try_from(dir.path().to_str().expect("operation should succeed")).expect("operation should succeed");
         let disk = LocalDisk::new(&endpoint, false).await.expect("operation should succeed");
 
-        async fn scan_names(disk: &LocalDisk, bucket: &str, base_dir: &str, forward_to: &str) -> (Vec<String>, i32) {
+        async fn scan_names(disk: &LocalDisk, bucket: &str, base_dir: &str, forward_to: &str, limit: i32) -> (Vec<String>, i32) {
             let (reader, mut writer) = tokio::io::duplex(4096);
             let mut out = MetacacheWriter::new(&mut writer);
             let opts = WalkDirOptions {
                 bucket: bucket.to_string(),
                 base_dir: base_dir.to_string(),
                 recursive: true,
+                limit,
                 forward_to: Some(forward_to.to_string()),
                 ..Default::default()
             };
@@ -31812,7 +32293,7 @@ mod test {
         }
 
         let (engineering_names, engineering_count) =
-            scan_names(&disk, bucket, "engineering/", "engineering/engineering/engineering/repo-0001").await;
+            scan_names(&disk, bucket, "engineering/", "engineering/engineering/engineering/repo-0001", 0).await;
 
         assert_eq!(
             engineering_names,
@@ -31828,7 +32309,7 @@ mod test {
         assert_eq!(engineering_count as usize, engineering_names.len());
 
         let (different_names, different_count) =
-            scan_names(&disk, bucket, "different/", "different/prefix/prefix/repo-0001").await;
+            scan_names(&disk, bucket, "different/", "different/prefix/prefix/repo-0001", 0).await;
 
         assert_eq!(
             different_names,
@@ -31840,7 +32321,8 @@ mod test {
         );
         assert_eq!(different_count as usize, different_names.len());
 
-        let (double_names, double_count) = scan_names(&disk, bucket, "engineering/", "engineering/engineering/repo-0001").await;
+        let (double_names, double_count) =
+            scan_names(&disk, bucket, "engineering/", "engineering/engineering/repo-0001", 0).await;
 
         assert_eq!(
             double_names,
@@ -31852,6 +32334,13 @@ mod test {
             "forward_to must not skip a child directory whose name repeats the base prefix"
         );
         assert_eq!(double_count as usize, double_names.len());
+
+        fs::write(bucket_dir.join("engineering/engineering").join(STORAGE_FORMAT_FILE), b"meta")
+            .await
+            .expect("write ancestor metadata");
+        let (names, count) = scan_names(&disk, bucket, "engineering/", "engineering/engineering/repo-0001", 2).await;
+        assert_eq!(count, 2);
+        assert!(names.iter().any(|name| name == "engineering/engineering/repo-0002"));
     }
 
     #[tokio::test]
@@ -35042,6 +35531,80 @@ mod test {
         assert!(body.ends_with(b"abcdef"));
     }
 
+    #[tokio::test]
+    async fn file_cache_reclaim_wrappers_round_trip_checksum_sized_file_buffers() {
+        use sha2::{Digest, Sha256};
+        use std::io::IoSlice;
+
+        let dir = tempfile::tempdir().expect("create wrapper test directory");
+        for checksum_bytes in [32, 64] {
+            let wire_len = 2 * 1024 * 1024 + checksum_bytes;
+            let content: Vec<_> = (0u8..=250).cycle().take(wire_len).collect();
+            let path = dir.path().join(format!("frame-{checksum_bytes}"));
+            let file = File::create(&path).await.expect("create writer file");
+            let mut writer = FileCacheReclaimWriter::new(file, wire_len, true);
+            let mut bufs = Vec::new();
+            for frame in content.chunks(wire_len / (checksum_bytes / 32)) {
+                bufs.push(IoSlice::new(&frame[..32]));
+                bufs.push(IoSlice::new(&frame[32..]));
+            }
+            let accepted = writer.write_vectored(&bufs).await.expect("accept checksum and data slices");
+            assert_eq!(accepted, wire_len, "checksum overhead must fit alongside 2 MiB of data");
+            let tail = b"short final tail!";
+            writer.write_all(tail).await.expect("write after the accepted frame");
+            writer.flush().await.expect("flush pending writes");
+            writer.shutdown().await.expect("finish writes before cache reclaim");
+            writer.inner.sync_all().await.expect("sync the completed test file");
+
+            let file = File::open(&path).await.expect("reopen completed file");
+            let mut reader = FileCacheReclaimReader::new(file, 0, wire_len + tail.len(), true, 0);
+            let mut actual = vec![0; wire_len];
+            let read = reader
+                .read(&mut actual)
+                .await
+                .expect("read the complete large frame in one request");
+            assert_eq!(read, wire_len, "the file buffer must read checksum overhead alongside 2 MiB of data");
+            assert_eq!(actual, content, "large reads must preserve every accepted byte");
+            assert_eq!(Sha256::digest(&actual), Sha256::digest(&content), "frame digest must survive file I/O");
+            let mut actual_tail = [0; 32];
+            assert_eq!(
+                reader
+                    .read_exact(&mut actual_tail)
+                    .await
+                    .expect_err("short tail must report EOF")
+                    .kind(),
+                std::io::ErrorKind::UnexpectedEof
+            );
+            assert_eq!(&actual_tail[..tail.len()], tail, "short read must preserve the available tail");
+            assert_eq!(reader.read(&mut [0; 1]).await.expect("read at EOF"), 0);
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn file_cache_reclaim_writer_propagates_shutdown_error_after_acceptance() {
+        use std::io::IoSlice;
+
+        let file = fs::OpenOptions::new()
+            .write(true)
+            .open("/dev/full")
+            .await
+            .expect("open full device");
+        let payload = vec![31; 2 * 1024 * 1024 + 64];
+        let mut writer = FileCacheReclaimWriter::new(file, payload.len(), true);
+        let accepted = writer
+            .write_vectored(&[IoSlice::new(&payload[..32]), IoSlice::new(&payload[32..])])
+            .await
+            .expect("Tokio may accept bytes before the blocking write fails");
+        assert_eq!(accepted, payload.len(), "the expanded buffer must accept the complete frame");
+        let error = writer
+            .shutdown()
+            .await
+            .expect_err("accepted bytes must not hide a failed blocking write");
+        assert_eq!(error.raw_os_error(), Some(libc::ENOSPC));
+        assert!(!writer.reclaimed, "failed shutdown must not run successful-write cache reclaim");
+    }
+
     #[cfg(target_os = "macos")]
     #[tokio::test]
     async fn macos_nocache_helpers_accept_tokio_and_std_files() {
@@ -36542,7 +37105,7 @@ mod test {
                     let (resources, gates) = test_resource_units(1);
                     let result = with_optional_resource_unit(
                         Some(resources.with_memory_budget(memory.clone())),
-                        disk.bitrot_verify(&path, payload.len(), algo.clone(), 8),
+                        disk.bitrot_verify(&path, payload.len(), algo.clone(), 8, Duration::ZERO),
                     )
                     .await;
                     if fits {
@@ -36580,7 +37143,7 @@ mod test {
             writer.shutdown().await.expect("complete bitrot frames");
             let path = dir.path().join("part.1");
             std::fs::write(&path, writer.into_inner().into_inner()).expect("write encoded shard");
-            disk.bitrot_verify(&path, payload.len(), algo.clone(), shard_size)
+            disk.bitrot_verify(&path, payload.len(), algo.clone(), shard_size, Duration::ZERO)
                 .await
                 .expect("fixture verifies before cancellation");
             let mut observations = Vec::new();
@@ -36589,7 +37152,7 @@ mod test {
                     let (resources, gates) = test_resource_units(count);
                     let mut future = Some(Box::pin(with_optional_resource_unit(
                         Some(resources),
-                        disk.bitrot_verify(&path, payload.len(), algo.clone(), shard_size),
+                        disk.bitrot_verify(&path, payload.len(), algo.clone(), shard_size, Duration::ZERO),
                     )));
                     for step in 0..=resume_step {
                         let (started_tx, started_rx) = tokio::sync::oneshot::channel();
@@ -36613,7 +37176,7 @@ mod test {
                     assert!(gates.iter().all(|gate| gate.snapshot().active == 0));
                 }
             }
-            disk.bitrot_verify(&path, payload.len(), algo, shard_size)
+            disk.bitrot_verify(&path, payload.len(), algo, shard_size, Duration::ZERO)
                 .await
                 .expect("cancellation preserves the encoded shard");
             for (count, step, held) in observations {
@@ -37094,7 +37657,10 @@ mod test {
                 match operation {
                     "full" => disk.read_file("test-volume", "shard").await.map(drop),
                     "range" => disk.read_file_stream("test-volume", "shard", 3, 1021).await.map(drop),
-                    "bitrot" => disk.bitrot_verify(&path, 992, HashAlgorithm::HighwayHash256S, 992).await,
+                    "bitrot" => {
+                        disk.bitrot_verify(&path, 992, HashAlgorithm::HighwayHash256S, 992, Duration::ZERO)
+                            .await
+                    }
                     _ => unreachable!("fixed operation list"),
                 }
             }));
@@ -40367,6 +40933,46 @@ mod test {
 
     #[cfg(unix)]
     #[test]
+    fn local_batch_reads_large_windows_per_shard_and_coalesces_small_windows() {
+        use crate::test_metrics::CapturingRecorder;
+
+        let dir = tempfile::tempdir().expect("dispatch shape directory");
+        let large = LOCAL_BATCH_PARALLEL_MIN_SHARD_BYTES;
+        let paths: Vec<_> = (0..2)
+            .map(|index| {
+                let path = dir.path().join(format!("shard-{index}"));
+                std::fs::write(&path, vec![u8::try_from(index).expect("small shard index"); large + 64])
+                    .expect("write dispatch shape shard");
+                path
+            })
+            .collect();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("dispatch shape runtime");
+        let previous = rustfs_io_metrics::get_stage_metrics_enabled();
+        rustfs_io_metrics::set_get_stage_metrics_enabled(true);
+        let dispatches = |length: usize| {
+            let recorder = CapturingRecorder::default();
+            let requests = paths.iter().map(|path| (path.clone(), 64, length)).collect();
+            let results = metrics::with_local_recorder(&recorder, || runtime.block_on(batch_shard_pread(requests)));
+            for (index, result) in results.iter().enumerate() {
+                let bytes = result.as_ref().expect("window inside the shard");
+                assert_eq!(bytes.len(), length);
+                assert!(bytes.iter().all(|byte| usize::from(*byte) == index), "results keep request order");
+            }
+            recorder.histogram_values("rustfs_io_get_object_local_batch_shards", &[])
+        };
+        let large_shape = dispatches(large);
+        let small_shape = dispatches(large - 1);
+        rustfs_io_metrics::set_get_stage_metrics_enabled(previous);
+
+        assert_eq!(large_shape, vec![1.0, 1.0], "copy-bound windows must not serialize in one worker");
+        assert_eq!(small_shape, vec![2.0], "small windows must share one blocking dispatch");
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn local_batch_read_metrics_survive_caller_cancellation() {
         use crate::test_metrics::CapturingRecorder;
 
@@ -40478,6 +41084,81 @@ mod test {
         assert!(results[1].as_ref().expect("empty range at EOF").is_empty());
         for result in &results[2..] {
             assert!(matches!(result, Err(DiskError::FileCorrupt)), "invalid range: {result:?}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_batch_shard_pread_returns_exact_multi_page_windows() {
+        let dir = tempfile::tempdir().expect("multi-page window fixture");
+        let path = dir.path().join("shard");
+        let window = 1024 * 1024 + 32;
+        let content: Vec<u8> = (0..3 * window).map(|i| (i % 251) as u8).collect();
+        std::fs::write(&path, &content).expect("write multi-page shard");
+        let unaligned = 2 * window + 7;
+        // Windows of one and two q frames, at zero and nonzero offsets.
+        let windows = [
+            (0, window),
+            (window, window),
+            (unaligned, content.len() - unaligned),
+            (0, 2 * window),
+            (window - 5, 2 * window),
+        ];
+        let results = batch_shard_pread(
+            windows
+                .iter()
+                .map(|&(offset, length)| (path.clone(), offset, length))
+                .collect(),
+        )
+        .await;
+        for (result, (offset, length)) in results.iter().zip(windows) {
+            let bytes = result.as_ref().expect("window inside the shard");
+            assert_eq!(bytes.len(), length, "window at {offset} must not over-read");
+            assert_eq!(bytes.as_ref(), &content[offset..offset + length], "window at {offset}");
+        }
+    }
+
+    /// A cold batch read must bring in only its window. Without an exact hint,
+    /// kernel readahead sizes the first request from the read size, so a 16 KiB
+    /// window at offset 0 caches several times its pages and a 2 MiB window
+    /// almost twice its pages.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn test_batch_shard_pread_cold_read_caches_only_its_window() {
+        use rustix::fs::{Advice, fadvise};
+
+        let dir = tempfile::tempdir().expect("cold window fixture");
+        let path = dir.path().join("shard");
+        std::fs::write(&path, vec![5u8; 8 << 20]).expect("write cold window shard");
+        std::fs::File::open(&path)
+            .expect("open shard for sync")
+            .sync_all()
+            .expect("clean pages before eviction");
+        let page = mmap_page_size().expect("page size should be available") as usize;
+        let evict = || {
+            let file = std::fs::File::open(&path).expect("open shard for eviction");
+            fadvise(&file, 0, None, Advice::DontNeed).expect("evict shard pages");
+        };
+        evict();
+        assert_eq!(
+            resident_pages(&path),
+            0,
+            "the temporary filesystem must be able to drop page cache, otherwise residency is unobservable"
+        );
+        for length in [16 * 1024 + 32, 2 * 1024 * 1024 + 64] {
+            evict();
+            let results = batch_shard_pread(vec![(path.clone(), 0, length)]).await;
+            assert_eq!(results[0].as_ref().expect("cold window read").len(), length);
+            let window_pages = length.div_ceil(page);
+            let resident = resident_pages(&path);
+            assert!(
+                resident >= window_pages,
+                "the window itself must be resident: {resident} < {window_pages}"
+            );
+            assert!(
+                resident <= window_pages + window_pages / 8 + 4,
+                "a {length}-byte cold read cached {resident} pages for a {window_pages}-page window"
+            );
         }
     }
 
@@ -41089,10 +41770,18 @@ mod test {
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn mountinfo_fallback_uses_the_exact_escaped_mountpoint() {
-        let mountinfo = "101 1 0:30 / / rw - rootfs rootfs rw\n202 101 0:42 / /mnt/replacement\\040disk rw - tmpfs tmpfs rw\n";
-        assert_eq!(mount_id_from_mountinfo_contents(mountinfo, Path::new("/mnt/replacement disk")), Some(202));
-        assert_eq!(mount_id_from_mountinfo_contents(mountinfo, Path::new("/mnt/replacement")), None);
+    fn mount_id_fdinfo_can_identify_a_directory_below_a_mount() {
+        let temp = tempfile::tempdir().expect("mount fixture directory");
+        let child_path = temp.path().join("data");
+        std::fs::create_dir(&child_path).expect("create data subdirectory");
+        let parent = std::fs::File::open(temp.path()).expect("open parent directory");
+        let child = std::fs::File::open(&child_path).expect("open data subdirectory");
+        let parent_identity = replacement_mount_identity_from_fdinfo(&parent).expect("read parent identity");
+        let child_identity = replacement_mount_identity_from_fdinfo(&child).expect("read child identity");
+        assert_eq!(child_identity.mount_id, parent_identity.mount_id);
+        assert_ne!(child_identity.inode, parent_identity.inode);
+        assert_eq!(replacement_mount_identity_for_fd(&child), Some(child_identity));
+        assert_eq!(replacement_mount_identity_for_path(&child_path), Some(child_identity));
     }
 
     #[cfg(not(windows))]
@@ -41442,6 +42131,425 @@ mod test {
             take_prepared_part_txn_receipt(&txn2_open).is_none(),
             "Drop for LocalDisk must purge cached part transaction receipts"
         );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn hotpath_non_inline_delete_and_multipart_budgets() {
+        const CHILD: &str = "RUSTFS_TEST_HOTPATH_BUDGET_CHILD";
+        const TEST: &str = "disk::local::test::hotpath_non_inline_delete_and_multipart_budgets";
+
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().expect("test executable"))
+                .args(["--exact", TEST, "--nocapture", "--test-threads=1"])
+                .env(CHILD, "1")
+                .env("RUSTFS_DURABILITY_MODE", "strict")
+                .env("RUSTFS_EXPERIMENTAL_DST_DIR_FSYNC_GROUP_COMMIT_ENABLE", "false")
+                .env("RUSTFS_EXPERIMENTAL_FILE_FDATASYNC_GROUP_COMMIT_ENABLE", "false")
+                .output()
+                .expect("hotpath budget subprocess");
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(output.status.success(), "hotpath budget child failed: {stdout}{stderr}");
+            assert!(
+                stdout.contains("HOTPATH_BUDGET_OK"),
+                "hotpath budget child must execute all assertions: {stdout}"
+            );
+            return;
+        }
+
+        let dir = tempfile::tempdir().expect("disk directory");
+        let endpoint = Endpoint::try_from(dir.path().to_str().expect("UTF-8 disk path")).expect("disk endpoint");
+        let disk = LocalDisk::new(&endpoint, false).await.expect("local disk");
+        let bucket = "hotpath-budget";
+        ensure_test_volume(&disk, bucket).await;
+        ensure_test_volume(&disk, RUSTFS_META_TMP_BUCKET).await;
+        ensure_test_volume(&disk, RUSTFS_META_MULTIPART_BUCKET).await;
+        disk.multipart_index.initialize().await;
+        disk.wait_for_startup_cleanup().await;
+        bucket_durability::set(bucket, Some(DurabilityMode::Strict));
+
+        let bucket_dir = disk.io_root().join(bucket);
+        let tmp_dir = disk.io_root().join(RUSTFS_META_TMP_BUCKET);
+
+        // 1. Non-inline rename_data with presynced part.1:
+        //    Must execute in 1 Fsync blocking-queue job (and 1 total queue job) with 2 bucket-tree directory fsyncs
+        //    (<object> and <bucket>), 1 staged data-directory fsync before rename, and 0 prepare_destination jobs.
+        let object = "non-inline-obj";
+        let data_dir = Uuid::new_v4();
+        let stage_id = Uuid::new_v4().to_string();
+        let part_rel = format!("{stage_id}/{data_dir}/part.1");
+        let payload = vec![b'x'; 131_072];
+        let mut writer = disk
+            .create_file(bucket, RUSTFS_META_TMP_BUCKET, &part_rel, payload.len() as i64)
+            .await
+            .expect("create_file for presynced part.1");
+        tokio::io::AsyncWriteExt::write_all(&mut writer, &payload)
+            .await
+            .expect("write payload");
+        tokio::io::AsyncWriteExt::shutdown(&mut writer)
+            .await
+            .expect("shutdown writer");
+        drop(writer);
+
+        let jobs_before_put = disk.blocking_queue.submitted_jobs_for_test();
+        let fsync_jobs_before_put = disk.blocking_queue.submitted_fsync_jobs_for_test();
+        let bucket_syncs_before_put = os::fsync_dir_recorder::count_under(&bucket_dir);
+        let tmp_syncs_before_put = os::fsync_dir_recorder::count_under(&tmp_dir);
+
+        let mut fi = test_file_info(object, Uuid::nil(), Some(data_dir), None);
+        fi.size = payload.len() as i64;
+        fi.parts[0].size = payload.len();
+        fi.parts[0].actual_size = payload.len() as i64;
+        disk.rename_data(RUSTFS_META_TMP_BUCKET, &stage_id, fi.clone(), bucket, object)
+            .await
+            .expect("non-inline rename_data");
+
+        assert_eq!(
+            disk.blocking_queue.submitted_jobs_for_test() - jobs_before_put,
+            2,
+            "non-inline rename_data with presynced shard must submit 1 Fsync commit job + 1 Foreground staging-cleanup job"
+        );
+        assert_eq!(
+            disk.blocking_queue.submitted_fsync_jobs_for_test() - fsync_jobs_before_put,
+            1,
+            "non-inline rename_data must submit exactly 1 job on the Fsync lane"
+        );
+        assert!(
+            (2..=3).contains(&(os::fsync_dir_recorder::count_under(&bucket_dir) - bucket_syncs_before_put)),
+            "fresh non-inline commit must fsync only the object directory and bucket directory"
+        );
+        assert_eq!(
+            os::fsync_dir_recorder::count_under(&tmp_dir) - tmp_syncs_before_put,
+            1,
+            "presynced non-inline commit must fsync the staged data directory once before rename"
+        );
+
+        // 2. Fused recoverable DELETE (Stage 1 -> Stage 2 -> Stage 3):
+        //    Must execute in 3 Fsync blocking-queue jobs (plus at most 1 reserve replenish job if reserve was disarmed)
+        //    and 7 directory fsyncs under Strict mode (Stage 1: 4, Stage 2: 1, Stage 3: 2).
+        let reserve_extra = usize::from(!disk.delete_reserve.is_armed());
+        let jobs_before_del = disk.blocking_queue.submitted_jobs_for_test();
+        let fsync_jobs_before_del = disk.blocking_queue.submitted_fsync_jobs_for_test();
+        let bucket_syncs_before_del = os::fsync_dir_recorder::count_under(&bucket_dir);
+        let del_tx = Uuid::new_v4();
+        let del_opts = DeleteOptions {
+            recoverable_delete: true,
+            old_data_dir: Some(del_tx),
+            ..Default::default()
+        };
+        disk.delete_version(bucket, object, fi, false, del_opts)
+            .await
+            .expect("recoverable delete stage 1");
+        let (journal, sole, satisfied) = disk
+            .try_publish_prepared_delete_local(bucket, object, del_tx, None)
+            .await
+            .expect("publish delete stage 2")
+            .expect("delete stage 2 satisfied");
+        assert!(sole && satisfied);
+        assert!(
+            disk.try_finish_and_finalize_prepared_delete_local(bucket, object, del_tx, &journal, None)
+                .await
+                .expect("finalize delete stage 3")
+        );
+
+        assert_eq!(
+            disk.blocking_queue.submitted_jobs_for_test() - jobs_before_del,
+            3 + reserve_extra,
+            "fused recoverable delete (Stage 1..3) must submit 3 blocking-queue jobs"
+        );
+        assert_eq!(
+            disk.blocking_queue.submitted_fsync_jobs_for_test() - fsync_jobs_before_del,
+            3 + reserve_extra,
+            "fused recoverable delete (Stage 1..3) must run on the Fsync lane"
+        );
+        assert_eq!(
+            os::fsync_dir_recorder::count_under(&bucket_dir) - bucket_syncs_before_del,
+            7,
+            "strict non-inline recoverable delete must execute 7 directory fsyncs across Stages 1..3"
+        );
+
+        // 3. Multipart part transaction on RUSTFS_META_MULTIPART_BUCKET
+        //    (prepare_part_transaction -> rename_part -> settle_part_transaction):
+        //    Must hit PreparedPartTxnReceipt, PublishedPartTxnReceipt, and MultipartSourceAdmission caches
+        //    and submit 3 Fsync blocking-queue jobs.
+        let mp_dst_path = concat!(
+            "6f897928dfe04a87a269ccd9f5a5897d9cbbdf6b55e4d903ef3cbc1125c0cb8f/",
+            "8f897819-2604-4f3d-b843-c32a45d198b2x1786372838834745500/",
+            "58ba822c-06e4-4332-81cc-be2c9d921900/part.1"
+        );
+        let source_root = multipart_staging::upload_scope_root(mp_dst_path, true);
+        let mut upload = FileInfo::new(source_root, 2, 2);
+        upload.erasure.index = 1;
+        upload.data_dir = Some(Uuid::new_v4());
+        upload.mod_time = Some(time::OffsetDateTime::now_utc());
+        upload.fresh = true;
+        disk.write_metadata("", RUSTFS_META_MULTIPART_BUCKET, source_root, upload)
+            .await
+            .expect("initialize live upload head");
+
+        let part_payload = Bytes::from_static(b"multipart-part-payload");
+        let part_meta = Bytes::from(
+            crate::disk::ObjectPartInfo {
+                number: 1,
+                size: part_payload.len(),
+                ..Default::default()
+            }
+            .marshal_msg()
+            .expect("part metadata"),
+        );
+        disk.write_all(RUSTFS_META_TMP_BUCKET, "mp-stage/part.1", part_payload.clone())
+            .await
+            .expect("stage multipart part");
+
+        let mp_dir = disk.io_root().join(RUSTFS_META_MULTIPART_BUCKET);
+        let jobs_before_mp = disk.blocking_queue.submitted_jobs_for_test();
+        let fsync_jobs_before_mp = disk.blocking_queue.submitted_fsync_jobs_for_test();
+        let mp_syncs_before = os::fsync_dir_recorder::count_under(&mp_dir);
+        disk.prepare_part_transaction(
+            RUSTFS_META_TMP_BUCKET,
+            "mp-stage/part.1",
+            RUSTFS_META_MULTIPART_BUCKET,
+            mp_dst_path,
+            part_meta.clone(),
+        )
+        .await
+        .expect("prepare_part_transaction");
+        disk.rename_part(
+            RUSTFS_META_TMP_BUCKET,
+            "mp-stage/part.1",
+            RUSTFS_META_MULTIPART_BUCKET,
+            mp_dst_path,
+            part_meta,
+        )
+        .await
+        .expect("rename_part");
+        disk.settle_part_transaction(RUSTFS_META_MULTIPART_BUCKET, mp_dst_path, PartTransactionAction::Commit)
+            .await
+            .expect("settle_part_transaction");
+
+        assert_eq!(
+            disk.blocking_queue.submitted_jobs_for_test() - jobs_before_mp,
+            3,
+            "prepare_part_transaction + rename_part + settle_part_transaction must submit 3 blocking-queue jobs"
+        );
+        assert_eq!(
+            disk.blocking_queue.submitted_fsync_jobs_for_test() - fsync_jobs_before_mp,
+            3,
+            "multipart part transaction stages must run on the Fsync lane"
+        );
+        assert_eq!(
+            os::fsync_dir_recorder::count_under(&mp_dir) - mp_syncs_before,
+            2,
+            "multipart part transaction commit must fsync the upload directory once in rename_part and once in settle_part_transaction"
+        );
+        assert_eq!(
+            disk.read_all(RUSTFS_META_MULTIPART_BUCKET, mp_dst_path)
+                .await
+                .expect("read settled part"),
+            part_payload
+        );
+
+        println!("HOTPATH_BUDGET_OK");
+    }
+
+    #[test]
+    fn read_metadata_only_from_reader_handles_short_reads_large_envelopes_and_errors() {
+        struct ScriptedShortReader<'a> {
+            data: &'a [u8],
+            pos: usize,
+            max_chunk: usize,
+            inject_interrupted: bool,
+        }
+
+        impl std::io::Read for ScriptedShortReader<'_> {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                if self.inject_interrupted {
+                    self.inject_interrupted = false;
+                    return Err(std::io::Error::new(ErrorKind::Interrupted, "scripted EINTR"));
+                }
+                if self.pos >= self.data.len() {
+                    return Ok(0);
+                }
+                let take_len = (self.data.len() - self.pos).min(buf.len()).min(self.max_chunk);
+                buf[..take_len].copy_from_slice(&self.data[self.pos..self.pos + take_len]);
+                self.pos += take_len;
+                self.inject_interrupted = true;
+                Ok(take_len)
+            }
+        }
+
+        // 1. Small (< 4 KiB) envelope with trailing 16 KiB inline payload across 128-byte short reads + EINTR:
+        // must never invoke size_fn (0 fstat) and must match read_xl_meta_no_data_sync byte-for-byte.
+        let mut small_fi = FileInfo::new("small-obj", 1, 1);
+        small_fi.size = 16 * 1024;
+        small_fi.data_dir = Some(Uuid::new_v4());
+        small_fi.mod_time = Some(OffsetDateTime::now_utc());
+        small_fi.data = Some(Bytes::from(vec![0x33; 16 * 1024]));
+        small_fi.set_inline_data();
+        let mut small_meta = FileMeta::default();
+        small_meta.add_version(small_fi).expect("add small version");
+        let small_full = small_meta.marshal_msg().expect("marshal small meta");
+        let expected_small =
+            read_xl_meta_no_data_sync(&mut std::io::Cursor::new(&small_full), small_full.len()).expect("expected small");
+        assert!(expected_small.len() < LISTING_META_INITIAL_READ_BYTES);
+
+        let mut size_fn_called = false;
+        let mut reader = ScriptedShortReader {
+            data: &small_full,
+            pos: 0,
+            max_chunk: 128,
+            inject_interrupted: true,
+        };
+        let actual_small = read_metadata_only_from_reader(&mut reader, |_| {
+            size_fn_called = true;
+            Ok(small_full.len())
+        })
+        .expect("read_metadata_only_from_reader on small meta");
+        assert!(!size_fn_called, "small (<4 KiB) envelope must not call size_fn / fstat");
+        assert_eq!(actual_small, expected_small);
+
+        // 2. Large (> 4 KiB) envelope with 48 versions + trailing 8 KiB inline payload across 512-byte short reads:
+        // must call size_fn once and match read_xl_meta_no_data_sync byte-for-byte.
+        let mut large_meta = FileMeta::default();
+        for idx in 1..=48_u128 {
+            let mut fi = FileInfo::new("large-obj", 2, 2);
+            fi.version_id = Some(Uuid::from_u128(idx));
+            fi.size = 128;
+            fi.mod_time = Some(OffsetDateTime::now_utc());
+            fi.metadata.insert("x-amz-meta-pad".to_string(), "p".repeat(120));
+            if idx == 1 {
+                fi.data = Some(Bytes::from(vec![0x77; 8 * 1024]));
+                fi.set_inline_data();
+            }
+            large_meta.add_version(fi).expect("add large version");
+        }
+        let large_full = large_meta.marshal_msg().expect("marshal large meta");
+        let expected_large =
+            read_xl_meta_no_data_sync(&mut std::io::Cursor::new(&large_full), large_full.len()).expect("expected large");
+        assert!(expected_large.len() > LISTING_META_INITIAL_READ_BYTES);
+
+        let mut large_size_calls = 0usize;
+        let mut large_reader = ScriptedShortReader {
+            data: &large_full,
+            pos: 0,
+            max_chunk: 512,
+            inject_interrupted: true,
+        };
+        let actual_large = read_metadata_only_from_reader(&mut large_reader, |_| {
+            large_size_calls += 1;
+            Ok(large_full.len())
+        })
+        .expect("read_metadata_only_from_reader on large meta");
+        assert_eq!(large_size_calls, 1, "large (>4 KiB) envelope must call size_fn once");
+        assert_eq!(actual_large, expected_large);
+
+        // 3. Truncated / corrupt inputs (< 4 KiB) must fail without calling size_fn.
+        let truncated = &expected_small[..expected_small.len() - 2];
+        let mut trunc_size_called = false;
+        let mut trunc_reader = ScriptedShortReader {
+            data: truncated,
+            pos: 0,
+            max_chunk: 64,
+            inject_interrupted: false,
+        };
+        assert!(
+            read_metadata_only_from_reader(&mut trunc_reader, |_| {
+                trunc_size_called = true;
+                Ok(truncated.len())
+            })
+            .is_err()
+        );
+        assert!(!trunc_size_called);
+
+        // 5. Opening a directory as xl.meta maps EISDIR/IsADirectory to FileNotFound.
+        let dir = tempfile::tempdir().expect("tempdir");
+        assert!(matches!(
+            read_metadata_only_std(std::fs::File::open(dir.path())),
+            Err(DiskError::FileNotFound)
+        ));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn std_backend_mount_lease_and_deferred_delete_path_validation_reject_symlinks() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let outside = tempfile::tempdir().expect("outside tempdir");
+        let endpoint = Endpoint::try_from(dir.path().to_str().expect("utf8 path")).expect("endpoint");
+        let disk = LocalDisk::new(&endpoint, false).await.expect("local disk");
+        ensure_test_volume(&disk, "bucket").await;
+        ensure_test_volume(&disk, RUSTFS_META_TMP_BUCKET).await;
+
+        std::os::unix::fs::symlink(outside.path(), dir.path().join("symlink-bucket")).expect("symlink bucket");
+        std::os::unix::fs::symlink(outside.path(), dir.path().join("bucket/symlink-obj")).expect("symlink obj");
+
+        // 1. local_disk_bucket_and_object_path_with_mount_lease rejects symlinked bucket and object.
+        assert!(matches!(
+            local_disk_bucket_and_object_path_with_mount_lease(
+                disk.io_root(),
+                #[cfg(target_os = "linux")]
+                Some(&disk.mount_lease),
+                "symlink-bucket",
+                "obj/part.1",
+            ),
+            Err(DiskError::InvalidPath)
+        ));
+        assert!(matches!(
+            local_disk_bucket_and_object_path_with_mount_lease(
+                disk.io_root(),
+                #[cfg(target_os = "linux")]
+                Some(&disk.mount_lease),
+                "bucket",
+                "symlink-obj/part.1",
+            ),
+            Err(DiskError::InvalidPath)
+        ));
+
+        // 2. Multi-version inline rename_data preserves earlier version payloads and drops overwritten same-version inline payloads.
+        let v1_id = Uuid::new_v4();
+        let v1_payload = bytes::Bytes::from_static(b"inline-version-1-payload");
+        let mut fi_v1 = test_file_info("inline-mv", v1_id, Some(Uuid::new_v4()), Some(v1_payload.clone()));
+        fi_v1.set_inline_data();
+        disk.rename_data(RUSTFS_META_TMP_BUCKET, &Uuid::new_v4().to_string(), fi_v1, "bucket", "inline-mv")
+            .await
+            .expect("commit inline v1");
+
+        let v2_id = Uuid::new_v4();
+        let v2_payload = bytes::Bytes::from_static(b"inline-version-2-payload");
+        let mut fi_v2 = test_file_info("inline-mv", v2_id, Some(Uuid::new_v4()), Some(v2_payload.clone()));
+        fi_v2.set_inline_data();
+        disk.rename_data(RUSTFS_META_TMP_BUCKET, &Uuid::new_v4().to_string(), fi_v2, "bucket", "inline-mv")
+            .await
+            .expect("commit inline v2");
+
+        let read_v1 = disk
+            .read_version(
+                "",
+                "bucket",
+                "inline-mv",
+                &v1_id.to_string(),
+                &ReadOptions {
+                    read_data: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("read v1");
+        assert_eq!(read_v1.data.as_deref(), Some(v1_payload.as_ref()));
+        let read_v2 = disk
+            .read_version(
+                "",
+                "bucket",
+                "inline-mv",
+                &v2_id.to_string(),
+                &ReadOptions {
+                    read_data: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("read v2");
+        assert_eq!(read_v2.data.as_deref(), Some(v2_payload.as_ref()));
     }
 }
 

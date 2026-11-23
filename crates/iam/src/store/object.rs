@@ -12,8 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use super::{GroupInfo, MappedPolicy, Store, UserType};
+use super::{GroupEdit, GroupInfo, MappedPolicy, Store, UserType};
 use crate::error::{Error, Result, is_err_config_not_found, is_err_no_such_group};
+use crate::storage_api::object_store::WriteCommitGuard;
 use crate::{
     IAM_CONFIG_ROOT_PREFIX, IamStorageError, IamStore, classify_iam_system_path_failure_reason, delete_iam_config,
     read_iam_config_no_lock, read_iam_config_with_metadata, save_iam_config, save_iam_config_with_opts,
@@ -32,7 +33,7 @@ use rustfs_utils::{
     MaskedAccessKey,
     path::{SLASH_SEPARATOR, path_join_buf},
 };
-use serde::{Serialize, de::DeserializeOwned};
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::sync::{LazyLock, Mutex};
 use std::time::{Duration, Instant};
 use std::{collections::HashMap, sync::Arc};
@@ -41,8 +42,8 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, warn};
 
 use crate::storage_api::object_store::{
-    HTTPPreconditions, ListOperations, ObjectInfoOrErr as StorageObjectInfoOrErr, ObjectOperations,
-    read_config_preserve_empty_with_metadata_opts,
+    HTTPPreconditions, ListOperations, NamespaceLocking, ObjectInfoOrErr as StorageObjectInfoOrErr, ObjectOperations,
+    get_lock_acquire_timeout, read_config_preserve_empty_with_metadata_opts,
 };
 
 pub static IAM_CONFIG_PREFIX: LazyLock<String> = LazyLock::new(|| format!("{IAM_CONFIG_ROOT_PREFIX}/iam"));
@@ -70,6 +71,48 @@ const IAM_IDENTITY_FILE: &str = "identity.json";
 const IAM_POLICY_FILE: &str = "policy.json";
 const IAM_GROUP_MEMBERS_FILE: &str = "members.json";
 const BACKGROUND_WALKDIR_TIMEOUT: Duration = Duration::from_secs(60);
+
+// Keep the epoch in the same atomic object as the owner credentials. Caches and
+// older identity readers may ignore it, but cannot supply delegation authority.
+#[derive(Serialize, Deserialize)]
+struct DelegationOwnerIdentity {
+    #[serde(flatten)]
+    identity: UserIdentity,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "present_delegation_epoch"
+    )]
+    plugin_delegation_epoch: Option<String>,
+}
+
+fn present_delegation_epoch<'de, D: serde::Deserializer<'de>>(deserializer: D) -> std::result::Result<Option<String>, D::Error> {
+    String::deserialize(deserializer).map(Some)
+}
+
+impl DelegationOwnerIdentity {
+    fn new(identity: UserIdentity) -> Self {
+        Self {
+            identity,
+            plugin_delegation_epoch: Some(format!("{:032x}", rand::random::<u128>())),
+        }
+    }
+}
+
+fn validate_regular_user_identity(name: &str, identity: &mut UserIdentity) -> Result<()> {
+    // As in load_user_identity_with, legacy records may use the object name as their access key.
+    if identity.credentials.access_key.is_empty() {
+        identity.credentials.access_key = name.to_owned();
+    }
+    if identity.credentials.access_key != name
+        || !matches!(identity.credentials.status.as_str(), "on" | "off")
+        || !identity.credentials.session_token.is_empty()
+        || !identity.credentials.parent_user.is_empty()
+    {
+        return Err(Error::IAMActionNotAllowed);
+    }
+    Ok(())
+}
 
 fn get_user_identity_path(user: &str, user_type: UserType) -> String {
     let base_path: &str = match user_type {
@@ -143,7 +186,6 @@ const SVC_ACC_LIST_KEY: &str = "service-accounts/";
 const GROUPS_LIST_KEY: &str = "groups/";
 const POLICIES_LIST_KEY: &str = "policies/";
 const STS_LIST_KEY: &str = "sts/";
-const POLICY_DB_PREFIX: &str = "policydb/";
 const POLICY_DB_USERS_LIST_KEY: &str = "policydb/users/";
 const POLICY_DB_STS_USERS_LIST_KEY: &str = "policydb/sts-users/";
 const POLICY_DB_GROUPS_LIST_KEY: &str = "policydb/groups/";
@@ -172,17 +214,6 @@ struct LazyRewriteEntry {
 
 static IAM_LAZY_REWRITE_TRACKER: LazyLock<Mutex<HashMap<String, LazyRewriteEntry>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
-
-// split_path splits a path into a top-level directory and a child item. The
-// parent directory retains the trailing slash.
-fn split_path(s: &str, last_index: bool) -> (&str, &str) {
-    let i = if last_index { s.rfind('/') } else { s.find('/') };
-
-    match i {
-        Some(index) => (&s[..index + 1], &s[index + 1..]),
-        None => (s, ""),
-    }
-}
 
 /// Attempts to decrypt an at-rest IAM config blob using the same key sources as
 /// the IAM load path: the RustFS master keys (`RUSTFS_IAM_MASTER_KEY[_OLD_KEYS]`)
@@ -218,6 +249,53 @@ pub(crate) fn decrypt_iam_blob(data: &[u8]) -> Result<Vec<u8>> {
 #[derive(Clone)]
 pub struct ObjectStore {
     object_api: Arc<IamStore>,
+}
+
+struct ObjectGroupEdit {
+    api: Arc<IamStore>,
+    path: String,
+    policy_path: String,
+    guard: WriteCommitGuard,
+}
+
+impl ObjectGroupEdit {
+    fn fenced(&self, mut opts: IamObjectOptions) -> Result<IamObjectOptions> {
+        if self.guard.is_lock_lost() {
+            return Err(Error::other("group transaction lock lost"));
+        }
+        if let Some(signal) = self.guard.lock_lost_signal() {
+            opts.add_namespace_lock_lost_signal(signal);
+        }
+        Ok(opts)
+    }
+}
+
+#[async_trait::async_trait]
+impl GroupEdit for ObjectGroupEdit {
+    async fn save(&self, group: &GroupInfo) -> Result<()> {
+        let data = ObjectStore::prepare_data_for_storage(&serde_json::to_vec(group)?)?;
+        let opts = self.fenced(IamObjectOptions {
+            max_parity: true,
+            ..Default::default()
+        })?;
+        save_iam_config_with_opts(self.api.clone(), &self.path, data, &opts).await?;
+        Ok(())
+    }
+
+    async fn delete_empty(&self) -> Result<()> {
+        for path in [&self.policy_path, &self.path] {
+            let opts = self.fenced(IamObjectOptions {
+                delete_prefix: true,
+                delete_prefix_object: true,
+                ..Default::default()
+            })?;
+            match self.api.delete_object(ObjectStore::BUCKET_NAME, path, opts).await {
+                Ok(_) | Err(IamStorageError::FileNotFound | IamStorageError::ObjectNotFound(_, _)) => (),
+                Err(err) => return Err(err.into()),
+            }
+        }
+        Ok(())
+    }
 }
 
 impl ObjectStore {
@@ -490,36 +568,41 @@ impl ObjectStore {
 
     #[hotpath::measure]
     async fn list_all_iamconfig_items(&self) -> Result<HashMap<String, Vec<String>>> {
-        let (tx, mut rx) = mpsc::channel::<StringOrErr>(100);
-
-        let ctx = CancellationToken::new();
-
-        self.list_iam_config_items(format!("{}/", *IAM_CONFIG_PREFIX).as_str(), ctx.clone(), tx)
-            .await;
-
         let mut res = HashMap::new();
+        let ctx = CancellationToken::new();
+        // Walk only cache partitions. Other children of config/iam (notably
+        // plugin delegations) have independent lifetimes and cardinalities.
+        for key in [
+            USERS_LIST_KEY,
+            GROUPS_LIST_KEY,
+            POLICIES_LIST_KEY,
+            SVC_ACC_LIST_KEY,
+            STS_LIST_KEY,
+            POLICY_DB_USERS_LIST_KEY,
+            POLICY_DB_GROUPS_LIST_KEY,
+            POLICY_DB_STS_USERS_LIST_KEY,
+        ] {
+            let (tx, mut rx) = mpsc::channel::<StringOrErr>(100);
+            self.list_iam_config_items(&format!("{}/{key}", *IAM_CONFIG_PREFIX), ctx.clone(), tx)
+                .await;
+            while let Some(v) = rx.recv().await {
+                if let Some(err) = v.err {
+                    warn!(
+                        path_kind = "iam_config",
+                        operation = "list_items",
+                        reason = "walk_result",
+                        error = %err,
+                        "system path list failed"
+                    );
+                    record_system_path_failure("iam_config", "list_items", "walk_result");
+                    ctx.cancel();
 
-        while let Some(v) = rx.recv().await {
-            if let Some(err) = v.err {
-                warn!(
-                    path_kind = "iam_config",
-                    operation = "list_items",
-                    reason = "walk_result",
-                    error = %err,
-                    "system path list failed"
-                );
-                record_system_path_failure("iam_config", "list_items", "walk_result");
-                ctx.cancel();
+                    return Err(err);
+                }
 
-                return Err(err);
-            }
-
-            if let Some(item) = v.item {
-                let last_index = item.starts_with(POLICY_DB_PREFIX);
-                let (list_key, trimmed_item) = split_path(&item, last_index);
-                res.entry(list_key.to_owned())
-                    .or_insert_with(Vec::new)
-                    .push(trimmed_item.to_owned());
+                if let Some(item) = v.item {
+                    res.entry(key.to_owned()).or_insert_with(Vec::new).push(item);
+                }
             }
         }
 
@@ -615,6 +698,72 @@ impl ObjectStore {
     fn decode_iam_config_strict<Item: DeserializeOwned>(data: &[u8]) -> Result<Item> {
         let outcome = Self::decrypt_data_with_source(data)?;
         Ok(serde_json::from_slice(&outcome.plain)?)
+    }
+
+    async fn read_regular_user_record<Item: DeserializeOwned>(&self, name: &str) -> Result<Option<(Item, String)>> {
+        if matches!(name, "" | "." | "..") || name.contains(['/', '\\', '\0']) {
+            return Err(Error::InvalidArgument);
+        }
+        let path = get_user_identity_path(name, UserType::Reg);
+        let existing =
+            read_config_preserve_empty_with_metadata_opts(self.object_api.clone(), &path, &LoadMode::Locked.read_opts()).await;
+        match existing.map_err(Error::from) {
+            Ok((data, metadata)) => {
+                let record = Self::decode_iam_config_strict(&data)?;
+                let etag = metadata
+                    .etag
+                    .filter(|tag| !tag.is_empty() && tag != "*")
+                    .ok_or_else(|| Error::other("missing IAM identity revision"))?;
+                Ok(Some((record, etag)))
+            }
+            Err(err) if is_err_config_not_found(&err) => Ok(None),
+            Err(err) => Err(err),
+        }
+    }
+
+    async fn read_plugin_delegation_owner(&self, name: &str) -> Result<(DelegationOwnerIdentity, String)> {
+        let (mut owner, revision) = self
+            .read_regular_user_record::<DelegationOwnerIdentity>(name)
+            .await?
+            .ok_or(Error::ConfigNotFound)?;
+        validate_regular_user_identity(name, &mut owner.identity)?;
+        if !owner.identity.credentials.is_valid() || owner.identity.credentials.is_service_account() {
+            return Err(Error::IAMActionNotAllowed);
+        }
+        if owner
+            .plugin_delegation_epoch
+            .as_ref()
+            .is_some_and(|epoch| epoch.len() != 32 || !epoch.bytes().all(|byte| byte.is_ascii_hexdigit()))
+        {
+            return Err(Error::InvalidArgument);
+        }
+        Ok((owner, revision))
+    }
+
+    async fn save_regular_user_record(&self, name: &str, record: &DelegationOwnerIdentity, revision: Option<&str>) -> Result<()> {
+        if matches!(name, "" | "." | "..") || name.contains(['/', '\\', '\0']) {
+            return Err(Error::InvalidArgument);
+        }
+        let path = get_user_identity_path(name, UserType::Reg);
+        let conditions = match revision {
+            Some("" | "*") => return Err(Error::IAMActionNotAllowed),
+            Some(tag) => HTTPPreconditions {
+                if_match: Some(tag.into()),
+                ..Default::default()
+            },
+            None => HTTPPreconditions {
+                if_none_match: Some("*".into()),
+                ..Default::default()
+            },
+        };
+        let opts = IamObjectOptions {
+            max_parity: true,
+            http_preconditions: Some(conditions),
+            ..Default::default()
+        };
+        let data = Self::prepare_data_for_storage(&serde_json::to_vec(record)?)?;
+        save_iam_config_with_opts(self.object_api.clone(), &path, data, &opts).await?;
+        Ok(())
     }
 
     /// Parameterized core of [`Store::load_user_identity`].
@@ -893,6 +1042,14 @@ impl Store for ObjectStore {
         user_identity: UserIdentity,
         _ttl: Option<usize>,
     ) -> Result<()> {
+        if user_type == UserType::None {
+            return Err(Error::InvalidArgument);
+        }
+        if user_type == UserType::Reg {
+            let mut identity = user_identity;
+            self.upsert_regular_user(name, &mut identity, true).await?;
+            return Ok(());
+        }
         // Pre-check storage health
         self.check_storage_readiness().await?;
 
@@ -904,6 +1061,61 @@ impl Store for ObjectStore {
             e
         })
     }
+    async fn regular_user_revision(&self, name: &str) -> Result<Option<(UserIdentity, String)>> {
+        let Some((mut identity, revision)) = self.read_regular_user_record::<UserIdentity>(name).await? else {
+            return Ok(None);
+        };
+        validate_regular_user_identity(name, &mut identity)?;
+        Ok(Some((identity, revision)))
+    }
+
+    async fn save_regular_user_revision(&self, name: &str, item: &UserIdentity, revision: Option<&str>) -> Result<()> {
+        // Plugin consent is invalidated by every identity edit, independently of
+        // the narrower STS secret-generation policy chosen by the caller.
+        self.save_regular_user_record(name, &DelegationOwnerIdentity::new(item.clone()), revision)
+            .await
+    }
+
+    async fn plugin_delegation_owner_revision(&self, name: &str) -> Result<(String, String)> {
+        let (owner, revision) = self.read_plugin_delegation_owner(name).await?;
+        Ok((owner.plugin_delegation_epoch.ok_or(Error::IAMActionNotAllowed)?, revision))
+    }
+
+    async fn authenticate_plugin_delegation_owner(&self, name: &str, signing_secret: &str) -> Result<(String, String)> {
+        use subtle::ConstantTimeEq as _;
+
+        let (owner, revision) = self.read_plugin_delegation_owner(name).await?;
+        let secret = &owner.identity.credentials.secret_key;
+        if !bool::from(secret.as_bytes().ct_eq(signing_secret.as_bytes())) {
+            return Err(Error::IAMActionNotAllowed);
+        }
+        if let Some(epoch) = owner.plugin_delegation_epoch {
+            return Ok((epoch, revision));
+        }
+        let owner = DelegationOwnerIdentity::new(owner.identity);
+        let epoch = owner.plugin_delegation_epoch.clone().ok_or(Error::InvalidArgument)?;
+        // Never overwrite a rotation, deletion, or another initializer observed
+        // after the legacy read. A lost/failed CAS requires a fresh registration.
+        #[cfg(test)]
+        if let Ok(barrier) = OWNER_EPOCH_INIT_BARRIER.try_with(Arc::clone) {
+            barrier.0.notify_one();
+            barrier.1.notified().await;
+        }
+        self.save_regular_user_record(name, &owner, Some(&revision)).await?;
+        #[cfg(test)]
+        if let Ok(barrier) = OWNER_EPOCH_INIT_READBACK_BARRIER.try_with(Arc::clone) {
+            barrier.0.notify_one();
+            barrier.1.notified().await;
+        }
+        // Read back the revision of our own initialized epoch, never a newer
+        // owner's epoch. The request retains this exact snapshot through publication.
+        let (current_epoch, revision) = self.plugin_delegation_owner_revision(name).await?;
+        if current_epoch != epoch {
+            return Err(Error::IAMActionNotAllowed);
+        }
+        Ok((epoch, revision))
+    }
+
     async fn delete_user_identity(&self, name: &str, user_type: UserType) -> Result<()> {
         self.delete_iam_config(get_user_identity_path(name, user_type))
             .await
@@ -958,6 +1170,28 @@ impl Store for ObjectStore {
             })?;
 
         Ok(u.credentials.secret_key)
+    }
+
+    async fn begin_group_edit(&self, name: &str) -> Result<(Box<dyn GroupEdit>, Option<GroupInfo>)> {
+        let path = get_group_info_path(name);
+        // Take the transaction lock before any object locks. A distinct key lets ordinary
+        // config reads, writes and deletes keep taking their own namespace locks.
+        let lock = self.object_api.new_ns_lock(Self::BUCKET_NAME, &format!("{path}.txn")).await?;
+        let guard = WriteCommitGuard::acquire(&lock, get_lock_acquire_timeout())
+            .await
+            .map_err(Error::other)?;
+        let group = match self.load_iam_config_strict(&path).await {
+            Ok(gi) => Some(gi),
+            Err(Error::ConfigNotFound) => None,
+            Err(err) => return Err(err),
+        };
+        let edit = ObjectGroupEdit {
+            api: self.object_api.clone(),
+            path,
+            policy_path: get_mapped_policy_path(name, UserType::Reg, true),
+            guard,
+        };
+        Ok((Box::new(edit), group))
     }
 
     async fn save_group_info(&self, name: &str, item: GroupInfo) -> Result<()> {
@@ -1377,6 +1611,8 @@ fn map_delete_user_identity_error(name: &str, err: Error) -> Error {
 #[cfg(test)]
 tokio::task_local! {
     static LOAD_ALL_COMMIT_BARRIER: std::sync::Arc<(tokio::sync::Notify, tokio::sync::Notify)>;
+    static OWNER_EPOCH_INIT_BARRIER: std::sync::Arc<(tokio::sync::Notify, tokio::sync::Notify)>;
+    static OWNER_EPOCH_INIT_READBACK_BARRIER: std::sync::Arc<(tokio::sync::Notify, tokio::sync::Notify)>;
 }
 
 #[cfg(test)]
@@ -1413,6 +1649,12 @@ mod tests {
                     )
                     .await;
                     let store = ObjectStore::new(env.ecstore);
+                    store
+                        .save_iam_config("fixture", "config/iam/plugin-delegations/v1/fixture")
+                        .await
+                        .expect("seed unrelated partition");
+                    let listed = store.list_all_iamconfig_items().await.expect("list IAM partitions");
+                    assert!(!listed.contains_key("plugin-delegations/"));
                     store
                         .save_group_info("reload-group", GroupInfo::new(vec!["reload-user".to_string()]))
                         .await
@@ -1502,6 +1744,610 @@ mod tests {
     fn missing_user_identity_delete_maps_to_no_such_user() {
         let err = map_delete_user_identity_error("missing-sts", Error::ConfigNotFound);
         assert!(matches!(err, Error::NoSuchUser(name) if name == "missing-sts"));
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn restricted_user_upsert_checks_durable_status_before_replacing_credentials() {
+        use crate::store::{Store, UserType};
+        let _credentials = test_cred();
+        let temp = tempfile::tempdir().expect("IAM fixture directory");
+        let env = Box::pin(
+            rustfs_test_utils::TestECStoreEnv::builder()
+                .base_dir(temp.path())
+                .init_bucket_metadata(false)
+                .build(),
+        )
+        .await;
+        let store = ObjectStore::new(env.ecstore);
+        let name = "status-fixture";
+        let mut entry = super::UserIdentity::from(Credentials {
+            access_key: name.into(),
+            status: "off".into(),
+            secret_key: "first-fixture".into(),
+            ..Default::default()
+        });
+        assert!(
+            !store
+                .save_regular_user_preserving_status(name, &entry)
+                .await
+                .expect("create absent account")
+        );
+        let (original, revision) = store
+            .regular_user_revision(name)
+            .await
+            .expect("read revision")
+            .expect("created identity");
+        assert!(store.save_regular_user_revision(name, &original, Some("*")).await.is_err());
+        entry.credentials.status = "on".into();
+        entry.credentials.secret_key = "second-fixture".into();
+        assert!(matches!(
+            store.save_regular_user_preserving_status(name, &entry).await,
+            Err(Error::IAMActionNotAllowed)
+        ));
+        let persisted = store
+            .load_user_identity(name, UserType::Reg)
+            .await
+            .expect("reload denied write");
+        assert_eq!(persisted.credentials.status, "off");
+        assert_eq!(persisted.credentials.secret_key, "first-fixture");
+        entry.credentials.status = "off".into();
+        assert!(
+            store
+                .save_regular_user_preserving_status(name, &entry)
+                .await
+                .expect("rotate while disabled")
+        );
+        assert!(
+            store
+                .save_regular_user_revision(name, &original, Some(&revision))
+                .await
+                .is_err(),
+            "a stale writer cannot restore the old secret or its generation"
+        );
+        let persisted = store.load_user_identity(name, UserType::Reg).await.expect("reload rotation");
+        assert!(persisted.sts_generation.is_some());
+        assert_ne!(persisted.sts_generation, original.sts_generation);
+        assert_eq!(persisted.credentials.status, "off");
+        assert_eq!(persisted.credentials.secret_key, "second-fixture");
+    }
+
+    async fn plugin_delegation_store() -> (tempfile::TempDir, ObjectStore) {
+        let _credentials = test_cred();
+        let temp = tempfile::tempdir().expect("delegation fixture directory");
+        let env = Box::pin(
+            rustfs_test_utils::TestECStoreEnv::builder()
+                .base_dir(temp.path())
+                .init_bucket_metadata(false)
+                .build(),
+        )
+        .await;
+        (temp, ObjectStore::new(env.ecstore))
+    }
+
+    fn plugin_delegation_identity() -> super::UserIdentity {
+        let mut identity = super::UserIdentity::from(Credentials {
+            access_key: "delegation-owner".into(),
+            secret_key: "original-fixture-secret".into(),
+            status: "on".into(),
+            ..Default::default()
+        });
+        identity.update_at = Some(time::OffsetDateTime::UNIX_EPOCH);
+        identity
+    }
+
+    fn plugin_delegation_restrictions() -> crate::delegation::Restrictions {
+        crate::delegation::Restrictions {
+            version: None,
+            output_bucket: None,
+            deployment: "fixture-runner".into(),
+            bucket: "fixture-bucket".into(),
+            input_prefix: "inputs/".into(),
+            output_prefix: "outputs/".into(),
+            expires_at_unix_seconds: 200,
+        }
+    }
+
+    async fn register_plugin_delegation(
+        store: &ObjectStore,
+        credentials: &Credentials,
+    ) -> std::result::Result<crate::delegation::Delegation, crate::delegation::DelegationError> {
+        let owner = crate::delegation::prepare_owner(store, &credentials.access_key, &credentials.secret_key).await?;
+        crate::delegation::create(store, owner, plugin_delegation_restrictions(), 100).await
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn plugin_delegation_owner_changes_reject_stale_peer_cache() {
+        use crate::{delegation, manager::IamCache, store::Store, store::UserType, sys::IamSys};
+        temp_env::async_with_vars([("RUSTFS_SKIP_BACKGROUND_TASK", Some("1"))], async {
+            let (_temp, store) = plugin_delegation_store().await;
+            let identity = plugin_delegation_identity();
+            let name = &identity.credentials.access_key;
+            store
+                .save_user_identity(name, UserType::Reg, identity.clone(), None)
+                .await
+                .expect("persist original owner");
+            let local = IamCache::new(store.clone()).await.expect("local IAM cache");
+            let peer_cache = IamCache::new(store.clone()).await.expect("peer IAM cache");
+            let peer = IamSys::new(peer_cache.clone());
+            let owner = peer
+                .prepare_plugin_delegation_owner(name, &identity.credentials.secret_key)
+                .await
+                .expect("authenticate registration request");
+            let record = peer
+                .create_plugin_delegation(owner, plugin_delegation_restrictions(), 100)
+                .await
+                .expect("register an ordinary owner's delegation");
+            assert!(peer.read_active_plugin_delegation_for_broker(&record.id, 101).await.is_ok());
+            assert!(peer.read_active_plugin_delegation(name, &record.id, 101).await.is_ok());
+
+            local
+                .update_user_secret_key(name, "replacement-fixture-secret")
+                .await
+                .expect("reset owner secret on another node");
+            assert_eq!(
+                peer.get_user(name).await.expect("stale peer owner").credentials.secret_key,
+                identity.credentials.secret_key,
+                "no notification or local sweep refreshed the peer"
+            );
+            assert!(matches!(
+                peer.read_active_plugin_delegation_for_broker(&record.id, 101).await,
+                Err(delegation::DelegationError::Revoked)
+            ));
+            assert!(peer.read_active_plugin_delegation(name, &record.id, 101).await.is_err());
+            assert!(peer.read_owned_plugin_delegation(name, &record.id).await.is_err());
+            local
+                .update_user_secret_key(name, &identity.credentials.secret_key)
+                .await
+                .expect("restore old secret");
+            assert!(peer.read_active_plugin_delegation_for_broker(&record.id, 101).await.is_err());
+
+            let before_delete = register_plugin_delegation(&store, &identity.credentials)
+                .await
+                .expect("new delegation after rotation");
+            local.delete_user(name, UserType::Reg).await.expect("remove owner");
+            assert!(peer.get_user(name).await.is_some(), "peer still has the deleted owner");
+            assert!(
+                peer.read_active_plugin_delegation_for_broker(&before_delete.id, 101)
+                    .await
+                    .is_err()
+            );
+            store
+                .save_user_identity(name, UserType::Reg, identity.clone(), None)
+                .await
+                .expect("recreate the exact same name, secret and timestamp");
+            assert!(
+                peer.read_active_plugin_delegation_for_broker(&before_delete.id, 101)
+                    .await
+                    .is_err()
+            );
+            assert!(peer.read_owned_plugin_delegation(name, &before_delete.id).await.is_err());
+            let replacement = register_plugin_delegation(&store, &identity.credentials)
+                .await
+                .expect("replacement owner can explicitly register a new delegation");
+            assert!(
+                peer.read_active_plugin_delegation_for_broker(&replacement.id, 101)
+                    .await
+                    .is_ok()
+            );
+            assert!(
+                !store
+                    .save_regular_user_preserving_status(name, &identity)
+                    .await
+                    .expect("same-secret conditional identity update")
+            );
+            assert!(
+                peer.read_active_plugin_delegation_for_broker(&replacement.id, 101)
+                    .await
+                    .is_err()
+            );
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn plugin_delegation_epoch_is_independent_of_sts_generation() {
+        use crate::{delegation, manager::IamCache, store::Store, store::UserType};
+        use rustfs_madmin::{AccountStatus, AddOrUpdateUserReq};
+
+        temp_env::async_with_vars([("RUSTFS_SKIP_BACKGROUND_TASK", Some("1"))], async {
+            let (_temp, store) = plugin_delegation_store().await;
+            for generation in [None, Some([7; 16])] {
+                let mut identity = plugin_delegation_identity();
+                identity.credentials.access_key = if generation.is_some() {
+                    "tracked-owner"
+                } else {
+                    "legacy-owner"
+                }
+                .into();
+                identity.sts_generation = generation;
+                let name = &identity.credentials.access_key;
+                store
+                    .save_iam_config(&identity, super::get_user_identity_path(name, UserType::Reg))
+                    .await
+                    .expect("owner without plugin epoch");
+                let (before_init, initial_revision) = store
+                    .regular_user_revision(name)
+                    .await
+                    .expect("read owner revision")
+                    .expect("persisted owner");
+                let record = register_plugin_delegation(&store, &identity.credentials)
+                    .await
+                    .expect("initialize only plugin epoch");
+                let (initialized, _) = store
+                    .regular_user_revision(name)
+                    .await
+                    .expect("initialized owner")
+                    .expect("owner");
+                assert_eq!(
+                    initialized.sts_generation, generation,
+                    "plugin initialization preserves legacy and tracked STS"
+                );
+                assert!(
+                    store
+                        .save_regular_user_revision(name, &before_init, Some(&initial_revision))
+                        .await
+                        .is_err(),
+                    "epoch initialization consumes the same identity revision as other edits"
+                );
+                assert!(
+                    delegation::read_active_for_broker(&store, &record.id, 101).await.is_ok(),
+                    "failed CAS preserves consent"
+                );
+
+                let cache = IamCache::new(store.clone()).await.expect("IAM cache");
+                for edit in ["upsert", "preserving-status", "save-identity", "ssh", "status"] {
+                    let record = register_plugin_delegation(&store, &identity.credentials)
+                        .await
+                        .expect("register before identity edit");
+                    let (before, revision) = store
+                        .regular_user_revision(name)
+                        .await
+                        .expect("pre-edit revision")
+                        .expect("owner");
+                    let epoch = store.plugin_delegation_owner_revision(name).await.expect("pre-edit epoch").0;
+                    match edit {
+                        "upsert" => {
+                            cache
+                                .add_user(
+                                    name,
+                                    &AddOrUpdateUserReq {
+                                        secret_key: identity.credentials.secret_key.clone(),
+                                        policy: None,
+                                        status: AccountStatus::Enabled,
+                                    },
+                                )
+                                .await
+                                .expect("same-secret manager upsert");
+                        }
+                        "preserving-status" => {
+                            assert!(
+                                !store
+                                    .save_regular_user_preserving_status(name, &before)
+                                    .await
+                                    .expect("same-secret restricted upsert")
+                            );
+                        }
+                        "save-identity" => {
+                            store
+                                .save_user_identity(name, UserType::Reg, before.clone(), None)
+                                .await
+                                .expect("same-secret direct save");
+                        }
+                        "ssh" => {
+                            cache
+                                .add_user_ssh_public_key(name, "ssh-ed25519 fixture-public-key")
+                                .await
+                                .expect("SSH edit");
+                        }
+                        "status" => {
+                            cache
+                                .set_user_status(name, AccountStatus::Disabled)
+                                .await
+                                .expect("disable owner");
+                            assert!(delegation::read_active_for_broker(&store, &record.id, 101).await.is_err());
+                            cache
+                                .set_user_status(name, AccountStatus::Enabled)
+                                .await
+                                .expect("re-enable owner");
+                        }
+                        _ => unreachable!("fixed identity edit matrix"),
+                    }
+                    let (after, _) = store
+                        .regular_user_revision(name)
+                        .await
+                        .expect("post-edit revision")
+                        .expect("owner");
+                    assert_eq!(after.sts_generation, generation, "{edit} must not rotate STS for an unchanged secret");
+                    assert_ne!(
+                        store.plugin_delegation_owner_revision(name).await.expect("post-edit epoch").0,
+                        epoch,
+                        "{edit}"
+                    );
+                    assert!(
+                        matches!(
+                            delegation::read_active_for_broker(&store, &record.id, 101).await,
+                            Err(delegation::DelegationError::Revoked)
+                        ),
+                        "{edit}"
+                    );
+                    assert!(
+                        store
+                            .save_regular_user_revision(name, &before, Some(&revision))
+                            .await
+                            .is_err(),
+                        "stale {edit} write"
+                    );
+                    assert_eq!(
+                        store
+                            .regular_user_revision(name)
+                            .await
+                            .expect("owner after stale write")
+                            .expect("owner")
+                            .0
+                            .sts_generation,
+                        generation
+                    );
+                }
+            }
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn plugin_delegation_registration_rechecks_snapshot_after_publication() {
+        use crate::{delegation, store::Store, store::UserType};
+
+        let (_temp, store) = plugin_delegation_store().await;
+        let identity = plugin_delegation_identity();
+        let name = &identity.credentials.access_key;
+        for edit in ["rotate", "recreate-same-secret", "rotate-restore", "same-epoch-revision"] {
+            store
+                .save_user_identity(name, UserType::Reg, identity.clone(), None)
+                .await
+                .expect("current owner");
+            let owner = delegation::prepare_owner(&store, name, &identity.credentials.secret_key)
+                .await
+                .expect("request snapshot");
+            let barrier = std::sync::Arc::new((tokio::sync::Notify::new(), tokio::sync::Notify::new()));
+            let registering = delegation::REGISTRATION_PUBLICATION_BARRIER
+                .scope(barrier.clone(), delegation::create(&store, owner, plugin_delegation_restrictions(), 100));
+            let editing = async {
+                barrier.0.notified().await;
+                if edit == "same-epoch-revision" {
+                    let path = super::get_user_identity_path(name, UserType::Reg);
+                    let mut record: serde_json::Value = store.load_iam_config_strict(&path).await.expect("atomic owner record");
+                    record["fixture_revision"] = serde_json::json!(1);
+                    store
+                        .save_iam_config(record, &path)
+                        .await
+                        .expect("same-epoch storage revision change");
+                } else {
+                    let mut next = identity.clone();
+                    if edit == "recreate-same-secret" {
+                        store
+                            .delete_user_identity(name, UserType::Reg)
+                            .await
+                            .expect("delete original owner");
+                    } else {
+                        next.credentials.secret_key = "new-publication-fixture-secret".into();
+                    }
+                    store
+                        .save_user_identity(name, UserType::Reg, next, None)
+                        .await
+                        .expect("edit during record publication");
+                    if edit == "rotate-restore" {
+                        store
+                            .save_user_identity(name, UserType::Reg, identity.clone(), None)
+                            .await
+                            .expect("restore old secret, not its epoch");
+                    }
+                }
+                barrier.1.notify_one();
+            };
+            let (result, ()) =
+                tokio::time::timeout(std::time::Duration::from_secs(30), async { tokio::join!(registering, editing) })
+                    .await
+                    .expect("bounded publication interleaving");
+            assert!(
+                matches!(result, Err(delegation::DelegationError::Revoked)),
+                "{edit} cannot rebind an in-flight request"
+            );
+        }
+        assert!(
+            register_plugin_delegation(&store, &identity.credentials).await.is_ok(),
+            "a fresh request using the current reused secret may register"
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn plugin_delegation_owner_binding_is_required_and_strict() {
+        use crate::{delegation, store::Store, store::UserType};
+        let (_temp, store) = plugin_delegation_store().await;
+        let identity = plugin_delegation_identity();
+        let name = &identity.credentials.access_key;
+        let path = super::get_user_identity_path(name, UserType::Reg);
+        store
+            .save_iam_config(&identity, &path)
+            .await
+            .expect("legacy owner without epoch");
+        assert!(store.plugin_delegation_owner_revision(name).await.is_err());
+        assert!(matches!(
+            delegation::prepare_owner(&store, name, "stale-legacy-fixture-secret").await,
+            Err(delegation::DelegationError::OwnerRejected)
+        ));
+        assert!(
+            store.plugin_delegation_owner_revision(name).await.is_err(),
+            "stale authentication cannot initialize legacy consent"
+        );
+        let record = register_plugin_delegation(&store, &identity.credentials)
+            .await
+            .expect("registration conditionally upgrades a legacy identity");
+        let epoch = store.plugin_delegation_owner_revision(name).await.expect("persisted epoch");
+        assert_eq!(
+            store
+                .authenticate_plugin_delegation_owner(name, &identity.credentials.secret_key)
+                .await
+                .expect("stable epoch"),
+            epoch
+        );
+        delegation::revoke(&store, name, &record.id)
+            .await
+            .expect("explicit revocation");
+        assert!(matches!(
+            delegation::read_active_for_broker(&store, &record.id, 101).await,
+            Err(delegation::DelegationError::Revoked)
+        ));
+        assert!(
+            delegation::read_owned(&store, name, &record.id).await.is_ok(),
+            "tombstones retain history"
+        );
+
+        let record = register_plugin_delegation(&store, &identity.credentials)
+            .await
+            .expect("new delegation");
+        let binding_path = format!("config/iam/plugin-delegations/v1/{}/owner.json", record.id);
+        store
+            .save_iam_config(serde_json::json!({}), &binding_path)
+            .await
+            .expect("malformed binding fixture");
+        assert!(matches!(
+            delegation::read_active_for_broker(&store, &record.id, 101).await,
+            Err(delegation::DelegationError::Unavailable)
+        ));
+        store
+            .delete_iam_config(&binding_path)
+            .await
+            .expect("unbound legacy record fixture");
+        assert!(matches!(
+            delegation::read_active_for_broker(&store, &record.id, 101).await,
+            Err(delegation::DelegationError::Revoked)
+        ));
+        assert!(delegation::read_owned(&store, name, &record.id).await.is_err());
+
+        let record = register_plugin_delegation(&store, &identity.credentials)
+            .await
+            .expect("bound delegation before corrupt owner fixture");
+        let mut corrupt = serde_json::to_value(&identity).expect("identity JSON");
+        corrupt["plugin_delegation_epoch"] = serde_json::Value::Null;
+        store.save_iam_config(corrupt, &path).await.expect("null owner epoch fixture");
+        assert!(matches!(
+            delegation::read_active_for_broker(&store, &record.id, 101).await,
+            Err(delegation::DelegationError::Unavailable)
+        ));
+        assert!(register_plugin_delegation(&store, &identity.credentials).await.is_err());
+        assert!(
+            store
+                .regular_user_revision(name)
+                .await
+                .expect("plugin corruption must not change STS identity decoding")
+                .expect("regular owner")
+                .0
+                .sts_generation
+                .is_none()
+        );
+        let mut disabled = identity.clone();
+        disabled.credentials.status = "off".into();
+        store
+            .save_user_identity(name, UserType::Reg, disabled, None)
+            .await
+            .expect("disabled owner");
+        assert!(register_plugin_delegation(&store, &identity.credentials).await.is_err());
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn plugin_delegation_legacy_epoch_initialization_preserves_concurrent_owner_edit() {
+        use crate::{delegation, store::Store, store::UserType};
+        let (_temp, store) = plugin_delegation_store().await;
+        let mut identity = plugin_delegation_identity();
+        let name = identity.credentials.access_key.clone();
+        store
+            .save_iam_config(&identity, super::get_user_identity_path(&name, UserType::Reg))
+            .await
+            .expect("legacy owner");
+        let barrier = std::sync::Arc::new((tokio::sync::Notify::new(), tokio::sync::Notify::new()));
+        let authenticated = identity.credentials.clone();
+        let registering =
+            super::OWNER_EPOCH_INIT_BARRIER.scope(barrier.clone(), register_plugin_delegation(&store, &authenticated));
+        let editing = async {
+            barrier.0.notified().await;
+            identity.credentials.secret_key = "concurrent-fixture-secret".into();
+            store
+                .save_user_identity(&name, UserType::Reg, identity.clone(), None)
+                .await
+                .expect("concurrent owner edit");
+            barrier.1.notify_one();
+        };
+        let (registered, ()) =
+            tokio::time::timeout(std::time::Duration::from_secs(30), async { tokio::join!(registering, editing) })
+                .await
+                .expect("bounded initialization interleaving");
+        assert!(matches!(registered, Err(delegation::DelegationError::Unavailable)));
+        assert_eq!(
+            store
+                .load_user_identity(&name, UserType::Reg)
+                .await
+                .expect("authoritative owner")
+                .credentials
+                .secret_key,
+            identity.credentials.secret_key,
+            "failed legacy CAS must not restore old credentials"
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn plugin_delegation_legacy_epoch_readback_does_not_adopt_replacement_owner() {
+        use crate::{delegation, store::Store, store::UserType};
+
+        let (_temp, store) = plugin_delegation_store().await;
+        let identity = plugin_delegation_identity();
+        let name = &identity.credentials.access_key;
+        for edit in ["rotate", "recreate-same-secret", "rotate-restore"] {
+            store
+                .save_iam_config(&identity, super::get_user_identity_path(name, UserType::Reg))
+                .await
+                .expect("legacy owner without epoch");
+            let barrier = std::sync::Arc::new((tokio::sync::Notify::new(), tokio::sync::Notify::new()));
+            let registering = super::OWNER_EPOCH_INIT_READBACK_BARRIER
+                .scope(barrier.clone(), register_plugin_delegation(&store, &identity.credentials));
+            let editing = async {
+                barrier.0.notified().await;
+                let mut next = identity.clone();
+                if edit == "recreate-same-secret" {
+                    store
+                        .delete_user_identity(name, UserType::Reg)
+                        .await
+                        .expect("delete initialized owner");
+                } else {
+                    next.credentials.secret_key = "replacement-initialization-fixture-secret".into();
+                }
+                store
+                    .save_user_identity(name, UserType::Reg, next, None)
+                    .await
+                    .expect("replace initialized epoch before readback");
+                if edit == "rotate-restore" {
+                    store
+                        .save_user_identity(name, UserType::Reg, identity.clone(), None)
+                        .await
+                        .expect("restore secret with a different epoch");
+                }
+                barrier.1.notify_one();
+            };
+            let (registered, ()) =
+                tokio::time::timeout(std::time::Duration::from_secs(30), async { tokio::join!(registering, editing) })
+                    .await
+                    .expect("bounded legacy readback interleaving");
+            assert!(
+                matches!(registered, Err(delegation::DelegationError::OwnerRejected)),
+                "{edit} must not adopt the replacement epoch"
+            );
+        }
     }
 
     fn test_cred() -> Credentials {
