@@ -84,6 +84,7 @@ use rustfs_protos::proto_gen::node_service::{
 };
 use rustfs_trusted_proxies::ClientInfo;
 use rustfs_utils::net::parse_and_resolve_address;
+#[cfg(test)]
 use s3s::host::MultiDomain;
 use socket2::{SockRef, TcpKeepalive};
 use std::io::{Error, Result};
@@ -1694,7 +1695,7 @@ struct ControlBodyDigestService<S> {
     idle_timeout: Duration,
     total_timeout: Duration,
     max_body_size: usize,
-    virtual_host: Option<Arc<MultiDomain>>,
+    virtual_host: Option<Arc<LegacyRustfsVirtualHosts>>,
 }
 
 /// The largest control-plane XML body read for digest validation: 20 MiB, the XML body limit
@@ -1721,13 +1722,15 @@ impl<S> ControlBodyDigestService<S> {
     fn with_virtual_host_domains(mut self, domains: Arc<[String]>) -> Self {
         if !domains.is_empty() {
             // Startup already validated this same domain set for S3Service.
-            self.virtual_host = Some(Arc::new(MultiDomain::new(domains.iter()).expect("validated S3 host domains")));
+            self.virtual_host = Some(Arc::new(
+                LegacyRustfsVirtualHosts::new(domains.iter()).expect("validated S3 host domains"),
+            ));
         }
         self
     }
 }
 
-fn control_body_digest_required<B>(request: &HttpRequest<B>, virtual_host: Option<&MultiDomain>) -> Option<bool> {
+fn control_body_digest_required<B>(request: &HttpRequest<B>, virtual_host: Option<&LegacyRustfsVirtualHosts>) -> Option<bool> {
     let query = url::form_urlencoded::parse(request.uri().query().unwrap_or_default().as_bytes());
     // Match s3s' multipart POST precedence, including its unique-header rule.
     if request.method() == Method::POST
@@ -1749,9 +1752,8 @@ fn control_body_digest_required<B>(request: &HttpRequest<B>, virtual_host: Optio
     }
     if request.method() == Method::POST {
         let decoded_path = urlencoding::decode(request.uri().path()).ok()?;
-        use s3s::host::S3Host;
-        // Use s3s' host parser, including CNAME fallback, and its Host-first
-        // precedence. A rate-limit host hint is intentionally only best-effort.
+        use rustfs_gateway_types::{LegacyRustfsNameValidator, NameValidator};
+        // This middleware selects Host first, with an authority fallback on HTTP/2 and HTTP/3.
         let mut host_values = request.headers().get_all("host").iter();
         let host = host_values.next().and_then(|value| value.to_str().ok()).or_else(|| {
             matches!(request.version(), Version::HTTP_2 | Version::HTTP_3)
@@ -1761,14 +1763,19 @@ fn control_body_digest_required<B>(request: &HttpRequest<B>, virtual_host: Optio
         if host_values.next().is_some() {
             return None;
         }
-        let host = match (virtual_host, host) {
-            (Some(parser), Some(host)) if host.parse::<SocketAddr>().is_err() && host.parse::<IpAddr>().is_err() => {
-                Some(parser.parse_host_header(host).ok()?)
-            }
+        let virtual_bucket = match (virtual_host, host) {
+            (Some(parser), Some(host)) => parser.bucket_for_host_header(host).ok()?,
             _ => None,
         };
-        let path = s3s::path::parse_virtual_hosted_style(host.as_ref().and_then(|host| host.bucket()), &decoded_path).ok()?;
-        if !matches!(path, s3s::path::S3Path::Bucket { .. }) {
+        let path = decoded_path.strip_prefix('/')?;
+        let is_bucket = if virtual_bucket.is_some() {
+            path.is_empty()
+        } else {
+            // A path-style bucket can end in one slash. Any remaining slash denotes an object.
+            let bucket = path.strip_suffix('/').unwrap_or(path);
+            LegacyRustfsNameValidator.check_bucket(bucket).into_result().is_ok()
+        };
+        if !is_bucket {
             return None;
         }
         let delete_objects = match operation_id.as_deref() {
