@@ -2545,67 +2545,6 @@ pub(crate) fn set_tonic_canonical_body_digest<T>(request: &mut tonic::Request<T>
     ecstore_rpc::set_tonic_canonical_body_digest(request, canonical_body)
 }
 
-/// Convert a raw stored ETag into the strongly-typed `s3s::dto::ETag`.
-///
-/// Supports already quoted (`"abc"`), weak (`W/"abc"`), or plain (`abc`) values.
-pub(crate) fn to_s3s_etag(etag: &str) -> s3s::dto::ETag {
-    use s3s::dto::ETag;
-
-    if let Some(rest) = etag.strip_prefix("W/\"") {
-        if let Some(body) = rest.strip_suffix('"') {
-            return ETag::Weak(body.to_string());
-        }
-        return ETag::Weak(rest.to_string());
-    }
-
-    if let Some(body) = etag.strip_prefix('"').and_then(|rest| rest.strip_suffix('"')) {
-        return ETag::Strong(body.to_string());
-    }
-
-    ETag::Strong(etag.to_string())
-}
-
-#[cfg(test)]
-mod to_s3s_etag_tests {
-    use super::to_s3s_etag;
-    use s3s::dto::ETag;
-
-    #[test]
-    fn test_to_s3s_etag() {
-        // Test unquoted ETag - should become strong etag
-        assert_eq!(
-            to_s3s_etag("6af8d12c0c74b78094884349f3c8a079"),
-            ETag::Strong("6af8d12c0c74b78094884349f3c8a079".to_string())
-        );
-
-        assert_eq!(
-            to_s3s_etag("\"6af8d12c0c74b78094884349f3c8a079\""),
-            ETag::Strong("6af8d12c0c74b78094884349f3c8a079".to_string())
-        );
-
-        assert_eq!(
-            to_s3s_etag("W/\"6af8d12c0c74b78094884349f3c8a079\""),
-            ETag::Weak("6af8d12c0c74b78094884349f3c8a079".to_string())
-        );
-
-        assert_eq!(to_s3s_etag(""), ETag::Strong(String::new()));
-
-        assert_eq!(to_s3s_etag("\"incomplete"), ETag::Strong("\"incomplete".to_string()));
-
-        assert_eq!(to_s3s_etag("incomplete\""), ETag::Strong("incomplete\"".to_string()));
-    }
-}
-
-/// The pinned s3s XML serializer writes ETag values as raw text. Escape only
-/// at XML response boundaries; HTTP headers and conditional comparisons keep
-/// the original stored value. Existing unsafe ETags must remain listable.
-pub(crate) fn to_s3s_xml_etag(etag: &str) -> s3s::dto::ETag {
-    let mut etag = to_s3s_etag(etag);
-    let (s3s::dto::ETag::Strong(value) | s3s::dto::ETag::Weak(value)) = &mut etag;
-    *value = quick_xml::escape::escape(value.as_str()).into_owned();
-    etag
-}
-
 pub(crate) fn table_catalog_path_hash(value: &str) -> String {
     ecstore_bucket::metadata::table_catalog_path_hash(value)
 }

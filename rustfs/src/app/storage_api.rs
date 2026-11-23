@@ -61,16 +61,16 @@ pub(crate) mod s3 {
     pub(crate) use s3s::auth::Credentials;
     pub(crate) use s3s::dto;
     #[cfg(test)]
+    pub(crate) use s3s::dto::PutObjectInput;
+    #[cfg(test)]
     pub(crate) use s3s::dto::{
         BucketLocationConstraint, CreateBucketConfiguration, CreateBucketInput, CreateMultipartUploadInput, DeleteObjectInput,
         ObjectLockRetention,
     };
     #[cfg(test)]
-    pub(crate) use s3s::dto::{GetObjectInput, ListObjectsV2Input, ListObjectsV2Output};
-    #[cfg(test)]
-    pub(crate) use s3s::dto::{GetObjectOutput, PutObjectInput};
-    #[cfg(test)]
     pub(crate) use s3s::dto::{ListObjectsInput, StreamingBlob};
+    #[cfg(test)]
+    pub(crate) use s3s::dto::{ListObjectsV2Input, ListObjectsV2Output};
     pub(crate) use s3s::header;
     pub(crate) use s3s::s3_error;
     pub(crate) use s3s::stream;
@@ -1663,12 +1663,6 @@ pub(crate) mod helper {
     };
 }
 
-pub(crate) mod object_utils {
-    #[cfg(test)]
-    pub(crate) use crate::storage::storage_api::to_s3s_etag;
-    pub(crate) use crate::storage::storage_api::to_s3s_xml_etag;
-}
-
 pub(crate) mod io {
     #[cfg(test)]
     pub(crate) use crate::storage::storage_api::{DecryptReader, EncryptReader, HardLimitReader, boxed_reader};
@@ -1778,7 +1772,7 @@ pub(crate) mod bucket_usecase {
         }
     }
 
-    pub(crate) use super::{access, bucket, error, helper, object_utils, request_context, s3, s3_api, sse};
+    pub(crate) use super::{access, bucket, error, helper, request_context, s3, s3_api, sse};
     pub(crate) use crate::storage::storage_api::{
         ECStore, StorageObjectInfo, StorageObjectOptions, get_validated_store, validate_list_object_unordered_with_delimiter,
         validate_website_configuration,
@@ -1844,8 +1838,6 @@ pub(crate) mod object_usecase {
         }
     }
 
-    #[cfg(test)]
-    pub(crate) use super::object_utils;
     pub(crate) use super::{
         access, bucket, compression, concurrency, data_usage, deadlock_detector, error, head_prefix, helper, io, options,
         request_context, s3_api, set_disk, sse, storage_class, timeout_wrapper,
@@ -1910,8 +1902,6 @@ pub(crate) mod multipart_usecase {
         }
     }
 
-    #[cfg(test)]
-    pub(crate) use super::object_utils;
     pub(crate) use super::{
         access, bucket, compression, data_usage, error, helper, io, options, request_context, s3_api, set_disk, sse,
     };
@@ -2012,7 +2002,7 @@ pub(crate) mod test {
             RecordingKmsKeyAuthorizer, TestAuthorizationHooks, sse_kms_object_metadata,
         };
     }
-    pub(crate) use super::{bucket, object_utils, runtime};
+    pub(crate) use super::{bucket, runtime};
     pub(crate) mod data_usage {
         pub(crate) use super::super::data_usage::*;
     }

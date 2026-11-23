@@ -24,7 +24,27 @@ pub(crate) async fn list_objects_v2(
     req: S3Request<ListObjectsV2Input>,
 ) -> S3Result<S3Response<ListObjectsV2Output>> {
     use rustfs_gateway_types::compat::s3s_5761ddfe::generated::ops::list_objects_v2 as ops;
-    let envelope = crate::app::RequestEnvelope::from_s3s(&req);
+    // Same facts `RequestEnvelope::from_s3s` copies: method, URI, headers, extensions, region, service, and credentials.
+    let credentials = req.credentials.as_ref().map(|credentials| {
+        let session_token = crate::auth::get_session_token(&req.uri, &req.headers).map(str::to_owned);
+        crate::app::RequestCredentials::new(
+            credentials.access_key.clone(),
+            credentials.secret_key.expose().to_owned(),
+            session_token.clone(),
+        )
+        .unwrap_or_else(|_| crate::app::RequestCredentials::without_secret_key(credentials.access_key.clone(), session_token))
+    });
+    let envelope = crate::app::RequestEnvelope::from_parts(
+        crate::app::RequestHead {
+            method: req.method.clone(),
+            uri: req.uri.clone(),
+            headers: req.headers.clone(),
+            credentials,
+            region: req.region.as_ref().map(|region| region.as_str().to_owned()),
+            service: req.service.clone(),
+        },
+        req.extensions.clone(),
+    );
     let input = ops::input_from_s3s(req.input).map_err(crate::app::dto_values::seam_error)?;
     let mut output = list_objects_v2_owned(usecase, envelope, input).await?;
     let migration_list = output.rustfs_on_demand_migration_list.take();

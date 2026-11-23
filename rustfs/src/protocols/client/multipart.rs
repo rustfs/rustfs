@@ -156,10 +156,10 @@ pub(super) fn complete_multipart_output(
     ] {
         if let Some(value) = value {
             http::HeaderValue::from_str(&value).map_err(|_| {
-                crate::app::dto_values::seam_error(rustfs_gateway_types::compat::ConversionError {
-                    field,
-                    reason: "not a header value",
-                })
+                S3Error::with_message(
+                    S3ErrorCode::InternalError,
+                    format!("failed to convert through the gateway compatibility seam: {field}: not a header value"),
+                )
             })?;
         }
     }

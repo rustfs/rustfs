@@ -94,8 +94,6 @@ use super::storage_api::object_usecase::object_cache::GetObjectBodySource;
 #[cfg(test)]
 use super::storage_api::object_usecase::object_cache::lookup_get_object_body_cache_hook;
 use super::storage_api::object_usecase::object_cache::{GetObjectBodyCacheHookLookup, get_object_body_cache_plaintext_len};
-#[cfg(test)]
-use super::storage_api::object_usecase::object_utils::to_s3s_etag;
 use super::storage_api::object_usecase::options::{
     copy_dst_opts_with_replication_authorization, copy_src_opts, del_opts_with_versioning, extract_metadata,
     extract_metadata_from_mime_with_object_name, filter_object_metadata, get_content_sha256_with_query, get_opts,
@@ -107,9 +105,13 @@ use super::storage_api::object_usecase::s3_api::multipart::parse_list_parts_para
 use super::storage_api::object_usecase::set_disk::{
     get_lock_acquire_timeout, get_object_disk_read_timeout, is_valid_storage_class,
 };
+#[cfg(not(test))]
+use super::storage_api::object_usecase::sse::{DecryptionRequest, SseKmsPrincipal};
+#[cfg(test)]
+pub(crate) use super::storage_api::object_usecase::sse::{DecryptionRequest, SseKmsPrincipal, sse_decryption};
 use super::storage_api::object_usecase::sse::{
-    DecryptionRequest, EncryptionRequest, SseKmsPrincipal, apply_bucket_default_lock_retention, authorize_sse_kms_object_read,
-    bucket_default_write_sse, build_ssec_read_headers, classify_sse_read_response, encryption_material_to_metadata,
+    EncryptionRequest, apply_bucket_default_lock_retention, authorize_sse_kms_object_read, bucket_default_write_sse,
+    build_ssec_read_headers, classify_sse_read_response, encryption_material_to_metadata,
     extract_server_side_encryption_from_headers, extract_ssec_params_from_headers, extract_ssekms_context_from_headers,
     get_buffer_size_opt_in, load_bucket_object_lock_config_state, map_get_object_reader_error, sse_encryption,
     validate_bucket_object_lock_enabled_state,
@@ -181,8 +183,6 @@ use rustfs_utils::http::{
 use rustfs_utils::path::{encode_dir_object, is_dir_object, path_join_buf};
 use rustfs_utils::retry::{DEFAULT_RETRY_CAP, DEFAULT_RETRY_UNIT, MAX_JITTER, RetryTimer};
 use rustfs_zip::{ArchiveLimits, CompressionFormat, ZipError};
-#[cfg(test)]
-use s3s::{S3Request, S3Response};
 
 /// Remove replication history owned by another source object before a local
 /// object-creation decision is made. Compatibility keys are case-insensitive,
@@ -234,8 +234,6 @@ pub(crate) use native_body::{BodyChunks, FrameTrailers, upload_frame_reader};
 pub(crate) use put_input::{PutObjectWriteInput, PutObjectWriteOutput};
 pub(crate) mod request_body;
 mod restore;
-#[cfg(test)]
-mod s3s_compat;
 pub(crate) mod shared;
 #[cfg(test)]
 mod test_support;

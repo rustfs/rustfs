@@ -2872,9 +2872,6 @@ mod tests {
     use tokio::io::AsyncReadExt;
     use tokio_tar::{Builder, EntryType, Header};
 
-    #[path = "gateway_test.rs"]
-    mod gateway_test;
-
     fn archive_input(bucket: &str, key: &str, archive: Vec<u8>) -> PutObjectWriteInput {
         PutObjectWriteInput {
             bucket: bucket.to_owned(),

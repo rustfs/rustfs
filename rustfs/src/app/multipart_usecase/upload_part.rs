@@ -543,36 +543,13 @@ impl UploadPartWriteInput {
 
 #[cfg(test)]
 impl DefaultMultipartUsecase {
-    pub async fn execute_upload_part(
+    pub(crate) async fn execute_upload_part(
         &self,
         req: crate::app::storage_api::s3::S3Request<crate::app::storage_api::s3::dto::UploadPartInput>,
-    ) -> crate::app::storage_api::s3::S3Result<
-        crate::app::storage_api::s3::S3Response<crate::app::storage_api::s3::dto::UploadPartOutput>,
-    > {
-        use crate::app::storage_api::s3::{
-            S3Response,
-            dto::{ServerSideEncryption, UploadPartOutput},
-        };
+    ) -> crate::app::storage_api::s3::S3Result<UploadPartWriteOutput> {
         let envelope = RequestEnvelope::from_s3s(&req);
         let input = UploadPartWriteInput::from_legacy(req.input, req.trailing_headers);
-        let output = self.execute_upload_part_with_audit(envelope, input).await?;
-        let mut response = S3Response::new(UploadPartOutput {
-            e_tag: output
-                .e_tag
-                .map(|tag| crate::app::storage_api::test::object_utils::to_s3s_etag(&tag)),
-            checksum_crc32: output.checksum_crc32,
-            checksum_crc32c: output.checksum_crc32c,
-            checksum_crc64nvme: output.checksum_crc64nvme,
-            checksum_sha1: output.checksum_sha1,
-            checksum_sha256: output.checksum_sha256,
-            server_side_encryption: output.server_side_encryption.map(ServerSideEncryption::from),
-            ssekms_key_id: output.ssekms_key_id,
-            sse_customer_algorithm: output.sse_customer_algorithm,
-            sse_customer_key_md5: output.sse_customer_key_md5,
-            ..Default::default()
-        });
-        response.headers = output.headers;
-        Ok(response)
+        self.execute_upload_part_with_audit(envelope, input).await.map_err(Into::into)
     }
 }
 
@@ -585,11 +562,26 @@ mod tests {
     use crate::app::storage_api::s3::dto::{StreamingBlob, UploadPartInput};
     use http::HeaderValue;
 
+    /// Method, URI, headers, extensions, region, and service. These fixtures leave credentials absent.
+    fn envelope_from_presigned_fixture<T>(req: &crate::app::storage_api::s3::S3Request<T>) -> RequestEnvelope {
+        RequestEnvelope::from_parts(
+            crate::app::RequestHead {
+                method: req.method.clone(),
+                uri: req.uri.clone(),
+                headers: req.headers.clone(),
+                credentials: None,
+                region: req.region.as_ref().map(|region| region.as_str().to_owned()),
+                service: req.service.clone(),
+            },
+            req.extensions.clone(),
+        )
+    }
+
     fn presigned_checksum_request(query: &str) -> (RequestEnvelope, UploadPartWriteInput) {
         let mut req = build_request(UploadPartInput::default(), Method::PUT);
         req.uri = format!("/bucket/object?{query}").parse().unwrap();
         req.extensions.insert(VerifiedPresignedRequest);
-        (RequestEnvelope::from_s3s(&req), UploadPartWriteInput::from_legacy(req.input, None))
+        (envelope_from_presigned_fixture(&req), UploadPartWriteInput::from_legacy(req.input, None))
     }
 
     #[tokio::test]
@@ -675,7 +667,7 @@ mod tests {
     fn normalize_presigned_part_checksums_requires_verified_presign() {
         let mut legacy = build_request(UploadPartInput::default(), Method::PUT);
         legacy.uri = "/bucket/object?x-amz-checksum-sha256=one".parse().unwrap();
-        let mut req = RequestEnvelope::from_s3s(&legacy);
+        let mut req = envelope_from_presigned_fixture(&legacy);
         let mut input = UploadPartWriteInput::from_legacy(legacy.input, None);
         normalize_presigned_part_checksums(&mut req, &mut input).unwrap();
         assert!(input.checksum_sha256.is_none());
@@ -862,7 +854,8 @@ mod tests {
                     let error = usecase
                         .execute_upload_part(request)
                         .await
-                        .expect_err("unknown or negative logical size");
+                        .err()
+                        .expect("unknown or negative logical size");
                     assert_eq!(
                         error.code(),
                         &if capped || content_length.is_some() {
@@ -928,7 +921,8 @@ mod tests {
         ));
         control.advance_wait_for_test(Duration::from_secs(60));
         sender.send(Ok(Frame::data(Bytes::from_static(b"x")))).unwrap();
-        assert_eq!(owner.await.unwrap().unwrap_err().code(), &LegacyErrorCode::RequestTimeout);
+        let error = owner.await.unwrap().err().expect("stalled part must fail");
+        assert_eq!(error.code(), &LegacyErrorCode::RequestTimeout);
         assert!(matches!(
             manager.admit_put_object(65536).await.unwrap(),
             ForegroundWriteAdmission::Admitted(_)

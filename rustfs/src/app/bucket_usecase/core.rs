@@ -371,7 +371,7 @@ impl DefaultBucketUsecase {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::app::bucket_usecase::test_support::{build_request_with_req_info, owned_envelope, s3_op_total};
+    use crate::app::bucket_usecase::test_support::{owned_envelope, s3_op_total};
     use http::Method;
 
     #[test]
@@ -403,9 +403,24 @@ mod tests {
     }
 
     /// The envelope of a request whose access phase installed `req_info`, or none.
+    /// Method PUT, URI `/`, empty headers, and that extension only.
     fn envelope(req_info: Option<ReqInfo>) -> RequestEnvelope {
         match req_info {
-            Some(req_info) => RequestEnvelope::from_s3s(&build_request_with_req_info((), Method::PUT, req_info)),
+            Some(req_info) => {
+                let mut extensions = http::Extensions::new();
+                extensions.insert(req_info);
+                RequestEnvelope::from_parts(
+                    crate::app::RequestHead {
+                        method: Method::PUT,
+                        uri: http::Uri::from_static("/"),
+                        headers: http::HeaderMap::new(),
+                        credentials: None,
+                        region: None,
+                        service: None,
+                    },
+                    extensions,
+                )
+            }
             None => owned_envelope(Method::PUT),
         }
     }

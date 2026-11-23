@@ -168,6 +168,12 @@ pub(crate) mod protocols {
 }
 
 pub(crate) mod server {
+    #[cfg(test)]
+    pub(crate) mod gateway_stack {
+        pub(crate) use crate::storage::storage_api::contract::multipart::PartInfo;
+        pub(crate) use crate::storage::storage_api::ecstore_bucket::metadata_sys::get_object_lock_config;
+    }
+
     pub(crate) mod event {
         pub(crate) mod contract {
             #[cfg(test)]
@@ -227,7 +233,7 @@ pub(crate) mod server {
                 pub(crate) use crate::storage::storage_api::contract::bucket::{
                     BucketOperations, DeleteBucketOptions, MakeBucketOptions,
                 };
-                pub(crate) use crate::storage::storage_api::contract::multipart::{CompletePart, MultipartOperations, PartInfo};
+                pub(crate) use crate::storage::storage_api::contract::multipart::{CompletePart, MultipartOperations};
                 pub(crate) use crate::storage::storage_api::contract::object::{ObjectIO, ObjectOperations};
                 pub(crate) use crate::storage::storage_api::{
                     StorageObjectOptions as ObjectOptions, StoragePutObjReader, get_bucket_metadata, is_err_object_not_found,
