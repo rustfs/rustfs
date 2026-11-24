@@ -9,10 +9,11 @@ use std::collections::BTreeMap;
 
 pub const BUCKET_SCAN_PROGRESS_VERSION: u16 = 1;
 pub const BUCKET_SCAN_PROGRESS_MAX_BYTES: usize = 16 * 1024;
+pub const BUCKET_SCAN_PROGRESS_OBJECT_NAME: &str = ".usage-progress.json";
 
 /// The object lives on its contributing erasure set, alongside its bucket cache.
 pub fn bucket_scan_progress_path(bucket: &str) -> String {
-    format!("buckets/{bucket}/.usage-progress.json")
+    format!("buckets/{bucket}/{BUCKET_SCAN_PROGRESS_OBJECT_NAME}")
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
