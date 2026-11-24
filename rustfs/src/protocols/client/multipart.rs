@@ -301,8 +301,6 @@ pub(super) fn prepare_upload_part_copy(
     super::owned::validate_copy_source(&input.copy_source, "UploadPartCopy copy_source")?;
     let copy_source_if_match =
         super::owned::copy_condition(input.copy_source_if_match.as_deref(), "copy_source_if_match", "UploadPartCopy input")?;
-    // Dates must be representable at the edge; storage does not evaluate date preconditions.
-    // Dates must fit the edge codec; the storage path does not evaluate date preconditions.
     input
         .copy_source_if_modified_since
         .map(|at| multipart_timestamp(at, "UploadPartCopy input", "copy_source_if_modified_since"))
@@ -333,6 +331,10 @@ pub(super) fn prepare_upload_part_copy(
         copy_source_range: nonempty(input.copy_source_range),
         copy_source_if_match,
         copy_source_if_none_match,
+        copy_source_dates: crate::app::object_usecase::CopySourceDates::new(
+            input.copy_source_if_modified_since,
+            input.copy_source_if_unmodified_since,
+        ),
         sse_customer_algorithm: nonempty(input.sse_customer_algorithm),
         sse_customer_key: input.sse_customer_key.map(|value| value.expose_secret().to_owned()),
         sse_customer_key_md5: nonempty(input.sse_customer_key_md5),
