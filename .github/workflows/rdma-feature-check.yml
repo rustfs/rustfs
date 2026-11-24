@@ -66,7 +66,7 @@ jobs:
       # These unit tests use a fake sysfs and plain host memory; none needs an
       # RDMA device or the NIXL libraries.
       - name: Run the rustfs-nixl unit tests
-        run: cargo test --locked -p rustfs-nixl --features sys
+        run: cargo test --locked -p rustfs-nixl --features client-http
 
   cuobject-check:
     name: cuObject server SDK and unit tests
