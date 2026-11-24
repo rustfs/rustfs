@@ -158,7 +158,7 @@ fn canonical_cache_value(mut value: Value) -> Value {
     value
 }
 
-fn same_cache(actual: &DataUsageCache, expected: &DataUsageCache) {
+pub(super) fn same_cache(actual: &DataUsageCache, expected: &DataUsageCache) {
     assert_eq!(
         canonical_cache_value(serde_json::to_value(actual).expect("actual cache structure")),
         canonical_cache_value(serde_json::to_value(expected).expect("expected cache structure")),

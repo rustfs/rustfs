@@ -19,8 +19,8 @@
 use super::ECStore;
 use crate::bucket::utils::is_meta_bucketname;
 use crate::disk::{DeleteRecoveryCursor, DiskAPI, DiskStore};
-use crate::error::StorageError;
 use futures::{StreamExt, future::BoxFuture, stream::FuturesUnordered};
+use rand::RngExt as _;
 use rustfs_heal_contracts::heal_channel::HealOpts;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{
@@ -42,12 +42,13 @@ const EVENT_DELETE_RECOVERY_STATUS: &str = "delete_recovery_status";
 const KEYS_PER_PASS: usize = 16;
 const RECOVERY_CONCURRENCY: usize = 4;
 const INTERVAL: Duration = Duration::from_secs(1);
-const INITIAL_RETRY_DELAY: Duration = Duration::from_secs(5);
-const MAX_RETRY_DELAY: Duration = Duration::from_secs(5 * 60);
 const INVENTORY_INTERVAL: Duration = Duration::from_secs(30);
 const DISCOVERY_BUDGET: Duration = Duration::from_secs(5);
 const ANTI_ENTROPY_INTERVAL: Duration = Duration::from_secs(60 * 60);
 const PASS_START_BUDGET: Duration = Duration::from_secs(30);
+const RETRY_INITIAL: Duration = Duration::from_secs(8);
+const RETRY_CAP: Duration = Duration::from_secs(5 * 60);
+const CORRUPT_RECHECK: Duration = Duration::from_secs(15 * 60);
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub(crate) struct DeleteRecoveryKey {
@@ -60,10 +61,8 @@ pub(crate) struct DeleteRecoveryKey {
 
 #[derive(Clone, Debug)]
 pub(crate) struct DeleteRecoveryTicket {
-    key: Arc<DeleteRecoveryKey>,
     generation: Uuid,
-    admission: Option<Arc<AdmissionGuard>>,
-    retry: Option<RetrySchedule>,
+    admission: Arc<AdmissionGuard>,
 }
 
 #[derive(Debug)]
@@ -86,40 +85,62 @@ impl Drop for AdmissionGuard {
     }
 }
 
-#[derive(Clone, Copy, Debug)]
-struct RetrySchedule {
-    ready_at: Instant,
-    delay: Duration,
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum FailureReason {
+    MissingQuorum,
+    Blocked,
+    Corrupt,
+    Failed,
 }
 
-impl RetrySchedule {
-    fn after_failure(previous: Option<Self>, now: Instant) -> Self {
-        let delay = previous.map_or(INITIAL_RETRY_DELAY, |retry| (retry.delay * 2).clamp(INITIAL_RETRY_DELAY, MAX_RETRY_DELAY));
+#[derive(Clone, Copy, Debug)]
+struct RetryBackoff {
+    reason: FailureReason,
+    ceiling: Duration,
+    next_eligible: Instant,
+}
+
+impl RetryBackoff {
+    fn after(reason: FailureReason, previous: Option<Self>) -> Self {
+        let ceiling = if reason == FailureReason::Corrupt {
+            CORRUPT_RECHECK
+        } else if let Some(previous) = previous.filter(|previous| previous.reason == reason) {
+            (previous.ceiling * 2).min(RETRY_CAP)
+        } else {
+            RETRY_INITIAL
+        };
+        // Equal jitter keeps a lower bound even when many keys fail together.
+        let delay = rand::rng().random_range(ceiling / 2..=ceiling);
         Self {
-            ready_at: now + delay,
-            delay,
+            reason,
+            ceiling,
+            next_eligible: Instant::now() + delay,
         }
     }
 }
 
 #[derive(Debug)]
 struct PendingHint {
-    generation: Uuid,
-    queue_generation: Uuid,
-    kind: PendingHintKind,
+    slot: Uuid,
+    // None for a new raw discovery: an older request cannot acknowledge it.
+    generation: Option<Uuid>,
+    retry: Option<RetryBackoff>,
 }
 
-#[derive(Clone, Copy, Debug)]
-enum PendingHintKind {
-    Foreground,
-    Discovered,
-    Retry(RetrySchedule),
+struct RecoveryAttempt {
+    key: Arc<DeleteRecoveryKey>,
+    generation: Uuid,
+    retry: Option<RetryBackoff>,
+    observed_drive_return: Option<Uuid>,
 }
 
 #[derive(Debug)]
 struct HintState {
     pending: HashMap<Arc<DeleteRecoveryKey>, PendingHint>,
     order: VecDeque<(Arc<DeleteRecoveryKey>, Uuid)>,
+    // One marker per configured set observed returning by local inventory.
+    drive_returns: HashMap<(usize, usize), Uuid>,
+    evicted_retries: HashMap<Arc<DeleteRecoveryKey>, RetryBackoff>,
     rescan: Option<Uuid>,
     started: HashSet<Uuid>,
     #[cfg(test)]
@@ -127,18 +148,6 @@ struct HintState {
 }
 
 impl HintState {
-    fn enqueue(&mut self, key: Arc<DeleteRecoveryKey>, generation: Uuid, kind: PendingHintKind) {
-        self.pending.insert(
-            key.clone(),
-            PendingHint {
-                generation,
-                queue_generation: generation,
-                kind,
-            },
-        );
-        self.order.push_back((key, generation));
-    }
-
     fn compact_order(&mut self, capacity: usize) {
         // Twice the pending capacity guarantees at least capacity completed
         // entries between compactions, even with a full retry backlog. This
@@ -152,7 +161,14 @@ impl HintState {
             self.compaction_visits += self.order.len();
         }
         let Self { pending, order, .. } = self;
-        order.retain(|(key, generation)| pending.get(key).is_some_and(|entry| entry.queue_generation == *generation));
+        order.retain(|(key, slot)| pending.get(key).is_some_and(|entry| entry.slot == *slot));
+    }
+
+    fn enqueue(&mut self, capacity: usize, key: Arc<DeleteRecoveryKey>, generation: Option<Uuid>, retry: Option<RetryBackoff>) {
+        self.compact_order(capacity);
+        let slot = generation.unwrap_or_else(Uuid::new_v4);
+        self.order.push_back((key.clone(), slot));
+        self.pending.insert(key, PendingHint { slot, generation, retry });
     }
 }
 
@@ -173,6 +189,8 @@ impl DeleteRecoveryHints {
             state: Arc::new(Mutex::new(HintState {
                 pending: HashMap::new(),
                 order: VecDeque::new(),
+                drive_returns: HashMap::new(),
+                evicted_retries: HashMap::new(),
                 rescan: Some(Uuid::new_v4()),
                 started: HashSet::new(),
                 #[cfg(test)]
@@ -188,144 +206,169 @@ impl DeleteRecoveryHints {
         let key = Arc::new(key);
         let mut state = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let generation = Uuid::new_v4();
-        if let Some(entry) = state.pending.get_mut(&key) {
-            entry.generation = generation;
-            entry.kind = PendingHintKind::Foreground;
+        state.evicted_retries.remove(&key);
+        if let Some(current) = state.pending.get_mut(&key) {
+            current.generation = Some(generation);
+            current.retry = None;
         } else {
             if state.pending.len() >= self.capacity {
                 // Durable evidence remains the authority. Rotate the oldest
                 // hint so permanently blocked keys cannot exclude later raw
                 // discoveries forever; the next scan revisits evicted keys.
-                while let Some((oldest, generation)) = state.order.pop_front() {
-                    if state
-                        .pending
-                        .get(&oldest)
-                        .is_some_and(|entry| entry.queue_generation == generation)
-                    {
+                while let Some((oldest, slot)) = state.order.pop_front() {
+                    if state.pending.get(&oldest).is_some_and(|entry| entry.slot == slot) {
                         state.pending.remove(&oldest);
                         break;
                     }
                 }
                 state.rescan = Some(Uuid::new_v4());
             }
-            state.compact_order(self.capacity);
-            state.enqueue(key.clone(), generation, PendingHintKind::Foreground);
+            state.enqueue(self.capacity, key.clone(), Some(generation), None);
         }
         Some(DeleteRecoveryTicket {
-            admission: Some(Arc::new(AdmissionGuard {
+            admission: Arc::new(AdmissionGuard {
                 state: self.state.clone(),
-                key: key.clone(),
+                key,
                 settled: AtomicBool::new(false),
-            })),
-            key,
+            }),
             generation,
-            retry: None,
         })
     }
 
     fn register_discovered(&self, key: DeleteRecoveryKey) -> bool {
         let mut state = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        if state.pending.contains_key(&key) {
+        if state.pending.contains_key(&key)
+            || state
+                .evicted_retries
+                .get(&key)
+                .is_some_and(|retry| retry.next_eligible > Instant::now())
+        {
             return true;
         }
         if state.pending.len() >= self.capacity {
             // Only previously attempted work may yield its slot. Unattempted
             // keys apply backpressure so a fast scan cannot overwrite them.
-            let retried = state.order.iter().position(|(queued, generation)| {
+            let retried = state.order.iter().position(|(key, slot)| {
                 state
                     .pending
-                    .get(queued)
-                    .is_some_and(|entry| entry.queue_generation == *generation && matches!(entry.kind, PendingHintKind::Retry(_)))
+                    .get(key)
+                    .is_some_and(|entry| entry.slot == *slot && entry.retry.is_some())
             });
             let Some(index) = retried else { return false };
-            if let Some((oldest, _)) = state.order.remove(index) {
-                state.pending.remove(&oldest);
+            if state.evicted_retries.len() >= self.capacity {
+                let now = Instant::now();
+                state.evicted_retries.retain(|_, retry| retry.next_eligible > now);
+                if state.evicted_retries.len() >= self.capacity {
+                    return false;
+                }
+            }
+            if let Some((oldest, _)) = state.order.remove(index)
+                && let Some(retry) = state.pending.remove(&oldest).and_then(|entry| entry.retry)
+            {
+                state.evicted_retries.insert(oldest, retry);
             }
             // This durable key has already been attempted. The hourly sweep
             // revisits it; immediate rescans would loop on permanent failures.
         }
-        state.compact_order(self.capacity);
-        state.enqueue(Arc::new(key), Uuid::new_v4(), PendingHintKind::Discovered);
+        let retry = state.evicted_retries.remove(&key);
+        state.enqueue(self.capacity, Arc::new(key), None, retry);
         true
     }
 
     pub(crate) fn ack(&self, ticket: &DeleteRecoveryTicket) {
-        if let Some(admission) = &ticket.admission {
-            admission.settled.store(true, Ordering::Release);
-        }
+        ticket.admission.settled.store(true, Ordering::Release);
         let mut state = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         if state
             .pending
-            .get(&ticket.key)
-            .is_some_and(|entry| entry.generation == ticket.generation)
+            .get(&ticket.admission.key)
+            .is_some_and(|entry| entry.generation == Some(ticket.generation))
         {
-            state.pending.remove(&ticket.key);
+            state.pending.remove(&ticket.admission.key);
         }
     }
 
-    fn take_available(&self, active: &HashSet<Arc<DeleteRecoveryKey>>, now: Instant) -> Option<DeleteRecoveryTicket> {
+    fn take_available(&self, active: &HashSet<Arc<DeleteRecoveryKey>>) -> Option<RecoveryAttempt> {
         let mut state = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let now = Instant::now();
         let queued = state.order.len();
         for _ in 0..queued {
             let (key, slot) = state.order.pop_front()?;
-            let Some(entry) = state.pending.get(&key).filter(|entry| entry.queue_generation == slot) else {
-                continue;
-            };
-            let retry = match entry.kind {
-                PendingHintKind::Retry(retry) => Some(retry),
-                PendingHintKind::Discovered | PendingHintKind::Foreground => None,
-            };
-            if retry.is_some_and(|retry| retry.ready_at > now) || active.contains(&key) {
-                state.order.push_back((key, slot));
-                continue;
+            if let Some(entry) = state.pending.get(&key)
+                && slot == entry.slot
+            {
+                if entry.retry.is_some_and(|retry| now < retry.next_eligible) || active.contains(&key) {
+                    state.order.push_back((key, slot));
+                    continue;
+                }
+                let generation = entry.generation.unwrap_or(slot);
+                let retry = entry.retry;
+                let observed_drive_return = state.drive_returns.get(&(key.pool, key.set)).copied();
+                state.pending.remove(&key);
+                return Some(RecoveryAttempt {
+                    key,
+                    generation,
+                    retry,
+                    observed_drive_return,
+                });
             }
-            let ticket = DeleteRecoveryTicket {
-                generation: entry.generation,
-                admission: None,
-                retry,
-                key,
-            };
-            state.pending.remove(&ticket.key);
-            return Some(ticket);
         }
         None
     }
 
     #[cfg(test)]
-    fn take(&self, limit: usize) -> Vec<DeleteRecoveryTicket> {
+    fn take(&self, limit: usize) -> Vec<RecoveryAttempt> {
         let active = HashSet::new();
-        std::iter::from_fn(|| self.take_available(&active, Instant::now()))
-            .take(limit)
-            .collect()
+        std::iter::from_fn(|| self.take_available(&active)).take(limit).collect()
     }
 
-    fn retry(&self, ticket: DeleteRecoveryTicket, retry: RetrySchedule) {
+    fn requeue(&self, attempt: RecoveryAttempt, failure: Option<FailureReason>) {
+        let mut retry = match failure {
+            Some(reason) => Some(RetryBackoff::after(reason, attempt.retry)),
+            None => attempt.retry,
+        };
         let mut state = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Some(entry) = state.pending.get_mut(&ticket.key) {
-            // Discovery can see the same journal while replay is in flight.
-            // Keep its queue slot, but only new foreground work resets backoff.
-            if matches!(entry.kind, PendingHintKind::Discovered) {
-                entry.kind = PendingHintKind::Retry(retry);
+        // A drive may have returned after admission but before this attempt
+        // reported missing quorum. Check under the same lock as wake and enqueue.
+        if let Some(retry) = &mut retry
+            && retry.reason == FailureReason::MissingQuorum
+            && attempt.observed_drive_return != state.drive_returns.get(&(attempt.key.pool, attempt.key.set)).copied()
+        {
+            retry.next_eligible = Instant::now();
+        }
+        if let Some(entry) = state.pending.get_mut(&attempt.key) {
+            if entry.generation.is_none() {
+                // A raw scan saw the same key while it was in flight. Preserve
+                // its FIFO position and history, but never delay a newer request.
+                entry.retry = retry;
             }
             return;
         }
         if state.pending.len() >= self.capacity {
-            // Attempted work yields to new admissions and the periodic durable sweep.
+            // Attempted failures yield until the periodic sweep. Cancellation
+            // may precede the first poll, so explicitly hand it back to discovery.
+            if failure.is_none() {
+                state.rescan = Some(Uuid::new_v4());
+            }
             return;
         }
-        state.compact_order(self.capacity);
-        state.enqueue(ticket.key, ticket.generation, PendingHintKind::Retry(retry));
+        state.enqueue(self.capacity, attempt.key, Some(attempt.generation), retry);
     }
 
-    #[cfg(test)]
-    fn retry_now(&self, ticket: DeleteRecoveryTicket) {
-        self.retry(
-            ticket,
-            RetrySchedule {
-                ready_at: Instant::now(),
-                delay: Duration::ZERO,
-            },
-        );
+    fn wake_quorum_waiters(&self, returning_sets: &HashSet<(usize, usize)>) {
+        let now = Instant::now();
+        let mut state = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let generation = Uuid::new_v4();
+        state
+            .drive_returns
+            .extend(returning_sets.iter().map(|&set| (set, generation)));
+        for (key, entry) in &mut state.pending {
+            if let Some(retry) = &mut entry.retry
+                && retry.reason == FailureReason::MissingQuorum
+                && returning_sets.contains(&(key.pool, key.set))
+            {
+                retry.next_eligible = now;
+            }
+        }
     }
 
     #[cfg(test)]
@@ -374,6 +417,7 @@ struct LocalSource {
     pool: usize,
     set: usize,
     disk: DiskStore,
+    available: bool,
 }
 
 struct BucketScan {
@@ -428,23 +472,45 @@ impl RecoveryPass {
                     .flatten()
                     .filter(|disk| disk.is_local())
                 {
+                    let available = matches!(disk.as_ref(), crate::disk::Disk::Local(wrapper)
+                        if wrapper.check_scanner_handle().is_ok());
                     sources.push(LocalSource {
                         pool: set.pool_index,
                         set: set.set_index,
                         disk,
+                        available,
                     });
                 }
             }
         }
-        let current_source = |source: &LocalSource| {
-            sources.iter().any(|current| {
+        let contains_source = |inventory: &[LocalSource], source: &LocalSource| {
+            inventory.iter().any(|current| {
                 current.pool == source.pool && current.set == source.set && Arc::ptr_eq(&current.disk, &source.disk)
             })
         };
-        if sources.len() != self.sources.len() || self.sources.iter().any(|source| !current_source(source)) {
-            store.ctx.delete_recovery_hints().request_rescan();
-            self.scans.retain(|scan| current_source(&scan.source));
-            self.deferred.retain(|(_, scan)| current_source(&scan.source));
+        if sources.len() != self.sources.len() || self.sources.iter().any(|source| !contains_source(&sources, source)) {
+            let hints = store.ctx.delete_recovery_hints();
+            hints.request_rescan();
+            self.scans.retain(|scan| contains_source(&sources, &scan.source));
+            self.deferred.retain(|(_, scan)| contains_source(&sources, &scan.source));
+        }
+        if self.next_inventory.is_some() {
+            let returning_sets: HashSet<_> = sources
+                .iter()
+                .filter(|source| {
+                    source.available
+                        && !self.sources.iter().any(|previous| {
+                            previous.available
+                                && Arc::ptr_eq(&previous.disk, &source.disk)
+                                && previous.pool == source.pool
+                                && previous.set == source.set
+                        })
+                })
+                .map(|source| (source.pool, source.set))
+                .collect();
+            if !returning_sets.is_empty() {
+                store.ctx.delete_recovery_hints().wake_quorum_waiters(&returning_sets);
+            }
         }
         self.sources = sources;
         self.next_inventory = Some(Instant::now() + INVENTORY_INTERVAL);
@@ -695,12 +761,7 @@ impl<'a> RecoveryWork<'a> {
             && Instant::now() < self.deadline
             && !self.cancel.is_cancelled()
         {
-            let Some(ticket) = self
-                .store
-                .ctx
-                .delete_recovery_hints()
-                .take_available(&self.active, Instant::now())
-            else {
+            let Some(ticket) = self.store.ctx.delete_recovery_hints().take_available(&self.active) else {
                 break;
             };
             self.active.insert(ticket.key.clone());
@@ -728,7 +789,7 @@ impl RecoveryFailures {
 async fn recover_hint(
     store: &Arc<ECStore>,
     cancel: &CancellationToken,
-    ticket: DeleteRecoveryTicket,
+    ticket: RecoveryAttempt,
 ) -> (Arc<DeleteRecoveryKey>, RecoveryFailures) {
     let key = ticket.key.clone();
     let opts = HealOpts {
@@ -746,32 +807,19 @@ async fn recover_hint(
         ) => Some(result),
     };
     let mut failures = RecoveryFailures::default();
-    let now = Instant::now();
-    let retry = match outcome {
-        Some(Ok(_)) => None,
-        Some(Err(StorageError::ErasureReadQuorum)) => {
-            failures.pending = 1;
-            // Check returning participants on the normal maintenance cadence.
-            Some(RetrySchedule {
-                ready_at: now + INTERVAL,
-                delay: INTERVAL,
-            })
-        }
+    match outcome {
+        Some(Ok(_)) => {}
         Some(Err(error)) => {
-            match error {
-                StorageError::SlowDown => failures.blocked = 1,
-                StorageError::FileCorrupt => failures.corrupt = 1,
-                _ => failures.failed = 1,
-            }
-            Some(RetrySchedule::after_failure(ticket.retry, now))
+            let (count, reason) = match error {
+                crate::error::StorageError::ErasureReadQuorum => (&mut failures.pending, FailureReason::MissingQuorum),
+                crate::error::StorageError::SlowDown => (&mut failures.blocked, FailureReason::Blocked),
+                crate::error::StorageError::FileCorrupt => (&mut failures.corrupt, FailureReason::Corrupt),
+                _ => (&mut failures.failed, FailureReason::Failed),
+            };
+            *count = 1;
+            store.ctx.delete_recovery_hints().requeue(ticket, Some(reason));
         }
-        None => Some(ticket.retry.unwrap_or(RetrySchedule {
-            ready_at: now,
-            delay: Duration::ZERO,
-        })),
-    };
-    if let Some(retry) = retry {
-        store.ctx.delete_recovery_hints().retry(ticket, retry);
+        None => store.ctx.delete_recovery_hints().requeue(ticket, None),
     }
     (key, failures)
 }
@@ -900,8 +948,8 @@ mod tests {
         assert_eq!(taken[0].key.object, "a", "coalescing must preserve fairness");
         assert_eq!(taken[0].generation, newer.generation);
         let latest = hints.register(key("a")).expect("hint during recovery");
-        hints.ack(&taken[0]);
-        hints.retry_now(taken.into_iter().next().expect("selected ticket"));
+        hints.ack(&newer);
+        hints.requeue(taken.into_iter().next().expect("selected ticket"), Some(FailureReason::Failed));
         let pending = hints.take(2);
         assert_eq!(pending[0].key.object, "b");
         assert_eq!(pending[1].generation, latest.generation, "old recovery cannot replace a newer hint");
@@ -928,8 +976,8 @@ mod tests {
         assert!(hints.rescan().is_none(), "synchronous settlement needs no new scan");
     }
 
-    #[test]
-    fn delete_recovery_hints_bound_tombstones_and_retry_after_drain() {
+    #[tokio::test(start_paused = true)]
+    async fn delete_recovery_hints_bound_tombstones_and_retry_after_drain() {
         let hints = DeleteRecoveryHints::with_capacity(2);
         for _ in 0..100 {
             let ticket = hints.register(key("same")).expect("register reusable key");
@@ -940,8 +988,176 @@ mod tests {
         assert!(hints.state.lock().expect("hint state").order.len() <= 2);
         let mut tickets = hints.take(2);
         assert_eq!(tickets.len(), 2);
-        hints.retry_now(tickets.remove(0));
+        hints.requeue(tickets.remove(0), Some(FailureReason::Failed));
+        assert!(hints.take(2).is_empty(), "a single failing key must not spin");
+        tokio::time::advance(RETRY_INITIAL).await;
         assert_eq!(hints.take(2).len(), 1, "failed work survives an empty queue");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn delete_recovery_rediscovery_keeps_evicted_retry_deadline() {
+        let hints = DeleteRecoveryHints::with_capacity(1);
+        assert!(hints.register_discovered(key("retry")));
+        let attempt = hints.take(1).pop().expect("first attempt");
+        hints.requeue(attempt, Some(FailureReason::Blocked));
+
+        assert!(hints.register_discovered(key("fresh")));
+        assert_eq!(hints.take(1)[0].key.object, "fresh");
+        assert!(hints.register_discovered(key("retry")));
+        assert!(hints.take(1).is_empty(), "rediscovery cannot bypass the deadline");
+
+        tokio::time::advance(RETRY_INITIAL).await;
+        assert!(hints.register_discovered(key("retry")));
+        let attempt = hints.take(1).pop().expect("retry is eligible again");
+        assert_eq!(attempt.retry.expect("retained backoff").reason, FailureReason::Blocked);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn delete_recovery_backs_off_repeated_reason_and_resets_on_change() {
+        use FailureReason::{Blocked, Corrupt, MissingQuorum};
+        let hints = DeleteRecoveryHints::with_capacity(2);
+        assert!(hints.register_discovered(key("retry")));
+        for (reason, max_seconds) in [
+            (MissingQuorum, 8),
+            (MissingQuorum, 16),
+            (MissingQuorum, 32),
+            (MissingQuorum, 64),
+            (MissingQuorum, 128),
+            (MissingQuorum, 256),
+            (MissingQuorum, 300),
+            (MissingQuorum, 300),
+            (Blocked, 8),
+            (Corrupt, 900),
+            (Corrupt, 900),
+            (Blocked, 8),
+        ] {
+            let attempt = hints.take(1).pop().expect("retry due by upper bound");
+            hints.requeue(attempt, Some(reason));
+            assert!(hints.register_discovered(key("retry")), "routine rediscovery coalesces");
+            let lower_bound = Duration::from_secs(max_seconds / 2);
+            let before_due = lower_bound - Duration::from_nanos(1);
+            tokio::time::advance(before_due).await;
+            assert!(hints.take(1).is_empty(), "{reason:?} must wait at least {lower_bound:?}");
+            assert!(hints.register_discovered(key("healthy")));
+            assert_eq!(hints.take(1).pop().expect("ready key behind retry").key.object, "healthy");
+            tokio::time::advance(Duration::from_secs(max_seconds) - before_due).await;
+        }
+        assert_eq!(hints.take(1).pop().expect("last retry is eligible").key.object, "retry");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn delete_recovery_only_foreground_generation_supersedes_backoff() {
+        let hints = DeleteRecoveryHints::with_capacity(1);
+        let original = hints.register(key("same")).expect("foreground hint");
+        let attempt = hints.take(1).pop().expect("initial attempt");
+        assert!(hints.register_discovered(key("same")), "disk scanned the in-flight key");
+        hints.requeue(attempt, Some(FailureReason::Corrupt));
+        hints.ack(&original);
+        assert_eq!(hints.pending_len(), 1, "stale ACK cannot consume raw evidence");
+        assert!(hints.take(1).is_empty(), "concurrent rediscovery cannot bypass corruption backoff");
+        let newer = hints.register(key("same")).expect("new generation during backoff");
+        assert!(!hints.register_discovered(key("other")), "new generation has not been attempted");
+        let attempt = hints.take(1).pop().expect("new generation is immediately eligible");
+        assert_eq!(attempt.generation, newer.generation);
+        hints.requeue(attempt, Some(FailureReason::Failed));
+        hints.ack(&newer);
+        assert_eq!(hints.pending_len(), 0, "matching foreground success can retire a deferred retry");
+    }
+
+    #[test]
+    fn delete_recovery_cancellation_retains_unattempted_work_or_rearms_discovery() {
+        let hints = DeleteRecoveryHints::with_capacity(1);
+        let scanning = hints.rescan().expect("current scan");
+        assert!(hints.register_discovered(key("interrupted")));
+        let attempt = hints.take(1).pop().expect("admission");
+        hints.requeue(attempt, None);
+        assert!(!hints.register_discovered(key("later")), "cancellation is not a failed attempt");
+        let returned = hints.take(1).pop().expect("canceled work is immediately runnable");
+        assert!(hints.register_discovered(key("later")), "fill the in-flight slot");
+        hints.requeue(returned, None);
+        hints.ack_rescan(scanning);
+        assert!(hints.rescan().is_some(), "a full queue hands canceled work to a new scan");
+        assert_eq!(hints.take(1).pop().expect("untouched work").key.object, "later");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn delete_recovery_returning_drive_only_wakes_its_sets_quorum_waiters() {
+        let hints = DeleteRecoveryHints::with_capacity(4);
+        for (pool, set, object, reason) in [
+            (0, 0, "quorum", FailureReason::MissingQuorum),
+            (0, 0, "corrupt", FailureReason::Corrupt),
+            (0, 1, "other-set", FailureReason::MissingQuorum),
+            (1, 0, "other-pool", FailureReason::MissingQuorum),
+        ] {
+            assert!(hints.register_discovered(DeleteRecoveryKey {
+                pool,
+                set,
+                ..key(object)
+            }));
+            let attempt = hints.take(1).pop().expect("first attempt");
+            hints.requeue(attempt, Some(reason));
+        }
+        hints.wake_quorum_waiters(&HashSet::from([(0, 0)]));
+        let runnable = hints.take(4);
+        assert_eq!(runnable.len(), 1);
+        assert_eq!(runnable[0].key.object, "quorum");
+        assert_eq!(hints.pending_len(), 3);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn delete_recovery_drive_return_between_take_and_requeue_survives_rediscovery() {
+        use FailureReason::{Corrupt, MissingQuorum};
+        let hints = DeleteRecoveryHints::with_capacity(5);
+        for (set, object) in [
+            (0, "in-flight"),
+            (0, "rediscovered"),
+            (0, "superseded"),
+            (0, "corrupt"),
+            (1, "other-set"),
+        ] {
+            assert!(hints.register_discovered(DeleteRecoveryKey { set, ..key(object) }));
+        }
+        for _ in 0..7 {
+            for attempt in hints.take(5) {
+                hints.requeue(attempt, Some(MissingQuorum));
+            }
+            tokio::time::advance(RETRY_CAP).await;
+        }
+        let admitted = hints.take(5);
+        assert_eq!(admitted.len(), 5);
+        hints.wake_quorum_waiters(&HashSet::from([(0, 0)]));
+        assert!(hints.register_discovered(key("rediscovered")));
+        let newer = hints.register(key("superseded")).expect("new foreground request");
+        for attempt in admitted {
+            let reason = if attempt.key.object == "corrupt" {
+                Corrupt
+            } else {
+                MissingQuorum
+            };
+            hints.requeue(attempt, Some(reason));
+        }
+
+        let ready = hints.take(5);
+        assert_eq!(
+            ready
+                .iter()
+                .map(|attempt| attempt.key.object.as_str())
+                .collect::<HashSet<_>>(),
+            HashSet::from(["in-flight", "rediscovered", "superseded"]),
+            "the set return is not lost while absent from pending or coalescing with raw evidence"
+        );
+        for attempt in ready {
+            if attempt.key.object == "superseded" {
+                assert_eq!(attempt.generation, newer.generation);
+                assert!(attempt.retry.is_none(), "old failure cannot attach to the new generation");
+            }
+            hints.requeue(attempt, Some(MissingQuorum));
+        }
+        assert!(
+            hints.take(5).is_empty(),
+            "attempts admitted after the drive return cannot reuse that signal"
+        );
+        assert_eq!(hints.pending_len(), 5);
     }
 
     #[test]
@@ -952,46 +1168,16 @@ mod tests {
         let active = HashSet::from([admitted.key.clone()]);
         let newer = hints.register(key("active")).expect("new foreground generation");
         hints.register(key("later")).expect("independent key");
-        let later = hints.take_available(&active, Instant::now()).expect("skip the active key");
+        let later = hints.take_available(&active).expect("skip the active key");
         assert_eq!(later.key.object, "later");
-        assert!(
-            hints.take_available(&active, Instant::now()).is_none(),
-            "a newer generation cannot occupy a second slot"
-        );
+        assert!(hints.take_available(&active).is_none(), "a newer generation cannot occupy a second slot");
         hints.ack(&original);
-        hints.retry_now(admitted);
+        hints.requeue(admitted, None);
         assert!(hints.is_pending(&key("active")), "old success or cancellation cannot clear newer work");
         let next = hints
-            .take_available(&HashSet::new(), Instant::now())
+            .take_available(&HashSet::new())
             .expect("active key becomes eligible after completion");
         assert_eq!(next.generation, newer.generation, "retry cannot overwrite the foreground generation");
-    }
-
-    #[test]
-    fn delete_recovery_backoff_survives_rediscovery_and_resets_for_foreground_work() {
-        let hints = DeleteRecoveryHints::with_capacity(2);
-        let active = HashSet::new();
-        let key = key("blocked");
-        let mut now = Instant::now();
-        assert!(hints.register_discovered(key.clone()));
-        let mut ticket = hints.take_available(&active, now).expect("discovery is immediately eligible");
-        for seconds in [5, 10, 20, 40, 80, 160, 300, 300] {
-            assert!(hints.register_discovered(key.clone()), "discovery arrives during replay");
-            let retry = RetrySchedule::after_failure(ticket.retry, now);
-            hints.retry(ticket, retry);
-            assert!(hints.register_discovered(key.clone()), "discovery also sees the queued retry");
-            now += Duration::from_secs(seconds);
-            assert!(hints.take_available(&active, now - Duration::from_nanos(1)).is_none());
-            ticket = hints.take_available(&active, now).expect("admit at the retry deadline");
-        }
-        let retry = RetrySchedule::after_failure(ticket.retry, now);
-        hints.retry(ticket, retry);
-        let foreground = hints.register(key).expect("foreground request during backoff");
-        let ticket = hints
-            .take_available(&active, now)
-            .expect("admit new foreground work promptly");
-        assert_eq!(ticket.generation, foreground.generation);
-        assert!(ticket.retry.is_none());
     }
 
     #[test]
@@ -1024,20 +1210,21 @@ mod tests {
         }
     }
 
-    #[test]
-    fn delete_recovery_saturated_blocked_hints_cannot_exclude_later_discovery() {
+    #[tokio::test(start_paused = true)]
+    async fn delete_recovery_saturated_blocked_hints_cannot_exclude_later_discovery() {
         let hints = DeleteRecoveryHints::with_capacity(2);
         hints.register(key("blocked-a")).expect("first blocked key");
         hints.register(key("blocked-b")).expect("second blocked key");
         for ticket in hints.take(2) {
-            hints.retry_now(ticket);
+            hints.requeue(ticket, Some(FailureReason::Blocked));
         }
         hints
             .register(key("healthy-later"))
             .expect("later page can replace oldest hint");
         let next = hints.take(2);
-        assert_eq!(next.len(), 2);
-        assert!(next.iter().any(|ticket| ticket.key.object == "healthy-later"));
+        assert_eq!(next.len(), 1);
+        assert_eq!(next[0].key.object, "healthy-later");
+        assert_eq!(hints.pending_len(), 1, "the surviving blocked key is deferred");
         assert!(hints.rescan().is_some(), "evicted durable work remains a discovery obligation");
     }
 
@@ -1072,6 +1259,33 @@ mod tests {
             .map(|disk| disk.expect("online disk"))
             .collect();
         (dirs, store, disks)
+    }
+
+    #[tokio::test]
+    async fn delete_recovery_inventory_wakes_quorum_waiters_when_handle_recovers_in_place() {
+        use crate::disk::health_state::RuntimeDriveHealthState;
+
+        let (_dirs, store, disks) = fixture("runtime-drive-return").await;
+        let disk = &disks[0];
+        disk.force_runtime_state_for_test(RuntimeDriveHealthState::Offline);
+        let mut pass = RecoveryPass::default();
+        pass.refresh_inventory(&store).await;
+        assert!(
+            pass.sources
+                .iter()
+                .any(|source| Arc::ptr_eq(&source.disk, disk) && !source.available)
+        );
+
+        let hints = store.ctx.delete_recovery_hints();
+        assert!(hints.register_discovered(key("waiting-quorum")));
+        let attempt = hints.take(1).pop().expect("initial quorum attempt");
+        hints.requeue(attempt, Some(FailureReason::MissingQuorum));
+        assert!(hints.take(1).is_empty(), "offline drive cannot wake the retry");
+
+        disk.force_runtime_state_for_test(RuntimeDriveHealthState::Online);
+        pass.next_inventory = Some(Instant::now());
+        pass.refresh_inventory(&store).await;
+        assert_eq!(hints.take(1)[0].key.object, "waiting-quorum");
     }
 
     async fn prepare(store: &Arc<ECStore>, disks: &[DiskStore], bucket: &str) -> Uuid {
@@ -1210,41 +1424,29 @@ mod tests {
                 "partial publication must converge through canonical recovery"
             );
         }
-        assert!(store.ctx.delete_recovery_hints().take(1).is_empty());
+        assert_eq!(store.ctx.delete_recovery_hints().pending_len(), 0);
     }
 
     #[tokio::test]
     async fn delete_recovery_offline_participant_retains_work_until_return() {
         let bucket = "runtime-offline-return";
         let (_dirs, store, disks) = fixture(bucket).await;
-        let mut pass = hint_only_pass(&store);
+        let mut pass = RecoveryPass::default();
         register(&store, bucket).await;
         let transaction = prepare(&store, &disks, bucket).await;
         publish_one(&disks[0], bucket, transaction).await;
         let set = &store.pools[0].disk_set[0];
         let offline = set.disks.write().await[3].take();
+        pass.refresh_inventory(&store).await;
         let cancel = CancellationToken::new();
-        assert_eq!(recover_hints(&store, &cancel).await.pending, 1, "the participant is required");
-        assert_eq!(
-            store
-                .ctx
-                .delete_recovery_hints()
-                .state
-                .lock()
-                .expect("pending state")
-                .pending
-                .len(),
-            1
-        );
+        assert_eq!(recover_hints(&store, &cancel).await.pending, 1);
+        let hints = store.ctx.delete_recovery_hints();
+        assert_eq!(hints.pending_len(), 1, "unavailable participant retains work");
         set.disks.write().await[3] = offline;
-        tokio::time::pause();
-        tokio::time::advance(INTERVAL).await;
-        tokio::time::resume();
-        pass.run(&store, &cancel).await;
-        assert!(
-            store.ctx.delete_recovery_hints().take(1).is_empty(),
-            "returning participant releases retained work"
-        );
+        pass.next_inventory = Some(Instant::now());
+        pass.refresh_inventory(&store).await;
+        recover_hints(&store, &cancel).await;
+        assert_eq!(hints.pending_len(), 0, "returning participant releases retained work");
         assert!(
             disks[0]
                 .discover_delete_transactions(bucket, Some("object"), None, 128)
@@ -1293,7 +1495,7 @@ mod tests {
             assert!(hints.register_discovered(key(&format!("blocked-{index}"))));
         }
         for ticket in hints.take(KEYS_PER_PASS) {
-            hints.retry_now(ticket);
+            hints.requeue(ticket, Some(FailureReason::Blocked));
         }
         for index in 0..KEYS_PER_PASS {
             assert!(
@@ -1303,7 +1505,7 @@ mod tests {
         }
         let in_flight = hints.take(1).pop().expect("one admitted recovery attempt");
         assert!(hints.register_discovered(key("arrived-during-recovery")));
-        hints.retry_now(in_flight);
+        hints.requeue(in_flight, Some(FailureReason::Blocked));
         let mut pass = RecoveryPass {
             next_inventory: Some(Instant::now() + ANTI_ENTROPY_INTERVAL),
             scan_generation: Some(scanning),
@@ -1328,65 +1530,6 @@ mod tests {
         assert_ne!(foreground, scanning);
         hints.ack_rescan(scanning);
         assert_eq!(hints.rescan(), Some(foreground), "an older scan cannot clear a foreground obligation");
-    }
-
-    #[tokio::test]
-    async fn delete_recovery_blocked_legacy_key_backs_off_without_delaying_other_keys() {
-        let bucket = "runtime-legacy-backoff";
-        let (dirs, store, disks) = fixture(bucket).await;
-        let transaction = Uuid::new_v4();
-        for disk in &disks {
-            disk.delete_version(
-                bucket,
-                "object",
-                FileInfo {
-                    name: "object".to_owned(),
-                    ..Default::default()
-                },
-                false,
-                DeleteOptions {
-                    old_data_dir: Some(transaction),
-                    ..Default::default()
-                },
-            )
-            .await
-            .expect("leave an undecided historical delete");
-        }
-        let backups: Vec<_> = dirs
-            .iter()
-            .map(|dir| {
-                dir.path()
-                    .join(bucket)
-                    .join("object")
-                    .join(transaction.to_string())
-                    .join("xl.meta.bkp")
-            })
-            .collect();
-        let before: Vec<_> = backups
-            .iter()
-            .map(|path| std::fs::read(path).expect("read original evidence"))
-            .collect();
-        register(&store, bucket).await;
-        let cancel = CancellationToken::new();
-        assert_eq!(recover_hints(&store, &cancel).await.blocked, 1);
-        let hints = store.ctx.delete_recovery_hints();
-        let healthy = DeleteRecoveryKey {
-            object: "absent-key".to_owned(),
-            bucket: bucket.to_owned(),
-            incarnation: Some(store.bucket_incarnation_id_from_disk(bucket).await.expect("bucket identity")),
-            ..key("absent-key")
-        };
-        assert!(hints.register_discovered(healthy.clone()));
-        assert_eq!(
-            recover_hints(&store, &cancel).await.blocked,
-            0,
-            "do not re-inspect a blocked key on the next pass"
-        );
-        assert!(!hints.is_pending(&healthy), "the independent key still settles promptly");
-        assert_eq!(hints.pending_len(), 1, "the blocked key remains eligible for a later retry");
-        for (path, bytes) in backups.iter().zip(before) {
-            assert_eq!(std::fs::read(path).expect("retained historical evidence"), bytes);
-        }
     }
 
     #[tokio::test]
@@ -1439,6 +1582,7 @@ mod tests {
         assert!(work.active.is_empty());
         assert_eq!(hints.pending_len(), KEYS_PER_PASS, "every admitted key is retained exactly once");
         let tickets = hints.take(KEYS_PER_PASS);
+        assert_eq!(tickets.len(), KEYS_PER_PASS, "cancellation imposes no retry delay");
         assert_eq!(
             tickets
                 .iter()
@@ -1582,7 +1726,7 @@ mod tests {
                 .expect("unattempted key remains queued")
                 .1;
             assert!(
-                matches!(queued.kind, PendingHintKind::Foreground),
+                queued.retry.is_none(),
                 "budget exhaustion must not grant discovery permission to evict untouched work"
             );
         }
@@ -1605,7 +1749,7 @@ mod tests {
                 for ticket in hints.take(KEYS_PER_PASS) {
                     let index: usize = ticket.key.object.parse().expect("numeric test key");
                     if index % 1_024 < KEYS_PER_PASS {
-                        hints.retry_now(ticket);
+                        hints.requeue(ticket, Some(FailureReason::Blocked));
                     } else {
                         recovered.insert(index);
                     }
@@ -1620,6 +1764,65 @@ mod tests {
                 healthy,
                 "permanent failures at every page-group boundary cannot starve later keys"
             );
+        }
+    }
+
+    #[tokio::test]
+    async fn delete_recovery_blocked_legacy_key_backs_off_without_delaying_other_keys() {
+        let bucket = "runtime-legacy-backoff";
+        let (dirs, store, disks) = fixture(bucket).await;
+        let transaction = Uuid::new_v4();
+        for disk in &disks {
+            disk.delete_version(
+                bucket,
+                "object",
+                FileInfo {
+                    name: "object".to_owned(),
+                    ..Default::default()
+                },
+                false,
+                DeleteOptions {
+                    old_data_dir: Some(transaction),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("leave an undecided historical delete");
+        }
+        let backups: Vec<_> = dirs
+            .iter()
+            .map(|dir| {
+                dir.path()
+                    .join(bucket)
+                    .join("object")
+                    .join(transaction.to_string())
+                    .join("xl.meta.bkp")
+            })
+            .collect();
+        let before: Vec<_> = backups
+            .iter()
+            .map(|path| std::fs::read(path).expect("read original evidence"))
+            .collect();
+        register(&store, bucket).await;
+        let cancel = CancellationToken::new();
+        assert_eq!(recover_hints(&store, &cancel).await.blocked, 1);
+        let hints = store.ctx.delete_recovery_hints();
+        let healthy = DeleteRecoveryKey {
+            object: "absent-key".to_owned(),
+            bucket: bucket.to_owned(),
+            incarnation: Some(store.bucket_incarnation_id_from_disk(bucket).await.expect("bucket identity")),
+            ..key("absent-key")
+        };
+        assert!(hints.register_discovered(healthy.clone()));
+        assert_eq!(
+            recover_hints(&store, &cancel).await.blocked,
+            0,
+            "do not re-inspect a blocked key on the next pass"
+        );
+        assert!(!hints.is_pending(&healthy), "the independent key still settles promptly");
+        assert_eq!(hints.pending_len(), 1, "the blocked key remains eligible for a later retry");
+        for (path, bytes) in backups.iter().zip(before) {
+            assert_eq!(std::fs::read(path).expect("retained historical evidence"), bytes);
         }
     }
 
@@ -1722,6 +1925,7 @@ mod tests {
                 pool: 0,
                 set: 0,
                 disk: disks[0].clone(),
+                available: true,
             },
             buckets: Some(VecDeque::from([bucket, other].map(|bucket| BucketScan {
                 bucket: bucket.to_owned(),

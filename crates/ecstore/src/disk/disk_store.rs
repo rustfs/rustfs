@@ -1975,6 +1975,26 @@ impl LocalDiskWrapper {
         self.cancel_token.cancel();
     }
 
+    pub(crate) fn retire_handle(&self) {
+        self.retired.cancel();
+        self.cancel_token.cancel();
+    }
+
+    /// Check the local handle without probing the disk. Native directory enumeration
+    /// bypasses the wrapper's I/O gate, so walkers must also check it between batches.
+    ///
+    /// # Errors
+    /// Returns `DiskNotFound` after retirement, or `FaultyDisk` while the I/O gate is faulty.
+    pub fn check_scanner_handle(&self) -> Result<()> {
+        if self.retired.is_cancelled() {
+            return Err(DiskError::DiskNotFound);
+        }
+        if self.health.is_faulty() {
+            return Err(DiskError::FaultyDisk);
+        }
+        Ok(())
+    }
+
     /// Observe retirement without granting callers authority to retire this wrapper.
     pub fn retirement_token(&self) -> CancellationToken {
         self.retired.child_token()

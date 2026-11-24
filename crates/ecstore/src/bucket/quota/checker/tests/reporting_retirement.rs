@@ -354,6 +354,41 @@ async fn quota_statistics_remain_available_without_a_complete_scanner_snapshot()
 }
 
 #[tokio::test]
+#[serial]
+async fn quota_statistics_exclude_local_deletes_while_snapshot_admission_retains_them() {
+    let (_dirs, store, _) = isolated_durable_quota_store().await;
+    let bucket = format!("quota-delete-report-{}", Uuid::new_v4().simple());
+    create_bucket_with_quota_json(&store, &bucket, legacy_quota_json(100)).await;
+    // Keep the snapshot-protocol control from initiating a background migration.
+    let metadata_sys = BucketMetadataSys::new(store.clone());
+    let (metadata, _) = metadata_sys.get_config(&bucket).await.expect("load quota metadata");
+    metadata_sys.set(bucket.clone(), metadata).await;
+    let checker = QuotaChecker::new(Arc::new(RwLock::new(metadata_sys)));
+    install_reporting_snapshot(store.clone(), &bucket, "complete", 60).await;
+    crate::data_usage::record_bucket_object_write_memory(&bucket, None, 40).await;
+
+    for (deleted, expected) in [(60, 40), (40, 0)] {
+        crate::data_usage::record_bucket_object_delete_memory(&bucket, deleted, true).await;
+        let (quota, usage) = checker.get_quota_stats(&bucket).await.expect("read quota statistics");
+        assert_eq!(quota.quota, Some(100));
+        assert_eq!(usage, Some(expected), "read-only quota GETs must report the surviving bytes");
+
+        let check = checker
+            .check_quota(&bucket, QuotaOperation::PutObject, 1)
+            .await
+            .expect("check snapshot quota");
+        assert_eq!(check.current_usage, Some(100));
+        assert!(!check.allowed, "reading statistics must not release held bytes for writes");
+    }
+
+    crate::data_usage::prepare_bucket_usage_for_namespace_change(&bucket, None)
+        .await
+        .expect("fixture cache cleanup");
+    crate::data_usage::invalidate_data_usage_snapshot_cache().await;
+    stop_reporting_fixture(&store).await;
+}
+
+#[tokio::test]
 async fn quota_statistics_preserve_configuration_errors() {
     let (_dirs, store, _) = isolated_durable_quota_store().await;
     let bucket = format!("quota-invalid-{}", Uuid::new_v4().simple());

@@ -30308,7 +30308,7 @@ mod delete_recovery_inventory_tests {
             .await
             .expect("seed actual version");
         let endpoint = set.set_endpoints[0].clone();
-        let ctx = crate::runtime::global::current_ctx();
+        let ctx = set.ctx.clone();
         let was_dist = ctx.is_dist_erasure().await;
         if was_dist {
             ctx.update_erasure_type(crate::layout::endpoints::SetupType::Erasure).await;
@@ -30351,14 +30351,6 @@ mod delete_recovery_inventory_tests {
         )
         .await
         .expect("queue real renewal writer");
-        let connected = map
-            .read()
-            .await
-            .get(&endpoint.to_string())
-            .cloned()
-            .flatten()
-            .expect("renewal registered new handle");
-        assert!(!Arc::ptr_eq(&connected, &disks[0]));
         drop(extra_gate);
         barrier.release();
         let outcome = tokio::time::timeout(Duration::from_secs(3), async { tokio::join!(renewal.as_mut(), &mut deletion) }).await;
@@ -30369,8 +30361,9 @@ mod delete_recovery_inventory_tests {
         if outcome.is_err() {
             let _ = deletion.await;
         }
-        {
+        let connected = {
             let mut map = map.write().await;
+            let connected = map.get(&endpoint.to_string()).cloned().flatten();
             match previous {
                 Some(old) => {
                     map.insert(endpoint.to_string(), old);
@@ -30379,13 +30372,18 @@ mod delete_recovery_inventory_tests {
                     map.remove(&endpoint.to_string());
                 }
             }
-        }
+            connected
+        };
         if was_dist {
             ctx.update_erasure_type(crate::layout::endpoints::SetupType::DistErasure)
                 .await;
         }
         let (_, result) =
             outcome.expect("batch DELETE and real queued disk renewal must finish without nested inventory-read deadlock");
+        let connected = connected.expect("renewal registered new handle");
+        let current = set.disk_inventory().await[0].clone().expect("renewal published set slot");
+        assert!(Arc::ptr_eq(&connected, &current), "both registries must agree after publication");
+        assert!(!Arc::ptr_eq(&connected, &disks[0]));
         let (_, errors) = result.expect("delete task must finish");
         assert!(errors.iter().all(Option::is_none), "DELETE result must remain successful: {errors:?}");
     }
