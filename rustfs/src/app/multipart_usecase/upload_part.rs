@@ -848,18 +848,29 @@ mod tests {
                         .body(Some(body))
                         .build()
                         .expect("part request");
-                    let mut request = build_request(input, Method::PUT);
-                    request
-                        .headers
-                        .insert("x-amz-decoded-content-length", HeaderValue::from_static("1024"));
+                    // Same facts `build_request` carried, plus the decoded-length and
+                    // optional aws-chunked headers this case asserts cannot bypass rejection.
+                    // Credentials, region, service, and extensions stay absent.
+                    let mut headers = http::HeaderMap::new();
+                    headers.insert("x-amz-decoded-content-length", HeaderValue::from_static("1024"));
                     if declared_chunk_encoding {
-                        request
-                            .headers
-                            .insert("content-encoding", HeaderValue::from_static("aws-chunked"));
+                        headers.insert("content-encoding", HeaderValue::from_static("aws-chunked"));
                     }
+                    let envelope = RequestEnvelope::from_parts(
+                        crate::app::RequestHead {
+                            method: Method::PUT,
+                            uri: http::Uri::from_static("/"),
+                            headers,
+                            credentials: None,
+                            region: None,
+                            service: None,
+                        },
+                        http::Extensions::new(),
+                    );
                     let error = usecase
-                        .execute_upload_part(request)
+                        .execute_upload_part_with_audit(envelope, UploadPartWriteInput::from_legacy(input, None))
                         .await
+                        .map_err(crate::error::legacy_error_for_test)
                         .err()
                         .expect("unknown or negative logical size");
                     assert_eq!(
