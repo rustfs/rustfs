@@ -3820,7 +3820,7 @@ where
     usize::try_from(size).unwrap_or_default()
 }
 
-fn is_decommission_set_local_usage_cache(bucket: &str, object: &str) -> bool {
+fn is_decommission_set_local_scanner_object(bucket: &str, object: &str) -> bool {
     if bucket != RUSTFS_META_BUCKET {
         return false;
     }
@@ -3830,8 +3830,11 @@ fn is_decommission_set_local_usage_cache(bucket: &str, object: &str) -> bool {
     else {
         return false;
     };
-    let name = match path.rsplit_once('/') {
-        Some((bucket, name)) if !bucket.is_empty() && !bucket.contains('/') && bucket != "." && bucket != ".." => name,
+    let name = match path.split_once('/') {
+        Some((bucket, rustfs_data_usage::BUCKET_SCAN_PROGRESS_OBJECT_NAME)) => {
+            return !crate::store::utils::is_reserved_or_invalid_bucket(bucket, false);
+        }
+        Some((bucket, name)) if !bucket.is_empty() && bucket != "." && bucket != ".." => name,
         Some(_) => return false,
         None => path,
     };
@@ -18225,10 +18228,10 @@ impl ECStore {
             max_attempts = DECOMMISSION_ENTRY_MAX_ATTEMPTS,
             "Decommission entry started"
         );
-        // Scanner caches describe their own erasure set and are rebuilt there.
+        // Scanner caches and progress samples describe their own erasure set and are rebuilt there.
         // Copying one onto another set can overwrite unrelated cache contents or
         // leave an unresolvable target-capacity intent after a conditional PUT.
-        if is_decommission_set_local_usage_cache(&bucket, &entry.name) {
+        if is_decommission_set_local_scanner_object(&bucket, &entry.name) {
             return Ok(DecommissionEntryAttemptOutcome::Complete);
         }
         let durable_ilm_record = if bucket == RUSTFS_META_BUCKET {
@@ -22011,7 +22014,13 @@ impl ECStore {
                             return;
                         }
 
-                        if is_decommission_set_local_usage_cache(&bucket_name, &entry.name) {
+                        let unresolved_entry = if require_all_disks {
+                            unresolved_entries_by_identity.get(&(set_index, bucket_name.clone(), entry.name.clone()))
+                        } else {
+                            None
+                        };
+                        let set_local = is_decommission_set_local_scanner_object(&bucket_name, &entry.name);
+                        if set_local && unresolved_entry.is_none() {
                             return;
                         }
 
@@ -22074,6 +22083,23 @@ impl ECStore {
                             }
                         };
 
+                        let record_resolved = async || {
+                            if let Some(unresolved_entry) = unresolved_entry {
+                                let mut resolved = resolved_unresolved_entries.lock().await;
+                                if !resolved.contains(unresolved_entry) {
+                                    resolved.push(unresolved_entry.clone());
+                                }
+                            }
+                        };
+                        if set_local {
+                            // A tracked local object needs a readable source version. A vanished
+                            // object is verified separately on every source disk.
+                            if !fivs.versions.is_empty() || !fivs.free_versions.is_empty() {
+                                record_resolved().await;
+                            }
+                            return;
+                        }
+
                         fivs.versions
                             .sort_by_key(|version| (version.mod_time.is_none(), std::cmp::Reverse(version.mod_time)));
 
@@ -22135,13 +22161,7 @@ impl ECStore {
                                 *first_path = Some(format!("{bucket_name}/{}", entry.name));
                             }
                         } else {
-                            let identity = (set_index, bucket_name.clone(), entry.name.clone());
-                            if let Some(unresolved_entry) = unresolved_entries_by_identity.get(&identity) {
-                                let mut resolved = resolved_unresolved_entries.lock().await;
-                                if !resolved.contains(unresolved_entry) {
-                                    resolved.push(unresolved_entry.clone());
-                                }
-                            }
+                            record_resolved().await;
                         }
 
                         versions_found.fetch_add(remaining, Ordering::Relaxed);
@@ -22409,19 +22429,32 @@ mod tests {
     }
 
     #[test]
-    fn decommission_set_local_usage_cache_classification_is_exact() {
+    fn decommission_set_local_scanner_object_classification_is_exact() {
         for object in [
             "buckets/.usage-cache.bin",
             "buckets/.usage-cache.bin.bkp",
             "buckets/photos/.usage-cache.bin",
             "buckets/photos/.usage-cache.bin.bkp",
+            "buckets/photos/.usage-progress.json",
         ] {
-            assert!(is_decommission_set_local_usage_cache(RUSTFS_META_BUCKET, object), "{object}");
-            assert!(!is_decommission_set_local_usage_cache("user-bucket", object), "{object}");
+            assert!(is_decommission_set_local_scanner_object(RUSTFS_META_BUCKET, object), "{object}");
+            assert!(!is_decommission_set_local_scanner_object("user-bucket", object), "{object}");
         }
         for object in [
             "buckets/.usage.v2.json",
             "buckets/.usage.v2.json.bkp",
+            "buckets/.usage.observed.json",
+            "buckets/.usage.buckets.json",
+            "buckets/.usage-progress.json",
+            "buckets/photos/.usage-progress.json.bkp",
+            "buckets/photos/.usage-progress.json.extra",
+            "buckets/photos/nested/.usage-progress.json",
+            "buckets/photos/.usage-progress.json/child",
+            "buckets//.usage-progress.json",
+            "buckets/./.usage-progress.json",
+            "buckets/../.usage-progress.json",
+            "buckets/.rustfs.sys/.usage-progress.json",
+            "config/photos/.usage-progress.json",
             "buckets/.usage-cache.bin.extra",
             "buckets/.usage-cache.bin.bkp.extra",
             "buckets/prefix.usage-cache.bin",
@@ -22435,13 +22468,13 @@ mod tests {
             "buckets-other/.usage-cache.bin",
             ".usage-cache.bin",
         ] {
-            assert!(!is_decommission_set_local_usage_cache(RUSTFS_META_BUCKET, object), "{object}");
+            assert!(!is_decommission_set_local_scanner_object(RUSTFS_META_BUCKET, object), "{object}");
         }
     }
 
     #[tokio::test]
     #[serial_test::serial]
-    async fn decommission_keeps_set_local_usage_caches_out_of_target_capacity() {
+    async fn decommission_keeps_set_local_scanner_objects_out_of_target_capacity() {
         use crate::object_api::PutObjReader;
         use tokio::io::AsyncReadExt as _;
 
@@ -22462,6 +22495,7 @@ mod tests {
             "buckets/.usage-cache.bin.bkp",
             "buckets/photos/.usage-cache.bin",
             "buckets/photos/.usage-cache.bin.bkp",
+            "buckets/photos/.usage-progress.json",
         ];
         let conflict_object = "buckets/.usage-cache.bin.conflict";
         let source_read_failure_object = "buckets/.usage-cache.bin.read-error";
@@ -22490,9 +22524,13 @@ mod tests {
         }
         let controls = [
             (RUSTFS_META_BUCKET, "buckets/.usage.v2.json"),
+            (RUSTFS_META_BUCKET, "buckets/.usage.observed.json"),
+            (RUSTFS_META_BUCKET, "buckets/.usage.buckets.json"),
+            (RUSTFS_META_BUCKET, "buckets/photos/.usage-progress.json.bkp"),
             (RUSTFS_META_BUCKET, "buckets/photos/.usage-cache.bin.extra"),
             (user_bucket, "ordinary-object"),
             (user_bucket, "buckets/.usage-cache.bin"),
+            (user_bucket, "buckets/photos/.usage-progress.json"),
         ];
         for (bucket, object) in controls {
             store.pools[0]
@@ -22691,7 +22729,7 @@ mod tests {
 
     #[tokio::test]
     #[serial_test::serial]
-    async fn decommission_final_sweep_excludes_only_set_local_usage_caches() {
+    async fn decommission_final_sweep_excludes_only_set_local_scanner_objects() {
         use crate::object_api::PutObjReader;
 
         let (_temp_dirs, store, _other_store) =
@@ -22701,6 +22739,7 @@ mod tests {
             "buckets/.usage-cache.bin.bkp",
             "buckets/photos/.usage-cache.bin",
             "buckets/photos/.usage-cache.bin.bkp",
+            "buckets/photos/.usage-progress.json",
         ] {
             store.pools[0]
                 .get_disks_by_key(object)
@@ -22729,12 +22768,15 @@ mod tests {
         store
             .check_after_decommission(0, &CancellationToken::new(), generation)
             .await
-            .expect("the four set-local cache forms must not block the final sweep");
+            .expect("set-local scanner objects must not block the final sweep");
 
         for object in [
             "buckets/.usage-cache.bin.extra",
             "buckets/photos/.usage-cache.bin.bkp.extra",
             "buckets/.usage.v2.json",
+            "buckets/.usage.observed.json",
+            "buckets/.usage.buckets.json",
+            "buckets/photos/.usage-progress.json.bkp",
         ] {
             let source_set = store.pools[0].get_disks_by_key(object);
             source_set
@@ -22760,7 +22802,7 @@ mod tests {
         store
             .check_after_decommission(0, &CancellationToken::new(), generation)
             .await
-            .expect("only the four set-local caches remain after removing the controls");
+            .expect("only the set-local scanner objects remain after removing the controls");
     }
 
     #[test]
@@ -36781,6 +36823,98 @@ mod pools_tests {
                 .unresolved_entries,
             in_memory_entries
         );
+    }
+
+    #[tokio::test]
+    async fn final_sweep_reconciles_retried_scan_progress_only_after_metadata_recovers() {
+        let (dirs, store) = temp_env::async_with_vars(
+            [
+                (rustfs_config::ENV_POOL_META_V2_WRITE, Some("true")),
+                (rustfs_config::ENV_POOL_META_V2_FLEET_CONFIRMED, Some("true")),
+            ],
+            metadata_sys::test_support::isolated_store_over_temp_disks(),
+        )
+        .await;
+        metadata_sys::init_bucket_metadata_sys(store.clone(), Vec::new()).await;
+        let object = rustfs_data_usage::bucket_scan_progress_path("photos");
+        let previous_generation = OffsetDateTime::UNIX_EPOCH;
+        let previous_entry = DecommissionUnresolvedEntry {
+            bucket: RUSTFS_META_BUCKET.to_owned(),
+            object: object.clone(),
+            pool_index: 0,
+            set_index: 0,
+            source_generation: previous_generation,
+            candidate_count: dirs.len(),
+            disk_error_count: 0,
+            observed_at: previous_generation,
+            reason: "metadata_resolution_failed".to_owned(),
+        };
+        {
+            let mut meta = store.pool_meta.write().await;
+            meta.dont_save = false;
+            meta.pools[0].decommission = Some(PoolDecommissionInfo {
+                failed: true,
+                unresolved_entries: vec![previous_entry],
+                ..Default::default()
+            });
+            meta.decommission(
+                0,
+                PoolSpaceInfo {
+                    free: 100,
+                    total: 100,
+                    used: 0,
+                },
+            )
+            .expect("retry the failed generation with its unresolved entry");
+        }
+        store
+            .save_current_pool_meta_for_test(&[0])
+            .await
+            .expect("persist the retry before running the final sweep");
+        let generation = store
+            .active_decommission_generation(0)
+            .await
+            .expect("active retry generation");
+
+        let mut heads = Vec::new();
+        for (index, dir) in dirs.iter().enumerate() {
+            let path = dir.path().join(RUSTFS_META_BUCKET).join(&object);
+            tokio::fs::create_dir_all(&path)
+                .await
+                .expect("create progress object directory");
+            let head = path.join(STORAGE_FORMAT_FILE);
+            tokio::fs::write(&head, format!("corrupt-xl-meta-{index}"))
+                .await
+                .expect("seed unresolved metadata on every disk");
+            heads.push(head);
+        }
+        let err = store
+            .check_after_decommission(0, &CancellationToken::new(), generation)
+            .await
+            .expect_err("the reserved progress path alone cannot verify an unresolved entry");
+        assert!(err.to_string().contains(&object), "unexpected final-sweep error: {err:?}");
+
+        let entries = store.pool_meta.read().await.pools[0]
+            .decommission
+            .as_ref()
+            .expect("active retry")
+            .unresolved_entries
+            .clone();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].source_generation, generation);
+        assert_eq!(entries[0].object, object);
+
+        for head in heads {
+            tokio::fs::remove_file(head).await.expect("remove damaged test metadata");
+        }
+        crate::config::com::save_config(store.pools[0].get_disks_by_key(&object), &object, b"{}".to_vec())
+            .await
+            .expect("rebuild a readable set-local progress object");
+        let verified = store
+            .check_after_decommission(0, &CancellationToken::new(), generation)
+            .await
+            .expect("a recovered progress object should reconcile during the retry");
+        assert_eq!(verified, entries);
     }
 
     #[tokio::test]
