@@ -6,7 +6,8 @@ Applies to `crates/kms/`.
 
 When changing key-management behavior, verify compatibility with:
 
-- `rustfs/src/storage/sse.rs`
+- `crates/sse/` (SSE key resolution; consumes this crate on the data path)
+- `rustfs/src/storage/sse.rs` (binds `crates/sse/` to the running server)
 - `rustfs/src/admin/handlers/kms.rs`
 - `rustfs/src/admin/handlers/kms_dynamic.rs`
 - `rustfs/src/admin/handlers/kms_keys.rs`

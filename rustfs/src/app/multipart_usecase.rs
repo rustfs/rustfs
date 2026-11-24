@@ -60,7 +60,7 @@ use super::storage_api::multipart_usecase::s3_api::multipart::{
 };
 use super::storage_api::multipart_usecase::set_disk::is_valid_storage_class;
 use super::storage_api::multipart_usecase::sse::{
-    DecryptionRequest, EncryptionKeyKind, EncryptionRequest, PrepareEncryptionRequest, SseKmsPrincipal,
+    DecryptionRequest, EncryptionKeyKind, EncryptionRequest, PrepareEncryptionRequest, SseKmsPrincipal, SseKmsPrincipalExt,
     apply_bucket_default_lock_retention, authorize_sse_kms_multipart_write, authorize_sse_kms_object_read,
     build_ssec_read_headers, encryption_material_to_metadata, extract_server_side_encryption_from_headers,
     extract_ssec_params_from_headers, extract_ssekms_context_from_headers, get_buffer_size_opt_in,

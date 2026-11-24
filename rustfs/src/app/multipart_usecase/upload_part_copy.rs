@@ -261,7 +261,8 @@ impl DefaultMultipartUsecase {
             content_size: 0,
             principal: None,
         }
-        .validate_multipart_ssec(&mp_info.user_defined)?;
+        .validate_multipart_ssec(&mp_info.user_defined)
+        .map_err(ApiError::from)?;
 
         let src_versioned = BucketVersioningSys::prefix_enabled(&src_bucket, &src_key).await;
         let src_version_suspended = BucketVersioningSys::prefix_suspended(&src_bucket, &src_key).await;

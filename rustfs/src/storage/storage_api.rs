@@ -452,8 +452,8 @@ pub(crate) mod s3_api_consumer {
 
 pub(crate) mod sse_consumer {
     pub(crate) use super::super::sse::{
-        EncryptionKeyKind, bucket_default_write_sse, build_ssec_read_headers, encryption_material_to_metadata,
-        extract_ssec_params_from_headers, extract_ssekms_context_from_headers, log_sse_kms_key_policy_mode,
+        EncryptionKeyKind, EncryptionMaterialExt, SseKmsPrincipalExt, bucket_default_write_sse, build_ssec_read_headers,
+        encryption_material_to_metadata, extract_ssec_params_from_headers, extract_ssekms_context_from_headers, init_sse_startup,
         map_get_object_reader_error, mark_encrypted_multipart_metadata, multipart_completion_authorization, stored_ssec_metadata,
     };
     pub(crate) use super::{
@@ -484,8 +484,7 @@ pub(crate) mod test_consumer {
     pub(crate) use super::super::access_owned::object_read::authorize_head_object;
     pub(crate) use super::super::legacy_s3_test_types;
     pub(crate) mod sse {
-        pub(crate) use super::super::super::sse::TestAuthorizationHooks;
-        pub(crate) use super::super::super::sse::tests::{RecordingKmsKeyAuthorizer, sse_kms_object_metadata};
+        pub(crate) use super::super::super::sse::{RecordingKmsKeyAuthorizer, TestAuthorizationHooks, sse_kms_object_metadata};
     }
     pub(crate) use super::super::{
         apply_cors_headers, apply_default_lock_retention_metadata, check_preconditions, decode_tags_to_map,

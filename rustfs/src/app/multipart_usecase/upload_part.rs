@@ -378,7 +378,8 @@ impl DefaultMultipartUsecase {
                 content_size: actual_size,
                 principal: None,
             }
-            .validate_multipart_ssec(&fi.user_defined)?;
+            .validate_multipart_ssec(&fi.user_defined)
+            .map_err(ApiError::from)?;
         }
         let (requested_sse, requested_kms_key_id) = if has_ssec {
             let ssec_material = sse_decryption(DecryptionRequest {
