@@ -245,12 +245,13 @@ mod tests {
             inventory.iter().any(|disk| Arc::ptr_eq(disk, &reopened)),
             "use the rebound handle for healing"
         );
+        // Keep the preferred endpoint busy until the rebound fallback is reacquired.
         slots.release(fallback);
-        slots.release(preferred);
         let mut parked = slots
             .take_for_bucket("wide", |disk| Arc::ptr_eq(disk, &reopened))
             .expect("available parked walker");
         assert!(Arc::ptr_eq(&parked.walker.disk, &reopened));
+        slots.release(preferred);
 
         let mut changed_format = set.as_ref().clone();
         changed_format.format.erasure.sets[0][index] = Uuid::new_v4();

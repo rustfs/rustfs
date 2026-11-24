@@ -27,7 +27,7 @@ async fn settle_namespace_commits(store: &ECStore) {
 }
 
 async fn complete_candidate(store: &Arc<ECStore>, cycle: u64) -> (crate::scanner_io::ScannerCycleResult, DataUsageInfo) {
-    let (result, candidate) = candidate_with_budget(store, cycle, Some(8)).await;
+    let (result, candidate) = candidate_with_budget(store, cycle, Some(8), None).await;
     assert_eq!(result.status, ScannerCycleStatus::Complete);
     let candidate = candidate.expect("complete scanner snapshot");
     assert!(candidate.usage_snapshot_complete);
@@ -41,6 +41,7 @@ async fn candidate_with_budget(
     store: &Arc<ECStore>,
     cycle: u64,
     max_objects: Option<u64>,
+    persisted_usage_baseline: Option<Bytes>,
 ) -> (crate::scanner_io::ScannerCycleResult, Option<DataUsageInfo>) {
     settle_namespace_commits(store).await;
     let ctx = CancellationToken::new();
@@ -66,7 +67,7 @@ async fn candidate_with_budget(
             leader_epoch: PROOF_EPOCH,
             scan_mode: HealScanMode::Normal,
             scan_scope: ScannerBucketScanScope::default(),
-            persisted_usage_baseline: None,
+            persisted_usage_baseline,
             completed_bucket_baseline: Ok(None),
             observed_usage_candidate: None,
             requires_full_scan: true,
@@ -910,6 +911,9 @@ async fn usage_durable_root_ack_requires_fresh_contributions_from_every_source()
     assert_eq!(fresh.usage_snapshot_set_states.len(), 2);
     assert_eq!(fresh.buckets_usage[PROOF_BUCKET].objects_count, 2);
     assert_eq!(fresh.buckets_usage[PROOF_BUCKET].size, 10);
+    let fresh_certificate = fresh.buckets_usage[PROOF_BUCKET]
+        .usage_certification
+        .expect("fresh bucket certificate");
     let fresh_bytes = serde_json::to_vec(&fresh).expect("exact all-source root");
     let publication = publish_candidate(&store, &fresh_scan, fresh, None).await;
     assert_eq!(publication.outcome(), DataUsagePersistOutcome::Saved);
@@ -920,7 +924,12 @@ async fn usage_durable_root_ack_requires_fresh_contributions_from_every_source()
     assert!(!crate::scanner_io::dirty_usage_buckets_pending());
 
     crate::scanner_io::record_dirty_usage_bucket(PROOF_BUCKET);
-    let (_, _) = candidate_with_budget(&store, PROOF_CYCLE + 1, Some(1)).await;
+    let baseline = read_data_usage_persist_baseline(store.clone())
+        .await
+        .expect("read the published root")
+        .data
+        .expect("prior root");
+    let (_, _) = candidate_with_budget(&store, PROOF_CYCLE + 1, Some(1), Some(baseline.clone())).await;
     let cache_name = path_join_buf(&[PROOF_BUCKET, DATA_USAGE_CACHE_NAME]);
     let mut mixed_source = None;
     for (index, pool) in store.pools.iter().enumerate() {
@@ -945,7 +954,7 @@ async fn usage_durable_root_ack_requires_fresh_contributions_from_every_source()
     }
     let mixed_source = mixed_source.expect("the count stop must retain a real source checkpoint");
     let dirty = crate::scanner_io::dirty_usage_buckets_for_tests();
-    let (scan, candidate) = candidate_with_budget(&store, PROOF_CYCLE + 2, None).await;
+    let (scan, candidate) = candidate_with_budget(&store, PROOF_CYCLE + 2, None, Some(baseline)).await;
     assert_eq!(
         scan.status,
         ScannerCycleStatus::Complete,
@@ -955,10 +964,13 @@ async fn usage_durable_root_ack_requires_fresh_contributions_from_every_source()
     assert_eq!(candidate.usage_snapshot_set_states.len(), 2);
     assert_eq!(candidate.usage_snapshot_pending_buckets, vec![PROOF_BUCKET.to_string()]);
     assert_eq!(candidate.usage_snapshot_converged, Some(false));
-    assert_eq!(candidate.buckets_usage[PROOF_BUCKET].objects_count, 2);
-    assert!(
-        candidate.buckets_usage[PROOF_BUCKET].usage_certification.is_none(),
-        "mixed source values cannot acquire a current certificate"
+    let carried = &candidate.buckets_usage[PROOF_BUCKET];
+    assert_eq!((carried.objects_count, carried.size), (2, 10));
+    assert_eq!(carried.usage_value_state, Some(rustfs_data_usage::BucketUsageValueState::Carried));
+    assert_eq!(
+        carried.usage_certification,
+        Some(fresh_certificate),
+        "mixed sources must retain the old certificate"
     );
     let publication = publish_candidate(&store, &scan, candidate, None).await;
     assert_eq!(publication.outcome(), DataUsagePersistOutcome::Saved);
