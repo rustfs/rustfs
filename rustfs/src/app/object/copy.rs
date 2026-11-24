@@ -1101,19 +1101,26 @@ mod tests {
 
     #[tokio::test]
     async fn copy_object_rejects_reserved_catalog_destination_before_store_lookup() {
-        let input = CopyObjectInput::builder()
-            .copy_source(CopySource::Bucket {
-                bucket: "source-bucket".into(),
-                key: "source-key".into(),
+        // Same facts `from_legacy` carried. Metadata directive, storage class, SSE, and tagging stay absent.
+        let input = CopyObjectWriteInput {
+            bucket: format!("missing-{}", Uuid::new_v4()),
+            key: ".rustfs-table/metadata/current.json".to_owned(),
+            copy_source: Some(CopySourceValue::Bucket {
+                bucket: "source-bucket".to_owned(),
+                key: "source-key".to_owned(),
                 version_id: None,
-            })
-            .bucket(format!("missing-{}", Uuid::new_v4()))
-            .key(".rustfs-table/metadata/current.json".to_string())
-            .build()
-            .unwrap();
-        let error = copy_method_only(&DefaultObjectUsecase::without_context(), input)
-            .await
-            .expect_err("reserved catalog destination must fail closed without bucket metadata");
+            }),
+            ..Default::default()
+        };
+        let usecase = DefaultObjectUsecase::without_context();
+        let error = Box::pin(async {
+            usecase
+                .execute_copy_object_owned(copy_envelope(HeaderMap::new()), input)
+                .await
+                .map_err(crate::error::legacy_error_for_test)
+        })
+        .await
+        .expect_err("reserved catalog destination must fail closed without bucket metadata");
         assert_eq!(error.code(), &S3ErrorCode::InvalidRequest);
         assert_eq!(error.message(), Some(crate::table_catalog::RESERVED_CATALOG_OBJECT_MESSAGE));
     }
