@@ -1412,17 +1412,17 @@ mod tests {
             .key(object.to_string())
             .build()
             .expect("create multipart input should build");
-        let mut initial_create_req = build_request(create_input.clone(), Method::POST);
-        initial_create_req
-            .headers
-            .insert(http::header::IF_NONE_MATCH, HeaderValue::from_static("*"));
-        let first_upload_id = usecase
-            .execute_create_multipart_upload_from_s3s(initial_create_req)
+        // Same If-None-Match header the s3s create request carried. Credentials, region, and service stay absent.
+        let first_created = usecase
+            .execute_create_multipart_upload(
+                completion_with_header(http::header::IF_NONE_MATCH, HeaderValue::from_static("*")),
+                super::super::CreateMultipartUploadFields::from_legacy(create_input.clone()),
+                None,
+            )
             .await
-            .expect("initial conditional create multipart upload should succeed")
-            .output
-            .upload_id
-            .expect("create response should contain upload id");
+            .expect("initial conditional create multipart upload should succeed");
+        let first_upload_id = first_created.upload_id;
+        assert!(!first_upload_id.is_empty(), "create response should contain upload id");
 
         let mut reader = PutObjReader::from_vec(initial_body.to_vec());
         let first_part = store
@@ -1446,15 +1446,18 @@ mod tests {
         let committed_etag = committed_info.etag.clone().expect("committed object should have an ETag");
         assert_eq!(committed_info.size, initial_body.len() as i64);
 
-        let mut second_create_req = build_request(create_input.clone(), Method::POST);
-        second_create_req
-            .headers
-            .insert(http::header::IF_NONE_MATCH, HeaderValue::from_static("*"));
-        let create_err = usecase
-            .execute_create_multipart_upload_from_s3s(second_create_req)
+        let create_err = match usecase
+            .execute_create_multipart_upload(
+                completion_with_header(http::header::IF_NONE_MATCH, HeaderValue::from_static("*")),
+                super::super::CreateMultipartUploadFields::from_legacy(create_input.clone()),
+                None,
+            )
             .await
-            .expect_err("create multipart upload with If-None-Match: * on existing key must fail");
-        assert_eq!(create_err.code(), &crate::app::storage_api::s3::S3ErrorCode::PreconditionFailed);
+        {
+            Err(error) => error,
+            Ok(_) => panic!("create multipart upload with If-None-Match: * on existing key must fail"),
+        };
+        assert_eq!(create_err.code(), &S3ErrorCode::PreconditionFailed);
 
         let second_created = usecase
             .execute_create_multipart_upload(
@@ -1620,17 +1623,16 @@ mod tests {
             .key(object.to_string())
             .build()
             .expect("delete-marker create input");
-        let mut dm_create_req = build_request(dm_create_input, Method::POST);
-        dm_create_req
-            .headers
-            .insert(http::header::IF_NONE_MATCH, HeaderValue::from_static("*"));
-        let dm_upload_id = usecase
-            .execute_create_multipart_upload_from_s3s(dm_create_req)
+        let dm_created = usecase
+            .execute_create_multipart_upload(
+                completion_with_header(http::header::IF_NONE_MATCH, HeaderValue::from_static("*")),
+                super::super::CreateMultipartUploadFields::from_legacy(dm_create_input),
+                None,
+            )
             .await
-            .expect("If-None-Match: * create must succeed past a delete marker")
-            .output
-            .upload_id
-            .expect("upload id");
+            .expect("If-None-Match: * create must succeed past a delete marker");
+        let dm_upload_id = dm_created.upload_id;
+        assert!(!dm_upload_id.is_empty(), "upload id");
         let mut dm_part_reader = PutObjReader::from_vec(b"after-delete-marker".to_vec());
         let dm_part = store
             .put_object_part(
