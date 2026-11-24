@@ -33,7 +33,7 @@ pub(crate) mod reference;
 mod scenarios;
 
 use crate::common::{RustFSTestEnvironment, init_logging, rustfs_binary_path, workspace_root};
-use compare::{Difference, Observation, Report, compare, compared_cases, compared_ops, render};
+use compare::{Difference, Observation, PairedReceipts, Report, compare, compared_cases, compared_ops, render};
 use reference::{SideA, binary_version};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -167,6 +167,7 @@ async fn run_differential(label: &str, config: &PairConfig) -> Run {
         compared_ops: compared_ops(&a, &b).len(),
         compared_cases: compared_cases(&a, &b),
         differences: compare(&a, &b),
+        responses: PairedReceipts::new(&a, &b),
     };
     let path = report.write_to(&report_directory()).expect("write the dual-stack report");
     Run { report, path, a }
