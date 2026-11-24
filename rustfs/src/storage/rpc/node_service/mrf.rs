@@ -204,13 +204,18 @@ fn error_code(error: &MrfLifecycleControlError) -> &'static str {
     }
 }
 
+const MAX_ACCEPTED_RISK_ACTOR_BYTES: usize = 256;
+
 pub(crate) async fn execute_action(
     action: MrfLegacyResponsibilityActionRequest,
     actor: String,
 ) -> Result<MrfActionResult, MrfLifecycleControlError> {
     validate_mrf_legacy_responsibility_action(&action)
         .map_err(|reason| MrfLifecycleControlError::InvalidAction(reason.into()))?;
-    if actor.trim().is_empty() || actor.len() > 256 {
+    if actor.trim().is_empty()
+        || (matches!(action.action, MrfLegacyResponsibilityAction::AcceptUnverifiedRisk)
+            && actor.len() > MAX_ACCEPTED_RISK_ACTOR_BYTES)
+    {
         return Err(MrfLifecycleControlError::InvalidAction("invalid authenticated actor".into()));
     }
     let state = match action.action {
@@ -257,4 +262,72 @@ pub(crate) async fn execute_action(
         data_verified: false,
         durable_responsibility_retained: true,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        MAX_ACCEPTED_RISK_ACTOR_BYTES, MrfLegacyResponsibilityAction, MrfLegacyResponsibilityActionRequest, execute_action,
+    };
+    use rustfs_heal::heal::mrf_queue::MrfLifecycleControlError;
+    use uuid::Uuid;
+
+    fn refresh_request() -> MrfLegacyResponsibilityActionRequest {
+        MrfLegacyResponsibilityActionRequest {
+            action: MrfLegacyResponsibilityAction::Refresh,
+            responsibility_id: Uuid::from_u128(1),
+            expected_bucket_incarnation_id: None,
+            acknowledge_unverified_data_risk: None,
+            acknowledge_unknown_source_incarnation: None,
+            acknowledge_bucket_incarnation_mismatch: None,
+            reason: None,
+            reference: None,
+            request_id: None,
+        }
+    }
+
+    fn accept_risk_request() -> MrfLegacyResponsibilityActionRequest {
+        MrfLegacyResponsibilityActionRequest {
+            action: MrfLegacyResponsibilityAction::AcceptUnverifiedRisk,
+            responsibility_id: Uuid::from_u128(1),
+            expected_bucket_incarnation_id: Some(Uuid::from_u128(2)),
+            acknowledge_unverified_data_risk: Some(true),
+            acknowledge_unknown_source_incarnation: Some(true),
+            acknowledge_bucket_incarnation_mismatch: Some(false),
+            reason: Some("accepted legacy unverified risk".into()),
+            reference: Some("INC-3194".into()),
+            request_id: Some(Uuid::from_u128(3)),
+        }
+    }
+
+    #[tokio::test]
+    async fn refresh_accepts_authenticated_actor_above_256_bytes_while_risk_acceptance_caps_it() {
+        let long_root_actor = "M".repeat(257);
+        let refresh_err = execute_action(refresh_request(), long_root_actor.clone())
+            .await
+            .expect_err("uninitialized queue returns unavailable after passing actor validation");
+        assert!(
+            !matches!(&refresh_err, MrfLifecycleControlError::InvalidAction(reason) if reason == "invalid authenticated actor"),
+            "refresh must not reject a 257-byte authenticated root actor: {refresh_err:?}"
+        );
+
+        let empty_err = execute_action(refresh_request(), "   ".into())
+            .await
+            .expect_err("blank actor must be rejected");
+        assert!(matches!(empty_err, MrfLifecycleControlError::InvalidAction(reason) if reason == "invalid authenticated actor"));
+
+        let risk_err = execute_action(accept_risk_request(), long_root_actor)
+            .await
+            .expect_err("persisted risk acceptance actor above 256 bytes must be rejected");
+        assert!(matches!(risk_err, MrfLifecycleControlError::InvalidAction(reason) if reason == "invalid authenticated actor"));
+
+        let bounded_actor = "M".repeat(MAX_ACCEPTED_RISK_ACTOR_BYTES);
+        let bounded_err = execute_action(accept_risk_request(), bounded_actor)
+            .await
+            .expect_err("uninitialized queue returns unavailable after passing actor validation");
+        assert!(
+            !matches!(&bounded_err, MrfLifecycleControlError::InvalidAction(reason) if reason == "invalid authenticated actor"),
+            "256-byte risk acceptance actor must pass validation: {bounded_err:?}"
+        );
+    }
 }
