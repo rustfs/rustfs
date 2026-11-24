@@ -230,12 +230,59 @@ pub async fn lookup_degraded_bucket_usage_baseline(store: Arc<ECStore>, bucket: 
         .and_then(|cached| cached.degraded_baseline.get(bucket).copied())
 }
 
+/// An immutable sample with its bucket certification metadata checked once.
+#[derive(Debug, Clone)]
+struct UsageSnapshot {
+    info: DataUsageInfo,
+    can_certify_buckets: bool,
+}
+
+impl UsageSnapshot {
+    fn new(info: DataUsageInfo) -> Self {
+        let pending = &info.usage_snapshot_pending_buckets;
+        let can_certify_buckets = info.is_complete_bucket_usage_snapshot()
+            && !info.usage_snapshot_observational
+            && info.scanner_cycle.is_some()
+            && info.scanner_epoch.is_some()
+            && u64::try_from(pending.len()).ok() == Some(info.usage_snapshot_pending_bucket_count)
+            && match info.usage_snapshot_converged {
+                Some(true) => pending.is_empty(),
+                Some(false) => !pending.is_empty() && pending.windows(2).all(|pair| pair[0] < pair[1]),
+                None => false,
+            };
+        Self {
+            info,
+            can_certify_buckets,
+        }
+    }
+
+    fn clone_info(&self) -> DataUsageInfo {
+        self.info.clone()
+    }
+
+    fn certified_bucket_usage(&self, bucket: &str, incarnation: uuid::Uuid) -> Option<u64> {
+        if !self.can_certify_buckets
+            || incarnation.is_nil()
+            || self
+                .info
+                .usage_snapshot_pending_buckets
+                .binary_search_by(|pending| pending.as_str().cmp(bucket))
+                .is_ok()
+        {
+            return None;
+        }
+        let usage = self.info.buckets_usage.get(bucket)?;
+        let certified = uuid::Uuid::parse_str(usage.bucket_incarnation.as_deref()?).ok()?;
+        (certified == incarnation).then_some(usage.size)
+    }
+}
+
 /// Cached copy of the last persisted data usage snapshot, served to admin
 /// endpoints for up to `DATA_USAGE_CACHE_TTL_SECS` between backend reads.
 #[derive(Debug, Clone)]
 struct CachedDataUsageSnapshot {
     /// Last successful load, retained through failures for lineage comparison.
-    info: Option<DataUsageInfo>,
+    snapshot: Option<UsageSnapshot>,
     /// Controls serving independently from the retained ordering evidence.
     last_load_failed: bool,
     loaded_at: tokio::time::Instant,
@@ -247,8 +294,8 @@ struct CachedDataUsageSnapshot {
 }
 
 impl CachedDataUsageSnapshot {
-    fn result<T>(&self, project: impl FnOnce(&DataUsageInfo) -> T) -> Result<T, Error> {
-        self.info
+    fn result<T>(&self, project: impl FnOnce(&UsageSnapshot) -> T) -> Result<T, Error> {
+        self.snapshot
             .as_ref()
             .filter(|_| !self.last_load_failed)
             .map(project)
@@ -260,7 +307,7 @@ fn fresh_cached_data_usage_snapshot<T>(
     cache: &Option<CachedDataUsageSnapshot>,
     now: tokio::time::Instant,
     ttl: Duration,
-    project: impl FnOnce(&DataUsageInfo) -> T,
+    project: impl FnOnce(&UsageSnapshot) -> T,
 ) -> Option<Result<T, Error>> {
     cache
         .as_ref()
@@ -274,7 +321,7 @@ fn cache_data_usage_snapshot_result<T>(
     loaded_at: tokio::time::Instant,
     refresh_generation: u64,
     current_generation: u64,
-    project: impl FnOnce(&DataUsageInfo) -> T,
+    project: impl FnOnce(&UsageSnapshot) -> T,
 ) -> Option<Result<T, Error>> {
     if current_generation != refresh_generation {
         return None;
@@ -290,12 +337,12 @@ fn cache_data_usage_snapshot_result<T>(
             // retry age without replacing a newer snapshot this process has
             // already read; snapshot size itself is not an ordering signal.
             if let Some(previous) = cache.as_mut()
-                && let Some(cached_info) = previous.info.as_ref()
-                && snapshot_predates(&info, cached_info)
+                && let Some(cached_snapshot) = previous.snapshot.as_ref()
+                && snapshot_predates(&info, &cached_snapshot.info)
             {
                 previous.loaded_at = loaded_at;
                 previous.last_load_failed = false;
-                return Some(Ok(project(cached_info)));
+                return Some(Ok(project(cached_snapshot)));
             }
             // A flaky observed read must not shrink quota coverage for a TTL
             // window: carry the previous refresh's baseline entries forward,
@@ -305,9 +352,10 @@ fn cache_data_usage_snapshot_result<T>(
                     degraded_baseline.entry(bucket.clone()).or_insert(*size);
                 }
             }
-            let projected = project(&info);
+            let snapshot = UsageSnapshot::new(info);
+            let projected = project(&snapshot);
             *cache = Some(CachedDataUsageSnapshot {
-                info: Some(info),
+                snapshot: Some(snapshot),
                 last_load_failed: false,
                 loaded_at,
                 degraded_baseline,
@@ -318,7 +366,7 @@ fn cache_data_usage_snapshot_result<T>(
             // A failed load is negatively cached, but cannot erase the last
             // good snapshot's ordering proof or grounded quota baseline.
             let cached = cache.get_or_insert_with(|| CachedDataUsageSnapshot {
-                info: None,
+                snapshot: None,
                 last_load_failed: true,
                 loaded_at,
                 degraded_baseline: HashMap::new(),
@@ -1601,7 +1649,7 @@ async fn normalize_loaded_data_usage(
 /// `save_data_usage_in_backend` invalidates the cache so a fresh scanner save
 /// is visible immediately in the saving process.
 pub async fn load_data_usage_from_backend_cached(store: Arc<ECStore>) -> Result<DataUsageInfo, Error> {
-    project_data_usage_from_backend_cached(store, DataUsageInfo::clone).await
+    project_data_usage_from_backend_cached(store, UsageSnapshot::clone_info).await
 }
 
 /// Read one bucket's persisted usage without cloning the complete snapshot.
@@ -1610,47 +1658,14 @@ pub async fn load_bucket_usage_from_backend_cached(
     bucket: &str,
     incarnation: uuid::Uuid,
 ) -> Result<Option<u64>, Error> {
-    project_data_usage_from_backend_cached(store, |info| certified_bucket_usage(info, bucket, incarnation)).await
-}
-
-fn certified_bucket_usage(info: &DataUsageInfo, bucket: &str, incarnation: uuid::Uuid) -> Option<u64> {
-    if incarnation.is_nil()
-        || !info.is_complete_bucket_usage_snapshot()
-        || info.usage_snapshot_observational
-        || info.scanner_cycle.is_none()
-        || info.scanner_epoch.is_none()
-    {
-        return None;
-    }
-    let pending_count = u64::try_from(info.usage_snapshot_pending_buckets.len()).ok()?;
-    if pending_count != info.usage_snapshot_pending_bucket_count {
-        return None;
-    }
-    match info.usage_snapshot_converged {
-        Some(true) if pending_count == 0 => {}
-        Some(false)
-            if pending_count > 0
-                && info.usage_snapshot_pending_buckets.windows(2).all(|pair| pair[0] < pair[1])
-                && info
-                    .usage_snapshot_pending_buckets
-                    .binary_search_by(|pending| pending.as_str().cmp(bucket))
-                    .is_err() => {}
-        _ => return None,
-    }
-    let usage = info.buckets_usage.get(bucket)?;
-    let certified = usage
-        .bucket_incarnation
-        .as_deref()
-        .and_then(|id| uuid::Uuid::parse_str(id).ok())
-        .filter(|id| !id.is_nil())?;
-    (certified == incarnation).then_some(usage.size)
+    project_data_usage_from_backend_cached(store, |snapshot| snapshot.certified_bucket_usage(bucket, incarnation)).await
 }
 
 // Project under the cache guard so scalar readers never copy the snapshot's
 // bucket maps. The owned API shares the same TTL, refresh and invalidation path.
 async fn project_data_usage_from_backend_cached<T>(
     store: Arc<ECStore>,
-    project: impl Fn(&DataUsageInfo) -> T,
+    project: impl Fn(&UsageSnapshot) -> T,
 ) -> Result<T, Error> {
     let ttl = Duration::from_secs(DATA_USAGE_CACHE_TTL_SECS);
 
@@ -1699,7 +1714,8 @@ async fn load_admin_data_usage_snapshot_cached(store: Arc<ECStore>) -> Result<Da
     loop {
         {
             let cache = admin_data_usage_snapshot_cache().read().await;
-            if let Some(result) = fresh_cached_data_usage_snapshot(&cache, tokio::time::Instant::now(), ttl, DataUsageInfo::clone)
+            if let Some(result) =
+                fresh_cached_data_usage_snapshot(&cache, tokio::time::Instant::now(), ttl, UsageSnapshot::clone_info)
             {
                 return result;
             }
@@ -1711,7 +1727,8 @@ async fn load_admin_data_usage_snapshot_cached(store: Arc<ECStore>) -> Result<Da
             .await;
         {
             let cache = admin_data_usage_snapshot_cache().read().await;
-            if let Some(result) = fresh_cached_data_usage_snapshot(&cache, tokio::time::Instant::now(), ttl, DataUsageInfo::clone)
+            if let Some(result) =
+                fresh_cached_data_usage_snapshot(&cache, tokio::time::Instant::now(), ttl, UsageSnapshot::clone_info)
             {
                 return result;
             }
@@ -1733,7 +1750,7 @@ async fn load_admin_data_usage_snapshot_cached(store: Arc<ECStore>) -> Result<Da
             loaded_at,
             refresh_generation,
             admin_data_usage_snapshot_generation(),
-            DataUsageInfo::clone,
+            UsageSnapshot::clone_info,
         ) {
             return result;
         }
@@ -2481,7 +2498,7 @@ async fn get_persisted_bucket_usage(bucket: &str) -> Option<u64> {
 }
 
 async fn persisted_bucket_usage(store: Arc<ECStore>, bucket: &str) -> Option<u64> {
-    project_data_usage_from_backend_cached(store, |info| info.buckets_usage.get(bucket).map(|usage| usage.size))
+    project_data_usage_from_backend_cached(store, |snapshot| snapshot.info.buckets_usage.get(bucket).map(|usage| usage.size))
         .await
         .ok()
         .flatten()
@@ -2511,9 +2528,10 @@ fn unknown_bucket_reload_due(cache: &Option<CachedDataUsageSnapshot>, bucket: &s
     if cached.last_load_failed {
         return false;
     }
-    let Some(info) = cached.info.as_ref() else {
+    let Some(snapshot) = cached.snapshot.as_ref() else {
         return false;
     };
+    let info = &snapshot.info;
     if info.buckets_usage.contains_key(bucket)
         || cached.degraded_baseline.contains_key(bucket)
         || now.duration_since(cached.loaded_at) < refresh_age
@@ -2601,7 +2619,7 @@ where
         tokio::time::Instant::now(),
         refresh_generation,
         data_usage_snapshot_generation(),
-        |info| info.buckets_usage.contains_key(bucket),
+        |snapshot| snapshot.info.buckets_usage.contains_key(bucket),
     )
     .is_some_and(|result| matches!(result, Ok(true)))
 }
@@ -4415,7 +4433,7 @@ mod tests {
     async fn install_data_usage_snapshot_cache_for_test(info: DataUsageInfo, age: Duration) {
         let degraded_baseline = info.bucket_sizes.clone();
         *data_usage_snapshot_cache().write().await = Some(CachedDataUsageSnapshot {
-            info: Some(info),
+            snapshot: Some(UsageSnapshot::new(info)),
             last_load_failed: false,
             loaded_at: tokio::time::Instant::now()
                 .checked_sub(age)
@@ -4468,8 +4486,8 @@ mod tests {
             .read()
             .await
             .as_ref()
-            .and_then(|cached| cached.info.as_ref())
-            .and_then(|info| info.buckets_usage.get(bucket))
+            .and_then(|cached| cached.snapshot.as_ref())
+            .and_then(|snapshot| snapshot.info.buckets_usage.get(bucket))
             .map(|usage| usage.size)
     }
 
@@ -4833,7 +4851,7 @@ mod tests {
             loaded_at,
             refresh_generation,
             data_usage_snapshot_generation(),
-            DataUsageInfo::clone,
+            UsageSnapshot::clone_info,
         )
         .expect("an uninterrupted refresh should populate the cache");
         assert!(matches!(first, Err(Error::ErasureReadQuorum)));
@@ -4842,7 +4860,7 @@ mod tests {
             &cache,
             loaded_at + Duration::from_secs(1),
             Duration::from_secs(30),
-            DataUsageInfo::clone,
+            UsageSnapshot::clone_info,
         )
         .expect("the failed load must remain cached within the TTL");
         assert!(cached.is_err());
@@ -4852,7 +4870,7 @@ mod tests {
                 &cache,
                 loaded_at + Duration::from_secs(30),
                 Duration::from_secs(30),
-                DataUsageInfo::clone
+                UsageSnapshot::clone_info
             )
             .is_none()
         );
@@ -4876,7 +4894,7 @@ mod tests {
             loaded_at,
             refresh_generation,
             data_usage_snapshot_generation(),
-            DataUsageInfo::clone,
+            UsageSnapshot::clone_info,
         )
         .expect("an uninterrupted refresh should populate the cache")
         .expect("successful load must be returned");
@@ -4886,7 +4904,7 @@ mod tests {
             &cache,
             loaded_at + Duration::from_secs(1),
             Duration::from_secs(30),
-            DataUsageInfo::clone,
+            UsageSnapshot::clone_info,
         )
         .expect("successful load must remain cached within the TTL")
         .expect("cached success must remain successful");
@@ -5070,7 +5088,7 @@ mod tests {
         observed.usage_snapshot_converged = Some(false);
         observed.usage_snapshot_authoritative_baseline = Some(baseline.snapshot_identity());
         let mut cache = Some(CachedDataUsageSnapshot {
-            info: Some(observed),
+            snapshot: Some(UsageSnapshot::new(observed)),
             last_load_failed: false,
             loaded_at,
             degraded_baseline: HashMap::new(),
@@ -5082,7 +5100,7 @@ mod tests {
             loaded_at,
             1,
             1,
-            DataUsageInfo::clone,
+            UsageSnapshot::clone_info,
         )
         .expect("matching refresh generation")
         .expect("a newer authority must retire observations of its predecessor");
@@ -5109,7 +5127,7 @@ mod tests {
             (loaded.scanner_epoch, loaded.scanner_cycle) = loaded_position;
             let expected = if accept { &loaded } else { &previous };
             let mut cache = Some(CachedDataUsageSnapshot {
-                info: Some(previous.clone()),
+                snapshot: Some(UsageSnapshot::new(previous.clone())),
                 last_load_failed: false,
                 loaded_at,
                 degraded_baseline: HashMap::new(),
@@ -5120,7 +5138,7 @@ mod tests {
                 loaded_at,
                 1,
                 1,
-                DataUsageInfo::clone,
+                UsageSnapshot::clone_info,
             )
             .expect("matching refresh generation")
             .expect("a valid usage snapshot remains available");
@@ -5136,7 +5154,7 @@ mod tests {
         let loaded_at = tokio::time::Instant::now();
         let expected = data_usage_info_for_test("bucket", 3, 42, SystemTime::UNIX_EPOCH + Duration::from_secs(2));
         let mut cache = Some(CachedDataUsageSnapshot {
-            info: Some(expected.clone()),
+            snapshot: Some(UsageSnapshot::new(expected.clone())),
             last_load_failed: false,
             loaded_at,
             degraded_baseline: HashMap::from([("bucket".to_string(), 42)]),
@@ -5148,7 +5166,7 @@ mod tests {
             refreshed_at,
             1,
             1,
-            DataUsageInfo::clone,
+            UsageSnapshot::clone_info,
         )
         .expect("matching refresh generation")
         .expect("the newer cached snapshot remains available");
@@ -5157,13 +5175,23 @@ mod tests {
         assert_eq!(retained.degraded_baseline.get("bucket"), Some(&42));
         assert_eq!(retained.loaded_at, refreshed_at, "an older fallback must retain the TTL backoff");
 
-        let result =
-            cache_data_usage_snapshot_result(&mut cache, Err(Error::ErasureReadQuorum), refreshed_at, 1, 1, DataUsageInfo::clone)
-                .expect("matching refresh generation");
+        let result = cache_data_usage_snapshot_result(
+            &mut cache,
+            Err(Error::ErasureReadQuorum),
+            refreshed_at,
+            1,
+            1,
+            UsageSnapshot::clone_info,
+        )
+        .expect("matching refresh generation");
         assert!(matches!(result, Err(Error::ErasureReadQuorum)));
         let failed = cache.as_ref().expect("negative cache should be populated");
         assert!(failed.last_load_failed);
-        assert_eq!(failed.info.as_ref(), Some(&expected), "failure must retain the last good ordering proof");
+        assert_eq!(
+            failed.snapshot.as_ref().map(|snapshot| &snapshot.info),
+            Some(&expected),
+            "failure must retain the last good ordering proof"
+        );
     }
 
     #[test]
@@ -5172,7 +5200,7 @@ mod tests {
         let now = SystemTime::now();
         let future = now + rustfs_data_usage::USAGE_LAST_UPDATE_FUTURE_TOLERANCE + Duration::from_secs(60);
         let mut cache = Some(CachedDataUsageSnapshot {
-            info: Some(data_usage_info_for_test("bucket", 3, 42, future)),
+            snapshot: Some(UsageSnapshot::new(data_usage_info_for_test("bucket", 3, 42, future))),
             last_load_failed: false,
             loaded_at,
             degraded_baseline: HashMap::new(),
@@ -5184,7 +5212,7 @@ mod tests {
             loaded_at,
             1,
             1,
-            DataUsageInfo::clone,
+            UsageSnapshot::clone_info,
         )
         .expect("matching refresh generation")
         .expect("a clock recovery snapshot must not be frozen behind an untrusted timestamp");
@@ -5202,16 +5230,22 @@ mod tests {
             loaded_at,
             1,
             1,
-            DataUsageInfo::clone,
+            UsageSnapshot::clone_info,
         )
         .expect("matching refresh generation")
         .expect("prime the last successful snapshot");
         assert_eq!(first, current);
 
         let failed_at = loaded_at + Duration::from_secs(DATA_USAGE_CACHE_TTL_SECS);
-        let failure =
-            cache_data_usage_snapshot_result(&mut cache, Err(Error::ErasureReadQuorum), failed_at, 1, 1, DataUsageInfo::clone)
-                .expect("matching refresh generation");
+        let failure = cache_data_usage_snapshot_result(
+            &mut cache,
+            Err(Error::ErasureReadQuorum),
+            failed_at,
+            1,
+            1,
+            UsageSnapshot::clone_info,
+        )
+        .expect("matching refresh generation");
         assert!(matches!(failure, Err(Error::ErasureReadQuorum)));
         assert!(
             fresh_cached_data_usage_snapshot(
@@ -5239,7 +5273,7 @@ mod tests {
             recovered_at,
             1,
             1,
-            DataUsageInfo::clone,
+            UsageSnapshot::clone_info,
         )
         .expect("matching refresh generation")
         .expect("a readable older backup must preserve the last good lineage");
@@ -5250,8 +5284,9 @@ mod tests {
             "a failed load must not erase the baseline's ordering proof"
         );
         assert_eq!(
-            fresh_cached_data_usage_snapshot(&cache, recovered_at, Duration::from_secs(DATA_USAGE_CACHE_TTL_SECS), |info| info
-                .objects_total_size,)
+            fresh_cached_data_usage_snapshot(&cache, recovered_at, Duration::from_secs(DATA_USAGE_CACHE_TTL_SECS), |snapshot| {
+                snapshot.info.objects_total_size
+            },)
             .expect("the recovered load starts a fresh TTL")
             .expect("the last successful snapshot is available again"),
             42
@@ -5264,7 +5299,7 @@ mod tests {
         let loaded_at = tokio::time::Instant::now();
         let refresh_generation = data_usage_snapshot_generation();
         let mut cache = Some(CachedDataUsageSnapshot {
-            info: Some(data_usage_info_for_test("bucket", 1, 42, SystemTime::UNIX_EPOCH)),
+            snapshot: Some(UsageSnapshot::new(data_usage_info_for_test("bucket", 1, 42, SystemTime::UNIX_EPOCH))),
             last_load_failed: false,
             loaded_at,
             degraded_baseline: HashMap::from([("observed-only".to_string(), 7_u64), ("covered".to_string(), 1)]),
@@ -5280,7 +5315,7 @@ mod tests {
             loaded_at,
             refresh_generation,
             data_usage_snapshot_generation(),
-            DataUsageInfo::clone,
+            UsageSnapshot::clone_info,
         )
         .expect("an uninterrupted refresh should populate the cache")
         .expect("successful load must be returned");
@@ -5298,7 +5333,7 @@ mod tests {
         let loaded_at = tokio::time::Instant::now();
         let refresh_generation = data_usage_snapshot_generation();
         let mut cache = Some(CachedDataUsageSnapshot {
-            info: Some(data_usage_info_for_test("stale", 1, 42, SystemTime::UNIX_EPOCH)),
+            snapshot: Some(UsageSnapshot::new(data_usage_info_for_test("stale", 1, 42, SystemTime::UNIX_EPOCH))),
             last_load_failed: false,
             loaded_at,
             degraded_baseline: HashMap::new(),
@@ -5315,7 +5350,7 @@ mod tests {
             loaded_at,
             refresh_generation,
             data_usage_snapshot_generation(),
-            DataUsageInfo::clone,
+            UsageSnapshot::clone_info,
         );
 
         assert!(stale_result.is_none());
@@ -6487,7 +6522,7 @@ mod tests {
         let successor = data_usage_info_for_test(BUCKET, 7, 294, SystemTime::now());
         let mut snapshot_cache = data_usage_snapshot_cache().write().await;
         *snapshot_cache = Some(CachedDataUsageSnapshot {
-            info: Some(successor),
+            snapshot: Some(UsageSnapshot::new(successor)),
             last_load_failed: false,
             loaded_at: tokio::time::Instant::now(),
             degraded_baseline: HashMap::new(),
@@ -6521,8 +6556,8 @@ mod tests {
         assert_eq!(
             snapshot_cache
                 .as_ref()
-                .and_then(|cached| cached.info.as_ref())
-                .and_then(|info| info.buckets_usage.get(BUCKET))
+                .and_then(|cached| cached.snapshot.as_ref())
+                .and_then(|snapshot| snapshot.info.buckets_usage.get(BUCKET))
                 .map(|usage| usage.objects_count),
             Some(7),
             "fresh successor snapshot cache must not be erased after namespace lock loss"
@@ -6559,7 +6594,7 @@ mod tests {
         let successor = data_usage_info_for_test(BUCKET, 7, 294, SystemTime::now());
         let mut snapshot_cache = data_usage_snapshot_cache().write().await;
         *snapshot_cache = Some(CachedDataUsageSnapshot {
-            info: Some(successor),
+            snapshot: Some(UsageSnapshot::new(successor)),
             last_load_failed: false,
             loaded_at: tokio::time::Instant::now(),
             degraded_baseline: HashMap::new(),
@@ -6590,8 +6625,8 @@ mod tests {
         assert_eq!(
             snapshot_cache
                 .as_ref()
-                .and_then(|cached| cached.info.as_ref())
-                .and_then(|info| info.buckets_usage.get(BUCKET))
+                .and_then(|cached| cached.snapshot.as_ref())
+                .and_then(|snapshot| snapshot.info.buckets_usage.get(BUCKET))
                 .map(|usage| usage.objects_count),
             Some(7),
             "fresh successor snapshot cache must not be erased by final invalidation after lock loss"
@@ -6612,7 +6647,7 @@ mod tests {
         };
         let stale = data_usage_info_for_test(BUCKET, 7, 294, SystemTime::now());
         *data_usage_snapshot_cache().write().await = Some(CachedDataUsageSnapshot {
-            info: Some(stale),
+            snapshot: Some(UsageSnapshot::new(stale)),
             last_load_failed: false,
             loaded_at: tokio::time::Instant::now(),
             degraded_baseline: HashMap::new(),

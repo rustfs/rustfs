@@ -205,6 +205,7 @@ fn native_copy_part_rejects_unproved_owner_without_changing_parts() {
                 copy_source_range: None,
                 copy_source_if_match: None,
                 copy_source_if_none_match: None,
+                copy_source_dates: Default::default(),
                 sse_customer_algorithm: None,
                 sse_customer_key: None,
                 sse_customer_key_md5: None,

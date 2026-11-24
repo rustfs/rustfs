@@ -655,26 +655,31 @@ mod tests {
         let ranged_body = ranged.body.collect().await?.into_bytes();
         assert_eq!(&ranged_body[..], &system_body[..4]);
 
-        let capacity = tokio::time::timeout(std::time::Duration::from_secs(180), async {
+        tokio::time::timeout(std::time::Duration::from_secs(180), async {
             loop {
                 match client.get_object().bucket(bucket).key(CAPACITY_KEY).send().await {
-                    Ok(capacity) => break Ok(capacity),
-                    Err(err) if err.code() == Some("ServiceUnavailable") => {
-                        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                    Ok(capacity) => {
+                        assert_eq!(capacity.content_type(), Some("application/xml"));
+                        let body = capacity.body.collect().await?.into_bytes();
+                        let xml = std::str::from_utf8(&body)?;
+                        let capacity: u64 = xml_text(xml, "Capacity")?.parse()?;
+                        let available: u64 = xml_text(xml, "Available")?.parse()?;
+                        let used = xml_text(xml, "Used")?;
+                        assert!(capacity > 0 && available <= capacity, "{xml}");
+                        if used != "-1" {
+                            let used: u64 = used.parse()?;
+                            assert!(used <= capacity, "{xml}");
+                            assert!(available <= capacity - used, "{xml}");
+                            break Ok::<(), Box<dyn std::error::Error + Send + Sync>>(());
+                        }
                     }
-                    Err(err) => break Err(err),
+                    Err(err) if err.code() == Some("ServiceUnavailable") => {}
+                    Err(err) => return Err(err.into()),
                 }
+                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
             }
         })
         .await??;
-        assert_eq!(capacity.content_type(), Some("application/xml"));
-        let capacity_body = capacity.body.collect().await?.into_bytes();
-        let capacity_xml = std::str::from_utf8(&capacity_body)?;
-        let capacity_value = xml_u64(capacity_xml, "Capacity")?;
-        let available_value = xml_u64(capacity_xml, "Available")?;
-        let used_value = xml_u64(capacity_xml, "Used")?;
-        assert!(used_value <= capacity_value, "{capacity_xml}");
-        assert!(available_value <= capacity_value.saturating_sub(used_value), "{capacity_xml}");
 
         let put_err = client
             .put_object()
@@ -737,7 +742,7 @@ mod tests {
         Ok(())
     }
 
-    fn xml_u64(xml: &str, element: &str) -> Result<u64, Box<dyn std::error::Error + Send + Sync>> {
+    fn xml_text<'a>(xml: &'a str, element: &str) -> Result<&'a str, Box<dyn std::error::Error + Send + Sync>> {
         let start = format!("<{element}>");
         let end = format!("</{element}>");
         let start_idx = xml.find(&start).ok_or_else(|| format!("missing {element} in {xml}"))? + start.len();
@@ -745,7 +750,7 @@ mod tests {
             .find(&end)
             .ok_or_else(|| format!("unclosed {element} in {xml}"))?
             + start_idx;
-        Ok(xml[start_idx..end_idx].parse()?)
+        Ok(&xml[start_idx..end_idx])
     }
 
     #[tokio::test]
