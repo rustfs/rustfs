@@ -148,6 +148,23 @@ pub async fn node_service_time_out_client_for_class(
     Ok(node_client_on_channel(channel, interceptor))
 }
 
+/// Select the control client before building a batch body. A known rejection
+/// only disables the optional batch route for this peer incarnation.
+pub(crate) async fn node_service_rename_batch_client(
+    addr: &str,
+    interceptor: TonicInterceptor,
+) -> Result<Option<NodeServiceClient<InterceptedService<AuthenticatedChannel, TonicInterceptor>>>, Box<dyn Error>> {
+    let interceptor = interceptor.with_rpc_audience(addr)?;
+    let channel = get_internode_channel_for_class(addr, ChannelClass::Control).await?;
+    if let (TonicInterceptor::Signature(signature), Some(connection)) = (&interceptor, channel.connection_snapshot())
+        && let Some(audience) = signature.audience.as_deref()
+        && rename_batch_unsupported(audience, connection)
+    {
+        return Ok(None);
+    }
+    Ok(Some(node_client_on_channel(channel, interceptor)))
+}
+
 pub(crate) async fn staged_shard_verification_client(
     addr: &str,
     interceptor: TonicInterceptor,
@@ -704,11 +721,13 @@ impl PeerReplayStateSnapshot {
 // Bounds state left by explicitly rebuilt channel IDs. Eviction only forces that connection to
 // request another proof; it cannot enable msgpack sending.
 const MSGPACK_CONNECTION_STATES_PER_PEER: usize = 64;
+const RENAME_BATCH_REJECTION_CAPACITY: usize = 512;
 
 #[derive(Default)]
 struct PeerReplayRegistry {
     replay: HashMap<String, PeerReplayState>,
     msgpack_by_channel: HashMap<String, HashMap<u64, PeerMsgpackCapability>>,
+    rename_batch_rejections: HashMap<String, (GrpcConnectionSnapshot, Uuid)>,
 }
 
 impl PeerReplayRegistry {
@@ -751,6 +770,56 @@ impl PeerReplayRegistry {
 }
 
 static PEER_REPLAY_STATES: LazyLock<Mutex<PeerReplayRegistry>> = LazyLock::new(|| Mutex::new(PeerReplayRegistry::default()));
+
+fn rename_batch_unsupported(audience: &str, connection: GrpcConnectionSnapshot) -> bool {
+    PEER_REPLAY_STATES.lock().is_ok_and(|states| {
+        states
+            .rename_batch_rejections
+            .get(audience)
+            .is_some_and(|(known, boot_epoch)| {
+                *known == connection
+                    && states.replay.get(audience).is_some_and(|state| {
+                        state.boot_epoch == Some(*boot_epoch) && state.cache_capability != Some(PeerReplayCapability::Revoked)
+                    })
+            })
+    })
+}
+
+impl PeerReplayRegistry {
+    fn remember_rename_batch_rejection(&mut self, audience: String, connection: GrpcConnectionSnapshot, boot_epoch: Uuid) {
+        if !self.replay.get(&audience).is_some_and(|state| {
+            state.boot_epoch == Some(boot_epoch) && state.cache_capability != Some(PeerReplayCapability::Revoked)
+        }) || self
+            .rename_batch_rejections
+            .get(&audience)
+            .is_some_and(|(known, _)| known.generation >= connection.generation)
+        {
+            return;
+        }
+
+        // Eviction only permits another ordinary batch attempt.
+        if self.rename_batch_rejections.len() >= RENAME_BATCH_REJECTION_CAPACITY
+            && !self.rename_batch_rejections.contains_key(&audience)
+            && let Some(victim) = self.rename_batch_rejections.keys().next().cloned()
+        {
+            self.rename_batch_rejections.remove(&victim);
+        }
+        self.rename_batch_rejections.insert(audience, (connection, boot_epoch));
+    }
+}
+
+fn remember_rename_batch_rejection(audience: String, connection: GrpcConnectionSnapshot, boot_epoch: Uuid) {
+    if let Ok(mut states) = PEER_REPLAY_STATES.lock() {
+        states.remember_rename_batch_rejection(audience, connection, boot_epoch);
+    }
+}
+
+fn explicit_batch_rejection(status: http::StatusCode, headers: &http::HeaderMap) -> bool {
+    status == http::StatusCode::OK
+        && headers.get("grpc-status").is_some_and(|value| value.as_bytes() == b"12")
+        && !headers.contains_key("grpc-status-details-bin")
+        && tonic::Status::from_header_map(headers).is_some_and(|status| status.code() == tonic::Code::Unimplemented)
+}
 
 impl<S> ReplayScopeChannel<S> {
     fn new(inner: S, audience: Option<String>, connection_state: Option<GrpcConnectionState>) -> Self {
@@ -949,6 +1018,7 @@ pub(crate) fn clear_peer_replay_state_for_addr(addr: &str) -> std::io::Result<()
     if let Ok(mut states) = PEER_REPLAY_STATES.lock() {
         states.replay.remove(&audience);
         states.msgpack_by_channel.remove(&audience);
+        states.rename_batch_rejections.remove(&audience);
     }
     Ok(())
 }
@@ -1035,6 +1105,10 @@ fn apply_peer_capabilities_response_for_connection(
 
             if current_state.boot_epoch != next_state.boot_epoch {
                 states.msgpack_by_channel.remove(&audience);
+                states.rename_batch_rejections.remove(&audience);
+            }
+            if next_state.cache_capability == Some(PeerReplayCapability::Revoked) {
+                states.rename_batch_rejections.remove(&audience);
             }
             if sent_state.msgpack_capability == current_snapshot.msgpack_capability
                 && sent_state.connection == current_connection
@@ -1219,6 +1293,18 @@ where
                     )
                 }
                 let current_connection = connection_state.as_ref().and_then(GrpcConnectionState::snapshot);
+                // A delayed or reconnected call cannot teach a different physical connection.
+                let rejection = if rpc_method
+                    .as_ref()
+                    .is_some_and(|method| method.service() == "node_service.NodeService" && method.method() == "RenameDataBatch")
+                    && explicit_batch_rejection(response.status(), response.headers())
+                    && let Some(connection) = current_connection.filter(|_| current_connection == sent_state.connection)
+                    && let Ok(proof) = &response_state
+                {
+                    Some((audience.clone(), connection, proof.boot_epoch))
+                } else {
+                    None
+                };
                 apply_peer_capabilities_response_for_connection(
                     audience,
                     sent_state,
@@ -1226,6 +1312,9 @@ where
                     msgpack_response,
                     current_connection,
                 );
+                if let Some((audience, connection, boot_epoch)) = rejection {
+                    remember_rename_batch_rejection(audience, connection, boot_epoch);
+                }
             }
             rustfs_io_metrics::record_put_object_stage_duration_from(
                 rustfs_io_metrics::PUT_STAGE_SET_DISK_RENAME_REMOTE_CLIENT_REPLAY_RESPONSE,
@@ -1886,6 +1975,7 @@ mod tests {
             .expect("peer capability cache lock must not be poisoned");
         states.replay.remove(audience);
         states.msgpack_by_channel.remove(audience);
+        states.rename_batch_rejections.remove(audience);
     }
 
     fn set_peer_capability(audience: &str, state: PeerReplayState) {
@@ -2648,6 +2738,97 @@ mod tests {
         assert!(manual_policy.omit_eligible_json());
         let disabled_policy = prepare_msgpack_send_policy_with_gates(Some(audience), Some(connection), false, false);
         assert!(!disabled_policy.omit_eligible_json());
+        clear_peer_capability(audience);
+    }
+
+    #[test]
+    fn rename_batch_rejection_table_remains_bounded_during_peer_churn() {
+        let mut states = PeerReplayRegistry::default();
+        let epoch = Uuid::new_v4();
+        let mut last = String::new();
+        for index in 0..=RENAME_BATCH_REJECTION_CAPACITY {
+            let audience = format!("rename-churn-{index}:9000");
+            let connection = GrpcConnectionState::new().record_connected();
+            states.replay.insert(
+                audience.clone(),
+                PeerReplayState {
+                    boot_epoch: Some(epoch),
+                    ..Default::default()
+                },
+            );
+            states.remember_rename_batch_rejection(audience.clone(), connection, epoch);
+            last = audience;
+        }
+        assert_eq!(states.rename_batch_rejections.len(), RENAME_BATCH_REJECTION_CAPACITY);
+        assert!(states.rename_batch_rejections.contains_key(&last));
+    }
+
+    #[test]
+    fn rename_batch_rejection_agrees_with_tonics_initial_status() {
+        let mut headers = http::HeaderMap::new();
+        headers.insert("grpc-status", http::HeaderValue::from_static("12"));
+        assert!(explicit_batch_rejection(http::StatusCode::OK, &headers));
+        assert!(!explicit_batch_rejection(http::StatusCode::NOT_FOUND, &headers));
+        headers.insert("grpc-message", http::HeaderValue::from_static("%FF"));
+        assert!(!explicit_batch_rejection(http::StatusCode::OK, &headers));
+        headers.clear();
+        headers.insert("grpc-status", http::HeaderValue::from_static("14"));
+        assert!(!explicit_batch_rejection(http::StatusCode::OK, &headers));
+    }
+
+    #[test]
+    fn rename_batch_rejection_follows_the_physical_connection_and_boot_epoch() {
+        let audience = "rename-batch-rejection-generation-test:9000";
+        clear_peer_capability(audience);
+        let epoch = Uuid::new_v4();
+        let state = GrpcConnectionState::new();
+        let first = state.record_connected();
+        set_peer_capability(
+            audience,
+            PeerReplayState {
+                boot_epoch: Some(epoch),
+                ..Default::default()
+            },
+        );
+        remember_rename_batch_rejection(audience.to_owned(), first, epoch);
+        assert!(rename_batch_unsupported(audience, first));
+
+        let second = state.record_connected();
+        assert!(!rename_batch_unsupported(audience, second));
+        remember_rename_batch_rejection(audience.to_owned(), second, epoch);
+        remember_rename_batch_rejection(audience.to_owned(), first, epoch);
+        assert!(
+            rename_batch_unsupported(audience, second),
+            "a late response cannot replace the latest generation"
+        );
+        assert!(!rename_batch_unsupported(audience, first));
+
+        set_peer_capability(
+            audience,
+            PeerReplayState {
+                boot_epoch: Some(epoch),
+                cache_capability: Some(PeerReplayCapability::Revoked),
+                ..Default::default()
+            },
+        );
+        assert!(
+            !rename_batch_unsupported(audience, second),
+            "a revoked proof cannot suppress a fresh probe"
+        );
+
+        let restarted_epoch = Uuid::new_v4();
+        set_peer_capability(
+            audience,
+            PeerReplayState {
+                boot_epoch: Some(restarted_epoch),
+                ..Default::default()
+            },
+        );
+        remember_rename_batch_rejection(audience.to_owned(), second, epoch);
+        assert!(
+            !rename_batch_unsupported(audience, second),
+            "a superseded boot epoch cannot suppress a fresh probe"
+        );
         clear_peer_capability(audience);
     }
 
