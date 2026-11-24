@@ -41,8 +41,9 @@ import gateway_corpus_capture as capture
 MAX_WIRE_BYTES = 8 * 1024 * 1024
 HEADERS = {
     "accept-ranges", "cache-control", "content-disposition", "content-encoding", "content-language",
-    "content-range", "content-type", "etag", "expires", "x-amz-delete-marker", "x-amz-object-lock-legal-hold",
-    "x-amz-object-lock-mode", "x-amz-object-lock-retain-until-date", "x-amz-request-charged", "x-amz-version-id",
+    "content-range", "content-type", "etag", "expires", "x-amz-copy-source-version-id", "x-amz-delete-marker",
+    "x-amz-expiration", "x-amz-mp-parts-count", "x-amz-object-lock-legal-hold", "x-amz-object-lock-mode",
+    "x-amz-object-lock-retain-until-date", "x-amz-replication-status", "x-amz-request-charged", "x-amz-version-id",
     "x-amz-website-redirect-location",
 }
 HEADER_PREFIXES = ("x-amz-server-side-encryption", "x-amz-meta-", "x-amz-checksum-")

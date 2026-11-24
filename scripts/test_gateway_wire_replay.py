@@ -72,6 +72,18 @@ class WireTests(unittest.TestCase):
                         candidate = wire.project(operation, method, 200, headers, body)
                         self.assertEqual(wire.differences(reference, candidate), expected)
 
+    def test_archived_s3_response_headers(self):
+        cases = [
+            ("PutObject", "PUT", 200, "X-Amz-Expiration", 'expiry-date="Tue, 01 Jan 2030 00:00:00 GMT", rule-id="logs"'),
+            ("CopyObject", "PUT", 200, "X-Amz-Copy-Source-Version-Id", "source-version"),
+            ("HeadObject", "HEAD", 200, "X-Amz-Replication-Status", "COMPLETED"),
+            ("GetObject", "GET", 206, "X-Amz-Mp-Parts-Count", "3"),
+        ]
+        for operation, method, status, name, value in cases:
+            with self.subTest(operation=operation, header=name):
+                response = wire.project(operation, method, status, [(name, value)], b"")
+                self.assertEqual(response["headers"], [(name.lower(), value)])
+
     def test_content_length_checked_before_wire_differences(self):
         with self.assertRaises(wire.ReplayError):
             wire.project("GetObject", "GET", 200, [("Content-Length", "1")], b"two")
