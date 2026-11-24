@@ -38,7 +38,7 @@ use crate::admin::auth::{SelfServiceMutation, validate_admin_request};
 use crate::admin::operation::{AdminRequest, AdminResponse, Operation};
 use crate::admin::router::{AdminOperation, S3Router};
 use crate::admin::runtime_sources::{current_action_credentials, current_ready_iam_handle, object_store_from_envelope};
-use crate::admin::service::caller_identity::{CallerIdentity, oidc_profile_fields};
+use crate::admin::service::caller_identity::{CallerIdentity, OidcProfileFields, oidc_profile_fields};
 use crate::admin::storage_api::s3::{self, S3ErrorCode, S3Result};
 use crate::admin::utils::read_compatible_admin_body;
 use crate::auth::constant_time_eq;
@@ -76,10 +76,8 @@ pub struct SelfAccountInfoHandler {}
 struct SelfAccountInfoResponse {
     #[serde(flatten)]
     account: SelfAccountInfo,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    username: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    email: Option<String>,
+    #[serde(flatten)]
+    profile: OidcProfileFields,
 }
 
 #[async_trait::async_trait]
@@ -133,7 +131,7 @@ impl Operation for SelfAccountInfoHandler {
             None => return Err(s3::error(S3ErrorCode::ServiceUnavailable, "the object store is not ready")),
         };
 
-        let (username, email) = oidc_profile_fields(&caller.credentials);
+        let profile = oidc_profile_fields(&caller.credentials);
         let info = SelfAccountInfoResponse {
             account: SelfAccountInfo {
                 access_key: caller.access_key.clone(),
@@ -147,8 +145,7 @@ impl Operation for SelfAccountInfoHandler {
                 mutable: caller.mutability(),
                 mfa,
             },
-            username,
-            email,
+            profile,
         };
 
         owned_admin_json_response(req.uri().path(), &caller.credentials.secret_key, StatusCode::OK, &info)
@@ -592,20 +589,26 @@ mod tests {
                 mutable: AccountMutability::default(),
                 mfa: AccountMfaSummary::default(),
             },
-            username: Some("oidc-user".to_string()),
-            email: Some("oidc-user@example.test".to_string()),
+            profile: OidcProfileFields {
+                username: Some("oidc-user".to_string()),
+                email: Some("oidc-user@example.test".to_string()),
+                display_name: Some("OIDC User".to_string()),
+                picture: Some("https://idp.example.test/oidc-user.png".to_string()),
+            },
         };
 
         let value = serde_json::to_value(&response).expect("serialize account response");
         assert_eq!(value["access_key"], "virtual-parent");
         assert_eq!(value["username"], "oidc-user");
         assert_eq!(value["email"], "oidc-user@example.test");
+        assert_eq!(value["display_name"], "OIDC User");
+        assert_eq!(value["picture"], "https://idp.example.test/oidc-user.png");
 
-        response.username = None;
-        response.email = None;
+        response.profile = OidcProfileFields::default();
         let legacy_shape = serde_json::to_value(&response).expect("serialize account response without OIDC fields");
-        assert!(!legacy_shape.as_object().unwrap().contains_key("username"));
-        assert!(!legacy_shape.as_object().unwrap().contains_key("email"));
+        for key in ["username", "email", "display_name", "picture"] {
+            assert!(!legacy_shape.as_object().unwrap().contains_key(key), "{key} must be omitted");
+        }
     }
 
     fn change_request(current: &str, new: &str) -> ChangePasswordRequest {

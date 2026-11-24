@@ -178,9 +178,16 @@ pub(crate) mod access_consumer {
         authorize_missing_object_disclosure, authorize_request, authorize_request_core, log_list_buckets_iam_implicit_deny,
         prepare_list_buckets_iam_authorization,
     };
-    pub(crate) use super::super::authorization_actions::delete_object_authorize_action;
+    pub(crate) use super::super::authorization::{
+        authorize_replication_only_put_headers, authorize_staged_multipart_part, authorize_write_etag_condition,
+        has_write_offset_bytes_header, load_bucket_generation, missing_req_info_error, table_data_plane_content_mutation,
+    };
+    pub(crate) use super::super::authorization_actions::{
+        delete_object_authorize_action, versioned_read_action, versioned_tagging_action,
+    };
     pub(crate) use super::super::denial_audit::DenialAuditor;
     pub(crate) use super::super::helper::{AuditRequestView, DenialScope};
+    pub(crate) use super::super::options::destination_version_id;
     pub(crate) use super::super::req_info::ReqInfo;
     pub(crate) use super::super::request_markers::StagedMultipartPartAuthorization;
     pub(crate) use super::super::request_markers::{
@@ -342,8 +349,9 @@ pub(crate) mod rpc_consumer {
         pub(crate) use super::super::{
             DeleteOptions, DiskStore, RemoteBackgroundIo, StorageDiskRpcExt, WalkDirOptions, check_and_record_signed_rpc_nonce,
             find_local_disk_by_ref_for_rpc, find_local_disk_by_ref_for_scanner_rpc, rpc_background_admission,
-            sign_ns_scanner_capability_with_usage_capabilities, sign_ns_scanner_usage_watch_capability, sign_put_file_capability,
-            verify_put_file_auth_trailer, verify_rpc_signature, with_remote_background_io,
+            sign_ns_scanner_capability_with_usage_capabilities, sign_ns_scanner_tier_registry_preflight_capability,
+            sign_ns_scanner_usage_watch_capability, sign_put_file_capability, verify_put_file_auth_trailer, verify_rpc_signature,
+            with_remote_background_io,
         };
     }
 
@@ -445,8 +453,8 @@ pub(crate) mod s3_api_consumer {
 
 pub(crate) mod sse_consumer {
     pub(crate) use super::super::sse::{
-        EncryptionKeyKind, bucket_default_write_sse, build_ssec_read_headers, encryption_material_to_metadata,
-        extract_ssec_params_from_headers, extract_ssekms_context_from_headers, log_sse_kms_key_policy_mode,
+        EncryptionKeyKind, EncryptionMaterialExt, SseKmsPrincipalExt, bucket_default_write_sse, build_ssec_read_headers,
+        encryption_material_to_metadata, extract_ssec_params_from_headers, extract_ssekms_context_from_headers, init_sse_startup,
         map_get_object_reader_error, mark_encrypted_multipart_metadata, multipart_completion_authorization, stored_ssec_metadata,
     };
     pub(crate) use super::{
@@ -475,9 +483,9 @@ pub(crate) mod tonic_service_consumer {
 #[cfg(test)]
 pub(crate) mod test_consumer {
     pub(crate) use super::super::access_owned::object_read::authorize_head_object;
+    pub(crate) use super::super::legacy_s3_test_types;
     pub(crate) mod sse {
-        pub(crate) use super::super::super::sse::TestAuthorizationHooks;
-        pub(crate) use super::super::super::sse::tests::{RecordingKmsKeyAuthorizer, sse_kms_object_metadata};
+        pub(crate) use super::super::super::sse::{RecordingKmsKeyAuthorizer, TestAuthorizationHooks, sse_kms_object_metadata};
     }
     pub(crate) use super::super::{
         apply_cors_headers, apply_default_lock_retention_metadata, check_preconditions, decode_tags_to_map,
@@ -681,15 +689,14 @@ pub(crate) mod ecstore_internode {
 }
 
 pub(crate) mod ecstore_rpc {
-    #[cfg(test)]
-    pub(crate) use rustfs_ecstore::api::rpc::verify_ns_scanner_capability_with_checkpoint_coverage;
     pub(crate) use rustfs_ecstore::api::rpc::{
         KMS_SIGNAL_SUBSYSTEM, LocalPeerS3Client, MAX_NETWORK_PROBE_BYTES, MAX_NETWORK_PROBE_DURATION, NetworkPeerProbeClient,
         NetworkPeerProbeError, PEER_RESTDRY_RUN, PEER_RESTSIGNAL, PEER_RESTSUB_SYS, PeerRestClient, PeerS3Client,
         SERVICE_SIGNAL_REFRESH_CONFIG, SERVICE_SIGNAL_RELOAD_DYNAMIC, TONIC_RPC_PREFIX, check_and_record_signed_rpc_nonce,
         decode_heal_bucket_rpc_options, normalize_tonic_rpc_audience, rpc_auth_is_resource_exhausted, rpc_background_admission,
-        sign_ns_scanner_capability_with_usage_capabilities, sign_ns_scanner_usage_watch_capability, sign_put_file_capability,
-        sign_tonic_rpc_response_proof, tonic_boot_epoch_challenge, tonic_boot_epoch_response_headers_with_msgpack_capability,
+        sign_ns_scanner_capability_with_usage_capabilities, sign_ns_scanner_tier_registry_preflight_capability,
+        sign_ns_scanner_usage_watch_capability, sign_put_file_capability, sign_tonic_rpc_response_proof,
+        tonic_boot_epoch_challenge, tonic_boot_epoch_response_headers_with_msgpack_capability,
         tonic_msgpack_manifest_capability_requested, tonic_rpc_auth_failure_reason, verify_put_file_auth_trailer,
         verify_rpc_signature, verify_tonic_canonical_body_digest, verify_tonic_mutation_body_digest,
         verify_tonic_mutation_body_digest_reject_unsigned, verify_tonic_rpc_signature_with_bootstrap,
@@ -700,6 +707,10 @@ pub(crate) mod ecstore_rpc {
         gen_tonic_replay_scope_headers, gen_tonic_signature_headers, set_tonic_canonical_body_digest,
         tonic_boot_epoch_response_headers, verify_ns_scanner_capability_with_usage_capabilities, verify_put_file_capability,
         verify_tonic_boot_epoch_response, verify_tonic_rpc_response_proof,
+    };
+    #[cfg(test)]
+    pub(crate) use rustfs_ecstore::api::rpc::{
+        verify_ns_scanner_capability_with_checkpoint_coverage, verify_ns_scanner_tier_registry_preflight_capability,
     };
 }
 
@@ -2453,6 +2464,13 @@ pub(crate) fn verify_put_file_auth_trailer(
     trailer: &[u8],
 ) -> std::io::Result<String> {
     ecstore_rpc::verify_put_file_auth_trailer(url, method, nonce, trailer)
+}
+
+pub(crate) fn sign_ns_scanner_tier_registry_preflight_capability(
+    challenge: uuid::Uuid,
+    server_epoch: uuid::Uuid,
+) -> std::io::Result<Vec<u8>> {
+    ecstore_rpc::sign_ns_scanner_tier_registry_preflight_capability(challenge, server_epoch)
 }
 
 pub(crate) fn sign_ns_scanner_usage_watch_capability(

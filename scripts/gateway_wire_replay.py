@@ -15,7 +15,7 @@
 """Compare identical signed Ceph requests on two disposable loopback servers."""
 
 import argparse
-from collections import Counter
+from collections import Counter, defaultdict
 from contextlib import contextmanager, redirect_stderr, redirect_stdout
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
@@ -41,8 +41,10 @@ import gateway_corpus_capture as capture
 MAX_WIRE_BYTES = 8 * 1024 * 1024
 HEADERS = {
     "accept-ranges", "cache-control", "content-disposition", "content-encoding", "content-language",
-    "content-range", "content-type", "etag", "expires", "x-amz-delete-marker", "x-amz-request-charged",
-    "x-amz-version-id", "x-amz-website-redirect-location",
+    "content-range", "content-type", "etag", "expires", "location", "x-amz-copy-source-version-id", "x-amz-delete-marker",
+    "x-amz-expiration", "x-amz-mp-parts-count", "x-amz-object-lock-legal-hold", "x-amz-object-lock-mode",
+    "x-amz-object-lock-retain-until-date", "x-amz-replication-status", "x-amz-request-charged", "x-amz-version-id",
+    "x-amz-website-redirect-location",
 }
 HEADER_PREFIXES = ("x-amz-server-side-encryption", "x-amz-meta-", "x-amz-checksum-")
 EXPECTED_CONTROLS = {"changed_error_code": ["error_code", "body"], "changed_object": ["body"]}
@@ -89,6 +91,32 @@ def project(operation, method, status, headers, body):
 
 def differences(left, right):
     return [field for field in left if left[field] != right[field]]
+
+
+def header_differences(reference, candidate):
+    """Describe projected header changes without exposing values or user-defined names."""
+    def group(headers):
+        values = defaultdict(list)
+        for name, value in headers:
+            values[name].append(value)
+        return values
+
+    left, right = group(reference), group(candidate)
+    changes = defaultdict(set)
+    for name in left.keys() | right.keys():
+        if name not in left:
+            direction = "candidate_added"
+        elif name not in right:
+            direction = "candidate_missing"
+        elif left[name] != right[name]:
+            direction = "values_changed"
+        else:
+            continue
+        if name in HEADERS or name == "content-length":
+            changes[direction].add(name)
+        else:
+            changes[direction].update(prefix + "*" for prefix in HEADER_PREFIXES if name.startswith(prefix))
+    return {direction: sorted(names) for direction, names in sorted(changes.items())}
 
 
 class SdkBody(io.BytesIO):
@@ -139,7 +167,10 @@ class WireReplay:
         self.operations[self.operation] += 1
         fields = differences(left, right)
         if fields:
-            self.diffs.append({"case": self.case, "request": self.counts[self.case], "operation": self.operation, "fields": fields})
+            diagnostic = {"case": self.case, "request": self.counts[self.case], "operation": self.operation, "fields": fields}
+            if "headers" in fields:
+                diagnostic["header_differences"] = header_differences(left["headers"], right["headers"])
+            self.diffs.append(diagnostic)
         if "changed_error_code" not in self.controls and left["error_code"] == "NoSuchKey":
             changed = content.replace(b"<Code>NoSuchKey</Code>", b"<Code>NoSuchBucket</Code>", 1)
             headers = [(k, str(len(changed)) if k.lower() == "content-length" else v) for k, v in reference_headers]

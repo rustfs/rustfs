@@ -22,7 +22,7 @@
 
 mod extra;
 
-use super::compare::Observation;
+use super::compare::{Observation, WireHead};
 use crate::common::{RustFSTestEnvironment, build_test_s3_config};
 use aws_sdk_s3::Client;
 use aws_sdk_s3::config::interceptors::BeforeDeserializationInterceptorContextRef;
@@ -67,7 +67,11 @@ const RETAIN_UNTIL_SECS: i64 = 4_070_908_800;
 const SELECT_DEADLINE: Duration = Duration::from_secs(30);
 
 type Fields = Vec<(&'static str, String)>;
-type Captured = (u16, Vec<(String, String)>);
+#[derive(Default, Debug)]
+struct Captured {
+    wire: Option<WireHead>,
+    sdk: Option<(u16, Vec<(String, String)>)>,
+}
 
 /// Every method of `impl S3 for FS` in `rustfs/src/storage/ecfs.rs`, by S3 operation name, sorted.
 /// Derived with
@@ -152,17 +156,32 @@ pub(crate) const OPERATIONS: [&str; 73] = [
 
 /// Records the status and headers of the one response each request receives (retries are off).
 #[derive(Clone, Debug, Default)]
-struct ResponseCapture(Arc<Mutex<Option<Captured>>>);
+struct ResponseCapture(Arc<Mutex<Captured>>);
 
 impl ResponseCapture {
-    fn take(&self) -> Option<Captured> {
-        self.0.lock().ok().and_then(|mut slot| slot.take())
+    fn take(&self) -> Captured {
+        self.0.lock().map(|mut slot| std::mem::take(&mut *slot)).unwrap_or_default()
     }
 }
 
 impl Intercept for ResponseCapture {
     fn name(&self) -> &'static str {
         "dual-stack-response-capture"
+    }
+
+    fn read_after_transmit(
+        &self,
+        context: &BeforeDeserializationInterceptorContextRef<'_>,
+        _runtime_components: &RuntimeComponents,
+        _cfg: &mut ConfigBag,
+    ) -> Result<(), BoxError> {
+        let response = context.response();
+        let head = WireHead::new(response.status().as_u16(), response.headers().iter().map(|(name, _)| name));
+        self.0
+            .lock()
+            .map_err(|_| std::io::Error::other("response capture mutex was poisoned"))?
+            .wire = Some(head);
+        Ok(())
     }
 
     fn read_before_deserialization(
@@ -177,11 +196,10 @@ impl Intercept for ResponseCapture {
             .iter()
             .map(|(name, value)| (name.to_owned(), value.to_owned()))
             .collect();
-        *self
-            .0
+        self.0
             .lock()
-            .map_err(|_| std::io::Error::other("response capture mutex was poisoned"))? =
-            Some((response.status().as_u16(), headers));
+            .map_err(|_| std::io::Error::other("response capture mutex was poisoned"))?
+            .sdk = Some((response.status().as_u16(), headers));
         Ok(())
     }
 }
@@ -277,25 +295,27 @@ impl Recorder {
     {
         let _ = self.capture.take();
         let result = request.await;
-        let (status, headers) = self.capture.take().unwrap_or_default();
+        let captured = self.capture.take();
+        let (status, headers) = captured.sdk.unwrap_or_default();
         let headers = headers.iter().map(|(name, value)| (name.as_str(), value.as_str()));
-        match result {
+        let (mut observation, output) = match result {
             Ok(output) => {
                 let observation = fields(&output)
                     .into_iter()
                     .fold(Observation::new(op, case, status, None, headers), |observation, (name, value)| {
                         observation.with_field(name, value)
                     });
-                self.observations.push(observation);
-                Some(output)
+                (observation, Some(output))
             }
             Err(error) => {
                 let mut observation = Observation::new(op, case, status, Some(error_code(&error)), headers);
                 observation.message = error.as_service_error().and_then(|e| e.message()).map(str::to_owned);
-                self.observations.push(observation);
-                None
+                (observation, None)
             }
-        }
+        };
+        observation.wire_head = captured.wire;
+        self.observations.push(observation);
+        output
     }
 
     /// Adds a field decoded after the response headers arrived (a streamed body).
@@ -1150,6 +1170,64 @@ mod tests {
     use super::super::compare::compare;
     use super::OPERATIONS;
     use super::{Observation, md5_hex, normalize_sse_c_etags};
+
+    #[tokio::test]
+    async fn head_object_receipt_uses_the_transmitted_headers_before_the_sdk_derives_expires_string() {
+        use super::{Client, Recorder, ResponseCapture, RetryConfig, build_test_s3_config, none};
+        use crate::dual_stack_differential::compare::PairedReceipts;
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+        const DATE: &str = "Wed, 21 Oct 2037 07:28:00 GMT";
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let capture = ResponseCapture::default();
+        let client = Client::from_conf(
+            build_test_s3_config(&endpoint, "test", &uuid::Uuid::new_v4().to_string(), None, "wire-head")
+                .to_builder()
+                .retry_config(RetryConfig::disabled())
+                .interceptor(capture.clone())
+                .build(),
+        );
+        let mut recorder = Recorder {
+            capture,
+            observations: Vec::new(),
+        };
+        let server = async {
+            for (status, extra) in [
+                ("200 OK", format!("Expires: {DATE}\r\nETag: \"data\"\r\n")),
+                ("404 Not Found", String::new()),
+            ] {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut lines = BufReader::new(&mut socket).lines();
+                assert!(lines.next_line().await.unwrap().unwrap().starts_with("HEAD /bucket/key "));
+                while !lines.next_line().await.unwrap().unwrap().is_empty() {}
+                let response = format!("HTTP/1.1 {status}\r\n{extra}Content-Length: 0\r\nConnection: close\r\n\r\n");
+                socket.write_all(response.as_bytes()).await.unwrap();
+            }
+        };
+        let requests = async {
+            let head = || client.head_object().bucket("bucket").key("key").send();
+            let output = recorder.step("HeadObject", "expires", head(), none).await.unwrap();
+            assert_eq!(output.expires_string(), Some(DATE));
+            assert!(recorder.step("HeadObject", "absent", head(), none).await.is_none());
+            let absent = recorder
+                .step("HeadObject", "unsent", client.head_object().key("key").send(), none)
+                .await;
+            assert!(absent.is_none());
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(10), async { tokio::join!(server, requests) })
+            .await
+            .unwrap();
+        let (a, b) = recorder.observations.split_at(1);
+        let receipts = serde_json::to_value(PairedReceipts::new(a, b)).unwrap();
+        assert_eq!(
+            receipts,
+            serde_json::json!({
+                "responses_a": [{"op":"HeadObject", "case":"expires", "status":200, "header_names_sha256":"bade6835ceb831c4bf589348000369e2501eec559843403cf4e596baae5367d7"}],
+                "responses_b": [{"op":"HeadObject", "case":"absent", "status":404, "header_names_sha256":"ef176135a5f329e2b96dace1cc94aaf3e2a172d89d99dd5c52ab12679b7383ba"}]
+            })
+        );
+    }
 
     #[test]
     fn the_operation_list_is_sorted_without_duplicates() {

@@ -16,7 +16,7 @@ use crate::admin::auth::authenticate_envelope_credentials;
 use crate::admin::operation::{AdminRequest, AdminResponse, Operation};
 use crate::admin::router::{AdminOperation, S3Router};
 use crate::admin::runtime_sources::{current_action_credentials, object_store_from_envelope};
-use crate::admin::service::caller_identity::oidc_profile_fields;
+use crate::admin::service::caller_identity::{OidcProfileFields, oidc_profile_fields};
 use crate::admin::storage_api::bucket::versioning_sys::BucketVersioningSys;
 use crate::admin::storage_api::contract::admin::StorageAdminApi;
 use crate::admin::storage_api::contract::bucket::{BucketOperations, BucketOptions};
@@ -60,10 +60,8 @@ pub struct AccountInfoHandler {}
 struct AccountInfoResponse {
     #[serde(flatten)]
     account: rustfs_madmin::AccountInfo,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    username: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    email: Option<String>,
+    #[serde(flatten)]
+    profile: OidcProfileFields,
 }
 
 pub fn register_account_info_route(r: &mut S3Router<AdminOperation>) -> std::io::Result<()> {
@@ -292,7 +290,7 @@ impl Operation for AccountInfoHandler {
         let policy_str = serde_json::to_string(&effective_policy)
             .map_err(|_e| S3Error::with_message(S3ErrorCode::InternalError, "parse policy failed"))?;
 
-        let (username, email) = oidc_profile_fields(&cred);
+        let profile = oidc_profile_fields(&cred);
         let mut account_info = rustfs_madmin::AccountInfo {
             account_name,
             server: StorageAdminApi::backend_info(store.as_ref()).await,
@@ -356,8 +354,7 @@ impl Operation for AccountInfoHandler {
 
         let data = serde_json::to_vec(&AccountInfoResponse {
             account: account_info,
-            username,
-            email,
+            profile,
         })
         .map_err(|_e| S3Error::with_message(S3ErrorCode::InternalError, "parse accountInfo failed"))?;
 
@@ -379,19 +376,25 @@ mod tests {
     fn accountinfo_response_adds_optional_oidc_display_fields() {
         let mut response = AccountInfoResponse {
             account: rustfs_madmin::AccountInfo::default(),
-            username: Some("oidc-user".to_string()),
-            email: Some("oidc-user@example.test".to_string()),
+            profile: OidcProfileFields {
+                username: Some("oidc-user".to_string()),
+                email: Some("oidc-user@example.test".to_string()),
+                display_name: Some("OIDC User".to_string()),
+                picture: Some("https://idp.example.test/oidc-user.png".to_string()),
+            },
         };
 
         let value = serde_json::to_value(&response).expect("serialize accountinfo response");
         assert_eq!(value["username"], "oidc-user");
         assert_eq!(value["email"], "oidc-user@example.test");
+        assert_eq!(value["display_name"], "OIDC User");
+        assert_eq!(value["picture"], "https://idp.example.test/oidc-user.png");
 
-        response.username = None;
-        response.email = None;
+        response.profile = OidcProfileFields::default();
         let legacy_shape = serde_json::to_value(&response).expect("serialize accountinfo response without OIDC fields");
-        assert!(!legacy_shape.as_object().unwrap().contains_key("username"));
-        assert!(!legacy_shape.as_object().unwrap().contains_key("email"));
+        for key in ["username", "email", "display_name", "picture"] {
+            assert!(!legacy_shape.as_object().unwrap().contains_key(key), "{key} must be omitted");
+        }
     }
 
     #[test]

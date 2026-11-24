@@ -5171,6 +5171,30 @@ pub(crate) fn stage_inline_rollback_backup_with_commit_guard_std(
     allow_hardlink: bool,
     commit_guard: &RenameCommitGuard,
 ) -> io::Result<()> {
+    stage_inline_rollback_backup_in_dir_with_commit_guard_std(
+        dst_file_path,
+        backup_parent,
+        backup_path,
+        old_destination_file,
+        sync_backup,
+        allow_hardlink,
+        false,
+        commit_guard,
+    )
+}
+
+#[cfg(target_os = "linux")]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn stage_inline_rollback_backup_in_dir_with_commit_guard_std(
+    dst_file_path: &Path,
+    backup_parent: &Path,
+    backup_path: &Path,
+    old_destination_file: &ReadDestinationFile,
+    sync_backup: bool,
+    allow_hardlink: bool,
+    expect_existing_dir: bool,
+    commit_guard: &RenameCommitGuard,
+) -> io::Result<()> {
     use rustix::fs::{AtFlags, CWD, Mode, OFlags, linkat, mkdirat, openat, unlinkat};
     use rustix::io::Errno;
     use std::os::fd::AsRawFd;
@@ -5200,27 +5224,64 @@ pub(crate) fn stage_inline_rollback_backup_with_commit_guard_std(
     let mut last_err = None;
     for attempt in 0..=2 {
         let mut created_dir = false;
-        match mkdirat(&*dst_dir.file, rollback_dir_name, Mode::from_raw_mode(0o777)) {
-            Ok(()) => created_dir = true,
-            Err(Errno::EXIST) => {}
-            Err(err) => return Err(io::Error::from(err)),
-        }
-        let rollback_dir_file = match open_linux_relative(
-            &dst_dir.file,
-            Path::new(rollback_dir_name),
-            OFlags::RDONLY | OFlags::DIRECTORY,
-            Mode::empty(),
-        ) {
-            Ok(dir_file) => dir_file,
-            Err(err) if err.kind() == io::ErrorKind::NotFound && attempt < 2 => {
-                last_err = Some(err);
-                continue;
-            }
-            Err(err) => {
-                if created_dir {
-                    let _ = unlinkat(&*dst_dir.file, rollback_dir_name, AtFlags::REMOVEDIR);
+        let rollback_dir_file = if expect_existing_dir {
+            match open_linux_relative(
+                &dst_dir.file,
+                Path::new(rollback_dir_name),
+                OFlags::RDONLY | OFlags::DIRECTORY,
+                Mode::empty(),
+            ) {
+                Ok(dir_file) => dir_file,
+                Err(err) if err.kind() == io::ErrorKind::NotFound => {
+                    match mkdirat(&*dst_dir.file, rollback_dir_name, Mode::from_raw_mode(0o777)) {
+                        Ok(()) => created_dir = true,
+                        Err(Errno::EXIST) => {}
+                        Err(err) => return Err(io::Error::from(err)),
+                    }
+                    match open_linux_relative(
+                        &dst_dir.file,
+                        Path::new(rollback_dir_name),
+                        OFlags::RDONLY | OFlags::DIRECTORY,
+                        Mode::empty(),
+                    ) {
+                        Ok(dir_file) => dir_file,
+                        Err(err) if err.kind() == io::ErrorKind::NotFound && attempt < 2 => {
+                            last_err = Some(err);
+                            continue;
+                        }
+                        Err(err) => {
+                            if created_dir {
+                                let _ = unlinkat(&*dst_dir.file, rollback_dir_name, AtFlags::REMOVEDIR);
+                            }
+                            return Err(err);
+                        }
+                    }
                 }
-                return Err(err);
+                Err(err) => return Err(err),
+            }
+        } else {
+            match mkdirat(&*dst_dir.file, rollback_dir_name, Mode::from_raw_mode(0o777)) {
+                Ok(()) => created_dir = true,
+                Err(Errno::EXIST) => {}
+                Err(err) => return Err(io::Error::from(err)),
+            }
+            match open_linux_relative(
+                &dst_dir.file,
+                Path::new(rollback_dir_name),
+                OFlags::RDONLY | OFlags::DIRECTORY,
+                Mode::empty(),
+            ) {
+                Ok(dir_file) => dir_file,
+                Err(err) if err.kind() == io::ErrorKind::NotFound && attempt < 2 => {
+                    last_err = Some(err);
+                    continue;
+                }
+                Err(err) => {
+                    if created_dir {
+                        let _ = unlinkat(&*dst_dir.file, rollback_dir_name, AtFlags::REMOVEDIR);
+                    }
+                    return Err(err);
+                }
             }
         };
 
@@ -7074,7 +7135,7 @@ pub(crate) fn prepare_rename_commit_guard_flat_inline(
     let destination = std::sync::OnceLock::new();
     match publication_root.open_directory(destination_parent) {
         Ok(directory) => {
-            let _ = destination.set(LinuxCommitDirectory::new(directory)?);
+            let _ = destination.set(LinuxCommitDirectory::new_lazy(directory));
         }
         Err(err) if err.kind() == io::ErrorKind::NotFound => {}
         Err(err) => return Err(err),
@@ -7101,14 +7162,15 @@ pub(crate) fn prepare_rename_commit_guard(
     #[cfg(target_os = "linux")]
     {
         existing_base_directory_suffix(destination_parent, destination_base)?;
-        let source = LinuxCommitDirectory::new(publication_root.open_directory(source_parent)?)?;
+        let source = LinuxCommitDirectory::new_lazy(publication_root.open_directory(source_parent)?);
         let destination = std::sync::OnceLock::new();
         if source_parent == destination_parent {
+            let _ = source.identity()?;
             let _ = destination.set(source.clone_shared());
         } else {
             match publication_root.open_directory(destination_parent) {
                 Ok(directory) => {
-                    let _ = destination.set(LinuxCommitDirectory::new(directory)?);
+                    let _ = destination.set(LinuxCommitDirectory::new_lazy(directory));
                 }
                 Err(err) if err.kind() == io::ErrorKind::NotFound => {}
                 Err(err) => return Err(err),

@@ -6306,7 +6306,7 @@ impl SetDisks {
         Ok(())
     }
 
-    #[tracing::instrument(skip(disks, meta))]
+    #[tracing::instrument(skip(self, disks, meta), fields(pool_index = self.pool_index, set_index = self.set_index))]
     #[allow(clippy::too_many_arguments)]
     pub(in crate::set_disk) async fn rename_part(
         &self,
@@ -8367,35 +8367,51 @@ mod tests {
             }
             assert_eq!(peer.available_permits(), rustfs_protos::INTERNODE_CONTROL_RPC_CONCURRENCY_LIMIT);
 
-            let mut file_info = metadata_test_fileinfo("object");
-            file_info.erasure.index = 0;
-            let commit = SetDisks::rename_data_owned(
-                &disks,
-                (RUSTFS_META_TMP_BUCKET, "source"),
-                vec![file_info; disks.len()],
-                ("bucket", "object"),
-                disks.len(),
-                false,
-            )
-            .await
-            .expect("unary fallback must satisfy every rename slot");
-
-            assert_eq!(peer.batch_calls(), 1, "one peer group makes one batch attempt");
-            let mut expected_disks = disks
+            let expected_disks = disks
                 .iter()
                 .flatten()
                 .map(|disk| disk.endpoint().to_string())
                 .collect::<Vec<_>>();
-            expected_disks.sort();
-            let mut batch_disks = peer.batch_disks();
-            batch_disks.sort();
-            assert_eq!(batch_disks, expected_disks, "the rejected batch must cover every planned slot");
-            let mut unary_disks = peer.unary_disks();
-            unary_disks.sort();
-            assert_eq!(unary_disks, expected_disks, "each slot falls back to unary exactly once");
-            assert_eq!(commit.online_disks.iter().filter(|disk| disk.is_some()).count(), disks.len());
-            assert_eq!(commit.convergence, RenameConvergence::AllSuccessIdentical);
-            assert_eq!(peer.available_permits(), rustfs_protos::INTERNODE_CONTROL_RPC_CONCURRENCY_LIMIT);
+            let mut expected_batches = Vec::new();
+            let mut expected_unary = Vec::new();
+            for (object, probe) in [("cold", true), ("warm", false), ("after-reconnect", true)] {
+                if object == "after-reconnect" {
+                    rustfs_protos::evict_failed_connection(peer.addr()).await;
+                }
+                let mut file_info = metadata_test_fileinfo(object);
+                file_info.erasure.index = 0;
+                let commit = SetDisks::rename_data_owned(
+                    &disks,
+                    (RUSTFS_META_TMP_BUCKET, "source"),
+                    vec![file_info; disks.len()],
+                    ("bucket", object),
+                    disks.len(),
+                    false,
+                )
+                .await
+                .expect("unary fallback must satisfy every rename slot");
+
+                if probe {
+                    expected_batches.extend_from_slice(&expected_disks);
+                }
+                expected_unary.extend_from_slice(&expected_disks);
+                let mut batch_disks = peer.batch_disks();
+                let mut unary_disks = peer.unary_disks();
+                batch_disks.sort();
+                unary_disks.sort();
+                expected_batches.sort();
+                expected_unary.sort();
+                assert_eq!(
+                    usize::try_from(peer.batch_calls()).expect("batch call count") * disks.len(),
+                    expected_batches.len(),
+                    "{object}: batch probe count"
+                );
+                assert_eq!(batch_disks, expected_batches, "{object}: attempted batches must cover all planned slots");
+                assert_eq!(unary_disks, expected_unary, "{object}: one authenticated unary call per slot");
+                assert_eq!(commit.online_disks.iter().filter(|disk| disk.is_some()).count(), disks.len());
+                assert_eq!(commit.convergence, RenameConvergence::AllSuccessIdentical);
+                assert_eq!(peer.available_permits(), rustfs_protos::INTERNODE_CONTROL_RPC_CONCURRENCY_LIMIT);
+            }
         })
         .await;
 

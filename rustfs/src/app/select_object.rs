@@ -2,7 +2,9 @@
 use super::storage_api::select_object::StorageError;
 use super::storage_api::select_object::options::get_opts;
 use super::storage_api::select_object::request_context::spawn_traced;
-use super::storage_api::select_object::sse::{SseKmsPrincipal, authorize_sse_kms_object_read, project_sse_read_response_headers};
+use super::storage_api::select_object::sse::{
+    SseKmsPrincipal, SseKmsPrincipalExt, authorize_sse_kms_object_read, project_sse_read_response_headers,
+};
 use super::storage_api::select_object::{
     StoragePrepareSelectObjectSnapshotError, StorageSelectObjectSnapshot, get_validated_store, validate_sse_headers_for_read,
     validate_ssec_for_read,

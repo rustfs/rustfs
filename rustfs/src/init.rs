@@ -25,7 +25,7 @@ use crate::storage_api::startup::init::{
 use crate::storage_api::startup::services::ECStore;
 #[cfg(any(feature = "ftps", feature = "webdav", feature = "sftp"))]
 use crate::storage_api::startup::services::ServerContextSlot;
-use crate::storage_api::startup::sse::log_sse_kms_key_policy_mode;
+use crate::storage_api::startup::sse::init_sse_startup;
 use crate::{admin, config, startup_runtime_sources, version};
 use rustfs_config::{
     DEFAULT_BUFFER_MAX_SIZE, DEFAULT_BUFFER_MIN_SIZE, DEFAULT_BUFFER_PROFILE, DEFAULT_BUFFER_UNKNOWN_SIZE, DEFAULT_UPDATE_CHECK,
@@ -539,7 +539,9 @@ pub async fn init_kms_system(config: &config::Config, store: Arc<ECStore>) -> st
     // Initialize global KMS service manager (starts in NotConfigured state)
     let service_manager = startup_runtime_sources::init_kms_service_manager();
 
-    log_sse_kms_key_policy_mode();
+    // Settles what SSE reads from the environment. Idempotent, so a second
+    // embedded server in this process reports nothing new.
+    init_sse_startup();
 
     // A key referenced by any bucket's encryption configuration must never be
     // deleted. Register the gate before the service can start so every

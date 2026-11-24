@@ -1084,59 +1084,71 @@ mod tests {
 
     #[tokio::test]
     async fn execute_copy_object_rejects_self_copy_without_replace_directive() {
-        let input = CopyObjectInput::builder()
-            .copy_source(CopySource::Bucket {
-                bucket: "test-bucket".into(),
-                key: "test-key".into(),
-                version_id: None,
-            })
-            .bucket("test-bucket".to_string())
-            .key("test-key".to_string())
-            .build()
-            .unwrap();
-
+        // Same facts `from_legacy` carried. Metadata directive, storage class, SSE, and tagging stay absent.
+        let input = copy_input("test-bucket", "test-key", "test-key", None);
         let usecase = DefaultObjectUsecase::without_context();
 
-        let err = Box::pin(copy_method_only(&usecase, input)).await.unwrap_err();
+        let err = Box::pin(async {
+            usecase
+                .execute_copy_object_owned(copy_envelope(HeaderMap::new()), input)
+                .await
+                .map_err(crate::error::legacy_error_for_test)
+        })
+        .await
+        .unwrap_err();
         assert_eq!(err.code(), &S3ErrorCode::InvalidRequest);
     }
 
     #[tokio::test]
     async fn copy_object_rejects_reserved_catalog_destination_before_store_lookup() {
-        let input = CopyObjectInput::builder()
-            .copy_source(CopySource::Bucket {
-                bucket: "source-bucket".into(),
-                key: "source-key".into(),
+        // Same facts `from_legacy` carried. Metadata directive, storage class, SSE, and tagging stay absent.
+        let input = CopyObjectWriteInput {
+            bucket: format!("missing-{}", Uuid::new_v4()),
+            key: ".rustfs-table/metadata/current.json".to_owned(),
+            copy_source: Some(CopySourceValue::Bucket {
+                bucket: "source-bucket".to_owned(),
+                key: "source-key".to_owned(),
                 version_id: None,
-            })
-            .bucket(format!("missing-{}", Uuid::new_v4()))
-            .key(".rustfs-table/metadata/current.json".to_string())
-            .build()
-            .unwrap();
-        let error = copy_method_only(&DefaultObjectUsecase::without_context(), input)
-            .await
-            .expect_err("reserved catalog destination must fail closed without bucket metadata");
+            }),
+            ..Default::default()
+        };
+        let usecase = DefaultObjectUsecase::without_context();
+        let error = Box::pin(async {
+            usecase
+                .execute_copy_object_owned(copy_envelope(HeaderMap::new()), input)
+                .await
+                .map_err(crate::error::legacy_error_for_test)
+        })
+        .await
+        .expect_err("reserved catalog destination must fail closed without bucket metadata");
         assert_eq!(error.code(), &S3ErrorCode::InvalidRequest);
         assert_eq!(error.message(), Some(crate::table_catalog::RESERVED_CATALOG_OBJECT_MESSAGE));
     }
 
     #[tokio::test]
     async fn execute_copy_object_rejects_invalid_storage_class() {
-        let input = CopyObjectInput::builder()
-            .copy_source(CopySource::Bucket {
-                bucket: "src-bucket".into(),
-                key: "src-key".into(),
+        // Same facts `from_legacy` carried. Metadata directive, SSE, and tagging stay absent.
+        let input = CopyObjectWriteInput {
+            bucket: "dst-bucket".to_owned(),
+            key: "dst-key".to_owned(),
+            copy_source: Some(CopySourceValue::Bucket {
+                bucket: "src-bucket".to_owned(),
+                key: "src-key".to_owned(),
                 version_id: None,
-            })
-            .bucket("dst-bucket".to_string())
-            .key("dst-key".to_string())
-            .storage_class(Some(StorageClass::from_static("INVALID")))
-            .build()
-            .unwrap();
-
+            }),
+            storage_class: Some("INVALID".to_owned()),
+            ..Default::default()
+        };
         let usecase = DefaultObjectUsecase::without_context();
 
-        let err = Box::pin(copy_method_only(&usecase, input)).await.unwrap_err();
+        let err = Box::pin(async {
+            usecase
+                .execute_copy_object_owned(copy_envelope(HeaderMap::new()), input)
+                .await
+                .map_err(crate::error::legacy_error_for_test)
+        })
+        .await
+        .unwrap_err();
         assert_eq!(err.code(), &S3ErrorCode::InvalidStorageClass);
     }
 

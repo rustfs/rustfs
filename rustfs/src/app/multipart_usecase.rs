@@ -60,7 +60,7 @@ use super::storage_api::multipart_usecase::s3_api::multipart::{
 };
 use super::storage_api::multipart_usecase::set_disk::is_valid_storage_class;
 use super::storage_api::multipart_usecase::sse::{
-    DecryptionRequest, EncryptionKeyKind, EncryptionRequest, PrepareEncryptionRequest, SseKmsPrincipal,
+    DecryptionRequest, EncryptionKeyKind, EncryptionRequest, PrepareEncryptionRequest, SseKmsPrincipal, SseKmsPrincipalExt,
     apply_bucket_default_lock_retention, authorize_sse_kms_multipart_write, authorize_sse_kms_object_read,
     build_ssec_read_headers, encryption_material_to_metadata, extract_server_side_encryption_from_headers,
     extract_ssec_params_from_headers, extract_ssekms_context_from_headers, get_buffer_size_opt_in,
@@ -322,7 +322,7 @@ fn completion_input(
 mod tests {
     use super::test_support::*;
     use super::*;
-    use crate::app::storage_api::s3::dto::{CreateMultipartUploadInput, ServerSideEncryption};
+    use crate::app::storage_api::s3::dto::ServerSideEncryption;
 
     #[test]
     fn internal_object_info_lookup_opts_drops_http_preconditions() {
@@ -558,17 +558,24 @@ mod tests {
             "parent/uuid/delete-prepared",
             "parent/uuid/delete-quorum-committed",
         ] {
-            let create = CreateMultipartUploadInput::builder()
-                .bucket("bucket".to_owned())
-                .key(key.to_owned())
-                .build()
-                .expect("valid create request DTO");
+            // Same facts `from_legacy` carried. Metadata, tagging, storage class, SSE, and object lock stay absent.
+            let create = super::create_values::CreateMultipartUploadFields {
+                bucket: "bucket".to_owned(),
+                key: key.to_owned(),
+                metadata: None,
+                tagging: None,
+                storage_class: None,
+                server_side_encryption: None,
+                sse_customer_algorithm: None,
+                sse_customer_key: None,
+                sse_customer_key_md5: None,
+                ssekms_key_id: None,
+                object_lock_legal_hold_status: None,
+                object_lock_mode: None,
+                object_lock_retain_until_date: None,
+            };
             let error = match make_usecase()
-                .execute_create_multipart_upload(
-                    owned_envelope(Method::POST),
-                    super::create_values::CreateMultipartUploadFields::from_legacy(create),
-                    None,
-                )
+                .execute_create_multipart_upload(owned_envelope(Method::POST), create, None)
                 .await
             {
                 Err(error) => error,
@@ -857,7 +864,8 @@ mod tests {
         requested_kms_key_id: Option<&str>,
         customer_key: Option<(&str, &str)>,
     ) -> (Vec<(&'static str, SseResponseFields)>, Vec<String>) {
-        use crate::app::storage_api::s3::dto::{StreamingBlob, UploadPartInput};
+        use crate::app::object::legacy_put_body;
+        use crate::app::storage_api::s3::dto::StreamingBlob;
         use crate::app::storage_api::test::contract::object::ObjectIO as _;
         use rustfs_gateway::{Limits, MetaView, OperationCodec, TargetKind, WireRequest};
 
@@ -904,21 +912,29 @@ mod tests {
         let part = usecase
             .execute_upload_part_with_audit(
                 owned_envelope(Method::PUT),
-                UploadPartWriteInput::from_legacy(
-                    UploadPartInput {
+                // Same facts `from_legacy` carried. Checksums and trailers stay absent.
+                UploadPartWriteInput {
+                    target: UploadPartTarget::Legacy {
                         bucket: bucket.to_string(),
                         key: key.to_string(),
                         upload_id: upload_id.clone(),
-                        part_number: 1,
-                        content_length: Some(3),
-                        body: Some(StreamingBlob::from(bytes::Bytes::from_static(b"abc"))),
-                        sse_customer_algorithm: customer_algorithm.clone(),
-                        sse_customer_key: customer_key.clone(),
-                        sse_customer_key_md5: customer_key_md5.clone(),
-                        ..Default::default()
                     },
-                    None,
-                ),
+                    part_number: 1,
+                    content_length: Some(3),
+                    body: Some(legacy_put_body(StreamingBlob::from(bytes::Bytes::from_static(b"abc")))),
+                    trailing_headers: None,
+                    frame_trailers: None,
+                    content_md5: None,
+                    checksum_algorithm: None,
+                    checksum_crc32: None,
+                    checksum_crc32c: None,
+                    checksum_crc64nvme: None,
+                    checksum_sha1: None,
+                    checksum_sha256: None,
+                    sse_customer_algorithm: customer_algorithm.clone(),
+                    sse_customer_key: customer_key.clone(),
+                    sse_customer_key_md5: customer_key_md5.clone(),
+                },
             )
             .await
             .expect("upload part");

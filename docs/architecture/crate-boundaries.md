@@ -30,9 +30,11 @@ Contract crates stay below implementation crates. Forbidden edges:
 | `security-governance -> rustfs` | Governance contracts stay below the binary crate |
 | `extension-schema -> rustfs` | The extension schema is consumed by the binary, never the reverse |
 | `extension-schema -> ecstore` | The extension schema must not reach storage internals |
+| `sse -> ecstore`, `sse -> iam`, `sse -> rustfs` | SSE key resolution reaches the running server only through its `SseHost` port |
 
 - `rustfs-storage-api` exposes storage-facing replication status/state contracts only through `crates/storage-api/src/replication.rs`, so its temporary dependency on `rustfs-filemeta` wire types stays centralized and no `rustfs-replication` / `rustfs-storage-api` cycle appears.
 - Leaf crates (`config`, `credentials`, `crypto`, `io-metrics`, `madmin`) may not depend on other `rustfs-*` crates, in either TOML spelling, except the adjudicated edges pinned in the guard's leaf allowlist: `io-metrics -> rustfs-s3-ops` (pure contract crates sharing the `S3Operation` vocabulary) and `madmin -> rustfs-signer` (the SigV4-signed admin SDK client). A new leaf exception must be a pure contract dependency (types and enums only, no I/O, no globals, no non-contract internal dependencies) and land together with its allowlist entry.
+- `rustfs-sse` sits between the S3 layer and the storage engine and depends on neither. Its internal dependencies are pinned in the same guard to `rustfs-config`, `rustfs-kms`, `rustfs-policy`, `rustfs-s3-types`, and `rustfs-utils`; the KMS service, a bucket's default encryption, and key-permission decisions arrive through `rustfs_sse::SseHost`, which `rustfs/src/storage/sse.rs` implements. That file also owns every translation across the engine boundary (`ObjectEncryptionResolver`, `WriteEncryption`, `MultipartCompletionAuthorization`), so neither side names the other's types.
 - Compile-time source reads follow the same direction: `include_str!` / `include!` of a `.rs` file must not resolve outside the including crate (`scripts/check_layer_dependencies.sh`). Shared source-text expectations belong in a contract surface such as `rustfs_protos::compat_manifest` (`crates/protos/src/compat_manifest.rs`) and are asserted by each owning crate.
 
 ## ECStore Access Boundary

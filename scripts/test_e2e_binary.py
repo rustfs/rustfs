@@ -51,7 +51,13 @@ if args[:2] == ["nextest", "run"]:
 target = pathlib.Path(args[args.index("--target-dir") + 1])
 binary = target / ("release" if "--release" in args else "debug") / "rustfs"
 binary.parent.mkdir(parents=True, exist_ok=True)
-binary.write_text("#!/bin/sh\\nexit 0\\n")
+if not os.environ.get("FAKE_REUSE_BINARY"):
+    head = os.environ["RUSTFS_E2E_BUILD_HEAD"]
+    display = os.environ.get("RUSTFS_BUILD_VERSION", head[:7])
+    binary.write_text(
+        f"#!{sys.executable}\\nimport sys\\nassert sys.argv[1:] == ['--version']\\n"
+        + f"print({'rustfs ' + display!r})\\nprint({'git commit   : ' + head!r})\\n"
+    )
 binary.chmod(0o755)
 features = ["default", "ftps", "webdav"]
 if "--features" in args:
@@ -129,6 +135,28 @@ if os.environ.get("FAKE_BUILD_MUTATE"):
             result = self.invoke("build", env=dict(self.env, **{failure: "1"}))
             self.assertNotEqual(result.returncode, 0)
             self.assertFalse(self.sidecar.exists())
+
+    def test_cached_binary_from_previous_commit_cannot_receive_new_identity(self):
+        self.build()
+        previous = self.sidecar.read_bytes()
+        subprocess.run(["git", "-c", "user.name=Test", "-c", "user.email=test@example.com",
+                        "commit", "--allow-empty", "-qm", "same files, new commit"], cwd=self.root, check=True)
+        stale = self.invoke("build", env=dict(self.env, FAKE_REUSE_BINARY="1"))
+        self.assertNotEqual(stale.returncode, 0)
+        self.assertIn("embedded Git commit", stale.stderr)
+        self.assertFalse(self.sidecar.exists())
+
+        # A legacy sidecar could already match the new checkout and the old binary's digest.
+        outdated = json.loads(previous)
+        outdated["source"]["head"] = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=self.root, text=True).strip()
+        self.sidecar.write_text(json.dumps(outdated))
+        refused = self.run_code("raise SystemExit(77)")
+        self.assertNotIn(refused.returncode, (0, 77))
+        self.assertIn("embedded Git commit", refused.stderr)
+
+        result = self.invoke("build", env=dict(self.env, RUSTFS_BUILD_VERSION="release-display"))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.run_code().returncode, 0)
 
     def test_child_failure_and_changes_during_run_fail(self):
         self.build()

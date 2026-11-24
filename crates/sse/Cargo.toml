@@ -1,0 +1,70 @@
+# Copyright 2024 RustFS Team
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+[package]
+name = "rustfs-sse"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+version.workspace = true
+homepage.workspace = true
+description = "S3 server-side encryption (SSE-S3, SSE-KMS, SSE-C) key resolution and metadata for RustFS."
+keywords = ["sse", "encryption", "s3", "kms", "rustfs"]
+categories = ["cryptography"]
+
+[lints]
+workspace = true
+
+[features]
+default = []
+# MinIO-compatible sealed object keys (DARE). Mirrors the `rio-v2` feature of
+# the server binary, which enables both together.
+rio-v2 = ["dep:chacha20poly1305", "dep:hmac", "dep:sha2"]
+# Test seams for dependents: per-principal authorization overrides, DEK
+# provider injection and metadata fixtures. Never enable in a release build.
+test-util = []
+
+[dependencies]
+# The only RustFS crates this one may reach. It sits between the S3 layer and
+# the storage engine and must not depend on either: what it needs from the
+# running server arrives through `SseHost`.
+rustfs-config = { workspace = true }
+rustfs-kms = { workspace = true }
+rustfs-policy = { workspace = true }
+rustfs-s3-types = { workspace = true }
+rustfs-utils = { workspace = true, features = ["http", "path"] }
+
+aes-gcm = { workspace = true, features = ["rand_core", "zeroize"] }
+async-trait = { workspace = true }
+base64-simd = { workspace = true }
+chacha20poly1305 = { workspace = true, optional = true }
+hmac = { workspace = true, optional = true }
+http = { workspace = true }
+md-5 = { workspace = true }
+rand = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+sha2 = { workspace = true, optional = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+# The fake AWS KMS endpoint the backend-selection tests talk to.
+axum = { workspace = true }
+temp-env = { workspace = true, features = ["async_closure"] }
+tempfile = { workspace = true }
+tokio = { workspace = true, features = ["macros", "net", "rt-multi-thread", "sync", "time"] }
+
+[lib]
+doctest = false

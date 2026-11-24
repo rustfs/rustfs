@@ -106,12 +106,14 @@ use super::storage_api::object_usecase::set_disk::{
     get_lock_acquire_timeout, get_object_disk_read_timeout, is_valid_storage_class,
 };
 #[cfg(not(test))]
-use super::storage_api::object_usecase::sse::{DecryptionRequest, SseKmsPrincipal};
+use super::storage_api::object_usecase::sse::{DecryptionRequest, SseKmsPrincipal, SseKmsPrincipalExt};
 #[cfg(test)]
-pub(crate) use super::storage_api::object_usecase::sse::{DecryptionRequest, SseKmsPrincipal, sse_decryption};
+pub(crate) use super::storage_api::object_usecase::sse::{
+    DecryptionRequest, SseKmsPrincipal, SseKmsPrincipalExt, sse_decryption,
+};
 use super::storage_api::object_usecase::sse::{
-    EncryptionRequest, apply_bucket_default_lock_retention, authorize_sse_kms_object_read, bucket_default_write_sse,
-    build_ssec_read_headers, classify_sse_read_response, encryption_material_to_metadata,
+    EncryptionMaterialExt, EncryptionRequest, apply_bucket_default_lock_retention, authorize_sse_kms_object_read,
+    bucket_default_write_sse, build_ssec_read_headers, classify_sse_read_response, encryption_material_to_metadata,
     extract_server_side_encryption_from_headers, extract_ssec_params_from_headers, extract_ssekms_context_from_headers,
     get_buffer_size_opt_in, load_bucket_object_lock_config_state, map_get_object_reader_error, sse_encryption,
     validate_bucket_object_lock_enabled_state,

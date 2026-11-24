@@ -640,7 +640,7 @@ async fn owned_audit_only_operation_matches_the_recorded_entries() {
 #[tokio::test]
 #[serial(owned_audit_probe)]
 async fn owned_operation_attaches_the_sse_kms_summary_to_the_audit_entry() {
-    use crate::app::object::{DecryptionRequest, SseKmsPrincipal, sse_decryption};
+    use crate::app::object::{DecryptionRequest, SseKmsPrincipal, SseKmsPrincipalExt as _, sse_decryption};
     use crate::server::{refresh_audit_module_enabled, refresh_notify_module_enabled};
 
     temp_env::async_with_vars(

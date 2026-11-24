@@ -16,7 +16,7 @@ use rustfs_credentials::Credentials;
 use serde_json::Value;
 use std::{collections::HashMap, fmt};
 
-use super::FederatedAuthorization;
+use super::{FederatedAuthorization, FederatedProfile};
 
 pub const OIDC_VIRTUAL_PARENT_CLAIM: &str = "x-rustfs-internal-oidc-parent";
 
@@ -27,6 +27,8 @@ pub(crate) struct FederatedClaims {
     pub(crate) username: String,
     pub(crate) groups: Vec<String>,
     pub(crate) raw: HashMap<String, Value>,
+    /// Display-only metadata; never read by policy mapping.
+    pub(crate) profile: FederatedProfile,
 }
 
 impl FederatedClaims {
@@ -80,6 +82,7 @@ impl fmt::Debug for VerifiedFederatedIdentity {
             .field("username_present", &!self.claims.username.is_empty())
             .field("source_group_count", &self.claims.groups.len())
             .field("attribute_count", &self.claims.raw.len())
+            .field("profile", &self.claims.profile)
             .finish()
     }
 }
@@ -115,6 +118,10 @@ impl VerifiedFederatedIdentity {
 
     pub fn attributes(&self) -> &HashMap<String, Value> {
         &self.claims.raw
+    }
+
+    pub fn profile(&self) -> &FederatedProfile {
+        &self.claims.profile
     }
 
     pub fn session_identity(&self) -> String {
@@ -183,6 +190,7 @@ mod tests {
             username: username.to_string(),
             groups: Vec::new(),
             raw: HashMap::new(),
+            profile: Default::default(),
         }
     }
 
@@ -208,6 +216,7 @@ mod tests {
                 username: " username ".to_string(),
                 groups: vec![" source-b ".to_string(), "source-a".to_string(), " source-b ".to_string()],
                 raw: attributes.clone(),
+                profile: Default::default(),
             },
         };
         let debug = format!("{identity:?}");

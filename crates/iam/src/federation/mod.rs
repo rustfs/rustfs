@@ -16,6 +16,7 @@ mod binding;
 mod error;
 mod mapper;
 mod model;
+mod profile;
 mod provider;
 mod transaction;
 
@@ -32,6 +33,7 @@ pub use model::{
     FederatedLoginSession, FederatedProviderRef, FederatedSession, FederatedSessionTransaction, OIDC_VIRTUAL_PARENT_CLAIM,
     VerifiedFederatedIdentity,
 };
+pub use profile::{FederatedProfile, OIDC_PROFILE_CLAIM};
 pub(crate) use provider::{FederatedProviderQuery, StandardOidcAuthentication, VerifiedFederatedCodeExchange};
 pub use provider::{FederatedProviderView, FederatedRedirectPolicy};
 pub use transaction::FederatedIdentityService;

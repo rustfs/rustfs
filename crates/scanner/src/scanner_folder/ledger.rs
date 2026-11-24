@@ -203,7 +203,7 @@ impl FolderScanner {
     }
 
     pub(super) async fn retry_pending_scanner_heals(&mut self) -> Result<(), ScannerError> {
-        if !self.should_heal().await {
+        if !self.try_should_heal().await? {
             return Ok(());
         }
 
@@ -217,7 +217,7 @@ impl FolderScanner {
         }
         self.prune_pending_scanner_heals();
         for pending in pending_scanner_heal_retry_candidates(&self.new_cache.info.pending_heals, &bucket) {
-            if !self.should_heal().await {
+            if !self.try_should_heal().await? {
                 break;
             }
 

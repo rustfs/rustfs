@@ -31,11 +31,10 @@ use crate::{
     layout::endpoints::{EndpointServerPools, SetupType},
     runtime::global::{
         GLOBAL_BOOT_TIME, GLOBAL_LIFECYCLE_SYS, GLOBAL_LOCAL_NODE_NAME_FALLBACK, GLOBAL_ROOT_DISK_THRESHOLD,
-        TypeLocalDiskSetDrives, get_background_services_cancel_token, get_global_bucket_monitor, get_global_deployment_id,
-        get_global_endpoints, get_global_endpoints_opt, get_global_lock_client, get_global_lock_clients, get_global_region,
-        get_global_tier_config_mgr, global_rustfs_port, init_global_bucket_monitor, is_dist_erasure, is_erasure, is_erasure_sd,
-        is_first_cluster_node_local, resolve_object_store_handle, set_global_lock_client, set_global_lock_clients,
-        set_object_layer, update_erasure_type,
+        get_background_services_cancel_token, get_global_bucket_monitor, get_global_deployment_id, get_global_endpoints,
+        get_global_endpoints_opt, get_global_lock_client, get_global_lock_clients, get_global_region, get_global_tier_config_mgr,
+        global_rustfs_port, init_global_bucket_monitor, is_dist_erasure, is_erasure, is_erasure_sd, is_first_cluster_node_local,
+        resolve_object_store_handle, set_global_lock_client, set_global_lock_clients, set_object_layer, update_erasure_type,
     },
     services::batch_processor::{GlobalBatchProcessors, get_global_processors},
     services::notification_sys::{NotificationSys, get_global_notification_sys},
@@ -408,10 +407,6 @@ pub(crate) fn local_disk_map_handle() -> Arc<RwLock<HashMap<String, Option<DiskS
 
 pub(crate) fn local_disk_id_map_handle() -> Arc<RwLock<HashMap<Uuid, String>>> {
     crate::runtime::global::current_ctx().local_disk_id_map()
-}
-
-pub(crate) fn local_disk_set_drives_handle() -> Arc<RwLock<TypeLocalDiskSetDrives>> {
-    crate::runtime::global::current_ctx().local_disk_set_drives()
 }
 
 pub(crate) fn tier_config_mgr_handle() -> Arc<RwLock<TierConfigMgr>> {
