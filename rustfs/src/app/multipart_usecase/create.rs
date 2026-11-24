@@ -479,38 +479,6 @@ impl CreateMultipartUploadFields {
 }
 
 #[cfg(test)]
-impl DefaultMultipartUsecase {
-    pub(crate) async fn execute_create_multipart_upload_from_s3s(
-        &self,
-        mut req: crate::app::storage_api::s3::S3Request<crate::app::storage_api::s3::dto::CreateMultipartUploadInput>,
-    ) -> crate::app::storage_api::s3::S3Result<
-        crate::app::storage_api::s3::S3Response<crate::app::storage_api::s3::dto::CreateMultipartUploadOutput>,
-    > {
-        use crate::app::storage_api::s3::{S3Response, dto::CreateMultipartUploadOutput};
-        let envelope = RequestEnvelope::from_s3s(&req);
-        let query_version = req.input.version_id.take();
-        let output = self
-            .execute_create_multipart_upload(envelope, CreateMultipartUploadFields::from_legacy(req.input), query_version)
-            .await
-            .map_err(crate::error::legacy_error_for_test)?;
-        let mut response = S3Response::new(CreateMultipartUploadOutput {
-            bucket: Some(output.bucket),
-            key: Some(output.key),
-            upload_id: Some(output.upload_id),
-            server_side_encryption: output.server_side_encryption.map(Into::into),
-            sse_customer_algorithm: output.sse_customer_algorithm,
-            sse_customer_key_md5: output.sse_customer_key_md5,
-            ssekms_key_id: output.ssekms_key_id,
-            checksum_algorithm: output.checksum_algorithm.map(Into::into),
-            checksum_type: output.checksum_type.map(Into::into),
-            ..Default::default()
-        });
-        response.headers.extend(output.response_headers);
-        Ok(response)
-    }
-}
-
-#[cfg(test)]
 mod tests {
     use super::super::test_support::*;
     use super::*;
