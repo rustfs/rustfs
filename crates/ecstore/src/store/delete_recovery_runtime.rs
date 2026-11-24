@@ -995,6 +995,24 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    async fn delete_recovery_rediscovery_keeps_evicted_retry_deadline() {
+        let hints = DeleteRecoveryHints::with_capacity(1);
+        assert!(hints.register_discovered(key("retry")));
+        let attempt = hints.take(1).pop().expect("first attempt");
+        hints.requeue(attempt, Some(FailureReason::Blocked));
+
+        assert!(hints.register_discovered(key("fresh")));
+        assert_eq!(hints.take(1)[0].key.object, "fresh");
+        assert!(hints.register_discovered(key("retry")));
+        assert!(hints.take(1).is_empty(), "rediscovery cannot bypass the deadline");
+
+        tokio::time::advance(RETRY_INITIAL).await;
+        assert!(hints.register_discovered(key("retry")));
+        let attempt = hints.take(1).pop().expect("retry is eligible again");
+        assert_eq!(attempt.retry.expect("retained backoff").reason, FailureReason::Blocked);
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn delete_recovery_backs_off_repeated_reason_and_resets_on_change() {
         use FailureReason::{Blocked, Corrupt, MissingQuorum};
         let hints = DeleteRecoveryHints::with_capacity(2);
