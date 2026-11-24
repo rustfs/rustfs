@@ -723,17 +723,36 @@ mod tests {
         }
     }
 
+    /// Bucket `bucket`, key `object`, upload `upload-id`. Checksums, SSE, and trailers stay absent.
+    fn admission_part_input(part_number: i32, content_length: Option<i64>, body: Option<Body>) -> UploadPartWriteInput {
+        UploadPartWriteInput {
+            target: UploadPartTarget::Legacy {
+                bucket: "bucket".to_owned(),
+                key: "object".to_owned(),
+                upload_id: "upload-id".to_owned(),
+            },
+            part_number,
+            content_length,
+            body,
+            trailing_headers: None,
+            frame_trailers: None,
+            content_md5: None,
+            checksum_algorithm: None,
+            checksum_crc32: None,
+            checksum_crc32c: None,
+            checksum_crc64nvme: None,
+            checksum_sha1: None,
+            checksum_sha256: None,
+            sse_customer_algorithm: None,
+            sse_customer_key: None,
+            sse_customer_key_md5: None,
+        }
+    }
+
     #[tokio::test]
     async fn execute_upload_part_rejects_missing_body() {
-        let input = UploadPartInput::builder()
-            .bucket("bucket".to_string())
-            .key("object".to_string())
-            .upload_id("upload-id".to_string())
-            .part_number(1)
-            .build()
-            .unwrap();
         let err = match make_usecase()
-            .execute_upload_part_with_audit(owned_envelope(Method::PUT), UploadPartWriteInput::from_legacy(input, None))
+            .execute_upload_part_with_audit(owned_envelope(Method::PUT), admission_part_input(1, None, None))
             .await
         {
             Err(error) => error,
@@ -751,17 +770,11 @@ mod tests {
 
         for (declared, expect_too_large) in [(ceiling + 1, true), (ceiling, false), (0, false)] {
             let (body, polls) = crate::app::object::PollCountingBody::streaming_blob();
-            let input = UploadPartInput::builder()
-                .bucket("bucket".to_string())
-                .key("object".to_string())
-                .upload_id("upload-id".to_string())
-                .part_number(1)
-                .body(Some(body))
-                .content_length(Some(declared))
-                .build()
-                .unwrap();
             let err = match make_usecase()
-                .execute_upload_part_with_audit(owned_envelope(Method::PUT), UploadPartWriteInput::from_legacy(input, None))
+                .execute_upload_part_with_audit(
+                    owned_envelope(Method::PUT),
+                    admission_part_input(1, Some(declared), Some(legacy_put_body(body))),
+                )
                 .await
             {
                 Err(error) => error,
@@ -783,15 +796,8 @@ mod tests {
     #[tokio::test]
     async fn execute_upload_part_rejects_invalid_part_number_before_body_lookup() {
         for part_number in [-1, 0, 10001] {
-            let input = UploadPartInput::builder()
-                .bucket("bucket".to_string())
-                .key("object".to_string())
-                .upload_id("upload-id".to_string())
-                .part_number(part_number)
-                .build()
-                .unwrap();
             let err = match make_usecase()
-                .execute_upload_part_with_audit(owned_envelope(Method::PUT), UploadPartWriteInput::from_legacy(input, None))
+                .execute_upload_part_with_audit(owned_envelope(Method::PUT), admission_part_input(part_number, None, None))
                 .await
             {
                 Err(error) => error,
