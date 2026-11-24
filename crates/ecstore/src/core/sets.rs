@@ -255,33 +255,31 @@ impl Sets {
             let mut set_endpoints = Vec::with_capacity(set_drive_count);
             for j in 0..set_drive_count {
                 let idx = i * set_drive_count + j;
-                let mut disk = disks[idx].clone();
-
                 let endpoint = endpoints.endpoints.as_ref()[idx].clone();
 
                 set_endpoints.push(endpoint);
 
-                if disk.is_none() {
+                let Some(mut disk) = disks[idx].clone() else {
                     warn!("sets new set_drive {}-{} is none", i, j);
                     set_drive.push(None);
                     continue;
-                }
+                };
 
-                if disk.as_ref().unwrap().is_local() && instance_ctx.is_dist_erasure().await {
-                    let local_disk = runtime_sources::local_disk_set_drive(&instance_ctx, pool_idx, i, j).await;
-
-                    if local_disk.is_none() {
+                if disk.is_local() && instance_ctx.is_dist_erasure().await {
+                    let Some(local_disk) = runtime_sources::local_disk_set_drive(&instance_ctx, pool_idx, i, j).await else {
                         warn!("sets new set_drive {}-{} local_disk is none", i, j);
                         set_drive.push(None);
                         continue;
+                    };
+
+                    // Format loading may have reused the registered disk that will serve this slot.
+                    if !Arc::ptr_eq(&disk, &local_disk) {
+                        let _ = disk.close().await;
                     }
-
-                    let _ = disk.as_ref().unwrap().close().await;
-
                     disk = local_disk;
                 }
 
-                let has_disk_id = disk.as_ref().unwrap().get_disk_id().await.unwrap_or_else(|err| {
+                let has_disk_id = disk.get_disk_id().await.unwrap_or_else(|err| {
                     if err == DiskError::UnformattedDisk {
                         error!("get_disk_id err {:?}", err);
                     } else {
@@ -292,7 +290,7 @@ impl Sets {
                 });
 
                 if let Some(_disk_id) = has_disk_id {
-                    set_drive.push(disk);
+                    set_drive.push(Some(disk));
                 } else {
                     error!("sets new set_drive {}-{} get_disk_id is none", i, j);
                     set_drive.push(None);
@@ -2342,6 +2340,59 @@ mod tests {
                 .expect("untouched replacement format path should be inspectable"),
             "unrequested slot {untouched} must remain unformatted"
         );
+    }
+
+    #[tokio::test]
+    async fn distributed_set_retires_only_displaced_local_disk_wrappers() {
+        let (dirs, format, fixture) = setup_heal_format_sets(3, false).await;
+        let pool = &fixture.endpoints;
+        let ctx = Arc::new(InstanceContext::new());
+        ctx.update_erasure_type(SetupType::DistErasure).await;
+        let options = DiskOption {
+            cleanup: false,
+            health_check: false,
+        };
+        runtime_sources::initialize_local_disk_maps(&ctx, vec![pool.clone()].into(), &options)
+            .await
+            .expect("register local disks");
+        let (mut disks, errors) = crate::store::init_format::init_disks(&ctx, &pool.endpoints, &options).await;
+        assert!(errors.iter().all(Option::is_none));
+        let registered = disks.clone();
+        let displaced = new_disk(&pool.endpoints.as_ref()[1], &options)
+            .await
+            .expect("open separate wrapper");
+        disks[1] = Some(displaced.clone());
+
+        let sets = Sets::new_with_instance_ctx(disks, pool, &format, 0, 1, ctx)
+            .await
+            .expect("assemble distributed set");
+        sets.stop_endpoint_monitor_for_test().await;
+        let slots = sets.disk_set[0].disks.read().await;
+        assert_eq!(slots.len(), dirs.len());
+        for (slot, expected) in slots.iter().zip(&registered) {
+            let active = slot.as_ref().expect("formatted slot must be populated");
+            assert!(Arc::ptr_eq(active, expected.as_ref().expect("registered wrapper")));
+            assert!(!active.local_retirement_token().expect("local disk").is_cancelled());
+        }
+        let displaced_retired = displaced.local_retirement_token().expect("local disk").is_cancelled();
+        assert!(displaced_retired);
+        println!(
+            "usage_assertion: {}",
+            serde_json::json!({
+                "case_id": "USAGE-21",
+                "assertion_id": "USAGE-21-A02",
+                "status": "PASS",
+                "evidence": {"active_registered_wrappers": slots.len(), "displaced_wrapper_retired": displaced_retired}
+            })
+        );
+        drop(slots);
+        drop(sets);
+        drop(registered);
+        drop(displaced);
+        for dir in dirs {
+            dir.close().expect("remove formatted disk fixture");
+        }
+        println!("usage_cleanup: {}", serde_json::json!({"case_id": "USAGE-21", "status": "PASS"}));
     }
 
     fn instance_ctx_test_pool_endpoints() -> (FormatV3, PoolEndpoints) {
