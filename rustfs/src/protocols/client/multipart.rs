@@ -17,6 +17,7 @@
 
 use super::ProtocolStorageClient;
 use rustfs_gateway_types::{ETag, Timestamp, dto};
+use rustfs_protocols::common::client::s3::MultipartRequest;
 use rustfs_s3_types::{S3Error, S3ErrorCode, S3Result};
 
 impl ProtocolStorageClient {
@@ -156,10 +157,10 @@ pub(super) fn complete_multipart_output(
     ] {
         if let Some(value) = value {
             http::HeaderValue::from_str(&value).map_err(|_| {
-                crate::app::dto_values::seam_error(rustfs_gateway_types::compat::ConversionError {
-                    field,
-                    reason: "not a header value",
-                })
+                S3Error::with_message(
+                    S3ErrorCode::InternalError,
+                    format!("failed to convert through the gateway compatibility seam: {field}: not a header value"),
+                )
             })?;
         }
     }
@@ -293,14 +294,13 @@ pub(super) fn upload_part_error(error: S3Error) -> S3Error {
     error
 }
 
-pub(super) fn upload_part_copy_input(
-    input: dto::UploadPartCopyInput,
-) -> S3Result<crate::app::multipart_usecase::UploadPartCopyWriteInput> {
+pub(super) fn prepare_upload_part_copy(
+    request: MultipartRequest<dto::UploadPartCopyInput>,
+) -> S3Result<(http::Uri, crate::app::multipart_usecase::UploadPartCopyWriteInput)> {
+    let (input, upload_id) = request.into_parts();
     super::owned::validate_copy_source(&input.copy_source, "UploadPartCopy copy_source")?;
     let copy_source_if_match =
         super::owned::copy_condition(input.copy_source_if_match.as_deref(), "copy_source_if_match", "UploadPartCopy input")?;
-    // Dates must be representable at the edge; storage does not evaluate date preconditions.
-    // Dates must fit the edge codec; the storage path does not evaluate date preconditions.
     input
         .copy_source_if_modified_since
         .map(|at| multipart_timestamp(at, "UploadPartCopy input", "copy_source_if_modified_since"))
@@ -314,17 +314,27 @@ pub(super) fn upload_part_copy_input(
         .copy_source_if_unmodified_since
         .map(|at| multipart_timestamp(at, "UploadPartCopy input", "copy_source_if_unmodified_since"))
         .transpose()?;
-    Ok(crate::app::multipart_usecase::UploadPartCopyWriteInput {
+    let part_number = input.part_number.to_string();
+    let uri = super::build_object_uri(
+        input.bucket.as_str(),
+        input.key.as_str(),
+        &[("partNumber", Some(&part_number)), ("uploadId", Some(&upload_id))],
+    )?;
+    let write = crate::app::multipart_usecase::UploadPartCopyWriteInput {
         target: crate::app::multipart_usecase::UploadPartTarget::Legacy {
             bucket: input.bucket.as_str().to_owned(),
             key: input.key.as_str().to_owned(),
-            upload_id: super::gateway_s3s_compat::leaf::upload_id_to_s3s(&input.upload_id),
+            upload_id,
         },
         part_number: input.part_number,
         copy_source: input.copy_source,
         copy_source_range: nonempty(input.copy_source_range),
         copy_source_if_match,
         copy_source_if_none_match,
+        copy_source_dates: crate::app::object_usecase::CopySourceDates::new(
+            input.copy_source_if_modified_since,
+            input.copy_source_if_unmodified_since,
+        ),
         sse_customer_algorithm: nonempty(input.sse_customer_algorithm),
         sse_customer_key: input.sse_customer_key.map(|value| value.expose_secret().to_owned()),
         sse_customer_key_md5: nonempty(input.sse_customer_key_md5),
@@ -333,7 +343,8 @@ pub(super) fn upload_part_copy_input(
             .copy_source_sse_customer_key
             .map(|value| value.expose_secret().to_owned()),
         copy_source_sse_customer_key_md5: nonempty(input.copy_source_sse_customer_key_md5),
-    })
+    };
+    Ok((uri, write))
 }
 
 pub(super) fn upload_part_copy_output(

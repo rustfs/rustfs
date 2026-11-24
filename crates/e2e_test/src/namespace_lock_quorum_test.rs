@@ -283,6 +283,7 @@ async fn test_cold_degraded_object_mutations_require_only_storage_quorum() -> Te
 #[tokio::test]
 async fn test_degraded_cluster_read_quorum_follows_erasure_layout() -> TestResult {
     crate::common::init_logging();
+    assert_single_node_cold_start_with_missing_volume().await?;
 
     for (node_count, parity) in [(3, 1), (4, 2), (6, 3), (6, 2), (4, 0)] {
         let read_quorum = node_count - parity;
@@ -427,6 +428,138 @@ async fn test_degraded_cluster_read_quorum_follows_erasure_layout() -> TestResul
         }
     }
 
+    Ok(())
+}
+
+async fn assert_single_node_cold_start_with_missing_volume() -> TestResult {
+    for drive_count in [2, 3, 4] {
+        let mut server = crate::chaos::DiskFaultHarness::new(drive_count).await?;
+        server.set_env("RUSTFS_STORAGE_CLASS_STANDARD", format!("EC:{}", drive_count / 2));
+        server.set_env("RUSTFS_PUT_RENAME_EARLY_ACK_ENABLE", "false");
+        server.set_env("RUSTFS_OBS_METRICS_EXPORT_ENABLED", "false");
+        server.set_env("RUSTFS_HEALTH_ENDPOINT_ENABLE", "true");
+        server.set_env("RUST_LOG", "warn");
+        server.start_server_at_read_quorum().await?;
+        let client = server.env.create_s3_client();
+        let client = Client::from_conf(
+            client
+                .config()
+                .to_builder()
+                .retry_config(aws_sdk_s3::config::retry::RetryConfig::standard().with_max_attempts(1))
+                .build(),
+        );
+        let bucket = format!("missing-volume-{drive_count}");
+        client.create_bucket().bucket(&bucket).send().await?;
+        let small = vec![17; 4096];
+        let large = vec![73; 8 * 1024 * 1024];
+        for (key, body) in [("small", &small), ("large", &large)] {
+            client
+                .put_object()
+                .bucket(&bucket)
+                .key(key)
+                .body(Bytes::copy_from_slice(body).into())
+                .send()
+                .await?;
+            for disk in 0..drive_count {
+                let census = crate::chaos::census_object_version_on_disk(server.disk_path(disk), &bucket, key, None)?;
+                assert!(census.is_complete(), "seed shard must exist before restart: {census:?}");
+            }
+        }
+        server.kill_server();
+        let missing = drive_count - 1;
+        server.take_disk_offline(missing)?;
+        server.start_server_at_read_quorum().await?;
+
+        for (key, body) in [("small", &small), ("large", &large)] {
+            assert_quorum_object_body(&client, &bucket, key, body).await?;
+            let head = client.head_object().bucket(&bucket).key(key).send().await?;
+            assert_eq!(head.content_length(), Some(i64::try_from(body.len())?));
+        }
+        let listing = client.list_objects_v2().bucket(&bucket).send().await?;
+        let keys: Vec<_> = listing.contents().iter().filter_map(|object| object.key()).collect();
+        assert_eq!(keys, ["large", "small"]);
+
+        let put = client
+            .put_object()
+            .bucket(&bucket)
+            .key("degraded-write")
+            .body(Bytes::from_static(b"degraded write").into())
+            .send()
+            .await;
+        if drive_count == 2 {
+            let error = put.expect_err("one of two drives cannot commit a new object");
+            assert_eq!(error.raw_response().map(|response| response.status().as_u16()), Some(503));
+            let error = client
+                .delete_object()
+                .bucket(&bucket)
+                .key("large")
+                .send()
+                .await
+                .expect_err("one of two drives cannot commit an object deletion");
+            assert_eq!(error.raw_response().map(|response| response.status().as_u16()), Some(503));
+            assert_quorum_object_body(&client, &bucket, "large", &large).await?;
+        } else {
+            put?;
+            assert_quorum_object_body(&client, &bucket, "degraded-write", b"degraded write").await?;
+            client.delete_object().bucket(&bucket).key("degraded-write").send().await?;
+        }
+        assert!(
+            !server.disk_path(missing).exists(),
+            "degraded startup and S3 operations must leave the root absent"
+        );
+
+        if drive_count == 2 {
+            server.kill_server();
+            std::fs::create_dir(server.disk_path(missing))?;
+            server.start_server_at_read_quorum().await?;
+            for (key, body) in [("small", &small), ("large", &large)] {
+                assert_quorum_object_body(&client, &bucket, key, body).await?;
+                client.head_object().bucket(&bucket).key(key).send().await?;
+            }
+            assert_eq!(client.list_objects_v2().bucket(&bucket).send().await?.contents().len(), 2);
+            let error = client
+                .put_object()
+                .bucket(&bucket)
+                .key("empty-root-write")
+                .body(Bytes::from_static(b"must remain unavailable").into())
+                .send()
+                .await
+                .expect_err("an empty replacement cannot restore write quorum");
+            assert_eq!(error.raw_response().map(|response| response.status().as_u16()), Some(503));
+            assert!(
+                !server
+                    .disk_path(missing)
+                    .join(crate::storage_api::RUSTFS_META_BUCKET)
+                    .join("format.json")
+                    .exists(),
+                "read admission must not format the empty replacement"
+            );
+        }
+        server.kill_server();
+        server.bring_disk_online(missing)?;
+        server.start_server_at_read_quorum().await?;
+        for (key, body) in [("small", &small), ("large", &large)] {
+            assert_quorum_object_body(&client, &bucket, key, body).await?;
+        }
+        for key in ["degraded-write", "empty-root-write"] {
+            let error = client
+                .head_object()
+                .bucket(&bucket)
+                .key(key)
+                .send()
+                .await
+                .expect_err("rejected or deleted degraded write must stay absent after recovery");
+            assert_eq!(error.raw_response().map(|response| response.status().as_u16()), Some(404));
+        }
+        client
+            .put_object()
+            .bucket(&bucket)
+            .key("recovery-write")
+            .body(Bytes::from_static(b"recovered write").into())
+            .send()
+            .await?;
+        assert_quorum_object_body(&client, &bucket, "recovery-write", b"recovered write").await?;
+    }
     Ok(())
 }
 

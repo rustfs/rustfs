@@ -13,18 +13,12 @@
 // limitations under the License.
 
 use crate::app::bucket_usecase::DefaultBucketUsecase;
-use crate::app::storage_api::s3::{ListObjectsV2Input, ListObjectsV2Output, S3Request, S3Response, S3Result};
 
-/// ListObjectsV2 through `usecase` as the legacy stack answers it.
-///
-/// Owned by the ListObjectsV2 batch (B2). Tests outside that batch's files call this seam instead of the use-case
-/// method; when batch B2 changes the use-case signature it changes only this body.
-pub(crate) async fn list_objects_v2(
+/// Calls `DefaultBucketUsecase::execute_list_objects_v2` with owned inputs.
+pub(crate) async fn list_objects_v2_owned(
     usecase: &DefaultBucketUsecase,
-    req: S3Request<ListObjectsV2Input>,
-) -> S3Result<S3Response<ListObjectsV2Output>> {
-    crate::storage::ecfs::list_objects_v2_through_legacy_edge(req, |envelope, input| {
-        usecase.execute_list_objects_v2(envelope, input)
-    })
-    .await
+    envelope: crate::app::RequestEnvelope,
+    input: rustfs_gateway::dto::ListObjectsV2Input,
+) -> rustfs_s3_types::S3Result<rustfs_gateway::dto::ListObjectsV2Output> {
+    usecase.execute_list_objects_v2(envelope, input).await
 }

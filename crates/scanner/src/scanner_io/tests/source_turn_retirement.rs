@@ -8,6 +8,22 @@ const EPOCH: u64 = 7;
 const RETIRED: &str = "retirement-generation";
 const LIVE: &str = "retirement-survivor";
 
+async fn close_fixture(directory: tempfile::TempDir, store: Arc<ECStore>) {
+    store.background_cancel_token().expect("fixture shutdown token").cancel();
+    tokio::time::timeout(Duration::from_secs(30), async {
+        for pool in &store.pools {
+            pool.stop_endpoint_monitor_for_test().await;
+        }
+    })
+    .await
+    .expect("endpoint monitors must stop before removing fixture disks");
+    wait_for_namespace_commit_tails(&store).await;
+    drop(store);
+    let path = directory.path().to_path_buf();
+    directory.close().expect("remove source retirement fixture");
+    assert!(!path.exists());
+}
+
 async fn run_turn(
     set: &Arc<SetDisks>,
     buckets: &[BucketInfo],
@@ -37,6 +53,7 @@ async fn run_turn(
                     digest: DataUsageScanPlanDigest([31; 32]),
                     bucket_coverage_digest: DataUsageScanPlanDigest([32; 32]),
                     checkpoint_coverage_digest: DataUsageScanPlanDigest([33; 32]),
+                    completed_checkpoint_cycle_floor: None,
                     requires_full_scan: true,
                     execution_digest: DataUsageScanPlanDigest([34; 32]),
                     leader_epoch: EPOCH,
@@ -143,10 +160,7 @@ async fn assert_retired_source_turn_discards_only_deleted_generation_and_retains
         failures.partial.lock().await.contains(RETIRED),
         "responsibility remains until namespace replanning"
     );
-    drop(store);
-    let path = directory.path().to_path_buf();
-    directory.close().expect("remove source retirement fixture");
-    assert!(!path.exists());
+    close_fixture(directory, store).await;
 }
 
 async fn assert_recreated_source_turn_rescans_successor_without_old_value_or_identity() {
@@ -188,10 +202,7 @@ async fn assert_recreated_source_turn_rescans_successor_without_old_value_or_ide
     assert_eq!((successor.objects, successor.size), (2, 28));
     assert_eq!(after.info.scan_bucket_incarnations[RETIRED], new_identity);
     assert_eq!(after.find(LIVE).expect("unrelated bucket").size, 13);
-    drop(store);
-    let path = directory.path().to_path_buf();
-    directory.close().expect("remove source retirement fixture");
-    assert!(!path.exists());
+    close_fixture(directory, store).await;
 }
 
 async fn assert_missing_retirement_proof_and_foreign_source_fences_cannot_clear_completion() {
@@ -218,10 +229,7 @@ async fn assert_missing_retirement_proof_and_foreign_source_fences_cannot_clear_
             .expect_err("unconfirmed identity changes cannot retire completed work");
         assert!(error.to_string().contains("identity"), "{field}: {error}");
     }
-    drop(store);
-    let path = directory.path().to_path_buf();
-    directory.close().expect("remove source retirement fixture");
-    assert!(!path.exists());
+    close_fixture(directory, store).await;
 }
 
 async fn assert_missing_directories_and_unreadable_retirement_proof_remain_unconfirmed() {
@@ -251,10 +259,7 @@ async fn assert_missing_directories_and_unreadable_retirement_proof_remain_uncon
         .await
         .expect_err("an unreadable retirement must preserve failed completion validation");
     assert!(error.to_string().contains("identity"));
-    drop(store);
-    let path = directory.path().to_path_buf();
-    directory.close().expect("remove source retirement fixture");
-    assert!(!path.exists());
+    close_fixture(directory, store).await;
 }
 
 #[tokio::test]

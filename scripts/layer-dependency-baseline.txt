@@ -20,10 +20,6 @@ cycle|infra<->interface
 dep|rustfs/src/app/admin_usecase.rs|app->interface|crate::server::collect_dependency_readiness_report
 dep|rustfs/src/cluster_snapshot.rs|infra->interface|crate::server::snapshot_dependency_readiness_report
 dep|rustfs/src/runtime_sources.rs|infra->app|crate::app::context
-dep|rustfs/src/storage/ecfs_extend.rs|infra->interface|crate::server::cors
-dep|rustfs/src/storage/ecfs_extend.rs|infra->interface|crate::storage::ecfs::ListObjectUnorderedQuery
-dep|rustfs/src/storage/helper.rs|infra->interface|crate::server::refresh_audit_module_enabled
-dep|rustfs/src/storage/helper.rs|infra->interface|crate::server::refresh_notify_module_enabled
 dep|rustfs/src/storage/rpc/http_service.rs|infra->interface|crate::server::RPC_PREFIX
 dep|rustfs/src/storage/rpc/node_service.rs|infra->interface|crate::admin::handlers::kms_dynamic::current_kms_config_fingerprint
 dep|rustfs/src/storage/rpc/node_service.rs|infra->interface|crate::admin::handlers::kms_dynamic::reload_persisted_kms_config
@@ -31,3 +27,4 @@ dep|rustfs/src/storage/rpc/node_service.rs|infra->interface|crate::admin::servic
 dep|rustfs/src/storage/rpc/node_service.rs|infra->interface|crate::admin::service::config::reload_runtime_config_snapshot
 dep|rustfs/src/storage/rpc/node_service.rs|infra->interface|crate::admin::service::site_replication::reload_site_replication_runtime_state
 dep|rustfs/src/storage/rpc/node_service.rs|infra->interface|crate::server::MODULE_SWITCHES_SIGNAL_SUBSYSTEM
+dep|rustfs/src/storage/s3_support.rs|infra->interface|crate::server::cors

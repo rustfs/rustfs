@@ -79,6 +79,9 @@ fn mark_bucket_notification_rules_reconciled() {
 }
 
 fn should_reconcile_bucket_notification_rules(runtime_changed: bool, notify_enabled: bool) -> bool {
+    // Dispatch follows store-owned metadata snapshots, including the periodic
+    // metadata refresh that repairs lost peer signals. Startup validation need
+    // not rescan all buckets on every five-second target-runtime tick.
     notify_enabled && (runtime_changed || !are_bucket_notification_rules_reconciled())
 }
 
@@ -111,6 +114,8 @@ fn convert_ecstore_event_args(args: EcstoreEventArgs) -> Option<NotifyEventArgs>
     };
 
     Some(NotifyEventArgs {
+        bucket_incarnation_id: args.bucket_incarnation_id,
+        bucket_removed_targets: None,
         event_name,
         bucket_name: args.bucket_name,
         object: convert_ecstore_object_info(args.object),
@@ -164,6 +169,10 @@ fn ensure_live_events_initialized() -> std::sync::Arc<NotificationSystem> {
     system
 }
 
+/// A published lifecycle generation is usable even when some targets are
+/// quarantined: healthy targets already carry events and per-target health is
+/// reported by the admin target list. Only an unpublished generation means the
+/// runtime is not available yet.
 fn ensure_event_notifier_converged(system: &NotificationSystem) -> Result<(), NotificationError> {
     if system.runtime_lifecycle_is_converged() {
         Ok(())
@@ -186,6 +195,7 @@ async fn reconcile_event_notifier_from_store_unlocked(
     let result = async {
         validate_notify_module_env().map_err(NotificationError::Initialization)?;
         let system = ensure_live_events_initialized();
+        system.bind_bucket_metadata_source(&store);
         let transition_system = system.clone();
         let transition_store = store.clone();
         let transition = with_refreshed_notify_module_state_from(store.clone(), move |resolution| async move {
@@ -352,6 +362,8 @@ where
         initialize_live_event_support(&system, None).await?;
         return Ok(());
     };
+
+    system.bind_bucket_metadata_source(&store);
 
     refresh_persisted_module_switches_from(store.clone())
         .await

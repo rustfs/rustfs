@@ -11,15 +11,15 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
-//! The gateway stack answers, without any of RustFS's tower patch layers, what those layers make
+//! The gateway stack answers, without any of RustFS's tower patch layers, what those layers made
 //! the legacy stack answer (rustfs/backlog#2771, the six layers ruled "replace by the gateway").
+//! Five of them are deleted; `EmptyBodyContentLengthCompatLayer` keeps its admin and console halves.
 //!
 //! Responsible for: the fixture the per-layer modules share, a stack assembled by the production
 //! builder whose handlers are probes. Nothing in front of [`GatewayStack::call`] runs here, so
-//! every answer below is the gateway's alone: the layers are installed by `server/http.rs` and
-//! the other harnesses of this crate drive the stack through them.
+//! every answer below is the gateway's alone.
 //! NOT responsible for: S3 behaviour behind the handlers (the probes answer an empty output).
-//! Upstream: `server/legacy_compat`, whose unit tests state what each layer answers. Downstream:
+//! Upstream: the deleted layers, whose answers each module states. Downstream:
 //! `GatewayStack::configured_builder`.
 
 use super::*;
@@ -124,6 +124,7 @@ pub(super) fn probe_stack_for(probe: &Arc<Probe>, assembly: GatewayAssembly) -> 
         Arc::new(ScriptedIam { ready: true }),
         root().source(),
         allow_when(|request| request.identity.is_some()),
+        std::convert::identity,
     )
     .expect("the production builder assembles");
     let service = builder
@@ -139,6 +140,7 @@ pub(super) fn probe_stack_for(probe: &Arc<Probe>, assembly: GatewayAssembly) -> 
     GatewayStack {
         service,
         keystone_auth: None,
+        control_plane: false,
     }
 }
 

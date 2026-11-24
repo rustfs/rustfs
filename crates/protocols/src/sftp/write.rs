@@ -27,7 +27,7 @@ use super::driver::SftpDriver;
 use super::errors::{SftpError, is_not_found_error, s3_error_to_sftp};
 use super::paths::{copy_source_value, parse_s3_path, sanitise_control_bytes};
 use super::state::{CompletedPart, HandleState, MultipartUpload, WritePhase};
-use crate::common::client::s3::StorageBackend;
+use crate::common::client::s3::{MultipartRequest, StorageBackend};
 use crate::common::gateway::S3Action;
 use bytes::Bytes;
 use russh_sftp::protocol::{FileAttributes, Handle, OpenFlags, StatusCode};
@@ -36,7 +36,7 @@ use rustfs_gateway_types::dto::{
     AbortMultipartUploadInput, CompleteMultipartUploadInput, CompletedMultipartUpload, CompletedPart as S3CompletedPart,
     CreateMultipartUploadInput, PutObjectInput, UploadPartCopyInput, UploadPartInput,
 };
-use rustfs_gateway_types::{BucketName, ObjectKey, UploadIdClaim};
+use rustfs_gateway_types::{BucketName, ObjectKey};
 use rustfs_utils::MaskedAccessKey;
 
 const LOG_COMPONENT_PROTOCOLS: &str = "protocols";
@@ -52,10 +52,6 @@ fn bucket_name(value: &str, operation: &'static str) -> Result<BucketName, SftpE
 
 fn object_key(value: &str, operation: &'static str) -> Result<ObjectKey, SftpError> {
     ObjectKey::new(value.to_owned()).map_err(|error| s3_error_to_sftp(operation, error))
-}
-
-fn upload_claim(value: &str) -> UploadIdClaim {
-    UploadIdClaim::from_wire(value.to_owned())
 }
 
 /// Running byte count for a write handle's current phase. Buffering is
@@ -336,7 +332,10 @@ impl<S: StorageBackend + Send + Sync + 'static> SftpDriver<S> {
             open_attrs,
             phase: WritePhase::Buffering { part_buffer: Vec::new() },
         })?;
-        Ok(Handle { id, handle })
+        Ok(Handle {
+            id,
+            handle: handle.into(),
+        })
     }
 
     /// Upload the buffered bytes to S3 with a single PutObject call.
@@ -446,14 +445,17 @@ impl<S: StorageBackend + Send + Sync + 'static> SftpDriver<S> {
         let input = UploadPartInput::builder()
             .bucket(bucket_name(bucket, "build_upload_part")?)
             .key(object_key(key, "build_upload_part")?)
-            .upload_id(upload_claim(upload_id))
             .part_number(part_number)
             .content_length(part_len)
             .body(streaming)
             .build();
 
         let out = self
-            .run_backend("upload_part", self.storage.upload_part(input, self.credentials()))
+            .run_backend(
+                "upload_part",
+                self.storage
+                    .upload_part(MultipartRequest::upload_part(input, upload_id), self.credentials()),
+            )
             .await?;
 
         let e_tag = if out.e_tag == rustfs_gateway_types::ETag::default() {
@@ -584,14 +586,14 @@ impl<S: StorageBackend + Send + Sync + 'static> SftpDriver<S> {
         let input = CompleteMultipartUploadInput::builder()
             .bucket(bucket_name(bucket, "build_complete_multipart_upload")?)
             .key(object_key(key, "build_complete_multipart_upload")?)
-            .upload_id(upload_claim(upload_id))
             .multipart_upload(CompletedMultipartUpload { parts })
             .build();
 
         let result = self
             .run_backend(
                 "complete_multipart_upload",
-                self.storage.complete_multipart_upload(input, self.credentials()),
+                self.storage
+                    .complete_multipart_upload(MultipartRequest::complete(input, upload_id), self.credentials()),
             )
             .await;
         result?;
@@ -853,11 +855,14 @@ impl<S: StorageBackend + Send + Sync + 'static> SftpDriver<S> {
         let input = AbortMultipartUploadInput::builder()
             .bucket(bucket_name(bucket, "build_abort_multipart_upload")?)
             .key(object_key(key, "build_abort_multipart_upload")?)
-            .upload_id(upload_claim(upload_id))
             .build();
 
-        self.run_backend("abort_multipart_upload", self.storage.abort_multipart_upload(input, self.credentials()))
-            .await?;
+        self.run_backend(
+            "abort_multipart_upload",
+            self.storage
+                .abort_multipart_upload(MultipartRequest::abort(input, upload_id), self.credentials()),
+        )
+        .await?;
         Ok(())
     }
 
@@ -1054,13 +1059,18 @@ impl<S: StorageBackend + Send + Sync + 'static> SftpDriver<S> {
                 let input = UploadPartCopyInput::builder(copy_source_value(src_bucket, src_key))
                     .bucket(bucket_name(dst_bucket, "build_upload_part_copy")?)
                     .key(object_key(dst_key, "build_upload_part_copy")?)
-                    .upload_id(upload_claim(&mp.upload_id))
                     .part_number(part_number)
                     .copy_source_range(range)
                     .build();
 
                 let out = self
-                    .run_backend("upload_part_copy", self.storage.upload_part_copy(input, self.credentials()))
+                    .run_backend(
+                        "upload_part_copy",
+                        self.storage.upload_part_copy(
+                            MultipartRequest::upload_part_copy(input, mp.upload_id.as_str()),
+                            self.credentials(),
+                        ),
+                    )
                     .await?;
 
                 let e_tag = if out.e_tag == rustfs_gateway_types::ETag::default() {
@@ -2105,7 +2115,7 @@ mod tests {
         )
         .await
         .expect("WRITE | CREATE | TRUNCATE on a missing file must allocate a handle");
-        assert!(!handle.handle.is_empty());
+        assert!(!handle.handle.as_bytes().is_empty());
         assert!(backend.head_object_calls().is_empty(), "the non-EXCL accept path must not HEAD");
     }
 
@@ -2130,7 +2140,7 @@ mod tests {
         )
         .await
         .expect("WRITE | CREATE | TRUNCATE on an existing file must allocate a handle");
-        assert!(!handle.handle.is_empty());
+        assert!(!handle.handle.as_bytes().is_empty());
         assert!(backend.head_object_calls().is_empty(), "the non-EXCL accept path must not HEAD");
     }
 
@@ -2177,7 +2187,7 @@ mod tests {
         )
         .await
         .expect("EXCL on a missing key must allow creation");
-        assert!(!handle.handle.is_empty());
+        assert!(!handle.handle.as_bytes().is_empty());
         assert_eq!(backend.head_object_calls().len(), 1, "EXCL must HEAD exactly once");
     }
 

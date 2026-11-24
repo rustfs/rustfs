@@ -17,7 +17,9 @@
 use super::object_write::{request_version_id, retain_until};
 use super::{OpRow, Served, row};
 use crate::app::multipart_usecase::{UploadPartCopyWriteInput, UploadPartTarget};
-use crate::app::object_usecase::{CopyObjectWriteInput, CopyObjectWriteOutput, CopySourceCondition, DefaultObjectUsecase};
+use crate::app::object_usecase::{
+    CopyObjectWriteInput, CopyObjectWriteOutput, CopySourceCondition, CopySourceDates, DefaultObjectUsecase,
+};
 use crate::app::{RequestEnvelope, dto_values, multipart_usecase::DefaultMultipartUsecase};
 use crate::runtime_sources::AppContext;
 use crate::storage_api::server::http::access::access_owned::object_commit::{
@@ -46,10 +48,7 @@ impl Served for dto::CompleteMultipartUpload {
             .ok_or_else(|| s3_error!(InternalError, "server context is not initialized"))?;
         let input = request.input();
         let specific_etag = input.if_match.as_deref().is_some_and(|value| value.trim() != "*");
-        Ok(
-            authorize_complete_multipart_upload(envelope, &server, input.bucket.as_str(), input.key.as_str(), specific_etag)
-                .await?,
-        )
+        authorize_complete_multipart_upload(envelope, &server, input.bucket.as_str(), input.key.as_str(), specific_etag).await
     }
 
     async fn execute(context: Option<Arc<AppContext>>, envelope: RequestEnvelope, request: Req<Self>) -> S3Result<Resp<Self>> {
@@ -90,7 +89,7 @@ impl Served for dto::CopyObject {
             legal_hold: input.object_lock_legal_hold_status.is_some(),
             retention: input.object_lock_mode.is_some() || input.object_lock_retain_until_date.is_some(),
         };
-        Ok(authorize_copy_object(envelope, &server, facts).await?)
+        authorize_copy_object(envelope, &server, facts).await
     }
 
     async fn execute(context: Option<Arc<AppContext>>, envelope: RequestEnvelope, request: Req<Self>) -> S3Result<Resp<Self>> {
@@ -122,7 +121,7 @@ impl Served for dto::UploadPartCopy {
         };
         let input = request.input();
         authorize_upload_part_copy(envelope, &server, input.bucket.as_str(), input.key.as_str(), source).await?;
-        Ok(check_copy_source_owner(envelope.headers())?)
+        check_copy_source_owner(envelope.headers())
     }
 
     async fn execute(context: Option<Arc<AppContext>>, envelope: RequestEnvelope, request: Req<Self>) -> S3Result<Resp<Self>> {
@@ -139,6 +138,7 @@ impl Served for dto::UploadPartCopy {
             copy_source_range: input.copy_source_range,
             copy_source_if_match: copy_condition(input.copy_source_if_match.as_deref())?,
             copy_source_if_none_match: copy_condition(input.copy_source_if_none_match.as_deref())?,
+            copy_source_dates: CopySourceDates::new(input.copy_source_if_modified_since, input.copy_source_if_unmodified_since),
             sse_customer_algorithm: input.sse_customer_algorithm,
             sse_customer_key: input.sse_customer_key.map(|key| key.expose_secret().to_owned()),
             sse_customer_key_md5: input.sse_customer_key_md5,
@@ -147,7 +147,7 @@ impl Served for dto::UploadPartCopy {
             copy_source_sse_customer_key_md5: input.copy_source_sse_customer_key_md5,
         };
         let output = DefaultMultipartUsecase::with_context(context)
-            .execute_upload_part_copy_owned(envelope, input)
+            .execute_upload_part_copy_with_audit(envelope, input)
             .await?;
         let tag = output
             .e_tag
@@ -234,6 +234,7 @@ fn copy_input(
         tagging_directive: input.tagging_directive.map(|value| value.as_str().to_owned()),
         copy_source_if_match: copy_condition(input.copy_source_if_match.as_deref())?,
         copy_source_if_none_match: copy_condition(input.copy_source_if_none_match.as_deref())?,
+        copy_source_dates: CopySourceDates::new(input.copy_source_if_modified_since, input.copy_source_if_unmodified_since),
         cache_control: input.cache_control,
         content_disposition: input.content_disposition,
         content_encoding: input.content_encoding,

@@ -116,7 +116,7 @@ impl DefaultBucketUsecase {
 
     async fn list_objects_page(&self, envelope: &mut RequestEnvelope, request: &PageRequest) -> S3Result<Page> {
         let PageRequest { bucket, params, .. } = request;
-        validate_list_object_unordered_with_delimiter(params.delimiter.as_ref(), envelope.uri().query())?;
+        validate_list_object_unordered_with_delimiter(params.delimiter.as_deref(), envelope.uri().query())?;
         let store = get_validated_store(bucket).await?;
         let incl_deleted = get_header(envelope.headers(), rustfs_utils::http::SUFFIX_INCLUDE_DELETED).as_deref() == Some("true");
         let table_list_access = envelope.table_list_access().cloned();
@@ -372,8 +372,78 @@ fn list_objects_next_marker(info: &ListObjectsV2Info, cursor: Option<&str>) -> O
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::app::bucket_usecase::test_support::build_request;
+    use crate::app::bucket_usecase::test_support::owned_envelope;
     use rustfs_gateway_types::BucketName;
+
+    #[test]
+    #[serial_test::serial]
+    fn list_apis_report_storage_read_quorum_as_unavailable() {
+        use crate::app::gating_test_env::{run_large_stack_test, shared_gating_ambient, shared_gating_ecstore};
+        run_large_stack_test("list-quorum-surface", || async {
+            let usecase = DefaultBucketUsecase::with_context(Some(shared_gating_ambient().await));
+            let store = shared_gating_ecstore().await;
+            let bucket = BucketName::new(format!("list-quorum-{}", uuid::Uuid::new_v4().simple())).unwrap();
+            store
+                .make_bucket(bucket.as_str(), &MakeBucketOptions::default())
+                .await
+                .unwrap();
+            let set = &store.pools[0].disk_set[0];
+            let saved_disks = {
+                let mut disks = set.disks.write().await;
+                let saved = disks.clone();
+                disks.iter_mut().skip(1).for_each(|disk| *disk = None);
+                saved
+            };
+            let envelope = || owned_envelope(http::Method::GET);
+            let results = [
+                usecase
+                    .execute_list_objects(
+                        envelope(),
+                        gateway_dto::ListObjectsInput {
+                            bucket: bucket.clone(),
+                            ..Default::default()
+                        },
+                    )
+                    .await
+                    .map(drop),
+                usecase
+                    .execute_list_objects_v2(
+                        envelope(),
+                        gateway_dto::ListObjectsV2Input {
+                            bucket: bucket.clone(),
+                            ..Default::default()
+                        },
+                    )
+                    .await
+                    .map(drop),
+                usecase
+                    .execute_list_object_versions(
+                        envelope(),
+                        gateway_dto::ListObjectVersionsInput {
+                            bucket,
+                            ..Default::default()
+                        },
+                    )
+                    .await
+                    .map(drop),
+            ];
+            *set.disks.write().await = saved_disks;
+            for result in results {
+                let error = result.expect_err("cannot list below storage read quorum");
+                assert_eq!(error.code(), &S3ErrorCode::ServiceUnavailable);
+                assert_eq!(error.status_code(), Some(StatusCode::SERVICE_UNAVAILABLE));
+                assert_eq!(error.message(), Some("The service is unavailable. Please retry."));
+                let source = error.source().expect("retain storage diagnostics");
+                assert!(
+                    matches!(
+                        source.downcast_ref::<StorageError>(),
+                        Some(StorageError::ErasureReadQuorum | StorageError::InsufficientReadQuorum(_, _))
+                    ),
+                    "{source}"
+                );
+            }
+        });
+    }
 
     fn object(name: &str) -> ObjectInfo {
         ObjectInfo {
@@ -414,7 +484,7 @@ mod tests {
     }
 
     fn envelope() -> RequestEnvelope {
-        RequestEnvelope::from_s3s(&build_request((), http::Method::GET))
+        owned_envelope(http::Method::GET)
     }
 
     #[test]

@@ -227,7 +227,6 @@ pub(super) fn put_input(input: dto::PutObjectInput) -> S3Result<crate::app::obje
         bucket: input.bucket.as_str().to_owned(),
         key: input.key.as_str().to_owned(),
         body: input.body.map(|body| body.into_body()),
-        #[cfg(feature = "gateway-stack")]
         post_archive: None,
         trailing_headers: None,
         frame_trailers: None,
@@ -535,6 +534,10 @@ pub(super) fn copy_input(input: dto::CopyObjectInput) -> S3Result<CopyObjectWrit
         tagging_directive: nonempty(input.tagging_directive.map(|value| value.as_str().to_owned())),
         copy_source_if_match,
         copy_source_if_none_match,
+        copy_source_dates: crate::app::object_usecase::CopySourceDates::new(
+            input.copy_source_if_modified_since,
+            input.copy_source_if_unmodified_since,
+        ),
         cache_control: nonempty(input.cache_control),
         content_disposition: nonempty(input.content_disposition),
         content_encoding: nonempty(input.content_encoding),

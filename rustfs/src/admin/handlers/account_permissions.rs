@@ -27,11 +27,13 @@ use crate::admin::runtime_sources::current_ready_iam_handle;
 use crate::app::RequestEnvelope;
 use crate::auth::get_condition_values;
 use crate::server::ADMIN_PREFIX;
-use crate::storage::access::{
-    ReqInfo, RequestedCopySource, RequestedObjectLegalHold, RequestedObjectLockRetainUntil, RequestedObjectLockRetention,
-    RequestedObjectTags, authorize_request_core, query_list_buckets_permission, s3_action_potential,
-};
 use crate::storage::authorization::AuthorizationRequest;
+use crate::storage::authorization::{authorize_request_core, query_list_buckets_permission, s3_action_potential};
+use crate::storage::req_info::ReqInfo;
+use crate::storage::request_markers::{
+    RequestedCopySource, RequestedObjectLegalHold, RequestedObjectLockRetainUntil, RequestedObjectLockRetention,
+    RequestedObjectTags,
+};
 use http::{HeaderMap, HeaderValue, Method, StatusCode, Uri};
 use matchit::Params;
 use rustfs_credentials::Credentials;
@@ -534,13 +536,9 @@ async fn evaluate_check(
         if missing {
             (Decision::Unknown, Some(s3_action_potential(&probe, action).await.unwrap_or(false)))
         } else if check.action == "s3:ListAllMyBuckets" {
-            (classify(query_list_buckets_permission(&probe).await.map_err(Into::into)), None)
+            (classify(query_list_buckets_permission(&probe).await), None)
         } else {
-            let decision = classify(
-                authorize_request_core(&mut probe, action, None, false)
-                    .await
-                    .map_err(Into::into),
-            );
+            let decision = classify(authorize_request_core(&mut probe, action, None, false).await);
             let potential = if decision == Decision::Unknown {
                 Some(s3_action_potential(&probe, action).await.unwrap_or(false))
             } else {

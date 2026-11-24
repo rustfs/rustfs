@@ -43,28 +43,30 @@ use super::super::{
     ReplicationObjectBridge, Result, SET_DISK_COMMIT_TAIL_WARN_THRESHOLD_MS, SLASH_SEPARATOR, SUFFIX_ACTUAL_SIZE,
     SUFFIX_COMPRESSION, SUFFIX_COMPRESSION_SIZE, SUFFIX_RESTORE_COPYBACK, SUFFIX_RESTORE_OPERATION_ID,
     SUFFIX_RESTORE_WORKER_LOCK, SetDisks, SmallWritePath, StorageError, TRANSITION_COMPLETE, UpdateMetadataOpts, Uuid,
-    WriteLayout, adaptive_duplex_buffer_size, build_get_object_info, build_inline_bitrot_readers, check_object_lock_delete,
-    check_object_lock_for_deletion_with_state, check_object_lock_retention_update, classify_get_codec_streaming_object_class,
-    classify_put_write_path, classify_storage_error, collect_inline_data_shard_fileinfos_by_index, contains_key_str,
-    create_bitrot_writer_with_orig_volume, debug, delete_file_info_version_id, disk, ensure_delete_commit_locks_held, error,
-    explicit_delete_removed_marker, finish_set_disk_read_lock, get_codec_streaming_reader_gate_with_plan,
-    get_object_body_cache_hook, get_raw_etag, get_small_object_direct_memory_decision_with_threshold_and_plan,
-    get_small_object_direct_memory_threshold, get_stage_timer_if_enabled, get_str,
-    get_transitioned_object_reader_with_tier_manager, insert_str, is_deadlock_detection_enabled, is_err_object_not_found,
-    is_err_version_not_found, is_explicit_null_version, is_get_codec_streaming_base_enabled,
-    is_get_small_object_direct_memory_enabled, is_lock_optimization_enabled, issue3031_diag_enabled, join_all,
-    known_put_object_storage_size, part_checksum_algorithm, path_join_buf, put_restore_opts, record_compression_total_memory,
-    record_get_codec_streaming_gate_decision, record_get_direct_memory_decision, record_get_object_pipeline_failure,
-    record_get_object_pipeline_failure_for_path, record_get_object_reader_path_observation, record_get_stage_duration_if_enabled,
-    record_lock_acquire, reduce_write_quorum_errs, release_materialized_read_lock, replication_write_may_pass_worm_gate,
-    republishes_data_movement_delete_marker, require_restore_operation_id, resolve_delete_version_state,
-    resolve_tiered_decommission_write_quorum_result, resolve_write_layout, restore_commit_operation_id_from_metadata,
-    restore_operation_id_from_metadata, send_event, set_disk_delete_creates_delete_marker,
-    should_force_delete_marker_for_missing_version, should_inline_put, should_persist_encryption_original_size,
-    should_preserve_delete_replication_state, should_use_inline_fast_path_with_plan, take_prepared_get_object_metadata,
-    to_object_err, try_decode_inline_data_shards, warn,
+    WriteLayout, adaptive_duplex_buffer_size, build_get_object_info, build_inline_bitrot_readers_with_frame_size,
+    check_object_lock_delete, check_object_lock_for_deletion_with_state, check_object_lock_retention_update,
+    classify_get_codec_streaming_object_class, classify_put_write_path, classify_storage_error,
+    collect_inline_data_shard_fileinfos_by_index, contains_key_str, create_bitrot_writer_with_orig_volume, debug,
+    delete_file_info_version_id, disk, ensure_delete_commit_locks_held, error, explicit_delete_removed_marker,
+    finish_set_disk_read_lock, get_codec_streaming_reader_gate_with_plan, get_object_body_cache_hook, get_raw_etag,
+    get_small_object_direct_memory_decision_with_threshold_and_plan, get_small_object_direct_memory_threshold,
+    get_stage_timer_if_enabled, get_str, get_transitioned_object_reader_with_tier_manager, insert_str,
+    is_deadlock_detection_enabled, is_err_object_not_found, is_err_version_not_found, is_explicit_null_version,
+    is_get_codec_streaming_base_enabled, is_get_small_object_direct_memory_enabled, is_lock_optimization_enabled,
+    issue3031_diag_enabled, join_all, known_put_object_storage_size, part_checksum_algorithm, path_join_buf, put_restore_opts,
+    record_compression_total_memory, record_get_codec_streaming_gate_decision, record_get_direct_memory_decision,
+    record_get_object_pipeline_failure, record_get_object_pipeline_failure_for_path, record_get_object_reader_path_observation,
+    record_get_stage_duration_if_enabled, record_lock_acquire, reduce_write_quorum_errs, release_materialized_read_lock,
+    replication_write_may_pass_worm_gate, republishes_data_movement_delete_marker, require_restore_operation_id,
+    resolve_delete_version_state, resolve_tiered_decommission_write_quorum_result, resolve_write_layout,
+    restore_commit_operation_id_from_metadata, restore_operation_id_from_metadata, send_event,
+    set_disk_delete_creates_delete_marker, should_force_delete_marker_for_missing_version, should_inline_put,
+    should_persist_encryption_original_size, should_preserve_delete_replication_state, should_use_inline_fast_path_with_plan,
+    take_prepared_get_object_metadata, to_object_err, try_decode_inline_data_shards, warn,
 };
-use super::bitrot_self_verify::{BitrotSelfVerifyTarget, drop_failed_writer_disks, verify_written_bitrot_shards};
+use super::bitrot_self_verify::{
+    BitrotSelfVerifyTarget, WrittenBitrotShards, drop_failed_writer_disks, verify_written_bitrot_shards,
+};
 use super::delete_recovery::DeleteRecoveryContext;
 
 const EVENT_SET_DISK_DELETE_OBJECTS_STAGE: &str = "set_disk_delete_objects_stage";
@@ -3170,6 +3172,8 @@ impl crate::storage_api_contracts::object::ObjectIO for SetDisks {
                 let read_length = erasure.shard_file_offset(0, object_size, object_size);
                 let total_shards = data_shards + fi.erasure.parity_blocks;
                 let (_disks, files) = Self::shuffle_disks_and_parts_metadata_by_index(disks, files, fi);
+                let frame_size = crate::set_disk::read::read_frame_size_for_file_info(fi, &erasure)
+                    .map_err(|error| to_object_err(error, vec![bucket, object]))?;
 
                 // Check if we have enough inline data shards
                 let inline_count = files
@@ -3180,13 +3184,14 @@ impl crate::storage_api_contracts::object::ObjectIO for SetDisks {
 
                 if inline_count >= data_shards {
                     let reader_setup_stage_start = rustfs_io_metrics::get_stage_metrics_enabled().then(Instant::now);
-                    let readers = build_inline_bitrot_readers(
+                    let readers = build_inline_bitrot_readers_with_frame_size(
                         files.iter(),
                         total_shards,
                         bucket,
                         object,
                         read_length,
                         erasure.shard_size(),
+                        frame_size,
                         &checksum_algo,
                         opts.skip_verify_bitrot,
                     )
@@ -4600,6 +4605,11 @@ impl SetDisks {
 
         let expected_restore_operation_id = restore_commit_operation_id_from_metadata(&opts.user_defined)?;
         let mut user_defined = opts.user_defined.clone();
+        let requested_ec_block_size = crate::object_api::take_ec_block_size_hint(&mut user_defined);
+        // This is a request-to-writer marker.  It must never become ordinary
+        // object metadata, even when the caller supplied it through an
+        // internal path.
+        rustfs_utils::http::metadata_compat::remove_str(&mut user_defined, crate::object_api::EC_BLOCK_SIZE_INFO_INTERNAL_SUFFIX);
         rustfs_filemeta::shard_integrity::clear_integrity_metadata(&mut user_defined);
         if let Some(eval_metadata) = &opts.eval_metadata {
             merge_evaluated_metadata(&mut user_defined, eval_metadata)?;
@@ -4645,6 +4655,9 @@ impl SetDisks {
         // }
 
         let mut fi = FileInfo::new([bucket, object].join("/").as_str(), data_drives, parity_drives);
+        if let Some(block_size) = requested_ec_block_size {
+            fi.erasure.block_size = block_size;
+        }
 
         fi.version_id = {
             if let Some(ref vid) = opts.version_id {
@@ -4686,7 +4699,8 @@ impl SetDisks {
 
         let tmp_dir = Uuid::new_v4().to_string();
 
-        let tmp_object = format!("{}/{}/part.1", tmp_dir, fi.data_dir.unwrap());
+        let tmp_data_dir = format!("{}/{}", tmp_dir, fi.data_dir.ok_or(Error::FileCorrupt)?);
+        let tmp_object = format!("{tmp_data_dir}/part.1");
 
         let (operation_cancellation, mut commit_cancellation_handoff_tx, cancellation_wait) =
             if let Some(cancellation) = opts.put_object_cancellation.clone() {
@@ -4731,6 +4745,21 @@ impl SetDisks {
             let collect_stage_timing = rustfs_io_metrics::put_stage_metrics_enabled() || issue3031_diag_enabled();
             let shard_file_size = shard_file_size_raw;
             let shard_size = erasure.shard_size();
+            // Large layout blocks are still useful for sequential writes, but
+            // they should not force every Range GET to verify/read that whole
+            // shard.  New unprotected, non-inline objects may opt into the
+            // bounded per-frame format; legacy and protected writes retain the
+            // historical framing so their existing readers and proofs remain
+            // byte-for-byte compatible.
+            let frame_size = if !is_inline_buffer && !protect_write && crate::object_api::ec_read_quantum_write_enabled() {
+                crate::object_api::select_ec_read_quantum(fi.erasure.block_size, erasure.data_shards, shard_size)
+                    .unwrap_or(shard_size)
+            } else {
+                shard_size
+            };
+            if frame_size != shard_size {
+                crate::object_api::insert_ec_read_quantum(&mut user_defined, frame_size);
+            }
             let write_path = classify_put_write_path(is_inline_buffer, put_object_size, fi.erasure.block_size);
             let direct_inline_commit = matches!(write_path, SmallWritePath::Inline);
             rustfs_io_metrics::record_put_object_path(write_path.metric_label());
@@ -4770,7 +4799,7 @@ impl SetDisks {
                                     RUSTFS_META_TMP_BUCKET,
                                     &tmp_obj,
                                     shard_file_size,
-                                    shard_size,
+                                    frame_size,
                                     HashAlgorithm::HighwayHash256S,
                                 )
                                 .await
@@ -4994,12 +5023,7 @@ impl SetDisks {
                     integrity.part
                 } else {
                     integrity
-                        .write(
-                            &mut shuffle_disks,
-                            bucket,
-                            RUSTFS_META_TMP_BUCKET,
-                            &format!("{tmp_dir}/{}", fi.data_dir.ok_or(Error::FileCorrupt)?),
-                        )
+                        .write(&mut shuffle_disks, bucket, RUSTFS_META_TMP_BUCKET, &tmp_data_dir)
                         .await?
                 })
             } else {
@@ -5106,19 +5130,21 @@ impl SetDisks {
                 verify_written_bitrot_shards(
                     &shuffle_disks,
                     if is_inline_buffer {
-                        Some(parts_metadatas.as_slice())
+                        WrittenBitrotShards::Inline(&parts_metadatas)
                     } else {
-                        None
+                        WrittenBitrotShards::Staged {
+                            directory: &tmp_data_dir,
+                            layout: &parts_metadatas[response_metadata_slot].erasure,
+                            part_size: w_size,
+                        }
                     },
                     BitrotSelfVerifyTarget {
                         operation: "put_object",
                         bucket,
                         object,
                         part_number: None,
-                        volume: RUSTFS_META_TMP_BUCKET,
-                        path: &tmp_object,
                         logical_shard_size,
-                        shard_size,
+                        shard_size: frame_size,
                         write_quorum,
                     },
                 )
@@ -6575,7 +6601,7 @@ impl SetDisks {
                 let diagnostic_context = crate::cluster::rpc::runtime_sources::ReadVersionDiagnosticContext::capture_entry(
                     rustfs_io_metrics::internode_metrics::ReadVersionEntrySource::PutCommitOwner,
                 );
-                let result = tokio::spawn(async move {
+                let result = tokio::spawn(crate::disk::with_detached_disk_io_context(async move {
                     let commit = Box::pin(commit(commit_submit_to_closure_enter_started, Some(child_token)));
                     #[cfg(feature = "diagnostic-read-version-caller")]
                     return crate::cluster::rpc::runtime_sources::with_read_version_diagnostic_context(
@@ -6586,7 +6612,7 @@ impl SetDisks {
                     .await;
                     #[cfg(not(feature = "diagnostic-read-version-caller"))]
                     commit.await
-                })
+                }))
                 .await
                 .map_err(|err| Error::other(format!("put_object commit task failed: {err}")))?;
                 rustfs_io_metrics::record_put_object_stage_duration_from(
@@ -7166,6 +7192,224 @@ mod legacy_duplex_producer_reader_tests {
             assert_eq!(out, plaintext);
             assert!(matches!(storage_error_source(&err), StorageError::FileCorrupt));
         }
+    }
+
+    #[cfg(feature = "rio-v2")]
+    struct ObjectKeyResolver {
+        object_key: [u8; 32],
+    }
+
+    #[cfg(feature = "rio-v2")]
+    #[async_trait::async_trait]
+    impl ObjectEncryptionResolver for ObjectKeyResolver {
+        async fn resolve_read_material(
+            &self,
+            _request: crate::object_api::ReadEncryptionRequest<'_>,
+        ) -> std::result::Result<Option<ReadEncryptionMaterial>, EncryptionResolutionError> {
+            Ok(Some(ReadEncryptionMaterial {
+                key_bytes: self.object_key,
+                mode: ReadEncryptionMode::Object,
+            }))
+        }
+    }
+
+    #[cfg(feature = "rio-v2")]
+    const RIO_V2_FIXTURE_OBJECT_KEY: [u8; 32] = [0x67; 32];
+
+    #[cfg(feature = "rio-v2")]
+    fn rio_v2_fixture_plaintext(len: usize, seed: usize) -> Vec<u8> {
+        (0..len)
+            .map(|index| u8::try_from((index + seed) % 251).expect("a remainder below 251 fits in u8"))
+            .collect()
+    }
+
+    /// Reads a rio-v2 encrypted object the way the legacy GET path does: a
+    /// producer task feeds the stored bytes into a pipe sized by
+    /// `adaptive_duplex_buffer_size`, so the decrypt reader sees `Pending`
+    /// wherever a DARE package outruns the pipe. `parts` lists each part's
+    /// `(plaintext, stored)` length as the object metadata records it, and
+    /// `stored` is what the drives actually hold, which a test may cut short.
+    #[cfg(feature = "rio-v2")]
+    async fn read_rio_v2_object_through_get_pipe(
+        stored: Vec<u8>,
+        parts: &[(usize, usize)],
+        range: Option<HTTPRangeSpec>,
+    ) -> std::io::Result<Vec<u8>> {
+        let plaintext_size: usize = parts.iter().map(|(plaintext_len, _)| plaintext_len).sum();
+        let multipart = parts.len() > 1;
+        let object_info = ObjectInfo {
+            bucket: "bucket".to_string(),
+            name: "rio-v2-encrypted-object".to_string(),
+            size: i64::try_from(parts.iter().map(|(_, stored_len)| stored_len).sum::<usize>())
+                .expect("stored fixture length should fit in i64"),
+            etag: multipart.then(|| format!("{}-{}", "0".repeat(32), parts.len())),
+            parts: Arc::new(if multipart {
+                parts
+                    .iter()
+                    .enumerate()
+                    .map(|(index, (plaintext_len, stored_len))| rustfs_filemeta::ObjectPartInfo {
+                        number: index + 1,
+                        size: *stored_len,
+                        actual_size: i64::try_from(*plaintext_len).expect("part plaintext length should fit in i64"),
+                        ..Default::default()
+                    })
+                    .collect()
+            } else {
+                Vec::new()
+            }),
+            user_defined: Arc::new(HashMap::from([
+                ("x-amz-server-side-encryption-customer-algorithm".to_string(), "AES256".to_string()),
+                (
+                    "x-amz-server-side-encryption-customer-original-size".to_string(),
+                    plaintext_size.to_string(),
+                ),
+            ])),
+            ..Default::default()
+        };
+        let ctx = InstanceContext::new();
+        assert!(
+            ctx.set_object_encryption_resolver(Arc::new(ObjectKeyResolver {
+                object_key: RIO_V2_FIXTURE_OBJECT_KEY
+            }))
+            .is_ok(),
+            "fresh context should accept resolver"
+        );
+
+        let (mut writer, reader) = tokio::io::duplex(adaptive_duplex_buffer_size(object_info.size));
+        let (terminal_tx, terminal_rx) = tokio::sync::oneshot::channel();
+        let (mut reader, storage_offset, storage_length) = get_legacy_object_reader_with_context(
+            &ctx,
+            reader,
+            terminal_rx,
+            range,
+            &object_info,
+            &ObjectOptions::default(),
+            &HeaderMap::new(),
+        )
+        .await
+        .expect("encrypted read plan should build");
+        let storage_length = usize::try_from(storage_length).expect("storage length should not be negative");
+        let producer = tokio::spawn(async move {
+            let window_end = stored.len().min(storage_offset + storage_length);
+            let window_start = storage_offset.min(window_end);
+            let written = writer.write_all(&stored[window_start..window_end]).await;
+            drop(writer);
+            // The reader may already have failed and dropped the receiver.
+            let _ = terminal_tx.send(Ok(()));
+            written
+        });
+
+        let mut out = Vec::new();
+        let read = reader.read_to_end(&mut out).await;
+        drop(reader);
+        // A failed read drops the pipe early, so the producer's own result only
+        // matters once the read itself succeeded.
+        let written = producer.await.expect("producer task should not panic");
+        read?;
+        written?;
+        Ok(out)
+    }
+
+    #[cfg(feature = "rio-v2")]
+    #[tokio::test]
+    async fn rio_v2_encrypted_get_survives_pipe_refills_mid_package() {
+        const MIB: usize = 1024 * 1024;
+
+        // Stored sizes up to 128 KiB get a 64 KiB pipe, smaller than one DARE
+        // package; 3 MiB objects get a 1 MiB pipe that packages straddle.
+        let mut failures = Vec::new();
+        for plaintext_len in [65_535, 65_536, 65_537, 71_680, 3 * MIB, 3 * MIB + 1] {
+            let plaintext = rio_v2_fixture_plaintext(plaintext_len, 0);
+            let mut stored = Vec::new();
+            crate::io_support::rio::EncryptReader::new_with_object_key(
+                std::io::Cursor::new(plaintext.clone()),
+                RIO_V2_FIXTURE_OBJECT_KEY,
+            )
+            .read_to_end(&mut stored)
+            .await
+            .expect("encrypt singlepart fixture");
+            let stored_len = stored.len();
+
+            match read_rio_v2_object_through_get_pipe(stored, &[(plaintext_len, stored_len)], None).await {
+                Ok(out) if out == plaintext => {}
+                Ok(_) => failures.push(format!("{plaintext_len}-byte object: plaintext mismatch")),
+                Err(err) => failures.push(format!("{plaintext_len}-byte object: {err}")),
+            }
+        }
+
+        assert!(failures.is_empty(), "rio-v2 encrypted GET failed for: {failures:#?}");
+    }
+
+    #[cfg(feature = "rio-v2")]
+    #[tokio::test]
+    async fn rio_v2_encrypted_multipart_get_survives_pipe_refills_mid_package() {
+        const MIB: usize = 1024 * 1024;
+        let part_plaintexts = [rio_v2_fixture_plaintext(5 * MIB, 1), rio_v2_fixture_plaintext(MIB + 17, 2)];
+
+        let (stored, parts) = rio_v2_multipart_fixture(&part_plaintexts).await;
+
+        let out = read_rio_v2_object_through_get_pipe(stored, &parts, None)
+            .await
+            .expect("read multipart object through the GET pipe");
+
+        assert!(out == part_plaintexts.concat(), "multipart plaintext mismatch");
+    }
+
+    /// Encrypts each part with its own part key and returns the concatenated
+    /// stored stream with every part's `(plaintext, stored)` length.
+    #[cfg(feature = "rio-v2")]
+    async fn rio_v2_multipart_fixture(part_plaintexts: &[Vec<u8>]) -> (Vec<u8>, Vec<(usize, usize)>) {
+        let mut stored = Vec::new();
+        let mut parts = Vec::new();
+        for (part_number, part_plaintext) in (1u32..).zip(part_plaintexts) {
+            let stored_before = stored.len();
+            crate::io_support::rio::EncryptReader::new_multipart_with_object_key(
+                std::io::Cursor::new(part_plaintext.clone()),
+                RIO_V2_FIXTURE_OBJECT_KEY,
+                part_number,
+            )
+            .read_to_end(&mut stored)
+            .await
+            .expect("encrypt multipart fixture part");
+            parts.push((part_plaintext.len(), stored.len() - stored_before));
+        }
+        (stored, parts)
+    }
+
+    #[cfg(feature = "rio-v2")]
+    #[tokio::test]
+    async fn rio_v2_encrypted_multipart_range_get_rejects_a_missing_trailing_part() {
+        let part_plaintexts = [rio_v2_fixture_plaintext(70_000, 1), rio_v2_fixture_plaintext(140_000, 2)];
+        let (mut stored, parts) = rio_v2_multipart_fixture(&part_plaintexts).await;
+        // The drives hold part 1 only, although the metadata still lists part 2.
+        stored.truncate(parts[0].1);
+
+        // The range starts in part 1 and ends inside the missing part 2.
+        let range = HTTPRangeSpec {
+            is_suffix_length: false,
+            start: 69_900,
+            end: 70_099,
+        };
+        let outcome = read_rio_v2_object_through_get_pipe(stored, &parts, Some(range)).await;
+
+        match outcome {
+            Err(err) => assert_eq!(err.kind(), std::io::ErrorKind::UnexpectedEof, "{err}"),
+            Ok(out) => panic!("a 200-byte range over a missing part read {} bytes as a clean EOF", out.len()),
+        }
+    }
+
+    #[cfg(feature = "rio-v2")]
+    #[tokio::test]
+    async fn rio_v2_encrypted_multipart_get_accepts_an_empty_trailing_part() {
+        let part_plaintexts = [rio_v2_fixture_plaintext(70_000, 1), Vec::new()];
+        let (stored, parts) = rio_v2_multipart_fixture(&part_plaintexts).await;
+        assert_eq!(parts[1], (0, 0), "an empty part stores no DARE package");
+
+        let out = read_rio_v2_object_through_get_pipe(stored, &parts, None)
+            .await
+            .expect("an empty trailing part is not a truncated stream");
+
+        assert!(out == part_plaintexts[0], "plaintext mismatch for an object with an empty trailing part");
     }
 
     #[tokio::test]
@@ -9294,7 +9538,12 @@ impl SetDisks {
             )
             .await?;
             if let Some((_, deleted_object)) = replication_delete {
-                ReplicationLifecycleBridge::schedule_delete(bucket.to_string(), deleted_object).await;
+                ReplicationLifecycleBridge::schedule_delete(
+                    bucket.to_string(),
+                    deleted_object,
+                    opts.expected_bucket_incarnation_id,
+                )
+                .await;
             }
             deleted += 1;
         }
@@ -10066,6 +10315,15 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
         };
         let mut replacement_metadata = (*src_info.user_defined).clone();
         rustfs_filemeta::shard_integrity::clear_integrity_metadata(&mut replacement_metadata);
+        if src_info.version_only {
+            // Shared shard files retain the selected version's persisted framing.
+            let suffix = crate::object_api::EC_READ_QUANTUM_INFO_INTERNAL_SUFFIX;
+            rustfs_utils::http::remove_str(&mut replacement_metadata, suffix);
+            if rustfs_utils::http::contains_key_str(&fi.metadata, suffix) {
+                let quantum = rustfs_utils::http::get_consistent_str(&fi.metadata, suffix).ok_or(Error::FileCorrupt)?;
+                rustfs_utils::http::insert_str(&mut replacement_metadata, suffix, quantum.to_owned());
+            }
+        }
         for suffix in [
             rustfs_filemeta::shard_integrity::SUFFIX_SHARD_INTEGRITY,
             rustfs_filemeta::shard_integrity::SUFFIX_INLINE_INTEGRITY,
@@ -11563,7 +11821,12 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
                             )
                             .await?;
                             if let Some((_, deleted_object)) = replication_delete {
-                                ReplicationLifecycleBridge::schedule_delete(bucket.to_string(), deleted_object).await;
+                                ReplicationLifecycleBridge::schedule_delete(
+                                    bucket.to_string(),
+                                    deleted_object,
+                                    opts.expected_bucket_incarnation_id,
+                                )
+                                .await;
                             }
                         }
                     } else {
@@ -12732,6 +12995,7 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
         let obj_info = ObjectInfo::from_file_info(&fi, bucket, object, opts.versioned || opts.version_suspended);
         send_event(EventArgs {
             event_name: event_name.to_string(),
+            bucket_incarnation_id: opts.notification_bucket_incarnation_id,
             bucket_name: bucket.to_string(),
             object: obj_info,
             user_agent: "Internal: [ILM-Transition]".to_string(),
@@ -12878,6 +13142,7 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
                 let restored_info = self_.finalize_restore_metadata(bucket, object, &restored_info, &opts).await?;
                 send_event(EventArgs {
                     event_name: EventName::ObjectRestoreCompleted.as_str().to_string(),
+                    bucket_incarnation_id: opts.expected_bucket_incarnation_id,
                     bucket_name: bucket.to_string(),
                     object: restored_info,
                     user_agent: "Internal: [Restore-Completed]".to_string(),
@@ -13014,6 +13279,7 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
             let restored_info = self_.finalize_restore_metadata(bucket, object, &restored_info, opts).await?;
             send_event(EventArgs {
                 event_name: EventName::ObjectRestoreCompleted.as_str().to_string(),
+                bucket_incarnation_id: opts.expected_bucket_incarnation_id,
                 bucket_name: bucket.to_string(),
                 object: restored_info,
                 user_agent: "Internal: [Restore-Completed]".to_string(),
@@ -13858,6 +14124,61 @@ mod replication_quota_safety_tests {
     use super::hermetic_set_disks_support::hermetic_set_disks;
     use super::*;
     use std::io::Cursor;
+
+    #[tokio::test]
+    async fn put_object_persists_transient_ec_block_size_without_leaking_marker_metadata() {
+        let (_temp_dirs, disks, set_disks) = hermetic_set_disks(4).await;
+        let bucket = "ec-block-size-marker";
+        for disk in &disks {
+            disk.make_volume(bucket).await.expect("bucket volume should be created");
+        }
+
+        for block_size in crate::object_api::EC_BLOCK_SIZE_CANDIDATES {
+            let object = format!("object-{block_size}");
+            let mut opts = ObjectOptions::default();
+            opts.user_defined
+                .insert(crate::object_api::EC_BLOCK_SIZE_HINT_INTERNAL_KEY.to_string(), block_size.to_string());
+            let payload = vec![0x61; 4096];
+            let mut reader = PutObjReader::from_vec(payload.clone());
+            set_disks
+                .put_object(bucket, &object, &mut reader, &opts)
+                .await
+                .expect("object with a supported block-size marker should be written");
+
+            let info = set_disks
+                .get_object_info(bucket, &object, &ObjectOptions::default())
+                .await
+                .expect("written object metadata should be readable");
+            assert_eq!(info.effective_ec_block_size(), Some(block_size));
+            assert!(
+                !info
+                    .user_defined
+                    .contains_key(crate::object_api::EC_BLOCK_SIZE_HINT_INTERNAL_KEY)
+            );
+
+            let mut object_reader = set_disks
+                .get_object_reader(
+                    bucket,
+                    &object,
+                    Some(HTTPRangeSpec {
+                        is_suffix_length: false,
+                        start: 128,
+                        end: 511,
+                    }),
+                    HeaderMap::new(),
+                    &ObjectOptions::default(),
+                )
+                .await
+                .expect("persisted block size should decode range reads");
+            let mut restored = Vec::new();
+            object_reader
+                .stream
+                .read_to_end(&mut restored)
+                .await
+                .expect("range read should complete");
+            assert_eq!(restored, payload[128..512]);
+        }
+    }
 
     #[tokio::test]
     async fn quota_put_future_keeps_commit_state_off_the_caller_stack() {
@@ -16423,6 +16744,137 @@ mod metadata_mutation_generation_tests {
         assert!(metadata.contains_key(&format!("x-minio-internal-{suffix}")));
     }
 
+    const EC_BLOCK_SIZE_PROJECTION_KEYS: [&str; 2] = ["x-rustfs-internal-ec-block-size", "x-minio-internal-ec-block-size"];
+
+    /// Metadata keys of the latest version as persisted on every disk.
+    async fn stored_metadata_keys(disks: &[DiskStore], bucket: &str, object: &str) -> Vec<HashSet<String>> {
+        let mut stored = Vec::with_capacity(disks.len());
+        for disk in disks {
+            let bytes = disk
+                .read_all(bucket, &format!("{object}/xl.meta"))
+                .await
+                .expect("persisted metadata");
+            let fi = FileMeta::load(&bytes)
+                .expect("decode xl.meta")
+                .into_fileinfo(bucket, object, "", false, false, false)
+                .expect("latest version");
+            stored.push(fi.metadata.into_keys().collect());
+        }
+        stored
+    }
+
+    #[tokio::test]
+    async fn default_layout_metadata_copy_persists_no_ec_block_size_projection() {
+        let (_temp_dirs, disks, set) = hermetic_set_disks(4).await;
+        let bucket = "default-layout-copy";
+        let object = "object";
+        for disk in &disks {
+            disk.make_volume(bucket).await.expect("create bucket");
+        }
+        set.put_object(
+            bucket,
+            object,
+            &mut PutObjReader::from_vec(b"default layout".to_vec()),
+            &ObjectOptions {
+                write_completion: crate::object_api::WriteCompletion::TailDrained,
+                user_defined: HashMap::from([("x-amz-meta-color".to_string(), "red".to_string())]),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("write object");
+        let before = stored_metadata_keys(&disks, bucket, object).await;
+
+        let opts = ObjectOptions {
+            object_lock_config_snapshot: Some(Arc::new(ObjectLockConfigSnapshot::new(ObjectLockConfigState::ConfirmedAbsent))),
+            ..Default::default()
+        };
+        let mut source = set.get_object_info(bucket, object, &opts).await.expect("read metadata");
+        assert_eq!(source.effective_ec_block_size(), Some(crate::object_api::DEFAULT_EC_BLOCK_SIZE));
+        source.metadata_only = true;
+        Arc::make_mut(&mut source.user_defined).insert("x-amz-meta-color".to_string(), "blue".to_string());
+        set.copy_object(bucket, object, bucket, object, &mut source, &opts, &opts)
+            .await
+            .expect("metadata-replacing copy");
+
+        let after = stored_metadata_keys(&disks, bucket, object).await;
+        for keys in &after {
+            for key in EC_BLOCK_SIZE_PROJECTION_KEYS {
+                assert!(!keys.contains(key), "a default-layout copy must not persist {key}");
+            }
+        }
+        assert_eq!(after, before, "a metadata-replacing copy keeps the stored key set");
+        let copied = set
+            .get_object_info(bucket, object, &opts)
+            .await
+            .expect("read copied metadata");
+        assert_eq!(copied.user_defined.get("x-amz-meta-color").map(String::as_str), Some("blue"));
+        assert_eq!(copied.effective_ec_block_size(), Some(crate::object_api::DEFAULT_EC_BLOCK_SIZE));
+    }
+
+    #[tokio::test]
+    async fn default_layout_replication_status_writeback_persists_no_ec_block_size_projection() {
+        let (_temp_dirs, disks, set) = hermetic_set_disks(4).await;
+        let bucket = "default-layout-writeback";
+        let object = "object";
+        for disk in &disks {
+            disk.make_volume(bucket).await.expect("create bucket");
+        }
+        set.put_object(
+            bucket,
+            object,
+            &mut PutObjReader::from_vec(b"default layout".to_vec()),
+            &ObjectOptions {
+                write_completion: crate::object_api::WriteCompletion::TailDrained,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("write object");
+        let before = stored_metadata_keys(&disks, bucket, object).await;
+        let snapshot = set
+            .get_object_info(bucket, object, &ObjectOptions::default())
+            .await
+            .expect("read metadata")
+            .replication_generation_snapshot();
+        let status = replication_metadata(None, None, "arn:test=COMPLETED;");
+        set.put_object_metadata(
+            bucket,
+            object,
+            &ObjectOptions {
+                eval_metadata: Some(status.clone()),
+                replication_status_writeback: Some(Box::new(ReplicationStatusWritebackCondition {
+                    expected_generation: snapshot,
+                    ..Default::default()
+                })),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("replication status write-back");
+
+        let after = stored_metadata_keys(&disks, bucket, object).await;
+        for (keys, before) in after.iter().zip(&before) {
+            for key in EC_BLOCK_SIZE_PROJECTION_KEYS {
+                assert!(!keys.contains(key), "a status write-back must not persist {key}");
+            }
+            // The write-back adds exactly the status keys `main` writes.
+            let added: HashSet<&str> = keys.difference(before).map(String::as_str).collect();
+            let expected: HashSet<&str> = status
+                .keys()
+                .map(String::as_str)
+                .chain([
+                    "X-Amz-Replication-Status",
+                    "x-rustfs-internal-replication-status",
+                    "x-minio-internal-replication-status",
+                    "x-rustfs-internal-data-moved",
+                    "x-minio-internal-data-moved",
+                ])
+                .collect();
+            assert_eq!(added, expected);
+        }
+    }
+
     #[tokio::test]
     async fn replication_status_writeback_cas_accepts_suspended_null_version_snapshot() {
         let (_temp_dirs, disk_stores, set_disks) = hermetic_set_disks(4).await;
@@ -17182,7 +17634,12 @@ mod metadata_mutation_generation_tests {
                 copy_object,
                 &mut copy_info,
                 &ObjectOptions::default(),
-                &ObjectOptions::default(),
+                &ObjectOptions {
+                    object_lock_config_snapshot: Some(Arc::new(ObjectLockConfigSnapshot::new(
+                        ObjectLockConfigState::ConfirmedAbsent,
+                    ))),
+                    ..Default::default()
+                },
             )
             .await
             .expect("metadata COPY should succeed");
@@ -17285,7 +17742,16 @@ mod metadata_mutation_generation_tests {
                 version_id: old.version_id.map(|id| id.to_string()),
                 versioned: true,
                 mod_time: Some(old_time),
+                object_lock_config_snapshot: Some(Arc::new(ObjectLockConfigSnapshot::new(
+                    ObjectLockConfigState::ConfirmedAbsent,
+                ))),
                 ..Default::default()
+            };
+            let dst_opts = ObjectOptions {
+                object_lock_config_snapshot: Some(Arc::new(ObjectLockConfigSnapshot::new(
+                    ObjectLockConfigState::ConfirmedAbsent,
+                ))),
+                ..opts.clone()
             };
             let mut source = set.get_object_info(bucket, object, &opts).await.expect("read old metadata");
             assert_eq!(source.user_tags.as_str(), tags);
@@ -17295,7 +17761,7 @@ mod metadata_mutation_generation_tests {
             source.metadata_only = true;
             Arc::make_mut(&mut source.user_defined)
                 .insert(metadata_keys::RESTORE.to_string(), "ongoing-request=\"true\"".to_string());
-            set.copy_object(bucket, object, bucket, object, &mut source, &opts, &opts)
+            set.copy_object(bucket, object, bucket, object, &mut source, &opts, &dst_opts)
                 .await
                 .expect("restore metadata update");
             let restored = set
@@ -17360,7 +17826,11 @@ mod metadata_mutation_generation_tests {
         let metadata = Arc::make_mut(&mut source.user_defined);
         metadata.insert(AMZ_OBJECT_TAGGING.to_string(), "new=value".to_string());
         metadata.insert("expires".to_string(), expires.format(&Rfc3339).expect("expiry"));
-        set.copy_object(bucket, "object", bucket, "object", &mut source, &opts, &opts)
+        let dst_opts = ObjectOptions {
+            object_lock_config_snapshot: Some(Arc::new(ObjectLockConfigSnapshot::new(ObjectLockConfigState::ConfirmedAbsent))),
+            ..Default::default()
+        };
+        set.copy_object(bucket, "object", bucket, "object", &mut source, &opts, &dst_opts)
             .await
             .expect("explicit metadata wins over externalized fields");
         let mut copied = set.get_object_info(bucket, "object", &opts).await.expect("copied metadata");
@@ -17371,7 +17841,7 @@ mod metadata_mutation_generation_tests {
         copied.metadata_only = true;
         copied.user_tags = Arc::new(String::new());
         copied.expires = None;
-        set.copy_object(bucket, "object", bucket, "object", &mut copied, &opts, &opts)
+        set.copy_object(bucket, "object", bucket, "object", &mut copied, &opts, &dst_opts)
             .await
             .expect("explicit empty replacement");
         let cleared = set.get_object_info(bucket, "object", &opts).await.expect("cleared metadata");
@@ -17388,6 +17858,10 @@ mod metadata_mutation_generation_tests {
         }
 
         let valid_object = "valid-sidecar";
+        let dst_opts = ObjectOptions {
+            object_lock_config_snapshot: Some(Arc::new(ObjectLockConfigSnapshot::new(ObjectLockConfigState::ConfirmedAbsent))),
+            ..Default::default()
+        };
         let (mut valid_source, _) = put_and_prime(&set_disks, bucket, valid_object, b"valid sidecar body").await;
         persist_part_checksum_sidecar(&set_disks, bucket, valid_object, r#"[[1,[["CRC32C","AAAAAA=="]]]]"#).await;
         valid_source.metadata_only = true;
@@ -17400,7 +17874,7 @@ mod metadata_mutation_generation_tests {
                 valid_object,
                 &mut valid_source,
                 &ObjectOptions::default(),
-                &ObjectOptions::default(),
+                &dst_opts,
             )
             .await
             .expect("metadata-only copy should preserve a valid checksum sidecar");
@@ -17473,7 +17947,7 @@ mod metadata_mutation_generation_tests {
                 conflicting_object,
                 &mut conflicting_source,
                 &ObjectOptions::default(),
-                &ObjectOptions::default(),
+                &dst_opts,
             )
             .await
             .expect_err("metadata-only copy must reject conflicting checksum aliases");
@@ -24985,6 +25459,64 @@ mod put_object_tmp_cleanup_tests {
     }
 
     #[tokio::test]
+    async fn background_put_retains_disk_admission_across_owned_commit() {
+        use crate::disk::with_background_disk_io;
+
+        let (_dirs, disks, set) = hermetic_set_disks(4).await;
+        let object = "background-cache-commit";
+        let barriers: Vec<_> = (0..disks.len())
+            .map(|index| rename_fanout_barrier::arm(object, index, rename_fanout_barrier::PHASE_RENAME))
+            .collect();
+        let writer = Arc::clone(&set);
+        let put = tokio::spawn(async move {
+            with_background_disk_io(CancellationToken::new(), async {
+                let mut reader = PutObjReader::from_vec(b"scanner checkpoint".to_vec());
+                writer
+                    .put_object(
+                        RUSTFS_META_BUCKET,
+                        object,
+                        &mut reader,
+                        &ObjectOptions {
+                            write_completion: WriteCompletion::TailDrained,
+                            ..Default::default()
+                        },
+                    )
+                    .await
+            })
+            .await
+        });
+        for barrier in &barriers {
+            tokio::time::timeout(Duration::from_secs(30), barrier.wait_until_paused())
+                .await
+                .expect("every disk reaches the commit boundary");
+        }
+        let local_disks: Vec<_> = disks
+            .iter()
+            .map(|disk| match disk.as_ref() {
+                disk::Disk::Local(local) => local,
+                disk::Disk::Remote(_) => panic!("hermetic fixture must use local disks"),
+            })
+            .collect();
+        let before: Vec<_> = local_disks
+            .iter()
+            .map(|disk| disk.background_io_admissions_for_tests())
+            .collect();
+        for barrier in barriers {
+            barrier.release();
+        }
+        put.await.expect("owned put task").expect("background checkpoint commits");
+        for ((disk, local), before) in disks.iter().zip(local_disks).zip(before) {
+            assert!(
+                local.background_io_admissions_for_tests() > before,
+                "the detached rename must retain background admission on every disk"
+            );
+            disk.read_version("", RUSTFS_META_BUCKET, object, "", &ReadOptions::default())
+                .await
+                .expect("committed checkpoint remains readable");
+        }
+    }
+
+    #[tokio::test]
     #[serial_test::serial(capacity_dirty_scope)]
     async fn borrowed_write_context_rejects_wrong_namespace_and_cache_flag() {
         let (_dirs, _disks, set) = hermetic_set_disks(4).await;
@@ -25519,6 +26051,9 @@ mod put_object_tmp_cleanup_tests {
                 &ObjectOptions {
                     no_lock: true,
                     namespace_lock_fence: Some(NamespaceLockFence::lost_for_test()),
+                    object_lock_config_snapshot: Some(Arc::new(ObjectLockConfigSnapshot::new(
+                        ObjectLockConfigState::ConfirmedAbsent,
+                    ))),
                     ..Default::default()
                 },
             )
@@ -25878,6 +26413,168 @@ mod put_object_tmp_cleanup_tests {
             .delete_object(bucket, object, version_opts)
             .await
             .expect("version delete must not be wedged by cleared lock metadata");
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn version_only_copy_preserves_quantized_shared_data() {
+        assert_version_only_copy_frame_metadata(true).await;
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn version_only_copy_ignores_injected_frame_markers() {
+        assert_version_only_copy_frame_metadata(false).await;
+    }
+
+    async fn assert_version_only_copy_frame_metadata(quantized: bool) {
+        const BLOCK: usize = 64 * 1024;
+        const FRAME: usize = 16 * 1024;
+        let (_dirs, disks, set) = hermetic_set_disks(4).await;
+        let bucket = "copy-version-frame-metadata";
+        let object = if quantized {
+            "quantized"
+        } else {
+            "legacy-with-injected-marker"
+        };
+        for disk in &disks {
+            disk.make_volume(bucket).await.expect("create version-only copy bucket");
+        }
+        let payload: Vec<u8> = (0..2 * BLOCK + 17)
+            .map(|index| u8::try_from(index % 251).expect("bounded fixture byte"))
+            .collect();
+        let mut put_options = ObjectOptions {
+            versioned: true,
+            ..Default::default()
+        };
+        put_options
+            .user_defined
+            .insert(crate::object_api::EC_BLOCK_SIZE_HINT_INTERNAL_KEY.to_owned(), BLOCK.to_string());
+        let enabled = if quantized { "true" } else { "false" };
+        let source = temp_env::async_with_vars(
+            [
+                (rustfs_config::ENV_EC_READ_QUANTUM_ENABLE, Some(enabled)),
+                (rustfs_config::ENV_EC_READ_QUANTUM_FLEET_CONFIRMED, Some(enabled)),
+                (rustfs_config::ENV_SHARD_INTEGRITY_WRITE, Some("false")),
+            ],
+            async {
+                set.put_object(bucket, object, &mut PutObjReader::from_vec(payload.clone()), &put_options)
+                    .await
+                    .expect("write physical source version")
+            },
+        )
+        .await;
+        let source_version = source.version_id.expect("source version ID").to_string();
+        let source_options = ObjectOptions {
+            version_id: Some(source_version.clone()),
+            versioned: true,
+            ..Default::default()
+        };
+        let mut source_info = set
+            .get_object_info(bucket, object, &source_options)
+            .await
+            .expect("project source metadata");
+        assert!(!rustfs_utils::http::contains_key_str(
+            &source_info.user_defined,
+            crate::object_api::EC_READ_QUANTUM_INFO_INTERNAL_SUFFIX
+        ));
+        let mut source_data_dirs = Vec::new();
+        for disk in &disks {
+            let fi = disk
+                .read_version("", bucket, object, &source_version, &crate::disk::ReadOptions::default())
+                .await
+                .expect("read source physical layout");
+            assert!(!fi.inline_data(), "fixture must share real shard files");
+            assert_eq!(fi.erasure.block_size, BLOCK);
+            assert_eq!(
+                crate::object_api::persisted_ec_read_quantum(
+                    &fi.metadata,
+                    BLOCK,
+                    fi.erasure.data_blocks,
+                    fi.erasure.shard_size(),
+                )
+                .expect("source frame geometry"),
+                quantized.then_some(FRAME)
+            );
+            source_data_dirs.push(fi.data_dir);
+        }
+        if !quantized {
+            // Replacement metadata cannot change the format of reused bytes.
+            crate::object_api::insert_ec_read_quantum(Arc::make_mut(&mut source_info.user_defined), FRAME);
+        }
+        source_info.version_only = true;
+        let copied = temp_env::async_with_vars(
+            [
+                (rustfs_config::ENV_EC_READ_QUANTUM_ENABLE, Some("false")),
+                (rustfs_config::ENV_EC_READ_QUANTUM_FLEET_CONFIRMED, Some("false")),
+            ],
+            async {
+                set.copy_object(
+                    bucket,
+                    object,
+                    bucket,
+                    object,
+                    &mut source_info,
+                    &source_options,
+                    &ObjectOptions {
+                        versioned: true,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect("version-only copy must commit a new version")
+            },
+        )
+        .await;
+        let copy_version = copied.version_id.expect("copied version ID").to_string();
+        assert_ne!(copy_version, source_version);
+        assert!(!rustfs_utils::http::contains_key_str(
+            &copied.user_defined,
+            crate::object_api::EC_READ_QUANTUM_INFO_INTERNAL_SUFFIX
+        ));
+        for version in [&source_version, &copy_version] {
+            let mut reader = set
+                .get_object_reader(
+                    bucket,
+                    object,
+                    None,
+                    HeaderMap::new(),
+                    &ObjectOptions {
+                        version_id: Some(version.clone()),
+                        versioned: true,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect("source and copied version must open");
+            let mut actual = Vec::new();
+            reader
+                .stream
+                .read_to_end(&mut actual)
+                .await
+                .expect("shared frames must remain readable");
+            assert_eq!(actual, payload);
+        }
+        for (disk, source_data_dir) in disks.iter().zip(source_data_dirs) {
+            let fi = disk
+                .read_version("", bucket, object, &copy_version, &crate::disk::ReadOptions::default())
+                .await
+                .expect("read copied version layout");
+            assert_eq!(fi.data_dir, source_data_dir, "version-only copy must reuse source data");
+            assert_eq!(
+                crate::object_api::persisted_ec_read_quantum(
+                    &fi.metadata,
+                    BLOCK,
+                    fi.erasure.data_blocks,
+                    fi.erasure.shard_size(),
+                )
+                .expect("copied frame geometry"),
+                quantized.then_some(FRAME)
+            );
+            for key in ["x-rustfs-internal-ec-read-quantum", "x-minio-internal-ec-read-quantum"] {
+                assert_eq!(fi.metadata.get(key).map(String::as_str), quantized.then_some("16384"));
+            }
+        }
     }
 
     #[tokio::test]

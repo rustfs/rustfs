@@ -307,6 +307,12 @@ pub const ADMIN_ROUTE_POLICY_SPECS: &[AdminRouteSpec] = &[
     ),
     admin(
         HttpMethod::Delete,
+        "/rustfs/admin/v3/target/{target_type}/{target_name}",
+        SET_BUCKET_TARGET,
+        RouteRiskLevel::High,
+    ),
+    admin(
+        HttpMethod::Delete,
         "/rustfs/admin/v3/target/{target_type}/{target_name}/reset",
         SET_BUCKET_TARGET,
         RouteRiskLevel::High,
@@ -824,6 +830,24 @@ pub const ADMIN_ROUTE_POLICY_SPECS: &[AdminRouteSpec] = &[
     admin(
         HttpMethod::Put,
         "/rustfs/admin/v3/site-replication/remove",
+        SITE_REPLICATION_REMOVE,
+        RouteRiskLevel::High,
+    ),
+    admin(
+        HttpMethod::Put,
+        "/rustfs/admin/v3/site-replication/remove-v2",
+        SITE_REPLICATION_REMOVE,
+        RouteRiskLevel::High,
+    ),
+    admin(
+        HttpMethod::Get,
+        "/rustfs/admin/v3/site-replication/remove-v2/capabilities",
+        SITE_REPLICATION_REMOVE,
+        RouteRiskLevel::Sensitive,
+    ),
+    admin(
+        HttpMethod::Put,
+        "/rustfs/admin/v3/site-replication/peer/remove-v2",
         SITE_REPLICATION_REMOVE,
         RouteRiskLevel::High,
     ),
@@ -1883,12 +1907,8 @@ pub const DEFERRED_ADMIN_ROUTE_POLICIES: &[DeferredAdminRoutePolicy] = &[
         "/rustfs/admin/v4/account/permissions",
         DeferredRoutePolicyReason::CredentialOnly,
     ),
-    // The self-service account routes act on the caller, never on a target
-    // named in the request, so they gate on possession of the credential (plus,
-    // for the mutation, knowledge of the current secret) rather than on an
-    // admin action. Giving them one would be wrong in both directions: it would
-    // stop an ordinary user from managing their own password, and it would let
-    // any holder of that action manage somebody else's.
+    // Self-service reads need only authentication. Mutation handlers also enforce
+    // credential eligibility, operation-specific proofs and explicit policy denies.
     deferred(
         HttpMethod::Get,
         "/rustfs/admin/v3/account/info",
@@ -1897,31 +1917,28 @@ pub const DEFERRED_ADMIN_ROUTE_POLICIES: &[DeferredAdminRoutePolicy] = &[
     deferred(
         HttpMethod::Post,
         "/rustfs/admin/v3/account/password",
-        DeferredRoutePolicyReason::CredentialOnly,
+        DeferredRoutePolicyReason::ContextualAuthorization,
     ),
-    // The MFA self-service family gates the same way, plus a proof of the
-    // second factor (and, for disable, of the account password) inside the
-    // handler.
     deferred(HttpMethod::Get, "/rustfs/admin/v3/account/mfa", DeferredRoutePolicyReason::CredentialOnly),
     deferred(
         HttpMethod::Post,
         "/rustfs/admin/v3/account/mfa/enroll",
-        DeferredRoutePolicyReason::CredentialOnly,
+        DeferredRoutePolicyReason::ContextualAuthorization,
     ),
     deferred(
         HttpMethod::Post,
         "/rustfs/admin/v3/account/mfa/activate",
-        DeferredRoutePolicyReason::CredentialOnly,
+        DeferredRoutePolicyReason::ContextualAuthorization,
     ),
     deferred(
         HttpMethod::Post,
         "/rustfs/admin/v3/account/mfa/disable",
-        DeferredRoutePolicyReason::CredentialOnly,
+        DeferredRoutePolicyReason::ContextualAuthorization,
     ),
     deferred(
         HttpMethod::Post,
         "/rustfs/admin/v3/account/mfa/recovery-codes",
-        DeferredRoutePolicyReason::CredentialOnly,
+        DeferredRoutePolicyReason::ContextualAuthorization,
     ),
     // The login challenge is signed with the identity's own credentials, so
     // possession of them is the whole authorization.
@@ -2638,6 +2655,20 @@ mod tests {
         assert_not_action(HttpMethod::Post, "/rustfs/admin/v3/ilm/transition/reconcile/{transaction_id}", LIST_TIER);
         assert_not_action(HttpMethod::Get, "/rustfs/admin/v3/ilm/transition/state/reconcile", SET_TIER);
         assert_not_action(HttpMethod::Post, "/rustfs/admin/v3/ilm/transition/state/reconcile", LIST_TIER);
+    }
+
+    #[test]
+    fn self_service_mutation_routes_defer_policy_to_handlers() {
+        for path in [
+            "/rustfs/admin/v3/account/password",
+            "/rustfs/admin/v3/account/mfa/enroll",
+            "/rustfs/admin/v3/account/mfa/activate",
+            "/rustfs/admin/v3/account/mfa/disable",
+            "/rustfs/admin/v3/account/mfa/recovery-codes",
+        ] {
+            assert_deferred(HttpMethod::Post, path, DeferredRoutePolicyReason::ContextualAuthorization);
+        }
+        assert_deferred(HttpMethod::Get, "/rustfs/admin/v3/account/mfa", DeferredRoutePolicyReason::CredentialOnly);
     }
 
     #[test]

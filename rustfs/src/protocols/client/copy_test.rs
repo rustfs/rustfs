@@ -94,28 +94,6 @@ fn protocol_copy_runtime_contract() {
         assert_eq!(count(), 0);
         rustfs_io_metrics::record_s3_op(rustfs_s3_ops::S3Operation::CopyObject);
         assert_eq!(count(), 1);
-        let mut old_input = input();
-        old_input.key = rustfs_gateway_types::ObjectKey::new("legacy-control".to_owned()).expect("legacy control key");
-        let old_input = legacy_input(old_input).expect("legacy input");
-        let before = count();
-        client
-            .legacy_fs()
-            .copy_object(
-                ProtocolStorageClient::create_request(
-                    old_input,
-                    Method::PUT,
-                    build_object_uri("copy-target", "legacy-control", &[]).expect("legacy URI"),
-                    RequestParams {
-                        bucket: Some("copy-target".into()),
-                        object: Some("legacy-control".into()),
-                        credentials: &root,
-                    },
-                )
-                .expect("legacy request"),
-            )
-            .await
-            .expect("legacy copy control");
-        assert_eq!(count() - before, 1);
 
         let mut rows = Vec::new();
         for case in [
@@ -216,16 +194,13 @@ fn protocol_copy_runtime_contract() {
     });
 }
 
-fn legacy_input(input: gateway_dto::CopyObjectInput) -> rustfs_s3_types::S3Result<CopyObjectInput> {
-    let source =
-        legacy_copy_source(input.copy_source.clone()).map_err(|error| conversion_error("CopyObject copy_source", error))?;
-    let context = gateway_request_context(
-        Method::PUT,
-        &build_object_uri(input.bucket.as_str(), input.key.as_str(), &[])?,
-        HeaderMap::new(),
-    );
-    gateway_s3s_compat::generated::ops::copy_object::input_to_s3s(input, source, &RequestWire::of(&context))
-        .map_err(|error| conversion_error("CopyObject input", error))
+fn legacy_input() -> CopyObjectInput {
+    CopyObjectInput::builder()
+        .bucket("copy-target".into())
+        .key("destination".into())
+        .copy_source(CopySource::parse("/copy-source/a%20%3F%26%2F%25%C3%A9").expect("legacy source"))
+        .build()
+        .expect("legacy copy input")
 }
 
 use crate::app::object_usecase::{CopyObjectWriteInput, CopyObjectWriteOutput, CopySourceCondition};
@@ -311,16 +286,15 @@ fn legacy_input_facts(input: CopyObjectInput) -> serde_json::Value {
         "retain":input.object_lock_retain_until_date.map(|value|time::OffsetDateTime::from(value).unix_timestamp_nanos().to_string())})
 }
 
-fn compare_input(rows: &mut Vec<serde_json::Value>, name: &str, make: impl Fn() -> gateway_dto::CopyObjectInput) {
-    let current = owned::copy_input(make())
-        .map(owned_input_facts)
-        .map_err(|error| error.to_string());
-    let old = legacy_input(make())
-        .map(legacy_input_facts)
-        .map_err(|error| error.to_string());
-    if current != old {
-        rows.push(serde_json::json!([name, current, old]));
-    }
+fn assert_copy_input(native: gateway_dto::CopyObjectInput, expected: Result<CopyObjectInput, String>) {
+    assert_eq!(
+        owned::copy_input(native)
+            .map(owned_input_facts)
+            .map_err(|error| error.to_string()),
+        expected
+            .map(legacy_input_facts)
+            .map_err(|reason| conversion_error("CopyObject input", reason).to_string())
+    );
 }
 
 fn copy_output_facts(tag: Option<&str>) -> CopyObjectWriteOutput {
@@ -346,23 +320,10 @@ fn copy_output_facts(tag: Option<&str>) -> CopyObjectWriteOutput {
         checksum_type: None,
     }
 }
+
 #[test]
 fn protocol_copy_request_head_matches_legacy() {
-    fn facts(envelope: &crate::app::RequestEnvelope) -> serde_json::Value {
-        let info = envelope.req_info().expect("request info");
-        let credentials = envelope.credentials().expect("request credentials");
-        let identity = info.cred.as_ref().expect("request identity");
-        serde_json::json!({
-            "method":envelope.method().as_str(),"uri":envelope.uri().to_string(),"headers":format!("{:?}",envelope.headers()),
-            "credentials":[credentials.access_key(),credentials.secret_key(),credentials.session_token()],
-            "identity":[identity.access_key,identity.secret_key,identity.session_token],
-            "bucket":info.bucket,"object":info.object,"version":info.version_id,"owner":info.is_owner,
-            "keystone":info.keystone_session_present,"replication":info.replication_request_authorized,"region":info.region,
-            "request_context":info.request_context.is_some(),"suppress_log":info.suppress_denial_log,"suppress_audit":info.suppress_denial_audit,
-            "head_region":envelope.region(),"service":envelope.service(),"server":envelope.server_context().is_some(),"presigned":envelope.verified_presigned().is_some(),
-        })
-    }
-    for secret in ["copy-secret", ""] {
+    for (secret, expected_head_secret) in [("copy-secret", Some("copy-secret")), ("", None)] {
         let credentials = rustfs_credentials::Credentials {
             access_key: "copy-identity".into(),
             secret_key: secret.into(),
@@ -371,21 +332,49 @@ fn protocol_copy_request_head_matches_legacy() {
             ..Default::default()
         };
         let uri = build_object_uri("copy-target", "a ?&/%é", &[]).expect("request URI");
-        let params = || RequestParams {
-            bucket: Some("copy-target".to_owned()),
-            object: Some("a ?&/%é".to_owned()),
-            credentials: &credentials,
-        };
-        let old = ProtocolStorageClient::create_request((), Method::PUT, uri.clone(), params()).expect("legacy request");
-        let old = crate::app::RequestEnvelope::from_s3s(&old);
-        let current = ProtocolStorageClient::create_envelope(Method::PUT, uri, params());
-        assert_eq!(facts(&current), facts(&old));
+        let envelope = ProtocolStorageClient::create_envelope(
+            Method::PUT,
+            uri,
+            RequestParams {
+                bucket: Some("copy-target".to_owned()),
+                object: Some("a ?&/%é".to_owned()),
+                credentials: &credentials,
+            },
+        );
+
+        assert_eq!(envelope.method(), &Method::PUT);
+        assert_eq!(envelope.uri().to_string(), "/copy-target/a%20%3F&/%25%C3%A9");
+        assert!(envelope.headers().is_empty());
+        assert!(envelope.region().is_none());
+        assert!(envelope.service().is_none());
+        assert!(envelope.server_context().is_none());
+        assert!(envelope.verified_presigned().is_none());
+
+        let head_credentials = envelope.credentials().expect("request credentials");
+        assert_eq!(head_credentials.access_key(), "copy-identity");
+        assert_eq!(head_credentials.secret_key(), expected_head_secret);
+        assert!(head_credentials.session_token().is_none());
+
+        let info = envelope.req_info().expect("request info");
+        let identity = info.cred.as_ref().expect("request identity");
+        assert_eq!(identity.access_key, "copy-identity");
+        assert_eq!(identity.secret_key, secret);
+        assert_eq!(identity.session_token, "identity-token");
+        assert_eq!(info.bucket.as_deref(), Some("copy-target"));
+        assert_eq!(info.object.as_deref(), Some("a ?&/%é"));
+        assert!(info.version_id.is_none());
+        assert!(!info.is_owner);
+        assert!(info.keystone_session_present.is_none());
+        assert!(!info.replication_request_authorized);
+        assert!(info.region.is_none());
+        assert!(info.request_context.is_some());
+        assert!(!info.suppress_denial_log);
+        assert!(!info.suppress_denial_audit);
     }
 }
 
 #[test]
 fn protocol_copy_input_projection_matches_legacy() {
-    let mut rows = Vec::new();
     for field in [
         "if_match",
         "if_none_match",
@@ -411,43 +400,71 @@ fn protocol_copy_input_projection_matches_legacy() {
             "é",
             "\"é\"",
         ] {
-            compare_input(&mut rows, &format!("{field}:{value:?}"), || {
-                let mut request = input();
-                match field {
-                    "if_match" => request.if_match = Some(value.into()),
-                    "if_none_match" => request.if_none_match = Some(value.into()),
-                    "copy_source_if_match" => request.copy_source_if_match = Some(value.into()),
-                    _ => request.copy_source_if_none_match = Some(value.into()),
-                }
-                request
-            });
+            let mut request = input();
+            match field {
+                "if_match" => request.if_match = Some(value.into()),
+                "if_none_match" => request.if_none_match = Some(value.into()),
+                "copy_source_if_match" => request.copy_source_if_match = Some(value.into()),
+                _ => request.copy_source_if_none_match = Some(value.into()),
+            }
+            let expected = (!value.is_empty())
+                .then(|| ETagCondition::parse_http_header(value.as_bytes()))
+                .transpose()
+                .map(|condition| {
+                    let mut old = legacy_input();
+                    match field {
+                        "if_match" => old.if_match = condition,
+                        "if_none_match" => old.if_none_match = condition,
+                        "copy_source_if_match" => old.copy_source_if_match = condition,
+                        _ => old.copy_source_if_none_match = condition,
+                    }
+                    old
+                })
+                .map_err(|_| format!("{field}: not an entity-tag condition the s3s input can hold"));
+            assert_copy_input(request, expected);
         }
     }
     for value in ["", "value"] {
-        compare_input(&mut rows, &format!("optionals:{value:?}"), || {
-            let mut request = input();
-            request.cache_control = Some(value.into());
-            request.content_disposition = Some(value.into());
-            request.content_encoding = Some(value.into());
-            request.content_language = Some(value.into());
-            request.content_type = Some(value.into());
-            request.tagging = Some(value.into());
-            request.ssekms_key_id = Some(value.into());
-            request.sse_customer_algorithm = Some(value.into());
-            request.sse_customer_key_md5 = Some(value.into());
-            request.copy_source_sse_customer_algorithm = Some(value.into());
-            request.copy_source_sse_customer_key_md5 = Some(value.into());
-            request.website_redirect_location = Some(value.into());
-            request.metadata_directive = Some(gateway_dto::MetadataDirective::custom(value.to_owned()));
-            request.tagging_directive = Some(gateway_dto::TaggingDirective::custom(value.to_owned()));
-            request.object_lock_legal_hold_status = Some(gateway_dto::ObjectLockLegalHoldStatus::custom(value.to_owned()));
-            request.object_lock_mode = Some(gateway_dto::ObjectLockMode::custom(value.to_owned()));
-            request.storage_class = Some(gateway_dto::StorageClass::custom(value.to_owned()));
-            request.server_side_encryption = Some(gateway_dto::ServerSideEncryption::custom(value.to_owned()));
-            request.checksum_algorithm = Some(gateway_dto::ChecksumAlgorithm::custom(value.to_owned()));
-            request.expires = Some(OpaqueString::from(value));
-            request
-        });
+        let mut request = input();
+        let mut old = legacy_input();
+        macro_rules! optional {
+            ($($field:ident),+) => {$(
+                request.$field = Some(value.to_owned());
+                old.$field = (!value.is_empty()).then(|| value.to_owned());
+            )+};
+        }
+        optional!(
+            cache_control,
+            content_disposition,
+            content_encoding,
+            content_language,
+            content_type,
+            tagging,
+            ssekms_key_id,
+            sse_customer_algorithm,
+            sse_customer_key_md5,
+            copy_source_sse_customer_algorithm,
+            copy_source_sse_customer_key_md5,
+            website_redirect_location
+        );
+        request.expires = Some(OpaqueString::from(value));
+        old.expires = (!value.is_empty()).then(|| value.to_owned());
+        macro_rules! enums {
+            ($($field:ident => $kind:ident),+) => {$(
+                request.$field = Some(gateway_dto::$kind::custom(value));
+                old.$field = (!value.is_empty()).then(|| value.to_owned().into());
+            )+};
+        }
+        enums!(
+            metadata_directive => MetadataDirective,
+            tagging_directive => TaggingDirective,
+            object_lock_legal_hold_status => ObjectLockLegalHoldStatus,
+            object_lock_mode => ObjectLockMode,
+            storage_class => StorageClass,
+            server_side_encryption => ServerSideEncryption,
+            checksum_algorithm => ChecksumAlgorithm
+        );
+        assert_copy_input(request, Ok(old));
     }
     for (secs, nanos) in [
         (1_700_000_000, 123_456_789),
@@ -455,12 +472,17 @@ fn protocol_copy_input_projection_matches_legacy() {
         (0, 123_456_789),
         (i64::MAX, 0),
     ] {
-        compare_input(&mut rows, &format!("retain:{secs}:{nanos}"), || {
-            let mut request = input();
-            request.object_lock_retain_until_date =
-                Some(rustfs_gateway_types::Timestamp::from_secs_nanos(secs, nanos).expect("instant"));
-            request
-        });
+        let mut request = input();
+        request.object_lock_retain_until_date =
+            Some(rustfs_gateway_types::Timestamp::from_secs_nanos(secs, nanos).expect("instant"));
+        let expected = Timestamp::parse(TimestampFormat::EpochSeconds, &format!("{secs}.{nanos:09}"))
+            .map(|date| {
+                let mut old = legacy_input();
+                old.object_lock_retain_until_date = Some(date);
+                old
+            })
+            .map_err(|_| "object_lock_retain_until_date: an instant outside what the s3s shape can hold".to_owned());
+        assert_copy_input(request, expected);
     }
     for case in [
         "event-hold",
@@ -469,25 +491,34 @@ fn protocol_copy_input_projection_matches_legacy() {
         "source-modified-time",
         "source-unmodified-time",
     ] {
-        compare_input(&mut rows, case, || {
-            let mut request = input();
-            match case {
-                "event-hold" => request.object_lock_event_hold = Some(gateway_dto::ObjectLockEventHold::custom("ON".to_owned())),
-                "event-days" => request.object_lock_event_hold_duration_days = Some(0),
-                "event-years" => request.object_lock_event_hold_duration_years = Some(1),
-                "source-modified-time" => {
-                    request.copy_source_if_modified_since =
-                        Some(rustfs_gateway_types::Timestamp::from_secs_nanos(i64::MAX, 0).expect("gateway timestamp"))
-                }
-                _ => {
-                    request.copy_source_if_unmodified_since =
-                        Some(rustfs_gateway_types::Timestamp::from_secs_nanos(i64::MAX, 0).expect("gateway timestamp"))
-                }
+        let mut request = input();
+        match case {
+            "event-hold" => request.object_lock_event_hold = Some(gateway_dto::ObjectLockEventHold::custom("ON".to_owned())),
+            "event-days" => request.object_lock_event_hold_duration_days = Some(0),
+            "event-years" => request.object_lock_event_hold_duration_years = Some(1),
+            "source-modified-time" => {
+                request.copy_source_if_modified_since =
+                    Some(rustfs_gateway_types::Timestamp::from_secs_nanos(i64::MAX, 0).expect("gateway timestamp"))
             }
-            request
-        });
+            _ => {
+                request.copy_source_if_unmodified_since =
+                    Some(rustfs_gateway_types::Timestamp::from_secs_nanos(i64::MAX, 0).expect("gateway timestamp"))
+            }
+        }
+        let (field, detail) = match case {
+            "event-hold" | "event-days" | "event-years" => (
+                match case {
+                    "event-hold" => "object_lock_event_hold",
+                    "event-days" => "object_lock_event_hold_duration_days",
+                    _ => "object_lock_event_hold_duration_years",
+                },
+                "an Object Lock event hold, which no pinned s3s shape holds and RustFS does not store",
+            ),
+            "source-modified-time" => ("copy_source_if_modified_since", "an instant outside what the s3s shape can hold"),
+            _ => ("copy_source_if_unmodified_since", "an instant outside what the s3s shape can hold"),
+        };
+        assert_copy_input(request, Err(format!("{field}: {detail}")));
     }
-    assert!(rows.is_empty(), "CopyObject input projection mismatches: {rows:#?}");
 }
 
 #[test]
@@ -545,7 +576,6 @@ fn protocol_copy_source_projection_matches_legacy() {
 
 #[test]
 fn protocol_copy_output_projection_matches_legacy() {
-    let mut mismatches = Vec::new();
     for (raw, tag) in [
         (None, None),
         (Some("abc"), Some(ETag::Strong("abc".to_owned()))),
@@ -556,37 +586,40 @@ fn protocol_copy_output_projection_matches_legacy() {
         (Some("\"\""), Some(ETag::Strong(String::new()))),
         (Some("a\nb"), Some(ETag::Strong("a\nb".to_owned()))),
     ] {
-        let old = CopyObjectOutput {
-            copy_object_result: Some(CopyObjectResult {
-                e_tag: tag,
-                last_modified: Some(Timestamp::from(
-                    time::OffsetDateTime::from_unix_timestamp_nanos(1_700_000_000_123_456_789).expect("instant"),
-                )),
-                ..Default::default()
-            }),
+        let actual = owned::copy_output(copy_output_facts(raw));
+        if matches!(raw, Some("" | "\"\"" | "a\nb")) {
+            assert_eq!(
+                actual.unwrap_err().to_string(),
+                conversion_error("CopyObject output", "e_tag: not an entity tag the gateway can write").to_string()
+            );
+            continue;
+        }
+        let tag = tag.map(|tag| {
+            match tag {
+                ETag::Strong(value) => rustfs_gateway_types::ETag::new(value),
+                ETag::Weak(value) => rustfs_gateway_types::ETag::new_weak(value),
+            }
+            .expect("recorded valid entity tag")
+        });
+        let expected = gateway_dto::CopyObjectOutput {
+            e_tag: tag,
+            last_modified: Some(
+                rustfs_gateway_types::Timestamp::from_secs_nanos(1_700_000_000, 123_000_000).expect("wire precision"),
+            ),
             ..Default::default()
         };
-        let old = gateway_s3s_compat::generated::ops::copy_object::output_from_s3s(old)
-            .map(|value| format!("{value:?}"))
-            .map_err(|error| conversion_error("CopyObject output", error).to_string());
-        let current = owned::copy_output(copy_output_facts(raw))
-            .map(|value| format!("{value:?}"))
-            .map_err(|error| error.to_string());
-        if old != current {
-            mismatches.push((raw, current, old));
-        }
+        assert_eq!(format!("{:?}", actual.expect("copy output")), format!("{expected:?}"), "{raw:?}");
     }
     let mut current = copy_output_facts(Some("populated"));
-    let mut old = CopyObjectOutput {
-        copy_object_result: Some(CopyObjectResult {
-            e_tag: Some(ETag::Strong("populated".into())),
-            last_modified: Some(Timestamp::from(current.last_modified.expect("fixture instant"))),
-            ..Default::default()
-        }),
+    let mut expected = gateway_dto::CopyObjectOutput {
+        e_tag: Some(rustfs_gateway_types::ETag::new("populated").expect("tag")),
+        last_modified: Some(
+            rustfs_gateway_types::Timestamp::from_secs_nanos(1_700_000_000, 123_000_000).expect("wire precision"),
+        ),
         ..Default::default()
     };
     macro_rules! top_fields {
-        ($($field:ident),*) => {$(current.$field=Some(stringify!($field).into());old.$field=Some(stringify!($field).into());)*};
+        ($($field:ident),*) => {$(current.$field=Some(stringify!($field).into());expected.$field=Some(stringify!($field).into());)*};
     }
     top_fields!(
         version_id,
@@ -596,12 +629,8 @@ fn protocol_copy_output_projection_matches_legacy() {
         sse_customer_key_md5
     );
     current.server_side_encryption = Some("AES256".into());
-    old.server_side_encryption = Some(ServerSideEncryption::from("AES256".to_owned()));
-    let result = old.copy_object_result.as_mut().expect("fixture result");
-    macro_rules! result_fields {
-        ($($field:ident),*) => {$(current.$field=Some(stringify!($field).into());result.$field=Some(stringify!($field).into());)*};
-    }
-    result_fields!(
+    expected.server_side_encryption = Some(gateway_dto::ServerSideEncryption::custom("AES256"));
+    top_fields!(
         checksum_crc32,
         checksum_crc32c,
         checksum_crc64nvme,
@@ -614,17 +643,11 @@ fn protocol_copy_output_projection_matches_legacy() {
         checksum_xxhash128
     );
     current.checksum_type = Some("FULL_OBJECT".into());
-    result.checksum_type = Some(ChecksumType::from("FULL_OBJECT".to_owned()));
-    let old = gateway_s3s_compat::generated::ops::copy_object::output_from_s3s(old)
-        .map(|value| format!("{value:?}"))
-        .map_err(|error| conversion_error("CopyObject output", error).to_string());
-    let current = owned::copy_output(current)
-        .map(|value| format!("{value:?}"))
-        .map_err(|error| error.to_string());
-    if old != current {
-        mismatches.push((Some("populated"), current, old));
-    }
-    assert!(mismatches.is_empty(), "CopyObject output projection mismatches: {mismatches:#?}");
+    expected.checksum_type = Some("FULL_OBJECT".into());
+    assert_eq!(
+        format!("{:?}", owned::copy_output(current).expect("populated copy output")),
+        format!("{expected:?}")
+    );
 }
 
 #[test]
@@ -638,8 +661,8 @@ fn protocol_copy_error_answers_match_legacy() {
         S3ErrorCode::NotImplemented,
         S3ErrorCode::InternalError,
     ] {
-        let old: S3Result<()> = Err(S3Error::new(code.clone()).into());
-        let old = old.map_err(S3Error::from).expect_err("legacy error");
+        let old: S3Result<()> = Err(crate::error::legacy_error_for_test(S3Error::new(code.clone())));
+        let old = old.map_err(crate::error::owned_error_for_test).expect_err("legacy error");
         let current = owned::copy_error(S3Error::new(code.clone()));
         if (old.code(), old.message(), old.status_code(), old.headers())
             != (current.code(), current.message(), current.status_code(), current.headers())
@@ -665,8 +688,8 @@ fn protocol_copy_error_answers_match_legacy() {
         error.set_headers(headers);
         error
     };
-    let old: S3Result<()> = Err(make().into());
-    let old = old.map_err(S3Error::from).expect_err("legacy refusal");
+    let old: S3Result<()> = Err(crate::error::legacy_error_for_test(make()));
+    let old = old.map_err(crate::error::owned_error_for_test).expect_err("legacy refusal");
     let current = owned::copy_error(make());
     if (old.code(), old.message(), old.status_code(), old.headers())
         != (current.code(), current.message(), current.status_code(), current.headers())

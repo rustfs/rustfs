@@ -52,7 +52,7 @@ impl Served for dto::GetBucketCors {
 
     async fn authorize(envelope: &mut RequestEnvelope, request: &Req<Self>) -> S3Result<()> {
         let action = Action::S3Action(S3Action::GetBucketCorsAction);
-        Ok(authorize_bucket_request(envelope, request.input().bucket.as_str(), action).await?)
+        authorize_bucket_request(envelope, request.input().bucket.as_str(), action).await
     }
 
     async fn execute(context: Option<Arc<AppContext>>, _envelope: RequestEnvelope, request: Req<Self>) -> S3Result<Resp<Self>> {
@@ -107,7 +107,7 @@ impl Served for dto::GetBucketEncryption {
 
     async fn authorize(envelope: &mut RequestEnvelope, request: &Req<Self>) -> S3Result<()> {
         let action = Action::S3Action(S3Action::GetBucketEncryptionAction);
-        Ok(authorize_bucket_request(envelope, request.input().bucket.as_str(), action).await?)
+        authorize_bucket_request(envelope, request.input().bucket.as_str(), action).await
     }
 
     async fn execute(context: Option<Arc<AppContext>>, _envelope: RequestEnvelope, request: Req<Self>) -> S3Result<Resp<Self>> {
@@ -169,7 +169,7 @@ impl Served for dto::GetBucketTagging {
 
     async fn authorize(envelope: &mut RequestEnvelope, request: &Req<Self>) -> S3Result<()> {
         let action = Action::S3Action(S3Action::GetBucketTaggingAction);
-        Ok(authorize_bucket_request(envelope, request.input().bucket.as_str(), action).await?)
+        authorize_bucket_request(envelope, request.input().bucket.as_str(), action).await
     }
 
     async fn execute(context: Option<Arc<AppContext>>, _envelope: RequestEnvelope, request: Req<Self>) -> S3Result<Resp<Self>> {
@@ -218,7 +218,7 @@ impl Served for dto::GetPublicAccessBlock {
 
     async fn authorize(envelope: &mut RequestEnvelope, request: &Req<Self>) -> S3Result<()> {
         let action = Action::S3Action(S3Action::GetBucketPublicAccessBlockAction);
-        Ok(authorize_bucket_request(envelope, request.input().bucket.as_str(), action).await?)
+        authorize_bucket_request(envelope, request.input().bucket.as_str(), action).await
     }
 
     async fn execute(context: Option<Arc<AppContext>>, _envelope: RequestEnvelope, request: Req<Self>) -> S3Result<Resp<Self>> {

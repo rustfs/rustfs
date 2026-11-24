@@ -24,7 +24,7 @@
 //!   not an EIO-returning half-dead disk.
 //! - [`DiskFaultHarness::bring_disk_online`] restores the renamed directory.
 //!   If the server recreated a skeleton directory at the original path in the
-//!   meantime, the skeleton is discarded first.
+//!   meantime, the skeleton is moved aside for cleanup with the test root.
 //! - [`DiskFaultHarness::replace_disk_with_empty`] retires the directory and
 //!   creates a fresh empty one, simulating a fresh-disk replacement that the
 //!   server should detect as unformatted and heal.
@@ -43,6 +43,7 @@ use rustfs_signer::sign_v4;
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
+use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use tracing::info;
 use uuid::Uuid;
@@ -170,6 +171,15 @@ impl DiskFaultHarness {
     /// Start (or restart after [`Self::kill_server`]) the RustFS server with
     /// all volume directories and the same address.
     pub async fn start_server(&mut self) -> ChaosResult<()> {
+        self.start_server_with_readiness(false).await
+    }
+
+    /// Start a process once its node read-readiness probe passes.
+    pub async fn start_server_at_read_quorum(&mut self) -> ChaosResult<()> {
+        self.start_server_with_readiness(true).await
+    }
+
+    async fn start_server_with_readiness(&mut self, read_quorum_only: bool) -> ChaosResult<()> {
         // The common helper always appends `env.temp_dir` as the final storage
         // path: point it at the last disk for startup and pass the remaining
         // disks explicitly, then restore it to the root so Drop cleans up
@@ -181,7 +191,13 @@ impl DiskFaultHarness {
         let arg_refs: Vec<&str> = disk_args.iter().map(String::as_str).collect();
         let env_refs: Vec<(&str, &str)> = self.extra_env.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
 
-        let result = self.env.start_rustfs_server_with_env(arg_refs, &env_refs).await;
+        let result = if read_quorum_only {
+            self.env
+                .start_rustfs_server_with_env_at_read_quorum(arg_refs, &env_refs)
+                .await
+        } else {
+            self.env.start_rustfs_server_with_env(arg_refs, &env_refs).await
+        };
         self.env.temp_dir = self.root.to_string_lossy().to_string();
         result
     }
@@ -212,19 +228,31 @@ impl DiskFaultHarness {
     }
 
     /// Restore a disk previously taken offline with [`Self::take_disk_offline`].
-    pub fn bring_disk_online(&self, disk_index: usize) -> ChaosResult<()> {
+    pub fn bring_disk_online(&mut self, disk_index: usize) -> ChaosResult<()> {
         let disk = &self.disks[disk_index];
         let offline = self.offline_path(disk_index);
         if !offline.exists() {
             return Err(format!("disk {disk_index} is not offline").into());
         }
-        // The running server may have recreated a skeleton directory at the
-        // original path (e.g. via degraded writes); discard it before
-        // restoring the original data.
-        if disk.exists() {
-            std::fs::remove_dir_all(disk)?;
+        // A degraded write may recreate the target even while it is being cleared.
+        // Move that tree aside atomically and leave its cleanup to the test root.
+        let mut displaced = 0;
+        loop {
+            match std::fs::rename(&offline, disk) {
+                Ok(()) => break,
+                Err(error)
+                    if displaced < 8
+                        && (matches!(error.kind(), ErrorKind::DirectoryNotEmpty | ErrorKind::AlreadyExists)
+                            || (cfg!(windows) && error.kind() == ErrorKind::PermissionDenied && disk.is_dir())) => {}
+                Err(error) => return Err(error.into()),
+            }
+            displaced += 1;
+            let retired = self.root.join(format!("disk{disk_index}.recreated-{}", Uuid::new_v4()));
+            match std::fs::rename(disk, retired) {
+                Err(error) if error.kind() == ErrorKind::NotFound => continue,
+                result => result?,
+            }
         }
-        std::fs::rename(&offline, disk)?;
         info!("Brought disk {} back online: {:?}", disk_index, disk);
         Ok(())
     }

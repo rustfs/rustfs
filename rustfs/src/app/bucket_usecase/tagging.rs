@@ -138,9 +138,9 @@ impl DefaultBucketUsecase {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::app::bucket_usecase::test_support::build_request;
-    use crate::app::storage_api::s3::dto::{self, PutBucketTaggingInput, Tag, Tagging};
+    use crate::app::bucket_usecase::test_support::owned_envelope;
     use http::Method;
+    use rustfs_gateway_types::cors_tagging::PersistedTag;
     use rustfs_s3_types::S3ErrorCode;
 
     #[tokio::test]
@@ -179,14 +179,14 @@ mod tests {
                 )
                 .await
                 .unwrap();
-            let tag = dto::Tag {
+            let tag = PersistedTag {
                 key: Some("team".to_owned()),
                 value: Some("storage".to_owned()),
             };
             for (tag_set, valid) in [
                 (vec![tag.clone()], true),
                 (
-                    vec![dto::Tag {
+                    vec![PersistedTag {
                         key: Some("team".to_owned()),
                         value: None,
                     }],
@@ -194,28 +194,30 @@ mod tests {
                 ),
                 (vec![tag.clone(), tag], false),
             ] {
-                let persisted = PersistedTagging {
-                    tag_set: tag_set
-                        .iter()
-                        .map(|tag| rustfs_gateway_types::cors_tagging::PersistedTag {
-                            key: tag.key.clone(),
-                            value: tag.value.clone(),
-                        })
-                        .collect(),
-                };
-                let input = PutBucketTaggingInput::builder()
-                    .bucket(bucket.clone())
-                    .tagging(dto::Tagging { tag_set })
-                    .build()
-                    .unwrap();
-                let mut req = build_request(input, Method::PUT);
-                req.extensions.insert(ReqInfo::default());
-                req.extensions.insert(slot.clone());
-                authorize_bucket_config_mutation(&slot, &mut req, &bucket, Action::S3Action(S3Action::PutBucketTaggingAction))
-                    .await
-                    .expect("permission allows tag updates");
+                let mut extensions = http::Extensions::new();
+                extensions.insert(ReqInfo::default());
+                extensions.insert(slot.clone());
+                let mut envelope = RequestEnvelope::from_parts(
+                    crate::app::RequestHead {
+                        method: Method::PUT,
+                        uri: http::Uri::from_static("/"),
+                        headers: http::HeaderMap::new(),
+                        credentials: None,
+                        region: None,
+                        service: None,
+                    },
+                    extensions,
+                );
+                authorize_bucket_config_mutation(
+                    &slot,
+                    &mut envelope,
+                    &bucket,
+                    Action::S3Action(S3Action::PutBucketTaggingAction),
+                )
+                .await
+                .expect("permission allows tag updates");
                 let result = usecase
-                    .execute_put_bucket_tagging(RequestEnvelope::from_s3s(&req), &req.input.bucket, persisted)
+                    .execute_put_bucket_tagging(envelope, &bucket, PersistedTagging { tag_set })
                     .await;
                 if valid {
                     result.expect("valid tags are persisted");
@@ -232,27 +234,22 @@ mod tests {
 
     #[tokio::test]
     async fn execute_put_bucket_tagging_returns_internal_error_when_store_uninitialized() {
-        let input = PutBucketTaggingInput::builder()
-            .bucket("test-bucket".to_string())
-            .tagging(Tagging {
-                tag_set: vec![Tag {
-                    key: Some("env".to_string()),
-                    value: Some("prod".to_string()),
-                }],
-            })
-            .build()
-            .unwrap();
-
-        let req = build_request(input, Method::PUT);
+        let bucket = "test-bucket";
+        let tagging = PersistedTagging {
+            tag_set: vec![PersistedTag {
+                key: Some("env".to_owned()),
+                value: Some("prod".to_owned()),
+            }],
+        };
         let usecase = DefaultBucketUsecase::without_context();
 
         let err = usecase
-            .execute_put_bucket_tagging(RequestEnvelope::from_s3s(&req), &req.input.bucket, PersistedTagging::default())
+            .execute_put_bucket_tagging(owned_envelope(Method::PUT), bucket, tagging)
             .await
             .unwrap_err();
         assert_eq!(err.code(), &S3ErrorCode::InternalError);
 
-        let tag = rustfs_gateway_types::cors_tagging::PersistedTag {
+        let tag = PersistedTag {
             key: Some("team".to_owned()),
             value: Some("storage".to_owned()),
         };
@@ -261,7 +258,7 @@ mod tests {
             (vec![tag; MAX_BUCKET_TAGS + 1], "Cannot have more than 50 tags per bucket"),
         ] {
             let err = usecase
-                .execute_put_bucket_tagging(RequestEnvelope::from_s3s(&req), &req.input.bucket, PersistedTagging { tag_set })
+                .execute_put_bucket_tagging(owned_envelope(Method::PUT), bucket, PersistedTagging { tag_set })
                 .await
                 .unwrap_err();
             assert_eq!(err.code(), &S3ErrorCode::InvalidTag);

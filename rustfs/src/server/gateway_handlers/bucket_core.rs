@@ -21,7 +21,7 @@ use crate::app::{RequestEnvelope, dto_values};
 use crate::runtime_sources::AppContext;
 use crate::storage_api::server::http::access::access_owned::bucket_core::{authorize_create_bucket, authorize_delete_bucket};
 use crate::storage_api::server::http::access::authorize_bucket_request;
-use rustfs_gateway::{Req, Resp, dto};
+use rustfs_gateway::{Req, Resp, dto, validate_accelerate, validate_request_payment};
 use rustfs_gateway_types::persistence::{
     parse_accelerate, parse_bucket_logging_dto, parse_request_payment, parse_website, parse_website_dto,
     serialize_accelerate_dto, serialize_bucket_logging_dto, serialize_request_payment_dto, serialize_website_dto,
@@ -69,7 +69,7 @@ impl Served for dto::HeadBucket {
 
     async fn authorize(envelope: &mut RequestEnvelope, request: &Req<Self>) -> S3Result<()> {
         let action = Action::S3Action(S3Action::ListBucketAction);
-        Ok(authorize_bucket_request(envelope, request.input().bucket.as_str(), action).await?)
+        authorize_bucket_request(envelope, request.input().bucket.as_str(), action).await
     }
 
     async fn execute(context: Option<Arc<AppContext>>, _envelope: RequestEnvelope, request: Req<Self>) -> S3Result<Resp<Self>> {
@@ -91,9 +91,23 @@ impl Served for dto::CreateBucket {
     }
 
     async fn execute(context: Option<Arc<AppContext>>, envelope: RequestEnvelope, request: Req<Self>) -> S3Result<Resp<Self>> {
-        let output = DefaultBucketUsecase::with_context(context)
-            .execute_create_bucket(envelope, request.into_input())
+        let input = request.into_input();
+        let served_in_default_region = context.as_ref().is_some_and(|context| {
+            context
+                .region()
+                .get()
+                .is_none_or(|region| region.as_str() == rustfs_config::RUSTFS_REGION)
+        });
+        // RustFS also accepts historical names and additional location constraints.
+        // Only ordinary buckets in us-east-1 have a documented path-only Location.
+        let location = (served_in_default_region
+            && requested_location_constraint(&input).is_none_or(|region| region == rustfs_config::RUSTFS_REGION)
+            && rustfs_gateway_types::validate_bucket_name(input.bucket.as_str()).is_ok())
+        .then(|| format!("/{}", input.bucket.as_str()));
+        let mut output = DefaultBucketUsecase::with_context(context)
+            .execute_create_bucket(envelope, input)
             .await?;
+        output.location = output.location.or(location);
         Ok(Resp::new(output))
     }
 }
@@ -118,7 +132,7 @@ impl Served for dto::GetBucketLocation {
 
     async fn authorize(envelope: &mut RequestEnvelope, request: &Req<Self>) -> S3Result<()> {
         let action = Action::S3Action(S3Action::GetBucketLocationAction);
-        Ok(authorize_bucket_request(envelope, request.input().bucket.as_str(), action).await?)
+        authorize_bucket_request(envelope, request.input().bucket.as_str(), action).await
     }
 
     async fn execute(context: Option<Arc<AppContext>>, _envelope: RequestEnvelope, request: Req<Self>) -> S3Result<Resp<Self>> {
@@ -134,7 +148,7 @@ impl Served for dto::GetBucketAccelerateConfiguration {
 
     async fn authorize(envelope: &mut RequestEnvelope, request: &Req<Self>) -> S3Result<()> {
         let action = Action::S3Action(S3Action::GetBucketPolicyAction);
-        Ok(authorize_bucket_request(envelope, request.input().bucket.as_str(), action).await?)
+        authorize_bucket_request(envelope, request.input().bucket.as_str(), action).await
     }
 
     async fn execute(context: Option<Arc<AppContext>>, _envelope: RequestEnvelope, request: Req<Self>) -> S3Result<Resp<Self>> {
@@ -153,7 +167,7 @@ impl Served for dto::GetBucketRequestPayment {
 
     async fn authorize(envelope: &mut RequestEnvelope, request: &Req<Self>) -> S3Result<()> {
         let action = Action::S3Action(S3Action::GetBucketPolicyAction);
-        Ok(authorize_bucket_request(envelope, request.input().bucket.as_str(), action).await?)
+        authorize_bucket_request(envelope, request.input().bucket.as_str(), action).await
     }
 
     async fn execute(context: Option<Arc<AppContext>>, _envelope: RequestEnvelope, request: Req<Self>) -> S3Result<Resp<Self>> {
@@ -171,7 +185,7 @@ impl Served for dto::GetBucketWebsite {
 
     async fn authorize(envelope: &mut RequestEnvelope, request: &Req<Self>) -> S3Result<()> {
         let action = Action::S3Action(S3Action::GetBucketPolicyAction);
-        Ok(authorize_bucket_request(envelope, request.input().bucket.as_str(), action).await?)
+        authorize_bucket_request(envelope, request.input().bucket.as_str(), action).await
     }
 
     async fn execute(context: Option<Arc<AppContext>>, _envelope: RequestEnvelope, request: Req<Self>) -> S3Result<Resp<Self>> {
@@ -193,7 +207,7 @@ impl Served for dto::GetBucketLogging {
 
     async fn authorize(envelope: &mut RequestEnvelope, request: &Req<Self>) -> S3Result<()> {
         let action = Action::S3Action(S3Action::GetBucketLoggingAction);
-        Ok(authorize_bucket_request(envelope, request.input().bucket.as_str(), action).await?)
+        authorize_bucket_request(envelope, request.input().bucket.as_str(), action).await
     }
 
     async fn execute(context: Option<Arc<AppContext>>, _envelope: RequestEnvelope, request: Req<Self>) -> S3Result<Resp<Self>> {
@@ -239,7 +253,9 @@ impl Served for dto::PutBucketAccelerateConfiguration {
         let input = request.into_input();
         DefaultBucketUsecase::with_context(context)
             .execute_put_bucket_accelerate_configuration(envelope, input.bucket.as_str(), || {
-                parse_accelerate(&serialize_accelerate_dto(&input.accelerate_configuration))
+                let configuration = &input.accelerate_configuration;
+                validate_accelerate(configuration).map_err(|err| rustfs_s3_types::s3_error!(MalformedXML, "{}", err.reason()))?;
+                parse_accelerate(&serialize_accelerate_dto(configuration))
                     .map_err(|err| rustfs_s3_types::s3_error!(MalformedXML, "{err}"))
             })
             .await?;
@@ -259,7 +275,10 @@ impl Served for dto::PutBucketRequestPayment {
         let input = request.into_input();
         DefaultBucketUsecase::with_context(context)
             .execute_put_bucket_request_payment(envelope, input.bucket.as_str(), || {
-                parse_request_payment(&serialize_request_payment_dto(&input.request_payment_configuration))
+                let configuration = &input.request_payment_configuration;
+                validate_request_payment(configuration)
+                    .map_err(|err| rustfs_s3_types::s3_error!(InvalidArgument, "{}", err.reason()))?;
+                parse_request_payment(&serialize_request_payment_dto(configuration))
                     .map_err(|err| rustfs_s3_types::s3_error!(MalformedXML, "{err}"))
             })
             .await?;

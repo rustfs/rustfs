@@ -23,13 +23,13 @@ use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::types::{
     ServerSideEncryption, ServerSideEncryptionByDefault, ServerSideEncryptionConfiguration, ServerSideEncryptionRule,
 };
-use chrono::{Duration as ChronoDuration, Utc};
 use flate2::{
     Compression,
     write::{GzEncoder, ZlibEncoder},
 };
 use http::HeaderValue;
 use http::header::{CONTENT_TYPE, HOST};
+use jiff::{SignedDuration, Timestamp};
 use md5::{Digest as Md5Digest, Md5};
 use rustfs_s3_types::Body;
 use rustfs_signer::constants::UNSIGNED_PAYLOAD;
@@ -42,8 +42,8 @@ use tokio::io::AsyncWriteExt;
 use uuid::Uuid;
 
 fn encode_post_policy(conditions: Vec<serde_json::Value>) -> String {
-    let expiration = (Utc::now() + ChronoDuration::hours(1))
-        .format("%Y-%m-%dT%H:%M:%S.000Z")
+    let expiration = (Timestamp::now() + SignedDuration::from_hours(1))
+        .strftime("%Y-%m-%dT%H:%M:%S.000Z")
         .to_string();
     let policy = serde_json::json!({
         "expiration": expiration,
@@ -1542,6 +1542,30 @@ async fn test_anonymous_post_object_honors_success_action_status() -> Result<(),
     let get_out = admin_client.get_object().bucket(bucket).key(object_key).send().await?;
     let uploaded = get_out.body.collect().await?.into_bytes();
     assert_eq!(uploaded.as_ref(), expected_body.as_slice(), "uploaded object body should match");
+
+    // An empty redirect is rejected when rendering the response, after storage succeeds.
+    for (field, value, expected_status) in [
+        ("success_action_status", "200", reqwest::StatusCode::OK),
+        ("success_action_status", "204", reqwest::StatusCode::NO_CONTENT),
+        ("success_action_redirect", "", reqwest::StatusCode::BAD_REQUEST),
+    ] {
+        let key = format!("{field}-{value}.txt");
+        let form = reqwest::multipart::Form::new()
+            .text("key", key.clone())
+            .text(field, value)
+            .part("file", reqwest::multipart::Part::bytes(expected_body.clone()).file_name("upload.txt"));
+        let response = local_http_client()
+            .post(format!("{}/{bucket}", env.url))
+            .multipart(form)
+            .send()
+            .await?;
+        assert_eq!(response.status(), expected_status);
+        if value.is_empty() {
+            assert!(response.text().await?.contains("<Code>InvalidArgument</Code>"));
+        }
+        let stored = admin_client.get_object().bucket(bucket).key(key).send().await?;
+        assert_eq!(stored.body.collect().await?.into_bytes().as_ref(), expected_body.as_slice());
+    }
 
     Ok(())
 }

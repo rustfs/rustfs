@@ -212,6 +212,7 @@ fn expected_admin_route_matrix() -> Vec<RouteMatrixEntry> {
         admin_route(Method::GET, "/v3/idp/builtin/policy-entities"),
         admin_route(Method::GET, "/v3/target/list"),
         admin_route_sample(Method::PUT, "/v3/target/{target_type}/{target_name}", "/v3/target/webhook/test-target"),
+        admin_route_sample(Method::DELETE, "/v3/target/{target_type}/{target_name}", "/v3/target/webhook/test-target"),
         admin_route_sample(
             Method::DELETE,
             "/v3/target/{target_type}/{target_name}/reset",
@@ -431,6 +432,9 @@ fn expected_admin_route_matrix() -> Vec<RouteMatrixEntry> {
         admin_route(Method::DELETE, "/v3/cancel-job"),
         admin_route(Method::PUT, "/v3/site-replication/add"),
         admin_route(Method::PUT, "/v3/site-replication/remove"),
+        admin_route(Method::PUT, "/v3/site-replication/remove-v2"),
+        admin_route(Method::GET, "/v3/site-replication/remove-v2/capabilities"),
+        admin_route(Method::PUT, "/v3/site-replication/peer/remove-v2"),
         admin_route(Method::GET, "/v3/site-replication/info"),
         admin_route(Method::GET, "/v3/site-replication/metainfo"),
         admin_route(Method::GET, "/v3/site-replication/status"),
@@ -1484,6 +1488,9 @@ fn test_register_routes_cover_representative_admin_paths() {
     assert_route(&router, Method::DELETE, &admin_path("/v3/cancel-job"));
     assert_route(&router, Method::PUT, &admin_path("/v3/site-replication/add"));
     assert_route(&router, Method::PUT, &admin_path("/v3/site-replication/remove"));
+    assert_route(&router, Method::PUT, &admin_path("/v3/site-replication/remove-v2"));
+    assert_route(&router, Method::GET, &admin_path("/v3/site-replication/remove-v2/capabilities"));
+    assert_route(&router, Method::PUT, &admin_path("/v3/site-replication/peer/remove-v2"));
     assert_route(&router, Method::GET, &admin_path("/v3/site-replication/info"));
     assert_route(&router, Method::GET, &admin_path("/v3/site-replication/metainfo"));
     assert_route(&router, Method::GET, &admin_path("/v3/site-replication/status"));

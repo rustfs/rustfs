@@ -30,13 +30,15 @@ use super::lifecycle::SessionDiag;
 use super::paths::{copy_source_value, parse_s3_path, sanitise_control_bytes};
 use super::state::{HandleState, WritePhase};
 use super::write::{build_write_tombstone, fstat_reported_size, rejects_excl_or_trunc_without_create, should_abort_on_drop};
-use crate::common::client::s3::StorageBackend;
+use crate::common::client::s3::{MultipartRequest, StorageBackend};
 use crate::common::gateway::{AuthorizationError, S3Action};
 use crate::common::session::SessionContext;
-use russh_sftp::protocol::{Attrs, Data, File, FileAttributes, Handle, Name, OpenFlags, Packet, Status, StatusCode, Version};
+use russh_sftp::protocol::{
+    Attrs, Data, File, FileAttributes, Handle, Name, OpenFlags, Packet, SftpHandle, Status, StatusCode, Version,
+};
 use rustfs_credentials::Credentials;
 use rustfs_gateway_types::dto::{AbortMultipartUploadInput, CopyObjectInput, ListObjectsV2Input};
-use rustfs_gateway_types::{BucketName, ObjectKey, UploadIdClaim};
+use rustfs_gateway_types::{BucketName, ObjectKey};
 use rustfs_utils::MaskedAccessKey;
 use std::collections::HashMap;
 use std::sync::atomic::AtomicU64;
@@ -206,6 +208,12 @@ impl<S: StorageBackend + Send + Sync + 'static> SftpDriver<S> {
             Some(state) => f(state),
             None => Err(SftpError::code(StatusCode::Failure)),
         }
+    }
+
+    /// russh-sftp 4 hands the Handler opaque `SftpHandle` bytes; the table
+    /// keys remain the UTF-8 UUID strings this driver mints.
+    fn handle_table_key(handle: SftpHandle) -> Result<String, SftpError> {
+        String::from_utf8(handle.into_bytes()).map_err(|_| SftpError::code(StatusCode::Failure))
     }
 
     /// Generate a fresh UUID v4 handle, insert the given state into the
@@ -494,8 +502,9 @@ impl<S: StorageBackend + Send + Sync + 'static> russh_sftp::server::Handler for 
     /// Streaming returns (next_part_number - 1) * part_size + buffer
     /// length. Failed returns the size recorded at the most recent
     /// successful write. An unknown handle returns Failure.
-    #[tracing::instrument(level = "debug", skip(self), fields(id, handle = %handle), err(Debug))]
-    async fn fstat(&mut self, id: u32, handle: String) -> Result<Attrs, Self::Error> {
+    #[tracing::instrument(level = "debug", skip(self), fields(id, handle = ?handle), err(Debug))]
+    async fn fstat(&mut self, id: u32, handle: SftpHandle) -> Result<Attrs, Self::Error> {
+        let handle = Self::handle_table_key(handle)?;
         self.session_diag.stamp();
         let part_size = self.part_size;
         let result = self.with_handle_ref(&handle, |state| match state {
@@ -541,8 +550,9 @@ impl<S: StorageBackend + Send + Sync + 'static> russh_sftp::server::Handler for 
     /// exhaustion, so it is normal control flow on this handler. The
     /// instrument attribute therefore omits err(Debug) and non-Eof
     /// failures are surfaced via the explicit error log below.
-    #[tracing::instrument(level = "debug", skip(self), fields(id, handle = %handle))]
-    async fn readdir(&mut self, id: u32, handle: String) -> Result<Name, Self::Error> {
+    #[tracing::instrument(level = "debug", skip(self), fields(id, handle = ?handle))]
+    async fn readdir(&mut self, id: u32, handle: SftpHandle) -> Result<Name, Self::Error> {
+        let handle = Self::handle_table_key(handle)?;
         self.session_diag.stamp();
         let result = self.readdir_inner(id, handle.clone()).await;
         self.session_diag.stamp();
@@ -617,8 +627,9 @@ impl<S: StorageBackend + Send + Sync + 'static> russh_sftp::server::Handler for 
     /// read-past-end-of-file, so it is normal control flow on this
     /// handler. The instrument attribute therefore omits err(Debug) and
     /// non-Eof failures are surfaced via the explicit error log below.
-    #[tracing::instrument(level = "debug", skip(self), fields(id, handle = %handle, offset, len))]
-    async fn read(&mut self, id: u32, handle: String, offset: u64, len: u32) -> Result<Data, Self::Error> {
+    #[tracing::instrument(level = "debug", skip(self), fields(id, handle = ?handle, offset, len))]
+    async fn read(&mut self, id: u32, handle: SftpHandle, offset: u64, len: u32) -> Result<Data, Self::Error> {
+        let handle = Self::handle_table_key(handle)?;
         self.session_diag.stamp();
         let result = self.read_inner(id, handle.clone(), offset, len).await;
         self.session_diag.stamp();
@@ -650,8 +661,9 @@ impl<S: StorageBackend + Send + Sync + 'static> russh_sftp::server::Handler for 
     ///
     /// A missing handle is treated as Ok to tolerate clients that
     /// double-close on session teardown.
-    #[tracing::instrument(level = "info", skip(self), fields(id, handle = %handle), err(Debug))]
-    async fn close(&mut self, id: u32, handle: String) -> Result<Status, Self::Error> {
+    #[tracing::instrument(level = "info", skip(self), fields(id, handle = ?handle), err(Debug))]
+    async fn close(&mut self, id: u32, handle: SftpHandle) -> Result<Status, Self::Error> {
+        let handle = Self::handle_table_key(handle)?;
         self.session_diag.stamp();
         let removed = self.handles.remove(&handle);
         let Some(HandleState::Write {
@@ -755,8 +767,9 @@ impl<S: StorageBackend + Send + Sync + 'static> russh_sftp::server::Handler for 
     /// to Streaming by issuing CreateMultipartUpload. A Failed handle
     /// rejects every subsequent write with the same status that caused
     /// the failure.
-    #[tracing::instrument(level = "debug", skip(self, data), fields(id, handle = %handle, offset, len = data.len()), err(Debug))]
-    async fn write(&mut self, id: u32, handle: String, offset: u64, data: Vec<u8>) -> Result<Status, Self::Error> {
+    #[tracing::instrument(level = "debug", skip(self, data), fields(id, handle = ?handle, offset, len = data.len()), err(Debug))]
+    async fn write(&mut self, id: u32, handle: SftpHandle, offset: u64, data: Vec<u8>) -> Result<Status, Self::Error> {
+        let handle = Self::handle_table_key(handle)?;
         self.session_diag.stamp();
         self.enforce_server_readonly()?;
 
@@ -983,8 +996,8 @@ impl<S: StorageBackend + Send + Sync + 'static> russh_sftp::server::Handler for 
     /// SSH_FXP_FSETSTAT, SFTP Internet Draft section 6.6. Same rationale
     /// as setstat: S3 cannot honour POSIX attributes, and clients use
     /// FSETSTAT during transfers to stamp the in-flight handle.
-    #[tracing::instrument(level = "debug", skip(self, _attrs), fields(id, handle = %_handle), err(Debug))]
-    async fn fsetstat(&mut self, id: u32, _handle: String, _attrs: FileAttributes) -> Result<Status, Self::Error> {
+    #[tracing::instrument(level = "debug", skip(self, _attrs), fields(id, handle = ?_handle), err(Debug))]
+    async fn fsetstat(&mut self, id: u32, _handle: SftpHandle, _attrs: FileAttributes) -> Result<Status, Self::Error> {
         self.enforce_server_readonly()?;
         Ok(ok_status(id))
     }
@@ -1114,11 +1127,10 @@ impl<S: StorageBackend + Send + Sync + 'static> Drop for SftpDriver<S> {
                     let input = AbortMultipartUploadInput::builder()
                         .bucket(BucketName::new(bucket.clone()).expect("validated bucket name"))
                         .key(ObjectKey::new(key.clone()).expect("validated object key"))
-                        .upload_id(UploadIdClaim::from_wire(upload_id.clone()))
                         .build();
                     match tokio::time::timeout(
                         std::time::Duration::from_secs(backend_op_timeout_secs),
-                        storage.abort_multipart_upload(input, &credentials),
+                        storage.abort_multipart_upload(MultipartRequest::abort(input, upload_id.clone()), &credentials),
                     )
                     .await
                     {
@@ -1254,7 +1266,7 @@ mod tests {
         let handle_id = driver
             .allocate_handle(file_handle("bucket", "k", 1234, attrs.clone()))
             .expect("allocate");
-        let out = driver.fstat(4, handle_id).await.expect("fstat on File must succeed");
+        let out = driver.fstat(4, handle_id.into()).await.expect("fstat on File must succeed");
         assert_eq!(out.attrs.size, Some(1234));
         assert_eq!(out.attrs.mtime, Some(1_700_000_000));
     }
@@ -1267,7 +1279,7 @@ mod tests {
             part_buffer: vec![0u8; 4096],
         };
         let handle_id = driver.allocate_handle(write_handle("bucket", "k", phase)).expect("allocate");
-        let out = driver.fstat(5, handle_id).await.expect("fstat on Write must succeed");
+        let out = driver.fstat(5, handle_id.into()).await.expect("fstat on Write must succeed");
         assert_eq!(
             out.attrs.size,
             Some(4096),
@@ -1283,7 +1295,7 @@ mod tests {
             .allocate_handle(file_handle("bucket", "k", 0, FileAttributes::default()))
             .expect("allocate");
         let status = driver
-            .fsetstat(6, handle_id, FileAttributes::default())
+            .fsetstat(6, handle_id.into(), FileAttributes::default())
             .await
             .expect("fsetstat must succeed on any attrs");
         assert!(matches!(status.status_code, StatusCode::Ok));
@@ -1417,7 +1429,7 @@ mod tests {
         let handle_id = driver
             .allocate_handle(file_handle("bucket", "k", 0, FileAttributes::default()))
             .expect("allocate");
-        let result = driver.fsetstat(10, handle_id, FileAttributes::default()).await;
+        let result = driver.fsetstat(10, handle_id.into(), FileAttributes::default()).await;
         match result {
             Err(err) => assert!(matches!(err.0, StatusCode::PermissionDenied)),
             Ok(_) => panic!("fsetstat must error in read-only mode"),

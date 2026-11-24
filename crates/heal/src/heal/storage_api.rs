@@ -25,6 +25,7 @@ pub(crate) use rustfs_ecstore::api::disk::{
     DiskStore as EcstoreDiskStore, HEAL_REPLACEMENT_RECOVERY_DIR as ECSTORE_HEAL_REPLACEMENT_RECOVERY_DIR,
     HEALING_MARKER_PATH as ECSTORE_HEALING_MARKER_PATH, RUSTFS_META_BUCKET as ECSTORE_RUSTFS_META_BUCKET,
     ReplacementExecutionLease as EcstoreReplacementExecutionLease,
+    UNCLEAN_SHUTDOWN_MARKER_PATH as ECSTORE_UNCLEAN_SHUTDOWN_MARKER_PATH,
 };
 #[cfg(test)]
 pub(crate) use rustfs_ecstore::api::disk::{

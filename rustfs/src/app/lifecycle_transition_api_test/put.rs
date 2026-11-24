@@ -16,13 +16,13 @@
 
 use super::common::*;
 use super::*;
+use rustfs_s3_types::S3ErrorCode;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 #[serial]
 #[ignore = "global-state ILM integration test: runs serialized in the CI ILM Integration (serial) lane, see ci.yml test-ilm-integration-serial and rustfs/backlog#1148 (ilm-1)"]
 async fn put_object_if_none_match_existing_object_returns_precondition_failed() {
     let (_disk_paths, ecstore) = setup_test_env().await;
-    let fs = FS::new();
     let usecase = DefaultObjectUsecase::from_global();
 
     let bucket = format!("test-put-if-none-match-{}", &Uuid::new_v4().simple().to_string()[..8]);
@@ -32,14 +32,8 @@ async fn put_object_if_none_match_existing_object_returns_precondition_failed() 
 
     create_test_bucket(&ecstore, bucket.as_str()).await;
 
-    let initial_input = PutObjectInput::builder()
-        .bucket(bucket.clone())
-        .key(object.to_string())
-        .body(Some(streaming_blob_from_bytes(initial_payload)))
-        .content_length(Some(initial_payload.len() as i64))
-        .build()
-        .unwrap();
-    Box::pin(usecase.execute_put_object(&fs, build_request(initial_input, Method::PUT)))
+    let initial_input = put_input(&bucket, object, Bytes::from_static(initial_payload));
+    Box::pin(usecase.execute_put_object_owned(request_envelope(Method::PUT, HeaderMap::new()), initial_input))
         .await
         .expect("Failed to upload initial object through usecase");
 
@@ -50,30 +44,22 @@ async fn put_object_if_none_match_existing_object_returns_precondition_failed() 
     let existing_etag = existing_info.etag.expect("existing object should have an ETag");
     let initial_versions = live_object_version_count(&ecstore, bucket.as_str(), object).await;
 
-    for (condition, expected_code) in [
-        (ETagCondition::Any, S3ErrorCode::PreconditionFailed),
-        (ETagCondition::ETag(ETag::Strong(existing_etag)), S3ErrorCode::NotImplemented),
+    for (header, expected_code) in [
+        (HeaderValue::from_static("*"), S3ErrorCode::PreconditionFailed),
         (
-            ETagCondition::ETag(ETag::Strong("different-etag".to_string())),
+            HeaderValue::from_str(&format!(r#""{existing_etag}""#)).unwrap(),
             S3ErrorCode::NotImplemented,
         ),
+        (HeaderValue::from_static(r#""different-etag""#), S3ErrorCode::NotImplemented),
     ] {
-        let header = condition.to_http_header().expect("conditional PUT header should encode");
-        // Cover header-only callers and the DTO-plus-header shape of parsed HTTP requests.
-        for if_none_match in [None, Some(condition)] {
-            let has_dto = if_none_match.is_some();
-            let replacement_input = PutObjectInput::builder()
-                .bucket(bucket.clone())
-                .key(object.to_string())
-                .body(Some(streaming_blob_from_bytes(replacement_payload)))
-                .content_length(Some(replacement_payload.len() as i64))
-                .if_none_match(if_none_match)
-                .build()
-                .expect("conditional replacement PUT input should build");
-            let mut req = build_request(replacement_input, Method::PUT);
-            req.headers.insert(IF_NONE_MATCH, header.clone());
+        // Cover header-only callers and the decoded precondition supplied by the gateway.
+        for has_dto in [false, true] {
+            let mut input = put_input(&bucket, object, Bytes::from_static(replacement_payload));
+            input.specific_if_none_match = has_dto && header != "*";
+            let mut headers = HeaderMap::new();
+            headers.insert(IF_NONE_MATCH, header.clone());
 
-            let err = Box::pin(usecase.execute_put_object(&fs, req))
+            let err = Box::pin(usecase.execute_put_object_owned(request_envelope(Method::PUT, headers), input))
                 .await
                 .expect_err("conditional PUT must reject the replacement");
             assert_eq!(err.code(), &expected_code, "header={header:?}, has_dto={has_dto}");
@@ -108,7 +94,6 @@ async fn put_object_computes_replication_decision_exactly_once() {
     use std::sync::atomic::Ordering;
 
     let (_disk_paths, ecstore) = setup_test_env().await;
-    let fs = FS::new();
     let usecase = DefaultObjectUsecase::from_global();
 
     let bucket = format!("test-repl-decision-once-{}", &Uuid::new_v4().simple().to_string()[..8]);
@@ -122,14 +107,8 @@ async fn put_object_computes_replication_decision_exactly_once() {
     // no unrelated `must_replicate_object` call can perturb the count.
     MUST_REPLICATE_OBJECT_CALLS.store(0, Ordering::SeqCst);
 
-    let input = PutObjectInput::builder()
-        .bucket(bucket.clone())
-        .key(object.to_string())
-        .body(Some(streaming_blob_from_bytes(payload)))
-        .content_length(Some(payload.len() as i64))
-        .build()
-        .unwrap();
-    Box::pin(usecase.execute_put_object(&fs, build_request(input, Method::PUT)))
+    let input = put_input(&bucket, object, Bytes::from_static(payload));
+    Box::pin(usecase.execute_put_object_owned(request_envelope(Method::PUT, HeaderMap::new()), input))
         .await
         .expect("Failed to upload object through usecase");
 
@@ -198,16 +177,10 @@ async fn put_object_extract_computes_replication_decision_per_entry() {
 
     MUST_REPLICATE_OBJECT_CALLS.store(0, Ordering::SeqCst);
 
-    let input = PutObjectInput::builder()
-        .bucket(bucket.clone())
-        .key("archive.tar".to_string())
-        .body(Some(streaming_blob_from_bytes(&archive)))
-        .content_length(Some(archive.len() as i64))
-        .build()
-        .unwrap();
-    let mut req = build_request(input, Method::PUT);
-    req.extensions.insert(ReqInfo::default());
-    Box::pin(usecase.execute_put_object_extract(req))
+    let input = put_input(&bucket, "archive.tar", Bytes::from(archive));
+    let mut envelope = request_envelope(Method::PUT, HeaderMap::new());
+    envelope.install_req_info(ReqInfo::default());
+    Box::pin(usecase.execute_put_object_extract_owned(envelope, input))
         .await
         .expect("Failed to extract archive through usecase");
 

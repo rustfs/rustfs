@@ -19,9 +19,9 @@
 //! Not responsible for: the helpers behind each route (their own modules test
 //! those) or object lambda, which is still served by the router itself.
 
-use super::{AdminOperation, Body, S3ErrorCode, S3Request, S3Response, S3Result, S3Route, S3Router};
+use super::{AdminOperation, Body, S3Request, S3Response, S3Route, S3Router};
 use crate::admin::storage_api::contract::bucket::MakeBucketOptions;
-use crate::app::storage_api::s3::Credentials;
+use crate::app::storage_api::s3::{Credentials, S3ErrorCode, S3Result};
 use http::{Extensions, HeaderMap, Method, StatusCode, header};
 use http_body_util::BodyExt;
 use rustfs_iam::store::{Store as _, UserType, object::ObjectStore};
@@ -147,7 +147,7 @@ async fn install_identities() -> (Callers, String) {
         .await
         .expect("IAM format");
     let iam = ambient.iam().handle();
-    let suffix = uuid::Uuid::new_v4().simple().to_string();
+    let suffix = format!("test{}", uuid::Uuid::new_v4().simple());
     let bucket = format!("ext-routes-{suffix}");
     let all = [
         Action::ResetReplication,

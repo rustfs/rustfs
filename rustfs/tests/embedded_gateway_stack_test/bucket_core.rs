@@ -15,7 +15,7 @@
 //! Refusal-matrix rows of migration batch A4 and of ListBuckets (rustfs/backlog#2765).
 
 use super::{
-    GATEWAY, LEGACY, MatrixRow, Outcome, USER_SECRET_KEY, anonymous_client, create_bucket_in_the_store,
+    GATEWAY, MatrixRow, Outcome, USER_SECRET_KEY, anonymous_client, create_bucket_in_the_store,
     create_user_allowed_on_one_bucket, outcome, refusal, s3_client, with_stack,
 };
 use aws_sdk_s3::Client;
@@ -204,6 +204,13 @@ async fn create_bucket_answers_as_before(server: RustFSServer) {
             .set_create_bucket_configuration(configuration)
             .send()
             .await;
+        if let Ok(output) = &created {
+            let expected = match bucket {
+                "create-fresh" => Some("/create-fresh"),
+                _ => None, // Accepted historical bucket names keep their measured response.
+            };
+            assert_eq!(output.location(), expected, "{bucket}");
+        }
         let refused = outcome(created).err().map(|refusal| (refusal.code, refusal.status));
         let exists = super::bucket_exists_in_the_store(bucket).await;
         observed.push((bucket, location, refused, exists));
@@ -216,17 +223,32 @@ async fn create_bucket_answers_as_before(server: RustFSServer) {
         })
         .collect();
     assert_eq!(observed, expected);
+
+    let global_bucket = "create-namespace-global";
+    let created_global = root
+        .create_bucket()
+        .bucket(global_bucket)
+        .customize()
+        .mutate_request(|request| {
+            request.headers_mut().insert("x-amz-bucket-namespace", "global");
+        })
+        .send()
+        .await
+        .expect("CreateBucket with x-amz-bucket-namespace: global should succeed");
+    assert_eq!(created_global.location(), Some("/create-namespace-global"));
+    assert!(super::bucket_exists_in_the_store(global_bucket).await);
+    root.head_bucket()
+        .bucket(global_bucket)
+        .send()
+        .await
+        .expect("HeadBucket after global-namespace CreateBucket should return 200");
+
     server.shutdown().await;
 }
 
 #[test]
 fn the_gateway_stack_creates_buckets_as_before() {
     with_stack(GATEWAY, create_bucket_answers_as_before);
-}
-
-#[test]
-fn the_legacy_stack_creates_buckets_as_before() {
-    with_stack(LEGACY, create_bucket_answers_as_before);
 }
 
 /// One DeleteBucket request by root: the bucket, the force-delete header it carries, whether the
@@ -245,10 +267,10 @@ const RUSTFS_INVALID: Option<(&str, u16)> = Some(("InvalidRequest", 400));
 const MINIO_INVALID: Option<(&str, u16)> = Some(("InvalidArgument", 400));
 
 /// The legacy answers, measured: `x-rustfs-force-delete` reads RustFS's wide boolean grammar,
-/// `x-minio-force-delete` only `true` and `false`. The force rows use a bucket that holds an
-/// object, so a refused value that deleted anyway, or a `false` read as `true`, cannot pass. A
-/// name the AWS grammar reserves is deleted like any other.
-const DELETE_CASES: [DeleteCase; 14] = [
+/// `x-minio-force-delete` accepts `true`, `false`, `True`, and `False`. The force rows use a
+/// bucket that holds an object, so a refused value that deleted anyway, or a `false` read as
+/// `true`, cannot pass. A name the AWS grammar reserves is deleted like any other.
+const DELETE_CASES: [DeleteCase; 17] = [
     ("delete-missing", None, false, Some(("NoSuchBucket", 404)), false),
     ("delete-plain", None, false, None, false),
     ("sthree-delete", None, false, None, false),
@@ -265,10 +287,25 @@ const DELETE_CASES: [DeleteCase; 14] = [
     ),
     ("delete-rustfs-false", Some(("x-rustfs-force-delete", "false")), true, NOT_EMPTY, true),
     ("delete-minio-true", Some(("x-minio-force-delete", "true")), true, None, false),
+    ("delete-minio-cap-true", Some(("x-minio-force-delete", "True")), true, None, false),
     ("delete-minio-upper", Some(("x-minio-force-delete", "TRUE")), true, MINIO_INVALID, true),
     ("delete-minio-one", Some(("x-minio-force-delete", "1")), true, MINIO_INVALID, true),
     ("delete-minio-maybe", Some(("x-minio-force-delete", "maybe")), true, MINIO_INVALID, true),
     ("delete-minio-false", Some(("x-minio-force-delete", "false")), true, NOT_EMPTY, true),
+    (
+        "delete-minio-cap-false-full",
+        Some(("x-minio-force-delete", "False")),
+        true,
+        NOT_EMPTY,
+        true,
+    ),
+    (
+        "delete-minio-cap-false-empty",
+        Some(("x-minio-force-delete", "False")),
+        false,
+        None,
+        false,
+    ),
 ];
 
 async fn delete_bucket_answers_as_before(server: RustFSServer) {
@@ -312,11 +349,6 @@ fn the_gateway_stack_deletes_buckets_as_before() {
     with_stack(GATEWAY, delete_bucket_answers_as_before);
 }
 
-#[test]
-fn the_legacy_stack_deletes_buckets_as_before() {
-    with_stack(LEGACY, delete_bucket_answers_as_before);
-}
-
 /// A bucket in the default region has an empty location constraint, under an ordinary name and
 /// under one the AWS grammar reserves; a missing bucket is `NoSuchBucket`.
 async fn get_bucket_location_answers_as_before(server: RustFSServer) {
@@ -338,11 +370,6 @@ async fn get_bucket_location_answers_as_before(server: RustFSServer) {
 #[test]
 fn the_gateway_stack_locates_buckets_as_before() {
     with_stack(GATEWAY, get_bucket_location_answers_as_before);
-}
-
-#[test]
-fn the_legacy_stack_locates_buckets_as_before() {
-    with_stack(LEGACY, get_bucket_location_answers_as_before);
 }
 
 async fn force_delete_header_order(server: RustFSServer) {
@@ -381,11 +408,6 @@ async fn force_delete_header_order(server: RustFSServer) {
     let error = outcome(result).expect_err("invalid header must be refused");
     assert_eq!((error.code.as_deref(), error.status), (Some("InvalidArgument"), Some(400)));
     server.shutdown().await;
-}
-
-#[test]
-fn the_legacy_stack_orders_force_delete_headers() {
-    with_stack(LEGACY, force_delete_header_order);
 }
 
 #[test]
@@ -517,11 +539,6 @@ fn the_gateway_stack_reads_core_bucket_configurations() {
     with_stack(GATEWAY, |server| core_configuration_reads(server, true));
 }
 
-#[test]
-fn the_legacy_stack_reads_core_bucket_configurations() {
-    with_stack(LEGACY, |server| core_configuration_reads(server, false));
-}
-
 fn put_bucket_logging<'a>(client: &'a Client, bucket: &'a str) -> BoxFuture<'a, Outcome> {
     Box::pin(async move {
         let enabled = LoggingEnabled::builder()
@@ -617,11 +634,6 @@ async fn bucket_logging_mutations(server: RustFSServer) {
 #[test]
 fn the_gateway_stack_mutates_bucket_logging() {
     with_stack(GATEWAY, bucket_logging_mutations);
-}
-
-#[test]
-fn the_legacy_stack_mutates_bucket_logging() {
-    with_stack(LEGACY, bucket_logging_mutations);
 }
 
 fn put_bucket_accelerate_configuration<'a>(client: &'a Client, bucket: &'a str) -> BoxFuture<'a, Outcome> {
@@ -776,9 +788,4 @@ async fn core_configuration_mutations(server: RustFSServer) {
 #[test]
 fn the_gateway_stack_mutates_core_bucket_configurations() {
     with_stack(GATEWAY, core_configuration_mutations);
-}
-
-#[test]
-fn the_legacy_stack_mutates_core_bucket_configurations() {
-    with_stack(LEGACY, core_configuration_mutations);
 }

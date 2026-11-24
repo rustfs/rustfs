@@ -191,19 +191,6 @@ impl NotifyInterface for NotifyHandle {
     ) -> Result<(), NotificationError> {
         runtime_sources::validate_event_specific_rules(bucket_name, region, event_rules).await
     }
-
-    async fn add_event_specific_rules(
-        &self,
-        bucket_name: &str,
-        region: &str,
-        event_rules: &[(Vec<EventName>, String, String, Vec<TargetID>)],
-    ) -> Result<(), NotificationError> {
-        runtime_sources::add_event_specific_rules(bucket_name, region, event_rules).await
-    }
-
-    async fn clear_bucket_notification_rules(&self, bucket_name: &str) -> Result<(), NotificationError> {
-        runtime_sources::clear_bucket_notification_rules(bucket_name).await
-    }
 }
 
 /// Default notification system handle adapter.

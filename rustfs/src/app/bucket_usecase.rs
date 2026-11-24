@@ -22,7 +22,7 @@ use super::storage_api::bucket_usecase::StorageObjectInfo as ObjectInfo;
 #[cfg(test)]
 use super::storage_api::bucket_usecase::access::ReqInfo;
 use super::storage_api::bucket_usecase::access::{
-    TableDataPlaneListAccess, authorize_request, bucket_config_mutation_incarnation, log_list_buckets_iam_implicit_deny,
+    authorize_request, bucket_config_mutation_incarnation, log_list_buckets_iam_implicit_deny,
     prepare_list_buckets_iam_authorization, prepare_odm_read_generation, req_info_ref,
 };
 #[cfg(test)]
@@ -48,15 +48,14 @@ use super::storage_api::bucket_usecase::bucket::{
     utils::{BucketConfigXml, serialize},
     versioning_sys::BucketVersioningSys,
 };
-use super::storage_api::bucket_usecase::contract::bucket::{
-    BucketOperations, BucketOptions, DeleteBucketOptions, MakeBucketOptions,
-};
+#[cfg(test)]
+use super::storage_api::bucket_usecase::contract::bucket::DeleteBucketOptions;
+use super::storage_api::bucket_usecase::contract::bucket::{BucketOperations, BucketOptions, MakeBucketOptions};
 use super::storage_api::bucket_usecase::contract::list::{
     ListObjectVersionsInfo as StorageListObjectVersionsInfo, ListObjectsV2Info as StorageListObjectsV2Info,
 };
 use super::storage_api::bucket_usecase::error::StorageError;
 use super::storage_api::bucket_usecase::helper::{OperationHelper, spawn_background_with_context};
-use super::storage_api::bucket_usecase::object_utils::to_s3s_xml_etag;
 use super::storage_api::bucket_usecase::s3_api::bucket::{
     ListObjectVersionsParams, ListObjectsV2Params, encode_list_objects_v2_continuation_token, parse_list_object_versions_params,
     parse_list_objects_v2_params, rustfs_owner,
@@ -98,14 +97,13 @@ use rustfs_policy::policy::{
     {BucketPolicy, BucketPolicyArgs, Effect},
 };
 use rustfs_s3_ops::S3Operation;
-use rustfs_s3_types::Region;
+use rustfs_s3_types::{Region, S3Error, S3ErrorCode, S3Result};
 use rustfs_targets::{
     EventName,
     arn::{ARN, TargetID, TargetIDError},
 };
 use rustfs_utils::http::get_header;
 use rustfs_utils::obj::extract_user_defined_metadata;
-use s3s::{S3Error, S3ErrorCode, S3Result};
 use std::{
     borrow::Cow,
     collections::{HashMap, HashSet},
@@ -121,7 +119,6 @@ use tracing::{Instrument as _, debug, error, info, instrument, warn};
 mod accelerate;
 mod acl;
 mod core;
-#[cfg(any(test, feature = "gateway-stack"))]
 pub(crate) use self::core::requested_location_constraint;
 mod cors;
 #[cfg(test)]
@@ -511,8 +508,7 @@ impl DefaultBucketUsecase {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::app::bucket_usecase::test_support::{build_request, build_request_with_req_info};
-    use crate::app::storage_api::s3::dto::CreateBucketInput;
+    use crate::app::bucket_usecase::test_support::owned_envelope;
     use http::Method;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use tokio::sync::Notify;
@@ -988,29 +984,33 @@ mod tests {
 
     #[test]
     fn build_request_with_req_info_preserves_owner_state() {
-        let input = CreateBucketInput::builder()
-            .bucket("test-bucket".to_string())
-            .build()
-            .unwrap();
-        let req = build_request_with_req_info(
-            input,
-            Method::PUT,
-            ReqInfo {
-                is_owner: true,
-                ..Default::default()
-            },
-        );
+        let mut extensions = http::Extensions::new();
+        extensions.insert(ReqInfo {
+            is_owner: true,
+            ..Default::default()
+        });
 
-        assert!(req_info_ref(&req).expect("req info should be present").is_owner);
+        // Same facts `RequestEnvelope::from_s3s` copies. Credentials, region, and service stay absent.
+        let envelope = RequestEnvelope::from_parts(
+            crate::app::RequestHead {
+                method: Method::PUT,
+                uri: http::Uri::from_static("/"),
+                headers: http::HeaderMap::new(),
+                credentials: None,
+                region: None,
+                service: None,
+            },
+            extensions,
+        );
+        assert!(envelope.req_info().expect("req info should be present").is_owner);
     }
 
     #[tokio::test]
     async fn execute_list_buckets_returns_internal_error_when_store_uninitialized() {
-        let req = build_request((), Method::GET);
         let usecase = DefaultBucketUsecase::without_context();
 
         let err = usecase
-            .execute_list_buckets(RequestEnvelope::from_s3s(&req), gateway_dto::ListBucketsInput::default())
+            .execute_list_buckets(owned_envelope(Method::GET), gateway_dto::ListBucketsInput::default())
             .await
             .unwrap_err();
         assert_eq!(err.code(), &rustfs_s3_types::S3ErrorCode::InternalError);

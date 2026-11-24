@@ -17,7 +17,7 @@
 //! The interface resolves owner privileges and the site contract. The bucket
 //! use case receives those facts without consulting site membership itself.
 
-use crate::storage::access::{AuthorizationRequest, req_info_ref};
+use crate::storage::authorization::{AuthorizationRequest, req_info_ref};
 use crate::storage::storage_api::ecstore_bucket::replication::OperatorRuleContract;
 use http::StatusCode;
 use rustfs_s3_types::{S3Error, S3ErrorCode, S3Result};
@@ -83,11 +83,54 @@ fn replication_deny_edit_error() -> S3Error {
 pub(crate) fn prepare_replication_config_edit<R: AuthorizationRequest + ?Sized>(
     request: &R,
 ) -> impl Future<Output = S3Result<(HashSet<String>, OperatorRuleContract)>> + Send + use<R> {
-    let is_owner = req_info_ref(request).map(|info| info.is_owner).map_err(S3Error::from);
+    let is_owner = req_info_ref(request).map(|info| info.is_owner);
     async move {
         if !is_owner? && site_replication_gate_enabled().await? {
             return Err(replication_deny_edit_error());
         }
         site_replication_edit_context().await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        SITE_REPLICATION_GATE_FORCE_DISABLED, SITE_REPLICATION_GATE_FORCE_ENABLED, SITE_REPLICATION_GATE_TEST_OVERRIDE,
+        prepare_replication_config_edit,
+    };
+    use crate::storage::authorization::tests::fixture::request;
+    use crate::storage::req_info::ReqInfo;
+    use http::{Method, StatusCode};
+    use std::sync::atomic::Ordering;
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn replication_config_edit_gate_denies_only_non_owner_under_site_replication() {
+        struct ResetOverride;
+        impl Drop for ResetOverride {
+            fn drop(&mut self) {
+                SITE_REPLICATION_GATE_TEST_OVERRIDE.store(0, Ordering::SeqCst);
+            }
+        }
+        let _reset = ResetOverride;
+        for state in [SITE_REPLICATION_GATE_FORCE_ENABLED, SITE_REPLICATION_GATE_FORCE_DISABLED] {
+            SITE_REPLICATION_GATE_TEST_OVERRIDE.store(state, Ordering::SeqCst);
+            for is_owner in [false, true] {
+                let envelope = request(Method::PUT)
+                    .extension(ReqInfo {
+                        is_owner,
+                        ..Default::default()
+                    })
+                    .build();
+                let result = prepare_replication_config_edit(&envelope).await;
+                if state == SITE_REPLICATION_GATE_FORCE_ENABLED && !is_owner {
+                    let err = result.unwrap_err();
+                    assert_eq!(err.code().as_str(), "XMinioReplicationDenyEdit");
+                    assert_eq!(err.status_code(), Some(StatusCode::BAD_REQUEST));
+                } else {
+                    result.expect("replication edit admitted");
+                }
+            }
+        }
     }
 }

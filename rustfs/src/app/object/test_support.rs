@@ -15,25 +15,9 @@
 //! Test-only scaffolding shared by the object use-case test modules.
 
 use super::*;
-use crate::app::storage_api::s3::S3Request;
-use http::{Extensions, HeaderMap, Method, Uri};
 use std::sync::Arc;
 
 pub(super) use crate::app::storage_api::s3::UploadStreamError;
-
-pub(super) fn build_request<T>(input: T, method: Method) -> S3Request<T> {
-    S3Request {
-        input,
-        method,
-        uri: Uri::from_static("/"),
-        headers: HeaderMap::new(),
-        extensions: Extensions::new(),
-        credentials: None,
-        region: None,
-        service: None,
-        trailing_headers: None,
-    }
-}
 
 pub(super) async fn real_cold_fill_test_context() -> (Arc<ECStore>, Arc<AppContext>) {
     let store = crate::app::gating_test_env::shared_gating_ecstore().await;

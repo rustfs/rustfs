@@ -18,7 +18,7 @@ use crate::sys::{get_claims_from_token_with_secret, get_claims_from_token_with_s
 use crate::{
     cache::{Cache, CacheEntity, LockedCache},
     error::{Error as IamError, is_err_no_such_group, is_err_no_such_policy, is_err_no_such_user},
-    store::{GroupInfo, MappedPolicy, Store, UserType, object::IAM_CONFIG_PREFIX},
+    store::{GroupEdit, GroupInfo, MappedPolicy, Store, UserType, object::IAM_CONFIG_PREFIX},
     sys::{
         MAX_SVCSESSION_POLICY_SIZE, SESSION_POLICY_NAME, SESSION_POLICY_NAME_EXTRACTED, SITE_REPLICATOR_CLAIM,
         SITE_REPLICATOR_SERVICE_ACCOUNT, STATUS_DISABLED, STATUS_ENABLED, UpdateServiceAccountOpts,
@@ -1122,7 +1122,9 @@ where
 
         let direct_policies = mapped_policy.to_slice();
         let has_identity_mapping = !direct_policies.is_empty();
-        let policies = self.policy_db_get_with_groups(direct_policies, groups).await?;
+        // An uncached group mapping can contain a Deny even when a direct policy exists.
+        let mut policies = direct_policies;
+        policies.extend(self.policy_db_get_with_groups(Vec::new(), groups).await?);
         Ok((policies, has_identity_mapping))
     }
 
@@ -1374,6 +1376,16 @@ where
     }
 
     pub async fn set_temp_user(&self, access_key: &str, cred: &Credentials, policy_name: Option<&str>) -> Result<OffsetDateTime> {
+        self.set_temp_user_with_generation(access_key, cred, policy_name, None).await
+    }
+
+    pub(crate) async fn set_temp_user_with_generation(
+        &self,
+        access_key: &str,
+        cred: &Credentials,
+        policy_name: Option<&str>,
+        generation: Option<[u8; 16]>,
+    ) -> Result<OffsetDateTime> {
         if access_key.is_empty() || !cred.is_temp() || cred.is_expired() || cred.parent_user.is_empty() {
             error!(
                 "set temp user invalid argument, access_key: {},  is_temp: {}, is_expired: {}, parent_user_empty: {}",
@@ -1404,7 +1416,8 @@ where
             None
         };
 
-        let u = UserIdentity::new(cred.clone());
+        let mut u = UserIdentity::new(cred.clone());
+        u.sts_generation = generation;
         self.api
             .save_user_identity(access_key, UserType::Sts, u.clone(), None)
             .await?;
@@ -1578,7 +1591,7 @@ where
         args: &AddOrUpdateUserReq,
         updated_at: OffsetDateTime,
     ) -> Result<OffsetDateTime> {
-        self.add_user_at_with_secret_change(access_key, args, updated_at)
+        self.add_user_at_with_secret_change(access_key, args, updated_at, true)
             .await
             .map(|(updated_at, _, _guard)| updated_at)
     }
@@ -1589,6 +1602,7 @@ where
         access_key: &str,
         args: &AddOrUpdateUserReq,
         updated_at: OffsetDateTime,
+        allow_status_change: bool,
     ) -> Result<(OffsetDateTime, bool, tokio::sync::OwnedMutexGuard<crate::cache::MutationLockState>)> {
         // A virtual OIDC parent is a canonical base64url-encoded SHA-256 digest.
         // It has no stored user record to collide with in the checks below.
@@ -1626,9 +1640,6 @@ where
                 return Err(Error::AccessKeyAlreadyExists);
             }
         }
-        let secret_changed = users
-            .get(access_key)
-            .is_some_and(|user| user.credentials.secret_key != args.secret_key);
         drop(cache);
         drop(users);
 
@@ -1646,8 +1657,9 @@ where
         });
         user_entry.update_at = Some(updated_at);
 
-        self.api
-            .save_user_identity(access_key, UserType::Reg, user_entry.clone(), None)
+        let secret_changed = self
+            .api
+            .upsert_regular_user(access_key, &mut user_entry, allow_status_change)
             .await?;
 
         self.update_user_with_claims(access_key, user_entry)?;
@@ -1774,7 +1786,7 @@ where
     }
 
     pub async fn update_user_secret_key(&self, access_key: &str, secret_key: &str) -> Result<(OffsetDateTime, AccountStatus)> {
-        self.update_user_secret_key_with_guard(access_key, secret_key, None)
+        self.update_user_secret_key_with_guard(access_key, secret_key, None, None)
             .await
             .map(|(updated_at, status, _guard)| (updated_at, status))
     }
@@ -1784,6 +1796,7 @@ where
         access_key: &str,
         secret_key: &str,
         expected_secret: Option<&str>,
+        session: Option<&Credentials>,
     ) -> Result<(
         OffsetDateTime,
         AccountStatus,
@@ -1795,9 +1808,7 @@ where
 
         let parent_lock = self.cache.parent_mutation_lock(access_key);
         let parent_guard = parent_lock.lock_owned().await;
-        let cache = self.cache.snapshot();
-        let users = Arc::clone(&cache.users);
-        let u = match users.get(access_key) {
+        let (u, revision) = match self.api.regular_user_revision(access_key).await? {
             Some(u) => u,
             None if expected_secret.is_some() => return Err(Error::IAMActionNotAllowed),
             None => return Err(Error::NoSuchUser(access_key.to_string())),
@@ -1814,6 +1825,51 @@ where
             }
         }
 
+        // Lock order is parent, then the presenting STS credential. Deletion and
+        // session refresh use the same STS lock. Release it before the revocation sweep.
+        let _session_guard = match session {
+            Some(session) => {
+                let guard = self.cache.sts_account_mutation_lock(&session.access_key).lock_owned().await;
+                let current = self
+                    .api
+                    .load_user_identity(&session.access_key, UserType::Sts)
+                    .await
+                    .map_err(|error| {
+                        if is_err_no_such_user(&error) {
+                            Error::IAMActionNotAllowed
+                        } else {
+                            error
+                        }
+                    })?;
+                let parent = if current.credentials.parent_user.is_empty() {
+                    current.credentials.claims_or_empty().get("parent").and_then(Value::as_str)
+                } else {
+                    Some(current.credentials.parent_user.as_str())
+                };
+                use subtle::ConstantTimeEq as _;
+                if !session.is_valid()
+                    || !current.credentials.is_valid()
+                    || !current.credentials.is_temp()
+                    || current.credentials.is_service_account()
+                    || current.credentials.access_key != session.access_key
+                    || parent != Some(access_key)
+                    || !bool::from(current.credentials.secret_key.as_bytes().ct_eq(session.secret_key.as_bytes()))
+                    || !bool::from(
+                        current
+                            .credentials
+                            .session_token
+                            .as_bytes()
+                            .ct_eq(session.session_token.as_bytes()),
+                    )
+                    || current.sts_generation != u.sts_generation
+                {
+                    return Err(Error::IAMActionNotAllowed);
+                }
+                Some(guard)
+            }
+            None => None,
+        };
+
         let mut cred = u.credentials.clone();
         cred.secret_key = secret_key.to_string();
 
@@ -1825,14 +1881,11 @@ where
         } else {
             AccountStatus::Disabled
         };
-        let u = UserIdentity::from(cred);
+        let mut u = UserIdentity::from(cred);
+        u.sts_generation = Some(rand::random());
         let updated_at = u.update_at.unwrap_or_else(OffsetDateTime::now_utc);
-        drop(cache);
-        drop(users);
 
-        self.api
-            .save_user_identity(access_key, UserType::Reg, u.clone(), None)
-            .await?;
+        self.api.save_regular_user_revision(access_key, &u, Some(&revision)).await?;
 
         self.update_user_with_claims(access_key, u)?;
         Ok((updated_at, status, parent_guard))
@@ -1846,20 +1899,15 @@ where
 
         let parent_lock = self.cache.parent_mutation_lock(access_key);
         let _parent_guard = parent_lock.lock().await;
-        let cache = self.cache.snapshot();
-        let users = Arc::clone(&cache.users);
-        let u = match users.get(access_key) {
-            Some(u) => u,
-            None => return Err(Error::NoSuchUser(access_key.to_string())),
-        };
-
-        let mut user_identity = u.clone();
+        let (mut user_identity, revision) = self
+            .api
+            .regular_user_revision(access_key)
+            .await?
+            .ok_or_else(|| Error::NoSuchUser(access_key.to_string()))?;
         user_identity.add_ssh_public_key(public_key);
-        drop(cache);
-        drop(users);
 
         self.api
-            .save_user_identity(access_key, UserType::Reg, user_identity.clone(), None)
+            .save_regular_user_revision(access_key, &user_identity, Some(&revision))
             .await?;
 
         self.update_user_with_claims(access_key, user_identity)
@@ -1887,12 +1935,11 @@ where
 
         let parent_lock = self.cache.parent_mutation_lock(access_key);
         let _parent_guard = parent_lock.lock().await;
-        let cache = self.cache.snapshot();
-        let users = Arc::clone(&cache.users);
-        let u = match users.get(access_key) {
-            Some(u) => u,
-            None => return Err(Error::NoSuchUser(access_key.to_string())),
-        };
+        let (u, revision) = self
+            .api
+            .regular_user_revision(access_key)
+            .await?
+            .ok_or_else(|| Error::NoSuchUser(access_key.to_string()))?;
 
         if u.credentials.is_temp() || u.credentials.is_service_account() {
             return Err(Error::IAMActionNotAllowed);
@@ -1912,11 +1959,10 @@ where
             ..Default::default()
         });
         user_entry.update_at = Some(updated_at);
-        drop(cache);
-        drop(users);
+        user_entry.sts_generation = u.sts_generation;
 
         self.api
-            .save_user_identity(access_key, UserType::Reg, user_entry.clone(), None)
+            .save_regular_user_revision(access_key, &user_entry, Some(&revision))
             .await?;
 
         self.update_user_with_claims(access_key, user_entry)?;
@@ -1993,38 +2039,25 @@ where
         // whose time predates the entity's load time — a replicated edit
         // whose source time is older than this node's startup would
         // otherwise never reach the cache.
-        let gi = match cache.groups.get(group) {
-            Some(res) => {
-                let mut gi = res.clone();
+        drop(cache);
+        let (edit, current) = self.api.begin_group_edit(group).await?;
+        let gi = match current {
+            Some(mut gi) => {
                 let mut uniq_set: HashSet<String, std::collections::hash_map::RandomState> =
                     HashSet::from_iter(gi.members.iter().cloned());
-                uniq_set.extend(members.iter().cloned());
+                uniq_set.extend(members);
 
                 gi.members = uniq_set.into_iter().collect();
                 gi.update_at = Some(updated_at);
                 gi
             }
             None => {
-                let mut gi = GroupInfo::new(members.clone());
+                let mut gi = GroupInfo::new(members);
                 gi.update_at = Some(updated_at);
                 gi
             }
         };
-        drop(cache);
-
-        self.api.save_group_info(group, gi.clone()).await?;
-
-        self.cache.with_write_lock(|cache| {
-            let now = OffsetDateTime::now_utc();
-            cache.add_or_update_group(group, &gi, now);
-
-            let user_group_memberships = Arc::clone(&cache.state().user_group_memberships);
-            members.iter().for_each(|member| {
-                let mut m = user_group_memberships.get(member).cloned().unwrap_or_default();
-                m.insert(group.to_string());
-                cache.add_or_update_user_group_membership(member, &m, now);
-            });
-        });
+        self.save_group_and_publish(group, &*edit, gi).await?;
 
         Ok(updated_at)
     }
@@ -2040,13 +2073,8 @@ where
             return Err(Error::InvalidArgument);
         }
 
-        let cache = self.cache.snapshot();
-        let groups = Arc::clone(&cache.groups);
-        let mut gi = match groups.get(name) {
-            Some(gi) => gi.clone(),
-            None => return Err(Error::NoSuchGroup(name.to_string())),
-        };
-        drop(cache);
+        let (edit, current) = self.api.begin_group_edit(name).await?;
+        let mut gi = current.ok_or_else(|| Error::NoSuchGroup(name.to_string()))?;
 
         if enable {
             gi.status = STATUS_ENABLED.to_owned();
@@ -2055,11 +2083,7 @@ where
         }
         gi.update_at = Some(updated_at);
 
-        self.api.save_group_info(name, gi.clone()).await?;
-
-        // Cache publication time is the local clock, not the record stamp
-        // (see `add_users_to_group_at`).
-        self.cache.add_or_update_group(name, &gi, OffsetDateTime::now_utc());
+        self.save_group_and_publish(name, &*edit, gi).await?;
 
         Ok(updated_at)
     }
@@ -2146,37 +2170,27 @@ where
         update_cache_only: bool,
         updated_at: OffsetDateTime,
     ) -> Result<OffsetDateTime> {
-        let cache = self.cache.snapshot();
-        let mut gi = cache
-            .groups
-            .get(name)
-            .cloned()
-            .ok_or_else(|| Error::NoSuchGroup(name.to_string()))?;
-        drop(cache);
-
-        let s: HashSet<&String> = HashSet::from_iter(gi.members.iter());
-        let d: HashSet<&String> = HashSet::from_iter(members.iter());
-        gi.members = s.difference(&d).map(|v| v.to_string()).collect::<Vec<String>>();
-        gi.update_at = Some(updated_at);
-        if !update_cache_only {
-            self.api.save_group_info(name, gi.clone()).await?;
-        }
-
-        self.cache.with_write_lock(|cache| {
-            // Sample after storage completes so a concurrent reload cannot
-            // make this publication older than the cache it must update.
-            let now = OffsetDateTime::now_utc();
-            cache.add_or_update_group(name, &gi, now);
-
-            let user_group_memberships = Arc::clone(&cache.state().user_group_memberships);
-            members.iter().for_each(|member| {
-                if let Some(m) = user_group_memberships.get(member) {
-                    let mut m = m.clone();
-                    m.remove(name);
-                    cache.add_or_update_user_group_membership(member, &m, now);
-                }
+        let removed: HashSet<_> = members.into_iter().collect();
+        let remove = |mut gi: GroupInfo| {
+            gi.members.retain(|m| !removed.contains(m));
+            gi.update_at = Some(updated_at);
+            gi
+        };
+        if update_cache_only {
+            return self.cache.with_write_lock(|cache| {
+                let gi = cache
+                    .state()
+                    .groups
+                    .get(name)
+                    .cloned()
+                    .ok_or_else(|| Error::NoSuchGroup(name.to_string()))?;
+                self.publish_group_unlocked(cache, name, &remove(gi));
+                Ok(updated_at)
             });
-        });
+        }
+        let (edit, current) = self.api.begin_group_edit(name).await?;
+        let gi = current.ok_or_else(|| Error::NoSuchGroup(name.to_string()))?;
+        self.save_group_and_publish(name, &*edit, remove(gi)).await?;
 
         Ok(updated_at)
     }
@@ -2201,7 +2215,6 @@ where
 
         let cache = self.cache.snapshot();
         let users_cache = Arc::clone(&cache.users);
-        let groups_cache = Arc::clone(&cache.groups);
         drop(cache);
 
         for member in members.iter() {
@@ -2214,65 +2227,60 @@ where
             }
         }
 
-        let gi = if members.is_empty() {
-            // Reload from backend so we see latest members (e.g. after user was deleted elsewhere)
-            let mut m = HashMap::new();
-            self.api.load_group(group, &mut m).await?;
-            m.get(group).cloned().ok_or_else(|| Error::NoSuchGroup(group.to_string()))?
-        } else {
-            groups_cache
-                .get(group)
-                .cloned()
-                .ok_or_else(|| Error::NoSuchGroup(group.to_string()))?
-        };
-
-        if members.is_empty() && !gi.members.is_empty() {
+        if !members.is_empty() {
+            return self.remove_members_from_group_at(group, members, false, updated_at).await;
+        }
+        let (edit, current) = self.api.begin_group_edit(group).await?;
+        let gi = current.ok_or_else(|| Error::NoSuchGroup(group.to_string()))?;
+        if !gi.members.is_empty() {
             return Err(Error::GroupNotEmpty);
         }
 
-        if members.is_empty() {
-            if let Err(err) = self.api.delete_mapped_policy(group, UserType::Reg, true).await
-                && !is_err_no_such_policy(&err)
-            {
-                return Err(err);
-            }
+        edit.delete_empty().await?;
 
-            if let Err(err) = self.api.delete_group_info(group).await
-                && !is_err_no_such_group(&err)
-            {
-                return Err(err);
-            }
+        self.cache.with_write_lock(|cache| {
+            let now = OffsetDateTime::now_utc();
+            Self::replace_cached_group_members(cache, group, &[], now);
+            cache.delete_group(group, now);
+            cache.delete_group_policy(group, now);
+        });
 
-            self.cache.with_write_lock(|cache| {
-                let now = OffsetDateTime::now_utc();
-                self.remove_group_from_memberships_map_unlocked(cache, group, now);
-                cache.delete_group(group, now);
-                cache.delete_group_policy(group, now);
-            });
-
-            return Ok(updated_at);
-        }
-
-        self.remove_members_from_group_at(group, members, false, updated_at).await
+        Ok(updated_at)
     }
 
-    fn remove_group_from_memberships_map_unlocked(&self, cache: &mut LockedCache, group: &str, now: OffsetDateTime) {
-        let user_group_memberships = Arc::clone(&cache.state().user_group_memberships);
-        for (k, v) in user_group_memberships.iter() {
-            if v.contains(group) {
-                let mut m = v.clone();
-                m.remove(group);
-                cache.add_or_update_user_group_membership(k, &m, now);
-            }
-        }
+    async fn save_group_and_publish(&self, group: &str, edit: &dyn GroupEdit, gi: GroupInfo) -> Result<()> {
+        edit.save(&gi).await?;
+        self.cache
+            .with_write_lock(|cache| self.publish_group_unlocked(cache, group, &gi));
+        Ok(())
     }
 
-    fn update_group_memberships_map_unlocked(&self, cache: &mut LockedCache, group: &str, gi: &GroupInfo, now: OffsetDateTime) {
-        let user_group_memberships = Arc::clone(&cache.state().user_group_memberships);
-        for member in gi.members.iter() {
-            let mut m = user_group_memberships.get(member).cloned().unwrap_or_default();
-            m.insert(group.to_string());
-            cache.add_or_update_user_group_membership(member, &m, now);
+    fn publish_group_unlocked(&self, cache: &mut LockedCache, group: &str, gi: &GroupInfo) {
+        let now = OffsetDateTime::now_utc();
+        cache.add_or_update_group(group, gi, now);
+        Self::replace_cached_group_members(cache, group, &gi.members, now);
+    }
+
+    fn replace_cached_group_members(cache: &mut LockedCache, group: &str, members: &[String], now: OffsetDateTime) {
+        // This node may have missed peer edits, so reconcile against the complete record,
+        // including memberships that were already stale before this edit began.
+        let mut missing: HashSet<_> = members.iter().collect();
+        let reverse = Arc::clone(&cache.state().user_group_memberships);
+        for (user, groups) in reverse.iter() {
+            if groups.contains(group) && !missing.remove(user) {
+                let mut groups = groups.clone();
+                groups.remove(group);
+                if groups.is_empty() {
+                    cache.delete_user_group_membership(user, now);
+                } else {
+                    cache.add_or_update_user_group_membership(user, &groups, now);
+                }
+            }
+        }
+        for user in missing {
+            let mut groups = reverse.get(user).cloned().unwrap_or_default();
+            groups.insert(group.to_owned());
+            cache.add_or_update_user_group_membership(user, &groups, now);
         }
     }
 
@@ -2297,7 +2305,7 @@ where
 
             self.cache.with_write_lock(|cache| {
                 let now = OffsetDateTime::now_utc();
-                self.remove_group_from_memberships_map_unlocked(cache, group, now);
+                Self::replace_cached_group_members(cache, group, &[], now);
                 cache.delete_group(group, now);
                 cache.delete_group_policy(group, now);
             });
@@ -2307,12 +2315,8 @@ where
 
         let gi = m[group].clone();
 
-        self.cache.with_write_lock(|cache| {
-            let now = OffsetDateTime::now_utc();
-            cache.add_or_update_group(group, &gi, now);
-            self.remove_group_from_memberships_map_unlocked(cache, group, now);
-            self.update_group_memberships_map_unlocked(cache, group, &gi, now);
-        });
+        self.cache
+            .with_write_lock(|cache| self.publish_group_unlocked(cache, group, &gi));
 
         Ok(())
     }
@@ -3137,9 +3141,15 @@ mod tests {
             .with_subscriber(subscriber)
             .await;
         assert!(
-            matches!(result, Err(Error::InvalidArgument)),
-            "the test store rejects persistence after the existing-user path"
+            matches!(result, Err(Error::IAMActionNotAllowed)),
+            "a store without conditional regular-user writes must reject the update"
         );
+        let retained = cache.cache.snapshot();
+        let retained = retained
+            .users
+            .get(&identity.credentials.access_key)
+            .expect("existing user retained");
+        assert_eq!(retained.credentials.secret_key, identity.credentials.secret_key);
         let captured = std::fs::read_to_string(log.path()).expect("read captured logs");
         assert!(
             captured.contains(EVENT_USER_UPDATE_EXISTING) || captured.contains("IAM user already exists"),
@@ -3635,6 +3645,7 @@ mod tests {
     fn test_extract_jwt_claims_basic() {
         let user_identity = UserIdentity {
             version: 1,
+            sts_generation: None,
             credentials: Credentials {
                 access_key: "test-access-key".to_string(),
                 secret_key: "test-secret-key".to_string(),
@@ -3664,6 +3675,7 @@ mod tests {
     fn test_extract_jwt_claims_no_claims() {
         let user_identity = UserIdentity {
             version: 1,
+            sts_generation: None,
             credentials: Credentials {
                 access_key: "test-access-key".to_string(),
                 secret_key: "test-secret-key".to_string(),
@@ -3739,6 +3751,7 @@ mod tests {
         let user_identity = UserIdentity {
             version: 1,
             credentials,
+            sts_generation: None,
             update_at: Some(OffsetDateTime::now_utc()),
         };
 

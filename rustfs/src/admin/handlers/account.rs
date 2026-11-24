@@ -18,8 +18,7 @@
 //! * `POST /rustfs/admin/v3/account/password` — rotate the caller's own secret
 //!
 //! These act on whoever is calling rather than on a target named in the
-//! request, so they carry no admin-action gate: every authenticated identity
-//! may inspect and manage itself. What they do carry instead is a proof-of-
+//! request. Rotation honors explicit policy denials and requires a proof-of-
 //! knowledge check, because a signature only proves that a credential was
 //! *used* — the Console signs with a short-lived STS session, so a hijacked
 //! browser tab could otherwise rewrite the parent identity's password without
@@ -35,7 +34,7 @@ use super::iam_error::iam_error_to_s3_error;
 use super::owned_admin_json_response;
 use super::site_replication::site_replication_iam_change_hook;
 use super::supervise_admin_mutation;
-use crate::admin::auth::validate_admin_request;
+use crate::admin::auth::{SelfServiceMutation, validate_admin_request};
 use crate::admin::operation::{AdminRequest, AdminResponse, Operation};
 use crate::admin::router::{AdminOperation, S3Router};
 use crate::admin::runtime_sources::{current_action_credentials, current_ready_iam_handle, object_store_from_envelope};
@@ -185,6 +184,10 @@ impl Operation for ChangeOwnPasswordHandler {
             return Err(err);
         }
 
+        SelfServiceMutation::Password
+            .check(&req, &caller.credentials, caller.is_owner)
+            .await?;
+
         let path = req.uri().path().to_string();
         let body =
             read_compatible_admin_body(req.take_body(), MAX_ADMIN_REQUEST_BODY_SIZE, &path, &caller.credentials.secret_key)
@@ -192,27 +195,14 @@ impl Operation for ChangeOwnPasswordHandler {
         let request: ChangePasswordRequest = serde_json::from_slice(&body)
             .map_err(|e| s3::error(S3ErrorCode::InvalidRequest, format!("invalid change-password request: {e}")))?;
 
-        let iam_store =
-            current_ready_iam_handle().map_err(|_| s3::error(S3ErrorCode::InternalError, "iam is not initialized"))?;
-
-        let Some(stored) = iam_store.get_user(&caller.access_key).await else {
-            // Reached only if the identity was deleted between authentication
-            // and this lookup.
-            emit_audit(
-                &audit,
-                AccountAuditRecord::failure(
-                    AccountAuditOperation::ChangeOwnPassword,
-                    &caller.access_key,
-                    caller.identity_type,
-                    AccountAuditFailure::Internal,
-                ),
-            );
-            return Err(s3::error(S3ErrorCode::InvalidRequest, "the calling identity no longer exists"));
+        // An STS session signs with its own secret. A direct IAM request must
+        // have been signed with the same password the caller is replacing.
+        let expected_signing_secret = if caller.identity_type == IdentityType::Sts {
+            &caller.credentials.secret_key
+        } else {
+            &request.current_secret_key
         };
-
-        if !constant_time_eq(&request.current_secret_key, &stored.credentials.secret_key)
-            || !constant_time_eq(&request.current_secret_key, &signing_secret)
-        {
+        if !constant_time_eq(expected_signing_secret, &signing_secret) {
             warn!(
                 component = LOG_COMPONENT_ADMIN,
                 subsystem = LOG_SUBSYSTEM_ACCOUNT,
@@ -253,8 +243,10 @@ impl Operation for ChangeOwnPasswordHandler {
         }
 
         let access_key = caller.access_key.clone();
-        let new_secret_key = request.new_secret_key.clone();
+        let current_secret_key = request.current_secret_key;
+        let new_secret_key = request.new_secret_key;
         let identity_type = caller.identity_type;
+        let session_credentials = (identity_type == IdentityType::Sts).then(|| caller.credentials.clone());
         let session_access_key = caller.session_access_key.clone();
         let audit_for_task = audit.clone();
 
@@ -265,16 +257,35 @@ impl Operation for ChangeOwnPasswordHandler {
             let iam_store =
                 current_ready_iam_handle().map_err(|_| s3::error(S3ErrorCode::InternalError, "iam is not initialized"))?;
 
-            let (updated_at, status, revoked) = iam_store
-                .change_own_secret_key(&access_key, &signing_secret, &new_secret_key)
-                .await
-                .map_err(|error| {
-                    if matches!(error, rustfs_iam::error::Error::IAMActionNotAllowed) {
-                        s3::error(S3ErrorCode::InvalidRequest, "the current secret key is incorrect")
-                    } else {
-                        iam_error_to_s3_error(error)
-                    }
-                })?;
+            let rotation = match session_credentials.as_ref() {
+                Some(session) => {
+                    iam_store
+                        .change_own_secret_key_from_session(&access_key, &current_secret_key, &new_secret_key, session)
+                        .await
+                }
+                None => {
+                    iam_store
+                        .change_own_secret_key(&access_key, &current_secret_key, &new_secret_key)
+                        .await
+                }
+            };
+            let (updated_at, status, revoked) = rotation.map_err(|error| {
+                if matches!(error, rustfs_iam::error::Error::IAMActionNotAllowed) {
+                    emit_audit(
+                        &audit_for_task,
+                        AccountAuditRecord::failure(
+                            AccountAuditOperation::ChangeOwnPassword,
+                            &access_key,
+                            identity_type,
+                            AccountAuditFailure::InvalidCurrentSecret,
+                        )
+                        .with_session_access_key(session_access_key.as_deref()),
+                    );
+                    s3::error(S3ErrorCode::InvalidRequest, "the current secret key is incorrect")
+                } else {
+                    iam_error_to_s3_error(error)
+                }
+            })?;
 
             emit_audit(
                 &audit_for_task,
@@ -387,6 +398,12 @@ impl Operation for SetUserSecretKeyHandler {
                 .with_session_access_key(Some(caller.access_key.as_str())),
             );
         })?;
+
+        if target == caller.access_key {
+            SelfServiceMutation::Password
+                .check(&req, &caller.credentials, caller.is_owner)
+                .await?;
+        }
 
         let path = req.uri().path().to_string();
         let body =

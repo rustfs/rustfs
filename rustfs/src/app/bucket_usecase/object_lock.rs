@@ -276,7 +276,6 @@ mod tests {
 
     use rustfs_gateway_types::persistence::PersistedObjectLockRule;
 
-    use crate::app::bucket_usecase::test_support::build_request;
     use crate::app::gating_test_env::{run_large_stack_test, shared_gating_ambient};
     use crate::app::runtime_sources::ServerContextSlot;
     use crate::app::storage_api::bucket_usecase::helper::MutationCompletionProbe;
@@ -400,10 +399,9 @@ mod tests {
 
         let server = ServerContextSlot::new();
         assert!(server.install(Arc::clone(&context)));
-        let mut request = build_request((), Method::PUT);
-        request.uri = format!("/{bucket}?object-lock").parse().expect("request URI");
-        request.extensions.insert(Arc::clone(&server));
-        request.extensions.insert(ReqInfo {
+        let mut extensions = http::Extensions::new();
+        extensions.insert(Arc::clone(&server));
+        extensions.insert(ReqInfo {
             cred: Some(Credentials {
                 access_key: "bucket-lock-owner".to_owned(),
                 ..Default::default()
@@ -411,7 +409,17 @@ mod tests {
             is_owner: true,
             ..Default::default()
         });
-        let mut envelope = RequestEnvelope::from_s3s(&request);
+        let mut envelope = RequestEnvelope::from_parts(
+            crate::app::RequestHead {
+                method: Method::PUT,
+                uri: format!("/{bucket}?object-lock").parse().expect("request URI"),
+                headers: http::HeaderMap::new(),
+                credentials: None,
+                region: None,
+                service: None,
+            },
+            extensions,
+        );
         authorize_bucket_config_mutation(
             &server,
             &mut envelope,
@@ -631,6 +639,24 @@ mod tests {
 
         assert_eq!(err.code(), &S3ErrorCode::InternalError);
         assert!(err.message().is_some_and(|message| message.contains("peer reload failed")));
+    }
+
+    #[tokio::test]
+    async fn execute_put_object_lock_configuration_returns_internal_error_when_store_uninitialized() {
+        let usecase = DefaultBucketUsecase::without_context();
+        let envelope = crate::app::bucket_usecase::test_support::owned_envelope(http::Method::PUT);
+        let error = usecase
+            .execute_put_object_lock_configuration(
+                envelope,
+                "test-bucket",
+                Some(ObjectLockConfiguration {
+                    object_lock_enabled: Some("Enabled".into()),
+                    rule: None,
+                }),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), &rustfs_s3_types::S3ErrorCode::InternalError);
     }
 
     #[tokio::test]

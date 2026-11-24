@@ -22,7 +22,7 @@
 //! multipart handlers' policy steps against the same storage contract.
 
 use super::*;
-use crate::app::storage_api::s3::{S3Error, S3ErrorCode, S3Response, S3Result};
+use rustfs_s3_types::{S3Error, S3ErrorCode};
 
 use crate::app::object_data_cache::invalidate_object_data_cache_after_complete_multipart_success;
 use crate::app::runtime_sources::current_app_context;
@@ -80,7 +80,8 @@ pub(crate) struct InternalPutContext {
 
 const INTERNAL_PUT_METHOD_NAME: &str = "PUT";
 
-fn api_error_from_s3(err: S3Error) -> ApiError {
+fn api_error_from_s3(err: impl Into<S3Error>) -> ApiError {
+    let err = err.into();
     ApiError {
         code: err.code().clone(),
         message: err.message().unwrap_or_default().to_string(),
@@ -139,7 +140,7 @@ async fn validate_internal_write_target(key: &str, bucket: &str, headers: &Heade
         headers.get("content-type").and_then(|value| value.to_str().ok()),
         headers.get("content-encoding").and_then(|value| value.to_str().ok()),
     )
-    .map_err(|err| api_error_from_s3(err.into()))
+    .map_err(api_error_from_s3)
 }
 
 fn internal_events_wanted() -> bool {
@@ -187,6 +188,11 @@ impl InternalPutObjectEvent {
             .req_param("principalId", principal_id)
     }
 
+    pub(super) fn with_bucket_incarnation(mut self, incarnation_id: Option<Uuid>) -> Self {
+        self.builder = self.builder.bucket_incarnation_id(incarnation_id);
+        self
+    }
+
     pub(super) fn object(self, obj_info: ObjectInfo) -> Self {
         let Self {
             builder,
@@ -213,17 +219,7 @@ impl InternalPutObjectEvent {
         }
     }
 
-    /// Publish the event when `result` is a success; failures publish nothing.
-    pub(super) fn complete<T>(self, result: &S3Result<S3Response<T>>) {
-        if let Ok(response) = result {
-            self.complete_owned(&Ok(()), &response.headers);
-        }
-    }
-
-    pub(super) fn complete_owned<T>(self, result: &rustfs_s3_types::S3Result<T>, headers: &HeaderMap) {
-        if result.is_err() {
-            return;
-        }
+    pub(super) fn publish(self, headers: &HeaderMap) {
         let Self {
             builder,
             notify,
@@ -321,6 +317,7 @@ impl DefaultObjectUsecase {
                 sse_customer_key_md5: None,
             },
             user_metadata,
+            ec_block_size_hint: None,
             internal_metadata,
             content: internal_put_content_input(&headers, tags),
             object_lock: PutObjectLockInput {
@@ -342,7 +339,7 @@ impl DefaultObjectUsecase {
             .put_object_core(write, super::native_body::from_io_stream(body), None, start_time)
             .await
             .map_err(|error| ApiError {
-                code: error.code().clone().into(),
+                code: error.code().clone(),
                 message: error.message().unwrap_or_default().to_owned(),
                 source: None,
             })?;
@@ -430,7 +427,11 @@ impl DefaultObjectUsecase {
         .await;
         if dsc.replicate_any() {
             insert_str(&mut opts.user_defined, SUFFIX_REPLICATION_GENERATION, Uuid::new_v4().to_string());
-            insert_str(&mut opts.user_defined, SUFFIX_REPLICATION_TIMESTAMP, jiff::Zoned::now().to_string());
+            insert_str(
+                &mut opts.user_defined,
+                SUFFIX_REPLICATION_TIMESTAMP,
+                jiff::ZonedDateTime::now().to_string(),
+            );
             insert_str(
                 &mut opts.user_defined,
                 SUFFIX_REPLICATION_STATUS,
@@ -688,7 +689,7 @@ impl DefaultObjectUsecase {
             insert_str(
                 &mut completion_replication_metadata,
                 SUFFIX_REPLICATION_TIMESTAMP,
-                jiff::Zoned::now().to_string(),
+                jiff::ZonedDateTime::now().to_string(),
             );
             insert_str(
                 &mut completion_replication_metadata,
@@ -709,6 +710,7 @@ impl DefaultObjectUsecase {
                 &key,
                 ctx.principal_id,
             )
+            .map(|event| event.with_bucket_incarnation(opts.expected_bucket_incarnation_id))
         });
 
         // The spawned task owns the commit so a cancelled caller cannot leave
@@ -739,10 +741,21 @@ impl DefaultObjectUsecase {
                     }
                 }
 
-                enqueue_transition_immediate(&obj_info, LcEventSrc::S3CompleteMultipartUpload).await;
+                enqueue_transition_immediate(
+                    &obj_info,
+                    LcEventSrc::S3CompleteMultipartUpload,
+                    opts.expected_bucket_incarnation_id,
+                )
+                .await;
 
                 if completion_replication_decision.replicate_any() {
-                    schedule_object_replication(obj_info.clone(), store, completion_replication_decision).await;
+                    schedule_object_replication(
+                        obj_info.clone(),
+                        store,
+                        completion_replication_decision,
+                        opts.expected_bucket_incarnation_id,
+                    )
+                    .await;
                 }
 
                 rustfs_scanner::record_dirty_usage_object_from_producer(
@@ -762,8 +775,7 @@ impl DefaultObjectUsecase {
             if versioned && let Some(version_id) = obj_info.version_id {
                 event = event.version_id(version_id.to_string());
             }
-            let result: S3Result<S3Response<()>> = Ok(S3Response::new(()));
-            event.complete(&result);
+            event.publish(&HeaderMap::new());
         }
         Ok(obj_info)
     }

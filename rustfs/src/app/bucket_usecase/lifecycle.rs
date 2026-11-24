@@ -15,8 +15,8 @@
 //! Bucket lifecycle configuration use-case operations.
 
 use super::*;
-use crate::app::storage_api::s3::{S3Error, S3ErrorCode, s3_error};
 use rustfs_gateway_types::persistence::{PersistedLifecycleRule, parse_lifecycle_dto};
+use rustfs_s3_types::{S3Error, S3ErrorCode, s3_error};
 
 const ERR_LIFECYCLE_RULE_STATUS: &str = "Rule status must be either Enabled or Disabled";
 
@@ -271,7 +271,7 @@ impl DefaultBucketUsecase {
                 let mut input_cfg = prepared_configuration.map_err(to_internal_error)?;
                 assign_lifecycle_rule_ids(&mut input_cfg.rules);
                 if let Err(err) = validate_lifecycle_config(&input_cfg, &rcfg).await {
-                    return Err(lifecycle_validation_error(&err).into());
+                    return Err(lifecycle_validation_error(&err));
                 }
 
                 if let Err(err) = validate_transition_tier(&input_cfg).await {
@@ -405,12 +405,11 @@ mod tests {
         // waiter again on the single-thread test runtime.
         assert_eq!(admission.available_permits(), 1);
     }
-    use crate::app::bucket_usecase::test_support::build_request;
+    use crate::app::bucket_usecase::test_support::owned_envelope;
     use crate::app::gating_test_env::{run_large_stack_test, shared_gating_ambient};
     use crate::app::runtime_sources::ServerContextSlot;
     use crate::app::storage_api::bucket_usecase::helper::MutationCompletionProbe;
     use crate::app::storage_api::owned_parity::{ReqInfo, authorize_bucket_config_mutation};
-    use crate::app::storage_api::s3::dto::PutBucketLifecycleConfigurationInput;
     use crate::site_replication::hooks::{BUCKET_META_HOOK_CALLS, BucketMetaHookCall};
     use http::Method;
     use rustfs_credentials::Credentials;
@@ -427,10 +426,9 @@ mod tests {
     fn delete_envelope(context: &Arc<AppContext>, bucket: &str) -> (Arc<ServerContextSlot>, RequestEnvelope) {
         let server = ServerContextSlot::new();
         assert!(server.install(Arc::clone(context)));
-        let mut request = build_request((), Method::DELETE);
-        request.uri = format!("/{bucket}?lifecycle").parse().expect("bucket request URI");
-        request.extensions.insert(Arc::clone(&server));
-        request.extensions.insert(ReqInfo {
+        let mut extensions = http::Extensions::new();
+        extensions.insert(Arc::clone(&server));
+        extensions.insert(ReqInfo {
             cred: Some(Credentials {
                 access_key: "lifecycle-delete-owner".to_owned(),
                 ..Default::default()
@@ -438,14 +436,25 @@ mod tests {
             is_owner: true,
             ..Default::default()
         });
-        request.extensions.insert(request_context::RequestContext {
+        extensions.insert(request_context::RequestContext {
             request_id: DELETE_REQUEST_ID.to_owned(),
             x_amz_request_id: DELETE_REQUEST_ID.to_owned(),
             trace_id: None,
             span_id: None,
             start_time: std::time::Instant::now(),
         });
-        (server, RequestEnvelope::from_s3s(&request))
+        let envelope = RequestEnvelope::from_parts(
+            crate::app::RequestHead {
+                method: Method::DELETE,
+                uri: format!("/{bucket}?lifecycle").parse().expect("bucket request URI"),
+                headers: http::HeaderMap::new(),
+                credentials: None,
+                region: None,
+                service: None,
+            },
+            extensions,
+        );
+        (server, envelope)
     }
 
     async fn authorized_lifecycle_envelope(context: &Arc<AppContext>, bucket: &str) -> RequestEnvelope {
@@ -685,7 +694,6 @@ mod tests {
         )
         .await
         .expect_err("a Filter And with one predicate is a schema violation");
-        assert_eq!(*lifecycle_validation_error(&malformed).code(), S3ErrorCode::MalformedXML);
 
         let invalid_value = validate_lifecycle_config(
             &rustfs_gateway_types::persistence::PersistedLifecycleConfiguration {
@@ -712,7 +720,25 @@ mod tests {
         )
         .await
         .expect_err("a negative retention count is rejected");
-        assert_eq!(*lifecycle_validation_error(&invalid_value).code(), S3ErrorCode::InvalidArgument);
+        for (failure, code, message) in [
+            (
+                malformed,
+                S3ErrorCode::MalformedXML,
+                "Malformed XML: Filter And must contain at least two predicates",
+            ),
+            (
+                invalid_value,
+                S3ErrorCode::InvalidArgument,
+                "'NewerNoncurrentVersions' must be a non-negative integer",
+            ),
+        ] {
+            let error = lifecycle_validation_error(&failure);
+            assert_eq!(error.code(), &code);
+            assert_eq!(error.message(), Some(message));
+            assert_eq!(error.status_code(), Some(StatusCode::BAD_REQUEST));
+            assert!(error.headers().is_none());
+            assert!(std::error::Error::source(&error).is_none());
+        }
     }
 
     #[test]
@@ -770,18 +796,12 @@ mod tests {
 
     #[tokio::test]
     async fn execute_put_bucket_lifecycle_configuration_rejects_missing_configuration() {
-        let input = PutBucketLifecycleConfigurationInput::builder()
-            .bucket("test-bucket".to_string())
-            .build()
-            .unwrap();
-
-        let req = build_request(input, Method::PUT);
         let usecase = DefaultBucketUsecase::without_context();
 
         let err = usecase
             .execute_put_bucket_lifecycle_configuration(
-                RequestEnvelope::from_s3s(&req),
-                &req.input.bucket,
+                owned_envelope(Method::PUT),
+                "test-bucket",
                 PreparedLifecycleConfiguration::Missing,
             )
             .await

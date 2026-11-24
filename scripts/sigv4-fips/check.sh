@@ -21,9 +21,14 @@ case $(uname -s) in
     *) echo "Run the native service indicator check on Linux or macOS" >&2; exit 1 ;;
 esac
 
+dep_flags=()
+while IFS= read -r dir; do
+    dep_flags+=(-L "dependency=$dir")
+done < <(jq -r 'select(.reason == "compiler-artifact") | .filenames[] | select(endswith(".rlib") or endswith(".dylib") or endswith(".so")) | sub("/[^/]+$"; "")' "$temp/build.json" | sort -u)
+
 cc -std=c11 -Wall -Werror -I"$out/include" -c scripts/sigv4-fips/observer.c -o "$temp/observer.o"
 rustc --edition=2024 -F unsafe-code scripts/sigv4-fips/probe.rs --extern "rustfs_utils=$rlib" \
-    -L "dependency=$(dirname "$rlib")/deps" -L "native=$native" \
+    "${dep_flags[@]}" -L "native=$native" \
     -C "link-arg=$temp/observer.o" -C "link-arg=$entry" -C "link-arg=-Wl,-rpath,$native" -o "$temp/probe"
 for operation in control sha256 fragments hmac; do
     "$temp/probe" "$operation"

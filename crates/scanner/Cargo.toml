@@ -73,6 +73,7 @@ hotpath-cpu = [
 ]
 
 [dependencies]
+tempfile.workspace = true
 hotpath.workspace = true
 rustfs-config = { workspace = true, features = ["server-config-model"] }
 rustfs-common = { workspace = true }
@@ -90,7 +91,7 @@ thiserror = { workspace = true }
 async-trait = { workspace = true }
 futures = { workspace = true }
 time = { workspace = true, features = ["parsing", "formatting", "macros", "serde"] }
-chrono = { workspace = true, features = ["serde"] }
+jiff = { workspace = true, features = ["serde"] }
 rmp-serde = { workspace = true }
 hmac = { workspace = true }
 sha2 = { workspace = true }
@@ -108,8 +109,14 @@ uuid = { workspace = true, features = ["v4", "serde", "fast-rng"] }
 bytes.workspace = true
 hex-simd.workspace = true
 
+[target.'cfg(any(target_os = "linux", target_os = "macos"))'.dependencies]
+rustix = { workspace = true, features = ["fs"] }
+
+[target.'cfg(windows)'.dependencies]
+same-file.workspace = true
+winapi-util.workspace = true
+
 [dev-dependencies]
-s3s = { workspace = true, features = ["minio"] }
 opentelemetry-proto.workspace = true
 opentelemetry_sdk.workspace = true
 prost.workspace = true
@@ -119,9 +126,8 @@ rustfs-test-utils.workspace = true
 tracing-subscriber = { workspace = true, features = ["json", "env-filter", "time"] }
 serial_test = { workspace = true }
 temp-env = { workspace = true, features = ["async_closure"] }
-tempfile = { workspace = true }
 uuid = { workspace = true, features = ["v4", "serde", "fast-rng", "macro-diagnostics"] }
-tokio = { workspace = true, features = ["test-util", "fs", "rt-multi-thread"] }
+tokio = { workspace = true, features = ["test-util", "fs", "process", "rt-multi-thread"] }
 # Test-only: pins the emitted scanner alert wire names against the canonical
 # EventName string forms subscribers configure (rustfs/backlog#1868).
 rustfs-s3-types.workspace = true

@@ -29,6 +29,7 @@ const LOG_SUBSYSTEM_HEAL: &str = "heal";
 const EVENT_HEAL_ABANDONED_PARTS: &str = "heal_abandoned_parts";
 const EVENT_HEAL_FORMAT_COMPLETED: &str = "heal_format_completed";
 const EVENT_HEAL_OBJECT_STARTED: &str = "heal_object_started";
+const EVENT_HEAL_DELETE_RECOVERY_BLOCKED: &str = "heal_delete_recovery_blocked";
 
 /// An explicit bucket-heal admission owns one lifecycle generation through its write tail.
 pub(crate) struct BucketHealScope {
@@ -109,6 +110,14 @@ fn invalid_heal_pool_index(pool_idx: usize, pool_count: usize) -> Error {
 
 fn is_pool_meta_object(bucket: &str, object: &str) -> bool {
     bucket == RUSTFS_META_BUCKET && object == POOL_META_NAME
+}
+
+/// Republish only for a confirmed missing, stale, or corrupt replica. A failed
+/// probe (including a timeout) can leave the replica intact. Republishing to
+/// the other drives in that case can leave no quorum after the next drive loss.
+fn pool_meta_drive_needs_repair(state: &str) -> bool {
+    use rustfs_heal_contracts::heal_channel::DriveState;
+    state == DriveState::Missing.to_str() || state == DriveState::Corrupt.to_str()
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -193,6 +202,28 @@ fn classify_heal_format_pool(
     None
 }
 
+fn select_pool_heal_result(
+    results: impl IntoIterator<Item = (HealResultItem, Option<Error>)>,
+    version_id: &str,
+) -> (HealResultItem, Option<Error>) {
+    let mut first_failure = None;
+    for (item, error) in results {
+        let Some(error) = error else { return (item, None) };
+        if first_failure.is_none() && !is_err_object_not_found(&error) && !is_err_version_not_found(&error) {
+            first_failure = Some((item, Some(error)));
+        }
+    }
+
+    first_failure.unwrap_or_else(|| {
+        let missing = if version_id.is_empty() {
+            Error::FileNotFound
+        } else {
+            Error::FileVersionNotFound
+        };
+        (HealResultItem::default(), Some(missing))
+    })
+}
+
 fn heal_format_pool_skip_error(skip: HealFormatPoolSkip) -> Error {
     match skip {
         HealFormatPoolSkip::Completed => StorageError::NoHealRequired,
@@ -205,6 +236,12 @@ fn heal_format_fence_lost_error() -> Error {
 }
 
 impl ECStore {
+    /// Whether this exact storage instance requires an incarnation-bound write
+    /// for the object currently owned by a bucket-heal scope.
+    pub fn object_requires_incarnation(&self, bucket: &str, object: &str) -> bool {
+        bucket_heal_scope_for_object(bucket, object).is_some_and(|scope| std::ptr::eq(Arc::as_ptr(&scope.store), self))
+    }
+
     pub async fn purge_delete_marker_with_proof(
         self: &Arc<Self>,
         bucket: &str,
@@ -408,6 +445,24 @@ impl ECStore {
                         summary.add(set.recover_delete_bucket(&bucket, recovery_context.clone()).await?);
                     }
                 }
+            }
+            if let Some(object) = &object
+                && !opts.dry_run
+                && summary.blocked > 0
+            {
+                tracing::debug!(
+                    event = EVENT_HEAL_DELETE_RECOVERY_BLOCKED,
+                    component = LOG_COMPONENT_ECSTORE,
+                    subsystem = LOG_SUBSYSTEM_HEAL,
+                    state = "insufficient_evidence",
+                    bucket = ?bucket,
+                    object = ?decode_dir_object(object),
+                    pool = opts.pool,
+                    set = opts.set,
+                    legacy_ambiguous = summary.legacy_ambiguous,
+                    other_blocked = summary.blocked - summary.legacy_ambiguous,
+                    "Exact-key delete recovery is blocked"
+                );
             }
             if object.is_some() && summary.pending > 0 {
                 return Err(StorageError::ErasureReadQuorum);
@@ -1381,7 +1436,8 @@ impl ECStore {
                     drop(save_guard);
                     results
                 }
-                Err(err) => (0..heal_pools.len()).map(|_| Err(err.clone())).collect(),
+                // The shared fence failed before any pool could produce a result.
+                Err(err) => vec![Err(err)],
             }
         } else {
             let mut futures = Vec::with_capacity(heal_pools.len());
@@ -1406,12 +1462,11 @@ impl ECStore {
         };
 
         let mut proofs = Vec::with_capacity(requested_pool_count);
-        let mut errs = Vec::with_capacity(self.pools.len());
-        let mut ress = Vec::with_capacity(self.pools.len());
+        let mut pool_results = Vec::with_capacity(results.len());
 
         for res in results.into_iter() {
             match res {
-                Ok((result, err, proof)) => {
+                Ok((mut result, err, proof)) => {
                     if let Some(proof) = proof
                         && (err.is_none()
                             || err
@@ -1420,15 +1475,10 @@ impl ECStore {
                     {
                         proofs.push(proof);
                     }
-                    let mut result = result;
                     result.object = decode_dir_object(&result.object);
-                    ress.push(result);
-                    errs.push(err);
+                    pool_results.push((result, err));
                 }
-                Err(err) => {
-                    errs.push(Some(err));
-                    ress.push(HealResultItem::default());
-                }
+                Err(err) => pool_results.push((HealResultItem::default(), Some(err))),
             }
         }
 
@@ -1438,31 +1488,7 @@ impl ECStore {
             *absence = Some(proofs);
         }
 
-        for (idx, err) in errs.iter().enumerate() {
-            if err.is_none() {
-                return Ok((ress.remove(idx), None));
-            }
-        }
-
-        // No pool returned a nil error, return the first non 'not found' error
-        for (index, err) in errs.iter().enumerate() {
-            return match err {
-                Some(err) => {
-                    if is_err_object_not_found(err) || is_err_version_not_found(err) {
-                        continue;
-                    }
-                    Ok((ress.remove(index), Some(err.clone())))
-                }
-                None => Ok((ress.remove(index), None)),
-            };
-        }
-
-        // At this stage, all errors are 'not found'
-        if !version_id.is_empty() {
-            return Ok((HealResultItem::default(), Some(Error::FileVersionNotFound)));
-        }
-
-        Ok((HealResultItem::default(), Some(Error::FileNotFound)))
+        Ok(select_pool_heal_result(pool_results, version_id))
     }
 
     async fn heal_pool_meta_object_with_cas(
@@ -1489,7 +1515,11 @@ impl ECStore {
             .await?;
         let target = pool.get_disks_for_heal_object(POOL_META_NAME, opts)?;
         let owns_replica = Arc::ptr_eq(&target, &pool.get_disks_by_key(POOL_META_NAME));
-        let needs_repair = !before.after.drives.is_empty() && before.after.drives.iter().any(|drive| drive.state != "ok");
+        let needs_repair = before
+            .after
+            .drives
+            .iter()
+            .any(|drive| pool_meta_drive_needs_repair(&drive.state));
         if opts.dry_run || error.is_some() || !owns_replica || !needs_repair {
             return Ok((before, error, absence));
         }
@@ -1570,6 +1600,7 @@ mod tests {
     use crate::runtime::instance::InstanceContext;
     use crate::services::rebalance::{
         RebalanceInfo, RebalanceStats, test_three_pool_stores_with_isolated_node_contexts, test_two_pool_stores,
+        test_two_pool_stores_with_three_drive_sets,
     };
     use crate::storage_api_contracts::bucket::{
         BucketInfo, BucketOperations, BucketOptions, DeleteBucketOptions, MakeBucketOptions,
@@ -1579,6 +1610,68 @@ mod tests {
     use crate::store::init_local_disks_with_instance_ctx;
     use rustfs_heal_contracts::heal_channel::DriveState;
     use tokio_util::sync::CancellationToken;
+
+    fn pool_heal_item(object: &str) -> HealResultItem {
+        HealResultItem {
+            object: object.to_owned(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn pool_heal_result_preserves_first_failure_and_its_typed_source() {
+        let quorum = Error::NamespaceLockQuorumUnavailable {
+            mode: "write",
+            bucket: "test-bucket".into(),
+            object: "object".into(),
+            required: 2,
+            achieved: 1,
+        };
+        let (item, error) = select_pool_heal_result(
+            [
+                (pool_heal_item("missing"), Some(Error::FileNotFound)),
+                (pool_heal_item("quorum"), Some(Error::from(DiskError::other(quorum)))),
+                (pool_heal_item("later failure"), Some(Error::Unexpected)),
+            ],
+            "",
+        );
+
+        assert_eq!(item.object, "quorum");
+        let Some(Error::Io(io)) = error else { panic!("expected wrapped storage error") };
+        let source = io.get_ref().and_then(|source| source.downcast_ref::<Error>());
+        assert!(matches!(source, Some(Error::NamespaceLockQuorumUnavailable {
+            mode: "write", bucket, object, required: 2, achieved: 1,
+        }) if bucket == "test-bucket" && object == "object"));
+    }
+
+    #[test]
+    fn pool_heal_result_prefers_first_success_across_pools() {
+        let (item, error) = select_pool_heal_result(
+            [
+                (pool_heal_item("failed"), Some(Error::Unexpected)),
+                (pool_heal_item("first success"), None),
+                (pool_heal_item("second success"), None),
+            ],
+            "",
+        );
+        assert_eq!(item.object, "first success");
+        assert!(error.is_none());
+    }
+
+    #[test]
+    fn pool_heal_result_reports_missing_for_the_requested_version() {
+        for (version_id, expected_error) in [("", Error::FileNotFound), ("some-version", Error::FileVersionNotFound)] {
+            let (item, error) = select_pool_heal_result(
+                [
+                    (pool_heal_item("missing object"), Some(Error::FileNotFound)),
+                    (pool_heal_item("missing version"), Some(Error::FileVersionNotFound)),
+                ],
+                version_id,
+            );
+            assert_eq!(item.object, HealResultItem::default().object);
+            assert_eq!(error, Some(expected_error));
+        }
+    }
 
     #[derive(Debug)]
     struct BlockingHealPeer {
@@ -3793,6 +3886,88 @@ mod tests {
             missing_disk.read_xl(RUSTFS_META_BUCKET, POOL_META_NAME, false).await.is_ok(),
             "pool metadata read repair should restore the missing shard"
         );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn pool_meta_read_repair_does_not_republish_for_an_unreachable_drive() {
+        // Three drives at EC:1. A republish while one drive is unreachable would
+        // give the two others a version the unreachable drive lacks; losing one
+        // of them later would leave pool.bin without read quorum.
+        let (_temp_dirs, store, _other_store) = test_two_pool_stores_with_three_drive_sets().await;
+        let disks: Vec<DiskStore> = store.pools[0]
+            .get_disks_by_key(POOL_META_NAME)
+            .disks
+            .read()
+            .await
+            .iter()
+            .map(|disk| disk.clone().expect("pool metadata fixture disk should be online"))
+            .collect();
+        assert_eq!(disks.len(), 3);
+        let unreachable = &disks[0];
+        unreachable.close().await.expect("stop disk monitoring");
+        unreachable.force_offline_for_test();
+        let mut replicas_before = Vec::new();
+        for disk in &disks[1..] {
+            let raw = disk
+                .read_xl(RUSTFS_META_BUCKET, POOL_META_NAME, false)
+                .await
+                .expect("reachable pool metadata replica");
+            replicas_before.push(raw.buf);
+        }
+
+        let (result, error) = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            store.handle_heal_object(
+                RUSTFS_META_BUCKET,
+                POOL_META_NAME,
+                "",
+                &HealOpts {
+                    read_repair: true,
+                    pool: Some(0),
+                    ..Default::default()
+                },
+            ),
+        )
+        .await
+        .expect("pool metadata read repair should not hang on an unreachable drive")
+        .expect("pool metadata read repair should report its outcome");
+
+        assert!(error.is_none(), "pool metadata inspection should have read quorum: {error:?}");
+        assert!(!result.metadata_repair_verified, "skipping a write must not report a verified repair");
+        assert!(
+            result
+                .after
+                .drives
+                .iter()
+                .any(|drive| [DriveState::Offline.to_string(), DriveState::Faulty.to_string()].contains(&drive.state)),
+            "the fixture drive should be reported unreachable: {:?}",
+            result.after.drives
+        );
+        for (disk, before) in disks[1..].iter().zip(replicas_before) {
+            let after = disk
+                .read_xl(RUSTFS_META_BUCKET, POOL_META_NAME, false)
+                .await
+                .expect("reachable pool metadata replica");
+            assert_eq!(after.buf, before, "pool.bin must keep the version the unreachable drive holds");
+        }
+    }
+
+    #[test]
+    fn pool_meta_drive_needs_repair_only_for_confirmed_replica_damage() {
+        for state in [
+            DriveState::Ok,
+            DriveState::Offline,
+            DriveState::Faulty,
+            DriveState::Unknown(DiskError::Timeout.to_string()),
+            DriveState::Unknown(DiskError::from(tonic::Status::deadline_exceeded("metadata read deadline")).to_string()),
+            DriveState::Unknown(DiskError::from(tonic::Status::permission_denied("metadata read denied")).to_string()),
+        ] {
+            assert!(!pool_meta_drive_needs_repair(state.to_str()), "{state:?}");
+        }
+        for state in [DriveState::Missing, DriveState::Corrupt] {
+            assert!(pool_meta_drive_needs_repair(state.to_str()), "{state:?}");
+        }
     }
 
     #[tokio::test]

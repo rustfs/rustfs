@@ -196,9 +196,10 @@ pub struct RequestEnvelope {
     verified_sigv4: Option<VerifiedSigV4Request>,
     verified_presigned: Option<VerifiedPresignedRequest>,
     website_read: Option<WebsiteRead>,
+    /// S3 REST reads of the current object condition missing-key responses on ListBucket.
+    pub(in crate::app) check_list_bucket_on_missing_key: bool,
     post_object: Option<PostObjectRequestMarker>,
     gateway_post: bool,
-    #[cfg(feature = "gateway-stack")]
     gateway_post_archive_identity: Option<Arc<()>>,
     post_object_policy_headers: Option<PostObjectPolicyHeaders>,
     // Attached by the authorization phase (`storage/access.rs`) for the use case.
@@ -250,9 +251,9 @@ impl RequestEnvelope {
             verified_sigv4: extensions.remove(),
             verified_presigned: extensions.remove(),
             website_read: extensions.remove(),
+            check_list_bucket_on_missing_key: false,
             post_object: extensions.remove(),
             gateway_post: false,
-            #[cfg(feature = "gateway-stack")]
             gateway_post_archive_identity: None,
             post_object_policy_headers: extensions.remove(),
             req_info: extensions.remove(),
@@ -302,9 +303,9 @@ impl RequestEnvelope {
             verified_sigv4: self.verified_sigv4,
             verified_presigned: self.verified_presigned,
             website_read: self.website_read.clone(),
+            check_list_bucket_on_missing_key: self.check_list_bucket_on_missing_key,
             post_object: self.post_object.clone(),
             gateway_post: self.gateway_post,
-            #[cfg(feature = "gateway-stack")]
             gateway_post_archive_identity: self.gateway_post_archive_identity.clone(),
             post_object_policy_headers: self.post_object_policy_headers.clone(),
             req_info: self.req_info.clone(),
@@ -498,13 +499,11 @@ impl RequestEnvelope {
         self.gateway_post
     }
 
-    #[cfg(feature = "gateway-stack")]
     pub(crate) fn mark_gateway_post(&mut self) {
         self.gateway_post = true;
         self.gateway_post_archive_identity = None;
     }
 
-    #[cfg(feature = "gateway-stack")]
     pub(crate) fn bind_gateway_post_archive_identity(&mut self) -> Option<&Arc<()>> {
         if !self.gateway_post {
             return None;
@@ -512,7 +511,6 @@ impl RequestEnvelope {
         Some(self.gateway_post_archive_identity.get_or_insert_with(|| Arc::new(())))
     }
 
-    #[cfg(feature = "gateway-stack")]
     pub(crate) fn gateway_post_identity(&self) -> Option<&Arc<()>> {
         self.gateway_post_archive_identity.as_ref()
     }
@@ -533,7 +531,6 @@ impl RequestEnvelope {
         self.bucket_generation.as_ref()
     }
 
-    #[cfg(feature = "gateway-stack")]
     pub(crate) fn take_bucket_generation(&mut self) -> Option<BucketGenerationGuard> {
         self.bucket_generation.take()
     }
@@ -563,7 +560,6 @@ impl RequestEnvelope {
     }
 
     /// Releases preflight guards before uncommitted POST staging; publication must reauthorize.
-    #[cfg(feature = "gateway-stack")]
     pub(crate) fn release_table_publication_guards(&mut self) {
         self.table_publication_guards = None;
     }
@@ -793,9 +789,7 @@ pub(crate) async fn authorize_owned_request(
     location_constraint: Option<String>,
 ) -> rustfs_s3_types::S3Result<()> {
     prepare_owned_authorization(req, action)?;
-    authorize_request_core(req, action, location_constraint, false)
-        .await
-        .map_err(Into::into)
+    authorize_request_core(req, action, location_constraint, false).await
 }
 
 /// Authorizes one exact object key after its enclosing table-catalog operation has been authorized.
@@ -806,11 +800,11 @@ pub(crate) async fn authorize_owned_internal_object_request(
     action: Action,
 ) -> rustfs_s3_types::S3Result<()> {
     prepare_owned_authorization(req, action)?;
-    authorize_request_core(req, action, None, true).await.map_err(Into::into)
+    authorize_request_core(req, action, None, true).await
 }
 
 fn prepare_owned_authorization(req: &mut RequestEnvelope, action: Action) -> rustfs_s3_types::S3Result<()> {
-    crate::auth::hoist_signed_query_params(&mut req.headers, req.uri.query()).map_err(rustfs_s3_types::S3Error::from)?;
+    crate::auth::hoist_signed_query_params(&mut req.headers, req.uri.query())?;
     require_body_policy_inputs(req, action)
 }
 
@@ -849,6 +843,12 @@ impl RequestEnvelope {
             self.client_info(),
             self.remote_addr(),
             self.request_context(),
+            PendingDeleteBucketGenerationGuard::resolve_generation(
+                self.bucket_generation(),
+                self.pending_delete_bucket_generation(),
+            )
+            .ok()
+            .flatten(),
         )
     }
 }
@@ -976,6 +976,120 @@ mod tests {
                 true,
                 true
             ),
+        );
+    }
+
+    #[test]
+    fn extensions_bag_is_empty_after_migration() {
+        use crate::storage::authorization::envelope_payloads as payloads;
+
+        let peer: std::net::SocketAddr = "127.0.0.1:9".parse().expect("peer address");
+        let mut form_headers = HeaderMap::new();
+        form_headers.insert("x-amz-tagging", http::HeaderValue::from_static("bag=form"));
+        let retain_until = time::OffsetDateTime::from_unix_timestamp(1_700_000_000).expect("timestamp");
+        let mut extensions = Extensions::new();
+        extensions.insert(Some(RemoteAddr(peer)));
+        extensions.insert(ClientInfo::direct(peer));
+        extensions.insert(NativeTlsTransport(true));
+        extensions.insert(RequestContext::from_external_headers(&HeaderMap::new()));
+        extensions.insert(ServerContextSlot::new());
+        extensions.insert(BodyReadControl::default());
+        extensions.insert(VerifiedSigV4Request);
+        extensions.insert(VerifiedPresignedRequest);
+        extensions.insert(WebsiteRead);
+        extensions.insert(PostObjectRequestMarker);
+        extensions.insert(PostObjectPolicyHeaders(form_headers));
+        extensions.insert(ReqInfo {
+            bucket: Some("bag-bucket".to_owned()),
+            ..ReqInfo::default()
+        });
+        extensions.insert(payloads::bucket_generation("bag-bucket"));
+        extensions.insert(payloads::pending_delete_bucket_generation("bag-bucket"));
+        extensions.insert(payloads::copy_source_bucket_generation("source-bucket"));
+        extensions.insert(payloads::odm_read_generation("bag-bucket"));
+        extensions.insert(payloads::bucket_config_mutation("bag-bucket"));
+        extensions.insert(TableDataPlanePublicationGuards::default());
+        extensions.insert(payloads::table_list_access("bag-bucket"));
+        extensions.insert(payloads::object_tag_conditions("bag-bucket"));
+        extensions.insert(MultipartStagingOperation);
+        extensions.insert(StagedMultipartPartAuthorization);
+        extensions.insert(RequestedObjectLockRetention {
+            mode: Some("GOVERNANCE".to_owned()),
+            retain_until: None,
+        });
+        extensions.insert(RequestedObjectLockRetainUntil(retain_until));
+        extensions.insert(RequestedObjectLegalHold(Some("ON".to_owned())));
+        extensions.insert(RequestedObjectTags(vec![("bag".to_owned(), "tag".to_owned())]));
+        extensions.insert(RequestedCopySource("source-bucket/source-key".to_owned()));
+
+        let envelope = RequestEnvelope::from_parts(
+            RequestHead {
+                method: Method::PUT,
+                uri: "/bucket/key".parse().expect("valid URI"),
+                headers: HeaderMap::new(),
+                credentials: None,
+                region: None,
+                service: None,
+            },
+            extensions,
+        );
+
+        assert!(envelope.residual_extensions().is_empty(), "named extension left in the residual bag");
+        assert_eq!(envelope.remote_addr(), Some(peer));
+        assert_eq!(envelope.client_info().map(|info| info.real_ip), Some(peer.ip()));
+        assert_eq!(envelope.native_tls_transport(), Some(true));
+        assert!(envelope.request_context().is_some());
+        assert!(envelope.server_context().is_some());
+        assert!(envelope.body_read_control().is_some());
+        assert!(envelope.verified_sigv4().is_some());
+        assert!(envelope.verified_presigned().is_some());
+        assert!(envelope.website_read().is_some());
+        assert!(envelope.post_object().is_some());
+        assert_eq!(
+            envelope
+                .post_object_policy_headers()
+                .and_then(|headers| headers.0.get("x-amz-tagging"))
+                .and_then(|value| value.to_str().ok()),
+            Some("bag=form")
+        );
+        assert_eq!(envelope.req_info().and_then(|info| info.bucket.as_deref()), Some("bag-bucket"));
+        assert_eq!(envelope.bucket_generation().map(|guard| guard.bucket.as_str()), Some("bag-bucket"));
+        assert!(envelope.pending_delete_bucket_generation().is_some());
+        assert_eq!(
+            envelope.copy_source_bucket_generation().map(|guard| guard.bucket.as_str()),
+            Some("source-bucket")
+        );
+        assert!(envelope.odm_read_generation().is_some());
+        assert_eq!(
+            envelope.bucket_config_mutation().map(|snapshot| snapshot.bucket.as_str()),
+            Some("bag-bucket")
+        );
+        assert!(envelope.table_publication_guards().is_some());
+        assert_eq!(envelope.table_list_access().map(|access| access.bucket.as_str()), Some("bag-bucket"));
+        assert_eq!(
+            envelope.object_tag_conditions().map(|conditions| conditions.bucket.as_str()),
+            Some("bag-bucket")
+        );
+        assert!(envelope.multipart_staging_operation().is_some());
+        assert!(envelope.staged_multipart_part_authorization().is_some());
+        assert_eq!(
+            envelope
+                .requested_object_lock_retention()
+                .and_then(|value| value.mode.as_deref()),
+            Some("GOVERNANCE")
+        );
+        assert_eq!(envelope.requested_object_lock_retain_until().map(|value| value.0), Some(retain_until));
+        assert_eq!(envelope.requested_object_legal_hold().and_then(|hold| hold.0.as_deref()), Some("ON"));
+        assert_eq!(
+            envelope
+                .requested_object_tags()
+                .and_then(|tags| tags.0.first())
+                .map(|(key, _)| key.as_str()),
+            Some("bag")
+        );
+        assert_eq!(
+            envelope.requested_copy_source().map(|source| source.0.as_str()),
+            Some("source-bucket/source-key")
         );
     }
 

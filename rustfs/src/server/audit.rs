@@ -147,7 +147,7 @@ pub(crate) async fn start_audit_system_for_context(context: Option<&AppContext>)
                     info!(
                         target: "rustfs::main::start_audit_system",
                         "Audit system reloaded successfully with time: {}.",
-                        jiff::Zoned::now()
+                        jiff::ZonedDateTime::now()
                     );
                     Ok(())
                 }
@@ -166,7 +166,7 @@ pub(crate) async fn start_audit_system_for_context(context: Option<&AppContext>)
                 info!(
                     target: "rustfs::main::start_audit_system",
                     "Audit system started successfully with time: {}.",
-                    jiff::Zoned::now()
+                    jiff::ZonedDateTime::now()
                 );
                 Ok(())
             }
@@ -196,7 +196,7 @@ pub async fn stop_audit_system() -> AuditResult<()> {
         // Prepare before stopping
         system.close().await?;
         // Record after stopping
-        info!("Audit system stopped at {}", jiff::Zoned::now());
+        info!("Audit system stopped at {}", jiff::ZonedDateTime::now());
         Ok(())
     } else {
         warn!("Audit system not initialized, cannot stop");

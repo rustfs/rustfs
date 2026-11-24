@@ -70,10 +70,6 @@ url.workspace = true
 urlencoding = { workspace = true }
 uuid = { workspace = true, features = ["v4", "fast-rng", "serde", "macro-diagnostics"] }
 
-# The remote error code table is checked against the legacy client's.
-[dev-dependencies]
-s3s = { workspace = true, features = ["minio"] }
-
 [lints]
 workspace = true
 

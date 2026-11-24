@@ -12,6 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#![cfg(test)]
+
 //! Parity of every `S3ErrorCode` variant a call site moved off s3s names.
 //!
 //! Responsible for: the table of variant names used by the call sites that the

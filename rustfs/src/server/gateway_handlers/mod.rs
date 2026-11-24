@@ -31,11 +31,16 @@ mod envelope;
 mod error;
 
 mod bucket_access;
+#[cfg(test)]
+pub(crate) use bucket_access::prepare_notification_configuration;
 mod bucket_configs;
 mod bucket_core;
 mod bucket_replication_lifecycle;
 mod lifecycle_input;
+#[cfg(test)]
+pub(crate) use lifecycle_input::prepare_lifecycle_configuration;
 mod listing_multipart;
+pub(crate) mod metadata_listing;
 mod object_commit;
 mod object_meta;
 mod object_misc;
@@ -49,7 +54,7 @@ mod post_object;
 pub(crate) mod test_support;
 
 pub(super) use self::access::verified_signature;
-pub(super) use self::error::handler_error;
+pub(crate) use self::error::handler_error;
 use crate::app::{Answered, RequestEnvelope};
 use crate::runtime_sources::{AppContext, ServerContextSlot};
 use rustfs_gateway::{Handler, HandlerError, HandlerResult, OperationCodec, Req, Resp, ServiceBuilder};

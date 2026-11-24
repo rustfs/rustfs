@@ -775,6 +775,15 @@ impl ECStore {
         sys.read().await.get(bucket).await
     }
 
+    /// Snapshots this instance's cached bucket metadata without disk IO.
+    ///
+    /// # Errors
+    /// Returns an error when this instance's metadata system is not initialized.
+    pub async fn cached_bucket_metadata(&self) -> Result<Vec<Arc<BucketMetadata>>> {
+        let sys = metadata_sys::require_bucket_metadata_sys_in(&self.ctx)?;
+        Ok(sys.read().await.cached_metadata().await)
+    }
+
     /// Resolve stored tags for authorization. Only confirmed absence returns an
     /// empty map; unavailable, fabricated or malformed metadata must not grant access.
     pub async fn get_bucket_tags_for_policy(&self, bucket: &str) -> Result<HashMap<String, String>> {
@@ -1926,6 +1935,46 @@ impl ECStore {
         opts: &DeleteBucketOptions,
         diagnostic_budget: BucketDeleteDiagnosticBudget,
     ) -> Result<()> {
+        self.delete_bucket_capturing_notification(bucket, opts, diagnostic_budget, false)
+            .await
+            .map(|_| ())
+    }
+
+    /// Deletes a bucket and captures its final notification metadata under the
+    /// lifecycle, metadata-transaction and namespace fences. No cached rules are used.
+    /// Missing or unreadable metadata yields no notification authority.
+    ///
+    /// # Errors
+    /// Returns the same deletion failures as `delete_bucket`; capture is returned
+    /// only after deletion succeeds, with the same cancellation/partial-delete contract.
+    pub fn delete_bucket_with_notification<'a>(
+        &'a self,
+        bucket: &'a str,
+        force: bool,
+    ) -> futures::future::BoxFuture<'a, Result<Option<Arc<crate::bucket::metadata::BucketMetadata>>>> {
+        // Preserve the boxed native-operation boundary instead of propagating the
+        // deletion state machine through request and gateway futures.
+        Box::pin(async move {
+            self.delete_bucket_capturing_notification(
+                bucket,
+                &DeleteBucketOptions {
+                    force,
+                    ..Default::default()
+                },
+                BucketDeleteDiagnosticBudget::new(),
+                true,
+            )
+            .await
+        })
+    }
+
+    async fn delete_bucket_capturing_notification(
+        &self,
+        bucket: &str,
+        opts: &DeleteBucketOptions,
+        diagnostic_budget: BucketDeleteDiagnosticBudget,
+        capture_notification: bool,
+    ) -> Result<Option<Arc<crate::bucket::metadata::BucketMetadata>>> {
         if is_meta_bucketname(bucket) {
             return Err(StorageError::BucketNameInvalid(bucket.to_string()));
         }
@@ -1950,7 +1999,7 @@ impl ECStore {
             publication_guard.as_ref(),
             bucket,
             "table-bucket publication fence during bucket deletion",
-            self.handle_delete_bucket_under_publication_lock(bucket, opts, diagnostic_budget),
+            self.handle_delete_bucket_under_publication_lock(bucket, opts, diagnostic_budget, capture_notification),
         )
         .await
     }
@@ -1960,7 +2009,8 @@ impl ECStore {
         bucket: &str,
         opts: &DeleteBucketOptions,
         mut diagnostic_budget: BucketDeleteDiagnosticBudget,
-    ) -> Result<()> {
+        capture_notification: bool,
+    ) -> Result<Option<Arc<crate::bucket::metadata::BucketMetadata>>> {
         let bucket_lifecycle_guard = if !opts.no_lock {
             Some(self.acquire_bucket_lifecycle_write_lock(bucket).await?)
         } else {
@@ -1970,7 +2020,7 @@ impl ECStore {
         // bucket namespace. Holding the transaction while waiting for the
         // namespace prevents a migration writer and force delete from
         // acquiring these two locks in opposite orders.
-        let object_lock_metadata_transaction = if opts.force && !is_meta_bucketname(bucket) {
+        let metadata_transaction = if (opts.force || capture_notification) && !is_meta_bucketname(bucket) {
             Some(
                 await_bucket_namespace_operation(
                     bucket_lifecycle_guard.as_ref(),
@@ -2041,16 +2091,19 @@ impl ECStore {
 
         // Keep configuration changes fenced until data deletion finishes;
         // a force delete cannot bypass any Object Lock protection.
-        let object_lock_metadata_guard = if bucket_exists && let Some(guard) = object_lock_metadata_transaction {
+        let object_lock_incarnation = if bucket_exists
+            && opts.force
+            && let Some(guard) = metadata_transaction.as_ref()
+        {
             let (state, incarnation, _) =
                 crate::bucket::metadata_sys::get_object_lock_config_and_incarnation_from_disk_with_guard_in(
                     &self.ctx,
                     bucket,
-                    Some(ns_guard.as_deref().unwrap_or(&guard)),
+                    Some(ns_guard.as_deref().unwrap_or(guard)),
                 )
                 .await?;
             match state {
-                crate::bucket::metadata_sys::ObjectLockConfigState::ConfirmedAbsent => Some((guard, incarnation)),
+                crate::bucket::metadata_sys::ObjectLockConfigState::ConfirmedAbsent => Some(incarnation),
                 crate::bucket::metadata_sys::ObjectLockConfigState::Configured { .. } => {
                     return Err(StorageError::PrefixAccessDenied(bucket.to_owned(), String::new()));
                 }
@@ -2076,7 +2129,7 @@ impl ECStore {
                 bucket,
                 "bucket delete marker creation",
                 await_bucket_namespace_operation(
-                    object_lock_metadata_guard.as_ref().map(|(guard, _)| guard),
+                    metadata_transaction.as_ref(),
                     bucket,
                     "Object Lock configuration fence during bucket retirement",
                     self.mark_bucket_deleted(bucket),
@@ -2089,7 +2142,7 @@ impl ECStore {
         // Legacy buckets without a stamp cannot produce retirement authority.
         let retirement = if bucket_exists && bucket_lifecycle_guard.is_some() && !is_meta_bucketname(bucket) {
             if let Some(store) = metadata_sys::object_store_if_initialized_in(&self.ctx).await {
-                if let Some((_, incarnation)) = object_lock_metadata_guard.as_ref() {
+                if let Some(incarnation) = object_lock_incarnation.as_ref() {
                     Some((store, *incarnation))
                 } else {
                     crate::bucket::metadata::load_bucket_incarnation(store.clone(), bucket)
@@ -2103,12 +2156,26 @@ impl ECStore {
             None
         };
 
+        let notification = if capture_notification && bucket_exists {
+            if let Some(store) = metadata_sys::object_store_if_initialized_in(&self.ctx).await {
+                crate::bucket::metadata::load_bucket_metadata_parse_with_presence(store, bucket, true)
+                    .await
+                    .ok()
+                    .filter(|(metadata, persisted)| *persisted && !metadata.bucket_incarnation_id.is_nil())
+                    .map(|(metadata, _)| Arc::new(metadata))
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
         let delete_result = await_bucket_namespace_operation(
             bucket_lifecycle_guard.as_ref(),
             bucket,
             "physical bucket deletion",
             await_bucket_namespace_operation(
-                object_lock_metadata_guard.as_ref().map(|(guard, _)| guard),
+                metadata_transaction.as_ref(),
                 bucket,
                 "Object Lock configuration fence during bucket deletion",
                 run_physical_bucket_deletion(ns_guard.as_deref(), bucket, async {
@@ -2119,7 +2186,7 @@ impl ECStore {
             ),
         )
         .await;
-        drop(object_lock_metadata_guard);
+        drop(metadata_transaction);
         if let Err(err) = delete_result
             && (!sr_delete || !is_err_strict_volume_not_found(&err))
         {
@@ -2178,7 +2245,7 @@ impl ECStore {
         // A scanner may have sampled the first fence before the physical
         // namespace disappeared. The completion fence invalidates that scan.
         crate::store::list_objects::observe_scanner_namespace_mutations(bucket, 1);
-        Ok(())
+        Ok(notification)
     }
 }
 
@@ -2447,6 +2514,86 @@ mod tests {
             !operation_completed.load(Ordering::SeqCst),
             "lock loss must stop the old owner before a successor can acquire the namespace"
         );
+    }
+
+    #[tokio::test]
+    async fn deleted_notification_snapshot_ignores_a_previous_incarnation_cache() {
+        let (_dirs, store) = metadata_sys::test_support::isolated_store_over_temp_disks().await;
+        metadata_sys::init_bucket_metadata_sys(store.clone(), Vec::new()).await;
+        let bucket = "deleted-notification-stale-cache";
+        store
+            .make_bucket(bucket, &MakeBucketOptions::default())
+            .await
+            .expect("create original");
+        metadata_sys::update_in(&store.ctx, bucket, crate::bucket::metadata::BUCKET_NOTIFICATION_CONFIG,
+            b"<NotificationConfiguration><QueueConfiguration><Id>old</Id><Queue>arn:rustfs:sqs:us-east-1:old:webhook</Queue><Event>s3:BucketRemoved:*</Event></QueueConfiguration></NotificationConfiguration>".to_vec()).await.expect("commit the original removal subscription");
+        let sys = metadata_sys::bucket_metadata_sys_of(&store.ctx).expect("metadata owner");
+        let stale = sys.read().await.get(bucket).await.expect("original metadata");
+        store
+            .delete_bucket(bucket, &DeleteBucketOptions::default())
+            .await
+            .expect("delete original");
+        store
+            .make_bucket(bucket, &MakeBucketOptions::default())
+            .await
+            .expect("create replacement");
+        let replacement = store
+            .bucket_incarnation_id_from_disk(bucket)
+            .await
+            .expect("replacement identity");
+        let xml = b"<NotificationConfiguration/>".to_vec();
+        metadata_sys::update_in(&store.ctx, bucket, crate::bucket::metadata::BUCKET_NOTIFICATION_CONFIG, xml.clone())
+            .await
+            .expect("commit replacement configuration");
+        sys.read().await.set(bucket.to_string(), stale.clone()).await;
+        let removed = store
+            .delete_bucket_with_notification(bucket, false)
+            .await
+            .expect("delete replacement")
+            .expect("authoritative snapshot");
+        assert_ne!(replacement, stale.bucket_incarnation_id);
+        assert_eq!(removed.bucket_incarnation_id, replacement);
+        assert_eq!(removed.notification_config_xml, xml);
+    }
+
+    #[tokio::test]
+    async fn deleted_notification_snapshot_observes_the_last_fenced_configuration() {
+        let (_dirs, store) = metadata_sys::test_support::isolated_store_over_temp_disks().await;
+        metadata_sys::init_bucket_metadata_sys(store.clone(), Vec::new()).await;
+        let bucket = "deleted-notification-last-commit";
+        store
+            .make_bucket(bucket, &MakeBucketOptions::default())
+            .await
+            .expect("create bucket");
+        metadata_sys::update_in(&store.ctx, bucket, crate::bucket::metadata::BUCKET_NOTIFICATION_CONFIG,
+            b"<NotificationConfiguration><QueueConfiguration><Id>old</Id><Queue>arn:rustfs:sqs:us-east-1:old:webhook</Queue><Event>s3:BucketRemoved:*</Event></QueueConfiguration></NotificationConfiguration>".to_vec()).await.expect("commit the original removal subscription");
+        let lock = store
+            .new_ns_lock(bucket, rustfs_common::table_catalog::TABLE_BUCKET_PUBLICATION_LOCK_PATH)
+            .await
+            .expect("publication lock");
+        let guard = lock
+            .get_read_lock(get_lock_acquire_timeout())
+            .await
+            .expect("hold configuration publication");
+        let other = store.clone();
+        let mut deletion = tokio::spawn(async move { other.delete_bucket_with_notification(bucket, false).await });
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(100), &mut deletion)
+                .await
+                .is_err(),
+            "deletion must wait for the publication fence"
+        );
+        let xml = b"<NotificationConfiguration/>".to_vec();
+        metadata_sys::update_in(&store.ctx, bucket, crate::bucket::metadata::BUCKET_NOTIFICATION_CONFIG, xml.clone())
+            .await
+            .expect("withdraw subscription before deletion acquires its fence");
+        drop(guard);
+        let removed = deletion
+            .await
+            .expect("join delete")
+            .expect("delete bucket")
+            .expect("metadata snapshot");
+        assert_eq!(removed.notification_config_xml, xml);
     }
 
     async fn setup_bucket_delete_test_env() -> (Vec<PathBuf>, Arc<ECStore>) {

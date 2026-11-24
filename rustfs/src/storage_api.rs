@@ -141,11 +141,9 @@ pub(crate) mod protocols {
         pub(crate) use crate::storage::storage_api::contract::bucket::{BucketOperations, MakeBucketOptions};
         #[cfg(test)]
         pub(crate) use crate::storage::storage_api::contract::object::ObjectIO;
+        pub(crate) use crate::storage::storage_api::request_context_consumer::RequestContext;
         #[cfg(test)]
         pub(crate) use crate::storage::storage_api::{StorageObjectOptions, StoragePutObjReader};
-        #[cfg(test)]
-        pub(crate) type FS = crate::storage::storage_api::FS;
-        pub(crate) use crate::storage::storage_api::request_context_consumer::RequestContext;
         #[cfg(test)]
         pub(crate) use rustfs_gateway_types::dto::ListObjectsV2Input;
         #[cfg(all(test, any(feature = "webdav", feature = "sftp")))]
@@ -170,6 +168,12 @@ pub(crate) mod protocols {
 }
 
 pub(crate) mod server {
+    #[cfg(test)]
+    pub(crate) mod gateway_stack {
+        pub(crate) use crate::storage::storage_api::contract::multipart::PartInfo;
+        pub(crate) use crate::storage::storage_api::ecstore_bucket::metadata_sys::get_object_lock_config;
+    }
+
     pub(crate) mod event {
         pub(crate) mod contract {
             #[cfg(test)]
@@ -210,31 +214,11 @@ pub(crate) mod server {
             tonic_boot_epoch_response_headers, verify_tonic_boot_epoch_response,
         };
 
-        pub(crate) mod ecfs {
-            pub(crate) type FS = crate::storage::storage_api::FS;
-        }
-
-        pub(crate) mod metadata_route {
-            pub(crate) fn with_metadata_route<A>(
-                admin: A,
-                host: Option<s3s::host::MultiDomain>,
-                website_domains: Vec<String>,
-                website_scheme: &'static str,
-                server_ctx: std::sync::Arc<super::ServerContextSlot>,
-            ) -> impl s3s::route::S3Route
-            where
-                A: s3s::route::S3Route,
-            {
-                crate::app::metadata_route::with_metadata_route(admin, host, website_domains, website_scheme, server_ctx)
-            }
-        }
-
         pub(crate) mod request_context {
             pub(crate) use crate::storage::storage_api::request_context_consumer::RequestContext;
         }
 
         /// The access-phase functions the gateway stack shares with the legacy access hooks.
-        #[cfg(feature = "gateway-stack")]
         pub(crate) mod access {
             /// The per-batch authorization shapes, one module per migration batch.
             pub(crate) use crate::storage::storage_api::access_consumer::access_owned;
@@ -252,21 +236,14 @@ pub(crate) mod server {
                 pub(crate) use crate::storage::storage_api::contract::multipart::{CompletePart, MultipartOperations};
                 pub(crate) use crate::storage::storage_api::contract::object::{ObjectIO, ObjectOperations};
                 pub(crate) use crate::storage::storage_api::{
-                    FS, StorageObjectOptions as ObjectOptions, StoragePutObjReader, get_bucket_metadata, is_err_object_not_found,
+                    StorageObjectOptions as ObjectOptions, StoragePutObjReader, get_bucket_metadata, is_err_object_not_found,
                     set_bucket_metadata,
-                };
-                pub(crate) use s3s::{
-                    S3Request,
-                    access::S3Access,
-                    dto::{ETag, ETagCondition, PutObjectInput},
                 };
             }
         }
 
         pub(crate) mod rpc {
             pub(crate) use crate::storage::storage_api::rpc_consumer::InternodeRpcService;
-            #[cfg(test)]
-            pub(crate) use s3s::Body;
         }
 
         pub(crate) mod tonic_service {
@@ -298,14 +275,6 @@ pub(crate) mod server {
                 RequestContext, extract_request_id_from_headers, spawn_traced,
             };
         }
-    }
-
-    /// The s3s error types the s3s-compat tower layers in
-    /// `server::legacy_compat` render and match on, funneled here so those
-    /// files stay off the direct s3s surface (s3s footprint ratchet). T2.12
-    /// (rustfs/backlog#2771) removes the layers and with them this module.
-    pub(crate) mod legacy_compat {
-        pub(crate) use s3s::{S3Error, S3ErrorCode};
     }
 
     pub(crate) mod module_switch {
@@ -360,7 +329,7 @@ pub(crate) mod connect {
 /// targets, replication-config primitives, and the config-object lock
 /// helpers its state transaction runs on.
 pub(crate) mod site_replication {
-    pub(crate) use super::storage_contracts::{BucketOperations, BucketOptions};
+    pub(crate) use super::storage_contracts::{BucketOperations, BucketOptions, NamespaceLocking};
     pub(crate) use crate::storage::storage_api::ecstore_bucket::bucket_target_sys::BucketTargetSys;
     pub(crate) use crate::storage::storage_api::ecstore_bucket::lifecycle::lifecycle::{
         format_lifecycle_date, parse_lifecycle_date,
@@ -390,11 +359,13 @@ pub(crate) mod site_replication {
         ECStore, EndpointServerPools, StorageError, delete_config_no_lock, is_err_bucket_not_found, lock_bucket_targets_metadata,
         read_config, read_config_no_lock, save_config_no_lock, with_config_object_read_lock, with_config_object_write_lock,
     };
+    pub(crate) use crate::storage::storage_api::{RUSTFS_META_BUCKET, get_lock_acquire_timeout};
 
     pub(crate) mod metadata_sys {
         pub(crate) use crate::storage::storage_api::ecstore_bucket::metadata_sys::{
+            BucketMetadataMutationGuard, acquire_bucket_metadata_transaction_lock_for_incarnation,
             capture_bucket_metadata_incarnation, get, get_replication_config, get_versioning_config, list_bucket_targets,
-            update_if_incarnation,
+            update_if_incarnation, update_under_transaction_lock,
         };
     }
 
@@ -410,7 +381,6 @@ pub(crate) mod site_replication {
         };
         #[cfg(test)]
         pub(crate) use rustfs_gateway_types::persistence::{PersistedLifecycleExpiration, PersistedTransition};
-        pub(crate) use s3s::{Body, S3Response};
     }
 }
 
@@ -457,14 +427,6 @@ pub(crate) mod startup {
     }
 
     pub(crate) mod init {
-        /// Renders a persisted notification configuration as the DTO the notify
-        /// runtime still consumes (rustfs/backlog#2745).
-        pub(crate) fn notification_config_to_s3s(
-            config: &rustfs_gateway_types::persistence::PersistedNotificationConfiguration,
-        ) -> s3s::S3Result<s3s::dto::NotificationConfiguration> {
-            crate::storage::storage_api::persisted_to_s3s(config)
-        }
-
         pub(crate) use crate::storage::storage_api::ecstore_bucket::config_parse_mode::validate_bucket_config_parse_mode_env;
         pub(crate) use crate::storage::storage_api::{
             get_bucket_notification_config, process_lambda_configurations, process_queue_configurations,

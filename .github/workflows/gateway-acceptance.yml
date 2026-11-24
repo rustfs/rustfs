@@ -15,31 +15,20 @@
 # Gateway black-box acceptance lanes (rustfs/backlog#2775 T3.4, #2776 T3.5).
 #
 # Runs two suites of the rustfs/gateway repository against the candidate binary,
-# once per S3 stack (RUSTFS_S3_STACK=legacy and =gateway), one server per stack:
+# with isolated data and a separate server for each suite:
 #
-#   - the conformance corpus, `--profile rustfs`. That profile describes the
-#     gateway edge, so scripts/check_conformance_rulings.py judges the gateway
-#     stack against .config/conformance-rulings.toml (red: an unruled failure, a
-#     ruled case failing differently, a stale ruling, a skip on the server's own
-#     answer) and publishes the legacy run as a reference that is never judged:
-#     it only has to serve, stay up and complete;
-#   - the client matrix, ci/compat/run_matrix.sh --external, judged per stack by
+#   - the conformance corpus, `--profile rustfs`, judged by
+#     scripts/check_conformance_rulings.py against .config/conformance-rulings.toml
+#     (red: an unruled failure, a ruled case failing differently, a stale ruling,
+#     a skip on the server's own answer);
+#   - the client matrix, ci/compat/run_matrix.sh --external, judged by
 #     scripts/compat_matrix_report.py (no `fail`, no `sut-unregistered`, every
 #     client ran; a client that could not be installed is reported as skipped).
-#     The legacy matrix is the baseline: every cell that passes on legacy must
-#     pass on gateway (`compare`).
 #
 # The suites are checked out at the rustfs/gateway rev Cargo.toml pins, so the
-# suite and the framework under test never drift apart. The verdict of each
-# stack is computed from what the run left on disk (startup record, the stack
-# the server's own log names, runner exit code, liveness after the corpus,
-# report), never from the exit status of an earlier step. Needs
-# scripts/dual_stack.py and the `s3_stack` startup field of rustfs/rustfs#9367.
-#
-# The gateway stack is report-only until T2.10: its job may fail without failing
-# the workflow, and its summary says what it observed (did not start, or how many
-# cases ran, passed, failed and were answered 501). The stack comparison is
-# report-only for the same reason; its conformance half is information only.
+# suite and the framework under test never drift apart. The verdict is computed
+# from what the run left on disk (startup record, runner exit code, liveness
+# after the corpus, report), never from the exit status of an earlier step.
 #
 # Not a pull-request gate. Scheduled failures are owned by the scheduled-validation
 # watchdog (.github/scheduled-validations.json).
@@ -75,26 +64,16 @@ jobs:
     timeout-minutes: 5
     outputs:
       gateway-rev: ${{ steps.pin.outputs.rev }}
+      ceph-rev: ${{ steps.pin.outputs.ceph-rev }}
     steps:
       - name: Checkout repository
         uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7
         with:
           persist-credentials: false
 
-      - name: Read the rustfs/gateway rev from Cargo.toml
+      - name: Read the gateway and Ceph pins
         id: pin
-        run: |
-          set -euo pipefail
-          python3 - <<'PY' >> "$GITHUB_OUTPUT"
-          import re, sys, tomllib
-          dependencies = tomllib.load(open("Cargo.toml", "rb"))["workspace"]["dependencies"]
-          revs = {spec.get("rev") for spec in dependencies.values()
-                  if isinstance(spec, dict) and spec.get("git") == "https://github.com/rustfs/gateway.git"}
-          if len(revs) != 1 or not re.fullmatch(r"[0-9a-f]{40}", str(next(iter(revs)))):
-              sys.exit(f"Cargo.toml must pin rustfs/gateway at exactly one full rev, found {sorted(map(str, revs))}")
-          print(f"rev={revs.pop()}")
-          PY
-          cat "$GITHUB_OUTPUT"
+        run: python3 scripts/gateway_corpus_capture.py pins >> "$GITHUB_OUTPUT"
 
   build-candidate:
     name: Build candidate binary
@@ -151,8 +130,8 @@ jobs:
       - name: Build
         working-directory: gateway
         run: |
-          cargo build --locked --release -p rustfs-gateway-conformance -p rustfs-gateway-compat-sut \
-            --bin rustfs-gateway-conformance --bin compat-sut
+          cargo build --locked --release -p rustfs-gateway-conformance -p rustfs-gateway-compat-sut -p rustfs-gateway-corpus \
+            --bin rustfs-gateway-conformance --bin compat-sut --bin corpus
 
       - name: Upload tools
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
@@ -162,26 +141,22 @@ jobs:
           path: |
             gateway/target/release/rustfs-gateway-conformance
             gateway/target/release/compat-sut
+            gateway/target/release/corpus
           if-no-files-found: error
           retention-days: 1
 
   acceptance:
-    name: ${{ matrix.stack == 'gateway' && 'Acceptance (gateway, report-only until T2.10)' || 'Acceptance (legacy)' }}
+    name: Acceptance
     needs: [ plan, build-candidate, build-gateway-tools ]
     # GitHub-hosted like the s3-tests targets of reference-parity.yml: the job
     # only runs prebuilt binaries and the pinned clients, none of which needs Docker.
     runs-on: ubuntu-latest
-    # About 3x the 15 minutes the legacy job took in run 43325101234 (client install about
+    # About 3x the 15 minutes the job took in run 43325101234 (client install about
     # 8, matrix about 3, corpus about 3), so a hung server costs 45 runner minutes, not more.
     timeout-minutes: 45
-    continue-on-error: ${{ matrix.stack == 'gateway' }}
-    strategy:
-      fail-fast: false
-      matrix:
-        stack: [ legacy, gateway ]
     env:
-      STACK: ${{ matrix.stack }}
       ENDPOINT: http://127.0.0.1:9000
+      CONFORMANCE_ENDPOINT: http://127.0.0.1:19000
       # The conformance suite signs with these fixed fixture credentials (the AWS
       # documentation example pair), so the candidate is started with them and the
       # client matrix is handed the same pair.
@@ -213,43 +188,42 @@ jobs:
           name: gateway-acceptance-tools
           path: tools
 
-      # Records `ready`, or what the process said when it exited, in lane/startup.txt. `ready`
-      # also needs the server's own `server_starting` log event to name the requested stack
-      # (its `s3_stack` field comes from rustfs/rustfs#9367; scripts/dual_stack.py reads it).
-      - name: Start candidate (${{ matrix.stack }} stack)
-        run: |
+      - name: Start conformance candidate
+        env:
+          # The corpus declares both virtual-host endpoints and a 2 MiB HTTP/2 connection window.
+          ENDPOINT: ${{ env.CONFORMANCE_ENDPOINT }}
+          HOST_DIR: lane
+          RUSTFS_H2_INITIAL_CONN_WINDOW_SIZE: "2097152"
+          RUSTFS_CONSOLE_ENABLE: "false"
+          RUSTFS_SERVER_DOMAINS: s3.example.com,s3.us-east-1.example.com
+        run: &start-candidate |
           set -uo pipefail
           chmod +x target/debug/rustfs tools/*
-          mkdir -p lane "$RUNNER_TEMP"/data/rustfs{0..3}
-          target/debug/rustfs --version | tee lane/candidate-version.txt
+          mkdir -p "$HOST_DIR" "$RUNNER_TEMP/$HOST_DIR"/data/rustfs{0..3}
+          target/debug/rustfs --version | tee "$HOST_DIR/candidate-version.txt"
           # The four directories share the runner's one disk; the bypass is the CI case the
           # physical-disk guard sanctions (as in mint.yml).
-          RUSTFS_S3_STACK="$STACK" RUSTFS_UNSAFE_BYPASS_DISK_CHECK=true RUST_LOG=info target/debug/rustfs --address 127.0.0.1:9000 \
-            --access-key "$ACCESS_KEY" --secret-key "$SECRET_KEY" "$RUNNER_TEMP"/data/rustfs{0..3} \
-            > lane/rustfs.log 2>&1 &
+          RUSTFS_UNSAFE_BYPASS_DISK_CHECK=true RUST_LOG=info target/debug/rustfs --address "${ENDPOINT#http://}" \
+            --access-key "$ACCESS_KEY" --secret-key "$SECRET_KEY" "$RUNNER_TEMP/$HOST_DIR"/data/rustfs{0..3} \
+            > "$HOST_DIR/rustfs.log" 2>&1 &
           pid=$!
-          echo "$pid" > lane/rustfs.pid
+          echo "$pid" > "$HOST_DIR/rustfs.pid"
           # Liveness first: a ready answer counts only while this process is still running.
           for _ in $(seq 120); do
             if ! kill -0 "$pid" 2>/dev/null; then
               status=0
               wait "$pid" || status=$?
-              echo "did not start: exit ${status}: $(grep -v '^[[:space:]]*$' lane/rustfs.log | tail -n 1)" > lane/startup.txt
-              cat lane/startup.txt
+              echo "did not start: exit ${status}: $(grep -v '^[[:space:]]*$' "$HOST_DIR/rustfs.log" | tail -n 1)" > "$HOST_DIR/startup.txt"
+              cat "$HOST_DIR/startup.txt"
               exit 1
             fi
             if curl -sf "$ENDPOINT/health/ready" >/dev/null; then
-              if python3 scripts/dual_stack.py stack --expect "$STACK" --out lane/stack.json lane/rustfs.log > /dev/null; then
-                echo ready > lane/startup.txt
-                exit 0
-              fi
-              echo "did not start: stack not observed" > lane/startup.txt
-              cat lane/startup.txt
-              exit 1
+              echo ready > "$HOST_DIR/startup.txt"
+              exit 0
             fi
             sleep 1
           done
-          echo "did not start: /health/ready did not answer within 120 seconds" > lane/startup.txt
+          echo "did not start: /health/ready did not answer within 120 seconds" > "$HOST_DIR/startup.txt"
           exit 1
 
       # The exit code is data for the judge step, not this step's result.
@@ -257,10 +231,11 @@ jobs:
         run: |
           set +e
           tools/rustfs-gateway-conformance run --root gateway/conformance --profile rustfs \
-            --endpoint "$ENDPOINT" --allow-external-fixtures \
+            --endpoint "$CONFORMANCE_ENDPOINT" --allow-external-fixtures \
             --json lane/report.json > lane/conformance.log 2>&1
           echo "$?" > lane/runner-exit.txt
           if kill -0 "$(cat lane/rustfs.pid)" 2>/dev/null; then echo alive; else echo exited; fi > lane/alive-after-conformance.txt
+          kill "$(cat lane/rustfs.pid)" 2>/dev/null || true
           tail -n 20 lane/conformance.log
 
       - name: Set up Python
@@ -315,6 +290,11 @@ jobs:
           echo "COMPAT_CLIENTS=$(IFS=,; echo "${installed[*]}")" >> "$GITHUB_ENV"
           cat ../lane/skipped-clients.txt 2>/dev/null || echo "every pinned client installed"
 
+      - name: Start client matrix candidate with default protocol settings
+        env:
+          HOST_DIR: lane/matrix-host
+        run: *start-candidate
+
       # The exit code is data for the judge step, not this step's result.
       - name: Run client matrix (external)
         working-directory: gateway
@@ -338,21 +318,22 @@ jobs:
         run: |
           set -uo pipefail
           status=0
-          python3 scripts/check_conformance_rulings.py --stack "$STACK" --run-dir lane | tee -a "$GITHUB_STEP_SUMMARY" || status=1
-          python3 scripts/compat_matrix_report.py check --stack "$STACK" --run-dir lane | tee -a "$GITHUB_STEP_SUMMARY" || status=1
+          python3 scripts/check_conformance_rulings.py --run-dir lane --case-dir gateway/conformance/cases | tee -a "$GITHUB_STEP_SUMMARY" || status=1
+          python3 scripts/compat_matrix_report.py check --run-dir lane --server-dir lane/matrix-host | tee -a "$GITHUB_STEP_SUMMARY" || status=1
           exit "$status"
 
       - name: Upload lane results
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: gateway-acceptance-lane-${{ matrix.stack }}
+          name: gateway-acceptance-lane
           overwrite: true
           path: |
             lane/*.txt
             lane/*.log
+            lane/matrix-host/*.txt
+            lane/matrix-host/*.log
             lane/report.json
-            lane/stack.json
             lane/compat/matrix.json
             lane/compat/probe.jsonl
             lane/compat/sut.log
@@ -360,36 +341,119 @@ jobs:
           if-no-files-found: error
           retention-days: 14
 
-  compare:
-    name: Compare stacks (report-only until T2.10)
-    needs: [ acceptance ]
-    if: always()
+  capture-corpus:
+    name: Capture wire samples (selected E2E and Ceph tests)
+    needs: [ plan, build-gateway-tools ]
     runs-on: ubuntu-latest
-    timeout-minutes: 10
-    continue-on-error: true
+    timeout-minutes: 120
     steps:
       - name: Checkout repository
         uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7
         with:
           persist-credentials: false
 
-      - name: Download lane results
+      - name: Setup Rust environment
+        uses: ./.github/actions/setup
+        with:
+          # Reuse the hosted server and e2e harness dependencies. Capture jobs never save caches.
+          cache-shared-key: ci-e2e-distributed-hosted
+          cache-save-if: 'false'
+          install-build-packaging-tools: 'false'
+
+      # Keep external source and tools outside the verified server's source inventory.
+      - name: Checkout gateway's independent secret scanner
+        uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7
+        with:
+          repository: rustfs/gateway
+          ref: ${{ needs.plan.outputs.gateway-rev }}
+          path: target/wire/gateway
+          persist-credentials: false
+
+      - name: Checkout pinned Ceph tests
+        uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7
+        with:
+          repository: ceph/s3-tests
+          ref: ${{ needs.plan.outputs.ceph-rev }}
+          path: target/wire/ceph
+          persist-credentials: false
+
+      - name: Download matching corpus tools
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
-          pattern: gateway-acceptance-lane-*
-          path: lanes
+          name: gateway-acceptance-tools
+          path: target/wire/tools
 
-      - name: Diff legacy and gateway
+      - name: Install Ceph's test dependencies
         run: |
-          set -uo pipefail
-          status=0
-          {
-            python3 scripts/check_conformance_rulings.py \
-              --diff lanes/gateway-acceptance-lane-legacy lanes/gateway-acceptance-lane-gateway || status=1
-            echo
-            python3 scripts/compat_matrix_report.py diff \
-              --legacy lanes/gateway-acceptance-lane-legacy --gateway lanes/gateway-acceptance-lane-gateway || status=1
-          } > diff.md
-          cat diff.md
-          cat diff.md >> "$GITHUB_STEP_SUMMARY"
-          exit "$status"
+          python3 -m venv "$RUNNER_TEMP/ceph-venv"
+          "$RUNNER_TEMP/ceph-venv/bin/python" -m pip install -r target/wire/ceph/requirements.txt
+
+      - name: Build the debug-only recording server
+        id: wire_server
+        run: python3 scripts/e2e_binary.py build --features corpus-record
+
+      - name: Record and verify selected scenarios from both sources
+        id: capture
+        run: |
+          chmod +x target/wire/tools/corpus
+          python3 scripts/e2e_binary.py run --features corpus-record -- \
+            "$RUNNER_TEMP/ceph-venv/bin/python" scripts/gateway_corpus_capture.py record --suite nightly \
+            --gateway target/wire/gateway --ceph target/wire/ceph --tool target/wire/tools/corpus \
+            --summary "$RUNNER_TEMP/gateway-capture-summary.json"
+
+      - name: Require 1000–2000 retained entries
+        run: python3 scripts/gateway_corpus_capture.py check-size "$RUNNER_TEMP/gateway-capture-summary.json"
+
+      # Only publish after the enclosing binary verifier also succeeds. A size shortfall still has valid counts.
+      - name: Upload validated counts
+        if: ${{ !cancelled() && steps.capture.outcome == 'success' }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: gateway-capture-summary
+          path: ${{ runner.temp }}/gateway-capture-summary.json
+          if-no-files-found: error
+          retention-days: 14
+
+      # The capture size and release parity are independent verdicts.
+      - name: Fetch the verified release reference
+        id: wire_reference
+        if: ${{ !cancelled() && steps.wire_server.outcome == 'success' }}
+        uses: ./.github/actions/reference-binary
+
+      - name: Install a child-process clock for the wire comparison
+        id: wire_clock
+        if: ${{ !cancelled() && steps.wire_reference.outcome == 'success' }}
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install --no-install-recommends -y libfaketime
+          lib="$(dpkg-query -L libfaketime | sed -n '/\/libfaketime\.so\.1$/p')"
+          test -f "$lib"
+          echo "path=$lib" >> "$GITHUB_OUTPUT"
+
+      - name: Compare the same signed Ceph requests against the release
+        id: wire_compare
+        if: ${{ !cancelled() && steps.wire_clock.outcome == 'success' }}
+        env:
+          REF_BINARY: ${{ steps.wire_reference.outputs.path }}
+          REF_SHA256: ${{ steps.wire_reference.outputs.executable-sha256 }}
+          REF_VERSION: ${{ steps.wire_reference.outputs.version }}
+          CLOCK_LIBRARY: ${{ steps.wire_clock.outputs.path }}
+        run: |
+          python3 scripts/e2e_binary.py run --features corpus-record -- \
+            "$RUNNER_TEMP/ceph-venv/bin/python" scripts/gateway_wire_replay.py compare \
+            --ceph target/wire/ceph --gateway target/wire/gateway --reference "$REF_BINARY" \
+            --reference-sha256 "$REF_SHA256" --reference-version "$REF_VERSION" --clock-library "$CLOCK_LIBRARY" \
+            --summary "$RUNNER_TEMP/gateway-wire-differences.json"
+
+      - name: Require zero response differences on replayed cases
+        if: ${{ !cancelled() && steps.wire_compare.outcome == 'success' }}
+        run: python3 scripts/gateway_wire_replay.py check "$RUNNER_TEMP/gateway-wire-differences.json"
+
+      - name: Upload validated difference counts and case IDs
+        if: ${{ !cancelled() && steps.wire_compare.outcome == 'success' }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: gateway-wire-differences
+          path: ${{ runner.temp }}/gateway-wire-differences.json
+          if-no-files-found: error
+          retention-days: 14

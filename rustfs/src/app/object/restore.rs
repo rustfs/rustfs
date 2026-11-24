@@ -540,11 +540,46 @@ fn restore_output() -> RestoreObjectOutput {
 }
 
 #[cfg(test)]
+impl DefaultObjectUsecase {
+    /// Projects a legacy RestoreObject request onto the shared restore path.
+    pub async fn execute_restore_object(
+        &self,
+        req: crate::app::storage_api::s3::S3Request<crate::app::storage_api::s3::dto::RestoreObjectInput>,
+    ) -> crate::app::storage_api::s3::S3Result<
+        crate::app::storage_api::s3::S3Response<crate::app::storage_api::s3::dto::RestoreObjectOutput>,
+    > {
+        use crate::app::storage_api::object_usecase::bucket::restore_request_from_wire;
+        use crate::app::storage_api::s3::{
+            S3Response,
+            dto::{RequestCharged, RestoreObjectOutput},
+        };
+        let envelope = RequestEnvelope::from_s3s(&req);
+        let input = req.input;
+        self.execute_restore_object_owned(
+            envelope,
+            input.bucket,
+            input.key,
+            input.version_id,
+            input.restore_request.map(restore_request_from_wire),
+        )
+        .await
+        .map(|output| {
+            S3Response::new(RestoreObjectOutput {
+                request_charged: output
+                    .request_charged
+                    .map(|value| RequestCharged::from(value.as_str().to_owned())),
+                restore_output_path: output.restore_output_path,
+            })
+        })
+        .map_err(crate::error::legacy_error_for_test)
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
-    use http::Method;
-    use s3s::S3ErrorCode;
-    use s3s::dto::{RestoreObjectInput, RestoreRequest};
+    use crate::app::RequestHead;
+    use http::{Extensions, HeaderMap, Method, Uri};
 
     fn ongoing_metadata(operation_id: Uuid) -> HashMap<String, String> {
         let mut metadata = HashMap::new();
@@ -676,28 +711,31 @@ mod tests {
         }
     }
 
-    fn restore_input(bucket: &str, key: &str, rreq: RestoreRequest) -> RestoreObjectInput {
-        RestoreObjectInput::builder()
-            .bucket(bucket.to_string())
-            .key(key.to_string())
-            .restore_request(Some(rreq))
-            .build()
-            .expect("restore input should build")
+    /// The same head `build_request` plus `RequestEnvelope::from_s3s` produces:
+    /// POST `/`, empty headers, and no attached payloads.
+    fn restore_envelope() -> RequestEnvelope {
+        RequestEnvelope::from_parts(
+            RequestHead {
+                method: Method::POST,
+                uri: Uri::from_static("/"),
+                headers: HeaderMap::new(),
+                credentials: None,
+                region: None,
+                service: None,
+            },
+            Extensions::new(),
+        )
     }
 
     /// backlog#2205: a missing restore body is a client error, not a 500.
     #[tokio::test]
     async fn execute_restore_object_rejects_missing_restore_request() {
-        let input = RestoreObjectInput::builder()
-            .bucket("test-bucket".to_string())
-            .key("test-key".to_string())
-            .build()
-            .unwrap();
-
-        let req = build_request(input, Method::POST);
         let usecase = DefaultObjectUsecase::without_context();
 
-        let err = usecase.execute_restore_object(req).await.unwrap_err();
+        let err = usecase
+            .execute_restore_object_owned(restore_envelope(), "test-bucket".to_owned(), "test-key".to_owned(), None, None)
+            .await
+            .unwrap_err();
         assert_eq!(err.code(), &S3ErrorCode::MalformedXML);
     }
 
@@ -709,12 +747,14 @@ mod tests {
     #[tokio::test]
     async fn execute_restore_object_rejects_select_type() {
         let mut rreq = restore_request(None);
-        rreq.type_ = Some(s3s::dto::RestoreRequestType::from_static(s3s::dto::RestoreRequestType::SELECT));
+        rreq.type_ = Some("SELECT".to_owned());
 
-        let req = build_request(restore_input("test-bucket", "test-key", rreq), Method::POST);
         let usecase = DefaultObjectUsecase::without_context();
 
-        let err = usecase.execute_restore_object(req).await.unwrap_err();
+        let err = usecase
+            .execute_restore_object_owned(restore_envelope(), "test-bucket".to_owned(), "test-key".to_owned(), None, Some(rreq))
+            .await
+            .unwrap_err();
         assert_eq!(err.code(), &S3ErrorCode::NotImplemented);
     }
 
@@ -746,30 +786,40 @@ mod tests {
         // An illegal `Days` is a client error, rejected before any lock or
         // object read.
         let err = usecase
-            .execute_restore_object(build_request(
-                restore_input(&bucket, "local-object", restore_request(Some(0))),
-                Method::POST,
-            ))
+            .execute_restore_object_owned(
+                restore_envelope(),
+                bucket.clone(),
+                "local-object".to_owned(),
+                None,
+                Some(restore_request(Some(0))),
+            )
             .await
             .expect_err("days=0 must be rejected");
         assert_eq!(err.code(), &S3ErrorCode::InvalidRequest);
 
         // A malformed version-id keeps InvalidArgument instead of being
         // flattened inside `post_restore_opts`.
-        let mut input = restore_input(&bucket, "local-object", restore_request(Some(1)));
-        input.version_id = Some("not-a-uuid".to_string());
         let err = usecase
-            .execute_restore_object(build_request(input, Method::POST))
+            .execute_restore_object_owned(
+                restore_envelope(),
+                bucket.clone(),
+                "local-object".to_owned(),
+                Some("not-a-uuid".to_owned()),
+                Some(restore_request(Some(1))),
+            )
             .await
             .expect_err("malformed version-id must be rejected");
         assert_eq!(err.code(), &S3ErrorCode::InvalidArgument);
 
         // A missing key stays NoSuchKey.
         let err = usecase
-            .execute_restore_object(build_request(
-                restore_input(&bucket, "missing-object", restore_request(Some(1))),
-                Method::POST,
-            ))
+            .execute_restore_object_owned(
+                restore_envelope(),
+                bucket.clone(),
+                "missing-object".to_owned(),
+                None,
+                Some(restore_request(Some(1))),
+            )
             .await
             .expect_err("missing key must be rejected");
         assert_eq!(err.code(), &S3ErrorCode::NoSuchKey);
@@ -777,10 +827,13 @@ mod tests {
         // Restoring an object that was never transitioned is the S3
         // InvalidObjectState case, not an internal error.
         let err = usecase
-            .execute_restore_object(build_request(
-                restore_input(&bucket, "local-object", restore_request(Some(1))),
-                Method::POST,
-            ))
+            .execute_restore_object_owned(
+                restore_envelope(),
+                bucket,
+                "local-object".to_owned(),
+                None,
+                Some(restore_request(Some(1))),
+            )
             .await
             .expect_err("untransitioned object must be rejected");
         assert_eq!(err.code(), &S3ErrorCode::InvalidObjectState);
@@ -788,26 +841,18 @@ mod tests {
 
     #[tokio::test]
     async fn execute_restore_object_returns_internal_error_when_store_uninitialized() {
-        let restore_request = RestoreRequest {
-            days: Some(1),
-            description: None,
-            glacier_job_parameters: None,
-            output_location: None,
-            select_parameters: None,
-            tier: None,
-            type_: None,
-        };
-        let input = RestoreObjectInput::builder()
-            .bucket("test-bucket".to_string())
-            .key("test-key".to_string())
-            .restore_request(Some(restore_request))
-            .build()
-            .unwrap();
-
-        let req = build_request(input, Method::POST);
         let usecase = DefaultObjectUsecase::without_context();
 
-        let err = usecase.execute_restore_object(req).await.unwrap_err();
+        let err = usecase
+            .execute_restore_object_owned(
+                restore_envelope(),
+                "test-bucket".to_owned(),
+                "test-key".to_owned(),
+                None,
+                Some(restore_request(Some(1))),
+            )
+            .await
+            .unwrap_err();
         assert_eq!(err.code(), &S3ErrorCode::InternalError);
     }
 }

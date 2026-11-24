@@ -12,6 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+mod access_request_validation_test;
+
 #[cfg(test)]
 mod storage_metric_ownership_test;
 
@@ -31,11 +33,14 @@ pub mod chaos;
 #[cfg(test)]
 pub mod fake_s3_target;
 
-// Dual-stack differential (rustfs/backlog#2740): one binary, two processes on
-// different RUSTFS_S3_STACK values, the same SDK script for every S3 operation,
+// Differential (rustfs/backlog#2740): two processes, the binary under test against
+// itself or a released reference binary, the same SDK script for every S3 operation,
 // compared on status, error code, allowlisted headers and typed body fields.
 #[cfg(test)]
 mod dual_stack_differential;
+
+#[cfg(test)]
+mod persistence_parity;
 
 // On-demand migration (backlog#2147): shared two-server environment, admin
 // wrappers, and the harness self-test (backlog#2151). Behavior scenarios are
@@ -101,6 +106,9 @@ mod replication_target_matrix_test;
 // Data usage regression tests
 #[cfg(test)]
 mod data_usage_test;
+
+#[cfg(test)]
+mod scanner_wide_directory_test;
 
 // KMS-specific test modules
 #[cfg(test)]

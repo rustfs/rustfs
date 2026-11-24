@@ -110,13 +110,16 @@ impl ReplicationObjectBridge {
         check_replicate_delete_with_snapshot(object, source, opts, source_error, snapshot)
     }
 
+    /// Admits replication with the bucket identity verified by the originating mutation.
+    /// An absent identity suppresses external notifications; workers never infer one by name.
     pub async fn schedule_object<S: ReplicationStorage>(
         object: ObjectInfo,
         storage: Arc<S>,
         decision: ReplicateDecision,
         op_type: ReplicationType,
+        notification_bucket_incarnation: Option<uuid::Uuid>,
     ) {
-        schedule_replication(object, storage, decision, op_type).await;
+        schedule_replication(object, storage, decision, op_type, notification_bucket_incarnation).await;
     }
 
     pub async fn schedule_delete(delete_object: DeletedObjectReplicationInfo) {
@@ -148,8 +151,16 @@ impl ReplicationObjectBridge {
         }
     }
 
-    pub async fn schedule_storage_delete(delete_object: DeletedObject, bucket: String, event_type: String) {
+    /// Schedules a committed delete with its originating bucket identity for notifications.
+    /// An absent identity leaves external notifications unbound.
+    pub async fn schedule_storage_delete(
+        delete_object: DeletedObject,
+        bucket: String,
+        event_type: String,
+        notification_bucket_incarnation: Option<uuid::Uuid>,
+    ) {
         Self::schedule_delete(DeletedObjectReplicationInfo {
+            notification_bucket_incarnation,
             delete_object: deleted_object_for_replication(delete_object),
             bucket,
             event_type,
@@ -158,10 +169,18 @@ impl ReplicationObjectBridge {
         .await;
     }
 
-    pub async fn schedule_storage_deletes(delete_objects: Vec<DeletedObject>, bucket: String, event_type: String) {
+    /// Schedules committed deletes from one bucket instance, retaining that notification identity.
+    /// An absent identity leaves external notifications unbound.
+    pub async fn schedule_storage_deletes(
+        delete_objects: Vec<DeletedObject>,
+        bucket: String,
+        event_type: String,
+        notification_bucket_incarnation: Option<uuid::Uuid>,
+    ) {
         let delete_objects = delete_objects
             .into_iter()
             .map(|delete_object| DeletedObjectReplicationInfo {
+                notification_bucket_incarnation,
                 delete_object: deleted_object_for_replication(delete_object),
                 bucket: bucket.clone(),
                 event_type: event_type.clone(),
