@@ -204,6 +204,13 @@ async fn create_bucket_answers_as_before(server: RustFSServer) {
             .set_create_bucket_configuration(configuration)
             .send()
             .await;
+        if let Ok(output) = &created {
+            let expected = match bucket {
+                "create-fresh" => Some("/create-fresh"),
+                _ => None, // Accepted historical bucket names keep their measured response.
+            };
+            assert_eq!(output.location(), expected, "{bucket}");
+        }
         let refused = outcome(created).err().map(|refusal| (refusal.code, refusal.status));
         let exists = super::bucket_exists_in_the_store(bucket).await;
         observed.push((bucket, location, refused, exists));

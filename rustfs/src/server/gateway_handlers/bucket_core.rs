@@ -91,9 +91,23 @@ impl Served for dto::CreateBucket {
     }
 
     async fn execute(context: Option<Arc<AppContext>>, envelope: RequestEnvelope, request: Req<Self>) -> S3Result<Resp<Self>> {
-        let output = DefaultBucketUsecase::with_context(context)
-            .execute_create_bucket(envelope, request.into_input())
+        let input = request.into_input();
+        let served_in_default_region = context.as_ref().is_some_and(|context| {
+            context
+                .region()
+                .get()
+                .is_none_or(|region| region.as_str() == rustfs_config::RUSTFS_REGION)
+        });
+        // RustFS also accepts historical names and additional location constraints.
+        // Only ordinary buckets in us-east-1 have a documented path-only Location.
+        let location = (served_in_default_region
+            && requested_location_constraint(&input).is_none_or(|region| region == rustfs_config::RUSTFS_REGION)
+            && rustfs_gateway_types::validate_bucket_name(input.bucket.as_str()).is_ok())
+        .then(|| format!("/{}", input.bucket.as_str()));
+        let mut output = DefaultBucketUsecase::with_context(context)
+            .execute_create_bucket(envelope, input)
             .await?;
+        output.location = output.location.or(location);
         Ok(Resp::new(output))
     }
 }
