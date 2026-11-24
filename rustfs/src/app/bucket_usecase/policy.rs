@@ -184,12 +184,15 @@ impl DefaultBucketUsecase {
                 .await
                 .map_err(ApiError::from)?;
 
-            let cfg: BucketPolicy =
-                serde_json::from_str(policy).map_err(|e| s3_error!(InvalidArgument, "parse policy failed {:?}", e))?;
+            let cfg: BucketPolicy = serde_json::from_str(policy).map_err(|_| s3_error!(MalformedPolicy))?;
 
             if cfg.is_valid().is_err() {
                 return Err(s3_error!(MalformedPolicy));
             }
+
+            let replication_policy = serde_json::from_str(policy)
+                .map(serde_json::Value::Object)
+                .map_err(|_| s3_error!(MalformedPolicy))?;
 
             let is_public_policy = cfg
                 .statements
@@ -228,8 +231,7 @@ impl DefaultBucketUsecase {
             notify_bucket_metadata_reload(bucket.to_owned(), "put bucket policy", request_context, false).await;
 
             let mut item = sr_bucket_meta_item(bucket.to_owned(), "policy");
-            item.policy =
-                Some(serde_json::from_str(policy).map_err(|e| s3_error!(InvalidArgument, "parse policy failed {:?}", e))?);
+            item.policy = Some(replication_policy);
             if let Err(err) = site_replication_bucket_meta_hook(item).await {
                 warn!(bucket = %bucket, error = ?err, "site replication bucket policy hook failed");
             }
