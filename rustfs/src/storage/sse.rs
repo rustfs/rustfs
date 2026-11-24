@@ -843,7 +843,6 @@ pub struct EncryptionMaterial {
 pub struct DecryptionMaterial {
     #[allow(unused)]
     pub sse_type: SSEType,
-    pub server_side_encryption: ServerSideEncryption,
     pub kms_key_id: Option<SSEKMSKeyId>,
     #[allow(unused)]
     pub algorithm: SSECustomerAlgorithm,
@@ -2812,7 +2811,6 @@ async fn apply_ssec_decryption_material(
 
     Ok(DecryptionMaterial {
         sse_type: SSEType::SseC,
-        server_side_encryption: ServerSideEncryption::from_static(ServerSideEncryption::AES256), // const
         kms_key_id: None,
         algorithm: SSECustomerAlgorithm::from(algorithm),
 
@@ -3292,11 +3290,6 @@ async fn apply_managed_decryption_material_inner(
 
     Ok(Some(DecryptionMaterial {
         sse_type: encryption_type,
-        // Synthesized from the resolved scheme rather than read back from
-        // metadata: a MinIO-written object has no stored scheme header, which is
-        // exactly why the gate above had to infer it. MinIO synthesizes the same
-        // header onto its own responses.
-        server_side_encryption: ServerSideEncryption::from(managed_sse_public_header(encryption_type).to_string()),
         kms_key_id: Some(SSEKMSKeyId::from(kms_key_id)),
         algorithm,
         customer_key_md5: None,
@@ -9346,7 +9339,10 @@ pub(crate) mod tests {
         .expect("classification should succeed without a dek provider")
         .expect("managed metadata must classify as encrypted");
 
-        assert_eq!(headers.server_side_encryption, unwrapped.server_side_encryption);
+        assert_eq!(
+            headers.server_side_encryption.as_str(),
+            crate::storage::sse::managed_sse_public_header(unwrapped.sse_type)
+        );
         assert_eq!(headers.ssekms_key_id, unwrapped.kms_key_id);
         assert_eq!(headers.sse_customer_algorithm, None);
         assert_eq!(headers.sse_customer_key_md5, None);
