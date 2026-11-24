@@ -63,6 +63,15 @@ class CaptureGateTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             capture.check_listing(listing, ["a", "b"])
 
+    def test_virtual_run_requires_a_bucket_in_the_recorded_host(self):
+        path = self.temp / "requests.jsonl"
+        for host in ["127.0.0.1:9000", "s3.localhost:9000", "bucket.s3.localhost.example"]:
+            path.write_text(json.dumps({"headers": [["Host", host]]}) + "\n")
+            with self.subTest(host=host), self.assertRaises(ValueError):
+                capture.check_virtual_capture(self.temp)
+        path.write_text(json.dumps({"headers": [["host", "bucket.s3.localhost:9000"]]}) + "\n")
+        capture.check_virtual_capture(self.temp)
+
     def test_missing_or_unexpected_source(self):
         path = self.temp / "raw.jsonl"
         sources = {"s3-tests@fixture", "rustfs-e2e@fixture"}

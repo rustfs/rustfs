@@ -33,6 +33,7 @@ from urllib.request import ProxyHandler, build_opener
 
 MINIMUM_ENTRIES = 1000
 MAXIMUM_ENTRIES = 2000
+CEPH_VIRTUAL_HOST = "s3.localhost"
 
 
 def select_tests(scope):
@@ -77,10 +78,10 @@ def revision(path):
     return subprocess.check_output(["git", "-C", path, "rev-parse", "HEAD"], text=True).strip()
 
 
-def ceph_config(temp, port, secret):
+def ceph_config(temp, port, secret, host="127.0.0.1"):
     config = Path(".github/s3tests/s3tests.conf").read_text()
     for key, value in {
-        "S3_HOST": "127.0.0.1", "S3_PORT": str(port), "S3_ACCESS_KEY": "rustfsadmin-ci", "S3_SECRET_KEY": secret,
+        "S3_HOST": host, "S3_PORT": str(port), "S3_ACCESS_KEY": "rustfsadmin-ci", "S3_SECRET_KEY": secret,
         "S3_ALT_ACCESS_KEY": "rustfsalt", "S3_ALT_SECRET_KEY": secrets.token_urlsafe(36),
     }.items():
         config = config.replace("${" + key + "}", value)
@@ -127,31 +128,58 @@ def ceph_server(binary, temp, env, secret):
                 srv.wait()
 
 
-def run_ceph(checkout, temp, env, tests):
+def run_ceph(checkout, temp, env, tests, *, virtual_host=False):
     """Run the implemented upstream tests on a fresh single-node fixture."""
     implemented = set(Path("scripts/s3-tests/implemented_tests.txt").read_text().splitlines())
     if not set(tests) <= implemented:
         raise ValueError("Selected Ceph tests are missing from the implemented manifest")
+    host = CEPH_VIRTUAL_HOST if virtual_host else "127.0.0.1"
+    if virtual_host:
+        temp.mkdir(exist_ok=True)
+        sdk_config = temp / "aws-config"
+        sdk_config.write_text("[default]\ns3 =\n    addressing_style = virtual\n")
+        env = dict(env, AWS_CONFIG_FILE=str(sdk_config), AWS_PROFILE="default",
+                   RUSTFS_SERVER_DOMAINS=host, NO_PROXY="*", no_proxy="*")
     secret = secrets.token_urlsafe(36)
     with ceph_server(env["CARGO_BIN_EXE_rustfs"], temp, env, secret) as port:
-        conf_file = ceph_config(temp, port, secret)
+        conf_file = ceph_config(temp, port, secret, host)
         with (temp / "ceph-tests.log").open("w") as log:
             # Use upstream's own assertions. Each test owns its bucket in this disposable store.
             command = [sys.executable, "-c", """
+import socket
 import sys
 from s3tests import functional
 from s3tests.functional import test_s3
+host = sys.argv[1]
+if host.endswith(".localhost"):
+    # Keep SDK addressing and signing intact even on runners without wildcard localhost DNS.
+    resolve = socket.getaddrinfo
+    def local_lookup(name, *args, **kwargs):
+        if isinstance(name, str) and (name == host or name.endswith("." + host)):
+            name = "127.0.0.1"
+        return resolve(name, *args, **kwargs)
+    socket.getaddrinfo = local_lookup
 functional.configure()
-for test in sys.argv[1:]:
+for test in sys.argv[2:]:
     print("Running " + test, flush=True)
     getattr(test_s3, test)()
-""", *tests]
+""", host, *tests]
             result = subprocess.run(command, cwd=checkout, env=dict(env, S3TEST_CONF=str(conf_file)),
                                     stdout=log, stderr=log)
             if result.returncode:
                 lines = (temp / "ceph-tests.log").read_text(errors="replace").splitlines()
                 started = [line[8:] for line in lines if line.startswith("Running ") and line[8:] in tests]
                 raise RuntimeError(f"Ceph testing failed in {started[-1] if started else 'setup'}")
+
+
+def check_virtual_capture(directory):
+    for path in directory.glob("*.jsonl"):
+        with path.open() as entries:
+            for line in entries:
+                if any(name.lower() == "host" and value.partition(":")[0].endswith("." + CEPH_VIRTUAL_HOST)
+                       for name, value in json.loads(line)["headers"]):
+                    return
+    raise ValueError("Ceph did not record a bucket addressed by virtual host")
 
 
 def count_entries(files, sources):
@@ -200,9 +228,18 @@ def collect(args, temp):
                     failed.add(fields[-1])
             raise RuntimeError(f"nextest exited {result.returncode}, failed cases {sorted(failed)}")
     print(f"Recording {len(tests['ceph'])} implemented Ceph tests ({args.suite})", flush=True)
-    run_ceph(args.ceph, temp, dict(env, RUSTFS_CORPUS_RECORD_SRC=ceph_source), tests["ceph"])
+    ceph_env = dict(env, RUSTFS_CORPUS_RECORD_SRC=ceph_source)
+    run_ceph(args.ceph, temp, ceph_env, tests["ceph"])
+    styles = ["path"]
+    if args.suite == "nightly":
+        virtual_raw = raw / "virtual"
+        virtual_raw.mkdir(mode=0o700)
+        run_ceph(args.ceph, temp / "ceph-virtual", dict(ceph_env, RUSTFS_CORPUS_DIR=str(virtual_raw)),
+                 tests["ceph"], virtual_host=True)
+        check_virtual_capture(virtual_raw)
+        styles.append("virtual")
     report = verify_capture(temp, args, {e2e_source, ceph_source})
-    report.update(selection=args.suite, e2e_profile="e2e-full", selected_tests=tests)
+    report.update(selection=args.suite, e2e_profile="e2e-full", selected_tests=tests, ceph_addressing_styles=styles)
     # The enclosing e2e_binary.py run verifies this identity before and after capture.
     identity = json.loads(Path(env["CARGO_BIN_EXE_rustfs"] + ".e2e.json").read_text())
     report.update(gateway_revision=gateway_rev, server_sha256=identity["binary_sha256"])
@@ -216,7 +253,7 @@ def scan(gateway, root):
 
 def verify_capture(temp, args, sources):
     raw = temp / "raw" / "corpus"
-    files = sorted(raw.glob("*.jsonl"))
+    files = sorted(raw.rglob("*.jsonl"))
     dest = temp / "checked" / "corpus"
     dest.parent.mkdir()
     scan(args.gateway, raw.parent)
