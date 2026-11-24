@@ -23,6 +23,8 @@ pub(crate) mod gateway_stack;
 mod gateway_stack;
 mod health;
 mod http;
+#[cfg(test)]
+pub(crate) use http::{IAMAuth, iam_lookup_error_to_s3_error, legacy_s3_code_name};
 mod hybrid;
 mod layer;
 mod legacy_compat;
