@@ -32,6 +32,37 @@ class CaptureGateTests(unittest.TestCase):
         self.summary = self.temp / "summary.json"
         self.args = ["record", "--ceph", ".", "--gateway", ".", "--tool", "./corpus", "--summary", str(self.summary)]
 
+    def test_smoke_and_nightly_selections(self):
+        smoke = capture.select_tests("smoke")
+        nightly = capture.select_tests("nightly")
+        for suite in ("ceph", "e2e"):
+            self.assertLess(set(smoke[suite]), set(nightly[suite]))
+        manifest = Path(capture.__file__).resolve().parent / "s3-tests/implemented_tests.txt"
+        self.assertLessEqual(set(nightly["ceph"]), set(manifest.read_text().splitlines()))
+        self.assertIn("test_multipart_upload_contents", smoke["ceph"])
+        self.assertIn("test_object_copy_versioned_bucket", nightly["ceph"])
+        self.assertTrue(any("copy_object_metadata_test" in name for name in nightly["e2e"]))
+
+    def test_default_nightly_and_explicit_capture_modes(self):
+        for extra, expected in [([], "nightly"), (["--suite", "nightly"], "nightly"), (["--suite", "smoke"], "smoke")]:
+            with self.subTest(args=extra), patch.object(capture, "collect", return_value={}) as collect, patch.object(capture, "scan"):
+                self.assertEqual(capture.main(self.args + extra), 0)
+                self.assertEqual(collect.call_args.args[0].suite, expected)
+
+    def test_nextest_discovery_requires_each_selected_case(self):
+        cases = {"a": {"ignored": False, "filter-match": {"status": "matches"}},
+                 "b": {"ignored": False, "filter-match": {"status": "matches"}}}
+        listing = {"rust-suites": {"e2e_test": {"testcases": cases}}}
+        capture.check_listing(listing, ["a", "b"])
+        for field, value in [("ignored", True), ("filter-match", {"status": "mismatch"})]:
+            with self.subTest(field=field), patch.dict(cases["b"], {field: value}), self.assertRaises(ValueError):
+                capture.check_listing(listing, ["a", "b"])
+        with self.assertRaises(ValueError):
+            capture.check_listing(listing, ["a"])
+        listing["rust-suites"]["other"] = {"testcases": {"a": cases["a"]}}
+        with self.assertRaises(ValueError):
+            capture.check_listing(listing, ["a", "b"])
+
     def test_missing_or_unexpected_source(self):
         path = self.temp / "raw.jsonl"
         sources = {"s3-tests@fixture", "rustfs-e2e@fixture"}
@@ -48,6 +79,13 @@ class CaptureGateTests(unittest.TestCase):
         failure = subprocess.CalledProcessError(2, ["scan"])
         with patch.object(capture, "collect", side_effect=failure), self.assertRaises(subprocess.CalledProcessError):
             capture.main(self.args)
+        self.assertFalse(self.summary.exists())
+
+    def test_report_scan_failure_blocks_the_artifact(self):
+        failure = subprocess.CalledProcessError(1, ["scan"])
+        with patch.object(capture, "collect", return_value={}), patch.object(capture, "scan", side_effect=failure):
+            with self.assertRaises(subprocess.CalledProcessError):
+                capture.main(self.args)
         self.assertFalse(self.summary.exists())
 
     def test_each_validation_failure_stops_before_publication(self):
@@ -82,10 +120,10 @@ class CaptureGateTests(unittest.TestCase):
             rows = [{"src": src, "sut": "rustfs-server"} for src in sorted(sources)]
             path.write_text("".join(json.dumps(rows[index % 2]) + "\n" for index in range(count)))
 
-        for retained, status in [(999, 1), (1000, 0)]:
+        for retained, status in [(999, 1), (1000, 0), (2000, 0), (2001, 1)]:
             with self.subTest(retained=retained):
                 def fake_collect(args, temp):
-                    write_entries(temp / "raw/corpus/raw.jsonl", 1500)
+                    write_entries(temp / "raw/corpus/raw.jsonl", 2400)
                     calls = []
 
                     def tool(command, **kwargs):
@@ -103,12 +141,14 @@ class CaptureGateTests(unittest.TestCase):
                     self.assertEqual(calls, ["raw", "ingest", "verify", "checked"])
                     return result
 
-                with patch.object(capture, "collect", side_effect=fake_collect):
+                with patch.object(capture, "collect", side_effect=fake_collect), patch.object(capture.subprocess, "run") as report_scan:
                     self.assertEqual(capture.main(self.args), 0)
+                    self.assertEqual(report_scan.call_count, 1)
+                    self.assertEqual(Path(report_scan.call_args.kwargs["env"]["GATEWAY_CHECK_ROOT"]).name, "report")
                 self.assertEqual(capture.main(["check-size", str(self.summary)]), status)
                 report = json.loads(self.summary.read_text())
                 self.assertEqual(report["retained_total"], retained)
-                self.assertEqual(sum(report["raw_counts"].values()), 1500)
+                self.assertEqual(sum(report["raw_counts"].values()), 2400)
                 self.assertFalse(report["full_suite_coverage"])
                 self.assertEqual(report["official_reference_replay"], "not run")
 

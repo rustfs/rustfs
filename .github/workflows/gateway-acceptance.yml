@@ -381,11 +381,11 @@ jobs:
         run: |
           chmod +x target/wire/tools/corpus
           python3 scripts/e2e_binary.py run --features corpus-record -- \
-            "$RUNNER_TEMP/ceph-venv/bin/python" scripts/gateway_corpus_capture.py record \
+            "$RUNNER_TEMP/ceph-venv/bin/python" scripts/gateway_corpus_capture.py record --suite nightly \
             --gateway target/wire/gateway --ceph target/wire/ceph --tool target/wire/tools/corpus \
             --summary "$RUNNER_TEMP/gateway-capture-summary.json"
 
-      - name: Require 1000 retained entries
+      - name: Require 1000–2000 retained entries
         run: python3 scripts/gateway_corpus_capture.py check-size "$RUNNER_TEMP/gateway-capture-summary.json"
 
       # Only publish after the enclosing binary verifier also succeeds. A size shortfall still has valid counts.
