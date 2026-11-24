@@ -50,15 +50,10 @@ impl DefaultBucketUsecase {
             .await
             .map_err(ApiError::from)?;
 
+        let owner = dto_values::owner();
         Ok(gateway_dto::GetBucketAclOutput {
-            grants: Some(vec![gateway_dto::Grant {
-                grantee: Some(gateway_dto::Grantee {
-                    r#type: Some(gateway_dto::Type::CANONICALUSER),
-                    ..Default::default()
-                }),
-                permission: Some(gateway_dto::Permission::FULL_CONTROL),
-            }]),
-            owner: Some(dto_values::owner()),
+            grants: Some(vec![dto_values::owner_full_control_grant(&owner)]),
+            owner: Some(owner),
         })
     }
 }

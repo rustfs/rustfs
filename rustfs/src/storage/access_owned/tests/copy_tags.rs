@@ -77,6 +77,7 @@ fn copy_write_input(
         tagging_directive: tagging_directive.map(str::to_owned),
         copy_source_if_match: None,
         copy_source_if_none_match: None,
+        copy_source_dates: Default::default(),
         cache_control: None,
         content_disposition: None,
         content_encoding: None,

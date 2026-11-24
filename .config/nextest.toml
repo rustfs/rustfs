@@ -997,6 +997,18 @@ test-group = 'e2e-inline-boundaries'
 filter = 'package(e2e_test) & test(/^heal_erasure_disk_rebuild_test::/)'
 test-group = 'e2e-cluster-nightly'
 
+# macOS can exceed the capability timeout when both startup CAS fixtures first
+# execute their private copies of the debug server at the same time.
+[[profile.e2e-full.overrides]]
+platform = { host = 'cfg(target_os = "macos")' }
+filter = """
+    package(e2e_test) & (
+        test(=distributed_startup_regression_test::tests::test_fresh_four_node_bootstrap_metadata_cas)
+        | test(=distributed_startup_regression_test::tests::test_two_pool_restart_repairs_missing_pool_metadata_via_bootstrap_cas)
+    )
+"""
+test-group = 'e2e-cluster-nightly'
+
 # The multi-pool crash fixture seeds three nodes and 36 drives. Reserve this
 # nextest run's workers so other multi-node tests do not starve its deadline.
 [[profile.e2e-full.overrides]]

@@ -701,9 +701,26 @@ mod tests {
             part.content_length = Some(3);
             // Keep typed request construction separate: each real handler must
             // consult the destination envelope before encryption or commit.
+            let part_request = denied_request(part, authorizer.clone());
+            // Same facts `RequestEnvelope::from_s3s` copies. Credentials, region, and service stay absent.
+            let part_envelope = crate::app::RequestEnvelope::from_parts(
+                crate::app::RequestHead {
+                    method: part_request.method,
+                    uri: part_request.uri,
+                    headers: part_request.headers,
+                    credentials: None,
+                    region: None,
+                    service: None,
+                },
+                part_request.extensions,
+            );
             let error = usecase
-                .execute_upload_part(denied_request(part, authorizer.clone()))
+                .execute_upload_part_with_audit(
+                    part_envelope,
+                    UploadPartWriteInput::from_legacy(part_request.input, part_request.trailing_headers),
+                )
                 .await
+                .map_err(crate::error::legacy_error_for_test)
                 .err()
                 .expect("denied part");
             assert_eq!(error.code(), &S3ErrorCode::AccessDenied);
@@ -738,6 +755,7 @@ mod tests {
                         copy_source_range: None,
                         copy_source_if_match: None,
                         copy_source_if_none_match: None,
+                        copy_source_dates: Default::default(),
                         sse_customer_algorithm: None,
                         sse_customer_key: None,
                         sse_customer_key_md5: None,
@@ -751,7 +769,19 @@ mod tests {
                 .expect("denied destination copy");
             assert_eq!(error.code(), &rustfs_s3_types::S3ErrorCode::AccessDenied);
             let complete = completion_input(&bucket, key, &upload.upload_id, vec![completion_part(1, Some("etag"))]);
-            let envelope = crate::app::RequestEnvelope::from_s3s(&denied_request((), authorizer.clone()));
+            let complete_request = denied_request((), authorizer.clone());
+            // Same facts `RequestEnvelope::from_s3s` copies. Credentials, region, and service stay absent.
+            let envelope = crate::app::RequestEnvelope::from_parts(
+                crate::app::RequestHead {
+                    method: complete_request.method,
+                    uri: complete_request.uri,
+                    headers: complete_request.headers,
+                    credentials: None,
+                    region: None,
+                    service: None,
+                },
+                complete_request.extensions,
+            );
             let error = Box::pin(usecase.execute_complete_multipart_upload(envelope, complete))
                 .await
                 .expect_err("denied completion");
@@ -785,7 +815,19 @@ mod tests {
                 .await
                 .expect("trusted owner completes upload");
             let replay = completion_input(&bucket, key, &upload.upload_id, vec![completion_part(1, Some("guessed-etag"))]);
-            let envelope = crate::app::RequestEnvelope::from_s3s(&denied_request((), authorizer.clone()));
+            let replay_request = denied_request((), authorizer.clone());
+            // Same facts `RequestEnvelope::from_s3s` copies. Credentials, region, and service stay absent.
+            let envelope = crate::app::RequestEnvelope::from_parts(
+                crate::app::RequestHead {
+                    method: replay_request.method,
+                    uri: replay_request.uri,
+                    headers: replay_request.headers,
+                    credentials: None,
+                    region: None,
+                    service: None,
+                },
+                replay_request.extensions,
+            );
             let error = Box::pin(usecase.execute_complete_multipart_upload(envelope, replay))
                 .await
                 .expect_err("replay must authorize before comparing guessed part metadata");
@@ -898,6 +940,7 @@ mod tests {
                 copy_source_range: None,
                 copy_source_if_match: None,
                 copy_source_if_none_match: None,
+                copy_source_dates: Default::default(),
                 sse_customer_algorithm: customer_algorithm.clone(),
                 sse_customer_key: customer_key.clone(),
                 sse_customer_key_md5: customer_key_md5.clone(),

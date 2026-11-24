@@ -46,11 +46,10 @@ unknown-registry = "deny"
 unknown-git = "deny"
 allow-registry = ["https://github.com/rust-lang/crates.io-index"]
 allow-git = [
-    # Official s3s repository pinned for Iceberg SigV4 path encoding support.
+    # The reviewed test oracles compare protocol behavior with this pinned s3s source.
     # owner: GatewayJ  review: 2026-10
     "https://github.com/s3s-project/s3s",
-    # rustfs-gateway-types, pinned to one gateway commit in the workspace
-    # dependencies while the engine crates move off s3s (rustfs/backlog#2745).
+    # The native S3 gateway packages share one workspace revision.
     # owner: rustfs-maintainers  review: 2027-01
     "https://github.com/rustfs/gateway",
     # Completion ownership patch fixed to rustfs/uring#20.
