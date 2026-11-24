@@ -507,6 +507,7 @@ mod tests {
                 ("iss".to_string(), serde_json::json!("https://idp.example.test")),
                 ("raw_poison".to_string(), serde_json::json!("must-not-leak")),
             ]),
+            profile: FederatedProfile::default(),
             policies: vec!["readwrite".to_string()],
             group_claim_policies: Vec::new(),
             mapped_iam_groups: vec!["devs".to_string()],

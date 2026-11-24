@@ -75,11 +75,11 @@ highlight = "all"
 # s3s-oracle: crates/s3-types/src/compat_s3s/call_site_codes.rs
 # s3s-oracle: crates/s3-types/src/error/http_response_tests.rs
 # s3s-oracle: rustfs/src/admin/router.rs
-# s3s-oracle: rustfs/src/app/storage_api.rs
 # s3s-oracle: rustfs/src/auth.rs
 # s3s-oracle: rustfs/src/error.rs
 # s3s-oracle: rustfs/src/protocols/client.rs
 # s3s-oracle: rustfs/src/server/http.rs
+# s3s-oracle: rustfs/src/storage/legacy_s3_test_types.rs
 # Only the old-stack comparison crates may have direct edges in this graph,
 # which includes dev dependencies. check_s3s_footprint.sh separately rejects
 # every normal edge, including optional, renamed and transitive dependencies.

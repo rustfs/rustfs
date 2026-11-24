@@ -30,6 +30,11 @@ use url::Url;
 /// defensively so this stays correct for any caller.
 const SENSITIVE_HEADERS: &[&str] = &[
     "authorization",
+    "proxy-authorization",
+    "x-auth-token",
+    "x-subject-token",
+    "x-storage-token",
+    "x-amz-request-token",
     "x-amz-security-token",
     "x-amz-content-sha256",
     "x-amz-server-side-encryption-customer-key",
@@ -453,6 +458,11 @@ mod tests {
     fn extract_params_header_redacts_credential_headers() {
         let mut headers = HeaderMap::new();
         headers.insert("authorization", HeaderValue::from_static("AWS4-HMAC-SHA256 Credential=AKIA.../secret"));
+        headers.insert("proxy-authorization", HeaderValue::from_static("proxy-credential"));
+        headers.insert("x-auth-token", HeaderValue::from_static("identity-token"));
+        headers.insert("x-subject-token", HeaderValue::from_static("identity-token"));
+        headers.insert("x-storage-token", HeaderValue::from_static("storage-token"));
+        headers.insert("x-amz-request-token", HeaderValue::from_static("object-lambda-token"));
         headers.insert("x-amz-security-token", HeaderValue::from_static("FQoGZXIvYXdzE.../session-token"));
         headers.insert("x-amz-content-sha256", HeaderValue::from_static("e3b0c44298fc1c149afbf4c8996fb924"));
         headers.insert("x-amz-server-side-encryption-customer-key", HeaderValue::from_static("destination-key"));
@@ -477,6 +487,11 @@ mod tests {
         // Sensitive headers keep their name for correlation but never leak the value.
         for name in [
             "authorization",
+            "proxy-authorization",
+            "x-auth-token",
+            "x-subject-token",
+            "x-storage-token",
+            "x-amz-request-token",
             "x-amz-security-token",
             "x-amz-content-sha256",
             "x-amz-server-side-encryption-customer-key",
