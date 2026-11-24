@@ -2,6 +2,7 @@
 // Licensed under the Apache License, Version 2.0.
 
 use super::*;
+use crate::storage_api::owner::ObjectOperations as _;
 use rustfs_data_usage::{BucketUsageCertification, BucketUsageInfo, CertifiedBucketsScope, CertifiedBucketsSource};
 
 async fn fixture() -> (tempfile::TempDir, Arc<ECStore>, DataUsageInfo, DataUsageInfo) {
@@ -150,7 +151,7 @@ async fn completed_bucket_snapshot_persists_history_and_survives_reopen_without_
         .delete_object(
             RUSTFS_META_BUCKET,
             DATA_USAGE_CERTIFIED_BUCKETS_OBJ_NAME_PATH.as_str(),
-            &Default::default(),
+            Default::default(),
         )
         .await
         .expect("lose sidecar without losing primary history");
