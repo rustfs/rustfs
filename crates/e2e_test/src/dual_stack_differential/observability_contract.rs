@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! SDK responses, audit receipts and both exported HTTP counters for the same isolated PUTs.
+//! SDK responses, audit receipts and HTTP counters for isolated successful PUTs and a missing-object GET.
 use super::reference::{SideA, binary_version};
 use super::{BoxError, RustFSTestEnvironment, rustfs_binary_path};
 use crate::common::admin_request;
@@ -55,11 +55,27 @@ struct Contract {
     audit_fields: Vec<String>,
 }
 
+#[derive(Clone, Copy, Default)]
+struct HttpCounts {
+    put_success: u64,
+    get_error: u64,
+}
+
+impl HttpCounts {
+    fn series(&mut self, method: &str, op: &str, outcome: &str) -> Option<&mut u64> {
+        match (method, op, outcome) {
+            ("PUT", PUT, "2xx") => Some(&mut self.put_success),
+            ("GET", "s3:GetObject", "4xx") => Some(&mut self.get_error),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Default)]
 struct Observations {
     labels: BTreeMap<String, BTreeSet<String>>,
     exports: usize,
-    http_puts: u64,
+    http: HttpCounts,
     audits: BTreeMap<String, String>,
     error: Option<&'static str>,
 }
@@ -110,16 +126,22 @@ impl Observations {
                 Some(Data::Sum(sum)) => {
                     for point in sum.data_points {
                         record(&point.attributes);
-                        if metric.name == HTTP_COUNTER
-                            && [("method", "PUT"), ("op", PUT), ("outcome", "2xx")].iter().all(|(k, v)| {
-                                point.attributes.iter().any(|a| {
-                                    a.key == *k
-                                        && matches!(a.value.as_ref().and_then(|v| v.value.as_ref()),
-                                    Some(any_value::Value::StringValue(value)) if value == v)
+                        if metric.name != HTTP_COUNTER {
+                            continue;
+                        }
+                        let attr = |key: &str| {
+                            point
+                                .attributes
+                                .iter()
+                                .find(|a| a.key == key)
+                                .and_then(|a| match a.value.as_ref()?.value.as_ref()? {
+                                    any_value::Value::StringValue(value) => Some(value.as_str()),
+                                    _ => None,
                                 })
-                            })
-                        {
-                            self.http_puts = match point.value {
+                                .unwrap_or_default()
+                        };
+                        if let Some(count) = self.http.series(attr("method"), attr("op"), attr("outcome")) {
+                            *count = match point.value {
                                 Some(number_data_point::Value::AsInt(n)) => {
                                     u64::try_from(n).map_err(|_| "negative HTTP counter")?
                                 }
@@ -219,7 +241,7 @@ async fn listen(listener: TcpListener, state: Arc<Mutex<Observations>>, bucket: 
     }
 }
 
-async fn admin_put_count(env: &RustFSTestEnvironment) -> Result<u64, BoxError> {
+async fn admin_http_counts(env: &RustFSTestEnvironment) -> Result<HttpCounts, BoxError> {
     let (code, text) = admin_request(
         &env.url,
         Method::GET,
@@ -233,12 +255,13 @@ async fn admin_put_count(env: &RustFSTestEnvironment) -> Result<u64, BoxError> {
     let report: RealtimeMetrics = serde_json::from_str(text.lines().next().ok_or("empty admin metrics")?)?;
     assert!(report.errors.is_empty(), "admin reported metric collection errors");
     let http = report.aggregated.http.ok_or("missing admin HTTP metrics")?;
-    Ok(http
-        .requests
-        .iter()
-        .filter(|r| r.method == "PUT" && r.operation == PUT && r.outcome == "2xx")
-        .map(|r| r.total)
-        .sum())
+    let mut counts = HttpCounts::default();
+    for row in http.requests {
+        if let Some(total) = counts.series(&row.method, &row.operation, &row.outcome) {
+            *total += row.total;
+        }
+    }
+    Ok(counts)
 }
 
 async fn wait_for(state: &Mutex<Observations>, ready: impl Fn(&Observations) -> bool) -> Result<(), BoxError> {
@@ -260,9 +283,10 @@ async fn wait_for(state: &Mutex<Observations>, ready: impl Fn(&Observations) -> 
     .map_err(|_| {
         let snapshot = state.lock().expect("collector mutex");
         format!(
-            "timed out after {} OTLP exports, {} PUTs, {} audit receipts and {} S3 metrics",
+            "timed out after {} OTLP exports, {} successful PUTs, {} failed GETs, {} audit receipts and {} S3 metrics",
             snapshot.exports,
-            snapshot.http_puts,
+            snapshot.http.put_success,
+            snapshot.http.get_error,
             snapshot.audits.len(),
             snapshot.labels.len()
         )
@@ -316,8 +340,8 @@ async fn check(side: SideA) -> Result<(), BoxError> {
     let client = env.create_s3_client();
     client.create_bucket().bucket(&bucket).send().await?;
     wait_for(&state, |s| s.exports > 0 && s.labels.contains_key(HTTP_COUNTER)).await?;
-    let start = state.lock().expect("collector mutex").http_puts;
-    let before = admin_put_count(&env).await?;
+    let start = state.lock().expect("collector mutex").http;
+    let before = admin_http_counts(&env).await?;
     let mut expected = BTreeMap::new();
     let etag = format!("\"{}\"", hex_simd::encode_to_string(Md5::digest(BODY), hex_simd::AsciiCase::Lower));
     for i in 0..contract.sdk_puts {
@@ -336,10 +360,25 @@ async fn check(side: SideA) -> Result<(), BoxError> {
             .ok_or("PUT omitted its request ID")?;
         assert!(expected.insert(id.to_owned(), key).is_none(), "duplicate SDK request ID");
     }
-    assert_eq!(admin_put_count(&env).await?.checked_sub(before), Some(contract.sdk_puts));
+    let missing = client
+        .get_object()
+        .bucket(&bucket)
+        .key("never-written")
+        .send()
+        .await
+        .expect_err("GET of a missing object must fail");
+    assert_eq!(missing.raw_response().map(|r| r.status().as_u16()), Some(404));
+    assert!(
+        missing.as_service_error().is_some_and(|err| err.is_no_such_key()),
+        "missing-object GET must return NoSuchKey"
+    );
+    let after = admin_http_counts(&env).await?;
+    assert_eq!(after.put_success.checked_sub(before.put_success), Some(contract.sdk_puts));
+    assert_eq!(after.get_error.checked_sub(before.get_error), Some(1), "admin GetObject 4xx delta");
     client.list_objects_v2().bucket(&bucket).send().await?;
     wait_for(&state, |s| {
-        s.http_puts >= start + contract.sdk_puts
+        s.http.put_success >= start.put_success + contract.sdk_puts
+            && s.http.get_error > start.get_error
             && s.audits.len() >= expected.len()
             && s.labels.len() == contract.s3_metrics.len()
     })
@@ -351,7 +390,12 @@ async fn check(side: SideA) -> Result<(), BoxError> {
     if let Some(error) = observed.error {
         return Err(error.into());
     }
-    assert_eq!(observed.http_puts.checked_sub(start), Some(contract.sdk_puts), "OTLP PUT delta");
+    assert_eq!(
+        observed.http.put_success.checked_sub(start.put_success),
+        Some(contract.sdk_puts),
+        "OTLP PUT delta"
+    );
+    assert_eq!(observed.http.get_error.checked_sub(start.get_error), Some(1), "OTLP GetObject 4xx delta");
     assert!(
         observed.audits == expected,
         "audit IDs and objects must match each successful SDK PUT once"
