@@ -41,6 +41,8 @@ pub(crate) mod head_prefix;
 #[cfg(test)]
 mod helpers_test;
 #[cfg(test)]
+pub(crate) mod legacy_s3_test_types;
+#[cfg(test)]
 mod minio_generated_read_test;
 #[cfg(test)]
 mod multi_factor_scheduler_integration_test;

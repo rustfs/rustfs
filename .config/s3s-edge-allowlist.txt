@@ -20,7 +20,7 @@
 # rustfs binary: reviewed #[cfg(test)] legacy comparison oracles
 rustfs/src/auth.rs
 rustfs/src/error.rs
-rustfs/src/app/storage_api.rs
+rustfs/src/storage/legacy_s3_test_types.rs
 rustfs/src/admin/router.rs
 rustfs/src/server/http.rs
 rustfs/src/protocols/client.rs

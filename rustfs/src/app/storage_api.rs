@@ -26,11 +26,11 @@ pub(crate) fn EndpointServerPools(
 
 /// Streaming body types the request-body adapters implement against.
 pub(crate) mod request_body {
+    #[cfg(test)]
+    pub(crate) use crate::storage::storage_api::test_consumer::legacy_s3_test_types::request_body::{
+        ByteStream, DynByteStream, RemainingLength, StreamingBlob,
+    };
     pub(crate) use rustfs_s3_types::StdError;
-    #[cfg(test)]
-    pub(crate) use s3s::dto::StreamingBlob;
-    #[cfg(test)]
-    pub(crate) use s3s::stream::{ByteStream, DynByteStream, RemainingLength};
 }
 
 #[cfg(feature = "diagnostic-read-version-caller")]
@@ -47,27 +47,17 @@ pub(crate) mod diagnostic {
 /// Legacy wire types used by app-layer compatibility tests.
 #[cfg(test)]
 pub(crate) mod s3 {
+    pub(crate) use crate::storage::storage_api::test_consumer::legacy_s3_test_types::s3::{
+        Body, BucketLocationConstraint, CreateBucketConfiguration, CreateBucketInput, CreateMultipartUploadInput, Credentials,
+        DeleteObjectInput, ObjectLockRetention, PutObjectInput, S3Error, S3ErrorCode, S3Request, S3Response, S3Result,
+        StreamingBlob, TrailingHeaders, UploadStreamError, dto, stream, xml,
+    };
     pub(crate) use rustfs_gateway_types::dto::Status;
     pub(crate) use rustfs_gateway_types::persistence::{
         PersistedOptionalReplicationStatus, PersistedReplicationConfiguration, PersistedReplicationDestination,
         PersistedReplicationFilter, PersistedReplicationRule, PersistedReplicationTag,
     };
     pub(crate) use rustfs_s3_types::StdError;
-    pub(crate) use s3s::Body;
-    pub(crate) use s3s::TrailingHeaders;
-    pub(crate) use s3s::auth::Credentials;
-    pub(crate) use s3s::dto;
-    pub(crate) use s3s::dto::PutObjectInput;
-    pub(crate) use s3s::dto::StreamingBlob;
-    pub(crate) use s3s::dto::{
-        BucketLocationConstraint, CreateBucketConfiguration, CreateBucketInput, CreateMultipartUploadInput, DeleteObjectInput,
-        ObjectLockRetention,
-    };
-    pub(crate) use s3s::stream;
-    pub(crate) use s3s::stream::upload_stream::UploadStreamError;
-    pub(crate) use s3s::xml;
-    pub(crate) use s3s::{S3Error, S3ErrorCode, S3Result};
-    pub(crate) use s3s::{S3Request, S3Response};
 }
 
 pub(crate) mod admin {
@@ -377,7 +367,9 @@ pub(crate) mod bucket {
 
     // The legacy edge keeps values that its decoder permits before domain validation.
     #[cfg(test)]
-    pub(crate) fn restore_request_from_wire(request: s3s::dto::RestoreRequest) -> RestoreRequest {
+    pub(crate) fn restore_request_from_wire(
+        request: crate::storage::storage_api::test_consumer::legacy_s3_test_types::LegacyRestoreRequest,
+    ) -> RestoreRequest {
         use rustfs_gateway_types::dto;
 
         RestoreRequest {
@@ -495,8 +487,8 @@ pub(crate) mod bucket {
     #[cfg(test)]
     mod restore_conversion_tests {
         use super::restore_request_from_wire;
+        use crate::storage::storage_api::test_consumer::legacy_s3_test_types::s3::dto as legacy;
         use rustfs_gateway_types::dto;
-        use s3s::dto as legacy;
 
         #[test]
         fn restore_request_conversion_preserves_legacy_output_values() {
