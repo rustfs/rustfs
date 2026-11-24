@@ -449,7 +449,7 @@ fn service_error(error: VectorServiceError) -> ProtocolError {
         VectorServiceError::Input(_) | VectorServiceError::Filter(_) | VectorServiceError::InvalidMetadataShape { .. } => {
             ProtocolError::validation("vectors", "invalid Vector data or filter")
         }
-        VectorServiceError::PendingIntegration(_) | VectorServiceError::OperationUnavailable(_) => unavailable(),
+        VectorServiceError::OperationUnavailable(_) => unavailable(),
         VectorServiceError::Dataset(
             crate::vector::lance::DatasetError::InvalidVector(_)
             | crate::vector::lance::DatasetError::DuplicateInputKey { .. }

@@ -374,14 +374,44 @@ pub(crate) fn guarded_managed_lance_objects(
     guard: Arc<crate::table_catalog::VectorCatalogOperationGuard>,
     limits: crate::vector::lance::ManifestIoLimits,
 ) -> std::result::Result<Arc<ManagedLanceObjects>, crate::vector::lance::LanceManifestError> {
+    guarded_managed_objects(access, request, definition, guard, limits, ManagedCatalogObjectScope::Dataset)
+}
+
+pub(crate) fn guarded_managed_query_results(
+    access: crate::storage_api::startup::services::ManagedObjectAccess,
+    request: Arc<crate::app::RequestEnvelope>,
+    definition: &crate::table_catalog::VectorIndexDefinitionV1,
+    guard: Arc<crate::table_catalog::VectorCatalogOperationGuard>,
+    limits: crate::vector::lance::ManifestIoLimits,
+) -> std::result::Result<Arc<ManagedLanceObjects>, crate::vector::lance::LanceManifestError> {
+    guarded_managed_objects(access, request, definition, guard, limits, ManagedCatalogObjectScope::QueryResults)
+}
+
+enum ManagedCatalogObjectScope {
+    Dataset,
+    QueryResults,
+}
+
+fn guarded_managed_objects(
+    access: crate::storage_api::startup::services::ManagedObjectAccess,
+    request: Arc<crate::app::RequestEnvelope>,
+    definition: &crate::table_catalog::VectorIndexDefinitionV1,
+    guard: Arc<crate::table_catalog::VectorCatalogOperationGuard>,
+    limits: crate::vector::lance::ManifestIoLimits,
+    scope: ManagedCatalogObjectScope,
+) -> std::result::Result<Arc<ManagedLanceObjects>, crate::vector::lance::LanceManifestError> {
     use crate::table_catalog::{CatalogFormat, VectorEffectiveEncryptionV1};
     definition.validate()?;
     guard.check_held()?;
     let resource = guard.resource_identity();
+    let prefix = match scope {
+        ManagedCatalogObjectScope::Dataset => resource.dataset_prefix(),
+        ManagedCatalogObjectScope::QueryResults => format!(".rustfs-table/{}/query-results/", resource.table_id().as_str()),
+    };
     if resource.vector_bucket() != Some(access.bucket())
         || resource.table_id() != access.table_id()
         || resource.format() != CatalogFormat::Lance
-        || resource.dataset_prefix() != access.allowed_prefix()
+        || prefix != access.allowed_prefix()
     {
         return Err(crate::vector::lance::LanceManifestError::ResourceMismatch {
             reason: "Managed Dataset access differs from its Catalog operation",

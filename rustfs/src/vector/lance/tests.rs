@@ -15,6 +15,9 @@
 #[path = "sdk_candidate_tests.rs"]
 mod sdk_candidate_tests;
 
+#[path = "pagination_service_tests.rs"]
+mod pagination_service_tests;
+
 use std::{collections::HashMap, error::Error, num::NonZeroU32, sync::Arc};
 
 use bytes::Bytes;
@@ -2622,6 +2625,8 @@ struct ServiceRequestFixture {
     backend: crate::table_catalog::test_support::TestCatalogObjectBackend,
     deny: bool,
     managed_calls: Arc<std::sync::atomic::AtomicUsize>,
+    pagination_principal: String,
+    pagination_now: i64,
 }
 
 #[async_trait::async_trait]
@@ -2637,6 +2642,42 @@ impl crate::vector::service::VectorRequestAccess for ServiceRequestFixture {
     }
     fn index_name(&self) -> &crate::table_catalog::CatalogName {
         &self.name
+    }
+
+    fn pagination_principal(&self) -> Result<[u8; 32], crate::vector::service::VectorServiceError> {
+        Ok(crate::vector::pagination::digest(&self.pagination_principal)?)
+    }
+
+    fn pagination_now(&self) -> i64 {
+        self.pagination_now
+    }
+
+    async fn managed_query_results(
+        &self,
+        guard: Arc<crate::table_catalog::VectorCatalogOperationGuard>,
+        definition: &crate::table_catalog::VectorIndexDefinitionV1,
+    ) -> Result<crate::vector::service::ManagedDatasetAccess, crate::vector::service::VectorServiceError> {
+        use crate::storage_api::vector::{ManagedObjectAccess, ManagedObjectOperation};
+        guard.check_held()?;
+        definition.validate()?;
+        let resource = guard.resource_identity();
+        let access = ManagedObjectAccess::try_from_parts(
+            self.bucket.clone(),
+            resource.table_id().clone(),
+            format!(".rustfs-table/{}/query-results/", resource.table_id().as_str()),
+            [
+                ManagedObjectOperation::CreateOnly,
+                ManagedObjectOperation::Get,
+                ManagedObjectOperation::Head,
+                ManagedObjectOperation::Range,
+            ]
+            .into(),
+        )
+        .unwrap();
+        Ok(crate::vector::service::ManagedDatasetAccess {
+            access,
+            objects: Arc::new(CatalogManagedObjects(self.backend.clone())),
+        })
     }
 
     async fn authorize_index(
@@ -2730,6 +2771,8 @@ fn service_request(fixture: &CatalogFixture) -> ServiceRequestFixture {
         backend: fixture.backend.clone(),
         deny: false,
         managed_calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        pagination_principal: "fixture-user".into(),
+        pagination_now: 1_800_000_000,
     }
 }
 
@@ -2965,16 +3008,36 @@ async fn service_list_vectors_does_not_return_incomplete_success_without_a_token
         return_metadata: Some(false),
     };
     context.request = Request::ListVectors(input.clone());
-    assert!(matches!(service.execute(&context).await, Err(VectorServiceError::PendingIntegration(_))));
+    let crate::vector::service::VectorExecution::Complete(crate::vector::protocol::Response::ListVectors(first)) =
+        service.execute(&context).await.unwrap()
+    else {
+        panic!("ListVectors page");
+    };
+    assert_eq!(first.vectors.len(), 1);
+    assert!(first.next_token.is_some());
     input.max_results = Some(1000);
     context.request = Request::ListVectors(input.clone());
-    assert!(
-        matches!(service.execute(&context).await, Err(VectorServiceError::PendingIntegration(_))),
-        "processed data over 1 MiB needs pagination even when fields are not returned"
-    );
+    let crate::vector::service::VectorExecution::Complete(crate::vector::protocol::Response::ListVectors(first)) =
+        service.execute(&context).await.unwrap()
+    else {
+        panic!("ListVectors byte-bounded page");
+    };
+    assert!(first.vectors.len() < 34);
+    assert!(first.vectors.iter().all(|row| row.data.is_none() && row.metadata.is_none()));
+    input.next_token = first.next_token;
+    assert!(input.next_token.is_some(), "processed data includes omitted fields");
+    context.request = Request::ListVectors(input.clone());
+    let crate::vector::service::VectorExecution::Complete(crate::vector::protocol::Response::ListVectors(second)) =
+        service.execute(&context).await.unwrap()
+    else {
+        panic!("ListVectors continuation");
+    };
+    assert_eq!(first.vectors.len() + second.vectors.len(), 34);
+    assert!(second.next_token.is_none());
     input.next_token = Some("unverified-token".into());
     context.request = Request::ListVectors(input);
-    assert!(matches!(service.execute(&context).await, Err(VectorServiceError::PendingIntegration(_))));
+    assert!(matches!(service.execute(&context).await, Err(VectorServiceError::Protocol(error))
+        if error.code() == crate::vector::protocol::ErrorCode::Validation));
 }
 
 #[tokio::test]
@@ -3477,7 +3540,7 @@ async fn service_query_output_retains_snapshot_metadata_and_cosine_metric() {
 async fn service_query_output_requires_pagination_only_above_one_hundred_matches() {
     use crate::vector::{
         protocol::{Request, Response, dto},
-        service::{VectorExecution, VectorServiceError},
+        service::VectorExecution,
     };
     let fixture = catalog_fixture().await;
     let mut context = service_request(&fixture);
@@ -3523,8 +3586,9 @@ async fn service_query_output_requires_pagination_only_above_one_hundred_matches
         else {
             panic!("expected the prepared pagination boundary query");
         };
-        assert_eq!(query.candidates.len(), expected_rows);
-        assert_eq!(query.metadata_rows.as_ref().expect("requested metadata").len(), expected_rows);
+        let page_rows = expected_rows.min(100);
+        assert_eq!(query.candidates.len(), page_rows);
+        assert_eq!(query.metadata_rows.as_ref().expect("requested metadata").len(), page_rows);
         for (ordinal, candidate) in query.candidates.iter().enumerate() {
             assert_eq!(candidate.key, format!("item-{ordinal:03}"));
             assert_eq!(
@@ -3532,14 +3596,9 @@ async fn service_query_output_requires_pagination_only_above_one_hundred_matches
                 f64::from(u16::try_from(ordinal).expect("bounded fixture ordinal"))
             );
         }
-        let result = query.into_output();
-        if expected_rows == 101 {
-            assert!(matches!(result, Err(VectorServiceError::PendingIntegration("query result pagination"))));
-            continue;
-        }
-        let output = result.expect("at most 100 actual matches fit one complete page");
-        assert_eq!(output.vectors.len(), expected_rows);
-        assert!(output.next_token.is_none());
+        let output = query.into_output().expect("bounded page output");
+        assert_eq!(output.vectors.len(), page_rows);
+        assert_eq!(output.next_token.is_some(), expected_rows > 100);
         assert_eq!(output.distance_metric, dto::DistanceMetric::Euclidean);
         for (ordinal, vector) in output.vectors.iter().enumerate() {
             assert_eq!(vector.key, format!("item-{ordinal:03}"));
@@ -3553,8 +3612,8 @@ async fn service_query_output_requires_pagination_only_above_one_hundred_matches
             .body_bytes()
             .expect("serialize the complete single page");
         let json: serde_json::Value = serde_json::from_slice(&body).expect("decode the actual single-page response");
-        assert_eq!(json["vectors"].as_array().expect("response vectors").len(), expected_rows);
-        assert!(json.get("nextToken").is_none());
+        assert_eq!(json["vectors"].as_array().expect("response vectors").len(), page_rows);
+        assert_eq!(json.get("nextToken").is_some(), expected_rows > 100);
     }
 }
 
@@ -3582,6 +3641,20 @@ impl crate::vector::service::VectorRequestAccess for ServiceRetryRequestFixture 
 
     fn index_name(&self) -> &crate::table_catalog::CatalogName {
         &self.inner.name
+    }
+
+    fn pagination_principal(&self) -> Result<[u8; 32], crate::vector::service::VectorServiceError> {
+        crate::vector::service::VectorRequestAccess::pagination_principal(&self.inner)
+    }
+    fn pagination_now(&self) -> i64 {
+        crate::vector::service::VectorRequestAccess::pagination_now(&self.inner)
+    }
+    async fn managed_query_results(
+        &self,
+        guard: Arc<crate::table_catalog::VectorCatalogOperationGuard>,
+        definition: &crate::table_catalog::VectorIndexDefinitionV1,
+    ) -> Result<crate::vector::service::ManagedDatasetAccess, crate::vector::service::VectorServiceError> {
+        crate::vector::service::VectorRequestAccess::managed_query_results(&self.inner, guard, definition).await
     }
 
     async fn authorize_index(

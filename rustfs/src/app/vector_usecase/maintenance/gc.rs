@@ -132,14 +132,14 @@ fn audit_for(work: &VectorMaintenanceWork, identity: &ManagedMaintenanceIdentity
     )
 }
 
-fn access_for(resource: &CatalogResourceIdentity) -> Result<ManagedObjectAccess, VectorMaintenanceExecutionError> {
+fn access_for(resource: &CatalogResourceIdentity, key: &str) -> Result<ManagedObjectAccess, VectorMaintenanceExecutionError> {
     let bucket = resource
         .vector_bucket()
         .ok_or_else(|| conflict("retirement requires a Vector bucket"))?;
     ManagedObjectAccess::try_from_parts(
         bucket.clone(),
         resource.table_id().clone(),
-        resource.dataset_prefix(),
+        vector_retirement_object_prefix(resource, key)?,
         BTreeSet::from([ManagedObjectOperation::Delete]),
     )
     .map_err(maintenance_execution_error)
@@ -290,7 +290,7 @@ impl MaintenanceExecutor {
         job_id: Uuid,
         expected_revision: Uuid,
     ) -> Result<NativeAdmission, VectorMaintenanceExecutionError> {
-        let access = access_for(request.resource())?;
+        let access = access_for(request.resource(), request.target().object_key())?;
         access
             .check(request.target().object_key(), ManagedObjectOperation::Delete)
             .map_err(maintenance_execution_error)?;
@@ -367,7 +367,7 @@ impl MaintenanceExecutor {
         work: &VectorMaintenanceWork,
         key: &str,
     ) -> Result<NativeAdmission, VectorMaintenanceExecutionError> {
-        let access = access_for(guard.lease().resource())?;
+        let access = access_for(guard.lease().resource(), key)?;
         let snapshot = catalog.read_vector_maintenance_authorization_with_guard(&guard).await?;
         let encryption = managed_encryption(&snapshot.definition().effective_encryption);
         let audit = audit_for(work, &self.identity);
@@ -777,7 +777,7 @@ impl MaintenanceExecutor {
         let io = control.acquire_io().await?;
         let guard = permit.dispatch_guard().clone();
         let snapshot = catalog.read_vector_maintenance_authorization_with_guard(&guard).await?;
-        let access = access_for(guard.lease().resource())?;
+        let access = access_for(guard.lease().resource(), permit.target().object_key())?;
         let context = ManagedObjectContext::from_maintenance(
             access.clone(),
             managed_encryption(&snapshot.definition().effective_encryption),

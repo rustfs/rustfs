@@ -165,6 +165,10 @@ impl VectorRequestAccess for IndexRequest<'_> {
         self.index
     }
 
+    fn pagination_principal(&self) -> Result<[u8; 32], VectorServiceError> {
+        Ok(self.authorization.verified.pagination_principal()?)
+    }
+
     async fn authorize_index(
         &self,
         request: &Request,
@@ -262,6 +266,53 @@ impl VectorRequestAccess for IndexRequest<'_> {
             self.owner.limits,
         )?;
         self.authorization.reader.bind(&objects);
+        Ok(ManagedDatasetAccess { access, objects })
+    }
+
+    async fn managed_query_results(
+        &self,
+        guard: Arc<VectorCatalogOperationGuard>,
+        definition: &VectorIndexDefinitionV1,
+    ) -> Result<ManagedDatasetAccess, VectorServiceError> {
+        guard.check_held()?;
+        let resource = guard.resource_identity();
+        let lifecycle = guard.lifecycle_guard()?;
+        let envelope = self
+            .authorized_envelope(self.request(), resource, definition, &lifecycle)
+            .await?;
+        let creates = match self.request() {
+            Request::QueryVectors(input) => input.next_token.is_none(),
+            Request::ListVectors(input) => input.next_token.is_none(),
+            _ => return Err(denied().into()),
+        };
+        encryption::preflight(&self.owner.server, &envelope, &definition.effective_encryption, creates).await?;
+        let mut operations = std::collections::BTreeSet::from([
+            ManagedObjectOperation::Get,
+            ManagedObjectOperation::Head,
+            ManagedObjectOperation::Range,
+        ]);
+        if creates {
+            operations.insert(ManagedObjectOperation::CreateOnly);
+        }
+        let access = ManagedObjectAccess::try_from_parts(
+            self.bucket().clone(),
+            resource.table_id().clone(),
+            format!(".rustfs-table/{}/query-results/", resource.table_id().as_str()),
+            operations,
+        )
+        .map_err(|_| denied())?;
+        let limits = crate::vector::lance::ManifestIoLimits {
+            max_manifest_bytes: std::num::NonZeroU64::new(crate::vector::pagination::MAX_SESSION_BYTES as u64)
+                .ok_or(VectorServiceError::InvalidContext("invalid pagination read limit"))?,
+            ..self.owner.limits
+        };
+        let objects = crate::startup_services::guarded_managed_query_results(
+            access.clone(),
+            Arc::new(envelope),
+            definition,
+            guard,
+            limits,
+        )?;
         Ok(ManagedDatasetAccess { access, objects })
     }
 }

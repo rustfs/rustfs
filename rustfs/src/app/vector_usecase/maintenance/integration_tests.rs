@@ -593,3 +593,6 @@ fn vector_maintenance_gc_planning_rechecks_changed_resource_tags() {
         guard.check_held().unwrap();
     });
 }
+
+#[path = "pagination_session_tests.rs"]
+mod pagination_session_tests;

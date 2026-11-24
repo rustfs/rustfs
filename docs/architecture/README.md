@@ -32,6 +32,7 @@ Required headings and strings in these files are asserted by `scripts/check_arch
 
 | Document | Use this when |
 |---|---|
+| [s3-vectors-pagination.md](s3-vectors-pagination.md) | changing Vector pagination tokens, session storage, snapshot retention, or expired-result collection |
 | [local-descriptor-cache.md](local-descriptor-cache.md) | changing descriptor cache keys/open modes or invalidation after local mutations |
 | [erasure-coding.md](erasure-coding.md) | changing anything under `crates/ecstore/src/erasure/`, `crates/filemeta/`, `crates/ecstore/src/set_disk/`, storage-class or layout code, or any decode, quorum, or heal boundary (normative spec) |
 | [placement-repair-invariants.md](placement-repair-invariants.md) | changing anything that resolves an object to a pool, set, or disk, or that admits scanner or heal work |

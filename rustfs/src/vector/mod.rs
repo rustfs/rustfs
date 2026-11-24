@@ -18,5 +18,6 @@ pub(crate) mod fault_test;
 pub(crate) mod filter;
 pub(crate) mod lance;
 pub(crate) mod model;
+pub(crate) mod pagination;
 pub(crate) mod protocol;
 pub(crate) mod service;

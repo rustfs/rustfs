@@ -84,6 +84,20 @@ impl VectorRequestAccess for ObservedRequest {
         self.owner.index_name()
     }
 
+    fn pagination_principal(&self) -> Result<[u8; 32], VectorServiceError> {
+        self.owner.pagination_principal()
+    }
+    fn pagination_now(&self) -> i64 {
+        self.owner.pagination_now()
+    }
+    async fn managed_query_results(
+        &self,
+        guard: Arc<crate::table_catalog::VectorCatalogOperationGuard>,
+        definition: &crate::table_catalog::VectorIndexDefinitionV1,
+    ) -> Result<ManagedDatasetAccess, VectorServiceError> {
+        self.owner.managed_query_results(guard, definition).await
+    }
+
     async fn authorize_index(
         &self,
         request: &Request,

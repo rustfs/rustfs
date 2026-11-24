@@ -12,11 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#[cfg(test)]
-use std::num::NonZeroU64;
 use std::{
     collections::{BTreeMap, VecDeque},
     fmt,
+    num::NonZeroU64,
     sync::{Arc, Mutex, OnceLock},
 };
 
@@ -467,7 +466,6 @@ impl<B: TableCatalogObjectBackend> LanceManifestAdapter<B> {
             .await
     }
 
-    #[cfg(test)]
     pub(crate) async fn open_committed_version(
         &self,
         access: &ManagedObjectAccess,

@@ -62,6 +62,12 @@ impl VerifiedVectorRequest {
         &self.request
     }
 
+    pub(super) fn pagination_principal(&self) -> Result<[u8; 32], ProtocolError> {
+        let credentials = self.envelope.credentials().ok_or_else(denied)?;
+        crate::vector::pagination::digest(&("vector-pagination-principal-v1", credentials.access_key()))
+            .map_err(|_| unavailable())
+    }
+
     #[cfg(test)]
     pub(super) fn fault_http_request_id(&self) -> Option<&str> {
         self.envelope.request_context().map(|context| context.request_id.as_str())

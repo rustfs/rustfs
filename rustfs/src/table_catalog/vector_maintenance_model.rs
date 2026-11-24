@@ -22,6 +22,22 @@ pub(crate) const VECTOR_MAINTENANCE_RECORD_MAX_BYTES: usize = 4_194_304;
 pub(crate) const VECTOR_RETIREMENT_PROGRESS_MAX_BYTES: usize = 262_144;
 pub(crate) const VECTOR_RETIREMENT_MAX_TARGETS: usize = 256;
 pub(crate) const VECTOR_RETIREMENT_MAX_REFERENCES: usize = 4096;
+/// Query sessions expire within fifteen minutes; retain their immutable objects for an hour.
+pub(crate) const VECTOR_QUERY_RESULTS_RETENTION_SECONDS: i64 = 3600;
+
+/// Only Dataset objects and canonical pagination session objects can enter retirement.
+pub(crate) fn vector_retirement_object_prefix(resource: &CatalogResourceIdentity, key: &str) -> TableCatalogStoreResult<String> {
+    let dataset = resource.dataset_prefix();
+    if key.starts_with(&dataset) {
+        return Ok(dataset);
+    }
+    let results = format!(".rustfs-table/{}/query-results/", resource.table_id().as_str());
+    let id = key.strip_prefix(&results).and_then(|name| name.strip_suffix(".session"));
+    if id.is_some_and(|id| id.len() == 64 && id.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))) {
+        return Ok(results);
+    }
+    Err(invalid("retirement object is outside the resource"))
+}
 
 pub(crate) trait VectorMaintenanceRecord: Serialize + DeserializeOwned {
     const MAX_BYTES: usize = VECTOR_MAINTENANCE_RECORD_MAX_BYTES;
@@ -1258,12 +1274,13 @@ fn targets(resource: &VectorMaintenanceResourceV1, values: &[VectorRetirementTar
         !values.is_empty() && values.len() <= VECTOR_RETIREMENT_MAX_TARGETS,
         "invalid retirement target count",
     )?;
-    let prefix = resource.identity()?.dataset_prefix();
+    let identity = resource.identity()?;
     let mut previous: Option<&str> = None;
     for value in values {
         value.validate()?;
         ensure(
-            value.object_key.starts_with(&prefix) && previous.is_none_or(|p| p < value.object_key.as_str()),
+            vector_retirement_object_prefix(&identity, &value.object_key).is_ok()
+                && previous.is_none_or(|p| p < value.object_key.as_str()),
             "retirement target scope or order mismatch",
         )?;
         previous = Some(&value.object_key);
@@ -1651,9 +1668,7 @@ impl VectorRetirementTargetV1 {
         object_key: CatalogObjectKey,
         metadata: &TableCatalogObjectMetadata,
     ) -> TableCatalogStoreResult<Self> {
-        if !object_key.as_str().starts_with(&resource.dataset_prefix()) {
-            return Err(invalid("retirement object is outside the resource"));
-        }
+        vector_retirement_object_prefix(resource, object_key.as_str())?;
         let value = Self {
             object_key: object_key.as_str().to_string(),
             body_revision: metadata

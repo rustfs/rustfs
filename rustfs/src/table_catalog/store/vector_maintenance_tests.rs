@@ -1481,3 +1481,42 @@ fn object_maintenance_deleted_batches_reuse_published_complete_evidence() {
         );
     });
 }
+
+#[tokio::test]
+async fn object_maintenance_query_sessions_have_exact_scope_and_expiry_window() {
+    let fixture = prepared_v3_fixture().await;
+    let (guard, _) = fixture
+        .store
+        .begin_vector_operation(
+            &fixture.bucket,
+            &Namespace::parse(&fixture.entry.namespace).unwrap(),
+            &CatalogName::parse(&fixture.entry.table).unwrap(),
+        )
+        .await
+        .unwrap();
+    let resource = guard.resource_identity();
+    let prefix = format!(".rustfs-table/{}/query-results/", resource.table_id().as_str());
+    let key = format!("{prefix}{}.session", "a".repeat(64));
+    assert_eq!(vector_retirement_object_prefix(resource, &key).unwrap(), prefix);
+    for key in [
+        format!("{prefix}session"),
+        format!("{prefix}../dataset/object"),
+        format!("{prefix}{}.session/extra", "a".repeat(64)),
+        format!(".rustfs-table/{}/query-results/{}.session", Uuid::new_v4(), "a".repeat(64)),
+    ] {
+        assert!(vector_retirement_object_prefix(resource, &key).is_err());
+    }
+    let now = OffsetDateTime::now_utc();
+    let mut target = VectorRetirementTargetV1 {
+        object_key: key,
+        body_revision: Uuid::new_v4(),
+        mod_time: Some(VectorObjectTimeV1::from_time(now - Duration::seconds(3599))),
+        content_length: 1,
+        etag: None,
+        version_id: None,
+        delete_marker: false,
+    };
+    assert!(!vector_retirement_target_is_old_enough(&target, VectorHistoryRetentionV1::All, now).unwrap());
+    target.mod_time = Some(VectorObjectTimeV1::from_time(now - Duration::seconds(3600)));
+    assert!(vector_retirement_target_is_old_enough(&target, VectorHistoryRetentionV1::All, now).unwrap());
+}

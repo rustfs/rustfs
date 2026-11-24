@@ -1170,7 +1170,7 @@ impl<B: TableCatalogObjectBackend> ObjectTableCatalogStore<B> {
             return Err(maintenance_error("invalid candidate page limit or cursor"));
         }
         let resource = guard.resource_identity();
-        let prefix = resource.dataset_prefix();
+        let prefix = format!(".rustfs-table/{}/", resource.table_id().as_str());
         if start_after.is_some_and(|value| !value.starts_with(&prefix)) {
             return Err(maintenance_error("candidate cursor is outside resource"));
         }
@@ -1188,6 +1188,10 @@ impl<B: TableCatalogObjectBackend> ObjectTableCatalogStore<B> {
         validate_maintenance_page(&page, &prefix, after.as_deref(), usize::from(limit.get()))?;
         let mut items = Vec::new();
         for candidate in page.objects {
+            if vector_retirement_object_prefix(resource, &candidate.key).is_err() {
+                after = Some(candidate.key);
+                continue;
+            }
             if candidate.delete_marker {
                 return Err(maintenance_error("Vector dataset candidate has a delete marker"));
             }
@@ -2103,6 +2107,13 @@ pub(crate) fn vector_retirement_target_is_old_enough(
         VectorHistoryRetentionV1::Last { min_age_seconds, .. } => i64::try_from(min_age_seconds)
             .map_err(|_| maintenance_error("retention age overflow"))?
             .max(TABLE_METADATA_CLEANUP_SAFETY_WINDOW_SECONDS),
+    };
+    // Immutable result objects are never retained less than the full session lifetime,
+    // even when Dataset history uses a shorter retention policy.
+    let minimum = if target.object_key.split('/').nth(2) == Some("query-results") {
+        minimum.max(VECTOR_QUERY_RESULTS_RETENTION_SECONDS)
+    } else {
+        minimum
     };
     let Some(time) = &target.mod_time else {
         return Ok(false);

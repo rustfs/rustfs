@@ -27,8 +27,13 @@ use super::{
         VectorRecord, decode_initialization_payload, encode_initialization_payload, plan_initial_manifest, validate_record_keys,
     },
     model::{VectorDistanceMetric, VectorInputError, validate_non_filterable_keys},
+    pagination::{
+        self, PaginationError, PaginationSession, ParsedToken, SessionBinding, SessionResults, SessionState, StoredMatch,
+    },
     protocol::{Operation, ProtocolError, Request, Response, dto},
 };
+
+mod pages;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct VectorRequestId(Uuid);
@@ -59,6 +64,8 @@ pub(crate) enum VectorServiceError {
     Input(#[from] VectorInputError),
     #[error("Vector filter validation failed")]
     Filter(#[from] FilterError),
+    #[error("Vector pagination failed")]
+    Pagination(#[from] PaginationError),
     #[error("Vector metadata at position {position} must be an object")]
     InvalidMetadataShape { position: usize },
     #[error("Vector request context is invalid: {0}")]
@@ -69,8 +76,6 @@ pub(crate) enum VectorServiceError {
         #[source]
         source: Box<dyn std::error::Error + Send + Sync>,
     },
-    #[error("Vector integration is not complete: {0}")]
-    PendingIntegration(&'static str),
     #[error("Vector operation {0:?} has no connected service path")]
     OperationUnavailable(Operation),
 }
@@ -87,6 +92,12 @@ pub(crate) trait VectorRequestAccess: Send + Sync {
     fn request_id(&self) -> VectorRequestId;
     fn bucket(&self) -> &BucketHandle;
     fn index_name(&self) -> &CatalogName;
+
+    fn pagination_principal(&self) -> Result<[u8; 32], VectorServiceError>;
+
+    fn pagination_now(&self) -> i64 {
+        time::OffsetDateTime::now_utc().unix_timestamp()
+    }
 
     /// Check the main and additional actions against this guarded current definition.
     /// QueryVectors with a filter or returnMetadata also requires GetVectors.
@@ -107,6 +118,13 @@ pub(crate) trait VectorRequestAccess: Send + Sync {
 
     /// Accepted owned writes must retain this entire guard until their storage tail drains.
     async fn managed_dataset(
+        &self,
+        guard: Arc<VectorCatalogOperationGuard>,
+        definition: &VectorIndexDefinitionV1,
+    ) -> Result<ManagedDatasetAccess, VectorServiceError>;
+
+    /// Grant the query-results prefix independently from Dataset access, under the same owner.
+    async fn managed_query_results(
         &self,
         guard: Arc<VectorCatalogOperationGuard>,
         definition: &VectorIndexDefinitionV1,
@@ -138,12 +156,13 @@ pub(crate) struct PreparedVectorQuery<B: TableCatalogObjectBackend> {
     pub candidates: Vec<QueryMatch>,
     pub metadata_rows: Option<Vec<ProjectedVector>>,
     pub return_distance: bool,
+    pub next_token: Option<String>,
 }
 
 impl<B: TableCatalogObjectBackend> PreparedVectorQuery<B> {
     pub(crate) fn into_output(self) -> Result<dto::QueryVectorsOutput, VectorServiceError> {
-        if self.candidates.len() > 100 {
-            return Err(VectorServiceError::PendingIntegration("query result pagination"));
+        if self.candidates.len() > pagination::QUERY_PAGE_SIZE {
+            return Err(VectorServiceError::InvalidContext("prepared query exceeds its page size"));
         }
         if let Some(rows) = &self.metadata_rows
             && (rows.len() != self.candidates.len()
@@ -174,7 +193,7 @@ impl<B: TableCatalogObjectBackend> PreparedVectorQuery<B> {
         Ok(dto::QueryVectorsOutput {
             vectors,
             distance_metric,
-            next_token: None,
+            next_token: self.next_token,
         })
     }
 }
@@ -542,10 +561,9 @@ impl<B: TableCatalogObjectBackend> VectorService<B> {
         context: &dyn VectorRequestAccess,
         input: &dto::ListVectorsInput,
     ) -> Result<dto::ListVectorsOutput, VectorServiceError> {
+        let issued_at = context.pagination_now();
         let bound = self.bind_index(context, None).await?;
-        if input.next_token.is_some() {
-            return Err(VectorServiceError::PendingIntegration("ListVectors pagination verification"));
-        }
+        let binding = self.page_binding(context, &bound)?;
         let max_results = usize::try_from(input.max_results.unwrap_or(500))
             .ok()
             .filter(|count| (1..=1000).contains(count))
@@ -562,13 +580,20 @@ impl<B: TableCatalogObjectBackend> VectorService<B> {
                 );
             }
         };
-        let snapshot = bound.adapter.open_catalog_entry(&bound.access, &bound.entry).await?;
+        let (session, snapshot, mut offset) = if let Some(token) = &input.next_token {
+            let (session, snapshot, position) = self.resume_page_session(context, &bound, token, &binding).await?;
+            if !matches!(session.state.results, SessionResults::List) || position == 0 {
+                return Err(PaginationError::invalid_token().into());
+            }
+            (Some(session), snapshot, position)
+        } else {
+            (None, bound.adapter.open_catalog_entry(&bound.access, &bound.entry).await?, 0)
+        };
         let batch_size = NonZeroUsize::new(64).ok_or(VectorServiceError::InvalidContext("invalid scan batch size"))?;
-        let mut offset = 0_u64;
+        let start_offset = offset;
         let mut processed_bytes = 0_usize;
         let mut vectors = Vec::with_capacity(max_results);
-        loop {
-            // The processing limit includes fields omitted from the response.
+        let more = 'scan: loop {
             let batch = snapshot
                 .list_batch(
                     offset,
@@ -582,7 +607,6 @@ impl<B: TableCatalogObjectBackend> VectorService<B> {
             let exhausted = batch.len() < batch_size.get();
             for row in batch {
                 let selected = offset % segments == segment;
-                offset = offset.checked_add(1).ok_or(DatasetError::InvalidOffset)?;
                 let mut vector = dto::ListOutputVector {
                     key: row.key,
                     data: row.data.map(|float32| dto::VectorData { float32 }),
@@ -594,10 +618,15 @@ impl<B: TableCatalogObjectBackend> VectorService<B> {
                         source: Box::new(source),
                     })?
                     .len();
-                processed_bytes = processed_bytes.checked_add(row_bytes).ok_or(DatasetError::InvalidOffset)?;
-                if processed_bytes > 1024 * 1024 || (selected && vectors.len() == max_results) {
-                    return Err(VectorServiceError::PendingIntegration("ListVectors snapshot pagination"));
+                let next_bytes = processed_bytes.checked_add(row_bytes).ok_or(DatasetError::InvalidOffset)?;
+                if next_bytes > 1024 * 1024 || (selected && vectors.len() == max_results) {
+                    if offset == start_offset {
+                        return Err(VectorServiceError::InvalidContext("one vector exceeds the ListVectors processing budget"));
+                    }
+                    break 'scan true;
                 }
+                processed_bytes = next_bytes;
+                offset = offset.checked_add(1).ok_or(DatasetError::InvalidOffset)?;
                 if selected {
                     if !input.return_data.unwrap_or(false) {
                         vector.data = None;
@@ -609,14 +638,24 @@ impl<B: TableCatalogObjectBackend> VectorService<B> {
                 }
             }
             if exhausted {
-                break;
+                break false;
             }
-        }
+        };
+        let next_token = if more {
+            let session = match session {
+                Some(session) => session,
+                None => {
+                    let session = self.new_page_session(binding, &snapshot, issued_at, SessionResults::List)?;
+                    self.persist_page_session(context, &bound, &session).await?;
+                    session
+                }
+            };
+            Some(session.token(offset)?)
+        } else {
+            None
+        };
         bound.guard.check_held()?;
-        Ok(dto::ListVectorsOutput {
-            vectors,
-            next_token: None,
-        })
+        Ok(dto::ListVectorsOutput { vectors, next_token })
     }
 
     async fn get_vectors(
@@ -655,27 +694,70 @@ impl<B: TableCatalogObjectBackend> VectorService<B> {
         context: &dyn VectorRequestAccess,
         input: &dto::QueryVectorsInput,
     ) -> Result<PreparedVectorQuery<B>, VectorServiceError> {
+        let issued_at = context.pagination_now();
         let bound = self.bind_index(context, None).await?;
-        if input.next_token.is_some() {
-            return Err(VectorServiceError::PendingIntegration("pagination verification and result loading"));
-        }
-        let index = LanceManifestAdapter::<B>::index_from_catalog(&bound.entry)?;
-        let filter = input
-            .filter
-            .as_ref()
-            .map(|filter| ValidatedFilter::parse(filter, &index.non_filterable_metadata_keys))
-            .transpose()?;
-        let top_k = usize::try_from(input.top_k)
-            .ok()
-            .and_then(NonZeroUsize::new)
-            .ok_or_else(|| ProtocolError::validation("topK", "must be positive"))?;
-        let snapshot = bound.adapter.open_catalog_entry(&bound.access, &bound.entry).await?;
-        #[cfg(test)]
-        bound
-            .adapter
-            .pause_query_snapshot(&snapshot, &bound.entry.head().expected_head())
-            .await;
-        let candidates = snapshot.query_matches(&input.query_vector.float32, top_k, filter).await?;
+        let binding = self.page_binding(context, &bound)?;
+        let (snapshot, candidates, next_token) = if let Some(token) = &input.next_token {
+            let (session, snapshot, position) = self.resume_page_session(context, &bound, token, &binding).await?;
+            let SessionResults::Query { matches } = &session.state.results else {
+                return Err(PaginationError::invalid_token().into());
+            };
+            let start = usize::try_from(position).map_err(|_| PaginationError::invalid_token())?;
+            if start == 0 || start >= matches.len() || !start.is_multiple_of(pagination::QUERY_PAGE_SIZE) {
+                return Err(PaginationError::invalid_token().into());
+            }
+            let end = start.saturating_add(pagination::QUERY_PAGE_SIZE).min(matches.len());
+            let candidates = matches[start..end]
+                .iter()
+                .map(|item| QueryMatch {
+                    key: item.key.clone(),
+                    row_id: item.row_id,
+                    distance_f64: f64::from_bits(item.distance_bits),
+                })
+                .collect();
+            let next = if end < matches.len() {
+                Some(session.token(end as u64)?)
+            } else {
+                None
+            };
+            (snapshot, candidates, next)
+        } else {
+            let index = LanceManifestAdapter::<B>::index_from_catalog(&bound.entry)?;
+            let filter = input
+                .filter
+                .as_ref()
+                .map(|filter| ValidatedFilter::parse(filter, &index.non_filterable_metadata_keys))
+                .transpose()?;
+            let top_k = usize::try_from(input.top_k)
+                .ok()
+                .filter(|count| *count <= 10_000)
+                .and_then(NonZeroUsize::new)
+                .ok_or_else(|| ProtocolError::validation("topK", "must be between 1 and 10000"))?;
+            let snapshot = bound.adapter.open_catalog_entry(&bound.access, &bound.entry).await?;
+            #[cfg(test)]
+            bound
+                .adapter
+                .pause_query_snapshot(&snapshot, &bound.entry.head().expected_head())
+                .await;
+            let mut candidates = snapshot.query_matches(&input.query_vector.float32, top_k, filter).await?;
+            let next = if candidates.len() > pagination::QUERY_PAGE_SIZE {
+                let matches = candidates
+                    .iter()
+                    .map(|candidate| StoredMatch {
+                        key: candidate.key.clone(),
+                        row_id: candidate.row_id,
+                        distance_bits: candidate.distance_f64.to_bits(),
+                    })
+                    .collect();
+                let session = self.new_page_session(binding, &snapshot, issued_at, SessionResults::Query { matches })?;
+                self.persist_page_session(context, &bound, &session).await?;
+                candidates.truncate(pagination::QUERY_PAGE_SIZE);
+                Some(session.token(pagination::QUERY_PAGE_SIZE as u64)?)
+            } else {
+                None
+            };
+            (snapshot, candidates, next)
+        };
         let metadata_rows = if input.return_metadata.unwrap_or(false) {
             let rows = snapshot
                 .take_rows(
@@ -699,6 +781,7 @@ impl<B: TableCatalogObjectBackend> VectorService<B> {
             candidates,
             metadata_rows,
             return_distance: input.return_distance.unwrap_or(false),
+            next_token,
         })
     }
 }
