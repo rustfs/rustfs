@@ -18,8 +18,8 @@
 //! `ReqInfo` and `RequestContext` accessors, the request-header predicates authorization
 //! reads, and the object and IAM stores a request resolves to.
 //! Not responsible for: any policy decision (`decision`), condition building (`conditions`),
-//! or an implementation of the trait — the legacy s3s request implements it in
-//! `storage::access`, the owned `RequestEnvelope` in the app layer.
+//! or the trait implementations, which belong to the legacy S3 request adapter and the
+//! app layer's owned `RequestEnvelope`.
 //! Upstream: both edges' access phases. Downstream: every module of `storage::authorization`,
 //! `storage::access_owned`, and the use cases that read authorization state.
 

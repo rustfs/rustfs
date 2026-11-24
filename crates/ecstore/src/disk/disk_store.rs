@@ -1972,7 +1972,7 @@ impl LocalDiskWrapper {
 
     /// Stop the disk monitoring
     pub async fn stop_monitoring(&self) {
-        self.retire_handle();
+        self.cancel_token.cancel();
     }
 
     pub(crate) fn retire_handle(&self) {
@@ -1986,7 +1986,7 @@ impl LocalDiskWrapper {
     /// # Errors
     /// Returns `DiskNotFound` after retirement, or `FaultyDisk` while the I/O gate is faulty.
     pub fn check_scanner_handle(&self) -> Result<()> {
-        if self.cancel_token.is_cancelled() {
+        if self.retired.is_cancelled() {
             return Err(DiskError::DiskNotFound);
         }
         if self.health.is_faulty() {
@@ -3007,6 +3007,7 @@ impl DiskAPI for LocalDiskWrapper {
     }
 
     async fn close(&self) -> Result<()> {
+        self.retired.cancel();
         self.stop_monitoring().await;
         self.disk.close().await
     }
