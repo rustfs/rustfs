@@ -322,7 +322,7 @@ fn completion_input(
 mod tests {
     use super::test_support::*;
     use super::*;
-    use crate::app::storage_api::s3::dto::{CreateMultipartUploadInput, ServerSideEncryption};
+    use crate::app::storage_api::s3::dto::ServerSideEncryption;
 
     #[test]
     fn internal_object_info_lookup_opts_drops_http_preconditions() {
@@ -558,17 +558,24 @@ mod tests {
             "parent/uuid/delete-prepared",
             "parent/uuid/delete-quorum-committed",
         ] {
-            let create = CreateMultipartUploadInput::builder()
-                .bucket("bucket".to_owned())
-                .key(key.to_owned())
-                .build()
-                .expect("valid create request DTO");
+            // Same facts `from_legacy` carried. Metadata, tagging, storage class, SSE, and object lock stay absent.
+            let create = super::create_values::CreateMultipartUploadFields {
+                bucket: "bucket".to_owned(),
+                key: key.to_owned(),
+                metadata: None,
+                tagging: None,
+                storage_class: None,
+                server_side_encryption: None,
+                sse_customer_algorithm: None,
+                sse_customer_key: None,
+                sse_customer_key_md5: None,
+                ssekms_key_id: None,
+                object_lock_legal_hold_status: None,
+                object_lock_mode: None,
+                object_lock_retain_until_date: None,
+            };
             let error = match make_usecase()
-                .execute_create_multipart_upload(
-                    owned_envelope(Method::POST),
-                    super::create_values::CreateMultipartUploadFields::from_legacy(create),
-                    None,
-                )
+                .execute_create_multipart_upload(owned_envelope(Method::POST), create, None)
                 .await
             {
                 Err(error) => error,
