@@ -762,6 +762,24 @@ mod tests {
             Extensions::new(),
         )
     }
+
+    /// PUT `/` with only the part checksum header. Credentials, region, and service stay absent.
+    fn put_part_checksum_envelope(checksum_sha256: &str) -> RequestEnvelope {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-amz-checksum-sha256", HeaderValue::from_str(checksum_sha256).expect("checksum header"));
+        RequestEnvelope::from_parts(
+            crate::app::RequestHead {
+                method: Method::PUT,
+                uri: Uri::from_static("/"),
+                headers,
+                credentials: None,
+                region: None,
+                service: None,
+            },
+            Extensions::new(),
+        )
+    }
+
     fn upload_metadata_with_checksum_type(recorded: &str) -> HashMap<String, String> {
         HashMap::from([(rustfs_rio::RUSTFS_MULTIPART_CHECKSUM_TYPE.to_string(), recorded.to_string())])
     }
@@ -1104,10 +1122,13 @@ mod tests {
             part_input.sse_customer_key_md5 = Some(customer_md5.to_string());
             part_input.checksum_algorithm = Some(ChecksumAlgorithm::from_static("SHA256"));
             part_input.checksum_sha256 = Some(plaintext_sha256.to_string());
-            let mut part = build_request(part_input, Method::PUT);
-            part.headers
-                .insert("x-amz-checksum-sha256", HeaderValue::from_static(plaintext_sha256));
-            let part = usecase.execute_upload_part(part).await.expect("SSE-C part");
+            let part = usecase
+                .execute_upload_part_with_audit(
+                    put_part_checksum_envelope(plaintext_sha256),
+                    super::super::UploadPartWriteInput::from_legacy(part_input, None),
+                )
+                .await
+                .expect("SSE-C part");
             // Reject keyless completion before checksum comparison, then enforce
             // the same key boundary on a successful commit and its replay.
             for (attempt, keyed) in [false, true, false, true].into_iter().enumerate() {
@@ -1409,16 +1430,26 @@ mod tests {
         let usecase = DefaultMultipartUsecase::from_global();
         let initial_body = b"initial multipart body";
 
-        let create_input = CreateMultipartUploadInput::builder()
-            .bucket(bucket.clone())
-            .key(object.to_string())
-            .build()
-            .expect("create multipart input should build");
+        let create_input = |bucket: &str| super::super::CreateMultipartUploadFields {
+            bucket: bucket.to_owned(),
+            key: object.to_owned(),
+            metadata: None,
+            tagging: None,
+            storage_class: None,
+            server_side_encryption: None,
+            sse_customer_algorithm: None,
+            sse_customer_key: None,
+            sse_customer_key_md5: None,
+            ssekms_key_id: None,
+            object_lock_legal_hold_status: None,
+            object_lock_mode: None,
+            object_lock_retain_until_date: None,
+        };
         // Same If-None-Match header the s3s create request carried. Credentials, region, and service stay absent.
         let first_created = usecase
             .execute_create_multipart_upload(
                 completion_with_header(http::header::IF_NONE_MATCH, HeaderValue::from_static("*")),
-                super::super::CreateMultipartUploadFields::from_legacy(create_input.clone()),
+                create_input(&bucket),
                 None,
             )
             .await
@@ -1451,7 +1482,7 @@ mod tests {
         let create_err = match usecase
             .execute_create_multipart_upload(
                 completion_with_header(http::header::IF_NONE_MATCH, HeaderValue::from_static("*")),
-                super::super::CreateMultipartUploadFields::from_legacy(create_input.clone()),
+                create_input(&bucket),
                 None,
             )
             .await
@@ -1462,11 +1493,7 @@ mod tests {
         assert_eq!(create_err.code(), &S3ErrorCode::PreconditionFailed);
 
         let second_created = usecase
-            .execute_create_multipart_upload(
-                owned_envelope(Method::POST),
-                super::super::CreateMultipartUploadFields::from_legacy(create_input),
-                None,
-            )
+            .execute_create_multipart_upload(owned_envelope(Method::POST), create_input(&bucket), None)
             .await
             .expect("unconditional create multipart upload should succeed");
         let second_upload_id = second_created.upload_id;
@@ -1620,15 +1647,10 @@ mod tests {
             .expect("delete versioned object to create delete marker");
         assert!(marker.delete_marker);
 
-        let dm_create_input = CreateMultipartUploadInput::builder()
-            .bucket(versioned_bucket.clone())
-            .key(object.to_string())
-            .build()
-            .expect("delete-marker create input");
         let dm_created = usecase
             .execute_create_multipart_upload(
                 completion_with_header(http::header::IF_NONE_MATCH, HeaderValue::from_static("*")),
-                super::super::CreateMultipartUploadFields::from_legacy(dm_create_input),
+                create_input(&versioned_bucket),
                 None,
             )
             .await
@@ -2240,12 +2262,13 @@ mod tests {
             part_input.checksum_algorithm = Some(ChecksumAlgorithm::from_static("SHA256"));
             part_input.checksum_sha256 = Some(part_checksum.encoded.clone());
 
-            let mut part_req = build_request(part_input, Method::PUT);
-            part_req.headers.insert(
-                "x-amz-checksum-sha256",
-                HeaderValue::from_str(&part_checksum.encoded).expect("header value"),
-            );
-            let uploaded = usecase.execute_upload_part(part_req).await.expect("upload part");
+            let uploaded = usecase
+                .execute_upload_part_with_audit(
+                    put_part_checksum_envelope(&part_checksum.encoded),
+                    super::super::UploadPartWriteInput::from_legacy(part_input, None),
+                )
+                .await
+                .expect("upload part");
             let mut part = completion_part(part_number, uploaded.e_tag.as_deref());
             part.checksum_sha256 = Some(part_checksum.encoded);
             completed_parts.push(part);

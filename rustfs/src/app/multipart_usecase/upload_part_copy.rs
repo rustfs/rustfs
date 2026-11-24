@@ -16,7 +16,10 @@
 //! Gateway and protocol clients supply request facts. Storage owns the multipart upload.
 
 use super::*;
-use crate::app::{RequestEnvelope, object_usecase::CopySourceCondition};
+use crate::app::{
+    RequestEnvelope,
+    object_usecase::{CopySourceCondition, CopySourceDates},
+};
 use rustfs_gateway_types::CopySourceValue;
 use rustfs_s3_types::{S3Error, S3ErrorCode, S3Result, s3_error};
 
@@ -28,6 +31,7 @@ pub(crate) struct UploadPartCopyWriteInput {
     pub(crate) copy_source_range: Option<String>,
     pub(crate) copy_source_if_match: Option<CopySourceCondition>,
     pub(crate) copy_source_if_none_match: Option<CopySourceCondition>,
+    pub(crate) copy_source_dates: CopySourceDates,
     pub(crate) sse_customer_algorithm: Option<String>,
     pub(crate) sse_customer_key: Option<String>,
     pub(crate) sse_customer_key_md5: Option<String>,
@@ -145,6 +149,7 @@ impl DefaultMultipartUsecase {
             part_number,
             copy_source_if_match,
             copy_source_if_none_match,
+            copy_source_dates,
             sse_customer_algorithm,
             sse_customer_key,
             sse_customer_key_md5,
@@ -309,25 +314,12 @@ impl DefaultMultipartUsecase {
 
         let resolved_src_version_id = format_copy_source_version_id(src_info.version_id, src_versioned, src_version_suspended);
 
-        if let Some(if_match) = copy_source_if_match {
-            if let Some(ref etag) = src_info.etag {
-                if let Some(strong_etag) = if_match.strong() {
-                    if etag != strong_etag {
-                        return Err(s3_error!(PreconditionFailed));
-                    }
-                } else {
-                    return Err(s3_error!(PreconditionFailed));
-                }
-            } else {
-                return Err(s3_error!(PreconditionFailed));
-            }
-        }
-
-        if let Some(if_none_match) = copy_source_if_none_match
-            && let Some(ref etag) = src_info.etag
-            && let Some(strong_etag) = if_none_match.strong()
-            && etag == strong_etag
-        {
+        if !copy_source_dates.permits_copy(
+            copy_source_if_match.as_ref(),
+            copy_source_if_none_match.as_ref(),
+            src_info.etag.as_deref(),
+            src_info.mod_time,
+        ) {
             return Err(s3_error!(PreconditionFailed));
         }
 
@@ -521,6 +513,7 @@ mod tests {
             copy_source_range: None,
             copy_source_if_match: None,
             copy_source_if_none_match: None,
+            copy_source_dates: Default::default(),
             sse_customer_algorithm: None,
             sse_customer_key: None,
             sse_customer_key_md5: None,
