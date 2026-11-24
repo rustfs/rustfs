@@ -64,26 +64,16 @@ jobs:
     timeout-minutes: 5
     outputs:
       gateway-rev: ${{ steps.pin.outputs.rev }}
+      ceph-rev: ${{ steps.pin.outputs.ceph-rev }}
     steps:
       - name: Checkout repository
         uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7
         with:
           persist-credentials: false
 
-      - name: Read the rustfs/gateway rev from Cargo.toml
+      - name: Read the gateway and Ceph pins
         id: pin
-        run: |
-          set -euo pipefail
-          python3 - <<'PY' >> "$GITHUB_OUTPUT"
-          import re, sys, tomllib
-          dependencies = tomllib.load(open("Cargo.toml", "rb"))["workspace"]["dependencies"]
-          revs = {spec.get("rev") for spec in dependencies.values()
-                  if isinstance(spec, dict) and spec.get("git") == "https://github.com/rustfs/gateway.git"}
-          if len(revs) != 1 or not re.fullmatch(r"[0-9a-f]{40}", str(next(iter(revs)))):
-              sys.exit(f"Cargo.toml must pin rustfs/gateway at exactly one full rev, found {sorted(map(str, revs))}")
-          print(f"rev={revs.pop()}")
-          PY
-          cat "$GITHUB_OUTPUT"
+        run: python3 scripts/gateway_corpus_capture.py pins >> "$GITHUB_OUTPUT"
 
   build-candidate:
     name: Build candidate binary
@@ -140,8 +130,8 @@ jobs:
       - name: Build
         working-directory: gateway
         run: |
-          cargo build --locked --release -p rustfs-gateway-conformance -p rustfs-gateway-compat-sut \
-            --bin rustfs-gateway-conformance --bin compat-sut
+          cargo build --locked --release -p rustfs-gateway-conformance -p rustfs-gateway-compat-sut -p rustfs-gateway-corpus \
+            --bin rustfs-gateway-conformance --bin compat-sut --bin corpus
 
       - name: Upload tools
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
@@ -151,6 +141,7 @@ jobs:
           path: |
             gateway/target/release/rustfs-gateway-conformance
             gateway/target/release/compat-sut
+            gateway/target/release/corpus
           if-no-files-found: error
           retention-days: 1
 
@@ -332,5 +323,122 @@ jobs:
             lane/compat/probe.jsonl
             lane/compat/sut.log
             lane/compat/results/**
+          if-no-files-found: error
+          retention-days: 14
+
+  capture-corpus:
+    name: Capture wire samples (selected E2E and Ceph tests)
+    needs: [ plan, build-gateway-tools ]
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7
+        with:
+          persist-credentials: false
+
+      - name: Setup Rust environment
+        uses: ./.github/actions/setup
+        with:
+          # Reuse the hosted server and e2e harness dependencies. Capture jobs never save caches.
+          cache-shared-key: ci-e2e-distributed-hosted
+          cache-save-if: 'false'
+          install-build-packaging-tools: 'false'
+
+      # Keep external source and tools outside the verified server's source inventory.
+      - name: Checkout gateway's independent secret scanner
+        uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7
+        with:
+          repository: rustfs/gateway
+          ref: ${{ needs.plan.outputs.gateway-rev }}
+          path: target/wire/gateway
+          persist-credentials: false
+
+      - name: Checkout pinned Ceph tests
+        uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7
+        with:
+          repository: ceph/s3-tests
+          ref: ${{ needs.plan.outputs.ceph-rev }}
+          path: target/wire/ceph
+          persist-credentials: false
+
+      - name: Download matching corpus tools
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: gateway-acceptance-tools
+          path: target/wire/tools
+
+      - name: Install Ceph's test dependencies
+        run: |
+          python3 -m venv "$RUNNER_TEMP/ceph-venv"
+          "$RUNNER_TEMP/ceph-venv/bin/python" -m pip install -r target/wire/ceph/requirements.txt
+
+      - name: Build the debug-only recording server
+        id: wire_server
+        run: python3 scripts/e2e_binary.py build --features corpus-record
+
+      - name: Record and verify selected scenarios from both sources
+        id: capture
+        run: |
+          chmod +x target/wire/tools/corpus
+          python3 scripts/e2e_binary.py run --features corpus-record -- \
+            "$RUNNER_TEMP/ceph-venv/bin/python" scripts/gateway_corpus_capture.py record --suite nightly \
+            --gateway target/wire/gateway --ceph target/wire/ceph --tool target/wire/tools/corpus \
+            --summary "$RUNNER_TEMP/gateway-capture-summary.json"
+
+      - name: Require 1000–2000 retained entries
+        run: python3 scripts/gateway_corpus_capture.py check-size "$RUNNER_TEMP/gateway-capture-summary.json"
+
+      # Only publish after the enclosing binary verifier also succeeds. A size shortfall still has valid counts.
+      - name: Upload validated counts
+        if: ${{ !cancelled() && steps.capture.outcome == 'success' }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: gateway-capture-summary
+          path: ${{ runner.temp }}/gateway-capture-summary.json
+          if-no-files-found: error
+          retention-days: 14
+
+      # The capture size and release parity are independent verdicts.
+      - name: Fetch the verified release reference
+        id: wire_reference
+        if: ${{ !cancelled() && steps.wire_server.outcome == 'success' }}
+        uses: ./.github/actions/reference-binary
+
+      - name: Install a child-process clock for the wire comparison
+        id: wire_clock
+        if: ${{ !cancelled() && steps.wire_reference.outcome == 'success' }}
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install --no-install-recommends -y libfaketime
+          lib="$(dpkg-query -L libfaketime | sed -n '/\/libfaketime\.so\.1$/p')"
+          test -f "$lib"
+          echo "path=$lib" >> "$GITHUB_OUTPUT"
+
+      - name: Compare the same signed Ceph requests against the release
+        id: wire_compare
+        if: ${{ !cancelled() && steps.wire_clock.outcome == 'success' }}
+        env:
+          REF_BINARY: ${{ steps.wire_reference.outputs.path }}
+          REF_SHA256: ${{ steps.wire_reference.outputs.executable-sha256 }}
+          REF_VERSION: ${{ steps.wire_reference.outputs.version }}
+          CLOCK_LIBRARY: ${{ steps.wire_clock.outputs.path }}
+        run: |
+          python3 scripts/e2e_binary.py run --features corpus-record -- \
+            "$RUNNER_TEMP/ceph-venv/bin/python" scripts/gateway_wire_replay.py compare \
+            --ceph target/wire/ceph --gateway target/wire/gateway --reference "$REF_BINARY" \
+            --reference-sha256 "$REF_SHA256" --reference-version "$REF_VERSION" --clock-library "$CLOCK_LIBRARY" \
+            --summary "$RUNNER_TEMP/gateway-wire-differences.json"
+
+      - name: Require zero response differences on replayed cases
+        if: ${{ !cancelled() && steps.wire_compare.outcome == 'success' }}
+        run: python3 scripts/gateway_wire_replay.py check "$RUNNER_TEMP/gateway-wire-differences.json"
+
+      - name: Upload validated difference counts and case IDs
+        if: ${{ !cancelled() && steps.wire_compare.outcome == 'success' }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: gateway-wire-differences
+          path: ${{ runner.temp }}/gateway-wire-differences.json
           if-no-files-found: error
           retention-days: 14

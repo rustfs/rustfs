@@ -49,6 +49,15 @@ use uuid::Uuid;
 // Common constants for all E2E tests
 pub const DEFAULT_ACCESS_KEY: &str = "rustfsadmin";
 pub const DEFAULT_SECRET_KEY: &str = "rustfsadmin";
+
+fn fixture_access_key() -> String {
+    if std::env::var("RUSTFS_CORPUS_RECORD").as_deref() == Ok("1") {
+        "rustfsadmin-ci".to_owned()
+    } else {
+        DEFAULT_ACCESS_KEY.to_owned()
+    }
+}
+
 pub const ENV_RUSTFS_BUILD_FEATURES: &str = "RUSTFS_BUILD_FEATURES";
 pub(crate) const FAST_DATA_USAGE_SCANNER_ENV: &[(&str, &str)] =
     &[("RUSTFS_SCANNER_CYCLE", "1"), ("RUSTFS_SCANNER_START_DELAY_SECS", "0")];
@@ -632,7 +641,7 @@ impl RustFSTestEnvironment {
             temp_dir,
             address,
             url,
-            access_key: DEFAULT_ACCESS_KEY.to_string(),
+            access_key: fixture_access_key(),
             secret_key: DEFAULT_SECRET_KEY.to_string(),
             process: None,
             capture_log_path,
@@ -651,7 +660,7 @@ impl RustFSTestEnvironment {
             temp_dir,
             address: address.to_string(),
             url,
-            access_key: DEFAULT_ACCESS_KEY.to_string(),
+            access_key: fixture_access_key(),
             secret_key: DEFAULT_SECRET_KEY.to_string(),
             process: None,
             capture_log_path,
@@ -2533,7 +2542,7 @@ mod tests {
         RustFSTestClusterEnvironment {
             nodes,
             temp_dir,
-            access_key: DEFAULT_ACCESS_KEY.to_string(),
+            access_key: fixture_access_key(),
             secret_key: DEFAULT_SECRET_KEY.to_string(),
             extra_env: Vec::new(),
             node_extra_env: vec![Vec::new(); topology.node_count],

@@ -746,6 +746,10 @@ mod tests {
     fn completion_with_header(name: impl http::header::IntoHeaderName, value: HeaderValue) -> RequestEnvelope {
         let mut headers = HeaderMap::new();
         headers.insert(name, value);
+        completion_with_headers(headers)
+    }
+
+    fn completion_with_headers(headers: HeaderMap) -> RequestEnvelope {
         RequestEnvelope::from_parts(
             crate::app::RequestHead {
                 method: Method::POST,
@@ -1074,20 +1078,18 @@ mod tests {
             create_input.sse_customer_key = Some(customer_key.to_string());
             create_input.sse_customer_key_md5 = Some(customer_md5.to_string());
             create_input.checksum_algorithm = Some(ChecksumAlgorithm::from_static("SHA256"));
-            let mut create = build_request(create_input, Method::POST);
-            create
-                .headers
-                .insert("x-amz-checksum-algorithm", HeaderValue::from_static("SHA256"));
-            create
-                .headers
-                .insert("x-amz-checksum-type", HeaderValue::from_static("COMPOSITE"));
+            let mut headers = HeaderMap::new();
+            headers.insert("x-amz-checksum-algorithm", HeaderValue::from_static("SHA256"));
+            headers.insert("x-amz-checksum-type", HeaderValue::from_static("COMPOSITE"));
             let upload_id = usecase
-                .execute_create_multipart_upload_from_s3s(create)
+                .execute_create_multipart_upload(
+                    completion_with_headers(headers),
+                    super::super::CreateMultipartUploadFields::from_legacy(create_input),
+                    None,
+                )
                 .await
                 .expect("SSE-C create")
-                .output
-                .upload_id
-                .expect("upload id");
+                .upload_id;
             let mut part_input = UploadPartInput::builder()
                 .bucket(bucket.clone())
                 .key(key.to_string())
@@ -2201,17 +2203,15 @@ mod tests {
             .build()
             .expect("create");
         create_input.checksum_algorithm = Some(ChecksumAlgorithm::from_static("SHA256"));
-        let mut create = build_request(create_input, Method::POST);
-        create
-            .headers
-            .insert("x-amz-checksum-algorithm", HeaderValue::from_static("SHA256"));
         let upload_id = usecase
-            .execute_create_multipart_upload_from_s3s(create)
+            .execute_create_multipart_upload(
+                completion_with_header("x-amz-checksum-algorithm", HeaderValue::from_static("SHA256")),
+                super::super::CreateMultipartUploadFields::from_legacy(create_input),
+                None,
+            )
             .await
             .expect("create sha256 multipart upload")
-            .output
-            .upload_id
-            .expect("upload id");
+            .upload_id;
 
         let part1_bytes = vec![b'a'; 5 * 1024 * 1024];
         let part2_bytes = b"part-two".to_vec();
