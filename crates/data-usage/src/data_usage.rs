@@ -1539,9 +1539,9 @@ pub fn prefix_usage_in_cache(
     } else {
         format!("{bucket}/{prefix}")
     };
-    let entry = clone_cache_value(cache.get(&clone_cache_value(&hash_path(&root).0))?);
+    let entry = cache.get(&hash_path(&root).0)?;
 
-    let usage = PrefixUsageSummary::from_entry(&flatten_entry(cache, &entry, 0)?);
+    let usage = PrefixUsageSummary::from_entry(&flatten_entry(cache, entry, 0)?);
 
     let child_prefix = format!("{root}/");
     let mut sub_prefixes: Vec<PrefixUsageEntry> = entry
@@ -1710,30 +1710,34 @@ impl DataUsageCache {
     }
 
     pub fn flatten(&self, root: &DataUsageEntry) -> DataUsageEntry {
+        let mut aggregate = clone_cache_value(root);
+        aggregate.children = HashSet::new();
+        let mut current = (aggregate, root.children.iter());
+        let mut ancestors = Vec::new();
         let mut visited = HashSet::new();
-        self.flatten_guard(root, &mut visited, 0)
-    }
-
-    fn flatten_guard(&self, root: &DataUsageEntry, visited: &mut HashSet<String>, depth: usize) -> DataUsageEntry {
-        let mut root = clone_cache_value(root);
-        if depth > PREFIX_USAGE_MAX_DEPTH {
-            root.children.clear();
-            return root;
-        }
-        for id in clone_cache_value(&root.children).iter() {
-            if !visited.insert(clone_cache_value(id)) {
-                continue;
-            }
-            if let Some(e) = self.cache.get(id) {
-                let mut e = clone_cache_value(e);
-                if !e.children.is_empty() {
-                    e = self.flatten_guard(&e, visited, depth + 1);
+        loop {
+            if let Some(id) = current.1.next() {
+                if !visited.insert(id.as_str()) {
+                    continue;
                 }
-                root.merge(&e);
+                let Some(child) = self.cache.get(id).filter(|child| !std::ptr::eq(*child, root)) else {
+                    continue;
+                };
+                if child.children.is_empty() {
+                    current.0.merge(child);
+                } else {
+                    let mut aggregate = clone_cache_value(child);
+                    aggregate.children = HashSet::new();
+                    ancestors.push(std::mem::replace(&mut current, (aggregate, child.children.iter())));
+                }
+            } else if let Some(mut parent) = ancestors.pop() {
+                // Preserve subtree grouping for tier accounting proofs.
+                parent.0.merge(&current.0);
+                current = parent;
+            } else {
+                return current.0;
             }
         }
-        root.children.clear();
-        root
     }
 
     pub fn copy_with_children(&mut self, src: &DataUsageCache, hash: &DataUsageHash, parent: &Option<DataUsageHash>) {
@@ -1803,19 +1807,15 @@ impl DataUsageCache {
     }
 
     pub fn size_recursive(&self, path: &str) -> Option<DataUsageEntry> {
-        match self.find(path) {
-            Some(root) => {
-                if root.children.is_empty() {
-                    return Some(root);
-                }
-                let mut flat = self.flatten(&root);
-                if flat.replication_stats.as_ref().is_some_and(ReplicationAllStats::is_empty) {
-                    flat.replication_stats = None;
-                }
-                Some(flat)
-            }
-            None => None,
+        let root = self.cache.get(&hash_path(path).0)?;
+        if root.children.is_empty() {
+            return Some(clone_cache_value(root));
         }
+        let mut flat = self.flatten(root);
+        if flat.replication_stats.as_ref().is_some_and(ReplicationAllStats::is_empty) {
+            flat.replication_stats = None;
+        }
+        Some(flat)
     }
 
     pub fn search_parent(&self, hash: &DataUsageHash) -> Option<DataUsageHash> {
@@ -2007,19 +2007,17 @@ impl DataUsageCache {
 
     /// Convert cache to DataUsageInfo for a specific path
     pub fn dui(&self, path: &str, buckets: &[String]) -> DataUsageInfo {
-        let e = match self.find(path) {
-            Some(e) => e,
-            None => return DataUsageInfo::default(),
+        let Some(e) = self.cache.get(&hash_path(path).0) else {
+            return DataUsageInfo::default();
         };
-        let flat = self.flatten(&e);
+        let flat = self.flatten(e);
 
         let mut buckets_usage = HashMap::new();
         for bucket_name in buckets.iter() {
-            let e = match self.find(bucket_name) {
-                Some(e) => e,
-                None => continue,
+            let Some(e) = self.cache.get(&hash_path(bucket_name).0) else {
+                continue;
             };
-            let flat = self.flatten(&e);
+            let flat = self.flatten(e);
             let mut bui = BucketUsageInfo {
                 size: flat.size as u64,
                 versions_count: flat.versions as u64,
@@ -4171,6 +4169,17 @@ mod tests {
             },
         );
         (cache, root)
+    }
+
+    #[test]
+    fn test_flatten_aggregates_nested_siblings() {
+        let (cache, root) = build_test_tree();
+        let root_entry = cache.cache.get(&root.0).expect("usage root");
+        let flattened = cache.flatten(root_entry);
+        assert!(flattened.children.is_empty());
+        assert_eq!(flattened.objects, 6);
+        assert_eq!(flattened.size, 60);
+        assert_eq!(root_entry.children.len(), 2);
     }
 
     #[test]
