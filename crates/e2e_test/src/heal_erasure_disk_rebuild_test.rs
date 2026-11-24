@@ -1080,6 +1080,7 @@ mod tests {
         assert!(!has_file_under(&disk0), "disk0 must be empty immediately after runtime wipe");
 
         let mut remaining_rebuild_keys: HashSet<String> = objects.iter().map(|(key, _, _)| key.clone()).collect();
+        let format_path = disk0.join(".rustfs.sys").join("format.json");
         for _ in 0..heal_timeout_secs {
             for (key, body, _) in &objects {
                 assert_object_body(&env, bucket, key, body).await;
@@ -1097,18 +1098,17 @@ mod tests {
                 }
             }
 
-            if remaining_rebuild_keys.is_empty() {
-                assert!(
-                    disk0.join(".rustfs.sys").join("format.json").is_file(),
-                    "runtime-wiped disk should have format.json restored by auto heal"
-                );
+            if remaining_rebuild_keys.is_empty() && format_path.is_file() {
                 return;
             }
 
             sleep(Duration::from_secs(1)).await;
         }
 
-        panic!("auto heal did not rebuild all files on the runtime-wiped disk within timeout");
+        panic!(
+            "runtime-wiped disk did not recover within timeout: missing object metadata={remaining_rebuild_keys:?}, format.json present={}",
+            format_path.is_file()
+        );
     }
 
     #[tokio::test]
@@ -1435,16 +1435,38 @@ mod tests {
         }
     }
 
+    struct ScannerWaitDiagnostics {
+        previous_cycle_end: u64,
+        nodes: Vec<String>,
+    }
+
+    impl Drop for ScannerWaitDiagnostics {
+        fn drop(&mut self) {
+            // The scenario timeout can cancel a poll before its own deadline.
+            if !self.nodes.is_empty() {
+                eprintln!(
+                    "Last scanner observations while waiting for a cycle after {}: {:?}",
+                    self.previous_cycle_end, self.nodes
+                );
+            }
+        }
+    }
+
     async fn wait_for_scanner_cycle_after(
         cluster: &RustFSTestClusterEnvironment,
         previous_cycle_end: u64,
     ) -> Result<u64, Box<dyn Error + Send + Sync>> {
         let mut deadline = Instant::now() + Duration::from_secs(60);
         let mut accounted_schedules = HashSet::new();
+        let mut diagnostics = ScannerWaitDiagnostics {
+            previous_cycle_end,
+            nodes: (0..cluster.nodes.len())
+                .map(|index| format!("node{index}: not polled yet"))
+                .collect(),
+        };
         loop {
             let mut latest_cycle_end = 0;
             let mut versions_observed = false;
-            let mut observations = Vec::with_capacity(cluster.nodes.len());
             for (node_index, node) in cluster.nodes.iter().enumerate() {
                 let response = timeout(
                     Duration::from_secs(5),
@@ -1461,16 +1483,16 @@ mod tests {
                 let (status, body) = match response {
                     Ok(Ok(response)) => response,
                     Ok(Err(error)) => {
-                        observations.push(format!("node{node_index}: scanner status request failed: {error}"));
+                        diagnostics.nodes[node_index] = format!("node{node_index}: scanner status request failed: {error}");
                         continue;
                     }
                     Err(_) => {
-                        observations.push(format!("node{node_index}: scanner status request exceeded 5s"));
+                        diagnostics.nodes[node_index] = format!("node{node_index}: scanner status request exceeded 5s");
                         continue;
                     }
                 };
                 if status != 200 {
-                    observations.push(format!("node{node_index}: scanner status returned {status}: {body}"));
+                    diagnostics.nodes[node_index] = format!("node{node_index}: scanner status returned {status}: {body}");
                     continue;
                 }
                 let status: serde_json::Value = serde_json::from_str(&body)?;
@@ -1516,22 +1538,25 @@ mod tests {
                     latest_cycle_end = latest_cycle_end.max(cycle_end);
                 }
                 versions_observed |= versions_scanned > 0;
-                observations.push(format!(
-                    "node{node_index}: end={cycle_end}, versions={versions_scanned}, cycle={}, active={}, leader={}, result={}, partial_reason={}, schedule={}",
+                diagnostics.nodes[node_index] = format!(
+                    "node{node_index}: end={cycle_end}, versions={versions_scanned}, cycle={}, active={}, leader={}, result={}, partial_reason={}, partial_stage={}, schedule={}",
                     metrics["current_cycle"],
                     metrics["current_cycle_active"],
                     metrics["leader_lock_state"],
                     metrics["last_cycle_result"],
                     metrics["last_cycle_partial_reason"],
+                    metrics["last_cycle_partial_stage"],
                     schedule,
-                ));
+                );
             }
             // The coordinator records cycle completion, but remote workers
             // record scanned versions. Both witnesses need not share a node.
             if latest_cycle_end > previous_cycle_end && versions_observed {
+                diagnostics.nodes.clear();
                 return Ok(latest_cycle_end);
             }
             if Instant::now() >= deadline {
+                let observations = std::mem::take(&mut diagnostics.nodes);
                 return Err(format!(
                     "enabled scanner did not complete an object-scanning cycle after {previous_cycle_end}: {observations:?}"
                 )
