@@ -4647,17 +4647,20 @@ mod tests {
 
     #[tokio::test]
     async fn execute_put_object_rejects_invalid_storage_class() {
-        let input = PutObjectInput::builder()
-            .bucket("test-bucket".to_string())
-            .key("test-key".to_string())
-            .storage_class(Some(StorageClass::from_static("INVALID-STORAGE-CLASS")))
-            .build()
-            .unwrap();
+        // Same facts `from_legacy` carried. Body, checksums, SSE, metadata, and trailers stay absent.
+        let input = PutObjectWriteInput {
+            bucket: "test-bucket".to_owned(),
+            key: "test-key".to_owned(),
+            storage_class: Some("INVALID-STORAGE-CLASS".to_owned()),
+            ..Default::default()
+        };
 
         let usecase = DefaultObjectUsecase::without_context();
 
-        let err = Box::pin(put_method_only(&usecase, input)).await.unwrap_err();
-        assert_eq!(err.code(), &S3ErrorCode::InvalidStorageClass);
+        let err = Box::pin(usecase.execute_put_object_owned(method_only_put_envelope(), input))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), &OwnedS3ErrorCode::InvalidStorageClass);
     }
 
     // https://github.com/rustfs/backlog/issues/1311 — bucket-quota admission must run against the authoritative
