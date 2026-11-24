@@ -75,6 +75,8 @@ license = []
 io-scheduler-debug = []  # Enable debug information in I/O scheduler
 tracing-chunk-debug = []  # Enable per-chunk tracing in data plane (high noise, for debugging only)
 full = ["metrics-gpu", "ftps", "swift", "webdav", "sftp", "pyroscope", "gcs"]
+# Test-server capture only. The build script rejects release profiles.
+corpus-record = ["dep:rustfs-gateway-corpus-recorder"]
 e2e-test-hooks = ["rustfs-ecstore/e2e-test-hooks", "rustfs-scanner/e2e-test-hooks"]
 # Shortens Connect credentials only in debug E2E builds.
 connect-e2e-short-credentials = []
@@ -273,6 +275,7 @@ rustfs-protocols = { workspace = true }
 rustfs-gateway = { workspace = true }
 rustfs-gateway-adapter = { workspace = true }
 rustfs-gateway-core = { workspace = true }
+rustfs-gateway-corpus-recorder = { workspace = true, optional = true, features = ["corpus-record"] }
 rustfs-gateway-dialect-rustfs-admin = { workspace = true }
 rustfs-gateway-stream = { workspace = true }
 rustfs-gateway-types = { workspace = true }
