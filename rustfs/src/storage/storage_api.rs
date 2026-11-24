@@ -475,6 +475,7 @@ pub(crate) mod tonic_service_consumer {
 #[cfg(test)]
 pub(crate) mod test_consumer {
     pub(crate) use super::super::access_owned::object_read::authorize_head_object;
+    pub(crate) use super::super::legacy_s3_test_types;
     pub(crate) mod sse {
         pub(crate) use super::super::super::sse::TestAuthorizationHooks;
         pub(crate) use super::super::super::sse::tests::{RecordingKmsKeyAuthorizer, sse_kms_object_metadata};
