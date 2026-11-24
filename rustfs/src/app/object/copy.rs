@@ -1084,20 +1084,18 @@ mod tests {
 
     #[tokio::test]
     async fn execute_copy_object_rejects_self_copy_without_replace_directive() {
-        let input = CopyObjectInput::builder()
-            .copy_source(CopySource::Bucket {
-                bucket: "test-bucket".into(),
-                key: "test-key".into(),
-                version_id: None,
-            })
-            .bucket("test-bucket".to_string())
-            .key("test-key".to_string())
-            .build()
-            .unwrap();
-
+        // Same facts `from_legacy` carried. Metadata directive, storage class, SSE, and tagging stay absent.
+        let input = copy_input("test-bucket", "test-key", "test-key", None);
         let usecase = DefaultObjectUsecase::without_context();
 
-        let err = Box::pin(copy_method_only(&usecase, input)).await.unwrap_err();
+        let err = Box::pin(async {
+            usecase
+                .execute_copy_object_owned(copy_envelope(HeaderMap::new()), input)
+                .await
+                .map_err(crate::error::legacy_error_for_test)
+        })
+        .await
+        .unwrap_err();
         assert_eq!(err.code(), &S3ErrorCode::InvalidRequest);
     }
 
