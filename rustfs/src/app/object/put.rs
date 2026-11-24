@@ -4456,25 +4456,14 @@ mod tests {
                 .body(Some(body))
                 .build()
                 .expect("archive input");
-            let mut request = build_request(input, Method::POST);
-            request.extensions.insert(PostObjectRequestMarker);
-            request.headers.insert(AMZ_SNOWBALL_EXTRACT, HeaderValue::from_static("true"));
-            // Same facts `RequestEnvelope::from_s3s` copies. Credentials, region, and service stay absent.
-            let mut envelope = RequestEnvelope::from_parts(
-                crate::app::RequestHead {
-                    method: request.method.clone(),
-                    uri: request.uri.clone(),
-                    headers: request.headers.clone(),
-                    credentials: None,
-                    region: None,
-                    service: None,
-                },
-                request.extensions.clone(),
-            );
+            let mut headers = HeaderMap::new();
+            headers.insert(AMZ_SNOWBALL_EXTRACT, HeaderValue::from_static("true"));
+            // POST `/`, the snowball header, and the post-object marker. Credentials, region, and service stay absent.
+            let mut envelope = write_envelope(Method::POST, http::Uri::from_static("/"), headers, http::Extensions::new());
             assert!(!envelope.is_gateway_post(), "legacy provenance must remain distinct");
             envelope.mark_gateway_post();
             assert!(envelope.fork_for_authorization().is_gateway_post());
-            let input = PutObjectWriteInput::from_legacy(request.input, None);
+            let input = PutObjectWriteInput::from_legacy(input, None);
             let usecase = DefaultObjectUsecase::without_context();
             let result = if direct_extract {
                 Box::pin(usecase.execute_put_object_extract_owned(envelope, input)).await
