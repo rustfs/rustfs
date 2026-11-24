@@ -178,9 +178,16 @@ pub(crate) mod access_consumer {
         authorize_missing_object_disclosure, authorize_request, authorize_request_core, log_list_buckets_iam_implicit_deny,
         prepare_list_buckets_iam_authorization,
     };
-    pub(crate) use super::super::authorization_actions::delete_object_authorize_action;
+    pub(crate) use super::super::authorization::{
+        authorize_replication_only_put_headers, authorize_staged_multipart_part, authorize_write_etag_condition,
+        has_write_offset_bytes_header, load_bucket_generation, missing_req_info_error, table_data_plane_content_mutation,
+    };
+    pub(crate) use super::super::authorization_actions::{
+        delete_object_authorize_action, versioned_read_action, versioned_tagging_action,
+    };
     pub(crate) use super::super::denial_audit::DenialAuditor;
     pub(crate) use super::super::helper::{AuditRequestView, DenialScope};
+    pub(crate) use super::super::options::destination_version_id;
     pub(crate) use super::super::req_info::ReqInfo;
     pub(crate) use super::super::request_markers::StagedMultipartPartAuthorization;
     pub(crate) use super::super::request_markers::{
@@ -475,6 +482,7 @@ pub(crate) mod tonic_service_consumer {
 #[cfg(test)]
 pub(crate) mod test_consumer {
     pub(crate) use super::super::access_owned::object_read::authorize_head_object;
+    pub(crate) use super::super::legacy_s3_test_types;
     pub(crate) mod sse {
         pub(crate) use super::super::super::sse::TestAuthorizationHooks;
         pub(crate) use super::super::super::sse::tests::{RecordingKmsKeyAuthorizer, sse_kms_object_metadata};

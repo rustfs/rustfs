@@ -18,8 +18,8 @@
 //! legacy hook calls, early enough for the gateway to refuse it before the handler runs.
 //! Not responsible for: replacing that hook. The handler still runs it. Body-derived conditions,
 //! the table publication fence, and any guard the hook installs stay in the handler.
-//! Upstream: [`super::gateway_stack::early_gate`]. Downstream: `storage::authorization` and the
-//! owned hooks in `storage::access_owned` that do not install a guard.
+//! Upstream: [`super::gateway_stack::early_gate`]. Downstream: the storage access facade, which
+//! reaches the authorization core and the owned hooks that do not install a guard.
 //!
 //! A decision of [`Decision::Allow`] is a real core allow, an explicit "the legacy hook does not
 //! check" row, or a remainder the handler still decides. A backend failure is indeterminate.
@@ -31,26 +31,22 @@ use crate::runtime_sources::ServerContextSlot;
 use crate::server::gateway_handlers::{OperationTable, metadata_listing, serves};
 use crate::server::gateway_stack::OwnedKeystoneIdentity;
 use crate::shared_types::{NativeTlsTransport, RemoteAddr};
-use crate::storage::access_owned::bucket_core::authorize_delete_bucket;
-use crate::storage::access_owned::object_misc::{authorize_select_object_content, decide_delete_object};
-use crate::storage::access_owned::object_read::authorize_get_object_attributes;
-use crate::storage::authorization::{
+use crate::storage_api::server::http::access::access_owned::bucket_core::authorize_delete_bucket;
+use crate::storage_api::server::http::access::access_owned::object_misc::{
+    authorize_select_object_content, decide_delete_object,
+};
+use crate::storage_api::server::http::access::access_owned::object_read::authorize_get_object_attributes;
+use crate::storage_api::server::http::access::{
     AccessMarkers, AuthorizationRequest, BucketConfigMutationSnapshot, BucketGenerationGuard, CopySourceBucketGenerationGuard,
-    ObjectTagConditions, OdmReadGenerationGuard, PendingDeleteBucketGenerationGuard, TableDataPlaneListAccess,
-    TableDataPlanePublicationGuards, VerifiedSignature, authorize_bucket_request, authorize_object_request,
-    authorize_replication_only_put_headers, authorize_request, authorize_staged_multipart_part, authorize_write_etag_condition,
-    has_write_offset_bytes_header, load_bucket_generation, missing_req_info_error, resolve_req_info,
-    set_requested_object_lock_retain_until, table_data_plane_content_mutation,
+    DenialAuditor, ObjectTagConditions, OdmReadGenerationGuard, PendingDeleteBucketGenerationGuard, PostObjectPolicyHeaders,
+    ReqInfo, RequestedCopySource, RequestedObjectLegalHold, RequestedObjectLockRetainUntil, RequestedObjectLockRetention,
+    RequestedObjectTags, TableDataPlaneListAccess, TableDataPlanePublicationGuards, VerifiedSignature, authorize_bucket_request,
+    authorize_object_request, authorize_replication_only_put_headers, authorize_request, authorize_staged_multipart_part,
+    authorize_write_etag_condition, destination_version_id, has_write_offset_bytes_header, load_bucket_generation,
+    missing_req_info_error, resolve_req_info, set_requested_object_lock_retain_until, table_data_plane_content_mutation,
+    versioned_read_action, versioned_tagging_action,
 };
-use crate::storage::authorization_actions::{versioned_read_action, versioned_tagging_action};
-use crate::storage::denial_audit::DenialAuditor;
-use crate::storage::options::destination_version_id;
-use crate::storage::req_info::ReqInfo;
-use crate::storage::request_context::RequestContext;
-use crate::storage::request_markers::{
-    PostObjectPolicyHeaders, RequestedCopySource, RequestedObjectLegalHold, RequestedObjectLockRetainUntil,
-    RequestedObjectLockRetention, RequestedObjectTags,
-};
+use crate::storage_api::server::http::request_context::RequestContext;
 use http::{Extensions, HeaderMap, Method, Uri};
 use rustfs_gateway::RequestContext as GatewayRequestContext;
 use rustfs_gateway::dto;

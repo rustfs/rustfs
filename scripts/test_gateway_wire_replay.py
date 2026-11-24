@@ -72,8 +72,9 @@ class WireTests(unittest.TestCase):
                         candidate = wire.project(operation, method, 200, headers, body)
                         self.assertEqual(wire.differences(reference, candidate), expected)
 
-    def test_archived_s3_response_headers(self):
+    def test_s3_response_headers(self):
         cases = [
+            ("CreateBucket", "PUT", 200, "Location", "/example-bucket"),
             ("PutObject", "PUT", 200, "X-Amz-Expiration", 'expiry-date="Tue, 01 Jan 2030 00:00:00 GMT", rule-id="logs"'),
             ("CopyObject", "PUT", 200, "X-Amz-Copy-Source-Version-Id", "source-version"),
             ("HeadObject", "HEAD", 200, "X-Amz-Replication-Status", "COMPLETED"),
@@ -83,6 +84,17 @@ class WireTests(unittest.TestCase):
             with self.subTest(operation=operation, header=name):
                 response = wire.project(operation, method, status, [(name, value)], b"")
                 self.assertEqual(response["headers"], [(name.lower(), value)])
+
+    def test_post_redirect_compares_location_including_query(self):
+        target = "https://example.com/upload/callback?origin=test&bucket=b&key=a%2Fb"
+
+        def project(headers):
+            return wire.project("PostObject", "POST", 303, headers, b"")
+
+        reference = project([("Location", target)])
+        self.assertEqual(wire.differences(reference, project([("location", target)])), [])
+        self.assertEqual(wire.differences(reference, project([])), ["headers"])
+        self.assertEqual(wire.differences(reference, project([("Location", target.split("?")[0])])), ["headers"])
 
     def test_content_length_checked_before_wire_differences(self):
         with self.assertRaises(wire.ReplayError):
