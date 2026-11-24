@@ -785,11 +785,6 @@ mod tests {
             let bucket = format!("create-multipart-{}", Uuid::new_v4().simple());
             let other = format!("create-multipart-{}", Uuid::new_v4().simple());
             let make_request = |target_bucket: &str| {
-                let mut input = CreateMultipartUploadInput {
-                    bucket: target_bucket.to_owned(),
-                    key: "object".to_owned(),
-                    ..Default::default()
-                };
                 let mut extensions = Extensions::new();
                 extensions.insert(slot.clone());
                 let envelope = RequestEnvelope::from_parts(
@@ -803,8 +798,23 @@ mod tests {
                     },
                     extensions,
                 );
-                let query_version = input.version_id.take();
-                let fields = CreateMultipartUploadFields::from_legacy(input);
+                // Same facts `from_legacy` carried. Metadata, tagging, storage class, SSE, and object lock stay absent.
+                let fields = CreateMultipartUploadFields {
+                    bucket: target_bucket.to_owned(),
+                    key: "object".to_owned(),
+                    metadata: None,
+                    tagging: None,
+                    storage_class: None,
+                    server_side_encryption: None,
+                    sse_customer_algorithm: None,
+                    sse_customer_key: None,
+                    sse_customer_key_md5: None,
+                    ssekms_key_id: None,
+                    object_lock_legal_hold_status: None,
+                    object_lock_mode: None,
+                    object_lock_retain_until_date: None,
+                };
+                let query_version: Option<String> = None;
                 (envelope, fields, query_version)
             };
             for name in [&bucket, &other] {
