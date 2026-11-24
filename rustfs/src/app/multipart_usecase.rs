@@ -857,7 +857,8 @@ mod tests {
         requested_kms_key_id: Option<&str>,
         customer_key: Option<(&str, &str)>,
     ) -> (Vec<(&'static str, SseResponseFields)>, Vec<String>) {
-        use crate::app::storage_api::s3::dto::{StreamingBlob, UploadPartInput};
+        use crate::app::object::legacy_put_body;
+        use crate::app::storage_api::s3::dto::StreamingBlob;
         use crate::app::storage_api::test::contract::object::ObjectIO as _;
         use rustfs_gateway::{Limits, MetaView, OperationCodec, TargetKind, WireRequest};
 
@@ -904,21 +905,29 @@ mod tests {
         let part = usecase
             .execute_upload_part_with_audit(
                 owned_envelope(Method::PUT),
-                UploadPartWriteInput::from_legacy(
-                    UploadPartInput {
+                // Same facts `from_legacy` carried. Checksums and trailers stay absent.
+                UploadPartWriteInput {
+                    target: UploadPartTarget::Legacy {
                         bucket: bucket.to_string(),
                         key: key.to_string(),
                         upload_id: upload_id.clone(),
-                        part_number: 1,
-                        content_length: Some(3),
-                        body: Some(StreamingBlob::from(bytes::Bytes::from_static(b"abc"))),
-                        sse_customer_algorithm: customer_algorithm.clone(),
-                        sse_customer_key: customer_key.clone(),
-                        sse_customer_key_md5: customer_key_md5.clone(),
-                        ..Default::default()
                     },
-                    None,
-                ),
+                    part_number: 1,
+                    content_length: Some(3),
+                    body: Some(legacy_put_body(StreamingBlob::from(bytes::Bytes::from_static(b"abc")))),
+                    trailing_headers: None,
+                    frame_trailers: None,
+                    content_md5: None,
+                    checksum_algorithm: None,
+                    checksum_crc32: None,
+                    checksum_crc32c: None,
+                    checksum_crc64nvme: None,
+                    checksum_sha1: None,
+                    checksum_sha256: None,
+                    sse_customer_algorithm: customer_algorithm.clone(),
+                    sse_customer_key: customer_key.clone(),
+                    sse_customer_key_md5: customer_key_md5.clone(),
+                },
             )
             .await
             .expect("upload part");
