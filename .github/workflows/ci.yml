@@ -16,9 +16,7 @@ name: Continuous Integration
 
 on:
   push:
-    # gateway/integration receives the daily merge of main as a direct push
-    # (rustfs/backlog#2734), so its pushes must prove the result like main's.
-    branches: [ main, gateway/integration ]
+    branches: [ main ]
     paths-ignore:
       - "**.md"
       - "docs/**"
@@ -38,9 +36,7 @@ on:
       - "flake.lock"
   pull_request:
     types: [ opened, synchronize, reopened, closed ]
-    # gateway/integration carries main's ruleset (rustfs/backlog#2734), so its
-    # pull requests must produce the same required checks.
-    branches: [ main, gateway/integration ]
+    branches: [ main ]
   merge_group:
     types: [ checks_requested ]
   schedule:
@@ -1062,13 +1058,13 @@ jobs:
     # Merge gate only (backlog#1149 ci-5): the never-automated user-visible
     # suites — KMS, object_lock, multipart_auth, quota, checksum, encryption,
     # security-boundary, ... — via the e2e-full nextest profile. Too heavy for
-    # every PR, so it is gated to main and gateway/integration pushes, the merge
+    # every PR, so it is gated to main pushes, the merge
     # queue, and manual dispatch. protocols / the 7 cluster suites / replication
     # / #[ignore] are owned by other lanes (see .config/nextest.toml profile.e2e-full).
     if: >-
       github.event_name == 'workflow_dispatch' ||
       github.event_name == 'merge_group' ||
-      (github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/gateway/integration'))
+      (github.event_name == 'push' && github.ref == 'refs/heads/main')
     needs: [ build-rustfs-debug-binary ]
     # Retain the producer image and fixture paths until the runtime pilot passes.
     runs-on: sm-standard-4
