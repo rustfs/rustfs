@@ -1218,151 +1218,6 @@ fn tier_accounting_proof_is_publishable(
     proof.physical_known == known_tier_physical_total
 }
 
-#[cfg(test)]
-mod certification_history_tests {
-    use super::*;
-
-    #[test]
-    fn completed_snapshot_pending_bucket_keeps_old_counters_and_certificate_before_sealing() {
-        let id = uuid::Uuid::from_u128(1).to_string();
-        let old_time = SystemTime::UNIX_EPOCH + Duration::from_secs(10);
-        let mut old = BucketUsageInfo {
-            objects_count: 10,
-            size: 100,
-            bucket_incarnation: Some(id.clone()),
-            ..Default::default()
-        };
-        old.certify(rustfs_data_usage::BucketUsageCertification {
-            epoch: 1,
-            cycle: 1,
-            certified_at: old_time,
-        });
-        let baseline = DataUsageInfo {
-            buckets_usage: HashMap::from([("bucket".into(), old.clone())]),
-            usage_snapshot_noninitial_buckets: HashMap::from([("bucket".into(), id.clone())]),
-            ..Default::default()
-        };
-        let mut current = BucketUsageInfo {
-            objects_count: 20,
-            size: 200,
-            bucket_incarnation: Some(id),
-            ..Default::default()
-        };
-        current.usage_value_state = Some(rustfs_data_usage::BucketUsageValueState::Certified);
-        let mut candidate = ValidatedUsageCandidate {
-            data: DataUsageInfo {
-                last_update: Some(old_time + Duration::from_secs(10)),
-                scanner_epoch: Some(1),
-                scanner_cycle: Some(2),
-                buckets_usage: HashMap::from([("bucket".into(), current)]),
-                ..Default::default()
-            },
-            last_update: old_time,
-            coverage_digest: DataUsageScanPlanDigest([1; 32]),
-        };
-        let pending = ScannerCyclePendingBuckets::from(["bucket".into()]);
-        assert!(candidate.retain_completed_certifications(&baseline, &pending));
-        let (data, expectation) = candidate.prepare(ScannerCycleStatus::Complete, &pending);
-        assert_eq!((data.objects_total_count, data.objects_total_size), (10, 100));
-        assert_eq!(data.buckets_usage["bucket"].usage_certification, old.usage_certification);
-        assert_eq!(data.usage_snapshot_noninitial_buckets, baseline.usage_snapshot_noninitial_buckets);
-        let digest: [u8; 32] = Sha256::digest(serde_json::to_vec(&data).expect("sealed candidate encoding")).into();
-        assert!(
-            expectation
-                .expect("complete candidate expectation")
-                .matches_encoded_candidate(&digest)
-        );
-    }
-
-    #[test]
-    fn completed_snapshot_pending_new_bucket_without_history_stays_unmeasured() {
-        let time = SystemTime::UNIX_EPOCH;
-        let mut candidate = ValidatedUsageCandidate {
-            data: DataUsageInfo {
-                last_update: Some(time),
-                scanner_epoch: Some(1),
-                scanner_cycle: Some(2),
-                buckets_usage: HashMap::from([(
-                    "new".into(),
-                    BucketUsageInfo {
-                        objects_count: 20,
-                        bucket_incarnation: Some(uuid::Uuid::from_u128(1).to_string()),
-                        ..Default::default()
-                    },
-                )]),
-                ..Default::default()
-            },
-            last_update: time,
-            coverage_digest: DataUsageScanPlanDigest([1; 32]),
-        };
-        let pending = ScannerCyclePendingBuckets::from(["new".into()]);
-        assert!(candidate.retain_completed_certifications(&DataUsageInfo::default(), &pending));
-        let (data, _) = candidate.prepare(ScannerCycleStatus::Complete, &pending);
-        assert!(data.buckets_usage.is_empty());
-        assert_eq!(data.usage_snapshot_pending_buckets, ["new"]);
-    }
-
-    #[test]
-    fn completed_snapshot_promotes_the_latest_complete_history_for_nonpending_carried_rows() {
-        let time = SystemTime::UNIX_EPOCH + Duration::from_secs(10);
-        let id = uuid::Uuid::from_u128(1).to_string();
-        let mut prior = BucketUsageInfo {
-            objects_count: 15,
-            size: 150,
-            bucket_incarnation: Some(id.clone()),
-            ..Default::default()
-        };
-        prior.certify(rustfs_data_usage::BucketUsageCertification {
-            epoch: 1,
-            cycle: 2,
-            certified_at: time,
-        });
-        let baseline = DataUsageInfo {
-            buckets_usage: HashMap::from([("carried".into(), prior.clone())]),
-            ..Default::default()
-        };
-        let mut carried = BucketUsageInfo {
-            objects_count: 10,
-            size: 100,
-            bucket_incarnation: Some(id),
-            ..Default::default()
-        };
-        carried.mark_carried();
-        let mut fresh = BucketUsageInfo {
-            objects_count: 3,
-            size: 30,
-            bucket_incarnation: Some(uuid::Uuid::from_u128(2).to_string()),
-            ..Default::default()
-        };
-        fresh.usage_value_state = Some(rustfs_data_usage::BucketUsageValueState::Certified);
-        let mut candidate = ValidatedUsageCandidate {
-            data: DataUsageInfo {
-                last_update: Some(time),
-                scanner_epoch: Some(1),
-                scanner_cycle: Some(3),
-                buckets_usage: HashMap::from([("carried".into(), carried), ("fresh".into(), fresh)]),
-                ..Default::default()
-            },
-            last_update: time,
-            coverage_digest: DataUsageScanPlanDigest([1; 32]),
-        };
-        let pending = ScannerCyclePendingBuckets::new();
-        assert!(candidate.needs_completed_history(&pending));
-        assert!(candidate.retain_completed_certifications(&baseline, &pending));
-        let (data, _) = candidate.prepare(ScannerCycleStatus::Complete, &pending);
-        assert_eq!(data.objects_total_count, 18);
-        assert_eq!(data.buckets_usage["carried"].usage_certification, prior.usage_certification);
-        assert_eq!(data.buckets_usage["carried"].objects_count, 15);
-        assert_eq!(
-            data.buckets_usage["fresh"]
-                .usage_certification
-                .expect("fresh certificate")
-                .cycle,
-            3
-        );
-    }
-}
-
 /// Project full-source observations into an additive field. No companion
 /// enters the canonical counters, cold-cache proof, or dirty ACK eligibility.
 fn attach_bucket_observations(
@@ -2106,5 +1961,150 @@ pub(super) async fn send_data_usage_update(updates: &mpsc::Sender<DataUsageInfo>
             );
             Err(StorageError::other("scanner data usage update already queued"))
         }
+    }
+}
+
+#[cfg(test)]
+mod certification_history_tests {
+    use super::*;
+
+    #[test]
+    fn completed_snapshot_pending_bucket_keeps_old_counters_and_certificate_before_sealing() {
+        let id = uuid::Uuid::from_u128(1).to_string();
+        let old_time = SystemTime::UNIX_EPOCH + Duration::from_secs(10);
+        let mut old = BucketUsageInfo {
+            objects_count: 10,
+            size: 100,
+            bucket_incarnation: Some(id.clone()),
+            ..Default::default()
+        };
+        old.certify(rustfs_data_usage::BucketUsageCertification {
+            epoch: 1,
+            cycle: 1,
+            certified_at: old_time,
+        });
+        let baseline = DataUsageInfo {
+            buckets_usage: HashMap::from([("bucket".into(), old.clone())]),
+            usage_snapshot_noninitial_buckets: HashMap::from([("bucket".into(), id.clone())]),
+            ..Default::default()
+        };
+        let mut current = BucketUsageInfo {
+            objects_count: 20,
+            size: 200,
+            bucket_incarnation: Some(id),
+            ..Default::default()
+        };
+        current.usage_value_state = Some(rustfs_data_usage::BucketUsageValueState::Certified);
+        let mut candidate = ValidatedUsageCandidate {
+            data: DataUsageInfo {
+                last_update: Some(old_time + Duration::from_secs(10)),
+                scanner_epoch: Some(1),
+                scanner_cycle: Some(2),
+                buckets_usage: HashMap::from([("bucket".into(), current)]),
+                ..Default::default()
+            },
+            last_update: old_time,
+            coverage_digest: DataUsageScanPlanDigest([1; 32]),
+        };
+        let pending = ScannerCyclePendingBuckets::from(["bucket".into()]);
+        assert!(candidate.retain_completed_certifications(&baseline, &pending));
+        let (data, expectation) = candidate.prepare(ScannerCycleStatus::Complete, &pending);
+        assert_eq!((data.objects_total_count, data.objects_total_size), (10, 100));
+        assert_eq!(data.buckets_usage["bucket"].usage_certification, old.usage_certification);
+        assert_eq!(data.usage_snapshot_noninitial_buckets, baseline.usage_snapshot_noninitial_buckets);
+        let digest: [u8; 32] = Sha256::digest(serde_json::to_vec(&data).expect("sealed candidate encoding")).into();
+        assert!(
+            expectation
+                .expect("complete candidate expectation")
+                .matches_encoded_candidate(&digest)
+        );
+    }
+
+    #[test]
+    fn completed_snapshot_pending_new_bucket_without_history_stays_unmeasured() {
+        let time = SystemTime::UNIX_EPOCH;
+        let mut candidate = ValidatedUsageCandidate {
+            data: DataUsageInfo {
+                last_update: Some(time),
+                scanner_epoch: Some(1),
+                scanner_cycle: Some(2),
+                buckets_usage: HashMap::from([(
+                    "new".into(),
+                    BucketUsageInfo {
+                        objects_count: 20,
+                        bucket_incarnation: Some(uuid::Uuid::from_u128(1).to_string()),
+                        ..Default::default()
+                    },
+                )]),
+                ..Default::default()
+            },
+            last_update: time,
+            coverage_digest: DataUsageScanPlanDigest([1; 32]),
+        };
+        let pending = ScannerCyclePendingBuckets::from(["new".into()]);
+        assert!(candidate.retain_completed_certifications(&DataUsageInfo::default(), &pending));
+        let (data, _) = candidate.prepare(ScannerCycleStatus::Complete, &pending);
+        assert!(data.buckets_usage.is_empty());
+        assert_eq!(data.usage_snapshot_pending_buckets, ["new"]);
+    }
+
+    #[test]
+    fn completed_snapshot_promotes_the_latest_complete_history_for_nonpending_carried_rows() {
+        let time = SystemTime::UNIX_EPOCH + Duration::from_secs(10);
+        let id = uuid::Uuid::from_u128(1).to_string();
+        let mut prior = BucketUsageInfo {
+            objects_count: 15,
+            size: 150,
+            bucket_incarnation: Some(id.clone()),
+            ..Default::default()
+        };
+        prior.certify(rustfs_data_usage::BucketUsageCertification {
+            epoch: 1,
+            cycle: 2,
+            certified_at: time,
+        });
+        let baseline = DataUsageInfo {
+            buckets_usage: HashMap::from([("carried".into(), prior.clone())]),
+            ..Default::default()
+        };
+        let mut carried = BucketUsageInfo {
+            objects_count: 10,
+            size: 100,
+            bucket_incarnation: Some(id),
+            ..Default::default()
+        };
+        carried.mark_carried();
+        let mut fresh = BucketUsageInfo {
+            objects_count: 3,
+            size: 30,
+            bucket_incarnation: Some(uuid::Uuid::from_u128(2).to_string()),
+            ..Default::default()
+        };
+        fresh.usage_value_state = Some(rustfs_data_usage::BucketUsageValueState::Certified);
+        let mut candidate = ValidatedUsageCandidate {
+            data: DataUsageInfo {
+                last_update: Some(time),
+                scanner_epoch: Some(1),
+                scanner_cycle: Some(3),
+                buckets_usage: HashMap::from([("carried".into(), carried), ("fresh".into(), fresh)]),
+                ..Default::default()
+            },
+            last_update: time,
+            coverage_digest: DataUsageScanPlanDigest([1; 32]),
+        };
+        let pending = ScannerCyclePendingBuckets::new();
+        assert!(candidate.needs_completed_history(&pending));
+        assert!(candidate.retain_completed_certifications(&baseline, &pending));
+        let (data, _) = candidate.prepare(ScannerCycleStatus::Complete, &pending);
+        assert_eq!(data.objects_total_count, 18);
+        assert_eq!(data.buckets_usage["carried"].usage_certification, prior.usage_certification);
+        assert_eq!(data.buckets_usage["carried"].objects_count, 15);
+        assert_eq!(
+            data.buckets_usage["fresh"]
+                .usage_certification
+                .expect("fresh certificate")
+                .cycle,
+            3
+        );
     }
 }
