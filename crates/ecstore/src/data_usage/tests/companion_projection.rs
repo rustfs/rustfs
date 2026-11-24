@@ -80,9 +80,13 @@ fn companion_cannot_backfill_quota_and_projection_is_rejected_at_storage_boundar
     backfill_degraded_baseline_from_observed(&mut accidental_quota, &snapshot);
     assert!(accidental_quota.is_empty());
     assert!(reject_admin_usage_projection(&snapshot).is_err());
-    assert!(certified_bucket_usage(&snapshot, "bucket", incarnation).is_none());
     let wire = serde_json::to_vec(&snapshot).expect("admin response remains serializable");
     assert!(parse_usage_snapshot(&wire).is_err(), "a serialized response is not a persisted snapshot");
+    assert!(
+        UsageSnapshot::new(snapshot)
+            .certified_bucket_usage("bucket", incarnation)
+            .is_none()
+    );
 }
 
 #[test]
@@ -376,8 +380,12 @@ async fn cached_canonical_admin_usage_rechecks_current_identity_without_peer_inv
     assert_eq!(second.usage_snapshot_converged, Some(false));
     assert!(second.usage_snapshot_admin_projection);
     assert!(reject_admin_usage_projection(&second).is_err());
-    assert!(certified_bucket_usage(&second, bucket, new_identity).is_none());
     assert!(parse_usage_snapshot(&serde_json::to_vec(&second).expect("encode display response")).is_err());
+    assert!(
+        UsageSnapshot::new(second)
+            .certified_bucket_usage(bucket, new_identity)
+            .is_none()
+    );
     let quota = load_data_usage_from_backend_cached(store.clone())
         .await
         .expect("independent quota baseline");
