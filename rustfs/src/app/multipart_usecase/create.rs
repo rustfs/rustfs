@@ -479,57 +479,10 @@ impl CreateMultipartUploadFields {
 }
 
 #[cfg(test)]
-impl DefaultMultipartUsecase {
-    pub(crate) async fn execute_create_multipart_upload_from_s3s(
-        &self,
-        mut req: crate::app::storage_api::s3::S3Request<crate::app::storage_api::s3::dto::CreateMultipartUploadInput>,
-    ) -> crate::app::storage_api::s3::S3Result<
-        crate::app::storage_api::s3::S3Response<crate::app::storage_api::s3::dto::CreateMultipartUploadOutput>,
-    > {
-        use crate::app::storage_api::s3::{S3Response, dto::CreateMultipartUploadOutput};
-        let envelope = RequestEnvelope::from_s3s(&req);
-        let query_version = req.input.version_id.take();
-        let output = self
-            .execute_create_multipart_upload(envelope, CreateMultipartUploadFields::from_legacy(req.input), query_version)
-            .await
-            .map_err(crate::error::legacy_error_for_test)?;
-        let mut response = S3Response::new(CreateMultipartUploadOutput {
-            bucket: Some(output.bucket),
-            key: Some(output.key),
-            upload_id: Some(output.upload_id),
-            server_side_encryption: output.server_side_encryption.map(Into::into),
-            sse_customer_algorithm: output.sse_customer_algorithm,
-            sse_customer_key_md5: output.sse_customer_key_md5,
-            ssekms_key_id: output.ssekms_key_id,
-            checksum_algorithm: output.checksum_algorithm.map(Into::into),
-            checksum_type: output.checksum_type.map(Into::into),
-            ..Default::default()
-        });
-        response.headers.extend(output.response_headers);
-        Ok(response)
-    }
-}
-
-#[cfg(test)]
 mod tests {
     use super::super::test_support::*;
     use super::*;
     use crate::app::storage_api::s3::{S3ErrorCode, dto::CreateMultipartUploadInput};
-
-    /// Method, URI, headers, extensions, region, and service. These fixtures leave credentials absent.
-    fn envelope_from_request<T>(req: &crate::app::storage_api::s3::S3Request<T>) -> RequestEnvelope {
-        RequestEnvelope::from_parts(
-            crate::app::RequestHead {
-                method: req.method.clone(),
-                uri: req.uri.clone(),
-                headers: req.headers.clone(),
-                credentials: None,
-                region: req.region.as_ref().map(|region| region.as_str().to_owned()),
-                service: req.service.clone(),
-            },
-            req.extensions.clone(),
-        )
-    }
 
     #[tokio::test]
     async fn create_multipart_baseline_legacy_direct() {
@@ -738,22 +691,32 @@ mod tests {
                     ..Default::default()
                 };
                 let authorizer = RecordingKmsKeyAuthorizer::new(allowed);
-                let mut req = build_request(input, Method::POST);
-                req.extensions.insert(ReqInfo {
+                // Same facts `build_request` carried. Credentials, region, and service stay absent.
+                let mut extensions = Extensions::new();
+                extensions.insert(ReqInfo {
                     cred: Some(rustfs_credentials::Credentials {
                         access_key: "test-kms-writer".to_owned(),
                         ..Default::default()
                     }),
                     ..Default::default()
                 });
-                req.extensions.insert(TestAuthorizationHooks {
+                extensions.insert(TestAuthorizationHooks {
                     enforced: true,
                     authorizer: authorizer.clone(),
                 });
-                let envelope = envelope_from_request(&req);
-                let query_version = req.input.version_id.take();
-                let fields = CreateMultipartUploadFields::from_legacy(req.input);
-                let result = usecase.execute_create_multipart_upload(envelope, fields, query_version).await;
+                let envelope = RequestEnvelope::from_parts(
+                    crate::app::RequestHead {
+                        method: Method::POST,
+                        uri: http::Uri::from_static("/"),
+                        headers: HeaderMap::new(),
+                        credentials: None,
+                        region: None,
+                        service: None,
+                    },
+                    extensions,
+                );
+                let fields = CreateMultipartUploadFields::from_legacy(input);
+                let result = usecase.execute_create_multipart_upload(envelope, fields, None).await;
                 let uploads = store
                     .list_multipart_uploads(&bucket, "", None, None, None, 100)
                     .await

@@ -481,10 +481,8 @@ class GateTests(unittest.TestCase):
 
     def test_the_queue_run_that_proves_a_push_validates_everything_that_push_would(self):
         queued = {job for job, result in gate.expected_results('full', 'merge_group', 'refs/heads/main').items() if result == 'success'}
-        for ref in gate.INTEGRATION_PUSH_REFS:
-            pushed = {job for job, result in gate.expected_results('full', 'push', ref).items() if result == 'success'}
-            with self.subTest(ref=ref):
-                self.assertLessEqual(pushed, queued)
+        pushed = {job for job, result in gate.expected_results('full', 'push', 'refs/heads/main').items() if result == 'success'}
+        self.assertLessEqual(pushed, queued)
 
     def test_legacy_base_cannot_authorize_skipped_new_jobs(self):
         expected = gate.expected_results('full', 'pull_request', 'refs/heads/main')
@@ -657,11 +655,14 @@ class GateTests(unittest.TestCase):
                 self.assertEqual(arguments[arguments.index('--target-dir-remap') + 1], str(root / 'target'))
                 self.assertIn(f'exit_status={status}', (root / 'artifacts/ilm-integration/diagnostics.txt').read_text())
 
-    def test_full_e2e_gate_covers_main_and_integration_pushes_only(self):
+    def test_full_e2e_gate_pushes_only_on_main(self):
+        workflow_path = Path(gate.__file__).resolve().parent.parent / ".github/workflows/ci.yml"
+        triggers = gate.workflow_document(workflow_path.read_text())["on"]
+        for event in ("push", "pull_request"):
+            self.assertEqual(triggers[event]["branches"], ["main"])
         for event, ref, required in (
             ("push", "refs/heads/main", "success"),
-            ("push", "refs/heads/gateway/integration", "success"),
-            ("push", "refs/heads/gateway/integration-old", "skipped"),
+            ("push", "refs/heads/gateway/integration", "skipped"),
             ("push", "refs/heads/release", "skipped"),
             ("push", "refs/heads/feature", "skipped"),
         ):

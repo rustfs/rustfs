@@ -1055,33 +1055,6 @@
       "origin": "added"
     },
     {
-      "workflow": ".github/workflows/gateway-integration-sync.yml",
-      "name": "Gateway Integration Sync",
-      "roles": [
-        "periodic",
-        "manual",
-        "maintenance"
-      ],
-      "events": [
-        "schedule",
-        "workflow_dispatch"
-      ],
-      "cadence": "nightly",
-      "timezone": "UTC",
-      "schedule": [
-        "0 2 * * 1-5"
-      ],
-      "owner": "@overtrue",
-      "policy": "active",
-      "monitor": "workflow",
-      "max_age_hours": 36,
-      "result_owner": "gateway-integration-sync.yml",
-      "disposition": "retained independent entry",
-      "failure_owner": "workflow",
-      "origin": "baseline",
-      "alert_contract": "independent"
-    },
-    {
       "workflow": ".github/workflows/helm-package.yml",
       "name": "Build candidate Helm chart",
       "roles": [

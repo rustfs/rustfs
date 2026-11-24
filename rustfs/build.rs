@@ -15,6 +15,9 @@
 use std::io::Write;
 
 fn main() -> shadow_rs::SdResult<()> {
+    if cfg!(feature = "corpus-record") && std::env::var("PROFILE")? != "debug" {
+        return Err(std::io::Error::other("corpus-record is restricted to debug test-server builds").into());
+    }
     println!("cargo:rustc-check-cfg=cfg(tokio_unstable)");
     println!("cargo:rerun-if-env-changed=RUSTFS_BUILD_VERSION");
     if let Ok(version) = std::env::var("RUSTFS_BUILD_VERSION")
