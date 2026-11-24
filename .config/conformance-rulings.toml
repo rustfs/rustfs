@@ -1,10 +1,18 @@
-# Rulings for the gateway conformance lane (.github/workflows/gateway-acceptance.yml).
-#
-# One row per case that fails on the GATEWAY stack for a reviewed reason: `case`; `ledger`, the
-# rustfs/backlog#2684 entry that accepts the difference (R-0xx or K-n); a one-line `reason`; and
-# `failure`, a prefix of the failure the ruling accepts, as the runner's report.json renders it
-# (`[expect/status] at /expect/status: exchange #1, attempt 1: expected status 400, observed 403`).
-# scripts/check_conformance_rulings.py fails the lane on a failed case without a row, on a ruled
-# case whose failures do not start with its `failure`, and on a row whose case no longer fails or
-# no longer exists. The legacy stack is a reference run and takes no rulings: the `rustfs` profile
-# describes the gateway edge, not the legacy one.
+# Rulings for the gateway conformance lane. Each row covers one complete diagnostic.
+# Remove a row when the case passes. Review the referenced compatibility decision before expiry.
+# Backlog #2684 registers both R/K entries and the legacy response heads in rustfs/gateway#1159.
+# Official RustFS 1.0.5 and the gateway candidate both omit the region on a successful HeadBucket.
+
+[[ruling]]
+case = "c-bkt-0008"
+ledger = "rustfs/gateway#1159"
+reason = "The RustFS profile preserves the absent bucket region on successful HeadBucket (rustfs/backlog#2684)."
+failure = "[expect/headers_present] at /expect/headers_present/x-amz-bucket-region: exchange #1, attempt 1: expected `x-amz-bucket-region: us-east-1`, observed no such header"
+expires = 2027-02-01
+
+[[ruling]]
+case = "c-bkt-0009"
+ledger = "rustfs/gateway#1159"
+reason = "The RustFS profile preserves the absent bucket region on successful HeadBucket (rustfs/backlog#2684)."
+failure = "[expect/headers_present] at /expect/headers_present/x-amz-bucket-region: exchange #1, attempt 1: expected `x-amz-bucket-region: us-east-1`, observed no such header"
+expires = 2027-02-01

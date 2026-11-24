@@ -15,7 +15,7 @@
 """Judge the conformance run against .config/conformance-rulings.toml.
 
 Usage:
-  check_conformance_rulings.py --run-dir <dir> [--rulings <toml>]
+  check_conformance_rulings.py --run-dir <dir> [--case-dir <pinned cases>] [--rulings <toml>]
   check_conformance_rulings.py --self-test
 
 <dir> holds what the lane observed: the server record acceptance_lane.py reads,
@@ -34,6 +34,8 @@ goes to stdout.
 """
 
 import argparse
+from collections import Counter
+from datetime import UTC, date, datetime, timedelta
 import json
 from pathlib import Path
 import re
@@ -48,9 +50,9 @@ from acceptance_lane import InputError, read_exit, read_text, served, write_serv
 ROOT = Path(__file__).resolve().parents[1]
 LEDGER = ROOT / ".config/conformance-rulings.toml"
 VERDICTS = ("passed", "failed", "skipped")
-# rustfs/backlog#2684 names its entries R-0xx (gateway ledger rows) and K-n (kept behaviour).
-LEDGER_ID = re.compile(r"(R-\d{3}|K-\d+)")
-RULING_KEYS = {"case", "ledger", "reason", "failure"}
+# rustfs/backlog#2684 also cites gateway#1159 directly for the legacy response heads.
+LEDGER_ID = re.compile(r"(R-\d{3}|K-\d+|rustfs/gateway#1159)")
+RULING_KEYS = {"case", "ledger", "reason", "failure", "expires"}
 NOT_SERVED = "observed 501"
 # Skip reasons of the pinned runner that are the server's answer, not a corpus limit.
 SERVER_SKIP = re.compile(r"environment: external (endpoint|fixture .* returned status)")
@@ -62,6 +64,7 @@ def load_rulings(path):
     except (OSError, tomllib.TOMLDecodeError) as error:
         raise InputError(f"{path}: {error}") from error
     rulings = {}
+    today = datetime.now(UTC).date()
     for row in rows:
         if not isinstance(row, dict) or set(row) != RULING_KEYS:
             raise InputError(f"{path}: a ruling has exactly the keys {sorted(RULING_KEYS)}: {row}")
@@ -70,6 +73,9 @@ def load_rulings(path):
         for key in ("reason", "failure"):
             if not isinstance(row[key], str) or not row[key].strip() or "\n" in row[key]:
                 raise InputError(f"{path}: the {key} of {row['case']} must be one non-empty line")
+        expiry = row["expires"]
+        if type(expiry) is not date or not today < expiry <= today + timedelta(days=90):
+            raise InputError(f"{path}: {row['case']} needs a future expiry within 90 days")
         if row["case"] in rulings:
             raise InputError(f"{path}: {row['case']} is ruled twice")
         rulings[row["case"]] = row
@@ -88,6 +94,11 @@ def read_report(run_dir):
             raise KeyError("cases")
     except (json.JSONDecodeError, KeyError, TypeError) as error:
         raise InputError(f"{path}: not a conformance report: {error}") from error
+    if any(not isinstance(case["id"], str) or not case["id"] for case in cases):
+        raise InputError(f"{path}: each case needs a non-empty ID")
+    duplicates = sorted(case for case, count in Counter(row["id"] for row in cases).items() if count != 1)
+    if duplicates:
+        raise InputError(f"{path}: repeated case IDs: {', '.join(duplicates)}")
     unknown = sorted({case["verdict"] for case in cases} - set(VERDICTS))
     if unknown:
         raise InputError(f"{path}: unknown verdicts {unknown}")
@@ -98,7 +109,7 @@ def first_failure(case):
     return (case.get("failures") or ["no failure recorded"])[0]
 
 
-def judge(rulings, run_dir):
+def judge(rulings, run_dir, case_dir=None):
     """Return (summary lines, problems)."""
     server, problem = served(run_dir)
     lines = ["### Conformance", "", server]
@@ -116,6 +127,17 @@ def judge(rulings, run_dir):
     cases = {case["id"]: case for case in report["cases"]}
     if not cases:
         return lines, [f"conformance: the report holds no case"]
+    if case_dir is not None:
+        # The pinned corpus requires the file stem to equal its declared case ID.
+        expected = Counter(path.stem for path in Path(case_dir).rglob("*.toml"))
+        if not expected or any(count != 1 for count in expected.values()):
+            raise InputError(f"{case_dir}: empty or ambiguous pinned case inventory")
+        missing = sorted(expected.keys() - cases.keys())
+        extra = sorted(cases.keys() - expected.keys())
+        if missing or extra:
+            return lines, [f"conformance: report differs from pinned cases: missing {missing}, unexpected {extra}"]
+        if report.get("profile") != "rustfs":
+            return lines, ["conformance: expected the rustfs profile"]
     by_verdict = {verdict: sorted(i for i, c in cases.items() if c["verdict"] == verdict) for verdict in VERDICTS}
     lines.append(f"- target_build: {report.get('target_build') or 'not reported by the endpoint'}, profile `{report.get('profile')}`")
     skip_reasons = {}
@@ -129,7 +151,7 @@ def judge(rulings, run_dir):
     failed = by_verdict["failed"]
     unruled = [case for case in failed if case not in rulings]
     different = [case for case in failed if case in rulings
-                 and not any(str(f).startswith(rulings[case]["failure"]) for f in cases[case].get("failures", []))]
+                 and cases[case].get("failures") != [rulings[case]["failure"]]]
     stale = sorted(case for case in rulings if cases.get(case, {}).get("verdict") != "failed")
     server_skips = [case for case in by_verdict["skipped"] if SERVER_SKIP.match(cases[case].get("reason") or "")]
     not_served = [case for case in failed if any(NOT_SERVED in str(f) for f in cases[case].get("failures", []))]
@@ -161,10 +183,11 @@ def main(argv=None):
         return 0 if unittest.TextTestRunner(verbosity=1).run(suite).wasSuccessful() else 1
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--run-dir", required=True)
+    parser.add_argument("--case-dir", type=Path, help="the cases directory of the pinned gateway corpus")
     parser.add_argument("--rulings", default=str(LEDGER))
     args = parser.parse_args(argv)
     try:
-        lines, problems = judge(load_rulings(args.rulings), args.run_dir)
+        lines, problems = judge(load_rulings(args.rulings), args.run_dir, args.case_dir)
     except InputError as error:
         print(f"error: {error}", file=sys.stderr)
         return 2
@@ -194,8 +217,9 @@ class SelfTest(unittest.TestCase):
 
     def ledger(self, *cases, failure="[expect/status]"):
         path = self.dir / "rulings.toml"
+        expiry = datetime.now(UTC).date() + timedelta(days=7)
         path.write_text("".join(
-            f'[[ruling]]\ncase = "{c}"\nledger = "R-001"\nreason = "why"\nfailure = "{failure}"\n' for c in cases))
+            f'[[ruling]]\ncase = "{c}"\nledger = "R-001"\nreason = "why"\nfailure = "{failure}"\nexpires = {expiry}\n' for c in cases))
         return load_rulings(path)
 
     def judged(self, rulings):
@@ -203,7 +227,7 @@ class SelfTest(unittest.TestCase):
 
     def test_every_failure_ruled_and_every_ruling_failing_is_clean(self):
         self.write_run([("c-a-0001", "passed", ""), ("c-a-0002", "failed", "[expect/status] at /expect/status: observed 403")])
-        lines, problems = self.judged(self.ledger("c-a-0002"))
+        lines, problems = self.judged(self.ledger("c-a-0002", failure="[expect/status] at /expect/status: observed 403"))
         self.assertEqual(problems, [])
         self.assertIn("ran 2, passed 1, failed 1 (ruled 1, unruled 0, failing differently 0)", "\n".join(lines))
         self.assertIn("- server: ready", lines)
@@ -217,6 +241,17 @@ class SelfTest(unittest.TestCase):
         self.write_run([("c-a-0001", "failed", "[expect/status] at /expect/status: expected status 200, observed 500")])
         self.assertEqual(self.judged(self.ledger("c-a-0001", failure="[expect/error.code]"))[1],
                          ["conformance: c-a-0001 fails differently from its ruling"])
+
+    def test_a_second_failure_or_changed_detail_is_not_ruled(self):
+        self.write_run([("c-a-0001", "failed", "missing region")])
+        report_path = self.dir / "report.json"
+        report = json.loads(report_path.read_text())
+        ruling = self.ledger("c-a-0001", failure="missing region")
+        for failures in (["missing region", "wrong status"], ["missing region on another exchange"]):
+            report["cases"][0]["failures"] = failures
+            report_path.write_text(json.dumps(report))
+            with self.subTest(failures=failures):
+                self.assertEqual(self.judged(ruling)[1], ["conformance: c-a-0001 fails differently from its ruling"])
 
     def test_a_skip_on_the_endpoint_not_answering_is_red(self):
         self.write_run([("c-a-0001", "passed", ""),
@@ -279,6 +314,22 @@ class SelfTest(unittest.TestCase):
         self.write_run([("c-a-0001", "failed", "[expect/status]: expected status 200, observed 501")])
         self.assertIn("answered 501 1", "\n".join(self.judged({})[0]))
 
+    def test_pinned_case_inventory_requires_every_id_exactly_once(self):
+        pinned = self.dir / "cases" / "bkt"
+        pinned.mkdir(parents=True)
+        for name in ("c-bkt-0001", "c-bkt-0002"):
+            (pinned / f"{name}.toml").touch()
+        a = ("c-bkt-0001", "passed", "")
+        b = ("c-bkt-0002", "skipped", "unsupported fixture")
+        self.write_run([a, b])
+        self.assertEqual(judge({}, self.dir, pinned.parent)[1], [])
+        for rows in ([a], [a, b, ("c-bkt-0003", "passed", "")]):
+            self.write_run(rows)
+            self.assertTrue(judge({}, self.dir, pinned.parent)[1])
+        self.write_run([a, a, b])
+        with self.assertRaisesRegex(InputError, "repeated case IDs"):
+            judge({}, self.dir, pinned.parent)
+
     def test_an_unknown_verdict_is_refused(self):
         self.write_run([("c-a-0001", "validated", "")])
         with self.assertRaises(InputError):
@@ -287,18 +338,23 @@ class SelfTest(unittest.TestCase):
     def test_malformed_ledgers_are_refused(self):
         path = self.dir / "rulings.toml"
         base = 'case = "c"\nledger = "R-001"\nreason = "r"\nfailure = "[expect/status]"\n'
+        today = datetime.now(UTC).date()
+        dated = base + f"expires = {today + timedelta(days=1)}\n"
         for body in (
+            base,
+            base + f"expires = {today}\n",
+            base + f"expires = {today + timedelta(days=91)}\n",
             'case = "c"\nledger = "R-001"\nreason = "r"\n',
             base + 'expires = "x"\n',
-            base + 'stack = "gateway"\n',
-            base.replace('"R-001"', '"2684"'),
-            base.replace('reason = "r"', 'reason = ""'),
-            base.replace('failure = "[expect/status]"', 'failure = ""'),
+            dated + 'stack = "gateway"\n',
+            dated.replace('"R-001"', '"2684"'),
+            dated.replace('reason = "r"', 'reason = ""'),
+            dated.replace('failure = "[expect/status]"', 'failure = ""'),
         ):
             path.write_text("[[ruling]]\n" + body)
             with self.subTest(body=body), self.assertRaises(InputError):
                 load_rulings(path)
-        path.write_text(("[[ruling]]\n" + base) * 2)
+        path.write_text(("[[ruling]]\n" + dated) * 2)
         with self.assertRaises(InputError):
             load_rulings(path)
 
