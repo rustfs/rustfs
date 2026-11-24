@@ -1655,6 +1655,7 @@ fn namespace_scanner_worker_selection_keeps_coordinator_fallback_disks() {
         supports_durable_progress: false,
         supports_complete_observation: false,
         supports_usage_watch: false,
+        supports_tier_registry_preflight: false,
     };
     let workers = namespace_scanner_workers(
         vec!["local", "legacy-remote"],
@@ -2067,6 +2068,7 @@ async fn usage_quantum_real_remote_wire_and_entry_fallback_preserve_parent_limit
         supports_durable_progress: true,
         supports_complete_observation: true,
         supports_usage_watch: true,
+        supports_tier_registry_preflight: false,
     };
     let ordinary = namespace_scanner_workers(vec!["local"], vec![("remote", capabilities)], &remaining);
     assert_eq!(ordinary[1].1, NamespaceScannerWorkerMode::RemoteV4(capabilities));

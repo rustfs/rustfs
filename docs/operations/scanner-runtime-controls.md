@@ -969,6 +969,8 @@ The existing `life_time_ops.read_metadata` and `last_minute.actions.read_metadat
 
 ## Reading Lifecycle Transition Status
 
+When the scanner leader and a remote worker see different tier registry generations, the leader logs `state="tier_registry_changed"` with both generations. It discards usage from that round and retains pending dirty work. If the remaining scan results and the publication fence permit it, the leader advances the cycle cursor. A later cycle can scan the object again once both registry views converge. During a rolling upgrade, two upgraded peers compare generations before the worker reads its bucket cache. An upgraded leader also detects a mismatch in a verified result from an older worker. An older leader performs the walk through its coordinator path when it encounters an upgraded worker.
+
 `metrics.lifecycle_transition`:
 
 | Field | Meaning |

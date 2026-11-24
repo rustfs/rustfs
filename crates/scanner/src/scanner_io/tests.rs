@@ -6071,6 +6071,7 @@ fn namespace_scanner_walkers_multiply_local_disks_and_share_their_admission() {
         supports_durable_progress: false,
         supports_complete_observation: false,
         supports_usage_watch: false,
+        supports_tier_registry_preflight: false,
     };
     let workers = vec![
         ("local-a", NamespaceScannerWorkerMode::Coordinator),

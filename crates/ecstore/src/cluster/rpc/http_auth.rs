@@ -1015,13 +1015,16 @@ pub fn sign_ns_scanner_capability_with_usage_capabilities(
         observation,
     )
 }
-fn ns_scanner_usage_watch_capability_mac(secret: &str, challenge: Uuid, server_epoch: Uuid) -> std::io::Result<HmacSha256> {
+const NS_SCANNER_USAGE_WATCH_CAPABILITY_DOMAIN: &[u8] = b"rustfs-ns-scanner-usage-watch-capability-v1\0";
+const NS_SCANNER_TIER_REGISTRY_PREFLIGHT_CAPABILITY_DOMAIN: &[u8] = b"rustfs-ns-scanner-tier-registry-preflight-capability-v1\0";
+
+fn ns_scanner_extension_capability_mac(domain: &[u8], challenge: Uuid, server_epoch: Uuid) -> std::io::Result<HmacSha256> {
     if challenge.is_nil() || server_epoch.is_nil() {
-        return Err(std::io::Error::other("Invalid namespace scanner usage watch capability scope"));
+        return Err(std::io::Error::other("Invalid namespace scanner capability scope"));
     }
-    let mut mac =
-        <HmacSha256 as KeyInit>::new_from_slice(secret.as_bytes()).map_err(|_| std::io::Error::other("Invalid RPC HMAC key"))?;
-    mac.update(b"rustfs-ns-scanner-usage-watch-capability-v1\0");
+    let mut mac = <HmacSha256 as KeyInit>::new_from_slice(get_shared_secret()?.as_bytes())
+        .map_err(|_| std::io::Error::other("Invalid RPC HMAC key"))?;
+    mac.update(domain);
     mac.update(&NS_SCANNER_PROTOCOL_VERSION.to_be_bytes());
     mac.update(challenge.as_bytes());
     mac.update(server_epoch.as_bytes());
@@ -1031,16 +1034,39 @@ fn ns_scanner_usage_watch_capability_mac(secret: &str, challenge: Uuid, server_e
 /// Sign the independent worker capability to validate bucket watches before
 /// reusing or durably publishing a complete scanner cache.
 pub fn sign_ns_scanner_usage_watch_capability(challenge: Uuid, server_epoch: Uuid) -> std::io::Result<Vec<u8>> {
-    Ok(ns_scanner_usage_watch_capability_mac(&get_shared_secret()?, challenge, server_epoch)?
-        .finalize()
-        .into_bytes()
-        .to_vec())
+    Ok(
+        ns_scanner_extension_capability_mac(NS_SCANNER_USAGE_WATCH_CAPABILITY_DOMAIN, challenge, server_epoch)?
+            .finalize()
+            .into_bytes()
+            .to_vec(),
+    )
 }
 
 pub fn verify_ns_scanner_usage_watch_capability(challenge: Uuid, server_epoch: Uuid, proof: &[u8]) -> std::io::Result<()> {
-    ns_scanner_usage_watch_capability_mac(&get_shared_secret()?, challenge, server_epoch)?
+    ns_scanner_extension_capability_mac(NS_SCANNER_USAGE_WATCH_CAPABILITY_DOMAIN, challenge, server_epoch)?
         .verify_slice(proof)
         .map_err(|_| std::io::Error::other("Invalid namespace scanner usage watch capability proof"))
+}
+
+/// Sign support for a generation check before a remote worker reads or persists a scanner cache.
+pub fn sign_ns_scanner_tier_registry_preflight_capability(challenge: Uuid, server_epoch: Uuid) -> std::io::Result<Vec<u8>> {
+    Ok(
+        ns_scanner_extension_capability_mac(NS_SCANNER_TIER_REGISTRY_PREFLIGHT_CAPABILITY_DOMAIN, challenge, server_epoch)?
+            .finalize()
+            .into_bytes()
+            .to_vec(),
+    )
+}
+
+/// Verify preflight support for this challenge and this peer startup epoch.
+pub fn verify_ns_scanner_tier_registry_preflight_capability(
+    challenge: Uuid,
+    server_epoch: Uuid,
+    proof: &[u8],
+) -> std::io::Result<()> {
+    ns_scanner_extension_capability_mac(NS_SCANNER_TIER_REGISTRY_PREFLIGHT_CAPABILITY_DOMAIN, challenge, server_epoch)?
+        .verify_slice(proof)
+        .map_err(|_| std::io::Error::other("Invalid namespace scanner tier registry preflight capability proof"))
 }
 
 pub fn verify_ns_scanner_capability_with_usage_capabilities(
@@ -2288,6 +2314,20 @@ mod tests {
         assert!(
             verify_ns_scanner_capability_proof("different-secret", challenge, server_epoch, &proof, false, false, false).is_err()
         );
+    }
+
+    #[test]
+    fn namespace_scanner_tier_registry_preflight_binds_challenge_epoch_and_domain() {
+        crate::runtime::sources::ensure_test_rpc_secret();
+        let challenge = Uuid::new_v4();
+        let epoch = Uuid::new_v4();
+        let proof = sign_ns_scanner_tier_registry_preflight_capability(challenge, epoch).expect("preflight proof");
+        verify_ns_scanner_tier_registry_preflight_capability(challenge, epoch, &proof).expect("exact preflight scope");
+        assert!(verify_ns_scanner_tier_registry_preflight_capability(Uuid::new_v4(), epoch, &proof).is_err());
+        assert!(verify_ns_scanner_tier_registry_preflight_capability(challenge, Uuid::new_v4(), &proof).is_err());
+        assert!(verify_ns_scanner_usage_watch_capability(challenge, epoch, &proof).is_err());
+        let watch = sign_ns_scanner_usage_watch_capability(challenge, epoch).expect("watch proof");
+        assert!(verify_ns_scanner_tier_registry_preflight_capability(challenge, epoch, &watch).is_err());
     }
 
     #[test]

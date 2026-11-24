@@ -50,6 +50,7 @@ pub const NS_SCANNER_COMPLETE_OBSERVATION_QUERY: &str = "ns_scanner_complete_obs
 pub const NS_SCANNER_DURABLE_PROGRESS_QUERY: &str = "ns_scanner_durable_progress";
 pub const NS_SCANNER_CHECKPOINT_COVERAGE_QUERY: &str = "ns_scanner_checkpoint_coverage";
 pub const NS_SCANNER_TIER_REGISTRY_GENERATION_QUERY: &str = "ns_scanner_tier_registry_generation";
+pub const NS_SCANNER_TIER_REGISTRY_PREFLIGHT_QUERY: &str = "ns_scanner_tier_registry_preflight";
 pub const NS_SCANNER_PROTOCOL_VERSION: u16 = 3;
 pub const SCANNER_ACTIVITY_LEGACY_PROTOCOL_VERSION: u32 = 0;
 pub const SCANNER_ACTIVITY_PREVIOUS_PROTOCOL_VERSION: u32 = 5;
@@ -81,6 +82,9 @@ pub struct NsScannerCapabilityResponse {
     /// Independent challenge-bound capability; omitted for older strict readers.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub usage_watch_proof: Option<Vec<u8>>,
+    /// Challenge-bound support for comparing tier registries before scanning or reusing a bucket.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tier_registry_preflight_proof: Option<Vec<u8>>,
 }
 
 /// Authenticated scanner capabilities for one peer startup epoch.
@@ -90,6 +94,7 @@ pub struct NsScannerCapabilities {
     pub supports_durable_progress: bool,
     pub supports_complete_observation: bool,
     pub supports_usage_watch: bool,
+    pub supports_tier_registry_preflight: bool,
 }
 
 pub mod admin;

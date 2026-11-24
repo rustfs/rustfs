@@ -1275,6 +1275,7 @@ impl RemoteDisk {
             supports_durable_progress: true,
             supports_complete_observation: true,
             supports_usage_watch: true,
+            supports_tier_registry_preflight: true,
         });
         let result = timeout(NS_SCANNER_CAPABILITY_PROBE_TIMEOUT, probe)
             .await
@@ -1290,6 +1291,7 @@ impl RemoteDisk {
                     supports_durable_progress: response.supports_durable_progress == Some(true),
                     supports_complete_observation: response.supports_complete_observation == Some(true),
                     supports_usage_watch: response.usage_watch_proof.is_some(),
+                    supports_tier_registry_preflight: response.tier_registry_preflight_proof.is_some(),
                 }))
             }
             Ok(_) => Ok(None),
@@ -7122,6 +7124,7 @@ mod tests {
                 supports_durable_progress: None,
                 supports_complete_observation: None,
                 usage_watch_proof: None,
+                tier_registry_preflight_proof: None,
             })
         }
 
