@@ -48,15 +48,14 @@ use super::storage_api::bucket_usecase::bucket::{
     utils::{BucketConfigXml, serialize},
     versioning_sys::BucketVersioningSys,
 };
-use super::storage_api::bucket_usecase::contract::bucket::{
-    BucketOperations, BucketOptions, DeleteBucketOptions, MakeBucketOptions,
-};
+#[cfg(test)]
+use super::storage_api::bucket_usecase::contract::bucket::DeleteBucketOptions;
+use super::storage_api::bucket_usecase::contract::bucket::{BucketOperations, BucketOptions, MakeBucketOptions};
 use super::storage_api::bucket_usecase::contract::list::{
     ListObjectVersionsInfo as StorageListObjectVersionsInfo, ListObjectsV2Info as StorageListObjectsV2Info,
 };
 use super::storage_api::bucket_usecase::error::StorageError;
 use super::storage_api::bucket_usecase::helper::{OperationHelper, spawn_background_with_context};
-use super::storage_api::bucket_usecase::object_utils::to_s3s_xml_etag;
 use super::storage_api::bucket_usecase::s3_api::bucket::{
     ListObjectVersionsParams, ListObjectsV2Params, encode_list_objects_v2_continuation_token, parse_list_object_versions_params,
     parse_list_objects_v2_params, rustfs_owner,
@@ -509,8 +508,7 @@ impl DefaultBucketUsecase {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::app::bucket_usecase::test_support::{build_request, build_request_with_req_info};
-    use crate::app::storage_api::s3::dto::CreateBucketInput;
+    use crate::app::bucket_usecase::test_support::owned_envelope;
     use http::Method;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use tokio::sync::Notify;
@@ -906,9 +904,7 @@ mod tests {
             .expect_err("full queue rejects immediately");
         assert_eq!(error.code(), &S3ErrorCode::SlowDown);
         assert_eq!(error.headers().expect("retry headers")[http::header::RETRY_AFTER], "1");
-        let response = s3s::S3Error::from(error)
-            .to_http_response()
-            .expect("serialize admission error");
+        let response = error.to_http_response().expect("serialize admission error");
         assert_eq!(response.status(), http::StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(response.headers()[http::header::RETRY_AFTER], "1");
         use http_body_util::BodyExt as _;
@@ -988,30 +984,33 @@ mod tests {
 
     #[test]
     fn build_request_with_req_info_preserves_owner_state() {
-        let input = CreateBucketInput::builder()
-            .bucket("test-bucket".to_string())
-            .build()
-            .unwrap();
-        let req = build_request_with_req_info(
-            input,
-            Method::PUT,
-            ReqInfo {
-                is_owner: true,
-                ..Default::default()
-            },
-        );
+        let mut extensions = http::Extensions::new();
+        extensions.insert(ReqInfo {
+            is_owner: true,
+            ..Default::default()
+        });
 
-        let envelope = RequestEnvelope::from_s3s(&req);
+        // Same facts `RequestEnvelope::from_s3s` copies. Credentials, region, and service stay absent.
+        let envelope = RequestEnvelope::from_parts(
+            crate::app::RequestHead {
+                method: Method::PUT,
+                uri: http::Uri::from_static("/"),
+                headers: http::HeaderMap::new(),
+                credentials: None,
+                region: None,
+                service: None,
+            },
+            extensions,
+        );
         assert!(envelope.req_info().expect("req info should be present").is_owner);
     }
 
     #[tokio::test]
     async fn execute_list_buckets_returns_internal_error_when_store_uninitialized() {
-        let req = build_request((), Method::GET);
         let usecase = DefaultBucketUsecase::without_context();
 
         let err = usecase
-            .execute_list_buckets(RequestEnvelope::from_s3s(&req), gateway_dto::ListBucketsInput::default())
+            .execute_list_buckets(owned_envelope(Method::GET), gateway_dto::ListBucketsInput::default())
             .await
             .unwrap_err();
         assert_eq!(err.code(), &rustfs_s3_types::S3ErrorCode::InternalError);

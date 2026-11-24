@@ -12,9 +12,13 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+mod pages;
+mod scan_load;
+
 use super::*;
 use bytes::Bytes;
 use std::sync::Arc;
+use tokio_util::sync::CancellationToken;
 
 #[derive(Debug)]
 struct CachePublicationAdmissionUnavailable;
@@ -70,6 +74,8 @@ struct DataUsageCacheLoadResult {
     cache: DataUsageCache,
     main_revision: DataUsageCacheRevision,
     backup_revision: Option<DataUsageCacheRevision>,
+    damaged_pages: DamagedPages,
+    loaded_from_main: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -106,34 +112,57 @@ impl DataUsageCache {
         store: Arc<S>,
         name: &str,
     ) -> StorageResult<DataUsageCacheRevisions> {
-        let backup_name = format!("{name}.bkp");
-        let backup_path = path_join_buf(&[BUCKET_META_PREFIX, &backup_name]);
+        self.load_with_baseline_revisions(store, name)
+            .await
+            .map(|baseline| baseline.revisions)
+    }
+
+    /// Loads cache revisions with provenance for unchanged-primary backup reconciliation.
+    /// Missing or rebuilt caches and a decoded backup do not establish a decoded primary.
+    pub(crate) async fn load_with_baseline_revisions<S: ScannerObjectIO>(
+        &mut self,
+        store: Arc<S>,
+        name: &str,
+    ) -> StorageResult<DataUsageCacheBaselineRevisions> {
         let loaded = Self::load_cache(store.clone(), name).await?;
         let backup = match loaded.backup_revision {
             Some(revision) => Some(revision),
-            None => match read_config_revision(store, &backup_path).await {
-                Ok(revision) => Some(revision),
-                Err(err) => {
-                    counter!(METRIC_CACHE_BACKUP_REVISION_FAILURE_TOTAL).increment(1);
-                    debug!(
-                        target: "rustfs::scanner::data_usage",
-                        event = EVENT_SCANNER_CACHE_LOAD_STATE,
-                        component = LOG_COMPONENT_SCANNER,
-                        subsystem = LOG_SUBSYSTEM_CACHE,
-                        cache_name = %name,
-                        backup_path = %backup_path,
-                        state = "backup_revision_unavailable",
-                        error = %err,
-                        "Scanner cache backup revision lookup failed"
-                    );
-                    None
-                }
-            },
+            None => Self::backup_revision(store, name).await,
         };
         let main = loaded.main_revision;
         *self = loaded.cache;
 
-        Ok(DataUsageCacheRevisions { main, backup })
+        Ok(DataUsageCacheBaselineRevisions {
+            revisions: DataUsageCacheRevisions {
+                main,
+                backup,
+                damaged_pages: loaded.damaged_pages,
+            },
+            loaded_from_main: loaded.loaded_from_main,
+        })
+    }
+
+    async fn backup_revision<S: ScannerObjectIO>(store: Arc<S>, name: &str) -> Option<DataUsageCacheRevision> {
+        let backup_name = format!("{name}.bkp");
+        let backup_path = path_join_buf(&[BUCKET_META_PREFIX, &backup_name]);
+        match read_config_revision(store, &backup_path).await {
+            Ok(revision) => Some(revision),
+            Err(err) => {
+                counter!(METRIC_CACHE_BACKUP_REVISION_FAILURE_TOTAL).increment(1);
+                debug!(
+                    target: "rustfs::scanner::data_usage",
+                    event = EVENT_SCANNER_CACHE_LOAD_STATE,
+                    component = LOG_COMPONENT_SCANNER,
+                    subsystem = LOG_SUBSYSTEM_CACHE,
+                    cache_name = %name,
+                    backup_path = %backup_path,
+                    state = "backup_revision_unavailable",
+                    error = %err,
+                    "Scanner cache backup revision lookup failed"
+                );
+                None
+            }
+        }
     }
 
     pub(crate) async fn read_revisions<S: ScannerObjectIO>(store: Arc<S>, name: &str) -> StorageResult<DataUsageCacheRevisions> {
@@ -142,7 +171,11 @@ impl DataUsageCache {
         let backup_path = path_join_buf(&[BUCKET_META_PREFIX, &backup_name]);
         let main = read_config_revision(store.clone(), &main_path).await?;
         let backup = Some(read_config_revision(store, &backup_path).await?);
-        Ok(DataUsageCacheRevisions { main, backup })
+        Ok(DataUsageCacheRevisions {
+            main,
+            backup,
+            damaged_pages: DamagedPages::default(),
+        })
     }
 
     async fn load_cache<S: ScannerObjectIO>(store: Arc<S>, name: &str) -> StorageResult<DataUsageCacheLoadResult> {
@@ -156,10 +189,14 @@ impl DataUsageCache {
                     cache,
                     revision: Some(main_revision),
                 } => {
+                    // Legacy-location fallback carries Missing for the primary path.
+                    let loaded_from_main = matches!(&main_revision, DataUsageCacheRevision::Etag(_));
                     return Ok(DataUsageCacheLoadResult {
                         cache: *cache,
                         main_revision,
                         backup_revision: None,
+                        damaged_pages: DamagedPages::default(),
+                        loaded_from_main,
                     });
                 }
                 DataUsageCacheLoadAttempt::Loaded { revision: None, .. } => {
@@ -184,6 +221,11 @@ impl DataUsageCache {
             let backup_name = format!("{name}.bkp");
             let backup_attempt = Self::try_load_inner(store.clone(), &backup_name, Duration::from_secs(30)).await?;
             let backup_revision = backup_attempt.revision();
+            if backup_revision.is_some()
+                && let Some(DataUsageCacheRevision::Etag(etag)) = &main_revision
+            {
+                scan_load::PendingBackup::finish(&store, name, etag);
+            }
             let backup_state = match backup_attempt {
                 DataUsageCacheLoadAttempt::Loaded {
                     cache,
@@ -197,6 +239,11 @@ impl DataUsageCache {
                             cache: *cache,
                             main_revision,
                             backup_revision: Some(backup_revision),
+                            damaged_pages: DamagedPages {
+                                main: main_state == DataUsageCacheLoadState::Corrupt,
+                                backup: false,
+                            },
+                            loaded_from_main: false,
                         });
                     }
                     DataUsageCacheLoadState::Loaded
@@ -220,6 +267,11 @@ impl DataUsageCache {
                         main_revision: main_revision
                             .ok_or_else(|| Error::other(format!("scanner cache missing state has no revision: {name}")))?,
                         backup_revision,
+                        damaged_pages: DamagedPages {
+                            main: main_state == DataUsageCacheLoadState::Corrupt,
+                            backup: backup_state == DataUsageCacheLoadState::Corrupt,
+                        },
+                        loaded_from_main: false,
                     });
                 }
                 (DataUsageCacheLoadState::Corrupt, DataUsageCacheLoadState::Missing)
@@ -239,6 +291,11 @@ impl DataUsageCache {
                         main_revision: main_revision
                             .ok_or_else(|| Error::other(format!("scanner cache corrupt state has no revision: {name}")))?,
                         backup_revision,
+                        damaged_pages: DamagedPages {
+                            main: main_state == DataUsageCacheLoadState::Corrupt,
+                            backup: backup_state == DataUsageCacheLoadState::Corrupt,
+                        },
+                        loaded_from_main: false,
                     });
                 }
                 _ => {}
@@ -294,10 +351,35 @@ impl DataUsageCache {
                         .filter(|etag| !etag.is_empty())
                         .cloned()
                         .map(DataUsageCacheRevision::Etag);
+                    if let Some(DataUsageCacheRevision::Etag(etag)) = &revision
+                        && scan_load::PendingBackup::needs_backup(&store, load_name, etag)
+                    {
+                        return Ok((None, revision, true));
+                    }
                     match reader.read_all().await {
-                        Ok(data) => match DataUsageCache::unmarshal(&data) {
+                        Ok(data) => match Box::pin(pages::decode(store.clone(), load_name, &data)).await {
                             Ok(cache) => Ok((Some(cache), revision, false)),
-                            Err(_) => Ok((None, revision, true)),
+                            Err(err)
+                                if matches!(err, StorageError::Io(ref io) if io.kind() == std::io::ErrorKind::InvalidData)
+                                    || matches!(err, StorageError::FileNotFound | StorageError::ObjectNotFound(..))
+                                    || (pages::is_manifest(&data) && pages::unreadable_page(&err)) =>
+                            {
+                                // A concurrent manifest commit can retire the generation
+                                // we were reading. Retry the current root before treating
+                                // missing pages as corruption or falling back to a backup.
+                                if pages::is_manifest(&data) {
+                                    if Some(read_config_revision(store.clone(), &path).await?) != revision {
+                                        return Err(StorageError::PreconditionFailed);
+                                    }
+                                    if !load_name.ends_with(".bkp")
+                                        && let Some(DataUsageCacheRevision::Etag(etag)) = &revision
+                                    {
+                                        scan_load::PendingBackup::begin(&store, load_name, etag);
+                                    }
+                                }
+                                Ok((None, revision, true))
+                            }
+                            Err(err) => Err(err),
                         },
                         Err(e) => {
                             // Read error
@@ -625,14 +707,22 @@ impl DataUsageCache {
         self.save_inner(store, name, Some(revisions), None).await
     }
 
+    /// All epoch-fenced cache writes use background disk admission. Incremental
+    /// checkpoints pass their scan token; finalization uses a fresh token so a
+    /// spent scan budget can still persist progress within the save timeout.
     pub(crate) async fn save_with_revisions_for_epoch<S: ScannerObjectIO + ScannerConfigObjectDelete>(
         &self,
         store: Arc<S>,
         name: &str,
         revisions: &DataUsageCacheRevisions,
         expected_epoch: u64,
+        cancellation: CancellationToken,
     ) -> StorageResult<()> {
-        self.save_inner(store, name, Some(revisions), Some(expected_epoch)).await
+        crate::storage_api::ecstore_with_background_disk_io(
+            cancellation,
+            self.save_inner(store, name, Some(revisions), Some(expected_epoch)),
+        )
+        .await
     }
 
     async fn save_inner<S: ScannerObjectIO + ScannerConfigObjectDelete>(
@@ -643,20 +733,58 @@ impl DataUsageCache {
         expected_epoch: Option<u64>,
     ) -> StorageResult<()> {
         let serialize_started = Instant::now();
-        let mut buf = Vec::new();
-        self.serialize(&mut rmp_serde::Serializer::new(&mut buf))?;
-        // Primary, backup, and retries read the same immutable encoded body.
-        let buf = Bytes::from(buf);
-        counter!("rustfs_scanner_cache_serialized_bytes_total").increment(u64::try_from(buf.len()).unwrap_or(u64::MAX));
+        let paged = matches!((revisions, expected_epoch), (Some(_), Some(_))) && pages::eligible(self, name);
+        let encoded = if paged { Some(pages::encode(self)?) } else { None };
+        let inline = if paged {
+            Bytes::new()
+        } else {
+            let mut buf = Vec::new();
+            self.serialize(&mut rmp_serde::Serializer::new(&mut buf))?;
+            Bytes::from(buf)
+        };
+        counter!("rustfs_scanner_cache_serialized_bytes_total").increment(
+            encoded
+                .as_ref()
+                .map_or_else(|| u64::try_from(inline.len()).unwrap_or(u64::MAX), pages::EncodedPages::length),
+        );
         histogram!("rustfs_scanner_cache_serialize_seconds").record(serialize_started.elapsed().as_secs_f64());
         let timeout_duration = Self::cache_save_timeout();
 
+        let (primary_buf, primary_retired) = match (&encoded, revisions, expected_epoch) {
+            (Some(encoded), Some(revisions), Some(epoch)) => {
+                Box::pin(pages::prepare(
+                    self,
+                    store.clone(),
+                    name,
+                    &revisions.main,
+                    encoded,
+                    epoch,
+                    revisions.damaged_pages.main,
+                ))
+                .await?
+            }
+            _ => (inline.clone(), [None, None]),
+        };
         let path = path_join_buf(&[BUCKET_META_PREFIX, name]);
+        let display_progress = timeout(Duration::from_secs(2), async {
+            let input = if expected_epoch.is_some() && self.info.scan_identity.is_some() && self.info.name != DATA_USAGE_ROOT {
+                match &encoded {
+                    Some(encoded) => encoded.progress_input().await,
+                    None => Some(vec![inline.clone()]),
+                }
+            } else {
+                None
+            };
+            self.prepare_display_progress(store.clone(), expected_epoch, input).await
+        })
+        .await
+        .ok()
+        .flatten();
         let primary_save_started = Instant::now();
         Self::save_path_with_retry(
             store.clone(),
             &path,
-            &buf,
+            &primary_buf,
             timeout_duration,
             DATA_USAGE_CACHE_SAVE_RETRIES,
             revisions.map(|revisions| revisions.main.clone()),
@@ -664,6 +792,8 @@ impl DataUsageCache {
         )
         .await?;
 
+        Self::persist_display_progress(store.clone(), display_progress, expected_epoch).await;
+        pages::reclaim_retired(store.clone(), name, primary_retired, expected_epoch).await;
         let backup_name = format!("{name}.bkp");
         let backup_path = path_join_buf(&[BUCKET_META_PREFIX, &backup_name]);
         let backup_timeout_duration = Self::backup_cache_save_timeout(timeout_duration, primary_save_started.elapsed());
@@ -671,17 +801,40 @@ impl DataUsageCache {
         if revisions.is_some() && backup_revision.is_none() {
             return Ok(());
         }
-        if let Err(e) = Self::save_path_with_retry(
-            store,
-            &backup_path,
-            &buf,
-            backup_timeout_duration,
-            DATA_USAGE_CACHE_BACKUP_SAVE_RETRIES,
-            backup_revision,
-            expected_epoch,
-        )
-        .await
-        {
+        let save_backup = async {
+            let (backup_buf, retired) = match (&encoded, &backup_revision, expected_epoch) {
+                (Some(encoded), Some(revision), Some(epoch)) => {
+                    Box::pin(pages::prepare(
+                        self,
+                        store.clone(),
+                        &backup_name,
+                        revision,
+                        encoded,
+                        epoch,
+                        revisions.is_some_and(|revisions| revisions.damaged_pages.backup),
+                    ))
+                    .await?
+                }
+                _ => (inline, [None, None]),
+            };
+            Self::save_path_with_retry(
+                store.clone(),
+                &backup_path,
+                &backup_buf,
+                backup_timeout_duration,
+                DATA_USAGE_CACHE_BACKUP_SAVE_RETRIES,
+                backup_revision,
+                expected_epoch,
+            )
+            .await?;
+            pages::reclaim_retired(store, &backup_name, retired, expected_epoch).await;
+            Ok::<_, StorageError>(())
+        };
+        let backup_result = match timeout(backup_timeout_duration, save_backup).await {
+            Ok(result) => result,
+            Err(_) => Err(StorageError::other("scanner cache backup save timed out")),
+        };
+        if let Err(e) = backup_result {
             warn!(
                 target: "rustfs::scanner::data_usage",
                 event = EVENT_SCANNER_CACHE_SAVE_STATE,

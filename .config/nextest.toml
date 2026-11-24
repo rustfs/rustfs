@@ -253,7 +253,7 @@ threads-required = "num-test-threads"
 # peers complete durable IO. Reserve capacity from unrelated test processes;
 # the shared fixture's durable_iam_state_ prefix keeps the whole family together.
 [[profile.default.overrides]]
-filter = 'package(rustfs) & test(/^admin::handlers::site_replication::tests::durable_iam_state_/)'
+filter = 'package(rustfs) & test(/^admin::handlers::site_replication::(tests::durable_iam_state_|removal_tests::decommission_durable_)/)'
 threads-required = "num-test-threads"
 
 # Real target-repair and rebalance-stop fixtures commit durable metadata while
@@ -582,7 +582,7 @@ threads-required = "num-test-threads"
 # Keep the same IAM/state fixture capacity reservation in CI without changing the
 # production lock deadline, internal concurrency, assertions, or retry policy.
 [[profile.ci.overrides]]
-filter = 'package(rustfs) & test(/^admin::handlers::site_replication::tests::durable_iam_state_/)'
+filter = 'package(rustfs) & test(/^admin::handlers::site_replication::(tests::durable_iam_state_|removal_tests::decommission_durable_)/)'
 threads-required = "num-test-threads"
 
 # Match the real admin fixture capacity reservation without retries or changes
@@ -731,7 +731,7 @@ test-group = 'ecstore-serial-flaky'
 [profile.e2e-smoke]
 default-filter = """
     package(e2e_test) & (
-        test(/^(delete_marker_migration_semantics|version_id_regression|list_objects_v2_pagination|list_object_versions_regression|list_objects_duplicates|list_buckets_double_slash|list_buckets_auth|list_buckets_iam_filter|leading_slash_key|special_chars|create_bucket_region|delete_objects_versioning|head_object_consistency|head_object_range|copy_object_metadata|copy_object_tagging|copy_source_invalid_date|content_encoding|compression|multipart_storage_class|multipart_upload_id|storage_class_capability|ssec_copy|anonymous_access|bucket_policy_check|presigned_negative|negative_sigv4|admin_auth|notification_webhook|tls_hot_reload|console_smoke|admin_iam_crud|admin_pools|sts_query_compat|data_usage)_test::|^fake_s3_target::/)
+        test(/^(access_request_validation|delete_marker_migration_semantics|version_id_regression|list_objects_v2_pagination|list_object_versions_regression|list_objects_duplicates|list_buckets_double_slash|list_buckets_auth|list_buckets_iam_filter|leading_slash_key|special_chars|create_bucket_region|delete_objects_versioning|head_object_consistency|head_object_range|copy_object_metadata|copy_object_tagging|copy_source_invalid_date|content_encoding|compression|multipart_storage_class|multipart_upload_id|storage_class_capability|ssec_copy|anonymous_access|bucket_policy_check|presigned_negative|negative_sigv4|admin_auth|notification_webhook|tls_hot_reload|console_smoke|admin_iam_crud|admin_pools|sts_query_compat|data_usage)_test::|^fake_s3_target::/)
         | test(/^replication_extension_test::(test_replication_check_succeeds_with_remote_target|test_replication_check_rejects_target_without_object_lock|test_set_remote_target_rejects_unversioned_source_bucket|test_replication_check_rejects_unversioned_source_bucket|test_replication_check_rejects_missing_replication_config|test_replication_check_rejects_invalid_bucket|test_set_remote_target_rejects_same_bucket_on_same_deployment|test_set_remote_target_rejects_unversioned_target_bucket|test_set_remote_target_update_requires_arn|test_set_remote_target_update_rejects_missing_target|test_set_remote_target_rejects_invalid_target_url|test_set_remote_target_rejects_self_signed_https_target_without_skip_tls_verify|test_set_remote_target_rejects_private_ca_https_target_without_ca_cert_pem|test_list_remote_targets_rejects_empty_bucket|test_list_remote_targets_rejects_invalid_bucket|test_remove_remote_target_rejects_missing_target|test_remove_remote_target_rejects_missing_arn|test_remove_remote_target_rejects_invalid_bucket|test_remove_remote_target_rejects_target_used_by_replication|test_delete_bucket_replication_removes_remote_target)$/)
         | test(/^reliant::lifecycle::/)
         | test(/^conditional_delete_objects_test::/)
@@ -960,10 +960,11 @@ path = "junit.xml"
 # differential picks side A (shell-script stand-ins, no server, no reference
 # binary). They already run on every pull request in e2e-smoke, so e2e-full
 # excludes them to keep its selection digest unchanged.
+# ACL admission protocol tests already run on every PR in e2e-smoke.
 [profile.e2e-full]
 default-filter = """
     package(e2e_test)
-    & !test(/^protocols::/)
+    & !test(/^(protocols|access_request_validation_test)::/)
     & !test(/^(admin_timeout_regression_test|cluster_concurrency_test|cluster_multidrive_pool_test|degraded_listing_availability_test|namespace_lock_quorum_test|object_lambda_test|stale_multipart_cleanup_cluster_test)::/)
     & !test(/^distributed::/)
     & !test(/^replication_extension_test::/)
@@ -994,6 +995,18 @@ test-group = 'e2e-inline-boundaries'
 # just as the nightly lane does, without changing membership or retry policy.
 [[profile.e2e-full.overrides]]
 filter = 'package(e2e_test) & test(/^heal_erasure_disk_rebuild_test::/)'
+test-group = 'e2e-cluster-nightly'
+
+# macOS can exceed the capability timeout when both startup CAS fixtures first
+# execute their private copies of the debug server at the same time.
+[[profile.e2e-full.overrides]]
+platform = { host = 'cfg(target_os = "macos")' }
+filter = """
+    package(e2e_test) & (
+        test(=distributed_startup_regression_test::tests::test_fresh_four_node_bootstrap_metadata_cas)
+        | test(=distributed_startup_regression_test::tests::test_two_pool_restart_repairs_missing_pool_metadata_via_bootstrap_cas)
+    )
+"""
 test-group = 'e2e-cluster-nightly'
 
 # The multi-pool crash fixture seeds three nodes and 36 drives. Reserve this

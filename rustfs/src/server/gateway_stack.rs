@@ -33,12 +33,13 @@
 //!
 //! # Authorization
 //!
-//! The gateway's `Authorizer` is only the early gate: it allows an operation the table serves and
-//! denies every other. Every authorization decision, an anonymous caller's included, is the
-//! handler's, made by the function the legacy access hook calls (`server/gateway_handlers`), which
-//! also writes its denial audit record. No policy source and no authorization audit sink is
-//! installed: nothing reads a policy snapshot, and the gate's only refusal is an operation without
-//! a handler, which the gateway answers `501 NotImplemented`.
+//! The gateway's `Authorizer` is an early gate in front of the handler, not a second policy
+//! engine. An operation the table does not serve is denied. A served operation is decided by the
+//! same core the legacy access hook calls (`server/gateway_authorizer`): the gate may deny only
+//! what that hook would deny, and the handler still runs the hook. Body-derived conditions and
+//! any check that would take the table publication fence stay in the handler. A backend failure
+//! is indeterminate. No policy source is installed: the gate reads the server's own IAM and
+//! bucket policy through that core.
 //!
 //! # Expected bucket owner
 //!
@@ -55,7 +56,7 @@ pub(crate) static CONFIG_HANDLER_CALLS: std::sync::atomic::AtomicUsize = std::sy
 
 use crate::app::dto_values::owner;
 use crate::runtime_sources::{ServerContextSlot, current_action_credentials};
-use crate::server::gateway_handlers::{GatewayBackend, OPERATIONS, OperationTable, metadata_listing, register, serves};
+use crate::server::gateway_handlers::{GatewayBackend, OPERATIONS, OperationTable, metadata_listing, register};
 use crate::server::ssec_transport::{is_secure_transport, require_tls};
 use crate::shared_types::{NativeTlsTransport, RemoteAddr};
 use crate::storage_api::server::http::request_context::RequestContext;
@@ -63,10 +64,12 @@ use http::{Extensions, Request, Response};
 use rustfs_config::RUSTFS_REGION;
 use rustfs_gateway::{
     AssemblyError, Authorizer, BoxFuture, BucketName, BucketOwnerError, BucketOwnerSource, ClientAddr, ConnectionIntent,
-    DEFAULT_MAX_BUFFERED_BODY_BYTES, Decision, HandlerDeadlineClass, HandlerDeadlineConfig, MintedTraces,
-    PlaintextCustomerKeyAck, RegionSet, RequestBodyDeadlineConfig, ServiceBuilder, ServiceConfig, SigV4Authenticator, SseConfig,
-    TransportSecurity, connection_intent_of, decide_with,
+    DEFAULT_MAX_BUFFERED_BODY_BYTES, HandlerDeadlineClass, HandlerDeadlineConfig, MintedTraces, PlaintextCustomerKeyAck,
+    RegionSet, RequestBodyDeadlineConfig, ServiceBuilder, ServiceConfig, SigV4Authenticator, SseConfig, TransportSecurity,
+    connection_intent_of,
 };
+#[cfg(test)]
+use rustfs_gateway::{Decision, decide_with};
 use rustfs_gateway_adapter::{
     IamCredentials, IamKeyLookup, KeystoneEstablished, KeystoneVerifier, RequestIdCarrier, RootCredentials, RootCredentialsError,
     RootSource, establish_keystone_identity, host_request_id, keystone_header_token_claim, rustfs_host_resolver,
@@ -175,8 +178,9 @@ impl GatewayStack {
         let iam = Arc::new(ServerIam {
             server_ctx: Arc::clone(&assembly.server_ctx),
         });
+        let server_ctx = Arc::clone(&assembly.server_ctx);
         let root = Arc::new(live_root(Arc::clone(&assembly.server_ctx)));
-        Self::assemble_with(assembly, iam, root, early_gate(OPERATIONS))
+        Self::assemble_with(assembly, iam, root, early_gate(OPERATIONS, server_ctx))
     }
 
     /// Assembles the gateway service for the two signed server-info aliases.
@@ -433,16 +437,11 @@ impl TestGateway {
     }
 }
 
-/// The early gate over `table` and the two metadata listings: an operation it serves is allowed on
-/// to its handler, which decides; every other operation is denied.
-fn early_gate(table: OperationTable) -> impl Authorizer {
-    decide_with(move |request| {
-        if serves(table, request.operation) || metadata_listing::NAMES.contains(&request.operation) {
-            Decision::Allow
-        } else {
-            Decision::Deny
-        }
-    })
+/// The early gate over `table` and the two metadata listings. An operation the table does not
+/// serve is denied. A served operation is decided by [`crate::server::gateway_authorizer`], which
+/// may deny only what the handler's legacy hook would deny.
+fn early_gate(table: OperationTable, server_ctx: Arc<ServerContextSlot>) -> impl Authorizer {
+    crate::server::gateway_authorizer::early_gate(table, server_ctx)
 }
 
 /// The gateway's request settings for RustFS, every deadline stated instead of inherited.
@@ -559,6 +558,189 @@ impl IamKeyLookup for ServerIam {
             };
             iam.check_key(access_key).await
         })
+    }
+}
+
+#[cfg(test)]
+mod snowball_tests {
+    use super::*;
+    use crate::app::storage_api::error::is_err_object_not_found;
+    use crate::app::storage_api::test::StorageObjectOptions;
+    use crate::app::storage_api::test::contract::bucket::{BucketOperations as _, MakeBucketOptions};
+    use crate::app::storage_api::test::contract::object::ObjectOperations as _;
+    use bytes::Bytes;
+    use http_body_util::BodyExt as _;
+    use rustfs_gateway_stream::Body;
+    use tokio_tar::Header;
+    use uuid::Uuid;
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn snowball_extract_preserves_sha256_failure_after_sniffing() {
+        let store = crate::app::gating_test_env::shared_gating_ecstore().await;
+        if crate::runtime_sources::current_app_context().is_none() {
+            crate::runtime_sources::install_test_app_context(Arc::clone(&store)).await;
+        }
+        let ambient = crate::runtime_sources::current_app_context().expect("Snowball gateway test requires an AppContext");
+        let context = Arc::new(crate::runtime_sources::AppContext::new(Arc::clone(&store), ambient.iam(), ambient.kms()));
+        let bucket = format!("extract-body-error-{}", Uuid::new_v4());
+        store
+            .make_bucket(&bucket, &MakeBucketOptions::default())
+            .await
+            .expect("create extract test bucket");
+        let mut header = Header::new_gnu();
+        header.set_path("member.txt").expect("valid member path");
+        header.set_size(0);
+        header.set_mode(0o644);
+        header.set_cksum();
+        let mut archive = header.as_bytes().to_vec();
+        archive.extend_from_slice(&[0; 1024]);
+        let archive = Bytes::from(archive);
+        let slot = ServerContextSlot::new();
+        assert!(slot.install(Arc::clone(&context)));
+        let gateway = TestGateway::over(&context, slot);
+        for valid in [false, true] {
+            let digest = if valid {
+                rustfs_utils::crypto::hex_sha256(&archive, str::to_owned)
+            } else {
+                "00".repeat(32)
+            };
+            // The first frame supplies the sniff prefix. The gateway compares the signed
+            // payload digest when it reaches the end of the second frame.
+            let body = Body::from_segments([archive.slice(..16), archive.slice(16..)]);
+            let request = http::Request::put(format!("http://localhost/{bucket}/archive.tar"))
+                .header(http::header::HOST, "localhost")
+                .header(http::header::CONTENT_LENGTH, archive.len())
+                .header("x-amz-meta-snowball-auto-extract", "true")
+                .header("x-amz-content-sha256", digest)
+                .body(body)
+                .expect("build Snowball upload");
+            let request = rustfs_signer::try_sign_v4(
+                request,
+                i64::try_from(archive.len()).expect("archive length fits i64"),
+                TestGateway::ACCESS_KEY,
+                TestGateway::SECRET_KEY,
+                "",
+                "us-east-1",
+            )
+            .expect("sign Snowball upload");
+            let response = gateway.call(request).await;
+            let status = response.status();
+            let response = response
+                .into_body()
+                .collect()
+                .await
+                .expect("collect Snowball response")
+                .to_bytes();
+            if valid {
+                assert_eq!(status, http::StatusCode::OK, "{response:?}");
+                assert_eq!(
+                    store
+                        .get_object_info(&bucket, "member.txt", &StorageObjectOptions::default())
+                        .await
+                        .expect("matching digest must extract the member")
+                        .size,
+                    0
+                );
+            } else {
+                assert_eq!(status, http::StatusCode::BAD_REQUEST, "{response:?}");
+                assert!(
+                    std::str::from_utf8(&response)
+                        .expect("S3 error response is UTF-8")
+                        .contains("<Code>XAmzContentSHA256Mismatch</Code>"),
+                    "{response:?}"
+                );
+                let missing = store
+                    .get_object_info(&bucket, "member.txt", &StorageObjectOptions::default())
+                    .await
+                    .expect_err("rejected archive cannot publish a member");
+                assert!(is_err_object_not_found(&missing), "{missing}");
+            }
+            let missing = store
+                .get_object_info(&bucket, "archive.tar", &StorageObjectOptions::default())
+                .await
+                .expect_err("the archive itself must not be stored");
+            assert!(is_err_object_not_found(&missing), "{missing}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod object_lock_tests {
+    use super::*;
+    use crate::app::storage_api::test::contract::bucket::{BucketOperations as _, MakeBucketOptions};
+    use bytes::Bytes;
+    use http::{Method, StatusCode};
+    use http_body_util::BodyExt as _;
+    use md5::Digest as _;
+    use rustfs_gateway_types::persistence::parse_object_lock;
+    use uuid::Uuid;
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn object_lock_round_trips_the_default_retention() {
+        let ambient = crate::app::gating_test_env::shared_gating_ambient().await;
+        let store = crate::app::gating_test_env::shared_gating_ecstore().await;
+        let context = Arc::new(crate::runtime_sources::AppContext::new(Arc::clone(&store), ambient.iam(), ambient.kms()));
+        let slot = ServerContextSlot::new();
+        assert!(slot.install(Arc::clone(&context)));
+        let gateway = TestGateway::over(&context, slot);
+        let bucket = format!("lock-config-{}", Uuid::new_v4());
+        store
+            .make_bucket(
+                &bucket,
+                &MakeBucketOptions {
+                    lock_enabled: true,
+                    versioning_enabled: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("create object-lock bucket");
+
+        let xml = b"<ObjectLockConfiguration><ObjectLockEnabled>Enabled</ObjectLockEnabled>\
+            <Rule><DefaultRetention><Mode>GOVERNANCE</Mode><Days>30</Days></DefaultRetention></Rule></ObjectLockConfiguration>";
+        let target = format!("/{bucket}?object-lock");
+        let checksum = base64_simd::STANDARD.encode_to_string(md5::Md5::digest(xml));
+        let put = gateway
+            .signed(Method::PUT, &target, vec![("content-md5", checksum)], Bytes::from_static(xml))
+            .await
+            .expect("PUT Object Lock configuration");
+        let put_status = put.status();
+        let put_body = put
+            .into_body()
+            .collect()
+            .await
+            .expect("collect PUT Object Lock response")
+            .to_bytes();
+        assert_eq!(put_status, StatusCode::OK, "{}", String::from_utf8_lossy(&put_body));
+
+        let (stored, _) = crate::storage_api::server::gateway_stack::get_object_lock_config(&bucket)
+            .await
+            .expect("stored lock config");
+        assert_eq!(stored.object_lock_enabled.as_deref(), Some("Enabled"));
+
+        let get = gateway
+            .signed(Method::GET, &target, vec![], Bytes::new())
+            .await
+            .expect("GET Object Lock configuration");
+        assert_eq!(get.status(), StatusCode::OK);
+        let body = get
+            .into_body()
+            .collect()
+            .await
+            .expect("collect GET Object Lock response")
+            .to_bytes();
+        let returned = parse_object_lock(&body).expect("get lock configuration");
+        assert_eq!(returned, stored);
+        let retention = returned
+            .rule
+            .expect("stored Object Lock rule")
+            .default_retention
+            .expect("stored default retention");
+        assert_eq!(retention.mode.as_deref(), Some("GOVERNANCE"));
+        assert_eq!(retention.days, Some(30));
+        assert_eq!(retention.years, None);
     }
 }
 

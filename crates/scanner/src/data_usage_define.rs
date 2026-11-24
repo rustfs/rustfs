@@ -200,10 +200,51 @@ pub(crate) async fn read_config_revision<S: ScannerObjectIO>(store: Arc<S>, path
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, Eq)]
 pub(crate) struct DataUsageCacheRevisions {
     main: DataUsageCacheRevision,
     backup: Option<DataUsageCacheRevision>,
+    damaged_pages: DamagedPages,
+}
+
+// Admissions compare CAS tokens. A reader's local repair hint does not
+// indicate that either committed object changed while its locks were released.
+impl PartialEq for DataUsageCacheRevisions {
+    fn eq(&self, other: &Self) -> bool {
+        self.main == other.main && self.backup == other.backup
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct DamagedPages {
+    main: bool,
+    backup: bool,
+}
+
+/// In-memory provenance of the decoded cache and the revisions observed by its loader.
+#[derive(Clone, Debug)]
+pub(crate) struct DataUsageCacheBaselineRevisions {
+    revisions: DataUsageCacheRevisions,
+    loaded_from_main: bool,
+}
+
+impl DataUsageCacheBaselineRevisions {
+    pub(crate) fn revisions(&self) -> &DataUsageCacheRevisions {
+        &self.revisions
+    }
+
+    /// A backup may catch up to an unchanged primary without changing the decoded baseline.
+    /// Both reads must have decoded that primary; an ETag on a corrupt primary is insufficient.
+    pub(crate) fn permits_unchanged_baseline_since(&self, initial: &Self) -> bool {
+        if self.revisions == initial.revisions {
+            return true;
+        }
+        self.loaded_from_main
+            && initial.loaded_from_main
+            && matches!(&initial.revisions.main, DataUsageCacheRevision::Etag(etag) if !etag.is_empty())
+            && self.revisions.main == initial.revisions.main
+            && self.revisions.backup.as_ref() == Some(&self.revisions.main)
+    }
 }
 
 pub static DATA_USAGE_BUCKET: LazyLock<String> =
@@ -509,6 +550,10 @@ pub struct DataUsageScanCoverageReceipt {
     pub digest: [u8; 32],
 }
 
+pub(crate) fn scan_measurement_time_millis(time: SystemTime) -> Option<u64> {
+    u64::try_from(time.duration_since(SystemTime::UNIX_EPOCH).ok()?.as_millis()).ok()
+}
+
 impl Serialize for DataUsageScanCoverageReceipt {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         let mut map = serializer.serialize_map(Some(2))?;
@@ -576,10 +621,31 @@ pub(crate) struct DataUsageDurableProgress {
     identity: Option<DataUsageScanIdentity>,
     started_plan: Option<DataUsageScanPlanDigest>,
     frontier: Option<String>,
+    dormant: HashMap<String, String>,
     raw: HashMap<String, crate::raw_page_index::RawEnumerationDurableProgress>,
+    compacted: Vec<crate::scanner_folder::DirectoryProgress>,
+    listings: Vec<crate::scanner_folder::DirectoryReadProgress>,
+    active_source: Option<String>,
 }
 
 impl DataUsageDurableProgress {
+    fn source_frontier(&self, source: Option<&str>) -> Option<&str> {
+        if source == self.active_source.as_deref() {
+            self.frontier.as_deref()
+        } else {
+            source.and_then(|source| self.dormant.get(source)).map(String::as_str)
+        }
+    }
+
+    fn covers_on(&self, source: Option<&str>, path: &str) -> bool {
+        self.source_frontier(source)
+            .is_some_and(|frontier| scan_frontier_covers_path(path, frontier))
+            || self
+                .compacted
+                .iter()
+                .any(|done| Some(done.physical.endpoint.as_str()) == source && done.covers(path))
+    }
+
     pub(crate) fn advanced_from(&self, previous: &Self) -> bool {
         if self.bucket != previous.bucket
             || self.source.is_none()
@@ -591,31 +657,69 @@ impl DataUsageDurableProgress {
         {
             return false;
         }
-        let mut advanced = match (&previous.frontier, &self.frontier) {
-            (Some(before), Some(after)) => {
-                if !scan_frontier_covers_path(before, after) {
-                    return false;
+        let active = self.active_source.as_deref();
+        let old = previous.active_source.as_deref();
+        let switched = old.is_some() && active != old;
+        // A frontier can move from active to dormant without earning a turn.
+        // Retention and forward movement are compared only on the same source.
+        if previous.frontier.as_deref().is_some_and(|path| !self.covers_on(old, path))
+            || previous
+                .dormant
+                .iter()
+                .any(|(source, path)| !self.covers_on(Some(source), path))
+        {
+            return false;
+        }
+        let mut advanced = self.frontier.as_deref().is_some_and(|now| {
+            previous
+                .source_frontier(active)
+                .is_none_or(|before| before != now && scan_frontier_covers_path(before, now))
+        });
+        if switched {
+            // Legacy raw-name pages are local to their writer. The physical
+            // root position must still exist for that writer across rotation.
+            if !previous.raw.is_empty()
+                && !previous.listings.iter().any(|before| {
+                    before.parent == self.bucket
+                        && Some(before.physical.endpoint.as_str()) == old
+                        && self.listings.iter().any(|after| after.extends(before))
+                })
+            {
+                return false;
+            }
+        } else {
+            for (parent, before) in &previous.raw {
+                match self.raw.get(parent) {
+                    Some(after) if after.extends(before) => {}
+                    None if self.covers_on(active, parent) => {}
+                    _ => return false,
                 }
-                before != after
             }
-            (Some(_), None) => return false,
-            (None, Some(_)) => true,
-            (None, None) => false,
-        };
-        for (parent, before) in &previous.raw {
-            match self.raw.get(parent) {
-                Some(after) if after.extends(before) => {}
-                None if self
-                    .frontier
-                    .as_ref()
-                    .is_some_and(|frontier| scan_frontier_covers_path(parent, frontier)) => {}
-                _ => return false,
+            advanced |= self.raw.iter().any(|(parent, after)| {
+                after.committed_entries() > previous.raw.get(parent).map_or(0, |before| before.committed_entries())
+            });
+        }
+        for before in &previous.listings {
+            if !self.listings.iter().any(|after| after.extends(before))
+                && !self.covers_on(Some(&before.physical.endpoint), &before.parent)
+            {
+                return false;
             }
         }
-        for (parent, after) in &self.raw {
-            let before = previous.raw.get(parent).map_or(0, |value| value.committed_entries());
-            advanced |= after.committed_entries() > before;
+        for before in &previous.compacted {
+            if !self.compacted.iter().any(|after| after.extends(before))
+                && !self.covers_on(Some(&before.physical.endpoint), &before.parent)
+            {
+                return false;
+            }
         }
+        advanced |= self.listings.iter().any(|after| {
+            Some(after.physical.endpoint.as_str()) == active && !previous.listings.iter().any(|before| before.extends(after))
+        });
+        advanced |= self.compacted.iter().any(|after| {
+            Some(after.physical.endpoint.as_str()) == active && !previous.compacted.iter().any(|before| before.extends(after))
+        });
+
         advanced
     }
 }
@@ -905,6 +1009,14 @@ pub struct DataUsageCacheInfo {
     pub scan_raw_enumeration_cursor: Option<DataUsageRawEnumerationCursor>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scan_raw_enumeration_page_index: Option<RawEnumerationPageIndex>,
+    /// Source-bound native listing positions and fully committed compacted work.
+    #[serde(default)]
+    pub scan_directory_work: Vec<crate::scanner_folder::DirectoryCheckpoint>,
+    /// Physical source of the regular linked tree and its frontier.
+    #[serde(default)]
+    pub scan_directory_source: Option<String>,
+    #[serde(default)]
+    pub scan_source_trees: std::collections::BTreeMap<String, Arc<source_tree::SourceTree>>,
     /// Indexes of the other directories on the active walk path. A restart
     /// must replay every wide ancestor before it reaches the selected one, and
     /// recharging those replays would stop a fixed budget from ever advancing.
@@ -933,8 +1045,8 @@ pub struct DataUsageCacheInfo {
     #[serde(default)]
     pub scan_plan_digest: Option<DataUsageScanPlanDigest>,
     /// Full activity and inventory scope of a set scan; only a complete
-    /// snapshot proves coverage. Bucket caches bind this scope into their
-    /// opaque scan plan digest instead.
+    /// snapshot proves coverage. A completed bucket stores its checkpoint
+    /// coverage plan here until the authoritative aggregate includes it.
     #[serde(default)]
     pub scan_coverage_digest: Option<DataUsageScanPlanDigest>,
     #[serde(default)]
@@ -981,6 +1093,9 @@ pub struct DataUsageCacheInfo {
     pub scan_bucket_observations: HashMap<String, DataUsageBucketObservation>,
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub scan_bucket_value_origins: HashMap<String, DataUsageBucketValueOrigin>,
+    /// Original accepted-frontier measurement time; absent on legacy checkpoints.
+    #[serde(default)]
+    pub scan_coverage_measured_at: Option<u64>,
 }
 
 impl Serialize for DataUsageCacheInfo {
@@ -994,10 +1109,14 @@ impl Serialize for DataUsageCacheInfo {
             + usize::from(self.scan_raw_enumeration_cursor.is_some())
             + usize::from(self.scan_raw_enumeration_page_index.is_some())
             + usize::from(!self.scan_raw_enumeration_path_page_indexes.is_empty())
+            + usize::from(!self.scan_directory_work.is_empty())
+            + usize::from(self.scan_directory_source.is_some())
+            + usize::from(!self.scan_source_trees.is_empty())
             + usize::from(self.scan_identity.is_some())
             + usize::from(self.scan_progress.is_some())
             + usize::from(self.scan_usage_watch.is_some())
             + usize::from(self.scan_coverage_receipt.is_some())
+            + usize::from(self.scan_coverage_measured_at.is_some())
             + usize::from(self.scan_coverage_digest.is_some())
             + usize::from(self.tier_registry_generation.is_some())
             + usize::from(!self.size_reconciliation.is_empty())
@@ -1029,6 +1148,15 @@ impl Serialize for DataUsageCacheInfo {
         if let Some(index) = &self.scan_raw_enumeration_page_index {
             state.serialize_entry("scan_raw_enumeration_page_index", index)?;
         }
+        if !self.scan_source_trees.is_empty() {
+            state.serialize_entry("scan_source_trees", &self.scan_source_trees)?;
+        }
+        if let Some(source) = &self.scan_directory_source {
+            state.serialize_entry("scan_directory_source", source)?;
+        }
+        if !self.scan_directory_work.is_empty() {
+            state.serialize_entry("scan_directory_work", &self.scan_directory_work)?;
+        }
         if !self.scan_raw_enumeration_path_page_indexes.is_empty() {
             state.serialize_entry("scan_raw_enumeration_path_page_indexes", &self.scan_raw_enumeration_path_page_indexes)?;
         }
@@ -1043,6 +1171,9 @@ impl Serialize for DataUsageCacheInfo {
         }
         if let Some(receipt) = &self.scan_coverage_receipt {
             state.serialize_entry("scan_coverage_receipt", receipt)?;
+        }
+        if let Some(measured_at) = self.scan_coverage_measured_at {
+            state.serialize_entry("scan_coverage_measured_at", &measured_at)?;
         }
         state.serialize_entry("pending_heals", &self.pending_heals)?;
         state.serialize_entry("object_lock", &crate::object_lock_cache::ObjectLockCache(&self.object_lock))?;
@@ -1236,6 +1367,25 @@ impl DataUsageCache {
             identity: self.info.scan_identity,
             started_plan: self.info.scan_progress.map(|progress| progress.started_plan),
             frontier: self.validated_scan_frontier().map(str::to_owned),
+            dormant: self
+                .info
+                .scan_source_trees
+                .iter()
+                .filter_map(|(source, tree)| tree.frontier(&self.info).map(|last| (source.clone(), last.to_owned())))
+                .collect(),
+            active_source: self.info.scan_directory_source.clone(),
+            listings: self
+                .info
+                .scan_directory_work
+                .iter()
+                .filter_map(|d| d.read_progress(&self.info))
+                .collect(),
+            compacted: self
+                .info
+                .scan_directory_work
+                .iter()
+                .filter_map(|d| d.progress(&self.info))
+                .collect(),
             raw: self
                 .info
                 .scan_raw_enumeration_page_index
@@ -1249,7 +1399,8 @@ impl DataUsageCache {
     }
 
     pub(crate) fn has_scan_position(&self) -> bool {
-        self.info.scan_resume_after.is_some()
+        !self.info.scan_directory_work.is_empty()
+            || self.info.scan_resume_after.is_some()
             || self.info.scan_checkpoint.is_some()
             || self.info.scan_raw_enumeration_cursor.is_some()
             || self.info.scan_raw_enumeration_page_index.is_some()
@@ -1319,7 +1470,8 @@ impl DataUsageCache {
             && self.info.scan_identity == Some(identity)
             && (self.validated_scan_frontier().is_some()
                 || self.validated_raw_enumeration_cursor().is_some()
-                || self.validated_raw_enumeration_page_index().is_some());
+                || self.validated_raw_enumeration_page_index().is_some()
+                || self.info.scan_directory_work.iter().any(|d| d.is_bound_to(&self.info)));
         let handoff_frontier = cross_epoch_checkpoint
             .then(|| self.validated_scan_frontier().map(clone_cache_value))
             .flatten();
@@ -1404,7 +1556,10 @@ impl DataUsageCache {
             .take(MAX_DATA_USAGE_CACHE_DEPTH)
             .filter(|index| self.raw_enumeration_page_index_is_valid(index))
             .collect();
+        let directory_work = std::mem::take(&mut self.info.scan_directory_work);
+        self.info.scan_directory_work = directory_work.into_iter().filter(|d| d.is_bound_to(&self.info)).collect();
         let cursor_is_valid = !self.has_scan_position()
+            || !self.info.scan_directory_work.is_empty()
             || self.validated_scan_frontier().is_some()
             || self.info.scan_raw_enumeration_cursor.is_some()
             || self.info.scan_raw_enumeration_page_index.is_some();
@@ -1447,7 +1602,11 @@ impl DataUsageCache {
             self.info.scan_raw_enumeration_cursor = None;
             self.info.scan_raw_enumeration_page_index = None;
             self.info.scan_raw_enumeration_path_page_indexes.clear();
+            self.info.scan_directory_work.clear();
+            self.info.scan_directory_source = None;
+            self.info.scan_source_trees.clear();
             self.info.scan_coverage_receipt = None;
+            self.info.scan_coverage_measured_at = None;
         }
         // Old readers do not understand coverage sweeps. An absent plan makes
         // their existing prepare path rebuild instead of promoting mixed data.
@@ -1627,9 +1786,22 @@ impl DataUsageCache {
     pub(crate) fn seal_scan_frontier(&mut self, frontier: Option<&str>) -> Result<(), serde_json::Error> {
         if self.info.scan_progress.is_none() {
             self.info.scan_coverage_receipt = None;
+            self.info.scan_coverage_measured_at = None;
             return Ok(());
         }
         let frontier = frontier.filter(|path| path.len() <= 16 * 1024 && self.find(path).is_some());
+        let measured_at = frontier.and_then(|through| {
+            if self
+                .info
+                .scan_coverage_receipt
+                .as_ref()
+                .is_some_and(|previous| previous.through == through)
+            {
+                self.info.scan_coverage_measured_at
+            } else {
+                scan_measurement_time_millis(SystemTime::now())
+            }
+        });
         self.info.scan_coverage_receipt = match frontier {
             Some(through) => Some(DataUsageScanCoverageReceipt {
                 through: clone_cache_value(through),
@@ -1637,6 +1809,7 @@ impl DataUsageCache {
             }),
             None => None,
         };
+        self.info.scan_coverage_measured_at = measured_at;
         self.info.scan_resume_after = frontier.map(clone_cache_value);
         let reason = self
             .info
@@ -2191,7 +2364,9 @@ impl DataUsageCache {
     }
 }
 
+mod display_progress;
 mod persistence;
+mod source_tree;
 
 #[derive(Default, Clone)]
 struct Inner {

@@ -709,6 +709,8 @@ pub struct ScannerMetrics {
     pub last_cycle_partial_source: String,
     #[serde(rename = "last_cycle_partial_source_code", default)]
     pub last_cycle_partial_source_code: u64,
+    #[serde(rename = "last_cycle_partial_stage", default, skip_serializing_if = "Option::is_none")]
+    pub last_cycle_partial_stage: Option<String>,
     #[serde(rename = "last_cycle_duration_seconds", default)]
     pub last_cycle_duration_seconds: f64,
     #[serde(rename = "last_cycle_objects_scanned", default)]
@@ -853,6 +855,7 @@ impl ScannerMetrics {
             self.last_cycle_partial_reason_code = other.last_cycle_partial_reason_code;
             self.last_cycle_partial_source = other.last_cycle_partial_source.clone();
             self.last_cycle_partial_source_code = other.last_cycle_partial_source_code;
+            self.last_cycle_partial_stage.clone_from(&other.last_cycle_partial_stage);
             self.last_cycle_duration_seconds = other.last_cycle_duration_seconds;
             self.throttle_idle_mode_enabled = other.throttle_idle_mode_enabled;
             self.throttle_sleep_factor = other.throttle_sleep_factor;
@@ -1506,6 +1509,27 @@ pub struct KeyRotationInfo {
     pub objects_failed: i64,
 }
 
+/// A single configured node's scanner observation. The epoch fences concurrent coordinator samples.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct ScannerNodeSample {
+    pub active: bool,
+    pub leader: bool,
+    pub cycle: u64,
+    pub epoch: Option<u64>,
+    pub started_at: Option<Timestamp>,
+    pub objects_scanned: u64,
+    pub last_attempt: Option<ScannerAttemptSample>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ScannerAttemptSample {
+    pub epoch: u64,
+    pub cycle: u64,
+    pub result: String,
+    pub partial_reason: Option<String>,
+    pub duration_seconds: f64,
+}
+
 #[derive(Debug, Default, Serialize, Deserialize)]
 pub struct RealtimeMetrics {
     #[serde(rename = "errors")]
@@ -1520,6 +1544,9 @@ pub struct RealtimeMetrics {
     pub by_disk: HashMap<String, DiskMetric>,
     #[serde(rename = "final")]
     pub finally: bool,
+    /// Internal GetMetrics reply to a scanner summary probe. Absent on older peers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scanner_node: Option<ScannerNodeSample>,
 }
 
 impl RealtimeMetrics {
@@ -1581,6 +1608,35 @@ mod tests {
 
     fn fixed_timestamp() -> Timestamp {
         Timestamp::constant(1_700_000_000, 123_456_000)
+    }
+
+    #[test]
+    fn cluster_scanner_node_sample_is_additive_on_the_peer_metrics_wire() {
+        let ordinary = serde_json::to_value(RealtimeMetrics::default()).expect("ordinary response");
+        assert!(ordinary.get("scanner_node").is_none());
+        let old = rmp_serde::to_vec_named(&ordinary).expect("previous map reply");
+        assert!(
+            rmp_serde::from_slice::<RealtimeMetrics>(&old)
+                .expect("old peers remain readable")
+                .scanner_node
+                .is_none()
+        );
+        let reply = RealtimeMetrics {
+            scanner_node: Some(ScannerNodeSample {
+                active: true,
+                leader: true,
+                epoch: Some(8),
+                cycle: 40,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let encoded = rmp_serde::to_vec_named(&reply).expect("scoped peer sample");
+        let sample = rmp_serde::from_slice::<RealtimeMetrics>(&encoded)
+            .expect("round trip")
+            .scanner_node
+            .expect("new capability field");
+        assert_eq!((sample.active, sample.leader, sample.epoch, sample.cycle), (true, true, Some(8), 40));
     }
 
     #[test]
@@ -2138,6 +2194,7 @@ mod tests {
             collected_at: collected_at + SignedDuration::from_secs(1),
             last_cycle_partial_source: "lifecycle".to_string(),
             last_cycle_partial_source_code: 2,
+            last_cycle_partial_stage: Some("object_budget".into()),
             pacing_pressure: ScannerPacingPressureSnapshot {
                 primary_pressure: "queued_scans".to_string(),
                 current_queued_scans: 4,
@@ -2162,6 +2219,7 @@ mod tests {
 
         assert_eq!(scanner.last_cycle_partial_source, "lifecycle");
         assert_eq!(scanner.last_cycle_partial_source_code, 2);
+        assert_eq!(scanner.last_cycle_partial_stage.as_deref(), Some("object_budget"));
         assert_eq!(scanner.pacing_pressure.primary_pressure, "queued_scans");
         assert_eq!(scanner.pacing_pressure.current_queued_scans, 4);
         assert_eq!(scanner.pacing_pressure.current_active_scans, 3);

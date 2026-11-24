@@ -232,6 +232,10 @@ impl DefaultBucketUsecase {
             S3Operation::DeleteBucketReplication,
             StatusCode::OK,
             |envelope| async move {
+                let _admission = match self.object_store() {
+                    Some(store) => Some(crate::site_replication::acquire_site_removal_read_admission(store).await?),
+                    None => None,
+                };
                 let (site_peers, contract) = prepare.await?;
                 self.delete_bucket_replication(envelope, bucket, site_peers, contract).await
             },
@@ -371,6 +375,10 @@ impl DefaultBucketUsecase {
             S3Operation::PutBucketReplication,
             StatusCode::OK,
             |envelope| async move {
+                let _admission = match self.object_store() {
+                    Some(store) => Some(crate::site_replication::acquire_site_removal_read_admission(store).await?),
+                    None => None,
+                };
                 let (replication_configuration, site_peers, contract) = prepare.await?;
                 self.put_bucket_replication(envelope, bucket, replication_configuration, site_peers, contract)
                     .await
@@ -434,7 +442,7 @@ impl DefaultBucketUsecase {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::app::bucket_usecase::test_support::{build_request, owned_envelope};
+    use crate::app::bucket_usecase::test_support::owned_envelope;
     use crate::app::gating_test_env::{run_large_stack_test, shared_gating_ambient};
     use crate::app::runtime_sources::ServerContextSlot;
     use crate::app::storage_api::owned_parity::{ReqInfo, authorize_bucket_config_mutation};
@@ -1019,10 +1027,9 @@ mod tests {
     async fn authorize_replication(context: &Arc<AppContext>, bucket: &str, method: Method) -> RequestEnvelope {
         let server = ServerContextSlot::new();
         assert!(server.install(Arc::clone(context)));
-        let mut request = build_request((), method);
-        request.uri = format!("/{bucket}?replication").parse().expect("replication URI");
-        request.extensions.insert(Arc::clone(&server));
-        request.extensions.insert(ReqInfo {
+        let mut extensions = http::Extensions::new();
+        extensions.insert(Arc::clone(&server));
+        extensions.insert(ReqInfo {
             cred: Some(Credentials {
                 access_key: "replication-owner".to_owned(),
                 ..Default::default()
@@ -1030,7 +1037,17 @@ mod tests {
             is_owner: true,
             ..Default::default()
         });
-        let mut envelope = RequestEnvelope::from_s3s(&request);
+        let mut envelope = RequestEnvelope::from_parts(
+            crate::app::RequestHead {
+                method,
+                uri: format!("/{bucket}?replication").parse().expect("replication URI"),
+                headers: http::HeaderMap::new(),
+                credentials: None,
+                region: None,
+                service: None,
+            },
+            extensions,
+        );
         authorize_bucket_config_mutation(
             &server,
             &mut envelope,

@@ -18,17 +18,14 @@ use super::put_input::{PutObjectWriteInput, PutObjectWriteOutput};
 use super::*;
 use crate::app::RequestEnvelope;
 use crate::app::storage_api::object_usecase::access::AuthorizationRequest;
+use crate::app::storage_api::object_usecase::bucket::object_lock::types::LegalHoldStatus;
 use crate::app::storage_api::object_usecase::bucket::replication::ReplicateDecision;
 #[cfg(test)]
 use crate::app::storage_api::object_usecase::concurrency::SNOWBALL_MEMBER_COMMIT_LIMIT;
 use crate::app::storage_api::object_usecase::concurrency::SNOWBALL_STAGING_BYTES_LIMIT;
-#[cfg(test)]
-use crate::app::storage_api::s3::dto::PutObjectInput;
-use crate::app::storage_api::s3::dto::{
-    ObjectLockLegalHoldStatus, ObjectLockMode, ServerSideEncryption, Timestamp, TimestampFormat,
-};
-use crate::app::storage_api::s3::{S3Error, S3ErrorCode, S3Result, s3_error};
 use futures::stream::FuturesUnordered;
+use rustfs_s3_types::{S3Error, S3ErrorCode, S3Result, s3_error};
+use rustfs_utils::http::headers::AMZ_ENCRYPTION_KMS;
 use std::collections::HashSet;
 
 // One logical member can be preceded by local PAX, GNU long-name, and GNU
@@ -500,7 +497,7 @@ where
         .unwrap_or_else(|| rustfs_io_core::PooledBuffer::unpooled(size));
     super::put::read_small_put_body_into(body, &mut *buffer, size)
         .await
-        .map_err(S3Error::from)?;
+        .map_err(with_archive_error_message)?;
     Ok(ExtractStagedBody {
         reader: Some(super::put::PooledBufferReader::new(buffer, size)),
     })
@@ -526,50 +523,49 @@ fn checked_extract_member_staging_weight(
     // retained key copies plus all dynamic maps frozen into ObjectOptions;
     // the fixed allowance covers the remaining options/write-plan handles.
     let mut total = body_reservation
-        .checked_add(
-            path.len()
-                .checked_mul(2)
-                .ok_or_else(|| object_s3_error(S3ErrorCode::InvalidArgument, "Snowball prepared member path size overflowed"))?,
-        )
+        .checked_add(path.len().checked_mul(2).ok_or_else(|| {
+            S3Error::with_message(S3ErrorCode::InvalidArgument, "Snowball prepared member path size overflowed")
+        })?)
         .and_then(|bytes| bytes.checked_add(EXTRACT_MEMBER_CONTEXT_OVERHEAD_BYTES))
-        .ok_or_else(|| object_s3_error(S3ErrorCode::InvalidArgument, "Snowball prepared member size overflowed"))?;
+        .ok_or_else(|| S3Error::with_message(S3ErrorCode::InvalidArgument, "Snowball prepared member size overflowed"))?;
     for metadata in std::iter::once(&opts.user_defined).chain(opts.eval_metadata.iter()) {
         for (name, value) in metadata {
             total = total
                 .checked_add(name.len())
                 .and_then(|bytes| bytes.checked_add(value.len()))
                 .and_then(|bytes| bytes.checked_add(EXTRACT_METADATA_ENTRY_OVERHEAD_BYTES))
-                .ok_or_else(|| object_s3_error(S3ErrorCode::InvalidArgument, "Snowball prepared member size overflowed"))?;
+                .ok_or_else(|| S3Error::with_message(S3ErrorCode::InvalidArgument, "Snowball prepared member size overflowed"))?;
         }
     }
     total = total
-        .checked_add(
-            checked_extract_hash_map_allocation(&replication.targets_map)
-                .ok_or_else(|| object_s3_error(S3ErrorCode::InvalidArgument, "Snowball replication decision size overflowed"))?,
-        )
-        .ok_or_else(|| object_s3_error(S3ErrorCode::InvalidArgument, "Snowball prepared member size overflowed"))?;
+        .checked_add(checked_extract_hash_map_allocation(&replication.targets_map).ok_or_else(|| {
+            S3Error::with_message(S3ErrorCode::InvalidArgument, "Snowball replication decision size overflowed")
+        })?)
+        .ok_or_else(|| S3Error::with_message(S3ErrorCode::InvalidArgument, "Snowball prepared member size overflowed"))?;
     for (target_name, target) in &replication.targets_map {
         total = total
             .checked_add(target_name.capacity())
             .and_then(|bytes| bytes.checked_add(target.arn.capacity()))
             .and_then(|bytes| bytes.checked_add(target.id.capacity()))
-            .ok_or_else(|| object_s3_error(S3ErrorCode::InvalidArgument, "Snowball replication decision size overflowed"))?;
+            .ok_or_else(|| {
+                S3Error::with_message(S3ErrorCode::InvalidArgument, "Snowball replication decision size overflowed")
+            })?;
     }
     Ok(total)
 }
 
 fn try_acquire_extract_staging_permit(manager: &ConcurrencyManager, staging_weight: usize) -> S3Result<OwnedSemaphorePermit> {
     if staging_weight > SNOWBALL_STAGING_BYTES_LIMIT {
-        return Err(object_s3_error(
+        return Err(S3Error::with_message(
             S3ErrorCode::SlowDown,
             "Snowball member retained state exceeds the global staging budget",
         ));
     }
     let permits = u32::try_from(staging_weight).map_err(|_| {
-        object_s3_error(S3ErrorCode::SlowDown, "Snowball member retained state exceeds the global staging budget")
+        S3Error::with_message(S3ErrorCode::SlowDown, "Snowball member retained state exceeds the global staging budget")
     })?;
     manager.try_acquire_snowball_staging_bytes(permits).ok_or_else(|| {
-        object_s3_error(
+        S3Error::with_message(
             S3ErrorCode::SlowDown,
             "Snowball staging budget is exhausted, please reduce your request rate",
         )
@@ -588,7 +584,7 @@ where
     // drive another codec. The returned reader owns the permit through archive
     // finalization and transport-length validation.
     let permit = manager.try_acquire_snowball_archive_decoder().ok_or_else(|| {
-        object_s3_error(
+        S3Error::with_message(
             S3ErrorCode::SlowDown,
             "Snowball archive decoder limit reached, please reduce your request rate",
         )
@@ -764,13 +760,16 @@ async fn complete_extract_member_post_commit(
     let _ = invalidate_object_data_cache_after_put_success(&context.cache_adapter, &context.bucket, &key).await;
 
     if replication.replicate_any() {
-        schedule_object_replication(obj_info.clone(), context.store.clone(), replication).await;
+        schedule_object_replication(obj_info.clone(), context.store.clone(), replication, opts.expected_bucket_incarnation_id)
+            .await;
     }
 
     let actual_version_id = extract_notification_version_id(obj_info.version_id, opts.versioned, opts.version_suspended);
     let mut event_object = convert_ecstore_object_info(obj_info);
     event_object.version_id = (!actual_version_id.is_empty()).then_some(actual_version_id.clone());
     let event = rustfs_notify::EventArgs {
+        bucket_incarnation_id: opts.expected_bucket_incarnation_id,
+        bucket_removed_targets: None,
         event_name: put_event_name_for_post_object(false),
         bucket_name: context.bucket.clone(),
         object: event_object,
@@ -859,7 +858,7 @@ where
             return ExtractCommitOutcome {
                 archive_seq,
                 event: None,
-                error: Some(ExtractCommitError::StorageWrite(object_s3_error(
+                error: Some(ExtractCommitError::StorageWrite(S3Error::with_message(
                     S3ErrorCode::SlowDown,
                     "foreground write concurrency limit reached, please reduce your request rate",
                 ))),
@@ -869,7 +868,7 @@ where
             return ExtractCommitOutcome {
                 archive_seq,
                 event: None,
-                error: Some(ExtractCommitError::Fatal(object_s3_error(
+                error: Some(ExtractCommitError::Fatal(S3Error::with_message(
                     S3ErrorCode::InternalError,
                     "Snowball foreground write admission closed",
                 ))),
@@ -1022,7 +1021,7 @@ async fn acquire_extract_member_lifecycle_permit(
     manager
         .acquire_snowball_member_commit()
         .await
-        .map_err(|_| object_s3_error(S3ErrorCode::InternalError, "Snowball member lifecycle admission closed"))
+        .map_err(|_| S3Error::with_message(S3ErrorCode::InternalError, "Snowball member lifecycle admission closed"))
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -1089,7 +1088,7 @@ fn is_header_only_special_entry(entry_type: tokio_tar::EntryType) -> bool {
 
 fn validate_extract_special_entry_size(entry_type: tokio_tar::EntryType, size: u64) -> S3Result<()> {
     if is_header_only_special_entry(entry_type) && size != 0 {
-        return Err(object_s3_error(
+        return Err(S3Error::with_message(
             S3ErrorCode::InvalidArgument,
             "Snowball special archive member declares a non-zero body",
         ));
@@ -1159,7 +1158,7 @@ fn normalize_extract_version_id(value: &str) -> S3Result<ExtractNormalizedVersio
 fn apply_extract_version_id(value: &str, opts: &mut ObjectOptions) -> S3Result<String> {
     let normalized = normalize_extract_version_id(value)?;
     if normalized.requires_versioning && !opts.versioned {
-        return Err(object_s3_error(
+        return Err(S3Error::with_message(
             S3ErrorCode::InvalidArgument,
             "Snowball version ID requires bucket versioning to be enabled",
         ));
@@ -1248,9 +1247,20 @@ pub fn normalize_extract_entry_key(path: &str, prefix: Option<&str>, is_dir: boo
     rustfs_utils::path::normalize_extract_entry_key(path, prefix, is_dir).map_err(|msg| s3_error!(InvalidArgument, "{msg}"))
 }
 
+// Archive failures have historically included the S3 code's default message when their
+// producer supplied none. Keep explicit messages and typed causes intact.
+fn with_archive_error_message(mut error: S3Error) -> S3Error {
+    if error.message().is_none()
+        && let Some(message) = error.code().default_message()
+    {
+        error.set_message(message);
+    }
+    error
+}
+
 fn map_extract_archive_error(err: std::io::Error) -> S3Error {
     let api_error = ApiError::from(err);
-    if api_error.code != rustfs_s3_types::S3ErrorCode::InternalError {
+    if api_error.code != S3ErrorCode::InternalError {
         return api_error.into();
     }
 
@@ -1260,7 +1270,7 @@ fn map_extract_archive_error(err: std::io::Error) -> S3Error {
 }
 
 fn map_extract_pax_text_error(err: impl std::fmt::Display) -> S3Error {
-    object_s3_error(S3ErrorCode::InvalidArgument, format!("Failed to decode archive PAX metadata: {}", err))
+    S3Error::with_message(S3ErrorCode::InvalidArgument, format!("Failed to decode archive PAX metadata: {}", err))
 }
 
 #[derive(Debug)]
@@ -1306,10 +1316,10 @@ fn extract_archive_entry_mod_time(header: &tokio_tar::Header) -> S3Result<Option
     }
 
     let modified_at_secs = i64::try_from(modified_at_secs)
-        .map_err(|_| object_s3_error(S3ErrorCode::InvalidArgument, "Archive entry modification time is out of range"))?;
+        .map_err(|_| S3Error::with_message(S3ErrorCode::InvalidArgument, "Archive entry modification time is out of range"))?;
     OffsetDateTime::from_unix_timestamp(modified_at_secs)
         .map(Some)
-        .map_err(|_| object_s3_error(S3ErrorCode::InvalidArgument, "Archive entry modification time is out of range"))
+        .map_err(|_| S3Error::with_message(S3ErrorCode::InvalidArgument, "Archive entry modification time is out of range"))
 }
 
 fn strict_extract_entry_path(path: &[u8]) -> Result<&str, ExtractEntryError> {
@@ -1323,7 +1333,7 @@ fn is_empty_extract_entry_path(path: &str) -> bool {
 
 fn validate_extract_member_key(path: &str, limits: ArchiveLimits) -> Result<(), ExtractEntryError> {
     validate_put_object_extract_entry_path(path, limits).map_err(ExtractEntryError::Recoverable)?;
-    validate_new_object_key(path, "PUT").map_err(|err| ExtractEntryError::Recoverable(err.into()))
+    validate_new_object_key(path, "PUT").map_err(ExtractEntryError::Recoverable)
 }
 
 fn record_extract_pax_metadata_bytes(
@@ -1337,32 +1347,32 @@ fn record_extract_pax_metadata_bytes(
         .checked_add(value_size)
         .and_then(|size| u64::try_from(size).ok())
         .ok_or_else(|| {
-            ExtractEntryError::Fatal(object_s3_error(
+            ExtractEntryError::Fatal(S3Error::with_message(
                 S3ErrorCode::InvalidArgument,
                 "Archive PAX metadata size overflowed while processing entry",
             ))
         })?;
     *entry_size = (*entry_size).checked_add(record_size).ok_or_else(|| {
-        ExtractEntryError::Fatal(object_s3_error(
+        ExtractEntryError::Fatal(S3Error::with_message(
             S3ErrorCode::InvalidArgument,
             "Archive PAX metadata size overflowed while processing entry",
         ))
     })?;
     *total_size = (*total_size).checked_add(record_size).ok_or_else(|| {
-        ExtractEntryError::Fatal(object_s3_error(
+        ExtractEntryError::Fatal(S3Error::with_message(
             S3ErrorCode::InvalidArgument,
             "Archive total PAX metadata size overflowed",
         ))
     })?;
 
     if *entry_size > limits.max_pax_metadata_size {
-        return Err(ExtractEntryError::Fatal(object_s3_error(
+        return Err(ExtractEntryError::Fatal(S3Error::with_message(
             S3ErrorCode::InvalidArgument,
             "Archive PAX metadata exceeds per-entry limit",
         )));
     }
     if *total_size > limits.max_total_pax_metadata_size {
-        return Err(ExtractEntryError::Fatal(object_s3_error(
+        return Err(ExtractEntryError::Fatal(S3Error::with_message(
             S3ErrorCode::InvalidArgument,
             "Archive total PAX metadata exceeds limit",
         )));
@@ -1377,26 +1387,26 @@ fn record_extract_pax_metadata_record(
     limits: ArchiveLimits,
 ) -> Result<(), ExtractEntryError> {
     *entry_records = entry_records.checked_add(1).ok_or_else(|| {
-        ExtractEntryError::Fatal(object_s3_error(
+        ExtractEntryError::Fatal(S3Error::with_message(
             S3ErrorCode::InvalidArgument,
             "Archive PAX metadata record count overflowed",
         ))
     })?;
     *total_records = total_records.checked_add(1).ok_or_else(|| {
-        ExtractEntryError::Fatal(object_s3_error(
+        ExtractEntryError::Fatal(S3Error::with_message(
             S3ErrorCode::InvalidArgument,
             "Archive total PAX metadata record count overflowed",
         ))
     })?;
 
     if *entry_records > limits.max_pax_metadata_records {
-        return Err(ExtractEntryError::Fatal(object_s3_error(
+        return Err(ExtractEntryError::Fatal(S3Error::with_message(
             S3ErrorCode::InvalidArgument,
             "Archive PAX metadata record count exceeds per-entry limit",
         )));
     }
     if *total_records > limits.max_total_pax_metadata_records {
-        return Err(ExtractEntryError::Fatal(object_s3_error(
+        return Err(ExtractEntryError::Fatal(S3Error::with_message(
             S3ErrorCode::InvalidArgument,
             "Archive total PAX metadata record count exceeds limit",
         )));
@@ -1417,7 +1427,7 @@ fn extract_pax_header_bytes(name: &http::HeaderName, value: &HeaderValue) -> usi
 
 fn validate_extract_pax_header_budget(headers: &HeaderMap) -> S3Result<()> {
     if headers.len() > EXTRACT_MAX_EFFECTIVE_PAX_FIELDS {
-        return Err(object_s3_error(
+        return Err(S3Error::with_message(
             S3ErrorCode::InvalidArgument,
             "Snowball PAX metadata field count exceeds limit",
         ));
@@ -1429,22 +1439,22 @@ fn validate_extract_pax_header_budget(headers: &HeaderMap) -> S3Result<()> {
         let field_bytes = extract_pax_header_bytes(name, value);
         header_bytes = header_bytes
             .checked_add(field_bytes)
-            .ok_or_else(|| object_s3_error(S3ErrorCode::InvalidArgument, "Snowball PAX metadata size overflowed"))?;
+            .ok_or_else(|| S3Error::with_message(S3ErrorCode::InvalidArgument, "Snowball PAX metadata size overflowed"))?;
         if is_extract_user_metadata_header(name) {
-            user_metadata_bytes = user_metadata_bytes
-                .checked_add(field_bytes)
-                .ok_or_else(|| object_s3_error(S3ErrorCode::InvalidArgument, "Snowball PAX user metadata size overflowed"))?;
+            user_metadata_bytes = user_metadata_bytes.checked_add(field_bytes).ok_or_else(|| {
+                S3Error::with_message(S3ErrorCode::InvalidArgument, "Snowball PAX user metadata size overflowed")
+            })?;
         }
     }
 
     if header_bytes > EXTRACT_MAX_EFFECTIVE_PAX_HEADER_BYTES {
-        return Err(object_s3_error(
+        return Err(S3Error::with_message(
             S3ErrorCode::InvalidArgument,
             "Snowball PAX metadata exceeds effective size limit",
         ));
     }
     if user_metadata_bytes > EXTRACT_MAX_EFFECTIVE_PAX_USER_METADATA_BYTES {
-        return Err(object_s3_error(
+        return Err(S3Error::with_message(
             S3ErrorCode::InvalidArgument,
             "Snowball PAX user metadata exceeds effective size limit",
         ));
@@ -1453,17 +1463,16 @@ fn validate_extract_pax_header_budget(headers: &HeaderMap) -> S3Result<()> {
 }
 
 fn try_insert_extract_header(headers: &mut HeaderMap, name: http::HeaderName, value: HeaderValue) -> S3Result<()> {
-    headers
-        .try_insert(name, value)
-        .map(|_| ())
-        .map_err(|_| object_s3_error(S3ErrorCode::InvalidArgument, "Snowball PAX metadata field count exceeds header capacity"))
+    headers.try_insert(name, value).map(|_| ()).map_err(|_| {
+        S3Error::with_message(S3ErrorCode::InvalidArgument, "Snowball PAX metadata field count exceeds header capacity")
+    })
 }
 
 fn replace_extract_header(headers: &mut HeaderMap, name: &'static str, value: &str) -> S3Result<()> {
     let value = HeaderValue::from_str(value)
-        .map_err(|_| object_s3_error(S3ErrorCode::InvalidArgument, "Invalid canonical Snowball PAX metadata value"))?;
+        .map_err(|_| S3Error::with_message(S3ErrorCode::InvalidArgument, "Invalid canonical Snowball PAX metadata value"))?;
     let name = http::HeaderName::from_bytes(name.as_bytes())
-        .map_err(|_| object_s3_error(S3ErrorCode::InvalidArgument, "Invalid canonical Snowball PAX metadata header"))?;
+        .map_err(|_| S3Error::with_message(S3ErrorCode::InvalidArgument, "Invalid canonical Snowball PAX metadata header"))?;
     try_insert_extract_header(headers, name, value)
 }
 
@@ -1476,16 +1485,18 @@ fn extract_pax_metadata_delta_bytes(baseline: &HashMap<String, String>, metadata
                 .len()
                 .checked_add(value.len())
                 .and_then(|size| u64::try_from(size).ok())
-                .ok_or_else(|| object_s3_error(S3ErrorCode::InvalidArgument, "Snowball expanded PAX metadata size overflowed"))?;
-            total
-                .checked_add(field_bytes)
-                .ok_or_else(|| object_s3_error(S3ErrorCode::InvalidArgument, "Snowball expanded PAX metadata size overflowed"))
+                .ok_or_else(|| {
+                    S3Error::with_message(S3ErrorCode::InvalidArgument, "Snowball expanded PAX metadata size overflowed")
+                })?;
+            total.checked_add(field_bytes).ok_or_else(|| {
+                S3Error::with_message(S3ErrorCode::InvalidArgument, "Snowball expanded PAX metadata size overflowed")
+            })
         })
 }
 
 fn validate_extract_expanded_pax_metadata_total(total: u64) -> S3Result<()> {
     if total > EXTRACT_MAX_EXPANDED_PAX_METADATA_BYTES {
-        return Err(object_s3_error(
+        return Err(S3Error::with_message(
             S3ErrorCode::InvalidArgument,
             "Snowball expanded PAX metadata exceeds archive limit",
         ));
@@ -1527,7 +1538,7 @@ impl ExtractPaxOverrides {
             return Ok(());
         }
         let header_value = HeaderValue::from_str(value)
-            .map_err(|_| object_s3_error(S3ErrorCode::InvalidArgument, "Invalid Snowball PAX metadata value"))?;
+            .map_err(|_| S3Error::with_message(S3ErrorCode::InvalidArgument, "Invalid Snowball PAX metadata value"))?;
 
         let previous_bytes = self
             .headers
@@ -1539,9 +1550,9 @@ impl ExtractPaxOverrides {
             .header_bytes
             .checked_sub(previous_bytes)
             .and_then(|bytes| bytes.checked_add(next_bytes))
-            .ok_or_else(|| object_s3_error(S3ErrorCode::InvalidArgument, "Snowball PAX metadata size overflowed"))?;
+            .ok_or_else(|| S3Error::with_message(S3ErrorCode::InvalidArgument, "Snowball PAX metadata size overflowed"))?;
         if next_header_bytes > EXTRACT_MAX_EFFECTIVE_PAX_HEADER_BYTES {
-            return Err(object_s3_error(
+            return Err(S3Error::with_message(
                 S3ErrorCode::InvalidArgument,
                 "Snowball PAX metadata exceeds effective size limit",
             ));
@@ -1551,18 +1562,20 @@ impl ExtractPaxOverrides {
             self.user_metadata_bytes
                 .checked_sub(previous_bytes)
                 .and_then(|bytes| bytes.checked_add(next_bytes))
-                .ok_or_else(|| object_s3_error(S3ErrorCode::InvalidArgument, "Snowball PAX user metadata size overflowed"))?
+                .ok_or_else(|| {
+                    S3Error::with_message(S3ErrorCode::InvalidArgument, "Snowball PAX user metadata size overflowed")
+                })?
         } else {
             self.user_metadata_bytes
         };
         if next_user_metadata_bytes > EXTRACT_MAX_EFFECTIVE_PAX_USER_METADATA_BYTES {
-            return Err(object_s3_error(
+            return Err(S3Error::with_message(
                 S3ErrorCode::InvalidArgument,
                 "Snowball PAX user metadata exceeds effective size limit",
             ));
         }
         if !self.headers.contains_key(&name) && self.headers.len() >= EXTRACT_MAX_EFFECTIVE_PAX_FIELDS {
-            return Err(object_s3_error(
+            return Err(S3Error::with_message(
                 S3ErrorCode::InvalidArgument,
                 "Snowball PAX metadata field count exceeds limit",
             ));
@@ -1644,8 +1657,8 @@ async fn authorized_extract_member_mod_time<R: AuthorizationRequest + ?Sized>(
     }
     match authorize_request(req, Action::S3Action(S3Action::ReplicateObjectAction)).await {
         Ok(()) => Ok(archive_time),
-        Err(err) if !replication_required && err.code() == &rustfs_s3_types::S3ErrorCode::AccessDenied => Ok(None),
-        Err(err) => Err(err.into()),
+        Err(err) if !replication_required && err.code() == &S3ErrorCode::AccessDenied => Ok(None),
+        Err(err) => Err(with_archive_error_message(err)),
     }
 }
 
@@ -1675,12 +1688,12 @@ fn apply_extract_pax_overrides(
                 .to_str()
                 .map(str::trim)
                 .map(str::to_owned)
-                .map_err(|_| object_s3_error_default(S3ErrorCode::InvalidStorageClass))
+                .map_err(|_| with_archive_error_message(S3Error::new(S3ErrorCode::InvalidStorageClass)))
         })
         .transpose()?;
     if let Some(storage_class) = storage_class.as_deref() {
         if !is_valid_storage_class(storage_class) {
-            return Err(object_s3_error_default(S3ErrorCode::InvalidStorageClass));
+            return Err(with_archive_error_message(S3Error::new(S3ErrorCode::InvalidStorageClass)));
         }
         replace_extract_header(&mut canonical_headers, AMZ_STORAGE_CLASS, storage_class)?;
     }
@@ -1701,16 +1714,12 @@ fn apply_extract_pax_overrides(
     let object_lock_mode = canonical_headers
         .get(AMZ_OBJECT_LOCK_MODE_LOWER)
         .map(|value| {
-            let value = value
+            value
                 .to_str()
-                .map(str::trim)
-                .map(str::to_ascii_uppercase)
-                .map_err(|_| object_s3_error(S3ErrorCode::InvalidArgument, "Invalid Snowball Object Lock mode"))?;
-            match value.as_str() {
-                ObjectLockMode::GOVERNANCE => Ok(ObjectLockMode::GOVERNANCE.to_owned()),
-                ObjectLockMode::COMPLIANCE => Ok(ObjectLockMode::COMPLIANCE.to_owned()),
-                _ => Err(s3_error!(InvalidArgument, "Invalid Snowball Object Lock mode")),
-            }
+                .ok()
+                .and_then(|value| RetentionMode::parse(value.trim()))
+                .map(|value| value.as_str().to_owned())
+                .ok_or_else(|| s3_error!(InvalidArgument, "Invalid Snowball Object Lock mode"))
         })
         .transpose()?;
     if let Some(mode) = object_lock_mode.as_ref() {
@@ -1720,12 +1729,10 @@ fn apply_extract_pax_overrides(
     let object_lock_retain_until_date = canonical_headers
         .get(AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE_LOWER)
         .map(|value| {
-            let value = value
-                .to_str()
-                .map(str::trim)
-                .map_err(|_| object_s3_error(S3ErrorCode::InvalidArgument, "Invalid Snowball Object Lock retain-until date"))?;
-            Timestamp::parse(TimestampFormat::DateTime, value)
-                .map(OffsetDateTime::from)
+            let value = value.to_str().map(str::trim).map_err(|_| {
+                S3Error::with_message(S3ErrorCode::InvalidArgument, "Invalid Snowball Object Lock retain-until date")
+            })?;
+            OffsetDateTime::parse(value, &Rfc3339)
                 .map_err(|_| s3_error!(InvalidArgument, "Invalid Snowball Object Lock retain-until date"))
         })
         .transpose()?;
@@ -1740,15 +1747,12 @@ fn apply_extract_pax_overrides(
     let object_lock_legal_hold_status = canonical_headers
         .get(AMZ_OBJECT_LOCK_LEGAL_HOLD_LOWER)
         .map(|value| {
-            let value =
-                value.to_str().map(str::trim).map(str::to_ascii_uppercase).map_err(|_| {
-                    object_s3_error(S3ErrorCode::InvalidArgument, "Invalid Snowball Object Lock legal-hold status")
-                })?;
-            match value.as_str() {
-                ObjectLockLegalHoldStatus::ON => Ok(ObjectLockLegalHoldStatus::ON.to_owned()),
-                ObjectLockLegalHoldStatus::OFF => Ok(ObjectLockLegalHoldStatus::OFF.to_owned()),
-                _ => Err(s3_error!(InvalidArgument, "Invalid Snowball Object Lock legal-hold status")),
-            }
+            value
+                .to_str()
+                .ok()
+                .and_then(|value| LegalHoldStatus::parse(value.trim()))
+                .map(|value| value.as_str().to_owned())
+                .ok_or_else(|| s3_error!(InvalidArgument, "Invalid Snowball Object Lock legal-hold status"))
         })
         .transpose()?;
     if let Some(status) = object_lock_legal_hold_status.as_ref() {
@@ -2037,23 +2041,23 @@ impl DefaultObjectUsecase {
         &self,
         envelope: RequestEnvelope,
         input: PutObjectWriteInput,
-    ) -> rustfs_s3_types::S3Result<PutObjectWriteOutput> {
+    ) -> S3Result<PutObjectWriteOutput> {
         // The legacy edge has no verified replay binding for individual members.
         if envelope.post_object().is_some() && !envelope.is_gateway_post() {
-            return Err(rustfs_s3_types::s3_error!(NotImplemented, "POST archive extraction is not supported"));
+            return Err(s3_error!(NotImplemented, "POST archive extraction is not supported"));
         }
         let input = if envelope.is_gateway_post() {
             let mut input = input;
             let archive = input
                 .post_archive
                 .take()
-                .ok_or_else(|| rustfs_s3_types::s3_error!(NotImplemented, "POST archive extraction is not supported"))?;
+                .ok_or_else(|| s3_error!(NotImplemented, "POST archive extraction is not supported"))?;
             if input.body.is_some()
                 || input.content_length.is_some()
                 || input.frame_trailers.is_some()
                 || input.trailing_headers.is_some()
             {
-                return Err(rustfs_s3_types::s3_error!(InvalidRequest, "POST archive replay is ambiguous"));
+                return Err(s3_error!(InvalidRequest, "POST archive replay is ambiguous"));
             }
             let (body, length) = archive.into_replay(&envelope, &input.bucket, &input.key)?;
             input.body = Some(body);
@@ -2061,10 +2065,7 @@ impl DefaultObjectUsecase {
             input
         } else {
             if input.post_archive.is_some() {
-                return Err(rustfs_s3_types::s3_error!(
-                    InvalidRequest,
-                    "POST archive replay requires its original request"
-                ));
+                return Err(s3_error!(InvalidRequest, "POST archive replay requires its original request"));
             }
             input
         };
@@ -2075,8 +2076,7 @@ impl DefaultObjectUsecase {
         &self,
         envelope: RequestEnvelope,
         input: PutObjectWriteInput,
-    ) -> rustfs_s3_types::S3Result<PutObjectWriteOutput> {
-        use rustfs_s3_types::S3Error;
+    ) -> S3Result<PutObjectWriteOutput> {
         let helper = OperationHelper::from_view(&envelope.audit_view(), EventName::ObjectCreatedPut, S3Operation::PutObject)
             .suppress_event();
         let request_context = helper.request_context_or_from_view(&envelope.audit_view());
@@ -2087,7 +2087,7 @@ impl DefaultObjectUsecase {
         // deliberately stays ahead of any key authorization.
         let extract_principal = SseKmsPrincipal::from_request(&envelope);
         if is_sse_kms_requested(&input, envelope.headers()) {
-            return Err(Into::into(s3_error!(NotImplemented, "SSE-KMS is not supported for extract uploads")));
+            return Err(s3_error!(NotImplemented, "SSE-KMS is not supported for extract uploads"));
         }
         let replication_authorized = replication_request_authorized(&envelope);
         let mut bucket_generation_opts = ObjectOptions::default();
@@ -2138,9 +2138,9 @@ impl DefaultObjectUsecase {
         );
         if effective_sse
             .as_ref()
-            .is_some_and(|sse| sse.as_str().eq_ignore_ascii_case(ServerSideEncryption::AWS_KMS))
+            .is_some_and(|sse| sse.as_str().eq_ignore_ascii_case(AMZ_ENCRYPTION_KMS))
         {
-            return Err(Into::into(s3_error!(NotImplemented, "SSE-KMS is not supported for extract uploads")));
+            return Err(s3_error!(NotImplemented, "SSE-KMS is not supported for extract uploads"));
         }
         validate_sse_headers_for_write(
             effective_sse.as_deref(),
@@ -2152,7 +2152,7 @@ impl DefaultObjectUsecase {
             true,
         )?;
         let Some(body) = body else {
-            return Err(Into::into(s3_error!(IncompleteBody)));
+            return Err(with_archive_error_message(s3_error!(IncompleteBody)));
         };
         let (chunks, _) = super::native_body::BodyChunks::with_trailers(body, input.frame_trailers);
         let body: super::request_body::UploadChunks = Box::new(chunks);
@@ -2183,15 +2183,15 @@ impl DefaultObjectUsecase {
                 if let Some(val) = envelope.headers().get(AMZ_DECODED_CONTENT_LENGTH) {
                     match atoi::atoi::<i64>(val.as_bytes()) {
                         Some(x) => x,
-                        None => return Err(Into::into(s3_error!(UnexpectedContent))),
+                        None => return Err(with_archive_error_message(s3_error!(UnexpectedContent))),
                     }
                 } else {
-                    return Err(Into::into(s3_error!(UnexpectedContent)));
+                    return Err(with_archive_error_message(s3_error!(UnexpectedContent)));
                 }
             }
         };
         if size < 0 {
-            return Err(Into::into(s3_error!(UnexpectedContent)));
+            return Err(with_archive_error_message(s3_error!(UnexpectedContent)));
         }
         validate_new_object_key(&key, "PUT")?;
         validate_table_catalog_object_mutation(&bucket, &key).await?;
@@ -2199,13 +2199,13 @@ impl DefaultObjectUsecase {
             .check_bucket_quota(
                 &bucket,
                 QuotaOperation::PutObject,
-                u64::try_from(size).map_err(|_| S3Error::new(S3ErrorCode::UnexpectedContent.into()))?,
+                u64::try_from(size).map_err(|_| S3Error::new(S3ErrorCode::UnexpectedContent))?,
             )
             .await?;
         match get_concurrency_manager()
             .admit_put_object(size)
             .await
-            .map_err(|_| object_s3_error(S3ErrorCode::InternalError, "foreground write admission closed"))?
+            .map_err(|_| S3Error::with_message(S3ErrorCode::InternalError, "foreground write admission closed"))?
         {
             ForegroundWriteAdmission::Disabled => {}
             ForegroundWriteAdmission::Admitted(permit) => {
@@ -2216,10 +2216,10 @@ impl DefaultObjectUsecase {
             }
             ForegroundWriteAdmission::Rejected => {
                 counter!("rustfs.put_object.foreground_admission.total", "result" => "rejected").increment(1);
-                return Err(Into::into(object_s3_error(
+                return Err(S3Error::with_message(
                     S3ErrorCode::SlowDown,
                     "foreground write concurrency limit reached, please reduce your request rate",
-                )));
+                ));
             }
         }
         let mut put_request_guard = ExtractPutRequestGuard::new();
@@ -2228,7 +2228,7 @@ impl DefaultObjectUsecase {
         // Uses workload profile configuration (enabled by default) to select appropriate buffer size.
         // Buffer sizes range from 32KB to 4MB depending on file size and configured workload profile.
         let buffer_size = get_buffer_size_opt_in(size);
-        let expected_archive_length = u64::try_from(size).map_err(|_| S3Error::new(S3ErrorCode::UnexpectedContent.into()))?;
+        let expected_archive_length = u64::try_from(size).map_err(|_| S3Error::new(S3ErrorCode::UnexpectedContent))?;
         let chunks = Box::pin(archive_transport_chunks(body, expected_archive_length));
         let body = tokio::io::BufReader::with_capacity(buffer_size, StreamReader::new(chunks));
 
@@ -2266,7 +2266,7 @@ impl DefaultObjectUsecase {
         })?;
 
         let Some(store) = self.object_store() else {
-            return Err(S3Error::with_message(S3ErrorCode::InternalError.into(), "Not init".to_string()));
+            return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
         };
 
         let extract_quota_check = if let Some(metadata_sys) = self.bucket_metadata_sys() {
@@ -2490,7 +2490,7 @@ impl DefaultObjectUsecase {
                 total_expanded_pax_metadata
                     .checked_add(pax_authorization.expanded_metadata_bytes)
                     .ok_or_else(|| {
-                        object_s3_error(S3ErrorCode::InvalidArgument, "Snowball expanded PAX metadata size overflowed")
+                        S3Error::with_message(S3ErrorCode::InvalidArgument, "Snowball expanded PAX metadata size overflowed")
                     })
             );
             extract_try!(validate_extract_expanded_pax_metadata_total(total_expanded_pax_metadata,));
@@ -2502,7 +2502,7 @@ impl DefaultObjectUsecase {
                             entry_size,
                         ))
                         .ok_or_else(|| {
-                            object_s3_error(
+                            S3Error::with_message(
                                 S3ErrorCode::InvalidArgument,
                                 "Archive quota growth overflowed while processing entries",
                             )
@@ -2515,11 +2515,11 @@ impl DefaultObjectUsecase {
             // must describe the same stored member in both authorization views.
             for (name, value) in &pax_authorization.headers {
                 extract_try!(auth_req.headers_mut().try_insert(name.clone(), value.clone()).map_err(|_| {
-                    object_s3_error(S3ErrorCode::InvalidArgument, "Snowball IAM condition header capacity exceeded")
+                    S3Error::with_message(S3ErrorCode::InvalidArgument, "Snowball IAM condition header capacity exceeded")
                 }));
                 if let Some(headers) = auth_req.post_object_policy_headers_mut() {
                     extract_try!(headers.try_insert(name.clone(), value.clone()).map_err(|_| {
-                        object_s3_error(S3ErrorCode::InvalidArgument, "Snowball IAM condition header capacity exceeded")
+                        S3Error::with_message(S3ErrorCode::InvalidArgument, "Snowball IAM condition header capacity exceeded")
                     }));
                 }
             }
@@ -2663,10 +2663,10 @@ impl DefaultObjectUsecase {
             // accounts every serial or staged member until storage returns.
             let manager = get_concurrency_manager();
 
-            let member_size = extract_try!(
-                usize::try_from(size)
-                    .map_err(|_| object_s3_error(S3ErrorCode::InvalidArgument, "Snowball member size does not fit into usize"))
-            );
+            let member_size = extract_try!(usize::try_from(size).map_err(|_| S3Error::with_message(
+                S3ErrorCode::InvalidArgument,
+                "Snowball member size does not fit into usize"
+            )));
             let staging_weight = extract_try!(checked_extract_member_staging_weight(&fpath, member_size, &opts, &replication,));
             let action = batch_state.action(&fpath, member_size, staging_weight, max_inflight, durable_quota);
 
@@ -2811,7 +2811,7 @@ impl DefaultObjectUsecase {
         let mut decoder = match ar.into_inner() {
             Ok(decoder) => decoder,
             Err(_) => {
-                return Err(Into::into(s3_error!(InvalidArgument, "Failed to finalize archive reader")));
+                return Err(s3_error!(InvalidArgument, "Failed to finalize archive reader"));
             }
         };
         tokio::io::copy(&mut decoder, &mut tokio::io::sink())
@@ -2820,12 +2820,12 @@ impl DefaultObjectUsecase {
         let archive_etag = {
             let state = archive_upload_state
                 .lock()
-                .map_err(|_| object_s3_error(S3ErrorCode::InternalError, "Archive upload state lock was poisoned"))?;
+                .map_err(|_| S3Error::with_message(S3ErrorCode::InternalError, "Archive upload state lock was poisoned"))?;
             if !state.body_complete {
-                return Err(Into::into(object_s3_error(
+                return Err(S3Error::with_message(
                     S3ErrorCode::UnexpectedContent,
                     "Archive decoder did not consume the complete request body",
-                )));
+                ));
             }
             state.etag.clone()
         };
@@ -2857,19 +2857,36 @@ pub(super) mod post_archive_preflight;
 mod tests {
     use super::*;
 
-    /// Archive extraction through the owned entry point the gateway handler calls, its error in
-    /// the s3s form these tests compare.
-    async fn extract_owned(usecase: &DefaultObjectUsecase, req: S3Request<PutObjectInput>) -> S3Result<PutObjectWriteOutput> {
-        let (envelope, input) = PutObjectWriteInput::from_test_request(req);
-        Box::pin(usecase.execute_put_object_extract_owned(envelope, input))
-            .await
-            .map_err(S3Error::from)
-    }
     use crate::app::storage_api::s3::StdError;
-    use crate::app::storage_api::s3::dto::{ObjectLockRetentionMode, StreamingBlob};
+    use crate::app::storage_api::s3::dto::ObjectLockRetentionMode;
     use http::{HeaderMap, HeaderName, HeaderValue};
+    use rustfs_gateway_stream::Body;
     use tokio::io::AsyncReadExt;
     use tokio_tar::{Builder, EntryType, Header};
+
+    fn archive_input(bucket: &str, key: &str, archive: Vec<u8>) -> PutObjectWriteInput {
+        PutObjectWriteInput {
+            bucket: bucket.to_owned(),
+            key: key.to_owned(),
+            content_length: Some(i64::try_from(archive.len()).expect("archive size")),
+            body: Some(Body::from_bytes(Bytes::from(archive))),
+            ..Default::default()
+        }
+    }
+
+    fn archive_envelope(method: http::Method, extensions: http::Extensions) -> RequestEnvelope {
+        RequestEnvelope::from_parts(
+            crate::app::RequestHead {
+                method,
+                uri: http::Uri::from_static("/"),
+                headers: HeaderMap::new(),
+                credentials: None,
+                region: None,
+                service: None,
+            },
+            extensions,
+        )
+    }
 
     struct RecordingNotify {
         events: tokio::sync::mpsc::UnboundedSender<String>,
@@ -2887,19 +2904,6 @@ mod tests {
             _region: &str,
             _event_rules: &[(Vec<rustfs_targets::EventName>, String, String, Vec<rustfs_targets::arn::TargetID>)],
         ) -> Result<(), rustfs_notify::NotificationError> {
-            Ok(())
-        }
-
-        async fn add_event_specific_rules(
-            &self,
-            _bucket_name: &str,
-            _region: &str,
-            _event_rules: &[(Vec<rustfs_targets::EventName>, String, String, Vec<rustfs_targets::arn::TargetID>)],
-        ) -> Result<(), rustfs_notify::NotificationError> {
-            Ok(())
-        }
-
-        async fn clear_bucket_notification_rules(&self, _bucket_name: &str) -> Result<(), rustfs_notify::NotificationError> {
             Ok(())
         }
     }
@@ -2931,8 +2935,9 @@ mod tests {
         let mut owners = Vec::new();
         for _ in 0..4 {
             let (sender, receiver) = tokio::sync::mpsc::unbounded_channel::<Result<Bytes, std::io::Error>>();
-            let (body, _control) = super::super::request_body::guard_upload_progress(
-                StreamingBlob::wrap(UnboundedReceiverStream::new(receiver)),
+            let chunks = UnboundedReceiverStream::new(receiver).map(|chunk| chunk.map_err(Into::into));
+            let (body, _control) = super::super::request_body::guard_native_upload_progress(
+                Box::new(chunks),
                 Duration::ZERO,
                 "bucket",
                 "archive.tar",
@@ -3302,6 +3307,7 @@ mod tests {
             .err()
             .expect("a truncated TAR member must fail staging");
         assert_eq!(error.code(), &S3ErrorCode::IncompleteBody);
+        assert_eq!(error.message(), S3ErrorCode::IncompleteBody.default_message());
 
         let mut oversized = std::io::Cursor::new(b"abc".to_vec());
         let error = stage_extract_member_body(&mut oversized, 2)
@@ -3309,6 +3315,7 @@ mod tests {
             .err()
             .expect("a TAR member longer than its declared size must fail staging");
         assert_eq!(error.code(), &S3ErrorCode::UnexpectedContent);
+        assert_eq!(error.message(), S3ErrorCode::UnexpectedContent.default_message());
     }
 
     #[tokio::test]
@@ -3359,12 +3366,12 @@ mod tests {
             ExtractCommitOutcome {
                 archive_seq: 2,
                 event: None,
-                error: Some(ExtractCommitError::Fatal(object_s3_error(S3ErrorCode::InvalidArgument, "later"))),
+                error: Some(ExtractCommitError::Fatal(S3Error::with_message(S3ErrorCode::InvalidArgument, "later"))),
             },
             ExtractCommitOutcome {
                 archive_seq: 1,
                 event: None,
-                error: Some(ExtractCommitError::Fatal(object_s3_error(S3ErrorCode::NoSuchKey, "earlier"))),
+                error: Some(ExtractCommitError::Fatal(S3Error::with_message(S3ErrorCode::NoSuchKey, "earlier"))),
             },
         ];
         let (_, error) = ordered_extract_outcomes(outcomes, false);
@@ -3496,7 +3503,7 @@ mod tests {
             ExtractCommitOutcome {
                 archive_seq: 1,
                 event: None,
-                error: Some(ExtractCommitError::StorageWrite(object_s3_error(
+                error: Some(ExtractCommitError::StorageWrite(S3Error::with_message(
                     S3ErrorCode::InternalError,
                     "injected write failure",
                 ))),
@@ -3513,12 +3520,14 @@ mod tests {
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].version_id, "later-success");
 
-        let slowdown = ExtractCommitError::StorageWrite(object_s3_error(S3ErrorCode::SlowDown, "injected admission rejection"));
+        let slowdown =
+            ExtractCommitError::StorageWrite(S3Error::with_message(S3ErrorCode::SlowDown, "injected admission rejection"));
         assert!(
             slowdown.into_unignored(true).is_none(),
             "ignore-errors must treat member admission rejection as a skipped write"
         );
-        let slowdown = ExtractCommitError::StorageWrite(object_s3_error(S3ErrorCode::SlowDown, "injected admission rejection"));
+        let slowdown =
+            ExtractCommitError::StorageWrite(S3Error::with_message(S3ErrorCode::SlowDown, "injected admission rejection"));
         assert_eq!(
             slowdown
                 .into_unignored(false)
@@ -3533,7 +3542,7 @@ mod tests {
         let outcomes = vec![ExtractCommitOutcome {
             archive_seq: 1,
             event: None,
-            error: Some(ExtractCommitError::Fatal(object_s3_error(
+            error: Some(ExtractCommitError::Fatal(S3Error::with_message(
                 S3ErrorCode::IncompleteBody,
                 "injected reader failure",
             ))),
@@ -3571,8 +3580,9 @@ mod tests {
                         ExtractCommitOutcome {
                             archive_seq,
                             event: None,
-                            error: (archive_seq == 2)
-                                .then(|| ExtractCommitError::Fatal(object_s3_error(S3ErrorCode::InvalidArgument, "injected"))),
+                            error: (archive_seq == 2).then(|| {
+                                ExtractCommitError::Fatal(S3Error::with_message(S3ErrorCode::InvalidArgument, "injected"))
+                            }),
                         }
                     }
                 }
@@ -3643,9 +3653,11 @@ mod tests {
         }
     }
 
-    #[test]
-    fn archive_error_mapping_preserves_classified_body_errors() {
+    #[tokio::test]
+    async fn archive_error_mapping_preserves_classified_body_errors() {
         use crate::error::{ClientBodyReadTimeout, ServerSideSourceReadError, UploadLimitExceeded};
+        let mut body = rustfs_s3_types::Body::from(bytes::Bytes::from_static(b"abcdef"));
+        let too_large = body.store_all_limited(5).await.expect_err("six bytes exceed the limit");
         for (error, code) in [
             (
                 io::Error::other(ClientBodyReadTimeout {
@@ -3654,10 +3666,7 @@ mod tests {
                 }),
                 S3ErrorCode::RequestTimeout,
             ),
-            (
-                io::Error::other(crate::app::storage_api::s3::BodySizeLimitExceeded { size: 6, limit: 5 }),
-                S3ErrorCode::EntityTooLarge,
-            ),
+            (io::Error::other(too_large), S3ErrorCode::EntityTooLarge),
             (io::Error::other(UploadLimitExceeded { limit: 5 }), S3ErrorCode::EntityTooLarge),
             (
                 io::Error::other(ServerSideSourceReadError::new("CopyObject", io::Error::other("source unavailable"))),
@@ -3666,7 +3675,7 @@ mod tests {
         ] {
             let error = map_extract_archive_error(error);
             assert_eq!(error.code(), &code);
-            assert_eq!(error.message(), Some(ApiError::error_code_to_message(&code.into()).as_str()));
+            assert_eq!(error.message(), Some(ApiError::error_code_to_message(&code).as_str()));
             assert!(error.source().is_some());
         }
         let error = map_extract_archive_error(io::Error::new(io::ErrorKind::InvalidData, "invalid TAR header"));
@@ -3695,7 +3704,10 @@ mod tests {
         }
         let displays = Arc::new(AtomicUsize::new(0));
         let error = map_extract_archive_error(io::Error::other(DisplayProbe {
-            source: io::Error::other(UploadStreamError::Sha256Mismatch),
+            source: io::Error::other(rustfs_rio::Sha256Mismatch {
+                expected_sha256: "expected".into(),
+                calculated_sha256: "calculated".into(),
+            }),
             displays: Arc::clone(&displays),
         }));
         assert_eq!(error.code().as_str(), "XAmzContentSHA256Mismatch");
@@ -3704,59 +3716,6 @@ mod tests {
             0,
             "classified body failures need only their public message"
         );
-    }
-
-    #[tokio::test]
-    #[serial_test::serial]
-    async fn snowball_extract_preserves_sha256_failure_after_sniffing() {
-        use crate::app::storage_api::s3::UploadStream;
-        use crate::app::storage_api::test::contract::bucket::{BucketOperations as _, MakeBucketOptions};
-        use http::Method;
-
-        let (store, context) = real_store_test_context().await;
-        let bucket = format!("extract-body-error-{}", Uuid::new_v4());
-        store
-            .make_bucket(&bucket, &MakeBucketOptions::default())
-            .await
-            .expect("create extract test bucket");
-        let mut header = Header::new_gnu();
-        header.set_path("member.txt").expect("valid member path");
-        header.set_size(0);
-        header.set_mode(0o644);
-        header.set_cksum();
-        let mut archive = header.as_bytes().to_vec();
-        archive.extend_from_slice(&[0; 1024]);
-        let size = archive.len();
-        // Sniffing consumes only the prefix; the final frame fails while TAR
-        // reads its first header, before a member can be prepared or committed.
-        let frames = futures::stream::iter([
-            Ok::<_, StdError>(Bytes::copy_from_slice(&archive[..16])),
-            Ok(Bytes::copy_from_slice(&archive[16..])),
-        ]);
-        let body = StreamingBlob::wrap(UploadStream::new(frames, size, s3s_sigv4::Sha256Sum::from_bytes([0; 32])));
-        let input = PutObjectInput::builder()
-            .bucket(bucket.clone())
-            .key("archive.tar".to_string())
-            .content_length(Some(i64::try_from(size).expect("fixture size")))
-            .body(Some(body))
-            .build()
-            .expect("extract input");
-        let mut request = build_request(input, Method::PUT);
-        request
-            .headers
-            .insert("x-amz-meta-snowball-auto-extract", HeaderValue::from_static("true"));
-        let error = extract_owned(&DefaultObjectUsecase::with_context(Some(context)), request)
-            .await
-            .expect_err("a bad payload digest must reject the archive request");
-        assert_eq!(error.code().as_str(), "XAmzContentSHA256Mismatch");
-        assert_eq!(error.status_code(), Some(http::StatusCode::BAD_REQUEST));
-        for key in ["archive.tar", "member.txt"] {
-            let missing = store
-                .get_object_info(&bucket, key, &ObjectOptions::default())
-                .await
-                .expect_err("rejected archive cannot publish a member");
-            assert!(is_err_object_not_found(&missing), "{missing}");
-        }
     }
 
     #[tokio::test]
@@ -3818,17 +3777,14 @@ mod tests {
                 .expect("append member");
             let archive = builder.into_inner().await.expect("finish archive");
             let before = OffsetDateTime::now_utc();
-            let input = PutObjectInput::builder()
-                .bucket(bucket.clone())
-                .key("archive.tar".to_string())
-                .version_id(explicit_version.then(|| Uuid::new_v4().to_string()))
-                .content_length(Some(i64::try_from(archive.len()).expect("archive size")))
-                .body(Some(StreamingBlob::from_bytes(Bytes::from(archive))))
-                .build()
-                .expect("extract request");
-            let mut request = build_request(input, Method::PUT);
-            request.extensions.insert(ReqInfo::default());
-            let result = Box::pin(extract_owned(&usecase, request)).await;
+            let input = PutObjectWriteInput {
+                version_id: explicit_version.then(|| Uuid::new_v4().to_string()),
+                ..archive_input(&bucket, "archive.tar", archive)
+            };
+            let mut extensions = http::Extensions::new();
+            extensions.insert(ReqInfo::default());
+            let result =
+                Box::pin(usecase.execute_put_object_extract_owned(archive_envelope(Method::PUT, extensions), input)).await;
             if explicit_version && !replicate {
                 assert_eq!(
                     result
@@ -3912,17 +3868,11 @@ mod tests {
                 .await
                 .expect("archive member");
             let archive = builder.into_inner().await.expect("finish archive");
-            let input = PutObjectInput {
-                bucket: bucket.clone(),
-                key: "archive.tar".to_owned(),
-                content_length: Some(i64::try_from(archive.len()).expect("archive size")),
-                body: Some(StreamingBlob::from_bytes(Bytes::from(archive))),
-                ..Default::default()
-            };
-            let mut request = build_request(input, Method::PUT);
-            request.extensions.insert(ReqInfo::default());
-            let envelope = RequestEnvelope::from_s3s(&request);
-            let input = PutObjectWriteInput::from_legacy(request.input, None);
+            let input = archive_input(&bucket, "archive.tar", archive);
+            let mut extensions = http::Extensions::new();
+            extensions.insert(ReqInfo::default());
+            let envelope = archive_envelope(Method::PUT, extensions);
+
             let result = Box::pin(usecase.execute_put_object_extract_owned(envelope, input)).await;
             if allowed {
                 result.expect("caller is allowed to write member");
@@ -3998,21 +3948,15 @@ mod tests {
                 .await
                 .expect("archive member");
             let archive = builder.into_inner().await.expect("finish archive");
-            let input = PutObjectInput {
-                bucket: bucket.clone(),
-                key: key.to_owned(),
-                content_length: Some(i64::try_from(archive.len()).expect("archive size")),
-                body: Some(StreamingBlob::from_bytes(Bytes::from(archive))),
-                ..Default::default()
-            };
-            let mut request = build_request(input, Method::PUT);
+            let input = archive_input(&bucket, key, archive);
+            let mut extensions = http::Extensions::new();
             let req_info = ReqInfo {
                 bucket: Some(bucket.clone()),
                 object: Some(key.to_owned()),
                 ..Default::default()
             };
-            request.extensions.insert(req_info);
-            let mut envelope = RequestEnvelope::from_s3s(&request);
+            extensions.insert(req_info);
+            let mut envelope = archive_envelope(Method::PUT, extensions);
             authorize_request(&mut envelope, Action::S3Action(S3Action::PutObjectAction))
                 .await
                 .expect("outer authorization caches public tags");
@@ -4032,7 +3976,7 @@ mod tests {
                 .get_object_info(&bucket, key, &ObjectOptions::default())
                 .await
                 .expect("object before");
-            let input = PutObjectWriteInput::from_legacy(request.input, None);
+
             let result = Box::pin(usecase.execute_put_object_extract_owned(envelope, input)).await;
             let after = store
                 .get_object_info(&bucket, key, &ObjectOptions::default())
@@ -4097,23 +4041,17 @@ mod tests {
                 .await
                 .expect("archive member");
             let archive = builder.into_inner().await.expect("finish archive");
-            let input = PutObjectInput {
-                bucket: bucket.clone(),
-                key: "archive.tar".to_owned(),
-                content_length: Some(i64::try_from(archive.len()).expect("archive size")),
-                body: Some(StreamingBlob::from_bytes(Bytes::from(archive))),
-                ..Default::default()
-            };
-            let mut request = build_request(input, Method::POST);
-            request.extensions.insert(ReqInfo::default());
-            request.extensions.insert(PostObjectRequestMarker);
+            let input = archive_input(&bucket, "archive.tar", archive);
+            let mut extensions = http::Extensions::new();
+            extensions.insert(ReqInfo::default());
+            extensions.insert(PostObjectRequestMarker);
             if projected {
                 let mut headers = HeaderMap::new();
                 headers.insert("x-amz-tagging", HeaderValue::from_static("classification=private"));
-                request.extensions.insert(PostObjectPolicyHeaders(headers));
+                extensions.insert(PostObjectPolicyHeaders(headers));
             }
-            let envelope = RequestEnvelope::from_s3s(&request);
-            let input = PutObjectWriteInput::from_legacy(request.input, None);
+            let envelope = archive_envelope(Method::POST, extensions);
+
             // Exercise member IAM independently of the outer POST admission check.
             let result = Box::pin(usecase.execute_put_object_extract_inner(envelope, input)).await;
             let stored = store.get_object_info(&bucket, &member, &ObjectOptions::default()).await;
@@ -4198,17 +4136,11 @@ mod tests {
                     .await
                     .expect("archive member");
                 let archive = builder.into_inner().await.expect("finish archive");
-                let input = PutObjectInput {
-                    bucket: bucket.clone(),
-                    key: "archive.tar".to_owned(),
-                    content_length: Some(i64::try_from(archive.len()).expect("archive size")),
-                    body: Some(StreamingBlob::from_bytes(Bytes::from(archive))),
-                    ..Default::default()
-                };
-                let mut request = build_request(input, Method::PUT);
-                request.extensions.insert(ReqInfo::default());
-                let envelope = RequestEnvelope::from_s3s(&request);
-                let input = PutObjectWriteInput::from_legacy(request.input, None);
+                let input = archive_input(&bucket, "archive.tar", archive);
+                let mut extensions = http::Extensions::new();
+                extensions.insert(ReqInfo::default());
+                let envelope = archive_envelope(Method::PUT, extensions);
+
                 let result = Box::pin(usecase.execute_put_object_extract_owned(envelope, input)).await;
                 let stored = store.get_object_info(&bucket, &member, &ObjectOptions::default()).await;
                 if permission == "allow" {
@@ -4262,6 +4194,14 @@ mod tests {
         let error = map_extract_archive_error(err);
         assert_eq!(error.code().as_str(), "XAmzContentSHA256Mismatch");
         assert_eq!(error.status_code(), Some(http::StatusCode::BAD_REQUEST));
+        let mismatch = error
+            .source()
+            .and_then(|source| source.downcast_ref::<std::io::Error>())
+            .and_then(std::io::Error::get_ref)
+            .and_then(|source| source.downcast_ref::<rustfs_rio::Sha256Mismatch>())
+            .expect("the mapped failure must retain the digest verifier's typed source");
+        assert_eq!(mismatch.expected_sha256, "00".repeat(32));
+        assert_ne!(mismatch.calculated_sha256, mismatch.expected_sha256);
     }
 
     fn pax_record(key: &str, value: &[u8]) -> Vec<u8> {
@@ -4961,6 +4901,7 @@ mod tests {
         )
         .expect_err("invalid PAX storage class must be rejected");
         assert_eq!(err.code(), &S3ErrorCode::InvalidStorageClass);
+        assert_eq!(err.message(), S3ErrorCode::InvalidStorageClass.default_message());
     }
 
     #[test]
@@ -5345,12 +5286,12 @@ mod tests {
 
     #[test]
     fn extract_entry_error_boundary_only_ignores_recoverable_members() {
-        let recoverable = ExtractEntryError::Recoverable(object_s3_error(S3ErrorCode::InvalidArgument, "invalid member"));
+        let recoverable = ExtractEntryError::Recoverable(S3Error::with_message(S3ErrorCode::InvalidArgument, "invalid member"));
         recoverable
             .ignore_or_return(true)
             .expect("recoverable member should be skipped");
 
-        let recoverable = ExtractEntryError::Recoverable(object_s3_error(S3ErrorCode::InvalidArgument, "invalid member"));
+        let recoverable = ExtractEntryError::Recoverable(S3Error::with_message(S3ErrorCode::InvalidArgument, "invalid member"));
         assert_eq!(
             recoverable
                 .ignore_or_return(false)
@@ -5359,7 +5300,7 @@ mod tests {
             &S3ErrorCode::InvalidArgument
         );
 
-        let fatal = ExtractEntryError::Fatal(object_s3_error(S3ErrorCode::InvalidArgument, "invalid archive"));
+        let fatal = ExtractEntryError::Fatal(S3Error::with_message(S3ErrorCode::InvalidArgument, "invalid archive"));
         assert_eq!(
             fatal
                 .ignore_or_return(true)
@@ -5588,14 +5529,14 @@ mod tests {
 
         assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
         assert!(failed.load(Ordering::Acquire));
-        let classified = classify_extract_member_write_error(object_s3_error_default(S3ErrorCode::IncompleteBody), &failed)
+        let classified = classify_extract_member_write_error(S3Error::new(S3ErrorCode::IncompleteBody), &failed)
             .into_unignored(true)
             .expect("a reader-backed store error must remain fatal");
         assert_eq!(classified.code(), &S3ErrorCode::IncompleteBody);
 
         let storage_only_failure = AtomicBool::new(false);
         assert!(
-            classify_extract_member_write_error(object_s3_error_default(S3ErrorCode::InternalError), &storage_only_failure)
+            classify_extract_member_write_error(S3Error::new(S3ErrorCode::InternalError), &storage_only_failure)
                 .into_unignored(true)
                 .is_none(),
             "a storage-only write failure may be ignored"
@@ -5604,9 +5545,8 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn snowball_extract_body_guard_aborts_stalled_upload() {
-        let body = StreamingBlob::wrap(futures::stream::pending::<Result<Bytes, std::io::Error>>());
-        let (mut guarded, _) = super::request_body::guard_upload_progress(
-            body,
+        let (mut guarded, _) = super::request_body::guard_native_upload_progress(
+            Box::new(futures::stream::pending()),
             Duration::from_millis(1),
             "test-bucket",
             "archive.tar",

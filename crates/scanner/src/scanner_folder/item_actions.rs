@@ -557,6 +557,7 @@ pub struct ScannerItem {
     pub heal_enabled: bool,
     pub heal_bitrot: bool,
     pub debug: bool,
+    pub notification_bucket_incarnation: Option<uuid::Uuid>,
 }
 
 impl ScannerItem {
@@ -658,6 +659,7 @@ impl ScannerItem {
         size_summary: &mut SizeSummary,
         cancellation: Option<&CancellationToken>,
     ) {
+        let notification_bucket_incarnation = self.notification_bucket_incarnation;
         if cancellation.is_some_and(CancellationToken::is_cancelled) {
             return;
         }
@@ -734,7 +736,7 @@ impl ScannerItem {
             if cancellation.is_some_and(CancellationToken::is_cancelled) {
                 return;
             }
-            self.alert_excessive_versions(object_infos.len(), cumulative_size);
+            self.alert_excessive_versions(object_infos.len(), cumulative_size, notification_bucket_incarnation);
 
             debug!(
                 target: "rustfs::scanner::folder",
@@ -882,7 +884,8 @@ impl ScannerItem {
                             }
                             IlmAction::TransitionAction | IlmAction::TransitionVersionAction => {
                                 let trace_started_at = trace_start_instant();
-                                let queued = apply_transition_rule(event, &LcEventSrc::Scanner, oi).await;
+                                let queued =
+                                    apply_transition_rule(event, &LcEventSrc::Scanner, oi, notification_bucket_incarnation).await;
                                 emit_scanner_ilm_action_trace(&self.bucket, &oi.name, event.action, 1, queued, trace_started_at);
                                 if record_scanner_ilm_action_if_queued(global_metrics(), event.action, 1, queued) {
                                     let done_ilm = Metrics::time_ilm(event.action);
@@ -1011,7 +1014,8 @@ impl ScannerItem {
                         );
                         let done_ilm = Metrics::time_ilm(event.action);
                         let trace_started_at = trace_start_instant();
-                        let queued = apply_transition_rule(event, &LcEventSrc::Scanner, oi).await;
+                        let queued =
+                            apply_transition_rule(event, &LcEventSrc::Scanner, oi, notification_bucket_incarnation).await;
                         emit_scanner_ilm_action_trace(&self.bucket, &oi.name, event.action, 1, queued, trace_started_at);
                         if record_scanner_ilm_action_if_queued(global_metrics(), event.action, 1, queued) {
                             done_ilm(1)();
@@ -1073,7 +1077,7 @@ impl ScannerItem {
             }
         }
         if !cancellation.is_some_and(CancellationToken::is_cancelled) {
-            self.alert_excessive_versions(remaining_versions, cumulative_size);
+            self.alert_excessive_versions(remaining_versions, cumulative_size, notification_bucket_incarnation);
         }
     }
 
@@ -1263,7 +1267,12 @@ impl ScannerItem {
         }
     }
 
-    pub(super) fn alert_excessive_versions(&self, remaining_versions: usize, cumulative_size: i64) {
+    pub(super) fn alert_excessive_versions(
+        &self,
+        remaining_versions: usize,
+        cumulative_size: i64,
+        notification_bucket_incarnation: Option<uuid::Uuid>,
+    ) {
         ensure_scanner_alert_metrics_registered();
         let (too_many_versions, too_large_versions) = should_alert_excessive_versions(remaining_versions, cumulative_size);
         // Threshold check first so healthy objects never pay for the
@@ -1286,6 +1295,7 @@ impl ScannerItem {
                     &self.bucket,
                     &object_path,
                     cumulative_size,
+                    notification_bucket_incarnation,
                     &[
                         ("versions", remaining_versions.to_string()),
                         ("threshold", scanner_excess_versions_threshold().to_string()),
@@ -1323,6 +1333,7 @@ impl ScannerItem {
                     &self.bucket,
                     &object_path,
                     cumulative_size,
+                    notification_bucket_incarnation,
                     &[
                         ("versions", remaining_versions.to_string()),
                         ("cumulativeSize", cumulative_size.to_string()),
@@ -1387,6 +1398,7 @@ mod tests {
             heal_enabled: false,
             heal_bitrot: false,
             debug: false,
+            notification_bucket_incarnation: None,
         }
     }
 

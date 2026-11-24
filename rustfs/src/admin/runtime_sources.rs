@@ -141,15 +141,13 @@ mod tests {
         object_store_from_envelope, publish_test_app_context,
     };
     use crate::admin::operation::{AdminRequest, AdminResponse, Operation};
-    use crate::admin::router::S3Router;
-    use crate::app::RequestEnvelope;
+    use crate::admin::router::{S3Router, call_legacy};
+    use crate::app::{RequestEnvelope, RequestHead};
     use hyper::{Method, StatusCode};
     use matchit::Params;
     use rustfs_iam::{store::object::ObjectStore, sys::IamSys};
     use rustfs_kms::KmsServiceManager;
-    use rustfs_s3_types::{S3ErrorCode, s3_error};
-    use s3s::route::S3Route;
-    use s3s::{Body, S3Request};
+    use rustfs_s3_types::s3_error;
     use std::sync::Arc;
 
     struct UnreadyIam;
@@ -192,22 +190,18 @@ mod tests {
         Arc::new(AppContext::new(context.object_store(), Arc::new(UnreadyIam), Arc::new(TestKms)))
     }
 
-    fn request(extensions: http::Extensions) -> S3Request<Body> {
-        S3Request {
-            input: Body::empty(),
-            method: Method::GET,
-            uri: "/context-probe".parse().expect("test URI"),
-            headers: http::HeaderMap::new(),
-            extensions,
-            credentials: None,
-            region: None,
-            service: None,
-            trailing_headers: None,
-        }
-    }
-
     fn envelope(extensions: http::Extensions) -> RequestEnvelope {
-        RequestEnvelope::from_s3s(&request(extensions))
+        RequestEnvelope::from_parts(
+            RequestHead {
+                method: Method::GET,
+                uri: "/context-probe".parse().expect("test URI"),
+                headers: http::HeaderMap::new(),
+                credentials: None,
+                region: None,
+                service: None,
+            },
+            extensions,
+        )
     }
 
     #[tokio::test]
@@ -329,15 +323,13 @@ mod tests {
             .insert(Method::GET, "/context-probe", ContextDependentAdminRoute)
             .expect("register test route");
 
-        let err = router
-            .call(request(http::Extensions::new()))
+        let err = call_legacy(&router, Method::GET, "/context-probe", http::Extensions::new())
             .await
             .expect_err("empty slot must fail closed");
-        assert_eq!(err.code(), &S3ErrorCode::ServiceUnavailable.into());
+        assert_eq!(err.code(), &crate::app::storage_api::s3::S3ErrorCode::ServiceUnavailable);
 
         assert!(slot.install(distinct_context(&ambient)));
-        let response = router
-            .call(request(http::Extensions::new()))
+        let response = call_legacy(&router, Method::GET, "/context-probe", http::Extensions::new())
             .await
             .expect("installed slot must serve request");
         assert_eq!(response.status, Some(StatusCode::NO_CONTENT));

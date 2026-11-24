@@ -410,7 +410,10 @@ impl<S: StorageBackend + Send + Sync + 'static> SftpDriver<S> {
             }
         };
         let handle = self.allocate_handle(HandleState::Dir(cursor))?;
-        Ok(Handle { id, handle })
+        Ok(Handle {
+            id,
+            handle: handle.into(),
+        })
     }
 
     /// READDIR body shared with the Handler trait wrapper. Removes the
@@ -666,8 +669,11 @@ mod tests {
             assert_eq!(auth.continuation_token, call.continuation_token);
         }
         assert_eq!(authorized[2].continuation_token.as_ref().map(|value| value.as_str()), Some("next-page"));
-        let denied =
-            with_test_auth_override(|_, _, prefix| prefix != Some("private/"), driver.readdir_inner(2, handle.handle)).await;
+        let denied = with_test_auth_override(
+            |_, _, prefix| prefix != Some("private/"),
+            driver.readdir_inner(2, String::from_utf8(handle.handle.into_bytes()).expect("utf8 handle")),
+        )
+        .await;
         assert!(denied.is_err(), "policy change must deny the next READDIR");
         assert_eq!(backend.list_objects_calls().len(), 2, "denied READDIR cannot reach storage");
     }
@@ -716,7 +722,7 @@ mod tests {
         };
         let handle_id = driver.allocate_handle(HandleState::Dir(cursor)).expect("allocate");
 
-        let readdir_fut = driver.readdir(1, handle_id.clone());
+        let readdir_fut = driver.readdir(1, handle_id.clone().into());
 
         with_test_auth_override(|_, _, _| true, async {
             tokio::select! {
@@ -758,7 +764,7 @@ mod tests {
         // token, no skipped entries).
         backend.clear_stall_list_objects_v2();
         backend.queue_list_objects_v2_ok_empty();
-        let result = with_test_auth_override(|_, _, _| true, driver.readdir(2, handle_id)).await;
+        let result = with_test_auth_override(|_, _, _| true, driver.readdir(2, handle_id.into())).await;
         // Empty page returns Eof per readdir's empty-Name-to-Eof translation.
         let err = result.expect_err("re-issued READDIR against an empty listing must return Eof, not Ok");
         assert!(
@@ -785,7 +791,7 @@ mod tests {
         let handle_id = driver.allocate_handle(HandleState::Dir(cursor)).expect("allocate");
 
         let (result, captured) =
-            capture_tracing_at(Level::ERROR, with_test_auth_override(|_, _, _| true, driver.readdir(7, handle_id))).await;
+            capture_tracing_at(Level::ERROR, with_test_auth_override(|_, _, _| true, driver.readdir(7, handle_id.into()))).await;
         let err = result.expect_err("exhausted cursor must return Eof");
         assert!(matches!(StatusCode::from(err), StatusCode::Eof));
         assert!(
@@ -818,7 +824,7 @@ mod tests {
         let handle_id = driver.allocate_handle(HandleState::Dir(cursor)).expect("allocate");
 
         let (result, captured) =
-            capture_tracing_at(Level::ERROR, with_test_auth_override(|_, _, _| true, driver.readdir(8, handle_id))).await;
+            capture_tracing_at(Level::ERROR, with_test_auth_override(|_, _, _| true, driver.readdir(8, handle_id.into()))).await;
         let err = result.expect_err("backend error must propagate as Err");
         assert!(!matches!(StatusCode::from(err), StatusCode::Eof), "backend error must not be Eof");
         assert!(

@@ -32,13 +32,11 @@ use crate::storage_api::protocols::client::{MultipartStagingOperation, ReqInfo, 
 use http::{HeaderMap, Method};
 use percent_encoding::{AsciiSet, CONTROLS, utf8_percent_encode};
 use rustfs_credentials;
-use rustfs_gateway_types::compat::s3s_5761ddfe as gateway_s3s_compat;
-#[cfg(test)]
-use rustfs_gateway_types::compat::s3s_5761ddfe::{leaf::RequestWire, request_context::GatewayRequestContext};
 use rustfs_gateway_types::dto as gateway_dto;
 #[cfg(test)]
 use rustfs_gateway_types::{BucketName, OpaqueString};
 use rustfs_protocols::common::SessionContext;
+use rustfs_protocols::common::client::s3::MultipartRequest;
 #[cfg(feature = "webdav")]
 use rustfs_protocols::common::client::s3::{BucketCapacity, SessionCapacityView};
 use rustfs_protocols::common::gateway::{AuthorizationError, S3Action, is_operation_supported};
@@ -129,27 +127,18 @@ fn format_copy_source(bucket: &str, key: &str) -> String {
     format!("/{bucket}/{}", urlencoding::encode(key))
 }
 
-/// Converts a protocol copy source into the source the s3s storage path consumes.
-///
-/// A bucket source goes through the same header rendering and `CopySource::parse` that the
-/// protocol layer used when it handed the storage client a header string, so bucket-name and
-/// key validation and their errors are unchanged. Access point and Outposts sources are moved
-/// across unchanged, and the storage copy path refuses them as it does for any other request.
+/// Parses the historical bucket-source header with the pinned protocol parser.
 #[cfg(test)]
-fn legacy_copy_source(
-    source: rustfs_gateway_types::CopySourceValue,
-) -> Result<s3s::dto::CopySource, s3s::dto::ParseCopySourceError> {
-    match source {
-        rustfs_gateway_types::CopySourceValue::Bucket { bucket, key, version_id } => {
-            let mut header = format_copy_source(&bucket, &key);
-            if let Some(version_id) = version_id {
-                header.push_str("?versionId=");
-                header.push_str(&urlencoding::encode(&version_id));
-            }
-            s3s::dto::CopySource::parse(&header)
-        }
-        source => Ok(gateway_s3s_compat::copy_source::to_s3s(source)),
+fn legacy_copy_source(source: rustfs_gateway_types::CopySourceValue) -> Result<CopySource, ParseCopySourceError> {
+    let rustfs_gateway_types::CopySourceValue::Bucket { bucket, key, version_id } = source else {
+        panic!("expected a bucket-source fixture");
+    };
+    let mut header = format_copy_source(&bucket, &key);
+    if let Some(version_id) = version_id {
+        header.push_str("?versionId=");
+        header.push_str(&urlencoding::encode(&version_id));
     }
+    CopySource::parse(&header)
 }
 
 /// Refuses a listing entry without an ETag, as the compatibility seam did while `Object.ETag` was required.
@@ -158,52 +147,6 @@ fn require_listed_etags(output: gateway_dto::ListObjectsV2Output) -> Result<gate
         return Err("ListObjectsV2 contents entry has no e_tag".to_owned());
     }
     Ok(output)
-}
-
-#[cfg(test)]
-fn list_buckets_output_from_s3s(output: s3s::dto::ListBucketsOutput) -> Result<gateway_dto::ListBucketsOutput, String> {
-    let s3s::dto::ListBucketsOutput {
-        buckets,
-        continuation_token,
-        owner,
-        prefix,
-    } = output;
-
-    // The storage inventory also contains RustFS-internal names such as
-    // `sftp_host_keys`. They were representable by s3s but cannot be emitted
-    // as gateway bucket names, so keep them out of protocol listings.
-    let buckets = buckets
-        .unwrap_or_default()
-        .into_iter()
-        .filter_map(|bucket| {
-            let valid_name = bucket.name.as_ref().is_some_and(|name| BucketName::new(name.clone()).is_ok());
-            valid_name.then_some(bucket)
-        })
-        .map(|bucket| gateway_s3s_compat::generated::shapes::bucket::bucket_from_s3s(bucket).map_err(|e| e.to_string()))
-        .collect::<Result<Vec<_>, _>>()?;
-    let owner = owner
-        .ok_or_else(|| "owner: the gateway shape requires this member".to_owned())
-        .and_then(|owner| gateway_s3s_compat::generated::shapes::owner::owner_from_s3s(owner).map_err(|e| e.to_string()))?;
-
-    Ok(gateway_dto::ListBucketsOutput {
-        buckets,
-        owner,
-        continuation_token: continuation_token.map(OpaqueString::from),
-        prefix,
-    })
-}
-
-#[cfg(test)]
-fn gateway_request_context(method: Method, uri: &http::Uri, headers: HeaderMap) -> GatewayRequestContext {
-    GatewayRequestContext {
-        method,
-        raw_path: uri.path().to_owned(),
-        raw_query: uri.query().unwrap_or_default().to_owned(),
-        headers,
-        principal: None,
-        host_region: None,
-        declares_trailers: false,
-    }
 }
 
 fn trace_protocol_request(operation: &str, bucket: Option<&str>, object: Option<&str>) {
@@ -396,9 +339,8 @@ impl ProtocolStorageClient {
                 "protocol server application context is not initialized",
             )
         })?;
-        let (credentials, is_owner) = crate::auth::check_key_valid_with_context("", session.access_key(), Some(context.as_ref()))
-            .await
-            .map_err(rustfs_s3_types::S3Error::from)?;
+        let (credentials, is_owner) =
+            crate::auth::check_key_valid_with_context("", session.access_key(), Some(context.as_ref())).await?;
         let mut envelope =
             self.protocol_authorization_envelope(session, action, bucket, object, listing, (credentials, is_owner))?;
         authorize_request(&mut envelope, protocol_policy_action(action)).await
@@ -785,7 +727,6 @@ impl rustfs_protocols::common::client::s3::StorageBackend for ProtocolStorageCli
         let (credentials, is_owner) =
             crate::auth::check_key_valid_with_context("", session_context.access_key(), Some(context.as_ref()))
                 .await
-                .map_err(rustfs_s3_types::S3Error::from)
                 .map_err(|e| match e.code() {
                     rustfs_s3_types::S3ErrorCode::InvalidAccessKeyId => {
                         rustfs_s3_types::S3Error::new(rustfs_s3_types::S3ErrorCode::AccessDenied)
@@ -1014,9 +955,10 @@ impl rustfs_protocols::common::client::s3::StorageBackend for ProtocolStorageCli
 
     async fn upload_part(
         &self,
-        input: gateway_dto::UploadPartInput,
+        request: MultipartRequest<gateway_dto::UploadPartInput>,
         credentials: &rustfs_credentials::Credentials,
     ) -> Result<gateway_dto::UploadPartOutput, Self::Error> {
+        let (input, upload_id) = request.into_parts();
         trace!(
             event = EVENT_PROTOCOL_STORAGE_CLIENT_REQUEST,
             component = LOG_COMPONENT_PROTOCOLS,
@@ -1031,8 +973,6 @@ impl rustfs_protocols::common::client::s3::StorageBackend for ProtocolStorageCli
         let bucket = input.bucket.as_str().to_owned();
         let key = input.key.as_str().to_owned();
         let content_length = input.content_length;
-        // This scalar projection remains until the compatibility seam retires.
-        let upload_id = gateway_s3s_compat::leaf::upload_id_to_s3s(&input.upload_id);
         let part_number = input.part_number.to_string();
         let uri = build_object_uri(
             &bucket,
@@ -1075,9 +1015,10 @@ impl rustfs_protocols::common::client::s3::StorageBackend for ProtocolStorageCli
 
     async fn complete_multipart_upload(
         &self,
-        input: gateway_dto::CompleteMultipartUploadInput,
+        request: MultipartRequest<gateway_dto::CompleteMultipartUploadInput>,
         credentials: &rustfs_credentials::Credentials,
     ) -> Result<gateway_dto::CompleteMultipartUploadOutput, Self::Error> {
+        let (input, upload_id) = request.into_parts();
         trace!(
             event = EVENT_PROTOCOL_STORAGE_CLIENT_REQUEST,
             component = LOG_COMPONENT_PROTOCOLS,
@@ -1090,8 +1031,6 @@ impl rustfs_protocols::common::client::s3::StorageBackend for ProtocolStorageCli
 
         let bucket = input.bucket.as_str().to_owned();
         let key = input.key.as_str().to_owned();
-        // This scalar projection remains until the compatibility seam retires.
-        let upload_id = gateway_s3s_compat::leaf::upload_id_to_s3s(&input.upload_id);
         let input = multipart::complete_multipart_input(input)?;
         let uri = build_object_uri(&bucket, &key, &[("uploadId", Some(upload_id.as_str()))])?;
         let envelope = Self::create_envelope(
@@ -1113,9 +1052,10 @@ impl rustfs_protocols::common::client::s3::StorageBackend for ProtocolStorageCli
 
     async fn abort_multipart_upload(
         &self,
-        input: gateway_dto::AbortMultipartUploadInput,
+        request: MultipartRequest<gateway_dto::AbortMultipartUploadInput>,
         credentials: &rustfs_credentials::Credentials,
     ) -> Result<gateway_dto::AbortMultipartUploadOutput, Self::Error> {
+        let (input, upload_id) = request.into_parts();
         trace!(
             event = EVENT_PROTOCOL_STORAGE_CLIENT_REQUEST,
             component = LOG_COMPONENT_PROTOCOLS,
@@ -1129,8 +1069,6 @@ impl rustfs_protocols::common::client::s3::StorageBackend for ProtocolStorageCli
         let bucket = input.bucket.as_str().to_owned();
         let key = input.key.as_str().to_owned();
         multipart::abort_multipart_input(&input)?;
-        // This scalar projection remains until the compatibility seam retires.
-        let upload_id = gateway_s3s_compat::leaf::upload_id_to_s3s(&input.upload_id);
         let uri = build_object_uri(&bucket, &key, &[("uploadId", Some(upload_id.as_str()))])?;
         let envelope = Self::create_envelope(
             Method::DELETE,
@@ -1153,9 +1091,10 @@ impl rustfs_protocols::common::client::s3::StorageBackend for ProtocolStorageCli
 
     async fn upload_part_copy(
         &self,
-        input: gateway_dto::UploadPartCopyInput,
+        request: MultipartRequest<gateway_dto::UploadPartCopyInput>,
         credentials: &rustfs_credentials::Credentials,
     ) -> Result<gateway_dto::UploadPartCopyOutput, Self::Error> {
+        let input = request.input();
         trace!(
             event = EVENT_PROTOCOL_STORAGE_CLIENT_REQUEST,
             component = LOG_COMPONENT_PROTOCOLS,
@@ -1169,7 +1108,7 @@ impl rustfs_protocols::common::client::s3::StorageBackend for ProtocolStorageCli
 
         let bucket = input.bucket.as_str().to_owned();
         let key = input.key.as_str().to_owned();
-        let (uri, input) = multipart::prepare_upload_part_copy(input)?;
+        let (uri, input) = multipart::prepare_upload_part_copy(request)?;
 
         let envelope = Self::create_envelope(
             Method::PUT,
@@ -1312,8 +1251,8 @@ mod tests {
     }
 
     #[test]
-    fn legacy_copy_source_hands_access_point_and_outpost_sources_to_the_refusing_copy_path() {
-        let access_point = legacy_copy_source(rustfs_gateway_types::CopySourceValue::AccessPoint {
+    fn protocol_copy_refuses_access_point_and_outpost_sources() {
+        let access_point = owned::copy_source(rustfs_gateway_types::CopySourceValue::AccessPoint {
             partition: "aws".to_owned(),
             region: "us-east-1".to_owned(),
             account_id: "123456789012".to_owned(),
@@ -1322,9 +1261,9 @@ mod tests {
             version_id: None,
         })
         .expect("access point source");
-        assert!(matches!(access_point, s3s::dto::CopySource::AccessPoint { .. }));
+        assert!(access_point.is_none());
 
-        let outpost = legacy_copy_source(rustfs_gateway_types::CopySourceValue::Outpost {
+        let outpost = owned::copy_source(rustfs_gateway_types::CopySourceValue::Outpost {
             partition: "aws".to_owned(),
             region: "us-east-1".to_owned(),
             account_id: "123456789012".to_owned(),
@@ -1333,7 +1272,7 @@ mod tests {
             version_id: None,
         })
         .expect("outpost source");
-        assert!(matches!(outpost, s3s::dto::CopySource::Outpost { .. }));
+        assert!(outpost.is_none());
     }
 
     #[test]
@@ -1609,6 +1548,7 @@ mod tests {
     #[test]
     fn protocol_mainflow_retention_timestamp_matches_legacy_precision() {
         use crate::app::object_usecase::{GetObjectOutputFacts, HeadObjectOutputFacts};
+
         let instant = rustfs_gateway_types::Timestamp::from_secs_nanos(1_700_000_000, 123_456_789).expect("test timestamp");
         let get = || GetObjectOutputFacts {
             dto: gateway_dto::GetObjectOutput {
@@ -1624,16 +1564,12 @@ mod tests {
             },
             etag: None,
         };
-        let old_get =
-            gateway_s3s_compat::generated::ops::get_object::output_from_s3s(get().into_s3s().expect("old GET projection"))
-                .expect("old GET output");
-        let old_head =
-            gateway_s3s_compat::generated::ops::head_object::output_from_s3s(head().into_s3s().expect("old HEAD projection"))
-                .expect("old HEAD output");
-        let old = (old_get.object_lock_retain_until_date, old_head.object_lock_retain_until_date);
-        let expected =
-            Some(rustfs_gateway_types::Timestamp::from_secs_nanos(1_700_000_000, 123_000_000).expect("millisecond timestamp"));
-        assert_eq!(old, (expected, expected));
+        let old = Timestamp::parse(TimestampFormat::EpochSeconds, "1700000000.123456789").expect("legacy retention instant");
+        let mut spelling = Vec::new();
+        old.format(TimestampFormat::DateTime, &mut spelling)
+            .expect("legacy retention header");
+        assert_eq!(spelling, b"2023-11-14T22:13:20.123Z");
+        let expected = Some(rustfs_gateway_types::Timestamp::from_secs_nanos(1_700_000_000, 123_000_000).expect("milliseconds"));
         let current = (
             owned::get_output(get())
                 .expect("protocol GET output")
@@ -1642,7 +1578,7 @@ mod tests {
                 .expect("protocol HEAD output")
                 .object_lock_retain_until_date,
         );
-        assert_eq!(current, old);
+        assert_eq!(current, (expected, expected));
     }
 }
 
@@ -1681,16 +1617,17 @@ mod put_tests {
         })
     }
 
-    fn legacy_fields(input: gateway_dto::PutObjectInput) -> Result<serde_json::Value, String> {
-        let length = input.content_length;
-        gateway_s3s_compat::put_object::input_to_s3s(input)
-            .map(|mut input| {
-                if length < 0 {
-                    input.content_length = None;
-                }
-                fields(PutObjectWriteInput::from_legacy(input, None))
-            })
-            .map_err(|error| conversion_error("PutObject input", error).to_string())
+    fn old_input() -> PutObjectInput {
+        PutObjectInput {
+            bucket: "protocol-put-oracle".into(),
+            key: "object".into(),
+            content_length: Some(4),
+            ..Default::default()
+        }
+    }
+
+    fn legacy_fields(input: PutObjectInput) -> serde_json::Value {
+        fields(PutObjectWriteInput::from_legacy(input, None))
     }
 
     #[test]
@@ -1738,7 +1675,26 @@ mod put_tests {
                     }
                     request
                 };
-                let old = legacy_fields(make());
+                let old = (!value.is_empty())
+                    .then(|| ETagCondition::parse_http_header(value.as_bytes()))
+                    .transpose()
+                    .map(|parsed| {
+                        let mut old = old_input();
+                        if none {
+                            old.if_none_match = parsed;
+                        } else {
+                            old.if_match = parsed;
+                        }
+                        legacy_fields(old)
+                    })
+                    .map_err(|_| {
+                        let field = if none { "if_none_match" } else { "if_match" };
+                        conversion_error(
+                            "PutObject input",
+                            format!("{field}: not an entity-tag condition the s3s input can hold"),
+                        )
+                        .to_string()
+                    });
                 let current = owned::put_input(make()).map(fields).map_err(|error| error.to_string());
                 observations.push((value.clone(), none, current, old));
             }
@@ -1753,34 +1709,47 @@ mod put_tests {
     #[test]
     fn protocol_put_optional_values_match_legacy() {
         for value in ["", "value"] {
-            let make = || {
-                let mut request = input();
-                request.cache_control = Some(value.to_owned());
-                request.content_disposition = Some(value.to_owned());
-                request.content_encoding = Some(value.to_owned());
-                request.content_language = Some(value.to_owned());
-                request.content_type = Some(value.to_owned());
-                request.content_md5 = Some(value.to_owned());
-                request.tagging = Some(value.to_owned());
-                request.sse_customer_algorithm = Some(value.to_owned());
-                request.sse_customer_key_md5 = Some(value.to_owned());
-                request.ssekms_key_id = Some(value.to_owned());
-                request.website_redirect_location = Some(value.to_owned());
-                request.storage_class = Some(gateway_dto::StorageClass::custom(value.to_owned()));
-                request.server_side_encryption = Some(gateway_dto::ServerSideEncryption::custom(value.to_owned()));
-                request.object_lock_mode = Some(gateway_dto::ObjectLockMode::custom(value.to_owned()));
-                request.object_lock_legal_hold_status = Some(gateway_dto::ObjectLockLegalHoldStatus::custom(value.to_owned()));
-                request.checksum_algorithm = Some(gateway_dto::ChecksumAlgorithm::custom(value.to_owned()));
-                request.expires = Some(OpaqueString::from(value));
-                if !value.is_empty() {
-                    request.metadata.insert("key".to_owned(), "value".to_owned());
-                }
-                request
-            };
-            assert_eq!(
-                owned::put_input(make()).map(fields).map_err(|error| error.to_string()),
-                legacy_fields(make())
+            let mut request = input();
+            let mut old = old_input();
+            macro_rules! strings {
+                ($($field:ident),+) => {$(
+                    request.$field = Some(value.to_owned());
+                    old.$field = (!value.is_empty()).then(|| value.to_owned());
+                )+};
+            }
+            strings!(
+                cache_control,
+                content_disposition,
+                content_encoding,
+                content_language,
+                content_type,
+                content_md5,
+                tagging,
+                sse_customer_algorithm,
+                sse_customer_key_md5,
+                ssekms_key_id,
+                website_redirect_location
             );
+            macro_rules! enums {
+                ($($field:ident => $kind:ident),+) => {$(
+                    request.$field = Some(gateway_dto::$kind::custom(value));
+                    old.$field = (!value.is_empty()).then(|| value.to_owned().into());
+                )+};
+            }
+            enums!(
+                storage_class => StorageClass,
+                server_side_encryption => ServerSideEncryption,
+                object_lock_mode => ObjectLockMode,
+                object_lock_legal_hold_status => ObjectLockLegalHoldStatus,
+                checksum_algorithm => ChecksumAlgorithm
+            );
+            request.expires = Some(OpaqueString::from(value));
+            old.expires = (!value.is_empty()).then(|| value.to_owned());
+            if !value.is_empty() {
+                request.metadata.insert("key".into(), "value".into());
+                old.metadata = Some([("key".into(), "value".into())].into());
+            }
+            assert_eq!(fields(owned::put_input(request).expect("optional values")), legacy_fields(old));
         }
     }
 
@@ -1800,10 +1769,19 @@ mod put_tests {
                     Some(rustfs_gateway_types::ChecksumSpec::parse_header(header, value).expect("test checksum"));
                 request
             };
+            let mut old = old_input();
+            let digest = Some(value.to_owned());
+            match header {
+                "x-amz-checksum-crc32" => old.checksum_crc32 = digest,
+                "x-amz-checksum-crc32c" => old.checksum_crc32c = digest,
+                "x-amz-checksum-crc64nvme" => old.checksum_crc64nvme = digest,
+                "x-amz-checksum-sha1" => old.checksum_sha1 = digest,
+                _ => old.checksum_sha256 = digest,
+            }
             observations.push((
                 header,
                 owned::put_input(make()).map(fields).map_err(|error| error.to_string()),
-                legacy_fields(make()),
+                Ok(legacy_fields(old)),
             ));
         }
         let mismatches: Vec<_> = observations.into_iter().filter(|(_, current, old)| current != old).collect();
@@ -1825,11 +1803,24 @@ mod put_tests {
                     Some(rustfs_gateway_types::Timestamp::from_secs_nanos(secs, nanos).expect("instant"));
                 request
             };
+            let expected = Timestamp::parse(TimestampFormat::EpochSeconds, &format!("{secs}.{nanos:09}"))
+                .map(|date| {
+                    let mut old = old_input();
+                    old.object_lock_retain_until_date = Some(date);
+                    legacy_fields(old)
+                })
+                .map_err(|_| {
+                    conversion_error(
+                        "PutObject input",
+                        "object_lock_retain_until_date: an instant outside what the s3s input can hold",
+                    )
+                    .to_string()
+                });
             observations.push((
                 secs,
                 nanos,
                 owned::put_input(make()).map(fields).map_err(|error| error.to_string()),
-                legacy_fields(make()),
+                expected,
             ));
         }
         let mismatches: Vec<_> = observations
@@ -1853,11 +1844,26 @@ mod put_tests {
             (Some("\"\""), Some(s3s::dto::ETag::Strong(String::new()))),
             (Some("a\nb"), Some(s3s::dto::ETag::Strong("a\nb".to_owned()))),
         ] {
-            let old = gateway_s3s_compat::put_object::output_from_s3s(PutObjectOutput {
-                e_tag: tag,
-                ..Default::default()
-            })
-            .map_err(|error| conversion_error("PutObject output", error));
+            let old = match tag {
+                None => Err(conversion_error(
+                    "PutObject output",
+                    "e_tag: a PutObject answer carries an entity tag and the gateway output cannot omit one",
+                )),
+                Some(_) if matches!(raw, Some("" | "\"\"" | "a\nb")) => {
+                    Err(conversion_error("PutObject output", "e_tag: not an entity tag the gateway can write"))
+                }
+                Some(tag) => {
+                    let tag = match tag {
+                        ETag::Weak(value) => rustfs_gateway_types::ETag::new_weak(value.trim_matches('"').to_owned()),
+                        ETag::Strong(value) => rustfs_gateway_types::ETag::new(value),
+                    }
+                    .expect("recorded entity tag");
+                    Ok(gateway_dto::PutObjectOutput {
+                        e_tag: tag,
+                        ..Default::default()
+                    })
+                }
+            };
             let current = owned::put_output(PutObjectWriteOutput {
                 e_tag: raw.map(str::to_owned),
                 ..Default::default()
@@ -1877,40 +1883,53 @@ mod put_tests {
                 e_tag: Some("abc".to_owned()),
                 ..Default::default()
             };
-            let mut old = PutObjectOutput {
-                e_tag: Some(s3s::dto::ETag::Strong("abc".to_owned())),
-                ..Default::default()
-            };
             match index {
                 0 => {
                     current.checksum_crc32 = Some(checksum.to_owned());
-                    old.checksum_crc32 = Some(checksum.to_owned());
                 }
                 1 => {
                     current.checksum_crc32c = Some(checksum.to_owned());
-                    old.checksum_crc32c = Some(checksum.to_owned());
                 }
                 2 => {
                     current.checksum_crc64nvme = Some(checksum.to_owned());
-                    old.checksum_crc64nvme = Some(checksum.to_owned());
                 }
                 3 => {
                     current.checksum_sha1 = Some(checksum.to_owned());
-                    old.checksum_sha1 = Some(checksum.to_owned());
                 }
                 4 => {
                     current.checksum_sha256 = Some(checksum.to_owned());
-                    old.checksum_sha256 = Some(checksum.to_owned());
                 }
                 _ => {
                     current.checksum_crc32 = Some(checksum.to_owned());
                     current.checksum_crc32c = Some(checksum.to_owned());
-                    old.checksum_crc32 = Some(checksum.to_owned());
-                    old.checksum_crc32c = Some(checksum.to_owned());
                 }
             }
-            let old =
-                gateway_s3s_compat::put_object::output_from_s3s(old).map_err(|error| conversion_error("PutObject output", error));
+            let old = match (index, checksum) {
+                (5, _) => Err(conversion_error(
+                    "PutObject output",
+                    "checksum_spec: the gateway output carries one checksum, so a second would be lost",
+                )),
+                (_, "bad") => Err(conversion_error(
+                    "PutObject output",
+                    "checksum_crc32: not a checksum value of this algorithm's width",
+                )),
+                _ => {
+                    let header = [
+                        "x-amz-checksum-crc32",
+                        "x-amz-checksum-crc32c",
+                        "x-amz-checksum-crc64nvme",
+                        "x-amz-checksum-sha1",
+                        "x-amz-checksum-sha256",
+                    ][index];
+                    Ok(gateway_dto::PutObjectOutput {
+                        e_tag: rustfs_gateway_types::ETag::new("abc").expect("tag"),
+                        checksum_spec: Some(
+                            rustfs_gateway_types::ChecksumSpec::parse_header(header, checksum).expect("recorded checksum"),
+                        ),
+                        ..Default::default()
+                    })
+                }
+            };
             let current = owned::put_output(current);
             observations.push((format!("checksum {index} {checksum}"), outcome(&old), outcome(&current)));
         }
@@ -1924,18 +1943,16 @@ mod put_tests {
             ssekms_key_id: Some("key-id".to_owned()),
             ..Default::default()
         };
-        let old = PutObjectOutput {
-            e_tag: Some(s3s::dto::ETag::Strong("abc".to_owned())),
+        let old = Ok(gateway_dto::PutObjectOutput {
+            e_tag: rustfs_gateway_types::ETag::new("abc").expect("tag"),
             version_id: Some("version".to_owned()),
-            expiration: Some("expiry".to_owned()),
-            server_side_encryption: Some(ServerSideEncryption::from("AES256".to_owned())),
+            expiration: Some("expiry".into()),
+            server_side_encryption: Some(gateway_dto::ServerSideEncryption::custom("AES256")),
             sse_customer_algorithm: Some("AES256".to_owned()),
             sse_customer_key_md5: Some("md5".to_owned()),
             ssekms_key_id: Some("key-id".to_owned()),
             ..Default::default()
-        };
-        let old =
-            gateway_s3s_compat::put_object::output_from_s3s(old).map_err(|error| conversion_error("PutObject output", error));
+        });
         observations.push(("populated output".to_owned(), outcome(&old), outcome(&owned::put_output(current))));
         let mismatches: Vec<_> = observations.into_iter().filter(|(_, old, current)| old != current).collect();
         assert!(mismatches.is_empty(), "PutObject output mismatches: {mismatches:#?}");
@@ -2020,8 +2037,8 @@ mod put_tests {
                 }
                 error
             };
-            let old: s3s::S3Error = make().into();
-            let old = Err(S3Error::from(old));
+            let old: s3s::S3Error = crate::error::legacy_error_for_test(make());
+            let old = Err(crate::error::owned_error_for_test(old));
             let current = Err(owned::put_error(make()));
             observations.push((code, explicit, outcome(&old), outcome(&current)));
         }
@@ -2633,7 +2650,6 @@ mod listing_tests {
     #[test]
     fn protocol_listing_output_matches_legacy_projection() {
         use rustfs_gateway_types::{ETag, ObjectKey, Timestamp};
-        let mut observations = Vec::new();
         let tags = [None, Some("abc".to_owned()), Some("a&\"b".to_owned()), Some(String::new())]
             .into_iter()
             .chain((0_u8..32).map(|byte| Some(char::from(byte).to_string())));
@@ -2668,44 +2684,50 @@ mod listing_tests {
                 ..Default::default()
             };
             let current = owned::listing_output(output.clone());
-            output.rustfs_on_demand_migration_list = None;
-            let old = gateway_s3s_compat::generated::ops::list_objects_v2::output_to_s3s(output)
-                .map_err(|error| conversion_error("ListObjectsV2 output", error))
-                .and_then(|mut old| {
-                    for object in old.contents.iter_mut().flatten() {
-                        if let Some(key) = &mut object.key {
-                            *key = key
-                                .split('/')
-                                .map(|part| urlencoding::encode(part).into_owned())
-                                .collect::<Vec<_>>()
-                                .join("/");
-                        }
-                        if let Some(s3s::dto::ETag::Strong(value) | s3s::dto::ETag::Weak(value)) = &mut object.e_tag {
-                            *value = quick_xml::escape::escape(value.as_str()).into_owned();
-                        }
-                    }
-                    for prefix in old.common_prefixes.iter_mut().flatten() {
-                        if let Some(value) = &mut prefix.prefix {
-                            *value = value
-                                .split('/')
-                                .map(|part| urlencoding::encode(part).into_owned())
-                                .collect::<Vec<_>>()
-                                .join("/");
-                        }
-                    }
-                    gateway_s3s_compat::generated::ops::list_objects_v2::output_from_s3s(old)
-                        .map_err(|error| error.to_string())
-                        .and_then(require_listed_etags)
-                        .map_err(|error| conversion_error("ListObjectsV2 output", error))
-                });
-            let describe = |result: rustfs_s3_types::S3Result<gateway_dto::ListObjectsV2Output>| match result {
-                Ok(output) => format!("{output:?}"),
-                Err(error) => format!("{:?}:{:?}:{:?}", error.code(), error.status_code(), error.message()),
+            let refusal = match tag.as_deref() {
+                None => Some("ListObjectsV2 contents entry has no e_tag"),
+                Some("") => Some("e_tag: not an entity tag the gateway can write"),
+                Some(tag) if tag.bytes().any(|byte| byte < 32 && byte != b'\r') => {
+                    Some("e_tag: not an entity tag the gateway can write")
+                }
+                _ if key.len() == 1024 => Some("key: not an object key the gateway can write"),
+                _ => None,
             };
-            observations.push(((name, key, tag, weak), describe(old), describe(current)));
+            if let Some(reason) = refusal {
+                let error = current.expect_err("original listing refusal");
+                assert_eq!(
+                    (error.code().as_str(), error.status_code(), error.message()),
+                    (
+                        "InternalError",
+                        Some(http::StatusCode::INTERNAL_SERVER_ERROR),
+                        Some(
+                            format!("failed to convert ListObjectsV2 output through the gateway compatibility seam: {reason}")
+                                .as_str()
+                        )
+                    )
+                );
+                continue;
+            }
+            let key = match key.as_str() {
+                "dir a/key&" => "dir%20a/key%26",
+                "key" => "key",
+                _ => panic!("unrecorded listing key"),
+            };
+            let escaped = match tag.as_deref().expect("recorded tag") {
+                "abc" => "abc",
+                "a&\"b" => "a&amp;&quot;b",
+                "a&b" => "a&amp;b",
+                "\r" => "&#13;",
+                _ => panic!("unrecorded listing tag"),
+            };
+            let object = &mut output.contents[0];
+            object.key = ObjectKey::new(key).expect("legacy encoded key");
+            object.e_tag = Some(if weak { ETag::new_weak(escaped) } else { ETag::new(escaped) }.expect("legacy tag"));
+            object.last_modified = Timestamp::from_secs_nanos(1_700_000_000, 123_000_000).expect("legacy precision");
+            output.common_prefixes[0].prefix = "prefix%20a/sub%26".into();
+            output.rustfs_on_demand_migration_list = None;
+            assert_eq!(format!("{:?}", current.expect("listing")), format!("{output:?}"), "{name} {tag:?}");
         }
-        let mismatches: Vec<_> = observations.into_iter().filter(|(_, old, current)| old != current).collect();
-        assert!(mismatches.is_empty(), "listing projection mismatches: {mismatches:#?}");
     }
 
     #[test]
@@ -2722,16 +2744,50 @@ mod listing_tests {
             owner: crate::app::dto_values::owner(),
             ..Default::default()
         };
-        let old = gateway_s3s_compat::generated::ops::list_buckets::output_to_s3s(output.clone()).expect("legacy bucket output");
-        let old = list_buckets_output_from_s3s(old).expect("legacy bucket projection");
+        let expected = gateway_dto::ListBucketsOutput {
+            buckets: vec![gateway_dto::Bucket {
+                name: BucketName::new("listing-output").expect("public bucket"),
+                creation_date: rustfs_gateway_types::Timestamp::from_secs_nanos(1_700_000_000, 123_000_000)
+                    .expect("legacy wire precision"),
+                ..Default::default()
+            }],
+            owner: crate::app::dto_values::owner(),
+            ..Default::default()
+        };
         let current = owned::bucket_listing_output(output);
-        assert_eq!(format!("{old:?}"), format!("{current:?}"));
+        assert_eq!(format!("{expected:?}"), format!("{current:?}"));
         assert_eq!(
             current.buckets.iter().map(|bucket| bucket.name.as_str()).collect::<Vec<_>>(),
             ["listing-output"]
         );
         assert_eq!(current.buckets[0].creation_date.subsec_nanos(), 123000000);
     }
+
+    /// Same facts `RequestEnvelope::from_s3s` copies: method, URI, headers, extensions, region, service, and credentials.
+    #[cfg(any(feature = "webdav", feature = "sftp"))]
+    fn envelope_from_legacy_listing_request<T>(req: &S3Request<T>) -> crate::app::RequestEnvelope {
+        let credentials = req.credentials.as_ref().map(|credentials| {
+            let session_token = crate::auth::get_session_token(&req.uri, &req.headers).map(str::to_owned);
+            crate::app::RequestCredentials::new(
+                credentials.access_key.clone(),
+                credentials.secret_key.expose().to_owned(),
+                session_token.clone(),
+            )
+            .unwrap_or_else(|_| crate::app::RequestCredentials::without_secret_key(credentials.access_key.clone(), session_token))
+        });
+        crate::app::RequestEnvelope::from_parts(
+            crate::app::RequestHead {
+                method: req.method.clone(),
+                uri: req.uri.clone(),
+                headers: req.headers.clone(),
+                credentials,
+                region: req.region.as_ref().map(|region| region.as_str().to_owned()),
+                service: req.service.clone(),
+            },
+            req.extensions.clone(),
+        )
+    }
+
     #[cfg(any(feature = "webdav", feature = "sftp"))]
     #[test]
     fn protocol_listing_session_credential_projection_matches_legacy() {
@@ -2767,7 +2823,7 @@ mod listing_tests {
                 )
                 .expect("legacy request");
                 legacy.headers = headers.clone();
-                let legacy = crate::app::RequestEnvelope::from_s3s(&legacy);
+                let legacy = envelope_from_legacy_listing_request(&legacy);
                 let current =
                     session_list_buckets_envelope(ServerContextSlot::new(), &session, &headers, true, credentials, false);
                 let legacy = legacy.credentials().expect("legacy credentials");

@@ -20,7 +20,9 @@ use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
-use crate::bucket::lifecycle::bucket_lifecycle_ops::enqueue_recovered_free_version_with_cancel;
+use crate::bucket::lifecycle::bucket_lifecycle_ops::{
+    EVENT_LIFECYCLE_WORKER_STATE, LOG_COMPONENT_ECSTORE, LOG_SUBSYSTEM_LIFECYCLE, enqueue_recovered_free_version_with_cancel,
+};
 use crate::disk::RUSTFS_META_BUCKET;
 use crate::error::Result;
 use crate::object_api::ObjectInfo;
@@ -28,9 +30,10 @@ use crate::services::tier::tier::{ERR_TIER_INVALID_CONFIG, TierConfigMgr};
 use crate::storage_api_contracts::namespace::NamespaceLocking as _;
 use crate::storage_api_contracts::{
     bucket::{BucketOperations, BucketOptions},
-    list::{ListOperations as _, StorageObjectInfoOrErr, StorageWalkOptions},
+    list::StorageWalkOptions,
 };
 use crate::store::ECStore;
+use crate::store::list_objects::TierRecoveryEntry;
 use rustfs_filemeta::FileInfo;
 use rustfs_lock::error::LockError;
 use rustfs_s3_client::admin_handler_utils::AdminError;
@@ -45,7 +48,6 @@ const BACKGROUND_WALK_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 #[cfg(test)]
 const BACKGROUND_WALK_SHUTDOWN_TIMEOUT: Duration = Duration::from_millis(100);
 
-type ObjectInfoOrErr = StorageObjectInfoOrErr<ObjectInfo, crate::error::Error>;
 type WalkOptions = StorageWalkOptions<fn(&FileInfo) -> bool>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -143,6 +145,8 @@ pub struct TierCleanupRetryReport {
     pub scanned: usize,
     pub enqueued: usize,
     pub failed: usize,
+    /// Unreadable logical objects encountered in this pass, whose tier is unknown.
+    pub unreadable_objects: usize,
     pub scan_truncated: bool,
 }
 
@@ -161,6 +165,7 @@ impl TierCleanupRetryReport {
             scanned: 0,
             enqueued: 0,
             failed: 0,
+            unreadable_objects: 0,
             scan_truncated: false,
         }
     }
@@ -267,6 +272,7 @@ async fn retry_tier_free_version_cleanup_page(
     .map_err(|_| tier_cleanup_retry_error())?;
     let mut report = TierCleanupRetryReport::new(tier_name, TierCleanupRetryStatus::Accepted);
     report.scanned = page.scanned_entries;
+    report.unreadable_objects = page.unreadable_objects;
     report.scan_truncated = page.truncated;
     for object in page.items {
         if cancel.is_cancelled() {
@@ -290,6 +296,7 @@ pub struct FreeVersionRecoveryStats {
     pub next_object_marker: Option<String>,
     pub scanned_entries: usize,
     pub buckets_scanned: usize,
+    pub unreadable_objects: usize,
     pub truncated: bool,
 }
 
@@ -300,6 +307,7 @@ pub struct FreeVersionRecoveryPage {
     pub next_object_marker: Option<String>,
     pub scanned_entries: usize,
     pub buckets_scanned: usize,
+    pub unreadable_objects: usize,
     pub truncated: bool,
 }
 
@@ -343,6 +351,7 @@ pub(super) async fn recover_tier_free_versions_with_cancel(
         next_object_marker: page.next_object_marker,
         scanned_entries: page.scanned_entries,
         buckets_scanned: page.buckets_scanned,
+        unreadable_objects: page.unreadable_objects,
         truncated: page.truncated,
     };
 
@@ -472,6 +481,7 @@ async fn list_tier_free_versions_for_tier(
         next_object_marker: None,
         scanned_entries: 0,
         buckets_scanned: 0,
+        unreadable_objects: 0,
         truncated: false,
     };
 
@@ -505,6 +515,7 @@ async fn list_tier_free_versions_for_tier(
     let mut bucket_seen = bucket_marker.is_none();
     let mut truncated_after: Option<RecoveryCursor> = None;
     let mut remaining_scan_objects = work_budget.max_objects;
+    let mut first_unreadable = None;
 
     for bucket in buckets {
         if cancel_token.is_cancelled() {
@@ -535,7 +546,7 @@ async fn list_tier_free_versions_for_tier(
         };
         let bucket_walk_limit = remaining_scan_objects;
 
-        let (tx, mut rx) = mpsc::channel::<ObjectInfoOrErr>(100);
+        let (tx, mut rx) = mpsc::channel::<Result<TierRecoveryEntry>>(100);
         let cancel = cancel_token.child_token();
         let mut draining_after_truncation = false;
         let mut drain_deadline = None;
@@ -559,14 +570,7 @@ async fn list_tier_free_versions_for_tier(
                     match action {
                         RecoveryWalkTestAction::SendItems(items) => {
                             for item in items {
-                                if tx
-                                    .send(ObjectInfoOrErr {
-                                        item: Some(item),
-                                        err: None,
-                                    })
-                                    .await
-                                    .is_err()
-                                {
+                                if tx.send(Ok(TierRecoveryEntry::Version(Box::new(item)))).await.is_err() {
                                     return Ok(());
                                 }
                             }
@@ -574,35 +578,16 @@ async fn list_tier_free_versions_for_tier(
                         }
                         RecoveryWalkTestAction::SendItemsThenError(items, err) => {
                             for item in items {
-                                if tx
-                                    .send(ObjectInfoOrErr {
-                                        item: Some(item),
-                                        err: None,
-                                    })
-                                    .await
-                                    .is_err()
-                                {
+                                if tx.send(Ok(TierRecoveryEntry::Version(Box::new(item)))).await.is_err() {
                                     return Ok(());
                                 }
                             }
-                            let _ = tx
-                                .send(ObjectInfoOrErr {
-                                    item: None,
-                                    err: Some(err),
-                                })
-                                .await;
+                            let _ = tx.send(Err(err)).await;
                             return Ok(());
                         }
                         RecoveryWalkTestAction::SendItemsThenHang(items, started) => {
                             for item in items {
-                                if tx
-                                    .send(ObjectInfoOrErr {
-                                        item: Some(item),
-                                        err: None,
-                                    })
-                                    .await
-                                    .is_err()
-                                {
+                                if tx.send(Ok(TierRecoveryEntry::Version(Box::new(item)))).await.is_err() {
                                     return Ok(());
                                 }
                             }
@@ -614,14 +599,11 @@ async fn list_tier_free_versions_for_tier(
                             let mut index = 0usize;
                             loop {
                                 if tx
-                                    .send(ObjectInfoOrErr {
-                                        item: Some(ObjectInfo {
-                                            bucket: bucket_name.clone(),
-                                            name: format!("nonrecoverable-{index:08}"),
-                                            ..Default::default()
-                                        }),
-                                        err: None,
-                                    })
+                                    .send(Ok(TierRecoveryEntry::Version(Box::new(ObjectInfo {
+                                        bucket: bucket_name.clone(),
+                                        name: format!("nonrecoverable-{index:08}"),
+                                        ..Default::default()
+                                    }))))
                                     .await
                                     .is_err()
                                 {
@@ -639,7 +621,7 @@ async fn list_tier_free_versions_for_tier(
                     }
                 }
 
-                api.walk(cancel, &bucket_name, "", tx, recovery_walk_options(bucket_walk_limit, object_marker))
+                api.walk_for_tier_recovery(cancel, &bucket_name, tx, recovery_walk_options(bucket_walk_limit, object_marker))
                     .await
             }
         });
@@ -669,21 +651,25 @@ async fn list_tier_free_versions_for_tier(
                 },
             };
             page.scanned_entries += 1;
-            if let Some(err) = item.err {
-                cancel.cancel();
-                receive_error = Some(err);
-                break;
-            }
+            let entry = match item {
+                Ok(entry) => entry,
+                Err(err) => {
+                    cancel.cancel();
+                    receive_error = Some(err);
+                    break;
+                }
+            };
             if draining_after_truncation {
                 continue;
             }
-            let Some(oi) = item.item else {
-                continue;
+            let name = match &entry {
+                TierRecoveryEntry::Version(oi) => oi.name.as_str(),
+                TierRecoveryEntry::Unreadable { object } => object.as_str(),
             };
-            if last_seen_object.as_deref() != Some(oi.name.as_str()) && scanned_objects >= bucket_walk_limit {
+            if last_seen_object.as_deref() != Some(name) && scanned_objects >= bucket_walk_limit {
                 // The disk listing limit follows S3-visible counting rules and
                 // does not charge metadata containing only hidden/free versions.
-                // Enforce the repair budget again at the decoded-object boundary.
+                // Charge the recovery budget by key, including unreadable metadata.
                 page.truncated = true;
                 page.next_bucket_marker = Some(bucket.name.clone());
                 page.next_object_marker = last_seen_object.clone();
@@ -692,9 +678,9 @@ async fn list_tier_free_versions_for_tier(
                 drain_deadline = Some(tokio::time::Instant::now() + BACKGROUND_WALK_SHUTDOWN_TIMEOUT);
                 continue;
             }
-            record_scanned_object(&mut last_seen_object, &mut scanned_objects, &oi.name);
+            record_scanned_object(&mut last_seen_object, &mut scanned_objects, name);
             if let Some(cursor) = &truncated_after
-                && (cursor.bucket.as_str() != bucket.name.as_str() || cursor.object.as_str() != oi.name.as_str())
+                && (cursor.bucket.as_str() != bucket.name.as_str() || cursor.object.as_str() != name)
             {
                 page.truncated = true;
                 cancel.cancel();
@@ -702,6 +688,14 @@ async fn list_tier_free_versions_for_tier(
                 drain_deadline = Some(tokio::time::Instant::now() + BACKGROUND_WALK_SHUTDOWN_TIMEOUT);
                 continue;
             }
+            let oi = match entry {
+                TierRecoveryEntry::Version(oi) => *oi,
+                TierRecoveryEntry::Unreadable { object } => {
+                    page.unreadable_objects += 1;
+                    first_unreadable.get_or_insert_with(|| (bucket.name.clone(), object));
+                    continue;
+                }
+            };
             if is_recoverable_tier_free_version_for_tier(&oi, tier_name) {
                 let current_cursor = RecoveryCursor {
                     bucket: bucket.name.clone(),
@@ -756,6 +750,18 @@ async fn list_tier_free_versions_for_tier(
         page.next_object_marker = None;
     }
 
+    if let Some((bucket, object)) = first_unreadable {
+        tracing::warn!(
+            event = EVENT_LIFECYCLE_WORKER_STATE,
+            component = LOG_COMPONENT_ECSTORE,
+            subsystem = LOG_SUBSYSTEM_LIFECYCLE,
+            state = "free_version_recovery_unreadable_metadata",
+            unreadable_objects = page.unreadable_objects,
+            sample_bucket = ?bucket,
+            sample_object = ?object,
+            "Retained unreadable objects during tier free-version recovery"
+        );
+    }
     Ok(page)
 }
 
@@ -823,6 +829,7 @@ mod tests {
             next_object_marker: None,
             scanned_entries: 1,
             buckets_scanned: 1,
+            unreadable_objects: 0,
             truncated: false,
         };
 
@@ -843,6 +850,7 @@ mod tests {
             next_object_marker: Some("object".to_string()),
             scanned_entries: 1,
             buckets_scanned: 1,
+            unreadable_objects: 0,
             truncated: false,
         };
 
@@ -863,6 +871,7 @@ mod tests {
             next_object_marker: Some("object-a".to_string()),
             scanned_entries: 1,
             buckets_scanned: 1,
+            unreadable_objects: 0,
             truncated: false,
         };
         let mut cursor = RetryCursor::new(stats.next_bucket_marker.clone(), stats.next_object_marker.clone());
@@ -973,6 +982,7 @@ mod tests {
             next_object_marker: None,
             scanned_entries: DEFAULT_FREE_VERSION_RECOVERY_SCAN_LIMIT,
             buckets_scanned: 1,
+            unreadable_objects: 0,
             truncated: false,
         };
 

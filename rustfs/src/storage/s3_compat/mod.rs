@@ -12,8 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Legacy request and configuration conversions used by the compatibility tests.
+//! Legacy request conversion used by the compatibility tests.
 
 mod envelope;
-pub(crate) mod lifecycle;
-pub(crate) mod replication;

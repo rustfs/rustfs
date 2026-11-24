@@ -15,18 +15,18 @@
 //! Store and callback observations through the legacy Put entrypoint and shared use case.
 
 use super::*;
-use crate::app::bucket_usecase::test_support::build_request_with_req_info;
+use crate::app::RequestHead;
 use crate::app::gating_test_env::{app_context_from_current_environment, run_large_stack_test, shared_gating_ambient};
 use crate::app::storage_api::bucket_usecase::access::ReqInfo;
 use crate::app::storage_api::bucket_usecase::helper::MutationCompletionProbe;
-use crate::app::storage_api::s3::dto::{
-    FilterRule, LambdaFunctionConfiguration, NotificationConfiguration, NotificationConfigurationFilter,
-    PutBucketNotificationConfigurationInput, QueueConfiguration, S3KeyFilter, TopicConfiguration,
-};
-use crate::app::storage_api::s3::{S3ErrorCode, S3Request};
 use crate::runtime_sources::{NotifyInterface, ServerContextSlot};
-use http::Method;
+use http::{Extensions, HeaderMap, Method};
+use rustfs_gateway_types::dto::{
+    Events, FilterRule, LambdaFunctionConfiguration, Name, NotificationConfiguration, NotificationConfigurationFilter,
+    QueueConfiguration, S3KeyFilter, TopicConfiguration,
+};
 use rustfs_notify::{EventArgs, NotificationError};
+use rustfs_s3_types::S3ErrorCode;
 use std::sync::Mutex;
 
 const EMPTY_XML: &[u8] = b"<NotificationConfiguration></NotificationConfiguration>";
@@ -50,22 +50,18 @@ enum Callback {
     Validate,
     ReloadStarted,
     ReloadCompleted,
-    Clear,
-    Add,
 }
 
 #[derive(Debug, PartialEq, Eq)]
 enum Observation {
     Rules(Callback, String, Vec<RuntimeRule>, Vec<u8>),
     Reload(Callback, &'static str, bool),
-    Clear(Vec<u8>),
 }
 
 struct RecordingNotify {
     bucket: String,
     fail_at: Option<Callback>,
     calls: Arc<Mutex<Vec<Observation>>>,
-    active_rules: Mutex<Vec<RuntimeRule>>,
 }
 
 async fn read_notification_xml(bucket: &str) -> Vec<u8> {
@@ -112,60 +108,41 @@ impl NotifyInterface for RecordingNotify {
         self.record_rules(Callback::Validate, bucket, region, rules).await;
         self.maybe_fail(Callback::Validate)
     }
-
-    async fn add_event_specific_rules(&self, bucket: &str, region: &str, rules: &[RuntimeRule]) -> Result<(), NotificationError> {
-        self.record_rules(Callback::Add, bucket, region, rules).await;
-        self.maybe_fail(Callback::Add)?;
-        *self.active_rules.lock().unwrap() = rules.to_vec();
-        Ok(())
-    }
-
-    async fn clear_bucket_notification_rules(&self, bucket: &str) -> Result<(), NotificationError> {
-        assert_eq!(bucket, self.bucket);
-        let xml = read_notification_xml(bucket).await;
-        self.calls.lock().unwrap().push(Observation::Clear(xml));
-        self.maybe_fail(Callback::Clear)?;
-        self.active_rules.lock().unwrap().clear();
-        Ok(())
-    }
 }
 
 fn configuration() -> NotificationConfiguration {
     NotificationConfiguration {
-        queue_configurations: Some(vec![QueueConfiguration {
+        queue_configurations: vec![QueueConfiguration {
             id: Some("queue".into()),
-            events: vec![
-                "s3:ObjectCreated:*".to_owned().into(),
-                "s3:Future:Unrecognized".to_owned().into(),
-            ],
+            events: vec![Events::custom("s3:ObjectCreated:*"), Events::custom("s3:Future:Unrecognized")],
             queue_arn: "arn:rustfs:sqs:us-east-1:1:webhook".into(),
             filter: Some(NotificationConfigurationFilter {
                 key: Some(S3KeyFilter {
-                    filter_rules: Some(vec![
+                    filter_rules: vec![
                         FilterRule {
-                            name: Some("Prefix".to_owned().into()),
+                            name: Some(Name::custom("Prefix")),
                             value: Some("logs/%2F".into()),
                         },
                         FilterRule {
-                            name: Some("Suffix".to_owned().into()),
+                            name: Some(Name::custom("Suffix")),
                             value: Some(".csv".into()),
                         },
-                    ]),
+                    ],
                 }),
             }),
-        }]),
-        topic_configurations: Some(vec![TopicConfiguration {
+        }],
+        topic_configurations: vec![TopicConfiguration {
             id: Some("topic".into()),
-            events: vec!["s3:ObjectRemoved:*".to_owned().into()],
+            events: vec![Events::custom("s3:ObjectRemoved:*")],
             topic_arn: "arn:rustfs:sqs:us-east-1:2:webhook".into(),
             filter: None,
-        }]),
-        lambda_function_configurations: Some(vec![LambdaFunctionConfiguration {
+        }],
+        lambda_function_configurations: vec![LambdaFunctionConfiguration {
             id: Some("lambda".into()),
-            events: vec!["s3:Future:Unrecognized".to_owned().into()],
+            events: vec![Events::custom("s3:Future:Unrecognized")],
             lambda_function_arn: "arn:rustfs:sqs:us-east-1:3:webhook".into(),
             filter: None,
-        }]),
+        }],
         ..Default::default()
     }
 }
@@ -190,70 +167,24 @@ fn expected_rules() -> Vec<RuntimeRule> {
     .into()
 }
 
-fn notification_request(
-    bucket: &str,
-    configuration: NotificationConfiguration,
-    slot: &Arc<ServerContextSlot>,
-) -> S3Request<PutBucketNotificationConfigurationInput> {
-    let input = PutBucketNotificationConfigurationInput::builder()
-        .bucket(bucket.to_owned())
-        .notification_configuration(configuration)
-        .build()
-        .unwrap();
-    let mut request = build_request_with_req_info(
-        input,
-        Method::PUT,
-        ReqInfo {
-            bucket: Some(bucket.to_owned()),
-            ..Default::default()
+fn notification_envelope(bucket: &str, slot: &Arc<ServerContextSlot>) -> RequestEnvelope {
+    let mut extensions = Extensions::new();
+    extensions.insert(ReqInfo {
+        bucket: Some(bucket.to_owned()),
+        ..Default::default()
+    });
+    extensions.insert(slot.clone());
+    RequestEnvelope::from_parts(
+        RequestHead {
+            method: Method::PUT,
+            uri: format!("/{bucket}?notification").parse().unwrap(),
+            headers: HeaderMap::new(),
+            credentials: None,
+            region: Some("eu-west-2".to_owned()),
+            service: None,
         },
-    );
-    request.extensions.insert(slot.clone());
-    request.uri = format!("/{bucket}?notification").parse().unwrap();
-    request.region = Some("eu-west-2".parse().unwrap());
-    request
-}
-
-fn notification_filters(filter: Option<NotificationConfigurationFilter>) -> Vec<(Option<String>, Option<String>)> {
-    filter
-        .and_then(|f| f.key)
-        .and_then(|k| k.filter_rules)
-        .unwrap_or_default()
-        .into_iter()
-        .map(|rule| (rule.name.map(|n| n.as_str().to_owned()), rule.value))
-        .collect()
-}
-
-fn notification_destinations(configuration: NotificationConfiguration) -> Vec<NotificationDestination> {
-    let mut destinations = Vec::new();
-    for cfg in configuration.queue_configurations.into_iter().flatten() {
-        destinations.push(NotificationDestination {
-            kind: "QueueConfiguration",
-            id: cfg.id,
-            events: cfg.events.into_iter().map(|event| event.as_ref().to_owned()).collect(),
-            target_arn: cfg.queue_arn,
-            filters: notification_filters(cfg.filter),
-        });
-    }
-    for cfg in configuration.topic_configurations.into_iter().flatten() {
-        destinations.push(NotificationDestination {
-            kind: "TopicConfiguration",
-            id: cfg.id,
-            events: cfg.events.into_iter().map(|event| event.as_ref().to_owned()).collect(),
-            target_arn: cfg.topic_arn,
-            filters: notification_filters(cfg.filter),
-        });
-    }
-    for cfg in configuration.lambda_function_configurations.into_iter().flatten() {
-        destinations.push(NotificationDestination {
-            kind: "LambdaFunctionConfiguration",
-            id: cfg.id,
-            events: cfg.events.into_iter().map(|event| event.as_ref().to_owned()).collect(),
-            target_arn: cfg.lambda_function_arn,
-            filters: notification_filters(cfg.filter),
-        });
-    }
-    destinations
+        extensions,
+    )
 }
 
 async fn authorize_notification_put(
@@ -273,14 +204,14 @@ async fn authorize_notification_put(
 
 async fn put_notification(
     slot: &Arc<ServerContextSlot>,
-    mut envelope: RequestEnvelope,
-    input: PutBucketNotificationConfigurationInput,
+    bucket: &str,
+    configuration: NotificationConfiguration,
 ) -> rustfs_s3_types::S3Result<gateway_dto::PutBucketNotificationConfigurationOutput> {
-    authorize_notification_put(slot, &mut envelope, &input.bucket).await?;
-    let prepared = crate::storage::persisted_from_s3s(&input.notification_configuration).map_err(rustfs_s3_types::S3Error::from);
-    let destinations = notification_destinations(input.notification_configuration);
+    let mut envelope = notification_envelope(bucket, slot);
+    authorize_notification_put(slot, &mut envelope, bucket).await?;
+    let (destinations, prepared) = crate::server::prepare_notification_configuration(configuration);
     DefaultBucketUsecase::with_context(slot.app_context())
-        .execute_put_bucket_notification_configuration(envelope, &input.bucket, destinations, prepared)
+        .execute_put_bucket_notification_configuration(envelope, bucket, destinations, prepared)
         .await
 }
 
@@ -288,7 +219,7 @@ fn check_notification_write_order() {
     run_large_stack_test("notification-write-order", || async {
         let ambient = shared_gating_ambient().await;
         let store = ambient.object_store();
-        for fail_at in [None, Some(Callback::Validate), Some(Callback::Clear), Some(Callback::Add)] {
+        for fail_at in [None, Some(Callback::Validate)] {
             let bucket = format!("notify-order-{}", uuid::Uuid::new_v4().simple());
             store.make_bucket(&bucket, &MakeBucketOptions::default()).await.unwrap();
             store
@@ -310,9 +241,8 @@ fn check_notification_write_order() {
                 bucket: bucket.clone(),
                 fail_at,
                 calls: calls.clone(),
-                active_rules: Mutex::new(expected_rules()),
             });
-            let context = Arc::new(app_context_from_current_environment(&ambient).with_test_notify_interface(recorder.clone()));
+            let context = Arc::new(app_context_from_current_environment(&ambient).with_test_notify_interface(recorder));
             let region = context
                 .region()
                 .get()
@@ -320,25 +250,19 @@ fn check_notification_write_order() {
             let slot = ServerContextSlot::new();
             assert!(slot.install(context.clone()));
             let audit = MutationCompletionProbe::install(&bucket);
-            let request = notification_request(&bucket, configuration(), &slot);
-            let envelope = RequestEnvelope::from_s3s(&request);
-            let result = observe_reload(&bucket, calls.clone(), put_notification(&slot, envelope, request.input)).await;
+            let result = observe_reload(&bucket, calls.clone(), put_notification(&slot, &bucket, configuration())).await;
             let expected = expected_rules();
             let mut timeline = vec![Observation::Rules(
                 Callback::Validate,
                 region.clone(),
-                expected.clone(),
+                expected,
                 OLD_XML.to_vec(),
             )];
             if fail_at != Some(Callback::Validate) {
                 timeline.extend([
                     Observation::Reload(Callback::ReloadStarted, "put bucket notification", false),
                     Observation::Reload(Callback::ReloadCompleted, "put bucket notification", false),
-                    Observation::Clear(NEW_XML.to_vec()),
                 ]);
-                if fail_at != Some(Callback::Clear) {
-                    timeline.push(Observation::Rules(Callback::Add, region.clone(), expected.clone(), NEW_XML.to_vec()));
-                }
             }
             assert_eq!(*calls.lock().unwrap(), timeline);
             let stored = if fail_at == Some(Callback::Validate) {
@@ -347,14 +271,10 @@ fn check_notification_write_order() {
                 NEW_XML
             };
             assert_eq!(read_notification_xml(&bucket).await, stored);
-            let error_message = match fail_at {
-                Some(Callback::Clear) => Some("Failed to clear rules: Rule configuration error: fixture failure"),
-                Some(_) => Some("Failed to add rules: Rule configuration error: fixture failure"),
-                None => None,
-            };
+            let error_message = fail_at.map(|_| "Failed to add rules: Rule configuration error: fixture failure");
             if let Some(message) = error_message {
                 let error = result.expect_err("injected callback failure");
-                assert_eq!(error.code().as_str(), S3ErrorCode::InternalError.as_str());
+                assert_eq!(error.code(), &S3ErrorCode::InternalError);
                 assert_eq!(error.message(), Some(message));
             } else {
                 result.expect("configuration written");
@@ -370,16 +290,13 @@ fn check_notification_write_order() {
             assert!(audit.events.lock().unwrap().is_empty());
 
             if fail_at.is_none() {
-                assert_eq!(*recorder.active_rules.lock().unwrap(), expected);
                 let mut invalid = configuration();
-                invalid.lambda_function_configurations.as_mut().unwrap()[0].lambda_function_arn = "invalid-arn".into();
-                let invalid = notification_request(&bucket, invalid, &slot);
-                let invalid_env = RequestEnvelope::from_s3s(&invalid);
+                invalid.lambda_function_configurations[0].lambda_function_arn = "invalid-arn".into();
                 calls.lock().unwrap().clear();
-                let err = observe_reload(&bucket, calls.clone(), put_notification(&slot, invalid_env, invalid.input))
+                let err = observe_reload(&bucket, calls.clone(), put_notification(&slot, &bucket, invalid))
                     .await
                     .expect_err("the last destination has an invalid ARN");
-                assert_eq!(err.code().as_str(), S3ErrorCode::InvalidArgument.as_str());
+                assert_eq!(err.code(), &S3ErrorCode::InvalidArgument);
                 assert!(
                     err.message()
                         .unwrap()
@@ -401,23 +318,22 @@ fn check_notification_write_order() {
                 assert_eq!(output.queue_configurations[0].events[1].as_str(), "s3:Future:Unrecognized");
 
                 calls.lock().unwrap().clear();
-                let empty = notification_request(&bucket, NotificationConfiguration::default(), &slot);
-                let empty_env = RequestEnvelope::from_s3s(&empty);
-                observe_reload(&bucket, calls.clone(), put_notification(&slot, empty_env, empty.input))
-                    .await
-                    .unwrap();
+                observe_reload(
+                    &bucket,
+                    calls.clone(),
+                    put_notification(&slot, &bucket, NotificationConfiguration::default()),
+                )
+                .await
+                .unwrap();
                 assert_eq!(
                     *calls.lock().unwrap(),
                     [
                         Observation::Rules(Callback::Validate, region.clone(), Vec::new(), NEW_XML.to_vec()),
                         Observation::Reload(Callback::ReloadStarted, "put bucket notification", false),
                         Observation::Reload(Callback::ReloadCompleted, "put bucket notification", false),
-                        Observation::Clear(EMPTY_XML.to_vec()),
-                        Observation::Rules(Callback::Add, region, Vec::new(), EMPTY_XML.to_vec()),
                     ]
                 );
                 assert_eq!(read_notification_xml(&bucket).await, EMPTY_XML);
-                assert!(recorder.active_rules.lock().unwrap().is_empty());
             }
         }
     });
@@ -425,7 +341,7 @@ fn check_notification_write_order() {
 
 #[test]
 #[serial_test::serial]
-fn legacy_put_notification_keeps_callback_order_and_durable_bytes() {
+fn put_notification_keeps_callback_order_and_durable_bytes() {
     temp_env::with_var(rustfs_config::ENV_AUDIT_ENABLE, Some("true"), || {
         crate::server::refresh_audit_module_enabled();
         check_notification_write_order();
@@ -453,7 +369,7 @@ async fn observe_reload<T>(bucket: &str, calls: Arc<Mutex<Vec<Observation>>>, op
 }
 
 #[test]
-fn legacy_put_notification_does_not_write_after_the_bucket_is_recreated() {
+fn put_notification_does_not_write_after_the_bucket_is_recreated() {
     run_large_stack_test("notification-stale-incarnation", || async {
         let ambient = shared_gating_ambient().await;
         let store = ambient.object_store();
@@ -474,13 +390,11 @@ fn legacy_put_notification_does_not_write_after_the_bucket_is_recreated() {
             bucket: bucket.clone(),
             fail_at: None,
             calls: calls.clone(),
-            active_rules: Mutex::new(Vec::new()),
         });
         let context = Arc::new(app_context_from_current_environment(&ambient).with_test_notify_interface(recorder));
         let slot = ServerContextSlot::new();
         assert!(slot.install(context));
-        let request = notification_request(&bucket, configuration(), &slot);
-        let mut envelope = RequestEnvelope::from_s3s(&request);
+        let mut envelope = notification_envelope(&bucket, &slot);
         authorize_notification_put(&slot, &mut envelope, &bucket).await.unwrap();
         assert_eq!(bucket_config_mutation_incarnation(&envelope, &bucket).unwrap(), Some(first));
 
@@ -509,9 +423,7 @@ fn legacy_put_notification_does_not_write_after_the_bucket_is_recreated() {
             .await
             .unwrap();
 
-        let prepared =
-            crate::storage::persisted_from_s3s(&request.input.notification_configuration).map_err(rustfs_s3_types::S3Error::from);
-        let destinations = notification_destinations(request.input.notification_configuration);
+        let (destinations, prepared) = crate::server::prepare_notification_configuration(configuration());
         let result = observe_reload(
             &bucket,
             calls.clone(),
@@ -524,7 +436,7 @@ fn legacy_put_notification_does_not_write_after_the_bucket_is_recreated() {
         )
         .await;
         assert_eq!(read_notification_xml(&bucket).await, OLD_XML);
-        assert_eq!(result.unwrap_err().code().as_str(), S3ErrorCode::NoSuchBucket.as_str());
+        assert_eq!(result.unwrap_err().code(), &S3ErrorCode::NoSuchBucket);
         assert!(
             matches!(calls.lock().unwrap().as_slice(), [Observation::Rules(Callback::Validate, _, _, xml)] if xml == OLD_XML)
         );
@@ -651,7 +563,7 @@ fn notification_dispatch_follows_peer_reload_delete_and_recreation() {
                 .await
                 .into_iter()
                 .collect::<Vec<_>>(),
-            vec![inert_target]
+            vec![std::sync::Arc::new(inert_target)]
         );
         assert!(system.has_subscriber(&bucket, &EventName::ObjectRemovedDelete).await);
         assert!(!system.has_subscriber(&bucket, &EventName::ObjectCreatedPut).await);

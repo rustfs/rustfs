@@ -40,12 +40,13 @@ fn scan_options(scan_mode: HealScanMode) -> ScannerDiskScanOptions {
         scan_mode,
         prefix_scan_scope: None,
         checkpoint_tx: None,
+        local_stop: None,
     }
 }
 
 /// Real cache persistence codec and CAS calls, backed by two bounded local files.
 #[derive(Debug)]
-struct FixtureStore {
+pub(super) struct FixtureStore {
     root: std::path::PathBuf,
     _owned_root: Option<tempfile::TempDir>,
     reject_save: AtomicBool,
@@ -61,7 +62,7 @@ impl FixtureStore {
         })
     }
 
-    fn reopen(root: std::path::PathBuf) -> Arc<Self> {
+    pub(super) fn reopen(root: std::path::PathBuf) -> Arc<Self> {
         assert!(root.is_dir(), "reopen only an existing checkpoint fixture directory");
         Arc::new(Self {
             root,
@@ -71,6 +72,9 @@ impl FixtureStore {
     }
 
     fn path(&self, object: &str) -> std::path::PathBuf {
+        if object == rustfs_data_usage::bucket_scan_progress_path("bucket") {
+            return self.root.join("progress");
+        }
         assert!(object.ends_with(CACHE_NAME) || object.ends_with(&format!("{CACHE_NAME}.bkp")));
         self.root.join(if object.ends_with(".bkp") { "backup" } else { "main" })
     }
@@ -152,6 +156,9 @@ impl ObjectIO for FixtureStore {
 
 #[async_trait::async_trait]
 impl crate::ScannerConfigObjectDelete for FixtureStore {
+    async fn scanner_data_usage_movement_generation(&self) -> Option<u64> {
+        Some(0)
+    }
     async fn delete_config_object(
         &self,
         _bucket: &str,
@@ -290,6 +297,129 @@ fn bound_checkpoint() -> (DataUsageCache, crate::DataUsageScanIdentity) {
         .seal_scan_frontier(Some("bucket/static"))
         .expect("completed fixture prefix receipt");
     (cache, identity)
+}
+
+#[tokio::test]
+async fn display_progress_only_advances_after_a_durable_primary_commit() {
+    let directory = tempfile::tempdir().expect("owned checkpoint storage");
+    let writer = FixtureStore::reopen(directory.path().to_owned());
+    let (mut cache, _) = bound_checkpoint();
+    cache.info.last_update = Some(SystemTime::now());
+    cache.info.scan_directory_source = Some("fixture".into());
+    let revisions = DataUsageCache::default()
+        .load_with_revisions(writer.clone(), CACHE_NAME)
+        .await
+        .expect("missing primary revisions");
+    cache
+        .save_with_revisions_for_epoch(writer.clone(), CACHE_NAME, &revisions, 0, CancellationToken::new())
+        .await
+        .expect("commit primary and display sample");
+    let before = tokio::fs::read(directory.path().join("progress"))
+        .await
+        .expect("saved progress");
+    let revisions = DataUsageCache::default()
+        .load_with_revisions(writer.clone(), CACHE_NAME)
+        .await
+        .expect("committed revisions");
+    cache.info.leader_epoch += 1;
+    cache.info.last_update = Some(SystemTime::now());
+    writer.reject_save.store(true, Ordering::SeqCst);
+    assert!(
+        cache
+            .save_with_revisions_for_epoch(writer.clone(), CACHE_NAME, &revisions, 0, CancellationToken::new())
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        tokio::fs::read(directory.path().join("progress"))
+            .await
+            .expect("unchanged progress"),
+        before
+    );
+    drop(writer);
+    let cold_reader = FixtureStore::reopen(directory.path().to_owned());
+    let mut loaded = DataUsageCache::default();
+    loaded
+        .load(cold_reader.clone(), CACHE_NAME)
+        .await
+        .expect("cold primary reload");
+    let sample: rustfs_data_usage::BucketScanProgressSource = serde_json::from_slice(
+        &tokio::fs::read(cold_reader.root.join("progress"))
+            .await
+            .expect("cold display reload"),
+    )
+    .expect("valid cold display sample");
+    assert_eq!(loaded.display_scan_progress(0), Some(sample));
+}
+
+#[tokio::test]
+async fn display_progress_keeps_reference_during_executor_enumeration_then_replaces_it_on_completion() {
+    let directory = tempfile::tempdir().expect("owned checkpoint storage");
+    let writer = FixtureStore::reopen(directory.path().to_owned());
+    let (mut cache, _) = bound_checkpoint();
+    let original_time = SystemTime::UNIX_EPOCH + Duration::from_secs(10);
+    cache.info.last_update = Some(original_time);
+    cache.info.scan_coverage_measured_at = Some(10_000);
+    cache.info.scan_directory_source = Some("first-executor".into());
+    let mut revisions = DataUsageCache::default()
+        .load_with_revisions(writer.clone(), CACHE_NAME)
+        .await
+        .expect("initial revision");
+    cache
+        .save_with_revisions_for_epoch(writer.clone(), CACHE_NAME, &revisions, 0, CancellationToken::new())
+        .await
+        .expect("save accepted prefix");
+    revisions = DataUsageCache::read_revisions(writer.clone(), CACHE_NAME)
+        .await
+        .expect("accepted revision");
+    cache.cache.clear();
+    cache.replace("bucket", "", DataUsageEntry::default());
+    cache.info.scan_resume_after = None;
+    cache.info.scan_checkpoint = None;
+    cache.info.scan_coverage_receipt = None;
+    cache.info.scan_directory_source = Some("next-executor".into());
+    cache.info.leader_epoch += 1;
+    cache.info.last_update = Some(original_time + Duration::from_secs(10));
+    assert_eq!(cache.display_scan_progress(0).expect("enumeration sample").objects, None);
+    for _ in 0..2 {
+        cache
+            .save_with_revisions_for_epoch(writer.clone(), CACHE_NAME, &revisions, 0, CancellationToken::new())
+            .await
+            .expect("save reenumeration");
+        revisions = DataUsageCache::read_revisions(writer.clone(), CACHE_NAME)
+            .await
+            .expect("enumeration revision");
+        let bytes = tokio::fs::read(directory.path().join("progress"))
+            .await
+            .expect("shared reference sample");
+        let sample: rustfs_data_usage::BucketScanProgressSource = serde_json::from_slice(&bytes).expect("reference progress");
+        assert_eq!(sample.objects, Some(3));
+        assert_eq!(sample.updated_at, 10_000, "carrying an observation never refreshes its measurement time");
+    }
+    cache.info.snapshot_complete = true;
+    cache.replace(
+        "bucket",
+        "",
+        DataUsageEntry {
+            objects: 1,
+            size: 11,
+            ..Default::default()
+        },
+    );
+    cache
+        .save_with_revisions_for_epoch(writer, CACHE_NAME, &revisions, 0, CancellationToken::new())
+        .await
+        .expect("save completed smaller measurement");
+    let bytes = tokio::fs::read(directory.path().join("progress"))
+        .await
+        .expect("completed sample");
+    let sample: rustfs_data_usage::BucketScanProgressSource = serde_json::from_slice(&bytes).expect("completed progress");
+    assert_eq!(
+        (sample.objects, sample.size),
+        (Some(1), Some(11)),
+        "completion replaces old samples even after deletions"
+    );
+    assert_eq!(sample.stage, rustfs_data_usage::BucketScanStage::Completed);
 }
 
 #[test]
@@ -623,7 +753,7 @@ async fn checkpoint_fixture_existing_uncovered_cursor_cannot_skip_to_complete() 
             cache.info.scan_coverage_receipt.as_mut().expect("receipt").through = "bucket/z-stale".into();
         }
         cache
-            .save_with_revisions_for_epoch(store.clone(), CACHE_NAME, &revisions, 0)
+            .save_with_revisions_for_epoch(store.clone(), CACHE_NAME, &revisions, 0, CancellationToken::new())
             .await
             .expect("persist corrupted existing cursor");
         let mut loaded = store.strict_load().await;
@@ -663,7 +793,7 @@ async fn checkpoint_fixture_existing_uncovered_cursor_cannot_skip_to_complete() 
         assert_eq!(cache.checked_flatten("bucket/b-pending").expect("revisited prefix").size, 7);
         assert!(!cache.info.snapshot_complete);
         cache
-            .save_with_revisions_for_epoch(store.clone(), CACHE_NAME, &revisions, 0)
+            .save_with_revisions_for_epoch(store.clone(), CACHE_NAME, &revisions, 0, CancellationToken::new())
             .await
             .expect("persist verified partial");
         assert!(!store.strict_load().await.info.snapshot_complete);
@@ -827,7 +957,7 @@ async fn check_complete_sampling_resumption(resume_mode: HealScanMode) {
         .await
         .expect("fixture revision");
     cache
-        .save_with_revisions_for_epoch(store.clone(), CACHE_NAME, &revisions, 0)
+        .save_with_revisions_for_epoch(store.clone(), CACHE_NAME, &revisions, 0, CancellationToken::new())
         .await
         .expect("persist sampling partial");
     if resume_mode == HealScanMode::Deep {
@@ -876,7 +1006,7 @@ async fn check_complete_sampling_resumption(resume_mode: HealScanMode) {
             assert_eq!(cache.find("bucket/prefix/0000").expect("Deep revisits earlier prefix").size, 7);
         }
         cache
-            .save_with_revisions_for_epoch(store.clone(), CACHE_NAME, &revisions, 0)
+            .save_with_revisions_for_epoch(store.clone(), CACHE_NAME, &revisions, 0, CancellationToken::new())
             .await
             .expect("save bounded recovery");
         if complete {
@@ -964,6 +1094,7 @@ async fn run_hot_bucket_certification(advance_epoch: bool, logs: &CapturedLogs) 
                 tier_registry_generation: Some(identity.tier_registry_generation),
                 checkpoint_identity: Some(identity),
                 checkpoint_plan_digest: None,
+                completed_checkpoint_cycle_floor: None,
             },
         );
         cache.info.skip_healing = true;
@@ -995,7 +1126,7 @@ async fn run_hot_bucket_certification(advance_epoch: bool, logs: &CapturedLogs) 
         };
         assert_eq!(budget.budget_elapsed(), max_objects.is_some(), "round {round} budget");
         cache
-            .save_with_revisions_for_epoch(store.clone(), CACHE_NAME, &revisions, 0)
+            .save_with_revisions_for_epoch(store.clone(), CACHE_NAME, &revisions, 0, CancellationToken::new())
             .await
             .expect("save hot bucket sweep");
         let saved = store.strict_load().await;
@@ -1129,7 +1260,7 @@ async fn checkpoint_admission_log_capture_survives_another_future_dispatcher() {
     }
 }
 
-async fn write_checkpoint_object(root: &std::path::Path, object: &str, versions: &[(Option<Uuid>, i64)]) {
+pub(super) async fn write_checkpoint_object(root: &std::path::Path, object: &str, versions: &[(Option<Uuid>, i64)]) {
     let mut metadata = FileMeta::new();
     for (index, (version_id, size)) in versions.iter().enumerate() {
         let mut info = FileInfo::new(object, 4, 2);
@@ -1209,7 +1340,7 @@ pub(super) async fn scan_budgeted_metadata_repair_tail() -> DataUsageCache {
         assert!(!cache.info.skip_healing);
         assert!(!cache.info.snapshot_complete);
         cache
-            .save_with_revisions_for_epoch(store.clone(), CACHE_NAME, &revisions, 0)
+            .save_with_revisions_for_epoch(store.clone(), CACHE_NAME, &revisions, 0, CancellationToken::new())
             .await
             .expect("persist scanner repair obligation with CAS");
         let saved = store.strict_load().await;
@@ -1282,6 +1413,7 @@ where
                 tier_registry_generation: None,
                 checkpoint_identity: Some(identity),
                 checkpoint_plan_digest: None,
+                completed_checkpoint_cycle_floor: None,
             },
         );
         let prepared = retained(&cache);
@@ -1307,6 +1439,7 @@ where
                     scan_mode: HealScanMode::Normal,
                     prefix_scan_scope: None,
                     checkpoint_tx: None,
+                    local_stop: None,
                 },
             )
             .await
@@ -1318,7 +1451,7 @@ where
         assert_eq!(budget.reason(), Some(crate::scanner_budget::ScannerCycleBudgetReason::Objects));
         let scanned = retained(&cache);
         cache
-            .save_with_revisions_for_epoch(store.clone(), CACHE_NAME, &revisions, 0)
+            .save_with_revisions_for_epoch(store.clone(), CACHE_NAME, &revisions, 0, CancellationToken::new())
             .await
             .expect("persist partial checkpoint");
         let mut loaded = DataUsageCache::default();
@@ -1357,14 +1490,14 @@ where
         .await
         .expect("read durable checkpoint bytes");
     let epoch_error = loaded
-        .save_with_revisions_for_epoch(store.clone(), CACHE_NAME, &revisions, 1)
+        .save_with_revisions_for_epoch(store.clone(), CACHE_NAME, &revisions, 1, CancellationToken::new())
         .await
         .expect_err("stale publication epoch must reject persistence");
     assert!(epoch_error.to_string().contains(crate::SCANNER_PUBLICATION_EPOCH_CHANGED));
     store.reject_save.store(true, Ordering::SeqCst);
     loaded.info.next_cycle += 1;
     loaded
-        .save_with_revisions_for_epoch(store.clone(), CACHE_NAME, &revisions, 0)
+        .save_with_revisions_for_epoch(store.clone(), CACHE_NAME, &revisions, 0, CancellationToken::new())
         .await
         .expect_err("injected save failure must not report durable progress");
     assert_eq!(
@@ -1390,6 +1523,7 @@ where
                 scan_mode: HealScanMode::Normal,
                 prefix_scan_scope: None,
                 checkpoint_tx: None,
+                local_stop: None,
             },
         )
         .await;
@@ -1422,6 +1556,7 @@ where
                 tier_registry_generation: Some(identity.tier_registry_generation),
                 checkpoint_identity: Some(identity),
                 checkpoint_plan_digest: None,
+                completed_checkpoint_cycle_floor: None,
             },
         );
         cache.info.skip_healing = true;
@@ -1452,7 +1587,7 @@ where
             ScannerDiskScanOutcome::NamespaceNotFound(_) => panic!("fixture namespace exists"),
         };
         cache
-            .save_with_revisions_for_epoch(store.clone(), CACHE_NAME, &revisions, 0)
+            .save_with_revisions_for_epoch(store.clone(), CACHE_NAME, &revisions, 0, CancellationToken::new())
             .await
             .expect("save each bounded sweep");
         let saved = store.strict_load().await;

@@ -15,7 +15,6 @@
 //! Request fixtures shared by the bucket use-case tests.
 
 use super::*;
-use crate::app::storage_api::s3::S3Request;
 use http::{Extensions, HeaderMap, Method, Uri};
 
 pub(super) fn s3_op_total(op: S3Operation) -> u64 {
@@ -26,20 +25,6 @@ pub(super) fn s3_op_total(op: S3Operation) -> u64 {
         .unwrap_or_default()
 }
 
-pub(super) fn build_request<T>(input: T, method: Method) -> S3Request<T> {
-    S3Request {
-        input,
-        method,
-        uri: Uri::from_static("/"),
-        headers: HeaderMap::new(),
-        extensions: Extensions::new(),
-        credentials: None,
-        region: None,
-        service: None,
-        trailing_headers: None,
-    }
-}
-
 /// A bucket name for an owned use-case input.
 pub(super) fn gateway_bucket(name: &str) -> rustfs_gateway_types::BucketName {
     rustfs_gateway_types::BucketName::new(name).expect("valid bucket name")
@@ -47,11 +32,15 @@ pub(super) fn gateway_bucket(name: &str) -> rustfs_gateway_types::BucketName {
 
 /// The envelope of a request that carries nothing but `method`.
 pub(super) fn owned_envelope(method: Method) -> RequestEnvelope {
-    RequestEnvelope::from_s3s(&build_request((), method))
-}
-
-pub(super) fn build_request_with_req_info<T>(input: T, method: Method, req_info: ReqInfo) -> S3Request<T> {
-    let mut req = build_request(input, method);
-    req.extensions.insert(req_info);
-    req
+    RequestEnvelope::from_parts(
+        crate::app::RequestHead {
+            method,
+            uri: Uri::from_static("/"),
+            headers: HeaderMap::new(),
+            credentials: None,
+            region: None,
+            service: None,
+        },
+        Extensions::new(),
+    )
 }

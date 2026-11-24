@@ -55,32 +55,41 @@ mod tests {
     use http::{HeaderMap, HeaderValue, StatusCode};
     use rustfs_config::MI_B;
     use rustfs_gateway_types::persistence::{
-        PersistedFilterRule, PersistedLambdaFunctionConfiguration, PersistedNotificationConfigurationFilter,
+        PersistedDefaultRetention, PersistedFilterRule, PersistedLambdaFunctionConfiguration,
+        PersistedNotificationConfigurationFilter, PersistedObjectLockConfiguration, PersistedObjectLockRule,
         PersistedQueueConfiguration, PersistedS3KeyFilter, PersistedTopicConfiguration,
     };
-    use rustfs_s3_types::{S3ErrorCode, S3Result};
+    use rustfs_s3_types::{S3Error, S3ErrorCode, S3Result, s3_error};
     use rustfs_utils::http::{
         AMZ_OBJECT_LOCK_LEGAL_HOLD_LOWER, AMZ_OBJECT_LOCK_MODE_LOWER, AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE_LOWER,
         MINIO_INTERNAL_PREFIX, RUSTFS_INTERNAL_PREFIX, SUFFIX_OBJECTLOCK_LEGALHOLD_TIMESTAMP,
         SUFFIX_OBJECTLOCK_RETENTION_TIMESTAMP, contains_key_str, get_str, insert_str,
     };
     use rustfs_zip::CompressionFormat;
-    use s3s::dto::{
-        DefaultRetention, ObjectLockConfiguration, ObjectLockEnabled, ObjectLockLegalHold, ObjectLockLegalHoldStatus,
-        ObjectLockRetention, ObjectLockRetentionMode, ObjectLockRule,
-    };
     use std::collections::HashMap;
     use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 
-    fn parse_object_lock_retention(retention: Option<ObjectLockRetention>) -> S3Result<HashMap<String, String>> {
-        parse_object_lock_retention_native(retention.map(|r| RequestedObjectLockRetention {
-            mode: r.mode.map(|m| m.as_str().to_owned()),
-            retain_until: r.retain_until_date.map(OffsetDateTime::from),
-        }))
+    fn parse_object_lock_retention(retention: Option<RequestedObjectLockRetention>) -> S3Result<HashMap<String, String>> {
+        parse_object_lock_retention_native(retention)
     }
 
-    fn parse_object_lock_legal_hold(legal_hold: Option<ObjectLockLegalHold>) -> S3Result<HashMap<String, String>> {
-        parse_object_lock_legal_hold_native(legal_hold.map(|h| RequestedObjectLegalHold(h.status.map(|s| s.as_str().to_owned()))))
+    fn parse_object_lock_legal_hold(legal_hold: Option<RequestedObjectLegalHold>) -> S3Result<HashMap<String, String>> {
+        parse_object_lock_legal_hold_native(legal_hold)
+    }
+
+    /// Bucket default retention already stored, the shape `apply_default_lock_retention_metadata` reads.
+    /// `Enabled` / `COMPLIANCE` / `GOVERNANCE` are the spellings s3s 5761ddfe wrote for these fixtures.
+    fn enabled_lock(retention: Option<(&str, i32)>) -> PersistedObjectLockConfiguration {
+        PersistedObjectLockConfiguration {
+            object_lock_enabled: Some("Enabled".to_owned()),
+            rule: retention.map(|(mode, days)| PersistedObjectLockRule {
+                default_retention: Some(PersistedDefaultRetention {
+                    mode: Some(mode.to_owned()),
+                    days: Some(days),
+                    years: None,
+                }),
+            }),
+        }
     }
 
     #[test]
@@ -155,8 +164,6 @@ mod tests {
 
     #[test]
     fn test_s3_error_scenarios() {
-        use s3s::{S3Error, S3ErrorCode, s3_error};
-
         // Test that we can create expected S3 errors for common validation cases
 
         // Test incomplete body error
@@ -185,27 +192,12 @@ mod tests {
         assert_eq!(gz_format.extension(), "gz");
     }
 
-    /// The bucket default retention path reads the persisted shape; the request
-    /// literals in these tests stay on the wire DTO and convert once here.
-    fn persisted_lock(cfg: &ObjectLockConfiguration) -> rustfs_gateway_types::persistence::PersistedObjectLockConfiguration {
-        crate::storage::persisted_from_s3s(cfg).expect("the test configuration converts")
-    }
-
     #[test]
     fn test_apply_default_lock_retention_metadata_applies_bucket_default() {
-        let cfg = ObjectLockConfiguration {
-            object_lock_enabled: Some(ObjectLockEnabled::from_static(ObjectLockEnabled::ENABLED)),
-            rule: Some(ObjectLockRule {
-                default_retention: Some(DefaultRetention {
-                    mode: Some(ObjectLockRetentionMode::from_static(ObjectLockRetentionMode::COMPLIANCE)),
-                    days: Some(1),
-                    years: None,
-                }),
-            }),
-        };
+        let cfg = enabled_lock(Some(("COMPLIANCE", 1)));
         let mut metadata = std::collections::HashMap::new();
 
-        assert!(apply_default_lock_retention_metadata(Some(&persisted_lock(&cfg)), &mut metadata));
+        assert!(apply_default_lock_retention_metadata(Some(&cfg), &mut metadata));
         assert_eq!(metadata.get(AMZ_OBJECT_LOCK_MODE_LOWER), Some(&"COMPLIANCE".to_string()));
         let retain_until = metadata
             .get(AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE_LOWER)
@@ -224,22 +216,13 @@ mod tests {
     fn test_apply_default_lock_retention_metadata_preserves_explicit_retention() {
         use std::collections::HashMap;
 
-        let cfg = ObjectLockConfiguration {
-            object_lock_enabled: Some(ObjectLockEnabled::from_static(ObjectLockEnabled::ENABLED)),
-            rule: Some(ObjectLockRule {
-                default_retention: Some(DefaultRetention {
-                    mode: Some(ObjectLockRetentionMode::from_static(ObjectLockRetentionMode::COMPLIANCE)),
-                    days: Some(1),
-                    years: None,
-                }),
-            }),
-        };
+        let cfg = enabled_lock(Some(("COMPLIANCE", 1)));
         let mut metadata = HashMap::from([
             (AMZ_OBJECT_LOCK_MODE_LOWER.to_string(), "GOVERNANCE".to_string()),
             (AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE_LOWER.to_string(), "2030-01-01T00:00:00Z".to_string()),
         ]);
 
-        assert!(!apply_default_lock_retention_metadata(Some(&persisted_lock(&cfg)), &mut metadata));
+        assert!(!apply_default_lock_retention_metadata(Some(&cfg), &mut metadata));
         assert_eq!(metadata.get(AMZ_OBJECT_LOCK_MODE_LOWER), Some(&"GOVERNANCE".to_string()));
         assert_eq!(
             metadata.get(AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE_LOWER),
@@ -249,30 +232,17 @@ mod tests {
 
     #[test]
     fn test_apply_default_lock_retention_metadata_ignores_bucket_without_default() {
-        let cfg = ObjectLockConfiguration {
-            object_lock_enabled: Some(ObjectLockEnabled::from_static(ObjectLockEnabled::ENABLED)),
-            rule: None,
-        };
+        let cfg = enabled_lock(None);
         let mut metadata = std::collections::HashMap::new();
 
-        assert!(!apply_default_lock_retention_metadata(Some(&persisted_lock(&cfg)), &mut metadata));
+        assert!(!apply_default_lock_retention_metadata(Some(&cfg), &mut metadata));
         assert!(metadata.is_empty());
     }
 
     #[test]
     fn test_apply_bucket_default_lock_retention_applies_authoritative_default() {
-        let config = ObjectLockConfiguration {
-            object_lock_enabled: Some(ObjectLockEnabled::from_static(ObjectLockEnabled::ENABLED)),
-            rule: Some(ObjectLockRule {
-                default_retention: Some(DefaultRetention {
-                    mode: Some(ObjectLockRetentionMode::from_static(ObjectLockRetentionMode::GOVERNANCE)),
-                    days: Some(1),
-                    years: None,
-                }),
-            }),
-        };
         let state = ObjectLockConfigState::Configured {
-            config: persisted_lock(&config),
+            config: enabled_lock(Some(("GOVERNANCE", 1))),
             updated_at: OffsetDateTime::now_utc(),
         };
         let mut metadata = std::collections::HashMap::new();
@@ -286,19 +256,10 @@ mod tests {
 
     #[test]
     fn empty_retention_metadata_does_not_suppress_bucket_default() {
-        let config = ObjectLockConfiguration {
-            object_lock_enabled: Some(ObjectLockEnabled::from_static(ObjectLockEnabled::ENABLED)),
-            rule: Some(ObjectLockRule {
-                default_retention: Some(DefaultRetention {
-                    mode: Some(ObjectLockRetentionMode::from_static(ObjectLockRetentionMode::GOVERNANCE)),
-                    days: Some(1),
-                    years: None,
-                }),
-            }),
-        };
+        let config = enabled_lock(Some(("GOVERNANCE", 1)));
         for name in [AMZ_OBJECT_LOCK_MODE_LOWER, AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE_LOWER] {
             let mut metadata = HashMap::from([(name.to_string(), String::new())]);
-            assert!(apply_default_lock_retention_metadata(Some(&persisted_lock(&config)), &mut metadata));
+            assert!(apply_default_lock_retention_metadata(Some(&config), &mut metadata));
             assert_eq!(metadata.get(AMZ_OBJECT_LOCK_MODE_LOWER).map(String::as_str), Some("GOVERNANCE"));
             assert!(!metadata[AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE_LOWER].is_empty());
         }
@@ -306,18 +267,8 @@ mod tests {
 
     #[test]
     fn test_apply_bucket_default_lock_retention_preserves_explicit_retention_path() {
-        let config = ObjectLockConfiguration {
-            object_lock_enabled: Some(ObjectLockEnabled::from_static(ObjectLockEnabled::ENABLED)),
-            rule: Some(ObjectLockRule {
-                default_retention: Some(DefaultRetention {
-                    mode: Some(ObjectLockRetentionMode::from_static(ObjectLockRetentionMode::COMPLIANCE)),
-                    days: Some(1),
-                    years: None,
-                }),
-            }),
-        };
         let state = ObjectLockConfigState::Configured {
-            config: persisted_lock(&config),
+            config: enabled_lock(Some(("COMPLIANCE", 1))),
             updated_at: OffsetDateTime::now_utc(),
         };
         let mut metadata = HashMap::new();
@@ -655,15 +606,15 @@ mod tests {
         // [1] Normal case: No retention specified (empty metadata)
         assert!(parse_object_lock_retention(None).is_ok());
         assert!(parse_object_lock_retention(None).unwrap().is_empty());
-        let cleared = parse_object_lock_retention(Some(ObjectLockRetention::default())).unwrap();
+        let cleared = parse_object_lock_retention(Some(RequestedObjectLockRetention::default())).unwrap();
         assert_eq!(cleared.get(AMZ_OBJECT_LOCK_MODE_LOWER).map(String::as_str), Some(""));
         assert_eq!(cleared.get(AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE_LOWER).map(String::as_str), Some(""));
         assert!(contains_key_str(&cleared, SUFFIX_OBJECTLOCK_RETENTION_TIMESTAMP));
 
         // [2] Normal case: Retention with valid COMPLIANCE mode (future date)
-        let valid_compliance_retention = ObjectLockRetention {
-            mode: Some(ObjectLockRetentionMode::from_static(ObjectLockRetentionMode::COMPLIANCE)),
-            retain_until_date: Some(datetime!(2030-01-01 00:00:00 UTC).into()),
+        let valid_compliance_retention = RequestedObjectLockRetention {
+            mode: Some("COMPLIANCE".to_owned()),
+            retain_until: Some(datetime!(2030-01-01 00:00:00 UTC)),
         };
         let compliance_metadata = parse_object_lock_retention(Some(valid_compliance_retention)).unwrap();
         assert_eq!(compliance_metadata.get(AMZ_OBJECT_LOCK_MODE_LOWER).unwrap(), "COMPLIANCE");
@@ -678,26 +629,26 @@ mod tests {
         assert!(retention_timestamp <= OffsetDateTime::now_utc());
 
         // [3] Normal case: Retention with valid GOVERNANCE mode (future date)
-        let valid_governance_retention = ObjectLockRetention {
-            mode: Some(ObjectLockRetentionMode::from_static(ObjectLockRetentionMode::GOVERNANCE)),
-            retain_until_date: Some(datetime!(2030-01-01 00:00:00 UTC).into()),
+        let valid_governance_retention = RequestedObjectLockRetention {
+            mode: Some("GOVERNANCE".to_owned()),
+            retain_until: Some(datetime!(2030-01-01 00:00:00 UTC)),
         };
         let governance_metadata = parse_object_lock_retention(Some(valid_governance_retention)).unwrap();
         assert_eq!(governance_metadata.get(AMZ_OBJECT_LOCK_MODE_LOWER).unwrap(), "GOVERNANCE");
 
         // A retention update is either empty or has both fields.
-        let none_mode_retention = ObjectLockRetention {
+        let none_mode_retention = RequestedObjectLockRetention {
             mode: None,
-            retain_until_date: Some(datetime!(2030-01-01 00:00:00 UTC).into()),
+            retain_until: Some(datetime!(2030-01-01 00:00:00 UTC)),
         };
         assert_eq!(
             parse_object_lock_retention(Some(none_mode_retention)).unwrap_err().code(),
             &S3ErrorCode::MalformedXML
         );
 
-        let none_date_retention = ObjectLockRetention {
-            mode: Some(ObjectLockRetentionMode::from_static(ObjectLockRetentionMode::COMPLIANCE)),
-            retain_until_date: None,
+        let none_date_retention = RequestedObjectLockRetention {
+            mode: Some("COMPLIANCE".to_owned()),
+            retain_until: None,
         };
         assert_eq!(
             parse_object_lock_retention(Some(none_date_retention)).unwrap_err().code(),
@@ -705,9 +656,9 @@ mod tests {
         );
 
         // [6] Error case: Retention with invalid mode (non COMPLIANCE/GOVERNANCE)
-        let invalid_mode_retention = ObjectLockRetention {
-            mode: Some(ObjectLockRetentionMode::from_static("INVALID_MODE")),
-            retain_until_date: Some(datetime!(2030-01-01 00:00:00 UTC).into()),
+        let invalid_mode_retention = RequestedObjectLockRetention {
+            mode: Some("INVALID_MODE".to_owned()),
+            retain_until: Some(datetime!(2030-01-01 00:00:00 UTC)),
         };
         let err = parse_object_lock_retention(Some(invalid_mode_retention)).unwrap_err();
         assert_eq!(err.code().as_str(), S3ErrorCode::MalformedXML.as_str());
@@ -717,9 +668,9 @@ mod tests {
         );
 
         // [7] Error case: Retention with past date should fail
-        let past_date_retention = ObjectLockRetention {
-            mode: Some(ObjectLockRetentionMode::from_static(ObjectLockRetentionMode::COMPLIANCE)),
-            retain_until_date: Some(datetime!(2020-01-01 00:00:00 UTC).into()),
+        let past_date_retention = RequestedObjectLockRetention {
+            mode: Some("COMPLIANCE".to_owned()),
+            retain_until: Some(datetime!(2020-01-01 00:00:00 UTC)),
         };
         let err = parse_object_lock_retention(Some(past_date_retention)).unwrap_err();
         assert_eq!(err.code().as_str(), S3ErrorCode::InvalidArgument.as_str());
@@ -730,9 +681,9 @@ mod tests {
             .to_offset(UtcOffset::from_hms(5, 30, 45).expect("offset with seconds should be constructible"));
         assert!(unsupported_rfc3339_date > OffsetDateTime::now_utc());
 
-        let unsupported_date_retention = ObjectLockRetention {
-            mode: Some(ObjectLockRetentionMode::from_static(ObjectLockRetentionMode::COMPLIANCE)),
-            retain_until_date: Some(unsupported_rfc3339_date.into()),
+        let unsupported_date_retention = RequestedObjectLockRetention {
+            mode: Some("COMPLIANCE".to_owned()),
+            retain_until: Some(unsupported_rfc3339_date),
         };
         let err = parse_object_lock_retention(Some(unsupported_date_retention)).unwrap_err();
         assert_eq!(err.code().as_str(), S3ErrorCode::InvalidArgument.as_str());
@@ -746,9 +697,7 @@ mod tests {
         assert!(parse_object_lock_legal_hold(None).unwrap().is_empty());
 
         // [2] Normal case: Legal hold with valid ON status
-        let valid_on_legal_hold = ObjectLockLegalHold {
-            status: Some(ObjectLockLegalHoldStatus::from_static(ObjectLockLegalHoldStatus::ON)),
-        };
+        let valid_on_legal_hold = RequestedObjectLegalHold(Some("ON".to_owned()));
         let on_metadata = parse_object_lock_legal_hold(Some(valid_on_legal_hold)).unwrap();
         assert_eq!(on_metadata.get(AMZ_OBJECT_LOCK_LEGAL_HOLD_LOWER).unwrap(), "ON");
         let legal_hold_timestamp = get_str(&on_metadata, SUFFIX_OBJECTLOCK_LEGALHOLD_TIMESTAMP)
@@ -757,20 +706,16 @@ mod tests {
         assert!(legal_hold_timestamp <= OffsetDateTime::now_utc());
 
         // [3] Normal case: Legal hold with valid OFF status
-        let valid_off_legal_hold = ObjectLockLegalHold {
-            status: Some(ObjectLockLegalHoldStatus::from_static(ObjectLockLegalHoldStatus::OFF)),
-        };
+        let valid_off_legal_hold = RequestedObjectLegalHold(Some("OFF".to_owned()));
         let off_metadata = parse_object_lock_legal_hold(Some(valid_off_legal_hold)).unwrap();
         assert_eq!(off_metadata.get(AMZ_OBJECT_LOCK_LEGAL_HOLD_LOWER).unwrap(), "OFF");
 
-        let none_status_legal_hold = ObjectLockLegalHold { status: None };
+        let none_status_legal_hold = RequestedObjectLegalHold(None);
         let err = parse_object_lock_legal_hold(Some(none_status_legal_hold)).expect_err("Status is required");
         assert_eq!(err.code().as_str(), S3ErrorCode::MalformedXML.as_str());
 
         // [5] Error case: Legal hold with invalid status (non ON/OFF)
-        let invalid_status_legal_hold = ObjectLockLegalHold {
-            status: Some(ObjectLockLegalHoldStatus::from_static("INVALID_STATUS")),
-        };
+        let invalid_status_legal_hold = RequestedObjectLegalHold(Some("INVALID_STATUS".to_owned()));
         let err = parse_object_lock_legal_hold(Some(invalid_status_legal_hold)).unwrap_err();
         assert_eq!(err.code().as_str(), S3ErrorCode::MalformedXML.as_str());
         assert_eq!(
@@ -1094,7 +1039,7 @@ mod tests {
                 .source()
                 .is_some_and(|cause| cause.is::<http::header::InvalidHeaderValue>())
         );
-        let wire = s3s::S3Error::from(error);
+        let wire = crate::error::legacy_error_for_test(error);
         assert_eq!(wire.status_code(), Some(StatusCode::INTERNAL_SERVER_ERROR));
         assert!(
             wire.source()

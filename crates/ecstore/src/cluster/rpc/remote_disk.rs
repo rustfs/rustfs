@@ -1102,6 +1102,22 @@ struct RenameAdmissionGrant {
     batch: bool,
 }
 
+struct QuarantinedRenamePermit {
+    permit: Option<OwnedSemaphorePermit>,
+    batch: bool,
+    items: usize,
+}
+
+impl Drop for QuarantinedRenamePermit {
+    fn drop(&mut self) {
+        let Some(permit) = self.permit.take() else {
+            return;
+        };
+        drop(permit);
+        rustfs_io_metrics::record_ecstore_rename_quarantine_released(self.batch, self.items);
+    }
+}
+
 impl RenameAdmissionGrant {
     fn release_one(&mut self) -> bool {
         self.permit.as_mut().is_some_and(|permit| permit.split(1).is_some())
@@ -1111,7 +1127,7 @@ impl RenameAdmissionGrant {
         drop(self.permit.take());
     }
 
-    fn quarantine_until(mut self, deadline: tokio::time::Instant) {
+    fn quarantine_after_ambiguity(mut self) {
         let Some(permit) = self.permit.take() else {
             return;
         };
@@ -1119,19 +1135,26 @@ impl RenameAdmissionGrant {
         if items == 0 {
             return;
         }
-        let hold = deadline.saturating_duration_since(tokio::time::Instant::now());
+        // The RPC deadline has already expired when timeout ambiguity is
+        // detected. Hold admission for another operation timeout so detached
+        // server-side disk work cannot immediately be replaced by new work.
+        let hold = get_max_timeout_duration();
+        let release_at = tokio::time::Instant::now() + hold;
         rustfs_io_metrics::record_ecstore_rename_quarantine(self.batch, items, hold);
-        let batch = self.batch;
+        let permit = QuarantinedRenamePermit {
+            permit: Some(permit),
+            batch: self.batch,
+            items,
+        };
         if let Ok(handle) = tokio::runtime::Handle::try_current() {
             handle.spawn(async move {
-                tokio::time::sleep_until(deadline).await;
+                tokio::time::sleep_until(release_at).await;
                 drop(permit);
-                rustfs_io_metrics::record_ecstore_rename_quarantine_released(batch, items);
             });
         } else {
             // Without a runtime there is no safe deadline task. Leaking until
             // process exit is safer than admitting work over a still-running mutation.
-            rustfs_io_metrics::record_ecstore_rename_quarantine_no_runtime(batch, items);
+            rustfs_io_metrics::record_ecstore_rename_quarantine_no_runtime(self.batch, items);
             std::mem::forget(permit);
         }
     }
@@ -1187,7 +1210,7 @@ impl Drop for RenameBatchCallGuard {
         if self.dispatch_state == RenameAdmissionDispatchState::MayHavePublished
             && let Some(admission) = self.admission.take()
         {
-            admission.quarantine_until(self.deadline);
+            admission.quarantine_after_ambiguity();
         }
     }
 }
@@ -1228,7 +1251,7 @@ impl RemoteRenameBatchStream {
         }
         self.terminal = true;
         if let Some(admission) = self.admission.take() {
-            admission.quarantine_until(self.deadline);
+            admission.quarantine_after_ambiguity();
         }
         error
     }
@@ -1302,7 +1325,7 @@ impl Drop for RemoteRenameBatchStream {
             rustfs_io_metrics::record_ecstore_rename_batch_terminal_missing(missing);
         }
         if let Some(admission) = self.admission.take() {
-            admission.quarantine_until(self.deadline);
+            admission.quarantine_after_ambiguity();
         }
     }
 }
@@ -1909,6 +1932,50 @@ impl RemoteDisk {
         }
     }
 
+    pub(crate) async fn read_format_control(&self, volume: &str, path: &str) -> Result<FileReader> {
+        if self.data_transport.requires_bounded_reads() {
+            let control = Arc::new(super::internode_data_transport::TcpHttpInternodeDataTransport);
+            return self.open_file_range(control, volume, path, 0, 0).await;
+        }
+        self.read_file(volume, path).await
+    }
+
+    async fn open_file_range(
+        &self,
+        transport: Arc<dyn InternodeDataTransport>,
+        volume: &str,
+        path: &str,
+        offset: usize,
+        length: usize,
+    ) -> Result<FileReader> {
+        if self.health.is_faulty() {
+            return Err(DiskError::FaultyDisk);
+        }
+        let disk = self.disk_ref().await;
+        let timeouts = remote_read_timeouts(get_object_disk_read_timeout());
+        let request = ReadStreamRequest {
+            endpoint: self.endpoint.grid_host(),
+            disk,
+            volume: volume.to_string(),
+            path: path.to_string(),
+            offset,
+            length,
+            stall_timeout: timeouts.body_stall,
+        };
+        #[cfg(feature = "internode-transport")]
+        if self.external_streams {
+            return transport.open_read(request).await;
+        }
+        let reader = Self::open_read_with_retry(transport.as_ref(), request.clone()).await?;
+        Ok(Box::new(RetryingRemoteReader::new_with_timeouts(
+            reader,
+            transport,
+            request,
+            timeouts.initial_read,
+            timeouts.recovery,
+        )))
+    }
+
     /// Open a remote read stream with a bounded retry on transient transport failures, mirroring
     /// [`Self::open_write_with_retry`]. A freshly-committed object exists on only `write_quorum`
     /// disks until background heal reconstructs the rest, so a single transient network error
@@ -1916,16 +1983,16 @@ impl RemoteDisk {
     /// window can drop the readable-shard count below `data_shards` and surface as a spurious
     /// `InsufficientReadQuorum`. Opening the stream is idempotent, so re-dialing once absorbs the
     /// transient failure instead of eroding quorum. See issue #2761.
-    async fn open_read_with_retry(&self, request: ReadStreamRequest) -> Result<FileReader> {
+    async fn open_read_with_retry(transport: &dyn InternodeDataTransport, request: ReadStreamRequest) -> Result<FileReader> {
         let mut attempt = 1;
         let mut last_retry_classification = None;
         loop {
             // The second attempt bypasses the pool. The first failure is often a
             // stale kept-alive connection to a peer that just restarted.
             let opened = if attempt == 1 {
-                self.data_transport.open_read(request.clone()).await
+                transport.open_read(request.clone()).await
             } else {
-                self.data_transport.open_read_fresh(request.clone()).await
+                transport.open_read_fresh(request.clone()).await
             };
             match opened {
                 Ok(reader) => {
@@ -2756,6 +2823,75 @@ impl RemoteDisk {
             .map_err(|err| Error::RemoteClientUnavailable(err.to_string()))
     }
 
+    pub(crate) async fn verify_staged_part(&self, directory: &str, fi: &FileInfo, encoded_size: usize) -> Result<CheckPartsResp> {
+        // The reply arrives after the complete disk scan. A fixed control-RPC
+        // deadline would reject healthy large shards even while reads progress.
+        let scan_seconds = u64::try_from(encoded_size)
+            .map_err(Error::other)?
+            .div_ceil(rustfs_config::DEFAULT_OBJECT_BYTES_PER_SECOND);
+        let base = get_max_timeout_duration();
+        // gRPC encodes deadlines with at most eight digits and hours as its largest unit.
+        let timeout = if base.is_zero() {
+            Duration::ZERO
+        } else {
+            base.saturating_add(Duration::from_secs(scan_seconds))
+                .min(Duration::from_secs(99_999_999 * 3600))
+        };
+        self.verify_file_rpc(crate::disk::RUSTFS_META_TMP_BUCKET, directory, fi, Some(timeout))
+            .await
+    }
+
+    async fn verify_file_rpc(
+        &self,
+        volume: &str,
+        path: &str,
+        fi: &FileInfo,
+        scan_timeout: Option<Duration>,
+    ) -> Result<CheckPartsResp> {
+        self.execute_with_timeout_for_op(
+            "verify_file",
+            || async {
+                let file_info = serde_json::to_string(fi)?;
+                let mut client = if scan_timeout.is_some() {
+                    if let Some(err) = self.offline_bypass_error() {
+                        return Err(err);
+                    }
+                    super::client::staged_shard_verification_client(
+                        &self.addr,
+                        TonicInterceptor::Signature(gen_tonic_signature_interceptor()),
+                    )
+                    .await
+                    .map_err(|err| Error::RemoteClientUnavailable(err.to_string()))?
+                } else {
+                    self.get_client().await?
+                };
+                let mut request = Request::new(VerifyFileRequest {
+                    disk: self.endpoint.to_string(),
+                    volume: volume.to_string(),
+                    path: path.to_string(),
+                    file_info,
+                });
+
+                if let Some(timeout) = scan_timeout.filter(|duration| !duration.is_zero()) {
+                    request.set_timeout(timeout);
+                }
+                let response = client.verify_file(request).await?.into_inner();
+                if let Some(error) = response.error {
+                    return Err(error.into());
+                }
+                if !response.success {
+                    return Err(Error::other("peer failed file verification without an error"));
+                }
+
+                let check_parts_resp = serde_json::from_str::<CheckPartsResp>(&response.check_parts_resp)?;
+
+                Ok(check_parts_resp)
+            },
+            scan_timeout.unwrap_or_else(get_max_timeout_duration),
+        )
+        .await
+    }
+
     async fn get_client_with_msgpack_policy(&self) -> Result<(NodeRpcClient, MsgpackSendPolicy)> {
         if let Some(err) = self.offline_bypass_error() {
             return Err(err);
@@ -2816,7 +2952,12 @@ impl RemoteDisk {
         {
             Ok(Ok(permit)) => (Ok(permit), false),
             Ok(Err(_)) => (Err(Error::RemoteClientUnavailable("internode rename admission closed".to_owned())), false),
-            Err(_) => (Err(DiskError::DiskOngoingReq), true),
+            Err(_) => {
+                if started.is_none() {
+                    rustfs_io_metrics::record_ecstore_rename_admission(item_count > 1, item_count, Duration::ZERO, true);
+                }
+                (Err(DiskError::DiskOngoingReq), true)
+            }
         };
         if let Some(started) = started {
             rustfs_io_metrics::record_ecstore_rename_admission(item_count > 1, item_count, started.elapsed(), timed_out);
@@ -2883,7 +3024,11 @@ fn encode_delete_options_msgpack(value: &DeleteOptions) -> Result<Vec<u8>> {
 }
 
 fn encode_file_info_msgpack(value: &FileInfo) -> Result<Vec<u8>> {
-    encode_msgpack_with_capacity(value, FILE_INFO_MSGPACK_ENCODE_CAPACITY_HINT)
+    // Inline shards dominate the encoded payload. Reserving their known size
+    // avoids repeated growth while retaining the bounded base hint for metadata.
+    let inline_bytes = value.data.as_ref().map_or(0, Bytes::len);
+    let capacity = FILE_INFO_MSGPACK_ENCODE_CAPACITY_HINT.saturating_add(inline_bytes);
+    encode_msgpack_with_capacity(value, capacity)
 }
 
 fn encode_file_info_versions_msgpack(value: &FileInfoVersions) -> Result<Vec<u8>> {
@@ -4929,41 +5074,8 @@ impl DiskAPI for RemoteDisk {
 
     #[tracing::instrument(level = "trace", skip_all)]
     async fn read_file_stream(&self, volume: &str, path: &str, offset: usize, length: usize) -> Result<FileReader> {
-        // warn!(
-        //     "disk remote read_file_stream {}/{}/{} offset={} length={}",
-        //     self.endpoint.to_string(),
-        //     volume,
-        //     path,
-        //     offset,
-        //     length
-        // );
-
-        if self.health.is_faulty() {
-            return Err(DiskError::FaultyDisk);
-        }
-        let disk = self.disk_ref().await;
-        let timeouts = remote_read_timeouts(get_object_disk_read_timeout());
-        let request = ReadStreamRequest {
-            endpoint: self.endpoint.grid_host(),
-            disk,
-            volume: volume.to_string(),
-            path: path.to_string(),
-            offset,
-            length,
-            stall_timeout: timeouts.body_stall,
-        };
-        #[cfg(feature = "internode-transport")]
-        if self.external_streams {
-            return self.data_transport.open_read(request).await;
-        }
-        let reader = self.open_read_with_retry(request.clone()).await?;
-        Ok(Box::new(RetryingRemoteReader::new_with_timeouts(
-            reader,
-            Arc::clone(&self.data_transport),
-            request,
-            timeouts.initial_read,
-            timeouts.recovery,
-        )))
+        self.open_file_range(self.data_transport.clone(), volume, path, offset, length)
+            .await
     }
 
     async fn read_file_stream_chunks(
@@ -5457,30 +5569,7 @@ impl DiskAPI for RemoteDisk {
             "Remote disk RPC started"
         );
 
-        self.execute_with_timeout(
-            || async {
-                let file_info = serde_json::to_string(&fi)?;
-                let mut client = self.get_client().await?;
-                let request = Request::new(VerifyFileRequest {
-                    disk: self.endpoint.to_string(),
-                    volume: volume.to_string(),
-                    path: path.to_string(),
-                    file_info,
-                });
-
-                let response = client.verify_file(request).await?.into_inner();
-
-                if !response.success {
-                    return Err(response.error.unwrap_or_default().into());
-                }
-
-                let check_parts_resp = serde_json::from_str::<CheckPartsResp>(&response.check_parts_resp)?;
-
-                Ok(check_parts_resp)
-            },
-            get_max_timeout_duration(),
-        )
-        .await
+        self.verify_file_rpc(volume, path, fi, None).await
     }
 
     #[tracing::instrument(level = "trace", skip_all)]
@@ -5834,6 +5923,9 @@ impl DiskAPI for RemoteDisk {
         ScanGuard(Arc::clone(&self.scanning))
     }
 }
+
+#[cfg(test)]
+pub(crate) use tests::{RenameBatchFallbackPeer, with_lost_staged_shard_peer, with_staged_part_peer};
 
 #[cfg(test)]
 mod tests {
@@ -6415,6 +6507,145 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial]
+    async fn rename_batch_unimplemented_releases_real_tonic_admission() {
+        runtime_sources::ensure_test_rpc_secret();
+        let peer = TestGrpcPeer::spawn(Bytes::new(), Bytes::new())
+            .await
+            .expect("rename batch peer must bind");
+        temp_env::async_with_vars([(ENV_RUSTFS_EXPERIMENTAL_RENAME_STREAM_BATCH, Some("true"))], async {
+            let remote = remote_disk_for_addr(&peer.addr).await;
+            let gate = Arc::clone(remote.rename_admission.as_ref().expect("rename admission enabled"));
+            let file_infos = vec![sample_rename_data_file_info(), sample_rename_data_file_info()];
+
+            let result = remote
+                .start_rename_data_batch("tmp", "source", "bucket", "object", rename_batch_client_items(&file_infos))
+                .await;
+            assert!(matches!(result, Err(RenameBatchStartError::UnsupportedBeforeStream)));
+            assert_eq!(peer.peer.rename_batch_calls(), 1, "the real peer must observe one batch attempt");
+            assert_eq!(
+                gate.available_permits(),
+                rustfs_protos::INTERNODE_CONTROL_RPC_CONCURRENCY_LIMIT,
+                "call-level UNIMPLEMENTED must release every batch permit without quarantine"
+            );
+
+            remote.cancel_token.cancel();
+            rustfs_protos::evict_failed_connection(&peer.addr).await;
+        })
+        .await;
+        peer.stop().await;
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn rename_batch_real_tonic_stream_decodes_out_of_order_items_and_releases_permits() {
+        runtime_sources::ensure_test_rpc_secret();
+        let peer = TestGrpcPeer::spawn(Bytes::new(), Bytes::new())
+            .await
+            .expect("rename batch peer must bind");
+        peer.peer.serve_rename_batch_results(usize::MAX);
+        temp_env::async_with_vars([(ENV_RUSTFS_EXPERIMENTAL_RENAME_STREAM_BATCH, Some("true"))], async {
+            let remote = remote_disk_for_addr(&peer.addr).await;
+            let gate = Arc::clone(remote.rename_admission.as_ref().expect("rename admission enabled"));
+
+            for width in [2_usize, 4] {
+                let file_infos = (0..width).map(|_| sample_rename_data_file_info()).collect::<Vec<_>>();
+                let mut stream = remote
+                    .start_rename_data_batch("tmp", "source", "bucket", "object", rename_batch_client_items(&file_infos))
+                    .await
+                    .unwrap_or_else(|_| panic!("{width}-item real batch must start"));
+                assert_eq!(
+                    gate.available_permits(),
+                    rustfs_protos::INTERNODE_CONTROL_RPC_CONCURRENCY_LIMIT - width,
+                    "the batch owns one permit per pending item"
+                );
+
+                for completed in 1..=width {
+                    let expected_slot = width - completed;
+                    let outcome = stream
+                        .next_outcome()
+                        .await
+                        .expect("real batch stream item must decode")
+                        .expect("real batch stream must contain every item");
+                    assert_eq!(outcome.slot, expected_slot, "the test peer returns items in reverse order");
+                    let response = outcome.result.expect("real batch result payload must decode");
+                    assert_eq!(response.sign, Some(u32::try_from(expected_slot).unwrap().to_be_bytes().to_vec()));
+                    assert_eq!(
+                        gate.available_permits(),
+                        rustfs_protos::INTERNODE_CONTROL_RPC_CONCURRENCY_LIMIT - width + completed,
+                        "each decoded item releases exactly one permit"
+                    );
+                }
+                assert!(stream.next_outcome().await.expect("complete real stream EOF").is_none());
+                drop(stream);
+                assert_eq!(gate.available_permits(), rustfs_protos::INTERNODE_CONTROL_RPC_CONCURRENCY_LIMIT);
+            }
+            assert_eq!(peer.peer.rename_batch_calls(), 2);
+
+            remote.cancel_token.cancel();
+            rustfs_protos::evict_failed_connection(&peer.addr).await;
+        })
+        .await;
+        peer.stop().await;
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn rename_batch_real_partial_eof_quarantines_only_missing_items() {
+        runtime_sources::ensure_test_rpc_secret();
+        let peer = TestGrpcPeer::spawn(Bytes::new(), Bytes::new())
+            .await
+            .expect("rename batch peer must bind");
+        peer.peer.serve_rename_batch_results(1);
+        temp_env::async_with_vars(
+            [
+                (ENV_RUSTFS_EXPERIMENTAL_RENAME_STREAM_BATCH, Some("true")),
+                (rustfs_config::ENV_DRIVE_MAX_TIMEOUT_DURATION, Some("1")),
+            ],
+            async {
+                let remote = remote_disk_for_addr(&peer.addr).await;
+                let gate = Arc::clone(remote.rename_admission.as_ref().expect("rename admission enabled"));
+                let file_infos = (0..4).map(|_| sample_rename_data_file_info()).collect::<Vec<_>>();
+                let mut stream = remote
+                    .start_rename_data_batch("tmp", "source", "bucket", "object", rename_batch_client_items(&file_infos))
+                    .await
+                    .unwrap_or_else(|_| panic!("real partial batch must start"));
+
+                let outcome = stream
+                    .next_outcome()
+                    .await
+                    .expect("the first real response must decode")
+                    .expect("the partial stream must return one response");
+                assert_eq!(outcome.slot, 3);
+                assert!(outcome.result.is_ok());
+                assert_eq!(
+                    gate.available_permits(),
+                    rustfs_protos::INTERNODE_CONTROL_RPC_CONCURRENCY_LIMIT - 3,
+                    "the completed item releases one permit before EOF"
+                );
+
+                let error = match stream.next_outcome().await {
+                    Err(error) => error,
+                    Ok(_) => panic!("real partial EOF must be commit-ambiguous"),
+                };
+                assert!(matches!(error, DiskError::Unexpected));
+                assert_eq!(peer.peer.rename_batch_calls(), 1);
+                assert_eq!(
+                    gate.available_permits(),
+                    rustfs_protos::INTERNODE_CONTROL_RPC_CONCURRENCY_LIMIT - 3,
+                    "only missing item permits enter the fresh ambiguity quarantine"
+                );
+
+                drop(stream);
+                remote.cancel_token.cancel();
+                rustfs_protos::evict_failed_connection(&peer.addr).await;
+            },
+        )
+        .await;
+        peer.stop().await;
+    }
+
+    #[tokio::test]
     async fn quota_fence_old_peer_rejects_without_legacy_fallback() {
         runtime_sources::ensure_test_rpc_secret();
         crate::services::notification_sys::install_cross_pool_fence_fleet_proof_for_test();
@@ -6599,7 +6830,9 @@ mod tests {
         );
         assert_eq!(
             remote
-                .pool_meta_native_recovery(PoolMetaNativeRecoveryRequest::Probe {})
+                .pool_meta_native_recovery(PoolMetaNativeRecoveryRequest::Inspect {
+                    object: crate::disk::PoolMetaNativeObject::PoolBin,
+                })
                 .await,
             Err(DiskError::UnsupportedDisk),
         );
@@ -6610,7 +6843,7 @@ mod tests {
                 "/node_service.NodeService/UndoPoolMetaWrite",
                 "/node_service.NodeService/PoolMetaNativeRecovery"
             ],
-            "protected mutations and capability probes must never fall back to legacy RPCs",
+            "protected mutations and native inspection must never fall back to legacy RPCs",
         );
         peer.stop().await;
     }
@@ -7220,12 +7453,18 @@ mod tests {
         audience: String,
         disk_info_calls: Arc<AtomicU32>,
         read_all_calls: Arc<AtomicU32>,
+        rename_batch_calls: Arc<AtomicU32>,
+        rename_batch_disks: Arc<StdMutex<Vec<String>>>,
+        rename_batch_result_limit: Arc<StdMutex<Option<usize>>>,
+        serve_rename_data: Arc<AtomicBool>,
+        rename_data_disks: Arc<StdMutex<Vec<String>>>,
         object_read_all_disks: Arc<StdMutex<Vec<String>>>,
         format_data: Bytes,
         read_all_data: Bytes,
         fail_format_reads: Arc<AtomicBool>,
         next_format_read_gate: Arc<StdMutex<Option<Arc<TestFormatReadGate>>>>,
         bounded_discovery: Arc<StdMutex<Option<Arc<TestBoundedDiscovery>>>>,
+        verify_disk: Arc<StdMutex<Option<crate::disk::DiskStore>>>,
         unsupported_methods: Arc<StdMutex<Vec<String>>>,
     }
 
@@ -7247,12 +7486,18 @@ mod tests {
                 audience,
                 disk_info_calls: Arc::new(AtomicU32::new(0)),
                 read_all_calls: Arc::new(AtomicU32::new(0)),
+                rename_batch_calls: Arc::new(AtomicU32::new(0)),
+                rename_batch_disks: Arc::default(),
+                rename_batch_result_limit: Arc::default(),
+                serve_rename_data: Arc::default(),
+                rename_data_disks: Arc::default(),
                 object_read_all_disks: Arc::default(),
                 format_data,
                 read_all_data,
                 fail_format_reads: Arc::default(),
                 next_format_read_gate: Arc::default(),
                 bounded_discovery: Arc::default(),
+                verify_disk: Arc::default(),
                 unsupported_methods: Arc::default(),
             }
         }
@@ -7269,6 +7514,35 @@ mod tests {
 
         fn read_all_calls(&self) -> u32 {
             self.read_all_calls.load(Ordering::Acquire)
+        }
+
+        fn serve_rename_batch_results(&self, limit: usize) {
+            *self
+                .rename_batch_result_limit
+                .lock()
+                .expect("rename batch result limit lock poisoned") = Some(limit);
+        }
+
+        fn rename_batch_calls(&self) -> u32 {
+            self.rename_batch_calls.load(Ordering::Acquire)
+        }
+
+        fn rename_batch_disks(&self) -> Vec<String> {
+            self.rename_batch_disks
+                .lock()
+                .expect("rename batch disks lock poisoned")
+                .clone()
+        }
+
+        fn serve_rename_data(&self) {
+            self.serve_rename_data.store(true, Ordering::Release);
+        }
+
+        fn rename_data_disks(&self) -> Vec<String> {
+            self.rename_data_disks
+                .lock()
+                .expect("rename data disks lock poisoned")
+                .clone()
         }
 
         fn object_read_all_disks(&self) -> Vec<String> {
@@ -7309,6 +7583,120 @@ mod tests {
 
         fn call(&mut self, request: http::Request<B>) -> Self::Future {
             match request.uri().path() {
+                "/node_service.NodeService/RenameData" if self.peer.serve_rename_data.load(Ordering::Acquire) => {
+                    #[derive(Clone)]
+                    struct RenameDataSvc(AuthenticatedReadPeer);
+
+                    impl tonic::server::UnaryService<RenameDataRequest> for RenameDataSvc {
+                        type Response = rustfs_protos::proto_gen::node_service::RenameDataResponse;
+                        type Future = Pin<Box<dyn Future<Output = std::result::Result<Response<Self::Response>, Status>> + Send>>;
+
+                        fn call(&mut self, request: Request<RenameDataRequest>) -> Self::Future {
+                            let peer = self.0.clone();
+                            Box::pin(async move {
+                                peer.verify_auth(&request, "/node_service.NodeService/RenameData")?;
+                                let canonical_body = rustfs_protos::canonical_rename_data_request_body(request.get_ref())
+                                    .map_err(|_| Status::invalid_argument("rename data body length"))?;
+                                crate::cluster::rpc::verify_tonic_mutation_body_digest(&request, &canonical_body)
+                                    .map_err(|_| Status::permission_denied("rename data body digest"))?;
+                                let request = request.into_inner();
+                                serde_json::from_str::<FileInfo>(&request.file_info)
+                                    .map_err(|error| Status::invalid_argument(error.to_string()))?;
+                                peer.rename_data_disks
+                                    .lock()
+                                    .expect("rename data disks lock poisoned")
+                                    .push(request.disk);
+                                let payload = serde_json::to_string(&RenameDataResp {
+                                    sign: Some(vec![1]),
+                                    ..Default::default()
+                                })
+                                .map_err(|error| Status::internal(error.to_string()))?;
+                                Ok(Response::new(rustfs_protos::proto_gen::node_service::RenameDataResponse {
+                                    success: true,
+                                    rename_data_resp: payload,
+                                    error: None,
+                                    rename_data_resp_bin: Bytes::new(),
+                                }))
+                            })
+                        }
+                    }
+
+                    let peer = self.peer.clone();
+                    Box::pin(async move {
+                        let method = RenameDataSvc(peer);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec);
+                        Ok(grpc.unary(method, request).await)
+                    })
+                }
+                "/node_service.NodeService/RenameDataBatch" => {
+                    type RenameBatchStream = Pin<
+                        Box<dyn futures_util::Stream<Item = std::result::Result<RenameDataBatchResult, Status>> + Send + 'static>,
+                    >;
+
+                    #[derive(Clone)]
+                    struct RenameDataBatchSvc(AuthenticatedReadPeer);
+
+                    impl tonic::server::ServerStreamingService<RenameDataBatchRequest> for RenameDataBatchSvc {
+                        type Response = RenameDataBatchResult;
+                        type ResponseStream = RenameBatchStream;
+                        type Future =
+                            Pin<Box<dyn Future<Output = std::result::Result<Response<Self::ResponseStream>, Status>> + Send>>;
+
+                        fn call(&mut self, request: Request<RenameDataBatchRequest>) -> Self::Future {
+                            let peer = self.0.clone();
+                            Box::pin(async move {
+                                peer.rename_batch_calls.fetch_add(1, Ordering::AcqRel);
+                                peer.rename_batch_disks
+                                    .lock()
+                                    .expect("rename batch disks lock poisoned")
+                                    .extend(request.get_ref().items.iter().map(|item| item.disk.clone()));
+                                let Some(limit) = *peer
+                                    .rename_batch_result_limit
+                                    .lock()
+                                    .expect("rename batch result limit lock poisoned")
+                                else {
+                                    return Err(Status::unimplemented("test peer does not support rename batch"));
+                                };
+                                peer.verify_auth(&request, "/node_service.NodeService/RenameDataBatch")?;
+                                let canonical_body = rustfs_protos::canonical_rename_data_batch_request_body(request.get_ref())
+                                    .map_err(|_| Status::invalid_argument("rename batch body length"))?;
+                                crate::cluster::rpc::verify_tonic_canonical_body_digest(&request, &canonical_body)
+                                    .map_err(|_| Status::permission_denied("rename batch body digest"))?;
+                                let responses = request
+                                    .into_inner()
+                                    .items
+                                    .into_iter()
+                                    .rev()
+                                    .take(limit)
+                                    .map(|item| {
+                                        let response = RenameDataResp {
+                                            sign: Some(item.item_index.to_be_bytes().to_vec()),
+                                            ..Default::default()
+                                        };
+                                        let payload = rmp_serde::to_vec_named(&response)
+                                            .map_err(|error| Status::internal(error.to_string()))?;
+                                        Ok(RenameDataBatchResult {
+                                            item_index: item.item_index,
+                                            success: true,
+                                            error: None,
+                                            rename_data_resp_msgpack: payload.into(),
+                                        })
+                                    })
+                                    .collect::<Vec<_>>();
+                                Ok(Response::new(Box::pin(tokio_stream::iter(responses)) as RenameBatchStream))
+                            })
+                        }
+                    }
+
+                    let peer = self.peer.clone();
+                    Box::pin(async move {
+                        let method = RenameDataBatchSvc(peer);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec);
+                        Ok(grpc.server_streaming(method, request).await)
+                    })
+                }
                 "/node_service.NodeService/DiskInfo" => {
                     #[derive(Clone)]
                     struct DiskInfoSvc(AuthenticatedReadPeer);
@@ -7350,6 +7738,77 @@ mod tests {
                         let codec = tonic_prost::ProstCodec::default();
                         let mut grpc = tonic::server::Grpc::new(codec);
                         Ok(grpc.unary(method, request).await)
+                    })
+                }
+                "/node_service.NodeService/ReadVersion"
+                    if self.peer.verify_disk.lock().expect("verification fixture").is_some() =>
+                {
+                    struct ReadVersionSvc(AuthenticatedReadPeer);
+                    impl tonic::server::UnaryService<ReadVersionRequest> for ReadVersionSvc {
+                        type Response = rustfs_protos::proto_gen::node_service::ReadVersionResponse;
+                        type Future = Pin<Box<dyn Future<Output = std::result::Result<Response<Self::Response>, Status>> + Send>>;
+
+                        fn call(&mut self, request: Request<ReadVersionRequest>) -> Self::Future {
+                            let peer = self.0.clone();
+                            Box::pin(async move {
+                                peer.verify_auth(&request, "/node_service.NodeService/ReadVersion")?;
+                                let req = request.into_inner();
+                                let disk = peer.verify_disk.lock().expect("verification fixture").clone().expect("disk");
+                                let opts = rmp_serde::from_slice(&req.opts_bin).expect("read options");
+                                let mut response = Self::Response::default();
+                                match disk.read_version("", &req.volume, &req.path, &req.version_id, &opts).await {
+                                    Ok(fi) => {
+                                        response.success = true;
+                                        response.file_info_bin = encode_file_info_msgpack(&fi).expect("encode file info").into();
+                                    }
+                                    Err(err) => response.error = Some(err.into()),
+                                }
+                                Ok(Response::new(response))
+                            })
+                        }
+                    }
+                    let method = ReadVersionSvc(self.peer.clone());
+                    Box::pin(async move {
+                        Ok(tonic::server::Grpc::new(tonic_prost::ProstCodec::default())
+                            .unary(method, request)
+                            .await)
+                    })
+                }
+                "/node_service.NodeService/VerifyFile" => {
+                    struct VerifySvc(AuthenticatedReadPeer);
+                    impl tonic::server::UnaryService<VerifyFileRequest> for VerifySvc {
+                        type Response = rustfs_protos::proto_gen::node_service::VerifyFileResponse;
+                        type Future = Pin<Box<dyn Future<Output = std::result::Result<Response<Self::Response>, Status>> + Send>>;
+                        fn call(&mut self, request: Request<VerifyFileRequest>) -> Self::Future {
+                            let peer = self.0.clone();
+                            Box::pin(async move {
+                                peer.verify_auth(&request, "/node_service.NodeService/VerifyFile")?;
+                                let request = request.into_inner();
+                                let disk = peer
+                                    .verify_disk
+                                    .lock()
+                                    .expect("verification fixture")
+                                    .clone()
+                                    .expect("verification disk");
+                                let fi: FileInfo = serde_json::from_str(&request.file_info).expect("verification layout");
+                                assert!(fi.data.is_none());
+                                let result = disk
+                                    .verify_file(&request.volume, &request.path, &fi)
+                                    .await
+                                    .expect("disk verification");
+                                Ok(Response::new(Self::Response {
+                                    success: true,
+                                    check_parts_resp: serde_json::to_string(&result).expect("verification result"),
+                                    error: None,
+                                }))
+                            })
+                        }
+                    }
+                    let method = VerifySvc(self.peer.clone());
+                    Box::pin(async move {
+                        Ok(tonic::server::Grpc::new(tonic_prost::ProstCodec::default())
+                            .unary(method, request)
+                            .await)
                     })
                 }
                 "/node_service.NodeService/RecoverDeleteTransaction"
@@ -7518,6 +7977,104 @@ mod tests {
         }
     }
 
+    pub(crate) struct RenameBatchFallbackPeer(TestGrpcPeer);
+
+    impl RenameBatchFallbackPeer {
+        pub(crate) async fn spawn() -> Self {
+            let peer = TestGrpcPeer::spawn(Bytes::new(), Bytes::new())
+                .await
+                .expect("rename fallback peer must bind");
+            peer.peer.serve_rename_data();
+            Self(peer)
+        }
+
+        pub(crate) fn addr(&self) -> &str {
+            &self.0.addr
+        }
+
+        pub(crate) fn batch_calls(&self) -> u32 {
+            self.0.peer.rename_batch_calls()
+        }
+
+        pub(crate) fn batch_disks(&self) -> Vec<String> {
+            self.0.peer.rename_batch_disks()
+        }
+
+        pub(crate) fn unary_disks(&self) -> Vec<String> {
+            self.0.peer.rename_data_disks()
+        }
+
+        pub(crate) fn available_permits(&self) -> usize {
+            peer_rename_admission(&self.0.addr, true)
+                .expect("rename fallback admission enabled")
+                .available_permits()
+        }
+
+        pub(crate) async fn stop(self) {
+            self.0.stop().await;
+        }
+    }
+
+    pub(crate) async fn with_staged_part_peer<F, Fut>(disk: crate::disk::DiskStore, exercise: F)
+    where
+        F: FnOnce(RemoteDisk, RemoteDisk) -> Fut,
+        Fut: Future<Output = ()>,
+    {
+        runtime_sources::ensure_test_rpc_secret();
+        let peer = TestGrpcPeer::spawn(Bytes::new(), Bytes::new())
+            .await
+            .expect("bind verification peer");
+        *peer.peer.verify_disk.lock().expect("verification fixture") = Some(disk);
+        let tcp = remote_disk_for_addr(&peer.addr).await;
+        let mut nixl = remote_disk_for_addr(&peer.addr).await;
+        nixl.data_transport = Arc::new(crate::cluster::rpc::nixl_internode::NixlInternodeDataTransport::from_env());
+        // Ordinary control RPCs have a fixed deadline. Verification must use
+        // its own channel even when a short-lived control channel is cached.
+        let control = tonic::transport::Endpoint::from_shared(peer.addr.clone())
+            .expect("peer URI")
+            .timeout(Duration::from_nanos(1))
+            .connect()
+            .await
+            .expect("connect control channel");
+        rustfs_common::cache_connection(peer.addr.clone(), control).await;
+        exercise(tcp, nixl).await;
+        assert_eq!(peer.peer.read_all_calls(), 0);
+        assert!(peer.peer.unsupported_methods.lock().expect("unexpected requests").is_empty());
+        peer.stop().await;
+    }
+
+    /// The peer acknowledges the stream but loses the staged shard. Its signed VerifyFile
+    /// handler reads the actual backing disk, so the upload receives a missing-part status.
+    pub(crate) async fn with_lost_staged_shard_peer<F, Fut>(disk: crate::disk::DiskStore, exercise: F)
+    where
+        F: FnOnce(RemoteDisk) -> Fut,
+        Fut: Future<Output = ()>,
+    {
+        runtime_sources::ensure_test_rpc_secret();
+        let peer = TestGrpcPeer::spawn(Bytes::new(), Bytes::new())
+            .await
+            .expect("bind verification peer");
+        *peer.peer.verify_disk.lock().expect("verification fixture") = Some(disk);
+        let writes = Arc::new(RecordingInternodeDataTransport::default());
+        let mut remote = remote_disk_for_addr(&peer.addr).await;
+        remote.data_transport = writes.clone();
+        exercise(remote).await;
+        assert!(
+            writes
+                .calls()
+                .iter()
+                .any(|call| matches!(call, RecordedTransportCall::Write(_)))
+        );
+        let methods = peer.peer.unsupported_methods.lock().expect("peer requests").clone();
+        assert!(
+            !methods
+                .iter()
+                .any(|path| path.contains("Rename") || path.ends_with("/PreparePartTransaction")),
+            "{methods:?}"
+        );
+        peer.stop().await;
+    }
+
     impl RecordingInternodeDataTransport {
         fn with_ns_scanner_probe_status(status: u16) -> Self {
             Self {
@@ -7670,6 +8227,18 @@ mod tests {
             },
             ..Default::default()
         }
+    }
+
+    fn rename_batch_client_items(file_infos: &[FileInfo]) -> Vec<RenameBatchClientItem<'_>> {
+        file_infos
+            .iter()
+            .enumerate()
+            .map(|(slot, file_info)| RenameBatchClientItem {
+                slot,
+                disk: format!("disk-{slot}"),
+                file_info,
+            })
+            .collect()
     }
 
     fn sample_read_multiple_resp(file: &str, data: &[u8]) -> ReadMultipleResp {
@@ -8151,6 +8720,38 @@ mod tests {
             named_msgpack.len(),
             json.len()
         );
+    }
+
+    #[test]
+    fn rename_data_inline_file_info_msgpack_reserves_known_payloads() {
+        for (object_size, inline_len) in [(32 * 1024, 2_763), (100 * 1024, 8_566), (12 * (32 * 1024 - 32), 32 * 1024)] {
+            let mut file_info = sample_rename_data_file_info();
+            file_info.size = object_size;
+            file_info.erasure.data_blocks = 12;
+            file_info.erasure.parity_blocks = 4;
+            file_info.erasure.distribution = (1..=16).collect();
+            file_info.data = Some(Bytes::from(vec![0x5a; inline_len]));
+
+            let fixed_hint = encode_msgpack_with_capacity(&file_info, FILE_INFO_MSGPACK_ENCODE_CAPACITY_HINT)
+                .expect("fixed-hint inline file info should encode");
+            assert!(
+                fixed_hint.capacity() > Vec::<u8>::with_capacity(FILE_INFO_MSGPACK_ENCODE_CAPACITY_HINT).capacity(),
+                "the fixed hint must grow for the representative inline shard"
+            );
+            let encoded = encode_file_info_msgpack(&file_info).expect("inline file info should encode");
+            let reserved = FILE_INFO_MSGPACK_ENCODE_CAPACITY_HINT + inline_len;
+            assert!(
+                encoded.len() <= reserved,
+                "the payload-aware capacity must cover a representative inline shard"
+            );
+            assert_eq!(
+                encoded.capacity(),
+                Vec::<u8>::with_capacity(reserved).capacity(),
+                "encoding the inline shard must not grow the initial buffer"
+            );
+            let decoded: FileInfo = rmp_serde::from_slice(&encoded).expect("inline file info should decode");
+            assert_eq!(decoded, file_info);
+        }
     }
 
     #[test]
@@ -13474,26 +14075,145 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn rename_admission_quarantine_holds_until_absolute_deadline() {
+    #[serial_test::serial(rename_admission_metrics)]
+    async fn rename_admission_timeout_is_visible_without_stage_metrics() {
+        temp_env::async_with_vars([(ENV_RUSTFS_EXPERIMENTAL_RENAME_STREAM_BATCH, Some("true"))], async {
+            rustfs_io_metrics::set_put_stage_metrics_enabled(false);
+            let disk = remote_disk_for_addr("http://127.0.0.1:59989").await;
+            let gate = Arc::clone(disk.rename_admission.as_ref().expect("configured rename admission"));
+            let recorder = crate::test_metrics::CapturingRecorder::default();
+            let _recorder_guard = metrics::set_default_local_recorder(&recorder);
+
+            let admission = disk
+                .acquire_rename_admission_until(1, tokio::time::Instant::now() + Duration::from_secs(1))
+                .await
+                .expect("available admission succeeds")
+                .expect("rename admission is enabled");
+            drop(admission);
+            assert_eq!(
+                recorder.counter_value("rustfs_ecstore_rename_admission_timeouts_total", &[("mode", "unary")]),
+                0
+            );
+
+            let held = Arc::clone(&gate)
+                .acquire_many_owned(
+                    u32::try_from(rustfs_protos::INTERNODE_CONTROL_RPC_CONCURRENCY_LIMIT)
+                        .expect("rename admission limit fits u32"),
+                )
+                .await
+                .expect("hold every rename admission permit");
+            let error = match disk
+                .acquire_rename_admission_until(1, tokio::time::Instant::now() + Duration::from_secs(1))
+                .await
+            {
+                Ok(_) => panic!("exhausted admission must time out"),
+                Err(error) => error,
+            };
+            assert!(matches!(error, DiskError::DiskOngoingReq));
+            assert_eq!(
+                recorder.counter_value("rustfs_ecstore_rename_admission_timeouts_total", &[("mode", "unary")]),
+                1
+            );
+
+            drop(held);
+            gate.close();
+            let error = match disk
+                .acquire_rename_admission_until(1, tokio::time::Instant::now() + Duration::from_secs(1))
+                .await
+            {
+                Ok(_) => panic!("closed admission must fail without a timeout"),
+                Err(error) => error,
+            };
+            assert!(matches!(error, DiskError::RemoteClientUnavailable(_)));
+            assert_eq!(
+                recorder.counter_value("rustfs_ecstore_rename_admission_timeouts_total", &[("mode", "unary")]),
+                1
+            );
+            disk.cancel_token.cancel();
+        })
+        .await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn rename_admission_quarantine_holds_after_ambiguity() {
         let gate = peer_rename_admission("http://rename-quarantine-peer", true).expect("enabled rename gate");
         let permit = Arc::clone(&gate)
             .acquire_many_owned(4)
             .await
             .expect("weighted batch admission");
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
         RenameAdmissionGrant {
             permit: Some(permit),
             batch: true,
         }
-        .quarantine_until(deadline);
+        .quarantine_after_ambiguity();
         assert_eq!(gate.available_permits(), rustfs_protos::INTERNODE_CONTROL_RPC_CONCURRENCY_LIMIT - 4);
 
-        tokio::time::advance(Duration::from_millis(999)).await;
+        let hold = get_max_timeout_duration();
+        assert!(!hold.is_zero(), "the test requires a bounded positive ambiguity hold");
+        tokio::time::advance(hold - Duration::from_nanos(1)).await;
         tokio::task::yield_now().await;
         assert_eq!(gate.available_permits(), rustfs_protos::INTERNODE_CONTROL_RPC_CONCURRENCY_LIMIT - 4);
-        tokio::time::advance(Duration::from_millis(1)).await;
+        tokio::time::advance(Duration::from_nanos(1)).await;
         tokio::task::yield_now().await;
         assert_eq!(gate.available_permits(), rustfs_protos::INTERNODE_CONTROL_RPC_CONCURRENCY_LIMIT);
+    }
+
+    #[test]
+    fn rename_admission_quarantine_metrics_release_when_runtime_stops() {
+        use metrics_util::MetricKind;
+        use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let gate = peer_rename_admission("http://rename-quarantine-runtime-stop-peer", true).expect("enabled rename gate");
+        metrics::with_local_recorder(&recorder, || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_time()
+                .build()
+                .expect("quarantine runtime");
+            runtime.block_on(async {
+                let permit = Arc::clone(&gate)
+                    .acquire_many_owned(4)
+                    .await
+                    .expect("weighted batch admission");
+                RenameAdmissionGrant {
+                    permit: Some(permit),
+                    batch: true,
+                }
+                .quarantine_after_ambiguity();
+                assert_eq!(gate.available_permits(), rustfs_protos::INTERNODE_CONTROL_RPC_CONCURRENCY_LIMIT - 4);
+            });
+            drop(runtime);
+        });
+
+        assert_eq!(gate.available_permits(), rustfs_protos::INTERNODE_CONTROL_RPC_CONCURRENCY_LIMIT);
+        let rows = snapshotter.snapshot().into_vec();
+        let metric_value = |name: &str, kind: MetricKind| {
+            &rows
+                .iter()
+                .find(|(composite, _, _, _)| {
+                    composite.kind() == kind
+                        && composite.key().name() == name
+                        && composite
+                            .key()
+                            .labels()
+                            .any(|label| label.key() == "mode" && label.value() == "batch")
+                })
+                .unwrap_or_else(|| panic!("missing batch quarantine metric {name}"))
+                .3
+        };
+        assert!(matches!(
+            metric_value("rustfs_ecstore_rename_quarantine_events_total", MetricKind::Counter),
+            DebugValue::Counter(1)
+        ));
+        assert!(matches!(
+            metric_value("rustfs_ecstore_rename_quarantine_released_items_total", MetricKind::Counter),
+            DebugValue::Counter(4)
+        ));
+        assert!(matches!(
+            metric_value("rustfs_ecstore_rename_quarantine_active_items", MetricKind::Gauge),
+            DebugValue::Gauge(value) if value.into_inner() == 0.0
+        ));
     }
 
     #[tokio::test(start_paused = true)]
@@ -13523,7 +14243,7 @@ mod tests {
         guard.mark_dispatched();
         drop(guard);
         assert_eq!(gate.available_permits(), rustfs_protos::INTERNODE_CONTROL_RPC_CONCURRENCY_LIMIT - 4);
-        tokio::time::advance(Duration::from_secs(1)).await;
+        tokio::time::advance(get_max_timeout_duration()).await;
         tokio::task::yield_now().await;
         assert_eq!(gate.available_permits(), rustfs_protos::INTERNODE_CONTROL_RPC_CONCURRENCY_LIMIT);
 
@@ -13541,6 +14261,123 @@ mod tests {
         };
         guard.mark_dispatched();
         guard.release_without_quarantine();
+        assert_eq!(gate.available_permits(), rustfs_protos::INTERNODE_CONTROL_RPC_CONCURRENCY_LIMIT);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn rename_call_guard_timeout_starts_a_fresh_ambiguity_hold() {
+        let gate = peer_rename_admission("http://rename-expired-call-guard-peer", true).expect("enabled rename gate");
+        let permit = Arc::clone(&gate).acquire_many_owned(4).await.expect("dispatched permits");
+        let mut guard = RenameBatchCallGuard {
+            admission: Some(RenameAdmissionGrant {
+                permit: Some(permit),
+                batch: true,
+            }),
+            deadline: tokio::time::Instant::now(),
+            dispatch_state: RenameAdmissionDispatchState::NotDispatched,
+        };
+        guard.mark_dispatched();
+        drop(guard);
+        tokio::task::yield_now().await;
+        assert_eq!(
+            gate.available_permits(),
+            rustfs_protos::INTERNODE_CONTROL_RPC_CONCURRENCY_LIMIT - 4,
+            "an RPC timeout must not immediately readmit work over detached mutations"
+        );
+
+        let hold = get_max_timeout_duration();
+        assert!(!hold.is_zero(), "the test requires a bounded positive ambiguity hold");
+        tokio::time::advance(hold - Duration::from_nanos(1)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(gate.available_permits(), rustfs_protos::INTERNODE_CONTROL_RPC_CONCURRENCY_LIMIT - 4);
+        tokio::time::advance(Duration::from_nanos(1)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(gate.available_permits(), rustfs_protos::INTERNODE_CONTROL_RPC_CONCURRENCY_LIMIT);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn rename_batch_stream_incomplete_eof_quarantines_only_missing_items() {
+        use tonic::codec::Codec;
+
+        let gate = peer_rename_admission("http://rename-incomplete-stream-peer", true).expect("enabled rename gate");
+        let permit = Arc::clone(&gate).acquire_many_owned(4).await.expect("batch permits");
+        let mut admission = RenameAdmissionGrant {
+            permit: Some(permit),
+            batch: true,
+        };
+        assert!(admission.release_one(), "the completed first item releases its permit");
+        let mut codec = tonic_prost::ProstCodec::<RenameDataBatchResult, RenameDataBatchResult>::default();
+        let inner = Streaming::new_empty(codec.decoder(), http_body_util::Empty::<Bytes>::new());
+        let mut stream = RemoteRenameBatchStream {
+            inner,
+            expected_mask: 0b1111,
+            seen_mask: 0b0001,
+            admission: Some(admission),
+            deadline: tokio::time::Instant::now(),
+            terminal: false,
+            stream_started_at: None,
+            first_item_at: None,
+        };
+
+        let error = match stream.next_outcome().await {
+            Err(error) => error,
+            Ok(_) => panic!("incomplete EOF must be commit-ambiguous"),
+        };
+        assert!(matches!(error, DiskError::Unexpected));
+        tokio::task::yield_now().await;
+        assert_eq!(
+            gate.available_permits(),
+            rustfs_protos::INTERNODE_CONTROL_RPC_CONCURRENCY_LIMIT - 3,
+            "only the three missing item permits remain quarantined"
+        );
+
+        let hold = get_max_timeout_duration();
+        tokio::time::advance(hold - Duration::from_nanos(1)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(gate.available_permits(), rustfs_protos::INTERNODE_CONTROL_RPC_CONCURRENCY_LIMIT - 3);
+        tokio::time::advance(Duration::from_nanos(1)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(gate.available_permits(), rustfs_protos::INTERNODE_CONTROL_RPC_CONCURRENCY_LIMIT);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn rename_batch_stream_drop_quarantines_only_missing_items() {
+        use tonic::codec::Codec;
+
+        let gate = peer_rename_admission("http://rename-dropped-stream-peer", true).expect("enabled rename gate");
+        let permit = Arc::clone(&gate).acquire_many_owned(4).await.expect("batch permits");
+        let mut admission = RenameAdmissionGrant {
+            permit: Some(permit),
+            batch: true,
+        };
+        assert!(admission.release_one(), "the completed first item releases its permit");
+        let mut codec = tonic_prost::ProstCodec::<RenameDataBatchResult, RenameDataBatchResult>::default();
+        let inner = Streaming::new_empty(codec.decoder(), http_body_util::Empty::<Bytes>::new());
+        let stream = RemoteRenameBatchStream {
+            inner,
+            expected_mask: 0b1111,
+            seen_mask: 0b0001,
+            admission: Some(admission),
+            deadline: tokio::time::Instant::now(),
+            terminal: false,
+            stream_started_at: None,
+            first_item_at: None,
+        };
+
+        drop(stream);
+        tokio::task::yield_now().await;
+        assert_eq!(
+            gate.available_permits(),
+            rustfs_protos::INTERNODE_CONTROL_RPC_CONCURRENCY_LIMIT - 3,
+            "dropping an active stream quarantines only the three missing item permits"
+        );
+
+        let hold = get_max_timeout_duration();
+        tokio::time::advance(hold - Duration::from_nanos(1)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(gate.available_permits(), rustfs_protos::INTERNODE_CONTROL_RPC_CONCURRENCY_LIMIT - 3);
+        tokio::time::advance(Duration::from_nanos(1)).await;
+        tokio::task::yield_now().await;
         assert_eq!(gate.available_permits(), rustfs_protos::INTERNODE_CONTROL_RPC_CONCURRENCY_LIMIT);
     }
 

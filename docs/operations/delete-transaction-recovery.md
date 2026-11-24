@@ -89,6 +89,7 @@ Settlement uses a rolling window of at most four distinct keys, admitting at
 most sixteen attempts per maintenance tick. A slow shard verification or
 exact-key lock does not hold up other keys or later admission windows. A newer
 hint for an active key remains queued until that key's attempt completes.
+Blocked or failed background attempts back off per exact key from five seconds to five minutes after consecutive failures. Quorum-unavailable attempts are eligible again after one second so returning participants can resume promptly. Rediscovery preserves the delay for retained hints. A new foreground delete hint is immediately eligible once any active attempt completes. The backoff lives in memory and restarts with the process. For exact-key diagnosis, the `heal_delete_recovery_blocked` debug event records the bucket, key, and counts for ambiguous legacy evidence and other safety blocks.
 Cancellation retries admitted generations without clearing newer hints. Queue
 overflow remains covered by durable discovery, including after a restart.
 These limits bound background work, not the canonical rollback deadline or

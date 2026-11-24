@@ -14,10 +14,58 @@
 
 use async_trait::async_trait;
 use rustfs_credentials::Credentials;
+use rustfs_gateway_types::UploadIdClaim;
 use rustfs_gateway_types::dto::*;
 
 use crate::common::gateway::{AuthorizationError, S3Action};
 use crate::common::session::SessionContext;
+
+/// Keeps the protocol upload ID used for request encoding together with the claim sent to storage.
+#[derive(Clone)]
+pub struct MultipartRequest<T> {
+    input: T,
+    upload_id: String,
+}
+
+impl<T> MultipartRequest<T> {
+    fn new(mut input: T, id: impl Into<String>, claim: fn(&mut T) -> &mut UploadIdClaim) -> Self {
+        let upload_id = id.into();
+        *claim(&mut input) = UploadIdClaim::from_wire(upload_id.clone());
+        Self { input, upload_id }
+    }
+
+    pub fn input(&self) -> &T {
+        &self.input
+    }
+
+    pub fn into_parts(self) -> (T, String) {
+        (self.input, self.upload_id)
+    }
+}
+
+impl MultipartRequest<UploadPartInput> {
+    pub fn upload_part(input: UploadPartInput, id: impl Into<String>) -> Self {
+        Self::new(input, id, |input| &mut input.upload_id)
+    }
+}
+
+impl MultipartRequest<CompleteMultipartUploadInput> {
+    pub fn complete(input: CompleteMultipartUploadInput, id: impl Into<String>) -> Self {
+        Self::new(input, id, |input| &mut input.upload_id)
+    }
+}
+
+impl MultipartRequest<AbortMultipartUploadInput> {
+    pub fn abort(input: AbortMultipartUploadInput, id: impl Into<String>) -> Self {
+        Self::new(input, id, |input| &mut input.upload_id)
+    }
+}
+
+impl MultipartRequest<UploadPartCopyInput> {
+    pub fn upload_part_copy(input: UploadPartCopyInput, id: impl Into<String>) -> Self {
+        Self::new(input, id, |input| &mut input.upload_id)
+    }
+}
 
 /// Per-bucket capacity inputs for WebDAV quota reporting.
 #[cfg(feature = "webdav")]
@@ -161,12 +209,16 @@ pub trait StorageBackend: Send + Sync {
     /// Upload one part of a multipart upload. The part_number must be in
     /// the range 1 to the 10 000-part S3 limit. The returned ETag
     /// identifies the part in the subsequent CompleteMultipartUpload call.
-    async fn upload_part(&self, input: UploadPartInput, credentials: &Credentials) -> Result<UploadPartOutput, Self::Error>;
+    async fn upload_part(
+        &self,
+        input: MultipartRequest<UploadPartInput>,
+        credentials: &Credentials,
+    ) -> Result<UploadPartOutput, Self::Error>;
     /// Assemble the parts listed in the input into the final object.
     /// The parts list must be sorted by part_number with no duplicates.
     async fn complete_multipart_upload(
         &self,
-        input: CompleteMultipartUploadInput,
+        input: MultipartRequest<CompleteMultipartUploadInput>,
         credentials: &Credentials,
     ) -> Result<CompleteMultipartUploadOutput, Self::Error>;
     /// Abort an in-progress multipart upload. Releases any storage
@@ -176,7 +228,7 @@ pub trait StorageBackend: Send + Sync {
     /// if_match_initiated_time) that non-SFTP consumers may need.
     async fn abort_multipart_upload(
         &self,
-        input: AbortMultipartUploadInput,
+        input: MultipartRequest<AbortMultipartUploadInput>,
         credentials: &Credentials,
     ) -> Result<AbortMultipartUploadOutput, Self::Error>;
     /// Copy a byte range from an existing object into a part of an
@@ -184,7 +236,63 @@ pub trait StorageBackend: Send + Sync {
     /// than the 5 GiB single-shot CopyObject limit.
     async fn upload_part_copy(
         &self,
-        input: UploadPartCopyInput,
+        input: MultipartRequest<UploadPartCopyInput>,
         credentials: &Credentials,
     ) -> Result<UploadPartCopyOutput, Self::Error>;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rustfs_gateway_types::{BucketName, CopySourceValue, ObjectKey, RecordedUpload, resolve_upload};
+
+    struct Fixture;
+
+    impl RecordedUpload for Fixture {
+        fn bucket(&self) -> &str {
+            "bucket"
+        }
+
+        fn key(&self) -> &str {
+            "key"
+        }
+    }
+
+    #[test]
+    fn multipart_request_binds_all_operation_claims_to_the_protocol_id() {
+        let bucket = BucketName::new("bucket".to_owned()).unwrap();
+        let key = ObjectKey::new("key".to_owned()).unwrap();
+        for id in ["", "issued+/id=%2F"] {
+            let old = || UploadIdClaim::from_wire("different");
+            let upload = UploadPartInput::builder().upload_id(old()).part_number(3).build();
+            let complete = CompleteMultipartUploadInput::builder().upload_id(old()).build();
+            let abort = AbortMultipartUploadInput::builder().upload_id(old()).build();
+            let source = CopySourceValue::Bucket {
+                bucket: "source".into(),
+                key: "x".into(),
+                version_id: None,
+            };
+            let copy = UploadPartCopyInput::builder(source).upload_id(old()).build();
+            let (upload, upload_id) = MultipartRequest::upload_part(upload, id).into_parts();
+            assert_eq!(upload.part_number, 3);
+            let (complete, complete_id) = MultipartRequest::complete(complete, id).into_parts();
+            let (abort, abort_id) = MultipartRequest::abort(abort, id).into_parts();
+            let (copy, copy_id) = MultipartRequest::upload_part_copy(copy, id).into_parts();
+
+            for (claim, raw) in [
+                (upload.upload_id, upload_id),
+                (complete.upload_id, complete_id),
+                (abort.upload_id, abort_id),
+                (copy.upload_id, copy_id),
+            ] {
+                assert_eq!(raw, id);
+                assert_eq!(claim.is_explicitly_empty(), id.is_empty());
+                if !id.is_empty() {
+                    let (resolved, _) =
+                        resolve_upload(&claim, &bucket, &key, |candidate| (candidate == id).then_some(Fixture)).unwrap();
+                    assert_eq!(resolved.id(), id);
+                }
+            }
+        }
+    }
 }

@@ -77,6 +77,7 @@ fn copy_write_input(
         tagging_directive: tagging_directive.map(str::to_owned),
         copy_source_if_match: None,
         copy_source_if_none_match: None,
+        copy_source_dates: Default::default(),
         cache_control: None,
         content_disposition: None,
         content_encoding: None,
@@ -175,7 +176,7 @@ async fn tag_dependent_access_hooks_preserve_local_miss_for_replication_proxy() 
     check(&envelope);
 
     let mut envelope = request(Method::PUT).req_info().server_context(&slot).build();
-    authorize_put_object_tagging(&mut envelope, &bucket, "missing", None, RequestedObjectTags(Vec::new()))
+    authorize_put_object_tagging(&mut envelope, &slot, &bucket, "missing", None, RequestedObjectTags(Vec::new()))
         .await
         .expect("local miss does not match the tag deny");
     check(&envelope);

@@ -16,6 +16,7 @@ mod audit;
 mod compress;
 pub mod cors;
 mod event;
+mod gateway_authorizer;
 mod gateway_handlers;
 #[cfg(test)]
 pub(crate) mod gateway_stack;
@@ -27,6 +28,7 @@ mod hybrid;
 mod layer;
 mod legacy_compat;
 mod module_switch;
+mod post_object_location;
 mod prefix;
 pub mod rate_limit;
 mod readiness;
@@ -68,6 +70,8 @@ pub(crate) use event::{
     is_event_notifier_reconciled, mark_event_notifier_reconciled, mark_event_notifier_unreconciled,
     reconcile_event_notifier_from_store, start_persisted_event_notifier_reconciler, with_notify_runtime_reconcile_lock,
 };
+#[cfg(test)]
+pub(crate) use gateway_handlers::{handler_error, prepare_lifecycle_configuration, prepare_notification_configuration};
 #[cfg(test)]
 pub(crate) use gateway_stack::TestGateway;
 #[cfg(test)]

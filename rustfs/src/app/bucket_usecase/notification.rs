@@ -183,7 +183,7 @@ impl DefaultBucketUsecase {
         })
     }
 
-    /// Persists notification configuration, then updates the active rules for the bucket.
+    /// Persists notification configuration and publishes the committed metadata snapshot.
     pub(crate) async fn execute_put_bucket_notification_configuration(
         &self,
         envelope: RequestEnvelope,
@@ -217,7 +217,7 @@ impl DefaultBucketUsecase {
                 let notify = current_notify_interface_for_context(self.context.as_deref());
                 let event_rules = build_notification_event_rules(destinations)?;
 
-                // Validate before the write. Clear and add still run after the durable update.
+                // The metadata publisher applies rules only after the durable update.
                 notify
                     .validate_event_specific_rules(bucket, &region, &event_rules)
                     .await
@@ -230,16 +230,6 @@ impl DefaultBucketUsecase {
 
                 notify_bucket_metadata_reload(bucket.to_owned(), "put bucket notification", request_context, false).await;
 
-                notify
-                    .clear_bucket_notification_rules(bucket)
-                    .await
-                    .map_err(|e| s3_error!(InternalError, "Failed to clear rules: {e}"))?;
-                warn!("notify event rules: {:?}", &event_rules);
-                notify
-                    .add_event_specific_rules(bucket, &region, &event_rules)
-                    .await
-                    .map_err(|e| s3_error!(InternalError, "Failed to add rules: {e}"))?;
-
                 Ok(gateway_dto::PutBucketNotificationConfigurationOutput::default())
             },
         )
@@ -250,7 +240,7 @@ impl DefaultBucketUsecase {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::app::bucket_usecase::test_support::{build_request, owned_envelope};
+    use crate::app::bucket_usecase::test_support::owned_envelope;
     use http::Method;
 
     #[tokio::test]
@@ -453,11 +443,21 @@ mod tests {
         assert_eq!(error.code(), &S3ErrorCode::MalformedXML);
         assert_eq!(error.message(), Some("persistence conversion"));
 
-        let mut request = build_request((), Method::PUT);
-        request.extensions.insert(crate::runtime_sources::ServerContextSlot::new());
+        let mut extensions = http::Extensions::new();
+        extensions.insert(crate::runtime_sources::ServerContextSlot::new());
         let error = usecase
             .execute_put_bucket_notification_configuration(
-                RequestEnvelope::from_s3s(&request),
+                RequestEnvelope::from_parts(
+                    crate::app::RequestHead {
+                        method: Method::PUT,
+                        uri: http::Uri::from_static("/"),
+                        headers: http::HeaderMap::new(),
+                        credentials: None,
+                        region: None,
+                        service: None,
+                    },
+                    extensions,
+                ),
                 bucket,
                 vec![destination("QueueConfiguration", &[(None, None)])],
                 Err(s3_error!(MalformedXML, "persistence conversion")),

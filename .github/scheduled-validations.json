@@ -524,6 +524,30 @@
       "origin": "baseline"
     },
     {
+      "workflow": ".github/workflows/agent-v1-protocol-regression.yml",
+      "name": "Agent v1 protocol regression",
+      "roles": [
+        "pr",
+        "push",
+        "manual"
+      ],
+      "events": [
+        "pull_request",
+        "push",
+        "workflow_dispatch"
+      ],
+      "cadence": "event",
+      "timezone": "UTC",
+      "schedule": [],
+      "owner": "@overtrue",
+      "policy": "active",
+      "monitor": "none",
+      "result_owner": "agent-v1-protocol-regression.yml",
+      "disposition": "validates Agent v1 schemas and fixture integrity",
+      "monitor_reason": "Runs on changes to the Agent v1 contract and on request.",
+      "origin": "added"
+    },
+    {
       "workflow": ".github/workflows/connect-diagnostic-schedule-acceptance.yml",
       "name": "Connect diagnostic scheduler receipt acceptance",
       "roles": [
@@ -1029,33 +1053,6 @@
       "disposition": "gateway conformance corpus (rustfs profile) and client matrix against the candidate on both S3 stacks",
       "failure_owner": "watchdog",
       "origin": "added"
-    },
-    {
-      "workflow": ".github/workflows/gateway-integration-sync.yml",
-      "name": "Gateway Integration Sync",
-      "roles": [
-        "periodic",
-        "manual",
-        "maintenance"
-      ],
-      "events": [
-        "schedule",
-        "workflow_dispatch"
-      ],
-      "cadence": "nightly",
-      "timezone": "UTC",
-      "schedule": [
-        "0 2 * * 1-5"
-      ],
-      "owner": "@overtrue",
-      "policy": "active",
-      "monitor": "workflow",
-      "max_age_hours": 36,
-      "result_owner": "gateway-integration-sync.yml",
-      "disposition": "retained independent entry",
-      "failure_owner": "workflow",
-      "origin": "baseline",
-      "alert_contract": "independent"
     },
     {
       "workflow": ".github/workflows/helm-package.yml",

@@ -15,13 +15,14 @@
 //! PutObject edge authorization and native frame tests against real storage.
 
 use super::*;
+use crate::app::RequestHead;
 use crate::runtime_sources::ServerContextSlot;
 use crate::storage_api::server::http::access::test_support::{
     AuthorizationRequest, BucketOperations as _, CompletePart, DeleteBucketOptions, MakeBucketOptions, MultipartOperations as _,
-    ObjectIO as _, ObjectOperations as _, ObjectOptions, ReqInfo, S3Request, get_bucket_metadata, set_bucket_metadata,
+    ObjectIO as _, ObjectOperations as _, ObjectOptions, ReqInfo, get_bucket_metadata, set_bucket_metadata,
 };
 use bytes::Bytes;
-use http::{HeaderMap, HeaderValue, Method};
+use http::{Extensions, HeaderMap, HeaderValue, Method, Uri};
 use rustfs_gateway::{Limits, MetaView, SseConfig, TargetKind, TransportSecurity, WireRequest};
 use rustfs_gateway_stream::{ByteStream, PayloadCaps, PayloadRead, PayloadStream, StreamError, TrailingHeaders};
 use serial_test::serial;
@@ -74,11 +75,20 @@ async fn set_policy(bucket: &str, statement: serde_json::Value) {
 }
 
 fn envelope(server: &Arc<ServerContextSlot>, headers: HeaderMap) -> RequestEnvelope {
-    let mut legacy = build_request((), Method::PUT);
-    legacy.extensions.insert(Arc::clone(server));
-    legacy.extensions.insert(ReqInfo::default());
-    legacy.headers = headers;
-    RequestEnvelope::from_s3s(&legacy)
+    let mut extensions = Extensions::new();
+    extensions.insert(Arc::clone(server));
+    extensions.insert(ReqInfo::default());
+    RequestEnvelope::from_parts(
+        RequestHead {
+            method: Method::PUT,
+            uri: Uri::from_static("/"),
+            headers,
+            credentials: None,
+            region: None,
+            service: None,
+        },
+        extensions,
+    )
 }
 
 #[tokio::test]
@@ -375,20 +385,6 @@ async fn native_put_frames_reach_checksum_validation_and_storage() {
     }
 }
 
-fn build_request<T>(input: T, method: Method) -> S3Request<T> {
-    S3Request {
-        input,
-        method,
-        uri: http::Uri::from_static("/"),
-        headers: HeaderMap::new(),
-        extensions: http::Extensions::new(),
-        credentials: None,
-        region: None,
-        service: None,
-        trailing_headers: None,
-    }
-}
-
 #[tokio::test]
 #[serial]
 async fn put_source_version_selects_versioned_read_permission() {
@@ -397,16 +393,26 @@ async fn put_source_version_selects_versioned_read_permission() {
         for (read, allowed) in [("s3:GetObject", false), ("s3:GetObjectVersion", true)] {
             let (server, bucket) = fixture(&["s3:PutObject", read, "s3:ReplicateObject"]).await;
             let mut headers = HeaderMap::new();
-            let mut legacy = build_request((), Method::PUT);
-            legacy.extensions.insert(Arc::clone(&server));
-            legacy.extensions.insert(ReqInfo::default());
-            if query {
-                legacy.uri = format!("/?versionId={VERSION}").parse().unwrap();
+            let uri = if query {
+                format!("/?versionId={VERSION}").parse().unwrap()
             } else {
                 headers.insert("x-minio-source-version-id", HeaderValue::from_static(VERSION));
-            }
-            legacy.headers = headers;
-            let mut envelope = RequestEnvelope::from_s3s(&legacy);
+                Uri::from_static("/")
+            };
+            let mut extensions = Extensions::new();
+            extensions.insert(Arc::clone(&server));
+            extensions.insert(ReqInfo::default());
+            let mut envelope = RequestEnvelope::from_parts(
+                RequestHead {
+                    method: Method::PUT,
+                    uri,
+                    headers,
+                    credentials: None,
+                    region: None,
+                    service: None,
+                },
+                extensions,
+            );
             let req = request(dto::PutObjectInput {
                 bucket: rustfs_gateway_types::BucketName::new(bucket).unwrap(),
                 key: rustfs_gateway_types::ObjectKey::new("allowed").unwrap(),
@@ -550,13 +556,13 @@ async fn native_upload_part_uses_frames_and_leaves_the_prior_part_on_failure() {
     let key = "allowed";
     let upload_id = store.new_multipart_upload(&bucket, key, &options).await.unwrap().upload_id;
     let etag = "900150983cd24fb0d6963f7d28e17f72";
+    // The wire-level signature refusal is covered by aws_chunked_named_errors_reject_put_and_upload_part.
     for (label, payload, size, checksum, expected) in [
         ("valid", b"abc", 3, Some("NSRBwg=="), None),
         ("missing trailer", b"xyz", 3, None, Some("BadDigest")),
         ("wrong checksum", b"xyz", 3, Some("AAAAAA=="), Some("BadDigest")),
         ("short", b"xyz", 4, Some("6466Zw=="), Some("IncompleteBody")),
         ("digest error", b"xyz", 3, None, Some("BadDigest")),
-        ("signature error", b"xyz", 3, None, Some("SignatureDoesNotMatch")),
     ] {
         let mut headers = HeaderMap::new();
         headers.insert("x-amz-trailer", HeaderValue::from_static("x-amz-checksum-crc32"));
@@ -564,17 +570,15 @@ async fn native_upload_part_uses_frames_and_leaves_the_prior_part_on_failure() {
         if let Some(value) = checksum {
             trailers.insert("x-amz-checksum-crc32", HeaderValue::from_static(value));
         }
-        let end = match label {
-            "digest error" => Err(StreamError::upstream(Box::new(rustfs_rio::BadDigest {
+        let end = if label == "digest error" {
+            Err(StreamError::upstream(Box::new(rustfs_rio::BadDigest {
                 expected_md5: String::new(),
                 calculated_md5: String::new(),
-            }))),
-            "signature error" => Err(StreamError::upstream(Box::new(
-                crate::app::storage_api::s3::stream::aws_chunked_stream::AwsChunkedStreamError::SignatureMismatch,
-            ))),
-            _ => Ok(PayloadRead::Eof {
+            })))
+        } else {
+            Ok(PayloadRead::Eof {
                 trailers: TrailingHeaders::from_header_map(trailers),
-            }),
+            })
         };
         let mut input = part_input(&bucket, &upload_id, 1);
         input.content_length = size;

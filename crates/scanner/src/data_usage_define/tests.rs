@@ -654,6 +654,7 @@ async fn cache_save_reconciles_an_ambiguous_committed_write() {
     cache.replace("bucket", "", DataUsageEntry::default());
     let revisions = DataUsageCacheRevisions {
         main: DataUsageCacheRevision::Missing,
+        damaged_pages: DamagedPages::default(),
         backup: None,
     };
 
@@ -771,6 +772,103 @@ async fn corrupt_primary_cache_loads_valid_backup() {
 
     assert_eq!(loaded.info.name, "recovered");
     assert_eq!(store.puts.load(Ordering::SeqCst), 0);
+}
+
+#[test]
+fn baseline_revisions_allow_only_a_decoded_unchanged_primary_backup_catchup() {
+    let etag = |value: &str| DataUsageCacheRevision::Etag(value.to_owned());
+    let initial = DataUsageCacheBaselineRevisions {
+        revisions: DataUsageCacheRevisions {
+            main: etag("primary"),
+            backup: Some(etag("old-backup")),
+            damaged_pages: DamagedPages::default(),
+        },
+        loaded_from_main: true,
+    };
+    assert!(initial.permits_unchanged_baseline_since(&initial));
+    let mut caught_up = initial.clone();
+    caught_up.revisions.backup = Some(etag("primary"));
+    assert!(caught_up.permits_unchanged_baseline_since(&initial));
+    assert!(
+        !initial.permits_unchanged_baseline_since(&caught_up),
+        "backup rollback changes the baseline"
+    );
+    for backup in [None, Some(DataUsageCacheRevision::Missing)] {
+        let mut missing_backup = initial.clone();
+        missing_backup.revisions.backup = backup;
+        assert!(caught_up.permits_unchanged_baseline_since(&missing_backup));
+        assert!(!missing_backup.permits_unchanged_baseline_since(&initial));
+    }
+    for (initial_from_main, current_from_main) in [(false, true), (true, false), (false, false)] {
+        let mut baseline = initial.clone();
+        baseline.loaded_from_main = initial_from_main;
+        let mut current = caught_up.clone();
+        current.loaded_from_main = current_from_main;
+        assert!(
+            !current.permits_unchanged_baseline_since(&baseline),
+            "backup fallback grants no primary proof"
+        );
+        current.revisions = baseline.revisions.clone();
+        assert!(
+            current.permits_unchanged_baseline_since(&baseline),
+            "exact revisions retain existing admission"
+        );
+    }
+    let mut changed_main = caught_up.clone();
+    changed_main.revisions.main = etag("new-primary");
+    changed_main.revisions.backup = Some(etag("new-primary"));
+    assert!(!changed_main.permits_unchanged_baseline_since(&initial));
+    let mut changed_backup = caught_up;
+    changed_backup.revisions.backup = Some(etag("unrelated-backup"));
+    assert!(!changed_backup.permits_unchanged_baseline_since(&initial));
+    for main in [DataUsageCacheRevision::Missing, etag("")] {
+        let mut baseline = initial.clone();
+        baseline.revisions.main = main.clone();
+        let mut current = baseline.clone();
+        current.revisions.backup = Some(main);
+        assert!(
+            !current.permits_unchanged_baseline_since(&baseline),
+            "missing or empty primary ETag is not proof"
+        );
+    }
+}
+
+#[tokio::test]
+async fn baseline_revisions_record_the_actual_decoded_cache_source() {
+    let mut expected = DataUsageCache::default();
+    expected.info.name = "decoded".to_owned();
+    let valid = expected.marshal_msg().expect("encode valid cache");
+    for (main, backup, from_main, name) in [
+        (valid.clone(), Some(valid.clone()), true, "decoded"),
+        (b"corrupt".to_vec(), Some(valid.clone()), false, "decoded"),
+        (b"corrupt".to_vec(), None, false, ""),
+        (Vec::new(), None, false, ""),
+    ] {
+        let store = Arc::new(CacheReadStore::new(CacheReadBody::Bytes(main), backup));
+        let mut loaded = DataUsageCache::default();
+        let baseline = loaded
+            .load_with_baseline_revisions(store.clone(), DATA_USAGE_CACHE_NAME)
+            .await
+            .expect("load actual cache source");
+        assert_eq!(baseline.loaded_from_main, from_main);
+        assert_eq!(loaded.info.name, name);
+        let mut raw_loaded = DataUsageCache::default();
+        let raw = raw_loaded
+            .load_with_revisions(store, DATA_USAGE_CACHE_NAME)
+            .await
+            .expect("load compatible raw revisions");
+        assert_eq!(baseline.revisions(), &raw, "raw loader retains its revision contract");
+    }
+    let mut legacy_store = CacheReadStore::new(CacheReadBody::Bytes(Vec::new()), None);
+    legacy_store.legacy = Some(valid);
+    let mut legacy_cache = DataUsageCache::default();
+    let legacy = legacy_cache
+        .load_with_baseline_revisions(Arc::new(legacy_store), "legacy-cache")
+        .await
+        .expect("load cache from the legacy location");
+    assert_eq!(legacy_cache.info.name, "decoded");
+    assert!(!legacy.loaded_from_main);
+    assert_eq!(legacy.revisions.main, DataUsageCacheRevision::Missing);
 }
 
 #[tokio::test]
@@ -2858,6 +2956,7 @@ async fn test_save_backup_budget_tracks_primary_cost() {
         let store = Arc::new(store);
         let revisions = DataUsageCacheRevisions {
             main: DataUsageCacheRevision::Missing,
+            damaged_pages: DamagedPages::default(),
             backup: Some(DataUsageCacheRevision::Etag("backup-etag".to_string())),
         };
         DataUsageCache::default()
@@ -2910,6 +3009,7 @@ async fn test_checkpoint_budget_covers_retries_and_reconciliation() {
             let store = Arc::new(store);
             let revisions = DataUsageCacheRevisions {
                 main: DataUsageCacheRevision::Missing,
+                damaged_pages: DamagedPages::default(),
                 backup: Some(DataUsageCacheRevision::Etag("backup-etag".to_string())),
             };
             let started = Instant::now();
@@ -2922,7 +3022,15 @@ async fn test_checkpoint_budget_covers_retries_and_reconciliation() {
             .expect("a successful or reconciled primary must survive a best-effort backup failure");
             assert_eq!(store.put_attempts[0].load(Ordering::SeqCst), 3);
             assert_eq!(store.put_attempts[1].load(Ordering::SeqCst), 1, "backup writes must not retry");
-            assert_eq!(*store.backup_reads.lock().await, 1, "backup must finish its bounded reconciliation");
+            assert_eq!(
+                *store.backup_reads.lock().await,
+                0,
+                "backup reconciliation must not outlive the total backup budget"
+            );
+            assert!(
+                store.puts.lock().await.iter().all(|put| !put.object.ends_with(".bkp")),
+                "a timed-out backup must not replace the previous fallback"
+            );
             assert!(started.elapsed() < DataUsageCache::persistence_timeout());
         }
     })

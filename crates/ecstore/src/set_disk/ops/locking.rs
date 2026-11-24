@@ -544,7 +544,7 @@ impl SetDisks {
                     return false;
                 }
 
-                let attached = match self.attach_unformatted_replacement_disk(ep).await {
+                let attached = match self.attach_unformatted_replacement_disk(ep, previous_disk.as_ref()).await {
                     Ok(attached) => attached,
                     Err(err) => {
                         warn!(endpoint = %ep, error = ?err, "renew_disk: unformatted replacement probe failed");
@@ -607,39 +607,75 @@ impl SetDisks {
             return false;
         }
 
-        new_disk.enable_health_check();
+        self.publish_local_reconnect(disk_idx, previous_disk.as_ref(), new_disk, true)
+            .await;
+        false
+    }
 
-        if new_disk.is_local() {
-            if let crate::disk::Disk::Local(wrapper) = new_disk.as_ref() {
-                wrapper.get_disk().usage_watch_binding.bind(&self.ctx.usage_watches);
-            }
-            let local_disk_map = runtime_sources::local_disk_map_handle();
-            let mut global_local_disk_map = local_disk_map.write().await;
-            let path = new_disk.endpoint().to_string();
-            global_local_disk_map.insert(path, Some(new_disk.clone()));
-
-            if runtime_sources::setup_is_dist_erasure().await {
-                let local_disk_set_drives = runtime_sources::local_disk_set_drives_handle();
-                let mut local_set_drives = local_disk_set_drives.write().await;
-                local_set_drives[self.pool_index][set_idx][disk_idx] = Some(new_disk.clone());
-            }
+    async fn publish_local_reconnect(
+        &self,
+        disk_idx: usize,
+        previous: Option<&DiskStore>,
+        replacement: DiskStore,
+        formatted: bool,
+    ) -> bool {
+        let set_drives = self.ctx.local_disk_set_drives();
+        let map = self.ctx.local_disk_map();
+        // Take the registry locks in startup order, then the set slot. No
+        // publisher can expose a different wrapper while this slot is replaced.
+        let mut registered_drives = if self.ctx.is_dist_erasure().await {
+            Some(set_drives.write().await)
+        } else {
+            None
+        };
+        let registered_slot = if let Some(registered_drives) = registered_drives.as_mut() {
+            let Some(slot) = registered_drives
+                .get_mut(self.pool_index)
+                .and_then(|sets| sets.get_mut(self.set_index))
+                .and_then(|disks| disks.get_mut(disk_idx))
+            else {
+                return false;
+            };
+            Some(slot)
+        } else {
+            None
+        };
+        let mut registered_disks = map.write().await;
+        let mut disks = self.disks.write().await;
+        let slot = &mut disks[disk_idx];
+        let unchanged = match (slot.as_ref(), previous) {
+            (None, None) => true,
+            (Some(current), Some(previous)) => Arc::ptr_eq(current, previous),
+            _ => false,
+        };
+        if !unchanged {
+            return false;
         }
-
-        debug!("renew_disk: update {:?}", fm.erasure.this);
-
-        let mut disk_lock = self.disks.write().await;
-        if let Some(disk::Disk::Local(displaced)) = disk_lock[disk_idx].as_deref() {
+        if let disk::Disk::Local(wrapper) = replacement.as_ref() {
+            wrapper.get_disk().usage_watch_binding.bind(&self.ctx.usage_watches);
+        }
+        if formatted {
+            replacement.enable_health_check();
+        }
+        registered_disks.insert(replacement.endpoint().to_string(), Some(replacement.clone()));
+        if let Some(registered_slot) = registered_slot {
+            *registered_slot = Some(replacement.clone());
+        }
+        if let Some(disk::Disk::Local(displaced)) = slot.replace(replacement).as_deref() {
             displaced.retire_handle();
         }
-        disk_lock[disk_idx] = Some(new_disk);
-        false
+        true
     }
 
     /// Attach a replacement target only after proving that the exact local slot
     /// is present and unformatted. A health-checked reconnect may reject a
     /// blank target before it reaches the format-heal path; that target still
     /// has to be visible in this set for the formatter to claim it safely.
-    async fn attach_unformatted_replacement_disk(&self, ep: &Endpoint) -> disk::error::Result<bool> {
+    async fn attach_unformatted_replacement_disk(
+        &self,
+        ep: &Endpoint,
+        previous: Option<&DiskStore>,
+    ) -> disk::error::Result<bool> {
         if !ep.is_local
             || usize::try_from(ep.pool_idx).ok() != Some(self.pool_index)
             || usize::try_from(ep.set_idx).ok() != Some(self.set_index)
@@ -665,31 +701,7 @@ impl SetDisks {
             Err(err) => return Err(err),
         }
 
-        {
-            let mut disks = self.disks.write().await;
-            if disks[disk_idx].as_ref().is_some_and(|existing| existing.endpoint() != *ep) {
-                warn!(endpoint = %ep, disk_idx, "renew_disk rejected unformatted replacement for an occupied foreign slot");
-                return Ok(false);
-            }
-            if let Some(disk::Disk::Local(displaced)) = disks[disk_idx].as_deref() {
-                displaced.retire_handle();
-            }
-            disks[disk_idx] = Some(replacement.clone());
-        }
-
-        let local_disk_map = runtime_sources::local_disk_map_handle();
-        local_disk_map
-            .write()
-            .await
-            .insert(replacement.endpoint().to_string(), Some(replacement.clone()));
-
-        if runtime_sources::setup_is_dist_erasure().await {
-            let local_disk_set_drives = runtime_sources::local_disk_set_drives_handle();
-            let mut local_set_drives = local_disk_set_drives.write().await;
-            local_set_drives[self.pool_index][self.set_index][disk_idx] = Some(replacement);
-        }
-
-        Ok(true)
+        Ok(self.publish_local_reconnect(disk_idx, previous, replacement, false).await)
     }
 
     pub(in crate::set_disk) fn find_disk_index(&self, fm: &FormatV3) -> Result<(usize, usize)> {
@@ -1285,6 +1297,24 @@ mod tests {
             "disk reconnect must preserve the local drive metrics tracker epoch"
         );
 
+        assert!(
+            !set_disks
+                .publish_local_reconnect(0, Some(renewed_disk), renewed_disk.clone(), true)
+                .await,
+            "a probe based on the retired handle cannot replace the newer wrapper"
+        );
+        let registered = set_disks
+            .ctx
+            .local_disk_map()
+            .read()
+            .await
+            .get(&endpoints[0].to_string())
+            .cloned()
+            .flatten()
+            .expect("renewed disk registry entry");
+        assert!(Arc::ptr_eq(&registered, renewed_again));
+        assert!(!current.retirement_token().is_cancelled());
+
         drop(temp_dirs);
     }
 
@@ -1485,7 +1515,7 @@ mod tests {
 
         assert!(
             set_disks
-                .attach_unformatted_replacement_disk(&replacement_endpoint)
+                .attach_unformatted_replacement_disk(&replacement_endpoint, None)
                 .await
                 .expect("a blank local replacement should be admitted")
         );

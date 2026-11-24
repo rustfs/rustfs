@@ -1235,23 +1235,66 @@ impl Serialize for DataUsageEntry {
     where
         S: serde::Serializer,
     {
+        self.serialize_fields(serializer, &self.children, &self.replication_stats, &self.all_tier_stats)
+    }
+}
+
+struct OrderedUsageEntry<'a>(&'a DataUsageEntry);
+
+impl Serialize for OrderedUsageEntry<'_> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut children: Vec<_> = self.0.children.iter().collect();
+        children.sort_unstable();
+        // MessagePack decoders accept struct fields as positional sequences.
+        // Include the nested target and tier maps in stable order as well.
+        let replication = self.0.replication_stats.as_ref().map(|stats| {
+            let ReplicationAllStats {
+                targets,
+                replica_size,
+                replica_count,
+            } = stats;
+            let targets: std::collections::BTreeMap<_, _> = targets.iter().collect();
+            (targets, replica_size, replica_count)
+        });
+        let tiers = self.0.all_tier_stats.as_ref().map(|stats| {
+            let AllTierStats { tiers } = stats;
+            let tiers: std::collections::BTreeMap<_, _> = tiers.iter().collect();
+            (tiers,)
+        });
+        self.0.serialize_fields(serializer, &children, &replication, &tiers)
+    }
+}
+
+impl DataUsageEntry {
+    /// Stable MessagePack encoding for independently reusable scanner checkpoint pages.
+    pub fn ordered_encoding(&self) -> impl Serialize + '_ {
+        OrderedUsageEntry(self)
+    }
+
+    fn serialize_fields<S: serde::Serializer, C: Serialize, R: Serialize, T: Serialize>(
+        &self,
+        serializer: S,
+        children: &C,
+        replication: &R,
+        tiers: &T,
+    ) -> Result<S::Ok, S::Error> {
         // Keep entries map-encoded so older readers can ignore fields appended
         // by newer scanner versions during rolling upgrades. The derived
         // (array) encoding made any appended field a decode error for them.
         let mut state = serializer.serialize_map(Some(
             11 + usize::from(self.unknown_tier_stats.is_some()) + usize::from(self.tier_accounting_proof.is_some()),
         ))?;
-        state.serialize_entry("children", &self.children)?;
+        state.serialize_entry("children", children)?;
         state.serialize_entry("size", &self.size)?;
         state.serialize_entry("objects", &self.objects)?;
         state.serialize_entry("versions", &self.versions)?;
         state.serialize_entry("delete_markers", &self.delete_markers)?;
         state.serialize_entry("obj_sizes", &self.obj_sizes)?;
         state.serialize_entry("obj_versions", &self.obj_versions)?;
-        state.serialize_entry("replication_stats", &self.replication_stats)?;
+        state.serialize_entry("replication_stats", replication)?;
         state.serialize_entry("compacted", &self.compacted)?;
         state.serialize_entry("failed_objects", &self.failed_objects)?;
-        state.serialize_entry("all_tier_stats", &self.all_tier_stats)?;
+        state.serialize_entry("all_tier_stats", tiers)?;
         // Keep the legacy no-unknown shape byte-for-byte stable. Once unknown
         // accounting exists, append its map field before the optional proof.
         if let Some(unknown_tier_stats) = self.unknown_tier_stats.as_ref() {
@@ -1496,9 +1539,9 @@ pub fn prefix_usage_in_cache(
     } else {
         format!("{bucket}/{prefix}")
     };
-    let entry = clone_cache_value(cache.get(&clone_cache_value(&hash_path(&root).0))?);
+    let entry = cache.get(&hash_path(&root).0)?;
 
-    let usage = PrefixUsageSummary::from_entry(&flatten_entry(cache, &entry, 0)?);
+    let usage = PrefixUsageSummary::from_entry(&flatten_entry(cache, entry, 0)?);
 
     let child_prefix = format!("{root}/");
     let mut sub_prefixes: Vec<PrefixUsageEntry> = entry
@@ -1667,28 +1710,69 @@ impl DataUsageCache {
     }
 
     pub fn flatten(&self, root: &DataUsageEntry) -> DataUsageEntry {
-        let mut root = clone_cache_value(root);
-        for id in clone_cache_value(&root.children).iter() {
-            if let Some(e) = self.cache.get(id) {
-                let mut e = clone_cache_value(e);
-                if !e.children.is_empty() {
-                    e = self.flatten(&e);
+        let mut aggregate = clone_cache_value(root);
+        aggregate.children = HashSet::new();
+        let mut current = (aggregate, root.children.iter());
+        let mut ancestors = Vec::new();
+        let mut visited = HashSet::new();
+        loop {
+            if let Some(id) = current.1.next() {
+                if !visited.insert(id.as_str()) {
+                    continue;
                 }
-                root.merge(&e);
+                let Some(child) = self.cache.get(id).filter(|child| !std::ptr::eq(*child, root)) else {
+                    continue;
+                };
+                if child.children.is_empty() {
+                    current.0.merge(child);
+                } else {
+                    let mut aggregate = clone_cache_value(child);
+                    aggregate.children = HashSet::new();
+                    ancestors.push(std::mem::replace(&mut current, (aggregate, child.children.iter())));
+                }
+            } else if let Some(mut parent) = ancestors.pop() {
+                // Preserve subtree grouping for tier accounting proofs.
+                parent.0.merge(&current.0);
+                current = parent;
+            } else {
+                return current.0;
             }
         }
-        root.children.clear();
-        root
     }
 
     pub fn copy_with_children(&mut self, src: &DataUsageCache, hash: &DataUsageHash, parent: &Option<DataUsageHash>) {
-        if let Some(e) = src.cache.get(&clone_cache_value(&hash.0)) {
-            self.cache.insert(clone_cache_value(&hash.0), clone_cache_value(e));
+        let mut visited = HashSet::new();
+        self.copy_with_children_guard(src, hash, parent, &mut visited, 0);
+    }
+
+    fn copy_with_children_guard(
+        &mut self,
+        src: &DataUsageCache,
+        hash: &DataUsageHash,
+        parent: &Option<DataUsageHash>,
+        visited: &mut HashSet<String>,
+        depth: usize,
+    ) {
+        if depth > PREFIX_USAGE_MAX_DEPTH {
+            return;
+        }
+        let key = clone_cache_value(&hash.0);
+        if !visited.insert(key.clone()) {
+            return;
+        }
+        if let Some(e) = src.cache.get(&key) {
+            self.cache.insert(key.clone(), clone_cache_value(e));
             for ch in e.children.iter() {
-                if *ch == clone_cache_value(&hash.0) {
+                if *ch == key {
                     return;
                 }
-                self.copy_with_children(src, &DataUsageHash(clone_cache_value(ch)), &Some(clone_cache_value(hash)));
+                self.copy_with_children_guard(
+                    src,
+                    &DataUsageHash(clone_cache_value(ch)),
+                    &Some(clone_cache_value(hash)),
+                    visited,
+                    depth + 1,
+                );
             }
             if let Some(parent) = parent {
                 let p = self.cache.entry(clone_cache_value(&parent.0)).or_default();
@@ -1698,32 +1782,40 @@ impl DataUsageCache {
     }
 
     pub fn delete_recursive(&mut self, hash: &DataUsageHash) {
+        let mut visited = HashSet::new();
+        self.delete_recursive_guard(&hash.0, &mut visited, 0);
+    }
+
+    fn delete_recursive_guard(&mut self, path: &str, visited: &mut HashSet<String>, depth: usize) {
+        if depth > PREFIX_USAGE_MAX_DEPTH {
+            return;
+        }
+        let key = clone_cache_value(path);
+        if !visited.insert(key.clone()) {
+            return;
+        }
         let mut need_remove = Vec::new();
-        if let Some(v) = self.cache.get(&clone_cache_value(&hash.0)) {
+        if let Some(v) = self.cache.get(&key) {
             for child in v.children.iter() {
                 need_remove.push(clone_cache_value(child));
             }
         }
-        self.cache.remove(&clone_cache_value(&hash.0));
+        self.cache.remove(&key);
         need_remove.iter().for_each(|child| {
-            self.delete_recursive(&DataUsageHash(clone_cache_value(child)));
+            self.delete_recursive_guard(child, visited, depth + 1);
         });
     }
 
     pub fn size_recursive(&self, path: &str) -> Option<DataUsageEntry> {
-        match self.find(path) {
-            Some(root) => {
-                if root.children.is_empty() {
-                    return Some(root);
-                }
-                let mut flat = self.flatten(&root);
-                if flat.replication_stats.as_ref().is_some_and(ReplicationAllStats::is_empty) {
-                    flat.replication_stats = None;
-                }
-                Some(flat)
-            }
-            None => None,
+        let root = self.cache.get(&hash_path(path).0)?;
+        if root.children.is_empty() {
+            return Some(clone_cache_value(root));
         }
+        let mut flat = self.flatten(root);
+        if flat.replication_stats.as_ref().is_some_and(ReplicationAllStats::is_empty) {
+            flat.replication_stats = None;
+        }
+        Some(flat)
     }
 
     pub fn search_parent(&self, hash: &DataUsageHash) -> Option<DataUsageHash> {
@@ -1845,6 +1937,17 @@ impl DataUsageCache {
     }
 
     pub fn total_children_rec(&self, path: &str) -> usize {
+        let mut visited = HashSet::new();
+        self.total_children_rec_guard(path, &mut visited, 0)
+    }
+
+    fn total_children_rec_guard(&self, path: &str, visited: &mut HashSet<String>, depth: usize) -> usize {
+        if depth > PREFIX_USAGE_MAX_DEPTH {
+            return 0;
+        }
+        if !visited.insert(clone_cache_value(path)) {
+            return 0;
+        }
         let Some(root) = self.find(path) else {
             return 0;
         };
@@ -1854,7 +1957,7 @@ impl DataUsageCache {
 
         let mut n = root.children.len();
         for ch in root.children.iter() {
-            n += self.total_children_rec(ch);
+            n += self.total_children_rec_guard(ch, visited, depth + 1);
         }
         n
     }
@@ -1904,19 +2007,17 @@ impl DataUsageCache {
 
     /// Convert cache to DataUsageInfo for a specific path
     pub fn dui(&self, path: &str, buckets: &[String]) -> DataUsageInfo {
-        let e = match self.find(path) {
-            Some(e) => e,
-            None => return DataUsageInfo::default(),
+        let Some(e) = self.cache.get(&hash_path(path).0) else {
+            return DataUsageInfo::default();
         };
-        let flat = self.flatten(&e);
+        let flat = self.flatten(e);
 
         let mut buckets_usage = HashMap::new();
         for bucket_name in buckets.iter() {
-            let e = match self.find(bucket_name) {
-                Some(e) => e,
-                None => continue,
+            let Some(e) = self.cache.get(&hash_path(bucket_name).0) else {
+                continue;
             };
-            let flat = self.flatten(&e);
+            let flat = self.flatten(e);
             let mut bui = BucketUsageInfo {
                 size: flat.size as u64,
                 versions_count: flat.versions as u64,
@@ -2532,6 +2633,32 @@ mod tests {
         let mut entry = DataUsageEntry::default();
         entry.add_tier_sizes(&HashMap::from([(tier.to_string(), stats)]));
         entry
+    }
+
+    #[test]
+    fn ordered_checkpoint_entry_round_trips_and_stays_identical_after_reload() {
+        let mut entry = DataUsageEntry::default();
+        let mut replication = ReplicationAllStats {
+            replica_size: 998,
+            replica_count: 3,
+            ..Default::default()
+        };
+        let mut tiers = AllTierStats::default();
+        for index in 1..=32 {
+            let key = format!("source-{index}");
+            entry.children.insert(key.clone());
+            replication.targets.insert(key.clone(), ReplicationTargetUsage::default());
+            tiers.tiers.insert(key, TierStats::default());
+        }
+        entry.replication_stats = Some(replication);
+        entry.all_tier_stats = Some(tiers);
+        let bytes = rmp_serde::to_vec(&entry.ordered_encoding()).expect("encode ordered checkpoint");
+        let reloaded: DataUsageEntry = rmp_serde::from_slice(&bytes).expect("read with the existing codec");
+        assert_eq!(reloaded.children, entry.children);
+        let replicas = reloaded.replication_stats.as_ref().expect("replication stats");
+        assert_eq!((replicas.targets.len(), replicas.replica_size, replicas.replica_count), (32, 998, 3));
+        assert_eq!(reloaded.all_tier_stats.as_ref().expect("tier stats").tiers.len(), 32);
+        assert_eq!(rmp_serde::to_vec(&reloaded.ordered_encoding()).expect("encode reloaded entry"), bytes);
     }
 
     #[test]
@@ -4042,6 +4169,17 @@ mod tests {
             },
         );
         (cache, root)
+    }
+
+    #[test]
+    fn test_flatten_aggregates_nested_siblings() {
+        let (cache, root) = build_test_tree();
+        let root_entry = cache.cache.get(&root.0).expect("usage root");
+        let flattened = cache.flatten(root_entry);
+        assert!(flattened.children.is_empty());
+        assert_eq!(flattened.objects, 6);
+        assert_eq!(flattened.size, 60);
+        assert_eq!(root_entry.children.len(), 2);
     }
 
     #[test]

@@ -49,6 +49,7 @@ pub(crate) fn test_single_inflight_construction_count() -> u64 {
 }
 
 type FillTask = oneshot::Receiver<FillResult>;
+type FillBatch = (Vec<u8>, VecDeque<Vec<u8>>);
 
 struct FillWorker {
     tx: mpsc::Sender<FillRequest>,
@@ -293,7 +294,7 @@ where
         Self::new_with_fill_policy_inner(source, engine, total_length, metrics_path, fill_policy)
     }
 
-    fn poll_fill_result(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<Option<Vec<u8>>>> {
+    fn poll_fill_result(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<Option<FillBatch>>> {
         if self.fill.is_none() {
             let fill_worker_tx = match self.fill_worker_tx() {
                 Ok(tx) => tx,
@@ -345,15 +346,6 @@ where
         if let Some(deferred_error) = deferred_error {
             self.prefetch_error = Some(deferred_error);
         }
-        // Queued stripes are delivered to the client via `prefetched_bufs.pop_front()`
-        // in `poll_read` without touching `self.remaining`, so their bytes must be
-        // accounted for here. Otherwise, under multi-in-flight fill policies (e.g. the
-        // default `DualInFlight`), `remaining` never reaches 0 and a fully delivered
-        // multi-block object still terminates the GET with `LessData`. Buffers in
-        // `queued_buffers` come only from `Ok(true)` decodes, so they are non-empty and
-        // their total is bounded by `remaining - main_buf.len()`, ruling out underflow.
-        self.remaining -= queued_buffers.iter().map(Vec::len).sum::<usize>();
-        self.prefetched_bufs.extend(queued_buffers);
 
         match result {
             Ok(Some(buf)) => {
@@ -362,8 +354,14 @@ where
                 }
                 rustfs_io_metrics::record_get_object_reader_stripe(self.metrics_path);
                 rustfs_io_metrics::record_get_object_reader_bytes(self.metrics_path, buf.len());
+                // Queued stripes are delivered to the client via `prefetched_bufs.pop_front()`
+                // in `poll_read` without touching `self.remaining`, so their bytes must be
+                // accounted for here alongside the primary stripe. Buffers in `queued_buffers`
+                // come only from `Ok(true)` decodes, so they are non-empty and their total is
+                // bounded by `remaining - buf.len()`, ruling out underflow.
                 self.remaining -= buf.len();
-                Poll::Ready(Ok(Some(buf)))
+                self.remaining -= queued_buffers.iter().map(Vec::len).sum::<usize>();
+                Poll::Ready(Ok(Some((buf, queued_buffers))))
             }
             Ok(None) => {
                 if self.remaining == 0 {
@@ -401,8 +399,8 @@ where
         };
 
         match fill {
-            Ok(Some(buf)) => {
-                let output_has_remaining = self.output_pos < self.output_buf.len();
+            Ok(Some((buf, queued_buffers))) => {
+                let output_has_remaining = self.output_pos < self.output_buf.len() || !self.prefetched_bufs.is_empty();
                 let mut queued_count = 0usize;
                 let mut queued_bytes = 0usize;
 
@@ -420,6 +418,7 @@ where
                     self.output_buf = buf;
                     self.output_pos = 0;
                 }
+                self.prefetched_bufs.extend(queued_buffers);
 
                 if !self.prefetched_bufs.is_empty() {
                     let total_prefetched_bytes = self.prefetched_bufs.iter().map(Vec::len).sum::<usize>();
@@ -451,7 +450,7 @@ where
                 Poll::Ready(Ok(()))
             }
             Err(err) => {
-                if self.output_pos < self.output_buf.len() {
+                if self.output_pos < self.output_buf.len() || !self.prefetched_bufs.is_empty() {
                     rustfs_io_metrics::record_get_object_reader_prefetch(self.metrics_path, GET_READER_PREFETCH_ERROR_DEFERRED);
                     self.prefetch_error = Some(err);
                     Poll::Ready(Ok(()))
@@ -1858,6 +1857,42 @@ mod tests {
         })
         .await
         .expect("dual inflight policy should prefetch two future stripes before current output drains");
+    }
+
+    #[tokio::test]
+    async fn erasure_decode_reader_dual_inflight_preserves_stripe_order_when_prefetch_completes_before_output_drains() {
+        let erasure = Erasure::new(4, 2, 16);
+        let data = (0..96u8).collect::<Vec<_>>();
+        let read_count = Arc::new(AtomicUsize::new(0));
+        let mut source = source_from_data(&erasure, &data, &[]);
+        source.read_count = Some(Arc::clone(&read_count));
+        let engine = LegacyEcDecodeEngine::new(erasure);
+        let mut reader = ErasureDecodeReader::new_with_fill_policy(
+            source,
+            engine,
+            data.len(),
+            GET_OBJECT_PATH_CODEC_STREAMING,
+            FillPolicy::DualInFlight,
+        )
+        .expect("reader should be constructed");
+
+        let mut decoded = Vec::with_capacity(data.len());
+        let mut chunk = [0u8; 5];
+        loop {
+            let n = reader.read(&mut chunk).await.expect("chunk read should succeed");
+            if n == 0 {
+                break;
+            }
+            decoded.extend_from_slice(&chunk[..n]);
+            // Yield between partial reads so the DualInFlight worker completes
+            // a 2-stripe fill (primary + queued_buffers) while output_buf still
+            // has unconsumed bytes.
+            for _ in 0..4 {
+                yield_now().await;
+            }
+        }
+
+        assert_eq!(decoded, data);
     }
 
     #[tokio::test]

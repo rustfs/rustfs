@@ -17,7 +17,6 @@
 //! entry and condition values. These live in the app layer because the
 //! envelope (and its impl of the storage facts trait) belongs here.
 
-use crate::app::RequestEnvelope;
 use crate::app::storage_api::context::MultipartStagingOperation;
 use crate::app::storage_api::owned_parity::parity_test_support as support;
 use crate::app::storage_api::owned_parity::{DenialAuditor, DenialRateLimiter};
@@ -28,8 +27,9 @@ use crate::app::storage_api::owned_parity::{
 use crate::app::storage_api::owned_parity::{authorize_create_bucket, authorize_delete_bucket};
 use crate::app::storage_api::s3::{
     BucketLocationConstraint, CreateBucketConfiguration, CreateBucketInput, CreateMultipartUploadInput, DeleteObjectInput,
-    ObjectLockRetention, PutObjectInput, S3Error, S3ErrorCode, S3Request,
+    ObjectLockRetention, PutObjectInput, S3ErrorCode, S3Request,
 };
+use crate::app::{RequestEnvelope, RequestHead};
 use crate::auth::facts::{AuthzPrincipal, AuthzTarget};
 use crate::storage::storage_api::contract::bucket::{BucketOperations as _, MakeBucketOptions};
 use crate::storage::storage_api::contract::object::{ObjectIO as _, ObjectOperations as _};
@@ -76,17 +76,45 @@ fn build_request<T>(input: T, method: Method) -> S3Request<T> {
     }
 }
 
+/// Method, URI, headers, extensions, region, and service. These fixtures leave credentials absent.
+fn envelope_from_request<T>(req: &S3Request<T>) -> RequestEnvelope {
+    RequestEnvelope::from_parts(
+        RequestHead {
+            method: req.method.clone(),
+            uri: req.uri.clone(),
+            headers: req.headers.clone(),
+            credentials: None,
+            region: req.region.as_ref().map(|region| region.as_str().to_owned()),
+            service: req.service.clone(),
+        },
+        req.extensions.clone(),
+    )
+}
+
 fn ensure_req_info<T>(req: &mut S3Request<T>) {
     req.extensions.insert(ReqInfo::default());
 }
 
+fn denial_envelope(method: Method, uri: Uri, extensions: Extensions) -> RequestEnvelope {
+    RequestEnvelope::from_parts(
+        RequestHead {
+            method,
+            uri,
+            headers: HeaderMap::new(),
+            credentials: None,
+            region: None,
+            service: None,
+        },
+        extensions,
+    )
+}
+
 #[test]
-fn owned_and_legacy_denials_share_audit_fields_and_rate_limit() {
+fn authenticated_denials_preserve_audit_fields_across_the_burst() {
     use crate::app::storage_api::owned_parity::DenialScope;
     use crate::app::storage_api::owned_parity::ReqInfo;
     use crate::app::storage_api::owned_parity::RequestContext;
-    use crate::app::storage_api::s3::S3Request;
-    use http::{Extensions, HeaderMap, Method, Uri};
+    use http::{Extensions, Method, Uri};
     use rustfs_credentials::Credentials;
     use rustfs_policy::policy::action::{Action, S3Action};
     use std::sync::{Arc, Mutex};
@@ -102,18 +130,8 @@ fn owned_and_legacy_denials_share_audit_fields_and_rate_limit() {
         },
     )
     .with_clock(move || now);
-    let mut req = S3Request {
-        input: (),
-        method: Method::GET,
-        uri: Uri::from_static("/uri-bucket/uri-object"),
-        headers: HeaderMap::new(),
-        extensions: Extensions::new(),
-        credentials: None,
-        region: None,
-        service: None,
-        trailing_headers: None,
-    };
-    req.extensions.insert(ReqInfo {
+    let mut extensions = Extensions::new();
+    extensions.insert(ReqInfo {
         cred: Some(Credentials {
             access_key: "audit-user".to_string(),
             ..Default::default()
@@ -129,11 +147,11 @@ fn owned_and_legacy_denials_share_audit_fields_and_rate_limit() {
         }),
         ..Default::default()
     });
-    let envelope = crate::app::RequestEnvelope::from_s3s(&req);
+    let envelope = denial_envelope(Method::GET, Uri::from_static("/uri-bucket/uri-object"), extensions);
     let action = Action::S3Action(S3Action::GetObjectAction);
-    auditor.audit(&req, &action, "denied", DenialScope::Request);
-    auditor.audit_owned(&envelope.audit_view(), &action, "denied", DenialScope::Request);
-    auditor.audit_owned(&envelope.audit_view(), &action, "denied", DenialScope::Request);
+    for _ in 0..3 {
+        auditor.audit_owned(&envelope.audit_view(), &action, "denied", DenialScope::Request);
+    }
 
     let entries = captured.lock().unwrap();
     assert_eq!(entries.len(), 2);
@@ -147,13 +165,12 @@ fn owned_and_legacy_denials_share_audit_fields_and_rate_limit() {
 }
 
 #[test]
-fn owned_and_legacy_denials_preserve_context_and_address_precedence() {
+fn denials_preserve_context_and_address_precedence() {
     use crate::app::storage_api::owned_parity::ReqInfo;
     use crate::app::storage_api::owned_parity::RequestContext;
-    use crate::app::storage_api::owned_parity::{DenialScope, authorization_denial_entry, authorization_denial_entry_for_view};
-    use crate::app::storage_api::s3::S3Request;
+    use crate::app::storage_api::owned_parity::{DenialScope, authorization_denial_entry_for_view};
     use crate::shared_types::RemoteAddr;
-    use http::{Extensions, HeaderMap, Method, Uri};
+    use http::{Extensions, Method, Uri};
     use rustfs_policy::policy::action::{Action, S3Action};
     use rustfs_trusted_proxies::ClientInfo;
     use std::net::SocketAddr;
@@ -166,57 +183,42 @@ fn owned_and_legacy_denials_preserve_context_and_address_precedence() {
         span_id: None,
         start_time: now,
     };
-    let mut req = S3Request {
-        input: (),
-        method: Method::GET,
-        uri: Uri::from_static("/uri-bucket/uri-object"),
-        headers: HeaderMap::new(),
-        extensions: Extensions::new(),
-        credentials: None,
-        region: None,
-        service: None,
-        trailing_headers: None,
-    };
-    req.extensions.insert(ReqInfo {
+    let mut extensions = Extensions::new();
+    extensions.insert(ReqInfo {
         bucket: Some(String::new()),
         object: Some(String::new()),
         request_context: Some(context("nested")),
         ..Default::default()
     });
-    req.extensions.insert(context("direct"));
-    req.extensions
-        .insert(Some(RemoteAddr("192.0.2.2:9000".parse::<SocketAddr>().unwrap())));
-    req.extensions.insert(ClientInfo::direct("198.51.100.7:443".parse().unwrap()));
+    extensions.insert(context("direct"));
+    extensions.insert(Some(RemoteAddr("192.0.2.2:9000".parse::<SocketAddr>().unwrap())));
+    extensions.insert(ClientInfo::direct("198.51.100.7:443".parse().unwrap()));
     let action = Action::S3Action(S3Action::GetObjectAction);
 
     for (client_present, expected_host) in [(true, "198.51.100.7"), (false, "192.0.2.2")] {
         if !client_present {
-            req.extensions.remove::<ClientInfo>();
-            req.extensions.remove::<RequestContext>();
+            extensions.remove::<ClientInfo>();
+            extensions.remove::<RequestContext>();
         }
-        let envelope = crate::app::RequestEnvelope::from_s3s(&req);
+        let envelope = denial_envelope(Method::GET, Uri::from_static("/uri-bucket/uri-object"), extensions.clone());
         let expected_id = if client_present { "direct" } else { "nested" };
-        let legacy = authorization_denial_entry(&req, &action, "denied", DenialScope::Request);
-        let owned = authorization_denial_entry_for_view(&envelope.audit_view(), &action, "denied", DenialScope::Request);
-        for entry in [legacy, owned] {
-            assert_eq!(
-                (
-                    entry.request_id.as_deref(),
-                    entry.remote_host.as_deref(),
-                    entry.api.bucket.as_deref(),
-                    entry.api.object.as_deref()
-                ),
-                (Some(expected_id), Some(expected_host), Some("uri-bucket"), Some("uri-object")),
-            );
-        }
+        let entry = authorization_denial_entry_for_view(&envelope.audit_view(), &action, "denied", DenialScope::Request);
+        assert_eq!(
+            (
+                entry.request_id.as_deref(),
+                entry.remote_host.as_deref(),
+                entry.api.bucket.as_deref(),
+                entry.api.object.as_deref()
+            ),
+            (Some(expected_id), Some(expected_host), Some("uri-bucket"), Some("uri-object")),
+        );
     }
 }
 
 #[test]
-fn anonymous_owned_and_legacy_denials_share_limit_and_bulk_scope() {
+fn anonymous_denials_preserve_bulk_scope_across_a_refill() {
     use crate::app::storage_api::owned_parity::DenialScope;
-    use crate::app::storage_api::s3::S3Request;
-    use http::{Extensions, HeaderMap, Method, Uri};
+    use http::{Extensions, Method, Uri};
     use rustfs_policy::policy::action::{Action, S3Action};
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
@@ -224,6 +226,8 @@ fn anonymous_owned_and_legacy_denials_share_limit_and_bulk_scope() {
     let now = Instant::now();
     let captured = Arc::new(Mutex::new(Vec::new()));
     let sink = Arc::clone(&captured);
+    let clock = Arc::new(Mutex::new(now));
+    let audit_clock = Arc::clone(&clock);
     let auditor = DenialAuditor::new(
         DenialRateLimiter::new(2, 1, now),
         || true,
@@ -231,22 +235,13 @@ fn anonymous_owned_and_legacy_denials_share_limit_and_bulk_scope() {
             sink.lock().unwrap().push((context, entry));
         },
     )
-    .with_clock(move || now + Duration::from_secs(1));
-    let req = S3Request {
-        input: (),
-        method: Method::POST,
-        uri: Uri::from_static("/bucket/key"),
-        headers: HeaderMap::new(),
-        extensions: Extensions::new(),
-        credentials: None,
-        region: None,
-        service: None,
-        trailing_headers: None,
-    };
-    let envelope = crate::app::RequestEnvelope::from_s3s(&req);
+    .with_clock(move || *audit_clock.lock().unwrap());
+    let envelope = denial_envelope(Method::POST, Uri::from_static("/bucket/key"), Extensions::new());
     let action = Action::S3Action(S3Action::DeleteObjectAction);
-    auditor.audit_at(&req, &action, "denied", DenialScope::Keys(3), now);
-    auditor.audit_at(&req, &action, "denied", DenialScope::Keys(3), now);
+    for _ in 0..2 {
+        auditor.audit_owned(&envelope.audit_view(), &action, "denied", DenialScope::Keys(3));
+    }
+    *clock.lock().unwrap() = now + Duration::from_secs(1);
     auditor.audit_owned(&envelope.audit_view(), &action, "denied", DenialScope::Keys(3));
 
     let entries = captured.lock().unwrap();
@@ -338,7 +333,7 @@ async fn owned_authorization_reloads_tags_when_version_changes() {
         ..Default::default()
     });
     legacy.extensions.insert(slot);
-    let mut owned = crate::app::RequestEnvelope::from_s3s(&legacy);
+    let mut owned = envelope_from_request(&legacy);
     for (index, allowed, expected_tag) in [(0, true, "allowed"), (1, false, "denied"), (0, true, "allowed")] {
         let version = &versions[index];
         owned.req_info_mut().expect("owned info").version_id = Some(version.clone());
@@ -427,15 +422,15 @@ async fn table_publication_guard_timeout_blocks_put_delete_and_multipart_authori
     put_req.extensions.insert(server_ctx.clone());
     delete_req.extensions.insert(server_ctx.clone());
     multipart_req.extensions.insert(server_ctx);
-    let mut owned_put = crate::app::RequestEnvelope::from_s3s(&put_req);
+    let mut owned_put = envelope_from_request(&put_req);
     let owned_info = owned_put.req_info_mut().expect("owned request info");
     owned_info.bucket = Some(bucket.clone());
     owned_info.object = Some("object".to_string());
-    let mut owned_delete = crate::app::RequestEnvelope::from_s3s(&delete_req);
+    let mut owned_delete = envelope_from_request(&delete_req);
     let delete_info = owned_delete.req_info_mut().expect("owned delete info");
     delete_info.bucket = Some(bucket.clone());
     delete_info.object = Some("object".to_string());
-    let mut owned_multipart = crate::app::RequestEnvelope::from_s3s(&multipart_req);
+    let mut owned_multipart = envelope_from_request(&multipart_req);
     let multipart_info = owned_multipart.req_info_mut().expect("owned multipart info");
     multipart_info.bucket = Some(bucket.clone());
     multipart_info.object = Some("object".to_string());
@@ -469,7 +464,7 @@ async fn table_publication_guard_timeout_blocks_put_delete_and_multipart_authori
             storage,
             crate::storage_api::error::StorageError::Lock(rustfs_lock::LockError::Timeout { .. })
         ));
-        let response = S3Error::from(err).to_http_response().expect("serialize publication failure");
+        let response = err.to_http_response().expect("serialize publication failure");
         assert_eq!(response.status(), http::StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(response.headers()[http::header::RETRY_AFTER], "1");
         let body = response.into_body().collect().await.expect("read error XML").to_bytes();
@@ -595,7 +590,7 @@ async fn owned_and_legacy_create_bucket_authorization_use_location_constraint() 
             .as_ref()
             .and_then(|c| c.location_constraint.as_ref())
             .map(|l| l.as_str().to_owned());
-        let mut owned = crate::app::RequestEnvelope::from_s3s(&legacy);
+        let mut owned = envelope_from_request(&legacy);
         let action = Action::S3Action(S3Action::CreateBucketAction);
         let owned_result = crate::app::authorize_owned_request(&mut owned, action, location).await;
         if allowed {
@@ -633,10 +628,15 @@ async fn owned_and_legacy_create_bucket_authorization_use_location_constraint() 
             cred: Some(credentials.clone()),
             ..Default::default()
         });
-        let mut owned = crate::app::RequestEnvelope::from_s3s(&legacy);
-        let input =
-            rustfs_gateway_types::compat::s3s_5761ddfe::generated::ops::create_bucket::input_from_s3s(legacy.input.clone())
-                .expect("a valid CreateBucket input");
+        let mut owned = envelope_from_request(&legacy);
+        let input = rustfs_gateway_types::dto::CreateBucketInput {
+            bucket: rustfs_gateway_types::BucketName::new(bucket).expect("valid bucket name"),
+            create_bucket_configuration: region.map(|region| rustfs_gateway_types::dto::CreateBucketConfiguration {
+                location_constraint: Some(rustfs_gateway_types::dto::LocationConstraint::custom(region.to_owned())),
+            }),
+            object_lock_enabled_for_bucket: Some(object_lock),
+            ..Default::default()
+        };
         let location = crate::app::bucket_usecase::requested_location_constraint(&input).map(str::to_owned);
         let lock = input.object_lock_enabled_for_bucket.is_some_and(|enabled| enabled);
 
@@ -669,22 +669,29 @@ async fn owned_and_legacy_delete_bucket_authorization_agree() {
         ("other-bucket", Some(("x-rustfs-force-delete", "maybe")), Some("AccessDenied")),
         ("force-delete-bucket", Some(("x-rustfs-force-delete", "true")), None),
     ] {
-        let mut legacy = build_request(
-            crate::app::storage_api::s3::dto::DeleteBucketInput {
-                bucket: bucket.to_owned(),
-                ..Default::default()
-            },
-            Method::DELETE,
-        );
+        // Method DELETE, URI `/`, and the force-delete header when this case sets one.
+        // Credentials, region, and service stay absent.
+        let mut headers = HeaderMap::new();
         if let Some((name, value)) = header {
-            legacy.headers.insert(name, HeaderValue::from_static(value));
+            headers.insert(name, HeaderValue::from_static(value));
         }
-        legacy.extensions.insert(Arc::clone(&slot));
-        legacy.extensions.insert(ReqInfo {
+        let mut extensions = Extensions::new();
+        extensions.insert(Arc::clone(&slot));
+        extensions.insert(ReqInfo {
             cred: Some(credentials.clone()),
             ..Default::default()
         });
-        let mut owned = crate::app::RequestEnvelope::from_s3s(&legacy);
+        let mut owned = RequestEnvelope::from_parts(
+            RequestHead {
+                method: Method::DELETE,
+                uri: Uri::from_static("/"),
+                headers,
+                credentials: None,
+                region: None,
+                service: None,
+            },
+            extensions,
+        );
         let owned_result = authorize_delete_bucket(&mut owned, bucket).await;
 
         let case = format!("{bucket} {header:?}");
@@ -705,7 +712,7 @@ fn owned_and_legacy_conditions_read_the_same_request_body_policy_inputs() {
         location_constraint: None,
     };
     let conditions_of = |req: &S3Request<()>, action| {
-        let owned = crate::app::RequestEnvelope::from_s3s(req);
+        let owned = envelope_from_request(req);
         support::authorization_conditions(&owned, &principal, &support::request_authz_facts(&owned, target(action)))
             .expect("owned conditions")
     };
@@ -760,7 +767,7 @@ fn installed_body_inputs_describe_the_request_the_same_on_both_forms() {
     legacy
         .headers
         .insert("x-amz-object-lock-mode", HeaderValue::from_static("COMPLIANCE"));
-    let mut owned = RequestEnvelope::from_s3s(&legacy);
+    let mut owned = envelope_from_request(&legacy);
     owned.install_requested_object_tags(RequestedObjectTags(vec![("class".to_owned(), "public".to_owned())]));
     owned.install_requested_legal_hold(RequestedObjectLegalHold::default());
     owned.install_requested_retention(RequestedObjectLockRetention {
@@ -828,7 +835,7 @@ fn create_bucket_location_constraint_conditions_use_only_xml() {
             .and_then(|c| c.location_constraint.as_ref())
             .map(|l| l.as_str().to_owned());
         let principal = AuthzPrincipal::new(&credentials, "");
-        let owned = crate::app::RequestEnvelope::from_s3s(&req);
+        let owned = envelope_from_request(&req);
         let owned_facts = support::request_authz_facts(
             &owned,
             AuthzTarget {
@@ -912,7 +919,7 @@ async fn request_slot_keeps_bucket_policy_bound_to_its_store() {
         ..Default::default()
     });
     request_a.extensions.insert(slot_a);
-    let mut owned_a = crate::app::RequestEnvelope::from_s3s(&request_a);
+    let mut owned_a = envelope_from_request(&request_a);
     crate::app::authorize_owned_request(&mut owned_a, Action::S3Action(S3Action::PutObjectAction), None)
         .await
         .expect("store A policy should authorize owned request");
@@ -924,7 +931,7 @@ async fn request_slot_keeps_bucket_policy_bound_to_its_store() {
         ..Default::default()
     });
     request_b.extensions.insert(slot_b);
-    let mut owned_b = crate::app::RequestEnvelope::from_s3s(&request_b);
+    let mut owned_b = envelope_from_request(&request_b);
     let owned_err = crate::app::authorize_owned_request(&mut owned_b, Action::S3Action(S3Action::PutObjectAction), None)
         .await
         .expect_err("store B policy must deny owned request");
@@ -950,7 +957,7 @@ async fn request_slot_keeps_bucket_policy_bound_to_its_store() {
         ..Default::default()
     });
     allowed_request_b.extensions.insert(slot_b);
-    let mut owned_allowed_b = crate::app::RequestEnvelope::from_s3s(&allowed_request_b);
+    let mut owned_allowed_b = envelope_from_request(&allowed_request_b);
     crate::app::authorize_owned_request(&mut owned_allowed_b, Action::S3Action(S3Action::PutObjectAction), None)
         .await
         .expect("store B policy should authorize owned request before public access block");
@@ -973,7 +980,7 @@ async fn request_slot_keeps_bucket_policy_bound_to_its_store() {
         ..Default::default()
     });
     restricted_request_b.extensions.insert(slot_b);
-    let mut owned_restricted_b = crate::app::RequestEnvelope::from_s3s(&restricted_request_b);
+    let mut owned_restricted_b = envelope_from_request(&restricted_request_b);
     let owned_err =
         crate::app::authorize_owned_request(&mut owned_restricted_b, Action::S3Action(S3Action::PutObjectAction), None)
             .await
@@ -1016,7 +1023,7 @@ async fn request_slot_keeps_bucket_policy_bound_to_its_store() {
         ..Default::default()
     });
     tagged_request_b.extensions.insert(slot_b);
-    let mut owned_tagged_b = crate::app::RequestEnvelope::from_s3s(&tagged_request_b);
+    let mut owned_tagged_b = envelope_from_request(&tagged_request_b);
     crate::app::authorize_owned_request(&mut owned_tagged_b, Action::S3Action(S3Action::PutObjectAction), None)
         .await
         .expect("store B existing object tags should authorize owned request");
@@ -1031,7 +1038,7 @@ async fn request_slot_keeps_bucket_policy_bound_to_its_store() {
     let mut unready_request = build_request((), Method::PUT);
     unready_request.extensions.insert(ServerContextSlot::new());
     ensure_req_info(&mut unready_request);
-    let mut owned_unready = crate::app::RequestEnvelope::from_s3s(&unready_request);
+    let mut owned_unready = envelope_from_request(&unready_request);
     let err = support::request_object_store(&owned_unready).expect_err("an unready request slot must not use an ambient store");
     assert_eq!(err.code(), &rustfs_s3_types::S3ErrorCode::InternalError);
     let owned_err = crate::app::authorize_owned_request(&mut owned_unready, Action::S3Action(S3Action::PutObjectAction), None)
@@ -1071,13 +1078,13 @@ fn get_object() -> rustfs_policy::policy::action::Action {
 #[tokio::test]
 async fn owned_entry_points_reject_duplicate_signed_metadata_like_the_legacy_edge() {
     let query = "x-amz-meta-a=1&x-amz-meta-a=2";
-    let mut owned = RequestEnvelope::from_s3s(&signed_zip_request(query));
+    let mut owned = envelope_from_request(&signed_zip_request(query));
     let owned_err = crate::app::authorize_owned_request(&mut owned, get_object(), None)
         .await
         .expect_err("owned rejects a repeated metadata key");
     assert_eq!(owned_err.code(), &rustfs_s3_types::S3ErrorCode::InvalidArgument);
 
-    let mut internal = RequestEnvelope::from_s3s(&signed_zip_request(query));
+    let mut internal = envelope_from_request(&signed_zip_request(query));
     let internal_err = crate::app::authorize_owned_internal_object_request(&mut internal, get_object())
         .await
         .expect_err("owned internal rejects a repeated metadata key");
@@ -1087,7 +1094,7 @@ async fn owned_entry_points_reject_duplicate_signed_metadata_like_the_legacy_edg
 #[tokio::test]
 async fn owned_entry_points_hoist_signed_metadata_into_the_headers_policy_reads() {
     let query = "x-amz-meta-a=1";
-    let mut owned = RequestEnvelope::from_s3s(&signed_zip_request(query));
+    let mut owned = envelope_from_request(&signed_zip_request(query));
     let owned_err = crate::app::authorize_owned_request(&mut owned, get_object(), None)
         .await
         .expect_err("no ReqInfo");
@@ -1156,12 +1163,12 @@ async fn owned_entry_point_fails_closed_without_a_body_policy_input() {
         }),
     ];
     for (name, req, action, supply) in cases {
-        let mut missing = RequestEnvelope::from_s3s(&req);
+        let mut missing = envelope_from_request(&req);
         let err = crate::app::authorize_owned_request(&mut missing, action, None)
             .await
             .expect_err(name);
         assert_eq!(err.code(), &rustfs_s3_types::S3ErrorCode::AccessDenied, "{name}: missing input must deny");
-        let mut internal = RequestEnvelope::from_s3s(&req);
+        let mut internal = envelope_from_request(&req);
         let err = crate::app::authorize_owned_internal_object_request(&mut internal, action)
             .await
             .expect_err(name);
@@ -1174,7 +1181,7 @@ async fn owned_entry_point_fails_closed_without_a_body_policy_input() {
         // With the input carried, the request reaches the core, which stops on the absent ReqInfo.
         let mut supplied_req = req;
         supply(&mut supplied_req.extensions);
-        let mut supplied = RequestEnvelope::from_s3s(&supplied_req);
+        let mut supplied = envelope_from_request(&supplied_req);
         let err = crate::app::authorize_owned_request(&mut supplied, action, None)
             .await
             .expect_err(name);
@@ -1580,10 +1587,10 @@ async fn owned_and_legacy_entry_points_reach_the_same_decisions() {
             ..Default::default()
         });
         (case.facts)(&mut legacy);
-        let mut owned = RequestEnvelope::from_s3s(&legacy);
+        let mut owned = envelope_from_request(&legacy);
         // The object shape both edges' access hooks call, on a forked envelope as an archive
         // member is authorized: it must reach the same decision.
-        let mut owned_shape = RequestEnvelope::from_s3s(&legacy).fork_for_authorization();
+        let mut owned_shape = envelope_from_request(&legacy).fork_for_authorization();
         let action = Action::S3Action(case.action);
         let owned_result = crate::app::authorize_owned_request(&mut owned, action, None).await;
         let shape_result = crate::app::storage_api::owned_parity::authorize_object_request(
@@ -1594,7 +1601,7 @@ async fn owned_and_legacy_entry_points_reach_the_same_decisions() {
             action,
         )
         .await
-        .map_err(S3Error::from);
+        .map_err(crate::error::legacy_error_for_test);
         let owned_ok = match &owned_result {
             Ok(()) => case.allowed,
             Err(err) => !case.allowed && err.code() == &rustfs_s3_types::S3ErrorCode::AccessDenied,
@@ -1734,27 +1741,27 @@ async fn owned_and_legacy_bucket_config_mutations_hand_on_the_same_decision_and_
             is_owner,
             ..Default::default()
         });
-        let mut owned = RequestEnvelope::from_s3s(&legacy);
+        let mut owned = envelope_from_request(&legacy);
         let action = Action::S3Action(action);
 
-        let owned_result = authorize_bucket_config_mutation(&slot, &mut owned, bucket, action)
-            .await
-            .map_err(S3Error::from);
-        let outcome = |result: Result<(), S3ErrorCode>, snapshot: Result<Option<uuid::Uuid>, S3ErrorCode>| match result {
+        use rustfs_s3_types::S3ErrorCode as OwnedErrorCode;
+
+        let owned_result = authorize_bucket_config_mutation(&slot, &mut owned, bucket, action).await;
+        let outcome = |result: Result<(), OwnedErrorCode>, snapshot: Result<Option<uuid::Uuid>, OwnedErrorCode>| match result {
             Ok(()) => MutationOutcome::Allowed(snapshot.ok().flatten()),
-            Err(S3ErrorCode::AccessDenied) => MutationOutcome::Denied,
+            Err(OwnedErrorCode::AccessDenied) => MutationOutcome::Denied,
             Err(code) => MutationOutcome::Failed(code.as_str().to_owned()),
         };
         let owned_outcome = outcome(
             owned_result.map_err(|err| err.code().clone()),
-            bucket_config_mutation_incarnation(&owned, bucket).map_err(|err| err.code().clone().into()),
+            bucket_config_mutation_incarnation(&owned, bucket).map_err(|err| err.code().clone()),
         );
         // A refused request hands no snapshot on: the use case's reader refuses to run without one.
-        let refused_without_snapshot = |snapshot: Result<Option<uuid::Uuid>, S3ErrorCode>| {
-            matches!(expected, MutationOutcome::Allowed(_)) || snapshot == Err(S3ErrorCode::InternalError)
+        let refused_without_snapshot = |snapshot: Result<Option<uuid::Uuid>, OwnedErrorCode>| {
+            matches!(expected, MutationOutcome::Allowed(_)) || snapshot == Err(OwnedErrorCode::InternalError)
         };
         let both_refused_without_snapshot =
-            refused_without_snapshot(bucket_config_mutation_incarnation(&owned, bucket).map_err(|err| err.code().clone().into()));
+            refused_without_snapshot(bucket_config_mutation_incarnation(&owned, bucket).map_err(|err| err.code().clone()));
         let bucket_recorded = owned.req_info().and_then(|info| info.bucket.as_deref()) == Some(bucket);
         if owned_outcome != expected || !both_refused_without_snapshot || !bucket_recorded {
             mismatches.push(format!("{name}: expected {expected:?}, owned {owned_outcome:?}"));
@@ -1988,11 +1995,64 @@ async fn owned_and_legacy_write_checks_hand_on_the_same_decision_and_state() {
             ..Default::default()
         });
         facts(&mut legacy);
-        let mut owned = RequestEnvelope::from_s3s(&legacy);
+        let mut owned = envelope_from_request(&legacy);
         let owned_outcome = run_write_shape(shape, &mut owned).await;
         if owned_outcome != expected {
             mismatches.push(format!("{name}: expected {expected:?}, owned {owned_outcome:?}"));
         }
     }
     assert!(mismatches.is_empty(), "write check mismatches:\n{}", mismatches.join("\n"));
+}
+
+#[tokio::test]
+#[serial]
+async fn metadata_mutation_authorization_binds_to_the_server_bucket() {
+    use crate::app::RequestHead;
+    use crate::app::storage_api::object_usecase::{StorageObjectOptions, access::apply_bucket_generation_guard};
+    use crate::app::storage_api::owned_parity::{
+        authorize_delete_object_tagging, authorize_put_object_acl, authorize_put_object_tagging,
+    };
+    let (_dirs, store, slot, _user, owner) = decision_world().await;
+    let identity = store.bucket_incarnation_id(PRIVATE).await.expect("server bucket identity");
+    let request = |method| {
+        let mut extensions = Extensions::new();
+        extensions.insert(Arc::clone(&slot));
+        extensions.insert(ReqInfo {
+            cred: Some(owner.clone()),
+            is_owner: true,
+            bucket: Some(PRIVATE.to_string()),
+            object: Some("allowed".to_string()),
+            ..Default::default()
+        });
+        RequestEnvelope::from_parts(
+            RequestHead {
+                method,
+                uri: Uri::from_static("/parity-private/allowed"),
+                headers: HeaderMap::new(),
+                credentials: None,
+                region: None,
+                service: None,
+            },
+            extensions,
+        )
+    };
+
+    let mut put_tagging = request(Method::PUT);
+    authorize_put_object_tagging(&mut put_tagging, &slot, PRIVATE, "allowed", None, RequestedObjectTags(vec![]))
+        .await
+        .expect("authorize PutObjectTagging");
+    let mut delete_tagging = request(Method::DELETE);
+    authorize_delete_object_tagging(&mut delete_tagging, &slot, PRIVATE, "allowed", None)
+        .await
+        .expect("authorize DeleteObjectTagging");
+    let mut put_acl = request(Method::PUT);
+    authorize_put_object_acl(&mut put_acl, &slot, PRIVATE, "allowed", None)
+        .await
+        .expect("authorize PutObjectAcl");
+
+    for request in [&put_tagging, &delete_tagging, &put_acl] {
+        let mut options = StorageObjectOptions::default();
+        apply_bucket_generation_guard(request, PRIVATE, &mut options).expect("bucket generation guard");
+        assert_eq!(options.expected_bucket_incarnation_id, Some(identity));
+    }
 }

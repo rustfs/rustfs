@@ -1695,7 +1695,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::{WebDavDriver, aggregate_session_capacity, copy_content_length};
-    use crate::common::client::s3::{BucketCapacity, SessionCapacityView, StorageBackend as S3StorageBackend};
+    use crate::common::client::s3::{BucketCapacity, MultipartRequest, SessionCapacityView, StorageBackend as S3StorageBackend};
     use crate::common::dummy_storage::DummyBackend;
     use crate::common::gateway::{S3Action, with_test_auth_override, with_test_iam_unavailable};
     use crate::common::session::{Protocol, ProtocolPrincipal, SessionContext, test_session};
@@ -1888,7 +1888,7 @@ mod tests {
 
         async fn upload_part(
             &self,
-            _input: UploadPartInput,
+            _input: MultipartRequest<UploadPartInput>,
             _credentials: &Credentials,
         ) -> Result<UploadPartOutput, Self::Error> {
             unreachable!("parse_path tests should not hit storage")
@@ -1896,7 +1896,7 @@ mod tests {
 
         async fn complete_multipart_upload(
             &self,
-            _input: CompleteMultipartUploadInput,
+            _input: MultipartRequest<CompleteMultipartUploadInput>,
             _credentials: &Credentials,
         ) -> Result<CompleteMultipartUploadOutput, Self::Error> {
             unreachable!("parse_path tests should not hit storage")
@@ -1904,7 +1904,7 @@ mod tests {
 
         async fn abort_multipart_upload(
             &self,
-            _input: AbortMultipartUploadInput,
+            _input: MultipartRequest<AbortMultipartUploadInput>,
             _credentials: &Credentials,
         ) -> Result<AbortMultipartUploadOutput, Self::Error> {
             unreachable!("parse_path tests should not hit storage")
@@ -1912,7 +1912,7 @@ mod tests {
 
         async fn upload_part_copy(
             &self,
-            _input: UploadPartCopyInput,
+            _input: MultipartRequest<UploadPartCopyInput>,
             _credentials: &Credentials,
         ) -> Result<UploadPartCopyOutput, Self::Error> {
             unreachable!("parse_path tests should not hit storage")
@@ -2244,7 +2244,7 @@ mod tests {
 
         async fn upload_part(
             &self,
-            _input: UploadPartInput,
+            _input: MultipartRequest<UploadPartInput>,
             _credentials: &Credentials,
         ) -> Result<UploadPartOutput, Self::Error> {
             unreachable!("upload_part is not used in rename regression tests")
@@ -2252,7 +2252,7 @@ mod tests {
 
         async fn complete_multipart_upload(
             &self,
-            _input: CompleteMultipartUploadInput,
+            _input: MultipartRequest<CompleteMultipartUploadInput>,
             _credentials: &Credentials,
         ) -> Result<CompleteMultipartUploadOutput, Self::Error> {
             unreachable!("complete_multipart_upload is not used in rename regression tests")
@@ -2260,7 +2260,7 @@ mod tests {
 
         async fn abort_multipart_upload(
             &self,
-            _input: AbortMultipartUploadInput,
+            _input: MultipartRequest<AbortMultipartUploadInput>,
             _credentials: &Credentials,
         ) -> Result<AbortMultipartUploadOutput, Self::Error> {
             unreachable!("abort_multipart_upload is not used in rename regression tests")
@@ -2268,7 +2268,7 @@ mod tests {
 
         async fn upload_part_copy(
             &self,
-            _input: UploadPartCopyInput,
+            _input: MultipartRequest<UploadPartCopyInput>,
             _credentials: &Credentials,
         ) -> Result<UploadPartCopyOutput, Self::Error> {
             unreachable!("upload_part_copy is not used in rename regression tests")

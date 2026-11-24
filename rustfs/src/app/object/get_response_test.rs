@@ -18,7 +18,11 @@
 use super::*;
 use crate::app::storage_api::s3::dto::Range;
 use crate::app::storage_api::test::ReqInfo;
+use crate::app::test_seams::{get_envelope, get_http_body, get_object_gateway, get_object_input};
 use http::Method;
+use http_body_util::BodyExt as _;
+use rustfs_gateway_types::{BucketName, ObjectKey, RangeSpec, dto};
+use rustfs_s3_types::S3ErrorCode;
 
 #[test]
 fn website_and_object_lambda_ranges_match_the_legacy_wire_reader() {
@@ -52,51 +56,43 @@ fn website_and_object_lambda_ranges_match_the_legacy_wire_reader() {
 
 #[test]
 fn website_and_object_lambda_conditions_match_the_legacy_wire_reader() {
-    use s3s::dto::{ETagCondition, Timestamp, TimestampFormat};
-    for value in [
-        b"*".as_slice(),
-        b"abc-2",
-        b"\"\"",
-        b"W/\"x\"",
-        b"\"a \tb\"",
-        b"\"a\"b\"",
-        b"",
-        b"bad etag",
-        b"w/\"x\"",
-        b"\"\xff\"",
-        b"\"\x7f\"",
-        b"\"x",
+    // Answers measured on s3s 5761ddfe (`ETagCondition::parse_http_header` and
+    // `Timestamp::parse(HttpDate)`). The owned checks must keep those answers.
+    for (value, accepted) in [
+        (b"*".as_slice(), true),
+        (b"abc-2", true),
+        (b"\"\"", true),
+        (b"W/\"x\"", true),
+        (b"\"a \tb\"", true),
+        (b"\"a\"b\"", true),
+        (b"", false),
+        (b"bad etag", false),
+        (b"w/\"x\"", false),
+        (b"\"\xff\"", false),
+        (b"\"\x7f\"", false),
+        (b"\"x", false),
     ] {
-        assert_eq!(
-            GetObjectFields::valid_etag_condition(value),
-            ETagCondition::parse_http_header(value).is_ok(),
-            "{value:?}"
-        );
+        assert_eq!(GetObjectFields::valid_etag_condition(value), accepted, "{value:?}");
     }
-    for value in [
-        "Sun, 06 Nov 1994 08:49:37 GMT",
-        "Sunday, 06-Nov-94 08:49:37 GMT",
-        "2025-01-01",
-        "Sun, 32 Nov 1994 08:49:37 GMT",
+    for (value, accepted) in [
+        ("Sun, 06 Nov 1994 08:49:37 GMT", true),
+        ("Sunday, 06-Nov-94 08:49:37 GMT", false),
+        ("2025-01-01", false),
+        ("Sun, 32 Nov 1994 08:49:37 GMT", false),
     ] {
-        assert_eq!(
-            GetObjectFields::valid_date_condition(value),
-            Timestamp::parse(TimestampFormat::HttpDate, value).is_ok(),
-            "{value}"
-        );
+        assert_eq!(GetObjectFields::valid_date_condition(value), accepted, "{value}");
     }
 }
 
-fn get_request(input: GetObjectInput) -> S3Request<GetObjectInput> {
-    let info = ReqInfo {
-        bucket: Some(input.bucket.clone()),
-        object: Some(input.key.clone()),
+fn get_envelope_with_info(input: &dto::GetObjectInput, headers: HeaderMap) -> crate::app::RequestEnvelope {
+    let mut extensions = http::Extensions::new();
+    extensions.insert(ReqInfo {
+        bucket: Some(input.bucket.as_str().to_owned()),
+        object: Some(input.key.as_str().to_owned()),
         version_id: input.version_id.clone(),
         ..Default::default()
-    };
-    let mut request = build_request(input, Method::GET);
-    request.extensions.insert(info);
-    request
+    });
+    get_envelope(headers, extensions)
 }
 
 async fn wire_get(
@@ -105,7 +101,6 @@ async fn wire_get(
     headers: &[(&str, &str)],
     admitted: bool,
 ) -> http::Response<Bytes> {
-    use http_body_util::BodyExt as _;
     use hyper_util::rt::TokioIo;
     let before = operation_counts();
     let socket = tokio::net::TcpStream::connect(server.address()).await.unwrap();
@@ -220,15 +215,13 @@ fn get_boundary(stack: Option<&str>) {
                         )
                         .await
                         .unwrap();
-                    let request = get_request(GetObjectInput {
-                        bucket: bucket.to_owned(),
-                        key: key.clone(),
-                        ..Default::default()
-                    });
-                    let response = crate::app::test_seams::get_object(&usecase, request).await.unwrap();
-                    let tag = response.output.e_tag.unwrap();
-                    assert_eq!(tag.value(), ["abc", "", "a\\b", "a\"b", "é", "a\rb", "a\nb", "a\0b"][index]);
-                    assert_eq!(tag.as_weak().is_some(), index == 1);
+                    let input = get_object_input(bucket, &key, None);
+                    let response = get_object_gateway(&usecase, get_envelope_with_info(&input, HeaderMap::new()), input)
+                        .await
+                        .unwrap();
+                    let tag = response.output.etag.expect("unencoded GET retains its ETag");
+                    assert_eq!(tag.opaque, ["abc", "", "a\\b", "a\"b", "é", "a\rb", "a\nb", "a\0b"][index]);
+                    assert_eq!(tag.weak, index == 1);
                     assert_eq!(response.status, None);
                     for (case, suffix, headers) in [
                         ("ordinary", String::new(), vec![]),
@@ -242,33 +235,28 @@ fn get_boundary(stack: Option<&str>) {
                         ("range", String::new(), vec![("range", "bytes=1-3")]),
                         ("unsatisfied", String::new(), vec![("range", "bytes=99-100")]),
                     ] {
-                        let range = match case {
-                            "range" => Some(Range::Int { first: 1, last: Some(3) }),
-                            "unsatisfied" => Some(Range::Int {
-                                first: 99,
-                                last: Some(100),
-                            }),
+                        let mut input =
+                            get_object_input(bucket, &key, (case == "version304").then(|| info.version_id.unwrap().to_string()));
+                        input.range = match case {
+                            "range" => Some(RangeSpec::new("bytes=1-3")),
+                            "unsatisfied" => Some(RangeSpec::new("bytes=99-100")),
                             _ => None,
                         };
-                        let input = GetObjectInput {
-                            bucket: bucket.to_owned(),
-                            key: key.clone(),
-                            range,
-                            version_id: (case == "version304").then(|| info.version_id.unwrap().to_string()),
-                            ..Default::default()
-                        };
-                        let mut request = get_request(input);
+                        let mut request_headers = HeaderMap::new();
                         for (name, value) in &headers {
-                            request.headers.insert(
+                            request_headers.insert(
                                 http::header::HeaderName::from_bytes(name.as_bytes()).unwrap(),
                                 HeaderValue::from_str(value).unwrap(),
                             );
                         }
-                        match crate::app::test_seams::get_object(&usecase, request).await {
+                        match get_object_gateway(&usecase, get_envelope_with_info(&input, request_headers), input).await {
                             Ok(response) => {
                                 assert!(matches!(case, "ordinary" | "range"));
                                 assert_eq!(response.status, None);
-                                assert_eq!(response.output.content_range.as_deref(), (case == "range").then_some("bytes 1-3/7"));
+                                assert_eq!(
+                                    response.output.dto.content_range.as_deref(),
+                                    (case == "range").then_some("bytes 1-3/7")
+                                );
                             }
                             Err(error) => {
                                 let expected = match case {
@@ -363,16 +351,22 @@ fn get_boundary(stack: Option<&str>) {
                 for (key, part, range) in [
                     ("", Some(0), None),
                     ("object-0", Some(0), None),
-                    ("object-0", Some(1), Some(Range::Int { first: 0, last: Some(1) })),
+                    ("object-0", Some(1), Some(RangeSpec::new("bytes=0-1"))),
                 ] {
-                    let input = GetObjectInput {
-                        bucket: "missing-boundary-bucket".to_owned(),
-                        key: key.to_owned(),
+                    let input = dto::GetObjectInput {
+                        bucket: BucketName::new("missing-boundary-bucket").unwrap(),
+                        // The DTO's missing-key placeholder exercises validation before the invalid part number.
+                        key: if key.is_empty() {
+                            ObjectKey::default()
+                        } else {
+                            ObjectKey::new(key).unwrap()
+                        },
                         part_number: part,
                         range,
                         ..Default::default()
                     };
-                    let Err(error) = crate::app::test_seams::get_object(&usecase, get_request(input)).await else {
+                    let Err(error) = get_object_gateway(&usecase, get_envelope_with_info(&input, HeaderMap::new()), input).await
+                    else {
                         panic!("invalid input must fail")
                     };
                     assert_eq!(error.code(), &S3ErrorCode::InvalidArgument);
@@ -389,8 +383,8 @@ fn get_boundary(stack: Option<&str>) {
                     );
                 }
                 let response = wire_get(&server, &format!("/{bucket}/missing"), &[], true).await;
-                assert_eq!(response.status(), StatusCode::NOT_FOUND);
-                assert_error_body(&response, "NoSuchKey");
+                assert_eq!(response.status(), StatusCode::FORBIDDEN);
+                assert_error_body(&response, "AccessDenied");
                 signed_override_contract(&server, bucket).await;
                 for (case, headers) in [
                     ("ordinary", vec![]),
@@ -399,8 +393,8 @@ fn get_boundary(stack: Option<&str>) {
                     ("range", vec![("range", "bytes=1-3")]),
                 ] {
                     let response = wire_get(&server, &format!("/{bucket}/missing"), &headers, true).await;
-                    assert_eq!(response.status(), StatusCode::NOT_FOUND, "{case}");
-                    assert_error_body(&response, "NoSuchKey");
+                    assert_eq!(response.status(), StatusCode::FORBIDDEN, "{case}");
+                    assert_error_body(&response, "AccessDenied");
                 }
                 let marker = store
                     .delete_object(
@@ -413,6 +407,7 @@ fn get_boundary(stack: Option<&str>) {
                     )
                     .await
                     .unwrap();
+                let anonymous = reqwest::Client::builder().no_proxy().build().expect("local anonymous client");
                 for path in [
                     format!("/{bucket}/object-0"),
                     format!("/{bucket}/object-0?versionId={}", marker.version_id.unwrap()),
@@ -424,6 +419,17 @@ fn get_boundary(stack: Option<&str>) {
                     assert_eq!(response.headers()["x-amz-version-id"], marker.version_id.unwrap().to_string());
                     assert_eq!(response.headers().contains_key(http::header::LAST_MODIFIED), explicit);
                     assert_error_body(&response, if explicit { "MethodNotAllowed" } else { "NoSuchKey" });
+
+                    let head = anonymous
+                        .head(format!("{}{path}", server.endpoint()))
+                        .send()
+                        .await
+                        .expect("HEAD delete marker");
+                    assert_eq!(head.status(), response.status(), "HEAD {path}");
+                    for name in ["x-amz-delete-marker", "x-amz-version-id", "last-modified"] {
+                        assert_eq!(head.headers().get(name), response.headers().get(name), "HEAD {path}: {name}");
+                    }
+                    assert!(head.bytes().await.expect("HEAD response body").is_empty());
                 }
                 ssec_wire_contract(&usecase, &server, bucket).await;
                 for reserved in ["sthree-get-boundary", "get-boundary-s3alias"] {
@@ -439,16 +445,14 @@ fn get_boundary(stack: Option<&str>) {
                         )
                         .await
                         .unwrap();
-                    let typed = crate::app::test_seams::get_object(
-                        &usecase,
-                        get_request(GetObjectInput {
-                            bucket: reserved.to_owned(),
-                            key: "object".to_owned(),
-                            ..Default::default()
-                        }),
-                    )
-                    .await
-                    .unwrap();
+                    let input = dto::GetObjectInput {
+                        bucket: crate::app::dto_values::stored_bucket_name(reserved).unwrap(),
+                        key: ObjectKey::new("object").unwrap(),
+                        ..Default::default()
+                    };
+                    let typed = get_object_gateway(&usecase, get_envelope_with_info(&input, HeaderMap::new()), input)
+                        .await
+                        .unwrap();
                     let wire = wire_get(&server, &format!("/{reserved}/object"), &[], true).await;
                     assert_eq!(typed.status, None);
                     assert_eq!(wire.status(), StatusCode::OK);
@@ -531,7 +535,7 @@ async fn signed_override_contract(server: &crate::embedded::RustFSServer, bucket
 }
 
 async fn ssec_wire_contract(usecase: &DefaultObjectUsecase, server: &crate::embedded::RustFSServer, bucket: &str) {
-    use crate::app::storage_api::s3::dto::PutObjectInput;
+    use crate::app::object_usecase::PutObjectWriteInput;
     use md5::{Digest as _, Md5};
     let key = [0x2a_u8; 32];
     let encoded = base64_simd::STANDARD.encode_to_string(key);
@@ -539,23 +543,28 @@ async fn ssec_wire_contract(usecase: &DefaultObjectUsecase, server: &crate::embe
     let wrong = [0x2b_u8; 32];
     let wrong_encoded = base64_simd::STANDARD.encode_to_string(wrong);
     let wrong_digest = base64_simd::STANDARD.encode_to_string(Md5::digest(wrong));
-    let input = PutObjectInput::builder()
-        .bucket(bucket.to_owned())
-        .key("encrypted".to_owned())
-        .body(Some(StreamingBlob::from_bytes(Bytes::from_static(b"protected payload"))))
-        .content_length(Some(17))
-        .sse_customer_algorithm(Some("AES256".to_owned()))
-        .sse_customer_key(Some(encoded.clone()))
-        .sse_customer_key_md5(Some(digest.clone()))
-        .build()
-        .unwrap();
-    {
-        let (envelope, input) =
-            crate::app::object_usecase::PutObjectWriteInput::from_test_request(build_request(input, Method::PUT));
-        crate::app::test_seams::put_object(usecase, envelope, input)
-    }
-    .await
-    .unwrap();
+    let input = PutObjectWriteInput {
+        bucket: bucket.to_owned(),
+        key: "encrypted".to_owned(),
+        body: Some(rustfs_gateway_stream::Body::from_bytes(Bytes::from_static(b"protected payload"))),
+        content_length: Some(17),
+        sse_customer_algorithm: Some("AES256".to_owned()),
+        sse_customer_key: Some(encoded.clone()),
+        sse_customer_key_md5: Some(digest.clone()),
+        ..Default::default()
+    };
+    let envelope = crate::app::RequestEnvelope::from_parts(
+        crate::app::RequestHead {
+            method: Method::PUT,
+            uri: http::Uri::from_static("/"),
+            headers: http::HeaderMap::new(),
+            credentials: None,
+            region: None,
+            service: None,
+        },
+        http::Extensions::new(),
+    );
+    crate::app::test_seams::put_object(usecase, envelope, input).await.unwrap();
     for (case, valid, wrong_key, condition, range) in [
         ("ordinary", true, false, false, false),
         ("missing", false, false, false, false),
@@ -654,7 +663,7 @@ async fn get_reader_handoff_preserves_baseline_copy_count() {
             remaining: length,
             writes: Arc::clone(&writes),
         };
-        let mut body = DefaultObjectUsecase::build_reader_blob(
+        let blob = DefaultObjectUsecase::build_reader_blob(
             reader,
             length as i64,
             "copy-probe",
@@ -667,13 +676,17 @@ async fn get_reader_handoff_preserves_baseline_copy_count() {
             None,
         )
         .await
-        .unwrap()
-        .into_s3s();
+        .unwrap();
+        let mut body = get_http_body(blob);
+        assert_eq!(http_body::Body::size_hint(&body).exact(), Some(length as u64));
         let mut chunks = Vec::new();
         let mut observed_writes = 0;
         let mut retained = 0;
-        while let Some(chunk) = body.next().await {
-            let chunk = chunk.unwrap();
+        while let Some(frame) = body.frame().await {
+            let chunk = frame
+                .expect("reader body must succeed")
+                .into_data()
+                .expect("unexpected reader trailers");
             let begin = chunk.as_ptr() as usize;
             let end = begin + chunk.len();
             let writes = writes.lock().unwrap();
@@ -691,6 +704,8 @@ async fn get_reader_handoff_preserves_baseline_copy_count() {
             observed_writes = writes.len();
             chunks.push(chunk);
         }
+        assert!(body.frame().await.is_none(), "EOF must be terminal");
+        assert_eq!(http_body::Body::size_hint(&body).exact(), Some(0));
         let writes = writes.lock().unwrap();
         let total: usize = chunks.iter().map(Bytes::len).sum();
         assert_eq!(total, length);
@@ -710,19 +725,27 @@ async fn get_memory_handoff_retains_the_original_allocation() {
     for once in ["false", "true"] {
         let bytes = Bytes::from(vec![b'm'; 8193]);
         let address = bytes.as_ptr() as usize;
-        let mut body = temp_env::with_var(ENV_RUSTFS_GET_SMALL_BODY_ONCE_ENABLE, Some(once), || {
+        let blob = temp_env::with_var(ENV_RUSTFS_GET_SMALL_BODY_ONCE_ENABLE, Some(once), || {
             DefaultObjectUsecase::build_memory_bytes_blob(
                 bytes.clone(),
                 bytes.len() as i64,
                 GET_MEMORY_BODY_SOURCE_BUFFERED_BODY,
                 GetObjectBodyLifecycle::disabled(),
             )
-        })
-        .into_s3s();
+        });
+        let mut body = get_http_body(blob);
+        assert_eq!(http_body::Body::size_hint(&body).exact(), Some(bytes.len() as u64));
         let mut chunks = Vec::new();
-        while let Some(chunk) = body.next().await {
-            chunks.push(chunk.unwrap());
+        while let Some(frame) = body.frame().await {
+            chunks.push(
+                frame
+                    .expect("memory body must succeed")
+                    .into_data()
+                    .expect("unexpected memory trailers"),
+            );
         }
+        assert!(body.frame().await.is_none(), "EOF must be terminal");
+        assert_eq!(http_body::Body::size_hint(&body).exact(), Some(0));
         let retained: usize = chunks
             .iter()
             .map(|chunk| {

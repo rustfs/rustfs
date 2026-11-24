@@ -50,6 +50,37 @@ class Repository:
 
 
 class PlannerTests(unittest.TestCase):
+    def test_runtime_package_install_uses_ipv4_and_propagates_errors(self):
+        root = Path(gate.__file__).resolve().parent.parent
+        action = gate.workflow_document((root / '.github/actions/test-runtime/action.yml').read_text())
+        body = next(step['run'] for step in action['runs']['steps'] if step.get('name') == 'Install runtime tools')
+        with tempfile.TemporaryDirectory() as directory:
+            commands = Path(directory)
+            sudo = commands / 'sudo'
+            sudo.write_text('#!/bin/sh\nexec "$@"\n')
+            sudo.chmod(0o755)
+            apt = commands / 'apt-get'
+            apt.write_text('''#!/bin/sh
+printf '%s\\n' "$*" >> "$APT_CALLS"
+[ "$1" = -o ] && [ "$2" = Acquire::ForceIPv4=true ] || exit 100
+shift 2
+[ "$1" != "$APT_FAIL_STEP" ] || exit 37
+''')
+            apt.chmod(0o755)
+            calls = commands / 'calls'
+            for fail_step, status in (('', 0), ('update', 37), ('install', 37)):
+                calls.write_text('')
+                environment = dict(os.environ, PATH=f"{commands}{os.pathsep}{os.environ['PATH']}",
+                                   APT_CALLS=str(calls), APT_FAIL_STEP=fail_step)
+                result = subprocess.run(['bash', '-e', '-o', 'pipefail', '-c', body],
+                                        env=environment, capture_output=True, text=True)
+                with self.subTest(fail_step=fail_step):
+                    self.assertEqual(result.returncode, status, result.stderr)
+                    expected = ['-o Acquire::ForceIPv4=true update']
+                    if fail_step != 'update':
+                        expected.append('-o Acquire::ForceIPv4=true install -y libssl-dev ripgrep')
+                    self.assertEqual(calls.read_text().splitlines(), expected)
+
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
@@ -450,10 +481,8 @@ class GateTests(unittest.TestCase):
 
     def test_the_queue_run_that_proves_a_push_validates_everything_that_push_would(self):
         queued = {job for job, result in gate.expected_results('full', 'merge_group', 'refs/heads/main').items() if result == 'success'}
-        for ref in gate.INTEGRATION_PUSH_REFS:
-            pushed = {job for job, result in gate.expected_results('full', 'push', ref).items() if result == 'success'}
-            with self.subTest(ref=ref):
-                self.assertLessEqual(pushed, queued)
+        pushed = {job for job, result in gate.expected_results('full', 'push', 'refs/heads/main').items() if result == 'success'}
+        self.assertLessEqual(pushed, queued)
 
     def test_legacy_base_cannot_authorize_skipped_new_jobs(self):
         expected = gate.expected_results('full', 'pull_request', 'refs/heads/main')
@@ -626,11 +655,14 @@ class GateTests(unittest.TestCase):
                 self.assertEqual(arguments[arguments.index('--target-dir-remap') + 1], str(root / 'target'))
                 self.assertIn(f'exit_status={status}', (root / 'artifacts/ilm-integration/diagnostics.txt').read_text())
 
-    def test_full_e2e_gate_covers_main_and_integration_pushes_only(self):
+    def test_full_e2e_gate_pushes_only_on_main(self):
+        workflow_path = Path(gate.__file__).resolve().parent.parent / ".github/workflows/ci.yml"
+        triggers = gate.workflow_document(workflow_path.read_text())["on"]
+        for event in ("push", "pull_request"):
+            self.assertEqual(triggers[event]["branches"], ["main"])
         for event, ref, required in (
             ("push", "refs/heads/main", "success"),
-            ("push", "refs/heads/gateway/integration", "success"),
-            ("push", "refs/heads/gateway/integration-old", "skipped"),
+            ("push", "refs/heads/gateway/integration", "skipped"),
             ("push", "refs/heads/release", "skipped"),
             ("push", "refs/heads/feature", "skipped"),
         ):

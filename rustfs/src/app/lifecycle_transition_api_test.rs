@@ -28,7 +28,6 @@ use super::storage_api::test::contract::{
     namespace::NamespaceLocking as _,
     object::{ObjectIO as _, ObjectOperations as _},
 };
-use super::storage_api::test::object_utils::to_s3s_etag;
 use super::storage_api::test::runtime::{
     MockWarmBackend, MockWarmOp, get_global_transition_state, register_mock_tier as register_mock_tier_util,
 };
@@ -39,10 +38,8 @@ use super::storage_api::test::{
 use super::{multipart_usecase::DefaultMultipartUsecase, object_usecase::DefaultObjectUsecase};
 use crate::app::bucket_usecase::DefaultBucketUsecase;
 use crate::app::runtime_sources::current_tier_config_handle;
-use crate::app::storage_api::s3::S3ErrorCode;
 use bytes::Bytes;
 use futures::FutureExt;
-use futures::stream;
 use http::{Extensions, HeaderMap, HeaderValue, Method, Uri, header::IF_NONE_MATCH};
 use rustfs_config::{ENV_OBJECT_LOCK_OPTIMIZATION_ENABLE, ENV_TEST_FORCE_IMMEDIATE_TRANSITION_ENQUEUE_TIMEOUT};
 use rustfs_gateway_types::dto::Status;
@@ -54,10 +51,8 @@ use rustfs_gateway_types::persistence::{
 use rustfs_object_capacity::capacity_manager::{HybridStrategyConfig, create_isolated_manager};
 use rustfs_utils::http::{AMZ_BUCKET_REPLICATION_STATUS, SUFFIX_FORCE_DELETE, insert_header};
 use rustfs_utils::path::encode_dir_object;
-use s3s::{S3Request, dto::*};
 use serial_test::serial;
 use std::{
-    convert::Infallible,
     env, fs as stdfs,
     path::PathBuf,
     sync::{Arc, OnceLock},
@@ -78,12 +73,3 @@ mod object_lock;
 mod put;
 mod restore;
 mod transition;
-
-/// PutObject through its test seam, from a test's s3s fixture request.
-async fn put_through_seam(
-    usecase: &DefaultObjectUsecase,
-    req: S3Request<PutObjectInput>,
-) -> rustfs_s3_types::S3Result<crate::app::object_usecase::PutObjectWriteOutput> {
-    let (envelope, input) = crate::app::object_usecase::PutObjectWriteInput::from_test_request(req);
-    crate::app::test_seams::put_object(usecase, envelope, input).await
-}

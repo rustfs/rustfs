@@ -140,6 +140,7 @@ struct HintState {
     order: VecDeque<(Arc<DeleteRecoveryKey>, Uuid)>,
     // One marker per configured set observed returning by local inventory.
     drive_returns: HashMap<(usize, usize), Uuid>,
+    evicted_retries: HashMap<Arc<DeleteRecoveryKey>, RetryBackoff>,
     rescan: Option<Uuid>,
     started: HashSet<Uuid>,
     #[cfg(test)]
@@ -189,6 +190,7 @@ impl DeleteRecoveryHints {
                 pending: HashMap::new(),
                 order: VecDeque::new(),
                 drive_returns: HashMap::new(),
+                evicted_retries: HashMap::new(),
                 rescan: Some(Uuid::new_v4()),
                 started: HashSet::new(),
                 #[cfg(test)]
@@ -204,6 +206,7 @@ impl DeleteRecoveryHints {
         let key = Arc::new(key);
         let mut state = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let generation = Uuid::new_v4();
+        state.evicted_retries.remove(&key);
         if let Some(current) = state.pending.get_mut(&key) {
             current.generation = Some(generation);
             current.retry = None;
@@ -234,7 +237,12 @@ impl DeleteRecoveryHints {
 
     fn register_discovered(&self, key: DeleteRecoveryKey) -> bool {
         let mut state = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        if state.pending.contains_key(&key) {
+        if state.pending.contains_key(&key)
+            || state
+                .evicted_retries
+                .get(&key)
+                .is_some_and(|retry| retry.next_eligible > Instant::now())
+        {
             return true;
         }
         if state.pending.len() >= self.capacity {
@@ -247,13 +255,23 @@ impl DeleteRecoveryHints {
                     .is_some_and(|entry| entry.slot == *slot && entry.retry.is_some())
             });
             let Some(index) = retried else { return false };
-            if let Some((oldest, _)) = state.order.remove(index) {
-                state.pending.remove(&oldest);
+            if state.evicted_retries.len() >= self.capacity {
+                let now = Instant::now();
+                state.evicted_retries.retain(|_, retry| retry.next_eligible > now);
+                if state.evicted_retries.len() >= self.capacity {
+                    return false;
+                }
+            }
+            if let Some((oldest, _)) = state.order.remove(index)
+                && let Some(retry) = state.pending.remove(&oldest).and_then(|entry| entry.retry)
+            {
+                state.evicted_retries.insert(oldest, retry);
             }
             // This durable key has already been attempted. The hourly sweep
             // revisits it; immediate rescans would loop on permanent failures.
         }
-        state.enqueue(self.capacity, Arc::new(key), None, None);
+        let retry = state.evicted_retries.remove(&key);
+        state.enqueue(self.capacity, Arc::new(key), None, retry);
         true
     }
 
@@ -399,6 +417,7 @@ struct LocalSource {
     pool: usize,
     set: usize,
     disk: DiskStore,
+    available: bool,
 }
 
 struct BucketScan {
@@ -453,10 +472,13 @@ impl RecoveryPass {
                     .flatten()
                     .filter(|disk| disk.is_local())
                 {
+                    let available = matches!(disk.as_ref(), crate::disk::Disk::Local(wrapper)
+                        if wrapper.check_scanner_handle().is_ok());
                     sources.push(LocalSource {
                         pool: set.pool_index,
                         set: set.set_index,
                         disk,
+                        available,
                     });
                 }
             }
@@ -469,18 +491,26 @@ impl RecoveryPass {
         if sources.len() != self.sources.len() || self.sources.iter().any(|source| !contains_source(&sources, source)) {
             let hints = store.ctx.delete_recovery_hints();
             hints.request_rescan();
-            if self.next_inventory.is_some() {
-                let returning_sets: HashSet<_> = sources
-                    .iter()
-                    .filter(|source| !contains_source(&self.sources, source))
-                    .map(|source| (source.pool, source.set))
-                    .collect();
-                if !returning_sets.is_empty() {
-                    hints.wake_quorum_waiters(&returning_sets);
-                }
-            }
             self.scans.retain(|scan| contains_source(&sources, &scan.source));
             self.deferred.retain(|(_, scan)| contains_source(&sources, &scan.source));
+        }
+        if self.next_inventory.is_some() {
+            let returning_sets: HashSet<_> = sources
+                .iter()
+                .filter(|source| {
+                    source.available
+                        && !self.sources.iter().any(|previous| {
+                            previous.available
+                                && Arc::ptr_eq(&previous.disk, &source.disk)
+                                && previous.pool == source.pool
+                                && previous.set == source.set
+                        })
+                })
+                .map(|source| (source.pool, source.set))
+                .collect();
+            if !returning_sets.is_empty() {
+                store.ctx.delete_recovery_hints().wake_quorum_waiters(&returning_sets);
+            }
         }
         self.sources = sources;
         self.next_inventory = Some(Instant::now() + INVENTORY_INTERVAL);
@@ -1213,6 +1243,33 @@ mod tests {
         (dirs, store, disks)
     }
 
+    #[tokio::test]
+    async fn delete_recovery_inventory_wakes_quorum_waiters_when_handle_recovers_in_place() {
+        use crate::disk::health_state::RuntimeDriveHealthState;
+
+        let (_dirs, store, disks) = fixture("runtime-drive-return").await;
+        let disk = &disks[0];
+        disk.force_runtime_state_for_test(RuntimeDriveHealthState::Offline);
+        let mut pass = RecoveryPass::default();
+        pass.refresh_inventory(&store).await;
+        assert!(
+            pass.sources
+                .iter()
+                .any(|source| Arc::ptr_eq(&source.disk, disk) && !source.available)
+        );
+
+        let hints = store.ctx.delete_recovery_hints();
+        assert!(hints.register_discovered(key("waiting-quorum")));
+        let attempt = hints.take(1).pop().expect("initial quorum attempt");
+        hints.requeue(attempt, Some(FailureReason::MissingQuorum));
+        assert!(hints.take(1).is_empty(), "offline drive cannot wake the retry");
+
+        disk.force_runtime_state_for_test(RuntimeDriveHealthState::Online);
+        pass.next_inventory = Some(Instant::now());
+        pass.refresh_inventory(&store).await;
+        assert_eq!(hints.take(1)[0].key.object, "waiting-quorum");
+    }
+
     async fn prepare(store: &Arc<ECStore>, disks: &[DiskStore], bucket: &str) -> Uuid {
         let transaction = Uuid::new_v4();
         let incarnation = store
@@ -1693,6 +1750,65 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn delete_recovery_blocked_legacy_key_backs_off_without_delaying_other_keys() {
+        let bucket = "runtime-legacy-backoff";
+        let (dirs, store, disks) = fixture(bucket).await;
+        let transaction = Uuid::new_v4();
+        for disk in &disks {
+            disk.delete_version(
+                bucket,
+                "object",
+                FileInfo {
+                    name: "object".to_owned(),
+                    ..Default::default()
+                },
+                false,
+                DeleteOptions {
+                    old_data_dir: Some(transaction),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("leave an undecided historical delete");
+        }
+        let backups: Vec<_> = dirs
+            .iter()
+            .map(|dir| {
+                dir.path()
+                    .join(bucket)
+                    .join("object")
+                    .join(transaction.to_string())
+                    .join("xl.meta.bkp")
+            })
+            .collect();
+        let before: Vec<_> = backups
+            .iter()
+            .map(|path| std::fs::read(path).expect("read original evidence"))
+            .collect();
+        register(&store, bucket).await;
+        let cancel = CancellationToken::new();
+        assert_eq!(recover_hints(&store, &cancel).await.blocked, 1);
+        let hints = store.ctx.delete_recovery_hints();
+        let healthy = DeleteRecoveryKey {
+            object: "absent-key".to_owned(),
+            bucket: bucket.to_owned(),
+            incarnation: Some(store.bucket_incarnation_id_from_disk(bucket).await.expect("bucket identity")),
+            ..key("absent-key")
+        };
+        assert!(hints.register_discovered(healthy.clone()));
+        assert_eq!(
+            recover_hints(&store, &cancel).await.blocked,
+            0,
+            "do not re-inspect a blocked key on the next pass"
+        );
+        assert!(!hints.is_pending(&healthy), "the independent key still settles promptly");
+        assert_eq!(hints.pending_len(), 1, "the blocked key remains eligible for a later retry");
+        for (path, bytes) in backups.iter().zip(before) {
+            assert_eq!(std::fs::read(path).expect("retained historical evidence"), bytes);
+        }
+    }
+
+    #[tokio::test]
     async fn delete_recovery_real_single_and_batch_delete_register_and_ack_cleanup() {
         for batch in [false, true] {
             for held_snapshot in [false, true] {
@@ -1791,6 +1907,7 @@ mod tests {
                 pool: 0,
                 set: 0,
                 disk: disks[0].clone(),
+                available: true,
             },
             buckets: Some(VecDeque::from([bucket, other].map(|bucket| BucketScan {
                 bucket: bucket.to_owned(),

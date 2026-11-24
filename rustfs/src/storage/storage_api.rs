@@ -100,8 +100,6 @@ pub(crate) mod contract {
         pub(crate) use super::super::storage_contracts::MultipartCompletionAuthorization;
         pub(crate) const MAX_MULTIPART_PART_NUMBER: i32 = 10000;
         #[cfg(test)]
-        pub(crate) use super::super::storage_contracts::ListPartsInfo;
-        #[cfg(test)]
         pub(crate) use super::super::storage_contracts::{CompletePart, MultipartOperations, PartInfo};
     }
 
@@ -177,7 +175,8 @@ pub(crate) mod access_consumer {
         authorize_bucket_config_mutation, authorize_bucket_request, authorize_bucket_tag_deletion, authorize_object_request,
     };
     pub(crate) use super::super::authorization::{
-        authorize_request, authorize_request_core, log_list_buckets_iam_implicit_deny, prepare_list_buckets_iam_authorization,
+        authorize_missing_object_disclosure, authorize_request, authorize_request_core, log_list_buckets_iam_implicit_deny,
+        prepare_list_buckets_iam_authorization,
     };
     pub(crate) use super::super::authorization_actions::delete_object_authorize_action;
     pub(crate) use super::super::denial_audit::DenialAuditor;
@@ -188,11 +187,15 @@ pub(crate) mod access_consumer {
         MultipartStagingOperation, PostObjectPolicyHeaders, PostObjectRequestMarker, RequestedCopySource,
         RequestedObjectLegalHold, RequestedObjectLockRetainUntil, RequestedObjectLockRetention, RequestedObjectTags,
     };
+    pub(crate) use super::ecstore_bucket::utils::check_object_args;
 }
 
 #[cfg(test)]
 pub(crate) mod owned_parity_consumer {
     pub(crate) use super::super::access_owned::bucket_core::{authorize_create_bucket, authorize_delete_bucket};
+    pub(crate) use super::super::access_owned::object_meta::{
+        authorize_delete_object_tagging, authorize_put_object_acl, authorize_put_object_tagging,
+    };
     pub(crate) use super::super::authorization::bucket_config_mutation_incarnation;
     pub(crate) use super::super::authorization::parity_test_support;
     pub(crate) use super::super::authorization::{AuthorizationRequest, replication_request_authorized};
@@ -201,7 +204,7 @@ pub(crate) mod owned_parity_consumer {
         authorize_staged_multipart_part, authorize_write_etag_condition,
     };
     pub(crate) use super::super::denial_audit::{DenialAuditor, DenialRateLimiter, SUPPRESSED_DENIALS_TAG};
-    pub(crate) use super::super::helper::{DenialScope, authorization_denial_entry, authorization_denial_entry_for_view};
+    pub(crate) use super::super::helper::{DenialScope, authorization_denial_entry_for_view};
     pub(crate) use super::super::req_info::ReqInfo;
     pub(crate) use super::super::request_context::RequestContext;
     pub(crate) use super::super::request_markers::{
@@ -338,9 +341,9 @@ pub(crate) mod rpc_consumer {
         };
         pub(crate) use super::super::{
             DeleteOptions, DiskStore, RemoteBackgroundIo, StorageDiskRpcExt, WalkDirOptions, check_and_record_signed_rpc_nonce,
-            find_local_disk_by_ref_for_rpc, rpc_background_admission, sign_ns_scanner_capability_with_usage_capabilities,
-            sign_ns_scanner_usage_watch_capability, sign_put_file_capability, verify_put_file_auth_trailer, verify_rpc_signature,
-            with_remote_background_io,
+            find_local_disk_by_ref_for_rpc, find_local_disk_by_ref_for_scanner_rpc, rpc_background_admission,
+            sign_ns_scanner_capability_with_usage_capabilities, sign_ns_scanner_usage_watch_capability, sign_put_file_capability,
+            verify_put_file_auth_trailer, verify_rpc_signature, with_remote_background_io,
         };
     }
 
@@ -360,7 +363,7 @@ pub(crate) mod rpc_consumer {
         pub(crate) use super::super::ecstore_rpc::decode_heal_bucket_rpc_options;
         pub(crate) use super::super::storage_contracts::{
             SCANNER_ACTIVITY_LEGACY_PROTOCOL_VERSION, SCANNER_ACTIVITY_PREVIOUS_PROTOCOL_VERSION,
-            SCANNER_ACTIVITY_V6_PROTOCOL_VERSION,
+            SCANNER_ACTIVITY_V6_PROTOCOL_VERSION, SCANNER_ACTIVITY_V7_PROTOCOL_VERSION,
         };
         pub(crate) use super::super::{
             BatchReadVersionReq, BatchReadVersionResp, CollectMetricsOpts, ConditionalFileUpdate, DeleteOptions, DiskError,
@@ -431,14 +434,8 @@ pub(crate) mod s3_api_consumer {
         pub(crate) mod contract {
             pub(crate) mod multipart {
                 pub(crate) use super::super::super::super::contract::multipart::MAX_MULTIPART_PART_NUMBER;
-
-                #[cfg(test)]
-                pub(crate) use super::super::super::super::contract::multipart::{ListPartsInfo, PartInfo};
             }
         }
-
-        #[cfg(test)]
-        pub(crate) use super::super::to_s3s_xml_etag;
     }
 
     pub(crate) mod tagging {
@@ -497,7 +494,7 @@ pub(crate) mod test_consumer {
 }
 
 pub(crate) mod ecstore_admin {
-    pub(crate) use rustfs_ecstore::api::admin::{get_local_server_property, get_server_info};
+    pub(crate) use rustfs_ecstore::api::admin::{get_local_server_property, get_server_info_with_inventory};
 }
 
 pub(crate) mod ecstore_bucket {
@@ -547,17 +544,18 @@ pub(crate) mod ecstore_config {
 
 pub(crate) mod ecstore_data_usage {
     pub(crate) use rustfs_ecstore::api::data_usage::{
-        apply_bucket_usage_memory_overlay, get_bucket_usage_memory, init_compression_total_memory_from_backend,
-        load_admin_data_usage_from_backend_cached, load_bucket_usage_from_backend_cached, load_data_usage_from_backend,
-        lookup_degraded_bucket_usage_baseline, quota_object_size, record_bucket_delete_marker_memory,
-        record_bucket_object_delete_memory, record_bucket_object_version_write_memory, record_bucket_object_write_memory,
-        record_bucket_object_write_unknown_previous_memory, store_compression_total_in_backend,
+        get_bucket_usage_memory, init_compression_total_memory_from_backend, load_admin_data_usage_from_backend_cached,
+        load_admin_data_usage_with_memory_overlay, load_bucket_scan_progress_for_admin, load_bucket_usage_from_backend_cached,
+        load_data_usage_from_backend, lookup_degraded_bucket_usage_baseline, quota_object_size,
+        record_bucket_delete_marker_memory, record_bucket_object_delete_memory, record_bucket_object_version_write_memory,
+        record_bucket_object_write_memory, record_bucket_object_write_unknown_previous_memory,
+        store_compression_total_in_backend, verified_account_bucket_usage,
     };
     // Test-only observables for the rustfs/backlog#1306 revert detector.
     #[cfg(test)]
     pub(crate) use rustfs_ecstore::api::data_usage::{
-        compute_bucket_usage, live_bucket_usage_computations, load_data_usage_from_backend_cached,
-        seed_bucket_usage_memory_for_test, store_data_usage_in_backend,
+        apply_bucket_usage_memory_overlay, compute_bucket_usage, live_bucket_usage_computations,
+        load_data_usage_from_backend_cached, seed_bucket_usage_memory_for_test, store_data_usage_in_backend,
     };
 }
 
@@ -763,8 +761,8 @@ pub(crate) mod ecstore_storage {
     pub(crate) use rustfs_ecstore::api::storage::init_local_disks;
     pub(crate) use rustfs_ecstore::api::storage::{
         BootstrapLocalTarget, ECStore, SCANNER_PUBLICATION_LEASE_TTL_MS, ScannerDataMovementPauseStatus, all_local_disk,
-        all_local_disk_path, find_local_disk_by_ref, find_local_disk_by_ref_for_rpc, init_local_disks_with_instance_ctx,
-        init_lock_clients, prewarm_local_disk_id_map_with_instance_ctx,
+        all_local_disk_path, find_local_disk_by_ref, find_local_disk_by_ref_for_rpc, find_local_disk_by_ref_for_scanner_rpc,
+        init_local_disks_with_instance_ctx, init_lock_clients, prewarm_local_disk_id_map_with_instance_ctx,
     };
 }
 
@@ -943,6 +941,14 @@ impl StorageReplicationPoolHandle {
         bucket: &str,
     ) -> Result<ecstore_bucket::replication::BucketReplicationResyncStatus> {
         self.inner.get_bucket_resync_status(bucket).await
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn read_durable_bucket_resync_status(
+        &self,
+        bucket: &str,
+    ) -> Result<ecstore_bucket::replication::BucketReplicationResyncStatus> {
+        self.inner.read_durable_bucket_resync_status(bucket).await
     }
 
     pub(crate) async fn cancel_bucket_resync(&self, opts: ecstore_bucket::replication::ResyncOpts) -> Result<()> {
@@ -2356,15 +2362,6 @@ pub(crate) fn decode_tags_to_map(tags: &str) -> std::collections::HashMap<String
     ecstore_bucket::tagging::decode_tags_to_map(tags)
 }
 
-/// Writes an s3s response body for test assertions. Bucket configurations go
-/// through `ecstore_bucket::utils::serialize`, which owns their persisted form.
-#[cfg(test)]
-pub(crate) fn serialize<T: s3s::xml::Serialize>(val: &T) -> s3s::xml::SerResult<Vec<u8>> {
-    let mut buf = Vec::with_capacity(256);
-    val.serialize(&mut s3s::xml::Serializer::new(&mut buf))?;
-    Ok(buf)
-}
-
 pub(crate) fn is_err_bucket_not_found(err: &Error) -> bool {
     ecstore_error::is_err_bucket_not_found(err)
 }
@@ -2549,67 +2546,6 @@ pub(crate) fn set_tonic_canonical_body_digest<T>(request: &mut tonic::Request<T>
     ecstore_rpc::set_tonic_canonical_body_digest(request, canonical_body)
 }
 
-/// Convert a raw stored ETag into the strongly-typed `s3s::dto::ETag`.
-///
-/// Supports already quoted (`"abc"`), weak (`W/"abc"`), or plain (`abc`) values.
-pub(crate) fn to_s3s_etag(etag: &str) -> s3s::dto::ETag {
-    use s3s::dto::ETag;
-
-    if let Some(rest) = etag.strip_prefix("W/\"") {
-        if let Some(body) = rest.strip_suffix('"') {
-            return ETag::Weak(body.to_string());
-        }
-        return ETag::Weak(rest.to_string());
-    }
-
-    if let Some(body) = etag.strip_prefix('"').and_then(|rest| rest.strip_suffix('"')) {
-        return ETag::Strong(body.to_string());
-    }
-
-    ETag::Strong(etag.to_string())
-}
-
-#[cfg(test)]
-mod to_s3s_etag_tests {
-    use super::to_s3s_etag;
-    use s3s::dto::ETag;
-
-    #[test]
-    fn test_to_s3s_etag() {
-        // Test unquoted ETag - should become strong etag
-        assert_eq!(
-            to_s3s_etag("6af8d12c0c74b78094884349f3c8a079"),
-            ETag::Strong("6af8d12c0c74b78094884349f3c8a079".to_string())
-        );
-
-        assert_eq!(
-            to_s3s_etag("\"6af8d12c0c74b78094884349f3c8a079\""),
-            ETag::Strong("6af8d12c0c74b78094884349f3c8a079".to_string())
-        );
-
-        assert_eq!(
-            to_s3s_etag("W/\"6af8d12c0c74b78094884349f3c8a079\""),
-            ETag::Weak("6af8d12c0c74b78094884349f3c8a079".to_string())
-        );
-
-        assert_eq!(to_s3s_etag(""), ETag::Strong(String::new()));
-
-        assert_eq!(to_s3s_etag("\"incomplete"), ETag::Strong("\"incomplete".to_string()));
-
-        assert_eq!(to_s3s_etag("incomplete\""), ETag::Strong("incomplete\"".to_string()));
-    }
-}
-
-/// The pinned s3s XML serializer writes ETag values as raw text. Escape only
-/// at XML response boundaries; HTTP headers and conditional comparisons keep
-/// the original stored value. Existing unsafe ETags must remain listable.
-pub(crate) fn to_s3s_xml_etag(etag: &str) -> s3s::dto::ETag {
-    let mut etag = to_s3s_etag(etag);
-    let (s3s::dto::ETag::Strong(value) | s3s::dto::ETag::Weak(value)) = &mut etag;
-    *value = quick_xml::escape::escape(value.as_str()).into_owned();
-    etag
-}
-
 pub(crate) fn table_catalog_path_hash(value: &str) -> String {
     ecstore_bucket::metadata::table_catalog_path_hash(value)
 }
@@ -2645,11 +2581,6 @@ pub(crate) fn is_valid_storage_class(storage_class: &str) -> bool {
     ecstore_set_disk::is_valid_storage_class(storage_class)
 }
 
-#[cfg(test)]
-pub(crate) fn effective_storage_class<'a>(stored_class: Option<&'a str>, completed_transition_tier: Option<&'a str>) -> &'a str {
-    ecstore_config::storageclass::effective_class(stored_class, completed_transition_tier)
-}
-
 pub(crate) fn register_event_dispatch_hook<F>(hook: F) -> bool
 where
     F: Fn(EventArgs) + Send + Sync + 'static,
@@ -2680,6 +2611,10 @@ pub(crate) async fn find_local_disk_by_ref_for_rpc(disk_ref: &str) -> std::resul
     ecstore_storage::find_local_disk_by_ref_for_rpc(disk_ref).await
 }
 
+pub(crate) async fn find_local_disk_by_ref_for_scanner_rpc(disk_ref: &str) -> std::result::Result<Option<DiskStore>, DiskError> {
+    ecstore_storage::find_local_disk_by_ref_for_scanner_rpc(disk_ref).await
+}
+
 pub(crate) type GetObjectReader = <ECStore as contract::object::ObjectIO>::GetObjectReader;
 pub(crate) type ObjectInfo = <ECStore as contract::object::ObjectOperations>::ObjectInfo;
 pub(crate) type ObjectOptions = <ECStore as contract::object::ObjectOperations>::ObjectOptions;
@@ -2693,203 +2628,9 @@ pub(crate) async fn init_compression_total_memory_from_backend(store: Arc<ECStor
     ecstore_data_usage::init_compression_total_memory_from_backend(store).await
 }
 
-// Bucket configurations cross the legacy S3 edge by writing one codec's XML and
-// reading it with the other (rustfs/backlog#2745). The byte goldens in
-// `crates/ecstore/tests/bucket_config_goldens.rs` pin both codecs to the same
-// bytes for every family, so each direction is lossless for every document
-// either side produces. Tagging converts field by field because it carries no
-// XML of its own on this path. DELETE BY T4.1 (rustfs/backlog#2783) with the
-// rest of the legacy edge.
-/// Reads the persisted shape of a request configuration through the legacy writer.
-///
-/// A document the legacy edge accepted but the persisted reader refuses is
-/// answered as `MalformedXML`, the code the old codec used for its own refusals.
 #[cfg(test)]
-pub(crate) fn persisted_from_s3s<S, T>(value: &S) -> s3s::S3Result<T>
-where
-    S: s3s::xml::Serialize,
-    T: ecstore_bucket::utils::BucketConfigXml,
-{
-    let mut buf = Vec::with_capacity(256);
-    {
-        let mut ser = s3s::xml::Serializer::new(&mut buf);
-        value
-            .serialize(&mut ser)
-            .map_err(|err| s3s::S3Error::with_message(s3s::S3ErrorCode::MalformedXML, err.to_string()))?;
-    }
-    ecstore_bucket::utils::deserialize::<T>(&buf)
-        .map_err(|err| s3s::S3Error::with_message(s3s::S3ErrorCode::MalformedXML, err.to_string()))
-}
-
-/// Renders a persisted configuration as the DTO the legacy edge answers with.
-#[cfg(test)]
-pub(crate) fn persisted_to_s3s<T, S>(value: &T) -> s3s::S3Result<S>
-where
-    T: ecstore_bucket::utils::BucketConfigXml,
-    S: for<'xml> s3s::xml::Deserialize<'xml>,
-{
-    let internal = |err: &dyn std::fmt::Display| s3s::S3Error::with_message(s3s::S3ErrorCode::InternalError, err.to_string());
-    let bytes = ecstore_bucket::utils::serialize(value).map_err(|err| internal(&err))?;
-    let mut de = s3s::xml::Deserializer::new(&bytes);
-    let value = S::deserialize(&mut de).map_err(|err| internal(&err))?;
-    de.expect_eof().map_err(|err| internal(&err))?;
-    Ok(value)
-}
-
-#[cfg(test)]
-fn tags_from_s3s(tags: Vec<s3s::dto::Tag>) -> Vec<rustfs_gateway_types::cors_tagging::PersistedTag> {
-    tags.into_iter()
-        .map(|tag| rustfs_gateway_types::cors_tagging::PersistedTag {
-            key: tag.key,
-            value: tag.value,
-        })
-        .collect()
-}
-
-#[cfg(test)]
-fn tags_to_s3s(tags: Vec<rustfs_gateway_types::cors_tagging::PersistedTag>) -> Vec<s3s::dto::Tag> {
-    tags.into_iter()
-        .map(|tag| s3s::dto::Tag {
-            key: tag.key,
-            value: tag.value,
-        })
-        .collect()
-}
-
-#[cfg(test)]
-pub(crate) fn tagging_from_s3s(value: &s3s::dto::Tagging) -> rustfs_gateway_types::cors_tagging::PersistedTagging {
-    rustfs_gateway_types::cors_tagging::PersistedTagging {
-        tag_set: tags_from_s3s(value.tag_set.clone()),
-    }
-}
-
-#[cfg(test)]
-pub(crate) fn tagging_to_s3s(value: &rustfs_gateway_types::cors_tagging::PersistedTagging) -> s3s::dto::Tagging {
-    s3s::dto::Tagging {
-        tag_set: tags_to_s3s(value.tag_set.clone()),
-    }
-}
-
-#[cfg(test)]
-mod bucket_config_compat_tests {
-    use super::{persisted_from_s3s, persisted_to_s3s, tagging_from_s3s, tagging_to_s3s};
-    use rustfs_gateway_types::cors_tagging::PersistedCorsConfiguration;
-    use rustfs_gateway_types::persistence::{
-        PersistedBucketEncryptionConfiguration, PersistedObjectLockConfiguration, PersistedVersioningConfiguration,
-        PersistedWebsiteConfiguration,
-    };
-    use s3s::dto::{
-        CORSConfiguration, CORSRule, DefaultRetention, ErrorDocument, ExcludedPrefix, IndexDocument, ObjectLockConfiguration,
-        ObjectLockEnabled, ObjectLockRetentionMode, ObjectLockRule, ServerSideEncryption, ServerSideEncryptionByDefault,
-        ServerSideEncryptionConfiguration, ServerSideEncryptionRule, VersioningConfiguration, WebsiteConfiguration,
-    };
-    use s3s::dto::{Tag, Tagging};
-
-    #[test]
-    fn versioning_round_trips_including_the_minio_extensions() {
-        let input = VersioningConfiguration {
-            exclude_folders: Some(true),
-            excluded_prefixes: Some(vec![ExcludedPrefix {
-                prefix: Some("tmp/".to_owned()),
-            }]),
-            mfa_delete: None,
-            status: Some(s3s::dto::BucketVersioningStatus::from_static(s3s::dto::BucketVersioningStatus::ENABLED)),
-        };
-        let persisted: PersistedVersioningConfiguration = persisted_from_s3s(&input).expect("convert");
-        assert_eq!(persisted.status.as_deref(), Some("Enabled"));
-        assert_eq!(persisted.exclude_folders, Some(true));
-        assert_eq!(persisted.excluded_prefixes, Some(vec![Some("tmp/".to_owned())]));
-        let back: VersioningConfiguration = persisted_to_s3s(&persisted).expect("convert back");
-        assert_eq!(back, input);
-    }
-
-    #[test]
-    fn an_unknown_versioning_status_survives_the_round_trip_for_the_use_case_to_refuse() {
-        let input = VersioningConfiguration {
-            status: Some(s3s::dto::BucketVersioningStatus::from_static("Invalid")),
-            ..Default::default()
-        };
-        let persisted: PersistedVersioningConfiguration = persisted_from_s3s(&input).expect("convert");
-        assert_eq!(persisted.status.as_deref(), Some("Invalid"));
-    }
-
-    #[test]
-    fn object_lock_round_trips_the_default_retention() {
-        let input = ObjectLockConfiguration {
-            object_lock_enabled: Some(ObjectLockEnabled::from_static(ObjectLockEnabled::ENABLED)),
-            rule: Some(ObjectLockRule {
-                default_retention: Some(DefaultRetention {
-                    days: Some(30),
-                    mode: Some(ObjectLockRetentionMode::from_static(ObjectLockRetentionMode::GOVERNANCE)),
-                    years: None,
-                }),
-            }),
-        };
-        let persisted: PersistedObjectLockConfiguration = persisted_from_s3s(&input).expect("convert");
-        assert_eq!(persisted.object_lock_enabled.as_deref(), Some("Enabled"));
-        let back: ObjectLockConfiguration = persisted_to_s3s(&persisted).expect("convert back");
-        assert_eq!(back, input);
-    }
-
-    #[test]
-    fn encryption_cors_and_website_round_trip() {
-        let encryption = ServerSideEncryptionConfiguration {
-            rules: vec![ServerSideEncryptionRule {
-                apply_server_side_encryption_by_default: Some(ServerSideEncryptionByDefault {
-                    kms_master_key_id: Some("key".to_owned()),
-                    sse_algorithm: ServerSideEncryption::from_static(ServerSideEncryption::AWS_KMS),
-                }),
-                blocked_encryption_types: None,
-                bucket_key_enabled: Some(true),
-            }],
-        };
-        let persisted: PersistedBucketEncryptionConfiguration = persisted_from_s3s(&encryption).expect("convert");
-        let back: ServerSideEncryptionConfiguration = persisted_to_s3s(&persisted).expect("convert back");
-        assert_eq!(back, encryption);
-
-        let cors = CORSConfiguration {
-            cors_rules: vec![CORSRule {
-                allowed_headers: Some(vec!["*".to_owned()]),
-                allowed_methods: vec!["GET".to_owned()],
-                allowed_origins: vec!["https://example.com".to_owned()],
-                expose_headers: None,
-                id: Some("r".to_owned()),
-                max_age_seconds: Some(60),
-            }],
-        };
-        let persisted: PersistedCorsConfiguration = persisted_from_s3s(&cors).expect("convert");
-        let back: CORSConfiguration = persisted_to_s3s(&persisted).expect("convert back");
-        assert_eq!(back, cors);
-
-        let website = WebsiteConfiguration {
-            error_document: Some(ErrorDocument {
-                key: "404.html".to_owned(),
-            }),
-            index_document: Some(IndexDocument {
-                suffix: "index.html".to_owned(),
-            }),
-            redirect_all_requests_to: None,
-            routing_rules: None,
-        };
-        let persisted: PersistedWebsiteConfiguration = persisted_from_s3s(&website).expect("convert");
-        let back: WebsiteConfiguration = persisted_to_s3s(&persisted).expect("convert back");
-        assert_eq!(back, website);
-    }
-
-    #[test]
-    fn tagging_keeps_keyless_tags() {
-        let tagging = Tagging {
-            tag_set: vec![
-                Tag {
-                    key: Some("k".to_owned()),
-                    value: Some("v".to_owned()),
-                },
-                Tag { key: None, value: None },
-            ],
-        };
-        assert_eq!(tagging_to_s3s(&tagging_from_s3s(&tagging)), tagging);
-    }
-}
+#[path = "storage_api_test.rs"]
+mod bucket_config_compat_tests;
 
 #[cfg(test)]
 mod tests {

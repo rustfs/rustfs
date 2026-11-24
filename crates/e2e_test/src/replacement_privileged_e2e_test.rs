@@ -24,7 +24,7 @@
 #[cfg(all(test, target_os = "linux"))]
 mod tests {
     use crate::chaos::{VersionShardCensus, census_object_version_on_disk};
-    use crate::common::{ClusterTopology, RustFSTestClusterEnvironment, admin_request, init_logging};
+    use crate::common::{ClusterTopology, RustFSTestClusterEnvironment, admin_request, init_logging, local_http_client};
     use aws_sdk_s3::Client;
     use aws_sdk_s3::primitives::ByteStream;
     use aws_sdk_s3::types::{BucketVersioningStatus, CompletedMultipartUpload, CompletedPart, VersioningConfiguration};
@@ -412,7 +412,7 @@ mod tests {
             .arg(test_binary)
             .arg("--exact")
             .arg(test_name)
-            .arg("--ignored")
+            .arg("--include-ignored")
             .arg("--nocapture")
             .env(NAMESPACE_ENV, "1")
             .status()?;
@@ -1522,6 +1522,110 @@ mod tests {
         assert!(assert_no_replacement_status_records_in_status(&omitted, target).is_err());
         let definitive = serde_json::json!({"cluster": {"definitive": true, "records": []}});
         assert!(assert_no_replacement_status_records_in_status(&definitive, target).is_ok());
+    }
+
+    /// Linux mount namespaces are per-thread; keep mount setup and process
+    /// spawning on one OS thread so child RustFS nodes inherit the test mounts.
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_privileged_4x1_subdirectory_replacement_waits_for_write_quorum() -> Result<(), Box<dyn Error + Send + Sync>> {
+        init_logging();
+        if !privileged_run_enabled()? {
+            return Ok(());
+        }
+        if std::env::var_os(NAMESPACE_ENV).is_none() {
+            return run_current_test_in_mount_namespace(
+                "replacement_privileged_e2e_test::tests::test_privileged_4x1_subdirectory_replacement_waits_for_write_quorum",
+            );
+        }
+
+        let mut mounts = MountNamespaceGuard::new()?;
+        let mut cluster = RustFSTestClusterEnvironment::new(4).await?;
+        let filesystem: serde_json::Value = serde_json::from_str(&run_command_stdout(
+            "findmnt",
+            &["--json", "--target", &cluster.temp_dir, "--output", "TARGET,FSTYPE"],
+        )?)?;
+        let xfs_root = filesystem["filesystems"][0]["target"]
+            .as_str()
+            .filter(|root| *root != "/" && filesystem["filesystems"][0]["fstype"] == "xfs");
+        for (index, node) in cluster.nodes.iter_mut().enumerate() {
+            let mount = PathBuf::from(&node.data_dir);
+            if xfs_root.is_none() {
+                mounts.mount_tmpfs(&mount, &format!("rustfs-replacement-4x1-{index}"))?;
+            }
+            let data = mount.join("data");
+            fs::create_dir(&data)?;
+            node.data_dir = path_to_string(&data, "replacement subdirectory")?;
+            node.data_dirs[0] = node.data_dir.clone();
+        }
+        let target = PathBuf::from(&cluster.nodes[TARGET_NODE].data_dir);
+        let mount = xfs_root.unwrap_or(target.parent().and_then(Path::to_str).ok_or("missing target mount root")?);
+        eprintln!(
+            "4x1 replacement fixture filesystem = {}",
+            if xfs_root.is_some() { "xfs" } else { "tmpfs" }
+        );
+        cluster.set_node_env(TARGET_NODE, "RUSTFS_HEAL_REPLACEMENT_MOUNT_ROOTS", mount)?;
+        cluster.set_env("RUSTFS_STORAGE_CLASS_STANDARD", "EC:2");
+        cluster.set_env("RUSTFS_HEAL_ENABLED", "true");
+        cluster.set_env("RUSTFS_HEAL_INTERVAL_SECS", "1");
+        cluster.set_env("RUSTFS_SCANNER_START_DELAY_SECS", "0");
+        cluster.set_env("RUSTFS_PUT_RENAME_EARLY_ACK_ENABLE", "false");
+        cluster.start().await?;
+        let clients = cluster.create_all_clients()?;
+        let versions = seed_baseline(&clients[0], &target, 0).await?;
+
+        cluster.stop_node_gracefully(TARGET_NODE).await?;
+        cluster.stop_node_gracefully(0).await?;
+        fs::remove_dir_all(&target)?;
+        fs::create_dir(&target)?;
+
+        let metadata = ["format.json", "pool.bin/xl.meta", "pool.bin.identity/xl.meta"];
+        let system_dir = Path::new(".rustfs.sys");
+        let survivor_files = cluster.nodes[2..]
+            .iter()
+            .flat_map(|node| metadata.map(|name| Path::new(&node.data_dir).join(system_dir).join(name)))
+            .map(|file| fs::read(&file).map(|bytes| (file, bytes)))
+            .collect::<std::io::Result<Vec<_>>>()?;
+
+        cluster.start_node_process(TARGET_NODE).await?;
+        let write_health = format!("{}/minio/health/cluster", cluster.nodes[2].url);
+        let http = local_http_client();
+        timeout(Duration::from_secs(30), async {
+            loop {
+                let status = http.get(&write_health).send().await?.status();
+                if status.as_u16() == 503 {
+                    break;
+                }
+                sleep(Duration::from_millis(200)).await;
+            }
+            Ok::<_, reqwest::Error>(())
+        })
+        .await??;
+        verify_bodies(&clients[2], &versions).await?;
+        let version = &versions[0];
+        let failed_delete = clients[2]
+            .delete_object()
+            .bucket(&version.bucket)
+            .key(&version.key)
+            .send()
+            .await
+            .expect_err("two of four drives must not delete an existing object");
+        assert_eq!(failed_delete.raw_response().map(|response| response.status().as_u16()), Some(503));
+        for name in metadata {
+            assert!(!target.join(system_dir).join(name).try_exists()?, "unadmitted target published {name}");
+        }
+        for (file, before) in survivor_files {
+            assert_eq!(fs::read(&file)?, before, "surviving pool evidence changed below write quorum");
+        }
+
+        cluster.start_node(0).await?;
+        wait_for_completed_replacement_with_census(&cluster, &target, &versions, 90).await?;
+        for name in metadata {
+            assert!(fs::metadata(target.join(system_dir).join(name))?.is_file());
+        }
+        cluster.stop_node_gracefully(TARGET_NODE).await?;
+        cluster.start_node(TARGET_NODE).await?;
+        assert!(incomplete_versions(&target, &versions)?.is_empty());
+        verify_bodies(&clients[TARGET_NODE], &versions).await
     }
 
     /// Linux mount namespaces are per-thread; keep mount setup and process

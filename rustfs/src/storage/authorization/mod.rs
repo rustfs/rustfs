@@ -58,9 +58,9 @@ pub(crate) use conditions::{
 pub(crate) use decision::{DenialContext, owner_can_bypass_policy_deny};
 pub(crate) use decision::{
     audit_request_denial, authorize_bucket_config_mutation, authorize_bucket_request, authorize_bucket_tag_deletion,
-    authorize_object_request, authorize_replication_only_put_headers, authorize_request, authorize_request_core,
-    authorize_request_with_location_constraint, authorize_staged_multipart_part, authorize_write_etag_condition,
-    iam_authorization_error,
+    authorize_missing_object_disclosure, authorize_object_request, authorize_replication_only_put_headers, authorize_request,
+    authorize_request_core, authorize_request_with_location_constraint, authorize_staged_multipart_part,
+    authorize_write_etag_condition, iam_authorization_error,
 };
 pub(crate) use discovery::{
     log_list_buckets_iam_implicit_deny, prepare_list_buckets_iam_authorization, query_list_buckets_permission,
@@ -87,13 +87,13 @@ pub(crate) use request::{
 #[cfg(test)]
 pub(crate) use table_data_plane::{
     TABLE_DATA_PLANE_LIST_CURSOR_MAX_ENCODED_LEN, require_owned_reserved_table_object, table_catalog_backend_for_data_plane,
-    table_data_plane_admin_action, table_data_plane_content_mutation, table_data_plane_resource_for_request,
-    table_publication_guard_error,
+    table_data_plane_admin_action, table_data_plane_resource_for_request, table_publication_guard_error,
 };
 pub(crate) use table_data_plane::{
     TABLE_DATA_PLANE_LIST_CURSOR_PREFIX, TableDataPlaneListAccess, TableDataPlaneListCursorPosition, TableDataPlaneListResource,
     TableDataPlanePublicationGuards, retain_table_bucket_publication_guard, table_bucket_enabled_for_data_plane,
-    table_catalog_store_for_data_plane, table_data_plane_list_internal_error, table_list_catalog_error,
+    table_catalog_store_for_data_plane, table_data_plane_content_mutation, table_data_plane_list_internal_error,
+    table_list_catalog_error,
 };
 
 #[cfg(test)]

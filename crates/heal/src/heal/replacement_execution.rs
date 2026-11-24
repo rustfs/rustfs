@@ -14,12 +14,9 @@
 
 use super::{
     DiskError, DiskStore, HEALING_MARKER_PATH, RUSTFS_META_BUCKET,
-    replacement_readiness::{auto_replacement_target_identities, replacement_target_disk},
+    replacement_readiness::{ReplacementTargets, local_replacement_disks, probe_replacement_mounts},
     resume::ReplacementTargetIdentity,
-    storage_api::{
-        EcstoreConditionalFileUpdate, EcstoreDiskAPI, EcstoreDiskBytes, EcstoreReplacementExecutionLease,
-        ecstore_local_disk_map_read,
-    },
+    storage_api::{EcstoreConditionalFileUpdate, EcstoreDiskAPI, EcstoreDiskBytes, EcstoreReplacementExecutionLease},
 };
 use crate::{Error, Result};
 use std::{future::Future, sync::Arc};
@@ -35,33 +32,27 @@ pub struct ReplacementExecution {
 
 impl ReplacementExecution {
     pub(crate) async fn acquire(targets: &[String]) -> Result<Arc<Self>> {
-        let identities = auto_replacement_target_identities(targets)
+        let targets = ReplacementTargets::open(targets)
+            .await
+            .ok_or_else(|| Error::ReplacementTargetNotReady("replacement target is unavailable".to_string()))?;
+        let identities = targets
+            .identities()
             .await
             .ok_or_else(|| Error::ReplacementTargetNotReady("target mount admission failed".to_string()))?;
-        let local_disks = ecstore_local_disk_map_read()
-            .await
-            .values()
-            .flatten()
-            .filter(|disk| EcstoreDiskAPI::is_local(disk.as_ref()))
-            .cloned()
-            .collect::<Vec<_>>();
-        let mut disks = Vec::with_capacity(identities.len());
         let mut leases = Vec::with_capacity(identities.len());
-        // Identities are sorted by endpoint, the same order on every opener.
-        for identity in &identities {
-            let disk = replacement_target_disk(&identity.endpoint, &local_disks)
-                .await
-                .ok_or_else(|| Error::ReplacementTargetNotReady("replacement target is unavailable".to_string()))?;
+        // Take leases in endpoint order. Revalidate those same handles against
+        // the current inventory so a reopened disk cannot supply their proof.
+        for disk in &targets.disks {
             leases.push(disk.acquire_replacement_execution_lease().await?);
-            disks.push(disk);
         }
-        if auto_replacement_target_identities(targets).await.as_ref() != Some(&identities) {
+        let local_disks = local_replacement_disks().await;
+        if probe_replacement_mounts(&targets.disks, &local_disks).await.as_ref() != Some(&identities) {
             return Err(Error::ReplacementTargetNotReady(
                 "target changed while acquiring execution leases".to_string(),
             ));
         }
         Ok(Arc::new(Self {
-            disks,
+            disks: targets.disks,
             identities,
             _leases: leases,
         }))

@@ -2,10 +2,15 @@
 //! surface of the crate lives here: disjoint range views and the
 //! memory-region trait the binding needs.
 
-// SAFETY: the allowance is scoped to this module: the two range views state
-// their invariant inline, and `as_ptr` is the binding's required unsafe
-// trait method returning the mapping's own pointer.
+// SAFETY: bounds and ownership are checked before creating server range views
+// or passing raw passive mappings to the kernel. NIXL requires a raw pointer
+// to each registered mapping.
 #![allow(unsafe_code)]
+
+#[cfg(feature = "client-http")]
+mod passive;
+#[cfg(feature = "client-http")]
+pub(crate) use passive::PassiveBuffer;
 
 use crate::NixlError;
 use memmap2::{MmapMut, MmapRaw};

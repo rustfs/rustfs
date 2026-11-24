@@ -3019,6 +3019,13 @@ pub fn record_ecstore_rename_batch_terminal_missing(items: usize) {
 
 #[inline(always)]
 pub fn record_ecstore_rename_admission(batch: bool, items: usize, wait: Duration, timed_out: bool) {
+    if timed_out {
+        metrics::counter!(
+            "rustfs_ecstore_rename_admission_timeouts_total",
+            "mode" => if batch { "batch" } else { "unary" }
+        )
+        .increment(1);
+    }
     if !put_stage_metrics_enabled() {
         return;
     }
@@ -3036,11 +3043,16 @@ pub fn record_ecstore_rename_admission(batch: bool, items: usize, wait: Duration
 
 #[inline(always)]
 pub fn record_ecstore_rename_quarantine(batch: bool, items: usize, hold: Duration) {
+    let mode = if batch { "batch" } else { "unary" };
+    let active_items = f64::from(u32::try_from(items).unwrap_or(u32::MAX));
+    let items = u64::try_from(items).unwrap_or(u64::MAX);
+    metrics::counter!("rustfs_ecstore_rename_quarantine_events_total", "mode" => mode).increment(1);
+    metrics::counter!("rustfs_ecstore_rename_quarantine_items_total", "mode" => mode).increment(items);
+    metrics::gauge!("rustfs_ecstore_rename_quarantine_active_items", "mode" => mode).increment(active_items);
     if !put_stage_metrics_enabled() {
         return;
     }
     let base = usize::from(batch) * 6;
-    let items = u64::try_from(items).unwrap_or(u64::MAX);
     let hold_ns = u64::try_from(hold.as_nanos()).unwrap_or(u64::MAX);
     ECSTORE_RENAME_QUARANTINE_COUNTS[base].fetch_add(1, Ordering::Relaxed);
     ECSTORE_RENAME_QUARANTINE_COUNTS[base + 1].fetch_add(items, Ordering::Relaxed);
@@ -3050,17 +3062,25 @@ pub fn record_ecstore_rename_quarantine(batch: bool, items: usize, hold: Duratio
 
 #[inline(always)]
 pub fn record_ecstore_rename_quarantine_released(batch: bool, items: usize) {
+    let mode = if batch { "batch" } else { "unary" };
+    let active_items = f64::from(u32::try_from(items).unwrap_or(u32::MAX));
+    let items = u64::try_from(items).unwrap_or(u64::MAX);
+    metrics::counter!("rustfs_ecstore_rename_quarantine_released_items_total", "mode" => mode).increment(items);
+    metrics::gauge!("rustfs_ecstore_rename_quarantine_active_items", "mode" => mode).decrement(active_items);
     if put_stage_metrics_enabled() {
         let base = usize::from(batch) * 6;
-        ECSTORE_RENAME_QUARANTINE_COUNTS[base + 4].fetch_add(u64::try_from(items).unwrap_or(u64::MAX), Ordering::Relaxed);
+        ECSTORE_RENAME_QUARANTINE_COUNTS[base + 4].fetch_add(items, Ordering::Relaxed);
     }
 }
 
 #[inline(always)]
 pub fn record_ecstore_rename_quarantine_no_runtime(batch: bool, items: usize) {
+    let mode = if batch { "batch" } else { "unary" };
+    let items = u64::try_from(items).unwrap_or(u64::MAX);
+    metrics::counter!("rustfs_ecstore_rename_quarantine_no_runtime_items_total", "mode" => mode).increment(items);
     if put_stage_metrics_enabled() {
         let base = usize::from(batch) * 6;
-        ECSTORE_RENAME_QUARANTINE_COUNTS[base + 5].fetch_add(u64::try_from(items).unwrap_or(u64::MAX), Ordering::Relaxed);
+        ECSTORE_RENAME_QUARANTINE_COUNTS[base + 5].fetch_add(items, Ordering::Relaxed);
     }
 }
 
@@ -3351,6 +3371,9 @@ pub struct AllocatorMemoryObservation {
     pub reserved_bytes: Option<u64>,
     pub committed_bytes: Option<u64>,
     pub page_committed_bytes: Option<u64>,
+    /// Allocator-reported block bytes, including size-class rounding and delayed statistics updates.
+    /// This is not live requested bytes or resident memory.
+    pub allocated_bytes: Option<u64>,
     pub malloc_requested_bytes: Option<u64>,
     pub malloc_requested_peak_bytes: Option<u64>,
     pub malloc_requested_total_bytes: Option<u64>,
@@ -3385,6 +3408,11 @@ pub fn record_allocator_memory_observation(backend: &'static str, observation: A
         .set(if observation.reserved_bytes.is_some() { 1.0 } else { 0.0 });
     gauge!("rustfs_memory_allocator_committed_bytes_available", "backend" => backend)
         .set(if observation.committed_bytes.is_some() { 1.0 } else { 0.0 });
+    gauge!("rustfs_memory_allocator_allocated_bytes_available", "backend" => backend)
+        .set(if observation.allocated_bytes.is_some() { 1.0 } else { 0.0 });
+    if let Some(allocated_bytes) = observation.allocated_bytes {
+        gauge!("rustfs_memory_allocator_allocated_bytes", "backend" => backend).set(allocated_bytes as f64);
+    }
     if let Some(reserved_bytes) = observation.reserved_bytes {
         gauge!("rustfs_memory_allocator_reserved_bytes", "backend" => backend).set(reserved_bytes as f64);
     }
@@ -3856,6 +3884,41 @@ mod tests {
                 Some(expected_availability),
             );
             assert_eq!(gauge_value(&rows, "rustfs_memory_allocator_malloc_requested_bytes"), expected_value);
+        }
+    }
+
+    #[test]
+    fn allocator_block_bytes_preserve_decreases_missing_and_zero() {
+        let _guard = METRICS_FLAG_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let sequence = [
+            (None, None, 0.0),
+            (Some(128), Some(128.0), 1.0),
+            (Some(64), Some(64.0), 1.0),
+            (None, Some(64.0), 0.0),
+            (Some(0), Some(0.0), 1.0),
+        ];
+        for (index, (_, expected, available)) in sequence.into_iter().enumerate() {
+            // Debugging snapshots consume values; replay each prefix before its only snapshot.
+            let recorder = DebuggingRecorder::new();
+            let snapshotter = recorder.snapshotter();
+            metrics::with_local_recorder(&recorder, || {
+                set_metrics_enabled(true);
+                for (current, ..) in sequence.iter().take(index + 1) {
+                    record_allocator_memory_observation(
+                        "mimalloc",
+                        AllocatorMemoryObservation {
+                            allocated_bytes: *current,
+                            ..Default::default()
+                        },
+                    );
+                }
+                set_metrics_enabled(false);
+            });
+            let rows = snapshotter.snapshot().into_vec();
+            assert_eq!(gauge_value(&rows, "rustfs_memory_allocator_allocated_bytes_available"), Some(available));
+            assert_eq!(gauge_value(&rows, "rustfs_memory_allocator_allocated_bytes"), expected);
+            assert_eq!(gauge_value(&rows, "rustfs_memory_allocator_malloc_requested_bytes_available"), Some(0.0));
+            assert_eq!(gauge_value(&rows, "rustfs_memory_allocator_malloc_requested_bytes"), None);
         }
     }
 
@@ -5045,6 +5108,79 @@ mod tests {
                 PUT_RENAME_QUORUM_FANOUT_STATE_PANIC.to_string(),
             ])
         );
+    }
+
+    #[test]
+    fn ecstore_rename_fault_metrics_remain_visible_without_stage_metrics() {
+        let _guard = METRICS_FLAG_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        metrics::with_local_recorder(&recorder, || {
+            set_put_stage_metrics_enabled(false);
+            record_ecstore_rename_admission(false, 1, Duration::from_nanos(10), false);
+            record_ecstore_rename_admission(false, 1, Duration::ZERO, true);
+            record_ecstore_rename_admission(true, 4, Duration::ZERO, true);
+            record_ecstore_rename_quarantine(false, 1, Duration::from_secs(1));
+            record_ecstore_rename_quarantine_released(false, 1);
+            record_ecstore_rename_quarantine(true, 3, Duration::from_secs(1));
+            record_ecstore_rename_quarantine_no_runtime(true, 3);
+        });
+
+        let rows = snapshotter.snapshot().into_vec();
+        let counter_by_mode = |name: &str, mode: &str| {
+            rows.iter()
+                .filter(|(composite, _, _, _)| {
+                    composite.kind() == MetricKind::Counter
+                        && composite.key().name() == name
+                        && composite
+                            .key()
+                            .labels()
+                            .any(|label| label.key() == "mode" && label.value() == mode)
+                })
+                .map(|(_, _, _, value)| match value {
+                    DebugValue::Counter(value) => *value,
+                    other => panic!("{name} is registered as a counter but holds {other:?}"),
+                })
+                .sum::<u64>()
+        };
+        assert_eq!(counter_by_mode("rustfs_ecstore_rename_admission_timeouts_total", "unary"), 1);
+        assert_eq!(counter_by_mode("rustfs_ecstore_rename_admission_timeouts_total", "batch"), 1);
+        assert_eq!(counter_total(&rows, "rustfs_ecstore_rename_quarantine_events_total"), Some(2));
+        assert_eq!(counter_total(&rows, "rustfs_ecstore_rename_quarantine_items_total"), Some(4));
+        assert_eq!(counter_by_mode("rustfs_ecstore_rename_quarantine_released_items_total", "unary"), 1);
+        assert_eq!(counter_by_mode("rustfs_ecstore_rename_quarantine_released_items_total", "batch"), 0);
+        assert_eq!(counter_by_mode("rustfs_ecstore_rename_quarantine_no_runtime_items_total", "unary"), 0);
+        assert_eq!(counter_by_mode("rustfs_ecstore_rename_quarantine_no_runtime_items_total", "batch"), 3);
+
+        let mut active_items = rows
+            .iter()
+            .filter(|(composite, _, _, _)| {
+                composite.kind() == MetricKind::Gauge && composite.key().name() == "rustfs_ecstore_rename_quarantine_active_items"
+            })
+            .map(|(composite, _, _, value)| {
+                let mode = composite
+                    .key()
+                    .labels()
+                    .find(|label| label.key() == "mode")
+                    .map(|label| label.value().to_string())
+                    .expect("rename quarantine gauge must carry the bounded mode label");
+                let DebugValue::Gauge(value) = value else {
+                    panic!("rename quarantine active items must be a gauge")
+                };
+                (mode, value.0)
+            })
+            .collect::<Vec<_>>();
+        active_items.sort_by(|left, right| left.0.cmp(&right.0));
+        assert_eq!(active_items, vec![("batch".to_owned(), 3.0), ("unary".to_owned(), 0.0)]);
+
+        assert!(
+            rows.iter()
+                .filter(|(composite, _, _, _)| composite.key().name().starts_with("rustfs_ecstore_rename_"))
+                .flat_map(|(composite, _, _, _)| composite.key().labels())
+                .all(|label| label.key() == "mode" && matches!(label.value(), "batch" | "unary")),
+            "fault metrics must use only the bounded rename mode label"
+        );
+        set_put_stage_metrics_enabled(false);
     }
 
     #[test]

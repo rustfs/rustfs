@@ -1686,9 +1686,26 @@ mod tests {
         physical_plan::stream::RecordBatchStreamAdapter,
         sql::sqlparser::parser::ParserError,
     };
-    use rustfs_gateway_types::compat::s3s_5761ddfe::select::output_to_s3s;
+    use http_body_util::BodyExt as _;
+    use rustfs_gateway::{Limits, MetaView, OperationCodec, ResponseBody, TargetKind, WireRequest, dto::SelectObjectContent};
     use rustfs_s3select_api::request::{CsvInput, ParquetInput, ScanRange};
     use rustfs_test_utils::TestECStoreEnv;
+
+    fn encoded_select_stream(
+        rx: mpsc::Receiver<S3Result<SelectObjectContentEvent>>,
+    ) -> http_body_util::BodyDataStream<rustfs_gateway::Body> {
+        let request = http::Request::builder()
+            .method("POST")
+            .uri("/bucket/key?select&select-type=2")
+            .header("host", "localhost")
+            .body(())
+            .unwrap();
+        let wire = WireRequest::accept(request, &Limits::default()).expect("select request");
+        let view = MetaView::of(&wire, TargetKind::Object).expect("object view");
+        let response = SelectObjectContent::encode(select_output(rx), &view, 200).expect("encode SelectObjectContent");
+        let ResponseBody::Stream(stream) = response.body else { panic!("expected a streaming response") };
+        stream.into_body().into_data_stream()
+    }
 
     fn event_stream_headers(mut bytes: &[u8]) -> Vec<Vec<(String, String)>> {
         let mut messages = Vec::new();
@@ -1727,9 +1744,7 @@ mod tests {
     }
 
     async fn http_xml_error(error: S3Error) -> (StatusCode, String) {
-        let response = s3s::S3Error::from(error)
-            .to_http_response()
-            .expect("S3 error should serialize to HTTP");
+        let response = error.to_http_response().expect("S3 error should serialize to HTTP");
         let status = response.status();
         let body = http_body_util::BodyExt::collect(response.into_body())
             .await
@@ -3118,10 +3133,7 @@ mod tests {
         let (producer, rx, lease_released) = spawn_test_producer(output, 4);
         producer.await.expect("producer should finish successfully");
 
-        let mut byte_stream = output_to_s3s(select_output(rx))
-            .payload
-            .expect("Select stream")
-            .into_byte_stream();
+        let mut byte_stream = encoded_select_stream(rx);
         let mut encoded = Vec::new();
         while let Some(chunk) = byte_stream.next().await {
             encoded.extend_from_slice(&chunk.expect("event-stream message should serialize"));
@@ -3247,10 +3259,7 @@ mod tests {
             let (producer, rx, lease_released) = spawn_test_producer(output, 2);
             producer.await.expect("producer should emit the terminal Select error");
 
-            let mut byte_stream = output_to_s3s(select_output(rx))
-                .payload
-                .expect("Select stream")
-                .into_byte_stream();
+            let mut byte_stream = encoded_select_stream(rx);
             let mut encoded = Vec::new();
             while let Some(chunk) = byte_stream.next().await {
                 encoded.extend_from_slice(&chunk.expect("event-stream message should serialize"));
@@ -3330,10 +3339,7 @@ mod tests {
             .await
             .expect("producer should emit records followed by the terminal error");
 
-        let mut byte_stream = output_to_s3s(select_output(rx))
-            .payload
-            .expect("Select stream")
-            .into_byte_stream();
+        let mut byte_stream = encoded_select_stream(rx);
         let mut encoded = Vec::new();
         while let Some(chunk) = byte_stream.next().await {
             encoded.extend_from_slice(&chunk.expect("event-stream message should serialize"));
@@ -3397,7 +3403,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn producer_drops_query_stream_and_snapshot_lease_when_receiver_closes() {
-        for legacy in [false, true] {
+        for encoded in [false, true] {
             let (stream_dropped_tx, stream_dropped_rx) = tokio::sync::oneshot::channel::<()>();
             let output = Box::pin(RecordBatchStreamAdapter::new(
                 Arc::new(Schema::empty()),
@@ -3420,8 +3426,8 @@ mod tests {
             tokio::pin!(producer);
 
             assert!(futures::poll!(producer.as_mut()).is_pending());
-            if legacy {
-                drop(output_to_s3s(select_output(rx)));
+            if encoded {
+                drop(encoded_select_stream(rx));
             } else {
                 drop(select_output(rx));
             }
@@ -4230,10 +4236,7 @@ mod tests {
             .expect("test channel should accept Records");
         drop(tx);
 
-        let mut byte_stream = output_to_s3s(select_output(rx))
-            .payload
-            .expect("Select stream")
-            .into_byte_stream();
+        let mut byte_stream = encoded_select_stream(rx);
         let mut encoded = Vec::new();
         while let Some(chunk) = byte_stream.next().await {
             encoded.extend_from_slice(&chunk.expect("Records event should serialize"));

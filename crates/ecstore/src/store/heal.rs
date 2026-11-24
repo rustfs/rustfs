@@ -29,6 +29,7 @@ const LOG_SUBSYSTEM_HEAL: &str = "heal";
 const EVENT_HEAL_ABANDONED_PARTS: &str = "heal_abandoned_parts";
 const EVENT_HEAL_FORMAT_COMPLETED: &str = "heal_format_completed";
 const EVENT_HEAL_OBJECT_STARTED: &str = "heal_object_started";
+const EVENT_HEAL_DELETE_RECOVERY_BLOCKED: &str = "heal_delete_recovery_blocked";
 
 /// An explicit bucket-heal admission owns one lifecycle generation through its write tail.
 pub(crate) struct BucketHealScope {
@@ -199,6 +200,28 @@ fn classify_heal_format_pool(
     }
 
     None
+}
+
+fn select_pool_heal_result(
+    results: impl IntoIterator<Item = (HealResultItem, Option<Error>)>,
+    version_id: &str,
+) -> (HealResultItem, Option<Error>) {
+    let mut first_failure = None;
+    for (item, error) in results {
+        let Some(error) = error else { return (item, None) };
+        if first_failure.is_none() && !is_err_object_not_found(&error) && !is_err_version_not_found(&error) {
+            first_failure = Some((item, Some(error)));
+        }
+    }
+
+    first_failure.unwrap_or_else(|| {
+        let missing = if version_id.is_empty() {
+            Error::FileNotFound
+        } else {
+            Error::FileVersionNotFound
+        };
+        (HealResultItem::default(), Some(missing))
+    })
 }
 
 fn heal_format_pool_skip_error(skip: HealFormatPoolSkip) -> Error {
@@ -422,6 +445,24 @@ impl ECStore {
                         summary.add(set.recover_delete_bucket(&bucket, recovery_context.clone()).await?);
                     }
                 }
+            }
+            if let Some(object) = &object
+                && !opts.dry_run
+                && summary.blocked > 0
+            {
+                tracing::debug!(
+                    event = EVENT_HEAL_DELETE_RECOVERY_BLOCKED,
+                    component = LOG_COMPONENT_ECSTORE,
+                    subsystem = LOG_SUBSYSTEM_HEAL,
+                    state = "insufficient_evidence",
+                    bucket = ?bucket,
+                    object = ?decode_dir_object(object),
+                    pool = opts.pool,
+                    set = opts.set,
+                    legacy_ambiguous = summary.legacy_ambiguous,
+                    other_blocked = summary.blocked - summary.legacy_ambiguous,
+                    "Exact-key delete recovery is blocked"
+                );
             }
             if object.is_some() && summary.pending > 0 {
                 return Err(StorageError::ErasureReadQuorum);
@@ -1395,7 +1436,8 @@ impl ECStore {
                     drop(save_guard);
                     results
                 }
-                Err(err) => (0..heal_pools.len()).map(|_| Err(err.clone())).collect(),
+                // The shared fence failed before any pool could produce a result.
+                Err(err) => vec![Err(err)],
             }
         } else {
             let mut futures = Vec::with_capacity(heal_pools.len());
@@ -1420,12 +1462,11 @@ impl ECStore {
         };
 
         let mut proofs = Vec::with_capacity(requested_pool_count);
-        let mut errs = Vec::with_capacity(self.pools.len());
-        let mut ress = Vec::with_capacity(self.pools.len());
+        let mut pool_results = Vec::with_capacity(results.len());
 
         for res in results.into_iter() {
             match res {
-                Ok((result, err, proof)) => {
+                Ok((mut result, err, proof)) => {
                     if let Some(proof) = proof
                         && (err.is_none()
                             || err
@@ -1434,15 +1475,10 @@ impl ECStore {
                     {
                         proofs.push(proof);
                     }
-                    let mut result = result;
                     result.object = decode_dir_object(&result.object);
-                    ress.push(result);
-                    errs.push(err);
+                    pool_results.push((result, err));
                 }
-                Err(err) => {
-                    errs.push(Some(err));
-                    ress.push(HealResultItem::default());
-                }
+                Err(err) => pool_results.push((HealResultItem::default(), Some(err))),
             }
         }
 
@@ -1452,31 +1488,7 @@ impl ECStore {
             *absence = Some(proofs);
         }
 
-        for (idx, err) in errs.iter().enumerate() {
-            if err.is_none() {
-                return Ok((ress.remove(idx), None));
-            }
-        }
-
-        // No pool returned a nil error, return the first non 'not found' error
-        for (index, err) in errs.iter().enumerate() {
-            return match err {
-                Some(err) => {
-                    if is_err_object_not_found(err) || is_err_version_not_found(err) {
-                        continue;
-                    }
-                    Ok((ress.remove(index), Some(err.clone())))
-                }
-                None => Ok((ress.remove(index), None)),
-            };
-        }
-
-        // At this stage, all errors are 'not found'
-        if !version_id.is_empty() {
-            return Ok((HealResultItem::default(), Some(Error::FileVersionNotFound)));
-        }
-
-        Ok((HealResultItem::default(), Some(Error::FileNotFound)))
+        Ok(select_pool_heal_result(pool_results, version_id))
     }
 
     async fn heal_pool_meta_object_with_cas(
@@ -1598,6 +1610,68 @@ mod tests {
     use crate::store::init_local_disks_with_instance_ctx;
     use rustfs_heal_contracts::heal_channel::DriveState;
     use tokio_util::sync::CancellationToken;
+
+    fn pool_heal_item(object: &str) -> HealResultItem {
+        HealResultItem {
+            object: object.to_owned(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn pool_heal_result_preserves_first_failure_and_its_typed_source() {
+        let quorum = Error::NamespaceLockQuorumUnavailable {
+            mode: "write",
+            bucket: "test-bucket".into(),
+            object: "object".into(),
+            required: 2,
+            achieved: 1,
+        };
+        let (item, error) = select_pool_heal_result(
+            [
+                (pool_heal_item("missing"), Some(Error::FileNotFound)),
+                (pool_heal_item("quorum"), Some(Error::from(DiskError::other(quorum)))),
+                (pool_heal_item("later failure"), Some(Error::Unexpected)),
+            ],
+            "",
+        );
+
+        assert_eq!(item.object, "quorum");
+        let Some(Error::Io(io)) = error else { panic!("expected wrapped storage error") };
+        let source = io.get_ref().and_then(|source| source.downcast_ref::<Error>());
+        assert!(matches!(source, Some(Error::NamespaceLockQuorumUnavailable {
+            mode: "write", bucket, object, required: 2, achieved: 1,
+        }) if bucket == "test-bucket" && object == "object"));
+    }
+
+    #[test]
+    fn pool_heal_result_prefers_first_success_across_pools() {
+        let (item, error) = select_pool_heal_result(
+            [
+                (pool_heal_item("failed"), Some(Error::Unexpected)),
+                (pool_heal_item("first success"), None),
+                (pool_heal_item("second success"), None),
+            ],
+            "",
+        );
+        assert_eq!(item.object, "first success");
+        assert!(error.is_none());
+    }
+
+    #[test]
+    fn pool_heal_result_reports_missing_for_the_requested_version() {
+        for (version_id, expected_error) in [("", Error::FileNotFound), ("some-version", Error::FileVersionNotFound)] {
+            let (item, error) = select_pool_heal_result(
+                [
+                    (pool_heal_item("missing object"), Some(Error::FileNotFound)),
+                    (pool_heal_item("missing version"), Some(Error::FileVersionNotFound)),
+                ],
+                version_id,
+            );
+            assert_eq!(item.object, HealResultItem::default().object);
+            assert_eq!(error, Some(expected_error));
+        }
+    }
 
     #[derive(Debug)]
     struct BlockingHealPeer {

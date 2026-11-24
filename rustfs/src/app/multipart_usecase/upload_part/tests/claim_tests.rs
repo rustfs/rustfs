@@ -14,6 +14,7 @@
 
 //! Upload target ownership and refusal order against real multipart state.
 
+use super::super::super::test_support::owned_envelope;
 use super::*;
 use crate::app::storage_api::test::contract::bucket::{BucketOperations as _, MakeBucketOptions};
 use rustfs_gateway_types::{BucketName, ObjectKey, UploadIdClaim};
@@ -86,22 +87,36 @@ async fn native_claim_checks_order_ownership_and_one_active_lookup() {
         (2, active.as_str(), Some(3), true, LookupResult::Outage, 1, Some("ServiceUnavailable")),
         (10000, active.as_str(), Some(3), true, LookupResult::Real, 1, None),
     ] {
-        let mut input = UploadPartWriteInput::from_legacy(UploadPartInput::default(), None);
-        input.target = UploadPartTarget::Gateway {
-            bucket: BucketName::new(bucket.clone()).unwrap(),
-            key: ObjectKey::new(key).unwrap(),
-            upload_id: UploadIdClaim::from_wire(id),
+        // Same facts `from_legacy` carried. Checksums, SSE, content MD5, and trailers stay absent.
+        let input = UploadPartWriteInput {
+            target: UploadPartTarget::Gateway {
+                bucket: BucketName::new(bucket.clone()).unwrap(),
+                key: ObjectKey::new(key).unwrap(),
+                upload_id: UploadIdClaim::from_wire(id),
+            },
+            part_number: number,
+            content_length: length,
+            body: body.then(|| {
+                if length.is_none() {
+                    legacy_put_body(StreamingBlob::wrap(futures::stream::pending::<Result<Bytes, std::io::Error>>()))
+                } else {
+                    Body::from(Bytes::from_static(b"abc"))
+                }
+            }),
+            trailing_headers: None,
+            frame_trailers: None,
+            content_md5: None,
+            checksum_algorithm: None,
+            checksum_crc32: None,
+            checksum_crc32c: None,
+            checksum_crc64nvme: None,
+            checksum_sha1: None,
+            checksum_sha256: None,
+            sse_customer_algorithm: None,
+            sse_customer_key: None,
+            sse_customer_key_md5: None,
         };
-        input.part_number = number;
-        input.content_length = length;
-        input.body = body.then(|| {
-            if length.is_none() {
-                legacy_put_body(StreamingBlob::wrap(futures::stream::pending::<Result<Bytes, std::io::Error>>()))
-            } else {
-                Body::from(Bytes::from_static(b"abc"))
-            }
-        });
-        let envelope = RequestEnvelope::from_s3s(&build_request((), Method::PUT));
+        let envelope = owned_envelope(Method::PUT);
         LOOKUP
             .scope((Cell::new(0), mode), async {
                 let result = usecase.execute_upload_part_with_audit(envelope, input).await;
@@ -204,6 +219,7 @@ fn native_copy_part_rejects_unproved_owner_without_changing_parts() {
                 copy_source_range: None,
                 copy_source_if_match: None,
                 copy_source_if_none_match: None,
+                copy_source_dates: Default::default(),
                 sse_customer_algorithm: None,
                 sse_customer_key: None,
                 sse_customer_key_md5: None,
@@ -211,15 +227,14 @@ fn native_copy_part_rejects_unproved_owner_without_changing_parts() {
                 copy_source_sse_customer_key: None,
                 copy_source_sse_customer_key_md5: None,
             };
-            let envelope = RequestEnvelope::from_s3s(&build_request((), Method::PUT));
+            let envelope = owned_envelope(Method::PUT);
             LOOKUP
                 .scope((Cell::new(0), mode), async {
                     let result = Box::pin(usecase.execute_upload_part_copy_with_audit(envelope, input)).await;
                     assert_eq!(result.as_ref().err().map(|error| error.code().as_str()), expected, "{mode:?}");
                     assert_eq!(LOOKUP.with(|(calls, _)| calls.get()), 1, "{mode:?}");
                     if expected == Some("NoSuchUpload") {
-                        let Err(error) = result else { panic!("expected missing upload") };
-                        let actual: crate::app::storage_api::s3::S3Error = error.into();
+                        let Err(actual) = result else { panic!("expected missing upload") };
                         let facts = (
                             actual.code().as_str().to_owned(),
                             actual.status_code().map(|status| status.as_u16()),
@@ -231,11 +246,10 @@ fn native_copy_part_rejects_unproved_owner_without_changing_parts() {
                             absence_facts = Some(facts);
                         }
                     } else if matches!(mode, LookupResult::Outage) {
-                        let Err(error) = result else { panic!("expected read quorum failure") };
-                        let actual: crate::app::storage_api::s3::S3Error = error.into();
+                        let Err(actual) = result else { panic!("expected read quorum failure") };
                         let expected: crate::app::storage_api::s3::S3Error =
                             ApiError::from(StorageError::ErasureReadQuorum).into();
-                        assert_eq!(actual.code(), expected.code());
+                        assert_eq!(actual.code().as_str(), expected.code().as_str());
                         assert_eq!(actual.status_code(), expected.status_code());
                         assert_eq!(actual.message(), expected.message());
                         assert!(

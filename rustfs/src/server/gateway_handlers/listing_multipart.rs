@@ -39,6 +39,9 @@ use rustfs_s3_ops::S3Operation;
 use rustfs_s3_types::{S3Result, s3_error};
 use std::sync::Arc;
 
+#[cfg(test)]
+mod list_parts_tests;
+
 pub(super) const ROWS: &[OpRow] = &[
     row::<dto::ListObjectsV2>(),
     row::<dto::ListObjects>(),

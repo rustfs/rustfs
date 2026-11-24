@@ -30,6 +30,7 @@ checked_files=(
   "rustfs/src/admin/handlers/kms_keys.rs"
   "rustfs/src/admin/handlers/kms_key_lifecycle.rs"
   "rustfs/src/admin/handlers/site_replication.rs"
+  "rustfs/src/admin/handlers/site_replication/removal.rs"
   "rustfs/src/site_replication/mod.rs"
   "rustfs/src/site_replication/identity.rs"
   "rustfs/src/site_replication/state_lock.rs"

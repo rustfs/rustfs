@@ -19,9 +19,9 @@
 //! Not responsible for: the helpers behind each route (their own modules test
 //! those) or object lambda, which is still served by the router itself.
 
-use super::{AdminOperation, Body, S3ErrorCode, S3Request, S3Response, S3Result, S3Route, S3Router};
+use super::{AdminOperation, Body, S3Request, S3Response, S3Route, S3Router};
 use crate::admin::storage_api::contract::bucket::MakeBucketOptions;
-use crate::app::storage_api::s3::Credentials;
+use crate::app::storage_api::s3::{Credentials, S3ErrorCode, S3Result};
 use http::{Extensions, HeaderMap, Method, StatusCode, header};
 use http_body_util::BodyExt;
 use rustfs_iam::store::{Store as _, UserType, object::ObjectStore};
@@ -77,7 +77,7 @@ fn uri_for(template: &str, bucket: &str) -> String {
 
 async fn send(router: &S3Router<AdminOperation>, mut req: S3Request<Body>) -> S3Result<S3Response<Body>> {
     router.check_access(&mut req).await?;
-    router.call(req).await.map_err(Into::into)
+    router.call(req).await
 }
 
 fn error_code(result: S3Result<S3Response<Body>>, context: &str) -> S3ErrorCode {
@@ -222,7 +222,7 @@ async fn extension_routes_refuse_anonymous_callers_before_dispatch() {
             .check_access(&mut req)
             .await
             .expect_err("an anonymous extension request is refused");
-        assert_eq!(S3ErrorCode::from(error.code().clone()), S3ErrorCode::AccessDenied, "{method} {uri}");
+        assert_eq!(error.code(), &S3ErrorCode::AccessDenied, "{method} {uri}");
     }
 }
 

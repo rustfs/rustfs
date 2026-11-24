@@ -171,6 +171,70 @@ impl DataUsageBucketObservation {
 }
 
 impl DataUsageInfo {
+    /// Hide values that cannot be bound to the current storage-owned identity.
+    ///
+    /// `incarnations` contains canonical non-nil identities read from storage;
+    /// a missing entry means identity was unavailable. Neither legacy values
+    /// without identity nor metadata read failures establish confirmed zero.
+    /// Changed responses are display-only and cannot authorize quota or writes.
+    /// If retained counters overflow, all values remain unknown.
+    /// Returns the number of canonical values removed.
+    pub fn retain_current_bucket_usage_for_admin(&mut self, incarnations: &HashMap<String, String>) -> usize {
+        let original_count = self.buckets_usage.len();
+        let original_observation_count = self.usage_snapshot_bucket_observations.len();
+        let matches_current = |bucket: &String, usage: &BucketUsageInfo| {
+            incarnations.get(bucket).is_some_and(|current| {
+                !current.is_empty()
+                    && current != "00000000-0000-0000-0000-000000000000"
+                    && usage.bucket_incarnation.as_ref() == Some(current)
+            })
+        };
+        self.buckets_usage.retain(|bucket, usage| matches_current(bucket, usage));
+        self.usage_snapshot_bucket_observations.retain(|bucket, observation| {
+            matches_current(bucket, &observation.usage)
+                && observation
+                    .sources
+                    .iter()
+                    .all(|source| incarnations.get(bucket) == Some(&source.bucket_incarnation))
+        });
+        if original_count == self.buckets_usage.len()
+            && original_observation_count == self.usage_snapshot_bucket_observations.len()
+        {
+            return 0;
+        }
+        let totals = self.buckets_usage.values().try_fold([0_u64; 4], |total, usage| {
+            Some([
+                total[0].checked_add(usage.size)?,
+                total[1].checked_add(usage.objects_count)?,
+                total[2].checked_add(usage.versions_count)?,
+                total[3].checked_add(usage.delete_markers_count)?,
+            ])
+        });
+        let [size, objects, versions, markers] = totals.unwrap_or_else(|| {
+            self.buckets_usage.clear();
+            self.usage_snapshot_bucket_observations.clear();
+            [0; 4]
+        });
+        self.bucket_sizes = self
+            .buckets_usage
+            .iter()
+            .map(|(bucket, usage)| (bucket.clone(), usage.size))
+            .collect();
+        self.buckets_count = u64::try_from(self.buckets_usage.len()).unwrap_or(u64::MAX);
+        self.objects_total_size = size;
+        self.objects_total_count = objects;
+        self.versions_total_count = versions;
+        self.delete_markers_total_count = markers;
+        self.replication_info.clear();
+        self.tier_stats = None;
+        self.unknown_tier_stats = None;
+        self.usage_snapshot_complete = false;
+        self.usage_snapshot_partial = true;
+        self.usage_snapshot_converged = Some(false);
+        self.usage_snapshot_admin_projection = true;
+        original_count.saturating_sub(self.buckets_usage.len())
+    }
+
     /// Overlay validated companions on an owned admin response only.
     ///
     /// `incarnations` must come from current storage metadata, not the companion.

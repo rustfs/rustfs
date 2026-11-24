@@ -14,7 +14,6 @@
 
 use super::*;
 use crate::app::storage_api::s3::S3ErrorCode;
-use crate::app::storage_api::s3::dto::{CopySource, UploadPartCopyInput};
 use crate::app::storage_api::test::contract::bucket::{BucketOperations, MakeBucketOptions};
 use crate::app::storage_api::test::contract::object::{ObjectIO, ObjectOperations};
 
@@ -49,18 +48,19 @@ fn upload_part_copy_shares_foreground_admission_with_upload_part() {
         let held = manager.admit_multipart_part(1024).await.expect("hold UploadPart permit");
         assert!(matches!(held, ForegroundWriteAdmission::Admitted(_)));
         let usecase = DefaultMultipartUsecase::with_context_and_concurrency_manager(Some(context), Arc::clone(&manager));
-        let input = UploadPartCopyInput::builder()
-            .bucket(bucket.clone())
-            .key("object".to_owned())
-            .copy_source(CopySource::Bucket {
-                bucket: bucket.clone().into(),
-                key: "source".into(),
-                version_id: None,
-            })
-            .part_number(1)
-            .upload_id(upload.upload_id.clone())
-            .build()
-            .expect("copy request");
+        let input = || {
+            copy_part_input(
+                &bucket,
+                "object",
+                &upload.upload_id,
+                1,
+                CopySourceValue::Bucket {
+                    bucket: bucket.clone(),
+                    key: "source".into(),
+                    version_id: None,
+                },
+            )
+        };
         let recorder = metrics_util::debugging::DebuggingRecorder::new();
         let snapshotter = recorder.snapshotter();
         let _recorder = metrics::set_default_local_recorder(&recorder);
@@ -76,9 +76,10 @@ fn upload_part_copy_shares_foreground_admission_with_upload_part() {
                         .any(|label| label.key() == "size_bucket" && label.value() == source_size_bucket)
             })
         };
-        let error = Box::pin(usecase.execute_upload_part_copy(build_request(input.clone(), Method::PUT)))
-            .await
-            .expect_err("copy must not bypass the occupied UploadPart pool");
+        let error = match Box::pin(usecase.execute_upload_part_copy_with_audit(owned_envelope(Method::PUT), input())).await {
+            Err(error) => crate::error::legacy_error_for_test(error),
+            Ok(_) => panic!("copy must not bypass the occupied UploadPart pool"),
+        };
         assert_eq!(error.code(), &S3ErrorCode::SlowDown);
         assert!(!source_reader_observed(), "saturated copy must not construct a source body reader");
         let parts = store
@@ -87,24 +88,17 @@ fn upload_part_copy_shares_foreground_admission_with_upload_part() {
             .expect("list parts");
         assert!(parts.parts.is_empty(), "rejected copy must not create a destination part");
         drop(held);
-        let copied = Box::pin(usecase.execute_upload_part_copy(build_request(input, Method::PUT)))
-            .await
-            .expect("retry copy after releasing UploadPart permit");
+        let copied = match Box::pin(usecase.execute_upload_part_copy_with_audit(owned_envelope(Method::PUT), input())).await {
+            Ok(output) => output,
+            Err(error) => panic!("retry copy after releasing UploadPart permit: {error:?}"),
+        };
         assert!(source_reader_observed());
         assert_eq!(
             manager.put_object_admission_snapshot().active,
             Some(0),
             "success releases the copy permit"
         );
-        let etag = copied
-            .output
-            .copy_part_result
-            .expect("part result")
-            .e_tag
-            .expect("copy ETag")
-            .value()
-            .trim_matches('"')
-            .to_owned();
+        let etag = copied.e_tag.expect("copy ETag");
         Arc::clone(&store)
             .complete_multipart_upload(
                 &bucket,
@@ -152,22 +146,24 @@ fn upload_part_copy_shares_foreground_admission_with_upload_part() {
             (None, S3ErrorCode::NoSuchKey),
             (Some(marker_version), S3ErrorCode::MethodNotAllowed),
         ] {
-            let input = UploadPartCopyInput::builder()
-                .bucket(bucket.clone())
-                .key("deleted-copy".to_owned())
-                .copy_source(CopySource::Bucket {
-                    bucket: bucket.clone().into(),
-                    key: "source".into(),
-                    version_id: version_id.map(Into::into),
-                })
-                .copy_source_if_match(Some("\"wrong-etag\"".parse().expect("source condition")))
-                .part_number(1)
-                .upload_id(deleted_upload.upload_id.clone())
-                .build()
-                .expect("deleted-source copy request");
-            let error = Box::pin(usecase.execute_upload_part_copy(build_request(input, Method::PUT)))
-                .await
-                .expect_err("deleted source must fail before conditions or admission");
+            let input = UploadPartCopyWriteInput {
+                copy_source_if_match: Some(CopySourceCondition::Strong("wrong-etag".to_owned())),
+                ..copy_part_input(
+                    &bucket,
+                    "deleted-copy",
+                    &deleted_upload.upload_id,
+                    1,
+                    CopySourceValue::Bucket {
+                        bucket: bucket.clone(),
+                        key: "source".into(),
+                        version_id,
+                    },
+                )
+            };
+            let error = match Box::pin(usecase.execute_upload_part_copy_with_audit(owned_envelope(Method::PUT), input)).await {
+                Err(error) => crate::error::legacy_error_for_test(error),
+                Ok(_) => panic!("deleted source must fail before conditions or admission"),
+            };
             assert_eq!(error.code(), &expected);
         }
     });
@@ -199,19 +195,19 @@ fn upload_part_copy_range_error_and_cancellation_release_foreground_permit() {
             .new_multipart_upload(&bucket, "cancelled", &ObjectOptions::default())
             .await
             .expect("cancelled destination session");
-        let cancelled_input = UploadPartCopyInput::builder()
-            .bucket(bucket.clone())
-            .key("cancelled".to_owned())
-            .copy_source(CopySource::Bucket {
-                bucket: bucket.clone().into(),
+        let cancelled_input = copy_part_input(
+            &bucket,
+            "cancelled",
+            &cancelled_upload.upload_id,
+            1,
+            CopySourceValue::Bucket {
+                bucket: bucket.clone(),
                 key: "source".into(),
                 version_id: None,
-            })
-            .part_number(1)
-            .upload_id(cancelled_upload.upload_id.clone())
-            .build()
-            .expect("cancelled copy request");
-        let mut cancelled_copy = Box::pin(usecase.execute_upload_part_copy(build_request(cancelled_input, Method::PUT)));
+            },
+        );
+        let mut cancelled_copy =
+            Box::pin(usecase.execute_upload_part_copy_with_audit(owned_envelope(Method::PUT), cancelled_input));
         tokio::time::timeout(Duration::from_secs(10), async {
             tokio::select! {
                 biased;
@@ -220,7 +216,10 @@ fn upload_part_copy_range_error_and_cancellation_release_foreground_permit() {
                         tokio::task::yield_now().await;
                     }
                 } => {}
-                result = &mut cancelled_copy => panic!("copy completed before cancellation: {result:?}"),
+                result = &mut cancelled_copy => match result {
+                    Ok(_) => panic!("copy completed before cancellation"),
+                    Err(error) => panic!("copy completed before cancellation: {error:?}"),
+                },
             }
         })
         .await
@@ -247,30 +246,32 @@ fn upload_part_copy_range_error_and_cancellation_release_foreground_permit() {
                 .new_multipart_upload(&bucket, "object", &opts)
                 .await
                 .expect("range destination session");
-            let input = UploadPartCopyInput::builder()
-                .bucket(bucket.clone())
-                .key("object".to_owned())
-                .copy_source(CopySource::Bucket {
-                    bucket: bucket.clone().into(),
-                    key: "source".into(),
-                    version_id: None,
-                })
-                .copy_source_range(Some("bytes=12345-1060920".to_owned()))
-                .part_number(1)
-                .upload_id(upload.upload_id.clone())
-                .build()
-                .expect("range request");
-            let response = Box::pin(usecase.execute_upload_part_copy(build_request(input, Method::PUT))).await;
+            let input = UploadPartCopyWriteInput {
+                copy_source_range: Some("bytes=12345-1060920".to_owned()),
+                ..copy_part_input(
+                    &bucket,
+                    "object",
+                    &upload.upload_id,
+                    1,
+                    CopySourceValue::Bucket {
+                        bucket: bucket.clone(),
+                        key: "source".into(),
+                        version_id: None,
+                    },
+                )
+            };
+            let response = Box::pin(usecase.execute_upload_part_copy_with_audit(owned_envelope(Method::PUT), input)).await;
             assert_eq!(
                 manager.put_object_admission_snapshot().active,
                 Some(0),
                 "copy releases its permit on every outcome"
             );
             if capped {
-                assert_eq!(
-                    response.expect_err("range exceeds destination size limit").code(),
-                    &S3ErrorCode::EntityTooLarge
-                );
+                let error = match response {
+                    Err(error) => crate::error::legacy_error_for_test(error),
+                    Ok(_) => panic!("range exceeds destination size limit"),
+                };
+                assert_eq!(error.code(), &S3ErrorCode::EntityTooLarge);
                 let parts = store
                     .list_object_parts(&bucket, "object", &upload.upload_id, None, 1000, &ObjectOptions::default())
                     .await
@@ -281,16 +282,11 @@ fn upload_part_copy_range_error_and_cancellation_release_foreground_permit() {
                     .await
                     .expect("abort capped session");
             } else {
-                let copied = response.expect("range copy after failed request released its source and permit");
-                let etag = copied
-                    .output
-                    .copy_part_result
-                    .expect("range result")
-                    .e_tag
-                    .expect("range ETag")
-                    .value()
-                    .trim_matches('"')
-                    .to_owned();
+                let copied = match response {
+                    Ok(output) => output,
+                    Err(error) => panic!("range copy after failed request released its source and permit: {error:?}"),
+                };
+                let etag = copied.e_tag.expect("range ETag");
                 Arc::clone(&store)
                     .complete_multipart_upload(
                         &bucket,
