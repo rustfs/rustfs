@@ -1038,8 +1038,16 @@ pub struct ScannerBucketScanPlan {
     segment_invalidation_proof: Option<crate::DataUsageSegmentInvalidationProof>,
 }
 
+#[derive(Default)]
+struct ScannerTierRegistryReplan {
+    mismatched_buckets: HashSet<String>,
+    /// Every omitted bucket returned a mismatch or reported unfinished work.
+    gaps_accounted: bool,
+}
+
 #[derive(Clone, Default)]
 struct ScannerBucketFailureState {
+    registry_replan: Arc<Mutex<ScannerTierRegistryReplan>>,
     usage_watch_completions: Arc<Mutex<HashMap<DataUsageCacheSource, HashMap<String, ScannerUsageWatchProof>>>>,
     hard: Arc<Mutex<HashSet<String>>>,
     partial: Arc<Mutex<HashSet<String>>>,

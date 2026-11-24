@@ -45,12 +45,14 @@ fn durable_receipt() -> RemoteScannerDurableProgress {
 async fn durable_progress_requires_negotiation_exact_scope_mac_and_eof() {
     for case in [
         "valid",
+        "generation",
         "legacy",
         "source",
         "identity",
         "epoch",
         "plan",
         "future_observation",
+        "future_cycle_old_epoch",
         "mac",
         "trailing",
     ] {
@@ -58,12 +60,24 @@ async fn durable_progress_requires_negotiation_exact_scope_mac_and_eof() {
         let writer_auth = FrameAuthenticator::for_test(request_id);
         let reader_auth = FrameAuthenticator::for_test(if case == "mac" { Uuid::new_v4() } else { request_id });
         let mut receipt = durable_receipt();
+        if case != "valid" {
+            receipt.identity.tier_registry_generation = 1;
+            receipt.observation.as_mut().expect("fixture observation").identity = receipt.identity;
+        }
         match case {
             "source" => receipt.source = DataUsageCacheSource::new(99, 99),
-            "identity" => receipt.identity.bucket_incarnation = Uuid::from_u128(99),
+            "identity" => {
+                receipt.identity.bucket_incarnation = Uuid::from_u128(99);
+                receipt.observation.as_mut().expect("fixture observation").identity = receipt.identity;
+            }
             "epoch" => receipt.leader_epoch += 1,
             "plan" => receipt.checkpoint_plan_digest = DataUsageScanPlanDigest([99; 32]),
             "future_observation" => receipt.observation.as_mut().expect("fixture observation").completed_cycle += 1,
+            "future_cycle_old_epoch" => {
+                let observation = receipt.observation.as_mut().expect("fixture observation");
+                observation.completed_epoch -= 1;
+                observation.completed_cycle += 1;
+            }
             _ => {}
         }
         let mut bytes = Vec::new();
@@ -112,10 +126,27 @@ async fn durable_progress_requires_negotiation_exact_scope_mac_and_eof() {
             };
             assert!(advanced);
             assert_eq!(observation.expect("preserved companion").entry.objects, 5);
+        } else if case == "generation" {
+            assert!(matches!(
+                result,
+                Ok(RemoteScannerOutcome::TierRegistryMismatch { expected: 0, actual: 1 })
+            ));
         } else {
             assert!(result.is_err(), "invalid progress case {case}");
         }
     }
+}
+
+#[test]
+fn durable_receipt_with_no_tier_generation_fails_wire_validation() {
+    let mut wire = serde_json::to_value(durable_receipt()).expect("legacy receipt");
+    serde_json::from_value::<RemoteScannerDurableProgress>(wire.clone()).expect("valid receipt fixture");
+    wire["identity"]
+        .as_object_mut()
+        .expect("identity map")
+        .remove("tier_registry_generation");
+    let error = serde_json::from_value::<RemoteScannerDurableProgress>(wire).expect_err("missing receipt generation");
+    assert!(error.to_string().contains("tier_registry_generation"));
 }
 
 #[test]
