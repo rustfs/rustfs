@@ -76,7 +76,7 @@ fn system_xml_keeps_minio_quote_spelling_and_omits_optional_blocks() {
 #[test]
 fn capacity_math_clamps_used_and_available() {
     let quota = capacity_figures(CapacityInputs {
-        used_bucket: 250,
+        used_bucket: Some(250),
         hard_quota: Some(1_000),
         capacity_cluster: 9_000,
         free_cluster: 8_000,
@@ -85,46 +85,65 @@ fn capacity_math_clamps_used_and_available() {
         quota,
         CapacityFigures {
             capacity: 1_000,
-            used: 250,
-            available: 750,
+            used: Some(250),
+            available: Some(750),
         }
     );
 
     let cluster = capacity_figures(CapacityInputs {
-        used_bucket: 100,
+        used_bucket: Some(100),
         hard_quota: None,
         capacity_cluster: 5_000,
         free_cluster: 4_000,
     });
     assert_eq!(cluster.capacity, 5_000);
-    assert_eq!(cluster.used, 100);
-    assert_eq!(cluster.available, 4_000);
+    assert_eq!(cluster.used, Some(100));
+    assert_eq!(cluster.available, Some(4_000));
 
     let saturated = capacity_figures(CapacityInputs {
-        used_bucket: 9_000,
+        used_bucket: Some(9_000),
         hard_quota: Some(1_000),
         capacity_cluster: 50_000,
         free_cluster: 40_000,
     });
-    assert_eq!(saturated.used, 1_000);
-    assert_eq!(saturated.available, 0);
+    assert_eq!(saturated.used, Some(1_000));
+    assert_eq!(saturated.available, Some(0));
 
     let free_clamp = capacity_figures(CapacityInputs {
-        used_bucket: 100,
+        used_bucket: Some(100),
         hard_quota: Some(10_000),
         capacity_cluster: 50_000,
         free_cluster: 50,
     });
-    assert_eq!(free_clamp.available, 50);
-    assert!(free_clamp.available <= free_clamp.capacity - free_clamp.used);
+    assert_eq!(free_clamp.available, Some(50));
 
     let zero_quota = capacity_figures(CapacityInputs {
-        used_bucket: 10,
+        used_bucket: Some(10),
         hard_quota: Some(0),
         capacity_cluster: 400,
         free_cluster: 300,
     });
     assert_eq!(zero_quota.capacity, 400);
+}
+
+#[test]
+fn pending_capacity_only_reports_known_figures() {
+    for (hard_quota, free_cluster, capacity, available) in [
+        (None, u64::MAX, u64::MAX, "18446744073709551615"),
+        (Some(0), 8_000, u64::MAX, "8000"),
+        (Some(1_000), 8_000, 1_000, "-1"),
+        (Some(1_000), 0, 1_000, "0"),
+    ] {
+        let xml = capacity_xml(&capacity_figures(CapacityInputs {
+            used_bucket: None,
+            hard_quota,
+            capacity_cluster: u64::MAX,
+            free_cluster,
+        }));
+        assert_eq!(element_text(&xml, "Capacity"), capacity.to_string());
+        assert_eq!(element_text(&xml, "Available"), available);
+        assert_eq!(element_text(&xml, "Used"), "-1");
+    }
 }
 
 #[tokio::test]
@@ -139,8 +158,8 @@ async fn concurrent_capacity_refreshes_share_one_load_and_preserve_modification_
     let calls = AtomicUsize::new(0);
     let figures = || CapacityFigures {
         capacity: 100,
-        used: 20,
-        available: 80,
+        used: Some(20),
+        available: Some(80),
     };
     let load = || async {
         calls.fetch_add(1, Ordering::SeqCst);
@@ -158,6 +177,7 @@ async fn concurrent_capacity_refreshes_share_one_load_and_preserve_modification_
         .await
         .expect("refresh unchanged content");
     assert_eq!(first, unchanged);
+    assert_eq!(first.0.as_ptr(), unchanged.0.as_ptr(), "unchanged refresh reuses the XML allocation");
     assert_eq!(calls.load(Ordering::SeqCst), 2);
     let replacement = CapacityCacheKey {
         incarnation: Uuid::new_v4(),
@@ -176,8 +196,8 @@ async fn concurrent_capacity_refreshes_share_one_load_and_preserve_modification_
     let changed = cached_or_load_capacity(&caches, &key, || async {
         Ok(CapacityFigures {
             capacity: 100,
-            used: 30,
-            available: 70,
+            used: Some(30),
+            available: Some(70),
         })
     })
     .await
@@ -219,8 +239,8 @@ async fn different_buckets_refresh_concurrently_even_if_old_stripes_collide() {
                 second_started.notified().await;
                 Ok(CapacityFigures {
                     capacity: 1,
-                    used: 0,
-                    available: 1,
+                    used: Some(0),
+                    available: Some(1),
                 })
             }),
             cached_or_load_capacity(&caches, &second, || async {
@@ -228,8 +248,8 @@ async fn different_buckets_refresh_concurrently_even_if_old_stripes_collide() {
                 second_started.notify_one();
                 Ok(CapacityFigures {
                     capacity: 1,
-                    used: 0,
-                    available: 1,
+                    used: Some(0),
+                    available: Some(1),
                 })
             })
         )
@@ -264,8 +284,8 @@ async fn capacity_refresh_admission_is_bounded_and_released_on_cancel() {
             std::future::pending::<()>().await;
             Ok(CapacityFigures {
                 capacity: 1,
-                used: 0,
-                available: 1,
+                used: Some(0),
+                available: Some(1),
             })
         })
         .await
@@ -281,8 +301,8 @@ async fn capacity_refresh_admission_is_bounded_and_released_on_cancel() {
             second_calls.fetch_add(1, Ordering::SeqCst);
             Ok(CapacityFigures {
                 capacity: 1,
-                used: 0,
-                available: 1,
+                used: Some(0),
+                available: Some(1),
             })
         })
         .await
@@ -325,8 +345,8 @@ async fn concurrent_capacity_failures_are_coalesced_and_retryable() {
     let recovered = cached_or_load_capacity(&caches, &key, || async {
         Ok(CapacityFigures {
             capacity: 1,
-            used: 0,
-            available: 1,
+            used: Some(0),
+            available: Some(1),
         })
     })
     .await
@@ -499,8 +519,8 @@ async fn cancelled_capacity_refresh_can_be_retried() {
             std::future::pending::<()>().await;
             Ok(CapacityFigures {
                 capacity: 1,
-                used: 0,
-                available: 1,
+                used: Some(0),
+                available: Some(1),
             })
         })
         .await
@@ -513,8 +533,8 @@ async fn cancelled_capacity_refresh_can_be_retried() {
         cached_or_load_capacity(&caches, &key, || async {
             Ok(CapacityFigures {
                 capacity: 1,
-                used: 0,
-                available: 1,
+                used: Some(0),
+                available: Some(1),
             })
         }),
     )
@@ -542,8 +562,8 @@ async fn cancelled_capacity_leader_hands_over_to_waiter() {
             std::future::pending::<()>().await;
             Ok(CapacityFigures {
                 capacity: 1,
-                used: 0,
-                available: 1,
+                used: Some(0),
+                available: Some(1),
             })
         })
         .await
@@ -552,8 +572,8 @@ async fn cancelled_capacity_leader_hands_over_to_waiter() {
     let mut waiter = Box::pin(cached_or_load_capacity(&caches, &key, || async {
         Ok(CapacityFigures {
             capacity: 2,
-            used: 0,
-            available: 2,
+            used: Some(0),
+            available: Some(2),
         })
     }));
     tokio::select! {
@@ -574,8 +594,8 @@ async fn cancelled_capacity_leader_hands_over_to_waiter() {
 fn etag_is_md5_of_the_full_body_and_range_slices_it() {
     let xml = capacity_xml(&CapacityFigures {
         capacity: 10,
-        used: 4,
-        available: 3,
+        used: Some(4),
+        available: Some(3),
     });
     let bytes = Bytes::from(xml.clone());
     let etag = md5_hex(&bytes);
@@ -716,14 +736,53 @@ fn veeam_sosapi_http_contract() {
 
             let unknown_capacity = owner.call(owner_call(Method::GET, capacity_uri.clone(), Vec::new(), Bytes::new()))
                 .await.expect("unknown capacity");
-            assert_eq!(unknown_capacity.status(), http::StatusCode::SERVICE_UNAVAILABLE);
+            assert_eq!(unknown_capacity.status(), http::StatusCode::OK);
+            let unknown_etag = unknown_capacity.headers()["etag"].to_str().expect("pending capacity etag").to_owned();
+            let unknown_modified = unknown_capacity.headers()["last-modified"].clone();
+            let unknown_body = BodyExt::collect(unknown_capacity.into_body()).await.expect("pending capacity body").to_bytes();
+            let unknown_xml = std::str::from_utf8(&unknown_body).expect("utf-8");
+            let cluster_capacity: u64 = element_text(unknown_xml, "Capacity").parse().expect("cluster capacity");
+            let cluster_available: u64 = element_text(unknown_xml, "Available").parse().expect("cluster free space");
+            assert!(cluster_capacity > 0 && cluster_available <= cluster_capacity);
+            assert_eq!(element_text(unknown_xml, "Used"), "-1");
+            assert_eq!(unknown_etag, format!("\"{}\"", md5_hex(&unknown_body)));
+            let unknown_head = owner.call(owner_call(Method::HEAD, capacity_uri.clone(), Vec::new(), Bytes::new()))
+                .await.expect("HEAD pending capacity");
+            assert_eq!(unknown_head.status(), http::StatusCode::OK);
+            assert_eq!(unknown_head.headers()["etag"], unknown_etag);
+            assert_eq!(unknown_head.headers()["last-modified"], unknown_modified);
+            assert_eq!(unknown_head.headers()["content-length"], unknown_body.len().to_string());
+            assert!(BodyExt::collect(unknown_head.into_body()).await.expect("HEAD body").to_bytes().is_empty());
+            let bucket_incarnation = store.bucket_incarnation_id_from_disk(&bucket).await.expect("bucket incarnation");
+            let capacity_key = CapacityCacheKey { store_id: store.id, bucket: bucket.clone(), incarnation: bucket_incarnation };
+            let caches = capacity_caches();
+            let mut history = caches.history.get(&capacity_key).expect("pending capacity history");
+            // Model an unchanged document past Veeam's freshness window without sleeping.
+            history.modified_at = OffsetDateTime::now_utc() - time::Duration::minutes(10);
+            let aged_modified = history.modified_at.format(&super::super::RFC1123).expect("aged last-modified");
+            caches.history.insert(capacity_key.clone(), history);
+            caches.current.invalidate(&capacity_key).await;
+            cluster_capacity_cache().current.insert(store.id, (cluster_capacity, cluster_available)).await;
+
+            let unknown_not_modified = owner.call(owner_call(
+                Method::GET, capacity_uri.clone(), vec![("if-none-match", unknown_etag.clone())], Bytes::new(),
+            )).await.expect("conditional pending capacity");
+            assert_eq!(unknown_not_modified.status(), http::StatusCode::NOT_MODIFIED);
+            assert_eq!(unknown_not_modified.headers()["etag"], unknown_etag);
+            let renewed_modified = unknown_not_modified.headers()["last-modified"].clone();
+            assert_ne!(renewed_modified, aged_modified);
+            let since_aged = owner.call(owner_call(
+                Method::HEAD, capacity_uri.clone(), vec![("if-modified-since", aged_modified)], Bytes::new(),
+            )).await.expect("capacity revalidated since aged last-modified");
+            assert_eq!(since_aged.status(), http::StatusCode::OK);
+            assert_eq!(since_aged.headers()["last-modified"], renewed_modified);
+            assert_eq!(since_aged.headers()["etag"], unknown_etag);
             let mut snapshot = rustfs_data_usage::DataUsageInfo {
                 last_update: Some(std::time::SystemTime::now() + Duration::from_secs(1)),
                 buckets_count: 1,
                 usage_snapshot_complete: true,
                 ..Default::default()
             };
-            let bucket_incarnation = store.bucket_incarnation_id_from_disk(&bucket).await.expect("bucket incarnation");
             snapshot.usage_snapshot_converged = Some(true);
             snapshot.scanner_cycle = Some(1);
             snapshot.scanner_epoch = Some(1);
@@ -733,14 +792,16 @@ fn veeam_sosapi_http_contract() {
             snapshot.bucket_sizes.insert(bucket.clone(), 0);
             crate::app::storage_api::test::data_usage::store_data_usage_in_backend(snapshot.clone(), Arc::clone(&store))
                 .await.expect("seed capacity snapshot");
+            caches.current.invalidate(&capacity_key).await;
 
             let capacity = owner
-                .call(owner_call(Method::GET, capacity_uri.clone(), Vec::new(), Bytes::new()))
+                .call(owner_call(Method::GET, capacity_uri.clone(), vec![("if-none-match", unknown_etag.clone())], Bytes::new()))
                 .await
                 .expect("GET capacity.xml");
             assert_eq!(capacity.status(), http::StatusCode::OK);
             assert_eq!(capacity.headers()["content-type"], "application/xml");
             let capacity_etag = capacity.headers()["etag"].to_str().expect("capacity etag").to_string();
+            assert_ne!(capacity_etag, unknown_etag);
             let capacity_body = BodyExt::collect(capacity.into_body())
                 .await
                 .expect("capacity body")
@@ -749,7 +810,7 @@ fn veeam_sosapi_http_contract() {
             let capacity_value: u64 = element_text(capacity_xml, "Capacity").parse().expect("capacity");
             let available_value: u64 = element_text(capacity_xml, "Available").parse().expect("available");
             let used_value: u64 = element_text(capacity_xml, "Used").parse().expect("used");
-            assert!(used_value <= capacity_value);
+            assert_eq!(used_value, 0);
             assert!(available_value <= capacity_value.saturating_sub(used_value));
 
             let other_etag = "\"00000000000000000000000000000000\"";
@@ -868,15 +929,29 @@ fn veeam_sosapi_http_contract() {
                 .await
                 .expect("set quota on fresh bucket");
             crate::app::storage_api::test::set_disk::initialize_quota_ledger_for_test(Arc::clone(&store), &quota_bucket).await.expect("bootstrap quota usage");
+            let quota_incarnation = store.bucket_incarnation_id_from_disk(&quota_bucket).await.expect("quota bucket incarnation");
+            let pending_quota = owner.call(owner_call(
+                Method::GET, format!("/{quota_bucket}/{CAPACITY_KEY}"), Vec::new(), Bytes::new(),
+            )).await.expect("pending quota capacity");
+            assert_eq!(pending_quota.status(), http::StatusCode::OK);
+            let pending_quota_body = BodyExt::collect(pending_quota.into_body()).await.expect("pending quota body").to_bytes();
+            let pending_quota_xml = std::str::from_utf8(&pending_quota_body).expect("utf-8");
+            assert_eq!(element_text(pending_quota_xml, "Capacity"), "1000000");
+            assert_eq!(element_text(pending_quota_xml, "Used"), "-1");
+            let pending_available = element_text(pending_quota_xml, "Available");
+            assert!(pending_available == "-1" || pending_available == "0", "{pending_quota_xml}");
+
             snapshot.last_update = Some(std::time::SystemTime::now() + Duration::from_secs(2));
             snapshot.buckets_count = 2;
-            let quota_incarnation = store.bucket_incarnation_id_from_disk(&quota_bucket).await.expect("quota bucket incarnation");
             snapshot.buckets_usage.insert(quota_bucket.clone(), rustfs_data_usage::BucketUsageInfo {
                 bucket_incarnation: Some(quota_incarnation.to_string()), ..Default::default()
             });
             snapshot.bucket_sizes.insert(quota_bucket.clone(), 0);
             crate::app::storage_api::test::data_usage::store_data_usage_in_backend(snapshot.clone(), Arc::clone(&store))
                 .await.expect("seed quota bucket usage");
+            capacity_caches().current.invalidate(&CapacityCacheKey {
+                store_id: store.id, bucket: quota_bucket.clone(), incarnation: quota_incarnation,
+            }).await;
             let quota_response = owner
                 .call(owner_call(
                     Method::GET,
@@ -940,13 +1015,18 @@ fn veeam_sosapi_http_contract() {
             crate::app::storage_api::test::data_usage::store_data_usage_in_backend(snapshot.clone(), Arc::clone(&store))
                 .await.expect("seed stale incarnation snapshot");
             let stale = owner.call(owner_call(Method::GET, recycled_uri.clone(), Vec::new(), Bytes::new())).await.expect("stale capacity");
-            assert_eq!(stale.status(), http::StatusCode::SERVICE_UNAVAILABLE);
+            assert_eq!(stale.status(), http::StatusCode::OK);
+            let stale_body = BodyExt::collect(stale.into_body()).await.expect("stale capacity body").to_bytes();
+            assert_eq!(element_text(std::str::from_utf8(&stale_body).unwrap(), "Used"), "-1");
             snapshot.last_update = Some(std::time::SystemTime::now() + Duration::from_secs(5));
             snapshot.buckets_usage.get_mut(&recycled).unwrap().bucket_incarnation = Some(new_id.to_string());
             snapshot.buckets_usage.get_mut(&recycled).unwrap().size = 17;
             snapshot.bucket_sizes.insert(recycled.clone(), 17);
             crate::app::storage_api::test::data_usage::store_data_usage_in_backend(snapshot, Arc::clone(&store))
                 .await.expect("seed new incarnation snapshot");
+            capacity_caches().current.invalidate(&CapacityCacheKey {
+                store_id: store.id, bucket: recycled.clone(), incarnation: new_id,
+            }).await;
             let fresh = owner.call(owner_call(Method::GET, recycled_uri, Vec::new(), Bytes::new())).await.expect("new capacity");
             assert_eq!(fresh.status(), http::StatusCode::OK);
             let fresh_body = BodyExt::collect(fresh.into_body()).await.expect("new capacity body").to_bytes();

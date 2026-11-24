@@ -208,7 +208,7 @@ mod conditional_read_bench;
 pub(crate) use attributes::{GetObjectAttributesFields, GetObjectAttributesOutputFacts};
 mod copy;
 mod copy_input;
-pub(crate) use copy_input::{CopyObjectWriteInput, CopyObjectWriteOutput, CopySourceCondition};
+pub(crate) use copy_input::{CopyObjectWriteInput, CopyObjectWriteOutput, CopySourceCondition, CopySourceDates};
 #[cfg(all(any(feature = "cuobject", feature = "nixl"), target_os = "linux"))]
 pub(crate) mod cuobject;
 mod delete;
