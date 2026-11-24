@@ -265,7 +265,8 @@ const SCANNER_CYCLE_RECOVERY_PAUSED_INTERVAL: Duration = Duration::from_secs(5 *
 /// races the wait registration cannot leave the scanner asleep forever.
 const SCANNER_CYCLE_RECOVERY_BLOCKED_PROBE_INTERVAL: Duration = Duration::from_secs(5 * 60);
 const SCANNER_LEADER_LOCK_POLL_INTERVAL: Duration = Duration::from_secs(1);
-pub(crate) const SCANNER_PRODUCTION_SHUTDOWN_GRACE: Duration = Duration::from_secs(30);
+/// Grace period for the scanner to drain owned work during production shutdown.
+pub const SCANNER_PRODUCTION_SHUTDOWN_GRACE: Duration = Duration::from_secs(30);
 #[cfg(not(test))]
 pub(crate) const SCANNER_LOCK_LOSS_SHUTDOWN_TIMEOUT: Duration = SCANNER_PRODUCTION_SHUTDOWN_GRACE;
 #[cfg(test)]
