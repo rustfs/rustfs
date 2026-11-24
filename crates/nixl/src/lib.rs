@@ -288,6 +288,55 @@ pub struct ArenaRange {
     pub len: usize,
 }
 
+// Fields drop in declaration order. Unregister before destroying the native
+// agent and its backend, and keep the mapping alive throughout both steps.
+struct StagingRegistration {
+    registration: nixl_sys::RegistrationHandle,
+    backend: Backend,
+    agent: Agent,
+    buffer: HostBuffer,
+}
+
+/// An exclusive window exposed for a peer to read or write. The native agent
+/// progresses peer traffic. No local transfer request is submitted by this API.
+pub struct RegisteredClientWindow {
+    registration: Arc<StagingRegistration>,
+    offset: usize,
+    len: usize,
+}
+
+impl RegisteredClientWindow {
+    /// Register one allocation and return its agent metadata and disjoint windows.
+    pub fn register(config: &NixlConfig) -> Result<(Vec<u8>, Vec<Self>), NixlError> {
+        if !config.progress_thread {
+            return Err(NixlError::Token(
+                "registered client windows require the native progress thread".to_owned(),
+            ));
+        }
+        let registration = Arc::new(NixlServer::register_staging(config)?);
+        let metadata = registration.agent.get_local_md().map_err(nixl_err("local metadata"))?;
+        let windows = (0..registration.buffer.len() / config.chunk_bytes)
+            .map(|index| Self {
+                registration: Arc::clone(&registration),
+                offset: index * config.chunk_bytes,
+                len: config.chunk_bytes,
+            })
+            .collect();
+        Ok((metadata, windows))
+    }
+
+    /// Address for the peer transfer descriptor.
+    pub fn addr(&self) -> usize {
+        self.registration.buffer.addr() + self.offset
+    }
+
+    /// Borrow the registered range while the peer is idle. The caller must
+    /// wait for peer completion before borrowing, reusing, or dropping a window.
+    pub fn as_mut_slice(&mut self) -> Result<&mut [u8], NixlError> {
+        self.registration.buffer.slice_mut(self.offset, self.len)
+    }
+}
+
 struct Staging {
     buffer: HostBuffer,
     _registration: nixl_sys::RegistrationHandle,
@@ -505,8 +554,7 @@ fn metadata_hash(metadata: &[u8]) -> u64 {
 }
 
 impl NixlServer {
-    /// Creates the agent, the UCX backend and the staging pool.
-    pub fn new(config: &NixlConfig) -> Result<Arc<Self>, NixlError> {
+    fn register_staging(config: &NixlConfig) -> Result<StagingRegistration, NixlError> {
         if config.chunk_bytes == 0 || config.chunk_bytes > MAX_RDMA_OP_BYTES || config.pool_bytes < config.chunk_bytes {
             return Err(NixlError::Token("invalid staging configuration".to_owned()));
         }
@@ -536,9 +584,21 @@ impl NixlServer {
         let registration = agent
             .register_memory(&buffer, Some(&opt_args))
             .map_err(nixl_err("register staging"))?;
-        let engine = Arc::new(Engine {
-            agent,
+        Ok(StagingRegistration {
+            registration,
             backend,
+            agent,
+            buffer,
+        })
+    }
+
+    /// Creates the agent, the UCX backend and the staging pool.
+    pub fn new(config: &NixlConfig) -> Result<Arc<Self>, NixlError> {
+        let registration = Self::register_staging(config)?;
+        let chunks = registration.buffer.len() / config.chunk_bytes;
+        let engine = Arc::new(Engine {
+            agent: registration.agent,
+            backend: registration.backend,
             poll_interval: config.poll_interval,
             transfer_timeout: config.transfer_timeout,
         });
@@ -554,8 +614,8 @@ impl NixlServer {
         Ok(Arc::new(Self {
             engine,
             staging: Staging {
-                buffer,
-                _registration: registration,
+                buffer: registration.buffer,
+                _registration: registration.registration,
                 free: parking_lot::Mutex::new((0..chunks).collect()),
                 permits: Semaphore::new(chunks),
                 chunk_bytes: config.chunk_bytes,
@@ -994,6 +1054,40 @@ impl Engine {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn passive_windows_require_native_progress() {
+        let config = NixlConfig {
+            progress_thread: false,
+            ..NixlConfig::default()
+        };
+        assert!(matches!(
+            RegisteredClientWindow::register(&config),
+            Err(NixlError::Token(message)) if message == "registered client windows require the native progress thread"
+        ));
+    }
+
+    #[test]
+    #[ignore = "requires a native NIXL installation with the UCX backend"]
+    fn passive_windows_share_a_registration_until_the_last_window_drops() {
+        const CHUNK: usize = 4096;
+        let config = NixlConfig {
+            agent_name: format!("passive-window-test-{}", std::process::id()),
+            chunk_bytes: CHUNK,
+            pool_bytes: 2 * CHUNK + 1,
+            ..NixlConfig::default()
+        };
+        let (metadata, windows) = RegisteredClientWindow::register(&config).expect("register passive windows");
+        let [mut first, mut second]: [_; 2] = windows.try_into().ok().expect("two complete windows");
+        assert!(!metadata.is_empty());
+        assert_eq!(second.addr() - first.addr(), CHUNK);
+        first.as_mut_slice().expect("first window").fill(0xa5);
+        let second_slice = second.as_mut_slice().expect("second window");
+        assert_eq!(second_slice, &[0u8; CHUNK]);
+        second_slice.fill(0x5a);
+        drop(first);
+        assert_eq!(second.as_mut_slice().expect("remaining window"), &[0x5a; CHUNK]);
+    }
 
     #[test]
     fn token_parses_memory_device_address_and_length() {
