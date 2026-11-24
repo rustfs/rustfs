@@ -401,6 +401,7 @@ fn test_request(request_id: Uuid) -> RemoteScannerRequestWire {
         leader_epoch: 9,
         scan_plan_digest: TEST_PLAN_DIGEST,
         checkpoint_plan_digest: None,
+        expected_tier_registry_generation: None,
         supports_durable_progress: false,
         supports_complete_observation: false,
         usage_watch: None,
@@ -466,6 +467,12 @@ fn request_round_trip_preserves_scan_inputs_without_cache_data() {
             .as_object()
             .expect("request map")
             .contains_key("checkpoint_plan_digest")
+    );
+    assert!(
+        serde_json::to_value(&decoded.0)
+            .expect("legacy wire shape")
+            .get("expected_tier_registry_generation")
+            .is_none()
     );
     assert!(decoded.0.skip_healing);
     assert_eq!(decoded.0.scan_mode, HealScanMode::Deep);
@@ -720,8 +727,16 @@ async fn remote_worker_rechecks_real_producers_before_persisting_complete_usage(
 
 #[tokio::test]
 async fn remote_sender_preserves_independent_bucket_plan_identities_in_signed_body() {
+    for supports_tier_registry_preflight in [false, true] {
+        check_signed_scan_request(supports_tier_registry_preflight).await;
+    }
+}
+
+async fn check_signed_scan_request(supports_tier_registry_preflight: bool) {
     use crate::storage_api::owner::{EcstoreDiskOption, EcstoreEndpoint, ecstore_new_disk};
     use sha2::Digest as _;
+
+    const GENERATION: u64 = 57;
 
     let _ = rustfs_credentials::set_global_rpc_secret("remote-scanner-sender-test-secret".to_string());
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -777,7 +792,10 @@ async fn remote_sender_preserves_independent_bucket_plan_identities_in_signed_bo
                 RemoteScannerFrameResult::Complete(Box::new(RemoteScannerComplete {
                     source: TEST_SOURCE,
                     scan_plan_digest: request.scan_plan_digest,
-                    usage: test_usage("bucket", 3),
+                    usage: DataUsageEntryInfo {
+                        tier_registry_generation: Some(GENERATION),
+                        ..test_usage("bucket", 3)
+                    },
                     pending_maintenance_work: false,
                 })),
             ),
@@ -821,6 +839,7 @@ async fn remote_sender_preserves_independent_bucket_plan_identities_in_signed_bo
             parent,
             budget,
             RemoteScannerScanSpec {
+                supports_tier_registry_preflight,
                 supports_durable_progress: false,
                 supports_complete_observation: false,
                 usage_watch: None,
@@ -832,7 +851,7 @@ async fn remote_sender_preserves_independent_bucket_plan_identities_in_signed_bo
                 session_id: Uuid::new_v4(),
                 session_sequence: 0,
                 plans: ScannerBucketPlanDigests::from_work_plans(reuse, coverage, None),
-                tier_registry_generation: 0,
+                tier_registry_generation: GENERATION,
                 skip_healing: true,
                 scan_mode: HealScanMode::Deep,
             },
@@ -843,6 +862,10 @@ async fn remote_sender_preserves_independent_bucket_plan_identities_in_signed_bo
     .expect("authenticated remote scan");
     assert!(matches!(outcome, RemoteScannerOutcome::Complete { .. }));
     let captured = worker.await.expect("capture actual sender request");
+    assert_eq!(
+        captured.expected_tier_registry_generation,
+        supports_tier_registry_preflight.then_some(GENERATION)
+    );
     assert_eq!(captured.scan_plan_digest, reuse);
     assert_eq!(captured.checkpoint_plan_digest, Some(coverage));
     assert_eq!(captured.scan_mode, HealScanMode::Deep);
@@ -1163,6 +1186,7 @@ async fn terminal_frame_without_eof_still_obeys_rpc_deadline() {
         parent,
         budget,
         RemoteScannerResponseExpectation {
+            supports_tier_registry_preflight: false,
             supports_durable_progress: false,
             supports_complete_observation: false,
             checkpoint_identity: None,
@@ -1811,6 +1835,7 @@ async fn complete_terminal_frame_reconciles_progress_and_usage() {
         parent,
         budget.clone(),
         RemoteScannerResponseExpectation {
+            supports_tier_registry_preflight: false,
             supports_durable_progress: false,
             supports_complete_observation: false,
             checkpoint_identity: None,
@@ -1847,43 +1872,6 @@ async fn complete_terminal_frame_reconciles_progress_and_usage() {
     let finished = metrics.report().await;
     assert_eq!(finished.last_cycle_objects_scanned, 3);
     assert_eq!(finished.last_cycle_directories_scanned, 2);
-}
-
-#[tokio::test]
-async fn terminal_usage_from_a_different_tier_generation_requests_a_replan() {
-    let request_id = Uuid::new_v4();
-    let writer_auth = FrameAuthenticator::for_test(request_id);
-    let reader_auth = FrameAuthenticator::for_test(request_id);
-    let (mut writer, reader) = tokio::io::duplex(4096);
-    tokio::spawn(async move {
-        let mut usage = test_usage("bucket", 1);
-        usage.tier_registry_generation = Some(1);
-        let mut sequence = 0;
-        write_frame(
-            &mut writer,
-            &writer_auth,
-            &mut sequence,
-            &RemoteScannerFrame::terminal(
-                RemoteScannerProgress::default(),
-                RemoteScannerFrameResult::Complete(Box::new(RemoteScannerComplete {
-                    source: TEST_SOURCE,
-                    scan_plan_digest: TEST_PLAN_DIGEST,
-                    usage,
-                    pending_maintenance_work: false,
-                })),
-            ),
-        )
-        .await
-        .expect("terminal frame should write");
-    });
-
-    let parent = CancellationToken::new();
-    let budget = ScannerCycleBudget::new(&parent, ScannerCycleBudgetConfig::default());
-    let outcome = consume_remote_scanner_stream(reader, parent, budget, "bucket", TEST_SOURCE, TEST_PLAN_DIGEST, reader_auth)
-        .await
-        .expect("authenticated generation mismatch");
-
-    assert!(matches!(outcome, RemoteScannerOutcome::TierRegistryMismatch { expected: 0, actual: 1 }));
 }
 
 #[tokio::test]
@@ -2795,6 +2783,7 @@ async fn namespace_decode_denial_keeps_previously_reported_progress() {
         budget.token(),
         budget.clone(),
         RemoteScannerResponseExpectation {
+            supports_tier_registry_preflight: false,
             supports_durable_progress: false,
             supports_complete_observation: false,
             checkpoint_identity: None,
@@ -2955,6 +2944,8 @@ async fn background_envelope_accepts_the_full_wire_limit_and_matches_none() {
 
 #[path = "durable_progress.rs"]
 mod durable_progress;
+#[path = "tier_registry.rs"]
+mod tier_registry;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[serial_test::serial]

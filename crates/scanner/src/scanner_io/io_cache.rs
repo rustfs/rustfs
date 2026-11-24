@@ -1323,6 +1323,7 @@ impl ScannerIOCache for SetDisks {
                                 session_id: slot.remote_session_id,
                                 session_sequence: request_sequence,
                                 plans: bucket_plans,
+                                supports_tier_registry_preflight: capabilities.supports_tier_registry_preflight,
                                 supports_durable_progress: capabilities.supports_durable_progress,
                                 supports_complete_observation: capabilities.supports_complete_observation,
                                 usage_watch: bucket_usage_watch.as_ref(),

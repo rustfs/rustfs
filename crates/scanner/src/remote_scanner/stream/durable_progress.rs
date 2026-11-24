@@ -46,6 +46,7 @@ async fn durable_progress_requires_negotiation_exact_scope_mac_and_eof() {
     for case in [
         "valid",
         "generation",
+        "after_preflight",
         "legacy",
         "source",
         "identity",
@@ -102,6 +103,7 @@ async fn durable_progress_requires_negotiation_exact_scope_mac_and_eof() {
             parent,
             budget,
             RemoteScannerResponseExpectation {
+                supports_tier_registry_preflight: case == "after_preflight",
                 bucket: "bucket",
                 source: TEST_SOURCE,
                 next_cycle: TEST_NEXT_CYCLE,
@@ -201,6 +203,7 @@ async fn negotiated_progress_waits_for_the_persisted_terminal_after_budget_exhau
         parent,
         budget.clone(),
         RemoteScannerResponseExpectation {
+            supports_tier_registry_preflight: false,
             bucket: "bucket",
             source: TEST_SOURCE,
             next_cycle: TEST_NEXT_CYCLE,
@@ -250,6 +253,7 @@ async fn observation_only_receipt_cannot_authorize_progress_requeue() {
             owner,
             budget,
             RemoteScannerResponseExpectation {
+                supports_tier_registry_preflight: false,
                 bucket: "bucket",
                 source: TEST_SOURCE,
                 next_cycle: TEST_NEXT_CYCLE,
@@ -329,6 +333,7 @@ async fn budget_stop_does_not_restart_a_partly_decoded_frame() {
         owner,
         budget,
         RemoteScannerResponseExpectation {
+            supports_tier_registry_preflight: false,
             bucket: "bucket",
             source: TEST_SOURCE,
             next_cycle: TEST_NEXT_CYCLE,
