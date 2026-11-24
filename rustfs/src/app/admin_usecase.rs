@@ -335,18 +335,31 @@ impl DefaultAdminUsecase {
     /// This path never triggers a live full-version listing
     /// (rustfs/backlog#1306); freshness is owned by the scanner.
     pub(crate) async fn query_data_usage_info_with_store(store: Arc<ECStore>) -> AdminUsecaseResult<DataUsageInfo> {
-        let info = Self::map_data_usage_load_result(load_admin_data_usage_with_memory_overlay(store.clone()).await)?;
-        let buckets = store
-            .list_bucket(&BucketOptions {
-                cached: true,
-                no_metadata: true,
-                ..Default::default()
-            })
-            .await
-            .map_err(|_| Self::app_error(S3ErrorCode::InternalError, "list_bucket failed"))?;
-        let mut info = Self::present_identity_bound_data_usage_snapshot(info, buckets.into_iter().map(|bucket| bucket.name));
+        let bucket_usage = async {
+            let info = Self::map_data_usage_load_result(load_admin_data_usage_with_memory_overlay(store.clone()).await)?;
+            let buckets = store
+                .list_bucket(&BucketOptions {
+                    cached: true,
+                    no_metadata: true,
+                    ..Default::default()
+                })
+                .await
+                .map_err(|_| Self::app_error(S3ErrorCode::InternalError, "list_bucket failed"))?;
+            Ok(Self::present_identity_bound_data_usage_snapshot(
+                info,
+                buckets.into_iter().map(|bucket| bucket.name),
+            ))
+        };
+        Self::data_usage_with_capacity(bucket_usage, StorageAdminApi::storage_info(store.as_ref())).await
+    }
 
-        let storage_info = StorageAdminApi::storage_info(store.as_ref()).await;
+    async fn data_usage_with_capacity(
+        bucket_usage: impl Future<Output = AdminUsecaseResult<DataUsageInfo>>,
+        capacity: impl Future<Output = StorageInfo>,
+    ) -> AdminUsecaseResult<DataUsageInfo> {
+        // Both reads can wait on the same slow peer. Start them together while
+        // keeping bucket identity validation and namespace listing in order.
+        let (mut info, storage_info) = tokio::try_join!(bucket_usage, async { Ok(capacity.await) })?;
 
         // Keep the same capacity correction behavior as the previous admin handler implementation.
         const MAX_REASONABLE_CAPACITY: u64 = 100_000 * 1024 * 1024 * 1024 * 1024; // 100 PiB
@@ -869,6 +882,37 @@ mod tests {
         fn on_event(&self, _event: &tracing::Event<'_>, _ctx: Context<'_, S>) {
             panic!("data usage error mapping must not emit a duplicate event");
         }
+    }
+
+    #[tokio::test]
+    async fn data_usage_polls_capacity_while_bucket_usage_is_pending() {
+        let (finish, wait) = tokio::sync::oneshot::channel();
+        let capacity_started = std::cell::Cell::new(false);
+        let bucket_usage = async {
+            wait.await.expect("test releases the snapshot read");
+            Ok(DataUsageInfo::default())
+        };
+        let capacity = async {
+            capacity_started.set(true);
+            rustfs_madmin::StorageInfo::default()
+        };
+        let query = DefaultAdminUsecase::data_usage_with_capacity(bucket_usage, capacity);
+        tokio::pin!(query);
+        assert!(futures::poll!(query.as_mut()).is_pending());
+        assert!(capacity_started.get());
+        finish.send(()).expect("snapshot read is still pending");
+        query.await.expect("both reads completed");
+    }
+
+    #[tokio::test]
+    async fn data_usage_returns_bucket_error_while_capacity_is_pending() {
+        let bucket_usage = async { Err(DefaultAdminUsecase::app_error(S3ErrorCode::InternalError, "list_bucket failed")) };
+        let query = DefaultAdminUsecase::data_usage_with_capacity(bucket_usage, std::future::pending());
+        tokio::pin!(query);
+        let std::task::Poll::Ready(Err(error)) = futures::poll!(query) else {
+            panic!("a capacity probe must not delay a bucket error");
+        };
+        assert_eq!(error.message, "list_bucket failed");
     }
 
     #[test]
