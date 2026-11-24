@@ -15,15 +15,68 @@
 """Regression tests for the release wire comparison and its verdict."""
 
 import hashlib
+from email.message import Message
+from email.utils import parsedate_to_datetime
 import json
 from pathlib import Path
+import socket
 import tempfile
+from types import SimpleNamespace
 import unittest
+from unittest.mock import patch
 
 import gateway_wire_replay as wire
 
 
 class WireTests(unittest.TestCase):
+    def test_compare_reports_header_direction_without_wire_data(self):
+        date = "Tue, 24 Nov 2026 00:00:00 GMT"
+        replay = wire.WireReplay(9000, 9001, parsedate_to_datetime(date))
+        replay.case = "ceph-case"
+        replay.operation = "CreateBucket"
+
+        def compare(reference, candidate, status=200, method="PUT"):
+            headers = Message()
+            headers["Date"] = date
+            for name, value in reference:
+                headers[name] = value
+            response = SimpleNamespace(status_code=200, raw=SimpleNamespace(headers=headers))
+            request = (f"{method} /private-bucket HTTP/1.1\r\nHost: {replay.authority}\r\n"
+                       "Authorization: Credential=rustfsadmin-ci/test\r\n\r\n").encode()
+            client, server = socket.socketpair()
+            with client, server, patch.object(wire.socket, "create_connection", return_value=client):
+                reply = [f"HTTP/1.1 {status} Test", f"Date: {date}", *(f"{k}: {v}" for k, v in candidate)]
+                server.sendall(("\r\n".join(reply) + "\r\n\r\n").encode())
+                server.shutdown(socket.SHUT_WR)
+                replay.compare(method, request, response, b"")
+
+        location = [("Location", "/private-bucket")]
+        compare([], location)
+        self.assertEqual(replay.diffs[-1], {"case": "ceph-case", "request": 1, "operation": "CreateBucket",
+                                           "fields": ["headers"], "header_differences": {"candidate_added": ["location"]}})
+        compare(location, [])
+        self.assertEqual(replay.diffs[-1]["header_differences"], {"candidate_missing": ["location"]})
+        prefixes = ("x-amz-meta-", "x-amz-checksum-", "x-amz-server-side-encryption")
+        compare([(p + "old-private", "same-value") for p in prefixes],
+                [(p + "new-private", "same-value") for p in prefixes])
+        families = sorted(p + "*" for p in prefixes)
+        self.assertEqual(replay.diffs[-1]["header_differences"], {"candidate_missing": families, "candidate_added": families})
+        repeated = [("ETag", "first-value"), ("etag", "second-value")]
+        for candidate in (repeated[::-1], repeated[:1]):
+            compare(repeated, candidate)
+            self.assertEqual(replay.diffs[-1]["header_differences"], {"values_changed": ["etag"]})
+        count = len(replay.diffs)
+        compare(repeated, [(k.upper(), v) for k, v in repeated])
+        self.assertEqual(len(replay.diffs), count)
+        replay.operation = "HeadObject"
+        compare([("Content-Length", "123")], [("Content-Length", "456")], method="HEAD")
+        self.assertEqual(replay.diffs[-1]["header_differences"], {"values_changed": ["content-length"]})
+        compare([], [], status=204)
+        self.assertEqual(replay.diffs[-1]["fields"], ["status"])
+        self.assertNotIn("header_differences", replay.diffs[-1])
+        for private in ("private", "same-value", "first-value", "second-value", "123", "456"):
+            self.assertNotIn(private, json.dumps(replay.diffs))
+
     def test_xml_canonicalization_and_changed_error_code(self):
         a = b"<Error>\n <Code>NoSuchKey</Code><RequestId>r1</RequestId> </Error>"
         b = b"<Error><Code>NoSuchKey</Code>\n<RequestId>r2</RequestId></Error>"
@@ -117,6 +170,7 @@ class WireTests(unittest.TestCase):
             ok = {"requests_compared": len(counts), "requests_by_case": counts, "differences": [],
                   "negative_controls": wire.EXPECTED_CONTROLS}
             for change, status in [({}, 0), ({"requests_compared": 0}, 1), ({"differences": [{"fields": ["body"]}]}, 1),
+                                   ({"differences": [{"fields": ["headers"], "header_differences": {"candidate_added": ["location"]}}]}, 1),
                                    ({"negative_controls": {}}, 1), ({"requests_by_case": {}}, 1)]:
                 with self.subTest(change=change):
                     summary.write_text(json.dumps(dict(ok, **change)))

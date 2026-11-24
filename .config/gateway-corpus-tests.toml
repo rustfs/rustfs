@@ -361,6 +361,7 @@ ceph = [
     "test_object_write_file",
     "test_object_write_read_update_read_delete",
     "test_put_delete_tags",
+    "test_ranged_request_empty_object",
     "test_ranged_request_response_code",
     "test_ranged_request_return_trailing_bytes_response_code",
     "test_ranged_request_skip_leading_bytes_response_code",
