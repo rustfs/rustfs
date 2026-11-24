@@ -2017,7 +2017,7 @@ async fn complete_terminal_frame_reconciles_progress_and_usage() {
 }
 
 #[tokio::test]
-async fn terminal_usage_from_a_different_tier_generation_is_rejected() {
+async fn terminal_usage_from_a_different_tier_generation_requests_a_replan() {
     let request_id = Uuid::new_v4();
     let writer_auth = FrameAuthenticator::for_test(request_id);
     let reader_auth = FrameAuthenticator::for_test(request_id);
@@ -2046,11 +2046,11 @@ async fn terminal_usage_from_a_different_tier_generation_is_rejected() {
 
     let parent = CancellationToken::new();
     let budget = ScannerCycleBudget::new(&parent, ScannerCycleBudgetConfig::default());
-    let error = consume_remote_scanner_stream(reader, parent, budget, "bucket", TEST_SOURCE, TEST_PLAN_DIGEST, reader_auth)
+    let outcome = consume_remote_scanner_stream(reader, parent, budget, "bucket", TEST_SOURCE, TEST_PLAN_DIGEST, reader_auth)
         .await
-        .expect_err("generation mismatch must fail closed");
+        .expect("authenticated generation mismatch");
 
-    assert!(error.to_string().contains("tier registry generation"));
+    assert!(matches!(outcome, RemoteScannerOutcome::TierRegistryMismatch { expected: 0, actual: 1 }));
 }
 
 #[tokio::test]

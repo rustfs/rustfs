@@ -15,6 +15,8 @@ use sha2::Digest;
 const BUCKET: &str = "usage-native-remote-drain";
 const SEED_CYCLE: u64 = 91;
 const REMOTE_CYCLE: u64 = 92;
+const REGISTRY_CHANGE_CYCLE: u64 = 93;
+const REPLANNED_CYCLE: u64 = 94;
 const EPOCH: u64 = 13;
 
 struct WalkerProbe {
@@ -82,11 +84,16 @@ impl InternodeDataTransport for DrainTransport {
     }
 
     async fn open_ns_scanner(&self, request: NsScannerStreamRequest) -> TransportResult<FileReader> {
-        assert_eq!(request.next_cycle, REMOTE_CYCLE);
+        assert!(matches!(request.next_cycle, REMOTE_CYCLE | REGISTRY_CHANGE_CYCLE | REPLANNED_CYCLE));
         assert_eq!(request.leader_epoch, EPOCH);
         self.opened.fetch_add(1, Ordering::AcqRel);
         let (reader, writer) = tokio::io::duplex(64 * 1024);
-        let cache = self.source_cache.clone();
+        let mut cache = self.source_cache.clone();
+        if request.next_cycle == REGISTRY_CHANGE_CYCLE {
+            let identity = cache.info.scan_identity.as_mut().expect("fixture bucket identity");
+            identity.tier_registry_generation = identity.tier_registry_generation.wrapping_add(1);
+            cache.info.tier_registry_generation = Some(identity.tier_registry_generation);
+        }
         let store = self.source_store.clone();
         let release = self.release_complete.clone();
         let writer = tokio::spawn(async move {
@@ -161,9 +168,7 @@ fn request(
     }
 }
 
-#[tokio::test]
-#[serial]
-async fn usage_remote_complete_after_count_stop_reaches_real_candidate() {
+async fn setup_remote_drain_store() -> (tempfile::TempDir, Arc<ECStore>, Arc<SetDisks>, Arc<DrainTransport>, WalkerGuard) {
     let _ = rustfs_credentials::set_global_rpc_secret("usage-native-controlled-transport-secret".to_string());
     let (directory, store) = setup_local_scanner_store(1, 4).await;
     clear_dirty_usage_buckets_for_tests();
@@ -249,7 +254,14 @@ async fn usage_remote_complete_after_count_stop_reaches_real_candidate() {
             remote,
         });
     }
-    let guard = WalkerGuard;
+    (directory, store, set, transport, WalkerGuard)
+}
+
+#[tokio::test]
+#[serial]
+async fn usage_remote_complete_after_count_stop_reaches_real_candidate() {
+    let (directory, store, set, transport, guard) = setup_remote_drain_store().await;
+    let owner = CancellationToken::new();
     record_dirty_usage_bucket(BUCKET);
     let dirty_before = dirty_usage_buckets_for_tests();
     let budget = ScannerCycleBudget::new_with_progress_tracking(
@@ -357,4 +369,63 @@ async fn usage_remote_complete_after_count_stop_reaches_real_candidate() {
         "usage_cleanup: {}",
         serde_json::json!({"case_id": "USAGE-13", "status": "PASS", "fixture_removed": !fixture_path.exists()})
     );
+}
+
+#[tokio::test]
+#[serial]
+async fn tier_registry_change_preserves_dirty_and_set_root_until_fenced_replan() {
+    use crate::data_usage_define::DataUsageCacheRevision;
+    use crate::scanner::{ScannerCycleOutcome, run_data_scanner_cycle};
+    use rustfs_scanner_metrics::metrics::CurrentCycle;
+
+    let (_directory, store, set, transport, _guard) = setup_remote_drain_store().await;
+    transport.release_complete.cancel();
+    record_dirty_usage_bucket(BUCKET);
+    let dirty = dirty_usage_buckets_for_tests();
+    let owner = CancellationToken::new();
+    let budget = ScannerCycleBudget::new(&owner, Default::default());
+    let (tx, mut rx) = mpsc::channel(1);
+    let result = nsscanner_with_storage_status_scoped(store.as_ref(), request(&owner, &budget, tx, REGISTRY_CHANGE_CYCLE))
+        .await
+        .expect("classify the signed completion from a different registry");
+    assert_eq!(result.status, ScannerCycleStatus::Superseded);
+    assert_eq!(result.partial_stage, Some("tier_registry_changed"));
+    assert!(rx.recv().await.is_none());
+    assert!(result.publication_expectation().is_none());
+    assert!(!result.has_dirty_usage_to_acknowledge());
+    assert!(result.usage_watch_retirements().is_empty());
+    let mut cycle = CurrentCycle {
+        next: REGISTRY_CHANGE_CYCLE,
+        ..Default::default()
+    };
+    let mut revision = DataUsageCacheRevision::Missing;
+    let skipped = run_data_scanner_cycle(&owner, &store, &mut cycle, &mut revision, EPOCH).await;
+    assert_eq!(skipped, ScannerCycleOutcome::Superseded);
+    assert_eq!(cycle.next, REPLANNED_CYCLE);
+    assert_ne!(revision, DataUsageCacheRevision::Missing);
+    assert!(cycle.cycle_completed.is_empty());
+    assert_eq!(dirty_usage_buckets_for_tests(), dirty);
+    let mut source = DataUsageCache::default();
+    source
+        .load(set.clone(), DATA_USAGE_CACHE_NAME)
+        .await
+        .expect("read the original set root");
+    assert!(source.info.snapshot_complete);
+    assert_eq!(source.info.next_cycle, SEED_CYCLE);
+    assert_eq!(source.info.scan_bucket_value_origins[BUCKET].cycle, SEED_CYCLE);
+    let completed = run_data_scanner_cycle(&owner, &store, &mut cycle, &mut revision, EPOCH).await;
+    assert!(matches!(
+        completed,
+        ScannerCycleOutcome::Completed | ScannerCycleOutcome::CompletedWithPendingMaintenance
+    ));
+    assert_eq!(cycle.next, REPLANNED_CYCLE + 1);
+    assert_eq!(transport.opened.load(Ordering::Acquire), 3);
+    source
+        .load(set, DATA_USAGE_CACHE_NAME)
+        .await
+        .expect("read the recertified set root");
+    assert_eq!(source.info.next_cycle, REPLANNED_CYCLE);
+    assert_eq!(source.info.scan_bucket_value_origins[BUCKET].cycle, REPLANNED_CYCLE);
+    assert!(!source.info.scan_bucket_value_origins[BUCKET].carried);
+    assert!(!dirty_usage_buckets_for_tests().contains_key(BUCKET));
 }

@@ -248,6 +248,10 @@ pub(crate) enum RemoteScannerOutcome {
     Partial,
     NamespaceNotFound,
     CycleAhead(u64),
+    TierRegistryMismatch {
+        expected: u64,
+        actual: u64,
+    },
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -280,6 +284,18 @@ struct RemoteScannerResponseExpectation<'a> {
     next_cycle: u64,
     scan_plan_digest: DataUsageScanPlanDigest,
     tier_registry_generation: u64,
+}
+
+impl RemoteScannerResponseExpectation<'_> {
+    fn legacy_tier_registry_mismatch(self, actual: u64) -> Option<RemoteScannerOutcome> {
+        if actual == self.tier_registry_generation {
+            return None;
+        }
+        Some(RemoteScannerOutcome::TierRegistryMismatch {
+            expected: self.tier_registry_generation,
+            actual,
+        })
+    }
 }
 
 #[derive(Debug)]
@@ -1758,17 +1774,29 @@ where
                         "remote namespace scanner returned usage for a different bucket plan",
                     )));
                 }
-                if complete.usage.tier_registry_generation != Some(expected.tier_registry_generation) {
-                    return Err(RemoteScannerStreamError::reconciled(StorageError::other(
-                        "remote namespace scanner returned usage for a different tier registry generation",
-                    )));
-                }
                 if !complete.usage.entry.children.is_empty() {
                     return Err(RemoteScannerStreamError::reconciled(StorageError::other(
                         "remote namespace scanner returned non-flattened bucket usage",
                     )));
                 }
-                if budget.budget_elapsed() && !(expected.supports_durable_progress || expected.supports_complete_observation) {
+                let actual = complete.usage.tier_registry_generation.ok_or_else(|| {
+                    RemoteScannerStreamError::reconciled(StorageError::other(
+                        "remote namespace scanner returned usage without a tier registry generation",
+                    ))
+                })?;
+                if let Some(mismatch) = expected.legacy_tier_registry_mismatch(actual) {
+                    if expected
+                        .checkpoint_identity
+                        .is_some_and(|identity| complete.usage.bucket_incarnation != Some(identity.bucket_incarnation))
+                    {
+                        return Err(RemoteScannerStreamError::reconciled(StorageError::other(
+                            "remote namespace scanner returned usage for a different bucket incarnation",
+                        )));
+                    }
+                    Some(Ok(mismatch))
+                } else if budget.budget_elapsed()
+                    && !(expected.supports_durable_progress || expected.supports_complete_observation)
+                {
                     Some(Ok(RemoteScannerOutcome::Partial))
                 } else {
                     Some(Ok(RemoteScannerOutcome::Complete {
@@ -1778,33 +1806,41 @@ where
                 }
             }
             RemoteScannerFrameResult::DurableProgress(receipt) => {
+                let actual = receipt.identity.tier_registry_generation;
+                let expected_identity = crate::DataUsageScanIdentity {
+                    tier_registry_generation: expected.tier_registry_generation,
+                    ..receipt.identity
+                };
                 if !(expected.supports_durable_progress || expected.supports_complete_observation)
                     || (!expected.supports_durable_progress && receipt.advanced)
                     || (!expected.supports_complete_observation && receipt.observation.is_some())
                     || frame.phase != RemoteScannerPhase::Persisting
                     || receipt.source != expected.source
-                    || Some(receipt.identity) != expected.checkpoint_identity
+                    || Some(expected_identity) != expected.checkpoint_identity
                     || receipt.scan_plan_digest != expected.scan_plan_digest
                     || receipt.checkpoint_plan_digest != expected.checkpoint_plan_digest
                     || receipt.leader_epoch != expected.leader_epoch
                     || receipt.next_cycle != expected.next_cycle
-                    || receipt.identity.tier_registry_generation != expected.tier_registry_generation
                     || !receipt.identity.is_valid()
                     || receipt.observation.as_ref().is_some_and(|observation| {
                         !observation.matches(expected.source, receipt.identity)
-                            || (observation.completed_epoch, observation.completed_cycle)
-                                > (expected.leader_epoch, expected.next_cycle)
+                            || observation.completed_epoch > expected.leader_epoch
+                            || observation.completed_cycle > expected.next_cycle
                     })
                 {
                     return Err(RemoteScannerStreamError::reconciled(StorageError::other(
                         "remote namespace scanner returned an unnegotiated or mismatched durable progress receipt",
                     )));
                 }
-                Some(Ok(RemoteScannerOutcome::DurableProgress {
-                    advanced: receipt.advanced,
-                    resource_deferred: receipt.resource_deferred,
-                    observation: receipt.observation,
-                }))
+                if let Some(mismatch) = expected.legacy_tier_registry_mismatch(actual) {
+                    Some(Ok(mismatch))
+                } else {
+                    Some(Ok(RemoteScannerOutcome::DurableProgress {
+                        advanced: receipt.advanced,
+                        resource_deferred: receipt.resource_deferred,
+                        observation: receipt.observation,
+                    }))
+                }
             }
             RemoteScannerFrameResult::Partial => Some(Ok(RemoteScannerOutcome::Partial)),
             RemoteScannerFrameResult::NamespaceNotFound => Some(Ok(RemoteScannerOutcome::NamespaceNotFound)),

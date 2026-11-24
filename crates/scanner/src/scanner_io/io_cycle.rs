@@ -1430,6 +1430,36 @@ where
         remote_certification.as_ref(),
         remote_certification_attempted,
     );
+    let mut registry_changed = false;
+    let mut coverage_accounted = true;
+    for (source, cache) in source_failures.iter().zip(&results) {
+        let replan = source.registry_replan.lock().await;
+        registry_changed |= !replan.mismatched_buckets.is_empty();
+        coverage_accounted &= replan.gaps_accounted || (cache.info.snapshot_complete && cache.info.last_update.is_some());
+    }
+    if registry_changed {
+        result?;
+        let status = classify_tier_registry_change(
+            bucket_plan_complete
+                && scan_scope_matches
+                && coverage_accounted
+                && !has_set_failure
+                && namespace_not_found_buckets.is_empty(),
+            owner_ctx.is_cancelled(),
+            bucket_scan_status,
+            dirty_usage_status,
+            activity_status,
+        );
+        // Return before preparing any usage candidate, ACK or watch retirement.
+        // The superseded path advances only the fenced cursor and paces retries.
+        return Ok(ScannerCycleResult::new(status, None)
+            .with_partial_stage(Some("tier_registry_changed"))
+            .with_publication_epoch(publication_epoch)
+            .with_remote_publication_lease_targets(remote_publication_lease_targets)
+            .with_failed_dirty_usage(has_set_failure || !failed_buckets.is_empty())
+            .with_pending_maintenance_work(true)
+            .with_required_cycle_floor(required_cycle_floor));
+    }
     let all_bucket_names = all_buckets.iter().map(|bucket| bucket.name.clone()).collect::<Vec<_>>();
     let completed_candidate = completed_usage_candidate(
         &results,
@@ -1864,6 +1894,32 @@ fn e2e_scope_observation(scope: &ScannerBucketScanScope) -> serde_json::Value {
     }
 }
 
+fn classify_tier_registry_change(
+    coverage_accounted: bool,
+    cancelled: bool,
+    bucket_status: ScannerBucketScanStatus,
+    dirty_status: DirtyUsageSnapshotStatus,
+    activity_status: ScannerCycleActivityStatus,
+) -> ScannerCycleStatus {
+    // A reported partial walk is unfinished work for the next registry. A
+    // hard failure or unexplained missing root cannot authorize a cursor advance.
+    if activity_status == ScannerCycleActivityStatus::Unverified {
+        return ScannerCycleStatus::Deferred(ScannerCycleDeferReason::ActivityBaselineUnavailable);
+    }
+    if coverage_accounted
+        && !cancelled
+        && dirty_status != DirtyUsageSnapshotStatus::Unverified
+        && matches!(
+            bucket_status,
+            ScannerBucketScanStatus::Complete | ScannerBucketScanStatus::Partial | ScannerBucketScanStatus::PartialCarried
+        )
+    {
+        ScannerCycleStatus::Superseded
+    } else {
+        ScannerCycleStatus::Incomplete
+    }
+}
+
 #[cfg(test)]
 mod collector_summary_tests {
     use super::*;
@@ -1998,5 +2054,43 @@ mod collector_summary_tests {
         assert_eq!(summary.unobserved, 12);
         assert_eq!(summary.anomalous, 12);
         assert_eq!(summary.sample.expect("one bounded sample").expected, first);
+    }
+
+    #[test]
+    fn tier_registry_replan_accepts_accounted_partial_work_and_preserves_failures() {
+        let dirty = DirtyUsageSnapshotStatus::Current;
+        let activity = ScannerCycleActivityStatus::Unchanged;
+        for bucket in [
+            ScannerBucketScanStatus::Complete,
+            ScannerBucketScanStatus::Partial,
+            ScannerBucketScanStatus::PartialCarried,
+        ] {
+            assert_eq!(
+                classify_tier_registry_change(true, false, bucket, dirty, activity),
+                ScannerCycleStatus::Superseded
+            );
+        }
+        for (accounted, cancelled, bucket, dirty) in [
+            (false, false, ScannerBucketScanStatus::Partial, dirty),
+            (true, true, ScannerBucketScanStatus::Complete, dirty),
+            (true, false, ScannerBucketScanStatus::Failed, dirty),
+            (true, false, ScannerBucketScanStatus::NamespaceNotFound, dirty),
+            (true, false, ScannerBucketScanStatus::Complete, DirtyUsageSnapshotStatus::Unverified),
+        ] {
+            assert_eq!(
+                classify_tier_registry_change(accounted, cancelled, bucket, dirty, activity),
+                ScannerCycleStatus::Incomplete
+            );
+        }
+        assert_eq!(
+            classify_tier_registry_change(
+                true,
+                false,
+                ScannerBucketScanStatus::Partial,
+                dirty,
+                ScannerCycleActivityStatus::Unverified
+            ),
+            ScannerCycleStatus::Deferred(ScannerCycleDeferReason::ActivityBaselineUnavailable),
+        );
     }
 }
