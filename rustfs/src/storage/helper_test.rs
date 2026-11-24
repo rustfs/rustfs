@@ -309,13 +309,12 @@ async fn trusted_operation_audit_tags_survive_completion_and_early_drop() {
                 start_time: std::time::Instant::now(),
             });
         });
-        let mut helper =
-            OperationHelper::from_view(&request.audit_view(), EventName::ObjectAccessedGet, S3Operation::GetObject)
-                .with_audit_tags(HashMap::from([("maintenanceJobId".into(), serde_json::json!("job"))]))
-                .with_audit_tags(HashMap::from([
-                    ("maintenanceAttempt".into(), serde_json::json!(2)),
-                    ("traceId".into(), serde_json::json!("cannot-replace-request-trace")),
-                ]));
+        let mut helper = OperationHelper::from_view(&request.audit_view(), EventName::ObjectAccessedGet, S3Operation::GetObject)
+            .with_audit_tags(HashMap::from([("maintenanceJobId".into(), serde_json::json!("job"))]))
+            .with_audit_tags(HashMap::from([
+                ("maintenanceAttempt".into(), serde_json::json!(2)),
+                ("traceId".into(), serde_json::json!("cannot-replace-request-trace")),
+            ]));
         if completed {
             helper = helper.complete_owned(&Ok(()), StatusCode::OK, &HeaderMap::new());
         }

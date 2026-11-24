@@ -1059,7 +1059,7 @@ impl<B: TableCatalogObjectBackend> ObjectTableCatalogStore<B> {
             let path = self.paths.vector_maintenance_dispatch_path(&lease.resource, id)?;
             if id == lease.job_id {
                 let dispatch = self.backend.acquire_read_lock(self.catalog_bucket(), &path).await?;
-                dispatch_owner = Some(dispatch.namespace_read_guard.clone().ok_or_else(|| {
+                dispatch_owner = Some(dispatch.namespace_read_guard.ok_or_else(|| {
                     TableCatalogStoreError::Unsupported("maintenance dispatch requires a native namespace owner".into())
                 })?);
             } else {
