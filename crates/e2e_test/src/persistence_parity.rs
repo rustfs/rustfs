@@ -23,7 +23,7 @@ use crate::storage_api::persistence_parity::{BucketMetadata, RUSTFS_META_BUCKET}
 use crate::upgrade_compatibility_test::{set_bucket_quota, write_multipart};
 use aws_sdk_s3::Client;
 use aws_sdk_s3::primitives::ByteStream;
-use aws_sdk_s3::types::{BucketCannedAcl, Tag, Tagging};
+use aws_sdk_s3::types::{BucketCannedAcl, ObjectLockLegalHoldStatus, ObjectLockMode, ObjectLockRetentionMode, Tag, Tagging};
 use http::{HeaderMap, Method};
 use md5::{Digest, Md5};
 use rustfs_filemeta::{FileMeta, MetaObject};
@@ -36,6 +36,9 @@ const CONFIGS: &str = "persisted-configs";
 const OBJECTS: &str = "persisted-objects";
 const FIRST_PART_SIZE: usize = 5 * 1024 * 1024;
 const LOGS: &str = "rustfs-access-logs";
+const LOCKED: &str = "persistence-locked";
+const SEEDED_OBJECTS: [(&str, &str); 3] = [(LOCKED, "locked"), (OBJECTS, "ssec"), (OBJECTS, "multipart")];
+const BODY: &[u8] = b"persisted protected object";
 
 fn bucket_metadata(volume: &Path, bucket: &str) -> Result<BucketMetadata, Error> {
     let key = BucketMetadata::new(bucket).save_file_path();
@@ -127,7 +130,7 @@ struct Snapshot {
     multipart_files: BTreeMap<String, Vec<u8>>,
 }
 
-async fn capture(binary: &Path, target: &FakeS3Target, clock: &str, clock_library: &str) -> Result<Snapshot, Error> {
+async fn capture(binary: &Path, peer: &Path, target: &FakeS3Target, clock: &str, clock_library: &str) -> Result<Snapshot, Error> {
     let mut env = RustFSTestEnvironment::new().await?;
     let queue = tempfile::tempdir()?;
     let clock_loader = if cfg!(target_os = "macos") {
@@ -160,8 +163,160 @@ async fn capture(binary: &Path, target: &FakeS3Target, clock: &str, clock_librar
     let client = env.create_s3_client();
     write_configs(&env, &client, target).await?;
     write_objects(&client).await?;
+    let key: [u8; 32] = rand::random();
+    let customer_key = base64_simd::STANDARD.encode_to_string(key);
+    let customer_md5 = base64_simd::STANDARD.encode_to_string(Md5::digest(key));
+    client
+        .put_object()
+        .bucket(OBJECTS)
+        .key("ssec")
+        .sse_customer_algorithm("AES256")
+        .sse_customer_key(&customer_key)
+        .sse_customer_key_md5(&customer_md5)
+        .body(ByteStream::from_static(BODY))
+        .send()
+        .await?;
+    client
+        .create_bucket()
+        .bucket(LOCKED)
+        .object_lock_enabled_for_bucket(true)
+        .send()
+        .await?;
+    let retain_until = aws_sdk_s3::primitives::DateTime::from_secs(time::OffsetDateTime::now_utc().unix_timestamp() + 86_400);
+    let locked = client
+        .put_object()
+        .bucket(LOCKED)
+        .key("locked")
+        .object_lock_legal_hold_status(ObjectLockLegalHoldStatus::On)
+        .object_lock_mode(ObjectLockMode::Governance)
+        .object_lock_retain_until_date(retain_until)
+        .body(ByteStream::from_static(BODY))
+        .send()
+        .await?;
+    let version = locked.version_id().ok_or("missing locked object version")?;
+    let volume = PathBuf::from(&env.temp_dir);
+
+    // Both tag updates start with the same writer-produced version ID, encryption IV and multipart
+    // publication identity. The full raw version maps can then be compared without masking them.
+    let mut originals = Vec::new();
+    for (bucket, key) in SEEDED_OBJECTS {
+        let path = volume.join(bucket).join(key).join("xl.meta");
+        originals.push((path.clone(), std::fs::read(path)?));
+    }
+    let expected = tag_and_read_versions(&client, &volume, version).await?;
     env.stop_server();
-    read_snapshot(Path::new(&env.temp_dir))
+    for (path, bytes) in originals {
+        std::fs::write(path, bytes)?;
+    }
+    let snapshot = read_snapshot(&volume)?;
+    env.start_rustfs_server_from_binary_without_cleanup(peer, vec![], &options)
+        .await?;
+    let peer_client = env.create_s3_client();
+    let locked = peer_client
+        .get_object()
+        .bucket(LOCKED)
+        .key("locked")
+        .version_id(version)
+        .send()
+        .await?;
+    let retention = peer_client
+        .get_object_retention()
+        .bucket(LOCKED)
+        .key("locked")
+        .version_id(version)
+        .send()
+        .await?;
+    let retention = retention.retention().ok_or("missing persisted retention")?;
+    let legal_hold = peer_client
+        .get_object_legal_hold()
+        .bucket(LOCKED)
+        .key("locked")
+        .version_id(version)
+        .send()
+        .await?;
+    if locked.version_id() != Some(version)
+        || legal_hold.legal_hold().and_then(|hold| hold.status()) != Some(&ObjectLockLegalHoldStatus::On)
+        || retention.mode() != Some(&ObjectLockRetentionMode::Governance)
+        || retention.retain_until_date() != Some(&retain_until)
+        || locked.body.collect().await?.into_bytes().as_ref() != BODY
+    {
+        return Err("peer could not read the locked version, its contents and retention".into());
+    }
+    let encrypted = peer_client
+        .get_object()
+        .bucket(OBJECTS)
+        .key("ssec")
+        .sse_customer_algorithm("AES256")
+        .sse_customer_key(&customer_key)
+        .sse_customer_key_md5(&customer_md5)
+        .send()
+        .await?;
+    if encrypted.sse_customer_algorithm() != Some("AES256")
+        || encrypted.sse_customer_key_md5() != Some(customer_md5.as_str())
+        || encrypted.body.collect().await?.into_bytes().as_ref() != BODY
+    {
+        return Err("peer could not decrypt the persisted SSE-C object".into());
+    }
+    let multipart = peer_client
+        .get_object()
+        .bucket(OBJECTS)
+        .key("multipart")
+        .send()
+        .await?
+        .body
+        .collect()
+        .await?
+        .into_bytes();
+    if multipart.len() != FIRST_PART_SIZE + 100
+        || !multipart[..FIRST_PART_SIZE].iter().all(|&byte| byte == 0x31)
+        || !multipart[FIRST_PART_SIZE..].iter().all(|&byte| byte == 0x32)
+    {
+        return Err("peer read different multipart data".into());
+    }
+    let actual = tag_and_read_versions(&peer_client, &volume, version).await?;
+    for (index, (_, key)) in SEEDED_OBJECTS.iter().enumerate() {
+        if actual[index] != expected[index] {
+            return Err(
+                format!("{key}: the two writers persisted different full xl.meta version fields for the same seed").into(),
+            );
+        }
+    }
+    env.stop_server();
+    Ok(snapshot)
+}
+
+async fn tag_and_read_versions(client: &Client, volume: &Path, locked_version: &str) -> Result<Vec<VersionFields>, Error> {
+    let tags = Tagging::builder()
+        .tag_set(Tag::builder().key("purpose").value("persistence-parity").build()?)
+        .build()?;
+    let mut versions = Vec::new();
+    for (bucket, key) in SEEDED_OBJECTS {
+        let version = (bucket == LOCKED).then(|| locked_version.to_owned());
+        client
+            .put_object_tagging()
+            .bucket(bucket)
+            .key(key)
+            .set_version_id(version.clone())
+            .tagging(tags.clone())
+            .send()
+            .await?;
+        let actual = client
+            .get_object_tagging()
+            .bucket(bucket)
+            .key(key)
+            .set_version_id(version)
+            .send()
+            .await?;
+        if actual.tag_set() != tags.tag_set() {
+            return Err(format!("{key}: tagging update was not visible").into());
+        }
+        let meta = FileMeta::load(&std::fs::read(volume.join(bucket).join(key).join("xl.meta"))?)?;
+        let [version] = meta.versions.as_slice() else {
+            return Err(format!("{key}: expected one tagged version").into());
+        };
+        versions.push(rmp_serde::from_slice(&version.meta)?);
+    }
+    Ok(versions)
 }
 
 async fn write_configs(env: &RustFSTestEnvironment, client: &Client, target: &FakeS3Target) -> Result<(), Error> {
@@ -379,11 +534,11 @@ fn save_xml_samples(root: &Path, side: &str, snapshot: &Snapshot) -> Result<(), 
 
 #[tokio::test]
 async fn persistence_byte_parity() -> Result<(), Error> {
-    let reference = PathBuf::from(
+    let reference_binary = PathBuf::from(
         std::env::var_os("RUSTFS_PERSISTENCE_REFERENCE_BINARY").ok_or("missing pinned RUSTFS_PERSISTENCE_REFERENCE_BINARY")?,
     );
     let candidate = rustfs_binary_path();
-    if binary_version(&reference).await? == binary_version(&candidate).await? {
+    if binary_version(&reference_binary).await? == binary_version(&candidate).await? {
         return Err("reference and candidate binaries report identical build identities".into());
     }
     // The quota writer records the process wall clock inside its JSON document. Keep raw bytes
@@ -397,8 +552,8 @@ async fn persistence_byte_parity() -> Result<(), Error> {
     let target = FakeS3Target::start().await?;
     target.create_bucket("migration-source");
     target.create_bucket_with_object_lock("interop-dr");
-    let reference = capture(&reference, &target, &clock, &clock_library).await?;
-    let candidate = capture(&candidate, &target, &clock, &clock_library).await?;
+    let reference = capture(&reference_binary, &candidate, &target, &clock, &clock_library).await?;
+    let candidate = capture(&candidate, &reference_binary, &target, &clock, &clock_library).await?;
     if let Some(directory) = std::env::var_os("RUSTFS_PERSISTENCE_XML_DIR") {
         save_xml_samples(Path::new(&directory), "reference", &reference)?;
         save_xml_samples(Path::new(&directory), "candidate", &candidate)?;
@@ -421,7 +576,7 @@ async fn persistence_byte_parity() -> Result<(), Error> {
         return Err("different multipart part files or part metadata".into());
     }
     eprintln!(
-        "Compared {} bucket fields (canned ACL empty), {} full object records and multipart part files",
+        "Compared {} bucket fields (canned ACL empty), {} independently written object records, three shared-seed full version maps in both directions, and multipart part files",
         reference.configs.len(),
         reference.objects.len()
     );
