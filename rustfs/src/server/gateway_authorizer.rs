@@ -25,6 +25,7 @@
 //! check" row, or a remainder the handler still decides. A backend failure is indeterminate.
 //! An operation the table serves with no row is denied.
 
+use super::stack::OriginalS3Path;
 use crate::app::{RequestCredentials, RequestEnvelope, RequestHead};
 use crate::auth::{get_session_token, keystone_is_owner};
 use crate::runtime_sources::ServerContextSlot;
@@ -178,7 +179,8 @@ fn prepare_request(
     for (name, value) in header_view.iter_raw() {
         headers.append(name.clone(), value.clone());
     }
-    let uri = request_uri(raw_query).map_err(|()| Decision::Indeterminate)?;
+    let uri =
+        request_uri(context.server_extensions().get::<OriginalS3Path>(), raw_query).map_err(|()| Decision::Indeterminate)?;
     let session_token = get_session_token(&uri, &headers).map(str::to_owned);
     let caller = classify_caller(context, request)?;
     let credentials = match &caller {
@@ -284,13 +286,15 @@ fn verified_signature(scheme: AuthSchemeRef) -> VerifiedSignature {
     }
 }
 
-fn request_uri(raw_query: &str) -> Result<Uri, ()> {
-    let target = if raw_query.is_empty() {
-        "/".to_owned()
-    } else {
-        format!("/?{raw_query}")
-    };
-    target.parse().map_err(|_| ())
+fn request_uri(original_path: Option<&OriginalS3Path>, raw_query: &str) -> Result<Uri, ()> {
+    if raw_query.is_empty() {
+        return Ok(original_path.map_or_else(Uri::default, |path| Uri::from(path.0.clone())));
+    }
+    // Authorization sees the gateway's accepted query, including any credential filtering.
+    let path = original_path.map_or("/", |path| path.0.path());
+    http::uri::PathAndQuery::try_from(format!("{path}?{raw_query}"))
+        .map(Uri::from)
+        .map_err(|_| ())
 }
 
 fn copy_extension<T>(context: &GatewayRequestContext<'_>, extensions: &mut Extensions)
@@ -886,6 +890,91 @@ mod tests {
     use crate::server::gateway_handlers::{OPERATIONS, rows};
     use rustfs_s3_types::S3Error;
     use std::collections::BTreeSet;
+
+    #[derive(Default)]
+    struct CaptureEarlyEnvelope(std::sync::OnceLock<Uri>);
+
+    impl Authorizer for CaptureEarlyEnvelope {
+        fn authorize_route<'a>(
+            &'a self,
+            context: &'a GatewayRequestContext<'a>,
+            request: &'a AuthzRequest<'a>,
+        ) -> BoxFuture<'a, Decision> {
+            let prepared = prepare_request(
+                context,
+                request,
+                context.headers().unwrap(),
+                context.raw_query().unwrap(),
+                &ServerContextSlot::new(),
+            )
+            .unwrap();
+            assert!(
+                context
+                    .server_extensions()
+                    .get::<OriginalS3Path>()
+                    .unwrap()
+                    .0
+                    .query()
+                    .is_none()
+            );
+            self.0.set(prepared.envelope.uri().clone()).unwrap();
+            Box::pin(async { Decision::Deny })
+        }
+
+        fn authorize_input<'a>(
+            &'a self,
+            _context: &'a GatewayRequestContext<'a>,
+            _request: &'a InputAuthzRequest<'a>,
+        ) -> BoxFuture<'a, InputDecisions> {
+            unreachable!("the route already refused this request")
+        }
+    }
+
+    #[tokio::test]
+    async fn early_denial_uri_preserves_the_received_path_and_only_the_gateway_query() {
+        use crate::server::gateway_handlers::GatewayBackend;
+        use crate::server::stack::S3StackService;
+        use rustfs_gateway::{RegionSet, ServiceBuilder, SigV4Authenticator, StaticCredentials};
+        use std::convert::Infallible;
+        use tower::ServiceExt;
+
+        let probe = Arc::new(CaptureEarlyEnvelope::default());
+        let service = ServiceBuilder::new()
+            .rustfs_profile()
+            .authenticator(SigV4Authenticator::new(
+                Arc::new(StaticCredentials::new()),
+                RegionSet::new(["us-east-1"]).unwrap(),
+            ))
+            .authorizer(Arc::clone(&probe))
+            .register::<dto::GetObject, _>(Arc::new(GatewayBackend::new(ServerContextSlot::new())))
+            .build()
+            .unwrap();
+        let s3 = tower::service_fn(move |request| {
+            let service = service.clone();
+            async move { Ok::<_, Infallible>(service.call_bytes(request).await.map(|_| ())) }
+        });
+        let target = "/photos//a%20b%2Bc.jpg?versionId=first%2B";
+        let request = http::Request::get(target)
+            .header("host", "localhost")
+            .header("x-original-uri", "/unrelated")
+            .body(bytes::Bytes::new())
+            .unwrap();
+        let response = S3StackService::new(s3).oneshot(request).await.unwrap();
+        assert_eq!(response.status(), http::StatusCode::FORBIDDEN);
+        assert_eq!(probe.0.get(), Some(&target.parse::<Uri>().unwrap()));
+    }
+
+    #[test]
+    fn early_denial_uri_keeps_a_key_only_path_and_the_query_only_fallback() {
+        let key_path = OriginalS3Path("/folder%20name/key".parse().unwrap());
+        assert_eq!(
+            request_uri(Some(&key_path), "versionId=first%2B&versionId=second").unwrap(),
+            "/folder%20name/key?versionId=first%2B&versionId=second"
+        );
+        assert_eq!(request_uri(Some(&key_path), "").unwrap(), "/folder%20name/key");
+        assert_eq!(request_uri(None, "versionId=a%2Fb").unwrap(), "/?versionId=a%2Fb");
+        assert_eq!(request_uri(None, "").unwrap(), "/");
+    }
 
     const UNCHECKED: &[&str] = &[dto::GetObjectTorrent::NAME, dto::ListBuckets::NAME];
 
