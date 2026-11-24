@@ -1120,21 +1120,28 @@ mod tests {
 
     #[tokio::test]
     async fn execute_copy_object_rejects_invalid_storage_class() {
-        let input = CopyObjectInput::builder()
-            .copy_source(CopySource::Bucket {
-                bucket: "src-bucket".into(),
-                key: "src-key".into(),
+        // Same facts `from_legacy` carried. Metadata directive, SSE, and tagging stay absent.
+        let input = CopyObjectWriteInput {
+            bucket: "dst-bucket".to_owned(),
+            key: "dst-key".to_owned(),
+            copy_source: Some(CopySourceValue::Bucket {
+                bucket: "src-bucket".to_owned(),
+                key: "src-key".to_owned(),
                 version_id: None,
-            })
-            .bucket("dst-bucket".to_string())
-            .key("dst-key".to_string())
-            .storage_class(Some(StorageClass::from_static("INVALID")))
-            .build()
-            .unwrap();
-
+            }),
+            storage_class: Some("INVALID".to_owned()),
+            ..Default::default()
+        };
         let usecase = DefaultObjectUsecase::without_context();
 
-        let err = Box::pin(copy_method_only(&usecase, input)).await.unwrap_err();
+        let err = Box::pin(async {
+            usecase
+                .execute_copy_object_owned(copy_envelope(HeaderMap::new()), input)
+                .await
+                .map_err(crate::error::legacy_error_for_test)
+        })
+        .await
+        .unwrap_err();
         assert_eq!(err.code(), &S3ErrorCode::InvalidStorageClass);
     }
 
