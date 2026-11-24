@@ -12,7 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::runtime_sources::{AppContext, ServerContextSlot, current_action_credentials, current_ready_iam_handle};
+#[cfg(test)]
+use crate::runtime_sources::ServerContextSlot;
+use crate::runtime_sources::{AppContext, current_action_credentials, current_ready_iam_handle};
 use facts::{AuthzFacts, AuthzPrincipal, AuthzTarget};
 use http::HeaderMap;
 use http::HeaderValue;
@@ -25,16 +27,16 @@ use rustfs_iam::sys::{
 };
 use rustfs_policy::policy::action::Action;
 use rustfs_policy::policy::{ClaimLookup, get_claim_case_insensitive};
+use rustfs_s3_types::{S3Result as OwnedResult, s3_error as owned_error};
 use rustfs_trusted_proxies::ClientInfo;
 use rustfs_utils::MaskedAccessKey;
 use rustfs_utils::http::metadata_compat::starts_with_ignore_ascii_case;
-use s3s::S3Error;
-use s3s::S3ErrorCode;
-use s3s::S3Result;
-use s3s::auth::S3Auth;
-use s3s::auth::SecretKey;
-use s3s::auth::SimpleAuth;
-use s3s::s3_error;
+#[cfg(test)]
+use s3s::{
+    S3Error, S3Result,
+    auth::{S3Auth, SecretKey},
+    s3_error,
+};
 use serde_json::Value;
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -131,38 +133,24 @@ pub enum AuthType {
     StreamingUnsignedTrailer,
 }
 
-pub struct IAMAuth {
-    simple_auth: SimpleAuth,
+#[cfg(test)]
+#[derive(Clone)]
+pub(crate) struct IAMAuth {
     access_key: String,
     secret_key: SecretKey,
     server_ctx: Option<std::sync::Arc<ServerContextSlot>>,
 }
 
-impl Clone for IAMAuth {
-    fn clone(&self) -> Self {
-        Self {
-            simple_auth: SimpleAuth::from_single(self.access_key.clone(), self.secret_key.clone()),
-            access_key: self.access_key.clone(),
-            secret_key: self.secret_key.clone(),
-            server_ctx: self.server_ctx.clone(),
-        }
-    }
-}
-
+#[cfg(test)]
 impl IAMAuth {
-    pub fn new(ak: impl Into<String>, sk: impl Into<SecretKey>) -> Self {
-        let access_key = ak.into();
-        let secret_key = sk.into();
-        let simple_auth = SimpleAuth::from_single(access_key.clone(), secret_key.clone());
+    pub(crate) fn new(ak: impl Into<String>, sk: impl Into<SecretKey>) -> Self {
         Self {
-            simple_auth,
-            access_key,
-            secret_key,
+            access_key: ak.into(),
+            secret_key: sk.into(),
             server_ctx: None,
         }
     }
 
-    #[cfg(test)]
     pub(crate) fn with_server_context(
         ak: impl Into<String>,
         sk: impl Into<SecretKey>,
@@ -174,6 +162,7 @@ impl IAMAuth {
     }
 }
 
+#[cfg(test)]
 #[async_trait::async_trait]
 impl S3Auth for IAMAuth {
     async fn get_secret_key(&self, access_key: &str) -> S3Result<SecretKey> {
@@ -204,10 +193,6 @@ impl S3Auth for IAMAuth {
 
         if access_key == self.access_key {
             return Ok(self.secret_key.clone());
-        }
-
-        if let Ok(key) = self.simple_auth.get_secret_key(access_key).await {
-            return Ok(key);
         }
 
         let iam_store = match &self.server_ctx {
@@ -266,6 +251,7 @@ impl S3Auth for IAMAuth {
     }
 }
 
+#[cfg(test)]
 fn iam_lookup_error_to_s3_error(_err: &IamError) -> S3Error {
     s3_error!(InternalError, "IAM user lookup failed")
 }
@@ -285,7 +271,7 @@ pub(crate) fn keystone_is_owner(credentials: &Credentials) -> bool {
 }
 
 // check_key_valid checks the key is valid or not. return the user's credentials and if the user is the owner.
-pub async fn check_key_valid(session_token: &str, access_key: &str) -> S3Result<(Credentials, bool)> {
+pub async fn check_key_valid(session_token: &str, access_key: &str) -> OwnedResult<(Credentials, bool)> {
     check_key_valid_with_context(session_token, access_key, None).await
 }
 
@@ -308,7 +294,7 @@ pub async fn check_key_valid_with_context(
     session_token: &str,
     access_key: &str,
     ctx: Option<&AppContext>,
-) -> S3Result<(Credentials, bool)> {
+) -> OwnedResult<(Credentials, bool)> {
     // KEYSTONE INTEGRATION: Check if Keystone credentials are present in task-local storage
     // This handles both:
     // 1. Pure X-Auth-Token requests (access_key may be empty)
@@ -336,7 +322,7 @@ pub async fn check_key_valid_with_context(
         );
 
         if !auth_keystone::is_keystone_enabled() {
-            return Err(s3_error!(InvalidAccessKeyId, "Keystone authentication is not enabled"));
+            return Err(owned_error!(InvalidAccessKeyId, "Keystone authentication is not enabled"));
         }
 
         debug!(
@@ -378,10 +364,10 @@ pub async fn check_key_valid_with_context(
         );
 
         if !auth_keystone::is_keystone_enabled() {
-            return Err(s3_error!(InvalidAccessKeyId, "Keystone authentication is not enabled"));
+            return Err(owned_error!(InvalidAccessKeyId, "Keystone authentication is not enabled"));
         }
 
-        return Err(s3_error!(InvalidAccessKeyId, "Keystone authentication requires X-Auth-Token header"));
+        return Err(owned_error!(InvalidAccessKeyId, "Keystone authentication requires X-Auth-Token header"));
     }
 
     // Prefer this server's context (backlog#1052 S6); fall back to the ambient
@@ -391,10 +377,7 @@ pub async fn check_key_valid_with_context(
         None => current_action_credentials(),
     };
     let Some(mut cred) = root_cred else {
-        return Err(S3Error::with_message(
-            S3ErrorCode::InternalError,
-            format!("get_global_action_cred {:?}", IamError::IamSysNotInitialized),
-        ));
+        return Err(owned_error!(InternalError, "get_global_action_cred {:?}", IamError::IamSysNotInitialized));
     };
 
     let sys_cred = cred.clone();
@@ -406,16 +389,13 @@ pub async fn check_key_valid_with_context(
             None => current_ready_iam_handle().map_err(|_| ()),
         };
         let Ok(iam_store) = iam_store else {
-            return Err(S3Error::with_message(
-                S3ErrorCode::InternalError,
-                format!("check_key_valid {:?}", IamError::IamSysNotInitialized),
-            ));
+            return Err(owned_error!(InternalError, "check_key_valid {:?}", IamError::IamSysNotInitialized));
         };
 
         let (u, ok) = iam_store
             .check_key(access_key)
             .await
-            .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, format!("check claims failed1 {e}")))?;
+            .map_err(|e| owned_error!(InternalError, "check claims failed1 {e}"))?;
 
         if !ok {
             let Some(ref u) = u else {
@@ -427,7 +407,7 @@ pub async fn check_key_valid_with_context(
                     reason = "user_not_found",
                     "Access key validation rejected"
                 );
-                return Err(s3_error!(InvalidAccessKeyId, "check key failed"));
+                return Err(owned_error!(InvalidAccessKeyId, "check key failed"));
             };
 
             if u.credentials.status == "off" {
@@ -439,7 +419,7 @@ pub async fn check_key_valid_with_context(
                     reason = "account_disabled",
                     "Access key validation rejected"
                 );
-                return Err(s3_error!(InvalidAccessKeyId, "check key failed"));
+                return Err(owned_error!(InvalidAccessKeyId, "check key failed"));
             }
 
             check_session_token(session_token, &u.credentials)?;
@@ -452,11 +432,11 @@ pub async fn check_key_valid_with_context(
                 reason = "validation_failed",
                 "Access key validation rejected"
             );
-            return Err(s3_error!(InvalidRequest, "check key failed"));
+            return Err(owned_error!(InvalidRequest, "check key failed"));
         }
 
         let Some(u) = u else {
-            return Err(s3_error!(InvalidAccessKeyId, "check key failed"));
+            return Err(owned_error!(InvalidAccessKeyId, "check key failed"));
         };
 
         cred = u.credentials;
@@ -470,32 +450,32 @@ pub async fn check_key_valid_with_context(
     Ok((cred, owner))
 }
 
-pub fn check_claims_from_token(token: &str, cred: &Credentials) -> S3Result<HashMap<String, Value>> {
+pub fn check_claims_from_token(token: &str, cred: &Credentials) -> OwnedResult<HashMap<String, Value>> {
     check_claims_from_token_with_context(token, cred, None)
 }
 
-fn check_session_token(token: &str, cred: &Credentials) -> S3Result<()> {
+fn check_session_token(token: &str, cred: &Credentials) -> OwnedResult<()> {
     // Session identity survives expiration; is_temp() only describes active credentials.
     let has_session_token = !cred.session_token.is_empty();
 
     if !token.is_empty() && cred.access_key.is_empty() {
-        return Err(s3_error!(InvalidRequest, "no access key"));
+        return Err(owned_error!(InvalidRequest, "no access key"));
     }
 
     if token.is_empty() && has_session_token && !cred.is_service_account() {
-        return Err(s3_error!(InvalidRequest, "invalid token1"));
+        return Err(owned_error!(InvalidRequest, "invalid token1"));
     }
 
     if !token.is_empty() && !has_session_token {
-        return Err(s3_error!(InvalidRequest, "invalid token2"));
+        return Err(owned_error!(InvalidRequest, "invalid token2"));
     }
 
     if !cred.is_service_account() && has_session_token && !constant_time_eq(token, &cred.session_token) {
-        return Err(s3_error!(InvalidRequest, "invalid token3"));
+        return Err(owned_error!(InvalidRequest, "invalid token3"));
     }
 
     if has_session_token && !cred.is_service_account() && cred.is_expired() {
-        return Err(s3_error!(ExpiredToken, "The provided token has expired."));
+        return Err(owned_error!(ExpiredToken, "The provided token has expired."));
     }
 
     Ok(())
@@ -505,7 +485,7 @@ fn check_claims_from_token_with_context(
     token: &str,
     cred: &Credentials,
     ctx: Option<&AppContext>,
-) -> S3Result<HashMap<String, Value>> {
+) -> OwnedResult<HashMap<String, Value>> {
     check_session_token(token, cred)?;
 
     let sys_cred = match ctx {
@@ -513,7 +493,7 @@ fn check_claims_from_token_with_context(
         None => current_action_credentials(),
     };
     let Some(sys_cred) = sys_cred else {
-        return Err(s3_error!(InternalError, "action cred not init"));
+        return Err(owned_error!(InternalError, "action cred not init"));
     };
 
     let (token, secret) = if cred.is_service_account() {
@@ -525,9 +505,9 @@ fn check_claims_from_token_with_context(
     if !token.is_empty() {
         let claims: HashMap<String, Value> = if cred.is_service_account() {
             get_claims_from_token_with_secret_allow_missing_exp(token, secret)
-                .map_err(|_e| s3_error!(InvalidRequest, "invalid token"))?
+                .map_err(|_e| owned_error!(InvalidRequest, "invalid token"))?
         } else {
-            get_claims_from_token_with_secret(token, secret).map_err(|_e| s3_error!(InvalidRequest, "invalid token"))?
+            get_claims_from_token_with_secret(token, secret).map_err(|_e| owned_error!(InvalidRequest, "invalid token"))?
         };
         return Ok(claims);
     }
@@ -804,7 +784,7 @@ fn query_may_carry_user_metadata(query: &str) -> bool {
 /// not sign. Keys and values that could not have arrived as a header are
 /// rejected rather than stored: the read path rebuilds them as header fields,
 /// where a control character would fail every `HeadObject` of that object.
-pub fn hoist_signed_query_params(headers: &mut HeaderMap, query: Option<&str>) -> S3Result<()> {
+pub fn hoist_signed_query_params(headers: &mut HeaderMap, query: Option<&str>) -> OwnedResult<()> {
     let Some(query) = query else {
         return Ok(());
     };
@@ -858,9 +838,9 @@ pub fn hoist_signed_query_params(headers: &mut HeaderMap, query: Option<&str>) -
         return Ok(());
     }
     if duplicate {
-        return Err(S3Error::with_message(
-            S3ErrorCode::InvalidArgument,
-            "Duplicate x-amz request parameters in the request query string".to_owned(),
+        return Err(owned_error!(
+            InvalidArgument,
+            "Duplicate x-amz request parameters in the request query string"
         ));
     }
 
@@ -868,15 +848,10 @@ pub fn hoist_signed_query_params(headers: &mut HeaderMap, query: Option<&str>) -
         // The read path rebuilds `x-amz-meta-<key>` as a header name and the
         // value as a header value (s3s `add_opt_metadata`); anything that could
         // not have arrived as a header would 500 every Head/Get of the object.
-        let header_name = HeaderName::from_bytes(name.as_bytes()).map_err(|_| {
-            S3Error::with_message(S3ErrorCode::InvalidArgument, "Invalid x-amz request parameter name".to_owned())
-        })?;
-        let header_value = HeaderValue::from_bytes(value.as_bytes()).map_err(|_| {
-            S3Error::with_message(
-                S3ErrorCode::InvalidArgument,
-                "x-amz request parameter values must be valid HTTP header values".to_owned(),
-            )
-        })?;
+        let header_name = HeaderName::from_bytes(name.as_bytes())
+            .map_err(|_| owned_error!(InvalidArgument, "Invalid x-amz request parameter name"))?;
+        let header_value = HeaderValue::from_bytes(value.as_bytes())
+            .map_err(|_| owned_error!(InvalidArgument, "x-amz request parameter values must be valid HTTP header values"))?;
         if headers.contains_key(&header_name) {
             continue;
         }
@@ -1014,30 +989,27 @@ const SIGV4_UNSIGNED_ENVELOPE_HEADERS: &[&str] = &[
 ///
 /// Every signed-header list the request carries must cover every `x-amz-*`
 /// header, so an `Authorization` header can never widen a presigned URL and a
-/// query can never widen a header signature. The header is parsed with the
-/// verifier's own parser so both sides read the same `SignedHeaders` list, and
+/// query can never widen a header signature. The gateway reads the verifier's
+/// header grammar so both sides see the same `SignedHeaders` list, and
 /// the algorithm token is pinned because the verifier accepts any token there.
 /// A header the parser rejects never authenticates as SigV4 upstream, but one
 /// that claims the SigV4 algorithm still fails closed here. SigV2 signs every
 /// `x-amz-*` header itself; JWT and anonymous requests carry no SigV4 list.
-pub(crate) fn reject_unsigned_amz_headers_on_sigv4_request(header: &HeaderMap, query: Option<&str>) -> S3Result<()> {
+pub(crate) fn reject_unsigned_amz_headers_on_sigv4_request(header: &HeaderMap, query: Option<&str>) -> OwnedResult<()> {
     reject_unsigned_amz_headers_on_presigned_request(header, query)?;
 
     for value in header.get_all(http::header::AUTHORIZATION) {
         let Ok(value) = value.to_str() else {
             continue;
         };
-        let authorization = match s3s_sigv4::AuthorizationV4::parse(value) {
-            Ok(authorization) => authorization,
-            Err(_) if value.starts_with(SIGN_V4_ALGORITHM) => {
-                return Err(S3Error::with_message(
-                    S3ErrorCode::AccessDenied,
-                    "Invalid SigV4 authorization header".to_owned(),
-                ));
+        let authorization = match rustfs_gateway::sig::SigV4HeaderCoverage::parse(value) {
+            Some(authorization) => authorization,
+            None if value.starts_with(SIGN_V4_ALGORITHM) => {
+                return Err(owned_error!(AccessDenied, "Invalid SigV4 authorization header"));
             }
-            Err(_) => continue,
+            None => continue,
         };
-        if authorization.algorithm != SIGN_V4_ALGORITHM {
+        if authorization.algorithm() != SIGN_V4_ALGORITHM {
             warn!(
                 event = EVENT_SIGV4_UNSUPPORTED_ALGORITHM,
                 component = LOG_COMPONENT_AUTH,
@@ -1045,10 +1017,7 @@ pub(crate) fn reject_unsigned_amz_headers_on_sigv4_request(header: &HeaderMap, q
                 reason = "unsupported_algorithm",
                 "SigV4 request rejected"
             );
-            return Err(S3Error::with_message(
-                S3ErrorCode::AccessDenied,
-                UNSUPPORTED_SIGV4_ALGORITHM_MESSAGE.to_owned(),
-            ));
+            return Err(owned_error!(AccessDenied, "{UNSUPPORTED_SIGV4_ALGORITHM_MESSAGE}"));
         }
         for name in header.keys() {
             // `HeaderName` is already lowercase; the verifier looks signed
@@ -1057,10 +1026,7 @@ pub(crate) fn reject_unsigned_amz_headers_on_sigv4_request(header: &HeaderMap, q
             if !name.starts_with("x-amz-")
                 || SIGV4_UNSIGNED_ENVELOPE_HEADERS.contains(&name)
                 || PRESIGNED_UNSIGNED_AMZ_HEADER_ALLOWLIST.contains(&name)
-                || authorization
-                    .signed_headers
-                    .iter()
-                    .any(|signed_name| signed_name.eq_ignore_ascii_case(name))
+                || authorization.covers_header(name)
             {
                 continue;
             }
@@ -1072,7 +1038,7 @@ pub(crate) fn reject_unsigned_amz_headers_on_sigv4_request(header: &HeaderMap, q
                 header = name,
                 "SigV4 request rejected"
             );
-            return Err(S3Error::with_message(S3ErrorCode::AccessDenied, UNSIGNED_HEADERS_MESSAGE.to_string()));
+            return Err(owned_error!(AccessDenied, "{UNSIGNED_HEADERS_MESSAGE}"));
         }
     }
     Ok(())
@@ -1113,7 +1079,7 @@ pub(crate) const UNSIGNED_HEADERS_MESSAGE: &str = "There were headers present in
 /// The rule relies on the verifier signing every query parameter except the
 /// signature itself, so neither `X-Amz-SignedHeaders` nor a property-carrying
 /// query parameter can be added after presigning.
-pub(crate) fn reject_unsigned_amz_headers_on_presigned_request(header: &HeaderMap, query: Option<&str>) -> S3Result<()> {
+pub(crate) fn reject_unsigned_amz_headers_on_presigned_request(header: &HeaderMap, query: Option<&str>) -> OwnedResult<()> {
     let Some(query) = query else {
         return Ok(());
     };
@@ -1176,7 +1142,7 @@ pub(crate) fn reject_unsigned_amz_headers_on_presigned_request(header: &HeaderMa
             header = name,
             "Presigned request rejected"
         );
-        return Err(S3Error::with_message(S3ErrorCode::AccessDenied, UNSIGNED_HEADERS_MESSAGE.to_string()));
+        return Err(owned_error!(AccessDenied, "{UNSIGNED_HEADERS_MESSAGE}"));
     }
 
     Ok(())
@@ -1207,7 +1173,7 @@ pub(crate) fn parse_presigned_put_max_content_length(
     header: &HeaderMap,
     query: Option<&str>,
     verified_presigned: bool,
-) -> S3Result<Option<u64>> {
+) -> OwnedResult<Option<u64>> {
     let Some(query) = query else {
         return Ok(None);
     };
@@ -1218,16 +1184,13 @@ pub(crate) fn parse_presigned_put_max_content_length(
         decoded_query.push((name.to_string(), candidate.to_string()));
         if name == RUSTFS_MAX_CONTENT_LENGTH_QUERY {
             if value.is_some() {
-                return Err(S3Error::with_message(
-                    S3ErrorCode::InvalidRequest,
-                    format!("{RUSTFS_MAX_CONTENT_LENGTH_QUERY} must appear exactly once"),
-                ));
+                return Err(owned_error!(InvalidRequest, "{RUSTFS_MAX_CONTENT_LENGTH_QUERY} must appear exactly once"));
             }
             value = Some(candidate.into_owned());
         } else if name.eq_ignore_ascii_case(RUSTFS_MAX_CONTENT_LENGTH_QUERY) {
-            return Err(S3Error::with_message(
-                S3ErrorCode::InvalidRequest,
-                format!("query parameter name must be exactly {RUSTFS_MAX_CONTENT_LENGTH_QUERY}"),
+            return Err(owned_error!(
+                InvalidRequest,
+                "query parameter name must be exactly {RUSTFS_MAX_CONTENT_LENGTH_QUERY}"
             ));
         }
     }
@@ -1258,18 +1221,15 @@ pub(crate) fn parse_presigned_put_max_content_length(
         || !is_complete_sigv4_query
         || !matches!(get_request_auth_type_with_query(header, Some(query)), AuthType::Presigned)
     {
-        return Err(S3Error::with_message(
-            S3ErrorCode::InvalidRequest,
-            format!("{RUSTFS_MAX_CONTENT_LENGTH_QUERY} requires a SigV4 presigned request"),
+        return Err(owned_error!(
+            InvalidRequest,
+            "{RUSTFS_MAX_CONTENT_LENGTH_QUERY} requires a SigV4 presigned request"
         ));
     }
 
-    let limit = value.parse::<u64>().map_err(|_| {
-        S3Error::with_message(
-            S3ErrorCode::InvalidRequest,
-            format!("{RUSTFS_MAX_CONTENT_LENGTH_QUERY} must be a non-negative 64-bit integer"),
-        )
-    })?;
+    let limit = value
+        .parse::<u64>()
+        .map_err(|_| owned_error!(InvalidRequest, "{RUSTFS_MAX_CONTENT_LENGTH_QUERY} must be a non-negative 64-bit integer"))?;
 
     Ok(Some(limit))
 }
@@ -1280,11 +1240,11 @@ pub(crate) fn reject_presigned_put_max_content_length_for_other_operation(
     header: &HeaderMap,
     query: Option<&str>,
     verified_presigned: bool,
-) -> S3Result<()> {
+) -> OwnedResult<()> {
     if parse_presigned_put_max_content_length(header, query, verified_presigned)?.is_some() {
-        return Err(S3Error::with_message(
-            S3ErrorCode::InvalidRequest,
-            format!("{RUSTFS_MAX_CONTENT_LENGTH_QUERY} is only supported for presigned PutObject"),
+        return Err(owned_error!(
+            InvalidRequest,
+            "{RUSTFS_MAX_CONTENT_LENGTH_QUERY} is only supported for presigned PutObject"
         ));
     }
     Ok(())
@@ -1298,7 +1258,7 @@ pub(crate) fn parse_presigned_multipart_max_total_object_size(
     header: &HeaderMap,
     query: Option<&str>,
     verified_sigv4: bool,
-) -> S3Result<Option<u64>> {
+) -> OwnedResult<Option<u64>> {
     let Some(query) = query else {
         return Ok(None);
     };
@@ -1309,16 +1269,16 @@ pub(crate) fn parse_presigned_multipart_max_total_object_size(
         decoded_query.push((name.to_string(), candidate.to_string()));
         if name == RUSTFS_MAX_TOTAL_OBJECT_SIZE_QUERY {
             if value.is_some() {
-                return Err(S3Error::with_message(
-                    S3ErrorCode::InvalidRequest,
-                    format!("{RUSTFS_MAX_TOTAL_OBJECT_SIZE_QUERY} must appear exactly once"),
+                return Err(owned_error!(
+                    InvalidRequest,
+                    "{RUSTFS_MAX_TOTAL_OBJECT_SIZE_QUERY} must appear exactly once"
                 ));
             }
             value = Some(candidate.into_owned());
         } else if name.eq_ignore_ascii_case(RUSTFS_MAX_TOTAL_OBJECT_SIZE_QUERY) {
-            return Err(S3Error::with_message(
-                S3ErrorCode::InvalidRequest,
-                format!("query parameter name must be exactly {RUSTFS_MAX_TOTAL_OBJECT_SIZE_QUERY}"),
+            return Err(owned_error!(
+                InvalidRequest,
+                "query parameter name must be exactly {RUSTFS_MAX_TOTAL_OBJECT_SIZE_QUERY}"
             ));
         }
     }
@@ -1348,16 +1308,16 @@ pub(crate) fn parse_presigned_multipart_max_total_object_size(
 
     let authenticated = verified_sigv4 && (is_header_signed || (is_presigned && complete_presigned_query));
     if !authenticated {
-        return Err(S3Error::with_message(
-            S3ErrorCode::InvalidRequest,
-            format!("{RUSTFS_MAX_TOTAL_OBJECT_SIZE_QUERY} requires a verified SigV4 request"),
+        return Err(owned_error!(
+            InvalidRequest,
+            "{RUSTFS_MAX_TOTAL_OBJECT_SIZE_QUERY} requires a verified SigV4 request"
         ));
     }
 
     value.parse::<u64>().map(Some).map_err(|_| {
-        S3Error::with_message(
-            S3ErrorCode::InvalidRequest,
-            format!("{RUSTFS_MAX_TOTAL_OBJECT_SIZE_QUERY} must be a non-negative 64-bit integer"),
+        owned_error!(
+            InvalidRequest,
+            "{RUSTFS_MAX_TOTAL_OBJECT_SIZE_QUERY} must be a non-negative 64-bit integer"
         )
     })
 }
@@ -1366,11 +1326,11 @@ pub(crate) fn reject_presigned_multipart_max_total_object_size_for_other_operati
     header: &HeaderMap,
     query: Option<&str>,
     verified_sigv4: bool,
-) -> S3Result<()> {
+) -> OwnedResult<()> {
     if parse_presigned_multipart_max_total_object_size(header, query, verified_sigv4)?.is_some() {
-        return Err(S3Error::with_message(
-            S3ErrorCode::InvalidRequest,
-            format!("{RUSTFS_MAX_TOTAL_OBJECT_SIZE_QUERY} is only supported for CreateMultipartUpload"),
+        return Err(owned_error!(
+            InvalidRequest,
+            "{RUSTFS_MAX_TOTAL_OBJECT_SIZE_QUERY} is only supported for CreateMultipartUpload"
         ));
     }
     Ok(())
@@ -1382,6 +1342,7 @@ mod tests {
     use crate::runtime_sources::{IamInterface, KmsInterface};
     use http::header::{IF_MATCH, IF_NONE_MATCH};
     use http::{HeaderMap, HeaderValue, Uri};
+    use http_body_util::BodyExt;
     use rustfs_credentials::Credentials;
     use rustfs_iam::sys::OIDC_ISSUER_CLAIM;
     use rustfs_iam::{
@@ -1393,15 +1354,47 @@ mod tests {
     };
     use rustfs_kms::KmsServiceManager;
     use rustfs_policy::auth::get_new_credentials_with_metadata;
+    use rustfs_s3_types::S3ErrorCode;
     use rustfs_trusted_proxies::ValidationMode;
     use rustfs_utils::http::{
         AMZ_OBJECT_LOCK_LEGAL_HOLD_LOWER, AMZ_OBJECT_LOCK_MODE_LOWER, AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE_LOWER,
     };
+    use s3s::S3ErrorCode as LegacyErrorCode;
     use s3s::auth::SecretKey;
     use serde_json::json;
     use std::collections::HashMap;
     use std::sync::Arc;
     use time::OffsetDateTime;
+
+    #[test]
+    fn signed_metadata_hoist_preserves_errors_and_headers() {
+        for (query, message, applied) in [
+            (
+                "x-amz-meta-a=1&X-Amz-Meta-A=2",
+                "Duplicate x-amz request parameters in the request query string",
+                false,
+            ),
+            ("x-amz-meta-a=1&x-amz-meta-b%20c=2", "Invalid x-amz request parameter name", true),
+            (
+                "x-amz-meta-a=1&x-amz-meta-b=%0A",
+                "x-amz request parameter values must be valid HTTP header values",
+                true,
+            ),
+        ] {
+            let mut headers = HeaderMap::new();
+            headers.insert(http::header::AUTHORIZATION, HeaderValue::from_static(SIGN_V4_ALGORITHM));
+            let mut expected = headers.clone();
+            if applied {
+                expected.insert("x-amz-meta-a", HeaderValue::from_static("1"));
+            }
+            let error = hoist_signed_query_params(&mut headers, Some(query)).unwrap_err();
+            assert_eq!(headers, expected);
+            assert_eq!(error.code(), &S3ErrorCode::InvalidArgument);
+            assert_eq!(error.status_code(), Some(http::StatusCode::BAD_REQUEST));
+            assert_eq!(error.message(), Some(message));
+            assert!(error.source().is_none());
+        }
+    }
 
     struct ContextIam {
         handle: Arc<IamSys<ObjectStore>>,
@@ -1498,10 +1491,10 @@ mod tests {
         use rustfs_keystone::KEYSTONE_CREDENTIALS;
         let auth = IAMAuth::new("root", "root-secret");
         for key in ["keystone:x", "keystone:admin"] {
-            assert_eq!(auth.get_secret_key(key).await.unwrap_err().code(), &S3ErrorCode::InvalidAccessKeyId);
+            assert_eq!(auth.get_secret_key(key).await.unwrap_err().code(), &LegacyErrorCode::InvalidAccessKeyId);
             KEYSTONE_CREDENTIALS
                 .scope(None, async {
-                    assert_eq!(auth.get_secret_key(key).await.unwrap_err().code(), &S3ErrorCode::InvalidAccessKeyId);
+                    assert_eq!(auth.get_secret_key(key).await.unwrap_err().code(), &LegacyErrorCode::InvalidAccessKeyId);
                 })
                 .await;
         }
@@ -1544,8 +1537,8 @@ mod tests {
         let iam_auth = IAMAuth::new("test-ak", SecretKey::from("test-sk"));
         let cloned = iam_auth.clone();
 
-        let secret = cloned.get_secret_key("test-ak").await;
-        assert!(secret.is_ok());
+        let secret = cloned.get_secret_key("test-ak").await.expect("cloned root credentials");
+        assert_eq!(secret.expose(), "test-sk");
     }
 
     #[tokio::test]
@@ -1556,7 +1549,7 @@ mod tests {
 
         assert!(result.is_err());
         let error = result.unwrap_err();
-        assert_eq!(error.code(), &S3ErrorCode::UnauthorizedAccess);
+        assert_eq!(error.code(), &LegacyErrorCode::UnauthorizedAccess);
         assert!(error.message().unwrap_or("").contains("Your account is not signed up"));
     }
 
@@ -1603,7 +1596,7 @@ mod tests {
                 .with_subscriber(subscriber)
                 .await
                 .expect_err("unknown credentials must be rejected");
-            assert_eq!(error.code(), &S3ErrorCode::InvalidAccessKeyId);
+            assert_eq!(error.code(), &LegacyErrorCode::InvalidAccessKeyId);
             let captured = std::fs::read_to_string(log.path()).expect("read captured logs");
             assert!(captured.contains(reason), "capture the expected rejection: {captured}");
             for forbidden in ["LEAK", "TAIL", "private-access-key", "access_key="] {
@@ -1616,7 +1609,7 @@ mod tests {
     fn test_iam_lookup_error_maps_to_internal_error() {
         let result = iam_lookup_error_to_s3_error(&IamError::Io(std::io::Error::other("load user failed")));
 
-        assert_eq!(result.code(), &S3ErrorCode::InternalError);
+        assert_eq!(result.code(), &LegacyErrorCode::InternalError);
         assert_eq!(result.message(), Some("IAM user lookup failed"));
     }
 
@@ -1674,8 +1667,8 @@ mod tests {
         assert!(error.message().unwrap_or("").contains("invalid token3"));
     }
 
-    #[test]
-    fn test_check_claims_from_token_expired_credentials() {
+    #[tokio::test]
+    async fn test_check_claims_from_token_expired_credentials() {
         let mut cred = create_temp_credentials();
         cred.expiration = Some(OffsetDateTime::now_utc() - time::Duration::hours(1));
 
@@ -1683,7 +1676,7 @@ mod tests {
         assert_eq!(error.code(), &S3ErrorCode::ExpiredToken);
         let response = error.to_http_response().expect("serialize the S3 error");
         assert_eq!(response.status(), http::StatusCode::BAD_REQUEST);
-        let body = response.body().bytes().expect("error XML body");
+        let body = response.into_body().collect().await.expect("error XML body").to_bytes();
         let xml = std::str::from_utf8(&body).expect("UTF-8 error XML");
         assert!(xml.contains("<Code>ExpiredToken</Code>"));
         assert!(!xml.contains(&cred.session_token));
@@ -1735,16 +1728,18 @@ mod tests {
         iam_cache
             .cache
             .add_or_update_sts_account(&valid.access_key, &UserIdentity::new(valid.clone()), now);
-        assert!(
-            check_key_valid_with_context(&valid.session_token, &valid.access_key, Some(&context))
-                .await
-                .is_ok()
-        );
-        assert!(
-            check_key_valid_with_context("", &root.access_key, Some(&context))
-                .await
-                .is_ok()
-        );
+        for (fixture, expected_claims) in [(&valid, Some(&claims)), (&root, None)] {
+            let token = &fixture.session_token;
+            let key = &fixture.access_key;
+            let (verified, is_owner) = check_key_valid_with_context(token, key, Some(&context)).await.unwrap();
+            assert!(is_owner);
+            assert!(verified.access_key == fixture.access_key);
+            assert!(verified.secret_key == fixture.secret_key);
+            assert!(verified.session_token == fixture.session_token);
+            assert!(verified.parent_user == fixture.parent_user);
+            assert_eq!(verified.expiration, fixture.expiration);
+            assert!(verified.claims.as_ref() == expected_claims);
+        }
 
         // Seed the state of an issued identity after expiration without sleeping
         // or changing the clock used by signature verification.
@@ -1758,20 +1753,45 @@ mod tests {
         service_account.expiration = expired.expiration;
         let mut invalid_key = create_test_credentials();
         invalid_key.secret_key = "short".to_string();
-        for (name, credential, token, expected) in [
-            ("expired", &expired, expired.session_token.as_str(), S3ErrorCode::ExpiredToken),
-            ("expired without token", &expired, "", S3ErrorCode::InvalidRequest),
-            ("expired with wrong token", &expired, "wrong-token", S3ErrorCode::InvalidRequest),
+        for (name, credential, token, expected, message) in [
+            (
+                "expired",
+                &expired,
+                expired.session_token.as_str(),
+                S3ErrorCode::ExpiredToken,
+                "The provided token has expired.",
+            ),
+            ("expired without token", &expired, "", S3ErrorCode::InvalidRequest, "invalid token1"),
+            (
+                "expired with wrong token",
+                &expired,
+                "wrong-token",
+                S3ErrorCode::InvalidRequest,
+                "invalid token3",
+            ),
             (
                 "disabled expired",
                 &disabled,
                 disabled.session_token.as_str(),
                 S3ErrorCode::InvalidAccessKeyId,
+                "check key failed",
             ),
-            ("expired service account", &service_account, "", S3ErrorCode::InvalidRequest),
-            ("active without token", &valid, "", S3ErrorCode::InvalidRequest),
-            ("active with wrong token", &valid, "wrong-token", S3ErrorCode::InvalidRequest),
-            ("invalid key", &invalid_key, "", S3ErrorCode::InvalidRequest),
+            (
+                "expired service account",
+                &service_account,
+                "",
+                S3ErrorCode::InvalidRequest,
+                "check key failed",
+            ),
+            ("active without token", &valid, "", S3ErrorCode::InvalidRequest, "invalid token1"),
+            (
+                "active with wrong token",
+                &valid,
+                "wrong-token",
+                S3ErrorCode::InvalidRequest,
+                "invalid token3",
+            ),
+            ("invalid key", &invalid_key, "", S3ErrorCode::InvalidRequest, "check key failed"),
         ] {
             iam_cache.cache.add_or_update_sts_account(
                 &credential.access_key,
@@ -1782,10 +1802,13 @@ mod tests {
                 .await
                 .unwrap_err();
             assert_eq!(error.code(), &expected, "{name}");
+            assert_eq!(error.message(), Some(message), "{name}");
+            assert_eq!(error.status_code(), expected.status_code(), "{name}");
+            assert!(error.source().is_none(), "{name}");
             if expected == S3ErrorCode::ExpiredToken {
                 let response = error.to_http_response().expect("serialize the S3 error");
                 assert_eq!(response.status(), http::StatusCode::BAD_REQUEST);
-                let body = response.body().bytes().expect("error XML body");
+                let body = response.into_body().collect().await.expect("error XML body").to_bytes();
                 assert!(std::str::from_utf8(&body).unwrap().contains("<Code>ExpiredToken</Code>"));
             }
         }
@@ -2446,6 +2469,12 @@ mod tests {
         assert_eq!(result, Some("value=with=equals"));
     }
 
+    fn assert_invalid_capability(error: rustfs_s3_types::S3Error, message: &str) {
+        assert_eq!(error.code(), &rustfs_s3_types::S3ErrorCode::InvalidRequest);
+        assert_eq!(error.status_code(), Some(http::StatusCode::BAD_REQUEST));
+        assert_eq!(error.message(), Some(message));
+    }
+
     #[test]
     fn presigned_put_max_content_length_requires_exactly_one_signed_query_value() {
         let headers = HeaderMap::new();
@@ -2464,26 +2493,25 @@ mod tests {
         );
 
         let duplicate = format!("{query}&x-rustfs-max-content-length=1");
-        assert_eq!(
-            parse_presigned_put_max_content_length(&headers, Some(&duplicate), true)
-                .unwrap_err()
-                .code(),
-            &S3ErrorCode::InvalidRequest
+        assert_invalid_capability(
+            parse_presigned_put_max_content_length(&headers, Some(&duplicate), true).unwrap_err(),
+            "x-rustfs-max-content-length must appear exactly once",
         );
 
         let wrong_case = format!("{signed_prefix}&X-RustFS-Max-Content-Length=1");
-        assert_eq!(
-            parse_presigned_put_max_content_length(&headers, Some(&wrong_case), true)
-                .unwrap_err()
-                .code(),
-            &S3ErrorCode::InvalidRequest
+        assert_invalid_capability(
+            parse_presigned_put_max_content_length(&headers, Some(&wrong_case), true).unwrap_err(),
+            "query parameter name must be exactly x-rustfs-max-content-length",
         );
 
-        assert_eq!(
-            reject_presigned_put_max_content_length_for_other_operation(&headers, Some(&query), true)
-                .unwrap_err()
-                .code(),
-            &S3ErrorCode::InvalidRequest
+        assert_invalid_capability(
+            reject_presigned_put_max_content_length_for_other_operation(&headers, Some(&query), true).unwrap_err(),
+            "x-rustfs-max-content-length is only supported for presigned PutObject",
+        );
+        let overflow = format!("{signed_prefix}&x-rustfs-max-content-length=18446744073709551616");
+        assert_invalid_capability(
+            parse_presigned_put_max_content_length(&headers, Some(&overflow), true).unwrap_err(),
+            "x-rustfs-max-content-length must be a non-negative 64-bit integer",
         );
     }
 
@@ -2624,7 +2652,7 @@ mod tests {
         headers
     }
 
-    fn assert_unsigned_headers_denied(result: S3Result<()>) {
+    fn assert_unsigned_headers_denied(result: OwnedResult<()>) {
         let error = result.expect_err("unsigned x-amz header must be denied");
         assert_eq!(error.code(), &S3ErrorCode::AccessDenied);
         assert_eq!(error.message(), Some(UNSIGNED_HEADERS_MESSAGE));
@@ -2752,11 +2780,9 @@ mod tests {
     fn presigned_put_max_content_length_rejects_unsigned_or_invalid_values() {
         let headers = HeaderMap::new();
         let forged = "X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Date=20260827T000000Z&X-Amz-Expires=900&X-Amz-SignedHeaders=host&X-Amz-Credential=test/credential&X-Amz-Signature=fake&x-rustfs-max-content-length=1";
-        assert_eq!(
-            parse_presigned_put_max_content_length(&headers, Some(forged), false)
-                .unwrap_err()
-                .code(),
-            &S3ErrorCode::InvalidRequest
+        assert_invalid_capability(
+            parse_presigned_put_max_content_length(&headers, Some(forged), false).unwrap_err(),
+            "x-rustfs-max-content-length requires a SigV4 presigned request",
         );
         for query in [
             "x-rustfs-max-content-length=1",
@@ -2764,7 +2790,7 @@ mod tests {
             "X-Amz-Credential=test/credential&x-rustfs-max-content-length=18446744073709551616",
         ] {
             let error = parse_presigned_put_max_content_length(&headers, Some(query), true).unwrap_err();
-            assert_eq!(error.code(), &S3ErrorCode::InvalidRequest);
+            assert_invalid_capability(error, "x-rustfs-max-content-length requires a SigV4 presigned request");
         }
     }
 
@@ -2778,11 +2804,14 @@ mod tests {
             parse_presigned_multipart_max_total_object_size(&headers, Some(&query), true).unwrap(),
             Some(104_857_600)
         );
-        assert_eq!(
-            reject_presigned_multipart_max_total_object_size_for_other_operation(&headers, Some(&query), true)
-                .unwrap_err()
-                .code(),
-            &S3ErrorCode::InvalidRequest
+        assert_invalid_capability(
+            reject_presigned_multipart_max_total_object_size_for_other_operation(&headers, Some(&query), true).unwrap_err(),
+            "x-rustfs-max-total-object-size is only supported for CreateMultipartUpload",
+        );
+        let overflow = format!("{signed_prefix}&x-rustfs-max-total-object-size=18446744073709551616");
+        assert_invalid_capability(
+            parse_presigned_multipart_max_total_object_size(&headers, Some(&overflow), true).unwrap_err(),
+            "x-rustfs-max-total-object-size must be a non-negative 64-bit integer",
         );
     }
 
@@ -2790,27 +2819,31 @@ mod tests {
     fn multipart_max_total_object_size_rejects_tampering_and_invalid_values() {
         let headers = HeaderMap::new();
         let signed_prefix = "X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Date=20260827T000000Z&X-Amz-Expires=900&X-Amz-SignedHeaders=host&X-Amz-Credential=test/20260827/us-east-1/s3/aws4_request&X-Amz-Signature=signature";
-        for query in [
-            "x-rustfs-max-total-object-size=1",
-            "X-RustFS-Max-Total-Object-Size=1",
-            "X-Amz-Algorithm=AWS4-HMAC-SHA256&x-rustfs-max-total-object-size=1&x-rustfs-max-total-object-size=2",
-            "X-Amz-Algorithm=AWS4-HMAC-SHA256&x-rustfs-max-total-object-size=-1",
-            "X-Amz-Algorithm=AWS4-HMAC-SHA256&x-rustfs-max-total-object-size=18446744073709551616",
+        let auth_message = "x-rustfs-max-total-object-size requires a verified SigV4 request";
+        for (query, message) in [
+            ("x-rustfs-max-total-object-size=1", auth_message),
+            (
+                "X-RustFS-Max-Total-Object-Size=1",
+                "query parameter name must be exactly x-rustfs-max-total-object-size",
+            ),
+            (
+                "X-Amz-Algorithm=AWS4-HMAC-SHA256&x-rustfs-max-total-object-size=1&x-rustfs-max-total-object-size=2",
+                "x-rustfs-max-total-object-size must appear exactly once",
+            ),
+            ("X-Amz-Algorithm=AWS4-HMAC-SHA256&x-rustfs-max-total-object-size=-1", auth_message),
+            (
+                "X-Amz-Algorithm=AWS4-HMAC-SHA256&x-rustfs-max-total-object-size=18446744073709551616",
+                auth_message,
+            ),
         ] {
-            assert_eq!(
-                parse_presigned_multipart_max_total_object_size(&headers, Some(query), true)
-                    .unwrap_err()
-                    .code(),
-                &S3ErrorCode::InvalidRequest
-            );
+            let error = parse_presigned_multipart_max_total_object_size(&headers, Some(query), true).unwrap_err();
+            assert_invalid_capability(error, message);
         }
 
         let forged = format!("{signed_prefix}&x-rustfs-max-total-object-size=1");
-        assert_eq!(
-            parse_presigned_multipart_max_total_object_size(&headers, Some(&forged), false)
-                .unwrap_err()
-                .code(),
-            &S3ErrorCode::InvalidRequest
+        assert_invalid_capability(
+            parse_presigned_multipart_max_total_object_size(&headers, Some(&forged), false).unwrap_err(),
+            "x-rustfs-max-total-object-size requires a verified SigV4 request",
         );
     }
 
@@ -3157,7 +3190,7 @@ mod tests {
         // Should fail with InvalidAccessKeyId because Keystone is not enabled
         assert!(result.is_err());
         let err = result.unwrap_err();
-        assert_eq!(*err.code(), s3s::S3ErrorCode::InvalidAccessKeyId);
+        assert_eq!(*err.code(), S3ErrorCode::InvalidAccessKeyId);
     }
 
     #[tokio::test]

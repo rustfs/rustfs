@@ -19,9 +19,8 @@ use super::*;
 use crate::app::RequestEnvelope;
 use crate::app::storage_api::object_usecase::DeleteObjectCondition;
 use crate::app::storage_api::object_usecase::access::AuthorizationRequest as _;
-use crate::app::storage_api::s3::{S3ErrorCode, s3_error};
 use rustfs_gateway_types::dto as gateway_dto;
-use rustfs_s3_types::S3Result;
+use rustfs_s3_types::{S3ErrorCode, S3Result};
 use std::borrow::Cow;
 use std::collections::{BTreeMap, HashSet};
 
@@ -353,9 +352,9 @@ async fn replica_delete_fanout_state(
     replica_delete_fanout_state_from_config(config, replication_source, version_id, &site_peer_deployment_ids)
 }
 
-fn validate_undo_delete_version(expected: Option<&str>, requested: Option<&str>) -> crate::app::storage_api::s3::S3Result<()> {
+fn validate_undo_delete_version(expected: Option<&str>, requested: Option<&str>) -> S3Result<()> {
     if expected.is_some() && expected != requested {
-        return Err(s3_error!(PreconditionFailed));
+        return Err(rustfs_s3_types::S3Error::with_default_message(S3ErrorCode::PreconditionFailed));
     }
     Ok(())
 }
@@ -1862,8 +1861,9 @@ mod tests {
     }
 
     use super::*;
-    use crate::app::storage_api::s3::dto::GetObjectInput;
-    use crate::app::test_seams::{head_envelope, head_object_gateway, head_object_input};
+    use crate::app::test_seams::{
+        get_envelope, get_object_gateway, get_object_input, head_envelope, head_object_gateway, head_object_input, read_get_body,
+    };
     use http::{HeaderMap, HeaderValue, Method};
     use rustfs_gateway_types::dto::Status;
     use rustfs_gateway_types::persistence::{
@@ -2246,16 +2246,12 @@ mod tests {
 
                     for explicit in [false, true] {
                         let requested_version = explicit.then(|| marker_id.clone());
-                        let get = GetObjectInput::builder()
-                            .bucket(bucket.clone())
-                            .key(key.to_string())
-                            .version_id(requested_version.clone())
-                            .build()
-                            .expect("GET request");
+                        let get = get_object_input(&bucket, key, requested_version.clone());
                         let head = head_object_input(&bucket, key, requested_version);
-                        let get_error = crate::app::test_seams::get_object_method_only(&usecase, get)
-                            .await
-                            .expect_err("marker GET");
+                        let get_error =
+                            get_object_gateway(&usecase, get_envelope(HeaderMap::new(), http::Extensions::new()), get)
+                                .await
+                                .expect_err("marker GET");
                         let head_error =
                             head_object_gateway(&usecase, head_envelope(HeaderMap::new(), http::Extensions::new()), head)
                                 .await
@@ -2305,22 +2301,13 @@ mod tests {
                     }
 
                     let original_id = original.version_id.expect("historical version id").to_string();
-                    let get = GetObjectInput::builder()
-                        .bucket(bucket.clone())
-                        .key(key.to_string())
-                        .version_id(Some(original_id.clone()))
-                        .build()
-                        .expect("historical GET request");
-                    let response = crate::app::test_seams::get_object_method_only(&usecase, get)
+                    let get = get_object_input(&bucket, key, Some(original_id.clone()));
+                    let response = get_object_gateway(&usecase, get_envelope(HeaderMap::new(), http::Extensions::new()), get)
                         .await
                         .expect("historical GET");
                     assert!(!response.headers.contains_key("x-amz-delete-marker"));
-                    let mut body = response.output.body.expect("historical body");
-                    let mut actual = Vec::new();
-                    while let Some(chunk) = body.next().await {
-                        actual.extend_from_slice(&chunk.expect("historical data remains readable"));
-                    }
-                    assert_eq!(actual, payload);
+                    let body = response.output.body.expect("historical body");
+                    assert_eq!(read_get_body(body).await.as_ref(), payload);
                     let head = head_object_input(&bucket, key, Some(original_id.clone()));
                     let response = head_object_gateway(&usecase, head_envelope(HeaderMap::new(), http::Extensions::new()), head)
                         .await
@@ -2330,16 +2317,12 @@ mod tests {
                     assert!(!response.headers.contains_key("x-amz-delete-marker"));
 
                     for (absent_key, version) in [("missing", None), (key, Some(Uuid::new_v4().to_string()))] {
-                        let get = GetObjectInput::builder()
-                            .bucket(bucket.clone())
-                            .key(absent_key.to_string())
-                            .version_id(version.clone())
-                            .build()
-                            .expect("missing GET request");
+                        let get = get_object_input(&bucket, absent_key, version.clone());
                         let head = head_object_input(&bucket, absent_key, version);
-                        let get_error = crate::app::test_seams::get_object_method_only(&usecase, get)
-                            .await
-                            .expect_err("missing GET");
+                        let get_error =
+                            get_object_gateway(&usecase, get_envelope(HeaderMap::new(), http::Extensions::new()), get)
+                                .await
+                                .expect_err("missing GET");
                         let head_error =
                             head_object_gateway(&usecase, head_envelope(HeaderMap::new(), http::Extensions::new()), head)
                                 .await
@@ -2425,16 +2408,12 @@ mod tests {
                     assert!(marker.delete_marker);
                     let marker_id = delete_response_version_id(marker.version_id, false).expect("marker has a version identity");
                     assert_eq!(marker_id == "null", suspended);
-                    let get = GetObjectInput::builder()
-                        .bucket(bucket.clone())
-                        .key(key.to_string())
-                        .version_id(Some(marker_id.clone()))
-                        .build()
-                        .unwrap();
-                    let get_err = Box::pin(crate::app::test_seams::get_object_method_only(&usecase, get))
-                        .await
-                        .expect_err("GET of a marker remains forbidden");
-                    assert_eq!(get_err.code(), &S3ErrorCode::MethodNotAllowed);
+                    let get = get_object_input(&bucket, key, Some(marker_id.clone()));
+                    let get_err =
+                        Box::pin(get_object_gateway(&usecase, get_envelope(HeaderMap::new(), http::Extensions::new()), get))
+                            .await
+                            .expect_err("GET of a marker remains forbidden");
+                    assert_eq!(get_err.code(), &rustfs_s3_types::S3ErrorCode::MethodNotAllowed);
                     let head = head_object_input(&bucket, key, Some(marker_id.clone()));
                     let head_err = Box::pin(head_object_gateway(
                         &usecase,
@@ -2502,34 +2481,26 @@ mod tests {
                     assert_eq!(remaining.version_id, original.version_id);
                     assert!(!remaining.delete_marker);
                     assert_eq!(remaining.size, payload.len() as i64);
-                    let removed = GetObjectInput::builder()
-                        .bucket(bucket.clone())
-                        .key(key.to_string())
-                        .version_id(Some(marker_id))
-                        .build()
-                        .unwrap();
-                    let missing = Box::pin(crate::app::test_seams::get_object_method_only(&usecase, removed))
-                        .await
-                        .expect_err("the marker version must actually be gone");
+                    let removed = get_object_input(&bucket, key, Some(marker_id));
+                    let missing = Box::pin(get_object_gateway(
+                        &usecase,
+                        get_envelope(HeaderMap::new(), http::Extensions::new()),
+                        removed,
+                    ))
+                    .await
+                    .expect_err("the marker version must actually be gone");
                     assert_eq!(
                         missing.code(),
-                        &S3ErrorCode::NoSuchVersion,
+                        &rustfs_s3_types::S3ErrorCode::NoSuchVersion,
                         "pool_count={pool_count} suspended={suspended} batch={batch}: removed marker lookup returned {missing:?}"
                     );
-                    let get = GetObjectInput::builder()
-                        .bucket(bucket.clone())
-                        .key(key.to_string())
-                        .build()
-                        .unwrap();
-                    let response = Box::pin(crate::app::test_seams::get_object_method_only(&usecase, get))
-                        .await
-                        .expect("GET restores the historical payload");
-                    let mut body = response.output.body.expect("GET body");
-                    let mut actual = Vec::new();
-                    while let Some(chunk) = body.next().await {
-                        actual.extend_from_slice(&chunk.expect("historical data remains readable"));
-                    }
-                    assert_eq!(actual, payload);
+                    let get = get_object_input(&bucket, key, None);
+                    let response =
+                        Box::pin(get_object_gateway(&usecase, get_envelope(HeaderMap::new(), http::Extensions::new()), get))
+                            .await
+                            .expect("GET restores the historical payload");
+                    let body = response.output.body.expect("GET body");
+                    assert_eq!(read_get_body(body).await.as_ref(), payload);
                 }
             }
         });
@@ -2876,17 +2847,15 @@ mod tests {
     fn undo_delete_requires_version_id_to_match_expected_current() {
         let expected = Uuid::new_v4().to_string();
         assert!(validate_undo_delete_version(Some(&expected), Some(&expected)).is_ok());
-        assert_eq!(
-            validate_undo_delete_version(Some(&expected), Some(&Uuid::new_v4().to_string()))
-                .unwrap_err()
-                .code(),
-            &S3ErrorCode::PreconditionFailed
-        );
-        assert_eq!(
-            validate_undo_delete_version(Some(&expected), None).unwrap_err().code(),
-            &S3ErrorCode::PreconditionFailed
-        );
+        let different = Uuid::new_v4().to_string();
+        for requested in [Some(different.as_str()), None] {
+            let error = validate_undo_delete_version(Some(&expected), requested).unwrap_err();
+            assert_eq!(error.code(), &S3ErrorCode::PreconditionFailed);
+            assert_eq!(error.message(), Some("At least one of the preconditions you specified did not hold."));
+            assert_eq!(error.status_code(), Some(http::StatusCode::PRECONDITION_FAILED));
+        }
         assert!(validate_undo_delete_version(None, None).is_ok());
+        assert!(validate_undo_delete_version(None, Some(&expected)).is_ok());
     }
 
     #[tokio::test]

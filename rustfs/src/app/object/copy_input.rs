@@ -34,6 +34,42 @@ impl CopySourceCondition {
     }
 }
 
+#[derive(Default)]
+pub(crate) struct CopySourceDates {
+    modified_since: Option<i64>,
+    unmodified_since: Option<i64>,
+}
+
+impl CopySourceDates {
+    pub(crate) fn new(
+        modified_since: Option<rustfs_gateway_types::Timestamp>,
+        unmodified_since: Option<rustfs_gateway_types::Timestamp>,
+    ) -> Self {
+        Self {
+            modified_since: modified_since.map(|date| date.secs()),
+            unmodified_since: unmodified_since.map(|date| date.secs()),
+        }
+    }
+
+    pub(crate) fn permits_copy(
+        &self,
+        if_match: Option<&CopySourceCondition>,
+        if_none_match: Option<&CopySourceCondition>,
+        etag: Option<&str>,
+        last_modified: Option<OffsetDateTime>,
+    ) -> bool {
+        let matches = |condition: &CopySourceCondition| condition.strong().is_some_and(|tag| Some(tag) == etag);
+        if if_match.is_some_and(|condition| !matches(condition)) || if_none_match.is_some_and(matches) {
+            return false;
+        }
+        let Some(last_modified) = last_modified else { return true };
+        // HTTP dates have one-second precision. Each ETag condition takes precedence over its paired date.
+        let seconds = last_modified.unix_timestamp();
+        (if_none_match.is_some() || self.modified_since.is_none_or(|date| seconds > date))
+            && (if_match.is_some() || self.unmodified_since.is_none_or(|date| seconds <= date))
+    }
+}
+
 // Deliberately no Debug: these fields may contain customer encryption keys.
 #[cfg_attr(test, derive(Default))]
 pub(crate) struct CopyObjectWriteInput {
@@ -57,6 +93,7 @@ pub(crate) struct CopyObjectWriteInput {
     pub(crate) tagging_directive: Option<String>,
     pub(crate) copy_source_if_match: Option<CopySourceCondition>,
     pub(crate) copy_source_if_none_match: Option<CopySourceCondition>,
+    pub(crate) copy_source_dates: CopySourceDates,
     pub(crate) cache_control: Option<String>,
     pub(crate) content_disposition: Option<String>,
     pub(crate) content_encoding: Option<String>,
@@ -133,6 +170,14 @@ impl CopyObjectWriteInput {
             tagging_directive: input.tagging_directive.map(|value| value.as_str().to_owned()),
             copy_source_if_match: input.copy_source_if_match.map(condition),
             copy_source_if_none_match: input.copy_source_if_none_match.map(condition),
+            copy_source_dates: CopySourceDates {
+                modified_since: input
+                    .copy_source_if_modified_since
+                    .map(|at| OffsetDateTime::from(at).unix_timestamp()),
+                unmodified_since: input
+                    .copy_source_if_unmodified_since
+                    .map(|at| OffsetDateTime::from(at).unix_timestamp()),
+            },
             cache_control: input.cache_control,
             content_disposition: input.content_disposition,
             content_encoding: input.content_encoding,
@@ -147,12 +192,39 @@ impl CopyObjectWriteInput {
             checksum_algorithm: input.checksum_algorithm.map(|value| value.as_str().to_owned()),
         }
     }
+}
 
-    /// A test's s3s fixture request as the envelope and input a gateway handler hands the use case.
-    pub(crate) fn from_test_request(
-        req: crate::app::storage_api::s3::S3Request<crate::app::storage_api::s3::dto::CopyObjectInput>,
-    ) -> (crate::app::RequestEnvelope, Self) {
-        let envelope = crate::app::RequestEnvelope::from_s3s(&req);
-        (envelope, Self::from_legacy(req.input))
+#[cfg(test)]
+mod source_condition_tests {
+    use super::{CopySourceCondition, CopySourceDates};
+    use rustfs_gateway_types::Timestamp;
+    use time::OffsetDateTime;
+
+    #[test]
+    fn copy_source_dates_compare_the_selected_versions_http_second() {
+        let stored = OffsetDateTime::from_unix_timestamp_nanos(10_900_000_000).unwrap();
+        for (modified, unmodified, expected) in [
+            (Some(9), None, true),
+            (Some(10), None, false),
+            (None, Some(9), false),
+            (None, Some(10), true),
+            (Some(9), Some(10), true),
+        ] {
+            let dates = CopySourceDates::new(modified.map(Timestamp::from_secs), unmodified.map(Timestamp::from_secs));
+            assert_eq!(dates.permits_copy(None, None, None, Some(stored)), expected);
+        }
+    }
+
+    #[test]
+    fn copy_source_etag_precedence_only_applies_to_the_paired_date() {
+        let matched = CopySourceCondition::Strong("etag".to_owned());
+        let other = CopySourceCondition::Strong("other".to_owned());
+        let stored = Some(OffsetDateTime::UNIX_EPOCH);
+        let unmodified = CopySourceDates::new(None, Some(Timestamp::from_secs(-1)));
+        assert!(unmodified.permits_copy(Some(&matched), None, Some("etag"), stored));
+        assert!(!unmodified.permits_copy(None, Some(&other), Some("etag"), stored));
+        let modified = CopySourceDates::new(Some(Timestamp::from_secs(-1)), None);
+        assert!(!modified.permits_copy(None, Some(&matched), Some("etag"), stored));
+        assert!(modified.permits_copy(None, None, Some("etag"), stored));
     }
 }

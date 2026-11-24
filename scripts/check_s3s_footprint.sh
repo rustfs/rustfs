@@ -4,18 +4,22 @@
 # made a ratchet by rustfs/backlog#2734 task T0.4, rustfs/backlog#2739; allowlist
 # mode added by task T0.6, rustfs/backlog#2741).
 #
-# Usage: scripts/check_s3s_footprint.sh [--mode baseline|allowlist] [--dry-run] [--base <rev>]
+# Usage: scripts/check_s3s_footprint.sh [--mode baseline|allowlist|normal-deps|oracles] [--dry-run] [--base <rev>]
 #        scripts/check_s3s_footprint.sh --self-test
 #
-# The two modes are independent: each reads its own input file and runs its own
-# search, so a malformed baseline file cannot fail (or pass) the allowlist mode
-# and vice versa. CI runs the mode it wants; running both means two invocations.
+# By default, check both the source ratchet and the normal Cargo dependency
+# graphs. An explicit mode only checks its own inputs. The normal graphs cover
+# the rustfs package and the whole workspace with all features, across all
+# target platforms. Cargo package names catch renamed and transitive edges;
+# dev-only test oracles and build dependencies are outside a normal graph.
+# --mode oracles checks legacy crate references against reviewed test-only Rust
+# items. The default runs it too, including the simulated remote target.
 # Any other argument, an unknown mode, a repeated --mode, or --dry-run outside
 # the allowlist mode is rejected with exit 2 rather than ignored, so a typo in a
 # CI step cannot silently run a different check.
 #
 # ---------------------------------------------------------------------------
-# --mode baseline (the default)
+# --mode baseline
 #
 # Three counters are measured and compared against the committed values in
 # .config/s3s-footprint-baseline.txt, the only place the numbers live:
@@ -163,7 +167,7 @@ cd "$(dirname "$0")/.."
 REPO_ROOT="$(pwd)"
 
 usage() {
-    echo "usage: scripts/check_s3s_footprint.sh [--mode baseline|allowlist] [--dry-run] [--base <rev>]" >&2
+    echo "usage: scripts/check_s3s_footprint.sh [--mode baseline|allowlist|normal-deps|oracles] [--dry-run] [--base <rev>]" >&2
     echo "       scripts/check_s3s_footprint.sh --self-test" >&2
 }
 
@@ -193,7 +197,7 @@ while (($# > 0)); do
             ;;
         --mode)
             if (($# < 2)); then
-                echo "error: '--mode' needs a value: baseline or allowlist" >&2
+                echo "error: '--mode' needs a value: baseline, allowlist, normal-deps or oracles" >&2
                 usage
                 exit 2
             fi
@@ -203,9 +207,9 @@ while (($# > 0)); do
                 exit 2
             fi
             case "$2" in
-                baseline | allowlist) MODE="$2" ;;
+                baseline | allowlist | normal-deps | oracles) MODE="$2" ;;
                 *)
-                    echo "error: unknown mode '$2'; expected baseline or allowlist" >&2
+                    echo "error: unknown mode '$2'; expected baseline, allowlist, normal-deps or oracles" >&2
                     usage
                     exit 2
                     ;;
@@ -228,8 +232,8 @@ if ((SELF_TEST)) && { [[ -n "$MODE" ]] || ((DRY_RUN)); }; then
     usage
     exit 2
 fi
-MODE="${MODE:-baseline}"
-if { [[ -n "$BASE_REV" ]] || ((PRINT_COUNTS)); } && { [[ "$MODE" != baseline ]] || ((SELF_TEST)); }; then
+MODE="${MODE:-default}"
+if { [[ -n "$BASE_REV" ]] || ((PRINT_COUNTS)); } && { [[ "$MODE" != default && "$MODE" != baseline ]] || ((SELF_TEST)); }; then
     echo "error: '--base' is only valid in the baseline mode" >&2
     usage
     exit 2
@@ -258,6 +262,41 @@ S3_ERROR_LABEL='s3s s3_error! lines'
 
 TMP_DIR="$(mktemp -d)"
 trap 'rm -rf "$TMP_DIR"' EXIT
+
+# {p} reports the package's own name even if the manifest renamed it.
+# Rendering without a tree prefix keeps dependency depth and repeated edges
+# from affecting package matching. Do not mistake a Cargo error for no match.
+check_normal_deps() {
+    local scope="$1"
+    shift
+    cargo tree --locked --all-features --edges normal --target all --prefix none --format '{p}' "$@" >"$TMP_DIR/normal-tree" || return 1
+    awk -v scope="$scope" '
+        $1 == "rustfs" && $2 ~ /^v[0-9]/ { found_host = 1 }
+        $1 ~ /^s3s($|-)/ && !seen[$1]++ {
+            print "error: " scope " normal dependency tree contains " $1 " " $2
+            forbidden = 1
+        }
+        END {
+            if (!found_host) print "error: " scope " normal dependency tree omitted rustfs"
+            exit forbidden || !found_host
+        }
+    ' "$TMP_DIR/normal-tree" >&2
+}
+
+run_normal_deps() {
+    check_normal_deps rustfs -p rustfs || return 1
+    check_normal_deps workspace --workspace || return 1
+    echo "s3s normal dependency check passed (rustfs and workspace)"
+}
+
+if [[ "$MODE" == oracles ]]; then
+    exec scripts/python_bin.sh scripts/check_s3s_oracles.py
+fi
+
+if [[ "$MODE" == normal-deps ]]; then
+    run_normal_deps
+    exit
+fi
 
 # Git workspaces may contain generated Rust files left by an earlier quality
 # check. They are not part of the submitted tree and must not change the
@@ -403,7 +442,7 @@ self_test_run() {
     local root="$SELF_TEST_DIR/$1"
     printf 'files=%s\ns3_error_lines=%s\necstore_files=%s\n' "$2" "$3" "$4" \
         >"$root/.config/s3s-footprint-baseline.txt"
-    bash "$root/scripts/check_s3s_footprint.sh" <"$SELF_TEST_STDIN" 2>&1
+    bash "$root/scripts/check_s3s_footprint.sh" --mode baseline <"$SELF_TEST_STDIN" 2>&1
 }
 
 # Asserts that fixture tree $1 measures s3_error_lines=$2. The run uses an
@@ -454,6 +493,56 @@ self_test_expect_failure_args() {
         printf '%s\n' "$out" | sed 's/^/    /' >&2
         SELF_TEST_FAILURES=$((SELF_TEST_FAILURES + 1))
     fi
+}
+
+# Real, offline Cargo manifests exercise feature and package resolution. The
+# oracle lives outside the workspace so only the selected edge can pull it in.
+self_test_normal_deps() {
+    local name=normal-deps root="$SELF_TEST_DIR/normal-deps" package
+    self_test_tree "$name"
+    cp scripts/{check_s3s_oracles.py,check_test_seams.py,python_bin.sh} "$root/scripts/"
+    cp deny.toml "$root/deny.toml"
+    git -C "$root" init -q
+    # This Cargo graph fixture contains no oracle source.
+    : >"$root/crates/control/src/lib.rs"
+    for package in rustfs e2e_test independent s3s-sigv4; do
+        mkdir -p "$root/$package/src"
+        : >"$root/$package/src/lib.rs"
+        printf '[package]\nname = "%s"\nversion = "1.0.0"\nedition = "2021"\n' "$package" >"$root/$package/Cargo.toml"
+    done
+    self_test_file "$name" Cargo.toml '[workspace]' 'resolver = "2"' 'members = ["rustfs", "e2e_test", "independent"]' 'exclude = ["s3s-sigv4"]'
+    printf '[dependencies]\ne2e_test = { path = "../e2e_test" }\n' >>"$root/rustfs/Cargo.toml"
+    printf '[dev-dependencies]\nsigned = { package = "s3s-sigv4", path = "../s3s-sigv4" }\n' >>"$root/e2e_test/Cargo.toml"
+    (cd "$root" && cargo generate-lockfile --offline) || return 1
+
+    # Use the default entry point here: this also proves a dev-only oracle is
+    # allowed by the gate invoked in quick checks and on direct pushes.
+    printf 'files=0\ns3_error_lines=0\necstore_files=0\n' >"$root/.config/s3s-footprint-baseline.txt"
+    if ! bash "$root/scripts/check_s3s_footprint.sh" | grep -F 's3s normal dependency check passed'; then
+        echo "self-test FAILED: default check must accept a dev-only oracle" >&2
+        return 1
+    fi
+    printf '[dependencies]\nsigned = { package = "s3s-sigv4", path = "../s3s-sigv4", optional = true }\n' >>"$root/e2e_test/Cargo.toml"
+    (cd "$root" && cargo generate-lockfile --offline) || return 1
+    self_test_expect_failure_args "$name" 'workspace normal dependency tree contains s3s-sigv4' \
+        'an optional production dependency cannot hide behind a disabled default feature' --mode normal-deps
+    # The later cases exercise different scopes independently.
+    sed '/^\[dependencies\]$/,$d' "$root/e2e_test/Cargo.toml" >"$root/e2e_test/reset.toml"
+    mv "$root/e2e_test/reset.toml" "$root/e2e_test/Cargo.toml"
+    # A non-host target and a dependency alias must not mask a workspace edge.
+    cat >>"$root/independent/Cargo.toml" <<'TOML'
+[target.'cfg(target_os = "none")'.dependencies]
+signed = { package = "s3s-sigv4", path = "../s3s-sigv4" }
+TOML
+    (cd "$root" && cargo generate-lockfile --offline) || return 1
+    self_test_expect_failure_args "$name" 'workspace normal dependency tree contains s3s-sigv4' \
+        'a platform-specific normal edge in another workspace member fails' --mode normal-deps
+    printf '[dependencies]\nsigned = { package = "s3s-sigv4", path = "../s3s-sigv4" }\n' >>"$root/e2e_test/Cargo.toml"
+    (cd "$root" && cargo generate-lockfile --offline) || return 1
+    self_test_expect_failure_args "$name" 'rustfs normal dependency tree contains s3s-sigv4' \
+        'a renamed transitive host edge fails at the default entry point'
+    mv "$root/e2e_test/Cargo.toml" "$root/e2e_test/missing.toml"
+    self_test_expect_failure_args "$name" 'failed to load manifest' 'Cargo resolution failure cannot pass' --mode normal-deps
 }
 
 # Positive cases: s3s's macro in a recognised form is counted. Negative cases:
@@ -554,7 +643,7 @@ self_test() {
     git -C "$SELF_TEST_DIR/b1-base" add -A
     git -C "$SELF_TEST_DIR/b1-base" -c user.name=t -c user.email=t@t commit -q -m base
     rm "$SELF_TEST_DIR/b1-base/crates/a/src/lib.rs"
-    out="$(bash "$SELF_TEST_DIR/b1-base/scripts/check_s3s_footprint.sh" --base HEAD <"$SELF_TEST_STDIN" 2>&1)" && status=0 || status=$?
+    out="$(bash "$SELF_TEST_DIR/b1-base/scripts/check_s3s_footprint.sh" --mode baseline --base HEAD <"$SELF_TEST_STDIN" 2>&1)" && status=0 || status=$?
     if ((status == 0)) && [[ "$out" == *"files importing s3s is 1 (base revision 2"* ]]; then
         echo "self-test ok: b1-base: a drop against the base passes below the baseline (exit 0)"
     else
@@ -699,6 +788,8 @@ self_test() {
     self_test_expect_failure f4-rise '' "s3s footprint grew: 1 > 0 (ecstore files referencing s3s" \
         "an ecstore file referencing s3s above the ceiling fails"
 
+    scripts/python_bin.sh scripts/check_s3s_oracles.py --self-test || return 1
+    self_test_normal_deps || return 1
     if ((SELF_TEST_FAILURES != 0)); then
         echo "❌ s3s footprint self-test: $SELF_TEST_FAILURES case(s) failed" >&2
         return 1
@@ -903,3 +994,7 @@ if ((status != 0)); then
 fi
 
 echo "✅ s3s footprint baseline check passed"
+if [[ "$MODE" == default ]]; then
+    run_normal_deps
+    scripts/python_bin.sh scripts/check_s3s_oracles.py
+fi

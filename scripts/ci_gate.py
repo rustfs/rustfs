@@ -61,7 +61,6 @@ HIT_SKIP = "steps.setup.outputs.cache-hit != 'true'"
 LINT_COMMANDS = ("cargo clippy --all-targets -- -D warnings", "python3 scripts/ci_test_artifact.py cargo lint --configuration workspace")
 OPTIONAL_JOBS = ("build-rustfs-debug-binary-rio-v2", "e2e-tests-rio-v2", "e2e-full")
 NON_VALIDATION_JOBS = {"required-checks", "cancel-closed-pr-runs", "alert-on-failure"}
-INTEGRATION_PUSH_REFS = ("refs/heads/main", "refs/heads/gateway/integration")
 
 
 def documentation_path(path: str) -> bool:
@@ -243,7 +242,7 @@ def expected_results(mode: str, event: str, ref: str, connect: bool = True, acti
     expected.update({job: "success" if nightly else "skipped" for job in NIGHTLY_JOBS})
     expected["connect-feature-boundaries"] = "success" if nightly and connect else "skipped"
     expected.update({job: "success" if nightly else "skipped" for job in OPTIONAL_JOBS[:2]})
-    full = mode == "full" and (event in ("merge_group", "workflow_dispatch") or (event == "push" and ref in INTEGRATION_PUSH_REFS))
+    full = mode == "full" and (event in ("merge_group", "workflow_dispatch") or (event == "push" and ref == "refs/heads/main"))
     expected["e2e-full"] = "success" if full else "skipped"
     if event == "pull_request" and action == "closed":
         return {job: "skipped" for job in expected}

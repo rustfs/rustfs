@@ -175,7 +175,8 @@ pub(crate) mod access_consumer {
         authorize_bucket_config_mutation, authorize_bucket_request, authorize_bucket_tag_deletion, authorize_object_request,
     };
     pub(crate) use super::super::authorization::{
-        authorize_request, authorize_request_core, log_list_buckets_iam_implicit_deny, prepare_list_buckets_iam_authorization,
+        authorize_missing_object_disclosure, authorize_request, authorize_request_core, log_list_buckets_iam_implicit_deny,
+        prepare_list_buckets_iam_authorization,
     };
     pub(crate) use super::super::authorization_actions::delete_object_authorize_action;
     pub(crate) use super::super::denial_audit::DenialAuditor;
@@ -544,10 +545,11 @@ pub(crate) mod ecstore_config {
 pub(crate) mod ecstore_data_usage {
     pub(crate) use rustfs_ecstore::api::data_usage::{
         get_bucket_usage_memory, init_compression_total_memory_from_backend, load_admin_data_usage_from_backend_cached,
-        load_admin_data_usage_with_memory_overlay, load_bucket_usage_from_backend_cached, load_data_usage_from_backend,
-        lookup_degraded_bucket_usage_baseline, quota_object_size, record_bucket_delete_marker_memory,
-        record_bucket_object_delete_memory, record_bucket_object_version_write_memory, record_bucket_object_write_memory,
-        record_bucket_object_write_unknown_previous_memory, store_compression_total_in_backend, verified_account_bucket_usage,
+        load_admin_data_usage_with_memory_overlay, load_bucket_scan_progress_for_admin, load_bucket_usage_from_backend_cached,
+        load_data_usage_from_backend, lookup_degraded_bucket_usage_baseline, quota_object_size,
+        record_bucket_delete_marker_memory, record_bucket_object_delete_memory, record_bucket_object_version_write_memory,
+        record_bucket_object_write_memory, record_bucket_object_write_unknown_previous_memory,
+        store_compression_total_in_backend, verified_account_bucket_usage,
     };
     // Test-only observables for the rustfs/backlog#1306 revert detector.
     #[cfg(test)]
@@ -2544,67 +2546,6 @@ pub(crate) fn set_tonic_canonical_body_digest<T>(request: &mut tonic::Request<T>
     ecstore_rpc::set_tonic_canonical_body_digest(request, canonical_body)
 }
 
-/// Convert a raw stored ETag into the strongly-typed `s3s::dto::ETag`.
-///
-/// Supports already quoted (`"abc"`), weak (`W/"abc"`), or plain (`abc`) values.
-pub(crate) fn to_s3s_etag(etag: &str) -> s3s::dto::ETag {
-    use s3s::dto::ETag;
-
-    if let Some(rest) = etag.strip_prefix("W/\"") {
-        if let Some(body) = rest.strip_suffix('"') {
-            return ETag::Weak(body.to_string());
-        }
-        return ETag::Weak(rest.to_string());
-    }
-
-    if let Some(body) = etag.strip_prefix('"').and_then(|rest| rest.strip_suffix('"')) {
-        return ETag::Strong(body.to_string());
-    }
-
-    ETag::Strong(etag.to_string())
-}
-
-#[cfg(test)]
-mod to_s3s_etag_tests {
-    use super::to_s3s_etag;
-    use s3s::dto::ETag;
-
-    #[test]
-    fn test_to_s3s_etag() {
-        // Test unquoted ETag - should become strong etag
-        assert_eq!(
-            to_s3s_etag("6af8d12c0c74b78094884349f3c8a079"),
-            ETag::Strong("6af8d12c0c74b78094884349f3c8a079".to_string())
-        );
-
-        assert_eq!(
-            to_s3s_etag("\"6af8d12c0c74b78094884349f3c8a079\""),
-            ETag::Strong("6af8d12c0c74b78094884349f3c8a079".to_string())
-        );
-
-        assert_eq!(
-            to_s3s_etag("W/\"6af8d12c0c74b78094884349f3c8a079\""),
-            ETag::Weak("6af8d12c0c74b78094884349f3c8a079".to_string())
-        );
-
-        assert_eq!(to_s3s_etag(""), ETag::Strong(String::new()));
-
-        assert_eq!(to_s3s_etag("\"incomplete"), ETag::Strong("\"incomplete".to_string()));
-
-        assert_eq!(to_s3s_etag("incomplete\""), ETag::Strong("incomplete\"".to_string()));
-    }
-}
-
-/// The pinned s3s XML serializer writes ETag values as raw text. Escape only
-/// at XML response boundaries; HTTP headers and conditional comparisons keep
-/// the original stored value. Existing unsafe ETags must remain listable.
-pub(crate) fn to_s3s_xml_etag(etag: &str) -> s3s::dto::ETag {
-    let mut etag = to_s3s_etag(etag);
-    let (s3s::dto::ETag::Strong(value) | s3s::dto::ETag::Weak(value)) = &mut etag;
-    *value = quick_xml::escape::escape(value.as_str()).into_owned();
-    etag
-}
-
 pub(crate) fn table_catalog_path_hash(value: &str) -> String {
     ecstore_bucket::metadata::table_catalog_path_hash(value)
 }
@@ -2688,139 +2629,8 @@ pub(crate) async fn init_compression_total_memory_from_backend(store: Arc<ECStor
 }
 
 #[cfg(test)]
-mod bucket_config_compat_tests {
-    use crate::app::dto_values::stored_config;
-    use rustfs_gateway_types::cors_tagging::parse_cors;
-    use rustfs_gateway_types::persistence::{
-        parse_bucket_encryption, parse_bucket_encryption_dto, parse_cors_dto, parse_object_lock, parse_versioning,
-        parse_versioning_dto, parse_website, parse_website_dto, serialize_bucket_encryption_dto, serialize_cors_dto,
-        serialize_versioning_dto, serialize_website_dto,
-    };
-
-    #[test]
-    fn versioning_round_trips_including_the_minio_extensions() {
-        let xml = b"<VersioningConfiguration><ExcludeFolders>true</ExcludeFolders>\
-            <ExcludedPrefixes><Prefix>tmp/</Prefix></ExcludedPrefixes><Status>Enabled</Status></VersioningConfiguration>";
-        let stored = parse_versioning(xml).expect("stored versioning");
-        assert_eq!(stored.status.as_deref(), Some("Enabled"));
-        assert_eq!(stored.exclude_folders, Some(true));
-        assert_eq!(stored.excluded_prefixes, Some(vec![Some("tmp/".to_owned())]));
-        assert!(stored.mfa_delete.is_none());
-        let config = stored_config(&stored, parse_versioning_dto).expect("gateway configuration");
-        assert_eq!(serialize_versioning_dto(&config), xml);
-    }
-
-    #[test]
-    fn an_unknown_versioning_status_survives_the_round_trip_for_the_use_case_to_refuse() {
-        let xml = b"<VersioningConfiguration><Status>Invalid</Status></VersioningConfiguration>";
-        let config = parse_versioning_dto(xml).expect("string-backed gateway status");
-        let stored = parse_versioning(&serialize_versioning_dto(&config)).expect("prepare versioning update");
-        assert_eq!(stored.status.as_deref(), Some("Invalid"));
-    }
-
-    #[test]
-    #[serial_test::serial]
-    fn object_lock_round_trips_the_default_retention() {
-        use super::contract::bucket::{BucketOperations as _, MakeBucketOptions};
-        use crate::app::gating_test_env::{run_large_stack_test, shared_gating_ambient, shared_gating_ecstore};
-        use crate::runtime_sources::{AppContext, ServerContextSlot};
-        use crate::server::TestGateway;
-        use bytes::Bytes;
-        use http::{Method, StatusCode};
-        use http_body_util::BodyExt;
-        use md5::Digest;
-        use std::sync::Arc;
-
-        run_large_stack_test("bucket-config-object-lock", || async {
-            let ambient = shared_gating_ambient().await;
-            let store = shared_gating_ecstore().await;
-            let context = Arc::new(AppContext::new(Arc::clone(&store), ambient.iam(), ambient.kms()));
-            let slot = ServerContextSlot::new();
-            assert!(slot.install(Arc::clone(&context)));
-            let gateway = TestGateway::over(&context, slot);
-            let bucket = format!("lock-config-{}", uuid::Uuid::new_v4());
-            store
-                .make_bucket(
-                    &bucket,
-                    &MakeBucketOptions {
-                        lock_enabled: true,
-                        versioning_enabled: true,
-                        ..Default::default()
-                    },
-                )
-                .await
-                .expect("create object-lock bucket");
-
-            let xml = b"<ObjectLockConfiguration><ObjectLockEnabled>Enabled</ObjectLockEnabled>\
-                <Rule><DefaultRetention><Mode>GOVERNANCE</Mode><Days>30</Days></DefaultRetention></Rule></ObjectLockConfiguration>";
-            let target = format!("/{bucket}?object-lock");
-            let checksum = base64_simd::STANDARD.encode_to_string(md5::Md5::digest(xml));
-            let put = gateway
-                .signed(Method::PUT, &target, vec![("content-md5", checksum)], Bytes::from_static(xml))
-                .await
-                .unwrap();
-            let put_status = put.status();
-            let put_body = put.into_body().collect().await.unwrap().to_bytes();
-            assert_eq!(put_status, StatusCode::OK, "{}", String::from_utf8_lossy(&put_body));
-            let (stored, _) = super::ecstore_bucket::metadata_sys::get_object_lock_config(&bucket)
-                .await
-                .expect("stored lock config");
-            assert_eq!(stored.object_lock_enabled.as_deref(), Some("Enabled"));
-            let get = gateway.signed(Method::GET, &target, vec![], Bytes::new()).await.unwrap();
-            assert_eq!(get.status(), StatusCode::OK);
-            let body = get.into_body().collect().await.unwrap().to_bytes();
-            let returned = parse_object_lock(&body).expect("get lock configuration");
-            assert_eq!(returned, stored);
-            let retention = returned.rule.unwrap().default_retention.unwrap();
-            assert_eq!(retention.mode.as_deref(), Some("GOVERNANCE"));
-            assert_eq!(retention.days, Some(30));
-            assert_eq!(retention.years, None);
-        });
-    }
-
-    #[test]
-    fn encryption_cors_and_website_round_trip() {
-        let xml = b"<ServerSideEncryptionConfiguration><Rule><ApplyServerSideEncryptionByDefault>\
-            <KMSMasterKeyID>key</KMSMasterKeyID><SSEAlgorithm>aws:kms</SSEAlgorithm></ApplyServerSideEncryptionByDefault>\
-            <BucketKeyEnabled>true</BucketKeyEnabled></Rule></ServerSideEncryptionConfiguration>";
-        let stored = parse_bucket_encryption(xml).expect("stored encryption");
-        assert!(stored.rules[0].blocked_encryption_types.is_none());
-        let config = stored_config(&stored, parse_bucket_encryption_dto).expect("gateway encryption");
-        assert_eq!(serialize_bucket_encryption_dto(&config).unwrap(), xml);
-
-        let xml = b"<CORSConfiguration><CORSRule><AllowedHeader>*</AllowedHeader><AllowedMethod>GET</AllowedMethod>\
-            <AllowedOrigin>https://example.com</AllowedOrigin><ID>r</ID><MaxAgeSeconds>60</MaxAgeSeconds></CORSRule></CORSConfiguration>";
-        let stored = parse_cors(xml).expect("stored CORS");
-        assert!(stored.cors_rules[0].expose_headers.is_none());
-        let config = stored_config(&stored, parse_cors_dto).expect("gateway CORS");
-        assert!(config.cors_rules[0].expose_headers.is_empty());
-        assert_eq!(serialize_cors_dto(&config), xml);
-
-        let xml = b"<WebsiteConfiguration><ErrorDocument><Key>404.html</Key></ErrorDocument>\
-            <IndexDocument><Suffix>index.html</Suffix></IndexDocument></WebsiteConfiguration>";
-        let stored = parse_website(xml).expect("stored website");
-        let config = stored_config(&stored, parse_website_dto).expect("gateway website");
-        assert!(config.redirect_all_requests_to.is_none());
-        assert!(config.routing_rules.is_none());
-        assert_eq!(serialize_website_dto(&config), xml);
-    }
-
-    #[test]
-    fn tagging_keeps_keyless_tags() {
-        use rustfs_gateway_types::persistence::{parse_tagging_dto, serialize_tagging_dto};
-
-        let xml = b"<Tagging><TagSet><Tag><Key>k</Key><Value>v</Value></Tag><Tag></Tag></TagSet></Tagging>";
-        let tagging = parse_tagging_dto(xml).expect("read stored tags");
-        let pairs: Vec<_> = tagging
-            .tag_set
-            .iter()
-            .map(|tag| (tag.key.as_deref(), tag.value.as_deref()))
-            .collect();
-        assert_eq!(pairs, [(Some("k"), Some("v")), (None, None)]);
-        let stored = rustfs_gateway_types::cors_tagging::parse_tagging(&serialize_tagging_dto(&tagging)).expect("read back tags");
-        assert_eq!(stored, rustfs_gateway_types::cors_tagging::parse_tagging(xml).unwrap());
-    }
-}
+#[path = "storage_api_test.rs"]
+mod bucket_config_compat_tests;
 
 #[cfg(test)]
 mod tests {

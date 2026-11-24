@@ -205,7 +205,7 @@ impl DefaultMultipartUsecase {
         #[cfg(all(any(feature = "cuobject", feature = "nixl"), target_os = "linux"))]
         let (body, content_length, rdma_put) = match crate::app::object::cuobject::rdma_token_for_request(req.headers()) {
             Some(token) if content_length.unwrap_or(0) == 0 => {
-                let (body, total) = crate::app::object::cuobject::rdma_put_body(bucket, key, &token).map_err(S3Error::from)?;
+                let (body, total) = crate::app::object::cuobject::rdma_put_body(bucket, key, &token)?;
                 let total = i64::try_from(total).map_err(|_| S3Error::new(S3ErrorCode::EntityTooLarge))?;
                 (Some(body), Some(total), Some(total))
             }
@@ -543,36 +543,15 @@ impl UploadPartWriteInput {
 
 #[cfg(test)]
 impl DefaultMultipartUsecase {
-    pub async fn execute_upload_part(
+    pub(crate) async fn execute_upload_part(
         &self,
         req: crate::app::storage_api::s3::S3Request<crate::app::storage_api::s3::dto::UploadPartInput>,
-    ) -> crate::app::storage_api::s3::S3Result<
-        crate::app::storage_api::s3::S3Response<crate::app::storage_api::s3::dto::UploadPartOutput>,
-    > {
-        use crate::app::storage_api::s3::{
-            S3Response,
-            dto::{ServerSideEncryption, UploadPartOutput},
-        };
+    ) -> crate::app::storage_api::s3::S3Result<UploadPartWriteOutput> {
         let envelope = RequestEnvelope::from_s3s(&req);
         let input = UploadPartWriteInput::from_legacy(req.input, req.trailing_headers);
-        let output = self.execute_upload_part_with_audit(envelope, input).await?;
-        let mut response = S3Response::new(UploadPartOutput {
-            e_tag: output
-                .e_tag
-                .map(|tag| crate::app::storage_api::test::object_utils::to_s3s_etag(&tag)),
-            checksum_crc32: output.checksum_crc32,
-            checksum_crc32c: output.checksum_crc32c,
-            checksum_crc64nvme: output.checksum_crc64nvme,
-            checksum_sha1: output.checksum_sha1,
-            checksum_sha256: output.checksum_sha256,
-            server_side_encryption: output.server_side_encryption.map(ServerSideEncryption::from),
-            ssekms_key_id: output.ssekms_key_id,
-            sse_customer_algorithm: output.sse_customer_algorithm,
-            sse_customer_key_md5: output.sse_customer_key_md5,
-            ..Default::default()
-        });
-        response.headers = output.headers;
-        Ok(response)
+        self.execute_upload_part_with_audit(envelope, input)
+            .await
+            .map_err(crate::error::legacy_error_for_test)
     }
 }
 
@@ -585,11 +564,26 @@ mod tests {
     use crate::app::storage_api::s3::dto::{StreamingBlob, UploadPartInput};
     use http::HeaderValue;
 
+    /// Method, URI, headers, extensions, region, and service. These fixtures leave credentials absent.
+    fn envelope_from_presigned_fixture<T>(req: &crate::app::storage_api::s3::S3Request<T>) -> RequestEnvelope {
+        RequestEnvelope::from_parts(
+            crate::app::RequestHead {
+                method: req.method.clone(),
+                uri: req.uri.clone(),
+                headers: req.headers.clone(),
+                credentials: None,
+                region: req.region.as_ref().map(|region| region.as_str().to_owned()),
+                service: req.service.clone(),
+            },
+            req.extensions.clone(),
+        )
+    }
+
     fn presigned_checksum_request(query: &str) -> (RequestEnvelope, UploadPartWriteInput) {
         let mut req = build_request(UploadPartInput::default(), Method::PUT);
         req.uri = format!("/bucket/object?{query}").parse().unwrap();
         req.extensions.insert(VerifiedPresignedRequest);
-        (RequestEnvelope::from_s3s(&req), UploadPartWriteInput::from_legacy(req.input, None))
+        (envelope_from_presigned_fixture(&req), UploadPartWriteInput::from_legacy(req.input, None))
     }
 
     #[tokio::test]
@@ -675,7 +669,7 @@ mod tests {
     fn normalize_presigned_part_checksums_requires_verified_presign() {
         let mut legacy = build_request(UploadPartInput::default(), Method::PUT);
         legacy.uri = "/bucket/object?x-amz-checksum-sha256=one".parse().unwrap();
-        let mut req = RequestEnvelope::from_s3s(&legacy);
+        let mut req = envelope_from_presigned_fixture(&legacy);
         let mut input = UploadPartWriteInput::from_legacy(legacy.input, None);
         normalize_presigned_part_checksums(&mut req, &mut input).unwrap();
         assert!(input.checksum_sha256.is_none());
@@ -729,23 +723,42 @@ mod tests {
         }
     }
 
+    /// Bucket `bucket`, key `object`, upload `upload-id`. Checksums, SSE, and trailers stay absent.
+    fn admission_part_input(part_number: i32, content_length: Option<i64>, body: Option<Body>) -> UploadPartWriteInput {
+        UploadPartWriteInput {
+            target: UploadPartTarget::Legacy {
+                bucket: "bucket".to_owned(),
+                key: "object".to_owned(),
+                upload_id: "upload-id".to_owned(),
+            },
+            part_number,
+            content_length,
+            body,
+            trailing_headers: None,
+            frame_trailers: None,
+            content_md5: None,
+            checksum_algorithm: None,
+            checksum_crc32: None,
+            checksum_crc32c: None,
+            checksum_crc64nvme: None,
+            checksum_sha1: None,
+            checksum_sha256: None,
+            sse_customer_algorithm: None,
+            sse_customer_key: None,
+            sse_customer_key_md5: None,
+        }
+    }
+
     #[tokio::test]
     async fn execute_upload_part_rejects_missing_body() {
-        let input = UploadPartInput::builder()
-            .bucket("bucket".to_string())
-            .key("object".to_string())
-            .upload_id("upload-id".to_string())
-            .part_number(1)
-            .build()
-            .unwrap();
         let err = match make_usecase()
-            .execute_upload_part_with_audit(owned_envelope(Method::PUT), UploadPartWriteInput::from_legacy(input, None))
+            .execute_upload_part_with_audit(owned_envelope(Method::PUT), admission_part_input(1, None, None))
             .await
         {
-            Err(error) => crate::app::storage_api::s3::S3Error::from(error),
+            Err(error) => error,
             Ok(_) => panic!("missing body must be rejected"),
         };
-        assert_eq!(err.code(), &LegacyErrorCode::IncompleteBody);
+        assert_eq!(err.code(), &rustfs_s3_types::S3ErrorCode::IncompleteBody);
     }
 
     /// issue #7596: a part whose declared length exceeds the 5 GiB
@@ -757,27 +770,25 @@ mod tests {
 
         for (declared, expect_too_large) in [(ceiling + 1, true), (ceiling, false), (0, false)] {
             let (body, polls) = crate::app::object::PollCountingBody::streaming_blob();
-            let input = UploadPartInput::builder()
-                .bucket("bucket".to_string())
-                .key("object".to_string())
-                .upload_id("upload-id".to_string())
-                .part_number(1)
-                .body(Some(body))
-                .content_length(Some(declared))
-                .build()
-                .unwrap();
             let err = match make_usecase()
-                .execute_upload_part_with_audit(owned_envelope(Method::PUT), UploadPartWriteInput::from_legacy(input, None))
+                .execute_upload_part_with_audit(
+                    owned_envelope(Method::PUT),
+                    admission_part_input(1, Some(declared), Some(legacy_put_body(body))),
+                )
                 .await
             {
-                Err(error) => crate::app::storage_api::s3::S3Error::from(error),
+                Err(error) => error,
                 Ok(_) => panic!("declared part must be rejected"),
             };
             if expect_too_large {
-                assert_eq!(err.code(), &LegacyErrorCode::EntityTooLarge, "declared {declared}");
+                assert_eq!(err.code(), &rustfs_s3_types::S3ErrorCode::EntityTooLarge, "declared {declared}");
                 assert_eq!(polls.load(std::sync::atomic::Ordering::SeqCst), 0, "body must not be polled");
             } else {
-                assert_ne!(err.code(), &LegacyErrorCode::EntityTooLarge, "declared {declared} must pass admission");
+                assert_ne!(
+                    err.code(),
+                    &rustfs_s3_types::S3ErrorCode::EntityTooLarge,
+                    "declared {declared} must pass admission"
+                );
             }
         }
     }
@@ -785,21 +796,14 @@ mod tests {
     #[tokio::test]
     async fn execute_upload_part_rejects_invalid_part_number_before_body_lookup() {
         for part_number in [-1, 0, 10001] {
-            let input = UploadPartInput::builder()
-                .bucket("bucket".to_string())
-                .key("object".to_string())
-                .upload_id("upload-id".to_string())
-                .part_number(part_number)
-                .build()
-                .unwrap();
             let err = match make_usecase()
-                .execute_upload_part_with_audit(owned_envelope(Method::PUT), UploadPartWriteInput::from_legacy(input, None))
+                .execute_upload_part_with_audit(owned_envelope(Method::PUT), admission_part_input(part_number, None, None))
                 .await
             {
-                Err(error) => crate::app::storage_api::s3::S3Error::from(error),
+                Err(error) => error,
                 Ok(_) => panic!("invalid part number must be rejected"),
             };
-            assert_eq!(err.code(), &LegacyErrorCode::InvalidArgument);
+            assert_eq!(err.code(), &rustfs_s3_types::S3ErrorCode::InvalidArgument);
             assert_eq!(err.message(), Some("partNumber must be between 1 and 10000"));
         }
     }
@@ -850,19 +854,31 @@ mod tests {
                         .body(Some(body))
                         .build()
                         .expect("part request");
-                    let mut request = build_request(input, Method::PUT);
-                    request
-                        .headers
-                        .insert("x-amz-decoded-content-length", HeaderValue::from_static("1024"));
+                    // Same facts `build_request` carried, plus the decoded-length and
+                    // optional aws-chunked headers this case asserts cannot bypass rejection.
+                    // Credentials, region, service, and extensions stay absent.
+                    let mut headers = http::HeaderMap::new();
+                    headers.insert("x-amz-decoded-content-length", HeaderValue::from_static("1024"));
                     if declared_chunk_encoding {
-                        request
-                            .headers
-                            .insert("content-encoding", HeaderValue::from_static("aws-chunked"));
+                        headers.insert("content-encoding", HeaderValue::from_static("aws-chunked"));
                     }
+                    let envelope = RequestEnvelope::from_parts(
+                        crate::app::RequestHead {
+                            method: Method::PUT,
+                            uri: http::Uri::from_static("/"),
+                            headers,
+                            credentials: None,
+                            region: None,
+                            service: None,
+                        },
+                        http::Extensions::new(),
+                    );
                     let error = usecase
-                        .execute_upload_part(request)
+                        .execute_upload_part_with_audit(envelope, UploadPartWriteInput::from_legacy(input, None))
                         .await
-                        .expect_err("unknown or negative logical size");
+                        .map_err(crate::error::legacy_error_for_test)
+                        .err()
+                        .expect("unknown or negative logical size");
                     assert_eq!(
                         error.code(),
                         &if capped || content_length.is_some() {
@@ -918,9 +934,27 @@ mod tests {
             .body(Some(body))
             .build()
             .unwrap();
-        let mut request = build_request(input, Method::PUT);
-        request.extensions.insert(control.clone());
-        let owner = tokio::spawn(async move { usecase.execute_upload_part(request).await });
+        let mut extensions = http::Extensions::new();
+        extensions.insert(control.clone());
+        // Same facts `build_request` carried, plus the body-read budget this
+        // case advances after admission. Credentials, region, and service stay absent.
+        let envelope = RequestEnvelope::from_parts(
+            crate::app::RequestHead {
+                method: Method::PUT,
+                uri: http::Uri::from_static("/"),
+                headers: http::HeaderMap::new(),
+                credentials: None,
+                region: None,
+                service: None,
+            },
+            extensions,
+        );
+        let owner = tokio::spawn(async move {
+            usecase
+                .execute_upload_part_with_audit(envelope, UploadPartWriteInput::from_legacy(input, None))
+                .await
+                .map_err(crate::error::legacy_error_for_test)
+        });
         control.wait_until_pending_for_test().await;
         assert!(matches!(
             manager.admit_put_object(65536).await.unwrap(),
@@ -928,7 +962,8 @@ mod tests {
         ));
         control.advance_wait_for_test(Duration::from_secs(60));
         sender.send(Ok(Frame::data(Bytes::from_static(b"x")))).unwrap();
-        assert_eq!(owner.await.unwrap().unwrap_err().code(), &LegacyErrorCode::RequestTimeout);
+        let error = owner.await.unwrap().err().expect("stalled part must fail");
+        assert_eq!(error.code(), &LegacyErrorCode::RequestTimeout);
         assert!(matches!(
             manager.admit_put_object(65536).await.unwrap(),
             ForegroundWriteAdmission::Admitted(_)
@@ -984,10 +1019,10 @@ mod tests {
             .execute_upload_part_with_audit(owned_envelope(Method::PUT), UploadPartWriteInput::from_legacy(input, None))
             .await
         {
-            Err(error) => crate::app::storage_api::s3::S3Error::from(error),
+            Err(error) => error,
             Ok(_) => panic!("full foreground write admission should reject before body ingest"),
         };
-        assert_eq!(err.code(), &LegacyErrorCode::SlowDown);
+        assert_eq!(err.code(), &rustfs_s3_types::S3ErrorCode::SlowDown);
         drop(held);
     }
 

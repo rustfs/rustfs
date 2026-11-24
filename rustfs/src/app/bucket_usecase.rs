@@ -56,7 +56,6 @@ use super::storage_api::bucket_usecase::contract::list::{
 };
 use super::storage_api::bucket_usecase::error::StorageError;
 use super::storage_api::bucket_usecase::helper::{OperationHelper, spawn_background_with_context};
-use super::storage_api::bucket_usecase::object_utils::to_s3s_xml_etag;
 use super::storage_api::bucket_usecase::s3_api::bucket::{
     ListObjectVersionsParams, ListObjectsV2Params, encode_list_objects_v2_continuation_token, parse_list_object_versions_params,
     parse_list_objects_v2_params, rustfs_owner,
@@ -509,8 +508,7 @@ impl DefaultBucketUsecase {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::app::bucket_usecase::test_support::{build_request_with_req_info, owned_envelope};
-    use crate::app::storage_api::s3::dto::CreateBucketInput;
+    use crate::app::bucket_usecase::test_support::owned_envelope;
     use http::Method;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use tokio::sync::Notify;
@@ -986,20 +984,24 @@ mod tests {
 
     #[test]
     fn build_request_with_req_info_preserves_owner_state() {
-        let input = CreateBucketInput::builder()
-            .bucket("test-bucket".to_string())
-            .build()
-            .unwrap();
-        let req = build_request_with_req_info(
-            input,
-            Method::PUT,
-            ReqInfo {
-                is_owner: true,
-                ..Default::default()
-            },
-        );
+        let mut extensions = http::Extensions::new();
+        extensions.insert(ReqInfo {
+            is_owner: true,
+            ..Default::default()
+        });
 
-        let envelope = RequestEnvelope::from_s3s(&req);
+        // Same facts `RequestEnvelope::from_s3s` copies. Credentials, region, and service stay absent.
+        let envelope = RequestEnvelope::from_parts(
+            crate::app::RequestHead {
+                method: Method::PUT,
+                uri: http::Uri::from_static("/"),
+                headers: http::HeaderMap::new(),
+                credentials: None,
+                region: None,
+                service: None,
+            },
+            extensions,
+        );
         assert!(envelope.req_info().expect("req info should be present").is_owner);
     }
 

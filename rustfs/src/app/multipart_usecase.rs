@@ -49,8 +49,6 @@ use super::storage_api::multipart_usecase::io::{DecryptReader, EncryptReader, Ha
 use super::storage_api::multipart_usecase::io::{
     EtagAlgorithm, HashReader, WriteEncryption, WritePlan, compression_metadata_value,
 };
-#[cfg(test)]
-use super::storage_api::multipart_usecase::object_utils::{to_s3s_etag, to_s3s_xml_etag};
 use super::storage_api::multipart_usecase::options::{
     copy_src_opts, extract_metadata_from_mime, get_complete_multipart_upload_opts_with_replication_authorization,
     get_content_sha256_with_query, get_opts, has_replication_retention_update, namespace_reserved_user_metadata,
@@ -70,8 +68,7 @@ use super::storage_api::multipart_usecase::sse::{
     multipart_completion_authorization, sse_decryption, sse_prepare_encryption,
 };
 use super::storage_api::multipart_usecase::{
-    StorageObjectInfo as ObjectInfo, StorageObjectOptions as ObjectOptions, StoragePutObjReader as PutObjReader,
-    validate_new_object_key,
+    StorageObjectOptions as ObjectOptions, StoragePutObjReader as PutObjReader, validate_new_object_key,
 };
 use crate::app::object::{
     ConcurrencyManager, ForegroundWriteAdmission, get_concurrency_manager, put_object_body_read_timeout,
@@ -290,20 +287,42 @@ impl DefaultMultipartUsecase {
 /// or completed".
 fn multipart_upload_api_error(err: StorageError) -> S3Error {
     if matches!(err, StorageError::MalformedUploadID(_)) {
-        let mut error = S3Error::new(S3ErrorCode::NoSuchUpload);
-        if let Some(message) = error.code().default_message() {
-            error.set_message(message);
-        }
-        return error;
+        return S3Error::with_default_message(S3ErrorCode::NoSuchUpload);
     }
     ApiError::from(err).into()
+}
+
+#[cfg(test)]
+fn completion_part(number: i32, stored: Option<&str>) -> rustfs_gateway_types::dto::CompletedPart {
+    rustfs_gateway_types::dto::CompletedPart {
+        part_number: number,
+        e_tag: stored.map(crate::app::dto_values::stored_etag),
+        ..Default::default()
+    }
+}
+
+#[cfg(test)]
+fn completion_input(
+    bucket: &str,
+    key: &str,
+    upload_id: &str,
+    parts: Vec<rustfs_gateway_types::dto::CompletedPart>,
+) -> rustfs_gateway_types::dto::CompleteMultipartUploadInput {
+    use rustfs_gateway_types::{BucketName, ObjectKey, UploadIdClaim, dto};
+    dto::CompleteMultipartUploadInput {
+        bucket: BucketName::new(bucket).expect("test bucket"),
+        key: ObjectKey::new(key).expect("test key"),
+        upload_id: UploadIdClaim::from_wire(upload_id),
+        multipart_upload: dto::CompletedMultipartUpload { parts },
+        ..Default::default()
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::test_support::*;
     use super::*;
-    use crate::app::storage_api::s3::dto::{CompleteMultipartUploadInput, CreateMultipartUploadInput, ServerSideEncryption};
+    use crate::app::storage_api::s3::dto::{CreateMultipartUploadInput, ServerSideEncryption};
 
     #[test]
     fn internal_object_info_lookup_opts_drops_http_preconditions() {
@@ -552,27 +571,15 @@ mod tests {
                 )
                 .await
             {
-                Err(error) => crate::app::storage_api::s3::S3Error::from(error),
+                Err(error) => error,
                 Ok(_) => panic!("reserved key must be rejected before accessing storage"),
             };
-            assert_eq!(error.code(), &crate::app::storage_api::s3::S3ErrorCode::InvalidArgument);
+            assert_eq!(error.code(), &rustfs_s3_types::S3ErrorCode::InvalidArgument);
 
-            let complete = CompleteMultipartUploadInput::builder()
-                .bucket("bucket".to_owned())
-                .key(key.to_owned())
-                .upload_id("upload".to_owned())
-                .multipart_upload(Some(CompletedMultipartUpload::default()))
-                .build()
-                .expect("valid complete request DTO");
-            let error =
-                match rustfs_gateway_types::compat::s3s_5761ddfe::generated::ops::complete_multipart_upload::input_from_s3s(
-                    complete,
-                ) {
-                    Err(error) => crate::app::dto_values::seam_error(error),
-                    Ok(input) => Box::pin(make_usecase().execute_complete_multipart_upload(owned_envelope(Method::POST), input))
-                        .await
-                        .expect_err("uploads created before the fix must not publish reserved keys"),
-                };
+            let complete = completion_input("bucket", key, "upload", vec![]);
+            let error = Box::pin(make_usecase().execute_complete_multipart_upload(owned_envelope(Method::POST), complete))
+                .await
+                .expect_err("uploads created before the fix must not publish reserved keys");
             assert_eq!(error.code(), &rustfs_s3_types::S3ErrorCode::InvalidArgument);
         }
     }
@@ -631,10 +638,7 @@ mod tests {
     fn multipart_handlers_reject_another_callers_denied_kms_upload() {
         crate::app::gating_test_env::run_large_stack_test("mpu-kms-current-caller", || async {
             use crate::app::storage_api::s3::S3ErrorCode;
-            use crate::app::storage_api::s3::dto::{
-                CompleteMultipartUploadInput, CompletedMultipartUpload, CompletedPart, CopySource, StreamingBlob,
-                UploadPartCopyInput, UploadPartInput,
-            };
+            use crate::app::storage_api::s3::dto::{StreamingBlob, UploadPartInput};
             use crate::app::storage_api::test::ReqInfo;
             use crate::app::storage_api::test::sse::{
                 RecordingKmsKeyAuthorizer, TestAuthorizationHooks, sse_kms_object_metadata,
@@ -697,45 +701,88 @@ mod tests {
             part.content_length = Some(3);
             // Keep typed request construction separate: each real handler must
             // consult the destination envelope before encryption or commit.
+            let part_request = denied_request(part, authorizer.clone());
+            // Same facts `RequestEnvelope::from_s3s` copies. Credentials, region, and service stay absent.
+            let part_envelope = crate::app::RequestEnvelope::from_parts(
+                crate::app::RequestHead {
+                    method: part_request.method,
+                    uri: part_request.uri,
+                    headers: part_request.headers,
+                    credentials: None,
+                    region: None,
+                    service: None,
+                },
+                part_request.extensions,
+            );
             let error = usecase
-                .execute_upload_part(denied_request(part, authorizer.clone()))
+                .execute_upload_part_with_audit(
+                    part_envelope,
+                    UploadPartWriteInput::from_legacy(part_request.input, part_request.trailing_headers),
+                )
                 .await
-                .expect_err("denied part");
+                .map_err(crate::error::legacy_error_for_test)
+                .err()
+                .expect("denied part");
             assert_eq!(error.code(), &S3ErrorCode::AccessDenied);
-            let copy = UploadPartCopyInput::builder()
-                .bucket(bucket.clone())
-                .key(key.to_string())
-                .upload_id(upload.upload_id.clone())
-                .part_number(1)
-                .copy_source(CopySource::Bucket {
-                    bucket: bucket.clone().into(),
-                    key: "source".into(),
-                    version_id: None,
-                })
-                .build()
-                .expect("copy");
-            let copy_req = denied_request(copy, authorizer.clone());
+            let copy_request = denied_request((), authorizer.clone());
+            // Same facts `RequestEnvelope::from_s3s` copies. Credentials, region, and service stay absent.
+            let copy_envelope = crate::app::RequestEnvelope::from_parts(
+                crate::app::RequestHead {
+                    method: copy_request.method,
+                    uri: copy_request.uri,
+                    headers: copy_request.headers,
+                    credentials: None,
+                    region: None,
+                    service: None,
+                },
+                copy_request.extensions,
+            );
             let error = usecase
-                .execute_upload_part_copy(copy_req)
+                .execute_upload_part_copy_with_audit(
+                    copy_envelope,
+                    UploadPartCopyWriteInput {
+                        target: UploadPartTarget::Legacy {
+                            bucket: bucket.clone(),
+                            key: key.to_string(),
+                            upload_id: upload.upload_id.clone(),
+                        },
+                        part_number: 1,
+                        copy_source: rustfs_gateway_types::CopySourceValue::Bucket {
+                            bucket: bucket.clone(),
+                            key: "source".to_owned(),
+                            version_id: None,
+                        },
+                        copy_source_range: None,
+                        copy_source_if_match: None,
+                        copy_source_if_none_match: None,
+                        copy_source_dates: Default::default(),
+                        sse_customer_algorithm: None,
+                        sse_customer_key: None,
+                        sse_customer_key_md5: None,
+                        copy_source_sse_customer_algorithm: None,
+                        copy_source_sse_customer_key: None,
+                        copy_source_sse_customer_key_md5: None,
+                    },
+                )
                 .await
-                .expect_err("denied destination copy");
-            assert_eq!(error.code(), &S3ErrorCode::AccessDenied);
-            let complete = CompleteMultipartUploadInput::builder()
-                .bucket(bucket.clone())
-                .key(key.to_string())
-                .upload_id(upload.upload_id.clone())
-                .multipart_upload(Some(CompletedMultipartUpload {
-                    parts: Some(vec![CompletedPart {
-                        part_number: Some(1),
-                        e_tag: Some(crate::app::storage_api::s3::dto::ETag::Strong("etag".to_string())),
-                        ..Default::default()
-                    }]),
-                }))
-                .build()
-                .expect("complete");
-            let complete_req = denied_request(complete, authorizer.clone());
-            let error = usecase
-                .complete_for_s3s_request(complete_req)
+                .err()
+                .expect("denied destination copy");
+            assert_eq!(error.code(), &rustfs_s3_types::S3ErrorCode::AccessDenied);
+            let complete = completion_input(&bucket, key, &upload.upload_id, vec![completion_part(1, Some("etag"))]);
+            let complete_request = denied_request((), authorizer.clone());
+            // Same facts `RequestEnvelope::from_s3s` copies. Credentials, region, and service stay absent.
+            let envelope = crate::app::RequestEnvelope::from_parts(
+                crate::app::RequestHead {
+                    method: complete_request.method,
+                    uri: complete_request.uri,
+                    headers: complete_request.headers,
+                    credentials: None,
+                    region: None,
+                    service: None,
+                },
+                complete_request.extensions,
+            );
+            let error = Box::pin(usecase.execute_complete_multipart_upload(envelope, complete))
                 .await
                 .expect_err("denied completion");
             assert_eq!(error.code(), &rustfs_s3_types::S3ErrorCode::AccessDenied);
@@ -767,21 +814,21 @@ mod tests {
                 )
                 .await
                 .expect("trusted owner completes upload");
-            let replay = CompleteMultipartUploadInput::builder()
-                .bucket(bucket.clone())
-                .key(key.to_string())
-                .upload_id(upload.upload_id)
-                .multipart_upload(Some(CompletedMultipartUpload {
-                    parts: Some(vec![CompletedPart {
-                        part_number: Some(1),
-                        e_tag: Some(crate::app::storage_api::s3::dto::ETag::Strong("guessed-etag".to_string())),
-                        ..Default::default()
-                    }]),
-                }))
-                .build()
-                .expect("replay");
-            let error = usecase
-                .complete_for_s3s_request(denied_request(replay, authorizer.clone()))
+            let replay = completion_input(&bucket, key, &upload.upload_id, vec![completion_part(1, Some("guessed-etag"))]);
+            let replay_request = denied_request((), authorizer.clone());
+            // Same facts `RequestEnvelope::from_s3s` copies. Credentials, region, and service stay absent.
+            let envelope = crate::app::RequestEnvelope::from_parts(
+                crate::app::RequestHead {
+                    method: replay_request.method,
+                    uri: replay_request.uri,
+                    headers: replay_request.headers,
+                    credentials: None,
+                    region: None,
+                    service: None,
+                },
+                replay_request.extensions,
+            );
+            let error = Box::pin(usecase.execute_complete_multipart_upload(envelope, replay))
                 .await
                 .expect_err("replay must authorize before comparing guessed part metadata");
             assert_eq!(error.code(), &rustfs_s3_types::S3ErrorCode::AccessDenied);
@@ -810,10 +857,9 @@ mod tests {
         requested_kms_key_id: Option<&str>,
         customer_key: Option<(&str, &str)>,
     ) -> (Vec<(&'static str, SseResponseFields)>, Vec<String>) {
-        use crate::app::storage_api::s3::dto::{CompletedPart, CopySource, StreamingBlob, UploadPartInput};
+        use crate::app::storage_api::s3::dto::{StreamingBlob, UploadPartInput};
         use crate::app::storage_api::test::contract::object::ObjectIO as _;
         use rustfs_gateway::{Limits, MetaView, OperationCodec, TargetKind, WireRequest};
-        use rustfs_gateway_types::compat::s3s_5761ddfe::generated::ops::complete_multipart_upload;
 
         let store = crate::app::gating_test_env::shared_gating_ecstore().await;
         let usecase = DefaultMultipartUsecase::from_global();
@@ -886,14 +932,15 @@ mod tests {
                     upload_id: upload_id.clone(),
                 },
                 part_number: 2,
-                copy_source: rustfs_gateway_types::compat::s3s_5761ddfe::copy_source::from_s3s(CopySource::Bucket {
+                copy_source: rustfs_gateway_types::CopySourceValue::Bucket {
                     bucket: bucket.into(),
-                    key: source_key.into(),
+                    key: source_key,
                     version_id: None,
-                }),
+                },
                 copy_source_range: None,
                 copy_source_if_match: None,
                 copy_source_if_none_match: None,
+                copy_source_dates: Default::default(),
                 sse_customer_algorithm: customer_algorithm.clone(),
                 sse_customer_key: customer_key.clone(),
                 sse_customer_key_md5: customer_key_md5.clone(),
@@ -905,27 +952,10 @@ mod tests {
         .await
         .expect("copy part");
 
-        let mut complete_input = complete_multipart_upload::input_from_s3s(CompleteMultipartUploadInput {
-            bucket: bucket.to_string(),
-            key: key.to_string(),
-            upload_id,
-            multipart_upload: Some(CompletedMultipartUpload {
-                parts: Some(vec![CompletedPart {
-                    part_number: Some(1),
-                    ..Default::default()
-                }]),
-            }),
-            sse_customer_algorithm: customer_algorithm,
-            sse_customer_key: customer_key,
-            sse_customer_key_md5: customer_key_md5,
-            ..Default::default()
-        })
-        .map_err(crate::app::dto_values::seam_error)
-        .expect("owned completion input");
-        complete_input.multipart_upload.parts[0].e_tag = part
-            .e_tag
-            .as_deref()
-            .map(|tag| rustfs_gateway_types::ETag::from_stored(to_s3s_etag(tag).value().to_owned()));
+        let mut complete_input = completion_input(bucket, key, &upload_id, vec![completion_part(1, part.e_tag.as_deref())]);
+        complete_input.sse_customer_algorithm = customer_algorithm;
+        complete_input.sse_customer_key = customer_key.map(rustfs_gateway_types::SseCustomerKey::new);
+        complete_input.sse_customer_key_md5 = customer_key_md5;
         let complete = Box::pin(usecase.execute_complete_multipart_upload(owned_envelope(Method::POST), complete_input))
             .await
             .expect("complete multipart upload");
@@ -937,7 +967,9 @@ mod tests {
             .body(bytes::Bytes::new())
             .expect("wire request");
         let wire = WireRequest::accept(request, &Limits::default()).expect("accepted wire request");
-        let view = MetaView::of(&wire, TargetKind::Object).expect("object view");
+        let view = MetaView::of(&wire, TargetKind::Object)
+            .expect("object view")
+            .with_rustfs_response_layout();
         let encoded = rustfs_gateway::dto::CompleteMultipartUpload::encode(complete.clone(), &view, 200)
             .expect("completion response encodes");
         let mut completion_sse_headers: Vec<String> = encoded

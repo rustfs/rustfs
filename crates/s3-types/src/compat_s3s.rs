@@ -12,34 +12,16 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! The legacy edge between RustFS's S3 error and body types and the s3s ones.
-//!
-//! Responsible for: the `From` conversions in both directions (errors field by
-//! field; bodies frame by frame, keeping errors and the size hint), and the
-//! parity tests that pin this crate's statuses, parsing and body length
-//! reporting to the pinned s3s revision, which the tests use as an oracle.
-//! Not responsible for: anything the s3s-facing `impl S3` does with the result,
-//! the default messages s3s attaches to a bare code (restored by s3s's own
-//! constructor on the way out, never stored here), or read limits: a limit
-//! armed on an s3s body (`set_limit`) keeps applying inside the wrapped body,
-//! and our `Body` carries none, so none is armed on the way back.
-//! Upstream: `legacy_s3s`, the s3s package under the name the edge knows it
-//! by. Downstream: `rustfs` with the `compat-s3s` feature.
-//! DELETE BY T4.2 (rustfs/backlog#2784).
-//!
-//! Footprint note: `scripts/check_s3s_footprint.sh` counts files whose Rust
-//! paths name the s3s crate directly. This file reaches s3s through the
-//! renamed dependency, so that counter does not see it. The rename is stated here and
-//! in the PR rather than hidden; the edge whitelist of T0.6
-//! (rustfs/backlog#2741) is expected to list this file explicitly.
+#![cfg(test)]
+
+//! Test-only conversions for differential checks against the pinned S3 stack.
 
 use crate::{Body, Region, S3Error, S3ErrorCode};
 use std::borrow::Cow;
 use std::fmt;
 
 // Bodies cross the legacy edge as opaque frame streams: nothing is buffered,
-// and errors and the size hint pass through untouched. DELETE BY T4.2
-// (rustfs/backlog#2784) with the rest of this file.
+// and errors and the size hint pass through untouched.
 impl From<legacy_s3s::Body> for Body {
     fn from(body: legacy_s3s::Body) -> Self {
         Self::from_http_body(body)
@@ -133,14 +115,25 @@ impl From<S3Error> for legacy_s3s::S3Error {
     }
 }
 
-impl S3Error {
-    /// The pinned legacy serializer's XML response. Call sites stay on this type.
-    /// DELETE BY T4.2 with the rest of this file.
-    pub fn to_http_response(self) -> Result<http::Response<crate::Body>, Self> {
-        let response = legacy_s3s::S3Error::from(self).to_http_response().map_err(Self::from)?;
-        let (parts, body) = response.into_parts();
-        Ok(http::Response::from_parts(parts, crate::Body::from(body)))
-    }
+/// A converted error's original fields survive when its code did not change.
+pub(super) fn restore_http_response_parts(parts: &mut crate::S3ErrorParts) -> bool {
+    let Some(original) = parts
+        .source
+        .as_deref()
+        .and_then(|source| source.downcast_ref::<LegacyCause>())
+        .map(|cause| &cause.0)
+        .filter(|error| error.code() == &parts.code.clone().into())
+    else {
+        return false;
+    };
+    parts.message = parts
+        .message
+        .take()
+        .or_else(|| original.message().map(|text| Cow::Owned(text.to_owned())));
+    parts.request_id = parts.request_id.take().or_else(|| original.request_id().map(str::to_owned));
+    parts.status = parts.status.or_else(|| original.status_code());
+    parts.headers = parts.headers.take().or_else(|| original.headers().cloned());
+    true
 }
 
 impl From<legacy_s3s::S3Error> for S3Error {
@@ -252,7 +245,10 @@ mod tests {
     fn every_code_matches_the_s3s_default_message() {
         let mut mismatches = Vec::new();
         for code in S3ErrorCode::NAMED {
-            let legacy = oracle(code.as_str()).default_message();
+            let legacy_error = legacy_s3s::S3Error::new(oracle(code.as_str()));
+            let owned_error = S3Error::with_default_message(code.clone());
+            assert_eq!(owned_error.message(), legacy_error.message(), "{code}");
+            let legacy = legacy_error.code().default_message();
             if legacy.is_none() {
                 mismatches.push(format!("{code}: s3s has no default message"));
             }
@@ -264,6 +260,9 @@ mod tests {
         for custom in ["TierNotFound", "NoSuchKey", ""] {
             assert_eq!(legacy_s3s::S3ErrorCode::Custom(custom.into()).default_message(), None, "{custom}");
             assert_eq!(S3ErrorCode::Custom(custom.into()).default_message(), None, "{custom}");
+            let owned = S3Error::with_default_message(S3ErrorCode::Custom(custom.into()));
+            let legacy = legacy_s3s::S3Error::new(legacy_s3s::S3ErrorCode::Custom(custom.into()));
+            assert_eq!(owned.message(), legacy.message(), "{custom}");
         }
     }
 
@@ -838,5 +837,4 @@ mod tests {
     }
 }
 
-#[cfg(test)]
 mod call_site_codes;

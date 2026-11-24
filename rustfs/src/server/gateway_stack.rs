@@ -563,4 +563,187 @@ impl IamKeyLookup for ServerIam {
 }
 
 #[cfg(test)]
+mod snowball_tests {
+    use super::*;
+    use crate::app::storage_api::error::is_err_object_not_found;
+    use crate::app::storage_api::test::StorageObjectOptions;
+    use crate::app::storage_api::test::contract::bucket::{BucketOperations as _, MakeBucketOptions};
+    use crate::app::storage_api::test::contract::object::ObjectOperations as _;
+    use bytes::Bytes;
+    use http_body_util::BodyExt as _;
+    use rustfs_gateway_stream::Body;
+    use tokio_tar::Header;
+    use uuid::Uuid;
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn snowball_extract_preserves_sha256_failure_after_sniffing() {
+        let store = crate::app::gating_test_env::shared_gating_ecstore().await;
+        if crate::runtime_sources::current_app_context().is_none() {
+            crate::runtime_sources::install_test_app_context(Arc::clone(&store)).await;
+        }
+        let ambient = crate::runtime_sources::current_app_context().expect("Snowball gateway test requires an AppContext");
+        let context = Arc::new(crate::runtime_sources::AppContext::new(Arc::clone(&store), ambient.iam(), ambient.kms()));
+        let bucket = format!("extract-body-error-{}", Uuid::new_v4());
+        store
+            .make_bucket(&bucket, &MakeBucketOptions::default())
+            .await
+            .expect("create extract test bucket");
+        let mut header = Header::new_gnu();
+        header.set_path("member.txt").expect("valid member path");
+        header.set_size(0);
+        header.set_mode(0o644);
+        header.set_cksum();
+        let mut archive = header.as_bytes().to_vec();
+        archive.extend_from_slice(&[0; 1024]);
+        let archive = Bytes::from(archive);
+        let slot = ServerContextSlot::new();
+        assert!(slot.install(Arc::clone(&context)));
+        let gateway = TestGateway::over(&context, slot);
+        for valid in [false, true] {
+            let digest = if valid {
+                rustfs_utils::crypto::hex_sha256(&archive, str::to_owned)
+            } else {
+                "00".repeat(32)
+            };
+            // The first frame supplies the sniff prefix. The gateway compares the signed
+            // payload digest when it reaches the end of the second frame.
+            let body = Body::from_segments([archive.slice(..16), archive.slice(16..)]);
+            let request = http::Request::put(format!("http://localhost/{bucket}/archive.tar"))
+                .header(http::header::HOST, "localhost")
+                .header(http::header::CONTENT_LENGTH, archive.len())
+                .header("x-amz-meta-snowball-auto-extract", "true")
+                .header("x-amz-content-sha256", digest)
+                .body(body)
+                .expect("build Snowball upload");
+            let request = rustfs_signer::try_sign_v4(
+                request,
+                i64::try_from(archive.len()).expect("archive length fits i64"),
+                TestGateway::ACCESS_KEY,
+                TestGateway::SECRET_KEY,
+                "",
+                "us-east-1",
+            )
+            .expect("sign Snowball upload");
+            let response = gateway.call(request).await;
+            let status = response.status();
+            let response = response
+                .into_body()
+                .collect()
+                .await
+                .expect("collect Snowball response")
+                .to_bytes();
+            if valid {
+                assert_eq!(status, http::StatusCode::OK, "{response:?}");
+                assert_eq!(
+                    store
+                        .get_object_info(&bucket, "member.txt", &StorageObjectOptions::default())
+                        .await
+                        .expect("matching digest must extract the member")
+                        .size,
+                    0
+                );
+            } else {
+                assert_eq!(status, http::StatusCode::BAD_REQUEST, "{response:?}");
+                assert!(
+                    std::str::from_utf8(&response)
+                        .expect("S3 error response is UTF-8")
+                        .contains("<Code>XAmzContentSHA256Mismatch</Code>"),
+                    "{response:?}"
+                );
+                let missing = store
+                    .get_object_info(&bucket, "member.txt", &StorageObjectOptions::default())
+                    .await
+                    .expect_err("rejected archive cannot publish a member");
+                assert!(is_err_object_not_found(&missing), "{missing}");
+            }
+            let missing = store
+                .get_object_info(&bucket, "archive.tar", &StorageObjectOptions::default())
+                .await
+                .expect_err("the archive itself must not be stored");
+            assert!(is_err_object_not_found(&missing), "{missing}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod object_lock_tests {
+    use super::*;
+    use crate::app::storage_api::test::contract::bucket::{BucketOperations as _, MakeBucketOptions};
+    use bytes::Bytes;
+    use http::{Method, StatusCode};
+    use http_body_util::BodyExt as _;
+    use md5::Digest as _;
+    use rustfs_gateway_types::persistence::parse_object_lock;
+    use uuid::Uuid;
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn object_lock_round_trips_the_default_retention() {
+        let ambient = crate::app::gating_test_env::shared_gating_ambient().await;
+        let store = crate::app::gating_test_env::shared_gating_ecstore().await;
+        let context = Arc::new(crate::runtime_sources::AppContext::new(Arc::clone(&store), ambient.iam(), ambient.kms()));
+        let slot = ServerContextSlot::new();
+        assert!(slot.install(Arc::clone(&context)));
+        let gateway = TestGateway::over(&context, slot);
+        let bucket = format!("lock-config-{}", Uuid::new_v4());
+        store
+            .make_bucket(
+                &bucket,
+                &MakeBucketOptions {
+                    lock_enabled: true,
+                    versioning_enabled: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("create object-lock bucket");
+
+        let xml = b"<ObjectLockConfiguration><ObjectLockEnabled>Enabled</ObjectLockEnabled>\
+            <Rule><DefaultRetention><Mode>GOVERNANCE</Mode><Days>30</Days></DefaultRetention></Rule></ObjectLockConfiguration>";
+        let target = format!("/{bucket}?object-lock");
+        let checksum = base64_simd::STANDARD.encode_to_string(md5::Md5::digest(xml));
+        let put = gateway
+            .signed(Method::PUT, &target, vec![("content-md5", checksum)], Bytes::from_static(xml))
+            .await
+            .expect("PUT Object Lock configuration");
+        let put_status = put.status();
+        let put_body = put
+            .into_body()
+            .collect()
+            .await
+            .expect("collect PUT Object Lock response")
+            .to_bytes();
+        assert_eq!(put_status, StatusCode::OK, "{}", String::from_utf8_lossy(&put_body));
+
+        let (stored, _) = crate::storage_api::server::gateway_stack::get_object_lock_config(&bucket)
+            .await
+            .expect("stored lock config");
+        assert_eq!(stored.object_lock_enabled.as_deref(), Some("Enabled"));
+
+        let get = gateway
+            .signed(Method::GET, &target, vec![], Bytes::new())
+            .await
+            .expect("GET Object Lock configuration");
+        assert_eq!(get.status(), StatusCode::OK);
+        let body = get
+            .into_body()
+            .collect()
+            .await
+            .expect("collect GET Object Lock response")
+            .to_bytes();
+        let returned = parse_object_lock(&body).expect("get lock configuration");
+        assert_eq!(returned, stored);
+        let retention = returned
+            .rule
+            .expect("stored Object Lock rule")
+            .default_retention
+            .expect("stored default retention");
+        assert_eq!(retention.mode.as_deref(), Some("GOVERNANCE"));
+        assert_eq!(retention.days, Some(30));
+        assert_eq!(retention.years, None);
+    }
+}
+
+#[cfg(test)]
 mod tests;

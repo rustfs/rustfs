@@ -15,9 +15,7 @@
 use crate::storage_api::startup::lifecycle::ECStore;
 use crate::{
     connect::runtime::shutdown_connect_runtimes,
-    server::{
-        SHUTDOWN_TIMEOUT, ServiceStateManager, ShutdownHandle, start_persisted_event_notifier_reconciler, wait_for_shutdown,
-    },
+    server::{ServiceStateManager, ShutdownHandle, start_persisted_event_notifier_reconciler, wait_for_shutdown},
     startup_iam::{IamBootstrapDisposition, publish_ready_for_iam_bootstrap},
     startup_runtime_sources,
     startup_services::StartupServiceRuntime,
@@ -25,7 +23,7 @@ use crate::{
 };
 use rustfs_common::GlobalReadiness;
 use rustfs_object_capacity::capacity_manager::CapacityBackgroundTasks;
-use rustfs_scanner::init_scanner_with_recovery;
+use rustfs_scanner::{init_scanner_with_recovery, scanner::SCANNER_PRODUCTION_SHUTDOWN_GRACE};
 use std::{
     io::{Error, Result},
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
@@ -311,7 +309,7 @@ pub(crate) async fn wait_for_scanner_cleanup(cleanup: tokio::task::JoinHandle<()
     // Dropping a JoinHandle detaches rather than aborts the task. Keep an
     // in-flight reset's guards owned while this runtime remains alive. This
     // bounded wait does not prove I/O drain at a later runtime/process exit.
-    match tokio::time::timeout(SHUTDOWN_TIMEOUT, cleanup).await {
+    match tokio::time::timeout(SCANNER_PRODUCTION_SHUTDOWN_GRACE, cleanup).await {
         Ok(Ok(())) => true,
         Ok(Err(error)) => {
             tracing::warn!(
@@ -333,7 +331,7 @@ pub(crate) async fn wait_for_scanner_cleanup(cleanup: tokio::task::JoinHandle<()
                 subsystem = LOG_SUBSYSTEM_STARTUP,
                 state = "scanner_cleanup_not_joined",
                 reason = "timeout",
-                timeout_secs = SHUTDOWN_TIMEOUT.as_secs(),
+                timeout_secs = SCANNER_PRODUCTION_SHUTDOWN_GRACE.as_secs(),
                 "Scanner cleanup completion is unconfirmed; task was not aborted"
             );
             false
@@ -468,6 +466,12 @@ mod tests {
     #[tokio::test]
     async fn disabled_cleanup_shutdown_joins_a_finished_task() {
         assert!(wait_for_scanner_cleanup(tokio::spawn(async {})).await);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn scanner_cleanup_shutdown_joins_work_that_takes_several_seconds() {
+        let cleanup = tokio::spawn(tokio::time::sleep(std::time::Duration::from_secs(5)));
+        assert!(wait_for_scanner_cleanup(cleanup).await);
     }
 
     #[tokio::test]

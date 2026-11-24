@@ -17,13 +17,42 @@
 //! configuration must be set before either process initializes the store.
 
 use super::*;
-use crate::app::storage_api::s3::S3ErrorCode;
-use crate::app::storage_api::s3::dto::GetObjectInput;
 use crate::app::storage_api::test::contract::bucket::{BucketOperations as _, MakeBucketOptions};
 use futures::stream;
-use http::{HeaderValue, Method};
+use http::{HeaderMap, HeaderValue, StatusCode};
 use metrics_util::debugging::{DebugValue, DebuggingRecorder};
 use std::time::Instant;
+
+// The baseline installer replaces only this module to call that revision's GET API.
+mod get_api {
+    use super::*;
+    use crate::app::test_seams::{get_envelope, get_object_gateway, get_object_input};
+    use rustfs_gateway_stream::PayloadRead;
+    use std::future::poll_fn;
+
+    pub(super) async fn get(
+        usecase: &DefaultObjectUsecase,
+        object: &str,
+        headers: HeaderMap,
+    ) -> rustfs_s3_types::S3Result<crate::app::Answered<GetObjectOutputFacts>> {
+        let input = get_object_input("conditional-bench", object, None);
+        let envelope = get_envelope(headers, http::Extensions::new());
+        get_object_gateway(usecase, envelope, input).await
+    }
+
+    pub(super) async fn consume(body: GetObjectBody, actual: &mut Vec<u8>) {
+        match body {
+            GetObjectBody::Bytes(bytes) => actual.extend_from_slice(&bytes),
+            GetObjectBody::Stream(mut body) => {
+                while let PayloadRead::Chunk(chunk) =
+                    poll_fn(|cx| body.as_mut().poll_read(cx)).await.expect("benchmark body chunk")
+                {
+                    actual.extend_from_slice(&chunk);
+                }
+            }
+        }
+    }
+}
 
 fn percentile(samples: &mut [f64], percent: usize) -> f64 {
     assert!(!samples.is_empty(), "benchmark must collect samples");
@@ -33,33 +62,25 @@ fn percentile(samples: &mut [f64], percent: usize) -> f64 {
 
 async fn read_once(usecase: &DefaultObjectUsecase, object: &str, etag: &str, kind: &str, expected: &[u8]) -> f64 {
     let start = Instant::now();
-    let mut req = build_request(
-        GetObjectInput::builder()
-            .bucket("conditional-bench".to_owned())
-            .key(object.to_owned())
-            .build()
-            .expect("benchmark input"),
-        Method::GET,
-    );
+    let mut headers = HeaderMap::new();
     if kind != "unconditional" {
         let tag = if kind == "hit" { etag } else { "unmatched-benchmark-etag" };
-        req.headers.insert(
+        headers.insert(
             http::header::IF_NONE_MATCH,
             HeaderValue::from_str(&format!("\"{tag}\"")).expect("benchmark condition"),
         );
     }
-    match usecase.execute_get_object_from_s3s(req).await {
+    match get_api::get(usecase, object, headers).await {
         Err(error) => {
             assert_eq!(kind, "hit");
-            assert_eq!(error.code(), &S3ErrorCode::NotModified);
+            assert_eq!(error.code().as_str(), "NotModified");
+            assert_eq!(error.status_code(), Some(StatusCode::NOT_MODIFIED));
         }
-        Ok(mut response) => {
+        Ok(response) => {
             assert_ne!(kind, "hit");
-            let mut body = response.output.body.take().expect("benchmark body");
+            assert_eq!(response.status.unwrap_or(StatusCode::OK), StatusCode::OK);
             let mut actual = Vec::with_capacity(expected.len());
-            while let Some(chunk) = body.next().await {
-                actual.extend_from_slice(&chunk.expect("benchmark body chunk"));
-            }
+            get_api::consume(response.output.body.expect("benchmark body"), &mut actual).await;
             assert_eq!(actual, expected, "benchmark must consume and validate the whole body");
         }
     }

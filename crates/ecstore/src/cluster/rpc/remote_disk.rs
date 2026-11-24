@@ -5925,7 +5925,7 @@ impl DiskAPI for RemoteDisk {
 }
 
 #[cfg(test)]
-pub(crate) use tests::{with_lost_staged_shard_peer, with_staged_part_peer};
+pub(crate) use tests::{RenameBatchFallbackPeer, with_lost_staged_shard_peer, with_staged_part_peer};
 
 #[cfg(test)]
 mod tests {
@@ -6503,6 +6503,145 @@ mod tests {
             ],
             "each dispatch must use exactly one method; multipart publication must never downgrade",
         );
+        peer.stop().await;
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn rename_batch_unimplemented_releases_real_tonic_admission() {
+        runtime_sources::ensure_test_rpc_secret();
+        let peer = TestGrpcPeer::spawn(Bytes::new(), Bytes::new())
+            .await
+            .expect("rename batch peer must bind");
+        temp_env::async_with_vars([(ENV_RUSTFS_EXPERIMENTAL_RENAME_STREAM_BATCH, Some("true"))], async {
+            let remote = remote_disk_for_addr(&peer.addr).await;
+            let gate = Arc::clone(remote.rename_admission.as_ref().expect("rename admission enabled"));
+            let file_infos = vec![sample_rename_data_file_info(), sample_rename_data_file_info()];
+
+            let result = remote
+                .start_rename_data_batch("tmp", "source", "bucket", "object", rename_batch_client_items(&file_infos))
+                .await;
+            assert!(matches!(result, Err(RenameBatchStartError::UnsupportedBeforeStream)));
+            assert_eq!(peer.peer.rename_batch_calls(), 1, "the real peer must observe one batch attempt");
+            assert_eq!(
+                gate.available_permits(),
+                rustfs_protos::INTERNODE_CONTROL_RPC_CONCURRENCY_LIMIT,
+                "call-level UNIMPLEMENTED must release every batch permit without quarantine"
+            );
+
+            remote.cancel_token.cancel();
+            rustfs_protos::evict_failed_connection(&peer.addr).await;
+        })
+        .await;
+        peer.stop().await;
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn rename_batch_real_tonic_stream_decodes_out_of_order_items_and_releases_permits() {
+        runtime_sources::ensure_test_rpc_secret();
+        let peer = TestGrpcPeer::spawn(Bytes::new(), Bytes::new())
+            .await
+            .expect("rename batch peer must bind");
+        peer.peer.serve_rename_batch_results(usize::MAX);
+        temp_env::async_with_vars([(ENV_RUSTFS_EXPERIMENTAL_RENAME_STREAM_BATCH, Some("true"))], async {
+            let remote = remote_disk_for_addr(&peer.addr).await;
+            let gate = Arc::clone(remote.rename_admission.as_ref().expect("rename admission enabled"));
+
+            for width in [2_usize, 4] {
+                let file_infos = (0..width).map(|_| sample_rename_data_file_info()).collect::<Vec<_>>();
+                let mut stream = remote
+                    .start_rename_data_batch("tmp", "source", "bucket", "object", rename_batch_client_items(&file_infos))
+                    .await
+                    .unwrap_or_else(|_| panic!("{width}-item real batch must start"));
+                assert_eq!(
+                    gate.available_permits(),
+                    rustfs_protos::INTERNODE_CONTROL_RPC_CONCURRENCY_LIMIT - width,
+                    "the batch owns one permit per pending item"
+                );
+
+                for completed in 1..=width {
+                    let expected_slot = width - completed;
+                    let outcome = stream
+                        .next_outcome()
+                        .await
+                        .expect("real batch stream item must decode")
+                        .expect("real batch stream must contain every item");
+                    assert_eq!(outcome.slot, expected_slot, "the test peer returns items in reverse order");
+                    let response = outcome.result.expect("real batch result payload must decode");
+                    assert_eq!(response.sign, Some(u32::try_from(expected_slot).unwrap().to_be_bytes().to_vec()));
+                    assert_eq!(
+                        gate.available_permits(),
+                        rustfs_protos::INTERNODE_CONTROL_RPC_CONCURRENCY_LIMIT - width + completed,
+                        "each decoded item releases exactly one permit"
+                    );
+                }
+                assert!(stream.next_outcome().await.expect("complete real stream EOF").is_none());
+                drop(stream);
+                assert_eq!(gate.available_permits(), rustfs_protos::INTERNODE_CONTROL_RPC_CONCURRENCY_LIMIT);
+            }
+            assert_eq!(peer.peer.rename_batch_calls(), 2);
+
+            remote.cancel_token.cancel();
+            rustfs_protos::evict_failed_connection(&peer.addr).await;
+        })
+        .await;
+        peer.stop().await;
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn rename_batch_real_partial_eof_quarantines_only_missing_items() {
+        runtime_sources::ensure_test_rpc_secret();
+        let peer = TestGrpcPeer::spawn(Bytes::new(), Bytes::new())
+            .await
+            .expect("rename batch peer must bind");
+        peer.peer.serve_rename_batch_results(1);
+        temp_env::async_with_vars(
+            [
+                (ENV_RUSTFS_EXPERIMENTAL_RENAME_STREAM_BATCH, Some("true")),
+                (rustfs_config::ENV_DRIVE_MAX_TIMEOUT_DURATION, Some("1")),
+            ],
+            async {
+                let remote = remote_disk_for_addr(&peer.addr).await;
+                let gate = Arc::clone(remote.rename_admission.as_ref().expect("rename admission enabled"));
+                let file_infos = (0..4).map(|_| sample_rename_data_file_info()).collect::<Vec<_>>();
+                let mut stream = remote
+                    .start_rename_data_batch("tmp", "source", "bucket", "object", rename_batch_client_items(&file_infos))
+                    .await
+                    .unwrap_or_else(|_| panic!("real partial batch must start"));
+
+                let outcome = stream
+                    .next_outcome()
+                    .await
+                    .expect("the first real response must decode")
+                    .expect("the partial stream must return one response");
+                assert_eq!(outcome.slot, 3);
+                assert!(outcome.result.is_ok());
+                assert_eq!(
+                    gate.available_permits(),
+                    rustfs_protos::INTERNODE_CONTROL_RPC_CONCURRENCY_LIMIT - 3,
+                    "the completed item releases one permit before EOF"
+                );
+
+                let error = match stream.next_outcome().await {
+                    Err(error) => error,
+                    Ok(_) => panic!("real partial EOF must be commit-ambiguous"),
+                };
+                assert!(matches!(error, DiskError::Unexpected));
+                assert_eq!(peer.peer.rename_batch_calls(), 1);
+                assert_eq!(
+                    gate.available_permits(),
+                    rustfs_protos::INTERNODE_CONTROL_RPC_CONCURRENCY_LIMIT - 3,
+                    "only missing item permits enter the fresh ambiguity quarantine"
+                );
+
+                drop(stream);
+                remote.cancel_token.cancel();
+                rustfs_protos::evict_failed_connection(&peer.addr).await;
+            },
+        )
+        .await;
         peer.stop().await;
     }
 
@@ -7314,6 +7453,11 @@ mod tests {
         audience: String,
         disk_info_calls: Arc<AtomicU32>,
         read_all_calls: Arc<AtomicU32>,
+        rename_batch_calls: Arc<AtomicU32>,
+        rename_batch_disks: Arc<StdMutex<Vec<String>>>,
+        rename_batch_result_limit: Arc<StdMutex<Option<usize>>>,
+        serve_rename_data: Arc<AtomicBool>,
+        rename_data_disks: Arc<StdMutex<Vec<String>>>,
         object_read_all_disks: Arc<StdMutex<Vec<String>>>,
         format_data: Bytes,
         read_all_data: Bytes,
@@ -7342,6 +7486,11 @@ mod tests {
                 audience,
                 disk_info_calls: Arc::new(AtomicU32::new(0)),
                 read_all_calls: Arc::new(AtomicU32::new(0)),
+                rename_batch_calls: Arc::new(AtomicU32::new(0)),
+                rename_batch_disks: Arc::default(),
+                rename_batch_result_limit: Arc::default(),
+                serve_rename_data: Arc::default(),
+                rename_data_disks: Arc::default(),
                 object_read_all_disks: Arc::default(),
                 format_data,
                 read_all_data,
@@ -7365,6 +7514,35 @@ mod tests {
 
         fn read_all_calls(&self) -> u32 {
             self.read_all_calls.load(Ordering::Acquire)
+        }
+
+        fn serve_rename_batch_results(&self, limit: usize) {
+            *self
+                .rename_batch_result_limit
+                .lock()
+                .expect("rename batch result limit lock poisoned") = Some(limit);
+        }
+
+        fn rename_batch_calls(&self) -> u32 {
+            self.rename_batch_calls.load(Ordering::Acquire)
+        }
+
+        fn rename_batch_disks(&self) -> Vec<String> {
+            self.rename_batch_disks
+                .lock()
+                .expect("rename batch disks lock poisoned")
+                .clone()
+        }
+
+        fn serve_rename_data(&self) {
+            self.serve_rename_data.store(true, Ordering::Release);
+        }
+
+        fn rename_data_disks(&self) -> Vec<String> {
+            self.rename_data_disks
+                .lock()
+                .expect("rename data disks lock poisoned")
+                .clone()
         }
 
         fn object_read_all_disks(&self) -> Vec<String> {
@@ -7405,6 +7583,120 @@ mod tests {
 
         fn call(&mut self, request: http::Request<B>) -> Self::Future {
             match request.uri().path() {
+                "/node_service.NodeService/RenameData" if self.peer.serve_rename_data.load(Ordering::Acquire) => {
+                    #[derive(Clone)]
+                    struct RenameDataSvc(AuthenticatedReadPeer);
+
+                    impl tonic::server::UnaryService<RenameDataRequest> for RenameDataSvc {
+                        type Response = rustfs_protos::proto_gen::node_service::RenameDataResponse;
+                        type Future = Pin<Box<dyn Future<Output = std::result::Result<Response<Self::Response>, Status>> + Send>>;
+
+                        fn call(&mut self, request: Request<RenameDataRequest>) -> Self::Future {
+                            let peer = self.0.clone();
+                            Box::pin(async move {
+                                peer.verify_auth(&request, "/node_service.NodeService/RenameData")?;
+                                let canonical_body = rustfs_protos::canonical_rename_data_request_body(request.get_ref())
+                                    .map_err(|_| Status::invalid_argument("rename data body length"))?;
+                                crate::cluster::rpc::verify_tonic_mutation_body_digest(&request, &canonical_body)
+                                    .map_err(|_| Status::permission_denied("rename data body digest"))?;
+                                let request = request.into_inner();
+                                serde_json::from_str::<FileInfo>(&request.file_info)
+                                    .map_err(|error| Status::invalid_argument(error.to_string()))?;
+                                peer.rename_data_disks
+                                    .lock()
+                                    .expect("rename data disks lock poisoned")
+                                    .push(request.disk);
+                                let payload = serde_json::to_string(&RenameDataResp {
+                                    sign: Some(vec![1]),
+                                    ..Default::default()
+                                })
+                                .map_err(|error| Status::internal(error.to_string()))?;
+                                Ok(Response::new(rustfs_protos::proto_gen::node_service::RenameDataResponse {
+                                    success: true,
+                                    rename_data_resp: payload,
+                                    error: None,
+                                    rename_data_resp_bin: Bytes::new(),
+                                }))
+                            })
+                        }
+                    }
+
+                    let peer = self.peer.clone();
+                    Box::pin(async move {
+                        let method = RenameDataSvc(peer);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec);
+                        Ok(grpc.unary(method, request).await)
+                    })
+                }
+                "/node_service.NodeService/RenameDataBatch" => {
+                    type RenameBatchStream = Pin<
+                        Box<dyn futures_util::Stream<Item = std::result::Result<RenameDataBatchResult, Status>> + Send + 'static>,
+                    >;
+
+                    #[derive(Clone)]
+                    struct RenameDataBatchSvc(AuthenticatedReadPeer);
+
+                    impl tonic::server::ServerStreamingService<RenameDataBatchRequest> for RenameDataBatchSvc {
+                        type Response = RenameDataBatchResult;
+                        type ResponseStream = RenameBatchStream;
+                        type Future =
+                            Pin<Box<dyn Future<Output = std::result::Result<Response<Self::ResponseStream>, Status>> + Send>>;
+
+                        fn call(&mut self, request: Request<RenameDataBatchRequest>) -> Self::Future {
+                            let peer = self.0.clone();
+                            Box::pin(async move {
+                                peer.rename_batch_calls.fetch_add(1, Ordering::AcqRel);
+                                peer.rename_batch_disks
+                                    .lock()
+                                    .expect("rename batch disks lock poisoned")
+                                    .extend(request.get_ref().items.iter().map(|item| item.disk.clone()));
+                                let Some(limit) = *peer
+                                    .rename_batch_result_limit
+                                    .lock()
+                                    .expect("rename batch result limit lock poisoned")
+                                else {
+                                    return Err(Status::unimplemented("test peer does not support rename batch"));
+                                };
+                                peer.verify_auth(&request, "/node_service.NodeService/RenameDataBatch")?;
+                                let canonical_body = rustfs_protos::canonical_rename_data_batch_request_body(request.get_ref())
+                                    .map_err(|_| Status::invalid_argument("rename batch body length"))?;
+                                crate::cluster::rpc::verify_tonic_canonical_body_digest(&request, &canonical_body)
+                                    .map_err(|_| Status::permission_denied("rename batch body digest"))?;
+                                let responses = request
+                                    .into_inner()
+                                    .items
+                                    .into_iter()
+                                    .rev()
+                                    .take(limit)
+                                    .map(|item| {
+                                        let response = RenameDataResp {
+                                            sign: Some(item.item_index.to_be_bytes().to_vec()),
+                                            ..Default::default()
+                                        };
+                                        let payload = rmp_serde::to_vec_named(&response)
+                                            .map_err(|error| Status::internal(error.to_string()))?;
+                                        Ok(RenameDataBatchResult {
+                                            item_index: item.item_index,
+                                            success: true,
+                                            error: None,
+                                            rename_data_resp_msgpack: payload.into(),
+                                        })
+                                    })
+                                    .collect::<Vec<_>>();
+                                Ok(Response::new(Box::pin(tokio_stream::iter(responses)) as RenameBatchStream))
+                            })
+                        }
+                    }
+
+                    let peer = self.peer.clone();
+                    Box::pin(async move {
+                        let method = RenameDataBatchSvc(peer);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec);
+                        Ok(grpc.server_streaming(method, request).await)
+                    })
+                }
                 "/node_service.NodeService/DiskInfo" => {
                     #[derive(Clone)]
                     struct DiskInfoSvc(AuthenticatedReadPeer);
@@ -7685,6 +7977,44 @@ mod tests {
         }
     }
 
+    pub(crate) struct RenameBatchFallbackPeer(TestGrpcPeer);
+
+    impl RenameBatchFallbackPeer {
+        pub(crate) async fn spawn() -> Self {
+            let peer = TestGrpcPeer::spawn(Bytes::new(), Bytes::new())
+                .await
+                .expect("rename fallback peer must bind");
+            peer.peer.serve_rename_data();
+            Self(peer)
+        }
+
+        pub(crate) fn addr(&self) -> &str {
+            &self.0.addr
+        }
+
+        pub(crate) fn batch_calls(&self) -> u32 {
+            self.0.peer.rename_batch_calls()
+        }
+
+        pub(crate) fn batch_disks(&self) -> Vec<String> {
+            self.0.peer.rename_batch_disks()
+        }
+
+        pub(crate) fn unary_disks(&self) -> Vec<String> {
+            self.0.peer.rename_data_disks()
+        }
+
+        pub(crate) fn available_permits(&self) -> usize {
+            peer_rename_admission(&self.0.addr, true)
+                .expect("rename fallback admission enabled")
+                .available_permits()
+        }
+
+        pub(crate) async fn stop(self) {
+            self.0.stop().await;
+        }
+    }
+
     pub(crate) async fn with_staged_part_peer<F, Fut>(disk: crate::disk::DiskStore, exercise: F)
     where
         F: FnOnce(RemoteDisk, RemoteDisk) -> Fut,
@@ -7897,6 +8227,18 @@ mod tests {
             },
             ..Default::default()
         }
+    }
+
+    fn rename_batch_client_items(file_infos: &[FileInfo]) -> Vec<RenameBatchClientItem<'_>> {
+        file_infos
+            .iter()
+            .enumerate()
+            .map(|(slot, file_info)| RenameBatchClientItem {
+                slot,
+                disk: format!("disk-{slot}"),
+                file_info,
+            })
+            .collect()
     }
 
     fn sample_read_multiple_resp(file: &str, data: &[u8]) -> ReadMultipleResp {
