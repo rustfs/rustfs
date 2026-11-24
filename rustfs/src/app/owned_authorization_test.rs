@@ -669,22 +669,29 @@ async fn owned_and_legacy_delete_bucket_authorization_agree() {
         ("other-bucket", Some(("x-rustfs-force-delete", "maybe")), Some("AccessDenied")),
         ("force-delete-bucket", Some(("x-rustfs-force-delete", "true")), None),
     ] {
-        let mut legacy = build_request(
-            crate::app::storage_api::s3::dto::DeleteBucketInput {
-                bucket: bucket.to_owned(),
-                ..Default::default()
-            },
-            Method::DELETE,
-        );
+        // Method DELETE, URI `/`, and the force-delete header when this case sets one.
+        // Credentials, region, and service stay absent.
+        let mut headers = HeaderMap::new();
         if let Some((name, value)) = header {
-            legacy.headers.insert(name, HeaderValue::from_static(value));
+            headers.insert(name, HeaderValue::from_static(value));
         }
-        legacy.extensions.insert(Arc::clone(&slot));
-        legacy.extensions.insert(ReqInfo {
+        let mut extensions = Extensions::new();
+        extensions.insert(Arc::clone(&slot));
+        extensions.insert(ReqInfo {
             cred: Some(credentials.clone()),
             ..Default::default()
         });
-        let mut owned = envelope_from_request(&legacy);
+        let mut owned = RequestEnvelope::from_parts(
+            RequestHead {
+                method: Method::DELETE,
+                uri: Uri::from_static("/"),
+                headers,
+                credentials: None,
+                region: None,
+                service: None,
+            },
+            extensions,
+        );
         let owned_result = authorize_delete_bucket(&mut owned, bucket).await;
 
         let case = format!("{bucket} {header:?}");

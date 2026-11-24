@@ -4274,6 +4274,10 @@ impl DefaultObjectUsecase {
         let expiration = resolve_put_object_expiration(bucket, &info).await;
         record_get_object_s3_handler_stage_duration(GET_OBJECT_STAGE_LIFECYCLE_EXPIRATION, lifecycle_expiration_start);
         let storage_class = response_storage_class_name(&info, &info.user_defined);
+        let expires = info
+            .expires
+            .map(|value| value.format(RFC1123).map_err(S3Error::internal_error))
+            .transpose()?;
         let cache_control = info.user_defined.get("cache-control").cloned();
         let content_disposition = info.user_defined.get("content-disposition").cloned();
 
@@ -4292,6 +4296,7 @@ impl DefaultObjectUsecase {
                 content_encoding: info.content_encoding.clone(),
                 content_language: info.user_defined.get("content-language").cloned(),
                 cache_control,
+                expires: expires.map(Into::into),
                 content_disposition,
                 content_range,
                 parts_count,
@@ -12180,12 +12185,13 @@ mod tests {
 
     #[tokio::test]
     async fn build_get_object_output_context_returns_standard_headers() {
-        for (content_language, user_language) in [
-            (Some("zh-CN"), None),
-            (None, None),
-            (Some(""), None),
-            (Some("zh-CN"), Some("fr-FR")),
-            (None, Some("fr-FR")),
+        let stored_expires = time::macros::datetime!(2030-01-01 0:00 UTC);
+        for (content_language, user_language, expires) in [
+            (Some("zh-CN"), None, Some(stored_expires)),
+            (None, None, None),
+            (Some(""), None, None),
+            (Some("zh-CN"), Some("fr-FR"), None),
+            (None, Some("fr-FR"), None),
         ] {
             let mut metadata = HashMap::new();
             metadata.insert("cache-control".to_string(), "public, max-age=259200".to_string());
@@ -12201,6 +12207,7 @@ mod tests {
                 bucket: "test-bucket".to_string(),
                 name: "path/raw".to_string(),
                 user_defined: Arc::new(metadata),
+                expires,
                 ..Default::default()
             };
 
@@ -12259,6 +12266,10 @@ mod tests {
             assert_eq!(output.cache_control.as_deref(), Some("public, max-age=259200"));
             assert_eq!(output.content_disposition.as_deref(), Some("attachment; filename=\"demo.png\""));
             assert_eq!(output.content_language.as_deref(), content_language);
+            assert_eq!(
+                output.expires.as_ref().map(|value| value.as_str()),
+                expires.map(|_| "Tue, 01 Jan 2030 00:00:00 GMT")
+            );
             assert_eq!(output.metadata.get("content-language").map(String::as_str), user_language,);
             assert!(!output.metadata.contains_key("cache-control"));
             assert!(!output.metadata.contains_key("content-disposition"));

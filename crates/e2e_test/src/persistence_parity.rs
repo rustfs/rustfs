@@ -162,6 +162,7 @@ async fn capture(binary: &Path, peer: &Path, target: &FakeS3Target, clock: &str,
         .await?;
     let client = env.create_s3_client();
     write_configs(&env, &client, target).await?;
+    check_private_acl(&client, binary).await?;
     write_objects(&client).await?;
     let key: [u8; 32] = rand::random();
     let customer_key = base64_simd::STANDARD.encode_to_string(key);
@@ -212,6 +213,7 @@ async fn capture(binary: &Path, peer: &Path, target: &FakeS3Target, clock: &str,
     env.start_rustfs_server_from_binary_without_cleanup(peer, vec![], &options)
         .await?;
     let peer_client = env.create_s3_client();
+    check_private_acl(&peer_client, peer).await?;
     let locked = peer_client
         .get_object()
         .bucket(LOCKED)
@@ -319,6 +321,24 @@ async fn tag_and_read_versions(client: &Client, volume: &Path, locked_version: &
     Ok(versions)
 }
 
+async fn check_private_acl(client: &Client, reader: &Path) -> Result<(), Error> {
+    let acl = client.get_bucket_acl().bucket(CONFIGS).send().await?;
+    let owner = acl.owner().and_then(|owner| owner.id()).ok_or("ACL owner missing")?;
+    let [grant] = acl.grants() else { return Err("expected exactly one ACL grant".into()) };
+    let grantee = grant.grantee().ok_or("missing ACL grantee")?;
+    // Release 1.0.5 omits the canonical grantee ID. The candidate returns the bucket owner's ID,
+    // including when it reads the release's volume.
+    let expected_id = (reader == rustfs_binary_path()).then_some(owner);
+    if owner.is_empty()
+        || grant.permission().map(|p| p.as_str()) != Some("FULL_CONTROL")
+        || grantee.r#type().as_str() != "CanonicalUser"
+        || grantee.id() != expected_id
+    {
+        return Err("GET ACL changed its canonical owner grant".into());
+    }
+    Ok(())
+}
+
 async fn write_configs(env: &RustFSTestEnvironment, client: &Client, target: &FakeS3Target) -> Result<(), Error> {
     env.create_test_bucket(LOGS).await?;
     env.create_test_bucket(OBJECTS).await?;
@@ -372,17 +392,6 @@ async fn write_configs(env: &RustFSTestEnvironment, client: &Client, target: &Fa
         .acl(BucketCannedAcl::Private)
         .send()
         .await?;
-    let acl = client.get_bucket_acl().bucket(CONFIGS).send().await?;
-    let owner = acl.owner().and_then(|owner| owner.id()).ok_or("ACL owner missing")?;
-    let [grant] = acl.grants() else { return Err("expected exactly one ACL grant".into()) };
-    let grantee = grant.grantee().ok_or("missing ACL grantee")?;
-    if owner.is_empty()
-        || grant.permission().map(|p| p.as_str()) != Some("FULL_CONTROL")
-        || grantee.r#type().as_str() != "CanonicalUser"
-        || grantee.id().is_some()
-    {
-        return Err("GET ACL changed its canonical owner grant".into());
-    }
     let policy = serde_json::json!({
         "Version": "2012-10-17",
         "Statement": [{

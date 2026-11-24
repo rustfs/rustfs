@@ -39,8 +39,11 @@ import gateway_corpus_capture as capture
 
 
 MAX_WIRE_BYTES = 8 * 1024 * 1024
-HEADERS = {"accept-ranges", "content-range", "content-type", "etag", "x-amz-delete-marker",
-           "x-amz-request-charged", "x-amz-version-id"}
+HEADERS = {
+    "accept-ranges", "cache-control", "content-disposition", "content-encoding", "content-language",
+    "content-range", "content-type", "etag", "expires", "x-amz-delete-marker", "x-amz-request-charged",
+    "x-amz-version-id", "x-amz-website-redirect-location",
+}
 HEADER_PREFIXES = ("x-amz-server-side-encryption", "x-amz-meta-", "x-amz-checksum-")
 EXPECTED_CONTROLS = {"changed_error_code": ["error_code", "body"], "changed_object": ["body"]}
 

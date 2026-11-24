@@ -48,6 +48,27 @@ class WireTests(unittest.TestCase):
         self.assertNotEqual(project([("content-length", "16")]), project([("Content-Length", "32")]))
         self.assertEqual(project([("X-Amz-Request-Id", "foo")]), project([("Date", "other")]))
 
+    def test_object_read_metadata_headers(self):
+        fields = [
+            ("Cache-Control", "max-age=60", "no-cache"),
+            ("Content-Disposition", "inline", "attachment"),
+            ("Content-Encoding", "identity", "gzip"),
+            ("Content-Language", "en", "fr"),
+            ("Expires", "Wed, 01 Jan 2031 00:00:00 GMT", "Thu, 02 Jan 2031 00:00:00 GMT"),
+            ("X-Amz-Website-Redirect-Location", "/original", "/updated"),
+        ]
+        for operation, method, body in [("GetObject", "GET", b"object"), ("HeadObject", "HEAD", b"")]:
+            for name, value, changed in fields:
+                reference = wire.project(operation, method, 200, [(name, value)], body)
+                for scenario, headers, expected in [
+                    ("missing", [], ["headers"]),
+                    ("changed", [(name, changed)], ["headers"]),
+                    ("same", [(name.lower(), value)], []),
+                ]:
+                    with self.subTest(operation=operation, header=name, scenario=scenario):
+                        candidate = wire.project(operation, method, 200, headers, body)
+                        self.assertEqual(wire.differences(reference, candidate), expected)
+
     def test_content_length_checked_before_wire_differences(self):
         with self.assertRaises(wire.ReplayError):
             wire.project("GetObject", "GET", 200, [("Content-Length", "1")], b"two")

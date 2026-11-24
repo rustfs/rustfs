@@ -410,7 +410,6 @@ mod tests {
     use crate::app::runtime_sources::ServerContextSlot;
     use crate::app::storage_api::bucket_usecase::helper::MutationCompletionProbe;
     use crate::app::storage_api::owned_parity::{ReqInfo, authorize_bucket_config_mutation};
-    use crate::app::storage_api::s3::dto::PutBucketLifecycleConfigurationInput;
     use crate::site_replication::hooks::{BUCKET_META_HOOK_CALLS, BucketMetaHookCall};
     use http::Method;
     use rustfs_credentials::Credentials;
@@ -797,17 +796,12 @@ mod tests {
 
     #[tokio::test]
     async fn execute_put_bucket_lifecycle_configuration_rejects_missing_configuration() {
-        let input = PutBucketLifecycleConfigurationInput::builder()
-            .bucket("test-bucket".to_string())
-            .build()
-            .unwrap();
-
         let usecase = DefaultBucketUsecase::without_context();
 
         let err = usecase
             .execute_put_bucket_lifecycle_configuration(
                 owned_envelope(Method::PUT),
-                &input.bucket,
+                "test-bucket",
                 PreparedLifecycleConfiguration::Missing,
             )
             .await

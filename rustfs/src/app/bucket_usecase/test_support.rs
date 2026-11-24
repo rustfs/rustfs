@@ -15,7 +15,6 @@
 //! Request fixtures shared by the bucket use-case tests.
 
 use super::*;
-use crate::app::storage_api::s3::S3Request;
 use http::{Extensions, HeaderMap, Method, Uri};
 
 pub(super) fn s3_op_total(op: S3Operation) -> u64 {
@@ -24,20 +23,6 @@ pub(super) fn s3_op_total(op: S3Operation) -> u64 {
         .find(|snapshot| snapshot.op == op.as_str())
         .map(|snapshot| snapshot.total)
         .unwrap_or_default()
-}
-
-pub(super) fn build_request<T>(input: T, method: Method) -> S3Request<T> {
-    S3Request {
-        input,
-        method,
-        uri: Uri::from_static("/"),
-        headers: HeaderMap::new(),
-        extensions: Extensions::new(),
-        credentials: None,
-        region: None,
-        service: None,
-        trailing_headers: None,
-    }
 }
 
 /// A bucket name for an owned use-case input.
@@ -58,10 +43,4 @@ pub(super) fn owned_envelope(method: Method) -> RequestEnvelope {
         },
         Extensions::new(),
     )
-}
-
-pub(super) fn build_request_with_req_info<T>(input: T, method: Method, req_info: ReqInfo) -> S3Request<T> {
-    let mut req = build_request(input, method);
-    req.extensions.insert(req_info);
-    req
 }
