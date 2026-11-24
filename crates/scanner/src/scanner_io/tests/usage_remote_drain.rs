@@ -129,6 +129,7 @@ impl InternodeDataTransport for DrainTransport {
             supports_durable_progress: Some(true),
             supports_complete_observation: Some(true),
             usage_watch_proof: None,
+            tier_registry_preflight_proof: None,
         })
     }
 
