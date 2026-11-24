@@ -27,8 +27,7 @@ use crate::app::storage_api::object_usecase::helper::OperationHelper;
 use crate::app::storage_api::object_usecase::options::get_opts;
 use crate::error::ApiError;
 use http::{HeaderMap, StatusCode};
-use rustfs_gateway_types::dto::{GetObjectAclInput, PutObjectAclInput};
-use rustfs_gateway_types::dto::{GetObjectAclOutput, Grant, Grantee, Permission, PutObjectAclOutput, Type};
+use rustfs_gateway_types::dto::{GetObjectAclInput, GetObjectAclOutput, PutObjectAclInput, PutObjectAclOutput};
 use rustfs_s3_ops::S3Operation;
 use rustfs_s3_types::{EventName, S3Result, s3_error};
 
@@ -121,23 +120,18 @@ impl ObjectMetaUsecase {
 
 /// The one ACL RustFS answers: full control for the canonical owner.
 fn owner_full_control() -> GetObjectAclOutput {
-    let grant = Grant {
-        grantee: Some(Grantee {
-            r#type: Some(Type::CANONICALUSER),
-            ..Default::default()
-        }),
-        permission: Some(Permission::FULL_CONTROL),
-    };
+    let owner = dto_values::owner();
     GetObjectAclOutput {
-        grants: Some(vec![grant]),
-        owner: Some(dto_values::owner()),
+        grants: Some(vec![dto_values::owner_full_control_grant(&owner)]),
+        owner: Some(owner),
         ..Default::default()
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{Permission, Type, dto_values, owner_full_control};
+    use super::{dto_values, owner_full_control};
+    use rustfs_gateway_types::dto::{Permission, Type};
 
     #[test]
     fn the_acl_grants_the_owner_full_control_and_nothing_else() {
@@ -149,6 +143,9 @@ mod tests {
         let grantee = grants[0].grantee.as_ref().expect("a grantee");
         assert_eq!(grantee.r#type, Some(Type::CANONICALUSER));
         let owner = output.owner.expect("an owner");
+        assert!(owner.id.as_ref().is_some_and(|id| !id.is_empty()));
+        assert_eq!(grantee.id, owner.id);
+        assert_eq!(grantee.display_name, owner.display_name);
         assert_eq!((owner.id, owner.display_name), (dto_values::owner().id, dto_values::owner().display_name));
     }
 }

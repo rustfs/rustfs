@@ -277,6 +277,7 @@ rustfs-gateway-adapter = { workspace = true }
 rustfs-gateway-core = { workspace = true }
 rustfs-gateway-corpus-recorder = { workspace = true, optional = true, features = ["corpus-record"] }
 rustfs-gateway-dialect-rustfs-admin = { workspace = true }
+rustfs-gateway-http = { workspace = true }
 rustfs-gateway-stream = { workspace = true }
 rustfs-gateway-types = { workspace = true }
 rustfs-protos = { workspace = true }

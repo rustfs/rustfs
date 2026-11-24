@@ -15,7 +15,7 @@
 """Summarize and judge the gateway client matrix run against the RustFS candidate.
 
 Usage:
-  compat_matrix_report.py check --run-dir <dir> [--gateway-dir <checkout>]
+  compat_matrix_report.py check --run-dir <dir> [--gateway-dir <checkout>] [--server-dir <dir>]
   compat_matrix_report.py --self-test
 
 <dir> holds what the lane observed: the server record acceptance_lane.py reads,
@@ -91,9 +91,9 @@ def expected_cells(gateway_dir):
     return {(client, scenario) for client in clients for scenario in scenarios}
 
 
-def check(run_dir, gateway_dir=None):
+def check(run_dir, gateway_dir=None, server_dir=None):
     """Return (summary lines, problems)."""
-    server, problem = served(run_dir)
+    server, problem = served(run_dir if server_dir is None else server_dir)
     lines = ["### Client matrix", "", server]
     if problem:
         return lines, [f"matrix: {problem}; no client ran"]
@@ -130,10 +130,11 @@ def main(argv=None):
     commands = parser.add_subparsers(dest="command", required=True)
     one = commands.add_parser("check")
     one.add_argument("--run-dir", required=True)
+    one.add_argument("--server-dir", help="directory with a separate matrix server startup record")
     one.add_argument("--gateway-dir", help="gateway checkout used to run this matrix")
     args = parser.parse_args(argv)
     try:
-        lines, problems = check(args.run_dir, args.gateway_dir)
+        lines, problems = check(args.run_dir, args.gateway_dir, args.server_dir)
     except InputError as error:
         print(f"error: {error}", file=sys.stderr)
         return 2
@@ -221,6 +222,13 @@ class SelfTest(unittest.TestCase):
         lines, problems = self.checked(cells=None, matrix_exit=None, startup="did not start: refused")
         self.assertIn("- server: did not start: refused", lines)
         self.assertEqual(problems, ["matrix: the server did not serve; no client ran"])
+
+    def test_separate_server_requires_its_own_ready_record(self):
+        run = self.write_run(self.dir, cells={("boto3", "a"): "pass", ("restic", "a"): "pass"})
+        server = run / "matrix-host"
+        self.assertEqual(check(run, server_dir=server)[1], ["matrix: the server did not serve; no client ran"])
+        write_served(server)
+        self.assertEqual(check(run, server_dir=server)[1], [])
 
     def test_an_environment_exit_is_red_even_with_a_manifest(self):
         self.assertEqual(self.checked(cells={("boto3", "a"): "pass"}, matrix_exit="3")[1],

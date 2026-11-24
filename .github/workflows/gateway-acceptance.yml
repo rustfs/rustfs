@@ -15,7 +15,7 @@
 # Gateway black-box acceptance lanes (rustfs/backlog#2775 T3.4, #2776 T3.5).
 #
 # Runs two suites of the rustfs/gateway repository against the candidate binary,
-# one server:
+# with isolated data and a separate server for each suite:
 #
 #   - the conformance corpus, `--profile rustfs`, judged by
 #     scripts/check_conformance_rulings.py against .config/conformance-rulings.toml
@@ -156,6 +156,7 @@ jobs:
     timeout-minutes: 45
     env:
       ENDPOINT: http://127.0.0.1:9000
+      CONFORMANCE_ENDPOINT: http://127.0.0.1:19000
       # The conformance suite signs with these fixed fixture credentials (the AWS
       # documentation example pair), so the candidate is started with them and the
       # client matrix is handed the same pair.
@@ -187,36 +188,42 @@ jobs:
           name: gateway-acceptance-tools
           path: tools
 
-      # Records `ready`, or what the process said when it exited, in lane/startup.txt.
-      - name: Start candidate
-        run: |
+      - name: Start conformance candidate
+        env:
+          # The corpus declares both virtual-host endpoints and a 2 MiB HTTP/2 connection window.
+          ENDPOINT: ${{ env.CONFORMANCE_ENDPOINT }}
+          HOST_DIR: lane
+          RUSTFS_H2_INITIAL_CONN_WINDOW_SIZE: "2097152"
+          RUSTFS_CONSOLE_ENABLE: "false"
+          RUSTFS_SERVER_DOMAINS: s3.example.com,s3.us-east-1.example.com
+        run: &start-candidate |
           set -uo pipefail
           chmod +x target/debug/rustfs tools/*
-          mkdir -p lane "$RUNNER_TEMP"/data/rustfs{0..3}
-          target/debug/rustfs --version | tee lane/candidate-version.txt
+          mkdir -p "$HOST_DIR" "$RUNNER_TEMP/$HOST_DIR"/data/rustfs{0..3}
+          target/debug/rustfs --version | tee "$HOST_DIR/candidate-version.txt"
           # The four directories share the runner's one disk; the bypass is the CI case the
           # physical-disk guard sanctions (as in mint.yml).
-          RUSTFS_UNSAFE_BYPASS_DISK_CHECK=true RUST_LOG=info target/debug/rustfs --address 127.0.0.1:9000 \
-            --access-key "$ACCESS_KEY" --secret-key "$SECRET_KEY" "$RUNNER_TEMP"/data/rustfs{0..3} \
-            > lane/rustfs.log 2>&1 &
+          RUSTFS_UNSAFE_BYPASS_DISK_CHECK=true RUST_LOG=info target/debug/rustfs --address "${ENDPOINT#http://}" \
+            --access-key "$ACCESS_KEY" --secret-key "$SECRET_KEY" "$RUNNER_TEMP/$HOST_DIR"/data/rustfs{0..3} \
+            > "$HOST_DIR/rustfs.log" 2>&1 &
           pid=$!
-          echo "$pid" > lane/rustfs.pid
+          echo "$pid" > "$HOST_DIR/rustfs.pid"
           # Liveness first: a ready answer counts only while this process is still running.
           for _ in $(seq 120); do
             if ! kill -0 "$pid" 2>/dev/null; then
               status=0
               wait "$pid" || status=$?
-              echo "did not start: exit ${status}: $(grep -v '^[[:space:]]*$' lane/rustfs.log | tail -n 1)" > lane/startup.txt
-              cat lane/startup.txt
+              echo "did not start: exit ${status}: $(grep -v '^[[:space:]]*$' "$HOST_DIR/rustfs.log" | tail -n 1)" > "$HOST_DIR/startup.txt"
+              cat "$HOST_DIR/startup.txt"
               exit 1
             fi
             if curl -sf "$ENDPOINT/health/ready" >/dev/null; then
-              echo ready > lane/startup.txt
+              echo ready > "$HOST_DIR/startup.txt"
               exit 0
             fi
             sleep 1
           done
-          echo "did not start: /health/ready did not answer within 120 seconds" > lane/startup.txt
+          echo "did not start: /health/ready did not answer within 120 seconds" > "$HOST_DIR/startup.txt"
           exit 1
 
       # The exit code is data for the judge step, not this step's result.
@@ -224,10 +231,11 @@ jobs:
         run: |
           set +e
           tools/rustfs-gateway-conformance run --root gateway/conformance --profile rustfs \
-            --endpoint "$ENDPOINT" --allow-external-fixtures \
+            --endpoint "$CONFORMANCE_ENDPOINT" --allow-external-fixtures \
             --json lane/report.json > lane/conformance.log 2>&1
           echo "$?" > lane/runner-exit.txt
           if kill -0 "$(cat lane/rustfs.pid)" 2>/dev/null; then echo alive; else echo exited; fi > lane/alive-after-conformance.txt
+          kill "$(cat lane/rustfs.pid)" 2>/dev/null || true
           tail -n 20 lane/conformance.log
 
       - name: Set up Python
@@ -282,6 +290,11 @@ jobs:
           echo "COMPAT_CLIENTS=$(IFS=,; echo "${installed[*]}")" >> "$GITHUB_ENV"
           cat ../lane/skipped-clients.txt 2>/dev/null || echo "every pinned client installed"
 
+      - name: Start client matrix candidate with default protocol settings
+        env:
+          HOST_DIR: lane/matrix-host
+        run: *start-candidate
+
       # The exit code is data for the judge step, not this step's result.
       - name: Run client matrix (external)
         working-directory: gateway
@@ -305,8 +318,8 @@ jobs:
         run: |
           set -uo pipefail
           status=0
-          python3 scripts/check_conformance_rulings.py --run-dir lane | tee -a "$GITHUB_STEP_SUMMARY" || status=1
-          python3 scripts/compat_matrix_report.py check --run-dir lane | tee -a "$GITHUB_STEP_SUMMARY" || status=1
+          python3 scripts/check_conformance_rulings.py --run-dir lane --case-dir gateway/conformance/cases | tee -a "$GITHUB_STEP_SUMMARY" || status=1
+          python3 scripts/compat_matrix_report.py check --run-dir lane --server-dir lane/matrix-host | tee -a "$GITHUB_STEP_SUMMARY" || status=1
           exit "$status"
 
       - name: Upload lane results
@@ -318,6 +331,8 @@ jobs:
           path: |
             lane/*.txt
             lane/*.log
+            lane/matrix-host/*.txt
+            lane/matrix-host/*.log
             lane/report.json
             lane/compat/matrix.json
             lane/compat/probe.jsonl
