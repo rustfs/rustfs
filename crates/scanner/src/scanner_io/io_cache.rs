@@ -441,6 +441,8 @@ impl ScannerIOCache for SetDisks {
             cold_zero_walk_reuse_observed,
             segment_invalidation_proof,
         } = scan_plan;
+        // An earlier turn's receipt cannot explain a subsequent failure to save or report this set.
+        bucket_failures.registry_replan.lock().await.gaps_accounted = false;
         let structural_scan_plan_digest = scan_plan_digest;
         let scan_plan_digest = scanner_bucket_work_digest(scan_plan_digest, scan_mode, requires_full_scan);
         let bucket_work_digest = scanner_bucket_work_digest(bucket_coverage_digest, scan_mode, requires_full_scan);
@@ -1082,6 +1084,7 @@ impl ScannerIOCache for SetDisks {
             let active_disk_bucket_scans_clone = active_disk_bucket_scans.clone();
             let pool_label_clone = pool_label.clone();
             let set_label_clone = set_label.clone();
+            let registry_replan = bucket_failures.registry_replan.clone();
             let failed_dirty_buckets_clone = bucket_failures.hard.clone();
             let partial_dirty_buckets_clone = bucket_failures.partial.clone();
             let pending_maintenance_work_clone = pending_maintenance_work.clone();
@@ -1328,6 +1331,7 @@ impl ScannerIOCache for SetDisks {
                                 session_id: slot.remote_session_id,
                                 session_sequence: request_sequence,
                                 plans: bucket_plans,
+                                supports_tier_registry_preflight: capabilities.supports_tier_registry_preflight,
                                 supports_durable_progress: capabilities.supports_durable_progress,
                                 supports_complete_observation: capabilities.supports_complete_observation,
                                 usage_watch: bucket_usage_watch.as_ref(),
@@ -1347,6 +1351,22 @@ impl ScannerIOCache for SetDisks {
                             break;
                         }
                         match remote_outcome {
+                            Ok(crate::remote_scanner::RemoteScannerOutcome::TierRegistryMismatch { expected, actual }) => {
+                                registry_replan.lock().await.mismatched_buckets.insert(bucket.name.clone());
+                                debug!(
+                                    target: "rustfs::scanner::io",
+                                    event = EVENT_SCANNER_DISK_BUCKET_STATE,
+                                    component = LOG_COMPONENT_SCANNER,
+                                    subsystem = LOG_SUBSYSTEM_IO,
+                                    state = "tier_registry_changed",
+                                    cycle = want_cycle,
+                                    leader_epoch,
+                                    bucket = %bucket.name,
+                                    expected_tier_registry_generation = expected,
+                                    worker_tier_registry_generation = actual,
+                                    "Scanner worker observed a different tier registry"
+                                );
+                            }
                             Ok(crate::remote_scanner::RemoteScannerOutcome::Complete {
                                 usage,
                                 pending_maintenance_work,
@@ -2448,7 +2468,10 @@ impl ScannerIOCache for SetDisks {
         if let Some(err) = first_join_err {
             return Err(err);
         }
-        let continuation = (source_turn_ended
+        // A new turn under this same frozen registry cannot certify the missing root.
+        let registry_changed = !bucket_failures.registry_replan.lock().await.mismatched_buckets.is_empty();
+        let continuation = (!registry_changed
+            && source_turn_ended
             && budget.can_requeue_source_turn()
             && !owner_ctx.is_cancelled()
             && completed_buckets.len() < buckets.len())
@@ -2513,7 +2536,8 @@ impl ScannerIOCache for SetDisks {
         }
         let completed_count = completed_buckets.len();
         let covered_count = completed_count.saturating_add(carried_buckets.len());
-        let coverage_complete = should_publish_completed_snapshot(covered_count, buckets.len(), owner_ctx.is_cancelled());
+        let coverage_complete =
+            !registry_changed && should_publish_completed_snapshot(covered_count, buckets.len(), owner_ctx.is_cancelled());
         if coverage_complete {
             // A carried bucket was not walked to its end, so this set cannot
             // prove the producer window that prefix-level reuse would need.
@@ -2571,6 +2595,14 @@ impl ScannerIOCache for SetDisks {
                     error = %e,
                     "Scanner incomplete set scope publish failed"
                 );
+            } else {
+                let partial = bucket_failures.partial.lock().await;
+                let mut replan = bucket_failures.registry_replan.lock().await;
+                replan.gaps_accounted = buckets.iter().all(|bucket| {
+                    completed_buckets.contains(&bucket.name)
+                        || partial.contains(&bucket.name)
+                        || replan.mismatched_buckets.contains(&bucket.name)
+                });
             }
             debug!(
                 target: "rustfs::scanner::io",

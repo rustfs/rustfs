@@ -349,8 +349,9 @@ pub(crate) mod rpc_consumer {
         pub(crate) use super::super::{
             DeleteOptions, DiskStore, RemoteBackgroundIo, StorageDiskRpcExt, WalkDirOptions, check_and_record_signed_rpc_nonce,
             find_local_disk_by_ref_for_rpc, find_local_disk_by_ref_for_scanner_rpc, rpc_background_admission,
-            sign_ns_scanner_capability_with_usage_capabilities, sign_ns_scanner_usage_watch_capability, sign_put_file_capability,
-            verify_put_file_auth_trailer, verify_rpc_signature, with_remote_background_io,
+            sign_ns_scanner_capability_with_usage_capabilities, sign_ns_scanner_tier_registry_preflight_capability,
+            sign_ns_scanner_usage_watch_capability, sign_put_file_capability, verify_put_file_auth_trailer, verify_rpc_signature,
+            with_remote_background_io,
         };
     }
 
@@ -688,15 +689,14 @@ pub(crate) mod ecstore_internode {
 }
 
 pub(crate) mod ecstore_rpc {
-    #[cfg(test)]
-    pub(crate) use rustfs_ecstore::api::rpc::verify_ns_scanner_capability_with_checkpoint_coverage;
     pub(crate) use rustfs_ecstore::api::rpc::{
         KMS_SIGNAL_SUBSYSTEM, LocalPeerS3Client, MAX_NETWORK_PROBE_BYTES, MAX_NETWORK_PROBE_DURATION, NetworkPeerProbeClient,
         NetworkPeerProbeError, PEER_RESTDRY_RUN, PEER_RESTSIGNAL, PEER_RESTSUB_SYS, PeerRestClient, PeerS3Client,
         SERVICE_SIGNAL_REFRESH_CONFIG, SERVICE_SIGNAL_RELOAD_DYNAMIC, TONIC_RPC_PREFIX, check_and_record_signed_rpc_nonce,
         decode_heal_bucket_rpc_options, normalize_tonic_rpc_audience, rpc_auth_is_resource_exhausted, rpc_background_admission,
-        sign_ns_scanner_capability_with_usage_capabilities, sign_ns_scanner_usage_watch_capability, sign_put_file_capability,
-        sign_tonic_rpc_response_proof, tonic_boot_epoch_challenge, tonic_boot_epoch_response_headers_with_msgpack_capability,
+        sign_ns_scanner_capability_with_usage_capabilities, sign_ns_scanner_tier_registry_preflight_capability,
+        sign_ns_scanner_usage_watch_capability, sign_put_file_capability, sign_tonic_rpc_response_proof,
+        tonic_boot_epoch_challenge, tonic_boot_epoch_response_headers_with_msgpack_capability,
         tonic_msgpack_manifest_capability_requested, tonic_rpc_auth_failure_reason, verify_put_file_auth_trailer,
         verify_rpc_signature, verify_tonic_canonical_body_digest, verify_tonic_mutation_body_digest,
         verify_tonic_mutation_body_digest_reject_unsigned, verify_tonic_rpc_signature_with_bootstrap,
@@ -707,6 +707,10 @@ pub(crate) mod ecstore_rpc {
         gen_tonic_replay_scope_headers, gen_tonic_signature_headers, set_tonic_canonical_body_digest,
         tonic_boot_epoch_response_headers, verify_ns_scanner_capability_with_usage_capabilities, verify_put_file_capability,
         verify_tonic_boot_epoch_response, verify_tonic_rpc_response_proof,
+    };
+    #[cfg(test)]
+    pub(crate) use rustfs_ecstore::api::rpc::{
+        verify_ns_scanner_capability_with_checkpoint_coverage, verify_ns_scanner_tier_registry_preflight_capability,
     };
 }
 
@@ -2460,6 +2464,13 @@ pub(crate) fn verify_put_file_auth_trailer(
     trailer: &[u8],
 ) -> std::io::Result<String> {
     ecstore_rpc::verify_put_file_auth_trailer(url, method, nonce, trailer)
+}
+
+pub(crate) fn sign_ns_scanner_tier_registry_preflight_capability(
+    challenge: uuid::Uuid,
+    server_epoch: uuid::Uuid,
+) -> std::io::Result<Vec<u8>> {
+    ecstore_rpc::sign_ns_scanner_tier_registry_preflight_capability(challenge, server_epoch)
 }
 
 pub(crate) fn sign_ns_scanner_usage_watch_capability(
