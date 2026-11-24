@@ -56,6 +56,9 @@ class WireTests(unittest.TestCase):
             ("Content-Language", "en", "fr"),
             ("Expires", "Wed, 01 Jan 2031 00:00:00 GMT", "Thu, 02 Jan 2031 00:00:00 GMT"),
             ("X-Amz-Website-Redirect-Location", "/original", "/updated"),
+            ("X-Amz-Object-Lock-Mode", "GOVERNANCE", "COMPLIANCE"),
+            ("X-Amz-Object-Lock-Retain-Until-Date", "2031-01-01T00:00:00Z", "2031-01-02T00:00:00Z"),
+            ("X-Amz-Object-Lock-Legal-Hold", "ON", "OFF"),
         ]
         for operation, method, body in [("GetObject", "GET", b"object"), ("HeadObject", "HEAD", b"")]:
             for name, value, changed in fields:
