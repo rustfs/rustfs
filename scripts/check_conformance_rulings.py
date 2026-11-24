@@ -27,7 +27,8 @@ from the exit status of an earlier step.
 Red: a failed case without a ruling; a ruled case that fails
 differently from its ruling's `failure`; a ruling whose case no longer fails;
 and a skip whose reason is the server's own answer (the endpoint not answering,
-or a fixture it refused), which is a failure the runner records as a skip.
+or a fixture it refused). An unimplemented connection control also blocks acceptance and is
+reported as a runner limitation.
 
 Exit codes: 0 judged clean; 1 otherwise; 2 a malformed ledger, report or observation. The Markdown summary
 goes to stdout.
@@ -54,8 +55,11 @@ VERDICTS = ("passed", "failed", "skipped")
 LEDGER_ID = re.compile(r"(R-\d{3}|K-\d+|rustfs/gateway#(?:1120|1159))")
 RULING_KEYS = {"case", "ledger", "reason", "failure", "expires"}
 NOT_SERVED = "observed 501"
-# Skip reasons of the pinned runner that are the server's answer, not a corpus limit.
-SERVER_SKIP = re.compile(r"environment: external (endpoint|fixture .* returned status)")
+# External skips that block acceptance, including transport controls the runner cannot drive.
+EXTERNAL_SKIP = re.compile(r"environment: external (endpoint|fixture .* returned status)")
+RUNNER_CONTROL = re.compile(
+    r"environment: external endpoint `[a-z_]+` control is not implemented with concurrent response observation"
+)
 
 
 def load_rulings(path):
@@ -153,7 +157,13 @@ def judge(rulings, run_dir, case_dir=None):
     different = [case for case in failed if case in rulings
                  and cases[case].get("failures") != [rulings[case]["failure"]]]
     stale = sorted(case for case in rulings if cases.get(case, {}).get("verdict") != "failed")
-    server_skips = [case for case in by_verdict["skipped"] if SERVER_SKIP.match(cases[case].get("reason") or "")]
+    server_skips, runner_controls = [], []
+    for case in by_verdict["skipped"]:
+        reason = cases[case].get("reason") or ""
+        if RUNNER_CONTROL.fullmatch(reason):
+            runner_controls.append(case)
+        elif EXTERNAL_SKIP.match(reason):
+            server_skips.append(case)
     not_served = [case for case in failed if any(NOT_SERVED in str(f) for f in cases[case].get("failures", []))]
     lines.append(
         f"- cases: {len(cases)}; ran {executed}, passed {len(by_verdict['passed'])}, failed {len(failed)} "
@@ -162,6 +172,7 @@ def judge(rulings, run_dir, case_dir=None):
     sections = [
         ("Failed without a ruling", unruled, lambda case: first_failure(cases[case])),
         ("Failing differently from the ruling", different, lambda case: first_failure(cases[case])),
+        ("Skipped for unavailable runner controls", runner_controls, lambda case: cases[case].get("reason")),
         ("Skipped on the server's answer", server_skips, lambda case: cases[case].get("reason")),
         ("Stale rulings: the case no longer fails; remove the ruling", stale,
          lambda case: cases[case]["verdict"] if case in cases else "not in the report"),
@@ -171,6 +182,7 @@ def judge(rulings, run_dir, case_dir=None):
             lines += ["", f"#### {title} ({len(members)})", ""] + [f"- `{case}`: {detail(case)}" for case in members]
     problems = [f"conformance: {case} failed without a ruling" for case in unruled]
     problems += [f"conformance: {case} fails differently from its ruling" for case in different]
+    problems += [f"conformance: {case} requires an unavailable runner control" for case in runner_controls]
     problems += [f"conformance: {case} was skipped on the server's answer" for case in server_skips]
     problems += [f"conformance: the ruling on {case} is stale" for case in stale]
     return lines + (table if skip_reasons else []), problems
@@ -257,6 +269,17 @@ class SelfTest(unittest.TestCase):
         self.write_run([("c-a-0001", "passed", ""),
                         ("c-a-0002", "skipped", "environment: external endpoint 127.0.0.1:9000 could not connect: refused")])
         self.assertEqual(self.judged({})[1], ["conformance: c-a-0002 was skipped on the server's answer"])
+
+    def test_unimplemented_runner_controls_stay_red_and_are_attributed_to_the_runner(self):
+        for action in ("close", "half_close", "stall"):
+            with self.subTest(action=action):
+                reason = f"environment: external endpoint `{action}` control is not implemented with concurrent response observation"
+                self.write_run([("c-a-0001", "skipped", reason)])
+                lines, problems = self.judged({})
+                self.assertEqual(problems, ["conformance: c-a-0001 requires an unavailable runner control"])
+                self.assertIn("Skipped for unavailable runner controls (1)", "\n".join(lines))
+                self.assertIn("on the server's answer 0", "\n".join(lines))
+                self.assertIn(reason, "\n".join(lines))
 
     def test_a_skip_on_a_refused_fixture_is_red(self):
         self.write_run([("c-a-0001", "skipped", "environment: external fixture PUT for object `b/k` returned status 400; the failed create is not owned")])
