@@ -4320,6 +4320,17 @@ const WALK_DIR_BATCH_SIZE: usize = 32;
 #[cfg(not(test))]
 const WALK_DIR_BATCH_SIZE: usize = 256;
 
+/// Maximum directory depth `scan_dir` will recurse into.
+///
+/// Recursive listing of a directory tree one `Box::pin` future per level
+/// consumes worker-stack proportionally to the depth. On the default 2 MiB
+/// `rustfs-worker` stack the walk aborts the process with a stack overflow
+/// at roughly 150 levels (backlog#2809, backlog#3293). The bound below keeps
+/// a safety margin and converts runaway depth into a recoverable error
+/// instead of a server abort. Traversal is refused, never silently truncated,
+/// so callers can distinguish a too-deep tree from a complete listing.
+const MAX_SCAN_DIR_DEPTH: usize = 100;
+
 async fn read_identifier_tree_entries(path: &Path, leaf: &str, stall: Option<Duration>) -> Result<Vec<String>> {
     let mut entries = read_dir_with_walk_stall(path.to_path_buf(), stall).await?;
     let mut names = Vec::new();
@@ -12929,11 +12940,15 @@ impl LocalDisk {
         objs_returned: &'a mut i32,
         skip_current_dir_object: bool,
         multipart_dir_to_skip: Option<HashSet<String>>,
+        depth: usize,
     ) -> BoxFuture<'a, Result<bool>>
     where
         W: AsyncWrite + Unpin + Send + 'a,
     {
         Box::pin(async move {
+            if depth > MAX_SCAN_DIR_DEPTH {
+                return Err(DiskError::other("directory walk exceeds its recursion depth limit"));
+            }
             if opts.identifier_tree_leaf.is_some() {
                 let relative = current
                     .strip_prefix(&opts.base_dir)
@@ -13073,9 +13088,13 @@ impl LocalDisk {
                         let marker_name = entry.as_str().trim_end_matches(GLOBAL_DIR_SUFFIX_WITH_SLASH);
                         // An empty marker name would schedule the directory being
                         // scanned as its own child and recurse until the stack
-                        // overflows. Ignore malformed markers left by older writers
-                        // or corrupt disks instead of decoding them.
-                        if marker_name.is_empty() {
+                        // overflows. Marker names "." and ".." survive the empty
+                        // check but `path_join_buf` resolves them to the current
+                        // or parent directory, re-creating the same self-referential
+                        // schedule from the opposite direction. Ignore malformed
+                        // markers left by older writers or corrupt disks instead
+                        // of decoding them.
+                        if marker_name.is_empty() || marker_name == "." || marker_name == ".." {
                             item.clear();
                             continue;
                         }
@@ -13246,7 +13265,7 @@ impl LocalDisk {
                     let scan_path = pop.clone();
                     if opts.recursive && scan_required {
                         match self
-                            .scan_dir(pop, prefix.clone(), opts, out, objs_returned, skip_object, dir_to_skip)
+                            .scan_dir(pop, prefix.clone(), opts, out, objs_returned, skip_object, dir_to_skip, depth + 1)
                             .await
                         {
                             Ok(true) => return Ok(true),
@@ -13519,7 +13538,7 @@ impl LocalDisk {
                 let scan_path = dir.clone();
                 if opts.recursive && scan_required {
                     match self
-                        .scan_dir(dir, prefix.clone(), opts, out, objs_returned, skip_object, dir_to_skip)
+                        .scan_dir(dir, prefix.clone(), opts, out, objs_returned, skip_object, dir_to_skip, depth + 1)
                         .await
                     {
                         Ok(true) => return Ok(true),
@@ -17404,6 +17423,7 @@ impl DiskAPI for LocalDisk {
                 } else {
                     Some(multipart_dir_to_skip)
                 },
+                0,
             )
             .await?;
 
@@ -22402,6 +22422,7 @@ mod test {
                 &mut count,
                 true,
                 None,
+                0,
             )
             .await
             .expect_err("excessive depth must fail before filesystem I/O");
@@ -31613,7 +31634,7 @@ mod test {
         };
         let mut objs_returned = 0;
 
-        disk.scan_dir("".to_string(), "".to_string(), &opts, &mut out, &mut objs_returned, false, None)
+        disk.scan_dir("".to_string(), "".to_string(), &opts, &mut out, &mut objs_returned, false, None, 0)
             .await
             .expect("operation should succeed");
         out.close().await.expect("operation should succeed");
@@ -31702,7 +31723,7 @@ mod test {
             };
             let mut objs_returned = 0;
 
-            disk.scan_dir(String::new(), String::new(), &opts, &mut out, &mut objs_returned, false, None)
+            disk.scan_dir(String::new(), String::new(), &opts, &mut out, &mut objs_returned, false, None, 0)
                 .await
                 .expect("scan_dir should succeed");
             out.close().await.expect("metacache writer should close");
@@ -31774,7 +31795,7 @@ mod test {
                 };
                 let mut objs_returned = 0;
 
-                disk.scan_dir(String::new(), String::new(), &opts, &mut out, &mut objs_returned, false, None)
+                disk.scan_dir(String::new(), String::new(), &opts, &mut out, &mut objs_returned, false, None, 0)
                     .await
                     .expect("scan_dir should succeed");
                 out.close().await.expect("metacache writer should close");
@@ -31849,7 +31870,7 @@ mod test {
                 };
                 let mut objects_returned = 0;
 
-                disk.scan_dir(String::new(), String::new(), &opts, &mut out, &mut objects_returned, false, None)
+                disk.scan_dir(String::new(), String::new(), &opts, &mut out, &mut objects_returned, false, None, 0)
                     .await
                     .expect("scan_dir should succeed");
                 out.close().await.expect("metacache writer should close");
@@ -31988,7 +32009,7 @@ mod test {
         };
         let mut objs_returned = 0;
 
-        disk.scan_dir(base_dir.to_string(), "".to_string(), &opts, &mut out, &mut objs_returned, false, None)
+        disk.scan_dir(base_dir.to_string(), "".to_string(), &opts, &mut out, &mut objs_returned, false, None, 0)
             .await
             .expect("operation should succeed");
         out.close().await.expect("operation should succeed");
@@ -32032,7 +32053,7 @@ mod test {
         let mut count = 0;
         tokio::time::timeout(
             std::time::Duration::from_secs(5),
-            disk.scan_dir(String::new(), String::new(), &opts, &mut out, &mut count, false, None),
+            disk.scan_dir(String::new(), String::new(), &opts, &mut out, &mut count, false, None, 0),
         )
         .await
         .expect("malformed directory marker must not recurse into its parent")
@@ -32091,7 +32112,7 @@ mod test {
         };
         let mut objs_returned = 0;
 
-        disk.scan_dir("marker/".to_string(), "".to_string(), &opts, &mut out, &mut objs_returned, false, None)
+        disk.scan_dir("marker/".to_string(), "".to_string(), &opts, &mut out, &mut objs_returned, false, None, 0)
             .await
             .expect("operation should succeed");
         out.close().await.expect("operation should succeed");
@@ -32147,7 +32168,7 @@ mod test {
                 ..Default::default()
             };
             let mut objs_returned = 0;
-            disk.scan_dir(base.to_string(), "".to_string(), &opts, &mut out, &mut objs_returned, false, None)
+            disk.scan_dir(base.to_string(), "".to_string(), &opts, &mut out, &mut objs_returned, false, None, 0)
                 .await
                 .expect("scan_dir should succeed");
             out.close().await.expect("metacache writer should close");
@@ -32274,7 +32295,7 @@ mod test {
             };
             let mut objs_returned = 0;
 
-            disk.scan_dir(base_dir.to_string(), "".to_string(), &opts, &mut out, &mut objs_returned, false, None)
+            disk.scan_dir(base_dir.to_string(), "".to_string(), &opts, &mut out, &mut objs_returned, false, None, 0)
                 .await
                 .expect("operation should succeed");
             out.close().await.expect("operation should succeed");
@@ -32388,7 +32409,7 @@ mod test {
             };
             let mut objs_returned = 0;
 
-            disk.scan_dir("".to_string(), "".to_string(), &opts, &mut out, &mut objs_returned, false, None)
+            disk.scan_dir("".to_string(), "".to_string(), &opts, &mut out, &mut objs_returned, false, None, 0)
                 .await
                 .expect("operation should succeed");
             out.close().await.expect("operation should succeed");
@@ -32531,7 +32552,7 @@ mod test {
         };
         let mut objs_returned = 0;
 
-        disk.scan_dir("".to_string(), "".to_string(), &opts, &mut out, &mut objs_returned, false, None)
+        disk.scan_dir("".to_string(), "".to_string(), &opts, &mut out, &mut objs_returned, false, None, 0)
             .await
             .expect("operation should succeed");
         out.close().await.expect("operation should succeed");
@@ -32601,7 +32622,7 @@ mod test {
             DIRECTORY_LISTING_ENTRY_PROBE_COUNT
                 .scope(
                     Arc::clone(&probe_count),
-                    disk.scan_dir("".to_string(), "".to_string(), &opts, &mut output, &mut objects_returned, false, None),
+                    disk.scan_dir("".to_string(), "".to_string(), &opts, &mut output, &mut objects_returned, false, None, 0),
                 )
                 .await
                 .expect("scan_dir should succeed");
@@ -32752,6 +32773,7 @@ mod test {
                 &mut objects_returned,
                 false,
                 None,
+                0,
             )
             .await
             .expect("scan_dir should succeed");
@@ -32918,6 +32940,7 @@ mod test {
                 &mut objects_returned,
                 false,
                 None,
+                0,
             )
             .await
             .expect("scan_dir should succeed");
@@ -33025,6 +33048,7 @@ mod test {
                     &mut objects_returned,
                     false,
                     None,
+                    0,
                 ),
             )
             .await
@@ -33096,7 +33120,7 @@ mod test {
             };
             let mut objs_returned = 0;
 
-            disk.scan_dir(base_dir.to_string(), "".to_string(), &opts, &mut out, &mut objs_returned, false, None)
+            disk.scan_dir(base_dir.to_string(), "".to_string(), &opts, &mut out, &mut objs_returned, false, None, 0)
                 .await
                 .expect("scan_dir should succeed");
             out.close().await.expect("metacache writer should close");
@@ -33207,7 +33231,7 @@ mod test {
                 ..Default::default()
             };
             let mut objs_returned = 0;
-            disk.scan_dir(base_dir.to_string(), "".to_string(), &opts, &mut out, &mut objs_returned, false, None)
+            disk.scan_dir(base_dir.to_string(), "".to_string(), &opts, &mut out, &mut objs_returned, false, None, 0)
                 .await
                 .expect("scan_dir should succeed");
             out.close().await.expect("metacache writer should close");
@@ -33328,7 +33352,7 @@ mod test {
             };
             let mut objs_returned = 0;
 
-            disk.scan_dir("".to_string(), "".to_string(), &opts, &mut out, &mut objs_returned, false, None)
+            disk.scan_dir("".to_string(), "".to_string(), &opts, &mut out, &mut objs_returned, false, None, 0)
                 .await
                 .expect("scan_dir should succeed");
             out.close().await.expect("metacache writer should close");
@@ -33515,7 +33539,7 @@ mod test {
         };
         let mut objs_returned = 0;
 
-        disk.scan_dir("".to_string(), "".to_string(), &opts, &mut out, &mut objs_returned, false, None)
+        disk.scan_dir("".to_string(), "".to_string(), &opts, &mut out, &mut objs_returned, false, None, 0)
             .await
             .expect("scan_dir should succeed");
         out.close().await.expect("metacache writer should close");
@@ -33571,7 +33595,7 @@ mod test {
             };
             let mut objs_returned = 0;
 
-            disk.scan_dir("".to_string(), "".to_string(), &opts, &mut out, &mut objs_returned, false, None)
+            disk.scan_dir("".to_string(), "".to_string(), &opts, &mut out, &mut objs_returned, false, None, 0)
                 .await
                 .expect("scan_dir should succeed");
             out.close().await.expect("metacache writer should close");
@@ -33669,7 +33693,7 @@ mod test {
         let mut objs_returned = 0;
 
         let result = disk
-            .scan_dir("".to_string(), "".to_string(), &opts, &mut out, &mut objs_returned, false, None)
+            .scan_dir("".to_string(), "".to_string(), &opts, &mut out, &mut objs_returned, false, None, 0)
             .await;
 
         fs::set_permissions(&meta_path, original_permissions)
