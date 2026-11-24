@@ -46,6 +46,7 @@ use rustfs_config::{
     ENABLE_KEY, WEBHOOK_AUTH_TOKEN, WEBHOOK_CLIENT_CA, WEBHOOK_CLIENT_CERT, WEBHOOK_CLIENT_KEY, WEBHOOK_ENDPOINT,
     WEBHOOK_SKIP_TLS_VERIFY,
 };
+use rustfs_gateway_dialect_rustfs_admin::{RouteRecord, ops};
 use rustfs_madmin::utils::parse_duration;
 use rustfs_notify::notification_system;
 use rustfs_s3_types::{S3Error, S3ErrorCode, S3Result, s3_error};
@@ -887,34 +888,20 @@ pub(crate) fn claims_route(method: &Method, uri: &Uri, headers: &HeaderMap) -> b
         || is_control_plane_route(method, uri, headers)
 }
 
-/// Signed system-status and catalog-configuration reads, after object-lambda routing.
-pub(crate) fn claims_native_admin_route(method: &Method, uri: &Uri) -> bool {
-    method == Method::GET
-        && matches!(
-            uri.path(),
-            "/rustfs/admin/v3/info"
-                | "/minio/admin/v3/info"
-                | "/rustfs/admin/v3/storageinfo"
-                | "/minio/admin/v3/storageinfo"
-                | "/rustfs/admin/v4/runtime/capabilities"
-                | "/minio/admin/v4/runtime/capabilities"
-                | "/rustfs/admin/v3/object-data-cache/stats"
-                | "/minio/admin/v3/object-data-cache/stats"
-                | "/rustfs/admin/v3/datausageinfo"
-                | "/minio/admin/v3/datausageinfo"
-                | "/rustfs/admin/v4/plugins/catalog"
-                | "/minio/admin/v4/plugins/catalog"
-                | "/rustfs/admin/v4/cluster/snapshot"
-                | "/minio/admin/v4/cluster/snapshot"
-                | "/rustfs/admin/v4/extensions/catalog"
-                | "/minio/admin/v4/extensions/catalog"
-                | "/rustfs/admin/v3/module-switches"
-                | "/minio/admin/v3/module-switches"
-                | "/iceberg/v1/config"
-                | "/_iceberg/v1/config"
-        )
-        && parse_object_lambda_request(method, uri).is_none()
-}
+/// The reads whose handlers are wired to the native admin service. The edge selector and the
+/// operation gate use these same dialect records.
+pub(crate) const NATIVE_ADMIN_READS: &[RouteRecord] = &[
+    ops::get_iceberg_config::RECORD,
+    ops::get_v3_info::RECORD,
+    ops::get_v3_datausageinfo::RECORD,
+    ops::get_v4_plugins_catalog::RECORD,
+    ops::get_v4_cluster_snapshot::RECORD,
+    ops::get_v4_extensions_catalog::RECORD,
+    ops::get_v3_module_switches::RECORD,
+    ops::get_v3_storageinfo::RECORD,
+    ops::get_v4_runtime_capabilities::RECORD,
+    ops::get_v3_object_data_cache_stats::RECORD,
+];
 
 /// Console paths whose requests do not belong to an earlier extension route.
 pub(crate) fn claims_native_console_route(method: &Method, uri: &Uri) -> bool {

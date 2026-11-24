@@ -25,6 +25,7 @@ use crate::admin::handlers::plugins_catalog::GetPluginCatalogHandler;
 use crate::admin::handlers::system::{DataUsageInfoHandler, RuntimeCapabilitiesHandler, ServerInfoHandler, StorageInfoHandler};
 use crate::admin::handlers::table_catalog::GetCatalogConfigHandler;
 use crate::admin::operation::{AdminRequest, AdminResponse, Operation as AdminHandler};
+use crate::admin::router::NATIVE_ADMIN_READS;
 use crate::app::RequestEnvelope;
 use crate::runtime_sources::ServerContextSlot;
 use crate::server::gateway_handlers::{handler_error, verified_signature};
@@ -44,19 +45,6 @@ use rustfs_gateway_dialect_rustfs_admin::{AdminOperation, AdminResponse as WireR
 use rustfs_s3_types::{Body, S3Result, s3_error};
 use std::sync::{Arc, OnceLock};
 
-const OPERATIONS: [&str; 10] = [
-    GetIcebergConfig::NAME,
-    GetV3Info::NAME,
-    GetV3Datausageinfo::NAME,
-    GetV4PluginsCatalog::NAME,
-    GetV4ClusterSnapshot::NAME,
-    GetV4ExtensionsCatalog::NAME,
-    GetV3ModuleSwitches::NAME,
-    GetV3Storageinfo::NAME,
-    GetV4RuntimeCapabilities::NAME,
-    GetV3ObjectDataCacheStats::NAME,
-];
-
 fn declare<O: AdminOperation>(builder: DialectBuilder) -> DialectBuilder {
     builder.declare_claimed::<O>(ClaimedRoute {
         precedence: O::PRECEDENCE,
@@ -69,9 +57,14 @@ fn declare<O: AdminOperation>(builder: DialectBuilder) -> DialectBuilder {
 pub(super) fn dialect() -> Result<Dialect, GatewayAssemblyError> {
     static ROWS: OnceLock<Vec<OverlayRow>> = OnceLock::new();
     static OVERLAY_READS: OnceLock<DialectOverlay> = OnceLock::new();
-    let rows = OPERATIONS
+    let rows = NATIVE_ADMIN_READS
         .iter()
-        .map(|name| OVERLAY.row(name).copied().ok_or(GatewayAssemblyError::AdminOverlayMissing))
+        .map(|row| {
+            OVERLAY
+                .row(row.operation)
+                .copied()
+                .ok_or(GatewayAssemblyError::AdminOverlayMissing)
+        })
         .collect::<Result<Vec<_>, _>>()?;
     let overlay = OVERLAY_READS.get_or_init(|| DialectOverlay {
         name: "rustfs-system-reads",
@@ -99,7 +92,7 @@ pub(super) fn assemble(
     root: Arc<dyn RootSource>,
 ) -> Result<GatewayStack, GatewayAssemblyError> {
     let gate = decide_with(|request| {
-        if OPERATIONS.contains(&request.operation) {
+        if NATIVE_ADMIN_READS.iter().any(|row| row.operation == request.operation) {
             Decision::Allow
         } else {
             Decision::Deny

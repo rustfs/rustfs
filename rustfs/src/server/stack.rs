@@ -27,14 +27,27 @@
 //! This file names no stack's types: it is generic over the services with one response
 //! type, so `server/http.rs` decides what they are and how their bodies meet.
 
-use crate::admin::router::{claims_native_admin_route, claims_native_console_route, claims_route};
-use http::Request;
+use crate::admin::router::{NATIVE_ADMIN_READS, claims_native_console_route, claims_route, object_lambda_target};
+use crate::server::is_admin_path;
 use http::uri::PathAndQuery;
+use http::{Method, Request, Uri};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll, ready};
 use tower::Service;
+
+/// The native admin service accepts exact signed-read routes. Object Lambda keeps precedence
+/// when its selector also matches the same path.
+pub(super) fn claims_native_admin_read(method: &Method, uri: &Uri) -> bool {
+    let path = uri.path();
+    method == Method::GET
+        && is_admin_path(path)
+        && NATIVE_ADMIN_READS
+            .iter()
+            .any(|row| row.method == method.as_str() && row.query.is_none() && (path == row.path || Some(path) == row.alias))
+        && object_lambda_target(method, uri).is_none()
+}
 
 /// The S3 service of one server: the gateway stack with its website and control-plane services.
 #[derive(Clone)]
@@ -164,7 +177,7 @@ impl<G, C, W> GatewayServices<G, C, W> {
             return Box::pin(console.call(request));
         }
         if let Some(admin) = &mut self.native_admin
-            && claims_native_admin_route(request.method(), request.uri())
+            && claims_native_admin_read(request.method(), request.uri())
         {
             return Box::pin(admin.call(request));
         }
