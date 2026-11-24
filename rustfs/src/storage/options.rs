@@ -878,7 +878,17 @@ pub fn extract_metadata_from_mime_with_object_name(
                 continue;
             }
 
-            metadata.insert(stored_user_metadata_key(key), String::from_utf8_lossy(v.as_bytes()).to_string());
+            let raw = String::from_utf8_lossy(v.as_bytes());
+            // The gateway response codec encodes stored text. Store the decoded value for S3
+            // metadata even when a raw header overlays the typed request or an archive entry.
+            let value = if k.as_str().starts_with(CANONICAL_USER_METADATA_PREFIX) && raw.contains("=?") {
+                rustfs_gateway_http::decode_metadata_value(&raw)
+                    .map(|text| text.into_owned())
+                    .unwrap_or_else(|_| raw.into_owned())
+            } else {
+                raw.into_owned()
+            };
+            metadata.insert(stored_user_metadata_key(key), value);
             continue;
         }
 
@@ -2275,6 +2285,25 @@ mod tests {
         assert_eq!(metadata.get("user-id"), Some(&"12345".to_string()));
         assert_eq!(metadata.get("project"), Some(&"test-project".to_string()));
         assert!(!metadata.contains_key(""));
+    }
+
+    #[test]
+    fn user_metadata_encoded_words_are_stored_as_text() {
+        let mut headers = HeaderMap::new();
+        let words = HeaderValue::from_static("=?UTF-8?B?5Lit?=   =?UTF-8?B?5paH?=");
+        headers.insert("x-amz-meta-caption", words.clone());
+        headers.insert("x-minio-meta-alias", words);
+        headers.insert("x-amz-meta-literal", HeaderValue::from_static("=?UTF-8?Q?=3D=3FUTF-8=3FB=3F5Lit=3F=3D?="));
+        headers.insert("x-amz-meta-plain", HeaderValue::from_static("ordinary text"));
+        headers.insert("x-amz-meta-old", HeaderValue::from_static("=?malformed"));
+        let mut metadata = HashMap::from([("caption".to_owned(), "中文".to_owned())]);
+        extract_metadata_from_mime(&headers, &mut metadata);
+
+        assert_eq!(metadata["caption"], "中文");
+        assert_eq!(metadata["literal"], "=?UTF-8?B?5Lit?=");
+        assert_eq!(metadata["alias"], "=?UTF-8?B?5Lit?=   =?UTF-8?B?5paH?=");
+        assert_eq!(metadata["plain"], "ordinary text");
+        assert_eq!(metadata["old"], "=?malformed");
     }
 
     #[test]

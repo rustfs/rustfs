@@ -1039,7 +1039,7 @@ mod tests {
                 .source()
                 .is_some_and(|cause| cause.is::<http::header::InvalidHeaderValue>())
         );
-        let wire = crate::app::storage_api::s3::S3Error::from(error);
+        let wire = crate::error::legacy_error_for_test(error);
         assert_eq!(wire.status_code(), Some(StatusCode::INTERNAL_SERVER_ERROR));
         assert!(
             wire.source()

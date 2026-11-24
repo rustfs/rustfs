@@ -15,13 +15,14 @@
 """Summarize and judge the gateway client matrix run against the RustFS candidate.
 
 Usage:
-  compat_matrix_report.py check --run-dir <dir>
+  compat_matrix_report.py check --run-dir <dir> [--gateway-dir <checkout>] [--server-dir <dir>]
   compat_matrix_report.py --self-test
 
 <dir> holds what the lane observed: the server record acceptance_lane.py reads,
 `skipped-clients.txt` (`<client>: <reason>` per client that could not be
 installed), `matrix-exit.txt` (the exit code of the gateway's
-ci/compat/run_matrix.sh) and `compat/matrix.json` (its manifest).
+ci/compat/run_matrix.sh) and `compat/matrix.json` (its manifest). The pinned
+gateway checkout defaults to the lane's sibling `gateway` directory.
 
 `check` is clean only when the server served, the matrix
 finished, every client ran, and no cell is `fail` or `sut-unregistered`
@@ -38,6 +39,7 @@ import json
 from pathlib import Path
 import sys
 import tempfile
+import tomllib
 import unittest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -49,22 +51,49 @@ STATUSES = ("pass", "fail", "client-unsupported", "sut-unregistered")
 def read_cells(run_dir):
     """Return {(client, scenario): cell} from the run's manifest, or None when it wrote none."""
     manifest = Path(run_dir) / "compat/matrix.json"
-    cells = None
-    if manifest.is_file():
-        try:
-            cells = {(client["name"], scenario["id"]): scenario
-                     for client in json.loads(manifest.read_text(encoding="utf-8"))["clients"]
-                     for scenario in client["scenarios"]}
-        except (json.JSONDecodeError, KeyError, TypeError) as error:
-            raise InputError(f"{manifest}: not a client matrix manifest: {error}") from error
-        if any(cell.get("status") not in STATUSES for cell in cells.values()):
-            raise InputError(f"{manifest}: unknown cell status")
+    if not manifest.is_file():
+        return None
+    cells = {}
+    clients = set()
+    try:
+        rows = json.loads(manifest.read_text(encoding="utf-8"))["clients"]
+        if not isinstance(rows, list):
+            raise InputError(f"{manifest}: expected a list of clients")
+        for client in rows:
+            name = client["name"]
+            if not isinstance(name, str) or not name or not isinstance(client["scenarios"], list) or not client["scenarios"]:
+                raise InputError(f"{manifest}: expected a named client with scenario rows")
+            if name in clients:
+                raise InputError(f"{manifest}: duplicate client {name}")
+            clients.add(name)
+            for scenario in client["scenarios"]:
+                case = scenario["id"]
+                if not isinstance(case, str) or not case or scenario.get("status") not in STATUSES:
+                    raise InputError(f"{manifest}: invalid scenario id or status for {name}")
+                if (name, case) in cells:
+                    raise InputError(f"{manifest}: duplicate cell {name}/{case}")
+                cells[name, case] = scenario
+    except (OSError, ValueError, KeyError, TypeError) as error:
+        raise InputError(f"{manifest}: not a client matrix manifest: {error}") from error
     return cells
 
 
-def check(run_dir):
+def expected_cells(gateway_dir):
+    compat = Path(gateway_dir) / "compat"
+    try:
+        with (compat / "versions.toml").open("rb") as versions:
+            clients = tomllib.load(versions)["clients"]
+        scenarios = {path.stem for path in (compat / "scenarios").glob("*.yaml") if path.is_file()}
+    except (OSError, KeyError, tomllib.TOMLDecodeError) as error:
+        raise InputError(f"{compat}: cannot read gateway matrix inventory: {error}") from error
+    if not isinstance(clients, dict) or not clients or not scenarios:
+        raise InputError(f"{compat}: empty or invalid gateway matrix inventory")
+    return {(client, scenario) for client in clients for scenario in scenarios}
+
+
+def check(run_dir, gateway_dir=None, server_dir=None):
     """Return (summary lines, problems)."""
-    server, problem = served(run_dir)
+    server, problem = served(run_dir if server_dir is None else server_dir)
     lines = ["### Client matrix", "", server]
     if problem:
         return lines, [f"matrix: {problem}; no client ran"]
@@ -76,6 +105,11 @@ def check(run_dir):
     if cells is None or matrix_exit not in (0, 1) or not cells:
         lines.append("- manifest: none" if cells is None else "- manifest: written by a run that did not finish")
         return lines, problems + [f"matrix: the matrix did not complete (exit {matrix_exit})"]
+    expected = expected_cells(gateway_dir if gateway_dir is not None else Path(run_dir).resolve().parent / "gateway")
+    skipped_clients = {line.split(":", 1)[0] for line in skipped}
+    problems.extend(f"matrix: missing cell {client}/{case}" for client, case in sorted(expected - cells.keys())
+                    if client not in skipped_clients)
+    problems.extend(f"matrix: unexpected cell {client}/{case}" for client, case in sorted(cells.keys() - expected))
     counts = {status: sorted(cell for cell, value in cells.items() if value["status"] == status) for status in STATUSES}
     clients = {client for client, _ in cells}
     lines.append(f"- {len(clients)} clients x {len({scenario for _, scenario in cells})} scenarios: "
@@ -96,9 +130,11 @@ def main(argv=None):
     commands = parser.add_subparsers(dest="command", required=True)
     one = commands.add_parser("check")
     one.add_argument("--run-dir", required=True)
+    one.add_argument("--server-dir", help="directory with a separate matrix server startup record")
+    one.add_argument("--gateway-dir", help="gateway checkout used to run this matrix")
     args = parser.parse_args(argv)
     try:
-        lines, problems = check(args.run_dir)
+        lines, problems = check(args.run_dir, args.gateway_dir, args.server_dir)
     except InputError as error:
         print(f"error: {error}", file=sys.stderr)
         return 2
@@ -112,7 +148,11 @@ class SelfTest(unittest.TestCase):
     def setUp(self):
         temporary = tempfile.TemporaryDirectory()
         self.addCleanup(temporary.cleanup)
-        self.dir = Path(temporary.name)
+        self.dir = Path(temporary.name) / "lane"
+        self.compat = self.dir.parent / "gateway/compat"
+        (self.compat / "scenarios").mkdir(parents=True)
+        (self.compat / "scenarios/a.yaml").touch()
+        (self.compat / "versions.toml").write_text("[clients.boto3]\n[clients.restic]\n")
 
     def write_run(self, directory, cells, startup="ready", matrix_exit="0", skipped=""):
         write_served(directory, startup)
@@ -136,11 +176,42 @@ class SelfTest(unittest.TestCase):
         self.assertEqual(problems, [])
         self.assertIn("- 2 clients x 1 scenarios: pass 1, fail 0, client-unsupported 1, sut-unregistered 0", lines)
 
+    def test_a_missing_client_and_missing_scenario_are_red(self):
+        (self.compat / "scenarios/b.yaml").touch()
+        self.assertEqual(self.checked(cells={("boto3", "a"): "pass"})[1],
+                         ["matrix: missing cell boto3/b", "matrix: missing cell restic/a", "matrix: missing cell restic/b"])
+
+    def test_an_extra_cell_cannot_replace_a_missing_cell(self):
+        self.assertEqual(self.checked(cells={("boto3", "a"): "pass", ("restic", "other"): "pass"})[1],
+                         ["matrix: missing cell restic/a", "matrix: unexpected cell restic/other"])
+
+    def test_a_duplicate_cannot_overwrite_a_failure(self):
+        self.write_run(self.dir, {("boto3", "a"): "fail", ("restic", "a"): "pass"})
+        manifest = self.dir / "compat/matrix.json"
+        original = manifest.read_text()
+        row = {"id": "a", "status": "pass"}
+        for duplicate_client in (False, True):
+            with self.subTest(duplicate_client=duplicate_client):
+                data = json.loads(original)
+                if duplicate_client:
+                    data["clients"].append({"name": "boto3", "scenarios": [row]})
+                else:
+                    data["clients"][0]["scenarios"].append(row)
+                manifest.write_text(json.dumps(data))
+                with self.assertRaisesRegex(InputError, "duplicate"):
+                    check(self.dir)
+
+    def test_a_missing_inventory_is_refused(self):
+        (self.compat / "versions.toml").unlink()
+        with self.assertRaisesRegex(InputError, "matrix inventory"):
+            self.checked(cells={("boto3", "a"): "pass"})
+
     def test_a_failed_cell_is_red(self):
-        self.assertEqual(self.checked(cells={("boto3", "a"): "fail"}, matrix_exit="1")[1], ["matrix: boto3/a is fail"])
+        self.assertEqual(self.checked(cells={("boto3", "a"): "fail", ("restic", "a"): "pass"}, matrix_exit="1")[1], ["matrix: boto3/a is fail"])
 
     def test_an_unregistered_cell_is_red(self):
-        self.assertEqual(self.checked(cells={("mc", "a"): "sut-unregistered"})[1], ["matrix: mc/a is sut-unregistered"])
+        self.assertEqual(self.checked(cells={("boto3", "a"): "pass", ("restic", "a"): "sut-unregistered"})[1],
+                         ["matrix: restic/a is sut-unregistered"])
 
     def test_a_client_that_could_not_be_installed_is_skipped_never_passed(self):
         lines, problems = self.checked(cells={("boto3", "a"): "pass"}, skipped="restic: skipped: go is not on PATH\n")
@@ -152,6 +223,13 @@ class SelfTest(unittest.TestCase):
         self.assertIn("- server: did not start: refused", lines)
         self.assertEqual(problems, ["matrix: the server did not serve; no client ran"])
 
+    def test_separate_server_requires_its_own_ready_record(self):
+        run = self.write_run(self.dir, cells={("boto3", "a"): "pass", ("restic", "a"): "pass"})
+        server = run / "matrix-host"
+        self.assertEqual(check(run, server_dir=server)[1], ["matrix: the server did not serve; no client ran"])
+        write_served(server)
+        self.assertEqual(check(run, server_dir=server)[1], [])
+
     def test_an_environment_exit_is_red_even_with_a_manifest(self):
         self.assertEqual(self.checked(cells={("boto3", "a"): "pass"}, matrix_exit="3")[1],
                          ["matrix: the matrix did not complete (exit 3)"])
@@ -160,7 +238,7 @@ class SelfTest(unittest.TestCase):
         self.assertEqual(self.checked(cells=None)[1], ["matrix: the matrix did not complete (exit 0)"])
 
     def test_a_swallowed_exit_cannot_hide_a_failed_cell(self):
-        self.assertEqual(self.checked(cells={("boto3", "a"): "fail"}, matrix_exit="0")[1], ["matrix: boto3/a is fail"])
+        self.assertEqual(self.checked(cells={("boto3", "a"): "fail", ("restic", "a"): "pass"}, matrix_exit="0")[1], ["matrix: boto3/a is fail"])
 
     def test_an_unknown_status_is_refused(self):
         with self.assertRaises(InputError):

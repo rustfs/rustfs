@@ -204,6 +204,13 @@ async fn create_bucket_answers_as_before(server: RustFSServer) {
             .set_create_bucket_configuration(configuration)
             .send()
             .await;
+        if let Ok(output) = &created {
+            let expected = match bucket {
+                "create-fresh" => Some("/create-fresh"),
+                _ => None, // Accepted historical bucket names keep their measured response.
+            };
+            assert_eq!(output.location(), expected, "{bucket}");
+        }
         let refused = outcome(created).err().map(|refusal| (refusal.code, refusal.status));
         let exists = super::bucket_exists_in_the_store(bucket).await;
         observed.push((bucket, location, refused, exists));
@@ -216,6 +223,26 @@ async fn create_bucket_answers_as_before(server: RustFSServer) {
         })
         .collect();
     assert_eq!(observed, expected);
+
+    let global_bucket = "create-namespace-global";
+    let created_global = root
+        .create_bucket()
+        .bucket(global_bucket)
+        .customize()
+        .mutate_request(|request| {
+            request.headers_mut().insert("x-amz-bucket-namespace", "global");
+        })
+        .send()
+        .await
+        .expect("CreateBucket with x-amz-bucket-namespace: global should succeed");
+    assert_eq!(created_global.location(), Some("/create-namespace-global"));
+    assert!(super::bucket_exists_in_the_store(global_bucket).await);
+    root.head_bucket()
+        .bucket(global_bucket)
+        .send()
+        .await
+        .expect("HeadBucket after global-namespace CreateBucket should return 200");
+
     server.shutdown().await;
 }
 
@@ -240,10 +267,10 @@ const RUSTFS_INVALID: Option<(&str, u16)> = Some(("InvalidRequest", 400));
 const MINIO_INVALID: Option<(&str, u16)> = Some(("InvalidArgument", 400));
 
 /// The legacy answers, measured: `x-rustfs-force-delete` reads RustFS's wide boolean grammar,
-/// `x-minio-force-delete` only `true` and `false`. The force rows use a bucket that holds an
-/// object, so a refused value that deleted anyway, or a `false` read as `true`, cannot pass. A
-/// name the AWS grammar reserves is deleted like any other.
-const DELETE_CASES: [DeleteCase; 14] = [
+/// `x-minio-force-delete` accepts `true`, `false`, `True`, and `False`. The force rows use a
+/// bucket that holds an object, so a refused value that deleted anyway, or a `false` read as
+/// `true`, cannot pass. A name the AWS grammar reserves is deleted like any other.
+const DELETE_CASES: [DeleteCase; 17] = [
     ("delete-missing", None, false, Some(("NoSuchBucket", 404)), false),
     ("delete-plain", None, false, None, false),
     ("sthree-delete", None, false, None, false),
@@ -260,10 +287,25 @@ const DELETE_CASES: [DeleteCase; 14] = [
     ),
     ("delete-rustfs-false", Some(("x-rustfs-force-delete", "false")), true, NOT_EMPTY, true),
     ("delete-minio-true", Some(("x-minio-force-delete", "true")), true, None, false),
+    ("delete-minio-cap-true", Some(("x-minio-force-delete", "True")), true, None, false),
     ("delete-minio-upper", Some(("x-minio-force-delete", "TRUE")), true, MINIO_INVALID, true),
     ("delete-minio-one", Some(("x-minio-force-delete", "1")), true, MINIO_INVALID, true),
     ("delete-minio-maybe", Some(("x-minio-force-delete", "maybe")), true, MINIO_INVALID, true),
     ("delete-minio-false", Some(("x-minio-force-delete", "false")), true, NOT_EMPTY, true),
+    (
+        "delete-minio-cap-false-full",
+        Some(("x-minio-force-delete", "False")),
+        true,
+        NOT_EMPTY,
+        true,
+    ),
+    (
+        "delete-minio-cap-false-empty",
+        Some(("x-minio-force-delete", "False")),
+        false,
+        None,
+        false,
+    ),
 ];
 
 async fn delete_bucket_answers_as_before(server: RustFSServer) {

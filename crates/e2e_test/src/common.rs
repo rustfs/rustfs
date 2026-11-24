@@ -49,6 +49,15 @@ use uuid::Uuid;
 // Common constants for all E2E tests
 pub const DEFAULT_ACCESS_KEY: &str = "rustfsadmin";
 pub const DEFAULT_SECRET_KEY: &str = "rustfsadmin";
+
+fn fixture_access_key(default: &str) -> String {
+    if std::env::var("RUSTFS_CORPUS_RECORD").as_deref() == Ok("1") {
+        "rustfsadmin-ci".to_owned()
+    } else {
+        default.to_owned()
+    }
+}
+
 pub const ENV_RUSTFS_BUILD_FEATURES: &str = "RUSTFS_BUILD_FEATURES";
 pub(crate) const FAST_DATA_USAGE_SCANNER_ENV: &[(&str, &str)] =
     &[("RUSTFS_SCANNER_CYCLE", "1"), ("RUSTFS_SCANNER_START_DELAY_SECS", "0")];
@@ -632,7 +641,7 @@ impl RustFSTestEnvironment {
             temp_dir,
             address,
             url,
-            access_key: DEFAULT_ACCESS_KEY.to_string(),
+            access_key: fixture_access_key(DEFAULT_ACCESS_KEY),
             secret_key: DEFAULT_SECRET_KEY.to_string(),
             process: None,
             capture_log_path,
@@ -651,7 +660,7 @@ impl RustFSTestEnvironment {
             temp_dir,
             address: address.to_string(),
             url,
-            access_key: DEFAULT_ACCESS_KEY.to_string(),
+            access_key: fixture_access_key(DEFAULT_ACCESS_KEY),
             secret_key: DEFAULT_SECRET_KEY.to_string(),
             process: None,
             capture_log_path,
@@ -1035,8 +1044,7 @@ pub async fn execute_awscurl(
 
 /// `POST` with SigV4 `--service sts` and explicit `Content-Type: application/x-www-form-urlencoded`.
 ///
-/// RustFS `AssumeRole` is handled on `POST /` by the admin router; `is_match` requires this
-/// content type so s3s routes to the custom handler instead of `Unknown operation`.
+/// RustFS uses this content type to recognize an STS query on `POST /`.
 pub async fn awscurl_post_sts_form_urlencoded(
     url: &str,
     body: &str,
@@ -1413,7 +1421,7 @@ impl RustFSTestClusterEnvironment {
         Ok(Self {
             nodes,
             temp_dir,
-            access_key: "rustfs-cluster-test-access".to_string(),
+            access_key: fixture_access_key("rustfs-cluster-test-access"),
             secret_key: "rustfs-cluster-test-secret".to_string(),
             extra_env,
             node_extra_env: vec![Vec::new(); topology.node_count],
@@ -2534,7 +2542,7 @@ mod tests {
         RustFSTestClusterEnvironment {
             nodes,
             temp_dir,
-            access_key: DEFAULT_ACCESS_KEY.to_string(),
+            access_key: fixture_access_key(DEFAULT_ACCESS_KEY),
             secret_key: DEFAULT_SECRET_KEY.to_string(),
             extra_env: Vec::new(),
             node_extra_env: vec![Vec::new(); topology.node_count],

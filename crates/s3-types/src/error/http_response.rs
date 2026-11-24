@@ -21,6 +21,18 @@ use http::{HeaderValue, Response, StatusCode};
 use quick_xml::escape::escape;
 
 impl S3Error {
+    fn into_http_response_parts(self) -> crate::S3ErrorParts {
+        let mut parts = self.into_parts();
+        #[cfg(test)]
+        if crate::compat_s3s::restore_http_response_parts(&mut parts) {
+            return parts;
+        }
+        if parts.message.is_none() {
+            parts.message = parts.code.default_message().map(std::borrow::Cow::Borrowed);
+        }
+        parts
+    }
+
     /// Renders this error as an HTTP response using the legacy S3 wire format.
     ///
     /// # Errors

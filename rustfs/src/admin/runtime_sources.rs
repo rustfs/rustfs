@@ -147,7 +147,7 @@ mod tests {
     use matchit::Params;
     use rustfs_iam::{store::object::ObjectStore, sys::IamSys};
     use rustfs_kms::KmsServiceManager;
-    use rustfs_s3_types::{S3ErrorCode, s3_error};
+    use rustfs_s3_types::s3_error;
     use std::sync::Arc;
 
     struct UnreadyIam;
@@ -326,7 +326,7 @@ mod tests {
         let err = call_legacy(&router, Method::GET, "/context-probe", http::Extensions::new())
             .await
             .expect_err("empty slot must fail closed");
-        assert_eq!(err.code(), &S3ErrorCode::ServiceUnavailable.into());
+        assert_eq!(err.code(), &crate::app::storage_api::s3::S3ErrorCode::ServiceUnavailable);
 
         assert!(slot.install(distinct_context(&ambient)));
         let response = call_legacy(&router, Method::GET, "/context-probe", http::Extensions::new())

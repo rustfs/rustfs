@@ -4213,7 +4213,7 @@ impl DefaultObjectUsecase {
                     Ok(moved) => moved,
                     Err(error) => {
                         lifecycle.finish_err();
-                        return Err(error.into());
+                        return Err(error);
                     }
                 };
                 lifecycle.finish_ok();
@@ -4274,6 +4274,10 @@ impl DefaultObjectUsecase {
         let expiration = resolve_put_object_expiration(bucket, &info).await;
         record_get_object_s3_handler_stage_duration(GET_OBJECT_STAGE_LIFECYCLE_EXPIRATION, lifecycle_expiration_start);
         let storage_class = response_storage_class_name(&info, &info.user_defined);
+        let expires = info
+            .expires
+            .map(|value| value.format(RFC1123).map_err(S3Error::internal_error))
+            .transpose()?;
         let cache_control = info.user_defined.get("cache-control").cloned();
         let content_disposition = info.user_defined.get("content-disposition").cloned();
 
@@ -4292,6 +4296,7 @@ impl DefaultObjectUsecase {
                 content_encoding: info.content_encoding.clone(),
                 content_language: info.user_defined.get("content-language").cloned(),
                 cache_control,
+                expires: expires.map(Into::into),
                 content_disposition,
                 content_range,
                 parts_count,
@@ -4510,9 +4515,10 @@ impl DefaultObjectUsecase {
 
     pub(crate) async fn execute_get_object(
         &self,
-        envelope: RequestEnvelope,
+        mut envelope: RequestEnvelope,
         input: gateway_dto::GetObjectInput,
     ) -> S3Result<Answered<GetObjectOutputFacts>> {
+        envelope.check_list_bucket_on_missing_key = input.version_id.is_none();
         self.execute_get_object_fields(envelope, input.into()).await
     }
 
@@ -4771,7 +4777,7 @@ impl DefaultObjectUsecase {
                 }
                 Some(OdmGetOutcome::Respond(Err(err))) => {
                     lifecycle.finish_err();
-                    return Self::complete_get_object_error(helper.version_id(version_id_for_event), err);
+                    return finish_object_read_error(&mut envelope, helper.version_id(version_id_for_event), err).await;
                 }
                 Some(OdmGetOutcome::RetryLocal) => {
                     let prepare_read_retry_start = stage_metrics_enabled.then(std::time::Instant::now);
@@ -4803,7 +4809,7 @@ impl DefaultObjectUsecase {
             Err(err) => {
                 let err = enrich_delete_marker_read_error(&store, &bucket, &key, &opts, err).await;
                 lifecycle.finish_err();
-                return Self::complete_get_object_error(helper.version_id(version_id_for_event), err);
+                return finish_object_read_error(&mut envelope, helper.version_id(version_id_for_event), err).await;
             }
         };
         let GetObjectPreparedRead { io_planning, read_setup } = prepared_read;
@@ -12179,12 +12185,13 @@ mod tests {
 
     #[tokio::test]
     async fn build_get_object_output_context_returns_standard_headers() {
-        for (content_language, user_language) in [
-            (Some("zh-CN"), None),
-            (None, None),
-            (Some(""), None),
-            (Some("zh-CN"), Some("fr-FR")),
-            (None, Some("fr-FR")),
+        let stored_expires = time::macros::datetime!(2030-01-01 0:00 UTC);
+        for (content_language, user_language, expires) in [
+            (Some("zh-CN"), None, Some(stored_expires)),
+            (None, None, None),
+            (Some(""), None, None),
+            (Some("zh-CN"), Some("fr-FR"), None),
+            (None, Some("fr-FR"), None),
         ] {
             let mut metadata = HashMap::new();
             metadata.insert("cache-control".to_string(), "public, max-age=259200".to_string());
@@ -12200,6 +12207,7 @@ mod tests {
                 bucket: "test-bucket".to_string(),
                 name: "path/raw".to_string(),
                 user_defined: Arc::new(metadata),
+                expires,
                 ..Default::default()
             };
 
@@ -12258,6 +12266,10 @@ mod tests {
             assert_eq!(output.cache_control.as_deref(), Some("public, max-age=259200"));
             assert_eq!(output.content_disposition.as_deref(), Some("attachment; filename=\"demo.png\""));
             assert_eq!(output.content_language.as_deref(), content_language);
+            assert_eq!(
+                output.expires.as_ref().map(|value| value.as_str()),
+                expires.map(|_| "Tue, 01 Jan 2030 00:00:00 GMT")
+            );
             assert_eq!(output.metadata.get("content-language").map(String::as_str), user_language,);
             assert!(!output.metadata.contains_key("cache-control"));
             assert!(!output.metadata.contains_key("content-disposition"));

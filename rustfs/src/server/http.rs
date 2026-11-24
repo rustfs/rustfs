@@ -1569,9 +1569,18 @@ fn control_request_body(body: EdgeBody) -> ControlRequestBody {
     ControlRequestBody(body)
 }
 
+#[cfg(feature = "corpus-record")]
+mod corpus;
+
+#[cfg(feature = "corpus-record")]
+type S3Gateway =
+    tower::util::Either<rustfs_gateway_corpus_recorder::CorpusRecorderService<GatewayEdgeService>, GatewayEdgeService>;
+#[cfg(not(feature = "corpus-record"))]
+type S3Gateway = GatewayEdgeService;
+
 /// The S3 service mounted under the middleware: the gateway stack with its claimed-route hosts
 /// (`server/stack.rs`).
-type S3EdgeService = S3StackService<GatewayEdgeService, NativeConsoleEdgeService, NativeWebsiteEdgeService>;
+type S3EdgeService = S3StackService<S3Gateway, NativeConsoleEdgeService, NativeWebsiteEdgeService>;
 
 /// The gateway stack under the middleware, answering in the middleware's body and error types.
 #[derive(Clone)]
@@ -1680,8 +1689,19 @@ fn assemble_s3_stack(
     let router = admin::make_admin_router(config.console_enable, Arc::clone(&assembly.server_ctx))?;
     let control_plane =
         GatewayEdgeService(GatewayStack::assemble_control_plane(assembly.clone(), Arc::new(router)).map_err(Error::other)?);
-    let stack = GatewayStack::assemble(assembly).map_err(Error::other)?;
-    Ok(S3StackService::new(GatewayEdgeService(stack))
+    #[cfg(feature = "corpus-record")]
+    let recorder = corpus::recorder(config, &assembly.server_domains)?;
+    let s3 = GatewayEdgeService(GatewayStack::assemble(assembly).map_err(Error::other)?);
+    #[cfg(feature = "corpus-record")]
+    let (s3, native_admin, control_plane) = {
+        use tower::{Layer, util::Either};
+        (
+            Either::Left(recorder.layer(s3)),
+            Either::Right(native_admin),
+            Either::Right(control_plane),
+        )
+    };
+    Ok(S3StackService::new(s3)
         .with_native_console(NativeConsoleEdgeService::for_config(config))
         .with_native_website(NativeWebsiteEdgeService::claiming(website))
         .with_native_admin(Some(native_admin))
@@ -2457,6 +2477,8 @@ async fn start_http_server_inner(
 
     // Obtain the listener address
     let local_addr: SocketAddr = listener.local_addr()?;
+    #[cfg(feature = "corpus-record")]
+    corpus::validate_listener(local_addr.ip())?;
     let local_ip = match rustfs_utils::get_local_ip() {
         Some(ip) => ip,
         None => {
@@ -7404,7 +7426,7 @@ mod tests {
                 assert_eq!(req.input.key, "object");
                 assert_eq!(req.input.if_match.is_some(), req.headers.contains_key(http::header::IF_MATCH));
                 assert_eq!(req.input.if_none_match.is_some(), req.headers.contains_key(http::header::IF_NONE_MATCH));
-                check_preconditions(&req.headers, &object_info())?;
+                check_preconditions(&req.headers, &object_info()).map_err(crate::error::legacy_error_for_test)?;
                 Ok(s3s::S3Response::new(s3s::dto::GetObjectOutput {
                     body: Some(s3s::dto::StreamingBlob::from_bytes(Bytes::from_static(b"payload"))),
                     content_length: Some(7),
@@ -7422,7 +7444,7 @@ mod tests {
                 assert_eq!(req.input.key, "object");
                 assert_eq!(req.input.if_match.is_some(), req.headers.contains_key(http::header::IF_MATCH));
                 assert_eq!(req.input.if_none_match.is_some(), req.headers.contains_key(http::header::IF_NONE_MATCH));
-                check_preconditions(&req.headers, &object_info())?;
+                check_preconditions(&req.headers, &object_info()).map_err(crate::error::legacy_error_for_test)?;
                 Ok(s3s::S3Response::new(s3s::dto::HeadObjectOutput {
                     content_length: Some(7),
                     e_tag: Some(s3s::dto::ETag::Strong("abc".to_owned())),
@@ -8921,7 +8943,8 @@ mod tests {
                 let previous_name = rustfs_common::get_global_local_node_name().await;
                 rustfs_common::set_global_local_node_name(&address.to_string()).await;
                 let node = InterceptedService::new(NodeServiceServer::new(make_server()), check_auth);
-                let fallback = tower::service_fn(|_| async { Ok::<_, Infallible>(Response::new(s3s::Body::empty())) });
+                let fallback =
+                    tower::service_fn(|_| async { Ok::<_, Infallible>(Response::new(rustfs_s3_types::Body::empty())) });
                 let service = hybrid(
                     InternodeRpcService::new(fallback),
                     RpcRequestPathService::new(Routes::new(node).prepare()),

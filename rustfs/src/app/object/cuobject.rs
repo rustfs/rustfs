@@ -55,8 +55,8 @@ pub(crate) mod transport {
     };
 }
 use crate::app::storage_api::object_usecase::rdma::{RegisteredSlabArena, ShardBuf, ShardEmitter, install_shard_arena};
-use crate::app::storage_api::s3::{S3Error, S3ErrorCode, S3Result};
 use rustfs_gateway_stream::Body;
+use rustfs_s3_types::{S3Error, S3ErrorCode, S3Result};
 use rustfs_utils::{get_env_bool, get_env_opt_str, get_env_u64, get_env_usize};
 use std::collections::VecDeque;
 use std::io;

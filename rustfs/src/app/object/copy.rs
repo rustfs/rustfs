@@ -187,6 +187,7 @@ impl DefaultObjectUsecase {
             tagging_directive,
             copy_source_if_match,
             copy_source_if_none_match,
+            copy_source_dates,
             cache_control,
             content_disposition,
             content_encoding,
@@ -537,15 +538,12 @@ impl DefaultObjectUsecase {
                 .find_map(|(k, v)| rustfs_rio::Checksum::new_from_string(&k, &v))
         });
 
-        // Validate copy source conditions
-        if let Some(condition) = copy_source_if_match
-            && !condition.strong().is_some_and(|tag| Some(tag) == src_info.etag.as_deref())
-        {
-            return Err(s3_error!(PreconditionFailed));
-        }
-        if let Some(condition) = copy_source_if_none_match
-            && condition.strong().is_some_and(|tag| Some(tag) == src_info.etag.as_deref())
-        {
+        if !copy_source_dates.permits_copy(
+            copy_source_if_match.as_ref(),
+            copy_source_if_none_match.as_ref(),
+            src_info.etag.as_deref(),
+            src_info.mod_time,
+        ) {
             return Err(s3_error!(PreconditionFailed));
         }
 
@@ -968,7 +966,7 @@ mod tests {
         usecase
             .execute_copy_object_owned(copy_envelope(HeaderMap::new()), input)
             .await
-            .map_err(Into::into)
+            .map_err(crate::error::legacy_error_for_test)
     }
     use crate::app::storage_api::s3::S3ErrorCode;
     use crate::app::storage_api::s3::dto::ServerSideEncryption;
