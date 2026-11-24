@@ -601,17 +601,13 @@ async fn copy_contract(server: super::RustFSServer) {
             "missing" => Some(("NoSuchKey", 404)),
             "empty-version" => Some(("InvalidArgument", 400)),
             "malformed-version" => Some(("InternalError", 500)),
-            "match-wildcard" | "match-weak" | "destination-match-refusal" => Some(("PreconditionFailed", 412)),
+            "match-wildcard" | "match-weak" | "modified-future" | "unmodified-past" | "destination-match-refusal" => {
+                Some(("PreconditionFailed", 412))
+            }
             "modified-invalid" | "unmodified-invalid" => Some(("InvalidArgument", 400)),
             "destination-non-wildcard-none-match" | "access-point" => Some(("NotImplemented", 501)),
             "copy-with-tags" => Some(("InvalidRequest", 400)),
-            "null-version"
-            | "match-quoted"
-            | "match-bare"
-            | "none-match-wildcard"
-            | "none-match-weak"
-            | "modified-future"
-            | "unmodified-past" => None,
+            "null-version" | "match-quoted" | "match-bare" | "none-match-wildcard" | "none-match-weak" => None,
             _ => panic!("missing expectation: {name}"),
         };
         if let Some((code, status)) = expected {
