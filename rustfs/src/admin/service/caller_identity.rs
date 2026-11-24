@@ -31,7 +31,7 @@ use crate::admin::storage_api::s3::{self, S3ErrorCode, S3Result};
 use crate::app::RequestEnvelope;
 use crate::auth::constant_time_eq;
 use rustfs_credentials::Credentials;
-use rustfs_iam::federation::OIDC_VIRTUAL_PARENT_CLAIM;
+use rustfs_iam::federation::{FederatedProfile, OIDC_PROFILE_CLAIM, OIDC_VIRTUAL_PARENT_CLAIM};
 use rustfs_iam::sys::is_rustfs_oidc_claims;
 use rustfs_madmin::account::{AccountMutability, CredentialsSource, IdentityType};
 use serde_json::Value;
@@ -56,21 +56,49 @@ pub(crate) fn session_parent_identity(credentials: &Credentials) -> Option<&str>
         .and_then(|value| value.as_str())
 }
 
+/// Human-readable OIDC identity metadata for self-service responses.
+#[derive(Debug, Default, PartialEq, Eq, serde::Serialize)]
+pub(crate) struct OidcProfileFields {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) username: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) email: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) display_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) picture: Option<String>,
+}
+
 /// Human-readable OIDC identity metadata for self-service responses. These
 /// values never replace the issuer-scoped virtual parent used for authorization.
-pub(crate) fn oidc_profile_fields(credentials: &Credentials) -> (Option<String>, Option<String>) {
+///
+/// The top-level `preferred_username` and `email` claims come from the verified
+/// ID token and take precedence. The nested display profile fills what the ID
+/// token lacked (typically from the provider's UserInfo endpoint) and carries
+/// the full name and avatar URL.
+pub(crate) fn oidc_profile_fields(credentials: &Credentials) -> OidcProfileFields {
     let Some(claims) = credentials.claims.as_ref().filter(|claims| is_rustfs_oidc_claims(claims)) else {
-        return (None, None);
+        return OidcProfileFields::default();
     };
     let string_claim = |name| {
         claims
             .get(name)
             .and_then(Value::as_str)
-            .filter(|value| !value.trim().is_empty())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
             .map(ToOwned::to_owned)
     };
+    let profile = claims
+        .get(OIDC_PROFILE_CLAIM)
+        .map(FederatedProfile::from_claim_value)
+        .unwrap_or_default();
 
-    (string_claim("preferred_username"), string_claim("email"))
+    OidcProfileFields {
+        username: string_claim("preferred_username").or_else(|| profile.username().map(ToOwned::to_owned)),
+        email: string_claim("email").or_else(|| profile.email().map(ToOwned::to_owned)),
+        display_name: profile.name().map(ToOwned::to_owned),
+        picture: profile.picture().map(ToOwned::to_owned),
+    }
 }
 
 /// Why a credential may not change its own authentication material.
@@ -468,7 +496,11 @@ mod tests {
 
         assert_eq!(
             oidc_profile_fields(&credentials),
-            (Some("j.bruijns@pay.nl".to_string()), Some("fallback@pay.nl".to_string()))
+            OidcProfileFields {
+                username: Some("j.bruijns@pay.nl".to_string()),
+                email: Some("fallback@pay.nl".to_string()),
+                ..Default::default()
+            }
         );
     }
 
@@ -483,7 +515,7 @@ mod tests {
             ("email".to_string(), Value::Array(vec![Value::String("user@example.test".to_string())])),
         ]));
 
-        assert_eq!(oidc_profile_fields(&credentials), (None, None));
+        assert_eq!(oidc_profile_fields(&credentials), OidcProfileFields::default());
     }
 
     #[test]
@@ -492,9 +524,59 @@ mod tests {
         credentials.claims = Some(HashMap::from([
             ("preferred_username".to_string(), Value::String("attacker".to_string())),
             ("email".to_string(), Value::String("attacker@example.test".to_string())),
+            (
+                OIDC_PROFILE_CLAIM.to_string(),
+                serde_json::json!({ "username": "attacker", "picture": "https://attacker.example.test/a.png" }),
+            ),
         ]));
 
-        assert_eq!(oidc_profile_fields(&credentials), (None, None));
+        assert_eq!(oidc_profile_fields(&credentials), OidcProfileFields::default());
+    }
+
+    #[test]
+    fn oidc_profile_fields_fill_gaps_from_display_profile_claim() {
+        let mut credentials = sts_session("TEMPKEY", "oidc-parent");
+        credentials.claims = Some(HashMap::from([
+            ("iss".to_string(), Value::String("rustfs-oidc".to_string())),
+            ("oidc_provider".to_string(), Value::String("authelia".to_string())),
+            ("sub".to_string(), Value::String("subject-123".to_string())),
+            ("email".to_string(), Value::String("token@example.test".to_string())),
+            (
+                OIDC_PROFILE_CLAIM.to_string(),
+                serde_json::json!({
+                    "username": "jane",
+                    "email": "userinfo@example.test",
+                    "name": "Jane Doe",
+                    "picture": "https://idp.example.test/jane.png",
+                }),
+            ),
+        ]));
+
+        assert_eq!(
+            oidc_profile_fields(&credentials),
+            OidcProfileFields {
+                username: Some("jane".to_string()),
+                email: Some("token@example.test".to_string()),
+                display_name: Some("Jane Doe".to_string()),
+                picture: Some("https://idp.example.test/jane.png".to_string()),
+            }
+        );
+    }
+
+    #[test]
+    fn oidc_profile_fields_drop_unsafe_display_profile_values() {
+        let mut credentials = sts_session("TEMPKEY", "oidc-parent");
+        credentials.claims = Some(HashMap::from([
+            ("iss".to_string(), Value::String("rustfs-oidc".to_string())),
+            ("oidc_provider".to_string(), Value::String("authelia".to_string())),
+            ("sub".to_string(), Value::String("subject-123".to_string())),
+            (
+                OIDC_PROFILE_CLAIM.to_string(),
+                serde_json::json!({ "name": "Jane\u{0}Doe", "picture": "javascript:alert(1)" }),
+            ),
+        ]));
+
+        assert_eq!(oidc_profile_fields(&credentials), OidcProfileFields::default());
     }
 
     #[test]
