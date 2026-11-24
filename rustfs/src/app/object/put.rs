@@ -4538,19 +4538,26 @@ mod tests {
     #[tokio::test]
     async fn execute_put_object_rejects_oversize_content_length_before_reading_the_body() {
         let ceiling = i64::try_from(rustfs_config::MAX_SINGLE_PUT_OBJECT_SIZE).expect("ceiling fits i64");
-        let (body, polls) = PollCountingBody::streaming_blob();
-        let input = PutObjectInput::builder()
-            .bucket("test-bucket".to_string())
-            .key("huge.bin".to_string())
-            .body(Some(body))
-            .content_length(Some(ceiling + 1))
-            .build()
-            .unwrap();
-
+        let polls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let body_polls = std::sync::Arc::clone(&polls);
+        let body = super::super::native_body::from_io_stream(futures::stream::repeat_with(move || {
+            body_polls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(Bytes::from_static(b"x"))
+        }));
+        // Same facts `from_legacy` carried. Checksums, SSE, metadata, and trailers stay absent.
+        let input = PutObjectWriteInput {
+            bucket: "test-bucket".to_owned(),
+            key: "huge.bin".to_owned(),
+            body: Some(body),
+            content_length: Some(ceiling + 1),
+            ..Default::default()
+        };
         let usecase = DefaultObjectUsecase::without_context();
 
-        let err = Box::pin(put_method_only(&usecase, input)).await.unwrap_err();
-        assert_eq!(err.code(), &S3ErrorCode::EntityTooLarge);
+        let err = Box::pin(usecase.execute_put_object_owned(method_only_put_envelope(), input))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), &OwnedS3ErrorCode::EntityTooLarge);
         assert_eq!(polls.load(std::sync::atomic::Ordering::SeqCst), 0, "body must not be polled");
     }
 
