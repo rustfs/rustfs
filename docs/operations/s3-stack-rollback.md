@@ -14,4 +14,4 @@ The gateway release serves S3 with rustfs/gateway. Remove `RUSTFS_S3_STACK` from
 | --- | --- |
 | `c-sig-0598` (R-053) | For an access key the S3 parser cannot read, both versions return HTTP 403. The gateway returns the XML error code `AccessDenied`. The legacy binary returns `InvalidAccessKeyId`. Clients that classify these errors by code need to handle both during a rollout. |
 
-The case is recorded in the [pinned gateway conformance rulings](https://github.com/rustfs/gateway/blob/60dcd2a55713dbcc9dbd6e165922e1a0df4473d7/conformance/rulings/rustfs-profile.toml#L298-L304).
+The case is recorded in the [pinned gateway conformance rulings](https://github.com/rustfs/gateway/blob/cc8cba78dd8e29bb706d3a020f5264de43c9d69d/conformance/rulings/rustfs-profile.toml); host-assembled conformance rulings are tracked in [`.config/conformance-rulings.toml`](../../.config/conformance-rulings.toml).

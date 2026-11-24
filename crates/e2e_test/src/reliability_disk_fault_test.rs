@@ -198,8 +198,23 @@ mod tests {
         .await?;
         verify_manifest(&client, bucket, &manifest, "read-back of degraded write").await?;
 
+        // Model an in-flight write to the directory the server recreated while the
+        // original volume was offline. The restore must leave that tree intact.
+        let disk = harness.disk_path(0).to_owned();
+        let marker = ".e2e-in-flight";
+        std::fs::create_dir_all(&disk)?;
+        std::fs::write(disk.join(marker), b"pending")?;
         harness.bring_disk_online(0)?;
 
+        assert!(!disk.join(marker).exists(), "the original volume must be back in its slot");
+        let mut preserved = false;
+        for entry in std::fs::read_dir(&harness.env.temp_dir)? {
+            if entry?.path().join(marker).is_file() {
+                preserved = true;
+                break;
+            }
+        }
+        assert!(preserved, "the displaced tree must remain available to its writer");
         verify_manifest(&client, bucket, &manifest, "after disk0 came back online").await?;
         Ok(())
     }

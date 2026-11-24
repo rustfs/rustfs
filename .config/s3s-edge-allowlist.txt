@@ -17,19 +17,14 @@
 # entirely, and the script rejects such an entry. Only the s3s-facing edge of
 # the rustfs binary and the e2e oracle keep it.
 
-# rustfs binary: the s3s-facing edge that survives Phase 1
-rustfs/src/storage/ecfs.rs
-rustfs/src/storage/s3_compat/**
-rustfs/src/storage/access.rs
+# rustfs binary: reviewed #[cfg(test)] legacy comparison oracles
 rustfs/src/auth.rs
 rustfs/src/error.rs
-rustfs/src/storage_api.rs
 rustfs/src/app/storage_api.rs
 rustfs/src/admin/router.rs
-rustfs/src/app/metadata_route.rs
 rustfs/src/server/http.rs
 rustfs/src/protocols/client.rs
 
-# e2e oracle: the test target that verifies S3 behaviour against s3s
-crates/e2e_test/src/fake_s3_target/**
-crates/e2e_test/src/**
+# e2e oracle: reviewed test targets that compare S3 behaviour against s3s
+crates/e2e_test/src/access_request_validation_test.rs
+crates/e2e_test/src/dual_stack_differential/compare.rs

@@ -101,6 +101,24 @@ cargo nextest list -p e2e_test --profile e2e-smoke --message-format json \
   | sort | uniq -c
 ```
 
+## Record requests from a test server
+
+The debug-only `corpus-record` feature captures S3 requests and response heads at the native S3 handler boundary. Bind the test server to loopback and use a disposable fixture with synthetic data and an allowlisted test identity. The shared E2E fixture uses `rustfsadmin-ci` when recording is enabled. The recorder rejects the shipped default root and refuses to start without an approved source. Console, admin and internode traffic are outside the S3 capture. For changes made by the outer HTTP middleware, compare the client-observed response separately.
+
+From a clean checkout, run a selected E2E scenario with the verified server:
+
+```sh
+export TMPDIR="$(mktemp -d)"
+export RUSTFS_CORPUS_DIR="$TMPDIR/capture"
+mkdir -m 700 "$RUSTFS_CORPUS_DIR"
+export RUSTFS_CORPUS_RECORD=1
+export RUSTFS_CORPUS_RECORD_SRC="rustfs-e2e@$(git rev-parse HEAD)"
+python3 scripts/e2e_binary.py build --features corpus-record
+python3 scripts/e2e_binary.py run --features corpus-record -- cargo nextest run -p e2e_test --profile e2e-full -E 'test(listing_regression_test)' --no-tests fail
+```
+
+For the Ceph implemented suite, use `s3-tests@<Ceph commit>` as the source. Keep the JSONL files in the private temporary directory. Each server process writes a separate file. The pinned gateway recorder limits memory and sanitizes entries before writing. Ingest and strictly verify the captured files with the matching gateway corpus CLI before counting unique entries. Record the suite selection, source revisions, number of recorded and admitted entries, and reference-binary comparison separately.
+
 ## Flake policy
 
 A flaky test fails non-deterministically without a corresponding code change. Retry semantics live in `.config/nextest.toml`: `default` never retries, `ci` has global `retries = 0`, and only quarantined tests get `retries = 2` under `ci`. A quarantined test that passes on retry is marked `flaky` in `target/nextest/ci/junit.xml` (uploaded as a CI artifact); that marker, not a green check, is how a live flake stays visible.

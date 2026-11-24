@@ -23,7 +23,7 @@
 
 use super::storage_api::bucket_usecase::bucket::utils::{BucketConfigXml, serialize};
 use super::storage_api::bucket_usecase::s3_api::bucket::{RUSTFS_OWNER_DISPLAY_NAME, RUSTFS_OWNER_ID};
-use rustfs_gateway_types::dto::Owner;
+use rustfs_gateway_types::dto::{Grant, Grantee, Owner, Permission, Type};
 use rustfs_gateway_types::{BucketName, ETag, NamePolicy, NameValidator, ObjectKey, Stricter, Timestamp};
 use rustfs_s3_types::{S3Error, S3ErrorCode, S3Result};
 use std::fmt::Display;
@@ -94,6 +94,19 @@ pub(crate) fn owner() -> Owner {
     }
 }
 
+/// A default ACL grants full control to the owner named in the same response.
+pub(crate) fn owner_full_control_grant(owner: &Owner) -> Grant {
+    Grant {
+        grantee: Some(Grantee {
+            r#type: Some(Type::CANONICALUSER),
+            id: owner.id.clone(),
+            display_name: owner.display_name.clone(),
+            ..Default::default()
+        }),
+        permission: Some(Permission::FULL_CONTROL),
+    }
+}
+
 /// The entity tag the store holds, as an answer carries it: every answer that carries a stored tag
 /// converts it here, and none drops, rewrites or refuses one.
 ///
@@ -143,6 +156,17 @@ mod tests {
         PersistedLifecycleConfiguration, PersistedReplicationConfiguration, parse_lifecycle_dto, parse_replication_dto,
         serialize_lifecycle_dto, serialize_replication_dto,
     };
+
+    #[test]
+    fn full_control_grant_identifies_the_supplied_owner_without_a_display_name() {
+        let owner = Owner {
+            id: Some("other-owner".to_owned()),
+            display_name: None,
+        };
+        let grantee = owner_full_control_grant(&owner).grantee.expect("a grantee");
+        assert_eq!(grantee.id, owner.id);
+        assert_eq!(grantee.display_name, None);
+    }
 
     /// Names RustFS's create rule admits and the AWS bucket grammar refuses.
     const RUSTFS_ONLY_NAMES: [&str; 5] = ["a-s3alias", "sthree-x", "x--ol-s3", "x--x-s3", "xn--abc"];
