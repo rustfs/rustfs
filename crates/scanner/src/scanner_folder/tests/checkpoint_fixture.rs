@@ -46,7 +46,7 @@ fn scan_options(scan_mode: HealScanMode) -> ScannerDiskScanOptions {
 
 /// Real cache persistence codec and CAS calls, backed by two bounded local files.
 #[derive(Debug)]
-struct FixtureStore {
+pub(super) struct FixtureStore {
     root: std::path::PathBuf,
     _owned_root: Option<tempfile::TempDir>,
     reject_save: AtomicBool,
@@ -62,7 +62,7 @@ impl FixtureStore {
         })
     }
 
-    fn reopen(root: std::path::PathBuf) -> Arc<Self> {
+    pub(super) fn reopen(root: std::path::PathBuf) -> Arc<Self> {
         assert!(root.is_dir(), "reopen only an existing checkpoint fixture directory");
         Arc::new(Self {
             root,
@@ -72,6 +72,9 @@ impl FixtureStore {
     }
 
     fn path(&self, object: &str) -> std::path::PathBuf {
+        if object == rustfs_data_usage::bucket_scan_progress_path("bucket") {
+            return self.root.join("progress");
+        }
         assert!(object.ends_with(CACHE_NAME) || object.ends_with(&format!("{CACHE_NAME}.bkp")));
         self.root.join(if object.ends_with(".bkp") { "backup" } else { "main" })
     }
@@ -153,6 +156,9 @@ impl ObjectIO for FixtureStore {
 
 #[async_trait::async_trait]
 impl crate::ScannerConfigObjectDelete for FixtureStore {
+    async fn scanner_data_usage_movement_generation(&self) -> Option<u64> {
+        Some(0)
+    }
     async fn delete_config_object(
         &self,
         _bucket: &str,
@@ -291,6 +297,129 @@ fn bound_checkpoint() -> (DataUsageCache, crate::DataUsageScanIdentity) {
         .seal_scan_frontier(Some("bucket/static"))
         .expect("completed fixture prefix receipt");
     (cache, identity)
+}
+
+#[tokio::test]
+async fn display_progress_only_advances_after_a_durable_primary_commit() {
+    let directory = tempfile::tempdir().expect("owned checkpoint storage");
+    let writer = FixtureStore::reopen(directory.path().to_owned());
+    let (mut cache, _) = bound_checkpoint();
+    cache.info.last_update = Some(SystemTime::now());
+    cache.info.scan_directory_source = Some("fixture".into());
+    let revisions = DataUsageCache::default()
+        .load_with_revisions(writer.clone(), CACHE_NAME)
+        .await
+        .expect("missing primary revisions");
+    cache
+        .save_with_revisions_for_epoch(writer.clone(), CACHE_NAME, &revisions, 0, CancellationToken::new())
+        .await
+        .expect("commit primary and display sample");
+    let before = tokio::fs::read(directory.path().join("progress"))
+        .await
+        .expect("saved progress");
+    let revisions = DataUsageCache::default()
+        .load_with_revisions(writer.clone(), CACHE_NAME)
+        .await
+        .expect("committed revisions");
+    cache.info.leader_epoch += 1;
+    cache.info.last_update = Some(SystemTime::now());
+    writer.reject_save.store(true, Ordering::SeqCst);
+    assert!(
+        cache
+            .save_with_revisions_for_epoch(writer.clone(), CACHE_NAME, &revisions, 0, CancellationToken::new())
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        tokio::fs::read(directory.path().join("progress"))
+            .await
+            .expect("unchanged progress"),
+        before
+    );
+    drop(writer);
+    let cold_reader = FixtureStore::reopen(directory.path().to_owned());
+    let mut loaded = DataUsageCache::default();
+    loaded
+        .load(cold_reader.clone(), CACHE_NAME)
+        .await
+        .expect("cold primary reload");
+    let sample: rustfs_data_usage::BucketScanProgressSource = serde_json::from_slice(
+        &tokio::fs::read(cold_reader.root.join("progress"))
+            .await
+            .expect("cold display reload"),
+    )
+    .expect("valid cold display sample");
+    assert_eq!(loaded.display_scan_progress(0), Some(sample));
+}
+
+#[tokio::test]
+async fn display_progress_keeps_reference_during_executor_enumeration_then_replaces_it_on_completion() {
+    let directory = tempfile::tempdir().expect("owned checkpoint storage");
+    let writer = FixtureStore::reopen(directory.path().to_owned());
+    let (mut cache, _) = bound_checkpoint();
+    let original_time = SystemTime::UNIX_EPOCH + Duration::from_secs(10);
+    cache.info.last_update = Some(original_time);
+    cache.info.scan_coverage_measured_at = Some(10_000);
+    cache.info.scan_directory_source = Some("first-executor".into());
+    let mut revisions = DataUsageCache::default()
+        .load_with_revisions(writer.clone(), CACHE_NAME)
+        .await
+        .expect("initial revision");
+    cache
+        .save_with_revisions_for_epoch(writer.clone(), CACHE_NAME, &revisions, 0, CancellationToken::new())
+        .await
+        .expect("save accepted prefix");
+    revisions = DataUsageCache::read_revisions(writer.clone(), CACHE_NAME)
+        .await
+        .expect("accepted revision");
+    cache.cache.clear();
+    cache.replace("bucket", "", DataUsageEntry::default());
+    cache.info.scan_resume_after = None;
+    cache.info.scan_checkpoint = None;
+    cache.info.scan_coverage_receipt = None;
+    cache.info.scan_directory_source = Some("next-executor".into());
+    cache.info.leader_epoch += 1;
+    cache.info.last_update = Some(original_time + Duration::from_secs(10));
+    assert_eq!(cache.display_scan_progress(0).expect("enumeration sample").objects, None);
+    for _ in 0..2 {
+        cache
+            .save_with_revisions_for_epoch(writer.clone(), CACHE_NAME, &revisions, 0, CancellationToken::new())
+            .await
+            .expect("save reenumeration");
+        revisions = DataUsageCache::read_revisions(writer.clone(), CACHE_NAME)
+            .await
+            .expect("enumeration revision");
+        let bytes = tokio::fs::read(directory.path().join("progress"))
+            .await
+            .expect("shared reference sample");
+        let sample: rustfs_data_usage::BucketScanProgressSource = serde_json::from_slice(&bytes).expect("reference progress");
+        assert_eq!(sample.objects, Some(3));
+        assert_eq!(sample.updated_at, 10_000, "carrying an observation never refreshes its measurement time");
+    }
+    cache.info.snapshot_complete = true;
+    cache.replace(
+        "bucket",
+        "",
+        DataUsageEntry {
+            objects: 1,
+            size: 11,
+            ..Default::default()
+        },
+    );
+    cache
+        .save_with_revisions_for_epoch(writer, CACHE_NAME, &revisions, 0, CancellationToken::new())
+        .await
+        .expect("save completed smaller measurement");
+    let bytes = tokio::fs::read(directory.path().join("progress"))
+        .await
+        .expect("completed sample");
+    let sample: rustfs_data_usage::BucketScanProgressSource = serde_json::from_slice(&bytes).expect("completed progress");
+    assert_eq!(
+        (sample.objects, sample.size),
+        (Some(1), Some(11)),
+        "completion replaces old samples even after deletions"
+    );
+    assert_eq!(sample.stage, rustfs_data_usage::BucketScanStage::Completed);
 }
 
 #[test]

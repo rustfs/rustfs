@@ -1026,6 +1026,12 @@ impl<T> ScannerObjectIO for T where
 
 #[async_trait::async_trait]
 pub trait ScannerConfigObjectDelete: Send + Sync + std::fmt::Debug + 'static {
+    /// Shared movement scope for diagnostic samples; absence disables progress
+    /// publication without affecting checkpoint recovery.
+    async fn scanner_data_usage_movement_generation(&self) -> Option<u64> {
+        None
+    }
+
     async fn delete_config_object(
         &self,
         bucket: &str,
@@ -1090,6 +1096,9 @@ impl ScannerDataUsagePublicationAdmission {
 
 #[async_trait::async_trait]
 impl ScannerConfigObjectDelete for ECStore {
+    async fn scanner_data_usage_movement_generation(&self) -> Option<u64> {
+        ECStore::scanner_durable_data_movement_generation(self).await
+    }
     async fn delete_config_object(
         &self,
         bucket: &str,
@@ -1134,6 +1143,9 @@ impl ScannerConfigObjectDelete for ECStore {
 
 #[async_trait::async_trait]
 impl ScannerConfigObjectDelete for SetDisks {
+    async fn scanner_data_usage_movement_generation(&self) -> Option<u64> {
+        SetDisks::scanner_durable_data_movement_generation(self).await
+    }
     async fn delete_config_object(
         &self,
         bucket: &str,

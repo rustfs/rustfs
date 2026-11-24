@@ -508,76 +508,74 @@ fn protocol_upload_copy_input_matches_original_codec() {
             }
             request
         };
-        let expected = legacy_copy_source(make().copy_source)
-            .map_err(|error| conversion_error("UploadPartCopy copy_source", error))
-            .and_then(|source| {
-                let mut legacy = make();
-                legacy.upload_id = UploadIdClaim::from_wire("upload ?&");
-                gateway_s3s_compat::generated::ops::upload_part_copy::input_to_s3s(legacy, source)
-                    .map_err(|error| conversion_error("UploadPartCopy input", error))
-            });
-        let actual = multipart::prepare_upload_part_copy(MultipartRequest::upload_part_copy(make(), "upload ?&"));
-        match (actual, expected) {
-            (Err(actual), Err(expected)) => assert_eq!(error_facts(actual), error_facts(expected)),
-            (Ok((uri, actual)), Ok(expected)) => {
-                assert_eq!(uri.path(), "/bucket/copy-target");
-                assert_eq!(uri.query(), Some("partNumber=1&uploadId=upload%20%3F%26"));
-                let crate::app::multipart_usecase::UploadPartTarget::Legacy { bucket, key, upload_id } = actual.target else {
-                    panic!("protocol client must use the legacy upload target")
-                };
-                let condition = |value: Option<ETagCondition>| -> Option<(String, Option<String>)> {
-                    value.map(|value| match value {
-                        ETagCondition::Any => ("any".into(), None),
-                        ETagCondition::ETag(ETag::Weak(_)) => ("weak".into(), None),
-                        ETagCondition::ETag(ETag::Strong(value)) => ("strong".into(), Some(value)),
-                    })
-                };
-                assert_eq!(
-                    (
-                        owned_condition(actual.copy_source_if_match),
-                        owned_condition(actual.copy_source_if_none_match)
-                    ),
-                    (condition(expected.copy_source_if_match), condition(expected.copy_source_if_none_match))
-                );
-                assert_eq!(
-                    (
-                        bucket,
-                        key,
-                        upload_id,
-                        actual.part_number,
-                        format!("{:?}", actual.copy_source),
-                        actual.copy_source_range
-                    ),
-                    (
-                        expected.bucket,
-                        expected.key,
-                        expected.upload_id,
-                        expected.part_number,
-                        format!("{:?}", gateway_s3s_compat::copy_source::from_s3s(expected.copy_source)),
-                        expected.copy_source_range
-                    )
-                );
-                assert_eq!(
-                    (
-                        actual.sse_customer_algorithm,
-                        actual.sse_customer_key_md5,
-                        actual.copy_source_sse_customer_algorithm,
-                        actual.copy_source_sse_customer_key_md5,
-                        actual.sse_customer_key.as_ref().map(String::len),
-                        actual.copy_source_sse_customer_key.as_ref().map(String::len)
-                    ),
-                    (
-                        expected.sse_customer_algorithm,
-                        expected.sse_customer_key_md5,
-                        expected.copy_source_sse_customer_algorithm,
-                        expected.copy_source_sse_customer_key_md5,
-                        expected.sse_customer_key.as_ref().map(String::len),
-                        expected.copy_source_sse_customer_key.as_ref().map(String::len)
-                    )
-                );
-            }
-            _ => panic!("UploadPartCopy codec refusal differs for case {case}"),
+        let request = make();
+        let source = request.copy_source.clone();
+        let condition = request
+            .copy_source_if_match
+            .as_deref()
+            .filter(|value| !value.is_empty())
+            .map(|value| ETagCondition::parse_http_header(value.as_bytes()))
+            .transpose();
+        let actual = multipart::prepare_upload_part_copy(MultipartRequest::upload_part_copy(request, "upload ?&"));
+        let refusal = match case {
+            9 | 11 => Some("copy_source_if_modified_since: an instant outside what the s3s shape can hold"),
+            10 => Some("copy_source_if_unmodified_since: an instant outside what the s3s shape can hold"),
+            _ if condition.is_err() => Some("copy_source_if_match: not an entity-tag condition the s3s input can hold"),
+            _ => None,
+        };
+        if let Some(reason) = refusal {
+            let error = actual.err().expect("old codec refused this request");
+            assert_eq!(
+                error_facts(error),
+                (
+                    "InternalError".into(),
+                    Some(format!(
+                        "failed to convert UploadPartCopy input through the gateway compatibility seam: {reason}"
+                    )),
+                    Some(http::StatusCode::INTERNAL_SERVER_ERROR),
+                    None
+                ),
+                "case {case}"
+            );
+            continue;
         }
+
+        let (uri, actual) = actual.expect("old codec accepted this request");
+        assert_eq!(uri.path(), "/bucket/copy-target");
+        assert_eq!(uri.query(), Some("partNumber=1&uploadId=upload%20%3F%26"));
+        let crate::app::multipart_usecase::UploadPartTarget::Legacy { bucket, key, upload_id } = actual.target else {
+            panic!("protocol client must use the legacy upload target")
+        };
+        assert_eq!(
+            (bucket.as_str(), key.as_str(), upload_id.as_str(), actual.part_number),
+            ("bucket", "copy-target", "upload ?&", 1)
+        );
+        assert_eq!(actual.copy_source, source);
+        let expected_condition = condition.expect("legacy condition").map(|value| match value {
+            ETagCondition::Any => ("any".into(), None),
+            ETagCondition::ETag(ETag::Weak(_)) => ("weak".into(), None),
+            ETagCondition::ETag(ETag::Strong(value)) => ("strong".into(), Some(value)),
+        });
+        assert_eq!(owned_condition(actual.copy_source_if_match), expected_condition);
+        assert_eq!(owned_condition(actual.copy_source_if_none_match), expected_condition);
+        let value = (case == 15).then_some("value");
+        assert_eq!(
+            (
+                actual.copy_source_range.as_deref(),
+                actual.sse_customer_algorithm.as_deref(),
+                actual.sse_customer_key_md5.as_deref(),
+                actual.copy_source_sse_customer_algorithm.as_deref(),
+                actual.copy_source_sse_customer_key_md5.as_deref()
+            ),
+            (value, value, value, value, value)
+        );
+        let key_len = match case {
+            14 => Some(0),
+            15 => Some(5),
+            _ => None,
+        };
+        assert_eq!(actual.sse_customer_key.as_ref().map(String::len), key_len);
+        assert_eq!(actual.copy_source_sse_customer_key.as_ref().map(String::len), key_len);
     }
 }
 
@@ -680,8 +678,8 @@ fn protocol_upload_copy_error_keeps_explicit_message_headers_and_storage_cause()
         error.set_source(Box::new(StorageError::ObjectNotFound("bucket".into(), "key".into())));
         error
     };
-    let old: S3Result<()> = Err(make().into());
-    let expected = old.map_err(S3Error::from).expect_err("legacy error");
+    let old: S3Result<()> = Err(crate::error::legacy_error_for_test(make()));
+    let expected = old.map_err(crate::error::owned_error_for_test).expect_err("legacy error");
     let actual = owned::copy_error(make());
     assert!(
         actual

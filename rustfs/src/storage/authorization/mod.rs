@@ -58,9 +58,9 @@ pub(crate) use conditions::{
 pub(crate) use decision::{DenialContext, owner_can_bypass_policy_deny};
 pub(crate) use decision::{
     audit_request_denial, authorize_bucket_config_mutation, authorize_bucket_request, authorize_bucket_tag_deletion,
-    authorize_object_request, authorize_replication_only_put_headers, authorize_request, authorize_request_core,
-    authorize_request_with_location_constraint, authorize_staged_multipart_part, authorize_write_etag_condition,
-    iam_authorization_error,
+    authorize_missing_object_disclosure, authorize_object_request, authorize_replication_only_put_headers, authorize_request,
+    authorize_request_core, authorize_request_with_location_constraint, authorize_staged_multipart_part,
+    authorize_write_etag_condition, iam_authorization_error,
 };
 pub(crate) use discovery::{
     log_list_buckets_iam_implicit_deny, prepare_list_buckets_iam_authorization, query_list_buckets_permission,

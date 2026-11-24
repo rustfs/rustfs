@@ -65,7 +65,7 @@ pub const MAX_HEAL_REQUEST_SIZE: usize = 1024 * 1024; // 1 MB
 pub const MAX_S3_CLIENT_RESPONSE_SIZE: usize = 10 * 1024 * 1024; // 10 MB
 
 /// Maximum body size accepted by a single `PutObject` or `UploadPart` request (5 GiB).
-/// Used for: the s3s streaming-body limit and the request-header admission check.
+/// Enforced on the upload body and at request-header admission.
 /// Rationale: matches the AWS S3 single-PUT / single-part ceiling. Larger objects
 /// must use multipart upload. The header check rejects an oversize
 /// `Content-Length` before any body byte is read so the client gets

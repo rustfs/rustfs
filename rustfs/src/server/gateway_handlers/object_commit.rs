@@ -17,7 +17,9 @@
 use super::object_write::{request_version_id, retain_until};
 use super::{OpRow, Served, row};
 use crate::app::multipart_usecase::{UploadPartCopyWriteInput, UploadPartTarget};
-use crate::app::object_usecase::{CopyObjectWriteInput, CopyObjectWriteOutput, CopySourceCondition, DefaultObjectUsecase};
+use crate::app::object_usecase::{
+    CopyObjectWriteInput, CopyObjectWriteOutput, CopySourceCondition, CopySourceDates, DefaultObjectUsecase,
+};
 use crate::app::{RequestEnvelope, dto_values, multipart_usecase::DefaultMultipartUsecase};
 use crate::runtime_sources::AppContext;
 use crate::storage_api::server::http::access::access_owned::object_commit::{
@@ -136,6 +138,7 @@ impl Served for dto::UploadPartCopy {
             copy_source_range: input.copy_source_range,
             copy_source_if_match: copy_condition(input.copy_source_if_match.as_deref())?,
             copy_source_if_none_match: copy_condition(input.copy_source_if_none_match.as_deref())?,
+            copy_source_dates: CopySourceDates::new(input.copy_source_if_modified_since, input.copy_source_if_unmodified_since),
             sse_customer_algorithm: input.sse_customer_algorithm,
             sse_customer_key: input.sse_customer_key.map(|key| key.expose_secret().to_owned()),
             sse_customer_key_md5: input.sse_customer_key_md5,
@@ -231,6 +234,7 @@ fn copy_input(
         tagging_directive: input.tagging_directive.map(|value| value.as_str().to_owned()),
         copy_source_if_match: copy_condition(input.copy_source_if_match.as_deref())?,
         copy_source_if_none_match: copy_condition(input.copy_source_if_none_match.as_deref())?,
+        copy_source_dates: CopySourceDates::new(input.copy_source_if_modified_since, input.copy_source_if_unmodified_since),
         cache_control: input.cache_control,
         content_disposition: input.content_disposition,
         content_encoding: input.content_encoding,

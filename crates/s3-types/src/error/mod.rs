@@ -22,9 +22,8 @@
 //! edge converts through `compat_s3s`, the gateway edge through `into_parts`.
 
 mod code;
-#[cfg(any(test, feature = "compat-s3s"))]
+#[cfg(any(test, feature = "http-response"))]
 mod http_response;
-#[cfg(test)]
 mod http_response_tests;
 
 use http::{HeaderMap, StatusCode};
@@ -170,7 +169,7 @@ impl S3Error {
     /// The cause, if one was attached.
     pub fn source(&self) -> Option<&(dyn std::error::Error + Send + Sync + 'static)> {
         let source = self.0.source.as_deref()?;
-        #[cfg(any(test, feature = "compat-s3s"))]
+        #[cfg(test)]
         if let Some(legacy) = source.downcast_ref::<crate::compat_s3s::LegacyCause>() {
             return legacy.cause();
         }

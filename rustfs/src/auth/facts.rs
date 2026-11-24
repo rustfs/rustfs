@@ -276,6 +276,10 @@ impl AuthzFacts {
             .map(|(_, (key, _))| key.as_str())
     }
 
+    pub(crate) fn clear_list_query(&mut self) {
+        self.list_query.clear();
+    }
+
     pub(crate) fn action(&self) -> Action {
         self.action
     }

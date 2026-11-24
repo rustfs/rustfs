@@ -40,11 +40,37 @@ fn part_request(bucket: &str, upload: &str, body: StreamingBlob, size: i64) -> S
 
 type BodySender = mpsc::UnboundedSender<Result<Frame<Bytes>, std::io::Error>>;
 
+/// Method PUT, URI `/`, empty headers. Credentials, region, and service stay absent.
+fn part_envelope(
+    input: UploadPartInput,
+    extensions: http::Extensions,
+) -> (crate::app::RequestEnvelope, crate::app::multipart_usecase::UploadPartWriteInput) {
+    let envelope = crate::app::RequestEnvelope::from_parts(
+        crate::app::RequestHead {
+            method: Method::PUT,
+            uri: http::Uri::from_static("/"),
+            headers: http::HeaderMap::new(),
+            credentials: None,
+            region: None,
+            service: None,
+        },
+        extensions,
+    );
+    (envelope, crate::app::multipart_usecase::UploadPartWriteInput::from_legacy(input, None))
+}
+
 fn observed_request(
     bucket: &str,
     upload: &str,
     size: usize,
-) -> (S3Request<UploadPartInput>, BodySender, oneshot::Receiver<()>, Arc<AtomicUsize>) {
+) -> (
+    crate::app::RequestEnvelope,
+    crate::app::multipart_usecase::UploadPartWriteInput,
+    BodySender,
+    oneshot::Receiver<()>,
+    Arc<AtomicUsize>,
+    BodyReadControl,
+) {
     let (sender, mut receiver) = mpsc::unbounded_channel();
     let (started, waiting) = oneshot::channel();
     let mut started = Some(started);
@@ -62,9 +88,19 @@ fn observed_request(
     });
     let control = BodyReadControl::default();
     let body = ObservedBody::new(http_body_util::StreamBody::new(stream), control.clone());
-    let mut request = part_request(bucket, upload, StreamingBlob::from(S3Body::http_body_unsync(body)), size as i64);
-    request.extensions.insert(control);
-    (request, sender, waiting, polls)
+    let input = UploadPartInput::builder()
+        .bucket(bucket.to_owned())
+        .key("object".to_owned())
+        .upload_id(upload.to_owned())
+        .part_number(1)
+        .content_length(Some(size as i64))
+        .body(Some(StreamingBlob::from(S3Body::http_body_unsync(body))))
+        .build()
+        .expect("part input");
+    let mut extensions = http::Extensions::new();
+    extensions.insert(control.clone());
+    let (envelope, input) = part_envelope(input, extensions);
+    (envelope, input, sender, waiting, polls, control)
 }
 
 async fn temporary_entries(disks: &[std::path::PathBuf]) -> std::collections::BTreeSet<std::path::PathBuf> {
@@ -173,12 +209,16 @@ async fn assert_body_timeout_storage_lifecycle(part_size: usize, partial_size: u
         for (replacement, retry_after_failure) in [(false, true), (true, true), (true, false)] {
             let baseline = temporary_entries(&disks).await;
             let _ = path_count();
-            let (request, sender, waiting, _) = observed_request(&bucket, &upload.upload_id, part_size);
-            let control = request.extensions.get::<BodyReadControl>().expect("raw body control").clone();
+            let (envelope, input, sender, waiting, _, control) = observed_request(&bucket, &upload.upload_id, part_size);
             sender
                 .send(Ok(Frame::data(Bytes::from(vec![7; partial_size]))))
                 .expect("partial body");
-            let mut upload_future = Box::pin(usecase.execute_upload_part(request));
+            let mut upload_future = Box::pin(async {
+                usecase
+                    .execute_upload_part_with_audit(envelope, input)
+                    .await
+                    .map_err(crate::error::legacy_error_for_test)
+            });
             tokio::time::timeout(Duration::from_secs(10), async {
                 tokio::select! {
                     result = &mut upload_future => panic!("upload finished before storage requested raw input: {:?}", result.err().map(|error| error.code().clone())),
@@ -221,11 +261,26 @@ async fn assert_body_timeout_storage_lifecycle(part_size: usize, partial_size: u
                 continue;
             }
             let payload = vec![if replacement { 9 } else { 8 }; part_size];
-            let request = part_request(&bucket, &upload.upload_id, StreamingBlob::from(Bytes::from(payload)), part_size as i64);
-            let retry = tokio::time::timeout(Duration::from_secs(10), usecase.execute_upload_part(request))
-                .await
-                .expect("foreground and capped staging permits must be released")
-                .expect("same-number retry");
+            let input = UploadPartInput::builder()
+                .bucket(bucket.clone())
+                .key("object".to_owned())
+                .upload_id(upload.upload_id.clone())
+                .part_number(1)
+                .content_length(Some(part_size as i64))
+                .body(Some(StreamingBlob::from(Bytes::from(payload))))
+                .build()
+                .expect("part input");
+            // Same facts `build_request` carried. Headers and extensions stay empty.
+            let (envelope, input) = part_envelope(input, http::Extensions::new());
+            let retry = tokio::time::timeout(Duration::from_secs(10), async {
+                usecase
+                    .execute_upload_part_with_audit(envelope, input)
+                    .await
+                    .map_err(crate::error::legacy_error_for_test)
+            })
+            .await
+            .expect("foreground and capped staging permits must be released")
+            .expect("same-number retry");
             old_etag = retry.e_tag;
         }
         let parts = store
@@ -290,8 +345,13 @@ async fn assert_foreground_queue() {
         .new_multipart_upload(&bucket, "object", &ObjectOptions::default())
         .await
         .expect("upload session");
-    let (request, sender, waiting, polls) = observed_request(&bucket, &upload.upload_id, 4096);
-    let task = tokio::spawn(async move { usecase.execute_upload_part(request).await });
+    let (envelope, input, sender, waiting, polls, _) = observed_request(&bucket, &upload.upload_id, 4096);
+    let task = tokio::spawn(async move {
+        usecase
+            .execute_upload_part_with_audit(envelope, input)
+            .await
+            .map_err(crate::error::legacy_error_for_test)
+    });
     tokio::time::timeout(Duration::from_secs(10), async {
         while manager.put_object_admission_snapshot().queued != Some(1) {
             tokio::task::yield_now().await;
