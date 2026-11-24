@@ -26,6 +26,8 @@ mod http;
 #[cfg(test)]
 pub(crate) use http::{IAMAuth, iam_lookup_error_to_s3_error, legacy_s3_code_name};
 mod hybrid;
+#[cfg(test)]
+mod iam_auth_test;
 mod layer;
 mod legacy_compat;
 mod module_switch;

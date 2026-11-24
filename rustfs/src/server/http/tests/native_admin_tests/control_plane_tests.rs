@@ -605,7 +605,7 @@ async fn a_custom_code_without_a_status_is_answered_by_both_stacks_alike() {
         router
     };
     let mut legacy = S3ServiceBuilder::new(UnusedS3);
-    legacy.set_auth(crate::auth::IAMAuth::with_server_context(ROOT, ROOT_SECRET, slot.clone()));
+    legacy.set_auth(super::super::super::IAMAuth::with_server_context(ROOT, ROOT_SECRET, slot.clone()));
     legacy.set_route(router(&slot));
     let legacy = legacy.build();
     let edge = edge(&slot, router(&slot));
@@ -626,7 +626,7 @@ async fn a_custom_code_without_a_status_is_answered_by_both_stacks_alike() {
 async fn the_handler_sees_the_caller_the_legacy_stack_hands_it() {
     let (_env, slot, _) = admin_fixture().await;
     let mut legacy = S3ServiceBuilder::new(UnusedS3);
-    legacy.set_auth(crate::auth::IAMAuth::with_server_context(ROOT, ROOT_SECRET, slot.clone()));
+    legacy.set_auth(super::super::super::IAMAuth::with_server_context(ROOT, ROOT_SECRET, slot.clone()));
     legacy.set_route(probe_router(&slot));
     let legacy = legacy.build();
     let edge = edge(&slot, probe_router(&slot));
