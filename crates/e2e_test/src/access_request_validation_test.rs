@@ -12,6 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#![cfg(test)]
+
 // Exercise the production validator at the protocol boundary without importing the server crate.
 #[path = "../../../rustfs/src/storage/authorization/admission/request_validation.rs"]
 mod request_validation;

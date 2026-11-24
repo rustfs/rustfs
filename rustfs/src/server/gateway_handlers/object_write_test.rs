@@ -556,13 +556,13 @@ async fn native_upload_part_uses_frames_and_leaves_the_prior_part_on_failure() {
     let key = "allowed";
     let upload_id = store.new_multipart_upload(&bucket, key, &options).await.unwrap().upload_id;
     let etag = "900150983cd24fb0d6963f7d28e17f72";
+    // The wire-level signature refusal is covered by aws_chunked_named_errors_reject_put_and_upload_part.
     for (label, payload, size, checksum, expected) in [
         ("valid", b"abc", 3, Some("NSRBwg=="), None),
         ("missing trailer", b"xyz", 3, None, Some("BadDigest")),
         ("wrong checksum", b"xyz", 3, Some("AAAAAA=="), Some("BadDigest")),
         ("short", b"xyz", 4, Some("6466Zw=="), Some("IncompleteBody")),
         ("digest error", b"xyz", 3, None, Some("BadDigest")),
-        ("signature error", b"xyz", 3, None, Some("SignatureDoesNotMatch")),
     ] {
         let mut headers = HeaderMap::new();
         headers.insert("x-amz-trailer", HeaderValue::from_static("x-amz-checksum-crc32"));
@@ -570,17 +570,15 @@ async fn native_upload_part_uses_frames_and_leaves_the_prior_part_on_failure() {
         if let Some(value) = checksum {
             trailers.insert("x-amz-checksum-crc32", HeaderValue::from_static(value));
         }
-        let end = match label {
-            "digest error" => Err(StreamError::upstream(Box::new(rustfs_rio::BadDigest {
+        let end = if label == "digest error" {
+            Err(StreamError::upstream(Box::new(rustfs_rio::BadDigest {
                 expected_md5: String::new(),
                 calculated_md5: String::new(),
-            }))),
-            "signature error" => Err(StreamError::upstream(Box::new(
-                crate::app::storage_api::s3::stream::aws_chunked_stream::AwsChunkedStreamError::SignatureMismatch,
-            ))),
-            _ => Ok(PayloadRead::Eof {
+            })))
+        } else {
+            Ok(PayloadRead::Eof {
                 trailers: TrailingHeaders::from_header_map(trailers),
-            }),
+            })
         };
         let mut input = part_input(&bucket, &upload_id, 1);
         input.content_length = size;

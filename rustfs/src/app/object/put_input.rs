@@ -135,12 +135,4 @@ impl PutObjectWriteInput {
             checksum_crc64nvme: input.checksum_crc64nvme,
         }
     }
-
-    /// A test's s3s fixture request as the envelope and input a gateway handler hands the use case.
-    pub(crate) fn from_test_request(
-        req: crate::app::storage_api::s3::S3Request<crate::app::storage_api::s3::PutObjectInput>,
-    ) -> (crate::app::RequestEnvelope, Self) {
-        let envelope = crate::app::RequestEnvelope::from_s3s(&req);
-        (envelope, Self::from_legacy(req.input, req.trailing_headers))
-    }
 }

@@ -75,6 +75,8 @@ license = []
 io-scheduler-debug = []  # Enable debug information in I/O scheduler
 tracing-chunk-debug = []  # Enable per-chunk tracing in data plane (high noise, for debugging only)
 full = ["metrics-gpu", "ftps", "swift", "webdav", "sftp", "pyroscope", "gcs"]
+# Test-server capture only. The build script rejects release profiles.
+corpus-record = ["dep:rustfs-gateway-corpus-recorder"]
 e2e-test-hooks = ["rustfs-ecstore/e2e-test-hooks", "rustfs-scanner/e2e-test-hooks"]
 # Shortens Connect credentials only in debug E2E builds.
 connect-e2e-short-credentials = []
@@ -273,13 +275,14 @@ rustfs-protocols = { workspace = true }
 rustfs-gateway = { workspace = true }
 rustfs-gateway-adapter = { workspace = true }
 rustfs-gateway-core = { workspace = true }
+rustfs-gateway-corpus-recorder = { workspace = true, optional = true, features = ["corpus-record"] }
 rustfs-gateway-dialect-rustfs-admin = { workspace = true }
 rustfs-gateway-stream = { workspace = true }
-rustfs-gateway-types = { workspace = true, features = ["compat-s3s-rustfs"] }
+rustfs-gateway-types = { workspace = true }
 rustfs-protos = { workspace = true }
 rustfs-rio = { workspace = true }
 rustfs-s3-client = { workspace = true }
-rustfs-s3-types = { workspace = true, features = ["compat-s3s"] }
+rustfs-s3-types = { workspace = true }
 rustfs-s3-ops = { workspace = true }
 rustfs-security-governance = { workspace = true }
 rustfs-data-usage = { workspace = true }
@@ -382,8 +385,6 @@ percent-encoding = { workspace = true }
 pin-project-lite.workspace = true
 parking_lot = { workspace = true }
 rust-embed = { workspace = true, features = ["interpolate-folder-path"] }
-s3s = { workspace = true, features = ["minio"] }
-s3s-sigv4 = { workspace = true }
 shadow-rs = { workspace = true, default-features = false, features = ["build", "metadata"] }
 sysinfo = { workspace = true, features = ["multithread"] }
 thiserror = { workspace = true }
@@ -424,6 +425,9 @@ h2.workspace = true
 rustfs-targets = { workspace = true, features = ["test-support"] }
 uuid = { workspace = true, features = ["v4", "v5", "fast-rng", "macro-diagnostics"] }
 rustfs-iam = { workspace = true, features = ["test-util"] }
+rustfs-s3-types = { workspace = true, features = ["http-response"] }
+s3s = { git = "https://github.com/s3s-project/s3s", rev = "5761ddfe4c509fcac87e3b99fd5bd9e176b442c0", features = ["minio"] }
+s3s-sigv4 = { git = "https://github.com/s3s-project/s3s", rev = "5761ddfe4c509fcac87e3b99fd5bd9e176b442c0" }
 serial_test = { workspace = true }
 tempfile = { workspace = true }
 aws-config = { workspace = true }

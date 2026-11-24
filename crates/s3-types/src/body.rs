@@ -21,10 +21,10 @@
 //! wraps unchanged.
 //! Not responsible for: any S3 semantics. Trailers, checksums, aws-chunked
 //! framing and read limits belong to the layers that own them, never to this
-//! type. The s3s conversions live in `crate::compat_s3s`.
+//! type.
 //! Upstream: `bytes`, `futures-core`, `http-body`, `http-body-util`. Downstream:
-//! the outbound client crates (`rustfs-s3-client`), the Swift handlers in
-//! `rustfs-protocols`, and the legacy edge through `compat_s3s`.
+//! the outbound client crates (`rustfs-s3-client`), and the Swift handlers in
+//! `rustfs-protocols`.
 
 use crate::StdError;
 use bytes::Bytes;
@@ -65,8 +65,7 @@ impl Body {
     }
 
     /// Wraps any `Bytes` body, keeping its frames, errors and size hint.
-    #[cfg(any(test, feature = "compat-s3s"))]
-    pub(crate) fn from_http_body<B>(body: B) -> Self
+    pub fn from_http_body<B>(body: B) -> Self
     where
         B: http_body::Body<Data = Bytes> + Send + Sync + 'static,
         B::Error: Into<StdError>,

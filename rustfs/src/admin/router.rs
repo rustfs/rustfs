@@ -1077,18 +1077,21 @@ where
         if let Some(server_ctx) = &self.server_ctx {
             req.extensions.insert(server_ctx.clone());
         }
-        Ok(self.admit(&req.method, &req.uri, &req.headers, req.credentials.is_some())?)
+        self.admit(&req.method, &req.uri, &req.headers, req.credentials.is_some())
+            .map_err(crate::error::legacy_error_for_test)
     }
 
     async fn call(&self, mut req: S3Request<Body>) -> s3s::S3Result<S3Response<Body>> {
         if let Some(server_ctx) = &self.server_ctx {
             req.extensions.insert(server_ctx.clone());
             if !is_public_health_path(req.uri.path()) && server_ctx.installed_app_context().is_none() {
-                return Err(server_context_not_ready_error().into());
+                return Err(crate::error::legacy_error_for_test(server_context_not_ready_error()));
             }
         }
         if let Some((bucket, object)) = parse_object_lambda_request(&req.method, &req.uri) {
-            let response = Box::pin(handle_object_lambda_request(RequestEnvelope::from_s3s(&req), &bucket, &object)).await?;
+            let response = Box::pin(handle_object_lambda_request(RequestEnvelope::from_s3s(&req), &bucket, &object))
+                .await
+                .map_err(crate::error::legacy_error_for_test)?;
             return Ok(legacy_admin_response(response));
         }
         // Extension routes are claimed ahead of the console.
@@ -1108,7 +1111,10 @@ where
         }
 
         let envelope = crate::app::RequestEnvelope::from_s3s(&req);
-        Ok(legacy_admin_response(dispatch(self, envelope, req.input.into()).await?))
+        dispatch(self, envelope, rustfs_s3_types::Body::from_http_body(req.input))
+            .await
+            .map(legacy_admin_response)
+            .map_err(crate::error::legacy_error_for_test)
     }
 }
 
@@ -1263,7 +1269,8 @@ mod tests {
                     req.extensions.insert(slot.clone());
                     req.extensions.insert(ReqInfo::default());
                     req.headers.insert(http::header::IF_NONE_MATCH, HeaderValue::from_static("*"));
-                    let result = authorized_object_lambda_get_request(&RequestEnvelope::from_s3s(&req), &bucket, "object").await;
+                    let result =
+                        authorized_object_lambda_get_request(&object_lambda_test_envelope(&req), &bucket, "object").await;
                     // Version-only Allow covers current reads; Version Deny overrides
                     // the explicit current-read Allow as well as version grants.
                     if deny_versions || (version.is_some() && !grant_versions) {
@@ -1297,6 +1304,21 @@ mod tests {
     use std::net::{IpAddr, SocketAddr};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
+
+    /// Method, URI, headers, and extensions. These fixtures leave credentials, region, and service absent.
+    fn object_lambda_test_envelope(req: &S3Request<Body>) -> RequestEnvelope {
+        RequestEnvelope::from_parts(
+            crate::app::RequestHead {
+                method: req.method.clone(),
+                uri: req.uri.clone(),
+                headers: req.headers.clone(),
+                credentials: None,
+                region: None,
+                service: None,
+            },
+            req.extensions.clone(),
+        )
+    }
 
     #[derive(Clone)]
     struct StaticResolver(IpAddr);
@@ -1506,7 +1528,7 @@ mod tests {
             Err(io::Error::other("owned body sentinel")),
         ]);
         let mut request = router_request(Method::GET, "/__owned_admin/echo");
-        request.input = OwnedBody::from_stream(stream).into();
+        request.input = Body::http_body(OwnedBody::from_stream(stream));
 
         let response = router
             .call(request)
@@ -2110,7 +2132,7 @@ mod tests {
         };
 
         let payload = build_object_lambda_event_payload(
-            &RequestEnvelope::from_s3s(&req),
+            &object_lambda_test_envelope(&req),
             "arn:acme:s3-object-lambda::transformer:webhook",
             "https://example.com/source",
             "route-123",
@@ -2421,7 +2443,7 @@ mod tests {
         req.headers
             .insert(http::header::IF_MATCH, HeaderValue::from_static("\"abc\""));
 
-        let (uri, input) = build_object_lambda_get_request(&RequestEnvelope::from_s3s(&req), "demo-bucket", "object.txt")
+        let (uri, input) = build_object_lambda_get_request(&object_lambda_test_envelope(&req), "demo-bucket", "object.txt")
             .expect("bridge request should build");
 
         assert_eq!(uri.path(), "/demo-bucket/object.txt");
@@ -2433,7 +2455,7 @@ mod tests {
         assert_eq!(input.range, Some(rustfs_gateway_types::ByteRange::FromTo { first: 5, last: 10 }));
         req.headers
             .insert(http::header::IF_MATCH, HeaderValue::from_static("invalid etag"));
-        assert!(build_object_lambda_get_request(&RequestEnvelope::from_s3s(&req), "demo-bucket", "object.txt").is_err());
+        assert!(build_object_lambda_get_request(&object_lambda_test_envelope(&req), "demo-bucket", "object.txt").is_err());
     }
 
     #[test]
@@ -2454,7 +2476,7 @@ mod tests {
         req.headers
             .insert(http::header::RANGE, HeaderValue::from_static("bytes=10-5"));
 
-        let err = build_object_lambda_get_request(&RequestEnvelope::from_s3s(&req), "demo-bucket", "object.txt")
+        let err = build_object_lambda_get_request(&object_lambda_test_envelope(&req), "demo-bucket", "object.txt")
             .err()
             .expect("invalid range must fail");
         assert_eq!(err.code(), &S3ErrorCode::InvalidArgument);
@@ -2897,7 +2919,7 @@ pub struct Extra {
 #[cfg(test)]
 fn legacy_admin_response(response: AdminResponse) -> S3Response<Body> {
     let (status, headers, body) = response.into_parts();
-    let mut answer = S3Response::with_headers(body.into(), headers);
+    let mut answer = S3Response::with_headers(Body::http_body(body), headers);
     answer.status = Some(status);
     answer
 }

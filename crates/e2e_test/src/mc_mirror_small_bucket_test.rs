@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::common::{DEFAULT_ACCESS_KEY, DEFAULT_SECRET_KEY, RustFSTestEnvironment};
+use crate::common::RustFSTestEnvironment;
 use std::path::Path;
 use std::process::Command;
 use std::time::Duration;
@@ -75,7 +75,7 @@ async fn test_mc_mirror_small_bucket_completes_without_list_timeout() -> TestRes
     env.create_test_bucket(BUCKET).await?;
 
     let alias = format!("rustfs-issue-3107-{}", uuid::Uuid::new_v4());
-    run_mc(&["alias", "set", &alias, &env.url, DEFAULT_ACCESS_KEY, DEFAULT_SECRET_KEY])?;
+    run_mc(&["alias", "set", &alias, &env.url, &env.access_key, &env.secret_key])?;
 
     let fixture = Path::new(&env.temp_dir).join("issue-3107-fixture");
     let backup = Path::new(&env.temp_dir).join("issue-3107-backup");

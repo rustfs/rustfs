@@ -33,6 +33,9 @@ outputs:
   path:
     description: "Absolute path of the verified executable"
     value: ${{ steps.unpack.outputs.path }}
+  executable-sha256:
+    description: "SHA-256 of the executable extracted from the verified archive"
+    value: ${{ steps.unpack.outputs.executable-sha256 }}
   version:
     description: "Pinned reference version"
     value: ${{ steps.pin.outputs.version }}
@@ -93,4 +96,6 @@ runs:
         test -x "$path"
         echo "Reference executable: $path"
         "$path" --version
+        digest="$(sha256sum "$path")"
+        echo "executable-sha256=${digest%% *}" >> "$GITHUB_OUTPUT"
         echo "path=$path" >> "$GITHUB_OUTPUT"

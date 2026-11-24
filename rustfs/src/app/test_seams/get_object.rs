@@ -12,55 +12,57 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::app::object::GetObjectBody;
 use crate::app::object_usecase::DefaultObjectUsecase;
-use crate::app::storage_api::s3::{GetObjectInput, GetObjectOutput, S3Request, S3Response, S3Result};
 
-/// Calls `DefaultObjectUsecase::execute_get_object` with today's arguments.
-///
-/// Owned by the GetObject batch (C). Tests outside that batch's files call this seam instead of the use-case method;
-/// when batch C changes the use-case signature it changes only this body.
-pub(crate) async fn get_object(
-    usecase: &DefaultObjectUsecase,
-    req: S3Request<GetObjectInput>,
-) -> S3Result<S3Response<GetObjectOutput>> {
-    use crate::app::object_usecase::GetObjectFields;
-    use crate::app::{Answered, RequestEnvelope};
-    rustfs_io_metrics::record_s3_op(rustfs_s3_ops::S3Operation::GetObject);
-    let envelope = RequestEnvelope::from_s3s(&req);
-    let Answered { output, status, headers } = get_object_fields(usecase, envelope, GetObjectFields::from_s3s(req.input)).await?;
-    let mut response = S3Response::new(output.into_s3s().map_err(crate::app::dto_values::seam_error)?);
-    response.status = status;
-    response.headers = headers;
-    Ok(response)
-}
-
-/// [`get_object`] for a fixture that sets nothing but `GET /`.
-///
-/// `build_request` leaves the URI, headers, and extensions empty, so this envelope matches that request.
-#[cfg(test)]
-pub(crate) async fn get_object_method_only(
-    usecase: &DefaultObjectUsecase,
-    input: GetObjectInput,
-) -> S3Result<S3Response<GetObjectOutput>> {
-    use crate::app::object_usecase::GetObjectFields;
-    use crate::app::{Answered, RequestEnvelope};
-    rustfs_io_metrics::record_s3_op(rustfs_s3_ops::S3Operation::GetObject);
-    let envelope = RequestEnvelope::from_parts(
+pub(crate) fn get_envelope(headers: http::HeaderMap, extensions: http::Extensions) -> crate::app::RequestEnvelope {
+    crate::app::RequestEnvelope::from_parts(
         crate::app::RequestHead {
             method: http::Method::GET,
             uri: http::Uri::from_static("/"),
-            headers: http::HeaderMap::new(),
+            headers,
             credentials: None,
             region: None,
             service: None,
         },
-        http::Extensions::new(),
-    );
-    let Answered { output, status, headers } = get_object_fields(usecase, envelope, GetObjectFields::from_s3s(input)).await?;
-    let mut response = S3Response::new(output.into_s3s().map_err(crate::app::dto_values::seam_error)?);
-    response.status = status;
-    response.headers = headers;
-    Ok(response)
+        extensions,
+    )
+}
+
+pub(crate) fn get_object_input(bucket: &str, key: &str, version_id: Option<String>) -> rustfs_gateway_types::dto::GetObjectInput {
+    rustfs_gateway_types::dto::GetObjectInput {
+        bucket: rustfs_gateway_types::BucketName::new(bucket).expect("test bucket name"),
+        key: rustfs_gateway_types::ObjectKey::new(key).expect("test object key"),
+        version_id,
+        ..Default::default()
+    }
+}
+
+pub(crate) async fn get_object_gateway(
+    usecase: &DefaultObjectUsecase,
+    envelope: crate::app::RequestEnvelope,
+    input: rustfs_gateway_types::dto::GetObjectInput,
+) -> rustfs_s3_types::S3Result<crate::app::Answered<crate::app::object_usecase::GetObjectOutputFacts>> {
+    rustfs_io_metrics::record_s3_op(rustfs_s3_ops::S3Operation::GetObject);
+    get_object_fields(usecase, envelope, input.into()).await
+}
+
+pub(crate) fn get_http_body(body: GetObjectBody) -> rustfs_gateway_stream::Body {
+    use rustfs_gateway_stream::Body;
+
+    match body {
+        GetObjectBody::Bytes(bytes) => Body::from_bytes(bytes),
+        GetObjectBody::Stream(stream) => Body::from_stream(stream).expect("valid GET stream"),
+    }
+}
+
+/// Reads a successful GET body to completion where the caller verifies its bytes.
+pub(crate) async fn read_get_body(body: GetObjectBody) -> bytes::Bytes {
+    use http_body_util::BodyExt;
+
+    let collected = get_http_body(body).collect().await.expect("GET body must be readable");
+    assert!(collected.trailers().is_none(), "unexpected GET response trailers");
+    collected.to_bytes()
 }
 
 /// Calls `DefaultObjectUsecase::execute_get_object_fields` with owned inputs.

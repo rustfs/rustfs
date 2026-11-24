@@ -23,13 +23,9 @@ mod head_object;
 mod list_objects_v2;
 mod put_object;
 
-#[cfg(test)]
-pub(crate) use get_object::get_object_method_only;
-pub(crate) use get_object::{get_object, get_object_fields};
-#[cfg(test)]
-pub(crate) use head_object::head_object_method_only;
-pub(crate) use head_object::{head_object, head_object_fields};
-#[cfg(test)]
-pub(crate) use list_objects_v2::list_objects_v2_method_only;
-pub(crate) use list_objects_v2::{list_objects_v2, list_objects_v2_owned};
+pub(crate) use get_object::{
+    get_envelope, get_http_body, get_object_fields, get_object_gateway, get_object_input, read_get_body,
+};
+pub(crate) use head_object::{head_envelope, head_object_fields, head_object_gateway, head_object_input};
+pub(crate) use list_objects_v2::list_objects_v2_owned;
 pub(crate) use put_object::put_object;

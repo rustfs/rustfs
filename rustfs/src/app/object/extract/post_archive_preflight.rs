@@ -27,21 +27,6 @@ pub(in crate::app::object) async fn preflight_post_archive<R>(
     archive_key: &str,
     headers: &HeaderMap,
     permits: &(dyn Fn(&str) -> bool + Send + Sync),
-) -> rustfs_s3_types::S3Result<()>
-where
-    R: AsyncRead + Send + Unpin + 'static,
-{
-    preflight_inner(body, expected_length, archive_key, headers, permits)
-        .await
-        .map_err(Into::into)
-}
-
-async fn preflight_inner<R>(
-    body: R,
-    expected_length: u64,
-    archive_key: &str,
-    headers: &HeaderMap,
-    permits: &(dyn Fn(&str) -> bool + Send + Sync),
 ) -> S3Result<()>
 where
     R: AsyncRead + Send + Unpin + 'static,

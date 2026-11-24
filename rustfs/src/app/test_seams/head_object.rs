@@ -13,53 +13,42 @@
 // limitations under the License.
 
 use crate::app::object_usecase::DefaultObjectUsecase;
-use crate::app::storage_api::s3::{HeadObjectInput, HeadObjectOutput, S3Request, S3Response, S3Result};
+use crate::app::{RequestEnvelope, RequestHead};
+use rustfs_gateway_types::{BucketName, ObjectKey, dto as gateway_dto};
 
-/// Calls `DefaultObjectUsecase::execute_head_object` with today's arguments.
-///
-/// Owned by the HeadObject batch (C). Tests outside that batch's files call this seam instead of the use-case method;
-/// when batch C changes the use-case signature it changes only this body.
-pub(crate) async fn head_object(
-    usecase: &DefaultObjectUsecase,
-    req: S3Request<HeadObjectInput>,
-) -> S3Result<S3Response<HeadObjectOutput>> {
-    use crate::app::object_usecase::HeadObjectFields;
-    use crate::app::{Answered, RequestEnvelope};
-    rustfs_io_metrics::record_s3_op(rustfs_s3_ops::S3Operation::HeadObject);
-    let envelope = RequestEnvelope::from_s3s(&req);
-    let Answered { output, status, headers } =
-        head_object_fields(usecase, envelope, HeadObjectFields::from_s3s(req.input)).await?;
-    let mut response = S3Response::new(output.into_s3s().map_err(crate::app::dto_values::seam_error)?);
-    response.status = status;
-    response.headers = headers;
-    Ok(response)
-}
-
-/// [`head_object`] for a fixture that sets nothing but `HEAD /`.
-#[cfg(test)]
-pub(crate) async fn head_object_method_only(
-    usecase: &DefaultObjectUsecase,
-    input: HeadObjectInput,
-) -> S3Result<S3Response<HeadObjectOutput>> {
-    use crate::app::object_usecase::HeadObjectFields;
-    use crate::app::{Answered, RequestEnvelope};
-    rustfs_io_metrics::record_s3_op(rustfs_s3_ops::S3Operation::HeadObject);
-    let envelope = RequestEnvelope::from_parts(
-        crate::app::RequestHead {
+/// The method-only HEAD fixture uses `/`; operation fields carry the bucket and key.
+pub(crate) fn head_envelope(headers: http::HeaderMap, extensions: http::Extensions) -> RequestEnvelope {
+    RequestEnvelope::from_parts(
+        RequestHead {
             method: http::Method::HEAD,
             uri: http::Uri::from_static("/"),
-            headers: http::HeaderMap::new(),
+            headers,
             credentials: None,
             region: None,
             service: None,
         },
-        http::Extensions::new(),
-    );
-    let Answered { output, status, headers } = head_object_fields(usecase, envelope, HeadObjectFields::from_s3s(input)).await?;
-    let mut response = S3Response::new(output.into_s3s().map_err(crate::app::dto_values::seam_error)?);
-    response.status = status;
-    response.headers = headers;
-    Ok(response)
+        extensions,
+    )
+}
+
+pub(crate) fn head_object_input(bucket: &str, key: &str, version_id: Option<String>) -> gateway_dto::HeadObjectInput {
+    gateway_dto::HeadObjectInput {
+        bucket: BucketName::new(bucket).expect("test bucket name"),
+        key: ObjectKey::new(key).expect("test object key"),
+        version_id,
+        ..Default::default()
+    }
+}
+
+/// Runs a gateway HEAD input through the production field projection.
+#[cfg(test)]
+pub(crate) async fn head_object_gateway(
+    usecase: &DefaultObjectUsecase,
+    envelope: crate::app::RequestEnvelope,
+    input: rustfs_gateway_types::dto::HeadObjectInput,
+) -> rustfs_s3_types::S3Result<crate::app::Answered<crate::app::object_usecase::HeadObjectOutputFacts>> {
+    rustfs_io_metrics::record_s3_op(rustfs_s3_ops::S3Operation::HeadObject);
+    head_object_fields(usecase, envelope, input.into()).await
 }
 
 /// Calls `DefaultObjectUsecase::execute_head_object_fields` with owned inputs.

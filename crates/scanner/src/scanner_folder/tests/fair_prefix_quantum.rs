@@ -404,6 +404,14 @@ async fn cold_compacted_replicas_finish_within_their_independent_object_budgets(
                     );
                 }
                 cache = step.outcome;
+                let sample = cache.display_scan_progress(0).expect("durable cross-executor display sample");
+                if let (Some(objects), Some(size)) = (sample.objects, sample.size) {
+                    assert!(objects <= 40, "physical replicas cannot inflate logical progress");
+                    assert_eq!(size, objects);
+                }
+                let encoded = cache.marshal_msg().expect("persist cross-executor display source");
+                let cold = DataUsageCache::unmarshal(&encoded).expect("cold cross-executor display source");
+                assert_eq!(cold.display_scan_progress(0), Some(sample));
                 if step.finished {
                     assert!(round > 1);
                     assert!(cache.info.snapshot_complete);
@@ -415,6 +423,168 @@ async fn cold_compacted_replicas_finish_within_their_independent_object_budgets(
             panic!("two cold physical replicas did not converge within two independent object work budgets");
         })
         .await;
+}
+
+/// Each turn runs in another OS process and alternates the physical executor.
+/// Only the committed checkpoint and compact display object cross turns.
+#[tokio::test]
+#[serial]
+async fn display_progress_survives_process_restarts_leader_changes_and_repeated_reads() {
+    use super::checkpoint_fixture::FixtureStore;
+    const CHILD_ROOT: &str = "RUSTFS_TEST_SCAN_PROGRESS_CHILD_ROOT";
+    const CHILD_ROUND: &str = "RUSTFS_TEST_SCAN_PROGRESS_CHILD_ROUND";
+    const CACHE_NAME: &str = "bucket/checkpoint-fixture.bin";
+    if let Some(root) = std::env::var_os(CHILD_ROOT) {
+        let root = std::path::PathBuf::from(root);
+        assert!(
+            root.file_name()
+                .expect("owned temporary root")
+                .to_string_lossy()
+                .starts_with("rustfs-progress-restart-")
+        );
+        let round: u64 = std::env::var(CHILD_ROUND)
+            .expect("explicit child round")
+            .parse()
+            .expect("numeric round");
+        let store = FixtureStore::reopen(root.join("cache"));
+        let mut cache = DataUsageCache::default();
+        let revisions = cache
+            .load_with_revisions(store.clone(), CACHE_NAME)
+            .await
+            .expect("cold shared checkpoint load");
+        let identity = cache.info.scan_identity.expect("durable bucket identity");
+        let prepared = cache.prepare_bucket_checkpoint(
+            "bucket",
+            round + 2,
+            round + 1,
+            crate::DataUsageCacheSource::new(0, 0),
+            crate::DataUsageScanPlanDigest([31; 32]),
+            identity,
+        );
+        if round > 0 {
+            assert_eq!(prepared, crate::data_usage_define::DataUsageCachePrepareOutcome::Reused);
+        }
+        // Synthetic disks have no healing metadata. Reapply the fixture's
+        // scan options after prepare, which may reset the initial empty cache.
+        cache.info.skip_healing = true;
+        SCANNER_SLEEPER.disable_disk_io_budget_for_tests();
+        let (active, peer) = if round.is_multiple_of(2) {
+            (root.join("a"), root.join("b"))
+        } else {
+            (root.join("b"), root.join("a"))
+        };
+        let step = super::super::TEST_FORCE_COMPACTION_WIDTH
+            .scope(
+                16,
+                scan_one_replica_round(
+                    &active,
+                    Some(&peer),
+                    cache,
+                    ScannerCycleBudgetConfig {
+                        max_objects: Some(6),
+                        ..Default::default()
+                    },
+                ),
+            )
+            .await;
+        step.outcome
+            .save_with_revisions_for_epoch(store, CACHE_NAME, &revisions, 0, CancellationToken::new())
+            .await
+            .expect("commit checkpoint and display progress");
+        let bytes = tokio::fs::read(root.join("cache/progress"))
+            .await
+            .expect("durable progress after primary commit");
+        let sample: rustfs_data_usage::BucketScanProgressSource =
+            serde_json::from_slice(&bytes).expect("decode durable display sample");
+        if let Some(objects) = sample.objects {
+            assert!(objects <= 40, "physical replicas cannot double count objects");
+            assert_eq!(sample.size, Some(objects));
+        }
+        let repeated: rustfs_data_usage::BucketScanProgressSource = serde_json::from_slice(
+            &tokio::fs::read(root.join("cache/progress"))
+                .await
+                .expect("repeat independent progress read"),
+        )
+        .expect("decode repeated sample");
+        assert_eq!(sample, repeated);
+        if step.finished {
+            assert_eq!((sample.objects, sample.size), (Some(40), Some(40)));
+            assert_eq!(sample.stage, rustfs_data_usage::BucketScanStage::Completed);
+        }
+        tokio::fs::write(
+            root.join("result.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "pid": std::process::id(), "finished": step.finished, "sample": sample,
+            }))
+            .expect("encode child result"),
+        )
+        .await
+        .expect("commit child result");
+        return;
+    }
+    let temp = tempfile::Builder::new()
+        .prefix("rustfs-progress-restart-")
+        .tempdir()
+        .expect("owned restart fixture");
+    let root = temp.path();
+    let mut initial = seed_flat_bucket(&root.join("a"), 40).await;
+    seed_flat_bucket(&root.join("b"), 40).await;
+    let mut identity = initial.info.scan_identity.expect("initial identity");
+    identity.publication_epoch = 0;
+    identity.tier_registry_generation = crate::runtime_tier_registry_for_cycle(1, 0).await.generation;
+    initial.prepare_bucket_checkpoint(
+        "bucket",
+        1,
+        0,
+        crate::DataUsageCacheSource::new(0, 0),
+        crate::DataUsageScanPlanDigest([31; 32]),
+        identity,
+    );
+    initial.replace("bucket", "", DataUsageEntry::default());
+    tokio::fs::create_dir(root.join("cache"))
+        .await
+        .expect("fresh checkpoint storage");
+    tokio::fs::write(root.join("cache/main"), initial.marshal_msg().expect("initial checkpoint encoding"))
+        .await
+        .expect("persist initial checkpoint");
+    let name = format!(
+        "{}::display_progress_survives_process_restarts_leader_changes_and_repeated_reads",
+        module_path!().split_once("::").expect("crate-qualified module").1
+    );
+    let mut pids = std::collections::HashSet::new();
+    for round in 0..20 {
+        let mut command = tokio::process::Command::new(std::env::current_exe().expect("current libtest binary"));
+        command
+            .arg("--exact")
+            .arg(&name)
+            .arg("--nocapture")
+            .env(CHILD_ROOT, root)
+            .env(CHILD_ROUND, round.to_string())
+            .kill_on_drop(true);
+        let output = tokio::time::timeout(Duration::from_secs(30), command.output())
+            .await
+            .expect("bounded child scan turn")
+            .expect("launch child process");
+        assert!(
+            output.status.success(),
+            "child round {round}: {} {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let result: serde_json::Value =
+            serde_json::from_slice(&tokio::fs::read(root.join("result.json")).await.expect("child result exists"))
+                .expect("decode child result");
+        let pid = result["pid"].as_u64().expect("child process id");
+        assert_ne!(pid, u64::from(std::process::id()));
+        assert!(pids.insert(pid), "every turn must run after the previous executor exits");
+        if result["finished"] == true {
+            assert!(round > 1, "the fixed six-object budget must require multiple process restarts");
+            assert_eq!(result["sample"]["objects"], 40);
+            assert_eq!(result["sample"]["size"], 40);
+            return;
+        }
+    }
+    panic!("cold alternating executors must finish within their fixed per-turn budgets");
 }
 
 #[tokio::test]

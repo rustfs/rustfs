@@ -12,7 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#[cfg(test)]
 mod access_request_validation_test;
 
 #[cfg(test)]

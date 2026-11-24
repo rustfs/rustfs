@@ -15,11 +15,10 @@
 //! Protocol multipart compatibility probes against the original conversion and storage edge.
 //! These tests do not define storage or authorization rules.
 
-use super::super::{RequestParams, gateway_s3s_compat as compat};
+use super::super::{ETagCondition, RequestParams, Timestamp as LegacyTimestamp, TimestampFormat};
 use super::*;
 use http::{HeaderMap, Method};
-use rustfs_gateway_types::compat::s3s_5761ddfe::leaf::RequestWire;
-use rustfs_protocols::common::client::s3::StorageBackend;
+use rustfs_protocols::common::client::s3::{MultipartRequest, StorageBackend};
 use rustfs_s3_types::{S3Error, S3ErrorCode};
 
 fn create_input() -> dto::CreateMultipartUploadInput {
@@ -28,16 +27,6 @@ fn create_input() -> dto::CreateMultipartUploadInput {
         key: rustfs_gateway_types::ObjectKey::new("a ?#+%.txt").expect("key"),
         ..Default::default()
     }
-}
-
-fn original_create(
-    input: dto::CreateMultipartUploadInput,
-) -> S3Result<crate::app::multipart_usecase::CreateMultipartUploadFields> {
-    let uri = super::super::build_object_uri(input.bucket.as_str(), input.key.as_str(), &[("uploads", None)])?;
-    let context = super::super::gateway_request_context(Method::POST, &uri, HeaderMap::new());
-    let input = compat::generated::ops::create_multipart_upload::input_to_s3s(input, &RequestWire::of(&context))
-        .map_err(|error| super::super::conversion_error("CreateMultipartUpload input", error))?;
-    Ok(crate::app::multipart_usecase::CreateMultipartUploadFields::from_legacy(input))
 }
 
 #[test]
@@ -57,7 +46,26 @@ fn multipart_create_projection_matches_original_fields_and_times() {
                 input.object_lock_retain_until_date = Some(Timestamp::from_secs_nanos(seconds, 123_456_789).expect("timestamp"));
                 input
             };
-            let expected = original_create(make()).expect("original input");
+            let text = |value: &str| (!empty).then(|| value.to_owned());
+            let expected = crate::app::multipart_usecase::CreateMultipartUploadFields::from_legacy(
+                super::super::CreateMultipartUploadInput {
+                    bucket: "multipart-fields".into(),
+                    key: "a ?#+%.txt".into(),
+                    tagging: text("label=value"),
+                    storage_class: text("STANDARD").map(Into::into),
+                    object_lock_mode: text("GOVERNANCE").map(Into::into),
+                    object_lock_legal_hold_status: text("ON").map(Into::into),
+                    sse_customer_algorithm: text("AES256"),
+                    ssekms_key_id: text("key-label"),
+                    sse_customer_key_md5: text("digest"),
+                    metadata: Some([("label".into(), "value".into())].into()),
+                    object_lock_retain_until_date: Some(
+                        LegacyTimestamp::parse(TimestampFormat::EpochSeconds, &format!("{seconds}.123456789"))
+                            .expect("legacy timestamp"),
+                    ),
+                    ..Default::default()
+                },
+            );
             let actual = create_multipart_input(make()).expect("owned input");
             assert_eq!(
                 (actual.bucket, actual.key, actual.metadata, actual.tagging, actual.storage_class),
@@ -115,9 +123,25 @@ fn multipart_create_projection_preserves_refusals() {
             }
             input
         };
-        let expected = original_create(make()).err().expect("original refusal");
+        let reason = [
+            "object_lock_event_hold: an Object Lock event hold, which no pinned s3s shape holds and RustFS does not store",
+            "object_lock_event_hold_duration_days: an Object Lock event hold, which no pinned s3s shape holds and RustFS does not store",
+            "object_lock_event_hold_duration_years: an Object Lock event hold, which no pinned s3s shape holds and RustFS does not store",
+            "object_lock_retain_until_date: an instant outside what the s3s shape can hold",
+        ][field];
         let actual = create_multipart_input(make()).err().expect("owned refusal");
-        assert_eq!(error_facts(actual), error_facts(expected), "field {field}");
+        assert_eq!(
+            error_facts(actual),
+            (
+                "InternalError".into(),
+                Some(format!(
+                    "failed to convert CreateMultipartUpload input through the gateway compatibility seam: {reason}"
+                )),
+                Some(http::StatusCode::INTERNAL_SERVER_ERROR),
+                None
+            ),
+            "field {field}"
+        );
     }
 }
 
@@ -125,7 +149,6 @@ fn complete_input() -> dto::CompleteMultipartUploadInput {
     dto::CompleteMultipartUploadInput {
         bucket: rustfs_gateway_types::BucketName::new("multipart-fields").expect("bucket"),
         key: rustfs_gateway_types::ObjectKey::new("key").expect("key"),
-        upload_id: rustfs_gateway_types::UploadIdClaim::from_wire("missing-upload"),
         ..Default::default()
     }
 }
@@ -145,6 +168,7 @@ fn multipart_complete_projection_matches_original_parts_and_conditions() {
     ] {
         let make = || {
             let mut input = complete_input();
+            input.upload_id = rustfs_gateway_types::UploadIdClaim::from_wire("missing-upload");
             input.if_match = condition.map(str::to_owned);
             input.if_none_match = condition.map(str::to_owned);
             input.sse_customer_algorithm = Some(String::new());
@@ -156,50 +180,45 @@ fn multipart_complete_projection_matches_original_parts_and_conditions() {
             });
             input
         };
-        let expected = compat::generated::ops::complete_multipart_upload::input_to_s3s(make())
-            .map_err(|error| super::super::conversion_error("CompleteMultipartUpload input", error))
-            .and_then(|input| {
-                compat::generated::ops::complete_multipart_upload::input_from_s3s(input)
-                    .map_err(crate::app::dto_values::seam_error)
-            });
         let actual = complete_multipart_input(make());
-        match (actual, expected) {
-            (Ok(actual), Ok(expected)) => {
-                assert_eq!(
-                    (actual.if_match, actual.if_none_match, actual.sse_customer_algorithm),
-                    (expected.if_match, expected.if_none_match, expected.sse_customer_algorithm)
-                );
-                let snapshot = |parts: dto::CompletedMultipartUpload| {
-                    parts
-                        .parts
-                        .into_iter()
-                        .map(|part| (part.part_number, part.e_tag.map(|tag| tag.opaque_tag().to_owned()), part.checksum_crc32))
-                        .collect::<Vec<_>>()
-                };
-                assert_eq!(snapshot(actual.multipart_upload), snapshot(expected.multipart_upload));
+        let expected = condition
+            .filter(|value| !value.is_empty())
+            .map(|value| ETagCondition::parse_http_header(value.as_bytes()))
+            .transpose();
+        match expected {
+            Ok(parsed) => {
+                let actual = actual.expect("accepted condition");
+                let header = parsed.map(|value| value.to_http_header().expect("condition header").to_str().expect("ASCII condition").to_owned());
+                assert_eq!(actual.if_match, header);
+                assert_eq!(actual.if_none_match, header);
+                assert!(actual.sse_customer_algorithm.is_none());
                 assert!(actual.checksum_spec.is_none());
+                let [part] = actual.multipart_upload.parts.as_slice() else { panic!("expected one part") };
+                assert_eq!(part.part_number, -1);
+                assert_eq!(part.e_tag.as_ref().map(ETag::opaque_tag), Some("a&b"));
+                assert_eq!(part.checksum_crc32.as_deref(), Some(""));
             }
-            (Err(actual), Err(expected)) => assert_eq!(error_facts(actual), error_facts(expected)),
-            _ => panic!("owned and original conversion outcomes differ"),
+            Err(_) => assert_eq!(error_facts(actual.expect_err("rejected condition")), ("InternalError".into(), Some("failed to convert CompleteMultipartUpload input through the gateway compatibility seam: if_match: not an entity-tag condition the s3s input can hold".into()), Some(http::StatusCode::INTERNAL_SERVER_ERROR), None)),
         }
     }
 }
 
 #[test]
 fn multipart_completion_projection_preserves_original_escaped_tags() {
-    for (opaque, weak) in [("abc", false), ("a&b<c", false), ("a\"b", true)] {
+    for (opaque, weak, expected) in [
+        ("abc", false, "abc"),
+        ("a&b<c", false, "a&amp;b&lt;c"),
+        ("a\"b", true, "a&quot;b"),
+    ] {
         let input = dto::CompleteMultipartUploadOutput {
             e_tag: Some(if weak { ETag::new_weak(opaque) } else { ETag::new(opaque) }.expect("tag")),
             ..Default::default()
         };
-        let mut legacy =
-            compat::generated::ops::complete_multipart_upload::output_to_s3s(input.clone()).expect("original output");
-        let stored = if weak { format!("W/\"{opaque}\"") } else { opaque.to_owned() };
-        legacy.e_tag = Some(crate::app::storage_api::object_utils::to_s3s_xml_etag(&stored));
-        let expected = compat::generated::ops::complete_multipart_upload::output_from_s3s(legacy).expect("original answer");
-        let actual = complete_multipart_output(input).expect("owned answer");
-        let tag = |value: Option<ETag>| value.map(|value| (value.opaque_tag().to_owned(), value.is_weak()));
-        assert_eq!(tag(actual.e_tag), tag(expected.e_tag));
+        let tag = complete_multipart_output(input)
+            .expect("completion output")
+            .e_tag
+            .expect("ETag");
+        assert_eq!((tag.opaque_tag(), tag.is_weak()), (expected, weak));
     }
 }
 
@@ -232,19 +251,21 @@ fn multipart_refusals_match_original_client_errors() {
                 input
             };
             let actual = backend
-                .complete_multipart_upload(make(), &root)
+                .complete_multipart_upload(MultipartRequest::complete(make(), "missing-upload"), &root)
                 .await
                 .expect_err("owned refusal");
             assert_ne!(actual.code().as_str(), "", "part {part:?}, condition {condition:?}");
         }
         let error = backend
             .abort_multipart_upload(
-                dto::AbortMultipartUploadInput {
-                    bucket: rustfs_gateway_types::BucketName::new(bucket).expect("bucket"),
-                    key: rustfs_gateway_types::ObjectKey::new("key").expect("key"),
-                    upload_id: rustfs_gateway_types::UploadIdClaim::from_wire("missing-upload"),
-                    ..Default::default()
-                },
+                MultipartRequest::abort(
+                    dto::AbortMultipartUploadInput {
+                        bucket: rustfs_gateway_types::BucketName::new(bucket).expect("bucket"),
+                        key: rustfs_gateway_types::ObjectKey::new("key").expect("key"),
+                        ..Default::default()
+                    },
+                    "missing-upload",
+                ),
                 &root,
             )
             .await
@@ -255,28 +276,55 @@ fn multipart_refusals_match_original_client_errors() {
 
 #[test]
 fn multipart_completion_projection_preserves_header_only_field_behavior() {
-    let output = dto::CompleteMultipartUploadOutput {
-        checksum_header_xxhash3: Some("AAAAAAAAAAA=".into()),
-        sse_customer_algorithm: Some("AES256".into()),
-        sse_customer_key_md5: Some("digest".into()),
-        ..Default::default()
-    };
-    let output = complete_multipart_output(output).expect("header fields remain valid");
-    assert!(output.checksum_header_xxhash3.is_none());
-    assert!(output.sse_customer_algorithm.is_none());
-    assert!(output.sse_customer_key_md5.is_none());
-    let error = complete_multipart_output(dto::CompleteMultipartUploadOutput {
-        sse_customer_algorithm: Some("bad\nvalue".into()),
-        ..Default::default()
-    })
-    .expect_err("invalid original response header");
-    assert_eq!(error.code(), &S3ErrorCode::InternalError);
-    assert!(
-        error
-            .message()
-            .expect("message")
-            .contains("x-amz-server-side-encryption-customer-algorithm: not a header value")
-    );
+    let headers = [
+        "x-amz-checksum-md5",
+        "x-amz-checksum-sha512",
+        "x-amz-checksum-xxhash3",
+        "x-amz-checksum-xxhash64",
+        "x-amz-checksum-xxhash128",
+        "x-amz-server-side-encryption-customer-algorithm",
+        "x-amz-server-side-encryption-customer-key-md5",
+    ];
+    for first_invalid in 0..=headers.len() {
+        let valid = ["md5", "sha512", "AAAAAAAAAAA=", "xxhash64", "xxhash128", "AES256", "digest"];
+        let value = |index: usize| Some(if index < first_invalid { valid[index] } else { "bad\nvalue" }.to_owned());
+        let output = dto::CompleteMultipartUploadOutput {
+            checksum_header_md5: value(0),
+            checksum_header_sha512: value(1),
+            checksum_header_xxhash3: value(2),
+            checksum_header_xxhash64: value(3),
+            checksum_header_xxhash128: value(4),
+            sse_customer_algorithm: value(5),
+            sse_customer_key_md5: value(6),
+            ..Default::default()
+        };
+        let result = complete_multipart_output(output);
+        if let Some(header) = headers.get(first_invalid) {
+            let error = result.expect_err("invalid response header");
+            assert_eq!(error.code(), &S3ErrorCode::InternalError);
+            assert_eq!(
+                error.message(),
+                Some(format!("failed to convert through the gateway compatibility seam: {header}: not a header value").as_str())
+            );
+            assert_eq!(error.status_code(), Some(http::StatusCode::INTERNAL_SERVER_ERROR));
+            assert!(error.headers().is_none());
+            assert!(std::error::Error::source(&error).is_none());
+        } else {
+            let output = result.expect("valid response headers");
+            assert_eq!(
+                [
+                    output.checksum_header_md5,
+                    output.checksum_header_sha512,
+                    output.checksum_header_xxhash3,
+                    output.checksum_header_xxhash64,
+                    output.checksum_header_xxhash128,
+                    output.sse_customer_algorithm,
+                    output.sse_customer_key_md5
+                ],
+                [const { None }; 7]
+            );
+        }
+    }
 }
 
 #[test]
@@ -369,10 +417,12 @@ fn multipart_uses_bound_store_with_a_foreign_ambient_context() {
             let input = dto::AbortMultipartUploadInput {
                 bucket: created.bucket,
                 key: created.key,
-                upload_id: rustfs_gateway_types::UploadIdClaim::from_wire(&created.upload_id),
                 ..Default::default()
             };
-            backend.abort_multipart_upload(input, &root).await.expect("owned bound abort");
+            backend
+                .abort_multipart_upload(MultipartRequest::abort(input, &created.upload_id), &root)
+                .await
+                .expect("owned bound abort");
             assert!(
                 bound
                     .object_store()
@@ -397,8 +447,6 @@ fn multipart_create_output_matches_original_for_stored_names_and_empty_values() 
                 ssekms_key_id: Some(value.into()),
                 ..Default::default()
             };
-            let expected = compat::generated::ops::create_multipart_upload::output_from_s3s(legacy)
-                .map_err(|error| super::super::conversion_error("CreateMultipartUpload output", error));
             let actual = create_multipart_output(crate::app::multipart_usecase::CreateMultipartUploadResult {
                 bucket: name.into(),
                 key: "key".into(),
@@ -421,7 +469,17 @@ fn multipart_create_output_matches_original_for_stored_names_and_empty_values() 
                     output.ssekms_key_id,
                 )
             };
-            assert_eq!(actual.map(snapshot).map_err(error_facts), expected.map(snapshot).map_err(error_facts));
+            assert_eq!(
+                snapshot(actual.expect("stored names are representable")),
+                (
+                    legacy.bucket.expect("bucket"),
+                    legacy.key.expect("key"),
+                    legacy.upload_id.expect("upload id"),
+                    legacy.sse_customer_algorithm,
+                    legacy.sse_customer_key_md5,
+                    legacy.ssekms_key_id
+                )
+            );
         }
     }
 }

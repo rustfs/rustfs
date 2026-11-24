@@ -17,7 +17,7 @@
 
 use super::super::super::{
     ETag as LegacyETag, LegacyS3Error, LegacyS3ErrorCode, ServerSideEncryption as LegacyEncryption,
-    UploadPartOutput as LegacyOutput,
+    UploadPartInput as LegacyInput, UploadPartOutput as LegacyOutput,
 };
 use super::*;
 use crate::app::storage_api::test::contract::multipart::MultipartOperations;
@@ -58,7 +58,7 @@ impl PayloadStream for CountedBody {
     }
 }
 
-fn input(bucket: &str, upload: &str, number: i32, length: i64) -> (dto::UploadPartInput, Arc<AtomicUsize>) {
+fn input(bucket: &str, number: i32, length: i64) -> (dto::UploadPartInput, Arc<AtomicUsize>) {
     let polls = Arc::new(AtomicUsize::new(0));
     let body = ByteStream::new(Box::pin(CountedBody {
         polls: polls.clone(),
@@ -70,7 +70,6 @@ fn input(bucket: &str, upload: &str, number: i32, length: i64) -> (dto::UploadPa
         dto::UploadPartInput {
             bucket: crate::app::dto_values::stored_bucket_name(bucket).expect("stored bucket"),
             key: crate::app::dto_values::stored_object_key("directory/a ?#+%.txt").expect("stored key"),
-            upload_id: rustfs_gateway_types::UploadIdClaim::from_wire(upload),
             part_number: number,
             content_length: length,
             body: Some(body),
@@ -122,12 +121,13 @@ fn upload_part_refusals_match_original_without_persisting_parts() {
             "bad-sse-md5",
         ] {
             let make = || {
-                let (mut request, polls) = input(bucket, &created.upload_id, 1, 3);
+                let (mut request, polls) = input(bucket, 1, 3);
+                let mut upload_id = created.upload_id.as_str();
                 match case {
                     "zero" => request.part_number = 0,
                     "negative" => request.part_number = -1,
                     "too-large" => request.part_number = 10001,
-                    "missing-upload" => request.upload_id = rustfs_gateway_types::UploadIdClaim::from_wire("missing/+?=&%"),
+                    "missing-upload" => upload_id = "missing/+?=&%",
                     "wrong-key" => request.key = crate::app::dto_values::stored_object_key("different").expect("key"),
                     "no-body" => request.body = None,
                     "unknown-length" => request.content_length = -1,
@@ -151,7 +151,7 @@ fn upload_part_refusals_match_original_without_persisting_parts() {
                     }
                     _ => unreachable!(),
                 }
-                (request, polls)
+                (MultipartRequest::upload_part(request, upload_id), polls)
             };
             let (request, new_polls) = make();
             let before = count();
@@ -171,7 +171,12 @@ fn upload_part_refusals_match_original_without_persisting_parts() {
                 .parts;
             let actual_audit = audit_facts(&probe);
             let new_polls = new_polls.load(Ordering::Relaxed);
-            assert!(actual.is_err(), "{case}: expected refusal");
+            let refusal = actual.expect_err("expected upload refusal");
+            if case == "missing-upload" {
+                assert_eq!(refusal.code(), &S3ErrorCode::NoSuchUpload);
+                assert_eq!(refusal.status_code(), Some(http::StatusCode::NOT_FOUND));
+                assert!(!refusal.message().unwrap_or_default().contains("missing/+?=&%"));
+            }
             assert_eq!(parts.len(), 0, "{case}: no parts persisted");
             assert_eq!(actual_count, 1, "{case}: count");
             assert_eq!(actual_audit.len(), 1, "{case}: audit");
@@ -207,11 +212,14 @@ fn upload_part_client_preserves_stored_bytes_and_bound_context() {
             .await
             .expect("create upload");
         for part_num in [1, 2] {
-            let (mut request, polls) = input(bucket, &created.upload_id, part_num, 3);
+            let (mut request, polls) = input(bucket, part_num, 3);
             request.checksum_spec =
                 Some(rustfs_gateway_types::ChecksumSpec::parse_header("x-amz-checksum-crc32", "NSRBwg==").expect("checksum"));
             let before = count();
-            let output = backend.upload_part(request, &root).await.expect("upload part");
+            let output = backend
+                .upload_part(MultipartRequest::upload_part(request, &created.upload_id), &root)
+                .await
+                .expect("upload part");
             assert_eq!(count() - before, 1);
             assert!(polls.load(Ordering::Relaxed) > 0, "successful upload must poll its producer");
             let _ = &output.e_tag;
@@ -243,7 +251,6 @@ fn upload_part_client_preserves_stored_bytes_and_bound_context() {
         let complete = dto::CompleteMultipartUploadInput {
             bucket: created.bucket,
             key: created.key,
-            upload_id: rustfs_gateway_types::UploadIdClaim::from_wire(&created.upload_id),
             multipart_upload: dto::CompletedMultipartUpload {
                 parts: vec![dto::CompletedPart {
                     part_number: 2,
@@ -253,7 +260,10 @@ fn upload_part_client_preserves_stored_bytes_and_bound_context() {
             },
             ..Default::default()
         };
-        backend.complete_multipart_upload(complete, &root).await.expect("complete");
+        backend
+            .complete_multipart_upload(MultipartRequest::complete(complete, &created.upload_id), &root)
+            .await
+            .expect("complete");
         let read = backend
             .get_object(bucket, "directory/a ?#+%.txt", &root, None)
             .await
@@ -289,10 +299,12 @@ fn upload_part_checksum_observations_match_original() {
             )
             .await
             .expect("create upload");
-        let (mut request, _) = input(bucket, &created.upload_id, 1, 3);
+        let (mut request, _) = input(bucket, 1, 3);
         request.checksum_spec =
             Some(rustfs_gateway_types::ChecksumSpec::parse_header("x-amz-checksum-crc32", "AAAAAA==").expect("checksum"));
-        let result = backend.upload_part(request, &root).await;
+        let result = backend
+            .upload_part(MultipartRequest::upload_part(request, &created.upload_id), &root)
+            .await;
         assert!(result.is_ok(), "checksum projection remains representable");
     });
 }
@@ -313,10 +325,12 @@ fn input_fields(value: crate::app::multipart_usecase::UploadPartWriteInput) -> s
 
 #[test]
 fn upload_part_input_projection_matches_original_fields() {
+    use rustfs_gateway_types::ChecksumAlgorithm as Algorithm;
+
     for value in ["", "value"] {
         for length in [-1, 0, 3] {
-            for &algorithm in rustfs_gateway_types::ChecksumAlgorithm::ALL {
-                let make = || dto::UploadPartInput {
+            for &algorithm in Algorithm::ALL {
+                let native = dto::UploadPartInput {
                     bucket: crate::app::dto_values::stored_bucket_name("sftp_host_keys").expect("stored bucket"),
                     key: crate::app::dto_values::stored_object_key("directory/a ?#+%.txt").expect("stored key"),
                     upload_id: rustfs_gateway_types::UploadIdClaim::from_wire("upload/+?=&%"),
@@ -333,10 +347,37 @@ fn upload_part_input_projection_matches_original_fields() {
                     sse_customer_key_md5: Some(value.into()),
                     ..Default::default()
                 };
-                let legacy = compat::generated::ops::upload_part::input_to_s3s(make()).expect("original input");
+                let mut legacy = LegacyInput::builder()
+                    .bucket("sftp_host_keys".to_owned())
+                    .key("directory/a ?#+%.txt".to_owned())
+                    .upload_id("upload/+?=&%".to_owned())
+                    .part_number(10000)
+                    .build()
+                    .expect("legacy input");
+                legacy.content_length = Some(length);
+                let nonempty = (!value.is_empty()).then(|| value.to_owned());
+                legacy.content_md5 = nonempty.clone();
+                legacy.checksum_algorithm = nonempty.clone().map(Into::into);
+                legacy.sse_customer_algorithm = nonempty.clone();
+                legacy.sse_customer_key = Some(value.to_owned());
+                legacy.sse_customer_key_md5 = nonempty;
+                let checksum = match algorithm {
+                    Algorithm::Crc32 => &mut legacy.checksum_crc32,
+                    Algorithm::Crc32c => &mut legacy.checksum_crc32c,
+                    Algorithm::Crc64Nvme => &mut legacy.checksum_crc64nvme,
+                    Algorithm::Sha1 => &mut legacy.checksum_sha1,
+                    Algorithm::Sha256 => &mut legacy.checksum_sha256,
+                    Algorithm::Sha512 => &mut legacy.checksum_sha512,
+                    Algorithm::Md5 => &mut legacy.checksum_md5,
+                    Algorithm::XxHash64 => &mut legacy.checksum_xxhash64,
+                    Algorithm::XxHash3 => &mut legacy.checksum_xxhash3,
+                    Algorithm::XxHash128 => &mut legacy.checksum_xxhash128,
+                    other => panic!("missing legacy test vector for {other:?}"),
+                };
+                *checksum = Some(base64_simd::STANDARD.encode_to_string(vec![0; algorithm.digest_len()]));
                 let expected = crate::app::multipart_usecase::UploadPartWriteInput::from_legacy(legacy, None);
                 assert_eq!(
-                    input_fields(upload_part_input(make(), "upload/+?=&%".into())),
+                    input_fields(upload_part_input(native, "upload/+?=&%".into())),
                     input_fields(expected),
                     "{algorithm:?}, length {length}, value {value:?}"
                 );
@@ -348,7 +389,8 @@ fn upload_part_input_projection_matches_original_fields() {
 #[test]
 fn upload_part_output_projection_matches_original_fields_and_refusals() {
     use crate::app::multipart_usecase::UploadPartWriteOutput;
-    let mut observations = Vec::new();
+    // The refusal order and messages were measured against s3s 5761ddfe and
+    // the gateway-types 1c7486f conversion. The SDK fields below remain an independent oracle.
     for (raw, tag) in [
         (None, None),
         (Some("abc"), Some(LegacyETag::Strong("abc".into()))),
@@ -369,73 +411,102 @@ fn upload_part_output_projection_matches_original_fields_and_refusals() {
             (0, Some("bad")),
             (5, Some("AAAAAA==")),
         ] {
-            let mut current = UploadPartWriteOutput {
+            let field = |slot| {
+                checksum
+                    .filter(|_| index == slot || (index == 5 && slot < 2))
+                    .map(str::to_owned)
+            };
+            let current = UploadPartWriteOutput {
                 e_tag: raw.map(str::to_owned),
-                checksum_crc32: None,
-                checksum_crc32c: None,
-                checksum_crc64nvme: None,
-                checksum_sha1: None,
-                checksum_sha256: None,
+                checksum_crc32: field(0),
+                checksum_crc32c: field(1),
+                checksum_crc64nvme: field(2),
+                checksum_sha1: field(3),
+                checksum_sha256: field(4),
                 server_side_encryption: Some("AES256".into()),
                 ssekms_key_id: Some("test-key-id".into()),
                 sse_customer_algorithm: Some("AES256".into()),
                 sse_customer_key_md5: Some("test-md5".into()),
                 headers: HeaderMap::new(),
             };
-            let mut old = LegacyOutput {
+            let old = LegacyOutput {
                 e_tag: tag.clone(),
+                checksum_crc32: field(0),
+                checksum_crc32c: field(1),
+                checksum_crc64nvme: field(2),
+                checksum_sha1: field(3),
+                checksum_sha256: field(4),
                 server_side_encryption: Some(LegacyEncryption::from("AES256".to_owned())),
                 ssekms_key_id: Some("test-key-id".into()),
                 sse_customer_algorithm: Some("AES256".into()),
                 sse_customer_key_md5: Some("test-md5".into()),
                 ..Default::default()
             };
-            let checksum = checksum.map(str::to_owned);
-            match index {
-                0 => {
-                    current.checksum_crc32 = checksum.clone();
-                    old.checksum_crc32 = checksum;
-                }
-                1 => {
-                    current.checksum_crc32c = checksum.clone();
-                    old.checksum_crc32c = checksum;
-                }
-                2 => {
-                    current.checksum_crc64nvme = checksum.clone();
-                    old.checksum_crc64nvme = checksum;
-                }
-                3 => {
-                    current.checksum_sha1 = checksum.clone();
-                    old.checksum_sha1 = checksum;
-                }
-                4 => {
-                    current.checksum_sha256 = checksum.clone();
-                    old.checksum_sha256 = checksum;
-                }
-                _ => {
-                    current.checksum_crc32 = checksum.clone();
-                    current.checksum_crc32c = checksum.clone();
-                    old.checksum_crc32 = checksum.clone();
-                    old.checksum_crc32c = checksum;
-                }
+            let tag_value = old.e_tag.as_ref().map(|tag| match tag {
+                LegacyETag::Strong(value) => (false, value.as_str()),
+                LegacyETag::Weak(value) => (true, value.as_str()),
+            });
+            let refusal = match (tag_value, index, checksum) {
+                (None, _, _) => Some("e_tag: the gateway shape requires this member"),
+                (Some((_, "" | "a\nb")), _, _) => Some("e_tag: not an entity tag the gateway can write"),
+                (_, 5, _) => Some("checksum_spec: the gateway shape carries one checksum, so a second would be lost"),
+                (_, 0, Some("bad")) => Some("checksum_crc32: not a checksum value of this algorithm's width"),
+                _ => None,
+            };
+            let native = upload_part_output(current);
+            if let Some(reason) = refusal {
+                assert_eq!(
+                    error_facts(native.expect_err("original conversion refused this output")),
+                    (
+                        "InternalError".to_owned(),
+                        Some(format!(
+                            "failed to convert UploadPart output through the gateway compatibility seam: {reason}"
+                        )),
+                        Some(http::StatusCode::INTERNAL_SERVER_ERROR),
+                        None
+                    ),
+                    "{raw:?}, {index}, {checksum:?}"
+                );
+                continue;
             }
-            let expected = compat::generated::ops::upload_part::output_from_s3s(old)
-                .map_err(|error| super::super::super::conversion_error("UploadPart output", error));
-            observations.push((
-                raw,
-                index,
-                upload_part_output(current)
-                    .map(|output| format!("{output:?}"))
-                    .map_err(error_facts),
-                expected.map(|output| format!("{output:?}")).map_err(error_facts),
-            ));
+            let actual = native.expect("representable legacy output");
+            let (weak, value) = tag_value.expect("valid ETag");
+            let expected_tag = if weak {
+                rustfs_gateway_types::ETag::new_weak(value.to_owned())
+            } else {
+                rustfs_gateway_types::ETag::new(value.to_owned())
+            }
+            .expect("recorded valid ETag");
+            assert_eq!(format!("{:?}", actual.e_tag), format!("{expected_tag:?}"));
+            let expected_checksum = [
+                ("CRC32", old.checksum_crc32),
+                ("CRC32C", old.checksum_crc32c),
+                ("CRC64NVME", old.checksum_crc64nvme),
+                ("SHA1", old.checksum_sha1),
+                ("SHA256", old.checksum_sha256),
+            ]
+            .into_iter()
+            .find_map(|(name, value)| value.map(|value| (name, value)));
+            assert_eq!(
+                actual
+                    .checksum_spec
+                    .map(|spec| (spec.algorithm().wire_name(), spec.render_base64().to_owned())),
+                expected_checksum
+            );
+            assert_eq!(
+                actual.server_side_encryption.as_ref().map(|value| value.as_str()),
+                old.server_side_encryption.as_ref().map(|value| value.as_str())
+            );
+            assert_eq!(actual.ssekms_key_id, old.ssekms_key_id);
+            assert_eq!(actual.sse_customer_algorithm, old.sse_customer_algorithm);
+            assert_eq!(actual.sse_customer_key_md5, old.sse_customer_key_md5);
+            assert_eq!(actual.bucket_key_enabled, old.bucket_key_enabled);
+            assert_eq!(
+                actual.request_charged.as_ref().map(|value| value.as_str()),
+                old.request_charged.as_ref().map(|value| value.as_str())
+            );
         }
     }
-    let differences: Vec<_> = observations
-        .into_iter()
-        .filter(|(_, _, actual, expected)| actual != expected)
-        .collect();
-    assert!(differences.is_empty(), "UploadPart output differences: {differences:#?}");
 }
 
 #[test]
@@ -454,7 +525,10 @@ fn upload_part_error_projection_matches_original_defaults() {
                 Some(message) => LegacyS3Error::with_message(legacy_code.clone(), message),
                 None => LegacyS3Error::new(legacy_code.clone()),
             };
-            assert_eq!(error_facts(upload_part_error(actual)), error_facts(expected.into()));
+            assert_eq!(
+                error_facts(upload_part_error(actual)),
+                error_facts(crate::error::owned_error_for_test(expected))
+            );
         }
     }
 }

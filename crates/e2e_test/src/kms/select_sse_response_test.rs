@@ -114,7 +114,7 @@ async fn select_projects_encryption_headers_and_rejects_invalid_sse_c_before_str
     let log_path = format!("{}/server.log", kms.base_env.temp_dir);
     kms.base_env.capture_log_path = Some(log_path.clone());
     kms.base_env
-        .start_rustfs_server_with_env(Vec::new(), &[("RUST_LOG", "s3s=debug,rustfs=info")])
+        .start_rustfs_server_with_env(Vec::new(), &[("RUST_LOG", "rustfs_gateway=debug,rustfs=info")])
         .await?;
     let key_id = kms.configure_local_kms().await?;
     start_kms(&kms.base_env.url, &kms.base_env.access_key, &kms.base_env.secret_key).await?;

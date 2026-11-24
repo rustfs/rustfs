@@ -299,7 +299,6 @@ impl OdmWriteBack for OnDemandMigrationWriteBack {
 mod tests {
     use super::*;
     use crate::app::storage_api::multipart_usecase::contract::multipart::MultipartOperations as _;
-    use crate::app::storage_api::s3::dto::GetObjectInput;
     use crate::app::storage_api::s3::{
         PersistedOptionalReplicationStatus, PersistedReplicationConfiguration, PersistedReplicationDestination,
         PersistedReplicationFilter, PersistedReplicationRule, PersistedReplicationTag, Status,
@@ -307,6 +306,7 @@ mod tests {
     use crate::app::storage_api::test::bucket::utils::serialize;
     use crate::app::storage_api::test::contract::bucket::{BucketOperations as _, DeleteBucketOptions, MakeBucketOptions};
     use crate::app::storage_api::test::{get_global_bucket_metadata_sys, set_bucket_metadata};
+    use crate::app::test_seams::{get_envelope, get_object_gateway, get_object_input, read_get_body};
     use crate::on_demand_migration::{PullFailureReason, SourceSse};
     use rustfs_gateway_types::persistence::{
         PersistedBucketEncryptionConfiguration as ServerSideEncryptionConfiguration,
@@ -420,20 +420,15 @@ mod tests {
     }
 
     async fn get_via_app(bucket: &str, key: &str) -> Vec<u8> {
-        let input = GetObjectInput::builder()
-            .bucket(bucket.to_string())
-            .key(key.to_string())
-            .build()
-            .expect("GET input must build");
-        let mut response = crate::app::test_seams::get_object_method_only(&DefaultObjectUsecase::from_global(), input)
-            .await
-            .expect("app-layer GET must succeed");
-        let mut body = response.output.body.take().expect("GET response must include a body");
-        let mut actual = Vec::new();
-        while let Some(chunk) = body.next().await {
-            actual.extend_from_slice(&chunk.expect("GET body chunk"));
-        }
-        actual
+        let response = get_object_gateway(
+            &DefaultObjectUsecase::from_global(),
+            get_envelope(HeaderMap::new(), http::Extensions::new()),
+            get_object_input(bucket, key, None),
+        )
+        .await
+        .expect("app-layer GET must succeed");
+        let body = response.output.body.expect("GET response must include a body");
+        read_get_body(body).await.to_vec()
     }
 
     fn assert_provenance(metadata: &HashMap<String, String>, head: &SourceHead) {

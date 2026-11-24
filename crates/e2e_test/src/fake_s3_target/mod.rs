@@ -17,35 +17,26 @@
 //!
 //! See [`README.md`](README.md) for the supported protocol and fault surface.
 
-use async_trait::async_trait;
+mod bucket;
+mod multipart;
+mod object;
+mod service;
+
 use base64_simd::STANDARD as BASE64_STANDARD;
 use bytes::{Bytes, BytesMut};
 use futures::StreamExt;
 use http::header::{CONTENT_LENGTH, ETAG, LAST_MODIFIED, RANGE, USER_AGENT};
 use http::{HeaderMap, HeaderValue, Method, Request, Response, StatusCode, Uri};
+use http_body_util::BodyExt;
 use hyper::body::Incoming;
 use hyper::server::conn::http1;
 use hyper::service::service_fn;
 use hyper_util::rt::{TokioIo, TokioTimer};
 use md5::{Digest as Md5Digest, Md5};
-use s3s::access::{S3Access, S3AccessContext};
-use s3s::auth::SimpleAuth;
-use s3s::dto::{
-    AbortMultipartUploadInput, AbortMultipartUploadOutput, CommonPrefix, CompleteMultipartUploadInput,
-    CompleteMultipartUploadOutput, CreateMultipartUploadInput, CreateMultipartUploadOutput, DeleteMarkerEntry, DeleteObjectInput,
-    DeleteObjectOutput, DeleteObjectTaggingInput, DeleteObjectTaggingOutput, ETag, GetBucketVersioningInput,
-    GetBucketVersioningOutput, GetObjectInput, GetObjectLegalHoldInput, GetObjectLegalHoldOutput,
-    GetObjectLockConfigurationInput, GetObjectLockConfigurationOutput, GetObjectOutput, GetObjectRetentionInput,
-    GetObjectRetentionOutput, GetObjectTaggingInput, GetObjectTaggingOutput, HeadBucketInput, HeadBucketOutput, HeadObjectInput,
-    HeadObjectOutput, ListObjectVersionsInput, ListObjectVersionsOutput, ListObjectsV2Input, ListObjectsV2Output, Object,
-    ObjectLockConfiguration, ObjectLockEnabled, ObjectLockLegalHold, ObjectLockLegalHoldStatus, ObjectLockMode,
-    ObjectLockRetention, ObjectLockRetentionMode, ObjectStorageClass, ObjectVersionId, PutObjectInput, PutObjectLegalHoldInput,
-    PutObjectLegalHoldOutput, PutObjectOutput, PutObjectRetentionInput, PutObjectRetentionOutput, PutObjectTaggingInput,
-    PutObjectTaggingOutput, Range, StreamingBlob, Tag, TagSet, Timestamp, TimestampFormat, UploadPartInput, UploadPartOutput,
-};
-use s3s::service::{S3Service, S3ServiceBuilder};
-use s3s::validation::{AwsNameValidation, NameValidation};
-use s3s::{Body, S3, S3Request, S3Response, S3Result};
+use rustfs_gateway::{Body, ByteStream, S3Service};
+use rustfs_gateway_types::dto::{ObjectLockLegalHoldStatus, ObjectLockMode};
+use rustfs_gateway_types::{RangeOutcome, RangeSpec, Timestamp, TimestampFormat, dto};
+use rustfs_s3_types::{S3Error, S3Result, s3_error};
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::error::Error;
 use std::io;
@@ -57,6 +48,27 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore, watch};
 use tokio::task::JoinHandle;
 use tokio::time::{sleep, timeout};
 use uuid::Uuid;
+
+struct TargetRequest<I> {
+    input: I,
+    headers: HeaderMap,
+    extensions: http::Extensions,
+}
+
+struct TargetResponse<O> {
+    output: O,
+    headers: HeaderMap,
+    status: Option<StatusCode>,
+}
+impl<O> TargetResponse<O> {
+    fn new(output: O) -> Self {
+        Self {
+            output,
+            headers: HeaderMap::new(),
+            status: None,
+        }
+    }
+}
 
 type BoxError = Box<dyn Error + Send + Sync>;
 
@@ -228,7 +240,7 @@ impl SeedMetadata {
 
     /// Fixed `Last-Modified` instead of the seeding time.
     pub fn last_modified(mut self, value: SystemTime) -> Self {
-        self.last_modified = Some(Timestamp::from(value));
+        self.last_modified = Some(fixture_timestamp(value.into()));
         self
     }
 }
@@ -597,7 +609,7 @@ impl StandardHeaders {
         .flatten()
         .any(|value| value.len() > MAX_CONTENT_TYPE_BYTES);
         if too_long {
-            Err(s3s::s3_error!(InvalidArgument, "standard object headers exceed 1024 bytes"))
+            Err(s3_error!(InvalidArgument, "standard object headers exceed 1024 bytes"))
         } else {
             Ok(())
         }
@@ -648,11 +660,11 @@ impl VersionLock {
 
     fn legal_hold_status(&self) -> Option<ObjectLockLegalHoldStatus> {
         self.legal_hold.map(|on| {
-            ObjectLockLegalHoldStatus::from_static(if on {
+            if on {
                 ObjectLockLegalHoldStatus::ON
             } else {
                 ObjectLockLegalHoldStatus::OFF
-            })
+            }
         })
     }
 }
@@ -769,16 +781,14 @@ impl FakeS3Target {
             control: Arc::clone(&control),
             body_limit: Arc::clone(&body_limit),
         };
-        let service = {
-            let mut builder = S3ServiceBuilder::new(backend.clone());
-            builder.set_auth(SimpleAuth::from_single(FAKE_ACCESS_KEY, FAKE_SECRET_KEY));
-            builder.set_access(FaultAccess {
+        let service = service::build(
+            backend.clone(),
+            FaultAccess {
                 control: Arc::clone(&control),
                 body_limit,
                 store: Arc::clone(&backend.store),
-            });
-            builder.build()
-        };
+            },
+        )?;
         let (shutdown, mut shutdown_rx) = watch::channel(false);
         let connection_limit = Arc::new(Semaphore::new(MAX_CONNECTIONS));
         let (active_connections_tx, active_connections) = watch::channel(0usize);
@@ -932,10 +942,7 @@ impl FakeS3Target {
             },
             body,
             e_tag: e_tag.clone(),
-            last_modified: seed
-                .last_modified
-                .clone()
-                .unwrap_or_else(|| Timestamp::from(SystemTime::now())),
+            last_modified: seed.last_modified.unwrap_or_else(now_timestamp),
             delete_marker: false,
             content_type,
             metadata,
@@ -1196,7 +1203,7 @@ impl FakeS3Target {
 }
 
 fn valid_bucket_name(bucket: &str) -> bool {
-    AwsNameValidation::new().validate_bucket_name(bucket)
+    rustfs_gateway_types::validate_bucket_name(bucket).is_ok()
         && !RESERVED_BUCKET_PREFIXES.iter().any(|prefix| bucket.starts_with(prefix))
         && !RESERVED_BUCKET_SUFFIXES.iter().any(|suffix| bucket.ends_with(suffix))
 }
@@ -1254,24 +1261,21 @@ fn queued_fault_count(state: &ControlState) -> usize {
     state.scripts.values().map(VecDeque::len).sum::<usize>() + state.keyed_scripts.values().map(VecDeque::len).sum::<usize>()
 }
 
-#[async_trait]
-impl S3Access for FaultAccess {
-    async fn check(&self, context: &mut S3AccessContext<'_>) -> S3Result<()> {
-        if context
-            .credentials()
-            .is_none_or(|credentials| credentials.access_key != FAKE_ACCESS_KEY)
-        {
-            return Err(s3s::s3_error!(AccessDenied, "valid fixture credentials are required"));
-        }
-
-        let parsed = parse_request(context.method(), context.uri());
-        let operation = operation_from_s3_name(context.s3_op().name());
-        let journaled = JournaledHeaders::from_headers(context.headers());
+impl FaultAccess {
+    async fn admit(
+        &self,
+        method: &Method,
+        uri: &Uri,
+        headers: &HeaderMap,
+        operation: Operation,
+        slot: &RequestSequence,
+    ) -> S3Result<http::Extensions> {
+        let parsed = parse_request(method, uri);
+        let journaled = JournaledHeaders::from_headers(headers);
         let aws_chunked = journaled.transport.aws_chunked;
-        let (sequence, fault) = record_request(&self.control, operation, context.method().clone(), parsed, journaled);
-        if let Some(slot) = context.extensions_mut().get::<RequestSequence>() {
-            let _ = slot.0.set(sequence);
-        }
+        let (sequence, fault) = record_request(&self.control, operation, method.clone(), parsed, journaled);
+        let _ = slot.0.set(sequence);
+        let mut extensions = http::Extensions::new();
         if let Some(status) = fault.as_ref().and_then(|fault| scripted_status(&fault.action)) {
             return Err(scripted_status_error(status));
         }
@@ -1279,19 +1283,16 @@ impl S3Access for FaultAccess {
             && matches!(operation, Operation::PutObject | Operation::UploadPart)
             && lock(&self.store).reject_aws_chunked_uploads
         {
-            return Err(s3s::s3_error!(
+            return Err(s3_error!(
                 InvalidRequest,
                 "this target does not decode aws-chunked request bodies; send a plain signed payload with an exact Content-Length"
             ));
         }
         if matches!(operation, Operation::PutObject | Operation::UploadPart)
             && lock(&self.store).reject_reserved_internal_headers
-            && context
-                .headers()
-                .keys()
-                .any(|name| name.as_str().starts_with("x-minio-internal-"))
+            && headers.keys().any(|name| name.as_str().starts_with("x-minio-internal-"))
         {
-            return Err(s3s::s3_error!(InvalidArgument, "Your metadata headers are not supported."));
+            return Err(s3_error!(InvalidArgument, "Your metadata headers are not supported."));
         }
         let prebody_permit = if operation == Operation::CompleteMultipartUpload {
             Some(
@@ -1300,19 +1301,19 @@ impl S3Access for FaultAccess {
                     Arc::clone(&self.body_limit).acquire_many_owned(MAX_CONCURRENT_BODY_REQUESTS as u32),
                 )
                 .await
-                .map_err(|_| s3s::s3_error!(RequestTimeout, "fake target body limiter wait exceeded 30 seconds"))?
-                .map_err(|_| s3s::s3_error!(ServiceUnavailable, "fake target body limiter closed"))?,
+                .map_err(|_| s3_error!(RequestTimeout, "fake target body limiter wait exceeded 30 seconds"))?
+                .map_err(|_| s3_error!(ServiceUnavailable, "fake target body limiter closed"))?,
             )
         } else {
             None
         };
         if let Some(fault) = fault {
-            context.extensions_mut().insert(fault);
+            extensions.insert(fault);
         }
         if let Some(permit) = prebody_permit {
-            context.extensions_mut().insert(PrebodyPermit::new(permit));
+            extensions.insert(PrebodyPermit::new(permit));
         }
-        Ok(())
+        Ok(extensions)
     }
 }
 
@@ -1333,6 +1334,7 @@ fn operation_from_s3_name(name: &str) -> Operation {
         "GetObjectLegalHold" => Operation::GetObjectLegalHold,
         "PutObjectLegalHold" => Operation::PutObjectLegalHold,
         "ListObjectsV2" => Operation::ListObjectsV2,
+        "ListObjectVersions" => Operation::ListObjectVersions,
         "CreateMultipartUpload" => Operation::CreateMultipartUpload,
         "UploadPart" => Operation::UploadPart,
         "CompleteMultipartUpload" => Operation::CompleteMultipartUpload,
@@ -1415,17 +1417,18 @@ async fn handle_request(
     control: Arc<Mutex<ControlState>>,
 ) -> Result<Response<Body>, BoxError> {
     let started = Instant::now();
-    let sequence = RequestSequence::default();
-    request.extensions_mut().insert(sequence.clone());
+    let state = service::RequestState::new(&request);
+    request.extensions_mut().insert(state.clone());
     let mut response = timeout(MAX_REQUEST_DURATION, async {
-        let result = call_s3(service, request.map(Body::from)).await;
-        if let (Ok(response), Some(sequence)) = (&result, sequence.0.get()) {
-            update_prepared_response(&control, *sequence, response, started.elapsed());
+        let mut result = service.call(request).await;
+        state.apply_response(&mut result);
+        if let Some(sequence) = state.sequence() {
+            update_prepared_response(&control, sequence, &result, started.elapsed());
         }
         result
     })
     .await
-    .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "fake target request exceeded 65 seconds"))??;
+    .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "fake target request exceeded 65 seconds"))?;
     if response.headers_mut().remove(DISCONNECT_HEADER).is_some() {
         return Err(io::Error::new(io::ErrorKind::ConnectionAborted, "fake target scripted disconnect").into());
     }
@@ -1439,10 +1442,6 @@ async fn handle_request(
         sleep(Duration::from_millis(stall_ms)).await;
     }
     Ok(response)
-}
-
-async fn call_s3(service: S3Service, request: Request<Body>) -> Result<Response<Body>, BoxError> {
-    service.call(request).await.map_err(Into::into)
 }
 
 #[derive(Default)]
@@ -1558,7 +1557,7 @@ fn header_value(headers: &HeaderMap, names: &[&str]) -> Option<String> {
 
 fn validate_retained_identifier(value: String, field: &str) -> S3Result<String> {
     if value.len() > MAX_RETAINED_IDENTIFIER_BYTES {
-        Err(s3s::s3_error!(InvalidArgument, "{field} exceeds 1024 bytes"))
+        Err(s3_error!(InvalidArgument, "{field} exceeds 1024 bytes"))
     } else {
         Ok(value)
     }
@@ -1576,7 +1575,7 @@ fn new_version_id(headers: &HeaderMap, assign_own: bool) -> S3Result<String> {
         return Ok(Uuid::new_v4().to_string());
     }
     let value = validate_retained_identifier(value.trim().to_owned(), "source version ID")?;
-    let version_id = Uuid::parse_str(&value).map_err(|_| s3s::s3_error!(InvalidArgument, "source version ID must be a UUID"))?;
+    let version_id = Uuid::parse_str(&value).map_err(|_| s3_error!(InvalidArgument, "source version ID must be a UUID"))?;
     Ok(version_id.to_string())
 }
 
@@ -1612,7 +1611,7 @@ fn source_etag(headers: &HeaderMap) -> S3Result<Option<String>> {
 fn validate_stored_metadata(content_type: &Option<String>, metadata: &Option<HashMap<String, String>>) -> S3Result {
     let content_type_bytes = content_type.as_ref().map_or(0, String::len);
     if content_type_bytes > MAX_CONTENT_TYPE_BYTES {
-        return Err(s3s::s3_error!(InvalidArgument, "content type exceeds 1024 bytes"));
+        return Err(s3_error!(InvalidArgument, "content type exceeds 1024 bytes"));
     }
     let metadata_bytes = metadata
         .iter()
@@ -1620,54 +1619,62 @@ fn validate_stored_metadata(content_type: &Option<String>, metadata: &Option<Has
         .try_fold(0usize, |total, (key, value)| {
             total.checked_add(key.len()).and_then(|total| total.checked_add(value.len()))
         })
-        .ok_or_else(|| s3s::s3_error!(InvalidArgument, "object metadata size overflow"))?;
+        .ok_or_else(|| s3_error!(InvalidArgument, "object metadata size overflow"))?;
     if metadata_bytes > MAX_STORED_METADATA_BYTES {
-        Err(s3s::s3_error!(InvalidArgument, "fake target retains at most 2 KiB of user metadata"))
+        Err(s3_error!(InvalidArgument, "fake target retains at most 2 KiB of user metadata"))
     } else {
         Ok(())
     }
 }
 
+fn fixture_timestamp(at: time::OffsetDateTime) -> Timestamp {
+    Timestamp::from_secs_nanos(at.unix_timestamp(), at.nanosecond()).expect("nanoseconds within a second")
+}
+
+fn now_timestamp() -> Timestamp {
+    fixture_timestamp(time::OffsetDateTime::now_utc())
+}
+
 fn source_mtime(headers: &HeaderMap) -> Timestamp {
     if header_value(headers, &SOURCE_REPLICATION_REQUEST_HEADERS).is_none_or(|value| value != "true") {
-        return Timestamp::from(SystemTime::now());
+        return now_timestamp();
     }
     header_value(headers, &SOURCE_MTIME_HEADERS)
         .and_then(|value| time::OffsetDateTime::parse(value.trim(), &time::format_description::well_known::Rfc3339).ok())
-        .map(Timestamp::from)
-        .unwrap_or_else(|| Timestamp::from(SystemTime::now()))
+        .map(fixture_timestamp)
+        .unwrap_or_else(now_timestamp)
 }
 
 fn normalize_etag(value: &str) -> String {
     value.trim().trim_matches('"').to_string()
 }
 
-fn request_fault<T>(request: &S3Request<T>) -> Option<RequestFault> {
+fn request_fault<T>(request: &TargetRequest<T>) -> Option<RequestFault> {
     request.extensions.get::<RequestFault>().cloned()
 }
 
 /// Pair a scripted HTTP status with the S3 error code a real service would
 /// send, so SDK-side error classification matches production sources.
-fn scripted_status_error(status: StatusCode) -> s3s::S3Error {
+fn scripted_status_error(status: StatusCode) -> S3Error {
     let mut error = match status {
-        StatusCode::BAD_REQUEST => s3s::s3_error!(InvalidRequest, "scripted fake target fault"),
-        StatusCode::UNAUTHORIZED => s3s::s3_error!(UnauthorizedAccess, "scripted fake target fault"),
-        StatusCode::FORBIDDEN => s3s::s3_error!(AccessDenied, "scripted fake target fault"),
-        StatusCode::NOT_FOUND => s3s::s3_error!(NoSuchKey, "scripted fake target fault"),
-        StatusCode::METHOD_NOT_ALLOWED => s3s::s3_error!(MethodNotAllowed, "scripted fake target fault"),
-        StatusCode::REQUEST_TIMEOUT => s3s::s3_error!(RequestTimeout, "scripted fake target fault"),
-        StatusCode::RANGE_NOT_SATISFIABLE => s3s::s3_error!(InvalidRange, "scripted fake target fault"),
-        StatusCode::TOO_MANY_REQUESTS => s3s::s3_error!(SlowDown, "scripted fake target fault"),
-        StatusCode::NOT_IMPLEMENTED => s3s::s3_error!(NotImplemented, "scripted fake target fault"),
-        StatusCode::SERVICE_UNAVAILABLE => s3s::s3_error!(ServiceUnavailable, "scripted fake target fault"),
-        _ => s3s::s3_error!(InternalError, "scripted fake target fault"),
+        StatusCode::BAD_REQUEST => s3_error!(InvalidRequest, "scripted fake target fault"),
+        StatusCode::UNAUTHORIZED => s3_error!(UnauthorizedAccess, "scripted fake target fault"),
+        StatusCode::FORBIDDEN => s3_error!(AccessDenied, "scripted fake target fault"),
+        StatusCode::NOT_FOUND => s3_error!(NoSuchKey, "scripted fake target fault"),
+        StatusCode::METHOD_NOT_ALLOWED => s3_error!(MethodNotAllowed, "scripted fake target fault"),
+        StatusCode::REQUEST_TIMEOUT => s3_error!(RequestTimeout, "scripted fake target fault"),
+        StatusCode::RANGE_NOT_SATISFIABLE => s3_error!(InvalidRange, "scripted fake target fault"),
+        StatusCode::TOO_MANY_REQUESTS => s3_error!(SlowDown, "scripted fake target fault"),
+        StatusCode::NOT_IMPLEMENTED => s3_error!(NotImplemented, "scripted fake target fault"),
+        StatusCode::SERVICE_UNAVAILABLE => s3_error!(ServiceUnavailable, "scripted fake target fault"),
+        _ => s3_error!(InternalError, "scripted fake target fault"),
     };
     error.set_status_code(status);
     error
 }
 
-fn scripted_disconnect_error() -> s3s::S3Error {
-    let mut error = s3s::s3_error!(InternalError, "scripted fake target disconnect");
+fn scripted_disconnect_error() -> S3Error {
+    let mut error = s3_error!(InternalError, "scripted fake target disconnect");
     let mut headers = HeaderMap::new();
     headers.insert(DISCONNECT_HEADER, HeaderValue::from_static("true"));
     error.set_headers(headers);
@@ -1723,13 +1730,13 @@ async fn apply_non_body_fault(fault: Option<&RequestFault>, control: &Mutex<Cont
 }
 
 async fn collect_stream(
-    body: Option<StreamingBlob>,
+    body: Option<ByteStream>,
     content_length: Option<i64>,
     fault: Option<&RequestFault>,
     control: &Mutex<ControlState>,
     max_body_bytes: usize,
 ) -> S3Result<Bytes> {
-    let mut body = body.unwrap_or_else(|| StreamingBlob::new(Body::empty()));
+    let body = body.unwrap_or_else(|| ByteStream::from_bytes(Bytes::new()));
     let capacity = content_length
         .and_then(|length| usize::try_from(length).ok())
         .unwrap_or_default();
@@ -1750,10 +1757,11 @@ async fn collect_stream(
             }
             Some(FaultAction::Delay(_)) => {}
             Some(FaultAction::DisconnectAfterBytes(limit)) => {
+                let mut body = body.into_body().into_data_stream();
                 let mut consumed = 0usize;
                 while consumed < *limit {
                     let Some(chunk) = body.next().await else { break };
-                    let chunk = chunk.map_err(|error| s3s::s3_error!(InternalError, "request body failed: {error}"))?;
+                    let chunk = chunk.map_err(|error| s3_error!(InternalError, "request body failed: {error}"))?;
                     consumed = consumed.saturating_add(chunk.len().min(*limit - consumed));
                 }
                 update_consumed(control, fault.expect("matched fault").sequence, consumed);
@@ -1770,28 +1778,30 @@ async fn collect_stream(
             | None => {}
         }
 
+        let mut body = body.into_body().into_data_stream();
         let mut output = BytesMut::with_capacity(capacity);
         while let Some(chunk) = body.next().await {
-            let chunk = chunk.map_err(|error| s3s::s3_error!(InternalError, "request body failed: {error}"))?;
+            let chunk = chunk.map_err(|error| s3_error!(InternalError, "request body failed: {error}"))?;
             ensure_body_growth(output.len(), chunk.len(), max_body_bytes)?;
             output.extend_from_slice(&chunk);
         }
         Ok(output.freeze())
     })
     .await
-    .map_err(|_| s3s::s3_error!(RequestTimeout, "fake target body drain exceeded 30 seconds"))?
+    .map_err(|_| s3_error!(RequestTimeout, "fake target body drain exceeded 30 seconds"))?
 }
 
 async fn collect_stream_slow(
-    mut body: StreamingBlob,
+    body: ByteStream,
     capacity: usize,
     chunk_bytes: usize,
     delay: Duration,
     max_body_bytes: usize,
 ) -> S3Result<Bytes> {
+    let mut body = body.into_body().into_data_stream();
     let mut output = BytesMut::with_capacity(capacity);
     while let Some(chunk) = body.next().await {
-        let chunk = chunk.map_err(|error| s3s::s3_error!(InternalError, "request body failed: {error}"))?;
+        let chunk = chunk.map_err(|error| s3_error!(InternalError, "request body failed: {error}"))?;
         for slice in chunk.chunks(chunk_bytes) {
             ensure_body_growth(output.len(), slice.len(), max_body_bytes)?;
             output.extend_from_slice(slice);
@@ -1801,14 +1811,39 @@ async fn collect_stream_slow(
     Ok(output.freeze())
 }
 
-fn body_too_large(max_body_bytes: usize) -> s3s::S3Error {
-    s3s::s3_error!(EntityTooLarge, "fake target buffers at most {max_body_bytes} bytes")
+fn body_too_large(max_body_bytes: usize) -> S3Error {
+    s3_error!(EntityTooLarge, "fake target buffers at most {max_body_bytes} bytes")
 }
 
 /// GetObject body that announces `content_length` bytes but delivers only the
 /// first `truncate_at`, then fails the stream so hyper aborts the connection
 /// mid-body: the client observes a short read against the declared length.
-fn truncated_body(body: Bytes, truncate_at: usize) -> StreamingBlob {
+fn scripted_body(stream: impl futures::Stream<Item = io::Result<Bytes>> + Send + 'static) -> ByteStream {
+    use rustfs_gateway_stream::{PayloadCaps, PayloadRead, PayloadStream, StreamError, TrailingHeaders};
+    use std::pin::Pin;
+    use std::task::{Context, Poll};
+    struct Chunks(futures::stream::BoxStream<'static, io::Result<Bytes>>);
+    impl PayloadStream for Chunks {
+        fn poll_read(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<PayloadRead, StreamError>> {
+            self.0.as_mut().poll_next(cx).map(|frame| match frame {
+                Some(Ok(bytes)) => Ok(PayloadRead::Chunk(bytes)),
+                Some(Err(error)) => Err(StreamError::upstream(Box::new(error))),
+                None => Ok(PayloadRead::Eof {
+                    trailers: TrailingHeaders::empty(),
+                }),
+            })
+        }
+        fn caps(&self) -> PayloadCaps {
+            PayloadCaps::PUSH
+        }
+        fn len_hint(&self) -> Option<u64> {
+            None
+        }
+    }
+    ByteStream::new(Box::pin(Chunks(stream.boxed()))).expect("push stream with unknown length")
+}
+
+fn truncated_body(body: Bytes, truncate_at: usize) -> ByteStream {
     enum Step {
         Prefix(Bytes),
         Abort,
@@ -1818,7 +1853,7 @@ fn truncated_body(body: Bytes, truncate_at: usize) -> StreamingBlob {
     // The error is delayed one tick so hyper flushes the head and the prefix
     // before it sees the failure; an immediately-ready error aborts the
     // connection before any byte reaches the client.
-    StreamingBlob::wrap(futures::stream::unfold(Step::Prefix(prefix), |step| async move {
+    scripted_body(futures::stream::unfold(Step::Prefix(prefix), |step| async move {
         match step {
             Step::Prefix(prefix) => Some((Ok(prefix), Step::Abort)),
             Step::Abort => {
@@ -1836,8 +1871,8 @@ fn truncated_body(body: Bytes, truncate_at: usize) -> StreamingBlob {
 /// GetObject body delivered in `chunk_bytes` slices with `delay` between
 /// them. The head and the first slice are written immediately, so the client
 /// starts reading and then observes the source going quiet mid-body.
-fn slow_sent_body(body: Bytes, chunk_bytes: usize, delay: Duration) -> StreamingBlob {
-    StreamingBlob::wrap(futures::stream::unfold((body, true), move |(mut rest, first)| async move {
+fn slow_sent_body(body: Bytes, chunk_bytes: usize, delay: Duration) -> ByteStream {
+    scripted_body(futures::stream::unfold((body, true), move |(mut rest, first)| async move {
         if rest.is_empty() {
             return None;
         }
@@ -1868,7 +1903,7 @@ async fn assemble_multipart(
     }
     tokio::task::spawn_blocking(assemble)
         .await
-        .map_err(|error| s3s::s3_error!(InternalError, "multipart assembly worker failed: {error}"))
+        .map_err(|error| s3_error!(InternalError, "multipart assembly worker failed: {error}"))
 }
 
 fn maybe_wrong_etag(fault: Option<&RequestFault>, e_tag: String) -> String {
@@ -1879,7 +1914,7 @@ fn maybe_wrong_etag(fault: Option<&RequestFault>, e_tag: String) -> String {
     }
 }
 
-fn apply_response_fault<T>(mut response: S3Response<T>, fault: Option<&RequestFault>) -> S3Response<T> {
+fn apply_response_fault<T>(mut response: TargetResponse<T>, fault: Option<&RequestFault>) -> TargetResponse<T> {
     if fault.is_some_and(|fault| fault.action == FaultAction::WrongEtag) {
         response.headers.insert(ETAG, HeaderValue::from_static(WRONG_ETAG));
     }
@@ -1908,7 +1943,7 @@ async fn md5_digest(body: Bytes, permit: OwnedSemaphorePermit) -> S3Result<([u8;
     }
     tokio::task::spawn_blocking(move || (md5_bytes(body), permit))
         .await
-        .map_err(|error| s3s::s3_error!(InternalError, "MD5 worker failed: {error}"))
+        .map_err(|error| s3_error!(InternalError, "MD5 worker failed: {error}"))
 }
 
 fn md5_bytes(input: impl AsRef<[u8]>) -> [u8; 16] {
@@ -1928,19 +1963,19 @@ fn ensure_store_budget(state: &StoreState, removed_bytes: usize, added_bytes: us
         .total_bytes
         .checked_sub(removed_bytes)
         .and_then(|total| total.checked_add(added_bytes))
-        .ok_or_else(|| s3s::s3_error!(InternalError, "fake target storage accounting overflow"))?;
+        .ok_or_else(|| s3_error!(InternalError, "fake target storage accounting overflow"))?;
     if total_bytes > state.limits.max_total_bytes {
-        return Err(s3s::s3_error!(ServiceUnavailable, "fake target storage budget exhausted"));
+        return Err(s3_error!(ServiceUnavailable, "fake target storage budget exhausted"));
     }
     if adds_version && state.total_versions >= MAX_OBJECT_VERSIONS {
-        return Err(s3s::s3_error!(ServiceUnavailable, "fake target version budget exhausted"));
+        return Err(s3_error!(ServiceUnavailable, "fake target version budget exhausted"));
     }
     Ok(())
 }
 
 fn ensure_part_budget(state: &StoreState, adds_part: bool) -> S3Result {
     if adds_part && state.total_parts >= MAX_MULTIPART_PARTS {
-        Err(s3s::s3_error!(ServiceUnavailable, "fake target multipart part budget exhausted"))
+        Err(s3_error!(ServiceUnavailable, "fake target multipart part budget exhausted"))
     } else {
         Ok(())
     }
@@ -1948,7 +1983,7 @@ fn ensure_part_budget(state: &StoreState, adds_part: bool) -> S3Result {
 
 fn ensure_upload_budget(state: &StoreState) -> S3Result {
     if state.uploads.len() >= MAX_MULTIPART_UPLOADS {
-        Err(s3s::s3_error!(ServiceUnavailable, "fake target multipart budget exhausted"))
+        Err(s3_error!(ServiceUnavailable, "fake target multipart budget exhausted"))
     } else {
         Ok(())
     }
@@ -1961,7 +1996,7 @@ fn upsert_version(state: &mut StoreState, bucket: &str, key: String, version: Ob
     let bucket_state = state
         .buckets
         .get(bucket)
-        .ok_or_else(|| s3s::s3_error!(NoSuchBucket, "bucket does not exist"))?;
+        .ok_or_else(|| s3_error!(NoSuchBucket, "bucket does not exist"))?;
     let versioned = bucket_state.versioned;
     let versions = bucket_state.objects.get(&key);
     let existing = versions.and_then(|versions| {
@@ -2001,27 +2036,22 @@ fn upsert_version(state: &mut StoreState, bucket: &str, key: String, version: Ob
     Ok(())
 }
 
-fn marker_error(version: &ObjectVersion, explicit_version: bool) -> s3s::S3Error {
+fn marker_error(version: &ObjectVersion, explicit_version: bool) -> S3Error {
     let mut error = if explicit_version {
-        s3s::s3_error!(MethodNotAllowed, "requested version is a delete marker")
+        s3_error!(MethodNotAllowed, "requested version is a delete marker")
     } else {
-        s3s::s3_error!(NoSuchKey, "current version is a delete marker")
+        s3_error!(NoSuchKey, "current version is a delete marker")
     };
     let mut headers = HeaderMap::new();
     headers.insert("x-amz-delete-marker", HeaderValue::from_static("true"));
     if let Ok(value) = HeaderValue::from_str(&version.version_id) {
         headers.insert("x-amz-version-id", value);
     }
-    if explicit_version {
-        let mut formatted = Vec::new();
-        if version
-            .last_modified
-            .format(TimestampFormat::HttpDate, &mut formatted)
-            .is_ok()
-            && let Ok(value) = HeaderValue::from_bytes(&formatted)
-        {
-            headers.insert(LAST_MODIFIED, value);
-        }
+    if explicit_version
+        && let Ok(formatted) = version.last_modified.render(TimestampFormat::HttpDate)
+        && let Ok(value) = HeaderValue::from_str(&formatted)
+    {
+        headers.insert(LAST_MODIFIED, value);
     }
     error.set_headers(headers);
     error
@@ -2031,12 +2061,12 @@ fn find_version(state: &StoreState, bucket: &str, key: &str, version_id: Option<
     let bucket = state
         .buckets
         .get(bucket)
-        .ok_or_else(|| s3s::s3_error!(NoSuchBucket, "bucket does not exist"))?;
+        .ok_or_else(|| s3_error!(NoSuchBucket, "bucket does not exist"))?;
     let versions = bucket.objects.get(key).ok_or_else(|| {
         if version_id.is_some() {
-            s3s::s3_error!(NoSuchVersion, "object version does not exist")
+            s3_error!(NoSuchVersion, "object version does not exist")
         } else {
-            s3s::s3_error!(NoSuchKey, "object does not exist")
+            s3_error!(NoSuchKey, "object does not exist")
         }
     })?;
     let version = match version_id {
@@ -2045,9 +2075,9 @@ fn find_version(state: &StoreState, bucket: &str, key: &str, version_id: Option<
     }
     .ok_or_else(|| {
         if version_id.is_some() {
-            s3s::s3_error!(NoSuchVersion, "object version does not exist")
+            s3_error!(NoSuchVersion, "object version does not exist")
         } else {
-            s3s::s3_error!(NoSuchKey, "object does not exist")
+            s3_error!(NoSuchKey, "object does not exist")
         }
     })?;
     if version.delete_marker {
@@ -2129,7 +2159,7 @@ impl ServedRange {
 /// 9110 byte ranges as S3 applies them: `first-last` (last clamped to the
 /// object), `first-`, and `-suffix`; unsatisfiable ranges (first beyond the
 /// end, zero suffix, empty object) answer 416 with `Content-Range: bytes */len`.
-fn resolve_range(range: Option<&Range>, len: usize) -> S3Result<ServedRange> {
+fn resolve_range(range: Option<&RangeSpec>, len: usize) -> S3Result<ServedRange> {
     let Some(range) = range else {
         return Ok(ServedRange {
             range: 0..len,
@@ -2138,7 +2168,7 @@ fn resolve_range(range: Option<&Range>, len: usize) -> S3Result<ServedRange> {
         });
     };
     let unsatisfiable = || {
-        let mut error = s3s::s3_error!(InvalidRange, "the requested range is not satisfiable");
+        let mut error = s3_error!(InvalidRange, "the requested range is not satisfiable");
         let mut headers = HeaderMap::new();
         if let Ok(value) = HeaderValue::from_str(&format!("bytes */{len}")) {
             headers.insert("content-range", value);
@@ -2149,9 +2179,17 @@ fn resolve_range(range: Option<&Range>, len: usize) -> S3Result<ServedRange> {
     if len == 0 {
         return Err(unsatisfiable());
     }
-    let served = range.check(len as u64).map_err(|_| unsatisfiable())?;
-    let start = served.start as usize;
-    let end = served.end as usize;
+    let (start, end) = match range.resolve(len as u64) {
+        RangeOutcome::Satisfied { start, end_inclusive } => (start as usize, end_inclusive as usize + 1),
+        RangeOutcome::Full => {
+            return Ok(ServedRange {
+                range: 0..len,
+                content_range: None,
+                status: None,
+            });
+        }
+        RangeOutcome::Unsatisfiable { .. } => return Err(unsatisfiable()),
+    };
     Ok(ServedRange {
         range: start..end,
         content_range: Some(format!("bytes {start}-{}/{len}", end - 1)),
@@ -2248,7 +2286,7 @@ fn list_page(
             None => ListEntry::Object {
                 key: key.clone(),
                 e_tag: version.e_tag.clone(),
-                last_modified: version.last_modified.clone(),
+                last_modified: version.last_modified,
                 size: version.body.len(),
             },
         });
@@ -2266,989 +2304,7 @@ fn decode_continuation_token(token: &str) -> S3Result<String> {
     hex_simd::decode_to_vec(token.as_bytes())
         .ok()
         .and_then(|bytes| String::from_utf8(bytes).ok())
-        .ok_or_else(|| s3s::s3_error!(InvalidArgument, "the continuation token provided is incorrect"))
-}
-
-#[async_trait]
-impl S3 for FakeBackend {
-    async fn head_bucket(&self, req: S3Request<HeadBucketInput>) -> S3Result<S3Response<HeadBucketOutput>> {
-        let fault = request_fault(&req);
-        apply_non_body_fault(fault.as_ref(), &self.control).await?;
-        if !lock(&self.store).buckets.contains_key(&req.input.bucket) {
-            return Err(s3s::s3_error!(NoSuchBucket, "bucket does not exist"));
-        }
-        Ok(apply_response_fault(S3Response::new(HeadBucketOutput::default()), fault.as_ref()))
-    }
-
-    async fn get_bucket_versioning(
-        &self,
-        req: S3Request<GetBucketVersioningInput>,
-    ) -> S3Result<S3Response<GetBucketVersioningOutput>> {
-        let fault = request_fault(&req);
-        apply_non_body_fault(fault.as_ref(), &self.control).await?;
-        let versioned = lock(&self.store)
-            .buckets
-            .get(&req.input.bucket)
-            .map(|bucket| bucket.versioned)
-            .ok_or_else(|| s3s::s3_error!(NoSuchBucket, "bucket does not exist"))?;
-        Ok(apply_response_fault(
-            S3Response::new(GetBucketVersioningOutput {
-                status: versioned.then(|| "Enabled".to_string().into()),
-                ..Default::default()
-            }),
-            fault.as_ref(),
-        ))
-    }
-
-    async fn get_object_lock_configuration(
-        &self,
-        req: S3Request<GetObjectLockConfigurationInput>,
-    ) -> S3Result<S3Response<GetObjectLockConfigurationOutput>> {
-        let fault = request_fault(&req);
-        apply_non_body_fault(fault.as_ref(), &self.control).await?;
-        let object_lock = lock(&self.store)
-            .buckets
-            .get(&req.input.bucket)
-            .map(|bucket| bucket.object_lock)
-            .ok_or_else(|| s3s::s3_error!(NoSuchBucket, "bucket does not exist"))?;
-        if !object_lock {
-            return Err(s3s::s3_error!(
-                ObjectLockConfigurationNotFoundError,
-                "Object Lock configuration does not exist for this bucket"
-            ));
-        }
-        Ok(apply_response_fault(
-            S3Response::new(GetObjectLockConfigurationOutput {
-                object_lock_configuration: Some(ObjectLockConfiguration {
-                    object_lock_enabled: Some(ObjectLockEnabled::from_static(ObjectLockEnabled::ENABLED)),
-                    ..Default::default()
-                }),
-            }),
-            fault.as_ref(),
-        ))
-    }
-
-    /// Current versions only (a key whose newest version is a delete marker
-    /// is hidden), keys in byte order, `delimiter` folding into common
-    /// prefixes that count toward `max-keys`, and `start-after` /
-    /// `continuation-token` cursors. `encoding-type` and `fetch-owner` are
-    /// accepted but ignored.
-    async fn list_objects_v2(&self, req: S3Request<ListObjectsV2Input>) -> S3Result<S3Response<ListObjectsV2Output>> {
-        let fault = request_fault(&req);
-        apply_non_body_fault(fault.as_ref(), &self.control).await?;
-        let input = req.input;
-        let prefix = input.prefix.clone().unwrap_or_default();
-        let delimiter = input.delimiter.clone().filter(|delimiter| !delimiter.is_empty());
-        let max_keys = input.max_keys.unwrap_or(MAX_LIST_KEYS).clamp(0, MAX_LIST_KEYS);
-        let resume_after = input
-            .continuation_token
-            .as_deref()
-            .map(decode_continuation_token)
-            .transpose()?;
-        let mut cursors = Vec::with_capacity(2);
-        if let Some(start_after) = input.start_after.as_deref() {
-            cursors.push(ListCursor {
-                after: start_after,
-                skips_group: false,
-            });
-        }
-        if let Some(resume_after) = resume_after.as_deref() {
-            cursors.push(ListCursor {
-                after: resume_after,
-                skips_group: delimiter
-                    .as_deref()
-                    .is_some_and(|delimiter| resume_after.ends_with(delimiter)),
-            });
-        }
-        let page = {
-            let state = lock(&self.store);
-            let bucket_state = state
-                .buckets
-                .get(&input.bucket)
-                .ok_or_else(|| s3s::s3_error!(NoSuchBucket, "bucket does not exist"))?;
-            list_page(bucket_state, &prefix, delimiter.as_deref(), &cursors, max_keys as usize)
-        };
-        let next_continuation_token = page
-            .truncated
-            .then(|| page.entries.last().map(|entry| encode_continuation_token(entry.name())))
-            .flatten();
-        let key_count = page.entries.len() as i32;
-        let mut contents = Vec::new();
-        let mut common_prefixes = Vec::new();
-        for entry in page.entries {
-            match entry {
-                ListEntry::Object {
-                    key,
-                    e_tag,
-                    last_modified,
-                    size,
-                } => contents.push(Object {
-                    key: Some(key),
-                    e_tag: Some(ETag::Strong(e_tag)),
-                    last_modified: Some(last_modified),
-                    size: Some(size as i64),
-                    storage_class: Some(ObjectStorageClass::STANDARD.to_string().into()),
-                    ..Default::default()
-                }),
-                ListEntry::CommonPrefix(prefix) => common_prefixes.push(CommonPrefix { prefix: Some(prefix) }),
-            }
-        }
-        Ok(apply_response_fault(
-            S3Response::new(ListObjectsV2Output {
-                name: Some(input.bucket),
-                prefix: input.prefix,
-                delimiter: input.delimiter,
-                max_keys: Some(max_keys),
-                key_count: Some(key_count),
-                continuation_token: input.continuation_token,
-                start_after: input.start_after,
-                encoding_type: input.encoding_type,
-                is_truncated: Some(page.truncated),
-                next_continuation_token,
-                contents: (!contents.is_empty()).then_some(contents),
-                common_prefixes: (!common_prefixes.is_empty()).then_some(common_prefixes),
-                ..Default::default()
-            }),
-            fault.as_ref(),
-        ))
-    }
-
-    /// Prefix + max-keys subset only — enough for the replication-check probe
-    /// key allocation. No pagination markers or delimiter folding.
-    async fn list_object_versions(
-        &self,
-        req: S3Request<ListObjectVersionsInput>,
-    ) -> S3Result<S3Response<ListObjectVersionsOutput>> {
-        let fault = request_fault(&req);
-        apply_non_body_fault(fault.as_ref(), &self.control).await?;
-        let state = lock(&self.store);
-        let Some(bucket_state) = state.buckets.get(&req.input.bucket) else {
-            return Err(s3s::s3_error!(NoSuchBucket, "bucket does not exist"));
-        };
-        let prefix = req.input.prefix.as_deref().unwrap_or_default();
-        let max_keys = req.input.max_keys.unwrap_or(1000).max(0) as usize;
-
-        let mut keys: Vec<&String> = bucket_state.objects.keys().filter(|key| key.starts_with(prefix)).collect();
-        keys.sort();
-
-        let mut versions = Vec::new();
-        let mut delete_markers = Vec::new();
-        'keys: for key in keys {
-            for version in bucket_state.objects[key].iter().rev() {
-                if versions.len() + delete_markers.len() >= max_keys {
-                    break 'keys;
-                }
-                if version.delete_marker {
-                    delete_markers.push(DeleteMarkerEntry {
-                        key: Some(key.clone()),
-                        version_id: Some(ObjectVersionId::from(version.version_id.clone())),
-                        last_modified: Some(version.last_modified.clone()),
-                        ..Default::default()
-                    });
-                } else {
-                    versions.push(s3s::dto::ObjectVersion {
-                        key: Some(key.clone()),
-                        version_id: Some(ObjectVersionId::from(version.version_id.clone())),
-                        last_modified: Some(version.last_modified.clone()),
-                        e_tag: Some(ETag::Strong(version.e_tag.clone())),
-                        size: Some(version.body.len() as i64),
-                        ..Default::default()
-                    });
-                }
-            }
-        }
-        drop(state);
-
-        Ok(apply_response_fault(
-            S3Response::new(ListObjectVersionsOutput {
-                name: Some(req.input.bucket),
-                versions: Some(versions),
-                delete_markers: Some(delete_markers),
-                ..Default::default()
-            }),
-            fault.as_ref(),
-        ))
-    }
-
-    async fn put_object(&self, req: S3Request<PutObjectInput>) -> S3Result<S3Response<PutObjectOutput>> {
-        let fault = request_fault(&req);
-        let _body_permit = timeout(MAX_FAULT_DURATION, Arc::clone(&self.body_limit).acquire_owned())
-            .await
-            .map_err(|_| s3s::s3_error!(RequestTimeout, "fake target body limiter wait exceeded 30 seconds"))?
-            .map_err(|_| s3s::s3_error!(ServiceUnavailable, "fake target body limiter closed"))?;
-        let headers = req.headers;
-        let input = req.input;
-        let (assign_own, drop_unlisted, require_checksum, ignore_source_etags, limits, versioned) = {
-            let state = lock(&self.store);
-            (
-                state.assign_own_version_ids,
-                state.drop_unlisted_replication_headers,
-                state.require_checksum_for_object_lock,
-                state.ignore_source_etags,
-                state.limits,
-                bucket_versioned(&state, &input.bucket),
-            )
-        };
-        let transport = TransportSnapshot::from_headers(&headers);
-        if require_checksum
-            && transport.object_lock_params
-            && transport.content_md5.is_none()
-            && transport.checksum_headers.is_empty()
-        {
-            return Err(s3s::s3_error!(
-                InvalidRequest,
-                "Content-MD5 OR x-amz-checksum- HTTP header is required for Put Object requests with Object Lock parameters"
-            ));
-        }
-        let body =
-            collect_stream(input.body, input.content_length, fault.as_ref(), &self.control, limits.max_object_bytes).await?;
-        let mut body_permit = _body_permit;
-        if let Some(expected) = &transport.content_md5 {
-            let (digest, permit) = md5_digest(body.clone(), body_permit).await?;
-            body_permit = permit;
-            if BASE64_STANDARD.encode_to_string(digest) != expected.trim() {
-                return Err(s3s::s3_error!(BadDigest, "The Content-MD5 you specified did not match what we received."));
-            }
-        }
-        validate_stored_metadata(&input.content_type, &input.metadata)?;
-        let standard_headers = StandardHeaders {
-            cache_control: input.cache_control,
-            content_disposition: input.content_disposition,
-            content_encoding: input.content_encoding,
-            content_language: input.content_language,
-            expires: input.expires,
-        };
-        standard_headers.validate()?;
-        let version_id = if versioned {
-            new_version_id(&headers, assign_own)?
-        } else {
-            NULL_VERSION_ID.to_string()
-        };
-        let e_tag = match source_etag(&headers)?.filter(|_| !ignore_source_etags) {
-            Some(value) => value,
-            None => {
-                let (digest, permit) = md5_digest(body.clone(), body_permit).await?;
-                body_permit = permit;
-                hex_simd::encode_to_string(digest, hex_simd::AsciiCase::Lower)
-            }
-        };
-        // Held until the version is stored, like every other body-bearing op.
-        let _body_permit = body_permit;
-        let version = ObjectVersion {
-            version_id: version_id.clone(),
-            body,
-            e_tag: e_tag.clone(),
-            last_modified: source_mtime(&headers),
-            delete_marker: false,
-            content_type: input.content_type,
-            metadata: input.metadata,
-            standard_headers,
-            tags: Vec::new(),
-            replication_sse_headers: captured_replication_sse_headers(&headers, drop_unlisted),
-            lock: VersionLock::from_headers(
-                input.object_lock_mode,
-                input.object_lock_retain_until_date,
-                input.object_lock_legal_hold_status,
-            ),
-        };
-        upsert_version(&mut lock(&self.store), &input.bucket, input.key, version)?;
-        Ok(apply_response_fault(
-            S3Response::new(PutObjectOutput {
-                e_tag: Some(ETag::Strong(maybe_wrong_etag(fault.as_ref(), e_tag))),
-                version_id: versioned.then_some(version_id),
-                ..Default::default()
-            }),
-            fault.as_ref(),
-        ))
-    }
-
-    async fn get_object(&self, req: S3Request<GetObjectInput>) -> S3Result<S3Response<GetObjectOutput>> {
-        let fault = request_fault(&req);
-        apply_non_body_fault(fault.as_ref(), &self.control).await?;
-        let input = req.input;
-        let held_get = lock(&self.control)
-            .held_get
-            .as_ref()
-            .filter(|held| held.bucket == input.bucket && held.key == input.key)
-            .cloned();
-        if let Some(mut held) = held_get {
-            held.entered.send_modify(|count| *count += 1);
-            // Keep the gate installed when a request is cancelled or times out:
-            // a retry must cross the same boundary before returning any bytes.
-            let _ = held.released.wait_for(|released| *released).await;
-        }
-        let (version, versioned) = {
-            let state = lock(&self.store);
-            (
-                find_version(&state, &input.bucket, &input.key, input.version_id.as_deref())?,
-                bucket_versioned(&state, &input.bucket),
-            )
-        };
-        let sse_customer_algorithm = stored_sse_customer_algorithm(&version);
-        let served = resolve_range(input.range.as_ref(), version.body.len())?;
-        let body = version.body.slice(served.range.clone());
-        let body = match fault.as_ref().map(|fault| &fault.action) {
-            Some(FaultAction::TruncateBodyAt(truncate_at)) => truncated_body(body, *truncate_at),
-            Some(FaultAction::SlowSendBody { chunk_bytes, delay }) => slow_sent_body(body, *chunk_bytes, *delay),
-            _ => StreamingBlob::from(body),
-        };
-        let mut response = S3Response::new(GetObjectOutput {
-            body: Some(body),
-            content_length: Some(served.len() as i64),
-            content_range: served.content_range,
-            accept_ranges: Some("bytes".to_string()),
-            content_type: version.content_type,
-            metadata: version.metadata,
-            cache_control: version.standard_headers.cache_control,
-            content_disposition: version.standard_headers.content_disposition,
-            content_encoding: version.standard_headers.content_encoding,
-            content_language: version.standard_headers.content_language,
-            expires: version.standard_headers.expires,
-            e_tag: Some(ETag::Strong(version.e_tag)),
-            last_modified: Some(version.last_modified.clone()),
-            version_id: versioned.then_some(version.version_id),
-            sse_customer_algorithm,
-            object_lock_mode: version
-                .lock
-                .retention
-                .as_ref()
-                .map(|(mode, _)| ObjectLockMode::from(mode.clone())),
-            object_lock_retain_until_date: version.lock.retention.as_ref().map(|(_, until)| until.clone()),
-            object_lock_legal_hold_status: version.lock.legal_hold_status(),
-            ..Default::default()
-        });
-        response.status = served.status;
-        Ok(apply_response_fault(response, fault.as_ref()))
-    }
-
-    async fn head_object(&self, req: S3Request<HeadObjectInput>) -> S3Result<S3Response<HeadObjectOutput>> {
-        let fault = request_fault(&req);
-        apply_non_body_fault(fault.as_ref(), &self.control).await?;
-        let input = req.input;
-        let (version, versioned) = {
-            let state = lock(&self.store);
-            (
-                find_version(&state, &input.bucket, &input.key, input.version_id.as_deref())?,
-                bucket_versioned(&state, &input.bucket),
-            )
-        };
-        let sse_customer_algorithm = stored_sse_customer_algorithm(&version);
-        let served = resolve_range(input.range.as_ref(), version.body.len())?;
-        let mut response = S3Response::new(HeadObjectOutput {
-            content_length: Some(served.len() as i64),
-            content_range: served.content_range,
-            accept_ranges: Some("bytes".to_string()),
-            content_type: version.content_type,
-            metadata: version.metadata,
-            cache_control: version.standard_headers.cache_control,
-            content_disposition: version.standard_headers.content_disposition,
-            content_encoding: version.standard_headers.content_encoding,
-            content_language: version.standard_headers.content_language,
-            expires: version.standard_headers.expires,
-            e_tag: Some(ETag::Strong(version.e_tag)),
-            last_modified: Some(version.last_modified.clone()),
-            version_id: versioned.then_some(version.version_id),
-            sse_customer_algorithm,
-            object_lock_mode: version
-                .lock
-                .retention
-                .as_ref()
-                .map(|(mode, _)| ObjectLockMode::from(mode.clone())),
-            object_lock_retain_until_date: version.lock.retention.as_ref().map(|(_, until)| until.clone()),
-            object_lock_legal_hold_status: version.lock.legal_hold_status(),
-            ..Default::default()
-        });
-        response.status = served.status;
-        Ok(apply_response_fault(response, fault.as_ref()))
-    }
-
-    async fn get_object_tagging(&self, req: S3Request<GetObjectTaggingInput>) -> S3Result<S3Response<GetObjectTaggingOutput>> {
-        let fault = request_fault(&req);
-        apply_non_body_fault(fault.as_ref(), &self.control).await?;
-        let input = req.input;
-        let (version, versioned) = {
-            let state = lock(&self.store);
-            (
-                find_version(&state, &input.bucket, &input.key, input.version_id.as_deref())?,
-                bucket_versioned(&state, &input.bucket),
-            )
-        };
-        let tag_set: TagSet = version
-            .tags
-            .into_iter()
-            .map(|(key, value)| Tag {
-                key: Some(key),
-                value: Some(value),
-            })
-            .collect();
-        Ok(apply_response_fault(
-            S3Response::new(GetObjectTaggingOutput {
-                tag_set,
-                version_id: versioned.then(|| ObjectVersionId::from(version.version_id)),
-            }),
-            fault.as_ref(),
-        ))
-    }
-
-    async fn put_object_tagging(&self, req: S3Request<PutObjectTaggingInput>) -> S3Result<S3Response<PutObjectTaggingOutput>> {
-        let fault = request_fault(&req);
-        apply_non_body_fault(fault.as_ref(), &self.control).await?;
-        let input = req.input;
-        let tags = input
-            .tagging
-            .tag_set
-            .into_iter()
-            .map(|tag| (tag.key.unwrap_or_default(), tag.value.unwrap_or_default()))
-            .collect();
-        let (version_id, versioned) = {
-            let mut state = lock(&self.store);
-            (
-                set_version_tags(&mut state, &input.bucket, &input.key, input.version_id.as_deref(), tags)?,
-                bucket_versioned(&state, &input.bucket),
-            )
-        };
-        Ok(apply_response_fault(
-            S3Response::new(PutObjectTaggingOutput {
-                version_id: versioned.then(|| ObjectVersionId::from(version_id)),
-            }),
-            fault.as_ref(),
-        ))
-    }
-
-    async fn get_object_retention(
-        &self,
-        req: S3Request<GetObjectRetentionInput>,
-    ) -> S3Result<S3Response<GetObjectRetentionOutput>> {
-        let fault = request_fault(&req);
-        apply_non_body_fault(fault.as_ref(), &self.control).await?;
-        let input = req.input;
-        let version = find_version(&lock(&self.store), &input.bucket, &input.key, input.version_id.as_deref())?;
-        Ok(apply_response_fault(
-            S3Response::new(GetObjectRetentionOutput {
-                retention: version.lock.retention.map(|(mode, until)| ObjectLockRetention {
-                    mode: Some(ObjectLockRetentionMode::from(mode)),
-                    retain_until_date: Some(until),
-                }),
-            }),
-            fault.as_ref(),
-        ))
-    }
-
-    async fn put_object_retention(
-        &self,
-        req: S3Request<PutObjectRetentionInput>,
-    ) -> S3Result<S3Response<PutObjectRetentionOutput>> {
-        let fault = request_fault(&req);
-        apply_non_body_fault(fault.as_ref(), &self.control).await?;
-        let input = req.input;
-        let retention = input
-            .retention
-            .and_then(|retention| retention.mode.zip(retention.retain_until_date))
-            .map(|(mode, until)| (mode.as_str().to_string(), until));
-        update_version_lock(&mut lock(&self.store), &input.bucket, &input.key, input.version_id.as_deref(), |lock| {
-            lock.retention = retention;
-        })?;
-        Ok(apply_response_fault(S3Response::new(PutObjectRetentionOutput::default()), fault.as_ref()))
-    }
-
-    async fn get_object_legal_hold(
-        &self,
-        req: S3Request<GetObjectLegalHoldInput>,
-    ) -> S3Result<S3Response<GetObjectLegalHoldOutput>> {
-        let fault = request_fault(&req);
-        apply_non_body_fault(fault.as_ref(), &self.control).await?;
-        let input = req.input;
-        let version = find_version(&lock(&self.store), &input.bucket, &input.key, input.version_id.as_deref())?;
-        Ok(apply_response_fault(
-            S3Response::new(GetObjectLegalHoldOutput {
-                legal_hold: Some(ObjectLockLegalHold {
-                    status: Some(
-                        version
-                            .lock
-                            .legal_hold_status()
-                            .unwrap_or_else(|| ObjectLockLegalHoldStatus::from_static(ObjectLockLegalHoldStatus::OFF)),
-                    ),
-                }),
-            }),
-            fault.as_ref(),
-        ))
-    }
-
-    async fn put_object_legal_hold(
-        &self,
-        req: S3Request<PutObjectLegalHoldInput>,
-    ) -> S3Result<S3Response<PutObjectLegalHoldOutput>> {
-        let fault = request_fault(&req);
-        apply_non_body_fault(fault.as_ref(), &self.control).await?;
-        let input = req.input;
-        let legal_hold_on = input
-            .legal_hold
-            .and_then(|hold| hold.status)
-            .is_some_and(|status| status.as_str().eq_ignore_ascii_case("ON"));
-        update_version_lock(&mut lock(&self.store), &input.bucket, &input.key, input.version_id.as_deref(), |lock| {
-            lock.legal_hold = Some(legal_hold_on);
-        })?;
-        Ok(apply_response_fault(S3Response::new(PutObjectLegalHoldOutput::default()), fault.as_ref()))
-    }
-
-    async fn delete_object_tagging(
-        &self,
-        req: S3Request<DeleteObjectTaggingInput>,
-    ) -> S3Result<S3Response<DeleteObjectTaggingOutput>> {
-        let fault = request_fault(&req);
-        apply_non_body_fault(fault.as_ref(), &self.control).await?;
-        let input = req.input;
-        let (version_id, versioned) = {
-            let mut state = lock(&self.store);
-            (
-                set_version_tags(&mut state, &input.bucket, &input.key, input.version_id.as_deref(), Vec::new())?,
-                bucket_versioned(&state, &input.bucket),
-            )
-        };
-        Ok(apply_response_fault(
-            S3Response::new(DeleteObjectTaggingOutput {
-                version_id: versioned.then(|| ObjectVersionId::from(version_id)),
-            }),
-            fault.as_ref(),
-        ))
-    }
-
-    async fn delete_object(&self, req: S3Request<DeleteObjectInput>) -> S3Result<S3Response<DeleteObjectOutput>> {
-        let fault = request_fault(&req);
-        apply_non_body_fault(fault.as_ref(), &self.control).await?;
-        let headers = req.headers;
-        let input = req.input;
-        let held_delete = lock(&self.control)
-            .held_delete
-            .as_ref()
-            .filter(|held| held.bucket == input.bucket && held.key == input.key)
-            .cloned();
-        if let Some(mut held) = held_delete {
-            held.entered.send_modify(|count| *count += 1);
-            let _ = held.released.wait_for(|released| *released).await;
-        }
-        let mut state = lock(&self.store);
-        let Some(versioned) = state.buckets.get(&input.bucket).map(|bucket| bucket.versioned) else {
-            return Err(s3s::s3_error!(NoSuchBucket, "bucket does not exist"));
-        };
-        if !versioned {
-            // Unversioned buckets know only the `null` version: DELETE removes
-            // the key outright and never writes a delete marker.
-            if input
-                .version_id
-                .as_deref()
-                .is_some_and(|version_id| version_id != NULL_VERSION_ID)
-            {
-                return Err(s3s::s3_error!(InvalidArgument, "invalid version id specified"));
-            }
-            let removed = state
-                .buckets
-                .get_mut(&input.bucket)
-                .expect("bucket existence checked above")
-                .objects
-                .remove(&input.key)
-                .unwrap_or_default();
-            state.total_bytes -= removed.iter().map(|version| version.body.len()).sum::<usize>();
-            state.total_versions -= removed.len();
-            return Ok(apply_response_fault(S3Response::new(DeleteObjectOutput::default()), fault.as_ref()));
-        }
-        if let Some(version_id) = input.version_id {
-            let reject_unknown = state.reject_unknown_version_deletes;
-            let (removed_bytes, removed_versions, delete_marker, remove_key) = {
-                let Some(versions) = state
-                    .buckets
-                    .get_mut(&input.bucket)
-                    .expect("bucket existence checked above")
-                    .objects
-                    .get_mut(&input.key)
-                else {
-                    if reject_unknown {
-                        return Err(s3s::s3_error!(NoSuchVersion, "The specified version does not exist."));
-                    }
-                    return Ok(apply_response_fault(
-                        S3Response::new(DeleteObjectOutput {
-                            version_id: Some(version_id),
-                            ..Default::default()
-                        }),
-                        fault.as_ref(),
-                    ));
-                };
-                if reject_unknown && !versions.iter().any(|version| version.version_id == version_id) {
-                    return Err(s3s::s3_error!(NoSuchVersion, "The specified version does not exist."));
-                }
-                let mut removed_bytes = 0usize;
-                let mut removed_versions = 0usize;
-                let mut delete_marker = None;
-                versions.retain(|version| {
-                    if version.version_id == version_id {
-                        removed_bytes += version.body.len();
-                        removed_versions += 1;
-                        delete_marker.get_or_insert(version.delete_marker);
-                        false
-                    } else {
-                        true
-                    }
-                });
-                (removed_bytes, removed_versions, delete_marker, versions.is_empty())
-            };
-            if remove_key {
-                state
-                    .buckets
-                    .get_mut(&input.bucket)
-                    .expect("bucket existence checked above")
-                    .objects
-                    .remove(&input.key);
-            }
-            state.total_bytes -= removed_bytes;
-            state.total_versions -= removed_versions;
-            return Ok(apply_response_fault(
-                S3Response::new(DeleteObjectOutput {
-                    delete_marker,
-                    version_id: Some(version_id),
-                    ..Default::default()
-                }),
-                fault.as_ref(),
-            ));
-        }
-
-        // `state` is the live store guard: read the flag from it. Re-locking
-        // would self-deadlock (the store mutex is not reentrant).
-        let version_id = new_version_id(&headers, state.assign_own_version_ids)?;
-        upsert_version(
-            &mut state,
-            &input.bucket,
-            input.key,
-            ObjectVersion {
-                version_id: version_id.clone(),
-                body: Bytes::new(),
-                e_tag: String::new(),
-                last_modified: source_mtime(&headers),
-                delete_marker: true,
-                content_type: None,
-                metadata: None,
-                standard_headers: StandardHeaders::default(),
-                tags: Vec::new(),
-                replication_sse_headers: Vec::new(),
-                lock: VersionLock::default(),
-            },
-        )?;
-        Ok(apply_response_fault(
-            S3Response::new(DeleteObjectOutput {
-                delete_marker: Some(true),
-                version_id: Some(version_id),
-                ..Default::default()
-            }),
-            fault.as_ref(),
-        ))
-    }
-
-    async fn create_multipart_upload(
-        &self,
-        req: S3Request<CreateMultipartUploadInput>,
-    ) -> S3Result<S3Response<CreateMultipartUploadOutput>> {
-        let fault = request_fault(&req);
-        apply_non_body_fault(fault.as_ref(), &self.control).await?;
-        let headers = req.headers;
-        let input = req.input;
-        let mut state = lock(&self.store);
-        if !state.buckets.contains_key(&input.bucket) {
-            return Err(s3s::s3_error!(NoSuchBucket, "bucket does not exist"));
-        }
-        ensure_upload_budget(&state)?;
-        validate_stored_metadata(&input.content_type, &input.metadata)?;
-        let standard_headers = StandardHeaders {
-            cache_control: input.cache_control,
-            content_disposition: input.content_disposition,
-            content_encoding: input.content_encoding,
-            content_language: input.content_language,
-            expires: input.expires,
-        };
-        standard_headers.validate()?;
-        let upload_id = Uuid::new_v4().to_string();
-        // Read the flags before the mutable borrow of `state.uploads` below
-        // (and never re-lock the store: the mutex is not reentrant).
-        let mint_own = state.assign_own_version_ids || state.assign_own_multipart_version_ids;
-        let drop_unlisted = state.drop_unlisted_replication_headers;
-        let version_id = if bucket_versioned(&state, &input.bucket) {
-            new_version_id(&headers, mint_own)?
-        } else {
-            NULL_VERSION_ID.to_string()
-        };
-        state.uploads.insert(
-            upload_id.clone(),
-            MultipartState {
-                bucket: input.bucket.clone(),
-                key: input.key.clone(),
-                version_id,
-                content_type: input.content_type,
-                metadata: input.metadata,
-                standard_headers,
-                replication_sse_headers: captured_replication_sse_headers(&headers, drop_unlisted),
-                lock: VersionLock::from_headers(
-                    input.object_lock_mode,
-                    input.object_lock_retain_until_date,
-                    input.object_lock_legal_hold_status,
-                ),
-                parts: BTreeMap::new(),
-            },
-        );
-        Ok(apply_response_fault(
-            S3Response::new(CreateMultipartUploadOutput {
-                bucket: Some(input.bucket),
-                key: Some(input.key),
-                upload_id: Some(upload_id),
-                ..Default::default()
-            }),
-            fault.as_ref(),
-        ))
-    }
-
-    async fn upload_part(&self, req: S3Request<UploadPartInput>) -> S3Result<S3Response<UploadPartOutput>> {
-        let fault = request_fault(&req);
-        let declared_actual_size = req
-            .headers
-            .get("x-rustfs-replication-part-actual-size")
-            .and_then(|value| value.to_str().ok())
-            .and_then(|value| value.parse::<usize>().ok());
-        let _body_permit = timeout(MAX_FAULT_DURATION, Arc::clone(&self.body_limit).acquire_owned())
-            .await
-            .map_err(|_| s3s::s3_error!(RequestTimeout, "fake target body limiter wait exceeded 30 seconds"))?
-            .map_err(|_| s3s::s3_error!(ServiceUnavailable, "fake target body limiter closed"))?;
-        let input = req.input;
-        if !(1..=10_000).contains(&input.part_number) {
-            return Err(s3s::s3_error!(InvalidArgument, "part number must be in 1..=10000"));
-        }
-        let max_object_bytes = lock(&self.store).limits.max_object_bytes;
-        let body = collect_stream(input.body, input.content_length, fault.as_ref(), &self.control, max_object_bytes).await?;
-        let (digest, _body_permit) = md5_digest(body.clone(), _body_permit).await?;
-        let e_tag = hex_simd::encode_to_string(digest, hex_simd::AsciiCase::Lower);
-        let mut state = lock(&self.store);
-        let existing_bytes = state
-            .uploads
-            .get(&input.upload_id)
-            .filter(|upload| upload.bucket == input.bucket && upload.key == input.key)
-            .ok_or_else(|| s3s::s3_error!(NoSuchUpload, "multipart upload does not exist"))?
-            .parts
-            .get(&input.part_number)
-            .map_or(0, |part| part.body.len());
-        let adds_part = state
-            .uploads
-            .get(&input.upload_id)
-            .is_some_and(|upload| !upload.parts.contains_key(&input.part_number));
-        ensure_part_budget(&state, adds_part)?;
-        ensure_store_budget(&state, existing_bytes, body.len(), false)?;
-        state.total_bytes = state.total_bytes - existing_bytes + body.len();
-        if adds_part {
-            state.total_parts += 1;
-        }
-        let upload = state
-            .uploads
-            .get_mut(&input.upload_id)
-            .expect("upload existence checked above");
-        upload.parts.insert(
-            input.part_number,
-            MultipartPart {
-                body,
-                e_tag: e_tag.clone(),
-                digest,
-                actual_size: declared_actual_size,
-            },
-        );
-        Ok(apply_response_fault(
-            S3Response::new(UploadPartOutput {
-                e_tag: Some(ETag::Strong(maybe_wrong_etag(fault.as_ref(), e_tag))),
-                ..Default::default()
-            }),
-            fault.as_ref(),
-        ))
-    }
-
-    async fn complete_multipart_upload(
-        &self,
-        mut req: S3Request<CompleteMultipartUploadInput>,
-    ) -> S3Result<S3Response<CompleteMultipartUploadOutput>> {
-        let fault = request_fault(&req);
-        apply_non_body_fault(fault.as_ref(), &self.control).await?;
-        let _body_permits = match req.extensions.remove::<PrebodyPermit>().and_then(PrebodyPermit::take) {
-            Some(permit) => permit,
-            None => timeout(
-                MAX_FAULT_DURATION,
-                Arc::clone(&self.body_limit).acquire_many_owned(MAX_CONCURRENT_BODY_REQUESTS as u32),
-            )
-            .await
-            .map_err(|_| s3s::s3_error!(RequestTimeout, "fake target body limiter wait exceeded 30 seconds"))?
-            .map_err(|_| s3s::s3_error!(ServiceUnavailable, "fake target body limiter closed"))?,
-        };
-        let headers = req.headers;
-        let input = req.input;
-        let requested = input
-            .multipart_upload
-            .and_then(|upload| upload.parts)
-            .ok_or_else(|| s3s::s3_error!(InvalidPart, "completion omitted parts"))?;
-        if requested.is_empty() {
-            return Err(s3s::s3_error!(InvalidPart, "completion omitted parts"));
-        }
-        let mut requested_parts = Vec::with_capacity(requested.len());
-        let mut previous = 0;
-        for part in &requested {
-            let number = part
-                .part_number
-                .ok_or_else(|| s3s::s3_error!(InvalidPart, "part number is missing"))?;
-            if number <= previous {
-                return Err(s3s::s3_error!(InvalidPartOrder, "parts are not strictly ordered"));
-            }
-            previous = number;
-            let requested_etag = part
-                .e_tag
-                .as_ref()
-                .ok_or_else(|| s3s::s3_error!(InvalidPart, "part ETag is missing"))?;
-            requested_parts.push((number, normalize_etag(requested_etag.value())));
-        }
-
-        let (upload, selected_parts) = {
-            let state = lock(&self.store);
-            let upload = state
-                .uploads
-                .get(&input.upload_id)
-                .filter(|upload| upload.bucket == input.bucket && upload.key == input.key)
-                .ok_or_else(|| s3s::s3_error!(NoSuchUpload, "multipart upload does not exist"))?;
-            let mut selected = Vec::with_capacity(requested_parts.len());
-            for (index, (number, requested_etag)) in requested_parts.iter().enumerate() {
-                let stored = upload
-                    .parts
-                    .get(number)
-                    .ok_or_else(|| s3s::s3_error!(InvalidPart, "part was not uploaded"))?;
-                if requested_etag != &stored.e_tag {
-                    return Err(s3s::s3_error!(InvalidPart, "part ETag does not match"));
-                }
-                if index + 1 != requested_parts.len()
-                    && stored.actual_size.unwrap_or(stored.body.len()) < MIN_MULTIPART_PART_BYTES
-                {
-                    return Err(s3s::s3_error!(EntityTooSmall, "non-final multipart part is smaller than 5 MiB"));
-                }
-                selected.push((*number, stored.clone()));
-            }
-            (
-                MultipartState {
-                    bucket: upload.bucket.clone(),
-                    key: upload.key.clone(),
-                    version_id: upload.version_id.clone(),
-                    content_type: upload.content_type.clone(),
-                    metadata: upload.metadata.clone(),
-                    standard_headers: upload.standard_headers.clone(),
-                    replication_sse_headers: upload.replication_sse_headers.clone(),
-                    lock: upload.lock.clone(),
-                    parts: BTreeMap::new(),
-                },
-                selected,
-            )
-        };
-        let max_total_bytes = lock(&self.store).limits.max_total_bytes;
-        let total_len = selected_parts.iter().try_fold(0usize, |total, (_, part)| {
-            total
-                .checked_add(part.body.len())
-                .filter(|total| *total <= max_total_bytes)
-                .ok_or_else(|| s3s::s3_error!(EntityTooLarge, "multipart object exceeds {max_total_bytes} bytes"))
-        })?;
-        let assembly_parts = selected_parts
-            .iter()
-            .map(|(_, stored)| (stored.body.clone(), stored.digest))
-            .collect();
-        let (body, digests, _body_permits) = assemble_multipart(assembly_parts, total_len, _body_permits).await?;
-        let part_count = requested.len();
-        let ignore_source_etags = lock(&self.store).ignore_source_etags;
-        let e_tag = source_etag(&headers)?
-            .filter(|_| !ignore_source_etags)
-            .unwrap_or_else(|| format!("{}-{part_count}", md5_hex(digests)));
-        let version = ObjectVersion {
-            version_id: upload.version_id.clone(),
-            body,
-            e_tag: e_tag.clone(),
-            last_modified: Timestamp::from(SystemTime::now()),
-            delete_marker: false,
-            content_type: upload.content_type,
-            metadata: upload.metadata,
-            standard_headers: upload.standard_headers,
-            tags: Vec::new(),
-            replication_sse_headers: upload.replication_sse_headers,
-            lock: upload.lock,
-        };
-        let mut state = lock(&self.store);
-        let versioned = bucket_versioned(&state, &input.bucket);
-        let current = state
-            .uploads
-            .get(&input.upload_id)
-            .filter(|current| current.bucket == input.bucket && current.key == input.key)
-            .ok_or_else(|| s3s::s3_error!(NoSuchUpload, "multipart upload does not exist"))?;
-        for (part, (selected_number, selected_part)) in requested.iter().zip(&selected_parts) {
-            let number = part.part_number.expect("validated above");
-            debug_assert_eq!(number, *selected_number);
-            let current_part = current
-                .parts
-                .get(&number)
-                .ok_or_else(|| s3s::s3_error!(InvalidPart, "part changed during completion"))?;
-            if current_part.e_tag != selected_part.e_tag {
-                return Err(s3s::s3_error!(InvalidPart, "part changed during completion"));
-            }
-        }
-        let upload_bytes = current.parts.values().map(|part| part.body.len()).sum::<usize>();
-        let upload_part_count = current.parts.len();
-        let existing = state
-            .buckets
-            .get(&input.bucket)
-            .ok_or_else(|| s3s::s3_error!(NoSuchBucket, "bucket does not exist"))?
-            .objects
-            .get(&input.key)
-            .and_then(|versions| versions.iter().find(|candidate| candidate.version_id == version.version_id))
-            .map(|version| version.body.len());
-        ensure_store_budget(
-            &state,
-            upload_bytes + existing.unwrap_or_default(),
-            version.body.len(),
-            existing.is_none(),
-        )?;
-        state.total_bytes -= upload_bytes;
-        state.total_parts -= upload_part_count;
-        state.uploads.remove(&input.upload_id);
-        upsert_version(&mut state, &input.bucket, input.key.clone(), version)?;
-        Ok(apply_response_fault(
-            S3Response::new(CompleteMultipartUploadOutput {
-                bucket: Some(input.bucket),
-                key: Some(input.key),
-                e_tag: Some(ETag::Strong(maybe_wrong_etag(fault.as_ref(), e_tag))),
-                version_id: versioned.then_some(upload.version_id),
-                ..Default::default()
-            }),
-            fault.as_ref(),
-        ))
-    }
-
-    async fn abort_multipart_upload(
-        &self,
-        req: S3Request<AbortMultipartUploadInput>,
-    ) -> S3Result<S3Response<AbortMultipartUploadOutput>> {
-        let fault = request_fault(&req);
-        apply_non_body_fault(fault.as_ref(), &self.control).await?;
-        let input = req.input;
-        let mut state = lock(&self.store);
-        let matches = state
-            .uploads
-            .get(&input.upload_id)
-            .is_some_and(|upload| upload.bucket == input.bucket && upload.key == input.key);
-        if !matches {
-            return Err(s3s::s3_error!(NoSuchUpload, "multipart upload does not exist"));
-        }
-        let removed = state
-            .uploads
-            .remove(&input.upload_id)
-            .expect("upload existence checked above");
-        state.total_bytes -= removed.parts.values().map(|part| part.body.len()).sum::<usize>();
-        state.total_parts -= removed.parts.len();
-        Ok(apply_response_fault(
-            S3Response::new(AbortMultipartUploadOutput::default()),
-            fault.as_ref(),
-        ))
-    }
+        .ok_or_else(|| s3_error!(InvalidArgument, "the continuation token provided is incorrect"))
 }
 
 #[cfg(test)]
@@ -3333,8 +2389,8 @@ mod tests {
 
     /// A client that sends no SDK-computed checksum, the shape RustFS's
     /// replication client has had since rustfs#6895.
-    fn client_without_sdk_checksums(target: &FakeS3Target) -> Client {
-        let credentials = Credentials::new(FAKE_ACCESS_KEY, FAKE_SECRET_KEY, None, None, "fake-target");
+    fn client_without_sdk_checksums(target: &FakeS3Target, secret_key: &'static str) -> Client {
+        let credentials = Credentials::new(FAKE_ACCESS_KEY, secret_key, None, None, "fake-target");
         Client::from_conf(
             aws_sdk_s3::Config::builder()
                 .credentials_provider(credentials)
@@ -3363,32 +2419,31 @@ mod tests {
         }
         {
             let gate = target.hold_get_object(bucket, "held");
-            let request = || S3Request {
-                input: GetObjectInput {
-                    bucket: bucket.to_string(),
-                    key: "held".to_string(),
+            let request = || TargetRequest {
+                input: dto::GetObjectInput {
+                    bucket: rustfs_gateway_types::BucketName::new(bucket).expect("valid bucket"),
+                    key: rustfs_gateway_types::ObjectKey::new("held").expect("valid key"),
                     ..Default::default()
                 },
-                method: Method::GET,
-                uri: Uri::from_static("/gated-target/held"),
                 headers: HeaderMap::new(),
                 extensions: http::Extensions::new(),
-                credentials: None,
-                region: None,
-                service: None,
-                trailing_headers: None,
             };
             // Without a fault, only the gate can suspend this backend method.
-            let mut first = target.backend.get_object(request());
+            let mut first = Box::pin(target.backend.get_object(request()));
             assert!(futures::poll!(first.as_mut()).is_pending(), "the first GET must wait at the gate");
             drop(first);
-            let mut retry = target.backend.get_object(request());
+            let mut retry = Box::pin(target.backend.get_object(request()));
             assert!(futures::poll!(retry.as_mut()).is_pending(), "a cancelled GET must not consume the gate");
             drop(gate);
             let std::task::Poll::Ready(response) = futures::poll!(retry.as_mut()) else {
                 panic!("dropping the gate must release the waiting GET");
             };
-            let mut body = response?.output.body.expect("released GET body");
+            let mut body = response?
+                .output
+                .body
+                .expect("released GET body")
+                .into_body()
+                .into_data_stream();
             assert_eq!(body.next().await.transpose()?, Some(Bytes::from_static(b"payload")));
             assert!(body.next().await.is_none(), "released GET body must be complete");
         }
@@ -3538,7 +2593,7 @@ mod tests {
         let target = FakeS3Target::start().await?;
         target.create_bucket_with_object_lock("locked");
         target.require_checksum_for_object_lock(true);
-        let client = client_without_sdk_checksums(&target);
+        let client = client_without_sdk_checksums(&target, FAKE_SECRET_KEY);
         let locked_put = |key: &'static str| {
             client
                 .put_object()
@@ -3626,13 +2681,46 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn unframed_trailer_refusal_authenticates_before_consuming_a_fault() -> Result<(), BoxError> {
+        use aws_sdk_s3::error::ProvideErrorMetadata;
+        let target = FakeS3Target::start().await?;
+        target.create_bucket("plain");
+        target.reject_aws_chunked_uploads(true);
+        target.inject(Operation::PutObject, FaultAction::Status(StatusCode::SERVICE_UNAVAILABLE), 1);
+        for (secret, code, records) in [
+            ("wrong-secret", "SignatureDoesNotMatch", 0),
+            (FAKE_SECRET_KEY, "ServiceUnavailable", 1),
+            (FAKE_SECRET_KEY, "InvalidRequest", 2),
+        ] {
+            let error = client_without_sdk_checksums(&target, secret)
+                .put_object()
+                .bucket("plain")
+                .key("framed")
+                .body(ByteStream::from_static(b"payload"))
+                .customize()
+                .map_request(|mut req| {
+                    req.headers_mut().insert("x-amz-trailer", "x-amz-checksum-crc32");
+                    Ok::<_, std::convert::Infallible>(req)
+                })
+                .send()
+                .await
+                .expect_err("declared trailer without aws-chunked framing")
+                .into_service_error();
+            assert_eq!(error.code(), Some(code));
+            assert_eq!(target.requests().len(), records);
+            assert!(!target.has_object("plain", "framed"));
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn aws_chunked_rejecting_target_refuses_framed_uploads() -> Result<(), BoxError> {
         use aws_sdk_s3::error::ProvideErrorMetadata;
 
         let target = FakeS3Target::start().await?;
         target.create_bucket("plain");
         target.reject_aws_chunked_uploads(true);
-        let client = client_without_sdk_checksums(&target);
+        let client = client_without_sdk_checksums(&target, FAKE_SECRET_KEY);
 
         // An upload announcing a trailer is refused before its body is read.
         let err = client
@@ -4128,10 +3216,8 @@ mod tests {
                 .first()
                 .expect("version")
                 .last_modified
-                .clone()
         };
-        let invalid_last_modified: time::OffsetDateTime = invalid_last_modified.into();
-        assert!((invalid_before..=invalid_after).contains(&invalid_last_modified));
+        assert!((fixture_timestamp(invalid_before)..=fixture_timestamp(invalid_after)).contains(&invalid_last_modified));
         assert_eq!(
             get_bytes(&client, "target-bucket", "invalid-source-mtime", None).await?,
             Bytes::from_static(b"body"),
@@ -4174,10 +3260,8 @@ mod tests {
                 .first()
                 .expect("version")
                 .last_modified
-                .clone()
         };
-        let unmarked_last_modified: time::OffsetDateTime = unmarked_last_modified.into();
-        assert!((unmarked_before..=unmarked_after).contains(&unmarked_last_modified));
+        assert!((fixture_timestamp(unmarked_before)..=fixture_timestamp(unmarked_after)).contains(&unmarked_last_modified));
         assert_eq!(
             get_bytes(&client, "target-bucket", "unmarked-source-mtime", None).await?,
             Bytes::from_static(b"body"),
@@ -5147,7 +4231,7 @@ mod tests {
             let body_control = Mutex::new(ControlState::default());
             let max_body = Bytes::from(vec![0; MAX_BUFFERED_BODY_BYTES]);
             let collected = collect_stream(
-                Some(StreamingBlob::new(Body::from(max_body))),
+                Some(rustfs_gateway::ByteStream::from_bytes(max_body)),
                 Some(MAX_BUFFERED_BODY_BYTES as i64),
                 None,
                 &body_control,
@@ -5159,7 +4243,7 @@ mod tests {
             drop(collected);
             let over_body = Bytes::from(vec![0; MAX_BUFFERED_BODY_BYTES + 1]);
             let normal_overflow = collect_stream(
-                Some(StreamingBlob::new(Body::from(over_body.clone()))),
+                Some(rustfs_gateway::ByteStream::from_bytes(over_body.clone())),
                 None,
                 None,
                 &body_control,
@@ -5169,7 +4253,7 @@ mod tests {
             .expect_err("normal drain must enforce the body cap");
             assert_eq!(normal_overflow.code().as_str(), "EntityTooLarge");
             let slow_overflow = collect_stream_slow(
-                StreamingBlob::new(Body::from(over_body)),
+                rustfs_gateway::ByteStream::from_bytes(over_body),
                 0,
                 1024 * 1024,
                 Duration::ZERO,

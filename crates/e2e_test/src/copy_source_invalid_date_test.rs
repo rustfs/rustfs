@@ -21,23 +21,8 @@
 //! when it fails to parse (`amztime.ParseHeader` error is swallowed), so the copy
 //! proceeds.
 //!
-//! RustFS routes S3 through the `s3s` crate, which models the copy-source
-//! conditional-date headers as typed `Timestamp` fields and rejects an
-//! unparsable value with `400 InvalidArgument` during request deserialization —
-//! this happens *after* SigV4 verification but *before* the RustFS `CopyObject`
-//! handler runs. Because the header is part of the client's `SignedHeaders`, the
-//! value cannot be stripped or rewritten by a pre-`s3s` layer without breaking the
-//! signature, and `s3s` exposes no hook between auth and typed deserialization.
-//! Matching MinIO's tolerant behavior therefore requires a change in `s3s`
-//! (lenient parsing of conditional-date headers). See the PR description for
-//! details.
-//!
-//! This test pins the two ends of the current behavior:
-//!   * a *valid* HTTP-date copy-source conditional header is accepted and the copy
-//!     succeeds (the common, real-SDK path), and
-//!   * an *invalid* date value is rejected with `400 InvalidArgument` at the `s3s`
-//!     layer (the documented gap). When `s3s` gains lenient parsing, the second
-//!     assertion should be flipped to expect a successful copy.
+//! The RustFS gateway profile rejects unreadable conditional dates before the copy handler runs.
+//! The signed requests below pin both the successful copy and the HTTP 400 `InvalidArgument` response.
 
 #[cfg(test)]
 mod tests {
@@ -101,7 +86,7 @@ mod tests {
 
         let copy_source = format!("/{bucket}/src.txt");
 
-        // A valid future HTTP-date is accepted by s3s and the copy succeeds.
+        // A valid future HTTP-date allows the copy.
         let (status, body) = signed_copy(
             &env.url,
             &format!("/{bucket}/dst-valid.txt"),
@@ -114,10 +99,7 @@ mod tests {
         assert_eq!(status, reqwest::StatusCode::OK, "valid copy-source date must succeed: {body}");
         assert!(body.contains("CopyObjectResult"), "expected CopyObjectResult XML: {body}");
 
-        // An unparsable date ("Invalid Date") is currently rejected by s3s at the
-        // deserialization layer with 400 InvalidArgument. This documents the s3s
-        // limitation described in backlog#618 item 8. When s3s parses these headers
-        // leniently (matching MinIO), this should become a successful copy.
+        // The signed header reaches the RustFS profile's conditional-date check unchanged.
         let (status, body) = signed_copy(
             &env.url,
             &format!("/{bucket}/dst-invalid.txt"),
@@ -130,7 +112,7 @@ mod tests {
         assert_eq!(
             status,
             reqwest::StatusCode::BAD_REQUEST,
-            "invalid copy-source date currently rejected by s3s (backlog#618): {body}"
+            "expected the signed invalid date to be rejected (backlog#618): {body}"
         );
         assert!(body.contains("InvalidArgument"), "expected InvalidArgument for invalid date: {body}");
 

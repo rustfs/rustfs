@@ -5,12 +5,11 @@ use super::*;
 
 /// A linked tree paused on a different physical replica. It contains only
 /// traversal fields, so dormant sources cannot recursively contain each other.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Deserialize)]
 pub struct SourceTree {
     bucket: String,
     identity: DataUsageScanIdentity,
     started_plan: DataUsageScanPlanDigest,
-    #[serde(serialize_with = "ordered_entries")]
     entries: HashMap<String, DataUsageEntry>,
     resume_after: Option<String>,
     checkpoint: Option<DataUsageScanCheckpoint>,
@@ -18,6 +17,36 @@ pub struct SourceTree {
     cursor: Option<DataUsageRawEnumerationCursor>,
     index: Option<RawEnumerationPageIndex>,
     ancestors: Vec<RawEnumerationPageIndex>,
+    #[serde(default)]
+    coverage_measured_at: Option<u64>,
+}
+
+impl Serialize for SourceTree {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut map = serializer.serialize_map(Some(10 + usize::from(self.coverage_measured_at.is_some())))?;
+        map.serialize_entry("bucket", &self.bucket)?;
+        map.serialize_entry("identity", &self.identity)?;
+        map.serialize_entry("started_plan", &self.started_plan)?;
+        map.serialize_entry("entries", &OrderedEntries(&self.entries))?;
+        map.serialize_entry("resume_after", &self.resume_after)?;
+        map.serialize_entry("checkpoint", &self.checkpoint)?;
+        map.serialize_entry("coverage", &self.coverage)?;
+        map.serialize_entry("cursor", &self.cursor)?;
+        map.serialize_entry("index", &self.index)?;
+        map.serialize_entry("ancestors", &self.ancestors)?;
+        if let Some(measured_at) = self.coverage_measured_at {
+            map.serialize_entry("coverage_measured_at", &measured_at)?;
+        }
+        map.end()
+    }
+}
+
+struct OrderedEntries<'a>(&'a HashMap<String, DataUsageEntry>);
+
+impl Serialize for OrderedEntries<'_> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        ordered_entries(self.0, serializer)
+    }
 }
 
 impl SourceTree {
@@ -89,6 +118,7 @@ impl DataUsageCache {
             resume_after: self.info.scan_resume_after.take(),
             checkpoint: self.info.scan_checkpoint.take(),
             coverage: self.info.scan_coverage_receipt.take(),
+            coverage_measured_at: self.info.scan_coverage_measured_at.take(),
             cursor: self.info.scan_raw_enumeration_cursor.take(),
             index: self.info.scan_raw_enumeration_page_index.take(),
             ancestors: std::mem::take(&mut self.info.scan_raw_enumeration_path_page_indexes),
@@ -104,6 +134,7 @@ impl DataUsageCache {
             self.cache = tree.entries;
             self.info.scan_resume_after = tree.resume_after;
             self.info.scan_coverage_receipt = tree.coverage;
+            self.info.scan_coverage_measured_at = tree.coverage_measured_at;
             self.info.scan_checkpoint = tree.checkpoint;
             self.info.scan_raw_enumeration_cursor = tree.cursor;
             self.info.scan_raw_enumeration_page_index = tree.index;
@@ -122,6 +153,7 @@ impl DataUsageCache {
         self.info.scan_resume_after = None;
         self.info.scan_checkpoint = None;
         self.info.scan_coverage_receipt = None;
+        self.info.scan_coverage_measured_at = None;
         self.info.scan_raw_enumeration_cursor = None;
         self.info.scan_raw_enumeration_page_index = None;
         self.info.scan_raw_enumeration_path_page_indexes.clear();
@@ -130,4 +162,54 @@ impl DataUsageCache {
 
 fn directory_source_location(source: &str) -> &str {
     source.split_once('|').map_or(source, |(_, endpoint)| endpoint)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[derive(Serialize, Deserialize)]
+    struct LegacySourceTree {
+        bucket: String,
+        identity: DataUsageScanIdentity,
+        started_plan: DataUsageScanPlanDigest,
+        entries: HashMap<String, DataUsageEntry>,
+        resume_after: Option<String>,
+        checkpoint: Option<DataUsageScanCheckpoint>,
+        coverage: Option<DataUsageScanCoverageReceipt>,
+        cursor: Option<DataUsageRawEnumerationCursor>,
+        index: Option<RawEnumerationPageIndex>,
+        ancestors: Vec<RawEnumerationPageIndex>,
+    }
+
+    #[test]
+    fn source_tree_measurement_metadata_preserves_legacy_codecs() {
+        let tree = SourceTree {
+            bucket: "bucket".into(),
+            identity: DataUsageScanIdentity {
+                version: DATA_USAGE_SCAN_CHECKPOINT_VERSION,
+                bucket_incarnation: uuid::Uuid::from_u128(1),
+                set_layout: DataUsageScanPlanDigest([2; 32]),
+                publication_epoch: 0,
+                tier_registry_generation: 0,
+                scan_mode: HealScanMode::Normal,
+            },
+            started_plan: DataUsageScanPlanDigest([3; 32]),
+            entries: HashMap::from([("bucket".into(), DataUsageEntry::default())]),
+            resume_after: None,
+            checkpoint: None,
+            coverage: None,
+            cursor: None,
+            index: None,
+            ancestors: Vec::new(),
+            coverage_measured_at: Some(10_000),
+        };
+        let bytes = rmp_serde::to_vec(&tree).expect("encode additive named source tree");
+        let old: LegacySourceTree = rmp_serde::from_slice(&bytes).expect("old reader ignores diagnostic time");
+        let bytes = rmp_serde::to_vec(&old).expect("encode old positional source tree");
+        let recovered: SourceTree = rmp_serde::from_slice(&bytes).expect("new reader accepts old positional source tree");
+        assert_eq!(recovered.bucket, tree.bucket);
+        assert_eq!(recovered.entries.len(), 1);
+        assert_eq!(recovered.coverage_measured_at, None);
+    }
 }

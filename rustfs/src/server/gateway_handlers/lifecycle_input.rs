@@ -40,7 +40,7 @@ fn date_from_gateway(value: Option<Timestamp>, source_date: Option<&str>) -> std
         .transpose()
 }
 
-pub(super) fn prepare_lifecycle_configuration(
+pub(crate) fn prepare_lifecycle_configuration(
     configuration: Option<dto::BucketLifecycleConfiguration>,
     dates: Option<&LifecycleRequestDates>,
 ) -> PreparedLifecycleConfiguration {
