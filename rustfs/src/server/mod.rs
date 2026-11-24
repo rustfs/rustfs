@@ -16,6 +16,7 @@ mod audit;
 mod compress;
 pub mod cors;
 mod event;
+mod gateway_authorizer;
 mod gateway_handlers;
 #[cfg(test)]
 pub(crate) mod gateway_stack;

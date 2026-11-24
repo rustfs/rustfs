@@ -109,7 +109,10 @@ fn root() -> LiveRoot {
 
 /// The stack as production assembles it, over an IAM that knows no key but the root's.
 fn stack_over(iam: ScriptedIam) -> GatewayStack {
-    GatewayStack::assemble_with(assembly(), Arc::new(iam), root().source(), early_gate(OPERATIONS)).expect("the stack assembles")
+    let assembly = assembly();
+    let server_ctx = Arc::clone(&assembly.server_ctx);
+    GatewayStack::assemble_with(assembly, Arc::new(iam), root().source(), early_gate(OPERATIONS, server_ctx))
+        .expect("the stack assembles")
 }
 
 fn request(method: Method, target: &str) -> http::request::Builder {
@@ -218,9 +221,15 @@ fn a_missing_or_short_root_secret_fails_the_assembly() {
 async fn a_root_change_reaches_the_next_request_and_a_withdrawn_root_signs_nothing() {
     const ROTATED_ACCESS_KEY: &str = "rotatedgatewayroot";
     let live = root();
-    let stack =
-        GatewayStack::assemble_with(assembly(), Arc::new(ScriptedIam { ready: true }), live.source(), early_gate(OPERATIONS))
-            .expect("the stack assembles");
+    let assembly = assembly();
+    let server_ctx = Arc::clone(&assembly.server_ctx);
+    let stack = GatewayStack::assemble_with(
+        assembly,
+        Arc::new(ScriptedIam { ready: true }),
+        live.source(),
+        early_gate(OPERATIONS, server_ctx),
+    )
+    .expect("the stack assembles");
     let signed_as = |access_key: &str| signed_with_a_wrong_signature(request(Method::GET, "/"), access_key);
 
     let (_, _, known) = answer(&stack, signed_as(ROOT_ACCESS_KEY)).await;
@@ -318,9 +327,15 @@ fn a_disabled_body_read_timeout_lifts_the_idle_bound_instead_of_arming_zero() {
 async fn rejected_http1_body_is_released_to_the_host_drain() {
     use std::sync::atomic::{AtomicBool, Ordering};
 
-    let stack =
-        GatewayStack::assemble_with(assembly(), Arc::new(ScriptedIam { ready: true }), root().source(), early_gate(OPERATIONS))
-            .expect("the stack assembles");
+    let assembly = assembly();
+    let server_ctx = Arc::clone(&assembly.server_ctx);
+    let stack = GatewayStack::assemble_with(
+        assembly,
+        Arc::new(ScriptedIam { ready: true }),
+        root().source(),
+        early_gate(OPERATIONS, server_ctx),
+    )
+    .expect("the stack assembles");
     let dropped = Arc::new(AtomicBool::new(false));
     let request = signed_with_a_wrong_signature(request(Method::PUT, "/test-bucket/test-key"), ROOT_ACCESS_KEY)
         .version(http::Version::HTTP_11)
@@ -551,8 +566,15 @@ async fn the_early_gate_allows_only_what_the_table_serves() {
     static NOTHING: OperationTable = &[];
     let request = || signed_request(Signed::Header, Method::GET, "/", "", ROOT_ACCESS_KEY, ROOT_SECRET_KEY);
     let gated = |table| {
-        GatewayStack::assemble_with(assembly(), Arc::new(ScriptedIam { ready: true }), root().source(), early_gate(table))
-            .expect("the stack assembles")
+        let assembly = assembly();
+        let server_ctx = Arc::clone(&assembly.server_ctx);
+        GatewayStack::assemble_with(
+            assembly,
+            Arc::new(ScriptedIam { ready: true }),
+            root().source(),
+            early_gate(table, server_ctx),
+        )
+        .expect("the stack assembles")
     };
 
     let refused = gated(NOTHING).call(request()).await;
@@ -561,6 +583,14 @@ async fn the_early_gate_allows_only_what_the_table_serves() {
     let (status, _, body) = answer_request(&gated(OPERATIONS), request()).await;
     assert_ne!(status, StatusCode::FORBIDDEN, "{body}");
     assert!(!body.contains("AccessDenied"), "{body}");
+
+    // An empty server slot cannot evaluate GetBucketLocation. The core's store error is
+    // indeterminate, so the gate refuses before the handler can answer InternalError.
+    let location = signed_request(Signed::Header, Method::GET, "/photos", "location", ROOT_ACCESS_KEY, ROOT_SECRET_KEY);
+    let (status, _, body) = answer_request(&gated(OPERATIONS), location).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    assert!(body.contains("AccessDenied"), "{body}");
+    assert!(!body.contains("InternalError"), "{body}");
 }
 
 #[tokio::test]
