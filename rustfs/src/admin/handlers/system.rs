@@ -1238,18 +1238,19 @@ impl Operation for DataUsageInfoHandler {
         authorize_admin_request(&req, data_usage_info_gate_actions()).await?;
 
         let data = if super::account_info::requests_usage_snapshot(&req.uri) {
-            let store = object_store_from_req(&req).ok_or_else(|| s3_error!(InternalError, "Object store unavailable"))?;
+            let store = object_store_from_req(&req)
+                .ok_or_else(|| S3Error::with_message(S3ErrorCode::InternalError, "Object store unavailable"))?;
             let buckets = store
                 .list_bucket(&BucketOptions {
                     cached: true,
                     ..Default::default()
                 })
                 .await
-                .map_err(|_| s3_error!(InternalError, "Usage snapshot unavailable"))?;
+                .map_err(|_| S3Error::with_message(S3ErrorCode::InternalError, "Usage snapshot unavailable"))?;
             let names = buckets.into_iter().map(|bucket| bucket.name).collect::<Vec<_>>();
             let info = crate::admin::storage_api::data_usage::load_admin_usage_snapshot(store, &names)
                 .await
-                .map_err(|_| s3_error!(InternalError, "Usage snapshot unavailable"))?;
+                .map_err(|_| S3Error::with_message(S3ErrorCode::InternalError, "Usage snapshot unavailable"))?;
             serde_json::to_vec(&info)
         } else {
             let usecase = default_admin_usecase();

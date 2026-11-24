@@ -243,18 +243,18 @@ fn clear_tier_error_response(err: &AdminError) -> S3Error {
 fn decode_mutation_tier_name(params: &Params<'_, '_>) -> S3Result<String> {
     let name = params
         .get("tiername")
-        .ok_or_else(|| s3_error!(InvalidArgument, "missing tier path parameter"))?;
+        .ok_or_else(|| S3Error::with_message(S3ErrorCode::InvalidArgument, "missing tier path parameter"))?;
     percent_decode_str(name)
         .decode_utf8()
         .map(|decoded| decoded.into_owned())
-        .map_err(|_| s3_error!(InvalidArgument, "invalid tier path parameter"))
+        .map_err(|_| S3Error::with_message(S3ErrorCode::InvalidArgument, "invalid tier path parameter"))
 }
 
 fn resolve_tier_name(uri: &Uri, params: &Params<'_, '_>) -> S3Result<String> {
     if let Some(tier) = params.get("tier") {
         let decoded = percent_decode_str(tier)
             .decode_utf8()
-            .map_err(|_| s3_error!(InvalidArgument, "invalid tier path parameter"))?;
+            .map_err(|_| S3Error::with_message(S3ErrorCode::InvalidArgument, "invalid tier path parameter"))?;
         let trimmed = decoded.trim();
         if !trimmed.is_empty() {
             return Ok(trimmed.to_string());
