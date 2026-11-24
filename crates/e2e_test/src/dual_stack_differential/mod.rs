@@ -27,6 +27,7 @@
 //! is process-global, so two stacks in one process would read each other's buckets.
 
 mod compare;
+mod observability_contract;
 pub(crate) mod reference;
 mod scenarios;
 
