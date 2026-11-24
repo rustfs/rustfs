@@ -1348,34 +1348,53 @@ mod tests {
                 .await
                 .expect("configure bucket-default SSE-KMS");
             let usecase = DefaultMultipartUsecase::from_global();
+            // Same facts `from_legacy` carried. Metadata, tagging, storage class, request SSE, and object lock stay absent.
+            let create = super::super::CreateMultipartUploadFields {
+                bucket: bucket.clone(),
+                key: key.to_owned(),
+                metadata: None,
+                tagging: None,
+                storage_class: None,
+                server_side_encryption: None,
+                sse_customer_algorithm: None,
+                sse_customer_key: None,
+                sse_customer_key_md5: None,
+                ssekms_key_id: None,
+                object_lock_legal_hold_status: None,
+                object_lock_mode: None,
+                object_lock_retain_until_date: None,
+            };
             let created = usecase
-                .execute_create_multipart_upload(
-                    owned_envelope(Method::POST),
-                    super::super::CreateMultipartUploadFields::from_legacy(CreateMultipartUploadInput {
-                        bucket: bucket.clone(),
-                        key: key.to_string(),
-                        ..Default::default()
-                    }),
-                    None,
-                )
+                .execute_create_multipart_upload(owned_envelope(Method::POST), create, None)
                 .await
                 .expect("create KMS multipart upload");
             let upload_id = created.upload_id;
             assert!(!upload_id.is_empty(), "KMS upload id");
-            let input = UploadPartInput {
-                bucket: bucket.clone(),
-                key: key.to_string(),
-                upload_id: upload_id.clone(),
+            // Same facts `from_legacy` carried. Checksums, request SSE, content MD5, and trailers stay absent.
+            let input = super::super::UploadPartWriteInput {
+                target: super::super::UploadPartTarget::Legacy {
+                    bucket: bucket.clone(),
+                    key: key.to_owned(),
+                    upload_id: upload_id.clone(),
+                },
                 part_number: 1,
                 content_length: Some(3),
-                body: Some(StreamingBlob::from(Bytes::from_static(b"abc"))),
-                ..Default::default()
+                body: Some(crate::app::object::legacy_put_body(StreamingBlob::from(Bytes::from_static(b"abc")))),
+                trailing_headers: None,
+                frame_trailers: None,
+                content_md5: None,
+                checksum_algorithm: None,
+                checksum_crc32: None,
+                checksum_crc32c: None,
+                checksum_crc64nvme: None,
+                checksum_sha1: None,
+                checksum_sha256: None,
+                sse_customer_algorithm: None,
+                sse_customer_key: None,
+                sse_customer_key_md5: None,
             };
             let output = usecase
-                .execute_upload_part_with_audit(
-                    owned_envelope(Method::PUT),
-                    super::super::UploadPartWriteInput::from_legacy(input, None),
-                )
+                .execute_upload_part_with_audit(owned_envelope(Method::PUT), input)
                 .await
                 .expect("upload encrypted KMS part");
             for _ in 0..2 {
@@ -1430,16 +1449,26 @@ mod tests {
         let usecase = DefaultMultipartUsecase::from_global();
         let initial_body = b"initial multipart body";
 
-        let create_input = CreateMultipartUploadInput::builder()
-            .bucket(bucket.clone())
-            .key(object.to_string())
-            .build()
-            .expect("create multipart input should build");
+        let create_input = |bucket: &str| super::super::CreateMultipartUploadFields {
+            bucket: bucket.to_owned(),
+            key: object.to_owned(),
+            metadata: None,
+            tagging: None,
+            storage_class: None,
+            server_side_encryption: None,
+            sse_customer_algorithm: None,
+            sse_customer_key: None,
+            sse_customer_key_md5: None,
+            ssekms_key_id: None,
+            object_lock_legal_hold_status: None,
+            object_lock_mode: None,
+            object_lock_retain_until_date: None,
+        };
         // Same If-None-Match header the s3s create request carried. Credentials, region, and service stay absent.
         let first_created = usecase
             .execute_create_multipart_upload(
                 completion_with_header(http::header::IF_NONE_MATCH, HeaderValue::from_static("*")),
-                super::super::CreateMultipartUploadFields::from_legacy(create_input.clone()),
+                create_input(&bucket),
                 None,
             )
             .await
@@ -1472,7 +1501,7 @@ mod tests {
         let create_err = match usecase
             .execute_create_multipart_upload(
                 completion_with_header(http::header::IF_NONE_MATCH, HeaderValue::from_static("*")),
-                super::super::CreateMultipartUploadFields::from_legacy(create_input.clone()),
+                create_input(&bucket),
                 None,
             )
             .await
@@ -1483,11 +1512,7 @@ mod tests {
         assert_eq!(create_err.code(), &S3ErrorCode::PreconditionFailed);
 
         let second_created = usecase
-            .execute_create_multipart_upload(
-                owned_envelope(Method::POST),
-                super::super::CreateMultipartUploadFields::from_legacy(create_input),
-                None,
-            )
+            .execute_create_multipart_upload(owned_envelope(Method::POST), create_input(&bucket), None)
             .await
             .expect("unconditional create multipart upload should succeed");
         let second_upload_id = second_created.upload_id;
@@ -1641,15 +1666,10 @@ mod tests {
             .expect("delete versioned object to create delete marker");
         assert!(marker.delete_marker);
 
-        let dm_create_input = CreateMultipartUploadInput::builder()
-            .bucket(versioned_bucket.clone())
-            .key(object.to_string())
-            .build()
-            .expect("delete-marker create input");
         let dm_created = usecase
             .execute_create_multipart_upload(
                 completion_with_header(http::header::IF_NONE_MATCH, HeaderValue::from_static("*")),
-                super::super::CreateMultipartUploadFields::from_legacy(dm_create_input),
+                create_input(&versioned_bucket),
                 None,
             )
             .await

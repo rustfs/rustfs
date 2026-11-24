@@ -245,6 +245,7 @@ mod tests {
                         Vec::new()
                     },
                     raw: Default::default(),
+                    profile: Default::default(),
                 },
             )
         }

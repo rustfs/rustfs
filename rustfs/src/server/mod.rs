@@ -16,6 +16,7 @@ mod audit;
 mod compress;
 pub mod cors;
 mod event;
+mod gateway_authorizer;
 mod gateway_handlers;
 #[cfg(test)]
 pub(crate) mod gateway_stack;
@@ -23,7 +24,11 @@ pub(crate) mod gateway_stack;
 mod gateway_stack;
 mod health;
 mod http;
+#[cfg(test)]
+pub(crate) use http::{IAMAuth, iam_lookup_error_to_s3_error, legacy_s3_code_name};
 mod hybrid;
+#[cfg(test)]
+mod iam_auth_test;
 mod layer;
 mod legacy_compat;
 mod module_switch;

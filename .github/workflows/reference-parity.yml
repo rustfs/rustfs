@@ -56,6 +56,7 @@ on:
       - "scripts/s3-tests/reference_parity.py"
       - "scripts/junit_diff.py"
       - "crates/e2e_test/src/dual_stack_differential/**"
+      - "crates/gateway-adapter/tests/fixtures/observability-contract.json"
   schedule:
     - cron: "37 1 * * *"
   workflow_dispatch:
@@ -388,6 +389,24 @@ jobs:
         run: |
           echo "::error::the dual-stack differential failed; see the job summary for every (op, field, a, b)"
           exit 1
+
+      - name: Verify observability and middleware on the pinned reference and candidate
+        if: ${{ !cancelled() && (steps.differential.outcome == 'success' || steps.differential.outcome == 'failure') }}
+        env:
+          RUSTFS_E2E_REFERENCE_BINARY: ${{ steps.reference.outputs.path }}
+        run: |
+          set -euo pipefail
+          export no_proxy="$NO_PROXY"
+          test -x "$RUSTFS_E2E_REFERENCE_BINARY"
+          failed=0
+          for contract in observability middleware; do
+            for side in reference current; do
+              name="dual_stack_differential::${contract}_contract::${side}_${contract}_contract"
+              python3 scripts/e2e_binary.py run --features e2e-test-hooks -- \
+                cargo nextest run --locked -p e2e_test --lib --no-tests fail -E "test(=$name)" || failed=1
+            done
+          done
+          exit "$failed"
 
   compare:
     name: Compare targets

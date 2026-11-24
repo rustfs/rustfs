@@ -226,6 +226,16 @@ pub(crate) mod server {
                 AccessMarkers, ReqInfo, VerifiedSignature, admit_operation, authorize_bucket_config_mutation,
                 authorize_bucket_request, authorize_bucket_tag_deletion, authorize_object_request, resolve_req_info,
             };
+            pub(crate) use crate::storage::storage_api::access_consumer::{
+                AuthorizationRequest, BucketConfigMutationSnapshot, BucketGenerationGuard, CopySourceBucketGenerationGuard,
+                DenialAuditor, ObjectTagConditions, OdmReadGenerationGuard, PendingDeleteBucketGenerationGuard,
+                PostObjectPolicyHeaders, RequestedCopySource, RequestedObjectLegalHold, RequestedObjectLockRetainUntil,
+                RequestedObjectLockRetention, RequestedObjectTags, TableDataPlaneListAccess, TableDataPlanePublicationGuards,
+                authorize_replication_only_put_headers, authorize_request, authorize_staged_multipart_part,
+                authorize_write_etag_condition, destination_version_id, has_write_offset_bytes_header, load_bucket_generation,
+                missing_req_info_error, set_requested_object_lock_retain_until, table_data_plane_content_mutation,
+                versioned_read_action, versioned_tagging_action,
+            };
 
             #[cfg(test)]
             pub(crate) mod test_support {
@@ -443,7 +453,7 @@ pub(crate) mod startup {
     }
 
     pub(crate) mod sse {
-        pub(crate) use crate::storage::storage_api::sse_consumer::log_sse_kms_key_policy_mode;
+        pub(crate) use crate::storage::storage_api::sse_consumer::init_sse_startup;
     }
 
     pub(crate) mod notification {

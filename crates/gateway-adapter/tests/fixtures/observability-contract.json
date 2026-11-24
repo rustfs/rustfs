@@ -1,0 +1,61 @@
+{
+  "reference_version": "1.0.5",
+  "sdk_puts": 20,
+  "s3_metrics": {
+    "rustfs_s3_http_entry_to_dispatch_duration_seconds": [
+      "op",
+      "outcome"
+    ],
+    "rustfs_s3_http_requests_total": [
+      "method",
+      "op",
+      "outcome"
+    ],
+    "rustfs_s3_list_objects_local_read_dir_duration_ms": [
+      "count_mode",
+      "outcome"
+    ],
+    "rustfs_s3_list_objects_local_read_dir_entries": [
+      "count_mode",
+      "outcome"
+    ],
+    "rustfs_s3_list_objects_local_read_dir_limit": [
+      "count_mode"
+    ],
+    "rustfs_s3_list_objects_local_read_dir_total": [
+      "count_mode",
+      "has_filter_prefix",
+      "has_forward",
+      "is_root",
+      "outcome"
+    ],
+    "rustfs_s3_operations_total": [
+      "op"
+    ],
+    "rustfs_s3_put_object_duration_ms": [],
+    "rustfs_s3_put_object_size_bytes": [],
+    "rustfs_s3_put_object_total": []
+  },
+  "audit_fields": [
+    "/accessKey",
+    "/api",
+    "/api/bucket",
+    "/api/name",
+    "/api/object",
+    "/api/status",
+    "/api/status_code",
+    "/api/timeToResponseInNS",
+    "/api/time_to_response",
+    "/event",
+    "/remotehost",
+    "/requestHost",
+    "/requestID",
+    "/requestPath",
+    "/requestQuery",
+    "/responseHeader",
+    "/time",
+    "/trigger",
+    "/userAgent",
+    "/version"
+  ]
+}

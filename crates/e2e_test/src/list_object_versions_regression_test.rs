@@ -19,6 +19,7 @@
 mod tests {
     use crate::common::{RustFSTestEnvironment, init_logging};
     use aws_sdk_s3::Client;
+    use aws_sdk_s3::error::ProvideErrorMetadata;
     use aws_sdk_s3::primitives::ByteStream;
     use aws_sdk_s3::types::{BucketVersioningStatus, VersioningConfiguration};
     use tracing::info;
@@ -177,6 +178,53 @@ mod tests {
             Some(false),
             "Delete marker should no longer be latest after the second put"
         );
+
+        let expected = [
+            (second_version_id.as_str(), false),
+            (delete_marker_version_id.as_str(), true),
+            (first_version_id.as_str(), false),
+        ];
+        let mut key_marker = None;
+        let mut version_marker = None;
+        for (index, (version_id, is_delete_marker)) in expected.iter().copied().enumerate() {
+            let page = client
+                .list_object_versions()
+                .bucket(bucket)
+                .prefix(key)
+                .max_keys(1)
+                .set_key_marker(key_marker)
+                .set_version_id_marker(version_marker)
+                .send()
+                .await
+                .expect("Failed to list a page of object versions");
+            let entry = match (page.versions(), page.delete_markers()) {
+                ([version], []) => (version.key(), version.version_id(), false),
+                ([], [marker]) => (marker.key(), marker.version_id(), true),
+                _ => panic!("Expected exactly one version or delete marker on page {}", index + 1),
+            };
+            assert_eq!(entry, (Some(key), Some(version_id), is_delete_marker));
+            let more = index + 1 < expected.len();
+            assert_eq!(page.is_truncated(), Some(more));
+            if more {
+                assert!(page.next_key_marker().is_some_and(|marker| !marker.is_empty()));
+                assert!(page.next_version_id_marker().is_some_and(|marker| !marker.is_empty()));
+            } else {
+                assert!(page.next_key_marker().is_none());
+                assert!(page.next_version_id_marker().is_none());
+            }
+            key_marker = page.next_key_marker().map(str::to_owned);
+            version_marker = page.next_version_id_marker().map(str::to_owned);
+        }
+
+        let error = client
+            .list_object_versions()
+            .bucket(bucket)
+            .version_id_marker(&first_version_id)
+            .send()
+            .await
+            .expect_err("A version ID marker requires a key marker");
+        assert_eq!(error.raw_response().map(|response| response.status().as_u16()), Some(400));
+        assert_eq!(error.as_service_error().and_then(ProvideErrorMetadata::code), Some("InvalidArgument"));
     }
 
     #[tokio::test]

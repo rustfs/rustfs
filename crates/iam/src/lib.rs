@@ -118,6 +118,7 @@ pub(crate) struct LoadUserNotificationProbe {
 #[cfg(test)]
 tokio::task_local! {
     pub(crate) static LOAD_USER_NOTIFICATION_PROBE: std::sync::Arc<LoadUserNotificationProbe>;
+    pub(crate) static LOAD_SERVICE_ACCOUNT_NOTIFICATION_PROBE: std::sync::Arc<std::sync::Mutex<Vec<String>>>;
 }
 
 pub(crate) async fn notify_iam_load_user(access_key: &str, temp: bool) -> Vec<IamNotificationPeerErr> {
@@ -159,6 +160,15 @@ pub(crate) async fn notify_iam_load_user(access_key: &str, temp: bool) -> Vec<Ia
 }
 
 pub(crate) async fn notify_iam_load_service_account(access_key: &str) -> Vec<IamNotificationPeerErr> {
+    #[cfg(test)]
+    if let Ok(probe) = LOAD_SERVICE_ACCOUNT_NOTIFICATION_PROBE.try_with(std::sync::Arc::clone) {
+        probe
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(access_key.to_owned());
+        return Vec::new();
+    }
+
     match runtime_sources::notification_sys() {
         Some(notification_sys) => notification_sys
             .load_service_account(access_key)

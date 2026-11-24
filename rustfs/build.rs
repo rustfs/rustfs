@@ -15,6 +15,8 @@
 use std::io::Write;
 
 fn main() -> shadow_rs::SdResult<()> {
+    // E2E builds must refresh shadow-rs metadata even when only the Git revision changes.
+    println!("cargo:rerun-if-env-changed=RUSTFS_E2E_BUILD_HEAD");
     if cfg!(feature = "corpus-record") && std::env::var("PROFILE")? != "debug" {
         return Err(std::io::Error::other("corpus-record is restricted to debug test-server builds").into());
     }

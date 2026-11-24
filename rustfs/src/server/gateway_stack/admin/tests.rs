@@ -20,12 +20,14 @@ use crate::admin::operation::AdminResponse;
 use crate::server::gateway_handlers::handler_error;
 use crate::server::gateway_handlers::test_support::{CLIENT, PEER, REQUEST_ID, Signed, request_context, signed_request};
 use crate::server::gateway_stack::admin::{assemble, complete_response, dialect, envelope};
+use crate::server::stack::claims_native_admin_read;
 use crate::shared_types::RemoteAddr;
 use crate::storage_api::server::http::access::ReqInfo;
 use bytes::Bytes;
 use http::{HeaderMap, Method, StatusCode};
 use rustfs_gateway::Answer;
 use rustfs_gateway::{Decision, Handler, HandlerResult, Operation, PathStyleOnly, Req, Resp, decide_with};
+use rustfs_gateway_core::route::Predicate;
 use rustfs_gateway_dialect_rustfs_admin::AdminResponse as WireResponse;
 use rustfs_gateway_dialect_rustfs_admin::ops::{
     get_iceberg_config::GetIcebergConfig, get_v3_datausageinfo::GetV3Datausageinfo, get_v3_info::GetV3Info,
@@ -62,12 +64,18 @@ fn native_admin_registers_only_selected_reads_and_four_claims() {
         dialect.claims().iter().map(|claim| claim.prefix).collect::<Vec<_>>(),
         ["/rustfs/admin", "/minio/admin", "/_iceberg/v1", "/iceberg/v1"]
     );
-    assert!(
-        dialect
-            .claimed_operations()
-            .iter()
-            .all(|operation| operation.entries().len() == 2)
-    );
+    for operation in dialect.claimed_operations() {
+        assert_eq!(operation.entries().len(), 2, "canonical and alias rows for {}", operation.name());
+        for row in operation.entries() {
+            let path = row.template().as_str();
+            assert_eq!(row.entry().selector.predicates(), &[Predicate::Method(Method::GET)], "{path}");
+            let uri = format!("{path}?detail=1").parse().unwrap();
+            assert!(claims_native_admin_read(&Method::GET, &uri), "{uri}");
+            assert!(!claims_native_admin_read(&Method::HEAD, &uri), "{uri}");
+            let neighbor = format!("{path}-neighbor").parse().unwrap();
+            assert!(!claims_native_admin_read(&Method::GET, &neighbor), "{neighbor}");
+        }
+    }
     let stack = GatewayStack::assemble_admin(assembly()).unwrap();
     let mut names = stack.service.operations().collect::<Vec<_>>();
     names.sort();

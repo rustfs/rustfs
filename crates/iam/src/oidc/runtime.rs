@@ -26,15 +26,16 @@ use crate::{
     EVENT_OIDC_DIAGNOSTICS, LOG_COMPONENT_IAM, LOG_SUBSYSTEM_OIDC,
     federation::{
         CoreFederatedAuthorizationMapper, FederatedAuthorizationRule, FederatedAuthorizationRules, FederatedClaims,
-        FederatedIdentityService, FederatedProviderQuery, FederatedProviderRef, FederatedProviderView, FederatedRedirectPolicy,
-        FederationError, OpaqueLogoutContinuation, Result as FederationResult, StandardOidcAuthentication,
-        VerifiedFederatedCodeExchange, VerifiedFederatedIdentity,
+        FederatedIdentityService, FederatedProfile, FederatedProviderQuery, FederatedProviderRef, FederatedProviderView,
+        FederatedRedirectPolicy, FederationError, OpaqueLogoutContinuation, Result as FederationResult,
+        StandardOidcAuthentication, VerifiedFederatedCodeExchange, VerifiedFederatedIdentity,
     },
 };
 use openidconnect::core::{CoreAuthenticationFlow, CoreClient, CoreIdToken};
 use openidconnect::{
-    Audience, AuthType, AuthorizationCode, ClaimsVerificationError, ClientId, ClientSecret, CsrfToken, LogoutRequest, Nonce,
-    PkceCodeChallenge, PkceCodeVerifier, PostLogoutRedirectUrl, RedirectUrl, RequestTokenError, Scope,
+    AsyncHttpClient, Audience, AuthType, AuthorizationCode, ClaimsVerificationError, ClientId, ClientSecret, CsrfToken,
+    LogoutRequest, Nonce, OAuth2TokenResponse, PkceCodeChallenge, PkceCodeVerifier, PostLogoutRedirectUrl, RedirectUrl,
+    RequestTokenError, Scope,
 };
 use rustfs_policy::policy::{ClaimLookup, get_claim_case_insensitive};
 use rustfs_utils::logging::LogThrottle;
@@ -59,6 +60,10 @@ pub(crate) struct OidcClaims {
     pub username: String,
     pub groups: Vec<String>,
     pub raw: HashMap<String, serde_json::Value>,
+    /// Display-only metadata from the ID token, completed from UserInfo during
+    /// code exchange. Never used for policy mapping.
+    #[serde(skip)]
+    pub profile: FederatedProfile,
 }
 
 // ---- Core OIDC system ----
@@ -619,13 +624,49 @@ impl OidcSys {
         // (the crate verifies signature/expiry/nonce; we decode payload for non-standard claims)
         let raw_jwt = id_token.to_string();
         let raw = decode_jwt_payload(&raw_jwt);
+        let sub = extract_string_claim(&raw, "sub");
+
+        let mut profile = FederatedProfile::from_provider_claims(&raw, &config.username_claim, &config.email_claim);
+        let userinfo_endpoint = provider_state
+            .metadata
+            .console()
+            .ok()
+            .and_then(|metadata| metadata.userinfo_endpoint())
+            .map(|endpoint| endpoint.url().as_str().to_string());
+        if !profile.is_complete()
+            && !sub.is_empty()
+            && let Some(userinfo_endpoint) = userinfo_endpoint
+        {
+            match fetch_userinfo_profile(
+                self.provider_runtime.http_client(),
+                &userinfo_endpoint,
+                token_response.access_token().secret(),
+                &sub,
+                config,
+            )
+            .await
+            {
+                Ok(userinfo_profile) => profile.fill_missing_from(userinfo_profile),
+                Err(error) => warn!(
+                    event = EVENT_OIDC_DIAGNOSTICS,
+                    component = LOG_COMPONENT_IAM,
+                    subsystem = LOG_SUBSYSTEM_OIDC,
+                    result = "userinfo_profile_unavailable",
+                    provider_id = %session.provider_id,
+                    userinfo_endpoint = %userinfo_endpoint,
+                    error = %error,
+                    "oidc userinfo profile lookup failed; continuing with ID token claims"
+                ),
+            }
+        }
 
         let claims = OidcClaims {
-            sub: extract_string_claim(&raw, "sub"),
+            sub,
             email: extract_string_claim(&raw, &config.email_claim),
             username: extract_string_claim(&raw, &config.username_claim),
             groups: extract_canonical_group_values(&raw, &config.groups_claim, &config.roles_claim),
             raw,
+            profile,
         };
 
         Ok((claims, session.provider_id.clone(), session, raw_jwt))
@@ -795,6 +836,7 @@ impl OidcSys {
             email: extract_string_claim(&raw_claims, &config.email_claim),
             username: extract_string_claim(&raw_claims, &config.username_claim),
             groups: extract_canonical_group_values(&raw_claims, &config.groups_claim, &config.roles_claim),
+            profile: FederatedProfile::from_provider_claims(&raw_claims, &config.username_claim, &config.email_claim),
             raw: raw_claims,
         };
 
@@ -804,6 +846,56 @@ impl OidcSys {
     pub(crate) fn get_provider_config(&self, id: &str) -> Option<&OidcProviderConfig> {
         self.configs.get(id).map(|provider| &provider.config)
     }
+}
+
+/// Fetch display profile claims from the provider's UserInfo endpoint.
+///
+/// Only called after the ID token was verified, and only for display metadata:
+/// the result never changes the subject, groups, roles or policy-relevant claims.
+/// The request goes through the same outbound policy, CA set and response size
+/// limit as every other provider request. Signed or encrypted UserInfo responses
+/// (`application/jwt`) are not supported and are reported as an error.
+pub(super) async fn fetch_userinfo_profile(
+    http_client: &ReqwestHttpClient,
+    userinfo_endpoint: &str,
+    access_token: &str,
+    expected_subject: &str,
+    config: &OidcProviderConfig,
+) -> Result<FederatedProfile, String> {
+    let request = http::Request::builder()
+        .method(http::Method::GET)
+        .uri(userinfo_endpoint)
+        .header(http::header::ACCEPT, "application/json")
+        .header(http::header::AUTHORIZATION, format!("Bearer {access_token}"))
+        .body(Vec::new())
+        .map_err(|err| format!("invalid userinfo request: {err}"))?;
+    let response = http_client
+        .call(request)
+        .await
+        .map_err(|err| format!("userinfo request failed: {err}"))?;
+    if !response.status().is_success() {
+        return Err(format!("userinfo endpoint returned status {}", response.status().as_u16()));
+    }
+    let content_type = response
+        .headers()
+        .get(http::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default();
+    if content_type.trim_start().to_ascii_lowercase().starts_with("application/jwt") {
+        return Err("signed or encrypted userinfo responses are not supported".to_string());
+    }
+    let claims: HashMap<String, serde_json::Value> =
+        serde_json::from_slice(response.body()).map_err(|err| format!("userinfo response is not a JSON object: {err}"))?;
+    // OIDC Core 5.3.2: a UserInfo response whose `sub` differs from the ID token
+    // `sub` must not be used.
+    if claims.get("sub").and_then(serde_json::Value::as_str) != Some(expected_subject) {
+        return Err("userinfo subject does not match the ID token subject".to_string());
+    }
+    Ok(FederatedProfile::from_provider_claims(
+        &claims,
+        &config.username_claim,
+        &config.email_claim,
+    ))
 }
 
 /// Decode the payload section of a JWT without validation (token must already be verified).
@@ -860,6 +952,7 @@ fn verified_identity(provider: FederatedProviderRef, claims: OidcClaims) -> Veri
             username: claims.username,
             groups: claims.groups,
             raw: claims.raw,
+            profile: claims.profile,
         },
     )
 }

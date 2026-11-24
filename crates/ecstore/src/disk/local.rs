@@ -4868,6 +4868,21 @@ fn mark_presynced_tmp_file(file: impl AsRef<Path>) {
     PRESYNCED_TMP_FILES.insert(file.as_ref(), ());
 }
 
+fn mark_presynced_after_lazy_write(file_path: &Path, volume_dir: &Path, mark_dir_presynced: bool) {
+    if mark_dir_presynced && let Some(parent) = file_path.parent() {
+        mark_presynced_tmp_data_dir(parent);
+        if file_path.file_name() == Some(std::ffi::OsStr::new("part.1"))
+            && let Some(grandparent) = parent.parent()
+            && !volume_dir.as_os_str().is_empty()
+            && grandparent != volume_dir
+            && grandparent.parent() == Some(volume_dir)
+        {
+            return;
+        }
+    }
+    mark_presynced_tmp_file(file_path);
+}
+
 fn unmark_presynced_tmp_file(file: &Path) {
     let _ = PRESYNCED_TMP_FILES.remove(file);
 }
@@ -5011,6 +5026,7 @@ impl LazyLocalFileWriter {
         let sync_on_close = self.sync_on_close;
         let mark_dir_presynced = self.mark_dir_presynced;
         let parent_exists = self.parent_exists;
+        let volume_dir_for_presync = self.volume_dir.clone();
         self.last_integrity_digest = None;
         let write_and_finish = move |mut file: std::fs::File, file_path: PathBuf| {
             let digest = match integrity_spec {
@@ -5039,10 +5055,7 @@ impl LazyLocalFileWriter {
                 reclaim_std_file_cache(&file, reclaim_len, reclaim_on_shutdown);
                 drop(file);
                 if sync_on_close {
-                    if mark_dir_presynced && let Some(parent) = file_path.parent() {
-                        mark_presynced_tmp_data_dir(parent);
-                    }
-                    mark_presynced_tmp_file(file_path);
+                    mark_presynced_after_lazy_write(&file_path, &volume_dir_for_presync, mark_dir_presynced);
                 }
                 Ok((None, wire_len, digest))
             } else {
@@ -5261,10 +5274,7 @@ impl AsyncWrite for LazyLocalFileWriter {
                             }
                         }
                         if sync_on_close {
-                            if mark_dir_presynced && let Some(parent) = file_path.parent() {
-                                mark_presynced_tmp_data_dir(parent);
-                            }
-                            mark_presynced_tmp_file(file_path);
+                            mark_presynced_after_lazy_write(&file_path, &volume_dir, mark_dir_presynced);
                         }
                         Ok(())
                     }));
@@ -10631,22 +10641,21 @@ impl LocalDisk {
 
         // TODO(backlog): make disk space checks and trash cleanup event-driven instead of poll-based
 
-        let trash_path = self.io_get_object_path(RUSTFS_META_TMP_DELETED_BUCKET, Uuid::new_v4().to_string().as_str())?;
-        // if let Some(parent) = trash_path.parent() {
-        //     if !parent.exists() {
-        //         fs::create_dir_all(parent).await?;
-        //     }
-        // }
-
         let multipart_check = self.multipart_delete_check(delete_path, true)?;
         if let Some(check) = &multipart_check {
             multipart_source_state::invalidate_active_multipart_source_head(check.source());
         }
+        let trash_key = Uuid::new_v4().to_string();
+        let (trash_base_dir, trash_path) = if cfg!(target_os = "linux") && (recursive || multipart_check.is_some()) {
+            self.io_get_bucket_and_object_open_path(RUSTFS_META_TMP_DELETED_BUCKET, &trash_key)?
+        } else {
+            self.io_get_bucket_and_object_path(RUSTFS_META_TMP_DELETED_BUCKET, &trash_key)?
+        };
         let err = if let Some(check) = &multipart_check {
             if !recursive {
                 let delete_path_owned = delete_path.clone();
                 let trash_path_owned = trash_path.clone();
-                let base_dir = self.io_get_bucket_path(RUSTFS_META_TMP_DELETED_BUCKET)?;
+                let base_dir = trash_base_dir;
                 let root = self.publication_root.clone();
                 let callback = check.callback();
                 let lease = os::acquire_namespace_mutation_lease_with_owner(&trash_path_owned, namespace_owner.clone()).await;
@@ -10687,7 +10696,7 @@ impl LocalDisk {
             } else {
                 let delete_path_owned = delete_path.clone();
                 let trash_path_owned = trash_path.clone();
-                let base_dir = self.io_get_bucket_path(RUSTFS_META_TMP_DELETED_BUCKET)?;
+                let base_dir = trash_base_dir;
                 let root = self.publication_root.clone();
                 let callback = check.callback();
                 let lease = os::acquire_namespace_mutation_lease_with_owner(&trash_path_owned, namespace_owner.clone()).await;
@@ -10710,7 +10719,7 @@ impl LocalDisk {
             os::rename_all_ignore_missing_source_with_owner(
                 delete_path,
                 trash_path,
-                self.io_get_bucket_path(RUSTFS_META_TMP_DELETED_BUCKET)?,
+                trash_base_dir,
                 &self.publication_root,
                 namespace_owner.clone(),
             )
@@ -10734,11 +10743,16 @@ impl LocalDisk {
         };
 
         if multipart_check.is_none() && (immediate_purge || delete_path.to_string_lossy().ends_with(SLASH_SEPARATOR)) {
-            let trash_path2 = self.io_get_object_path(RUSTFS_META_TMP_DELETED_BUCKET, Uuid::new_v4().to_string().as_str())?;
+            let trash_key2 = Uuid::new_v4().to_string();
+            let (trash_base_dir2, trash_path2) = if cfg!(target_os = "linux") {
+                self.io_get_bucket_and_object_open_path(RUSTFS_META_TMP_DELETED_BUCKET, &trash_key2)?
+            } else {
+                self.io_get_bucket_and_object_path(RUSTFS_META_TMP_DELETED_BUCKET, &trash_key2)?
+            };
             let _ = os::rename_all_ignore_missing_source_with_owner(
                 encode_dir_object(delete_path.to_string_lossy().as_ref()),
                 trash_path2,
-                self.io_get_bucket_path(RUSTFS_META_TMP_DELETED_BUCKET)?,
+                trash_base_dir2,
                 &self.publication_root,
                 namespace_owner.clone(),
             )
@@ -11014,14 +11028,13 @@ impl LocalDisk {
         staging_cleanup: Option<&StagingCleanupLease>,
     ) -> Result<()> {
         let namespace_owner = self.validate_multipart_delete_owner(&source_owner, volume, path)?;
-        let volume_dir = self.io_get_bucket_path(volume)?;
+        let (volume_dir, file_path) = self.io_get_bucket_and_object_path(volume, path)?;
         if !skip_access_checks(volume)
             && let Err(e) = cached_access(&volume_dir).await
         {
             return Err(to_access_error(e, DiskError::VolumeAccessDenied).into());
         }
 
-        let file_path = self.io_get_object_path(volume, path)?;
         check_path_length(file_path.to_string_lossy().as_ref())?;
         let multipart_check = self.multipart_delete_check(&file_path, opt.recursive)?;
         if !source_owner.is_validated()
@@ -11416,7 +11429,7 @@ impl LocalDisk {
             if let Some(dir_path) = delete_path
                 .parent()
                 .filter(|parent| *parent != base_path && parent.starts_with(base_path))
-                && (!recursive || dir_path.is_dir())
+                && (!recursive || (std::fs::symlink_metadata(dir_path.join(STORAGE_FORMAT_FILE)).is_err() && dir_path.is_dir()))
             {
                 self.delete_file_with_namespace_owner(
                     base_path,
@@ -42141,8 +42154,8 @@ mod test {
 
         assert_eq!(
             disk.blocking_queue.submitted_jobs_for_test() - jobs_before_put,
-            2,
-            "non-inline rename_data with presynced shard must submit 1 Fsync commit job + 1 Foreground staging-cleanup job"
+            1,
+            "non-inline rename_data with presynced shard must submit exactly 1 blocking-queue job (on the Fsync lane)"
         );
         assert_eq!(
             disk.blocking_queue.submitted_fsync_jobs_for_test() - fsync_jobs_before_put,
@@ -42159,6 +42172,117 @@ mod test {
             "presynced non-inline commit must fsync the staged data directory once before rename"
         );
 
+        // 1b. Non-inline overwrite + old data-dir delete_data_dir:
+        //     2-level part.1 must mark only PRESYNCED_TMP_DATA_DIRS (not PRESYNCED_TMP_FILES),
+        //     overwrite rename_data must run in 1 Fsync job, and recursive delete_data_dir
+        //     must skip the parent rmdir job when xl.meta is present.
+        let data_dir2 = Uuid::new_v4();
+        let stage_id2 = Uuid::new_v4().to_string();
+        let part_rel2 = format!("{stage_id2}/{data_dir2}/part.1");
+        let mut writer2 = disk
+            .create_file(bucket, RUSTFS_META_TMP_BUCKET, &part_rel2, payload.len() as i64)
+            .await
+            .expect("create_file for overwrite part.1");
+        tokio::io::AsyncWriteExt::write_all(&mut writer2, &payload)
+            .await
+            .expect("write overwrite payload");
+        tokio::io::AsyncWriteExt::shutdown(&mut writer2)
+            .await
+            .expect("shutdown overwrite writer");
+        drop(writer2);
+        let staged_part2_path = disk
+            .get_object_path_for_io(RUSTFS_META_TMP_BUCKET, &part_rel2)
+            .expect("staged overwrite part path");
+        assert!(
+            !take_presynced_tmp_file(&staged_part2_path),
+            "2-level non-inline PUT part.1 must not insert an unused entry into PRESYNCED_TMP_FILES"
+        );
+
+        let jobs_before_overwrite = disk.blocking_queue.submitted_jobs_for_test();
+        let mut fi2 = test_file_info(object, Uuid::nil(), Some(data_dir2), None);
+        fi2.size = payload.len() as i64;
+        fi2.parts[0].size = payload.len();
+        fi2.parts[0].actual_size = payload.len() as i64;
+        let overwrite_resp = disk
+            .rename_data(RUSTFS_META_TMP_BUCKET, &stage_id2, fi2.clone(), bucket, object)
+            .await
+            .expect("non-inline overwrite rename_data");
+        assert_eq!(overwrite_resp.cleanup_data_dir, Some(data_dir));
+        assert_eq!(
+            disk.blocking_queue.submitted_jobs_for_test() - jobs_before_overwrite,
+            1,
+            "non-inline overwrite rename_data must submit 1 blocking-queue job"
+        );
+
+        let jobs_before_old_dir_del = disk.blocking_queue.submitted_jobs_for_test();
+        let old_dir_status = disk
+            .delete_data_dir(
+                bucket,
+                &format!("{object}/{data_dir}"),
+                DeleteOptions {
+                    recursive: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("reclaim overwritten data_dir");
+        assert_eq!(old_dir_status, DataDirDeleteStatus::Deleted);
+        assert_eq!(
+            disk.blocking_queue.submitted_jobs_for_test() - jobs_before_old_dir_del,
+            1,
+            "recursive delete_data_dir on a live object with xl.meta must skip the redundant parent rmdir job"
+        );
+
+        // 1c. Metadata-less recursive delete_data_dir must still prune its emptied parent directory,
+        //     and fused rename_data must reject a forged TMP multipart retirement anchor with PermissionDenied.
+        let metaless_obj = "metaless-obj";
+        let metaless_dd = Uuid::new_v4();
+        disk.write_all(bucket, &format!("{metaless_obj}/{metaless_dd}/part.1"), Bytes::from_static(b"orphan"))
+            .await
+            .expect("stage metadata-less data dir");
+        disk.delete_data_dir(
+            bucket,
+            &format!("{metaless_obj}/{metaless_dd}"),
+            DeleteOptions {
+                recursive: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("delete metadata-less data dir");
+        assert!(
+            !bucket_dir.join(metaless_obj).exists(),
+            "recursive delete_data_dir must prune the parent object directory when xl.meta is absent"
+        );
+
+        let forged_stage = Uuid::new_v4().to_string();
+        let forged_dd = Uuid::new_v4();
+        disk.write_all(
+            RUSTFS_META_TMP_BUCKET,
+            &format!("{forged_stage}/{forged_dd}/part.1"),
+            Bytes::from_static(b"payload"),
+        )
+        .await
+        .expect("stage forged data dir");
+        std::fs::write(
+            tmp_dir
+                .join(&forged_stage)
+                .join(forged_dd.to_string())
+                .join(multipart_source_state::RETIREMENT_ANCHOR),
+            b"forged",
+        )
+        .expect("write forged retirement anchor");
+        let mut forged_fi = test_file_info("forged-target", Uuid::nil(), Some(forged_dd), None);
+        forged_fi.size = 7;
+        let forged_err = disk
+            .rename_data(RUSTFS_META_TMP_BUCKET, &forged_stage, forged_fi, bucket, "forged-target")
+            .await
+            .expect_err("forged TMP retirement anchor must be rejected on fused path");
+        assert!(
+            matches!(forged_err, DiskError::Io(ref io_err) if io_err.kind() == ErrorKind::PermissionDenied),
+            "forged TMP retirement anchor must preserve DiskError::Io(PermissionDenied), got: {forged_err:?}"
+        );
+
         // 2. Fused recoverable DELETE (Stage 1 -> Stage 2 -> Stage 3):
         //    Must execute in 3 Fsync blocking-queue jobs (plus at most 1 reserve replenish job if reserve was disarmed)
         //    and 7 directory fsyncs under Strict mode (Stage 1: 4, Stage 2: 1, Stage 3: 2).
@@ -42172,7 +42296,7 @@ mod test {
             old_data_dir: Some(del_tx),
             ..Default::default()
         };
-        disk.delete_version(bucket, object, fi, false, del_opts)
+        disk.delete_version(bucket, object, fi2, false, del_opts)
             .await
             .expect("recoverable delete stage 1");
         let (journal, sole, satisfied) = disk

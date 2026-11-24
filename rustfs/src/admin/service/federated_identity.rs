@@ -18,7 +18,10 @@ use crate::admin::{
     runtime_sources::{current_action_credentials, current_ready_iam_handle, current_token_signing_key},
 };
 use rustfs_iam::{
-    federation::{FederatedSessionBinding, FederatedSessionBindingError, FederatedSessionTransaction, OIDC_VIRTUAL_PARENT_CLAIM},
+    federation::{
+        FederatedSessionBinding, FederatedSessionBindingError, FederatedSessionTransaction, OIDC_PROFILE_CLAIM,
+        OIDC_VIRTUAL_PARENT_CLAIM,
+    },
     store::{MappedPolicy, object::ObjectStore},
     sys::{IamSys, OIDC_EXPLICIT_POLICIES_CLAIM, OIDC_ISSUER_CLAIM, is_safe_claim_policy_name},
 };
@@ -121,6 +124,11 @@ fn build_oidc_token_claims(transaction: &FederatedSessionTransaction) -> HashMap
     }
     if !authorization.username().is_empty() {
         token_claims.insert("preferred_username".to_string(), Value::String(authorization.username().to_string()));
+    }
+    // A nested object, so policy condition expansion (string claims only)
+    // never sees display metadata such as a user-editable name.
+    if let Some(profile) = authorization.profile().to_claim_value() {
+        token_claims.insert(OIDC_PROFILE_CLAIM.to_string(), profile);
     }
     if !authorization.mapped_iam_groups().is_empty() {
         token_claims.insert(
@@ -473,7 +481,7 @@ mod tests {
     use super::*;
     use crate::admin::runtime_sources::{AppContext, current_object_store_handle, publish_test_app_context};
     use hmac::{Hmac, KeyInit, Mac};
-    use rustfs_iam::federation::FederatedAuthorizationFixture;
+    use rustfs_iam::federation::{FederatedAuthorizationFixture, FederatedProfile};
     use rustfs_iam::store::{
         Store, UserType,
         object::{IAM_CONFIG_POLICIES_PREFIX, IAM_CONFIG_PREFIX},
@@ -499,6 +507,7 @@ mod tests {
                 ("iss".to_string(), serde_json::json!("https://idp.example.test")),
                 ("raw_poison".to_string(), serde_json::json!("must-not-leak")),
             ]),
+            profile: FederatedProfile::default(),
             policies: vec!["readwrite".to_string()],
             group_claim_policies: Vec::new(),
             mapped_iam_groups: vec!["devs".to_string()],
@@ -579,6 +588,33 @@ mod tests {
                 ("roles".to_string(), serde_json::json!(["admin", "reader"])),
             ])
         );
+    }
+
+    #[test]
+    fn token_claims_store_display_profile_as_nested_object() {
+        let mut authorization = authorization_fixture();
+        authorization.profile = FederatedProfile::from_claim_value(&serde_json::json!({
+            "username": "jane",
+            "name": "Jane Doe",
+            "picture": "https://idp.example.test/jane.png",
+        }));
+        let transaction = transaction_from_fixture(authorization);
+
+        let claims = build_oidc_token_claims(&transaction);
+
+        assert_eq!(
+            claims.get(OIDC_PROFILE_CLAIM),
+            Some(&serde_json::json!({
+                "username": "jane",
+                "name": "Jane Doe",
+                "picture": "https://idp.example.test/jane.png",
+            }))
+        );
+        // The ID token claims that policies read stay exactly as before.
+        assert_eq!(claims.get("preferred_username"), Some(&serde_json::json!("user")));
+        assert_eq!(claims.get("email"), Some(&serde_json::json!("user@example.com")));
+        assert!(!claims.contains_key("name"));
+        assert!(!claims.contains_key("picture"));
     }
 
     #[test]

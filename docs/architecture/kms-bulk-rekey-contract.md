@@ -1,7 +1,7 @@
 # KMS Bulk Rekey Job Contract
 
 **Use this when:** changing the bulk envelope re-wrap sweep (`rustfs/src/kms_rekey.rs`), its admin endpoints (`rustfs/src/admin/handlers/kms_rekey.rs`), the re-wrap primitive, or anything that decides which objects a rekey may touch.
-**Source of truth:** `rustfs/src/kms_rekey.rs`, `rustfs/src/admin/handlers/kms_rekey.rs`, `rewrap_object_encryption_metadata` in `rustfs/src/storage/sse.rs`, `KmsManager::rewrap_data_key` / `KmsManager::describe_data_key_wrapping` in `crates/kms/src/manager.rs`, `put_object_metadata` in `crates/ecstore/src/set_disk/ops/object.rs`.
+**Source of truth:** `rustfs/src/kms_rekey.rs`, `rustfs/src/admin/handlers/kms_rekey.rs`, `rewrap_object_encryption_metadata` in `crates/sse/src/core/rewrap.rs`, `KmsManager::rewrap_data_key` / `KmsManager::describe_data_key_wrapping` in `crates/kms/src/manager.rs`, `put_object_metadata` in `crates/ecstore/src/set_disk/ops/object.rs`.
 
 The bulk rekey job re-wraps stored data-key envelopes under the current key-encryption key (KEK) without rewriting object bodies. This document is the acceptance bar; where the shipped v1 sweep deliberately narrows it, [Implementation Status](#implementation-status-v1-sweep) records the deviation.
 
@@ -52,7 +52,7 @@ Idempotency comes from object metadata itself: the envelope's state is the targe
 
 ### Reading the wrapping KEK version
 
-There is no key-version metadata key. Object metadata carries the key id (`x-rustfs-encryption-key-id`) and the sealed blob under `x-rustfs-encryption-key`; `DecryptResponse` in `crates/kms/src/types.rs` does not report a version either. The version is recoverable because the sealed blob is structured: for every backend that builds one, the ciphertext is the JSON of `DataKeyEnvelope` (`crates/kms/src/encryption/dek.rs`), and the read path already discriminates on it via `is_data_key_envelope` in `rustfs/src/storage/sse.rs`.
+There is no key-version metadata key. Object metadata carries the key id (`x-rustfs-encryption-key-id`) and the sealed blob under `x-rustfs-encryption-key`; `DecryptResponse` in `crates/kms/src/types.rs` does not report a version either. The version is recoverable because the sealed blob is structured: for every backend that builds one, the ciphertext is the JSON of `DataKeyEnvelope` (`crates/kms/src/encryption/dek.rs`), and the read path already discriminates on it via `is_data_key_envelope` in `crates/sse/src/core/read.rs`.
 
 | Backend | Rotates | Where the wrapping version lives | Recoverable by a scan |
 |---|---|---|---|
@@ -95,7 +95,7 @@ Replication destinations are unresolved: propagation depends on `rustfs/backlog#
 
 Three properties of `put_object_metadata` (`crates/ecstore/src/set_disk/ops/object.rs`) constrain the re-wrap write:
 
-- **The merge is additive; it cannot remove keys.** Overwriting a key that keeps its name is safe; a re-wrap that changes *which* keys describe the envelope leaves the old keys behind. This is a live hazard: `parse_minio_managed_sealed_key` in `rustfs/src/storage/sse.rs` selects the MinIO decrypt branch on the mere presence of the MinIO seal-algorithm header, so a RustFS-native envelope written onto MinIO-compatible headers without neutralizing them steers reads down the stale branch. Any envelope-shape change must neutralize superseded keys in the same write.
+- **The merge is additive; it cannot remove keys.** Overwriting a key that keeps its name is safe; a re-wrap that changes *which* keys describe the envelope leaves the old keys behind. This is a live hazard: `parse_minio_managed_sealed_key` in `crates/sse/src/core/keying/object.rs` selects the MinIO decrypt branch on the mere presence of the MinIO seal-algorithm header, so a RustFS-native envelope written onto MinIO-compatible headers without neutralizing them steers reads down the stale branch. Any envelope-shape change must neutralize superseded keys in the same write.
 - **Object-lock retention is enforced before the merge.** `check_object_lock_retention_update` (`crates/ecstore/src/set_disk/mod.rs`) runs first; rekey inherits its decision and must not acquire a bypass.
 - **`mod_time` is preserved unless the caller sets it.** The re-wrap path leaves it unset so age-based lifecycle rules are not perturbed.
 

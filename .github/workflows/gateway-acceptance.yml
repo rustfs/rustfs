@@ -157,6 +157,7 @@ jobs:
     env:
       ENDPOINT: http://127.0.0.1:9000
       CONFORMANCE_ENDPOINT: http://127.0.0.1:19000
+      CREATE_BUCKET_ENDPOINT: http://127.0.0.1:19001
       # The conformance suite signs with these fixed fixture credentials (the AWS
       # documentation example pair), so the candidate is started with them and the
       # client matrix is handed the same pair.
@@ -313,6 +314,47 @@ jobs:
           fi
           echo "$?" > ../lane/matrix-exit.txt
 
+      - name: Start isolated bucket creation candidate
+        id: create_bucket_host
+        env:
+          ENDPOINT: ${{ env.CREATE_BUCKET_ENDPOINT }}
+          HOST_DIR: lane/create-bucket
+          RUSTFS_CONSOLE_ENABLE: "false"
+          RUSTFS_SERVER_DOMAINS: s3.example.com,s3.us-east-1.example.com
+        run: *start-candidate
+
+      - name: Require bucket creation conformance
+        run: |
+          cases=(c-bkt-0001 c-bkt-0010 c-host-0003)
+          status=0
+          for id in "${cases[@]}"; do
+            tools/rustfs-gateway-conformance run --root gateway/conformance --profile rustfs \
+              --filter "$id" --endpoint "$CREATE_BUCKET_ENDPOINT" --allow-external-fixtures --allow-external-writes \
+              --json "lane/create-bucket/$id.json" || status=1
+          done
+          python3 - "$CREATE_BUCKET_ENDPOINT" "${cases[@]}" <<'PY'
+          import json
+          import sys
+          from pathlib import Path
+
+          endpoint, *case_ids = sys.argv[1:]
+          for case_id in case_ids:
+              report = json.loads(Path(f"lane/create-bucket/{case_id}.json").read_text())
+              if report.get("endpoint") != endpoint or report.get("profile") != "rustfs":
+                  sys.exit(f"{case_id}: report does not identify the requested RustFS endpoint")
+              observed = [(case["id"], case["phase"], case["verdict"]) for case in report["cases"]]
+              if report.get("validate_only") is not False or observed != [(case_id, "execute", "passed")]:
+                  sys.exit(f"{case_id}: expected one executed pass, got {observed}, validate_only={report.get('validate_only')}")
+          PY
+          exit "$status"
+
+      - name: Stop bucket creation candidate
+        if: always() && steps.create_bucket_host.outcome != 'skipped'
+        run: |
+          if [[ -f lane/create-bucket/rustfs.pid ]]; then
+            kill "$(cat lane/create-bucket/rustfs.pid)" 2>/dev/null || true
+          fi
+
       - name: Judge and summarize
         if: always()
         run: |
@@ -334,6 +376,7 @@ jobs:
             lane/matrix-host/*.txt
             lane/matrix-host/*.log
             lane/report.json
+            lane/create-bucket/c-*.json
             lane/compat/matrix.json
             lane/compat/probe.jsonl
             lane/compat/sut.log

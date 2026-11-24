@@ -99,6 +99,13 @@ impl DelegationOwnerIdentity {
     }
 }
 
+fn validate_iam_record_name(name: &str) -> Result<()> {
+    if matches!(name, "" | "." | "..") || name.contains(['/', '\\', '\0']) {
+        return Err(Error::InvalidArgument);
+    }
+    Ok(())
+}
+
 fn validate_regular_user_identity(name: &str, identity: &mut UserIdentity) -> Result<()> {
     // As in load_user_identity_with, legacy records may use the object name as their access key.
     if identity.credentials.access_key.is_empty() {
@@ -700,13 +707,9 @@ impl ObjectStore {
         Ok(serde_json::from_slice(&outcome.plain)?)
     }
 
-    async fn read_regular_user_record<Item: DeserializeOwned>(&self, name: &str) -> Result<Option<(Item, String)>> {
-        if matches!(name, "" | "." | "..") || name.contains(['/', '\\', '\0']) {
-            return Err(Error::InvalidArgument);
-        }
-        let path = get_user_identity_path(name, UserType::Reg);
+    async fn read_iam_record_with_revision<Item: DeserializeOwned>(&self, path: &str) -> Result<Option<(Item, String)>> {
         let existing =
-            read_config_preserve_empty_with_metadata_opts(self.object_api.clone(), &path, &LoadMode::Locked.read_opts()).await;
+            read_config_preserve_empty_with_metadata_opts(self.object_api.clone(), path, &LoadMode::Locked.read_opts()).await;
         match existing.map_err(Error::from) {
             Ok((data, metadata)) => {
                 let record = Self::decode_iam_config_strict(&data)?;
@@ -719,6 +722,12 @@ impl ObjectStore {
             Err(err) if is_err_config_not_found(&err) => Ok(None),
             Err(err) => Err(err),
         }
+    }
+
+    async fn read_regular_user_record<Item: DeserializeOwned>(&self, name: &str) -> Result<Option<(Item, String)>> {
+        validate_iam_record_name(name)?;
+        let path = get_user_identity_path(name, UserType::Reg);
+        self.read_iam_record_with_revision(&path).await
     }
 
     async fn read_plugin_delegation_owner(&self, name: &str) -> Result<(DelegationOwnerIdentity, String)> {
@@ -741,9 +750,7 @@ impl ObjectStore {
     }
 
     async fn save_regular_user_record(&self, name: &str, record: &DelegationOwnerIdentity, revision: Option<&str>) -> Result<()> {
-        if matches!(name, "" | "." | "..") || name.contains(['/', '\\', '\0']) {
-            return Err(Error::InvalidArgument);
-        }
+        validate_iam_record_name(name)?;
         let path = get_user_identity_path(name, UserType::Reg);
         let conditions = match revision {
             Some("" | "*") => return Err(Error::IAMActionNotAllowed),
@@ -1120,6 +1127,107 @@ impl Store for ObjectStore {
         self.delete_iam_config(get_user_identity_path(name, user_type))
             .await
             .map_err(|err| map_delete_user_identity_error(name, err))?;
+        Ok(())
+    }
+
+    async fn service_account_revision(&self, name: &str) -> Result<Option<(UserIdentity, String)>> {
+        validate_iam_record_name(name)?;
+        let path = get_user_identity_path(name, UserType::Svc);
+        let Some((mut identity, revision)) = self.read_iam_record_with_revision::<UserIdentity>(&path).await? else {
+            return Ok(None);
+        };
+        if identity.credentials.access_key.is_empty() {
+            identity.credentials.access_key = name.to_owned();
+        }
+        if identity.credentials.claims.is_none() && !identity.credentials.session_token.is_empty() {
+            identity.credentials.claims = Some(extract_jwt_claims_allow_missing_exp(&identity)?);
+        }
+        let claim_parent_matches = identity
+            .credentials
+            .claims
+            .as_ref()
+            .and_then(|claims| claims.get("parent"))
+            .is_none_or(|parent| parent.as_str() == Some(identity.credentials.parent_user.as_str()));
+        if identity.credentials.access_key != name
+            || !identity.credentials.is_service_account()
+            || identity.credentials.parent_user.is_empty()
+            || !claim_parent_matches
+        {
+            return Err(Error::IAMActionNotAllowed);
+        }
+        Ok(Some((identity, revision)))
+    }
+
+    async fn delete_service_account_revision(&self, name: &str, revision: &str) -> Result<()> {
+        validate_iam_record_name(name)?;
+        if revision.is_empty() || revision == "*" {
+            return Err(Error::IAMActionNotAllowed);
+        }
+
+        let policy_path = get_mapped_policy_path(name, UserType::Svc, false);
+        let policy_revision = match read_config_preserve_empty_with_metadata_opts(
+            self.object_api.clone(),
+            &policy_path,
+            &LoadMode::Locked.read_opts(),
+        )
+        .await
+        .map_err(Error::from)
+        {
+            Ok((_, metadata)) => metadata.etag.filter(|tag| !tag.is_empty() && tag != "*"),
+            Err(err) if is_err_config_not_found(&err) => None,
+            Err(err) => return Err(err),
+        };
+
+        // Conditionally delete the identity before touching any mapped policy. Keep `delete_prefix`
+        // false so ECStore evaluates `If-Match` against the current identity object revision.
+        let identity_path = get_user_identity_path(name, UserType::Svc);
+        let identity_opts = IamObjectOptions {
+            http_preconditions: Some(HTTPPreconditions {
+                if_match: Some(revision.to_owned()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        match self
+            .object_api
+            .delete_object(Self::BUCKET_NAME, &identity_path, identity_opts)
+            .await
+        {
+            Ok(_) => {}
+            Err(IamStorageError::PreconditionFailed) => return Err(Error::IAMActionNotAllowed),
+            Err(IamStorageError::FileNotFound | IamStorageError::ObjectNotFound(_, _)) => {
+                return Err(Error::NoSuchServiceAccount(name.to_owned()));
+            }
+            Err(err) => return Err(err.into()),
+        }
+
+        if let Some(policy_etag) = policy_revision {
+            let policy_opts = IamObjectOptions {
+                http_preconditions: Some(HTTPPreconditions {
+                    if_match: Some(policy_etag),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            };
+            match self
+                .object_api
+                .delete_object(Self::BUCKET_NAME, &policy_path, policy_opts)
+                .await
+            {
+                Ok(_)
+                | Err(
+                    IamStorageError::PreconditionFailed | IamStorageError::FileNotFound | IamStorageError::ObjectNotFound(_, _),
+                ) => {}
+                Err(err) => {
+                    debug!(
+                        name = %MaskedAccessKey(name),
+                        error = ?err,
+                        "Failed to clean up service account mapped policy after conditional delete"
+                    );
+                }
+            }
+        }
+
         Ok(())
     }
     async fn load_user_identity(&self, name: &str, user_type: UserType) -> Result<UserIdentity> {
@@ -2541,5 +2649,273 @@ mod tests {
                 assert_eq!(decrypted.source, DecryptSource::OldMasterKey);
             },
         );
+    }
+
+    fn test_service_account_identity(access_key: &str, parent_user: &str, secret_key: &str) -> crate::store::UserIdentity {
+        let claims = std::collections::HashMap::from([
+            ("accessKey".to_owned(), serde_json::Value::String(access_key.to_owned())),
+            ("parent".to_owned(), serde_json::Value::String(parent_user.to_owned())),
+            (
+                rustfs_policy::policy::iam_policy_claim_name_sa(),
+                serde_json::Value::String(rustfs_credentials::INHERITED_POLICY_TYPE.to_owned()),
+            ),
+        ]);
+        let session_token = rustfs_policy::auth::jwt_sign(&claims, secret_key).expect("sign service account token");
+        // Omit in-memory `claims` just like persisted records written by `new_service_account`.
+        crate::store::UserIdentity::new(Credentials {
+            access_key: access_key.to_owned(),
+            secret_key: secret_key.to_owned(),
+            session_token,
+            parent_user: parent_user.to_owned(),
+            status: rustfs_policy::auth::ACCOUNT_ON.to_owned(),
+            claims: None,
+            ..Default::default()
+        })
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn service_account_conditional_delete_preserves_replacement_account_and_policy() {
+        use crate::cache::Cache;
+        use crate::store::{MappedPolicy, Store, UserType};
+        use std::collections::HashMap;
+
+        let _credentials = test_cred();
+        let temp = tempfile::tempdir().expect("service account fixture directory");
+        let env = Box::pin(
+            rustfs_test_utils::TestECStoreEnv::builder()
+                .base_dir(temp.path())
+                .init_bucket_metadata(false)
+                .build(),
+        )
+        .await;
+        let store = ObjectStore::new(env.ecstore);
+        store
+            .save_iam_config(serde_json::json!({"version": 1}), format!("{}/format.json", *super::IAM_CONFIG_PREFIX))
+            .await
+            .expect("seed IAM format config");
+        let key_with_policy = "sa-cond-with-policy";
+        let key_without_policy = "sa-cond-no-policy";
+
+        for (access_key, seed_initial_policy) in [(key_with_policy, true), (key_without_policy, false)] {
+            let initial = test_service_account_identity(access_key, "alice", "initialServiceSecret123");
+            store
+                .save_user_identity(access_key, UserType::Svc, initial, None)
+                .await
+                .expect("save initial service account");
+            if seed_initial_policy {
+                store
+                    .save_mapped_policy(access_key, UserType::Svc, false, MappedPolicy::new("writeonly"), None)
+                    .await
+                    .expect("save initial service account mapped policy");
+            }
+
+            let (loaded, rev1) = store
+                .service_account_revision(access_key)
+                .await
+                .expect("read initial revision")
+                .expect("service account should exist");
+            assert_eq!(loaded.credentials.parent_user, "alice");
+
+            // Simulate a second node replacing the service account and attaching a policy before delete.
+            let replacement = test_service_account_identity(access_key, "bob", "replacementServiceSecret123");
+            store
+                .save_user_identity(access_key, UserType::Svc, replacement, None)
+                .await
+                .expect("replace service account");
+            store
+                .save_mapped_policy(access_key, UserType::Svc, false, MappedPolicy::new("readonly"), None)
+                .await
+                .expect("save replacement mapped policy");
+
+            let err = store
+                .delete_service_account_revision(access_key, &rev1)
+                .await
+                .expect_err("stale revision delete must be rejected");
+            assert!(matches!(err, Error::IAMActionNotAllowed), "got {err:?}");
+
+            // Both the replacement identity and its mapped policy must survive intact.
+            let (after_mismatch, rev2) = store
+                .service_account_revision(access_key)
+                .await
+                .expect("reload replacement")
+                .expect("replacement identity must survive");
+            assert_eq!(after_mismatch.credentials.parent_user, "bob");
+            let mut policies = HashMap::new();
+            store
+                .load_mapped_policy(access_key, UserType::Svc, false, &mut policies)
+                .await
+                .expect("replacement mapped policy must survive");
+            assert_eq!(policies[access_key].policies, "readonly");
+
+            // Deleting with the current revision removes the replacement identity and its policy cleanly.
+            store
+                .delete_service_account_revision(access_key, &rev2)
+                .await
+                .expect("current revision delete should succeed");
+            assert!(
+                store
+                    .service_account_revision(access_key)
+                    .await
+                    .expect("check deleted service account")
+                    .is_none()
+            );
+            let mut after_delete_policies = HashMap::new();
+            let err = store
+                .load_mapped_policy(access_key, UserType::Svc, false, &mut after_delete_policies)
+                .await
+                .expect_err("mapped policy must be deleted");
+            assert!(crate::error::is_err_no_such_policy(&err), "got {err:?}");
+        }
+
+        let cache = Cache::default();
+        store.load_all(&cache).await.expect("load_all after conditional deletes");
+        assert!(cache.snapshot().users.is_empty(), "no ghost service accounts after delete");
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn service_account_owner_delete_mismatch_emits_no_notification_and_admin_cleans_corrupt_record() {
+        use crate::LOAD_SERVICE_ACCOUNT_NOTIFICATION_PROBE;
+        use crate::manager::IamCache;
+        use crate::store::{MappedPolicy, Store, UserType};
+        use crate::sys::IamSys;
+        use std::collections::HashMap;
+        use std::sync::{Arc, Mutex};
+
+        let _credentials = test_cred();
+        let temp = tempfile::tempdir().expect("iam service account directory");
+        let env = Box::pin(
+            rustfs_test_utils::TestECStoreEnv::builder()
+                .base_dir(temp.path())
+                .init_bucket_metadata(false)
+                .build(),
+        )
+        .await;
+        let store = ObjectStore::new(env.ecstore.clone());
+        store
+            .save_iam_config(serde_json::json!({"version": 1}), format!("{}/format.json", *super::IAM_CONFIG_PREFIX))
+            .await
+            .expect("seed IAM format config");
+
+        let iam = temp_env::async_with_vars([("RUSTFS_SKIP_BACKGROUND_TASK", Some("1"))], async {
+            let cache = IamCache::new(store.clone()).await.expect("initialize IAM cache");
+            IamSys::new(cache)
+        })
+        .await;
+
+        let access_key = "sa-iam-mismatch";
+        store
+            .save_user_identity(
+                access_key,
+                UserType::Svc,
+                test_service_account_identity(access_key, "alice", "aliceServiceSecret123"),
+                None,
+            )
+            .await
+            .expect("persist alice service account");
+
+        let (cred1, rev1) = iam
+            .get_service_account_revision(access_key)
+            .await
+            .expect("lookup initial revision")
+            .expect("service account exists");
+        assert_eq!(cred1.parent_user, "alice");
+
+        // Second node replaces the service account and writes a mapped policy.
+        store
+            .save_user_identity(
+                access_key,
+                UserType::Svc,
+                test_service_account_identity(access_key, "bob", "bobServiceSecret123"),
+                None,
+            )
+            .await
+            .expect("replace service account in storage");
+        store
+            .save_mapped_policy(access_key, UserType::Svc, false, MappedPolicy::new("readonly"), None)
+            .await
+            .expect("persist replacement policy");
+
+        let notifications = Arc::new(Mutex::new(Vec::new()));
+        let err = LOAD_SERVICE_ACCOUNT_NOTIFICATION_PROBE
+            .scope(
+                Arc::clone(&notifications),
+                iam.delete_service_account_if_revision(access_key, "alice", &rev1, true),
+            )
+            .await
+            .expect_err("stale owner delete must be rejected");
+        assert!(matches!(err, Error::IAMActionNotAllowed), "got {err:?}");
+        assert!(
+            notifications.lock().expect("notifications lock").is_empty(),
+            "rejected conditional delete must not emit peer notifications"
+        );
+
+        let (surviving, rev2) = iam
+            .get_service_account_revision(access_key)
+            .await
+            .expect("load surviving service account")
+            .expect("replacement must survive");
+        assert_eq!(surviving.parent_user, "bob");
+        let mut policies = HashMap::new();
+        store
+            .load_mapped_policy(access_key, UserType::Svc, false, &mut policies)
+            .await
+            .expect("replacement mapped policy must survive");
+        assert_eq!(policies[access_key].policies, "readonly");
+
+        // Matching revision succeeds and emits exactly one notification.
+        LOAD_SERVICE_ACCOUNT_NOTIFICATION_PROBE
+            .scope(
+                Arc::clone(&notifications),
+                iam.delete_service_account_if_revision(access_key, "bob", &rev2, true),
+            )
+            .await
+            .expect("current owner revision delete should succeed");
+        assert_eq!(notifications.lock().expect("notifications lock").as_slice(), &[access_key]);
+        assert!(
+            iam.get_service_account_revision(access_key)
+                .await
+                .expect("check removed service account")
+                .is_none()
+        );
+
+        // Corrupt on-disk service-account record must fail revision read, but unrestricted admin delete cleans it up.
+        let corrupt_key = "corrupt-sa-record";
+        crate::save_iam_config(
+            env.ecstore,
+            &super::get_user_identity_path(corrupt_key, UserType::Svc),
+            b"{corrupt-service-account".to_vec(),
+        )
+        .await
+        .expect("seed corrupt service account bytes");
+        store
+            .save_mapped_policy(corrupt_key, UserType::Svc, false, MappedPolicy::new("readonly"), None)
+            .await
+            .expect("seed corrupt service account policy");
+
+        assert!(
+            iam.get_service_account_revision(corrupt_key).await.is_err(),
+            "corrupt record must fail strict revision read"
+        );
+        let deleted = iam
+            .delete_service_account_with_revision(corrupt_key, true)
+            .await
+            .expect("unrestricted admin delete should clean up corrupt record");
+        assert!(deleted.is_some());
+        assert!(
+            store
+                .service_account_revision(corrupt_key)
+                .await
+                .expect("check cleaned corrupt record")
+                .is_none()
+        );
+        let mut leftover_policies = HashMap::new();
+        assert!(crate::error::is_err_no_such_policy(
+            &store
+                .load_mapped_policy(corrupt_key, UserType::Svc, false, &mut leftover_policies)
+                .await
+                .expect_err("corrupt mapped policy must be removed")
+        ));
     }
 }

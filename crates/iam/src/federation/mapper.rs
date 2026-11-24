@@ -88,6 +88,11 @@ impl FederatedAuthorization {
         &self.claims.username
     }
 
+    /// Display-only profile; not an authorization input.
+    pub fn profile(&self) -> &crate::federation::FederatedProfile {
+        &self.claims.profile
+    }
+
     pub fn session_identity(&self) -> String {
         self.claims.session_identity()
     }
@@ -523,6 +528,7 @@ mod tests {
             mapped_iam_groups: vec!["mapped-a".to_string(), "mapped-b".to_string()],
             roles_claim_key: Some(" Roles ".to_string()),
             roles: vec!["role-b".to_string(), " role-a ".to_string(), "role-b".to_string()],
+            ..Default::default()
         }
         .into_authorization();
 
@@ -580,6 +586,7 @@ mod tests {
                     ("Policy".to_string(), json!(["explicit", "source-ops"])),
                     ("Roles".to_string(), json!("reader, writer, ,auditor")),
                 ]),
+                profile: Default::default(),
             },
         )
     }
@@ -656,6 +663,7 @@ mod tests {
                     ("policy".to_string(), json!("exact")),
                     ("Policy".to_string(), json!("fallback")),
                 ]),
+                profile: Default::default(),
             },
         );
 
@@ -685,6 +693,7 @@ mod tests {
                     ("Policy".to_string(), json!("first")),
                     ("POLICY".to_string(), json!("second")),
                 ]),
+                profile: Default::default(),
             },
         );
 
@@ -713,6 +722,7 @@ mod tests {
                 username: String::new(),
                 groups: Vec::new(),
                 raw: HashMap::from([("Policy".to_string(), json!(" explicit, ,audit "))]),
+                profile: Default::default(),
             },
         );
 
@@ -739,6 +749,7 @@ mod tests {
                 username: String::new(),
                 groups: Vec::new(),
                 raw: HashMap::from([("roles".to_string(), json!(["reader", "", 7, "writer"]))]),
+                profile: Default::default(),
             },
         );
 

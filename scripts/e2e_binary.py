@@ -122,6 +122,16 @@ def terminate_command(process):
         process.wait()
 
 
+def verify_embedded_head(binary, expected):
+    # The display version can be overridden for releases. The long version also
+    # reports the full commit embedded by the build script, independently of Cargo.
+    prefix = b"git commit   : "
+    version = subprocess.check_output([binary, "--version"], cwd=ROOT, timeout=30)
+    commits = [line[len(prefix):] for line in version.splitlines() if line.startswith(prefix)]
+    if commits != [expected.encode("ascii")]:
+        raise ValueError("RustFS embedded Git commit differs from the expected source identity")
+
+
 def build(binary, target_dir, profile, requested, all_bins):
     sidecar = sidecar_path(binary)
     sidecar.unlink(missing_ok=True)
@@ -133,7 +143,8 @@ def build(binary, target_dir, profile, requested, all_bins):
     if profile == "release":
         command.append("--release")
     artifact = None
-    with subprocess.Popen(command, cwd=ROOT, stdout=subprocess.PIPE, text=True, start_new_session=True) as process:
+    build_env = dict(os.environ, RUSTFS_E2E_BUILD_HEAD=before["head"])
+    with subprocess.Popen(command, cwd=ROOT, env=build_env, stdout=subprocess.PIPE, text=True, start_new_session=True) as process:
         try:
             for line in process.stdout:
                 message = json.loads(line)
@@ -150,6 +161,7 @@ def build(binary, target_dir, profile, requested, all_bins):
         raise ValueError("Cargo did not produce the requested RustFS executable")
     if source_identity() != before:
         raise ValueError("Build inputs changed during compilation; finish preparing embedded assets and rebuild in an isolated worktree")
+    verify_embedded_head(binary, before["head"])
     record = {
         "schema": 1,
         "source": before,
@@ -177,6 +189,7 @@ def verify(binary, profile, requested):
         raise ValueError("E2E binary was built from different inputs; rebuild before testing")
     if record["binary_sha256"] != file_hash(binary):
         raise ValueError("E2E binary content differs from its build identity")
+    verify_embedded_head(binary, record["source"]["head"])
     return record
 
 

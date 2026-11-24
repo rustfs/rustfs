@@ -12,9 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 use super::*;
-use crate::UNKNOWN_TIER;
 /// ScannerIODisk implementation for Disk: get_size and the per-disk bucket scan.
 use crate::data_usage_define::clone_cache_value;
+use crate::{DiskError, UNKNOWN_TIER};
 use rustfs_scanner_metrics::scan_observation::ScannerMetadataReadOutcome;
 
 ///
@@ -58,7 +58,7 @@ impl ScannerIODisk for Disk {
         let done_object = Metrics::time(Metric::ScanObject);
 
         if !is_xl_meta_path(&item.path) {
-            return Err(StorageError::other(SCANNER_SKIP_FILE_ERROR.to_string()));
+            return Err(StorageError::IsNotRegular);
         }
 
         ensure_scanner_node_operation_active(cancellation.as_ref())?;
@@ -84,13 +84,17 @@ impl ScannerIODisk for Disk {
             metadata_result
         };
         ensure_scanner_node_operation_active(cancellation.as_ref())?;
+        check_local_scanner_handle(self)?;
         let data = match metadata_result {
             Ok(data) => data,
             Err(e) if DiskError::is_err_object_not_found(&e) || DiskError::is_err_version_not_found(&e) => {
-                return Err(StorageError::other(SCANNER_SKIP_FILE_ERROR.to_string()));
+                return Err(StorageError::FileNotFound);
             }
-            Err(e @ (DiskError::FaultyDisk | DiskError::DiskNotFound)) if self.is_local() => return Err(e.into()),
             Err(e) => {
+                let e = StorageError::from(e);
+                if is_scanner_source_unavailable(&e) || matches!(e, StorageError::FileCorrupt) {
+                    return Err(e);
+                }
                 return Err(scanner_metadata_transient_error(
                     format!("failed to read metadata: {e}"),
                     &item.bucket,
@@ -102,18 +106,10 @@ impl ScannerIODisk for Disk {
         item.transform_meta_dir();
         let object_path = item.object_path();
 
-        let meta = FileMeta::load(&data)
-            .map_err(|e| scanner_metadata_corrupt_error(format!("failed to load metadata: {e}"), &item.bucket, &object_path))?;
-        let fivs = match meta.get_file_info_versions(item.bucket.as_str(), object_path.as_str(), false) {
-            Ok(versions) => versions,
-            Err(e) => {
-                return Err(scanner_metadata_corrupt_error(
-                    format!("failed to resolve file info versions: {e}"),
-                    &item.bucket,
-                    &object_path,
-                ));
-            }
-        };
+        let meta = FileMeta::load(&data).map_err(|_| StorageError::FileCorrupt)?;
+        let fivs = meta
+            .get_file_info_versions(item.bucket.as_str(), object_path.as_str(), false)
+            .map_err(|_| StorageError::FileCorrupt)?;
 
         // Single versioning lookup per object, shared with `apply_actions`
         // (which used to query it a second time). On failure keep the
@@ -375,7 +371,10 @@ impl ScannerIODisk for Disk {
                     done_drive();
                     emit_scan_bucket_drive_complete(source, false, &bucket, &disk_path, drive_start.elapsed());
                 }
-                Err(StorageError::other(format!("Failed to scan data folder: {e}")))
+                match e {
+                    ScannerError::SourceUnavailable(source) => Err(*source),
+                    other => Err(StorageError::other(format!("Failed to scan data folder: {other}"))),
+                }
             }
         }
     }
