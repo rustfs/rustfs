@@ -29,6 +29,7 @@
 
 use crate::admin::router::{claims_native_admin_route, claims_native_console_route, claims_route};
 use http::Request;
+use http::uri::PathAndQuery;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -39,6 +40,20 @@ use tower::Service;
 #[derive(Clone)]
 pub(crate) struct S3StackService<G, C = G, W = G> {
     services: GatewayServices<G, C, W>,
+}
+
+/// The encoded path selected for S3, without the pre-authentication query.
+#[derive(Clone)]
+pub(super) struct OriginalS3Path(pub(super) PathAndQuery);
+
+impl OriginalS3Path {
+    fn from_uri(uri: &http::Uri) -> Option<Self> {
+        let target = uri.path_and_query()?;
+        if target.query().is_none() {
+            return Some(Self(target.clone()));
+        }
+        target.path().parse().ok().map(Self)
+    }
 }
 
 /// Whether a request's target and `Host` select the service it is paired with.
@@ -154,6 +169,10 @@ impl<G, C, W> GatewayServices<G, C, W> {
             return Box::pin(admin.call(request));
         }
         if !claimed {
+            let mut request = request;
+            if let Some(path) = OriginalS3Path::from_uri(request.uri()) {
+                request.extensions_mut().insert(path);
+            }
             return Box::pin(self.s3.call(request));
         }
         match &mut self.control_plane {
@@ -221,7 +240,8 @@ mod tests {
             Poll::Ready(Ok(()))
         }
 
-        fn call(&mut self, _request: Request<()>) -> Self::Future {
+        fn call(&mut self, request: Request<()>) -> Self::Future {
+            assert_eq!(request.extensions().get::<OriginalS3Path>().is_some(), self.0 == "gateway");
             ready_future(Ok(Response::new(self.0)))
         }
     }
