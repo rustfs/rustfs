@@ -50,11 +50,11 @@ use uuid::Uuid;
 pub const DEFAULT_ACCESS_KEY: &str = "rustfsadmin";
 pub const DEFAULT_SECRET_KEY: &str = "rustfsadmin";
 
-fn fixture_access_key() -> String {
+fn fixture_access_key(default: &str) -> String {
     if std::env::var("RUSTFS_CORPUS_RECORD").as_deref() == Ok("1") {
         "rustfsadmin-ci".to_owned()
     } else {
-        DEFAULT_ACCESS_KEY.to_owned()
+        default.to_owned()
     }
 }
 
@@ -641,7 +641,7 @@ impl RustFSTestEnvironment {
             temp_dir,
             address,
             url,
-            access_key: fixture_access_key(),
+            access_key: fixture_access_key(DEFAULT_ACCESS_KEY),
             secret_key: DEFAULT_SECRET_KEY.to_string(),
             process: None,
             capture_log_path,
@@ -660,7 +660,7 @@ impl RustFSTestEnvironment {
             temp_dir,
             address: address.to_string(),
             url,
-            access_key: fixture_access_key(),
+            access_key: fixture_access_key(DEFAULT_ACCESS_KEY),
             secret_key: DEFAULT_SECRET_KEY.to_string(),
             process: None,
             capture_log_path,
@@ -1421,7 +1421,7 @@ impl RustFSTestClusterEnvironment {
         Ok(Self {
             nodes,
             temp_dir,
-            access_key: "rustfs-cluster-test-access".to_string(),
+            access_key: fixture_access_key("rustfs-cluster-test-access"),
             secret_key: "rustfs-cluster-test-secret".to_string(),
             extra_env,
             node_extra_env: vec![Vec::new(); topology.node_count],
@@ -2542,7 +2542,7 @@ mod tests {
         RustFSTestClusterEnvironment {
             nodes,
             temp_dir,
-            access_key: fixture_access_key(),
+            access_key: fixture_access_key(DEFAULT_ACCESS_KEY),
             secret_key: DEFAULT_SECRET_KEY.to_string(),
             extra_env: Vec::new(),
             node_extra_env: vec![Vec::new(); topology.node_count],
