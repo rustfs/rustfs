@@ -9993,6 +9993,7 @@ dependencies = [
  "rustfs-gateway-core",
  "rustfs-gateway-corpus-recorder",
  "rustfs-gateway-dialect-rustfs-admin",
+ "rustfs-gateway-http",
  "rustfs-gateway-stream",
  "rustfs-gateway-types",
  "rustfs-heal",
