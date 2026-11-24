@@ -378,7 +378,8 @@ impl DefaultMultipartUsecase {
                 content_size: actual_size,
                 principal: None,
             }
-            .validate_multipart_ssec(&fi.user_defined)?;
+            .validate_multipart_ssec(&fi.user_defined)
+            .map_err(ApiError::from)?;
         }
         let (requested_sse, requested_kms_key_id) = if has_ssec {
             let ssec_material = sse_decryption(DecryptionRequest {
@@ -1005,18 +1006,32 @@ mod tests {
         let usecase =
             DefaultMultipartUsecase::with_context_and_concurrency_manager(Some(context), Arc::clone(&concurrency_manager));
         let body = StreamingBlob::wrap(futures::stream::pending::<Result<Bytes, std::io::Error>>());
-        let input = UploadPartInput::builder()
-            .bucket(bucket)
-            .key("object".to_string())
-            .upload_id(upload.upload_id)
-            .part_number(1)
-            .content_length(Some(1024))
-            .body(Some(body))
-            .build()
-            .expect("upload part input should build");
+        // Same facts `from_legacy` carried. Checksums, SSE, and trailers stay absent.
+        let input = UploadPartWriteInput {
+            target: UploadPartTarget::Legacy {
+                bucket,
+                key: "object".to_owned(),
+                upload_id: upload.upload_id,
+            },
+            part_number: 1,
+            content_length: Some(1024),
+            body: Some(legacy_put_body(body)),
+            trailing_headers: None,
+            frame_trailers: None,
+            content_md5: None,
+            checksum_algorithm: None,
+            checksum_crc32: None,
+            checksum_crc32c: None,
+            checksum_crc64nvme: None,
+            checksum_sha1: None,
+            checksum_sha256: None,
+            sse_customer_algorithm: None,
+            sse_customer_key: None,
+            sse_customer_key_md5: None,
+        };
 
         let err = match usecase
-            .execute_upload_part_with_audit(owned_envelope(Method::PUT), UploadPartWriteInput::from_legacy(input, None))
+            .execute_upload_part_with_audit(owned_envelope(Method::PUT), input)
             .await
         {
             Err(error) => error,

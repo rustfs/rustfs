@@ -1698,6 +1698,7 @@ impl RemoteDisk {
             supports_durable_progress: true,
             supports_complete_observation: true,
             supports_usage_watch: true,
+            supports_tier_registry_preflight: true,
         });
         let result = timeout(NS_SCANNER_CAPABILITY_PROBE_TIMEOUT, probe)
             .await
@@ -1713,6 +1714,7 @@ impl RemoteDisk {
                     supports_durable_progress: response.supports_durable_progress == Some(true),
                     supports_complete_observation: response.supports_complete_observation == Some(true),
                     supports_usage_watch: response.usage_watch_proof.is_some(),
+                    supports_tier_registry_preflight: response.tier_registry_preflight_proof.is_some(),
                 }))
             }
             Ok(_) => Ok(None),
@@ -3336,8 +3338,7 @@ impl RemoteDisk {
         }
         let deadline = tokio::time::Instant::now() + get_max_timeout_duration();
         let mut expected_mask = 0_u16;
-        let mut request_items = Vec::with_capacity(items.len());
-        for item in items {
+        for item in &items {
             if item.slot >= 16 {
                 return Err(RenameBatchStartError::NotDispatched(DiskError::Unexpected));
             }
@@ -3346,6 +3347,26 @@ impl RemoteDisk {
                 return Err(RenameBatchStartError::NotDispatched(DiskError::Unexpected));
             }
             expected_mask |= bit;
+        }
+        if let Some(error) = self.offline_bypass_error() {
+            return Err(RenameBatchStartError::NotDispatched(error));
+        }
+        let routing = super::client::node_service_rename_batch_client(
+            &self.addr,
+            TonicInterceptor::Signature(gen_tonic_signature_interceptor()),
+        );
+        let mut client = match tokio::time::timeout_at(deadline, routing).await {
+            Ok(Ok(Some(client))) => client,
+            Ok(Ok(None)) => return Err(RenameBatchStartError::UnsupportedBeforeStream),
+            Ok(Err(error)) => {
+                return Err(RenameBatchStartError::NotDispatched(DiskError::RemoteClientUnavailable(
+                    error.to_string(),
+                )));
+            }
+            Err(_) => return Err(RenameBatchStartError::NotDispatched(DiskError::Timeout)),
+        };
+        let mut request_items = Vec::with_capacity(items.len());
+        for item in items {
             let item_index = u32::try_from(item.slot)
                 .map_err(Error::other)
                 .map_err(RenameBatchStartError::NotDispatched)?;
@@ -3369,10 +3390,6 @@ impl RemoteDisk {
         crate::cluster::rpc::set_tonic_canonical_body_digest(&mut request, &canonical_body)
             .map_err(Error::other)
             .map_err(RenameBatchStartError::NotDispatched)?;
-        let mut client = match tokio::time::timeout_at(deadline, self.get_client()).await {
-            Ok(result) => result.map_err(RenameBatchStartError::NotDispatched)?,
-            Err(_) => return Err(RenameBatchStartError::NotDispatched(DiskError::Timeout)),
-        };
         let admission = self
             .acquire_rename_admission_until(request.get_ref().items.len(), deadline)
             .await
@@ -6518,16 +6535,22 @@ mod tests {
             let gate = Arc::clone(remote.rename_admission.as_ref().expect("rename admission enabled"));
             let file_infos = vec![sample_rename_data_file_info(), sample_rename_data_file_info()];
 
-            let result = remote
-                .start_rename_data_batch("tmp", "source", "bucket", "object", rename_batch_client_items(&file_infos))
-                .await;
-            assert!(matches!(result, Err(RenameBatchStartError::UnsupportedBeforeStream)));
-            assert_eq!(peer.peer.rename_batch_calls(), 1, "the real peer must observe one batch attempt");
-            assert_eq!(
-                gate.available_permits(),
-                rustfs_protos::INTERNODE_CONTROL_RPC_CONCURRENCY_LIMIT,
-                "call-level UNIMPLEMENTED must release every batch permit without quarantine"
-            );
+            for (object, calls) in [("object", 1), ("other-object", 2)] {
+                let result = remote
+                    .start_rename_data_batch("tmp", "source", "bucket", object, rename_batch_client_items(&file_infos))
+                    .await;
+                assert!(matches!(result, Err(RenameBatchStartError::UnsupportedBeforeStream)));
+                assert_eq!(
+                    peer.peer.rename_batch_calls(),
+                    calls,
+                    "an unproved rejection must not suppress the next probe"
+                );
+                assert_eq!(
+                    gate.available_permits(),
+                    rustfs_protos::INTERNODE_CONTROL_RPC_CONCURRENCY_LIMIT,
+                    "call-level UNIMPLEMENTED must release every batch permit without quarantine"
+                );
+            }
 
             remote.cancel_token.cancel();
             rustfs_protos::evict_failed_connection(&peer.addr).await;
@@ -7538,6 +7561,16 @@ mod tests {
             self.serve_rename_data.store(true, Ordering::Release);
         }
 
+        fn legacy_epoch_proof<T>(&self, request: &Request<T>) -> tonic::metadata::MetadataMap {
+            let headers = request.metadata().clone().into_headers();
+            let challenge = crate::cluster::rpc::tonic_boot_epoch_challenge(&headers)
+                .expect("valid test epoch challenge")
+                .expect("signed client must send a challenge");
+            let proof = crate::cluster::rpc::tonic_boot_epoch_response_headers(&self.audience, challenge)
+                .expect("legacy peer boot epoch proof");
+            tonic::metadata::MetadataMap::from_headers(proof)
+        }
+
         fn rename_data_disks(&self) -> Vec<String> {
             self.rename_data_disks
                 .lock()
@@ -7599,6 +7632,7 @@ mod tests {
                                     .map_err(|_| Status::invalid_argument("rename data body length"))?;
                                 crate::cluster::rpc::verify_tonic_mutation_body_digest(&request, &canonical_body)
                                     .map_err(|_| Status::permission_denied("rename data body digest"))?;
+                                let proof = peer.legacy_epoch_proof(&request);
                                 let request = request.into_inner();
                                 serde_json::from_str::<FileInfo>(&request.file_info)
                                     .map_err(|error| Status::invalid_argument(error.to_string()))?;
@@ -7611,12 +7645,14 @@ mod tests {
                                     ..Default::default()
                                 })
                                 .map_err(|error| Status::internal(error.to_string()))?;
-                                Ok(Response::new(rustfs_protos::proto_gen::node_service::RenameDataResponse {
+                                let mut response = Response::new(rustfs_protos::proto_gen::node_service::RenameDataResponse {
                                     success: true,
                                     rename_data_resp: payload,
                                     error: None,
                                     rename_data_resp_bin: Bytes::new(),
-                                }))
+                                });
+                                *response.metadata_mut() = proof;
+                                Ok(response)
                             })
                         }
                     }
@@ -7656,7 +7692,15 @@ mod tests {
                                     .lock()
                                     .expect("rename batch result limit lock poisoned")
                                 else {
-                                    return Err(Status::unimplemented("test peer does not support rename batch"));
+                                    let message = "test peer does not support rename batch";
+                                    if peer.serve_rename_data.load(Ordering::Acquire) {
+                                        return Err(Status::with_metadata(
+                                            Code::Unimplemented,
+                                            message,
+                                            peer.legacy_epoch_proof(&request),
+                                        ));
+                                    }
+                                    return Err(Status::unimplemented(message));
                                 };
                                 peer.verify_auth(&request, "/node_service.NodeService/RenameDataBatch")?;
                                 let canonical_body = rustfs_protos::canonical_rename_data_batch_request_body(request.get_ref())
@@ -8849,6 +8893,7 @@ mod tests {
                 supports_durable_progress: None,
                 supports_complete_observation: None,
                 usage_watch_proof: None,
+                tier_registry_preflight_proof: None,
             })
         }
 

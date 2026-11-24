@@ -3826,6 +3826,138 @@ fn get_default_tcp_keepalive() -> TcpKeepalive {
     }
 }
 
+/// Test double for the legacy s3s auth trait. Production request auth does not use it.
+/// It lives in this file because that file already references s3s; `auth` does not.
+#[cfg(test)]
+#[derive(Clone)]
+pub(crate) struct IAMAuth {
+    access_key: String,
+    secret_key: s3s::auth::SecretKey,
+    server_ctx: Option<Arc<crate::runtime_sources::ServerContextSlot>>,
+}
+
+#[cfg(test)]
+impl IAMAuth {
+    pub(crate) fn new(ak: impl Into<String>, sk: impl Into<String>) -> Self {
+        Self {
+            access_key: ak.into(),
+            secret_key: s3s::auth::SecretKey::from(sk.into()),
+            server_ctx: None,
+        }
+    }
+
+    pub(crate) fn with_server_context(
+        ak: impl Into<String>,
+        sk: impl Into<String>,
+        server_ctx: Arc<crate::runtime_sources::ServerContextSlot>,
+    ) -> Self {
+        let mut auth = Self::new(ak, sk);
+        auth.server_ctx = Some(server_ctx);
+        auth
+    }
+
+    /// Inherent lookup so `auth` tests can call it without naming the legacy trait.
+    pub(crate) async fn get_secret_key(&self, access_key: &str) -> s3s::S3Result<s3s::auth::SecretKey> {
+        use rustfs_keystone::KEYSTONE_CREDENTIALS;
+
+        if let Ok(Some(creds)) = KEYSTONE_CREDENTIALS.try_with(|c| c.clone()) {
+            debug!(
+                event = crate::auth::EVENT_KEYSTONE_CREDENTIALS_DETECTED,
+                component = crate::auth::LOG_COMPONENT_AUTH,
+                subsystem = crate::auth::LOG_SUBSYSTEM_KEYSTONE,
+                principal = %rustfs_utils::MaskedAccessKey(&creds.parent_user),
+                result = "token_auth",
+                "Keystone task-local credentials detected"
+            );
+            return Ok(s3s::auth::SecretKey::from(String::new()));
+        }
+
+        if access_key.is_empty() {
+            return Err(s3s::s3_error!(UnauthorizedAccess, "Your account is not signed up"));
+        }
+
+        if access_key.starts_with("keystone:") {
+            return Err(s3s::s3_error!(InvalidAccessKeyId, "Keystone authentication requires X-Auth-Token header"));
+        }
+
+        if access_key == self.access_key {
+            return Ok(self.secret_key.clone());
+        }
+
+        let iam_store = match &self.server_ctx {
+            Some(server_ctx) => server_ctx
+                .installed_app_context()
+                .filter(|context| context.iam().is_ready())
+                .map(|context| context.iam().handle())
+                .ok_or(()),
+            None => crate::runtime_sources::current_ready_iam_handle().map_err(|_| ()),
+        };
+        if let Ok(iam_store) = iam_store {
+            match iam_store.check_key(access_key).await {
+                Ok((Some(id), _valid)) => {
+                    return Ok(s3s::auth::SecretKey::from(id.credentials.secret_key));
+                }
+                Ok((None, _)) => {
+                    warn!(
+                        event = crate::auth::EVENT_SECRET_KEY_LOOKUP_FAILED,
+                        component = crate::auth::LOG_COMPONENT_AUTH,
+                        subsystem = crate::auth::LOG_SUBSYSTEM_CREDENTIALS,
+                        reason = "no_such_user",
+                        "Secret key lookup rejected"
+                    );
+                }
+                Err(e) => {
+                    warn!(
+                        event = crate::auth::EVENT_SECRET_KEY_LOOKUP_FAILED,
+                        component = crate::auth::LOG_COMPONENT_AUTH,
+                        subsystem = crate::auth::LOG_SUBSYSTEM_CREDENTIALS,
+                        error = ?e,
+                        reason = "check_key_error",
+                        "Secret key lookup errored"
+                    );
+                    return Err(iam_lookup_error_to_s3_error(&e));
+                }
+            }
+        } else {
+            warn!(
+                event = crate::auth::EVENT_SECRET_KEY_LOOKUP_FAILED,
+                component = crate::auth::LOG_COMPONENT_AUTH,
+                subsystem = crate::auth::LOG_SUBSYSTEM_CREDENTIALS,
+                reason = "iam_not_initialized",
+                "Secret key lookup skipped"
+            );
+        }
+
+        Err(s3s::s3_error!(
+            InvalidAccessKeyId,
+            "The Access Key Id you provided does not exist in our records."
+        ))
+    }
+}
+
+#[cfg(test)]
+#[async_trait::async_trait]
+impl s3s::auth::S3Auth for IAMAuth {
+    async fn get_secret_key(&self, access_key: &str) -> s3s::S3Result<s3s::auth::SecretKey> {
+        IAMAuth::get_secret_key(self, access_key).await
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn iam_lookup_error_to_s3_error(_err: &rustfs_iam::error::Error) -> s3s::S3Error {
+    s3s::s3_error!(InternalError, "IAM user lookup failed")
+}
+
+#[cfg(test)]
+pub(crate) fn legacy_s3_code_name(error: &s3s::S3Error) -> &'static str {
+    match error.code() {
+        s3s::S3ErrorCode::InvalidAccessKeyId => "InvalidAccessKeyId",
+        s3s::S3ErrorCode::UnauthorizedAccess => "UnauthorizedAccess",
+        s3s::S3ErrorCode::InternalError => "InternalError",
+        _ => "other",
+    }
+}
+
 #[cfg(test)]
 mod tests {
     #[path = "production_batch_lock_rpc_tests.rs"]
@@ -4683,7 +4815,7 @@ mod tests {
             let slot = ServerContextSlot::new();
             assert!(slot.install(context));
             let mut legacy = s3s::service::S3ServiceBuilder::new(UnusedS3);
-            legacy.set_auth(crate::auth::IAMAuth::with_server_context(ROOT, ROOT_SECRET, slot.clone()));
+            legacy.set_auth(super::super::IAMAuth::with_server_context(ROOT, ROOT_SECRET, slot.clone()));
             legacy.set_route(crate::admin::make_admin_router(false, slot.clone()).unwrap());
             legacy.set_host(s3s::host::MultiDomain::new(["s3.example.test"]).unwrap());
             let legacy = legacy.build();

@@ -20,8 +20,9 @@ use crate::storage::storage_api::rpc_consumer::http_service::{
     PUT_FILE_CAPABILITY_VERSION, PutFileCapabilityResponse, RemoteBackgroundIo, StorageDiskRpcExt as _,
     WALK_DIR_STREAM_COMPLETION_V1, WalkDirOptions, background_pipe, check_and_record_signed_rpc_nonce,
     find_local_disk_by_ref_for_rpc, find_local_disk_by_ref_for_scanner_rpc, rpc_background_admission,
-    sign_ns_scanner_capability_with_usage_capabilities, sign_ns_scanner_usage_watch_capability, sign_put_file_capability,
-    verify_put_file_auth_trailer, verify_rpc_signature, with_remote_background_io, with_rpc_background_request,
+    sign_ns_scanner_capability_with_usage_capabilities, sign_ns_scanner_tier_registry_preflight_capability,
+    sign_ns_scanner_usage_watch_capability, sign_put_file_capability, verify_put_file_auth_trailer, verify_rpc_signature,
+    with_remote_background_io, with_rpc_background_request,
 };
 #[cfg(test)]
 use crate::storage::storage_api::rpc_consumer::http_service::{
@@ -397,6 +398,7 @@ struct NsScannerCapabilityQuery {
     ns_scanner_durable_progress: Option<bool>,
     ns_scanner_complete_observation: Option<bool>,
     ns_scanner_usage_watch: Option<bool>,
+    ns_scanner_tier_registry_preflight: Option<bool>,
 }
 
 fn verify_ns_scanner_body_digest(query: &NsScannerQuery, body: &[u8]) -> bool {
@@ -575,14 +577,7 @@ async fn handle_internode_rpc(
             (Method::GET, WALK_DIR_PATH) | (Method::HEAD, WALK_DIR_PATH) => handle_walk_dir(req).await,
             (Method::GET, NS_SCANNER_PATH) => match parse_query::<NsScannerCapabilityQuery>(&req) {
                 Ok(query) if query.ns_scanner_protocol == Some(NS_SCANNER_PROTOCOL_VERSION) => match query.ns_scanner_challenge {
-                    Some(challenge) if !challenge.is_nil() => ns_scanner_capability_response(
-                        challenge,
-                        query.ns_scanner_tier_registry_generation == Some(true),
-                        query.ns_scanner_checkpoint_coverage == Some(true),
-                        query.ns_scanner_durable_progress == Some(true),
-                        query.ns_scanner_complete_observation == Some(true),
-                        query.ns_scanner_usage_watch == Some(true),
-                    ),
+                    Some(challenge) if !challenge.is_nil() => ns_scanner_capability_response(challenge, query),
                     Some(_) | None => response_with_status(StatusCode::BAD_REQUEST, "namespace scanner challenge is invalid"),
                 },
                 Ok(_) => response_with_status(StatusCode::UPGRADE_REQUIRED, "namespace scanner protocol is unsupported"),
@@ -663,14 +658,19 @@ fn record_internode_rpc_error(operation: Option<&'static str>) {
     }
 }
 
-fn ns_scanner_capability_response(
-    challenge: uuid::Uuid,
-    include_tier_registry_generation: bool,
-    include_checkpoint_coverage: bool,
-    include_durable_progress: bool,
-    include_complete_observation: bool,
-    include_usage_watch: bool,
-) -> Response<Body> {
+fn ns_scanner_capability_response(challenge: uuid::Uuid, query: NsScannerCapabilityQuery) -> Response<Body> {
+    // A previous coordinator cannot replan a tier registry mismatch. Return its signed
+    // baseline so it keeps scanning these disks through its own coordinator.
+    let negotiated = if query.ns_scanner_tier_registry_preflight == Some(true) {
+        query
+    } else {
+        NsScannerCapabilityQuery::default()
+    };
+    let include_tier_registry_generation = negotiated.ns_scanner_tier_registry_generation == Some(true);
+    let include_checkpoint_coverage = negotiated.ns_scanner_checkpoint_coverage == Some(true);
+    let include_durable_progress = negotiated.ns_scanner_durable_progress == Some(true);
+    let include_complete_observation = negotiated.ns_scanner_complete_observation == Some(true);
+    let include_usage_watch = negotiated.ns_scanner_usage_watch == Some(true);
     let server_epoch = *NS_SCANNER_SERVER_EPOCH;
     let proof = match sign_ns_scanner_capability_with_usage_capabilities(
         challenge,
@@ -710,6 +710,18 @@ fn ns_scanner_capability_response(
             );
         }
     };
+    let tier_registry_preflight_proof = match (negotiated.ns_scanner_tier_registry_preflight == Some(true))
+        .then(|| sign_ns_scanner_tier_registry_preflight_capability(challenge, server_epoch))
+        .transpose()
+    {
+        Ok(proof) => proof,
+        Err(_) => {
+            return response_with_status(
+                StatusCode::UPGRADE_REQUIRED,
+                "namespace scanner tier registry authentication is unavailable",
+            );
+        }
+    };
     let body = match rmp_serde::to_vec_named(&NsScannerCapabilityResponse {
         version: NS_SCANNER_PROTOCOL_VERSION,
         server_epoch,
@@ -719,6 +731,7 @@ fn ns_scanner_capability_response(
         supports_durable_progress: include_durable_progress.then_some(true),
         supports_complete_observation: include_complete_observation.then_some(true),
         usage_watch_proof,
+        tier_registry_preflight_proof,
     }) {
         Ok(body) => body,
         Err(err) => {
@@ -2891,43 +2904,54 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn namespace_scanner_checkpoint_capability_response_keeps_authenticated_legacy_shapes() {
+    async fn namespace_scanner_returns_authenticated_baseline_for_coordinators_without_preflight() {
         #[derive(serde::Deserialize)]
         #[serde(deny_unknown_fields)]
-        struct GenerationCapabilityResponse {
+        struct LegacyResponse {
             version: u16,
             server_epoch: uuid::Uuid,
             proof: Vec<u8>,
-            #[serde(default)]
-            supports_tier_registry_generation: Option<bool>,
         }
+
         let _ = rustfs_credentials::set_global_rpc_secret("checkpoint-capability-server-test-secret".to_string());
-        for (tier, coverage) in [(false, false), (true, false), (true, true)] {
+        for requested in [None, Some(false), Some(true)] {
             let challenge = uuid::Uuid::new_v4();
-            let response = super::ns_scanner_capability_response(challenge, tier, coverage, false, false, false);
+            let query = super::NsScannerCapabilityQuery {
+                ns_scanner_tier_registry_preflight: requested,
+                ns_scanner_tier_registry_generation: Some(true),
+                ns_scanner_checkpoint_coverage: Some(true),
+                ns_scanner_durable_progress: Some(true),
+                ns_scanner_complete_observation: Some(true),
+                ns_scanner_usage_watch: Some(true),
+                ..Default::default()
+            };
+            let response = super::ns_scanner_capability_response(challenge, query);
             assert_eq!(response.status(), StatusCode::OK);
             let body = http_body_util::BodyExt::collect(response.into_body())
                 .await
                 .expect("capability body")
                 .to_bytes();
-            let capability: NsScannerCapabilityResponse = rmp_serde::from_slice(&body).expect("capability response");
-            crate::storage::storage_api::ecstore_rpc::verify_ns_scanner_capability_with_checkpoint_coverage(
-                challenge,
-                capability.server_epoch,
-                &capability.proof,
-                tier,
-                coverage,
-            )
-            .expect("capability proof binds exactly the requested extensions");
-            assert_eq!(capability.supports_checkpoint_coverage, coverage.then_some(true));
-            if coverage {
-                assert!(rmp_serde::from_slice::<GenerationCapabilityResponse>(&body).is_err());
+            if requested == Some(true) {
+                let current: NsScannerCapabilityResponse = rmp_serde::from_slice(&body).expect("current capability response");
+                assert_eq!(current.supports_checkpoint_coverage, Some(true));
+                assert!(current.usage_watch_proof.is_some());
+                crate::storage::storage_api::ecstore_rpc::verify_ns_scanner_tier_registry_preflight_capability(
+                    challenge,
+                    current.server_epoch,
+                    current.tier_registry_preflight_proof.as_deref().expect("preflight proof"),
+                )
+                .expect("preflight capability bound to the request and peer");
             } else {
-                let legacy: GenerationCapabilityResponse = rmp_serde::from_slice(&body).expect("old coordinator response shape");
+                let legacy: LegacyResponse = rmp_serde::from_slice(&body).expect("only the authenticated legacy fields");
                 assert_eq!(legacy.version, super::NS_SCANNER_PROTOCOL_VERSION);
-                assert_eq!(legacy.server_epoch, capability.server_epoch);
-                assert_eq!(legacy.proof, capability.proof);
-                assert_eq!(legacy.supports_tier_registry_generation, tier.then_some(true));
+                crate::storage::storage_api::ecstore_rpc::verify_ns_scanner_capability_with_checkpoint_coverage(
+                    challenge,
+                    legacy.server_epoch,
+                    &legacy.proof,
+                    false,
+                    false,
+                )
+                .expect("older coordinator authenticates the unsupported remote-worker result");
             }
         }
     }
@@ -2938,7 +2962,17 @@ mod tests {
         for progress in [false, true] {
             for observation in [false, true] {
                 let challenge = uuid::Uuid::new_v4();
-                let response = super::ns_scanner_capability_response(challenge, true, true, progress, observation, false);
+                let response = super::ns_scanner_capability_response(
+                    challenge,
+                    super::NsScannerCapabilityQuery {
+                        ns_scanner_tier_registry_preflight: Some(true),
+                        ns_scanner_tier_registry_generation: Some(true),
+                        ns_scanner_checkpoint_coverage: Some(true),
+                        ns_scanner_durable_progress: Some(progress),
+                        ns_scanner_complete_observation: Some(observation),
+                        ..Default::default()
+                    },
+                );
                 assert_eq!(response.status(), StatusCode::OK);
                 let body = http_body_util::BodyExt::collect(response.into_body())
                     .await
@@ -2980,6 +3014,7 @@ mod tests {
             supports_durable_progress: None,
             supports_complete_observation: None,
             usage_watch_proof: None,
+            tier_registry_preflight_proof: None,
         })
         .expect("old response shape should encode");
         let decoded: NsScannerCapabilityResponse = rmp_serde::from_slice(&old).expect("old response should decode");
@@ -3000,6 +3035,7 @@ mod tests {
             supports_durable_progress: None,
             supports_complete_observation: None,
             usage_watch_proof: None,
+            tier_registry_preflight_proof: None,
         })
         .expect("new response shape should encode");
         let decoded: NsScannerCapabilityResponse = rmp_serde::from_slice(&current).expect("new response should decode");
@@ -4368,11 +4404,20 @@ mod tests {
             ("put_file", Box::new(move || put_file_capability_response(challenge))),
             (
                 "ns_scanner",
-                Box::new(move || super::ns_scanner_capability_response(challenge, false, false, false, false, false)),
+                Box::new(move || super::ns_scanner_capability_response(challenge, Default::default())),
             ),
             (
                 "ns_scanner with tier generation",
-                Box::new(move || super::ns_scanner_capability_response(challenge, true, false, false, false, false)),
+                Box::new(move || {
+                    super::ns_scanner_capability_response(
+                        challenge,
+                        super::NsScannerCapabilityQuery {
+                            ns_scanner_tier_registry_generation: Some(true),
+                            ns_scanner_tier_registry_preflight: Some(true),
+                            ..Default::default()
+                        },
+                    )
+                }),
             ),
         ];
         for (name, build) in builders {

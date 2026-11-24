@@ -5251,7 +5251,7 @@ async fn get_size_treats_missing_metadata_as_skip_file() {
         .get_size(item.clone())
         .await
         .expect_err("missing metadata should be skipped instead of reported as a scanner failure");
-    assert!(matches!(err, StorageError::Io(ref io) if io.to_string() == SCANNER_SKIP_FILE_ERROR));
+    assert!(matches!(err, StorageError::FileNotFound));
 
     let missing = global_metrics().scan_observation().snapshot().metadata_reads;
     assert_eq!(missing.attempts, before.attempts + 1);
@@ -5336,7 +5336,7 @@ async fn get_size_marks_corrupt_metadata_for_heal() {
             .get_size(item.clone())
             .await
             .expect_err("corrupt metadata should be surfaced as scanner-heal work");
-        assert!(is_scanner_metadata_corrupt_error(&err));
+        assert!(matches!(err, StorageError::FileCorrupt));
     }
 
     let reads = global_metrics().scan_observation().snapshot().metadata_reads;
@@ -5996,6 +5996,7 @@ fn namespace_scanner_walkers_multiply_local_disks_and_share_their_admission() {
         supports_durable_progress: false,
         supports_complete_observation: false,
         supports_usage_watch: false,
+        supports_tier_registry_preflight: false,
     };
     let workers = vec![
         ("local-a", NamespaceScannerWorkerMode::Coordinator),

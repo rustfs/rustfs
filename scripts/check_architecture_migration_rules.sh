@@ -5497,13 +5497,18 @@ require_source_contains \
 # its internal dependency surface is pinned to exactly rustfs-signer so it cannot
 # quietly grow storage-side dependencies. Adding any other rustfs-* dependency to
 # any of these five crates needs its own adjudication, not a quiet Cargo.toml edit.
+# sse sits between the S3 layer and the storage engine and reaches the running
+# server only through its `SseHost` port, so its internal dependency surface is
+# pinned as well: the KMS it calls, the policy and S3 vocabularies it speaks, and
+# the two foundation crates. An edge to ecstore, iam, or the binary would let key
+# resolution reach engine or identity state behind the port.
 # The pattern matches both TOML dependency spellings: `rustfs-x = ...` and the
 # dotted `rustfs-x.workspace = true` form (which previously escaped this guard).
 LEAF_CRATE_DEP_HITS_FILE="${TMP_DIR}/leaf_crate_dep_hits.txt"
 : >"$LEAF_CRATE_DEP_HITS_FILE"
 (
   cd "$ROOT_DIR"
-  for leaf in config credentials crypto io-metrics madmin; do
+  for leaf in config credentials crypto io-metrics madmin sse; do
     manifest="crates/${leaf}/Cargo.toml"
     [[ -f "$manifest" ]] || continue
     leaf_dep_status=0
@@ -5518,6 +5523,9 @@ LEAF_CRATE_DEP_HITS_FILE="${TMP_DIR}/leaf_crate_dep_hits.txt"
       madmin)
         rg -v '^[^:]*:[0-9]+:rustfs-signer(\.[a-zA-Z_-]+)* *=' "${TMP_DIR}/leaf_dep_raw.txt" >>"$LEAF_CRATE_DEP_HITS_FILE" || true
         ;;
+      sse)
+        rg -v '^[^:]*:[0-9]+:rustfs-(config|kms|policy|s3-types|utils)(\.[a-zA-Z_-]+)* *=' "${TMP_DIR}/leaf_dep_raw.txt" >>"$LEAF_CRATE_DEP_HITS_FILE" || true
+        ;;
       *)
         cat "${TMP_DIR}/leaf_dep_raw.txt" >>"$LEAF_CRATE_DEP_HITS_FILE"
         ;;
@@ -5526,7 +5534,7 @@ LEAF_CRATE_DEP_HITS_FILE="${TMP_DIR}/leaf_crate_dep_hits.txt"
 )
 
 if [[ -s "$LEAF_CRATE_DEP_HITS_FILE" ]]; then
-  report_failure "leaf/pinned-dep crates: config/credentials/crypto take no internal rustfs-* dependency; io-metrics only rustfs-s3-ops (pure contract crate, backlog#1834); madmin only rustfs-signer (admin SDK SigV4 client, #6166); any new edge needs its own adjudication: $(paste -sd '; ' "$LEAF_CRATE_DEP_HITS_FILE")"
+  report_failure "leaf/pinned-dep crates: config/credentials/crypto take no internal rustfs-* dependency; io-metrics only rustfs-s3-ops (pure contract crate, backlog#1834); madmin only rustfs-signer (admin SDK SigV4 client, #6166); sse only rustfs-config/kms/policy/s3-types/utils (it reaches the server through SseHost); any new edge needs its own adjudication: $(paste -sd '; ' "$LEAF_CRATE_DEP_HITS_FILE")"
 fi
 
 # --- ecstore module-level lint blankets (backlog#1823 step 9) ---

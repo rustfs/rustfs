@@ -116,6 +116,8 @@ pub(super) struct RemoteScannerRequestWire {
     skip_healing: bool,
     scan_mode: HealScanMode,
     budget: RemoteScannerBudget,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    expected_tier_registry_generation: Option<u64>,
 }
 
 fn capability_disabled(value: &bool) -> bool {
@@ -182,6 +184,13 @@ struct RemoteScannerErrorFrame {
 }
 
 #[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct RemoteScannerTierRegistryMismatch {
+    expected: u64,
+    actual: u64,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 enum RemoteScannerFrameResult {
     Progress,
@@ -191,6 +200,7 @@ enum RemoteScannerFrameResult {
     NamespaceNotFound,
     CycleAhead { required_cycle: u64 },
     Error(RemoteScannerErrorFrame),
+    TierRegistryMismatch(RemoteScannerTierRegistryMismatch),
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -248,6 +258,10 @@ pub(crate) enum RemoteScannerOutcome {
     Partial,
     NamespaceNotFound,
     CycleAhead(u64),
+    TierRegistryMismatch {
+        expected: u64,
+        actual: u64,
+    },
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -261,6 +275,7 @@ pub(crate) struct RemoteScannerScanSpec<'a> {
     pub(crate) plans: ScannerBucketPlanDigests,
     pub(crate) supports_durable_progress: bool,
     pub(crate) supports_complete_observation: bool,
+    pub(crate) supports_tier_registry_preflight: bool,
     pub(crate) usage_watch: Option<&'a crate::scanner_io::ScannerUsageWatchProof>,
     pub(crate) checkpoint_identity: Option<crate::DataUsageScanIdentity>,
     pub(crate) tier_registry_generation: u64,
@@ -270,6 +285,7 @@ pub(crate) struct RemoteScannerScanSpec<'a> {
 
 #[derive(Clone, Copy)]
 struct RemoteScannerResponseExpectation<'a> {
+    supports_tier_registry_preflight: bool,
     supports_durable_progress: bool,
     supports_complete_observation: bool,
     checkpoint_identity: Option<crate::DataUsageScanIdentity>,
@@ -280,6 +296,23 @@ struct RemoteScannerResponseExpectation<'a> {
     next_cycle: u64,
     scan_plan_digest: DataUsageScanPlanDigest,
     tier_registry_generation: u64,
+}
+
+impl RemoteScannerResponseExpectation<'_> {
+    fn legacy_tier_registry_mismatch(self, actual: u64) -> RemoteScannerStreamResult<Option<RemoteScannerOutcome>> {
+        if actual == self.tier_registry_generation {
+            return Ok(None);
+        }
+        if self.supports_tier_registry_preflight {
+            return Err(RemoteScannerStreamError::reconciled(StorageError::other(
+                "remote namespace scanner returned a different tier registry generation after preflight",
+            )));
+        }
+        Ok(Some(RemoteScannerOutcome::TierRegistryMismatch {
+            expected: self.tier_registry_generation,
+            actual,
+        }))
+    }
 }
 
 #[derive(Debug)]
@@ -334,6 +367,18 @@ struct RemoteScannerServerError {
 }
 
 impl RemoteScannerServerError {
+    fn check_scan_source(disk: &Disk) -> Result<(), Self> {
+        crate::scanner_io::check_local_scanner_handle(disk).map_err(Self::source_unavailable)
+    }
+
+    fn source_unavailable(error: StorageError) -> Self {
+        Self {
+            scope: RemoteScannerErrorScope::Bucket,
+            error: ScannerError::source_unavailable(error),
+            retry_bucket: true,
+        }
+    }
+
     fn worker(message: impl Into<String>) -> Self {
         Self {
             scope: RemoteScannerErrorScope::Worker,
@@ -901,6 +946,7 @@ async fn scan_and_persist_local_bucket_with_store(
         leader_epoch,
         scan_plan_digest,
         checkpoint_plan_digest,
+        expected_tier_registry_generation,
         supports_durable_progress,
         supports_complete_observation,
         usage_watch,
@@ -939,6 +985,15 @@ async fn scan_and_persist_local_bucket_with_store(
             "remote namespace scanner disk does not belong to its storage instance",
         ));
     }
+    // A queued RPC can arrive after a verified blank replacement occupied the same path.
+    // Mirror coordinator admission before consulting any cache from the previous attachment.
+    let disk_info = disk
+        .disk_info(&crate::DiskInfoOptions::default())
+        .await
+        .map_err(|err| RemoteScannerServerError::retry_bucket(format!("scanner source identity unavailable: {err}")))?;
+    if disk_info.id.is_none_or(|id| id.is_nil()) || disk_info.healing {
+        return Err(RemoteScannerServerError::retry_bucket("scanner source is unformatted or rebuilding"));
+    }
     if let Some(proof) = usage_watch.as_deref()
         && !proof.verify_with_store(&store).await
     {
@@ -952,6 +1007,18 @@ async fn scan_and_persist_local_bucket_with_store(
     let expected_publication_epoch = scanner_publication_epoch(set.clone()).await.ok_or_else(|| {
         RemoteScannerServerError::worker("remote namespace scanner cache publication is blocked by data movement")
     })?;
+    // Compare the immutable local snapshot before cache reuse, checkpoint writes or ILM actions.
+    let tier_registry_generation = crate::runtime_tier_registry_for_cycle(next_cycle, leader_epoch)
+        .await
+        .generation;
+    if let Some(expected) = expected_tier_registry_generation
+        && expected != tier_registry_generation
+    {
+        return Ok(RemoteScannerFrameResult::TierRegistryMismatch(RemoteScannerTierRegistryMismatch {
+            expected,
+            actual: tier_registry_generation,
+        }));
+    }
     let cache_name = path_join_buf(&[&bucket, DATA_USAGE_CACHE_NAME]);
     let mut guard = acquire_scanner_cache_locks(set.as_ref(), &cache_name, source)
         .await
@@ -987,13 +1054,6 @@ async fn scan_and_persist_local_bucket_with_store(
         cache.info.snapshot_complete = false;
         cache.info.lkg_snapshot_complete = false;
     }
-    // Remote workers use the same cycle-frozen registry as `scan_data_folder`.
-    // Requiring its generation here prevents a cache snapshot classified by an
-    // older registry from being reused before the folder scan gets a chance to
-    // refresh it.
-    let tier_registry_generation = crate::runtime_tier_registry_for_cycle(next_cycle, leader_epoch)
-        .await
-        .generation;
     // Only a leader handoff needs this authoritative floor; ordinary cycles
     // avoid an extra config read. An unavailable/legacy floor forces a walk.
     let completed_checkpoint_cycle_floor = if cache.info.snapshot_complete
@@ -1070,6 +1130,7 @@ async fn scan_and_persist_local_bucket_with_store(
                     "remote namespace scanner usage watch changed before cache reuse",
                 ));
             }
+            RemoteScannerServerError::check_scan_source(&disk)?;
             return Ok(RemoteScannerFrameResult::Complete(Box::new(RemoteScannerComplete {
                 source,
                 scan_plan_digest,
@@ -1163,6 +1224,11 @@ async fn scan_and_persist_local_bucket_with_store(
             result = &mut scan => {
                 match result {
                     Ok(outcome) => break outcome,
+                    Err(err) if crate::scanner_io::is_scanner_source_unavailable(&err) => {
+                        // The coordinator's existing retry disposition also retires this worker. A
+                        // later health probe cannot validate a walk performed by an older handle.
+                        return Err(RemoteScannerServerError::source_unavailable(err));
+                    }
                     Err(err) => {
                         let disk_online =
                             tokio::time::timeout(NS_SCANNER_DISK_HEALTH_TIMEOUT, crate::scanner_disk_is_online(disk.as_ref()))
@@ -1189,6 +1255,11 @@ async fn scan_and_persist_local_bucket_with_store(
                     checkpoint_channel_closed = true;
                     continue;
                 };
+                if let Err(error) = RemoteScannerServerError::check_scan_source(&disk) {
+                    scan_ctx.cancel();
+                    let _ = tokio::time::timeout(NS_SCANNER_LOCK_LOSS_SHUTDOWN_TIMEOUT, scan.as_mut()).await;
+                    return Err(error);
+                }
                 if guard.is_lock_lost() {
                     scan_ctx.cancel();
                     let _ = tokio::time::timeout(NS_SCANNER_LOCK_LOSS_SHUTDOWN_TIMEOUT, scan.as_mut()).await;
@@ -1294,6 +1365,7 @@ async fn scan_and_persist_local_bucket_with_store(
         .map_err(|err| {
             RemoteScannerServerError::worker(format!("remote namespace scanner leader fence verification failed: {err}"))
         })?;
+    RemoteScannerServerError::check_scan_source(&disk)?;
     let done_save = Metrics::time(Metric::SaveUsage);
     // Each physical main/backup PUT must still prove the epoch captured before
     // the scan. A movement transition that starts and ends during the scan
@@ -1339,6 +1411,7 @@ async fn scan_and_persist_local_bucket_with_store(
         ));
     }
 
+    RemoteScannerServerError::check_scan_source(&disk)?;
     if let Some(partial_result) = partial_result {
         if matches!(partial_result, RemoteScannerFrameResult::Partial) {
             log_saved_partial_bucket_cache(&cache, &cache_name);
@@ -1395,6 +1468,7 @@ pub(crate) async fn scan_remote_bucket(
         session_id,
         session_sequence,
         plans,
+        supports_tier_registry_preflight,
         supports_durable_progress,
         supports_complete_observation,
         usage_watch,
@@ -1420,6 +1494,7 @@ pub(crate) async fn scan_remote_bucket(
         leader_epoch,
         scan_plan_digest,
         checkpoint_plan_digest: Some(checkpoint_plan_digest),
+        expected_tier_registry_generation: supports_tier_registry_preflight.then_some(tier_registry_generation),
         supports_durable_progress,
         supports_complete_observation,
         usage_watch: usage_watch.cloned().map(Box::new),
@@ -1513,6 +1588,7 @@ pub(crate) async fn scan_remote_bucket(
             ctx,
             budget.clone(),
             RemoteScannerResponseExpectation {
+                supports_tier_registry_preflight,
                 supports_durable_progress,
                 supports_complete_observation,
                 checkpoint_identity,
@@ -1636,6 +1712,7 @@ where
         ctx,
         budget,
         RemoteScannerResponseExpectation {
+            supports_tier_registry_preflight: false,
             supports_durable_progress: false,
             supports_complete_observation: false,
             checkpoint_identity: None,
@@ -1729,17 +1806,29 @@ where
                         "remote namespace scanner returned usage for a different bucket plan",
                     )));
                 }
-                if complete.usage.tier_registry_generation != Some(expected.tier_registry_generation) {
-                    return Err(RemoteScannerStreamError::reconciled(StorageError::other(
-                        "remote namespace scanner returned usage for a different tier registry generation",
-                    )));
-                }
                 if !complete.usage.entry.children.is_empty() {
                     return Err(RemoteScannerStreamError::reconciled(StorageError::other(
                         "remote namespace scanner returned non-flattened bucket usage",
                     )));
                 }
-                if budget.budget_elapsed() && !(expected.supports_durable_progress || expected.supports_complete_observation) {
+                let actual = complete.usage.tier_registry_generation.ok_or_else(|| {
+                    RemoteScannerStreamError::reconciled(StorageError::other(
+                        "remote namespace scanner returned usage without a tier registry generation",
+                    ))
+                })?;
+                if let Some(mismatch) = expected.legacy_tier_registry_mismatch(actual)? {
+                    if expected
+                        .checkpoint_identity
+                        .is_some_and(|identity| complete.usage.bucket_incarnation != Some(identity.bucket_incarnation))
+                    {
+                        return Err(RemoteScannerStreamError::reconciled(StorageError::other(
+                            "remote namespace scanner returned usage for a different bucket incarnation",
+                        )));
+                    }
+                    Some(Ok(mismatch))
+                } else if budget.budget_elapsed()
+                    && !(expected.supports_durable_progress || expected.supports_complete_observation)
+                {
                     Some(Ok(RemoteScannerOutcome::Partial))
                 } else {
                     Some(Ok(RemoteScannerOutcome::Complete {
@@ -1749,33 +1838,41 @@ where
                 }
             }
             RemoteScannerFrameResult::DurableProgress(receipt) => {
+                let actual = receipt.identity.tier_registry_generation;
+                let expected_identity = crate::DataUsageScanIdentity {
+                    tier_registry_generation: expected.tier_registry_generation,
+                    ..receipt.identity
+                };
                 if !(expected.supports_durable_progress || expected.supports_complete_observation)
                     || (!expected.supports_durable_progress && receipt.advanced)
                     || (!expected.supports_complete_observation && receipt.observation.is_some())
                     || frame.phase != RemoteScannerPhase::Persisting
                     || receipt.source != expected.source
-                    || Some(receipt.identity) != expected.checkpoint_identity
+                    || Some(expected_identity) != expected.checkpoint_identity
                     || receipt.scan_plan_digest != expected.scan_plan_digest
                     || receipt.checkpoint_plan_digest != expected.checkpoint_plan_digest
                     || receipt.leader_epoch != expected.leader_epoch
                     || receipt.next_cycle != expected.next_cycle
-                    || receipt.identity.tier_registry_generation != expected.tier_registry_generation
                     || !receipt.identity.is_valid()
                     || receipt.observation.as_ref().is_some_and(|observation| {
                         !observation.matches(expected.source, receipt.identity)
-                            || (observation.completed_epoch, observation.completed_cycle)
-                                > (expected.leader_epoch, expected.next_cycle)
+                            || observation.completed_epoch > expected.leader_epoch
+                            || observation.completed_cycle > expected.next_cycle
                     })
                 {
                     return Err(RemoteScannerStreamError::reconciled(StorageError::other(
                         "remote namespace scanner returned an unnegotiated or mismatched durable progress receipt",
                     )));
                 }
-                Some(Ok(RemoteScannerOutcome::DurableProgress {
-                    advanced: receipt.advanced,
-                    resource_deferred: receipt.resource_deferred,
-                    observation: receipt.observation,
-                }))
+                if let Some(mismatch) = expected.legacy_tier_registry_mismatch(actual)? {
+                    Some(Ok(mismatch))
+                } else {
+                    Some(Ok(RemoteScannerOutcome::DurableProgress {
+                        advanced: receipt.advanced,
+                        resource_deferred: receipt.resource_deferred,
+                        observation: receipt.observation,
+                    }))
+                }
             }
             RemoteScannerFrameResult::Partial => Some(Ok(RemoteScannerOutcome::Partial)),
             RemoteScannerFrameResult::NamespaceNotFound => Some(Ok(RemoteScannerOutcome::NamespaceNotFound)),
@@ -1786,6 +1883,22 @@ where
                     )));
                 }
                 Some(Ok(RemoteScannerOutcome::CycleAhead(required_cycle)))
+            }
+            RemoteScannerFrameResult::TierRegistryMismatch(mismatch) => {
+                if !expected.supports_tier_registry_preflight
+                    || mismatch.expected != expected.tier_registry_generation
+                    || mismatch.expected == mismatch.actual
+                    || frame.phase != RemoteScannerPhase::Scanning
+                    || frame.progress != RemoteScannerProgress::default()
+                {
+                    return Err(RemoteScannerStreamError::reconciled(StorageError::other(
+                        "remote namespace scanner returned an invalid tier registry preflight mismatch",
+                    )));
+                }
+                Some(Ok(RemoteScannerOutcome::TierRegistryMismatch {
+                    expected: mismatch.expected,
+                    actual: mismatch.actual,
+                }))
             }
             RemoteScannerFrameResult::Error(error_frame) => {
                 let retry_bucket = error_frame.message.starts_with(NS_SCANNER_RETRY_BUCKET_ERROR_PREFIX);

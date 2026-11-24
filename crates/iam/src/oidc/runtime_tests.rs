@@ -437,6 +437,7 @@ fn test_map_claims_to_policies_no_provider() {
     let sys = OidcSys::empty().expect("failed to initialize empty OIDC system");
 
     let claims = OidcClaims {
+        profile: Default::default(),
         sub: "user123".to_string(),
         email: "user@example.com".to_string(),
         username: "user".to_string(),
@@ -460,6 +461,7 @@ fn test_oidc_claims_default() {
 #[test]
 fn test_oidc_claims_serde_roundtrip() {
     let claims = OidcClaims {
+        profile: Default::default(),
         sub: "user123".to_string(),
         email: "user@example.com".to_string(),
         username: "testuser".to_string(),
@@ -679,6 +681,7 @@ fn test_map_claims_to_policies_with_prefix() {
     let sys = make_test_sys(vec![config]);
 
     let claims = OidcClaims {
+        profile: Default::default(),
         sub: "user456".to_string(),
         email: "user@corp.com".to_string(),
         username: "user".to_string(),
@@ -758,6 +761,7 @@ fn verified_identity_preserves_provider_and_claim_values() {
     let identity = verified_identity(
         FederatedProviderRef::new("corp".to_string()),
         OidcClaims {
+            profile: Default::default(),
             sub: " subject-123 ".to_string(),
             email: " user@example.test ".to_string(),
             username: " user ".to_string(),
@@ -818,4 +822,117 @@ fn adapter_preserves_provider_views_and_redirect_policy() {
         })
     );
     assert_eq!(adapter.redirect_policy("missing"), None);
+}
+
+/// Serve one UserInfo response and return the base URL plus the captured request head.
+async fn serve_userinfo_once(
+    status: &'static str,
+    content_type: &'static str,
+    body: String,
+) -> (String, tokio::task::JoinHandle<String>) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let handle = tokio::spawn(async move {
+        let (mut stream, _) = tokio::time::timeout(StdDuration::from_secs(10), listener.accept())
+            .await
+            .expect("userinfo request should arrive")
+            .unwrap();
+        let mut head = Vec::new();
+        while !head.ends_with(b"\r\n\r\n") {
+            head.push(stream.read_u8().await.unwrap());
+            assert!(head.len() < 8192);
+        }
+        let response = format!(
+            "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        stream.write_all(response.as_bytes()).await.unwrap();
+        String::from_utf8(head).unwrap().to_ascii_lowercase()
+    });
+    (base, handle)
+}
+
+async fn fetch_mock_userinfo(
+    status: &'static str,
+    content_type: &'static str,
+    body: serde_json::Value,
+) -> (Result<FederatedProfile, String>, String) {
+    let (base, handle) = serve_userinfo_once(status, content_type, body.to_string()).await;
+    let http_client = ReqwestHttpClient::with_policy(OutboundPolicy::from_allowed_origins(&base).unwrap());
+    let result = fetch_userinfo_profile(
+        &http_client,
+        &format!("{base}/userinfo"),
+        "test-access-token",
+        "existing-user",
+        &test_config("console"),
+    )
+    .await;
+    (result, handle.await.unwrap())
+}
+
+#[tokio::test]
+async fn userinfo_profile_reads_display_claims_with_bearer_token() {
+    let (result, request) = fetch_mock_userinfo(
+        "200 OK",
+        "application/json; charset=utf-8",
+        serde_json::json!({
+            "sub": "existing-user",
+            "preferred_username": "jane",
+            "email": "jane@example.test",
+            "name": "Jane Doe",
+            "picture": "https://idp.example.test/avatar.png",
+            "groups": ["admins"],
+        }),
+    )
+    .await;
+
+    assert!(request.starts_with("get /userinfo "), "{request}");
+    assert!(request.contains("authorization: bearer test-access-token\r\n"), "{request}");
+    let profile = result.expect("userinfo profile");
+    assert_eq!(profile.username(), Some("jane"));
+    assert_eq!(profile.email(), Some("jane@example.test"));
+    assert_eq!(profile.name(), Some("Jane Doe"));
+    assert_eq!(profile.picture(), Some("https://idp.example.test/avatar.png"));
+}
+
+#[tokio::test]
+async fn userinfo_profile_rejects_mismatched_subject() {
+    let (result, _) = fetch_mock_userinfo(
+        "200 OK",
+        "application/json",
+        serde_json::json!({ "sub": "someone-else", "preferred_username": "attacker" }),
+    )
+    .await;
+    assert_eq!(result.unwrap_err(), "userinfo subject does not match the ID token subject");
+
+    let (result, _) =
+        fetch_mock_userinfo("200 OK", "application/json", serde_json::json!({ "preferred_username": "no-subject" })).await;
+    assert_eq!(result.unwrap_err(), "userinfo subject does not match the ID token subject");
+}
+
+#[tokio::test]
+async fn userinfo_profile_rejects_error_status_and_signed_responses() {
+    let (result, _) =
+        fetch_mock_userinfo("401 Unauthorized", "application/json", serde_json::json!({ "error": "invalid_token" })).await;
+    assert_eq!(result.unwrap_err(), "userinfo endpoint returned status 401");
+
+    let (result, _) = fetch_mock_userinfo("200 OK", "application/jwt", serde_json::json!("header.payload.signature")).await;
+    assert_eq!(result.unwrap_err(), "signed or encrypted userinfo responses are not supported");
+}
+
+#[tokio::test]
+async fn userinfo_request_is_bound_by_outbound_policy() {
+    let http_client = ReqwestHttpClient::with_policy(OutboundPolicy::from_allowed_origins("http://127.0.0.1:1").unwrap());
+    let error = fetch_userinfo_profile(
+        &http_client,
+        "http://169.254.169.254/latest/meta-data",
+        "test-access-token",
+        "existing-user",
+        &test_config("console"),
+    )
+    .await
+    .unwrap_err();
+    assert!(error.starts_with("userinfo request failed:"), "{error}");
 }

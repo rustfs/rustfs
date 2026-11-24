@@ -1274,18 +1274,57 @@ impl<T: Store> IamSys<T> {
         crate::manager::extract_jwt_claims_allow_missing_exp(&u)
     }
 
+    pub async fn get_service_account_revision(&self, access_key: &str) -> Result<Option<(Credentials, String)>> {
+        let Some((mut identity, revision)) = self.store.service_account_revision(access_key).await? else {
+            return Ok(None);
+        };
+        identity.credentials.secret_key.clear();
+        identity.credentials.session_token.clear();
+        Ok(Some((identity.credentials, revision)))
+    }
+
     pub async fn delete_service_account(&self, access_key: &str, notify: bool) -> Result<()> {
         self.delete_service_account_with_revision(access_key, notify).await?;
         Ok(())
     }
 
-    pub async fn delete_service_account_with_revision(&self, access_key: &str, notify: bool) -> Result<Option<OffsetDateTime>> {
-        let Some(u) = self.store.get_user(access_key).await else {
-            return Ok(None);
-        };
+    pub async fn delete_service_account_if_revision(
+        &self,
+        access_key: &str,
+        expected_parent: &str,
+        expected_revision: &str,
+        notify: bool,
+    ) -> Result<OffsetDateTime> {
+        let deleted_at = self
+            .store
+            .delete_service_account_matching_revision(access_key, expected_parent, expected_revision)
+            .await?;
 
-        if !u.credentials.is_service_account() {
-            return Ok(None);
+        if notify && !self.has_watcher() {
+            for result in notify_iam_load_service_account(access_key).await {
+                if let Some(err) = result.err {
+                    warn!("notify deleted service account failed: {}", err);
+                }
+            }
+        }
+
+        Ok(deleted_at)
+    }
+
+    pub async fn delete_service_account_with_revision(&self, access_key: &str, notify: bool) -> Result<Option<OffsetDateTime>> {
+        if let Some(u) = self.store.get_user(access_key).await {
+            if !u.credentials.is_service_account() {
+                return Ok(None);
+            }
+        } else {
+            // Cache misses records created on peers or corrupt/undecryptable on-disk records.
+            // Keep confirmed absence and unsupported mocks returning Ok(None) while letting
+            // unrestricted admin cleanup remove corrupt records.
+            match self.store.service_account_revision(access_key).await {
+                Ok(None) | Err(IamError::IamSysNotInitialized) => return Ok(None),
+                Err(IamError::InvalidArgument) => return Err(IamError::InvalidArgument),
+                Ok(Some(_)) | Err(_) => {}
+            }
         }
 
         let deleted_at = self.store.delete_service_account_with_revision(access_key).await?;
@@ -2690,6 +2729,8 @@ fn self_service_deny_check(args: &Args<'_>) -> bool {
                 AdminAction::ChangeOwnPasswordAdminAction
                     | AdminAction::CreateUserAdminAction
                     | AdminAction::ManageOwnMFAAdminAction
+                    | AdminAction::ListServiceAccountsAdminAction
+                    | AdminAction::RemoveServiceAccountAdminAction
             )
         )
 }
@@ -3245,6 +3286,163 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn service_account_self_service_deny_check_allows_active_policyless_user_only() {
+        let iam_sys = test_iam_sys().await;
+        let now = OffsetDateTime::now_utc();
+        let active_user = UserIdentity::from(Credentials {
+            access_key: "policyless-enabled".to_string(),
+            secret_key: "longenoughsecret".to_string(),
+            status: ACCOUNT_ON.to_string(),
+            ..Default::default()
+        });
+        let inactive_user = UserIdentity::from(Credentials {
+            access_key: "policyless-disabled".to_string(),
+            secret_key: "longenoughsecret".to_string(),
+            status: rustfs_policy::auth::ACCOUNT_OFF.to_string(),
+            ..Default::default()
+        });
+        iam_sys.store.cache.with_write_lock(|cache| {
+            cache.add_or_update_user("policyless-enabled", &active_user, now);
+            cache.add_or_update_user("policyless-disabled", &inactive_user, now);
+        });
+
+        let groups = None;
+        let claims = HashMap::new();
+        let conditions = HashMap::new();
+        for action in [
+            AdminAction::ListServiceAccountsAdminAction,
+            AdminAction::RemoveServiceAccountAdminAction,
+        ] {
+            let active_self_args = Args {
+                account: "policyless-enabled",
+                groups: &groups,
+                action: Action::AdminAction(action),
+                bucket: "",
+                conditions: &conditions,
+                is_owner: false,
+                object: "",
+                claims: &claims,
+                deny_only: true,
+            };
+            assert!(
+                iam_sys.is_allowed(&active_self_args).await,
+                "active policyless user must retain self-service for {action:?}"
+            );
+
+            let active_full_args = Args {
+                deny_only: false,
+                ..active_self_args.clone()
+            };
+            assert!(
+                !iam_sys.is_allowed(&active_full_args).await,
+                "active policyless user must not satisfy deny_only=false for {action:?}"
+            );
+
+            let inactive_self_args = Args {
+                account: "policyless-disabled",
+                ..active_self_args
+            };
+            assert!(
+                !iam_sys.is_allowed(&inactive_self_args).await,
+                "inactive policyless user must be denied for {action:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn plugin_attempt_sts_is_terminally_denied_for_service_account_self_service_checks() {
+        ensure_test_global_credentials();
+        let iam = IamSys::new(IamCache::new(StsTestMockStore::new(false)).await.unwrap());
+        let previous = IamSys::<StsTestMockStore>::policy_plugin_state().await;
+        let signing_key = crate::root_credentials::token_signing_key().expect("test signing key");
+        let mut metadata = HashMap::from([
+            ("parent".into(), Value::String("sts-fallback-test-parent".into())),
+            (
+                "exp".into(),
+                serde_json::json!((OffsetDateTime::now_utc() + time::Duration::hours(1)).unix_timestamp()),
+            ),
+            (
+                SESSION_POLICY_NAME.into(),
+                Value::String(base64_simd::URL_SAFE_NO_PAD.encode_to_string(
+                    br#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":["s3:GetObject"],"Resource":["arn:aws:s3:::mybucket/inside"]}]}"#,
+                )),
+            ),
+        ]);
+        metadata.insert(PLUGIN_ATTEMPT_CREDENTIAL_CLAIM.into(), Value::Bool(true));
+        let mut marked = get_new_credentials_with_metadata(&metadata, &signing_key).unwrap();
+        marked.parent_user = "sts-fallback-test-parent".into();
+        let marked_claims: HashMap<String, Value> = rustfs_policy::utils::extract_claims(&marked.session_token, &signing_key)
+            .expect("signed test credentials must decode")
+            .claims;
+        iam.store.cache.add_or_update_sts_account(
+            &marked.access_key,
+            &UserIdentity::from(marked.clone()),
+            OffsetDateTime::now_utc(),
+        );
+
+        metadata.remove(PLUGIN_ATTEMPT_CREDENTIAL_CLAIM);
+        let mut ordinary = get_new_credentials_with_metadata(&metadata, &signing_key).unwrap();
+        ordinary.parent_user = marked.parent_user.clone();
+        let ordinary_claims: HashMap<String, Value> = rustfs_policy::utils::extract_claims(&ordinary.session_token, &signing_key)
+            .expect("signed test credentials must decode")
+            .claims;
+        iam.store.cache.add_or_update_sts_account(
+            &ordinary.access_key,
+            &UserIdentity::from(ordinary.clone()),
+            OffsetDateTime::now_utc(),
+        );
+
+        let groups = None;
+        let conditions = HashMap::new();
+        *get_policy_plugin_state().write().await = PolicyPluginState::Disabled;
+        let mut results = Vec::new();
+        for action in [
+            AdminAction::ListServiceAccountsAdminAction,
+            AdminAction::RemoveServiceAccountAdminAction,
+        ] {
+            let marked_args = Args {
+                account: &marked.access_key,
+                groups: &groups,
+                action: Action::AdminAction(action),
+                bucket: "",
+                conditions: &conditions,
+                is_owner: false,
+                object: "",
+                claims: &marked_claims,
+                deny_only: true,
+            };
+            let prepared_marked = iam.prepare_auth(&marked_args).await;
+            let terminal = matches!(prepared_marked.mode, PreparedIamMode::TerminalDeny)
+                && matches!(
+                    iam.try_eval_prepared(&prepared_marked, &marked_args).await,
+                    Err(Error::IAMActionNotAllowed)
+                )
+                && !iam.is_allowed(&marked_args).await;
+
+            let ordinary_args = Args {
+                account: &ordinary.access_key,
+                claims: &ordinary_claims,
+                ..marked_args.clone()
+            };
+            let ordinary_allowed = iam.is_allowed(&ordinary_args).await;
+            results.push((action, terminal, ordinary_allowed));
+        }
+        *get_policy_plugin_state().write().await = previous;
+
+        for (action, terminal, ordinary_allowed) in results {
+            assert!(
+                terminal,
+                "plugin-attempt STS with S3-only session policy must receive TerminalDeny on deny_only self-service check for {action:?}"
+            );
+            assert!(
+                ordinary_allowed,
+                "unmarked STS session whose parent has no explicit admin deny retains self-service fallback for {action:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
     #[serial]
     async fn restricted_vending_rejects_actual_external_policy_plugin_state() {
         let previous = IamSys::<StsTestMockStore>::policy_plugin_state().await;
@@ -3682,6 +3880,8 @@ mod tests {
         bucket_tags: Arc<Mutex<Result<HashMap<String, String>>>>,
         policy_load_barrier: Option<Arc<tokio::sync::Barrier>>,
         saved_sts_users: Arc<Mutex<HashMap<String, UserIdentity>>>,
+        saved_svc_policies: Arc<Mutex<HashMap<String, MappedPolicy>>>,
+        svc_revisions: Arc<Mutex<HashMap<String, u64>>>,
         saved_service_account_count: Arc<Mutex<usize>>,
         fail_delete: Arc<std::sync::atomic::AtomicBool>,
         deleted_mapped_policies: Arc<Mutex<Vec<(String, UserType)>>>,
@@ -3730,6 +3930,13 @@ mod tests {
             hasher.finish().to_string()
         }
 
+        fn hydrate_service_account(mut identity: UserIdentity) -> Result<Option<UserIdentity>> {
+            if identity.credentials.claims.is_none() && !identity.credentials.session_token.is_empty() {
+                identity.credentials.claims = Some(crate::manager::extract_jwt_claims_allow_missing_exp(&identity)?);
+            }
+            Ok(identity.credentials.is_service_account().then_some(identity))
+        }
+
         fn new(empty_policies: bool) -> Self {
             Self {
                 empty_policies,
@@ -3752,6 +3959,8 @@ mod tests {
                         }),
                     )])
                 })),
+                saved_svc_policies: Arc::new(Mutex::new(HashMap::new())),
+                svc_revisions: Arc::new(Mutex::new(HashMap::new())),
                 saved_service_account_count: Arc::new(Mutex::new(0)),
                 fail_delete: Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 deleted_mapped_policies: Arc::new(Mutex::new(Vec::new())),
@@ -3841,6 +4050,9 @@ mod tests {
                     .saved_service_account_count
                     .lock()
                     .expect("saved_service_account_count mutex poisoned") += 1;
+                let mut revisions = self.svc_revisions.lock().expect("svc_revisions mutex poisoned");
+                let next = revisions.get(name).copied().unwrap_or(0) + 1;
+                revisions.insert(name.to_string(), next);
             }
             self.saved_sts_users
                 .lock()
@@ -3860,6 +4072,44 @@ mod tests {
             self.saved_sts_users
                 .lock()
                 .expect("saved_sts_users mutex poisoned")
+                .remove(name);
+            Ok(())
+        }
+
+        async fn service_account_revision(&self, name: &str) -> Result<Option<(UserIdentity, String)>> {
+            let entry = {
+                let saved = self.saved_sts_users.lock().expect("saved_sts_users mutex poisoned");
+                let revisions = self.svc_revisions.lock().expect("svc_revisions mutex poisoned");
+                saved
+                    .get(name)
+                    .map(|user| (user.clone(), revisions.get(name).copied().unwrap_or(0)))
+            };
+            let Some((user, rev)) = entry else {
+                return Ok(None);
+            };
+            let raw_rev = format!("{}:{rev}", Self::revision(&user));
+            Ok(Self::hydrate_service_account(user)?.map(|hydrated| (hydrated, raw_rev)))
+        }
+
+        async fn delete_service_account_revision(&self, name: &str, revision: &str) -> Result<()> {
+            let mut saved = self.saved_sts_users.lock().expect("saved_sts_users mutex poisoned");
+            let revisions = self.svc_revisions.lock().expect("svc_revisions mutex poisoned");
+            let Some(current) = saved.get(name).cloned() else {
+                return Err(Error::NoSuchServiceAccount(name.to_owned()));
+            };
+            let raw_rev = format!("{}:{}", Self::revision(&current), revisions.get(name).copied().unwrap_or(0));
+            if Self::hydrate_service_account(current)?.is_none() {
+                return Err(Error::NoSuchServiceAccount(name.to_owned()));
+            }
+            if raw_rev != revision {
+                return Err(Error::IAMActionNotAllowed);
+            }
+            saved.remove(name);
+            drop(revisions);
+            drop(saved);
+            self.saved_svc_policies
+                .lock()
+                .expect("saved_svc_policies mutex poisoned")
                 .remove(name);
             Ok(())
         }
@@ -4011,12 +4261,19 @@ mod tests {
 
         async fn save_mapped_policy(
             &self,
-            _name: &str,
-            _user_type: UserType,
-            _is_group: bool,
-            _item: MappedPolicy,
+            name: &str,
+            user_type: UserType,
+            is_group: bool,
+            item: MappedPolicy,
             _ttl: Option<usize>,
         ) -> Result<()> {
+            if user_type == UserType::Svc && !is_group {
+                self.saved_svc_policies
+                    .lock()
+                    .expect("saved_svc_policies mutex poisoned")
+                    .insert(name.to_owned(), item);
+                return Ok(());
+            }
             Err(Error::InvalidArgument)
         }
 
@@ -4026,6 +4283,13 @@ mod tests {
                 .expect("deleted_mapped_policies mutex poisoned")
                 .push((name.to_string(), user_type));
             if is_group {
+                return Ok(());
+            }
+            if user_type == UserType::Svc {
+                self.saved_svc_policies
+                    .lock()
+                    .expect("saved_svc_policies mutex poisoned")
+                    .remove(name);
                 return Ok(());
             }
             Err(Error::InvalidArgument)
@@ -4038,6 +4302,19 @@ mod tests {
             is_group: bool,
             m: &mut HashMap<String, MappedPolicy>,
         ) -> Result<()> {
+            if user_type == UserType::Svc && !is_group {
+                if let Some(policy) = self
+                    .saved_svc_policies
+                    .lock()
+                    .expect("saved_svc_policies mutex poisoned")
+                    .get(name)
+                    .cloned()
+                {
+                    m.insert(name.to_owned(), policy);
+                } else {
+                    return Err(Error::NoSuchPolicy);
+                }
+            }
             if user_type == UserType::Reg && !is_group && name == "notify-user" {
                 m.insert(name.to_string(), MappedPolicy::new("readwrite"));
             }
@@ -4504,6 +4781,91 @@ mod tests {
             .await
             .expect("recreate service account");
         assert!(deleted_at <= recreated_at);
+    }
+
+    #[tokio::test]
+    async fn service_account_if_revision_rejects_replacement_and_suppresses_notification() {
+        ensure_test_global_credentials();
+
+        let (store, node_a, node_b) = shared_iam_caches().await;
+        let iam_a = IamSys::new(node_a);
+        let iam_b = IamSys::new(node_b);
+        let access_key = "SVCREVISIONRACEKEY1";
+
+        iam_a
+            .new_service_account("alice", None, service_account_opts(access_key, "aliceSecret123"))
+            .await
+            .expect("create initial service account");
+        let (cred1, rev1) = iam_a
+            .get_service_account_revision(access_key)
+            .await
+            .expect("lookup initial revision")
+            .expect("service account exists");
+        assert_eq!(cred1.parent_user, "alice");
+
+        // Second node replaces the service account under the same key and attaches a mapped policy.
+        iam_b
+            .store
+            .delete_service_account_with_revision(access_key)
+            .await
+            .expect("peer delete");
+        iam_b
+            .new_service_account("bob", None, service_account_opts(access_key, "bobSecret123"))
+            .await
+            .expect("peer recreate service account");
+        store
+            .save_mapped_policy(access_key, UserType::Svc, false, MappedPolicy::new("readonly"), None)
+            .await
+            .expect("peer attach mapped policy");
+
+        let notifications = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let err = crate::LOAD_SERVICE_ACCOUNT_NOTIFICATION_PROBE
+            .scope(
+                Arc::clone(&notifications),
+                iam_a.delete_service_account_if_revision(access_key, "alice", &rev1, true),
+            )
+            .await
+            .expect_err("stale revision delete must be rejected");
+        assert!(matches!(err, IamError::IAMActionNotAllowed), "got {err:?}");
+        assert!(
+            notifications.lock().expect("notifications mutex").is_empty(),
+            "rejected delete must not emit notifications"
+        );
+
+        let (surviving, rev2) = iam_b
+            .get_service_account_revision(access_key)
+            .await
+            .expect("lookup replacement")
+            .expect("replacement identity must survive");
+        assert_eq!(surviving.parent_user, "bob");
+        let mut policies = HashMap::new();
+        store
+            .load_mapped_policy(access_key, UserType::Svc, false, &mut policies)
+            .await
+            .expect("replacement mapped policy must survive");
+        assert_eq!(policies[access_key].policies, "readonly");
+
+        crate::LOAD_SERVICE_ACCOUNT_NOTIFICATION_PROBE
+            .scope(
+                Arc::clone(&notifications),
+                iam_b.delete_service_account_if_revision(access_key, "bob", &rev2, true),
+            )
+            .await
+            .expect("matching revision delete should succeed");
+        assert_eq!(notifications.lock().expect("notifications mutex").as_slice(), &[access_key]);
+        assert!(
+            iam_b
+                .get_service_account_revision(access_key)
+                .await
+                .expect("verify deleted")
+                .is_none()
+        );
+        assert!(matches!(
+            store
+                .load_mapped_policy(access_key, UserType::Svc, false, &mut HashMap::new())
+                .await,
+            Err(Error::NoSuchPolicy)
+        ));
     }
 
     #[tokio::test]

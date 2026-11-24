@@ -2677,6 +2677,17 @@ impl SourceStore {
 }
 
 impl LocalDisk {
+    pub(super) fn reject_imported_multipart_anchor_std(source_directory: &Path) -> std::io::Result<()> {
+        match std::fs::symlink_metadata(source_directory.join(RETIREMENT_ANCHOR)) {
+            Ok(_) => Err(IoError::new(
+                std::io::ErrorKind::PermissionDenied,
+                "TMP cannot import multipart retirement provenance",
+            )),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error),
+        }
+    }
+
     /// TMP/heal never imports or issues provenance. Conserve only an existing
     /// physical DD owner's immutable record; exact current-FI confirmation is
     /// performed separately when a native proof is requested.
@@ -2692,17 +2703,7 @@ impl LocalDisk {
         let source = source_directory.to_path_buf();
         let base = self.io_root().to_path_buf();
         let root = self.publication_root.clone();
-        os::run_blocking_namespace_operation(lease.clone(), move || {
-            match std::fs::symlink_metadata(source.join(RETIREMENT_ANCHOR)) {
-                Ok(_) => Err(IoError::new(
-                    std::io::ErrorKind::PermissionDenied,
-                    "TMP cannot import multipart retirement provenance",
-                )),
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-                Err(error) => Err(error),
-            }
-        })
-        .await?;
+        os::run_blocking_namespace_operation(lease.clone(), move || Self::reject_imported_multipart_anchor_std(&source)).await?;
         if !incoming.is_healing() {
             return Ok(());
         }

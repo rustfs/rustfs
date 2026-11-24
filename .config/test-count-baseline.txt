@@ -57,6 +57,7 @@ rustfs-scanner	1392	20
 rustfs-scanner-metrics	90	0
 rustfs-security-governance	20	0
 rustfs-signer	34	0
+rustfs-sse	145	0
 rustfs-storage-api	34	0
 rustfs-targets	612	26
 rustfs-test-utils	1	0

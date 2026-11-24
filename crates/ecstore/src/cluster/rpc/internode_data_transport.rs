@@ -24,10 +24,10 @@ use crate::storage_api_contracts::internode::{
     NS_SCANNER_COMPLETE_OBSERVATION_QUERY, NS_SCANNER_CYCLE_QUERY, NS_SCANNER_DURABLE_PROGRESS_QUERY,
     NS_SCANNER_LEADER_EPOCH_QUERY, NS_SCANNER_PROTOCOL_VERSION, NS_SCANNER_PROTOCOL_VERSION_QUERY, NS_SCANNER_REQUEST_ID_QUERY,
     NS_SCANNER_SERVER_EPOCH_QUERY, NS_SCANNER_SESSION_ID_QUERY, NS_SCANNER_SESSION_SEQUENCE_QUERY,
-    NS_SCANNER_TIER_REGISTRY_GENERATION_QUERY, NsScannerCapabilityResponse, PUT_FILE_AUTH_QUERY, PUT_FILE_AUTH_V1,
-    PUT_FILE_CAPABILITY_CHALLENGE_QUERY, PUT_FILE_CAPABILITY_QUERY, PUT_FILE_CAPABILITY_VERSION, PUT_FILE_NONCE_QUERY,
-    PUT_FILE_SERVER_EPOCH_QUERY, PutFileCapabilityResponse, WALK_DIR_BODY_SHA256_QUERY, WALK_DIR_STREAM_COMPLETION_QUERY,
-    WALK_DIR_STREAM_COMPLETION_V1,
+    NS_SCANNER_TIER_REGISTRY_GENERATION_QUERY, NS_SCANNER_TIER_REGISTRY_PREFLIGHT_QUERY, NsScannerCapabilityResponse,
+    PUT_FILE_AUTH_QUERY, PUT_FILE_AUTH_V1, PUT_FILE_CAPABILITY_CHALLENGE_QUERY, PUT_FILE_CAPABILITY_QUERY,
+    PUT_FILE_CAPABILITY_VERSION, PUT_FILE_NONCE_QUERY, PUT_FILE_SERVER_EPOCH_QUERY, PutFileCapabilityResponse,
+    WALK_DIR_BODY_SHA256_QUERY, WALK_DIR_STREAM_COMPLETION_QUERY, WALK_DIR_STREAM_COMPLETION_V1,
 };
 use async_trait::async_trait;
 use http::{HeaderMap, HeaderValue, Method, header::CONTENT_TYPE};
@@ -282,6 +282,7 @@ pub struct NsScannerCapabilityRequest {
     pub supports_durable_progress: bool,
     pub supports_complete_observation: bool,
     pub supports_usage_watch: bool,
+    pub supports_tier_registry_preflight: bool,
 }
 
 /// Data-plane stream opener used by `RemoteDisk`.
@@ -330,6 +331,7 @@ pub trait InternodeDataTransport: Send + Sync + std::fmt::Debug {
             supports_durable_progress: None,
             supports_complete_observation: None,
             usage_watch_proof: None,
+            tier_registry_preflight_proof: None,
         })
     }
     // Interface facet nobody calls yet: every transport implements both, but no
@@ -424,6 +426,21 @@ impl InternodeDataTransport for TcpHttpInternodeDataTransport {
     }
 
     async fn probe_ns_scanner_capability(&self, request: NsScannerCapabilityRequest) -> Result<NsScannerCapabilityResponse> {
+        let request = if request.supports_tier_registry_preflight {
+            match self.probe_ns_scanner_capability_once(&request).await {
+                Ok(response) if response.tier_registry_preflight_proof.is_some() => return Ok(response),
+                Err(error) if !ns_scanner_capability_error_allows_legacy(&error) => return Err(error),
+                // A strict older parser rejects the marker. A permissive peer ignores it, and
+                // an intermediary could strip the independent proof from a current response.
+                // Authenticate what this peer grants without the marker under a fresh challenge.
+                _ => NsScannerCapabilityRequest {
+                    supports_tier_registry_preflight: false,
+                    ..request
+                },
+            }
+        } else {
+            request
+        };
         let request = if request.supports_usage_watch {
             match self.probe_ns_scanner_capability_once(&request).await {
                 Ok(response) => return Ok(response),
@@ -493,6 +510,7 @@ impl InternodeDataTransport for TcpHttpInternodeDataTransport {
                         supports_durable_progress: false,
                         supports_complete_observation: false,
                         supports_usage_watch: false,
+                        supports_tier_registry_preflight: false,
                     };
                     match self.probe_ns_scanner_capability_once(&legacy_request).await {
                         Ok(mut response) => {
@@ -549,6 +567,18 @@ impl TcpHttpInternodeDataTransport {
             rmp_serde::from_slice(&body).map_err(|_| Error::other("invalid remote namespace scanner capability response"))?;
         if response.version != NS_SCANNER_PROTOCOL_VERSION || response.server_epoch.is_nil() {
             return Err(Error::other("incompatible remote namespace scanner capability response"));
+        }
+        if request.supports_tier_registry_preflight {
+            if let Some(proof) = response.tier_registry_preflight_proof.as_deref() {
+                crate::cluster::rpc::verify_ns_scanner_tier_registry_preflight_capability(
+                    challenge,
+                    response.server_epoch,
+                    proof,
+                )
+                .map_err(|_| Error::other("remote namespace scanner tier registry preflight capability authentication failed"))?;
+            }
+        } else {
+            response.tier_registry_preflight_proof = None;
         }
         if request.supports_usage_watch {
             if let Some(proof) = response.usage_watch_proof.as_deref() {
@@ -1020,40 +1050,30 @@ fn build_ns_scanner_url(request: &NsScannerStreamRequest) -> String {
 }
 
 fn build_ns_scanner_capability_url(request: &NsScannerCapabilityRequest, challenge: Uuid) -> String {
-    format!(
-        "{}{}?{}={}&{}={}{}{}{}{}{}",
+    let mut url = format!(
+        "{}{}?{}={}&{}={}",
         request.endpoint,
         NS_SCANNER_PATH,
         NS_SCANNER_PROTOCOL_VERSION_QUERY,
         NS_SCANNER_PROTOCOL_VERSION,
         NS_SCANNER_CAPABILITY_CHALLENGE_QUERY,
-        challenge,
-        if request.supports_tier_registry_generation {
-            format!("&{}=true", NS_SCANNER_TIER_REGISTRY_GENERATION_QUERY)
-        } else {
-            String::new()
-        },
-        if request.supports_checkpoint_coverage {
-            format!("&{}=true", NS_SCANNER_CHECKPOINT_COVERAGE_QUERY)
-        } else {
-            String::new()
-        },
-        if request.supports_durable_progress {
-            format!("&{}=true", NS_SCANNER_DURABLE_PROGRESS_QUERY)
-        } else {
-            String::new()
-        },
-        if request.supports_complete_observation {
-            format!("&{}=true", NS_SCANNER_COMPLETE_OBSERVATION_QUERY)
-        } else {
-            String::new()
-        },
-        if request.supports_usage_watch {
-            "&ns_scanner_usage_watch=true".to_string()
-        } else {
-            String::new()
+        challenge
+    );
+    for (requested, key) in [
+        (request.supports_tier_registry_generation, NS_SCANNER_TIER_REGISTRY_GENERATION_QUERY),
+        (request.supports_checkpoint_coverage, NS_SCANNER_CHECKPOINT_COVERAGE_QUERY),
+        (request.supports_durable_progress, NS_SCANNER_DURABLE_PROGRESS_QUERY),
+        (request.supports_complete_observation, NS_SCANNER_COMPLETE_OBSERVATION_QUERY),
+        (request.supports_usage_watch, "ns_scanner_usage_watch"),
+        (request.supports_tier_registry_preflight, NS_SCANNER_TIER_REGISTRY_PREFLIGHT_QUERY),
+    ] {
+        if requested {
+            url.push('&');
+            url.push_str(key);
+            url.push_str("=true");
         }
-    )
+    }
+    url
 }
 
 pub(super) fn json_headers() -> HeaderMap {
@@ -1436,6 +1456,7 @@ mod tests {
                 supports_durable_progress: false,
                 supports_complete_observation: false,
                 supports_usage_watch: false,
+                supports_tier_registry_preflight: false,
             })
             .await
             .expect_err("legacy transport should report namespace scanner as unsupported");
@@ -1463,16 +1484,31 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn namespace_scanner_watch_capability_preserves_older_capabilities_and_rejects_stale_proof() {
+    async fn namespace_scanner_preflight_and_watch_proofs_preserve_older_capabilities_and_reject_replay() {
         crate::runtime::sources::ensure_test_rpc_secret();
-        for peer in ["current", "strict-old", "missing-watch", "stale-watch"] {
+        for peer in [
+            "current",
+            "strict-old",
+            "watch-only",
+            "missing-watch",
+            "permissive-old",
+            "stripped-preflight",
+            "replayed-fallback",
+            "stale-watch",
+            "stale-preflight",
+        ] {
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
                 .await
                 .expect("watch capability listener");
             let address = listener.local_addr().expect("listener address");
             let epoch = Uuid::new_v4();
+            let requests = match peer {
+                "strict-old" => 3,
+                "watch-only" | "permissive-old" | "stripped-preflight" | "replayed-fallback" => 2,
+                _ => 1,
+            };
             let server = tokio::spawn(async move {
-                let requests = if peer == "strict-old" { 2 } else { 1 };
+                let mut first_challenge = None;
                 for index in 0..requests {
                     let (mut socket, _) = listener.accept().await.expect("watch capability request");
                     let mut bytes = Vec::new();
@@ -1486,28 +1522,62 @@ mod tests {
                     let target = headers.split_whitespace().nth(1).expect("target");
                     let url = reqwest::Url::parse(&format!("http://{address}{target}")).expect("request URL");
                     let query: HashMap<_, _> = url.query_pairs().into_owned().collect();
-                    assert_eq!(query.contains_key("ns_scanner_usage_watch"), index == 0);
+                    assert_eq!(query.contains_key(NS_SCANNER_TIER_REGISTRY_PREFLIGHT_QUERY), index == 0);
+                    assert_eq!(query.contains_key("ns_scanner_usage_watch"), index < 2);
                     assert!(query.contains_key(NS_SCANNER_DURABLE_PROGRESS_QUERY));
                     assert!(query.contains_key(NS_SCANNER_COMPLETE_OBSERVATION_QUERY));
-                    if peer == "strict-old" && index == 0 {
+                    let challenge = query[NS_SCANNER_CAPABILITY_CHALLENGE_QUERY].parse().expect("challenge");
+                    if index == 0 {
+                        first_challenge = Some(challenge);
+                    } else {
+                        assert_ne!(Some(challenge), first_challenge, "fallback must authenticate a fresh request");
+                    }
+                    if matches!(peer, "strict-old" | "watch-only") && index + 1 < requests {
                         socket
                             .write_all(b"HTTP/1.1 400 Bad Request\r\ncontent-length: 0\r\nconnection: close\r\n\r\n")
                             .await
                             .expect("old parser rejects only the new field");
                         continue;
                     }
-                    let challenge = query[NS_SCANNER_CAPABILITY_CHALLENGE_QUERY].parse().expect("challenge");
+                    // A current server without the marker grants only its authenticated baseline.
+                    let extensions = !(matches!(peer, "stripped-preflight" | "replayed-fallback") && index > 0);
+                    let proof_challenge = if peer == "replayed-fallback" && index > 0 {
+                        first_challenge.expect("first marked request")
+                    } else {
+                        challenge
+                    };
                     let proof = crate::cluster::rpc::sign_ns_scanner_capability_with_usage_capabilities(
-                        challenge, epoch, true, true, true, true,
+                        proof_challenge,
+                        epoch,
+                        extensions,
+                        extensions,
+                        extensions,
+                        extensions,
                     )
                     .expect("prior capability proof");
                     let usage_watch_proof = match peer {
-                        "current" => Some(
-                            crate::cluster::rpc::sign_ns_scanner_usage_watch_capability(challenge, epoch).expect("watch proof"),
-                        ),
+                        "current" | "watch-only" | "permissive-old" | "stripped-preflight" | "replayed-fallback"
+                            if extensions =>
+                        {
+                            Some(
+                                crate::cluster::rpc::sign_ns_scanner_usage_watch_capability(challenge, epoch)
+                                    .expect("watch proof"),
+                            )
+                        }
                         "stale-watch" => Some(
                             crate::cluster::rpc::sign_ns_scanner_usage_watch_capability(Uuid::new_v4(), epoch)
                                 .expect("stale watch proof"),
+                        ),
+                        _ => None,
+                    };
+                    let tier_registry_preflight_proof = match peer {
+                        "current" | "missing-watch" => Some(
+                            crate::cluster::rpc::sign_ns_scanner_tier_registry_preflight_capability(challenge, epoch)
+                                .expect("preflight proof"),
+                        ),
+                        "stale-preflight" => Some(
+                            crate::cluster::rpc::sign_ns_scanner_tier_registry_preflight_capability(Uuid::new_v4(), epoch)
+                                .expect("stale proof"),
                         ),
                         _ => None,
                     };
@@ -1515,11 +1585,12 @@ mod tests {
                         version: NS_SCANNER_PROTOCOL_VERSION,
                         server_epoch: epoch,
                         proof,
-                        supports_tier_registry_generation: Some(true),
-                        supports_checkpoint_coverage: Some(true),
-                        supports_durable_progress: Some(true),
-                        supports_complete_observation: Some(true),
+                        supports_tier_registry_generation: extensions.then_some(true),
+                        supports_checkpoint_coverage: extensions.then_some(true),
+                        supports_durable_progress: extensions.then_some(true),
+                        supports_complete_observation: extensions.then_some(true),
                         usage_watch_proof,
+                        tier_registry_preflight_proof,
                     })
                     .expect("capability body");
                     socket
@@ -1530,7 +1601,6 @@ mod tests {
                         .expect("response headers");
                     socket.write_all(&body).await.expect("response body");
                 }
-                requests
             });
             let response = tokio::time::timeout(
                 Duration::from_secs(10),
@@ -1541,11 +1611,12 @@ mod tests {
                     supports_durable_progress: true,
                     supports_complete_observation: true,
                     supports_usage_watch: true,
+                    supports_tier_registry_preflight: true,
                 }),
             )
             .await
             .expect("bounded probe");
-            if peer == "stale-watch" {
+            if matches!(peer, "stale-watch" | "stale-preflight" | "replayed-fallback") {
                 assert!(
                     response
                         .expect_err("stale response must fail authentication")
@@ -1554,11 +1625,24 @@ mod tests {
                 );
             } else {
                 let response = response.expect("verified capability result");
-                assert_eq!(response.usage_watch_proof.is_some(), peer == "current");
-                assert_eq!(response.supports_durable_progress, Some(true));
-                assert_eq!(response.supports_complete_observation, Some(true));
+                assert_eq!(
+                    response.usage_watch_proof.is_some(),
+                    matches!(peer, "current" | "watch-only" | "permissive-old")
+                );
+                assert_eq!(
+                    response.tier_registry_preflight_proof.is_some(),
+                    matches!(peer, "current" | "missing-watch")
+                );
+                let granted = (peer != "stripped-preflight").then_some(true);
+                assert_eq!(response.supports_tier_registry_generation, granted);
+                assert_eq!(response.supports_checkpoint_coverage, granted);
+                assert_eq!(response.supports_durable_progress, granted);
+                assert_eq!(response.supports_complete_observation, granted);
             }
-            assert_eq!(server.await.expect("capability server"), if peer == "strict-old" { 2 } else { 1 });
+            tokio::time::timeout(Duration::from_secs(10), server)
+                .await
+                .expect("all expected compatibility probes must arrive")
+                .expect("capability server");
         }
     }
 
@@ -1617,6 +1701,7 @@ mod tests {
                         supports_durable_progress: None,
                         supports_complete_observation: None,
                         usage_watch_proof: None,
+                        tier_registry_preflight_proof: None,
                     })
                     .expect("capability response");
                     socket
@@ -1638,6 +1723,7 @@ mod tests {
                     supports_durable_progress: false,
                     supports_complete_observation: false,
                     supports_usage_watch: false,
+                    supports_tier_registry_preflight: false,
                 }),
             )
             .await
@@ -1715,6 +1801,7 @@ mod tests {
                         supports_durable_progress: (peer != "current").then_some(true),
                         supports_complete_observation: None,
                         usage_watch_proof: None,
+                        tier_registry_preflight_proof: None,
                     })
                     .expect("capability response");
                     socket
@@ -1736,6 +1823,7 @@ mod tests {
                     supports_durable_progress: true,
                     supports_complete_observation: false,
                     supports_usage_watch: false,
+                    supports_tier_registry_preflight: false,
                 }),
             )
             .await
@@ -1815,6 +1903,7 @@ mod tests {
                         supports_durable_progress: Some(true),
                         supports_complete_observation: (peer != "current").then_some(true),
                         usage_watch_proof: None,
+                        tier_registry_preflight_proof: None,
                     })
                     .expect("capability response");
                     socket
@@ -1836,6 +1925,7 @@ mod tests {
                     supports_durable_progress: true,
                     supports_complete_observation: true,
                     supports_usage_watch: false,
+                    supports_tier_registry_preflight: false,
                 }),
             )
             .await
@@ -2605,6 +2695,7 @@ mod tests {
                 supports_durable_progress: false,
                 supports_complete_observation: false,
                 supports_usage_watch: false,
+                supports_tier_registry_preflight: false,
             },
             challenge,
         );
@@ -2628,6 +2719,7 @@ mod tests {
                 supports_durable_progress: false,
                 supports_complete_observation: false,
                 supports_usage_watch: false,
+                supports_tier_registry_preflight: false,
             },
             challenge,
         );
@@ -2670,6 +2762,7 @@ mod tests {
             supports_durable_progress: None,
             supports_complete_observation: None,
             usage_watch_proof: None,
+            tier_registry_preflight_proof: None,
         };
 
         normalize_ns_scanner_capability_response(&mut response, true, true, false, false);
@@ -2694,6 +2787,7 @@ mod tests {
             supports_durable_progress: None,
             supports_complete_observation: None,
             usage_watch_proof: None,
+            tier_registry_preflight_proof: None,
         };
         // A proof bound to a different challenge cannot authorize the legacy
         // fallback, even though the response has the expected shape.

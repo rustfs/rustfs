@@ -12,6 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+// Cargo tracks option_env! when compiling this script. Keep its usual package-file
+// change detection, while refreshing shadow-rs when an E2E build switches revisions.
+const _: Option<&str> = option_env!("RUSTFS_E2E_BUILD_HEAD");
+
 fn main() -> shadow_rs::SdResult<()> {
     shadow_rs::ShadowBuilder::builder().build()?;
     Ok(())

@@ -75,6 +75,16 @@ pub trait Store: Clone + Send + Sync + 'static {
         self.upsert_regular_user(name, &mut item.clone(), false).await
     }
     async fn delete_user_identity(&self, name: &str, user_type: UserType) -> Result<()>;
+    /// Read the authoritative service-account identity and its opaque storage revision.
+    /// Only confirmed absence yields `None`; corrupt, undecryptable, or malformed records remain errors.
+    async fn service_account_revision(&self, _name: &str) -> Result<Option<(UserIdentity, String)>> {
+        Err(crate::error::Error::IamSysNotInitialized)
+    }
+    /// Delete a service account only if its authoritative identity still matches `revision`,
+    /// deleting any pre-existing mapped policy afterward only if its revision still matches.
+    async fn delete_service_account_revision(&self, _name: &str, _revision: &str) -> Result<()> {
+        Err(crate::error::Error::IamSysNotInitialized)
+    }
     async fn load_user_identity(&self, name: &str, user_type: UserType) -> Result<UserIdentity>;
 
     /// Read an enabled regular owner's (plugin epoch, identity revision) from authoritative storage.

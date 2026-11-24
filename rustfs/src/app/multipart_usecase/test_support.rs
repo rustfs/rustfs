@@ -17,7 +17,6 @@
 use super::*;
 use crate::app::storage_api::s3::S3Request;
 pub(super) use crate::app::storage_api::s3::dto::CompletedMultipartUpload;
-pub(super) use crate::app::storage_api::s3::dto::StorageClass;
 use crate::app::{RequestEnvelope, RequestHead};
 pub(super) use http::Extensions;
 pub(super) use http::Method;

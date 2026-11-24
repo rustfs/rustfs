@@ -294,12 +294,17 @@ async fn get_bucket_acl_answers_the_owner_with_full_control(server: RustFSServer
         .send()
         .await
         .expect("acl");
-    assert!(acl.owner().and_then(|owner| owner.id()).is_some());
+    let owner = acl.owner().expect("an owner");
+    assert!(owner.id().is_some_and(|id| !id.is_empty()));
     let [grant] = acl.grants() else { panic!("one grant: {:?}", acl.grants()) };
     assert_eq!(grant.permission(), Some(&Permission::FullControl));
     assert_eq!(grant.grantee().map(|grantee| grantee.r#type()), Some(&Type::CanonicalUser));
     let grantee = grant.grantee().expect("a grantee");
-    assert_eq!((grantee.id(), grantee.display_name()), (None, None), "the grantee names no identity");
+    assert_eq!(
+        (grantee.id(), grantee.display_name()),
+        (owner.id(), owner.display_name()),
+        "the grantee names the bucket owner"
+    );
 
     let missing = client
         .get_bucket_acl()

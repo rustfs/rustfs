@@ -28,6 +28,12 @@ Default administrator bucket healing can reconstruct missing directories when ev
 
 Legacy objects without independent storage commitments can be physically repaired while their canonical dispositions remain `unknown`. Do not infer a verified repair count from progress counters; see [heal terminal reports](../architecture/heal-terminal-reports.md).
 
+### When a long heal stops at five minutes
+
+The default `RUSTFS_HEAL_TASK_TIMEOUT_SECS` is 300 seconds. This is an execution budget, separate from the ten-minute admin token retention window that starts at completion. Poll the original heal path and `clientToken` during execution and soon after the deadline. Record the timestamp, `outcome.execution`, `outcome.coverage`, and object dispositions. A deadline with partial coverage is an interrupted traversal, even when some objects were processed successfully. A `notFound` sampled only after retention expires cannot tell you whether the task timed out, succeeded, or repaired the target.
+
+For a replacement test, identify the intended disk UUID and object versions before running the heal. Verify the target shards against the fixture before issuing a normal GET: healthy peers can serve the request, and read-repair can change the result being measured. An online disk, growing filesystem usage, or a readable canary alone does not establish that redundancy was restored.
+
 ## Recovery records and stale tokens
 
 Pending records use schema 4 in `.rustfs.sys/root-heal-<task-id>.json` on the existing

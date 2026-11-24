@@ -872,7 +872,26 @@ impl LocalDisk {
             && src_volume == super::super::RUSTFS_META_TMP_BUCKET;
         let create_source_parent = (!no_inline || remote_metadata_source) && !preserve_upload_metadata;
 
+        // Resolved once for the whole commit so a concurrent configuration
+        // change can never leave a single rename_data half-synced. The tier is
+        // keyed on the destination volume: user data staged in scratch
+        // namespaces follows the configured tier, while commits into
+        // system-critical namespaces (IAM, config, bucket metadata) stay
+        // pinned to strict.
+        let durability = effective_durability(dst_volume);
+        #[cfg(target_os = "linux")]
+        let can_fuse_commit = flat_inline_tmp
+            || (!preserve_upload_metadata
+                && multipart_publication.is_none()
+                && pool_meta_condition.is_none()
+                && !fi_healing
+                && !dst_dir_group_commit
+                && !file_fdatasync_grouping_requires_async_shard_sync(no_inline));
+        #[cfg(not(target_os = "linux"))]
+        let can_fuse_commit = false;
+
         if multipart_publication.is_none()
+            && !can_fuse_commit
             && let Some((source_directory, target_directory)) = has_data_dir_path.as_ref()
         {
             // Reject imported provenance before any DD purge or publication.
@@ -891,14 +910,6 @@ impl LocalDisk {
         check_path_length(src_file_path.to_string_lossy().to_string().as_str())?;
         check_path_length(dst_file_path.to_string_lossy().to_string().as_str())?;
 
-        // Resolved once for the whole commit so a concurrent configuration
-        // change can never leave a single rename_data half-synced. The tier is
-        // keyed on the destination volume: user data staged in scratch
-        // namespaces follows the configured tier, while commits into
-        // system-critical namespaces (IAM, config, bucket metadata) stay
-        // pinned to strict.
-        let durability = effective_durability(dst_volume);
-
         let src_file_parent = src_file_path
             .parent()
             .ok_or_else(|| DiskError::other("missing staged metadata parent"))?;
@@ -907,14 +918,7 @@ impl LocalDisk {
             .ok_or_else(|| DiskError::other("missing object metadata parent"))?;
 
         #[cfg(target_os = "linux")]
-        let (rename_commit_guard, has_dst_buf) = if flat_inline_tmp
-            || (!preserve_upload_metadata
-                && multipart_publication.is_none()
-                && pool_meta_condition.is_none()
-                && !fi_healing
-                && !dst_dir_group_commit
-                && !file_fdatasync_grouping_requires_async_shard_sync(no_inline))
-        {
+        let (rename_commit_guard, has_dst_buf) = if can_fuse_commit {
             #[cfg(test)]
             if !no_inline {
                 run_inline_before_file_sync_admission(dst_path);
@@ -948,6 +952,11 @@ impl LocalDisk {
             let root_owned = self.root.clone();
 
             let fused_attempt = move |is_cancelled: &dyn Fn() -> bool| -> std::io::Result<FusedCommitAttempt> {
+                if let Some((source_directory, _)) = has_data_dir_path_owned.as_ref()
+                    && let Err(err) = Self::reject_imported_multipart_anchor_std(source_directory)
+                {
+                    return Ok(FusedCommitAttempt::CommitErr(DiskError::Io(err)));
+                }
                 let source_mode = if flat_inline_tmp {
                     SourcePreparationMode::FlatInlineTmp { defer_dst_preflight }
                 } else if !no_inline || remote_metadata_source {
@@ -1213,13 +1222,14 @@ impl LocalDisk {
                         }
                         #[cfg(test)]
                         run_owned_file_before_open(&backup_path);
-                        if let Err(err) = os::stage_inline_rollback_backup_with_commit_guard_std(
+                        if let Err(err) = os::stage_inline_rollback_backup_in_dir_with_commit_guard_std(
                             &dst_file_path_owned,
                             &backup_parent,
                             &backup_path,
                             old_file,
                             sync_recovery_protocol,
                             !should_fail_local_inline_rollback_hardlink(&dst_file_path_owned),
+                            has_old_data_dir.is_some(),
                             &guard,
                         ) {
                             return Ok(FusedCommitAttempt::RestoreDataSource(guard, to_file_error(err).into()));

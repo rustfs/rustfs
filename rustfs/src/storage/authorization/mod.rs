@@ -87,13 +87,13 @@ pub(crate) use request::{
 #[cfg(test)]
 pub(crate) use table_data_plane::{
     TABLE_DATA_PLANE_LIST_CURSOR_MAX_ENCODED_LEN, require_owned_reserved_table_object, table_catalog_backend_for_data_plane,
-    table_data_plane_admin_action, table_data_plane_content_mutation, table_data_plane_resource_for_request,
-    table_publication_guard_error,
+    table_data_plane_admin_action, table_data_plane_resource_for_request, table_publication_guard_error,
 };
 pub(crate) use table_data_plane::{
     TABLE_DATA_PLANE_LIST_CURSOR_PREFIX, TableDataPlaneListAccess, TableDataPlaneListCursorPosition, TableDataPlaneListResource,
     TableDataPlanePublicationGuards, retain_table_bucket_publication_guard, table_bucket_enabled_for_data_plane,
-    table_catalog_store_for_data_plane, table_data_plane_list_internal_error, table_list_catalog_error,
+    table_catalog_store_for_data_plane, table_data_plane_content_mutation, table_data_plane_list_internal_error,
+    table_list_catalog_error,
 };
 
 #[cfg(test)]

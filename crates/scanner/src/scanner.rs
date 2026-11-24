@@ -1883,7 +1883,7 @@ impl ScannerScopeFallbackSlot {
 }
 
 #[cfg(test)]
-async fn run_data_scanner_cycle<S>(
+pub(crate) async fn run_data_scanner_cycle<S>(
     ctx: &CancellationToken,
     storeapi: &Arc<S>,
     cycle_info: &mut CurrentCycle,
@@ -2617,6 +2617,7 @@ where
     if let Some(observation) = &durable_observation {
         let _ = crate::e2e_barrier::checkpoint("root_durable", observation.clone()).await;
     }
+    let superseded_reason = scan_cycle_result.partial_stage.unwrap_or("namespace_activity");
     let pending_dirty_usage_buckets = scan_cycle_result.pending_dirty_usage_buckets();
     // Ownership can be lost while an asynchronous publication hook or peer
     // operation yields. Durable bytes do not authorize an ACK after that loss.
@@ -2857,9 +2858,10 @@ where
                 event = EVENT_SCANNER_CYCLE_STATE,
                 component = LOG_COMPONENT_SCANNER,
                 subsystem = LOG_SUBSYSTEM_RUNTIME,
-                cycle = cycle_info.current,
                 state = "superseded",
-                "Scanner cycle usage snapshot was superseded by concurrent namespace activity"
+                reason = superseded_reason,
+                cycle = cycle_info.current,
+                "Scanner cycle superseded"
             );
             if finalize_partial_scan_cycle_for_epoch(
                 ctx,

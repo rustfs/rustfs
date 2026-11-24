@@ -20,6 +20,7 @@
 //! corpus, not here. The comparator is pure so it can be tested without a server.
 
 use serde::Serialize;
+use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
@@ -69,6 +70,9 @@ pub(crate) struct Observation {
     pub error_code: Option<String>,
     /// Allowlisted headers only, lowercase names, normalized values.
     pub headers: BTreeMap<String, String>,
+    /// Captured before SDK response interceptors can rewrite the response.
+    #[serde(skip)]
+    pub(super) wire_head: Option<WireHead>,
     /// Typed values decoded from the response body, never free text.
     pub fields: BTreeMap<String, String>,
     /// Diagnostic only; never compared.
@@ -87,10 +91,10 @@ impl Observation {
     ) -> Self {
         let headers = headers
             .into_iter()
-            .filter_map(|(name, value)| compared_header(name).map(|name| (name, value)))
-            .map(|(name, value)| {
+            .filter_map(|(name, value)| {
+                let name = compared_header(name)?;
                 let value = normalized_header_value(&name, value);
-                (name, value)
+                Some((name, value))
             })
             .collect();
         Self {
@@ -99,6 +103,7 @@ impl Observation {
             status,
             error_code,
             headers,
+            wire_head: None,
             fields: BTreeMap::new(),
             message: None,
         }
@@ -225,6 +230,65 @@ pub(crate) fn compared_cases(a: &[Observation], b: &[Observation]) -> usize {
         .count()
 }
 
+/// Status and the digest of unique header names at the transport boundary. Header values are never retained.
+#[derive(Clone, Debug, Serialize)]
+pub(super) struct WireHead {
+    status: u16,
+    header_names_sha256: String,
+}
+
+impl WireHead {
+    pub(super) fn new<'h>(status: u16, names: impl Iterator<Item = &'h str>) -> Self {
+        let names: BTreeSet<_> = names.map(str::to_ascii_lowercase).collect();
+        let mut digest = Sha256::new();
+        for name in names {
+            digest.update(name.as_bytes());
+            digest.update(b"\n");
+        }
+        Self {
+            status,
+            header_names_sha256: hex_simd::encode_to_string(digest.finalize(), hex_simd::AsciiCase::Lower),
+        }
+    }
+}
+
+/// Evidence for one transmitted response, including cases where the two sides agreed.
+#[derive(Debug, Serialize)]
+pub(super) struct ResponseReceipt {
+    op: &'static str,
+    case: &'static str,
+    #[serde(flatten)]
+    head: WireHead,
+}
+
+pub(super) fn response_receipts(observations: &[Observation]) -> Vec<ResponseReceipt> {
+    observations
+        .iter()
+        .filter_map(|o| {
+            Some(ResponseReceipt {
+                op: o.op,
+                case: o.case,
+                head: o.wire_head.clone()?,
+            })
+        })
+        .collect()
+}
+
+#[derive(Debug, Serialize)]
+pub(super) struct PairedReceipts {
+    responses_a: Vec<ResponseReceipt>,
+    responses_b: Vec<ResponseReceipt>,
+}
+
+impl PairedReceipts {
+    pub(super) fn new(a: &[Observation], b: &[Observation]) -> Self {
+        Self {
+            responses_a: response_receipts(a),
+            responses_b: response_receipts(b),
+        }
+    }
+}
+
 /// The JSON report written for every run.
 #[derive(Debug, Serialize)]
 pub(crate) struct Report {
@@ -243,6 +307,8 @@ pub(crate) struct Report {
     pub compared_ops: usize,
     pub compared_cases: usize,
     pub differences: Vec<Difference>,
+    #[serde(flatten)]
+    pub(super) responses: PairedReceipts,
 }
 
 impl Report {
@@ -485,6 +551,20 @@ mod tests {
     #[test]
     fn the_report_lists_each_difference_as_op_field_a_b() {
         let directory = std::env::temp_dir().join(format!("dual-stack-report-{}", uuid::Uuid::new_v4()));
+        let mut a = [Observation::new(
+            "GetBucketLocation",
+            "normal",
+            200,
+            None,
+            [("x-test-only", "private value"), ("Date", "clock a"), ("date", "duplicate")],
+        )
+        .with_field("location_constraint", "us-east-1")];
+        let mut b = [
+            Observation::new("GetBucketLocation", "normal", 200, None, [("DATE", "clock b"), ("X-TEST-ONLY", "other")])
+                .with_field("location_constraint", "eu-west-1"),
+        ];
+        a[0].wire_head = Some(WireHead::new(200, ["x-test-only", "Date", "date"].into_iter()));
+        b[0].wire_head = Some(WireHead::new(201, ["Date"].into_iter()));
         let report = Report {
             schema: 2,
             run: "unit".into(),
@@ -497,15 +577,26 @@ mod tests {
             region_b: Some("eu-west-1".into()),
             compared_ops: 1,
             compared_cases: 1,
-            differences: compare(
-                &[ok("GetBucketLocation").with_field("location_constraint", "us-east-1")],
-                &[ok("GetBucketLocation").with_field("location_constraint", "eu-west-1")],
-            ),
+            differences: compare(&a, &b),
+            responses: PairedReceipts::new(&a, &b),
         };
         let path = report.write_to(&directory).expect("write the report");
         let json: serde_json::Value = serde_json::from_slice(&std::fs::read(&path).expect("read the report")).expect("parse");
         let _ = std::fs::remove_dir_all(&directory);
         assert_eq!(path.file_name().and_then(|name| name.to_str()), Some("unit.json"));
+        let expected_receipt = serde_json::json!([{
+            "op": "GetBucketLocation", "case": "normal", "status": 200,
+            "header_names_sha256": "fc98ca59b6a14566b52845df9838e7fb48e1e162149d2b6967085ff0a6a20da3",
+        }]);
+        assert_eq!(json["responses_a"], expected_receipt);
+        assert_eq!(
+            json["responses_b"],
+            serde_json::json!([{
+                "op": "GetBucketLocation", "case": "normal", "status": 201,
+                "header_names_sha256": "426e0b848d77d7b3d778187d006056ee406221ca567ce2844ca403dc834ff8f1"
+            }])
+        );
+        assert!(response_receipts(&[ok("HeadBucket")]).is_empty());
         assert_eq!(json["compared_ops"], 1);
         assert_eq!(json["reference_side"], "a");
         assert_eq!(json["version_a"], "rustfs 1.0.4");

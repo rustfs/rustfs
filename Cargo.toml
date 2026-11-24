@@ -61,6 +61,7 @@ members = [
     "crates/security-governance", # Security governance contracts
     "crates/extension-schema", # Extension schema contracts
     "crates/signer", # client signer
+    "crates/sse", # S3 server-side encryption key resolution and metadata
     "crates/storage-api", # Storage API contracts
     "crates/test-utils", # Shared test bootstrap helpers (dev-dependency only)
     "crates/targets", # Target-specific configurations and utilities
@@ -142,6 +143,7 @@ rustfs-scanner = { path = "crates/scanner", version = "1.0.5" }
 rustfs-security-governance = { path = "crates/security-governance", version = "1.0.5" }
 rustfs-extension-schema = { path = "crates/extension-schema", version = "1.0.5" }
 rustfs-signer = { path = "crates/signer", version = "1.0.5" }
+rustfs-sse = { path = "crates/sse", version = "1.0.5" }
 rustfs-storage-api = { path = "crates/storage-api", version = "1.0.5" }
 rustfs-trusted-proxies = { path = "crates/trusted-proxies", version = "1.0.5" }
 rustfs-targets = { path = "crates/targets", version = "1.0.5" }

@@ -509,19 +509,24 @@ mod tests {
             ("bucket", "object", false, Some(date), ("InternalError", "Not init")),
             ("bucket", "object", true, Some(date), invalid_class),
         ] {
-            let input = CreateMultipartUploadInput::builder()
-                .bucket(bucket.to_owned())
-                .key(key.to_owned())
-                .storage_class(invalid.then(|| StorageClass::from("unknown-class".to_owned())))
-                .object_lock_retain_until_date(date.map(Timestamp::from))
-                .build()
-                .expect("direct fixture DTO");
+            // Same facts `from_legacy` carried. Metadata, tagging, SSE, and the other object-lock fields stay absent.
+            let fields = CreateMultipartUploadFields {
+                bucket: bucket.to_owned(),
+                key: key.to_owned(),
+                metadata: None,
+                tagging: None,
+                storage_class: invalid.then(|| "unknown-class".to_owned()),
+                server_side_encryption: None,
+                sse_customer_algorithm: None,
+                sse_customer_key: None,
+                sse_customer_key_md5: None,
+                ssekms_key_id: None,
+                object_lock_legal_hold_status: None,
+                object_lock_mode: None,
+                object_lock_retain_until_date: date.map(|value| time::OffsetDateTime::from(Timestamp::from(value))),
+            };
             let error = match make_usecase()
-                .execute_create_multipart_upload(
-                    owned_envelope(Method::POST),
-                    CreateMultipartUploadFields::from_legacy(input),
-                    None,
-                )
+                .execute_create_multipart_upload(owned_envelope(Method::POST), fields, None)
                 .await
             {
                 Err(error) => error,
@@ -785,11 +790,6 @@ mod tests {
             let bucket = format!("create-multipart-{}", Uuid::new_v4().simple());
             let other = format!("create-multipart-{}", Uuid::new_v4().simple());
             let make_request = |target_bucket: &str| {
-                let mut input = CreateMultipartUploadInput {
-                    bucket: target_bucket.to_owned(),
-                    key: "object".to_owned(),
-                    ..Default::default()
-                };
                 let mut extensions = Extensions::new();
                 extensions.insert(slot.clone());
                 let envelope = RequestEnvelope::from_parts(
@@ -803,8 +803,23 @@ mod tests {
                     },
                     extensions,
                 );
-                let query_version = input.version_id.take();
-                let fields = CreateMultipartUploadFields::from_legacy(input);
+                // Same facts `from_legacy` carried. Metadata, tagging, storage class, SSE, and object lock stay absent.
+                let fields = CreateMultipartUploadFields {
+                    bucket: target_bucket.to_owned(),
+                    key: "object".to_owned(),
+                    metadata: None,
+                    tagging: None,
+                    storage_class: None,
+                    server_side_encryption: None,
+                    sse_customer_algorithm: None,
+                    sse_customer_key: None,
+                    sse_customer_key_md5: None,
+                    ssekms_key_id: None,
+                    object_lock_legal_hold_status: None,
+                    object_lock_mode: None,
+                    object_lock_retain_until_date: None,
+                };
+                let query_version: Option<String> = None;
                 (envelope, fields, query_version)
             };
             for name in [&bucket, &other] {
