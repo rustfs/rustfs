@@ -50,8 +50,8 @@ from acceptance_lane import InputError, read_exit, read_text, served, write_serv
 ROOT = Path(__file__).resolve().parents[1]
 LEDGER = ROOT / ".config/conformance-rulings.toml"
 VERDICTS = ("passed", "failed", "skipped")
-# rustfs/backlog#2684 also cites gateway#1159 directly for the legacy response heads.
-LEDGER_ID = re.compile(r"(R-\d{3}|K-\d+|rustfs/gateway#1159)")
+# rustfs/backlog#2684 also links the upstream decisions on response heads and HTTP/1 connection closure.
+LEDGER_ID = re.compile(r"(R-\d{3}|K-\d+|rustfs/gateway#(?:1120|1159))")
 RULING_KEYS = {"case", "ledger", "reason", "failure", "expires"}
 NOT_SERVED = "observed 501"
 # Skip reasons of the pinned runner that are the server's answer, not a corpus limit.

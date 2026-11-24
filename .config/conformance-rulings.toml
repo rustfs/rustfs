@@ -16,3 +16,26 @@ ledger = "rustfs/gateway#1159"
 reason = "The RustFS profile preserves the absent bucket region on successful HeadBucket (rustfs/backlog#2684)."
 failure = "[expect/headers_present] at /expect/headers_present/x-amz-bucket-region: exchange #1, attempt 1: expected `x-amz-bucket-region: us-east-1`, observed no such header"
 expires = 2027-02-01
+
+# Connection-close ruling: https://github.com/rustfs/backlog/issues/2684#issuecomment-7124472117
+
+[[ruling]]
+case = "c-cred-0013"
+ledger = "rustfs/gateway#1120"
+reason = "The released and native hosts both close this HTTP/1 connection after serving the expected refusal."
+failure = "[expect/connection_after] at /expect/connection_after: exchange #1, attempt 1: expected the connection to be `open` afterwards, observed `closed`"
+expires = 2027-02-01
+
+[[ruling]]
+case = "c-cred-0016"
+ledger = "rustfs/gateway#1120"
+reason = "The released and native hosts both close this HTTP/1 connection after serving the expected refusal."
+failure = "[expect/connection_after] at /expect/connection_after: exchange #1, attempt 1: expected the connection to be `open` afterwards, observed `closed`"
+expires = 2027-02-01
+
+[[ruling]]
+case = "c-cred-0026"
+ledger = "rustfs/gateway#1120"
+reason = "The released and native hosts both close this HTTP/1 connection after serving the expected refusal."
+failure = "[expect/connection_after] at /expect/connection_after: exchange #1, attempt 1: expected the connection to be `open` afterwards, observed `closed`"
+expires = 2027-02-01
