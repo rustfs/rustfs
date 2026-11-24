@@ -106,6 +106,7 @@ script-tests: ## Run shell script tests
 	$(RUSTFS_PYTHON_BIN) ./scripts/check_conformance_rulings.py --self-test
 	$(RUSTFS_PYTHON_BIN) ./scripts/compat_matrix_report.py --self-test
 	$(RUSTFS_PYTHON_BIN) ./scripts/test_gateway_corpus_capture.py
+	$(RUSTFS_PYTHON_BIN) ./scripts/test_gateway_wire_replay.py
 	$(RUSTFS_PYTHON_BIN) ./scripts/s3-tests/test_report_compat.py
 	$(RUSTFS_PYTHON_BIN) ./scripts/s3-tests/test_runner_tools.py
 	$(RUSTFS_PYTHON_BIN) ./scripts/s3-tests/test_api_coverage.py

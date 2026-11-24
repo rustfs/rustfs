@@ -150,7 +150,7 @@ class CaptureGateTests(unittest.TestCase):
                 self.assertEqual(report["retained_total"], retained)
                 self.assertEqual(sum(report["raw_counts"].values()), 2400)
                 self.assertFalse(report["full_suite_coverage"])
-                self.assertEqual(report["official_reference_replay"], "not run")
+                self.assertEqual(report["official_reference_replay"], "see gateway-wire-differences report")
 
 
 if __name__ == "__main__":

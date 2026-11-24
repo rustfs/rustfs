@@ -16,6 +16,7 @@
 
 import argparse
 from collections import Counter
+from contextlib import contextmanager
 import json
 import os
 from pathlib import Path
@@ -76,31 +77,32 @@ def revision(path):
     return subprocess.check_output(["git", "-C", path, "rev-parse", "HEAD"], text=True).strip()
 
 
-def run_ceph(checkout, temp, env, tests):
-    """Run the implemented upstream tests on a fresh single-node fixture."""
-    implemented = set(Path("scripts/s3-tests/implemented_tests.txt").read_text().splitlines())
-    if not set(tests) <= implemented:
-        raise ValueError("Selected Ceph tests are missing from the implemented manifest")
-    with socket.socket() as sock:
-        sock.bind(("127.0.0.1", 0))
-        port = str(sock.getsockname()[1])
-    addr = f"127.0.0.1:{port}"
-    access = "rustfsadmin-ci"
-    secret = secrets.token_urlsafe(36)
-    data = temp / "ceph-data"
-    data.mkdir()
+def ceph_config(temp, port, secret):
     config = Path(".github/s3tests/s3tests.conf").read_text()
     for key, value in {
-        "S3_HOST": "127.0.0.1", "S3_PORT": port, "S3_ACCESS_KEY": access, "S3_SECRET_KEY": secret,
+        "S3_HOST": "127.0.0.1", "S3_PORT": str(port), "S3_ACCESS_KEY": "rustfsadmin-ci", "S3_SECRET_KEY": secret,
         "S3_ALT_ACCESS_KEY": "rustfsalt", "S3_ALT_SECRET_KEY": secrets.token_urlsafe(36),
     }.items():
         config = config.replace("${" + key + "}", value)
     conf_file = temp / "s3tests.conf"
     conf_file.write_text(config)
+    return conf_file
+
+
+@contextmanager
+def ceph_server(binary, temp, env, secret):
+    temp.mkdir(exist_ok=True)
+    with socket.socket() as sock:
+        sock.bind(("127.0.0.1", 0))
+        port = str(sock.getsockname()[1])
+    addr = f"127.0.0.1:{port}"
+    access = "rustfsadmin-ci"
+    data = temp / "ceph-data"
+    data.mkdir()
     server_env = dict(env, RUSTFS_ADDRESS=addr, RUSTFS_VOLUMES=str(data),
                       RUSTFS_ACCESS_KEY=access, RUSTFS_SECRET_KEY=secret, RUSTFS_CONSOLE_ENABLE="false")
     with (temp / "ceph.log").open("w") as log:
-        srv = subprocess.Popen([env["CARGO_BIN_EXE_rustfs"]], env=server_env, stdout=log, stderr=log)
+        srv = subprocess.Popen([binary], env=server_env, stdout=log, stderr=log)
         try:
             opener = build_opener(ProxyHandler({}))
             for _ in range(120):
@@ -115,6 +117,25 @@ def run_ceph(checkout, temp, env, tests):
                 time.sleep(0.5)
             else:
                 raise RuntimeError("Ceph fixture did not become ready")
+            yield int(port)
+        finally:
+            srv.terminate()
+            try:
+                srv.wait(timeout=15)
+            except subprocess.TimeoutExpired:
+                srv.kill()
+                srv.wait()
+
+
+def run_ceph(checkout, temp, env, tests):
+    """Run the implemented upstream tests on a fresh single-node fixture."""
+    implemented = set(Path("scripts/s3-tests/implemented_tests.txt").read_text().splitlines())
+    if not set(tests) <= implemented:
+        raise ValueError("Selected Ceph tests are missing from the implemented manifest")
+    secret = secrets.token_urlsafe(36)
+    with ceph_server(env["CARGO_BIN_EXE_rustfs"], temp, env, secret) as port:
+        conf_file = ceph_config(temp, port, secret)
+        with (temp / "ceph-tests.log").open("w") as log:
             # Use upstream's own assertions. Each test owns its bucket in this disposable store.
             command = [sys.executable, "-c", """
 import sys
@@ -128,16 +149,9 @@ for test in sys.argv[1:]:
             result = subprocess.run(command, cwd=checkout, env=dict(env, S3TEST_CONF=str(conf_file)),
                                     stdout=log, stderr=log)
             if result.returncode:
-                lines = (temp / "ceph.log").read_text(errors="replace").splitlines()
+                lines = (temp / "ceph-tests.log").read_text(errors="replace").splitlines()
                 started = [line[8:] for line in lines if line.startswith("Running ") and line[8:] in tests]
                 raise RuntimeError(f"Ceph testing failed in {started[-1] if started else 'setup'}")
-        finally:
-            srv.terminate()
-            try:
-                srv.wait(timeout=15)
-            except subprocess.TimeoutExpired:
-                srv.kill()
-                srv.wait()
 
 
 def count_entries(files, sources):
@@ -217,7 +231,7 @@ def verify_capture(temp, args, sources):
         "scope": "candidate recording subset", "raw_counts": dict(raw_counts), "retained_counts": dict(counts),
         "retained_total": total, "minimum_entries": MINIMUM_ENTRIES, "maximum_entries": MAXIMUM_ENTRIES,
         "size_gate_met": MINIMUM_ENTRIES <= total <= MAXIMUM_ENTRIES,
-        "official_reference_replay": "not run", "full_suite_coverage": False,
+        "official_reference_replay": "see gateway-wire-differences report", "full_suite_coverage": False,
     }
 
 
@@ -248,7 +262,7 @@ def main(argv=None):
     if args.cmd == "check-size":
         total = json.loads(args.summary.read_text())["retained_total"]
         print(f"Retained {total} unique entries (required {MINIMUM_ENTRIES}–{MAXIMUM_ENTRIES}). "
-              "Only selected scenarios ran. Official-reference replay is outstanding.")
+              "Only selected scenarios ran. The release comparison has a separate report.")
         return 0 if MINIMUM_ENTRIES <= total <= MAXIMUM_ENTRIES else 1
     # Only this numeric/provenance report may leave the temporary run directory.
     args.summary.unlink(missing_ok=True)

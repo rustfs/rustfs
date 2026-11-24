@@ -374,6 +374,7 @@ jobs:
           "$RUNNER_TEMP/ceph-venv/bin/python" -m pip install -r target/wire/ceph/requirements.txt
 
       - name: Build the debug-only recording server
+        id: wire_server
         run: python3 scripts/e2e_binary.py build --features corpus-record
 
       - name: Record and verify selected scenarios from both sources
@@ -395,5 +396,49 @@ jobs:
         with:
           name: gateway-capture-summary
           path: ${{ runner.temp }}/gateway-capture-summary.json
+          if-no-files-found: error
+          retention-days: 14
+
+      # The capture size and release parity are independent verdicts.
+      - name: Fetch the verified release reference
+        id: wire_reference
+        if: ${{ !cancelled() && steps.wire_server.outcome == 'success' }}
+        uses: ./.github/actions/reference-binary
+
+      - name: Install a child-process clock for the wire comparison
+        id: wire_clock
+        if: ${{ !cancelled() && steps.wire_reference.outcome == 'success' }}
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install --no-install-recommends -y libfaketime
+          lib="$(dpkg-query -L libfaketime | sed -n '/\/libfaketime\.so\.1$/p')"
+          test -f "$lib"
+          echo "path=$lib" >> "$GITHUB_OUTPUT"
+
+      - name: Compare the same signed Ceph requests against the release
+        id: wire_compare
+        if: ${{ !cancelled() && steps.wire_clock.outcome == 'success' }}
+        env:
+          REF_BINARY: ${{ steps.wire_reference.outputs.path }}
+          REF_SHA256: ${{ steps.wire_reference.outputs.executable-sha256 }}
+          REF_VERSION: ${{ steps.wire_reference.outputs.version }}
+          CLOCK_LIBRARY: ${{ steps.wire_clock.outputs.path }}
+        run: |
+          python3 scripts/e2e_binary.py run --features corpus-record -- \
+            "$RUNNER_TEMP/ceph-venv/bin/python" scripts/gateway_wire_replay.py compare \
+            --ceph target/wire/ceph --gateway target/wire/gateway --reference "$REF_BINARY" \
+            --reference-sha256 "$REF_SHA256" --reference-version "$REF_VERSION" --clock-library "$CLOCK_LIBRARY" \
+            --summary "$RUNNER_TEMP/gateway-wire-differences.json"
+
+      - name: Require zero response differences on replayed cases
+        if: ${{ !cancelled() && steps.wire_compare.outcome == 'success' }}
+        run: python3 scripts/gateway_wire_replay.py check "$RUNNER_TEMP/gateway-wire-differences.json"
+
+      - name: Upload validated difference counts and case IDs
+        if: ${{ !cancelled() && steps.wire_compare.outcome == 'success' }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: gateway-wire-differences
+          path: ${{ runner.temp }}/gateway-wire-differences.json
           if-no-files-found: error
           retention-days: 14
