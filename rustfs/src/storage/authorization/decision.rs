@@ -576,7 +576,7 @@ async fn authorize_request_with_facts<R: AuthorizationRequest + ?Sized>(
         };
 
         if iam_allowed {
-            if !internal_object_authorization {
+            if !internal_object_authorization && req.evaluates_table_data_plane() {
                 authorize_table_data_plane_if_needed(
                     req,
                     action,
@@ -638,7 +638,7 @@ async fn authorize_request_with_facts<R: AuthorizationRequest + ?Sized>(
         .map_err(ApiError::from)?;
 
         if policy_allowed_fallback {
-            if !internal_object_authorization {
+            if !internal_object_authorization && req.evaluates_table_data_plane() {
                 authorize_table_data_plane_if_needed(
                     req,
                     action,
@@ -760,7 +760,9 @@ async fn authorize_request_with_facts<R: AuthorizationRequest + ?Sized>(
                     .map_err(ApiError::from)?);
 
             if policy_allowed {
-                deny_anonymous_table_data_plane_if_needed(req, action, bucket.as_str(), object.as_str()).await?;
+                if req.evaluates_table_data_plane() {
+                    deny_anonymous_table_data_plane_if_needed(req, action, bucket.as_str(), object.as_str()).await?;
+                }
                 // RestrictPublicBuckets: when true, deny public access even if bucket policy allows it.
                 match store.restricts_public_bucket_access(bucket_name).await {
                     Ok(true) => return Err(denial.deny(req, "restrict_public_buckets", action)),
