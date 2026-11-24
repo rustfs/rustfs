@@ -36827,7 +36827,14 @@ mod pools_tests {
 
     #[tokio::test]
     async fn final_sweep_reconciles_retried_scan_progress_only_after_metadata_recovers() {
-        let (dirs, store) = metadata_sys::test_support::isolated_store_over_temp_disks().await;
+        let (dirs, store) = temp_env::async_with_vars(
+            [
+                (rustfs_config::ENV_POOL_META_V2_WRITE, Some("true")),
+                (rustfs_config::ENV_POOL_META_V2_FLEET_CONFIRMED, Some("true")),
+            ],
+            metadata_sys::test_support::isolated_store_over_temp_disks(),
+        )
+        .await;
         metadata_sys::init_bucket_metadata_sys(store.clone(), Vec::new()).await;
         let object = rustfs_data_usage::bucket_scan_progress_path("photos");
         let previous_generation = OffsetDateTime::UNIX_EPOCH;
