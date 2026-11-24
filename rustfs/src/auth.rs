@@ -12,8 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#[cfg(test)]
-use crate::runtime_sources::ServerContextSlot;
 use crate::runtime_sources::{AppContext, current_action_credentials, current_ready_iam_handle};
 use facts::{AuthzFacts, AuthzPrincipal, AuthzTarget};
 use http::HeaderMap;
@@ -31,12 +29,6 @@ use rustfs_s3_types::{S3Result as OwnedResult, s3_error as owned_error};
 use rustfs_trusted_proxies::ClientInfo;
 use rustfs_utils::MaskedAccessKey;
 use rustfs_utils::http::metadata_compat::starts_with_ignore_ascii_case;
-#[cfg(test)]
-use s3s::{
-    S3Error, S3Result,
-    auth::{S3Auth, SecretKey},
-    s3_error,
-};
 use serde_json::Value;
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -47,13 +39,13 @@ use url::form_urlencoded;
 
 pub(crate) mod facts;
 
-const LOG_COMPONENT_AUTH: &str = "auth";
-const LOG_SUBSYSTEM_CREDENTIALS: &str = "credentials";
-const LOG_SUBSYSTEM_KEYSTONE: &str = "keystone";
+pub(crate) const LOG_COMPONENT_AUTH: &str = "auth";
+pub(crate) const LOG_SUBSYSTEM_CREDENTIALS: &str = "credentials";
+pub(crate) const LOG_SUBSYSTEM_KEYSTONE: &str = "keystone";
 const LOG_SUBSYSTEM_REQUEST: &str = "request";
-const EVENT_SECRET_KEY_LOOKUP_FAILED: &str = "secret_key_lookup_failed";
+pub(crate) const EVENT_SECRET_KEY_LOOKUP_FAILED: &str = "secret_key_lookup_failed";
 const EVENT_ACCESS_KEY_VALIDATION_STARTED: &str = "access_key_validation_started";
-const EVENT_KEYSTONE_CREDENTIALS_DETECTED: &str = "keystone_credentials_detected";
+pub(crate) const EVENT_KEYSTONE_CREDENTIALS_DETECTED: &str = "keystone_credentials_detected";
 const EVENT_KEYSTONE_CREDENTIALS_VALIDATED: &str = "keystone_credentials_validated";
 const EVENT_KEYSTONE_CONTEXT_MISSING: &str = "keystone_context_missing";
 const EVENT_SESSION_TOKEN_EXTRACTION: &str = "session_token_extraction";
@@ -131,129 +123,6 @@ pub enum AuthType {
     STS,
     StreamingSignedTrailer,
     StreamingUnsignedTrailer,
-}
-
-#[cfg(test)]
-#[derive(Clone)]
-pub(crate) struct IAMAuth {
-    access_key: String,
-    secret_key: SecretKey,
-    server_ctx: Option<std::sync::Arc<ServerContextSlot>>,
-}
-
-#[cfg(test)]
-impl IAMAuth {
-    pub(crate) fn new(ak: impl Into<String>, sk: impl Into<SecretKey>) -> Self {
-        Self {
-            access_key: ak.into(),
-            secret_key: sk.into(),
-            server_ctx: None,
-        }
-    }
-
-    pub(crate) fn with_server_context(
-        ak: impl Into<String>,
-        sk: impl Into<SecretKey>,
-        server_ctx: std::sync::Arc<ServerContextSlot>,
-    ) -> Self {
-        let mut auth = Self::new(ak, sk);
-        auth.server_ctx = Some(server_ctx);
-        auth
-    }
-}
-
-#[cfg(test)]
-#[async_trait::async_trait]
-impl S3Auth for IAMAuth {
-    async fn get_secret_key(&self, access_key: &str) -> S3Result<SecretKey> {
-        // NEW: Check if Keystone credentials are present in task-local storage
-        // This handles pure X-Auth-Token requests without Authorization header
-        use rustfs_keystone::KEYSTONE_CREDENTIALS;
-
-        if let Ok(Some(creds)) = KEYSTONE_CREDENTIALS.try_with(|c| c.clone()) {
-            debug!(
-                event = EVENT_KEYSTONE_CREDENTIALS_DETECTED,
-                component = LOG_COMPONENT_AUTH,
-                subsystem = LOG_SUBSYSTEM_KEYSTONE,
-                principal = %MaskedAccessKey(&creds.parent_user),
-                result = "token_auth",
-                "Keystone task-local credentials detected"
-            );
-            // Return empty secret key - Keystone uses token validation, not AWS signatures
-            return Ok(SecretKey::from(String::new()));
-        }
-
-        if access_key.is_empty() {
-            return Err(s3_error!(UnauthorizedAccess, "Your account is not signed up"));
-        }
-
-        if access_key.starts_with("keystone:") {
-            return Err(s3_error!(InvalidAccessKeyId, "Keystone authentication requires X-Auth-Token header"));
-        }
-
-        if access_key == self.access_key {
-            return Ok(self.secret_key.clone());
-        }
-
-        let iam_store = match &self.server_ctx {
-            Some(server_ctx) => server_ctx
-                .installed_app_context()
-                .filter(|context| context.iam().is_ready())
-                .map(|context| context.iam().handle())
-                .ok_or(()),
-            None => current_ready_iam_handle().map_err(|_| ()),
-        };
-        if let Ok(iam_store) = iam_store {
-            // Use check_key instead of get_user to ensure user is loaded from disk if not in cache
-            // This is important for newly created users that may not be in cache yet.
-            // check_key will automatically attempt to load the user from disk if not found in cache.
-            match iam_store.check_key(access_key).await {
-                Ok((Some(id), _valid)) => {
-                    // Return secret key for signature verification regardless of user status.
-                    // Authorization will be checked separately in the authorization phase.
-                    return Ok(SecretKey::from(id.credentials.secret_key));
-                }
-                Ok((None, _)) => {
-                    warn!(
-                        event = EVENT_SECRET_KEY_LOOKUP_FAILED,
-                        component = LOG_COMPONENT_AUTH,
-                        subsystem = LOG_SUBSYSTEM_CREDENTIALS,
-                        reason = "no_such_user",
-                        "Secret key lookup rejected"
-                    );
-                }
-                Err(e) => {
-                    warn!(
-                        event = EVENT_SECRET_KEY_LOOKUP_FAILED,
-                        component = LOG_COMPONENT_AUTH,
-                        subsystem = LOG_SUBSYSTEM_CREDENTIALS,
-                        error = ?e,
-                        reason = "check_key_error",
-                        "Secret key lookup errored"
-                    );
-                    return Err(iam_lookup_error_to_s3_error(&e));
-                }
-            }
-        } else {
-            warn!(
-                event = EVENT_SECRET_KEY_LOOKUP_FAILED,
-                component = LOG_COMPONENT_AUTH,
-                subsystem = LOG_SUBSYSTEM_CREDENTIALS,
-                reason = "iam_not_initialized",
-                "Secret key lookup skipped"
-            );
-        }
-
-        Err(s3_error!(
-            InvalidAccessKeyId,
-            "The Access Key Id you provided does not exist in our records."
-        ))
-    }
-}
-
-#[cfg(test)]
-fn iam_lookup_error_to_s3_error(_err: &IamError) -> S3Error {
-    s3_error!(InternalError, "IAM user lookup failed")
 }
 
 /// Owner status of a validated Keystone identity, shared by both request edges.
@@ -1359,8 +1228,6 @@ mod tests {
     use rustfs_utils::http::{
         AMZ_OBJECT_LOCK_LEGAL_HOLD_LOWER, AMZ_OBJECT_LOCK_MODE_LOWER, AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE_LOWER,
     };
-    use s3s::S3ErrorCode as LegacyErrorCode;
-    use s3s::auth::SecretKey;
     use serde_json::json;
     use std::collections::HashMap;
     use std::sync::Arc;
@@ -1484,133 +1351,6 @@ mod tests {
         };
 
         assert!(!has_root_access(&sys_cred, &oidc_cred));
-    }
-
-    #[tokio::test]
-    async fn keystone_secret_lookup_requires_validated_token_context() {
-        use rustfs_keystone::KEYSTONE_CREDENTIALS;
-        let auth = IAMAuth::new("root", "root-secret");
-        for key in ["keystone:x", "keystone:admin"] {
-            assert_eq!(auth.get_secret_key(key).await.unwrap_err().code(), &LegacyErrorCode::InvalidAccessKeyId);
-            KEYSTONE_CREDENTIALS
-                .scope(None, async {
-                    assert_eq!(auth.get_secret_key(key).await.unwrap_err().code(), &LegacyErrorCode::InvalidAccessKeyId);
-                })
-                .await;
-        }
-        let credentials = Credentials {
-            access_key: "keystone:validated".to_owned(),
-            ..Default::default()
-        };
-        KEYSTONE_CREDENTIALS
-            .scope(Some(credentials), async {
-                assert_eq!(
-                    auth.get_secret_key("keystone:validated")
-                        .await
-                        .expect("validated Keystone token")
-                        .expose(),
-                    ""
-                );
-            })
-            .await;
-        assert_eq!(
-            auth.get_secret_key("root").await.expect("regular root credential").expose(),
-            "root-secret"
-        );
-    }
-
-    #[test]
-    fn test_iam_auth_creation() {
-        let access_key = "test-access-key";
-        let secret_key = SecretKey::from("test-secret-key");
-
-        let iam_auth = IAMAuth::new(access_key, secret_key);
-
-        // The struct should be created successfully
-        // We can't easily test internal state without exposing it,
-        // but we can test it doesn't panic on creation
-        assert_eq!(size_of_val(&iam_auth), size_of::<IAMAuth>());
-    }
-
-    #[tokio::test]
-    async fn test_iam_auth_clone_preserves_bootstrap_secret() {
-        let iam_auth = IAMAuth::new("test-ak", SecretKey::from("test-sk"));
-        let cloned = iam_auth.clone();
-
-        let secret = cloned.get_secret_key("test-ak").await.expect("cloned root credentials");
-        assert_eq!(secret.expose(), "test-sk");
-    }
-
-    #[tokio::test]
-    async fn test_iam_auth_get_secret_key_empty_access_key() {
-        let iam_auth = IAMAuth::new("test-ak", SecretKey::from("test-sk"));
-
-        let result = iam_auth.get_secret_key("").await;
-
-        assert!(result.is_err());
-        let error = result.unwrap_err();
-        assert_eq!(error.code(), &LegacyErrorCode::UnauthorizedAccess);
-        assert!(error.message().unwrap_or("").contains("Your account is not signed up"));
-    }
-
-    #[tokio::test]
-    async fn credential_boundary_rejected_access_key_logs_omit_key_fragments() {
-        use rustfs_iam::{cache::Cache, manager::IamCache};
-        use tracing::instrument::WithSubscriber;
-
-        let (_temp_dir, _disk_paths, store) = crate::app::gating_test_env::isolated_multi_pool_ecstore().await;
-        let (send_chan, _receiver) = tokio::sync::mpsc::channel(1);
-        let cache = Arc::new(IamCache {
-            cache: Cache::default(),
-            api: ObjectStore::new(store.clone()),
-            state: Default::default(),
-            loading: Default::default(),
-            roles: HashMap::new(),
-            send_chan,
-            last_timestamp: Default::default(),
-            sync_failures: Default::default(),
-            sync_successes: Default::default(),
-            last_sync_duration_millis: Default::default(),
-        });
-        let slot = ServerContextSlot::new();
-        let context = AppContext::new(
-            store,
-            Arc::new(ContextIam {
-                handle: Arc::new(IamSys::new(cache)),
-            }),
-            Arc::new(TestKms),
-        );
-        assert!(slot.install(Arc::new(context)));
-        for (slot, reason) in [(slot, "no_such_user"), (ServerContextSlot::new(), "iam_not_initialized")] {
-            let auth = IAMAuth::with_server_context("bootstrap-key", SecretKey::from("bootstrap-secret"), slot);
-            let log = tempfile::NamedTempFile::new().expect("capture file");
-            let writer = log.reopen().expect("capture writer");
-            let subscriber = tracing_subscriber::fmt()
-                .with_max_level(tracing::Level::WARN)
-                .with_ansi(false)
-                .without_time()
-                .with_writer(move || writer.try_clone().expect("clone capture writer"))
-                .finish();
-            let error = auth
-                .get_secret_key("LEAK-private-access-key-TAIL")
-                .with_subscriber(subscriber)
-                .await
-                .expect_err("unknown credentials must be rejected");
-            assert_eq!(error.code(), &LegacyErrorCode::InvalidAccessKeyId);
-            let captured = std::fs::read_to_string(log.path()).expect("read captured logs");
-            assert!(captured.contains(reason), "capture the expected rejection: {captured}");
-            for forbidden in ["LEAK", "TAIL", "private-access-key", "access_key="] {
-                assert!(!captured.contains(forbidden), "rejected access-key material must not be logged");
-            }
-        }
-    }
-
-    #[test]
-    fn test_iam_lookup_error_maps_to_internal_error() {
-        let result = iam_lookup_error_to_s3_error(&IamError::Io(std::io::Error::other("load user failed")));
-
-        assert_eq!(result.code(), &LegacyErrorCode::InternalError);
-        assert_eq!(result.message(), Some("IAM user lookup failed"));
     }
 
     #[test]

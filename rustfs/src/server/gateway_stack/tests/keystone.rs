@@ -361,7 +361,7 @@ fn probe_stack<H: rustfs_gateway::Handler<rustfs_gateway::dto::ListBuckets>>(
         &a,
         Arc::new(ScriptedIam { ready: true }),
         root().source(),
-        early_gate(OPERATIONS),
+        early_gate(OPERATIONS, Arc::clone(&a.server_ctx)),
         std::convert::identity,
     )
     .unwrap();
@@ -468,7 +468,7 @@ async fn keystone_envelope_refuses_missing_and_mismatched_owned_identity() {
             &a,
             Arc::new(ScriptedIam { ready: true }),
             root().source(),
-            early_gate(OPERATIONS),
+            early_gate(OPERATIONS, Arc::clone(&a.server_ctx)),
             std::convert::identity,
         )
         .unwrap();

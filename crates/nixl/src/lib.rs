@@ -27,6 +27,11 @@
 use bytes::Bytes;
 use nixl_sys::{Agent, AgentConfig, Backend, MemType, OptArgs, Params, ThreadSync, XferDescList, XferOp, XferStatus};
 
+#[cfg(feature = "client-http")]
+mod client;
+#[cfg(feature = "client-http")]
+pub use client::{ClientWindowHttp, ClientWindowResponse, ClientWindowTransfer, RegisteredClientWindow};
+
 pub mod devices;
 mod mem;
 mod remotes;
@@ -60,6 +65,9 @@ pub const NIXL_LIBRARY_VERSION: &str = "1.5.2";
 
 #[derive(Debug, Error)]
 pub enum NixlError {
+    #[cfg(feature = "client-http")]
+    #[error("registered window control exchange failed: {0}")]
+    Control(#[source] reqwest::Error),
     #[error("nixl {op} failed: {source}")]
     Nixl {
         op: &'static str,
@@ -288,6 +296,15 @@ pub struct ArenaRange {
     pub len: usize,
 }
 
+// Fields drop in declaration order. Unregister before destroying the native
+// agent and its backend, and keep the mapping alive throughout both steps.
+struct StagingRegistration<B> {
+    registration: nixl_sys::RegistrationHandle,
+    backend: Backend,
+    agent: Agent,
+    buffer: B,
+}
+
 struct Staging {
     buffer: HostBuffer,
     _registration: nixl_sys::RegistrationHandle,
@@ -505,8 +522,10 @@ fn metadata_hash(metadata: &[u8]) -> u64 {
 }
 
 impl NixlServer {
-    /// Creates the agent, the UCX backend and the staging pool.
-    pub fn new(config: &NixlConfig) -> Result<Arc<Self>, NixlError> {
+    fn register_staging<B: nixl_sys::MemoryRegion + nixl_sys::NixlDescriptor>(
+        config: &NixlConfig,
+        allocate: impl FnOnce(usize) -> Result<B, NixlError>,
+    ) -> Result<StagingRegistration<B>, NixlError> {
         if config.chunk_bytes == 0 || config.chunk_bytes > MAX_RDMA_OP_BYTES || config.pool_bytes < config.chunk_bytes {
             return Err(NixlError::Token("invalid staging configuration".to_owned()));
         }
@@ -530,15 +549,27 @@ impl NixlServer {
         }
         let backend = agent.create_backend("UCX", &params).map_err(nixl_err("ucx backend"))?;
         let chunks = config.pool_bytes / config.chunk_bytes;
-        let buffer = HostBuffer::new(chunks * config.chunk_bytes)?;
+        let buffer = allocate(chunks * config.chunk_bytes)?;
         let mut opt_args = OptArgs::new().map_err(nixl_err("opt args"))?;
         opt_args.add_backend(&backend).map_err(nixl_err("opt args backend"))?;
         let registration = agent
             .register_memory(&buffer, Some(&opt_args))
             .map_err(nixl_err("register staging"))?;
-        let engine = Arc::new(Engine {
-            agent,
+        Ok(StagingRegistration {
+            registration,
             backend,
+            agent,
+            buffer,
+        })
+    }
+
+    /// Creates the agent, the UCX backend and the staging pool.
+    pub fn new(config: &NixlConfig) -> Result<Arc<Self>, NixlError> {
+        let registration = Self::register_staging(config, HostBuffer::new)?;
+        let chunks = registration.buffer.len() / config.chunk_bytes;
+        let engine = Arc::new(Engine {
+            agent: registration.agent,
+            backend: registration.backend,
             poll_interval: config.poll_interval,
             transfer_timeout: config.transfer_timeout,
         });
@@ -554,8 +585,8 @@ impl NixlServer {
         Ok(Arc::new(Self {
             engine,
             staging: Staging {
-                buffer,
-                _registration: registration,
+                buffer: registration.buffer,
+                _registration: registration.registration,
                 free: parking_lot::Mutex::new((0..chunks).collect()),
                 permits: Semaphore::new(chunks),
                 chunk_bytes: config.chunk_bytes,
