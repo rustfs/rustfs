@@ -6306,7 +6306,7 @@ impl SetDisks {
         Ok(())
     }
 
-    #[tracing::instrument(skip(disks, meta))]
+    #[tracing::instrument(skip(self, disks, meta), fields(pool_index = self.pool_index, set_index = self.set_index))]
     #[allow(clippy::too_many_arguments)]
     pub(in crate::set_disk) async fn rename_part(
         &self,
