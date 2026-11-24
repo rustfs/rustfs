@@ -928,9 +928,27 @@ mod tests {
             .body(Some(body))
             .build()
             .unwrap();
-        let mut request = build_request(input, Method::PUT);
-        request.extensions.insert(control.clone());
-        let owner = tokio::spawn(async move { usecase.execute_upload_part(request).await });
+        let mut extensions = http::Extensions::new();
+        extensions.insert(control.clone());
+        // Same facts `build_request` carried, plus the body-read budget this
+        // case advances after admission. Credentials, region, and service stay absent.
+        let envelope = RequestEnvelope::from_parts(
+            crate::app::RequestHead {
+                method: Method::PUT,
+                uri: http::Uri::from_static("/"),
+                headers: http::HeaderMap::new(),
+                credentials: None,
+                region: None,
+                service: None,
+            },
+            extensions,
+        );
+        let owner = tokio::spawn(async move {
+            usecase
+                .execute_upload_part_with_audit(envelope, UploadPartWriteInput::from_legacy(input, None))
+                .await
+                .map_err(crate::error::legacy_error_for_test)
+        });
         control.wait_until_pending_for_test().await;
         assert!(matches!(
             manager.admit_put_object(65536).await.unwrap(),
