@@ -180,6 +180,8 @@ requires a compatibility window and a dedicated cleanup entry.
 
 The authoritative snapshot may include an optional `bucket_incarnation` in each bucket usage entry. The coordinator writes it only when every contributing set reports the same non-nil bucket UUID. Missing or conflicting identities leave that entry uncertified without affecting publication or quota admission. Veeam SOSAPI reports numeric `Used` only when this proof matches the current bucket incarnation. Missing usage or a snapshot without valid proof, including legacy and pending entries, yields `Used=-1`. With a hard quota, `Available` is also undefined unless live free space is zero. Failures to read authoritative bucket metadata or usage, or obtain live storage capacity, yield a retryable capacity error. The proof is additive for older snapshot readers and identifies the bucket generation without making scanner usage a real-time quota ledger.
 
+SOSAPI retains the XML and its content-derived ETag when the reported figures match the previous sample. Once Last-Modified reaches nine minutes of age, a successful refresh renews the timestamp ahead of Veeam's ten-minute limit. Refresh failures still return an error.
+
 ## Observed Snapshots
 
 Observed snapshots are a diagnostic and availability layer. They may be served

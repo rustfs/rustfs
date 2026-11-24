@@ -46,6 +46,8 @@ pub(super) const CAPACITY_KEY: &str = ".system-d26a9498-cb7c-4a87-a44a-8ae204f5b
 pub(super) const CONTENT_TYPE: &str = "application/xml";
 
 const CAPACITY_XML_CACHE_TTL: Duration = Duration::from_secs(12);
+// Leave room for a cache TTL before Veeam's ten-minute freshness limit.
+const CAPACITY_LAST_MODIFIED_MAX_AGE: time::Duration = time::Duration::minutes(9);
 const CAPACITY_HISTORY_IDLE: Duration = Duration::from_secs(3600);
 const CAPACITY_CACHE_ENTRIES: u64 = 1024;
 const CLUSTER_CACHE_ENTRIES: u64 = 16;
@@ -100,6 +102,7 @@ struct CapacityCacheKey {
 
 #[derive(Clone)]
 struct CachedXml {
+    figures: CapacityFigures,
     bytes: Bytes,
     etag_hex: String,
     modified_at: OffsetDateTime,
@@ -165,11 +168,11 @@ pub(super) fn capacity_figures(inputs: CapacityInputs) -> CapacityFigures {
     let hard_quota = inputs.hard_quota.filter(|&quota| quota > 0);
     let capacity = hard_quota.unwrap_or(inputs.capacity_cluster);
     let used = inputs.used_bucket.map(|used| used.min(capacity));
-    let free = inputs.free_cluster.min(capacity);
+    let free = inputs.free_cluster;
     let available = match used {
         Some(used) => Some((capacity - used).min(free)),
         // Without certified usage, quota headroom is unknown unless storage is already full.
-        None if hard_quota.is_none() || free == 0 => Some(free),
+        None if hard_quota.is_none() || free == 0 => Some(free.min(capacity)),
         None => None,
     };
     CapacityFigures {
@@ -336,16 +339,7 @@ async fn cached_or_build_capacity(store: &Arc<ECStore>, bucket: &str) -> S3Resul
         incarnation,
     };
     cached_or_load_capacity(capacity_caches(), &key, || async {
-        let inputs = load_capacity_inputs(store, bucket, incarnation).await?;
-        if store
-            .bucket_incarnation_id_from_disk(bucket)
-            .await
-            .map_err(|_| capacity_unavailable())?
-            != incarnation
-        {
-            return Err(capacity_unavailable());
-        }
-        Ok(capacity_figures(inputs))
+        Ok(capacity_figures(load_capacity_inputs(store, bucket, incarnation).await?))
     })
     .await
 }
@@ -363,17 +357,23 @@ where
         .current
         .try_get_with_by_ref(key, async {
             let _permit = caches.refresh_permits.acquire().await.map_err(|_| capacity_unavailable())?;
-            let bytes = Bytes::from(capacity_xml(&load().await?));
-            let etag_hex = md5_hex(&bytes);
-            let modified_at = caches
-                .history
-                .get(key)
-                .filter(|entry| entry.bytes == bytes)
-                .map_or_else(OffsetDateTime::now_utc, |entry| entry.modified_at);
-            let value = CachedXml {
-                bytes,
-                etag_hex,
-                modified_at,
+            let figures = load().await?;
+            let now = OffsetDateTime::now_utc();
+            let value = if let Some(mut cached) = caches.history.get(key).filter(|entry| entry.figures == figures) {
+                let age = now - cached.modified_at;
+                if (time::Duration::ZERO..CAPACITY_LAST_MODIFIED_MAX_AGE).contains(&age) {
+                    return Ok(cached);
+                }
+                cached.modified_at = now;
+                cached
+            } else {
+                let bytes = Bytes::from(capacity_xml(&figures));
+                CachedXml {
+                    figures,
+                    etag_hex: md5_hex(&bytes),
+                    bytes,
+                    modified_at: now,
+                }
             };
             caches.history.insert(key.clone(), value.clone());
             Ok::<_, S3Error>(value)
@@ -388,13 +388,6 @@ fn capacity_unavailable() -> S3Error {
 }
 
 async fn load_capacity_inputs(store: &Arc<ECStore>, bucket: &str, incarnation: Uuid) -> S3Result<CapacityInputs> {
-    let (quota, quota_incarnation, _) = store.bucket_quota_and_incarnation_from_disk(bucket).await.map_err(|_| {
-        log_quota_unavailable_once(bucket);
-        capacity_unavailable()
-    })?;
-    if quota_incarnation != incarnation {
-        return Err(capacity_unavailable());
-    }
     let used_bucket = load_bucket_usage_from_backend_cached(Arc::clone(store), bucket, incarnation)
         .await
         .map_err(|_| capacity_unavailable())?;
@@ -402,6 +395,14 @@ async fn load_capacity_inputs(store: &Arc<ECStore>, bucket: &str, incarnation: U
         log_usage_missing_once(bucket);
     }
     let (capacity_cluster, free_cluster) = cached_cluster_capacity(store).await?;
+    // The authoritative quota read also fences publication of the sampled capacity to this incarnation.
+    let (quota, quota_incarnation, _) = store.bucket_quota_and_incarnation_from_disk(bucket).await.map_err(|_| {
+        log_quota_unavailable_once(bucket);
+        capacity_unavailable()
+    })?;
+    if quota_incarnation != incarnation {
+        return Err(capacity_unavailable());
+    }
     Ok(CapacityInputs {
         used_bucket,
         hard_quota: quota.as_ref().and_then(hard_quota_bytes),

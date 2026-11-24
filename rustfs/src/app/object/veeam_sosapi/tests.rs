@@ -177,6 +177,7 @@ async fn concurrent_capacity_refreshes_share_one_load_and_preserve_modification_
         .await
         .expect("refresh unchanged content");
     assert_eq!(first, unchanged);
+    assert_eq!(first.0.as_ptr(), unchanged.0.as_ptr(), "unchanged refresh reuses the XML allocation");
     assert_eq!(calls.load(Ordering::SeqCst), 2);
     let replacement = CapacityCacheKey {
         incarnation: Uuid::new_v4(),
@@ -752,17 +753,36 @@ fn veeam_sosapi_http_contract() {
             assert_eq!(unknown_head.headers()["last-modified"], unknown_modified);
             assert_eq!(unknown_head.headers()["content-length"], unknown_body.len().to_string());
             assert!(BodyExt::collect(unknown_head.into_body()).await.expect("HEAD body").to_bytes().is_empty());
+            let bucket_incarnation = store.bucket_incarnation_id_from_disk(&bucket).await.expect("bucket incarnation");
+            let capacity_key = CapacityCacheKey { store_id: store.id, bucket: bucket.clone(), incarnation: bucket_incarnation };
+            let caches = capacity_caches();
+            let mut history = caches.history.get(&capacity_key).expect("pending capacity history");
+            // Model an unchanged document past Veeam's freshness window without sleeping.
+            history.modified_at = OffsetDateTime::now_utc() - time::Duration::minutes(10);
+            let aged_modified = history.modified_at.format(&super::super::RFC1123).expect("aged last-modified");
+            caches.history.insert(capacity_key.clone(), history);
+            caches.current.invalidate(&capacity_key).await;
+            cluster_capacity_cache().current.insert(store.id, (cluster_capacity, cluster_available)).await;
+
             let unknown_not_modified = owner.call(owner_call(
                 Method::GET, capacity_uri.clone(), vec![("if-none-match", unknown_etag.clone())], Bytes::new(),
             )).await.expect("conditional pending capacity");
             assert_eq!(unknown_not_modified.status(), http::StatusCode::NOT_MODIFIED);
+            assert_eq!(unknown_not_modified.headers()["etag"], unknown_etag);
+            let renewed_modified = unknown_not_modified.headers()["last-modified"].clone();
+            assert_ne!(renewed_modified, aged_modified);
+            let since_aged = owner.call(owner_call(
+                Method::HEAD, capacity_uri.clone(), vec![("if-modified-since", aged_modified)], Bytes::new(),
+            )).await.expect("capacity revalidated since aged last-modified");
+            assert_eq!(since_aged.status(), http::StatusCode::OK);
+            assert_eq!(since_aged.headers()["last-modified"], renewed_modified);
+            assert_eq!(since_aged.headers()["etag"], unknown_etag);
             let mut snapshot = rustfs_data_usage::DataUsageInfo {
                 last_update: Some(std::time::SystemTime::now() + Duration::from_secs(1)),
                 buckets_count: 1,
                 usage_snapshot_complete: true,
                 ..Default::default()
             };
-            let bucket_incarnation = store.bucket_incarnation_id_from_disk(&bucket).await.expect("bucket incarnation");
             snapshot.usage_snapshot_converged = Some(true);
             snapshot.scanner_cycle = Some(1);
             snapshot.scanner_epoch = Some(1);
@@ -772,9 +792,7 @@ fn veeam_sosapi_http_contract() {
             snapshot.bucket_sizes.insert(bucket.clone(), 0);
             crate::app::storage_api::test::data_usage::store_data_usage_in_backend(snapshot.clone(), Arc::clone(&store))
                 .await.expect("seed capacity snapshot");
-            capacity_caches().current.invalidate(&CapacityCacheKey {
-                store_id: store.id, bucket: bucket.clone(), incarnation: bucket_incarnation,
-            }).await;
+            caches.current.invalidate(&capacity_key).await;
 
             let capacity = owner
                 .call(owner_call(Method::GET, capacity_uri.clone(), vec![("if-none-match", unknown_etag.clone())], Bytes::new()))
