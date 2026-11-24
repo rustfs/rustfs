@@ -266,7 +266,11 @@ pub(crate) async fn execute_action(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::{
+        MAX_ACCEPTED_RISK_ACTOR_BYTES, MrfLegacyResponsibilityAction, MrfLegacyResponsibilityActionRequest, execute_action,
+    };
+    use rustfs_heal::heal::mrf_queue::MrfLifecycleControlError;
+    use uuid::Uuid;
 
     fn refresh_request() -> MrfLegacyResponsibilityActionRequest {
         MrfLegacyResponsibilityActionRequest {
