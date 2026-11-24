@@ -87,21 +87,35 @@ async fn native_claim_checks_order_ownership_and_one_active_lookup() {
         (2, active.as_str(), Some(3), true, LookupResult::Outage, 1, Some("ServiceUnavailable")),
         (10000, active.as_str(), Some(3), true, LookupResult::Real, 1, None),
     ] {
-        let mut input = UploadPartWriteInput::from_legacy(UploadPartInput::default(), None);
-        input.target = UploadPartTarget::Gateway {
-            bucket: BucketName::new(bucket.clone()).unwrap(),
-            key: ObjectKey::new(key).unwrap(),
-            upload_id: UploadIdClaim::from_wire(id),
+        // Same facts `from_legacy` carried. Checksums, SSE, content MD5, and trailers stay absent.
+        let input = UploadPartWriteInput {
+            target: UploadPartTarget::Gateway {
+                bucket: BucketName::new(bucket.clone()).unwrap(),
+                key: ObjectKey::new(key).unwrap(),
+                upload_id: UploadIdClaim::from_wire(id),
+            },
+            part_number: number,
+            content_length: length,
+            body: body.then(|| {
+                if length.is_none() {
+                    legacy_put_body(StreamingBlob::wrap(futures::stream::pending::<Result<Bytes, std::io::Error>>()))
+                } else {
+                    Body::from(Bytes::from_static(b"abc"))
+                }
+            }),
+            trailing_headers: None,
+            frame_trailers: None,
+            content_md5: None,
+            checksum_algorithm: None,
+            checksum_crc32: None,
+            checksum_crc32c: None,
+            checksum_crc64nvme: None,
+            checksum_sha1: None,
+            checksum_sha256: None,
+            sse_customer_algorithm: None,
+            sse_customer_key: None,
+            sse_customer_key_md5: None,
         };
-        input.part_number = number;
-        input.content_length = length;
-        input.body = body.then(|| {
-            if length.is_none() {
-                legacy_put_body(StreamingBlob::wrap(futures::stream::pending::<Result<Bytes, std::io::Error>>()))
-            } else {
-                Body::from(Bytes::from_static(b"abc"))
-            }
-        });
         let envelope = owned_envelope(Method::PUT);
         LOOKUP
             .scope((Cell::new(0), mode), async {

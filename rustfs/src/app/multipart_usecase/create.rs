@@ -562,14 +562,23 @@ mod tests {
 
     #[tokio::test]
     async fn execute_create_multipart_upload_rejects_invalid_storage_class() {
-        let input = CreateMultipartUploadInput::builder()
-            .bucket("bucket".to_string())
-            .key("object".to_string())
-            .storage_class(Some(StorageClass::from("invalid".to_string())))
-            .build()
-            .unwrap();
+        let fields = CreateMultipartUploadFields {
+            bucket: "bucket".to_owned(),
+            key: "object".to_owned(),
+            metadata: None,
+            tagging: None,
+            storage_class: Some("invalid".to_owned()),
+            server_side_encryption: None,
+            sse_customer_algorithm: None,
+            sse_customer_key: None,
+            sse_customer_key_md5: None,
+            ssekms_key_id: None,
+            object_lock_legal_hold_status: None,
+            object_lock_mode: None,
+            object_lock_retain_until_date: None,
+        };
         let err = match make_usecase()
-            .execute_create_multipart_upload(owned_envelope(Method::POST), CreateMultipartUploadFields::from_legacy(input), None)
+            .execute_create_multipart_upload(owned_envelope(Method::POST), fields, None)
             .await
         {
             Err(error) => error,

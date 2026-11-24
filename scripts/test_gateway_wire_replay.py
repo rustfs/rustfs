@@ -56,6 +56,9 @@ class WireTests(unittest.TestCase):
             ("Content-Language", "en", "fr"),
             ("Expires", "Wed, 01 Jan 2031 00:00:00 GMT", "Thu, 02 Jan 2031 00:00:00 GMT"),
             ("X-Amz-Website-Redirect-Location", "/original", "/updated"),
+            ("X-Amz-Object-Lock-Mode", "GOVERNANCE", "COMPLIANCE"),
+            ("X-Amz-Object-Lock-Retain-Until-Date", "2031-01-01T00:00:00Z", "2031-01-02T00:00:00Z"),
+            ("X-Amz-Object-Lock-Legal-Hold", "ON", "OFF"),
         ]
         for operation, method, body in [("GetObject", "GET", b"object"), ("HeadObject", "HEAD", b"")]:
             for name, value, changed in fields:
@@ -68,6 +71,30 @@ class WireTests(unittest.TestCase):
                     with self.subTest(operation=operation, header=name, scenario=scenario):
                         candidate = wire.project(operation, method, 200, headers, body)
                         self.assertEqual(wire.differences(reference, candidate), expected)
+
+    def test_s3_response_headers(self):
+        cases = [
+            ("CreateBucket", "PUT", 200, "Location", "/example-bucket"),
+            ("PutObject", "PUT", 200, "X-Amz-Expiration", 'expiry-date="Tue, 01 Jan 2030 00:00:00 GMT", rule-id="logs"'),
+            ("CopyObject", "PUT", 200, "X-Amz-Copy-Source-Version-Id", "source-version"),
+            ("HeadObject", "HEAD", 200, "X-Amz-Replication-Status", "COMPLETED"),
+            ("GetObject", "GET", 206, "X-Amz-Mp-Parts-Count", "3"),
+        ]
+        for operation, method, status, name, value in cases:
+            with self.subTest(operation=operation, header=name):
+                response = wire.project(operation, method, status, [(name, value)], b"")
+                self.assertEqual(response["headers"], [(name.lower(), value)])
+
+    def test_post_redirect_compares_location_including_query(self):
+        target = "https://example.com/upload/callback?origin=test&bucket=b&key=a%2Fb"
+
+        def project(headers):
+            return wire.project("PostObject", "POST", 303, headers, b"")
+
+        reference = project([("Location", target)])
+        self.assertEqual(wire.differences(reference, project([("location", target)])), [])
+        self.assertEqual(wire.differences(reference, project([])), ["headers"])
+        self.assertEqual(wire.differences(reference, project([("Location", target.split("?")[0])])), ["headers"])
 
     def test_content_length_checked_before_wire_differences(self):
         with self.assertRaises(wire.ReplayError):

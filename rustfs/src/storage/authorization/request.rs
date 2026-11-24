@@ -155,6 +155,14 @@ pub(crate) trait AuthorizationRequest {
     fn publication_guards(&self) -> Option<&TableDataPlanePublicationGuards>;
     fn install_publication_guards(&mut self, guards: TableDataPlanePublicationGuards);
     fn install_table_list_access(&mut self, access: TableDataPlaneListAccess);
+    /// Whether this decision may consult the table data plane.
+    ///
+    /// The publication fence is acquired only for a content mutation. The gateway's
+    /// early gate decides on a temporary request, so it returns false for those actions
+    /// and leaves the fenced check to the handler. Every other caller keeps the check.
+    fn evaluates_table_data_plane(&self) -> bool {
+        true
+    }
     fn audit_denial(&self, auditor: &DenialAuditor, action: &Action, reason: &'static str);
 }
 
