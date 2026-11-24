@@ -142,12 +142,23 @@ impl EarlyAuthorizer {
         if let Err(decision) = install_caller(&mut prepared, &self.server_ctx).await {
             return decision;
         }
+        if !matches!(prepared.caller, Caller::Anonymous) && policy_plugin_ready().await {
+            // An active OPA plugin is an external HTTP webhook evaluated once per check in the
+            // handler, after request body/tag validation and without duplicate outbound queries.
+            return Decision::Allow;
+        }
         let mut route = RouteRequest {
             inner: &mut prepared.envelope,
             evaluate_table: true,
         };
         decision_of(evaluate(&mut route, eval, bucket, key, version.as_deref()).await)
     }
+}
+
+async fn policy_plugin_ready() -> bool {
+    rustfs_iam::sys::IamSys::<rustfs_iam::store::object::ObjectStore>::get_policy_plugin_client()
+        .await
+        .is_some()
 }
 
 /// Who the gate resolves, classified the way [`super::gateway_handlers::access::admit`] does.
