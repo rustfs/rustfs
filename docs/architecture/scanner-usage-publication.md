@@ -178,17 +178,7 @@ requires a compatibility window and a dedicated cleanup entry.
 | `.scanner-cycle.lock` | scanner runtime lock | Serializes cycle-level work. A missing lock object is not itself usage evidence. |
 | `.scanner-pause-backlog.json` | scanner pause and catch-up ledger | Tracks dirty usage, discovered lifecycle work, and full-scan catch-up while authoritative publication is fenced by data movement. It never grants publication admission. |
 
-The authoritative snapshot may include an optional `bucket_incarnation` in each
-bucket usage entry. The coordinator writes it only when every contributing set
-reports the same non-nil bucket UUID. Missing or conflicting identities leave
-that entry uncertified; they do not reject the usage publication or change quota
-admission. Veeam SOSAPI capacity reads require this proof to match the bucket
-incarnation read from authoritative storage. An old snapshot, a mixed-version
-writer that omits the field, a pending target bucket, or an unavailable identity
-therefore yields a retryable capacity error until a compatible scanner publishes
-a certified entry. The optional field is omitted when unavailable so older
-snapshot readers continue to see the original shape. This proof identifies the
-bucket generation; it does not make scanner usage a real-time quota ledger.
+The authoritative snapshot may include an optional `bucket_incarnation` in each bucket usage entry. The coordinator writes it only when every contributing set reports the same non-nil bucket UUID. Missing or conflicting identities leave that entry uncertified without affecting publication or quota admission. Veeam SOSAPI reports numeric `Used` only when this proof matches the current bucket incarnation. Missing usage or a snapshot without valid proof, including legacy and pending entries, yields `Used=-1`. With a hard quota, `Available` is also undefined unless live free space is zero. Failures to read authoritative bucket metadata or usage, or obtain live storage capacity, yield a retryable capacity error. The proof is additive for older snapshot readers and identifies the bucket generation without making scanner usage a real-time quota ledger.
 
 ## Observed Snapshots
 

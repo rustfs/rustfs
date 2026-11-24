@@ -78,7 +78,7 @@ pub(super) struct SosapiRepresentation {
 }
 
 pub(super) struct CapacityInputs {
-    pub used_bucket: u64,
+    pub used_bucket: Option<u64>,
     pub hard_quota: Option<u64>,
     pub capacity_cluster: u64,
     pub free_cluster: u64,
@@ -87,8 +87,8 @@ pub(super) struct CapacityInputs {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct CapacityFigures {
     pub capacity: u64,
-    pub used: u64,
-    pub available: u64,
+    pub used: Option<u64>,
+    pub available: Option<u64>,
 }
 
 #[derive(Clone, Debug, Hash, PartialEq, Eq)]
@@ -162,13 +162,16 @@ pub(super) fn mutation_blocked(key: &str) -> bool {
 }
 
 pub(super) fn capacity_figures(inputs: CapacityInputs) -> CapacityFigures {
-    let used_bucket = inputs.used_bucket;
-    let capacity = inputs
-        .hard_quota
-        .filter(|quota| *quota > 0)
-        .unwrap_or(inputs.capacity_cluster);
-    let used = used_bucket.min(capacity);
-    let available = capacity.saturating_sub(used).min(inputs.free_cluster);
+    let hard_quota = inputs.hard_quota.filter(|&quota| quota > 0);
+    let capacity = hard_quota.unwrap_or(inputs.capacity_cluster);
+    let used = inputs.used_bucket.map(|used| used.min(capacity));
+    let free = inputs.free_cluster.min(capacity);
+    let available = match used {
+        Some(used) => Some((capacity - used).min(free)),
+        // Without certified usage, quota headroom is unknown unless storage is already full.
+        None if hard_quota.is_none() || free == 0 => Some(free),
+        None => None,
+    };
     CapacityFigures {
         capacity,
         used,
@@ -285,7 +288,9 @@ fn system_xml(version: &str) -> String {
 fn capacity_xml(figures: &CapacityFigures) -> String {
     format!(
         "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<CapacityInfo>\n  <Capacity>{}</Capacity>\n  <Available>{}</Available>\n  <Used>{}</Used>\n</CapacityInfo>\n",
-        figures.capacity, figures.available, figures.used,
+        figures.capacity,
+        figures.available.map_or(-1, i128::from),
+        figures.used.map_or(-1, i128::from),
     )
 }
 
@@ -392,12 +397,10 @@ async fn load_capacity_inputs(store: &Arc<ECStore>, bucket: &str, incarnation: U
     }
     let used_bucket = load_bucket_usage_from_backend_cached(Arc::clone(store), bucket, incarnation)
         .await
-        .ok()
-        .flatten()
-        .ok_or_else(|| {
-            log_usage_missing_once(bucket);
-            capacity_unavailable()
-        })?;
+        .map_err(|_| capacity_unavailable())?;
+    if used_bucket.is_none() {
+        log_usage_missing_once(bucket);
+    }
     let (capacity_cluster, free_cluster) = cached_cluster_capacity(store).await?;
     Ok(CapacityInputs {
         used_bucket,
@@ -409,7 +412,7 @@ async fn load_capacity_inputs(store: &Arc<ECStore>, bucket: &str, incarnation: U
 
 fn hard_quota_bytes(quota: &BucketQuota) -> Option<u64> {
     match quota.quota_type {
-        QuotaType::Hard => quota.quota.filter(|size| *size > 0),
+        QuotaType::Hard => quota.quota,
     }
 }
 
@@ -540,7 +543,7 @@ fn log_usage_missing_once(bucket: &str) {
             subsystem = LOG_SUBSYSTEM_OBJECT,
             state = "snapshot_missing",
             bucket = %bucket,
-            "Veeam SOSAPI capacity is unavailable because the data-usage snapshot is missing"
+            "Veeam SOSAPI is reporting undefined bucket usage"
         );
     }
 }
