@@ -298,7 +298,13 @@ struct StagingRegistration {
 }
 
 /// An exclusive window exposed for a peer to read or write. The native agent
-/// progresses peer traffic. No local transfer request is submitted by this API.
+/// progresses peer traffic without a local transfer request.
+///
+/// The agent metadata grants access to the entire registered allocation. Share
+/// it only with trusted peers that honor the advertised window bounds. Keep
+/// each window alive and exclusively available to its peer until the transfer
+/// completes. After a timeout or cancellation, quarantine the window until
+/// the peer confirms that it has stopped accessing the range.
 pub struct RegisteredClientWindow {
     registration: Arc<StagingRegistration>,
     offset: usize,
