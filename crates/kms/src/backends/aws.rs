@@ -56,6 +56,7 @@
 //! schedule/cancel deletion, enable/disable) are executed at most once because
 //! a lost response could otherwise be replayed into a second side effect.
 
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::future::Future;
 
@@ -69,6 +70,7 @@ use tokio_util::sync::CancellationToken;
 
 use super::{BackendCapabilities, ExpiredKeyRemoval, KmsBackend, empty_key_page, list_keys_page_size};
 use crate::config::{BackendConfig, KmsConfig};
+use crate::encryption::{DataKeyEnvelope, is_data_key_envelope};
 use crate::error::{KmsError, Result};
 use crate::policy::{self, AttemptError, ErrorClass, OpClass, RetryPolicy, classify_status};
 use crate::types::*;
@@ -288,6 +290,22 @@ pub struct AwsKmsBackend {
     cancel: CancellationToken,
 }
 
+/// The blob to hand to AWS `Decrypt` for a stored ciphertext.
+///
+/// [`KmsBackend::generate_data_key`] wraps the AWS blob in a
+/// [`DataKeyEnvelope`]; [`KmsBackend::encrypt`] returns it bare, and so did
+/// `generate_data_key` through 1.0.5. Both shapes stay decryptable. The
+/// envelope's recorded key id and context are not consulted: AWS resolves the
+/// key from the blob and authenticates the caller's context against it.
+fn native_ciphertext(ciphertext: &[u8]) -> Result<Cow<'_, [u8]>> {
+    if !is_data_key_envelope(ciphertext) {
+        return Ok(Cow::Borrowed(ciphertext));
+    }
+    let envelope: DataKeyEnvelope = serde_json::from_slice(ciphertext)
+        .map_err(|e| KmsError::cryptographic_error("parse", format!("Failed to parse data key envelope: {e}")))?;
+    Ok(Cow::Owned(envelope.encrypted_key))
+}
+
 impl AwsKmsBackend {
     /// Build the backend from a KMS configuration.
     ///
@@ -483,7 +501,8 @@ impl KmsBackend for AwsKmsBackend {
         // AWS ciphertext blobs identify their own key, so no key id is needed
         // here — and AWS refuses to decrypt with a disabled or pending-deletion
         // key, unlike the RustFS-managed backends.
-        let ciphertext = request.ciphertext.as_slice();
+        let ciphertext = native_ciphertext(&request.ciphertext)?;
+        let ciphertext = ciphertext.as_ref();
         let context = encryption_context(&request.encryption_context);
         let tokens = grant_tokens(&request.grant_tokens);
 
@@ -563,10 +582,29 @@ impl KmsBackend for AwsKmsBackend {
             .ciphertext_blob
             .ok_or_else(|| KmsError::backend_error(format!("AWS KMS GenerateDataKey returned no ciphertext for key {key_id}")))?;
 
+        let master_key_id = output.key_id.unwrap_or_else(|| request.key_id.clone());
+        // The envelope is what lets a reader recognize these bytes as
+        // KMS-wrapped: the native blob identifies its key to AWS, but nothing
+        // in it identifies AWS to RustFS.
+        let envelope = DataKeyEnvelope {
+            key_id: uuid::Uuid::new_v4().to_string(),
+            master_key_id: master_key_id.clone(),
+            key_spec: request.key_spec.as_str().to_string(),
+            encrypted_key: ciphertext.into_inner(),
+            nonce: Vec::new(),
+            encryption_context: request.encryption_context,
+            created_at: Zoned::now(),
+            // AWS addresses backing keys internally and never exposes a version.
+            master_key_version: None,
+            // AWS binds the context into the blob itself; this field describes
+            // only the local DekCrypto binding, which this backend never uses.
+            context_binding: None,
+        };
+
         Ok(GenerateDataKeyResponse {
-            key_id: output.key_id.unwrap_or_else(|| request.key_id.clone()),
+            key_id: master_key_id,
             plaintext_key: plaintext.into_inner(),
-            ciphertext_blob: ciphertext.into_inner(),
+            ciphertext_blob: serde_json::to_vec(&envelope)?,
         })
     }
 
@@ -826,6 +864,12 @@ impl KmsBackend for AwsKmsBackend {
             .with_production_supported(true)
     }
 
+    /// Releases through 1.0.5 persisted the `GenerateDataKey` blob without an
+    /// envelope, so objects written by them carry it bare.
+    fn reads_bare_data_key_ciphertext(&self) -> bool {
+        true
+    }
+
     /// Observe, never destroy.
     ///
     /// AWS runs the deletion window itself, so the sweep's job here is only to
@@ -972,15 +1016,49 @@ mod tests {
         insta::assert_json_snapshot!("aws_backend_capabilities", capabilities_snapshot(backend.capabilities()));
     }
 
-    #[tokio::test]
-    async fn generate_data_key_maps_the_native_response() {
-        let plaintext = vec![7u8; 32];
-        let ciphertext = b"encrypted-data-key".to_vec();
-        let (http_client, backend) = scripted_backend(vec![ok_event(serde_json::json!({
+    /// A data key blob shaped like AWS's: binary, not UTF-8, and nothing in it
+    /// that RustFS could recognize.
+    fn native_blob() -> Vec<u8> {
+        let mut blob = vec![0x01, 0x02, 0x02, 0x00, 0x78];
+        blob.extend((0u8..=178).map(|byte| byte.wrapping_mul(151).wrapping_add(0x80)));
+        blob
+    }
+
+    fn generate_data_key_event(plaintext: &[u8], blob: &[u8]) -> ReplayEvent {
+        ok_event(serde_json::json!({
             "KeyId": "arn:aws:kms:us-east-1:111122223333:key/test-key",
-            "Plaintext": BASE64.encode_to_string(&plaintext),
-            "CiphertextBlob": BASE64.encode_to_string(&ciphertext),
-        }))]);
+            "Plaintext": BASE64.encode_to_string(plaintext),
+            "CiphertextBlob": BASE64.encode_to_string(blob),
+        }))
+    }
+
+    fn decrypt_event(plaintext: &[u8]) -> ReplayEvent {
+        ok_event(serde_json::json!({
+            "KeyId": "arn:aws:kms:us-east-1:111122223333:key/test-key",
+            "Plaintext": BASE64.encode_to_string(plaintext),
+            "EncryptionAlgorithm": "SYMMETRIC_DEFAULT",
+        }))
+    }
+
+    /// The JSON body of the `index`-th request the backend actually sent.
+    fn sent_body(http_client: &StaticReplayClient, index: usize) -> serde_json::Value {
+        let request = http_client
+            .actual_requests()
+            .nth(index)
+            .expect("the backend should have sent this request");
+        serde_json::from_slice(request.body().bytes().expect("request body should be buffered"))
+            .expect("AWS KMS requests are JSON")
+    }
+
+    /// The data key has to come back in the envelope every reader classifies
+    /// KMS-wrapped keys by. Returning the bare blob made each object written
+    /// through this backend unreadable: the read path took the unrecognized
+    /// bytes for a locally wrapped key and never called AWS at all.
+    #[tokio::test]
+    async fn generate_data_key_wraps_the_native_blob_in_an_envelope() {
+        let plaintext = vec![7u8; 32];
+        let blob = native_blob();
+        let (http_client, backend) = scripted_backend(vec![generate_data_key_event(&plaintext, &blob)]);
 
         let response = backend
             .generate_data_key(generate_request())
@@ -988,23 +1066,89 @@ mod tests {
             .expect("generate_data_key should map the AWS response");
 
         assert_eq!(response.plaintext_key, plaintext);
-        assert_eq!(response.ciphertext_blob, ciphertext);
         assert_eq!(response.key_id, "arn:aws:kms:us-east-1:111122223333:key/test-key");
+        assert!(
+            is_data_key_envelope(&response.ciphertext_blob),
+            "the stored data key must be recognizable as KMS-wrapped from its bytes alone"
+        );
+        let envelope: DataKeyEnvelope = serde_json::from_slice(&response.ciphertext_blob).expect("envelope must parse");
+        assert_eq!(envelope.encrypted_key, blob, "the envelope must carry the AWS blob byte for byte");
+        assert_eq!(envelope.master_key_id, "arn:aws:kms:us-east-1:111122223333:key/test-key");
+        assert_eq!(envelope.key_spec, "AES_256");
+        assert_eq!(envelope.encryption_context, generate_request().encryption_context);
+        assert_eq!(envelope.master_key_version, None);
+        assert_eq!(envelope.context_binding, None);
         assert_eq!(http_client.actual_requests().count(), 1);
     }
 
+    /// What `generate_data_key` returns is what `decrypt` is later handed, so
+    /// AWS must receive the blob it issued — not the envelope around it — along
+    /// with the caller's context, which AWS authenticates.
     #[tokio::test]
-    async fn decrypt_recovers_the_plaintext_without_a_key_id() {
+    async fn decrypt_opens_a_generated_data_key_with_the_native_blob() {
+        let plaintext = vec![9u8; 32];
+        let blob = native_blob();
+        let (http_client, backend) =
+            scripted_backend(vec![generate_data_key_event(&plaintext, &blob), decrypt_event(&plaintext)]);
+
+        let data_key = backend
+            .generate_data_key(generate_request())
+            .await
+            .expect("generate_data_key should succeed");
+        let response = backend
+            .decrypt(DecryptRequest {
+                ciphertext: data_key.ciphertext_blob,
+                encryption_context: generate_request().encryption_context,
+                grant_tokens: Vec::new(),
+            })
+            .await
+            .expect("a generated data key must decrypt");
+
+        assert_eq!(response.plaintext, plaintext);
+        let sent = sent_body(&http_client, 1);
+        assert_eq!(sent["CiphertextBlob"], BASE64.encode_to_string(&blob));
+        assert_eq!(sent["EncryptionContext"], serde_json::json!({ "bucket": "aws" }));
+    }
+
+    /// The caller's context reaches AWS even when it disagrees with the one
+    /// recorded in the envelope: the recorded copy is unauthenticated, so AWS,
+    /// which bound the real context into the blob, has to be the judge.
+    #[tokio::test]
+    async fn decrypt_sends_the_callers_context_not_the_envelopes() {
+        let plaintext = vec![9u8; 32];
+        let (http_client, backend) = scripted_backend(vec![
+            generate_data_key_event(&plaintext, &native_blob()),
+            error_event(400, "InvalidCiphertextException", "context does not match"),
+        ]);
+
+        let data_key = backend
+            .generate_data_key(generate_request())
+            .await
+            .expect("generate_data_key should succeed");
+        backend
+            .decrypt(DecryptRequest {
+                ciphertext: data_key.ciphertext_blob,
+                encryption_context: HashMap::from([("bucket".to_string(), "other".to_string())]),
+                grant_tokens: Vec::new(),
+            })
+            .await
+            .expect_err("AWS rejects a context that does not match the blob");
+
+        assert_eq!(sent_body(&http_client, 1)["EncryptionContext"], serde_json::json!({ "bucket": "other" }));
+    }
+
+    /// Objects written through 1.0.5 store the AWS blob bare, and `encrypt`
+    /// still returns it that way, so a ciphertext that is not an envelope goes
+    /// to AWS untouched.
+    #[tokio::test]
+    async fn decrypt_sends_a_bare_blob_unchanged() {
         let plaintext = b"recovered-data-key".to_vec();
-        let (_http, backend) = scripted_backend(vec![ok_event(serde_json::json!({
-            "KeyId": "arn:aws:kms:us-east-1:111122223333:key/test-key",
-            "Plaintext": BASE64.encode_to_string(&plaintext),
-            "EncryptionAlgorithm": "SYMMETRIC_DEFAULT",
-        }))]);
+        let blob = native_blob();
+        let (http_client, backend) = scripted_backend(vec![decrypt_event(&plaintext)]);
 
         let response = backend
             .decrypt(DecryptRequest {
-                ciphertext: b"blob".to_vec(),
+                ciphertext: blob.clone(),
                 encryption_context: HashMap::new(),
                 grant_tokens: Vec::new(),
             })
@@ -1013,6 +1157,44 @@ mod tests {
 
         assert_eq!(response.plaintext, plaintext);
         assert_eq!(response.encryption_algorithm.as_deref(), Some("SYMMETRIC_DEFAULT"));
+        assert_eq!(sent_body(&http_client, 0)["CiphertextBlob"], BASE64.encode_to_string(&blob));
+        assert!(backend.reads_bare_data_key_ciphertext());
+    }
+
+    /// The object layer's write and read, through the same service entry
+    /// points the S3 handlers use: the key a PUT stores must be the key a GET
+    /// recovers, under the object's own context.
+    #[tokio::test]
+    async fn object_data_key_round_trips_through_the_encryption_service() {
+        use crate::manager::KmsManager;
+        use crate::service::ObjectEncryptionService;
+
+        let plaintext = vec![3u8; 32];
+        let blob = native_blob();
+        let (http_client, backend) =
+            scripted_backend(vec![generate_data_key_event(&plaintext, &blob), decrypt_event(&plaintext)]);
+        let manager = KmsManager::new(std::sync::Arc::new(backend), KmsConfig::aws(Some("us-east-1".to_string())));
+        let service = ObjectEncryptionService::new(manager);
+        let context = ObjectEncryptionContext::new("bucket".to_string(), "dir/object".to_string());
+
+        let (written, stored) = service
+            .create_data_key(&Some("test-key".to_string()), &context)
+            .await
+            .expect("the write path must obtain a data key");
+        assert!(is_data_key_envelope(&stored));
+        assert!(service.reads_bare_data_key_ciphertext());
+
+        let read = service
+            .decrypt_data_key(&stored, &context)
+            .await
+            .expect("the read path must recover the data key");
+
+        assert_eq!(read.plaintext_key, written.plaintext_key);
+        assert_eq!(sent_body(&http_client, 1)["CiphertextBlob"], BASE64.encode_to_string(&blob));
+        assert_eq!(
+            sent_body(&http_client, 1)["EncryptionContext"],
+            sent_body(&http_client, 0)["EncryptionContext"]
+        );
     }
 
     /// Asserts that a mapped failure landed on the intended `KmsError` variant.

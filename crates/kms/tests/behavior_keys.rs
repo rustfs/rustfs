@@ -39,7 +39,7 @@ mod common;
 
 use common::{
     BackendCase, BackendKind, TestKms, assert_invalid_operation, assert_key_already_exists, assert_key_not_found,
-    assert_unsupported_capability, ctx, for_each_backend, without_probe_key,
+    assert_unsupported_capability, ctx, for_each_backend, schedule_deletion, without_probe_key,
 };
 use rustfs_kms::{
     CancelKeyDeletionRequest, CreateKeyRequest, DecryptRequest, DeleteKeyRequest, DescribeKeyRequest, EncryptRequest,
@@ -417,11 +417,27 @@ async fn deletion_pending_window_is_bounded() {
 }
 
 #[tokio::test]
-async fn forced_immediate_deletion_removes_the_key() {
+async fn forced_immediate_deletion_removes_a_pending_key_and_refuses_any_other() {
     let kms = TestKms::local_with(|config| config.allow_immediate_deletion = true).await;
     let manager = kms.kms().await;
     let key_id = kms.create_key("burn-now").await;
 
+    // Destruction always passes through the cancellable pending state: asked
+    // of a key that was never scheduled, it is refused and changes nothing.
+    assert_invalid_operation(
+        manager
+            .delete_key(DeleteKeyRequest {
+                key_id: key_id.clone(),
+                pending_window_in_days: None,
+                force_immediate: Some(true),
+                confirm_key_id: Some(key_id.clone()),
+            })
+            .await,
+        "not pending deletion",
+    );
+    assert_eq!(describe_state(&manager, &key_id).await, KeyState::Enabled);
+
+    schedule_deletion(&manager, &key_id).await;
     let deleted = manager
         .delete_key(DeleteKeyRequest {
             key_id: key_id.clone(),

@@ -913,7 +913,9 @@ impl DefaultObjectUsecase {
         let output = CopyObjectOutput {
             copy_object_result: Some(copy_object_result),
             copy_source_version_id,
-            server_side_encryption: effective_sse,
+            // `x-amz-server-side-encryption` names a managed algorithm; an SSE-C
+            // destination answers with its customer-key headers only.
+            server_side_encryption: effective_sse.filter(|_| sse_customer_algorithm.is_none()),
             ssekms_key_id: effective_kms_key_id,
             sse_customer_algorithm,
             sse_customer_key_md5,
@@ -1630,5 +1632,75 @@ mod tests {
             .await
             .expect_err("a refused copy must not leave a destination object behind");
         assert!(is_err_object_not_found(&lookup_err), "{lookup_err}");
+    }
+
+    // `x-amz-server-side-encryption` names a managed algorithm. A copy to an SSE-C destination
+    // answers with its customer-key headers only, as PutObject does.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn copy_object_to_ssec_destination_answers_with_the_customer_key_headers_only() {
+        use crate::app::storage_api::test::contract::bucket::{BucketOperations as _, DeleteBucketOptions, MakeBucketOptions};
+
+        let store = crate::app::gating_test_env::shared_gating_ecstore().await;
+        if current_app_context().is_none() {
+            crate::app::runtime_sources::install_test_app_context(Arc::clone(&store)).await;
+        }
+        let ambient = current_app_context().expect("SSE-C copy test requires an AppContext");
+        let context = Arc::new(AppContext::new(Arc::clone(&store), ambient.iam(), ambient.kms()));
+        let bucket = format!("copy-ssec-response-{}", Uuid::new_v4());
+        let customer_key_md5 = "SaaDheEjzuynJH8eW6AEpQ==";
+        store
+            .make_bucket(&bucket, &MakeBucketOptions::default())
+            .await
+            .expect("SSE-C copy test bucket should be created");
+        store
+            .put_object(
+                &bucket,
+                "source.bin",
+                &mut PutObjReader::from_vec(b"copy source".to_vec()),
+                &ObjectOptions::default(),
+            )
+            .await
+            .expect("plaintext copy source should be written");
+
+        let mut input = CopyObjectInput::builder()
+            .copy_source(CopySource::Bucket {
+                bucket: bucket.clone().into(),
+                key: "source.bin".into(),
+                version_id: None,
+            })
+            .bucket(bucket.clone())
+            .key("customer-encrypted.bin".to_string())
+            .build()
+            .expect("SSE-C copy input should build");
+        input.sse_customer_algorithm = Some("AES256".to_string());
+        input.sse_customer_key = Some("KioqKioqKioqKioqKioqKioqKioqKioqKioqKioqKio=".to_string());
+        input.sse_customer_key_md5 = Some(customer_key_md5.to_string());
+        let response = DefaultObjectUsecase::with_context(Some(context))
+            .execute_copy_object(build_request(input, Method::PUT))
+            .await
+            .expect("copying to an SSE-C destination should succeed")
+            .output;
+
+        assert_eq!(
+            (
+                response.server_side_encryption.as_ref().map(|value| value.as_str()),
+                response.ssekms_key_id.as_deref(),
+                response.sse_customer_algorithm.as_deref(),
+                response.sse_customer_key_md5.as_deref(),
+            ),
+            (None, None, Some("AES256"), Some(customer_key_md5))
+        );
+
+        store
+            .delete_bucket(
+                &bucket,
+                &DeleteBucketOptions {
+                    force: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("SSE-C copy test bucket should be removed");
     }
 }
