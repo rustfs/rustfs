@@ -21,7 +21,7 @@ use crate::app::{RequestEnvelope, dto_values};
 use crate::runtime_sources::AppContext;
 use crate::storage_api::server::http::access::access_owned::bucket_core::{authorize_create_bucket, authorize_delete_bucket};
 use crate::storage_api::server::http::access::authorize_bucket_request;
-use rustfs_gateway::{Req, Resp, dto, validate_accelerate};
+use rustfs_gateway::{Req, Resp, dto, validate_accelerate, validate_request_payment};
 use rustfs_gateway_types::persistence::{
     parse_accelerate, parse_bucket_logging_dto, parse_request_payment, parse_website, parse_website_dto,
     serialize_accelerate_dto, serialize_bucket_logging_dto, serialize_request_payment_dto, serialize_website_dto,
@@ -275,7 +275,10 @@ impl Served for dto::PutBucketRequestPayment {
         let input = request.into_input();
         DefaultBucketUsecase::with_context(context)
             .execute_put_bucket_request_payment(envelope, input.bucket.as_str(), || {
-                parse_request_payment(&serialize_request_payment_dto(&input.request_payment_configuration))
+                let configuration = &input.request_payment_configuration;
+                validate_request_payment(configuration)
+                    .map_err(|err| rustfs_s3_types::s3_error!(InvalidArgument, "{}", err.reason()))?;
+                parse_request_payment(&serialize_request_payment_dto(configuration))
                     .map_err(|err| rustfs_s3_types::s3_error!(MalformedXML, "{err}"))
             })
             .await?;
