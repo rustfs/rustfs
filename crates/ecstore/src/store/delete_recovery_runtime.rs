@@ -275,6 +275,22 @@ impl DeleteRecoveryHints {
         true
     }
 
+    /// Leave a spare slot for recovery that could not finish inline.
+    pub(crate) fn has_cleanup_capacity_for_batch(&self, groups: usize) -> bool {
+        groups < self.capacity.saturating_sub(self.pending_len())
+    }
+
+    /// Admit optional cleanup only while this generation is queued and the
+    /// recovery worker still has room for more hints.
+    pub(crate) fn can_defer_cleanup(&self, ticket: &DeleteRecoveryTicket) -> bool {
+        let state = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.pending.len() < self.capacity
+            && state
+                .pending
+                .get(&ticket.admission.key)
+                .is_some_and(|entry| entry.generation == Some(ticket.generation))
+    }
+
     pub(crate) fn ack(&self, ticket: &DeleteRecoveryTicket) {
         ticket.admission.settled.store(true, Ordering::Release);
         let mut state = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -1178,6 +1194,25 @@ mod tests {
             .take_available(&HashSet::new())
             .expect("active key becomes eligible after completion");
         assert_eq!(next.generation, newer.generation, "retry cannot overwrite the foreground generation");
+    }
+
+    #[test]
+    fn delete_recovery_cleanup_deferral_requires_a_current_hint_and_spare_capacity() {
+        let hints = DeleteRecoveryHints::with_capacity(2);
+        assert!(hints.has_cleanup_capacity_for_batch(1));
+        assert!(!hints.has_cleanup_capacity_for_batch(2));
+        let original = hints.register(key("object")).expect("first generation");
+        assert!(hints.can_defer_cleanup(&original));
+        assert!(!hints.has_cleanup_capacity_for_batch(1));
+        let current = hints.register(key("object")).expect("replacement generation");
+        assert!(!hints.can_defer_cleanup(&original));
+        assert!(hints.can_defer_cleanup(&current));
+        let other = hints.register(key("other")).expect("last queue slot");
+        assert!(!hints.can_defer_cleanup(&current));
+        hints.ack(&other);
+        assert!(hints.can_defer_cleanup(&current));
+        hints.ack(&current);
+        assert!(!hints.can_defer_cleanup(&current));
     }
 
     #[test]

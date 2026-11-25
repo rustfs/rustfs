@@ -228,6 +228,8 @@ arbitrary downgrade while new recovery records exist.
 
 ## Batch preparation and settlement deadlines
 
+For distributed batches that create delete markers, the response can follow the durable per-key receipt quorum while the recovery worker finishes physical cleanup. This applies to groups that only create a marker and whose batch fits the available hint slots before preparation. The optional fast path falls back to inline cleanup when the queue fills or the hint generation changes. The durable journal and receipt continue to support replay after restart.
+
 `RUSTFS_DELETE_RECOVERY_TIMEOUT_SECS` controls the remote recoverable batch preparation and settlement RPC deadlines, including full shard verification during rollback. Batch preparation returns the per-object results together after the drive finishes staging the groups in the request. Key and bucket lifecycle ownership stay attached to late local filesystem operations after cancellation or timeout.
 
 The default is 900 seconds. Valid values are 30 through 86400 seconds. Invalid values fail explicitly. A stalled peer can hold the batch and its object locks until the preparation deadline because the coordinator waits for each drive’s reply. Ordinary reads, single-object preparation, and guarded batch preparation retain their existing deadlines. A timeout can conceal a completed mutation, so use the recovery records to inspect and settle the outcome.

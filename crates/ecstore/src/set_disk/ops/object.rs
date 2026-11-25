@@ -11141,6 +11141,8 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
             fi_vers.versions.retain(|fi| del_errs[fi.idx].is_none());
         }
         vers.retain(|fi_vers| !fi_vers.versions.is_empty());
+        let defer_marker_cleanup =
+            dist_erasure && vers.len() > 1 && self.ctx.delete_recovery_hints().has_cleanup_capacity_for_batch(vers.len());
         let recovery_tickets: Vec<_> = vers
             .iter()
             .map(|group| {
@@ -11422,6 +11424,10 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
                             DeleteRecoveryContext {
                                 work_budget: opts.delete_recovery_work_budget.clone(),
                                 recovery_ticket,
+                                // Marker creation publishes the new head during prepare. Keep
+                                // explicit version removal on the existing inline cleanup path.
+                                defer_cleanup: defer_marker_cleanup
+                                    && matches!(group.versions.as_slice(), [marker] if marker.deleted),
                                 namespace_owner,
                                 transaction_guard,
                                 ..DeleteRecoveryContext::new(opts.expected_bucket_incarnation_id, &can_commit)
