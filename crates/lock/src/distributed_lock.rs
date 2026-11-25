@@ -542,6 +542,7 @@ pub struct DistributedLock {
     namespace: Arc<str>,
     /// Quorum size for exclusive/write operations
     quorum: usize,
+    prefer_first_voter_on_contention: bool,
 }
 
 type LockAcquireTaskResult = (usize, Result<LockResponse>);
@@ -572,7 +573,12 @@ impl DistributedLock {
             clients,
             namespace,
             quorum: q,
+            prefer_first_voter_on_contention: false,
         }
+    }
+
+    pub(super) fn prefer_first_voter_on_contention(&mut self) {
+        self.prefer_first_voter_on_contention = true;
     }
 
     /// Get namespace identifier
@@ -1187,7 +1193,18 @@ impl DistributedLock {
             // A peer may grant promptly but deliver its response after its local
             // contention budget. Keep this round's owners until a response proves
             // quorum impossible or the caller's remaining budget expires.
-            let result = self.acquire_lock_quorum_once(&attempt_request, remaining).await?;
+            let contention_retry = self.prefer_first_voter_on_contention
+                && self.clients.len() > 1
+                && request.lock_type == LockType::Exclusive
+                && last_result.as_ref().is_some_and(|previous| !previous.quorum_impossible);
+            // Split votes can repeatedly occupy different peers without any writer
+            // reaching quorum. On a contention retry let one voter order the
+            // competing writers before fanning out; reserve at least half the
+            // remaining budget for a quorum that can exclude a silent first voter.
+            let first_vote_wait = contention_retry.then_some(remaining / 2);
+            let result = self
+                .acquire_lock_quorum_once(&attempt_request, remaining, first_vote_wait)
+                .await?;
             if !result.response.success {
                 tracing::trace!(
                     target: "rustfs_lock::namespace_owner",
@@ -1273,7 +1290,12 @@ impl DistributedLock {
     /// Quorum-based lock acquisition: success if at least the required quorum succeeds.
     /// Collects all individual lock_ids from successful clients and creates an aggregate lock_id.
     /// Returns the LockResponse with aggregate lock_id and individual lock mappings.
-    async fn acquire_lock_quorum_once(&self, request: &LockRequest, quorum_timeout: Duration) -> Result<LockAcquireQuorumResult> {
+    async fn acquire_lock_quorum_once(
+        &self,
+        request: &LockRequest,
+        quorum_timeout: Duration,
+        first_vote_wait: Option<Duration>,
+    ) -> Result<LockAcquireQuorumResult> {
         let voter_count =
             u32::try_from(self.clients.len().max(1)).map_err(|_| LockError::internal("lock voter count exceeds u32"))?;
         let required_quorum = self.required_quorum(request.lock_type);
@@ -1287,14 +1309,16 @@ impl DistributedLock {
             fallback_lock_id: request.lock_id.clone(),
         };
         let mut next_client_index = 0usize;
-        self.spawn_lock_requests_until(
-            &mut round.pending,
-            request,
-            &mut next_client_index,
-            required_quorum
-                .saturating_add(LOCK_ACQUIRE_SPARE_HEDGES)
-                .min(self.clients.len()),
-        );
+        let initial_width = required_quorum
+            .saturating_add(LOCK_ACQUIRE_SPARE_HEDGES)
+            .min(self.clients.len());
+        if let Some(first_vote_budget) = first_vote_wait {
+            let mut first = request.clone();
+            first.acquire_timeout = first_vote_budget;
+            self.spawn_lock_requests_until(&mut round.pending, &first, &mut next_client_index, 1);
+        } else {
+            self.spawn_lock_requests_until(&mut round.pending, request, &mut next_client_index, initial_width);
+        }
         let mut last_failure = None;
         let mut last_failure_kind = None;
         let mut last_hard_failure_kind = None;
@@ -1306,7 +1330,7 @@ impl DistributedLock {
         // Spread additional hedges across the existing attempt budget; fast
         // quorums still use only the initial quorum-plus-spare requests.
         let hedge_interval = request.acquire_timeout / voter_count;
-        let hedge_timer = tokio::time::sleep(hedge_interval);
+        let hedge_timer = tokio::time::sleep(first_vote_wait.unwrap_or(hedge_interval));
         tokio::pin!(hedge_timer);
 
         while !round.pending.is_empty() {
@@ -1351,7 +1375,11 @@ impl DistributedLock {
                 }
                 _ = &mut hedge_timer, if next_client_index < self.clients.len() => {
                     if start.elapsed() < quorum_timeout {
-                        let target_in_flight = round.pending.len().saturating_add(1);
+                        let target_in_flight = if first_vote_wait.is_some() && next_client_index == 1 {
+                            initial_width
+                        } else {
+                            round.pending.len().saturating_add(1)
+                        };
                         self.spawn_lock_requests_until(
                             &mut round.pending, request, &mut next_client_index, target_in_flight,
                         );
@@ -1382,6 +1410,9 @@ impl DistributedLock {
                 }
             };
 
+            if first_vote_wait.is_some() && next_client_index == 1 {
+                hedge_timer.set(tokio::time::sleep(hedge_interval));
+            }
             match join_result {
                 Ok((idx, Ok(resp))) => {
                     if resp.success {
@@ -3286,7 +3317,7 @@ mod tests {
         let request = LockRequest::new(ObjectKey::new("bucket", "partial-grants"), LockType::Shared, "owner")
             .with_acquire_timeout(Duration::from_secs(1));
         let result = lock
-            .acquire_lock_quorum_once(&request, request.acquire_timeout)
+            .acquire_lock_quorum_once(&request, request.acquire_timeout, None)
             .await
             .expect("partial quorum should return a timeout response");
         assert!(!result.response.success);
@@ -3476,7 +3507,7 @@ mod tests {
             let request = LockRequest::new(ObjectKey::new("bucket", "object"), LockType::Exclusive, "owner")
                 .with_acquire_timeout(Duration::from_secs(2));
             let result = lock
-                .acquire_lock_quorum_once(&request, request.acquire_timeout)
+                .acquire_lock_quorum_once(&request, request.acquire_timeout, None)
                 .await
                 .expect("round result");
             assert!(!result.response.success);
@@ -3498,7 +3529,7 @@ mod tests {
             .with_acquire_timeout(Duration::from_secs(2));
         let started = Instant::now();
         let result = lock
-            .acquire_lock_quorum_once(&request, request.acquire_timeout)
+            .acquire_lock_quorum_once(&request, request.acquire_timeout, None)
             .await
             .expect("round result");
         assert!(!result.response.success);
@@ -3535,7 +3566,7 @@ mod tests {
             .with_acquire_timeout(Duration::from_secs(2));
         let started = Instant::now();
         let result = lock
-            .acquire_lock_quorum_once(&request, request.acquire_timeout)
+            .acquire_lock_quorum_once(&request, request.acquire_timeout, None)
             .await
             .expect("round result");
         assert!(!result.response.success);
@@ -3563,7 +3594,7 @@ mod tests {
         let request = LockRequest::new(ObjectKey::new("bucket", "object"), LockType::Exclusive, "owner")
             .with_acquire_timeout(Duration::from_secs(1));
         let result = lock
-            .acquire_lock_quorum_once(&request, request.acquire_timeout)
+            .acquire_lock_quorum_once(&request, request.acquire_timeout, None)
             .await
             .expect("round result");
         assert!(!result.response.success);
@@ -3676,9 +3707,11 @@ mod tests {
         );
         let request = LockRequest::new(ObjectKey::new("bucket", "ready-after-deadline"), LockType::Shared, "owner")
             .with_acquire_timeout(Duration::from_secs(5));
-        let mut attempt = Box::pin(tokio::task::unconstrained(
-            lock.acquire_lock_quorum_once(&request, request.acquire_timeout),
-        ));
+        let mut attempt = Box::pin(tokio::task::unconstrained(lock.acquire_lock_quorum_once(
+            &request,
+            request.acquire_timeout,
+            None,
+        )));
         assert!(matches!(poll!(&mut attempt), Poll::Pending));
         tokio::time::timeout(Duration::from_secs(1), async {
             while clients
@@ -3744,6 +3777,108 @@ mod tests {
                 .is_none()
         );
         wait_for_acquisition_cleanup(&clients).await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn contended_write_retry_continues_hedging_past_a_silent_prefix() {
+        let clients: Vec<_> = (0..7)
+            .map(|_| {
+                Arc::new(SequencedClient::new(
+                    vec![AcquirePlan::Success {
+                        delay: Duration::from_secs(2),
+                    }],
+                    Arc::new(Mutex::new(Vec::new())),
+                ))
+            })
+            .collect();
+        let lock = DistributedLock::new(
+            "put-commit".to_owned(),
+            clients.iter().map(|client| client.clone() as Arc<dyn LockClient>).collect(),
+            4,
+        );
+        let timeout = Duration::from_secs(1);
+        let request =
+            LockRequest::new(ObjectKey::new("bucket", "hot-key"), LockType::Exclusive, "writer").with_acquire_timeout(timeout);
+        let task = tokio::spawn(async move {
+            lock.acquire_lock_quorum_once(&request, timeout, Some(Duration::from_millis(100)))
+                .await
+        });
+        tokio::time::timeout(Duration::from_millis(700), async {
+            while clients[6].requested_acquires.load(Ordering::SeqCst) == 0 {
+                tokio::time::advance(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("every voter must be tried even if the initial quorum plus spare is silent");
+        let result = task.await.expect("retry task").expect("retry round");
+        assert!(result.attempt_timed_out);
+        wait_for_acquisition_cleanup(&clients).await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn contended_write_retry_can_use_or_bypass_the_first_voter_and_clean_up() {
+        use crate::{NamespaceLock, NamespaceLockWrapper};
+
+        for (first_vote_delay, cancel) in [
+            (Duration::from_millis(100), false),
+            (Duration::from_secs(4), false),
+            (Duration::from_millis(100), true),
+        ] {
+            let clients: Vec<_> = (0..4)
+                .map(|index| {
+                    Arc::new(SequencedClient::new(
+                        vec![
+                            AcquirePlan::Failure {
+                                error: "Lock acquisition timeout",
+                                delay: Duration::ZERO,
+                            },
+                            AcquirePlan::Success {
+                                delay: if index == 0 { first_vote_delay } else { Duration::ZERO },
+                            },
+                        ],
+                        Arc::new(Mutex::new(Vec::new())),
+                    ))
+                })
+                .collect();
+            let mut lock = NamespaceLockWrapper::new(
+                NamespaceLock::with_clients_and_quorum(
+                    "put-commit".to_owned(),
+                    clients.iter().map(|client| client.clone() as Arc<dyn LockClient>).collect(),
+                    3,
+                ),
+                ObjectKey::new("bucket", "hot-key"),
+                "writer".to_owned(),
+            );
+            lock.prefer_first_voter_on_contention();
+            let timeout = Duration::from_secs(5);
+            let start = Instant::now();
+            let acquisition = tokio::spawn(async move { lock.get_write_lock(timeout).await });
+            tokio::time::timeout(Duration::from_secs(1), async {
+                while clients[0].requested_acquires.load(Ordering::SeqCst) < 2 {
+                    tokio::time::advance(Duration::from_millis(5)).await;
+                }
+            })
+            .await
+            .expect("reach preferred-voter retry");
+            assert!(
+                clients[1..]
+                    .iter()
+                    .all(|client| client.requested_acquires.load(Ordering::SeqCst) == 1),
+                "other writers must not be able to split retry votes while waiting for the first voter",
+            );
+            if cancel {
+                acquisition.abort();
+                assert!(acquisition.await.expect_err("cancelled acquire").is_cancelled());
+            } else {
+                let guard = acquisition.await.expect("acquire task").expect("three responsive voters");
+                assert!(start.elapsed() < timeout);
+                if first_vote_delay >= timeout / 2 {
+                    assert_eq!(clients[0].completed_acquires.load(Ordering::SeqCst), 1, "silent voter is optional");
+                }
+                drop(guard);
+            }
+            wait_for_acquisition_cleanup(&clients).await;
+        }
     }
 
     #[tokio::test(start_paused = true)]
