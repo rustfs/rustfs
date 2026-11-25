@@ -5333,10 +5333,18 @@ impl SetDisks {
         .with_attempt(attempt))
     }
 
+    async fn namespace_lock_for_write(&self, op: &str, bucket: &str, object: &str) -> Result<NamespaceLockWrapper> {
+        let mut lock = self.new_ns_lock(bucket, object).await?;
+        if op == "put_object_commit" {
+            lock.prefer_first_voter_on_contention();
+        }
+        Ok(lock)
+    }
+
     async fn acquire_write_lock_diag(&self, op: &'static str, bucket: &str, object: &str) -> Result<ObjectLockDiagGuard> {
         crate::hp_guard!("SetDisks::acquire_write_lock");
         let diag_enabled = is_object_lock_diag_enabled();
-        let ns_lock = self.new_ns_lock(bucket, object).await?;
+        let ns_lock = self.namespace_lock_for_write(op, bucket, object).await?;
         let acquire_start = Instant::now();
         let acquire_timeout = get_put_object_commit_lock_acquire_timeout(op);
         let mut attempt = ObjectLockAttempt::start(op, bucket, object, None, &ns_lock, "write", acquire_timeout);
@@ -5379,7 +5387,7 @@ impl SetDisks {
     ) -> Result<ObjectLockDiagGuard> {
         crate::hp_guard!("SetDisks::acquire_write_lock");
         let diag_enabled = is_object_lock_diag_enabled();
-        let ns_lock = self.new_ns_lock(bucket, object).await?;
+        let ns_lock = self.namespace_lock_for_write(op, bucket, object).await?;
         let acquire_start = Instant::now();
         let acquire_timeout = get_put_object_commit_lock_acquire_timeout(op);
         let mut attempt = ObjectLockAttempt::start(op, bucket, object, None, &ns_lock, "write", acquire_timeout);

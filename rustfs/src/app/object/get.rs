@@ -4133,6 +4133,7 @@ impl DefaultObjectUsecase {
             content_encoding: info.content_encoding.clone(),
             content_language: info.user_defined.get("content-language").cloned(),
             cache_control,
+            expires: info.expires.map(|value| format_expires_header(&value.into())).transpose()?,
             content_disposition,
             content_range,
             parts_count,
@@ -4236,6 +4237,7 @@ impl DefaultObjectUsecase {
             content_disposition: remote.content_disposition,
             content_language: remote.content_language,
             cache_control: remote.cache_control,
+            expires: remote.expires_string,
             e_tag: remote.e_tag.as_deref().and_then(|v| ETag::from_str(v).ok()),
             last_modified: remote
                 .last_modified
@@ -12107,12 +12109,13 @@ mod tests {
 
     #[tokio::test]
     async fn build_get_object_output_context_returns_standard_headers() {
-        for (content_language, user_language) in [
-            (Some("zh-CN"), None),
-            (None, None),
-            (Some(""), None),
-            (Some("zh-CN"), Some("fr-FR")),
-            (None, Some("fr-FR")),
+        let stored_expires = time::macros::datetime!(2030-01-01 0:00 UTC);
+        for (content_language, user_language, expires) in [
+            (Some("zh-CN"), None, Some(stored_expires)),
+            (None, None, None),
+            (Some(""), None, None),
+            (Some("zh-CN"), Some("fr-FR"), None),
+            (None, Some("fr-FR"), None),
         ] {
             let mut metadata = HashMap::new();
             metadata.insert("cache-control".to_string(), "public, max-age=259200".to_string());
@@ -12128,6 +12131,7 @@ mod tests {
                 bucket: "test-bucket".to_string(),
                 name: "path/raw".to_string(),
                 user_defined: Arc::new(metadata),
+                expires,
                 ..Default::default()
             };
 
@@ -12178,6 +12182,7 @@ mod tests {
             assert_eq!(context.output.cache_control.as_deref(), Some("public, max-age=259200"));
             assert_eq!(context.output.content_disposition.as_deref(), Some("attachment; filename=\"demo.png\""));
             assert_eq!(context.output.content_language.as_deref(), content_language);
+            assert_eq!(context.output.expires.as_deref(), expires.map(|_| "Tue, 01 Jan 2030 00:00:00 GMT"));
             assert_eq!(
                 context
                     .output

@@ -19,6 +19,7 @@ use crate::{
     types::{LockId, LockInfo, LockRequest, LockResponse, LockStatus, LockType},
 };
 use futures::{
+    FutureExt,
     future::join_all,
     stream::{FuturesUnordered, StreamExt},
 };
@@ -246,6 +247,52 @@ struct HeldLockEntry {
 impl HeldLockEntry {
     fn release_entry(&self) -> (LockId, Arc<dyn LockClient>) {
         (self.lock_id.clone(), self.client.clone())
+    }
+}
+
+/// A peer may finish after the coordinator returns or its caller disconnects.
+/// Each positive vote stays owned here until a guard or quorum rollback takes it.
+struct BatchPeerReply {
+    client: Arc<dyn LockClient>,
+    requests: Arc<[LockRequest]>,
+    responses: Result<Vec<LockResponse>>,
+}
+
+impl BatchPeerReply {
+    fn take_vote(&mut self, index: usize) -> std::result::Result<LockId, String> {
+        let response = self
+            .responses
+            .as_mut()
+            .map_err(|error| error.to_string())?
+            .get_mut(index)
+            .ok_or_else(|| "client returned incomplete batch lock response".to_owned())?;
+        if !std::mem::take(&mut response.success) {
+            return Err(response
+                .error
+                .take()
+                .unwrap_or_else(|| "distributed lock acquisition failed".to_owned()));
+        }
+        Ok(response
+            .lock_info
+            .take()
+            .map_or_else(|| self.requests[index].lock_id.clone(), |info| info.id))
+    }
+}
+
+impl Drop for BatchPeerReply {
+    fn drop(&mut self) {
+        if let Ok(responses) = &mut self.responses {
+            let unused = responses
+                .iter_mut()
+                .zip(self.requests.iter())
+                .filter(|(reply, _)| reply.success)
+                .map(|(reply, request)| {
+                    let id = reply.lock_info.take().map_or_else(|| request.lock_id.clone(), |info| info.id);
+                    (id, self.client.clone())
+                })
+                .collect();
+            DistributedLock::spawn_release_cleanup(unused, "distributed_lock_surplus_batch_votes");
+        }
     }
 }
 
@@ -542,6 +589,7 @@ pub struct DistributedLock {
     namespace: Arc<str>,
     /// Quorum size for exclusive/write operations
     quorum: usize,
+    prefer_first_voter_on_contention: bool,
 }
 
 type LockAcquireTaskResult = (usize, Result<LockResponse>);
@@ -572,7 +620,12 @@ impl DistributedLock {
             clients,
             namespace,
             quorum: q,
+            prefer_first_voter_on_contention: false,
         }
+    }
+
+    pub(super) fn prefer_first_voter_on_contention(&mut self) {
+        self.prefer_first_voter_on_contention = true;
     }
 
     /// Get namespace identifier
@@ -773,7 +826,7 @@ impl DistributedLock {
 
         let required_quorum = self.required_quorum(LockType::Exclusive);
         let attempt_started = Instant::now();
-        let requests: Vec<LockRequest> = resources
+        let requests: Arc<[LockRequest]> = resources
             .iter()
             .map(|resource| {
                 LockRequest::new(resource.clone(), LockType::Exclusive, owner)
@@ -782,48 +835,67 @@ impl DistributedLock {
             })
             .collect();
 
-        // One batched round per client; a client-level failure is a per-key
-        // failure for every key that still needed that client's vote.
-        let rounds = join_all(self.clients.iter().map(|client| {
-            let requests = requests.clone();
-            async move { client.acquire_locks_batch(&requests).await }
-        }))
-        .await;
+        // Keep each reply drainable after an early quorum or cancellation. Dropping a
+        // JoinHandle detaches the peer request. Its reply releases any unclaimed votes.
+        let mut pending: FuturesUnordered<_> = self
+            .clients
+            .iter()
+            .map(|client| {
+                let client = Arc::clone(client);
+                let requests = Arc::clone(&requests);
+                tokio::spawn(async move {
+                    let responses = client.acquire_locks_batch(&requests).await;
+                    BatchPeerReply {
+                        client,
+                        requests,
+                        responses,
+                    }
+                })
+            })
+            .collect();
+        let mut counts = vec![0; resources.len()];
+        let mut unconfirmed = resources.len();
+        let mut rounds = Vec::with_capacity(self.clients.len());
+        while let Some(completed) = pending.next().await {
+            let Ok(reply) = completed else { continue };
+            if let Ok(responses) = &reply.responses {
+                for (count, response) in counts.iter_mut().zip(responses) {
+                    if response.success {
+                        *count += 1;
+                        if *count == required_quorum {
+                            unconfirmed -= 1;
+                        }
+                    }
+                }
+            }
+            rounds.push(reply);
+            if unconfirmed == 0 {
+                // Retain already available spare votes without holding the majority
+                // hostage to a contended voter, including for a one-key batch.
+                while let Some(Some(completed)) = pending.next().now_or_never() {
+                    if let Ok(reply) = completed {
+                        rounds.push(reply);
+                    }
+                }
+                break;
+            }
+        }
+        drop(pending);
 
         let mut results: Vec<Result<DistributedLockGuard>> = Vec::with_capacity(resources.len());
         let mut orphaned_entries: Vec<(LockId, Arc<dyn LockClient>)> = Vec::new();
         for (key_idx, resource) in resources.iter().enumerate() {
             let mut entries: Vec<HeldLockEntry> = Vec::new();
             let mut failure: Option<String> = None;
-            for (client_idx, client) in self.clients.iter().enumerate() {
-                match &rounds[client_idx] {
-                    Ok(responses) => match responses.get(key_idx) {
-                        Some(response) if response.success => {
-                            let lock_id = response
-                                .lock_info
-                                .as_ref()
-                                .map(|info| info.id.clone())
-                                .unwrap_or_else(|| LockId::new_unique(resource));
-                            entries.push(HeldLockEntry {
-                                lock_id,
-                                client: client.clone(),
-                                valid_until: attempt_started.checked_add(ttl).unwrap_or(attempt_started),
-                            });
-                        }
-                        Some(response) => {
-                            failure.get_or_insert_with(|| {
-                                response
-                                    .error
-                                    .clone()
-                                    .unwrap_or_else(|| "distributed lock acquisition failed".to_string())
-                            });
-                        }
-                        None => {
-                            failure.get_or_insert_with(|| "client returned incomplete batch lock response".to_string());
-                        }
-                    },
-                    Err(err) => {
-                        failure.get_or_insert_with(|| err.to_string());
+            for reply in &mut rounds {
+                match reply.take_vote(key_idx) {
+                    Ok(lock_id) => entries.push(HeldLockEntry {
+                        lock_id,
+                        client: reply.client.clone(),
+                        valid_until: attempt_started.checked_add(ttl).unwrap_or(attempt_started),
+                    }),
+                    Err(error) => {
+                        failure.get_or_insert(error);
                     }
                 }
             }
@@ -860,7 +932,11 @@ impl DistributedLock {
         // keeps retrying in the background instead of parking the request
         // on the deferred unlock schedule.
         if !orphaned_entries.is_empty() {
-            Self::release_entries_bounded(orphaned_entries, "distributed_lock_batch_quorum_rollback").await;
+            // The caller waits for the first pass. If it disconnects during an
+            // unlock, the task still owns every minority vote until cleanup finishes.
+            let rollback =
+                tokio::spawn(Self::release_entries_bounded(orphaned_entries, "distributed_lock_batch_quorum_rollback"));
+            let _ = rollback.await;
         }
         results
     }
@@ -1187,7 +1263,18 @@ impl DistributedLock {
             // A peer may grant promptly but deliver its response after its local
             // contention budget. Keep this round's owners until a response proves
             // quorum impossible or the caller's remaining budget expires.
-            let result = self.acquire_lock_quorum_once(&attempt_request, remaining).await?;
+            let contention_retry = self.prefer_first_voter_on_contention
+                && self.clients.len() > 1
+                && request.lock_type == LockType::Exclusive
+                && last_result.as_ref().is_some_and(|previous| !previous.quorum_impossible);
+            // Split votes can repeatedly occupy different peers without any writer
+            // reaching quorum. On a contention retry let one voter order the
+            // competing writers before fanning out; reserve at least half the
+            // remaining budget for a quorum that can exclude a silent first voter.
+            let first_vote_wait = contention_retry.then_some(remaining / 2);
+            let result = self
+                .acquire_lock_quorum_once(&attempt_request, remaining, first_vote_wait)
+                .await?;
             if !result.response.success {
                 tracing::trace!(
                     target: "rustfs_lock::namespace_owner",
@@ -1273,7 +1360,12 @@ impl DistributedLock {
     /// Quorum-based lock acquisition: success if at least the required quorum succeeds.
     /// Collects all individual lock_ids from successful clients and creates an aggregate lock_id.
     /// Returns the LockResponse with aggregate lock_id and individual lock mappings.
-    async fn acquire_lock_quorum_once(&self, request: &LockRequest, quorum_timeout: Duration) -> Result<LockAcquireQuorumResult> {
+    async fn acquire_lock_quorum_once(
+        &self,
+        request: &LockRequest,
+        quorum_timeout: Duration,
+        first_vote_wait: Option<Duration>,
+    ) -> Result<LockAcquireQuorumResult> {
         let voter_count =
             u32::try_from(self.clients.len().max(1)).map_err(|_| LockError::internal("lock voter count exceeds u32"))?;
         let required_quorum = self.required_quorum(request.lock_type);
@@ -1287,14 +1379,16 @@ impl DistributedLock {
             fallback_lock_id: request.lock_id.clone(),
         };
         let mut next_client_index = 0usize;
-        self.spawn_lock_requests_until(
-            &mut round.pending,
-            request,
-            &mut next_client_index,
-            required_quorum
-                .saturating_add(LOCK_ACQUIRE_SPARE_HEDGES)
-                .min(self.clients.len()),
-        );
+        let initial_width = required_quorum
+            .saturating_add(LOCK_ACQUIRE_SPARE_HEDGES)
+            .min(self.clients.len());
+        if let Some(first_vote_budget) = first_vote_wait {
+            let mut first = request.clone();
+            first.acquire_timeout = first_vote_budget;
+            self.spawn_lock_requests_until(&mut round.pending, &first, &mut next_client_index, 1);
+        } else {
+            self.spawn_lock_requests_until(&mut round.pending, request, &mut next_client_index, initial_width);
+        }
         let mut last_failure = None;
         let mut last_failure_kind = None;
         let mut last_hard_failure_kind = None;
@@ -1306,7 +1400,7 @@ impl DistributedLock {
         // Spread additional hedges across the existing attempt budget; fast
         // quorums still use only the initial quorum-plus-spare requests.
         let hedge_interval = request.acquire_timeout / voter_count;
-        let hedge_timer = tokio::time::sleep(hedge_interval);
+        let hedge_timer = tokio::time::sleep(first_vote_wait.unwrap_or(hedge_interval));
         tokio::pin!(hedge_timer);
 
         while !round.pending.is_empty() {
@@ -1351,7 +1445,11 @@ impl DistributedLock {
                 }
                 _ = &mut hedge_timer, if next_client_index < self.clients.len() => {
                     if start.elapsed() < quorum_timeout {
-                        let target_in_flight = round.pending.len().saturating_add(1);
+                        let target_in_flight = if first_vote_wait.is_some() && next_client_index == 1 {
+                            initial_width
+                        } else {
+                            round.pending.len().saturating_add(1)
+                        };
                         self.spawn_lock_requests_until(
                             &mut round.pending, request, &mut next_client_index, target_in_flight,
                         );
@@ -1382,6 +1480,9 @@ impl DistributedLock {
                 }
             };
 
+            if first_vote_wait.is_some() && next_client_index == 1 {
+                hedge_timer.set(tokio::time::sleep(hedge_interval));
+            }
             match join_result {
                 Ok((idx, Ok(resp))) => {
                     if resp.success {
@@ -3286,7 +3387,7 @@ mod tests {
         let request = LockRequest::new(ObjectKey::new("bucket", "partial-grants"), LockType::Shared, "owner")
             .with_acquire_timeout(Duration::from_secs(1));
         let result = lock
-            .acquire_lock_quorum_once(&request, request.acquire_timeout)
+            .acquire_lock_quorum_once(&request, request.acquire_timeout, None)
             .await
             .expect("partial quorum should return a timeout response");
         assert!(!result.response.success);
@@ -3476,7 +3577,7 @@ mod tests {
             let request = LockRequest::new(ObjectKey::new("bucket", "object"), LockType::Exclusive, "owner")
                 .with_acquire_timeout(Duration::from_secs(2));
             let result = lock
-                .acquire_lock_quorum_once(&request, request.acquire_timeout)
+                .acquire_lock_quorum_once(&request, request.acquire_timeout, None)
                 .await
                 .expect("round result");
             assert!(!result.response.success);
@@ -3498,7 +3599,7 @@ mod tests {
             .with_acquire_timeout(Duration::from_secs(2));
         let started = Instant::now();
         let result = lock
-            .acquire_lock_quorum_once(&request, request.acquire_timeout)
+            .acquire_lock_quorum_once(&request, request.acquire_timeout, None)
             .await
             .expect("round result");
         assert!(!result.response.success);
@@ -3535,7 +3636,7 @@ mod tests {
             .with_acquire_timeout(Duration::from_secs(2));
         let started = Instant::now();
         let result = lock
-            .acquire_lock_quorum_once(&request, request.acquire_timeout)
+            .acquire_lock_quorum_once(&request, request.acquire_timeout, None)
             .await
             .expect("round result");
         assert!(!result.response.success);
@@ -3563,7 +3664,7 @@ mod tests {
         let request = LockRequest::new(ObjectKey::new("bucket", "object"), LockType::Exclusive, "owner")
             .with_acquire_timeout(Duration::from_secs(1));
         let result = lock
-            .acquire_lock_quorum_once(&request, request.acquire_timeout)
+            .acquire_lock_quorum_once(&request, request.acquire_timeout, None)
             .await
             .expect("round result");
         assert!(!result.response.success);
@@ -3676,9 +3777,11 @@ mod tests {
         );
         let request = LockRequest::new(ObjectKey::new("bucket", "ready-after-deadline"), LockType::Shared, "owner")
             .with_acquire_timeout(Duration::from_secs(5));
-        let mut attempt = Box::pin(tokio::task::unconstrained(
-            lock.acquire_lock_quorum_once(&request, request.acquire_timeout),
-        ));
+        let mut attempt = Box::pin(tokio::task::unconstrained(lock.acquire_lock_quorum_once(
+            &request,
+            request.acquire_timeout,
+            None,
+        )));
         assert!(matches!(poll!(&mut attempt), Poll::Pending));
         tokio::time::timeout(Duration::from_secs(1), async {
             while clients
@@ -3744,6 +3847,108 @@ mod tests {
                 .is_none()
         );
         wait_for_acquisition_cleanup(&clients).await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn contended_write_retry_continues_hedging_past_a_silent_prefix() {
+        let clients: Vec<_> = (0..7)
+            .map(|_| {
+                Arc::new(SequencedClient::new(
+                    vec![AcquirePlan::Success {
+                        delay: Duration::from_secs(2),
+                    }],
+                    Arc::new(Mutex::new(Vec::new())),
+                ))
+            })
+            .collect();
+        let lock = DistributedLock::new(
+            "put-commit".to_owned(),
+            clients.iter().map(|client| client.clone() as Arc<dyn LockClient>).collect(),
+            4,
+        );
+        let timeout = Duration::from_secs(1);
+        let request =
+            LockRequest::new(ObjectKey::new("bucket", "hot-key"), LockType::Exclusive, "writer").with_acquire_timeout(timeout);
+        let task = tokio::spawn(async move {
+            lock.acquire_lock_quorum_once(&request, timeout, Some(Duration::from_millis(100)))
+                .await
+        });
+        tokio::time::timeout(Duration::from_millis(700), async {
+            while clients[6].requested_acquires.load(Ordering::SeqCst) == 0 {
+                tokio::time::advance(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("every voter must be tried even if the initial quorum plus spare is silent");
+        let result = task.await.expect("retry task").expect("retry round");
+        assert!(result.attempt_timed_out);
+        wait_for_acquisition_cleanup(&clients).await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn contended_write_retry_can_use_or_bypass_the_first_voter_and_clean_up() {
+        use crate::{NamespaceLock, NamespaceLockWrapper};
+
+        for (first_vote_delay, cancel) in [
+            (Duration::from_millis(100), false),
+            (Duration::from_secs(4), false),
+            (Duration::from_millis(100), true),
+        ] {
+            let clients: Vec<_> = (0..4)
+                .map(|index| {
+                    Arc::new(SequencedClient::new(
+                        vec![
+                            AcquirePlan::Failure {
+                                error: "Lock acquisition timeout",
+                                delay: Duration::ZERO,
+                            },
+                            AcquirePlan::Success {
+                                delay: if index == 0 { first_vote_delay } else { Duration::ZERO },
+                            },
+                        ],
+                        Arc::new(Mutex::new(Vec::new())),
+                    ))
+                })
+                .collect();
+            let mut lock = NamespaceLockWrapper::new(
+                NamespaceLock::with_clients_and_quorum(
+                    "put-commit".to_owned(),
+                    clients.iter().map(|client| client.clone() as Arc<dyn LockClient>).collect(),
+                    3,
+                ),
+                ObjectKey::new("bucket", "hot-key"),
+                "writer".to_owned(),
+            );
+            lock.prefer_first_voter_on_contention();
+            let timeout = Duration::from_secs(5);
+            let start = Instant::now();
+            let acquisition = tokio::spawn(async move { lock.get_write_lock(timeout).await });
+            tokio::time::timeout(Duration::from_secs(1), async {
+                while clients[0].requested_acquires.load(Ordering::SeqCst) < 2 {
+                    tokio::time::advance(Duration::from_millis(5)).await;
+                }
+            })
+            .await
+            .expect("reach preferred-voter retry");
+            assert!(
+                clients[1..]
+                    .iter()
+                    .all(|client| client.requested_acquires.load(Ordering::SeqCst) == 1),
+                "other writers must not be able to split retry votes while waiting for the first voter",
+            );
+            if cancel {
+                acquisition.abort();
+                assert!(acquisition.await.expect_err("cancelled acquire").is_cancelled());
+            } else {
+                let guard = acquisition.await.expect("acquire task").expect("three responsive voters");
+                assert!(start.elapsed() < timeout);
+                if first_vote_delay >= timeout / 2 {
+                    assert_eq!(clients[0].completed_acquires.load(Ordering::SeqCst), 1, "silent voter is optional");
+                }
+                drop(guard);
+            }
+            wait_for_acquisition_cleanup(&clients).await;
+        }
     }
 
     #[tokio::test(start_paused = true)]
@@ -4033,14 +4238,28 @@ mod tests {
     struct ScriptedBatchClient {
         grants: Vec<String>,
         releases: Arc<Mutex<Vec<String>>>,
+        gate: Option<Arc<tokio::sync::Semaphore>>,
+        cleanup_gate: Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Semaphore>)>,
+        grants_returned: Arc<std::sync::atomic::AtomicUsize>,
     }
 
     impl ScriptedBatchClient {
         fn build(grants: &[&str]) -> (Arc<dyn LockClient>, Arc<Mutex<Vec<String>>>) {
+            Self::controlled(grants, None, Arc::default())
+        }
+
+        fn controlled(
+            grants: &[&str],
+            gate: Option<Arc<tokio::sync::Semaphore>>,
+            grants_returned: Arc<std::sync::atomic::AtomicUsize>,
+        ) -> (Arc<dyn LockClient>, Arc<Mutex<Vec<String>>>) {
             let releases = Arc::new(Mutex::new(Vec::new()));
             let client = Arc::new(Self {
                 grants: grants.iter().map(|object| (*object).to_string()).collect(),
                 releases: Arc::clone(&releases),
+                gate,
+                cleanup_gate: None,
+                grants_returned,
             }) as Arc<dyn LockClient>;
             (client, releases)
         }
@@ -4049,7 +4268,11 @@ mod tests {
     #[async_trait::async_trait]
     impl LockClient for ScriptedBatchClient {
         async fn acquire_lock(&self, request: &LockRequest) -> crate::Result<LockResponse> {
+            if let Some(gate) = &self.gate {
+                drop(gate.acquire().await.expect("gate stays open"));
+            }
             if self.grants.iter().any(|object| object == request.resource.object.as_ref()) {
+                self.grants_returned.fetch_add(1, Ordering::Release);
                 let info = LockInfo {
                     id: request.lock_id.clone(),
                     resource: request.resource.clone(),
@@ -4070,6 +4293,10 @@ mod tests {
         }
 
         async fn release(&self, lock_id: &LockId) -> crate::Result<bool> {
+            if let Some((entered, resume)) = &self.cleanup_gate {
+                entered.notify_one();
+                drop(resume.acquire().await.expect("rollback gate stays open"));
+            }
             self.releases
                 .lock()
                 .expect("release log")
@@ -4103,6 +4330,101 @@ mod tests {
 
         async fn is_local(&self) -> bool {
             false
+        }
+    }
+
+    #[tokio::test]
+    async fn cancelling_a_batch_during_quorum_rollback_still_returns_the_partial_vote() {
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let resume = Arc::new(tokio::sync::Semaphore::new(0));
+        let releases = Arc::new(Mutex::new(Vec::new()));
+        let voter = Arc::new(ScriptedBatchClient {
+            grants: vec!["lost".to_string()],
+            releases: Arc::clone(&releases),
+            gate: None,
+            grants_returned: Arc::default(),
+            cleanup_gate: Some((Arc::clone(&entered), Arc::clone(&resume))),
+        }) as Arc<dyn LockClient>;
+        let (denied, _) = ScriptedBatchClient::build(&[]);
+        let lock = DistributedLock::new("batch-rollback-cancel".into(), vec![voter, denied], 2);
+        let task = tokio::spawn(async move {
+            lock.acquire_guard_batch(
+                &[ObjectKey::new("bucket", "lost")],
+                "owner",
+                Duration::from_secs(5),
+                Duration::from_secs(30),
+            )
+            .await
+        });
+        tokio::time::timeout(Duration::from_secs(2), entered.notified())
+            .await
+            .expect("the partial vote must reach rollback");
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        resume.add_permits(1);
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while releases.lock().unwrap().is_empty() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("cancelling the caller must not abandon the only owner of a partial vote");
+        assert_eq!(*releases.lock().unwrap(), ["lost"]);
+    }
+
+    #[tokio::test]
+    async fn acquire_guard_batch_returns_a_complete_quorum_and_releases_late_votes() {
+        for cancel_before_quorum in [false, true] {
+            let gate = Arc::new(tokio::sync::Semaphore::new(0));
+            let granted = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let immediate = if cancel_before_quorum { 2 } else { 3 };
+            let keys = ["hot", "cold"];
+            let (clients, releases): (Vec<_>, Vec<_>) = (0..4)
+                .map(|peer| ScriptedBatchClient::controlled(&keys, (peer >= immediate).then(|| gate.clone()), granted.clone()))
+                .unzip();
+            let lock = DistributedLock::new("batch-quorum".into(), clients, 3);
+            let task = tokio::spawn(async move {
+                let keys = keys.map(|key| ObjectKey::new("bucket", key));
+                lock.acquire_guard_batch(&keys, "owner", Duration::from_secs(5), Duration::from_secs(30))
+                    .await
+            });
+            tokio::time::timeout(Duration::from_secs(2), async {
+                while granted.load(Ordering::Acquire) < immediate * keys.len() {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("reachable peers granted both keys");
+            let guards = if cancel_before_quorum {
+                assert!(!task.is_finished());
+                task.abort();
+                assert!(task.await.unwrap_err().is_cancelled());
+                None
+            } else {
+                let results = tokio::time::timeout(Duration::from_secs(2), task)
+                    .await
+                    .expect("three votes suffice even if the fourth peer is waiting")
+                    .unwrap();
+                Some(results.into_iter().collect::<crate::Result<Vec<_>>>().unwrap())
+            };
+            gate.add_permits(1);
+            tokio::time::timeout(Duration::from_secs(2), async {
+                for (peer, releases) in releases.iter().enumerate() {
+                    if !cancel_before_quorum && peer < immediate {
+                        assert!(releases.lock().unwrap().is_empty(), "the live guards retain their majority");
+                        continue;
+                    }
+                    while releases.lock().unwrap().len() < keys.len() {
+                        tokio::task::yield_now().await;
+                    }
+                    let mut objects = releases.lock().unwrap().clone();
+                    objects.sort();
+                    assert_eq!(objects, ["cold", "hot"]);
+                }
+            })
+            .await
+            .expect("every unclaimed vote is released");
+            drop(guards);
         }
     }
 
