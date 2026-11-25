@@ -34,10 +34,6 @@ pub(crate) mod s3 {
     pub(crate) use s3s::dto;
     pub(crate) use s3s::dto::PutObjectInput;
     pub(crate) use s3s::dto::StreamingBlob;
-    pub(crate) use s3s::dto::{
-        BucketLocationConstraint, CreateBucketConfiguration, CreateBucketInput, CreateMultipartUploadInput, DeleteObjectInput,
-        ObjectLockRetention,
-    };
     pub(crate) use s3s::stream;
     pub(crate) use s3s::stream::upload_stream::UploadStreamError;
     pub(crate) use s3s::xml;
