@@ -956,13 +956,12 @@ mod tests {
         )
     }
 
-    use crate::app::storage_api::s3::S3ErrorCode;
-    use crate::app::storage_api::s3::dto::ServerSideEncryption;
     use http::{HeaderValue, Method};
     use rustfs_gateway_types::persistence::{
         PersistedBucketEncryptionConfiguration as ServerSideEncryptionConfiguration,
         PersistedBucketEncryptionRule as ServerSideEncryptionRule, PersistedEncryptionByDefault as ServerSideEncryptionByDefault,
     };
+    use rustfs_utils::http::headers::{AMZ_ENCRYPTION_AES, AMZ_ENCRYPTION_KMS};
     use std::sync::Arc;
     use tokio::io::AsyncReadExt;
 
@@ -1038,12 +1037,12 @@ mod tests {
             .and_then(|rule| rule.apply_server_side_encryption_by_default.as_ref())
             .map(bucket_default_write_sse);
 
-        assert_eq!(effective_sse.as_deref(), Some(ServerSideEncryption::AES256));
+        assert_eq!(effective_sse.as_deref(), Some(AMZ_ENCRYPTION_AES));
 
         // Valid algorithms map to themselves, byte-identical to the PUT path.
         for (configured, expected) in [
-            (ServerSideEncryption::AES256, ServerSideEncryption::AES256),
-            (ServerSideEncryption::AWS_KMS, ServerSideEncryption::AWS_KMS),
+            (AMZ_ENCRYPTION_AES, AMZ_ENCRYPTION_AES),
+            (AMZ_ENCRYPTION_KMS, AMZ_ENCRYPTION_KMS),
         ] {
             let sse = ServerSideEncryptionByDefault {
                 sse_algorithm: configured.to_owned(),
@@ -1076,14 +1075,9 @@ mod tests {
         let input = copy_input("test-bucket", "test-key", "test-key", None);
         let usecase = DefaultObjectUsecase::without_context();
 
-        let err = Box::pin(async {
-            usecase
-                .execute_copy_object_owned(copy_envelope(HeaderMap::new()), input)
-                .await
-                .map_err(crate::error::legacy_error_for_test)
-        })
-        .await
-        .unwrap_err();
+        let err = Box::pin(usecase.execute_copy_object_owned(copy_envelope(HeaderMap::new()), input))
+            .await
+            .unwrap_err();
         assert_eq!(err.code(), &S3ErrorCode::InvalidRequest);
     }
 
@@ -1101,14 +1095,9 @@ mod tests {
             ..Default::default()
         };
         let usecase = DefaultObjectUsecase::without_context();
-        let error = Box::pin(async {
-            usecase
-                .execute_copy_object_owned(copy_envelope(HeaderMap::new()), input)
-                .await
-                .map_err(crate::error::legacy_error_for_test)
-        })
-        .await
-        .expect_err("reserved catalog destination must fail closed without bucket metadata");
+        let error = Box::pin(usecase.execute_copy_object_owned(copy_envelope(HeaderMap::new()), input))
+            .await
+            .expect_err("reserved catalog destination must fail closed without bucket metadata");
         assert_eq!(error.code(), &S3ErrorCode::InvalidRequest);
         assert_eq!(error.message(), Some(crate::table_catalog::RESERVED_CATALOG_OBJECT_MESSAGE));
     }
@@ -1129,14 +1118,9 @@ mod tests {
         };
         let usecase = DefaultObjectUsecase::without_context();
 
-        let err = Box::pin(async {
-            usecase
-                .execute_copy_object_owned(copy_envelope(HeaderMap::new()), input)
-                .await
-                .map_err(crate::error::legacy_error_for_test)
-        })
-        .await
-        .unwrap_err();
+        let err = Box::pin(usecase.execute_copy_object_owned(copy_envelope(HeaderMap::new()), input))
+            .await
+            .unwrap_err();
         assert_eq!(err.code(), &S3ErrorCode::InvalidStorageClass);
     }
 
@@ -1561,14 +1545,9 @@ mod tests {
             ..Default::default()
         };
         let usecase = DefaultObjectUsecase::without_context();
-        let err = Box::pin(async {
-            usecase
-                .execute_copy_object_owned(copy_envelope(HeaderMap::new()), input)
-                .await
-                .map_err(crate::error::legacy_error_for_test)
-        })
-        .await
-        .unwrap_err();
+        let err = Box::pin(usecase.execute_copy_object_owned(copy_envelope(HeaderMap::new()), input))
+            .await
+            .unwrap_err();
         assert_eq!(err.code(), &S3ErrorCode::InvalidArgument);
     }
 

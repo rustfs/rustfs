@@ -18,8 +18,6 @@ use super::put_input::{PutObjectWriteInput, PutObjectWriteOutput};
 use super::request_body::UploadChunks;
 use super::*;
 use crate::app::RequestEnvelope;
-#[cfg(test)]
-use crate::app::storage_api::request_body::{ByteStream, StreamingBlob};
 use futures::FutureExt;
 use rustfs_gateway_stream::Body as NativeBody;
 use rustfs_rio::SharedTrailerSource;
@@ -3551,25 +3549,38 @@ mod tests {
 
     #[tokio::test]
     async fn put_object_body_read_timeout_guard_preserves_length_and_passes_through() {
-        let body = StreamingBlob::from_bytes(Bytes::from_static(b"hello world"));
-        assert_eq!(body.remaining_length().exact(), Some(11));
+        let body = super::super::native_body::from_io_stream_with_length(
+            futures::stream::iter([Ok(Bytes::from_static(b"hello world"))]),
+            Some(11),
+        );
+        assert_eq!(body.len_hint(), Some(11));
 
-        let (mut guarded, _) = super::super::request_body::guard_upload_progress(
-            body,
+        let (chunks, _) = super::super::native_body::BodyChunks::new(body);
+        let (mut guarded, _) = super::super::request_body::guard_native_upload_progress(
+            Box::new(chunks),
             Duration::from_secs(60),
             "test-bucket",
             "ok-object",
             "req-2",
             11,
         );
-        // remaining_length must be forwarded, not reset to unknown.
-        assert_eq!(guarded.remaining_length().exact(), Some(11));
 
         let mut collected = Vec::new();
         while let Some(chunk) = guarded.next().await {
             collected.extend_from_slice(&chunk.expect("chunk should read"));
         }
         assert_eq!(collected, b"hello world");
+
+        // size_hint on UploadProgressStream must also forward the inner stream's bounds.
+        let (sized_guarded, _) = super::super::request_body::guard_native_upload_progress(
+            Box::new(futures::stream::iter([Ok(Bytes::from_static(b"hello world"))])),
+            Duration::from_secs(60),
+            "test-bucket",
+            "ok-object",
+            "req-3",
+            11,
+        );
+        assert_eq!(sized_guarded.size_hint(), (1, Some(1)));
     }
 
     #[tokio::test]

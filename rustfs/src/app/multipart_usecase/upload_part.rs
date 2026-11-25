@@ -512,38 +512,6 @@ impl DefaultMultipartUsecase {
 }
 
 #[cfg(test)]
-impl UploadPartWriteInput {
-    #[allow(dead_code)]
-    pub(crate) fn from_legacy(
-        input: crate::app::storage_api::s3::dto::UploadPartInput,
-        trailers: Option<crate::app::storage_api::s3::TrailingHeaders>,
-    ) -> Self {
-        Self {
-            target: UploadPartTarget::Legacy {
-                bucket: input.bucket,
-                key: input.key,
-                upload_id: input.upload_id,
-            },
-            part_number: input.part_number,
-            content_length: input.content_length,
-            body: input.body.map(crate::app::object::legacy_put_body),
-            trailing_headers: crate::app::trailer_adapter::trailer_source(trailers),
-            frame_trailers: None,
-            content_md5: input.content_md5,
-            checksum_algorithm: input.checksum_algorithm.map(|value| value.as_str().to_owned()),
-            checksum_crc32: input.checksum_crc32,
-            checksum_crc32c: input.checksum_crc32c,
-            checksum_crc64nvme: input.checksum_crc64nvme,
-            checksum_sha1: input.checksum_sha1,
-            checksum_sha256: input.checksum_sha256,
-            sse_customer_algorithm: input.sse_customer_algorithm,
-            sse_customer_key: input.sse_customer_key,
-            sse_customer_key_md5: input.sse_customer_key_md5,
-        }
-    }
-}
-
-#[cfg(test)]
 mod tests {
     use super::super::test_support::*;
     use super::*;

@@ -458,28 +458,6 @@ impl DefaultMultipartUsecase {
 }
 
 #[cfg(test)]
-impl CreateMultipartUploadFields {
-    #[allow(dead_code)]
-    pub(crate) fn from_legacy(input: crate::app::storage_api::s3::dto::CreateMultipartUploadInput) -> Self {
-        Self {
-            bucket: input.bucket,
-            key: input.key,
-            metadata: input.metadata,
-            tagging: input.tagging,
-            storage_class: input.storage_class.map(|value| value.as_str().to_owned()),
-            server_side_encryption: input.server_side_encryption.map(|value| value.as_str().to_owned()),
-            sse_customer_algorithm: input.sse_customer_algorithm,
-            sse_customer_key: input.sse_customer_key,
-            sse_customer_key_md5: input.sse_customer_key_md5,
-            ssekms_key_id: input.ssekms_key_id,
-            object_lock_legal_hold_status: input.object_lock_legal_hold_status.map(|value| value.as_str().to_owned()),
-            object_lock_mode: input.object_lock_mode.map(|value| value.as_str().to_owned()),
-            object_lock_retain_until_date: input.object_lock_retain_until_date.map(time::OffsetDateTime::from),
-        }
-    }
-}
-
-#[cfg(test)]
 mod tests {
     use super::super::test_support::*;
     use super::*;
