@@ -316,8 +316,12 @@ impl OidcSys {
     }
 
     /// Exchange an authorization code for tokens and extract claims.
+    ///
+    /// `provider_id` is the provider whose callback received `code`; the state must have been
+    /// issued for that same provider.
     pub(super) async fn exchange_code(
         &self,
+        provider_id: &str,
         state: &str,
         code: &str,
         redirect_uri: &str,
@@ -328,6 +332,23 @@ impl OidcSys {
             .take(state)
             .await
             .ok_or_else(|| "invalid or expired OIDC state".to_string())?;
+
+        // Enforce provider binding before any outbound token request: a code delivered to
+        // `provider_id`'s callback must never be redeemed at another provider's token endpoint
+        // (RFC 9700 section 4.4).
+        if session.provider_id != provider_id {
+            error!(
+                event = EVENT_OIDC_DIAGNOSTICS,
+                component = LOG_COMPONENT_IAM,
+                subsystem = LOG_SUBSYSTEM_OIDC,
+                result = "state_provider_mismatch",
+                provider_id = %provider_id,
+                state_provider_id = %session.provider_id,
+                redirect_uri = %redirect_uri,
+                "oidc token exchange failed"
+            );
+            return Err("OIDC state was issued for a different provider".to_string());
+        }
 
         let config = self
             .get_provider_config(&session.provider_id)
@@ -1017,13 +1038,14 @@ impl StandardOidcAuthentication for StandardOidcAdapter {
 
     async fn exchange_identity(
         &self,
+        provider_id: &str,
         state: &str,
         code: &str,
         redirect_uri: &str,
     ) -> FederationResult<VerifiedFederatedCodeExchange> {
         let (claims, provider_id, session, id_token) = self
             .oidc
-            .exchange_code(state, code, redirect_uri)
+            .exchange_code(provider_id, state, code, redirect_uri)
             .await
             .map_err(FederationError::CodeExchange)?;
         let provider = FederatedProviderRef::new(provider_id);

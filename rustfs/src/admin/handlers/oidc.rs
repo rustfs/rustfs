@@ -510,7 +510,14 @@ impl Operation for OidcCallbackHandler {
 
         let session_duration_seconds = console_session_duration_secs();
         let login = federation
-            .complete_authorization_code(&state, &code, &redirect_uri, session_duration_seconds, &DefaultFederatedSessionBinding)
+            .complete_authorization_code(
+                provider_id,
+                &state,
+                &code,
+                &redirect_uri,
+                session_duration_seconds,
+                &DefaultFederatedSessionBinding,
+            )
             .await
             .map_err(|error| {
                 if let FederationError::CodeExchange(message) = &error {
@@ -1460,11 +1467,11 @@ mod tests {
             "the callback must resolve the Console session duration from the environment"
         );
         assert!(
-            callback.contains(".complete_authorization_code(&state,&code,&redirect_uri,session_duration_seconds,"),
+            callback.contains(".complete_authorization_code(provider_id,&state,&code,&redirect_uri,session_duration_seconds,"),
             "the callback must hand the resolved session duration to the code exchange"
         );
         assert!(
-            !callback.contains(".complete_authorization_code(&state,&code,&redirect_uri,3600,"),
+            !callback.contains(".complete_authorization_code(provider_id,&state,&code,&redirect_uri,3600,"),
             "the callback must not hard-code the session duration"
         );
     }

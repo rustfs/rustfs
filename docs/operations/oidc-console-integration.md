@@ -164,6 +164,7 @@ curl -fsS "<ISSUER>/.well-known/openid-configuration" | jq '{issuer, authorizati
 | Login succeeds, access denied | no claim value matches a policy name | Emit `groups` or `roles` as a flat array equal to policy names; check for `/` prefixes. |
 | Console redirects to an internal host | `RUSTFS_BROWSER_REDIRECT_URL` unset or proxy headers wrong | Set `RUSTFS_BROWSER_REDIRECT_URL` to the public origin. |
 | Invalid or expired OIDC state | callback reached a different node | Configure load-balancer session affinity for authorize and callback. |
+| Server logs `state_provider_mismatch` (`OIDC state was issued for a different provider`) | callback arrived on another provider's `/oidc/callback/<provider_id>` path than the login started on | Configure each provider with its own `/rustfs/admin/v3/oidc/callback/<provider_id>` redirect URI; do not share a callback across providers. |
 | Console session expires after about an hour | callback issues credentials with the default lifetime | Set `RUSTFS_CONSOLE_OIDC_SESSION_DURATION` to the desired lifetime in seconds (max `604800`, 7 days) and restart RustFS. `RUSTFS_CONSOLE_AUTH_TIMEOUT` is a request timeout and does not extend the session. |
 
 ## Production checklist
