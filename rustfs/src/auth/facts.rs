@@ -197,6 +197,8 @@ pub(crate) struct AuthzFacts {
     transport_secure: bool,
     auth_type: Option<AuthTypeCondition>,
     signature_version: Option<SignatureVersionCondition>,
+    /// Server-derived age in milliseconds of a verified presigned SigV4 `X-Amz-Date`.
+    presigned_signature_age_ms: Option<i64>,
     /// The request headers without [`SECRET_HEADERS`].
     headers: HeaderMap,
     /// The decoded [`LIST_QUERY_KEYS`] pairs, in request order.
@@ -243,6 +245,7 @@ impl AuthzFacts {
             .and_then(|info| info.forwarded_proto.as_deref())
             .is_some_and(|proto| proto.eq_ignore_ascii_case("https"));
         let (auth_type, signature_version) = scheme_conditions(&get_request_auth_type_with_query(headers, raw_query));
+        let presigned_signature_age_ms = presigned_signature_age_millis(headers, raw_query, now);
         let mut headers = headers.clone();
         for name in SECRET_HEADERS {
             headers.remove(name);
@@ -257,6 +260,7 @@ impl AuthzFacts {
             transport_secure,
             auth_type,
             signature_version,
+            presigned_signature_age_ms,
             headers,
             list_query: list_query_pairs(raw_query),
             now,
@@ -300,12 +304,81 @@ impl fmt::Debug for AuthzFacts {
             .field("transport_secure", &self.transport_secure)
             .field("auth_type", &self.auth_type)
             .field("signature_version", &self.signature_version)
+            .field("has_presigned_signature_age", &self.presigned_signature_age_ms.is_some())
             .field("now", &self.now)
             .field("header_count", &self.headers.len())
             .field("header_names", &header_names)
             .field("query_pair_count", &self.list_query.len())
             .field("query_keys", &query_keys)
             .finish()
+    }
+}
+
+/// Age in milliseconds of a SigV4 presigned URL's signature, for `s3:signatureAge`.
+///
+/// Amazon S3 defines `s3:signatureAge` for presigned URLs only. Detection mirrors
+/// signature verification dispatch rather than the coarse [`AuthType`]: SigV2
+/// requests (a `Signature` query parameter or a single `Authorization: AWS key:sig`
+/// header) leave the key absent because SigV2 does not sign SigV4 query parameters;
+/// otherwise any query containing exact-case `X-Amz-Signature` and a unique
+/// exact-case `X-Amz-Date` is dated against `now` (clamped at 0 for slight future
+/// skew). Extra request headers can neither re-date nor suppress a presigned URL's
+/// age. POST Object forms are authenticated by form fields and drop any derived
+/// age in `authorization_conditions_with_internal`.
+pub(super) fn presigned_signature_age_millis(headers: &HeaderMap, raw_query: Option<&str>, now: OffsetDateTime) -> Option<i64> {
+    let mut is_presigned_v4 = false;
+    let mut amz_dates = Vec::new();
+    for (name, value) in form_urlencoded::parse(raw_query?.as_bytes()) {
+        match name.as_ref() {
+            "Signature" => return None,
+            "X-Amz-Signature" => is_presigned_v4 = true,
+            "X-Amz-Date" => amz_dates.push(value),
+            _ => {}
+        }
+    }
+    if !is_presigned_v4 {
+        return None;
+    }
+
+    let mut authorizations = headers.get_all(http::header::AUTHORIZATION).iter();
+    if let (Some(authorization), None) = (authorizations.next(), authorizations.next())
+        && std::str::from_utf8(authorization.as_bytes())
+            .ok()
+            .and_then(|value| value.strip_prefix(super::SIGN_V2_ALGORITHM))
+            .is_some_and(|value| value.contains(':'))
+    {
+        return None;
+    }
+
+    let [amz_date] = amz_dates.as_slice() else {
+        return None;
+    };
+    let parsed = rustfs_gateway::sig::AmzDate::parse(amz_date).ok()?;
+    let signed_at = amz_date_to_offset_date_time(parsed)?;
+    let age_millis = (now - signed_at).whole_milliseconds().max(0);
+    i64::try_from(age_millis).ok()
+}
+
+fn amz_date_to_offset_date_time(date: rustfs_gateway::sig::AmzDate) -> Option<OffsetDateTime> {
+    let text = date.as_str();
+    let year: i32 = text.get(0..4)?.parse().ok()?;
+    let month: u8 = text.get(4..6)?.parse().ok()?;
+    let day: u8 = text.get(6..8)?.parse().ok()?;
+    let hour: u8 = text.get(9..11)?.parse().ok()?;
+    let minute: u8 = text.get(11..13)?.parse().ok()?;
+    let second: u8 = text.get(13..15)?.parse().ok()?;
+    let month = time::Month::try_from(month).ok()?;
+    let calendar_date = time::Date::from_calendar_date(year, month, day).ok()?;
+    let (time_of_day, leap_second) = if second == 60 {
+        (time::Time::from_hms(hour, minute, 59).ok()?, true)
+    } else {
+        (time::Time::from_hms(hour, minute, second).ok()?, false)
+    };
+    let instant = calendar_date.with_time(time_of_day).assume_utc();
+    if leap_second {
+        instant.checked_add(time::Duration::seconds(1))
+    } else {
+        Some(instant)
     }
 }
 
@@ -481,8 +554,12 @@ pub(crate) fn base_conditions(principal: &AuthzPrincipal<'_>, facts: &AuthzFacts
         args.insert("LocationConstraint".to_owned(), vec![location_constraint.to_owned()]);
     }
 
-    if let Some(signature_age) = headers.get(SIGNATURE_AGE_HEADER) {
-        args.insert("signatureAge".to_owned(), vec![signature_age.to_str().unwrap_or("").to_owned()]);
+    // `s3:signatureAge` describes the verified presigned signature, so only the
+    // server may state it; a client-supplied `x-amz-signature-age` header is never read.
+    if !principal.account.is_empty()
+        && let Some(signature_age_ms) = facts.presigned_signature_age_ms
+    {
+        args.insert("signatureAge".to_owned(), vec![signature_age_ms.to_string()]);
     }
     for name in OBJECT_LOCK_HEADERS {
         let values = header_values(headers, name);

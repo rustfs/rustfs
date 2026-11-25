@@ -267,6 +267,15 @@ pub(crate) fn authorization_conditions_with_internal<R: AuthorizationRequest + ?
     } else {
         build_conditions(principal, facts)
     };
+    if !std::ptr::eq(req.policy_headers(), req.headers())
+        || req.req_info().is_some_and(|info| info.keystone_session_present.is_some())
+        || req.permission_probe()
+    {
+        // POST Object forms, header-token (Keystone) requests, and synthetic
+        // permission probes are not authenticated by URL query parameters, so
+        // any query signing timestamp is unverified.
+        conditions.remove("signatureAge");
+    }
     forward_secret_headers(req.headers(), &mut conditions);
     if internal_object_authorization {
         retain_internal_object_authorization_conditions(&mut conditions, principal.claims());
@@ -542,4 +551,74 @@ pub(crate) async fn maybe_merge_object_tag_conditions<R: AuthorizationRequest + 
     let tags = get_or_fetch_object_tag_conditions(req, store.as_ref(), bucket, object, version_id, action).await?;
     merge_object_tag_conditions(conditions, &tags);
     Ok(())
+}
+
+#[cfg(test)]
+mod signature_age_post_tests {
+    use super::*;
+    use crate::storage::authorization::tests::fixture::request;
+    use crate::storage::request_markers::PostObjectPolicyHeaders;
+    use http::{HeaderValue, Method};
+
+    #[test]
+    fn post_object_form_query_does_not_populate_signature_age() {
+        let cred = rustfs_credentials::Credentials {
+            access_key: "writer".to_owned(),
+            ..Default::default()
+        };
+        let principal = AuthzPrincipal::new(&cred, "");
+        let target = || AuthzTarget {
+            action: Action::S3Action(S3Action::PutObjectAction),
+            bucket: "vault",
+            object: "report.txt",
+            version_id: None,
+            location_constraint: None,
+        };
+        let presigned_uri = "/vault/report.txt?X-Amz-Date=20260801T000000Z&X-Amz-Signature=00";
+
+        // A presigned PUT carries the server-derived signature age and ignores a spoofed header.
+        let put = request(Method::PUT)
+            .uri(presigned_uri)
+            .header("x-amz-signature-age", "0")
+            .build();
+        let put_facts = request_authz_facts(&put, target());
+        let put_conditions = authorization_conditions(&put, &principal, &put_facts).expect("PUT conditions");
+        let age: i64 = put_conditions
+            .get("signatureAge")
+            .expect("presigned PUT must populate signatureAge")[0]
+            .parse()
+            .expect("numeric signatureAge");
+        assert!(age > 0, "presigned PUT age must reflect X-Amz-Date, got {age}");
+        assert!(!put_conditions.contains_key("x-amz-signature-age"));
+
+        // A POST form is authenticated by its fields, never its URL query string.
+        let mut post = request(Method::POST)
+            .uri(presigned_uri)
+            .header("x-amz-signature-age", "0")
+            .build();
+        let mut form_headers = post.headers().clone();
+        form_headers.insert("content-type", HeaderValue::from_static("multipart/form-data; boundary=test"));
+        post.install_post_object_policy_headers(PostObjectPolicyHeaders(form_headers));
+        let post_facts = request_authz_facts(&post, target());
+        let post_conditions = authorization_conditions(&post, &principal, &post_facts).expect("POST conditions");
+        assert!(
+            !post_conditions.contains_key("signatureAge"),
+            "POST Object form must not derive signatureAge from unverified query parameters"
+        );
+
+        // Header-token (Keystone) requests authenticate before query signature dispatch.
+        let keystone = request(Method::GET)
+            .uri(presigned_uri)
+            .extension(crate::storage::req_info::ReqInfo {
+                keystone_session_present: Some(false),
+                ..Default::default()
+            })
+            .build();
+        let keystone_facts = request_authz_facts(&keystone, target());
+        let keystone_conditions = authorization_conditions(&keystone, &principal, &keystone_facts).expect("Keystone conditions");
+        assert!(
+            !keystone_conditions.contains_key("signatureAge"),
+            "Keystone header-token request must not derive signatureAge from unverified query parameters"
+        );
+    }
 }

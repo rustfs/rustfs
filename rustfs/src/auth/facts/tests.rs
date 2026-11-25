@@ -342,6 +342,14 @@ fn run_cases() -> Vec<(Case, Conditions, Conditions)> {
             } else {
                 legacy_now(case.name, &legacy, before, after)
             };
+            // The historical oracle copied client-supplied `x-amz-signature-age` instead of
+            // deriving `s3:signatureAge` server-side from verified presigned `X-Amz-Date`.
+            legacy.remove("signatureAge");
+            if !credentials.access_key.is_empty()
+                && let Some(age) = super::presigned_signature_age_millis(&case.header_map(), case.query, now)
+            {
+                legacy.insert("signatureAge".to_owned(), vec![age.to_string()]);
+            }
             let current = case.current(&credentials, now);
             (case, legacy, current)
         })
@@ -531,6 +539,7 @@ fn render(case: &str, conditions: &Conditions) -> String {
         let rendered = match key.as_str() {
             "CurrentTime" => "[\"<current-time>\"]".to_owned(),
             "EpochTime" => "[\"<epoch-time>\"]".to_owned(),
+            "signatureAge" => "[\"<signature-age>\"]".to_owned(),
             _ => serde_json::to_string(values).expect("condition values serialize"),
         };
         out.push_str(&format!("{key}\t{rendered}\n"));
@@ -724,7 +733,7 @@ fn location_constraint_matches_legacy() {
 
 #[test]
 fn signature_age_matches_legacy() {
-    assert_key_matches_legacy("signatureAge", 1, 1);
+    assert_key_matches_legacy("signatureAge", 2, 1);
 }
 
 #[test]
@@ -1009,4 +1018,142 @@ fn keystone_session_presence_preserves_legacy_username_without_retaining_a_token
         credentials.session_token = if had_session { "original-session" } else { "" }.into();
         assert_eq!(AuthzPrincipal::new(&credentials, "").username, expected);
     }
+}
+
+#[test]
+fn signature_age_ignores_client_header_and_derives_from_presigned_date() {
+    let now = time::macros::datetime!(2026-08-27 00:10:00.250 UTC);
+    let user = credentials(Who::User);
+    let user_principal = AuthzPrincipal::new(&user, "");
+    let anon = Credentials::default();
+    let anon_principal = AuthzPrincipal::new(&anon, "");
+
+    // Spoofed x-amz-signature-age header is ignored for anonymous and header-signed requests.
+    for (who, principal) in [(Who::Anonymous, &anon_principal), (Who::User, &user_principal)] {
+        let case = Case::new("spoofed_age", who)
+            .sigv4()
+            .header("x-amz-signature-age", "0")
+            .header("signatureage", "0");
+        let conditions = build_conditions(principal, &case.facts(now));
+        assert!(!conditions.contains_key("signatureAge"), "{who:?} must not set signatureAge from header");
+        assert!(!conditions.contains_key("x-amz-signature-age"));
+    }
+
+    // Verified presigned SigV4 URL computes age from X-Amz-Date and ignores spoofed headers.
+    let presigned = "X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Date=20260827T000000Z&X-Amz-Expires=3600&X-Amz-Signature=00";
+    let presigned_case = Case::new("presigned_with_spoofed_header", Who::User)
+        .query(presigned)
+        .header("x-amz-signature-age", "0")
+        .header("x-amz-date", "20260827T001000Z")
+        .header("Authorization", SIGV4_AUTHORIZATION);
+    let conditions = build_conditions(&user_principal, &presigned_case.facts(now));
+    assert_eq!(conditions.get("signatureAge"), Some(&vec!["600250".to_owned()]));
+    assert!(!conditions.contains_key("x-amz-signature-age"));
+
+    // Slightly-in-future X-Amz-Date (within clock skew) clamps to 0 ms.
+    let future_case = Case::new("presigned_future_skew", Who::User).query("X-Amz-Date=20260827T001500Z&X-Amz-Signature=00");
+    let future_conditions = build_conditions(&user_principal, &future_case.facts(now));
+    assert_eq!(future_conditions.get("signatureAge"), Some(&vec!["0".to_owned()]));
+
+    // Anonymous requests never get signatureAge even if presigned query parameters are sent.
+    let anon_presigned = Case::new("anon_presigned", Who::Anonymous).query(presigned);
+    let anon_conditions = build_conditions(&anon_principal, &anon_presigned.facts(now));
+    assert!(!anon_conditions.contains_key("signatureAge"));
+}
+
+#[test]
+fn presigned_signature_age_rejects_non_presigned_sigv2_and_malformed_queries() {
+    let now = time::macros::datetime!(2026-08-27 00:10:00.250 UTC);
+    let empty = HeaderMap::new();
+    let presigned = "X-Amz-Date=20260827T000000Z&X-Amz-Signature=00";
+    assert_eq!(super::presigned_signature_age_millis(&empty, Some(presigned), now), Some(600_250));
+
+    // Non-SigV2 Authorization headers do not suppress presigned age.
+    let mut non_sigv2 = HeaderMap::new();
+    for value in [
+        "AWS4-HMAC-SHA256 test:signature",
+        "AWS test-without-colon",
+        "Bearer token:part",
+    ] {
+        non_sigv2.insert("authorization", HeaderValue::from_static(value));
+        assert_eq!(super::presigned_signature_age_millis(&non_sigv2, Some(presigned), now), Some(600_250));
+    }
+    non_sigv2.append("authorization", HeaderValue::from_static("AWS test:signature"));
+    assert_eq!(
+        super::presigned_signature_age_millis(&non_sigv2, Some(presigned), now),
+        Some(600_250),
+        "duplicate Authorization headers are not treated as SigV2"
+    );
+
+    // Single SigV2 Authorization header leaves signatureAge absent.
+    let mut sigv2_header = HeaderMap::new();
+    sigv2_header.insert("authorization", HeaderValue::from_static("AWS key:sig"));
+    assert_eq!(super::presigned_signature_age_millis(&sigv2_header, Some(presigned), now), None);
+
+    // Non-presigned, SigV2 query, wrong-case, duplicate, or malformed dates yield None.
+    for (name, query) in [
+        ("empty", ""),
+        ("date without signature", "X-Amz-Date=20260827T000000Z"),
+        ("lowercase signature", "X-Amz-Date=20260827T000000Z&x-amz-signature=00"),
+        ("lowercase date", "x-amz-date=20260827T000000Z&X-Amz-Signature=00"),
+        (
+            "duplicate date",
+            "X-Amz-Date=20260827T000000Z&X-Amz-Date=20260827T001000Z&X-Amz-Signature=00",
+        ),
+        ("malformed date", "X-Amz-Date=2026-08-27T00:00:00Z&X-Amz-Signature=00"),
+        (
+            "SigV2 presigned",
+            "AWSAccessKeyId=test&Expires=1&Signature=00&X-Amz-Date=20260827T000000Z&X-Amz-Signature=00",
+        ),
+    ] {
+        assert_eq!(super::presigned_signature_age_millis(&empty, Some(query), now), None, "{name}");
+    }
+}
+
+#[tokio::test]
+async fn signature_age_policy_denies_old_presigned_url_and_allows_fresh_one() {
+    use rustfs_policy::policy::Policy;
+
+    let policy: Policy = serde_json::from_str(
+        r#"{
+            "Version": "2012-10-17",
+            "Statement": [
+                {"Effect": "Allow", "Action": ["s3:GetObject"], "Resource": ["arn:aws:s3:::facts-bucket/*"]},
+                {
+                    "Effect": "Deny",
+                    "Action": ["s3:GetObject"],
+                    "Resource": ["arn:aws:s3:::facts-bucket/*"],
+                    "Condition": {"NumericGreaterThan": {"s3:signatureAge": 60000}}
+                }
+            ]
+        }"#,
+    )
+    .expect("signatureAge policy");
+
+    let now = time::macros::datetime!(2026-08-27 00:10:00 UTC);
+    let user = credentials(Who::User);
+    let principal = AuthzPrincipal::new(&user, "");
+
+    // 10-minute-old presigned URL is denied even with a spoofed x-amz-signature-age: 0 header.
+    let old_case = Case::new("old_presigned", Who::User)
+        .query("X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Date=20260827T000000Z&X-Amz-Expires=3600&X-Amz-Signature=00")
+        .header("x-amz-signature-age", "0");
+    let old_facts = old_case.facts(now);
+    let old_conditions = build_conditions(&principal, &old_facts);
+    assert!(
+        !policy.is_allowed(&build_args(&principal, &old_facts, &old_conditions)).await,
+        "10-minute-old presigned URL must be denied when s3:signatureAge > 60000"
+    );
+
+    // 30-second-old presigned URL is allowed.
+    let fresh_case = Case::new("fresh_presigned", Who::User)
+        .query("X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Date=20260827T000930Z&X-Amz-Expires=3600&X-Amz-Signature=00");
+    let fresh_facts = fresh_case.facts(now);
+    let fresh_conditions = build_conditions(&principal, &fresh_facts);
+    assert!(
+        policy
+            .is_allowed(&build_args(&principal, &fresh_facts, &fresh_conditions))
+            .await,
+        "30-second-old presigned URL must be allowed"
+    );
 }
