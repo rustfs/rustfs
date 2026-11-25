@@ -561,6 +561,23 @@ fn protocol_policy_denials_and_request_conditions() {
                 let response = reply(&mut read).await;
                 assert!(response.starts_with(status), "unexpected FTP response: {response}");
             }
+            let probe_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("bind loopback probe listener");
+            let probe_port = probe_listener.local_addr().expect("probe addr").port();
+            let port_cmd = format!("PORT 127,0,0,1,{},{}\r\n", probe_port >> 8, probe_port & 0xff);
+            write.write_all(port_cmd.as_bytes()).await.expect("send PORT");
+            let response = reply(&mut read).await;
+            assert!(
+                response.starts_with("502"),
+                "PORT must be refused with 502 in passive-only mode: {response}"
+            );
+            assert!(
+                tokio::time::timeout(std::time::Duration::from_millis(150), probe_listener.accept())
+                    .await
+                    .is_err(),
+                "rejected PORT must not connect to the requested address"
+            );
             write
                 .write_all(format!("SIZE /{bucket}/secret.txt\r\n").as_bytes())
                 .await
