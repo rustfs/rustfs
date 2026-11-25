@@ -1181,6 +1181,20 @@ fn format_commit_receipt_bytes(journal_raw: &[u8], finished: bool) -> Vec<u8> {
     out
 }
 
+// A visible transaction directory can survive an earlier failed parent fsync in the page cache.
+pub(super) fn sync_preparation_parents(object: &Path, through: &Path) -> std::io::Result<()> {
+    if !object.starts_with(through) {
+        return Err(DiskError::InvalidPath.into());
+    }
+    for parent in object.ancestors() {
+        os::fsync_dir_std(parent)?;
+        if parent == through {
+            break;
+        }
+    }
+    Ok(())
+}
+
 impl LocalDisk {
     // Native MPU source closure has its own conditional protocol. Generic
     // object recovery must never restore its head or acquire SourceRW under
@@ -1621,23 +1635,12 @@ impl LocalDisk {
         let publication_owner: Option<Arc<dyn Send + Sync>> = Some(Arc::new((owner.clone(), staged.clone())));
         os::rename_all_with_owner(staged.path(), &destination, &bucket, &self.publication_root, publication_owner).await?;
         if sync {
-            let mut dirs_to_sync = Vec::new();
-            let mut path = root.as_path();
-            loop {
-                dirs_to_sync.push(path.to_path_buf());
-                if !destination_was_absent || path == bucket {
-                    break;
-                }
-                path = path.parent().ok_or(DiskError::InvalidPath)?;
-            }
             let sync_owner = owner.clone();
             self.blocking_queue
                 .run_fsync_cancellable(move |_| {
                     let _owner = sync_owner;
-                    for dir in dirs_to_sync {
-                        os::fsync_dir_std(&dir)?;
-                    }
-                    Ok(())
+                    let through = if destination_was_absent { &bucket } else { &root };
+                    sync_preparation_parents(&root, through)
                 })
                 .await
                 .map_err(to_file_error)?;
@@ -1845,6 +1848,30 @@ impl LocalDisk {
         Ok(true)
     }
 
+    async fn publish_recovery_receipt(
+        &self,
+        bucket: &Path,
+        root: &Path,
+        receipt: &CommitReceipt,
+        inspect_object: Option<&str>,
+        owner: Option<Arc<dyn Send + Sync>>,
+    ) -> Result<Option<DeleteRecoveryInspection>> {
+        let journal = &receipt.journal;
+        let through = if journal.original_digest.is_none() { bucket } else { root };
+        write_delete_rollback_files(
+            self.io_root(),
+            &journal.volume,
+            root,
+            journal.transaction,
+            &[],
+            &[(DELETE_QUORUM_COMMITTED_FILE, &serde_json::to_vec(receipt)?)],
+            inspect_object,
+            Some(through),
+            owner,
+        )
+        .await
+    }
+
     async fn delete_recovery_settle_owned(
         &self,
         volume: &str,
@@ -1882,21 +1909,13 @@ impl LocalDisk {
                 // The coordinator supplies an inspected same-transaction
                 // receipt. Retain this drive's immutable hashes, data dirs and
                 // causal history when completing its partial publication.
-                let root = self.io_get_object_path(volume, object)?;
+                let (bucket, root) = self.io_get_bucket_and_object_path(volume, object)?;
                 let receipt = CommitReceipt {
                     journal: local.clone(),
                     finished: false,
                 };
-                write_delete_rollback_file(
-                    self.io_root(),
-                    volume,
-                    &root,
-                    transaction,
-                    DELETE_QUORUM_COMMITTED_FILE,
-                    &serde_json::to_vec(&receipt)?,
-                    owner.clone(),
-                )
-                .await?;
+                self.publish_recovery_receipt(&bucket, &root, &receipt, None, owner.clone())
+                    .await?;
                 self.delete_recovery_barrier(volume, object, transaction, "DECISION").await?;
                 return self.delete_recovery_inspect_owned(volume, object, transaction, owner).await;
             }
@@ -1910,29 +1929,21 @@ impl LocalDisk {
                 witness.original_digest = None;
                 witness.target_digest = None;
                 witness.data_dirs.clear();
-                let root = self.io_get_object_path(volume, object)?;
+                let (bucket, root) = self.io_get_bucket_and_object_path(volume, object)?;
                 let _ = self.activate_delete_preparation(&witness, None, None, owner.clone()).await?;
                 let receipt = CommitReceipt {
                     journal: witness,
                     finished: false,
                 };
-                write_delete_rollback_file(
-                    self.io_root(),
-                    volume,
-                    &root,
-                    transaction,
-                    DELETE_QUORUM_COMMITTED_FILE,
-                    &serde_json::to_vec(&receipt)?,
-                    owner.clone(),
-                )
-                .await?;
+                self.publish_recovery_receipt(&bucket, &root, &receipt, None, owner.clone())
+                    .await?;
                 self.delete_recovery_barrier(volume, object, transaction, "DECISION").await?;
                 return self.delete_recovery_inspect_owned(volume, object, transaction, owner).await;
             }
             if !authority.matches_adoption_source(&observed.current_versions) {
                 return Err(DiskError::OutdatedXLMeta);
             }
-            let root = self.io_get_object_path(volume, object)?;
+            let (bucket, root) = self.io_get_bucket_and_object_path(volume, object)?;
             let bytes = self.read_all(volume, &format!("{object}/{STORAGE_FORMAT_FILE}")).await?;
             let _ = self
                 .prepare_delete_recovery(
@@ -1956,16 +1967,8 @@ impl LocalDisk {
                 journal: adopted_journal,
                 finished: false,
             };
-            write_delete_rollback_file(
-                self.io_root(),
-                volume,
-                &root,
-                transaction,
-                DELETE_QUORUM_COMMITTED_FILE,
-                &serde_json::to_vec(&receipt)?,
-                owner.clone(),
-            )
-            .await?;
+            self.publish_recovery_receipt(&bucket, &root, &receipt, None, owner.clone())
+                .await?;
             self.delete_recovery_barrier(volume, object, transaction, "DECISION").await?;
             return self.delete_recovery_inspect_owned(volume, object, transaction, owner).await;
         }
@@ -2099,7 +2102,7 @@ impl LocalDisk {
             return self.delete_recovery_inspect_owned(volume, object, transaction, owner).await;
         }
         let journal = observed.journal.as_ref().ok_or(DiskError::FileCorrupt)?;
-        let root = self.io_get_object_path(volume, object)?;
+        let (bucket, root) = self.io_get_bucket_and_object_path(volume, object)?;
         let rollback = root.join(transaction.to_string());
         match action {
             DeleteRecoveryAction::PublishCommit => {
@@ -2119,17 +2122,9 @@ impl LocalDisk {
                     finished,
                 };
                 let inspect_after = (!cfg!(feature = "e2e-test-hooks")).then_some(object);
-                let inspected = write_delete_rollback_files(
-                    self.io_root(),
-                    volume,
-                    &root,
-                    transaction,
-                    &[],
-                    &[(DELETE_QUORUM_COMMITTED_FILE, &serde_json::to_vec(&receipt)?)],
-                    inspect_after,
-                    owner.clone(),
-                )
-                .await?;
+                let inspected = self
+                    .publish_recovery_receipt(&bucket, &root, &receipt, inspect_after, owner.clone())
+                    .await?;
                 self.delete_recovery_barrier(volume, object, transaction, "DECISION").await?;
                 if let Some(inspected) = inspected {
                     return Ok(inspected);
@@ -2250,6 +2245,7 @@ impl LocalDisk {
                 } else {
                     &[STORAGE_FORMAT_FILE_BACKUP, DELETE_MARKER_ROLLBACK_FILE]
                 };
+                let through = if journal.original_digest.is_none() { &bucket } else { &root };
                 if let Some(inspected) = write_delete_rollback_files(
                     self.io_root(),
                     volume,
@@ -2258,6 +2254,7 @@ impl LocalDisk {
                     remove_before_publish,
                     &[(FINISHED, &[]), (DELETE_QUORUM_COMMITTED_FILE, &receipt_bytes)],
                     Some(object),
+                    Some(through),
                     owner.clone(),
                 )
                 .await?
@@ -2871,7 +2868,7 @@ impl LocalDisk {
         let (object_path, bucket_path, root, staging_root, cached_receipt) = match cached_prepared {
             Some(entry) => (
                 entry.object_path,
-                Some(entry.bucket_path),
+                entry.bucket_path,
                 entry.file_path,
                 entry.staging_root,
                 Some((entry.journal_raw, entry.journal, entry.sole_transaction)),
@@ -2882,13 +2879,8 @@ impl LocalDisk {
                     return Err(DiskError::InvalidPath);
                 }
                 let obj_path = self.get_object_path(volume, object)?;
-                (
-                    obj_path,
-                    None,
-                    self.io_get_object_path(volume, object)?,
-                    self.io_get_bucket_path(RUSTFS_META_TMP_BUCKET)?,
-                    None,
-                )
+                let (bucket_path, root) = self.io_get_bucket_and_object_path(volume, object)?;
+                (obj_path, bucket_path, root, self.io_get_bucket_path(RUSTFS_META_TMP_BUCKET)?, None)
             }
         };
         let metadata_owner = os::acquire_metadata_mutation_lease(&object_path, namespace_owner).await;
@@ -2918,19 +2910,23 @@ impl LocalDisk {
                     if sync {
                         os::fsync_dir_std(&rollback)?;
                     }
-                    if let Some(bucket_path) = bucket_path {
-                        put_published_delete_receipt(
-                            rollback,
-                            PublishedDeleteReceiptEntry {
-                                object_path,
-                                bucket_path,
-                                file_path: root,
-                                staging_root,
-                                journal_raw,
-                            },
-                        );
-                    }
+                    put_published_delete_receipt(
+                        rollback,
+                        PublishedDeleteReceiptEntry {
+                            object_path,
+                            bucket_path,
+                            file_path: root,
+                            staging_root,
+                            journal_raw,
+                        },
+                    );
                     return Ok(Ok(Some((journal, sole_transaction, true))));
+                }
+                // The ordinary publisher preserves a physical completion record on a retry.
+                match regular_file_exists(&receipt_path) {
+                    Ok(true) => return Ok(Ok(None)),
+                    Ok(false) => {}
+                    Err(error) => return Ok(Err(error)),
                 }
                 let prepared = match regular_bytes(&rollback.join(PREPARED)) {
                     Ok(Some(bytes)) => bytes,
@@ -2992,6 +2988,14 @@ impl LocalDisk {
                         Err(err) if err.kind() == ErrorKind::NotFound => {}
                         Err(err) => return Err(err),
                     }
+                }
+                if sync {
+                    let through = if journal.original_digest.is_none() {
+                        &bucket_path
+                    } else {
+                        &root
+                    };
+                    sync_preparation_parents(&root, through)?;
                 }
                 let receipt = CommitReceipt {
                     journal: journal.clone(),
@@ -6525,6 +6529,11 @@ mod tests {
             assert_eq!(publish(state.fingerprint).await.unwrap_err(), DiskError::FileAccessDenied);
             assert!(receipt.is_file(), "rename can succeed before its directory sync fails");
         }
+        os::fsync_dir_recorder::set_failure(directory.parent().unwrap(), ErrorKind::PermissionDenied);
+        assert_eq!(
+            publish(inspect().await.unwrap().fingerprint).await.unwrap_err(),
+            DiskError::FileAccessDenied
+        );
         let state = publish(inspect().await.unwrap().fingerprint).await.unwrap();
         assert_eq!(state.state, DeleteRecoveryState::QuorumCommitted);
         let finished = disk
@@ -6542,6 +6551,79 @@ mod tests {
         assert_eq!(publish(finished.fingerprint).await.unwrap().state, DeleteRecoveryState::CommitFinished);
         let record: CommitReceipt = serde_json::from_slice(&tokio::fs::read(receipt).await.unwrap()).unwrap();
         assert!(record.finished, "a retried vote must preserve existing completion");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn delete_recovery_recertifies_failed_preparation_parents_before_voting() {
+        for failed_level in ["missing/nested/key", "missing", ""] {
+            let (_temp, disk, _, _) = fixture().await;
+            let object = "missing/nested/key";
+            let transaction = Uuid::new_v4();
+            let bucket = disk.io_get_bucket_path("recovery").unwrap();
+            let failed = bucket.join(failed_level);
+            let inspect = || disk.delete_recovery_inspect("recovery", object, transaction);
+            let publish = |fingerprint| {
+                disk.delete_recovery_settle(
+                    "recovery",
+                    object,
+                    transaction,
+                    fingerprint,
+                    DeleteRecoveryAction::PublishCommit,
+                    None,
+                )
+            };
+            os::fsync_dir_recorder::set_failure(&failed, ErrorKind::PermissionDenied);
+            assert_eq!(
+                publish(inspect().await.unwrap().fingerprint).await.unwrap_err(),
+                DiskError::FileAccessDenied
+            );
+            let prepared = inspect().await.unwrap();
+            assert_eq!(prepared.state, DeleteRecoveryState::NewPrepared);
+
+            os::fsync_dir_recorder::set_failure(&failed, ErrorKind::PermissionDenied);
+            assert_eq!(
+                disk.try_publish_prepared_delete_local("recovery", object, transaction, None)
+                    .await
+                    .unwrap_err(),
+                DiskError::FileAccessDenied
+            );
+            let prepared = inspect().await.unwrap();
+            assert_eq!(prepared.state, DeleteRecoveryState::NewPrepared);
+            let transaction_dir = bucket.join(object).join(transaction.to_string());
+            os::fsync_dir_recorder::set_failure(&transaction_dir, ErrorKind::PermissionDenied);
+            assert_eq!(publish(prepared.fingerprint).await.unwrap_err(), DiskError::FileAccessDenied);
+            let visible = inspect().await.unwrap();
+            assert_eq!(visible.state, DeleteRecoveryState::QuorumCommitted);
+            os::fsync_dir_recorder::set_failure(&failed, ErrorKind::PermissionDenied);
+            assert_eq!(publish(visible.fingerprint).await.unwrap_err(), DiskError::FileAccessDenied);
+            let confirmed = publish(inspect().await.unwrap().fingerprint).await.unwrap();
+            assert_eq!(confirmed.state, DeleteRecoveryState::QuorumCommitted);
+            let finished = disk
+                .delete_recovery_settle(
+                    "recovery",
+                    object,
+                    transaction,
+                    confirmed.fingerprint,
+                    DeleteRecoveryAction::FinishCommit,
+                    None,
+                )
+                .await
+                .unwrap();
+            assert_eq!(finished.state, DeleteRecoveryState::CommitFinished);
+            assert!(
+                disk.try_publish_prepared_delete_local("recovery", object, transaction, None)
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+            os::fsync_dir_recorder::set_failure(&failed, ErrorKind::PermissionDenied);
+            assert_eq!(publish(finished.fingerprint).await.unwrap_err(), DiskError::FileAccessDenied);
+            assert_eq!(
+                publish(inspect().await.unwrap().fingerprint).await.unwrap().state,
+                DeleteRecoveryState::CommitFinished
+            );
+        }
     }
 
     #[tokio::test]

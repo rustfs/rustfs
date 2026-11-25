@@ -649,9 +649,19 @@ async fn write_delete_rollback_file(
     data: &[u8],
     namespace_owner: Option<Arc<dyn Send + Sync>>,
 ) -> Result<()> {
-    write_delete_rollback_files(io_root, volume, object_dir, rollback_dir, &[], &[(name, data)], None, namespace_owner)
-        .await
-        .map(|_| ())
+    write_delete_rollback_files(
+        io_root,
+        volume,
+        object_dir,
+        rollback_dir,
+        &[],
+        &[(name, data)],
+        None,
+        None,
+        namespace_owner,
+    )
+    .await
+    .map(|_| ())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -663,6 +673,7 @@ async fn write_delete_rollback_files(
     remove_before_publish: &[&'static str],
     files: &[(&'static str, &[u8])],
     inspect_object: Option<&str>,
+    sync_preparation_through: Option<&Path>,
     namespace_owner: Option<Arc<dyn Send + Sync>>,
 ) -> Result<Option<crate::disk::DeleteRecoveryInspection>> {
     let backup_dir = object_dir.join(rollback_dir.to_string());
@@ -695,6 +706,7 @@ async fn write_delete_rollback_files(
     let staging_root = io_root.join(RUSTFS_META_TMP_BUCKET);
     let io_root = io_root.to_path_buf();
     let object_dir_buf = object_dir.to_path_buf();
+    let sync_preparation_through = sync_preparation_through.map(Path::to_owned);
     let volume_str = volume.to_owned();
     let inspect_object = inspect_object.map(str::to_owned);
     let recovery_scope = delete_recovery::recovery_operation_scope();
@@ -717,6 +729,9 @@ async fn write_delete_rollback_files(
         }
         let backup_dir_existed = backup_dir.is_dir();
         std::fs::create_dir_all(&backup_dir)?;
+        if sync && let Some(through) = sync_preparation_through.as_deref() {
+            delete_recovery::sync_preparation_parents(&object_dir_buf, through)?;
+        }
         std::fs::create_dir_all(&staging_root)?;
         // tempfile's Windows `persist` hands both the staged and the final path
         // straight to `MoveFileExW`, bypassing std's long-path handling, so a
@@ -751,7 +766,10 @@ async fn write_delete_rollback_files(
         }
         if sync {
             os::fsync_dir_std(&backup_dir)?;
-            if !backup_dir_existed && let Some(parent) = backup_dir.parent() {
+            if !backup_dir_existed
+                && sync_preparation_through.is_none()
+                && let Some(parent) = backup_dir.parent()
+            {
                 os::fsync_dir_std(parent)?;
             }
         }
