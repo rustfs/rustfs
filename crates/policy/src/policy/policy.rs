@@ -4337,6 +4337,101 @@ mod test {
         assert!(!allows(&deny_all_but("s3:GetObject"), "s3:ForceDeleteObject").await);
     }
 
+    #[tokio::test]
+    async fn not_action_allow_does_not_grant_cross_family_actions() {
+        async fn eval(policy: &Policy, action: &str, bucket: &str, object: &str) -> bool {
+            let conditions = HashMap::new();
+            let claims = HashMap::new();
+            let groups = None;
+            let args = Args {
+                account: "user",
+                groups: &groups,
+                action: Action::try_from(action).expect("action parses"),
+                bucket,
+                conditions: &conditions,
+                is_owner: false,
+                object,
+                claims: &claims,
+                deny_only: false,
+            };
+            policy.is_allowed(&args).await
+        }
+
+        // Admin/STS/KMS requests often pass an empty bucket/object (which resolves to
+        // "/") or a warehouse bucket; an S3 NotAction Allow must never cross into them.
+        for (resource_clause, bucket, object) in [
+            (r#""Resource":["arn:aws:s3:::*"]"#, "", ""),
+            (r#""Resource":["arn:aws:s3:::*/*"]"#, "", ""),
+            (r#""Resource":["*"]"#, "", ""),
+            (r#""NotResource":["arn:aws:s3:::secret/*"]"#, "", ""),
+            (r#""Resource":["arn:aws:s3:::warehouse","arn:aws:s3:::warehouse/*"]"#, "warehouse", ""),
+        ] {
+            for not_action in ["s3:DeleteObject", "s3:*"] {
+                let iam = Policy::parse_config(
+                    format!(
+                        r#"{{"Version":"2012-10-17","Statement":[{{"Effect":"Allow","NotAction":["{not_action}"],{resource_clause}}}]}}"#
+                    )
+                    .as_bytes(),
+                )
+                .expect("NotAction policy parses");
+
+                for action in [
+                    "admin:CreateUser",
+                    "admin:AttachUserOrGroupPolicy",
+                    "admin:ListUsers",
+                    "admin:GetTableBucket",
+                    "sts:AssumeRole",
+                    "kms:ListKeys",
+                    "kms:Decrypt",
+                ] {
+                    assert!(
+                        !eval(&iam, action, bucket, object).await,
+                        "IAM NotAction {not_action} with {resource_clause} must not grant {action}"
+                    );
+                }
+            }
+        }
+
+        // The same statement still grants non-excluded S3 actions (except force-delete).
+        let s3_not_delete = Policy::parse_config(
+            br#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","NotAction":["s3:DeleteObject"],"Resource":["arn:aws:s3:::*"]}]}"#,
+        )
+        .expect("S3 NotAction policy parses");
+        assert!(allows(&s3_not_delete, "s3:GetObject").await);
+        assert!(!allows(&s3_not_delete, "s3:DeleteObject").await);
+        assert!(!allows(&s3_not_delete, "s3:ForceDeleteObject").await);
+
+        // An explicit admin NotAction stays confined to admin actions.
+        let admin_not_delete = Policy::parse_config(
+            br#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","NotAction":["admin:DeleteUser"],"Resource":["*"]}]}"#,
+        )
+        .expect("admin NotAction policy parses");
+        assert!(eval(&admin_not_delete, "admin:CreateUser", "", "").await);
+        assert!(!eval(&admin_not_delete, "admin:DeleteUser", "", "").await);
+        assert!(!allows(&admin_not_delete, "s3:GetObject").await);
+        assert!(!eval(&admin_not_delete, "kms:ListKeys", "", "").await);
+        assert!(!eval(&admin_not_delete, "sts:AssumeRole", "", "").await);
+
+        // Deny + NotAction keeps covering every non-excluded action family.
+        let deny = Policy::parse_config(
+            br#"{"Version":"2012-10-17","Statement":[
+                {"Effect":"Allow","Action":["admin:*"]},
+                {"Effect":"Allow","Action":["kms:*"]},
+                {"Effect":"Allow","Action":["sts:*"]},
+                {"Effect":"Deny","NotAction":["s3:GetObject"],"Resource":["arn:aws:s3:::*"]}
+            ]}"#,
+        )
+        .expect("deny NotAction policy parses");
+        assert!(!eval(&deny, "admin:CreateUser", "", "").await);
+        assert!(!eval(&deny, "kms:ListKeys", "", "").await);
+        assert!(!eval(&deny, "sts:AssumeRole", "", "").await);
+
+        // An empty ActionSet paired with an empty NotAction fails closed.
+        let empty = crate::policy::ActionSet::default();
+        assert!(!empty.statement_covers(&empty, &Action::S3Action(S3Action::GetObjectAction), false));
+        assert!(!empty.statement_covers(&empty, &Action::S3Action(S3Action::GetObjectAction), true));
+    }
+
     async fn bucket_allows(policy: &BucketPolicy, action: &str) -> bool {
         let conditions = HashMap::new();
         policy
