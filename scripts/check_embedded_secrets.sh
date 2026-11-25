@@ -111,14 +111,7 @@ PATTERNS=(
 #      body that it is not a real key.
 # 8: rustfs/tests/fixtures/connect-logs-v1.json includes an explicitly
 #    synthetic PEM-shaped value to prove log redaction removes key material.
-# 9-11: fixed unknown access key ids in
-#      crates/e2e_test/src/sec_signature_matrix_test.rs. The GHSA cases need a
-#      well-formed id that is not a real account so both stacks answer 403
-#      InvalidAccessKeyId. They are not the AWS example key and they are not
-#      generated credentials. Excusing the exact id leaves any other key on
-#      the same line still failing.
 AWS_EXAMPLE_STEM="AKIAIOSFODNN7EXAMPL"
-UNKNOWN_AK_PREFIX="AKIA"
 AGENT_FIXTURE_RSA_BODY="MIIEowIBAAKCAQEAxEXAMPLEKEYBODYnotarealkey0000000000000000000000"
 NON_SECRET_LITERALS=(
     "-----${BEGIN_MARK} PRIVATE KEY-----\\nsecret\\n-----END PRIVATE KEY-----"
@@ -129,9 +122,6 @@ NON_SECRET_LITERALS=(
     "-----${BEGIN_MARK} PRIVATE KEY-----\\nMEECAQAwEwYHKoZIzj0CAQYIKoZIzj0DAQcEJzAlAgEBBCBleGFtcGxl\\n-----END PRIVATE KEY-----"
     "-----${BEGIN_MARK} RSA PRIVATE KEY-----\\n${AGENT_FIXTURE_RSA_BODY}\\nEXAMPLEEXAMPLEEXAMPLEEXAMPLEEXAMPLEEXAMPLEEXAMPLEEXAMPLEEXAMPLE=\\n-----END RSA PRIVATE KEY-----"
     "-----${BEGIN_MARK} PRIVATE KEY-----\\nSYNTHETIC_PRIVATE_KEY_BYTES\\n-----END PRIVATE KEY-----"
-    "${UNKNOWN_AK_PREFIX}UNKNOWNEMPTY0001"
-    "${UNKNOWN_AK_PREFIX}UNKNOWNFORGED002"
-    "${UNKNOWN_AK_PREFIX}STSUNKNOWN000001"
 )
 
 run_scan() {
