@@ -511,3 +511,163 @@ async fn an_unsigned_amz_header_is_refused_before_any_control_plane_handler() {
         }
     }
 }
+
+#[tokio::test]
+#[serial_test::serial]
+async fn typed_admin_routes_serve_canonical_alias_verified_body_and_presigned_object_lambda() {
+    use crate::app::storage_api::test::contract::bucket::{BucketOperations as _, MakeBucketOptions};
+    use crate::runtime_sources::{AppContext, publish_test_app_context};
+    use rustfs_iam::store::object::{IAM_CONFIG_PREFIX, ObjectStore};
+    use rustfs_iam::store::{Store as _, UserType};
+    use rustfs_madmin::{AccountStatus, AddOrUpdateUserReq};
+    use rustfs_policy::policy::Policy;
+    use serde_json::{Value, json};
+
+    const USER: &str = "typed-admin-caller";
+    const SECRET: &str = "typed-admin-caller-test-secret";
+    const BUCKET: &str = "typed-etag-bucket";
+    let env = rustfs_test_utils::TestECStoreEnv::builder()
+        .prefix("typed_admin_routes")
+        .disk_count(1)
+        .init_bucket_metadata(true)
+        .build()
+        .await;
+    env.ecstore
+        .make_bucket(BUCKET, &MakeBucketOptions::default())
+        .await
+        .expect("create bucket");
+    ObjectStore::new(env.ecstore.clone())
+        .save_iam_config(json!({"version":1}), format!("{}/format.json", *IAM_CONFIG_PREFIX))
+        .await
+        .expect("IAM format");
+    let iam = rustfs_iam::build_iam_sys(env.ecstore.clone()).await.expect("ready IAM");
+    iam.create_user(
+        USER,
+        &AddOrUpdateUserReq {
+            secret_key: SECRET.to_owned(),
+            policy: None,
+            status: AccountStatus::Enabled,
+        },
+    )
+    .await
+    .expect("create caller");
+    let policy = Policy::parse_config(
+        br#"{"Version":"2012-10-17","Statement":[
+            {"Effect":"Allow","Action":"admin:SiteReplicationRemove"},
+            {"Effect":"Allow","Action":"s3:GetObject","Resource":["arn:aws:s3:::rustfs/*","arn:aws:s3:::minio/*"]}
+        ]}"#,
+    )
+    .expect("caller policy");
+    iam.set_policy(USER, policy).await.expect("save caller policy");
+    iam.policy_db_set(USER, UserType::Reg, false, USER)
+        .await
+        .expect("attach caller policy");
+
+    let context = Arc::new(AppContext::with_default_interfaces(
+        env.ecstore.clone(),
+        iam,
+        Arc::new(rustfs_kms::KmsServiceManager::new()),
+    ));
+    assert!(context.iam().is_ready());
+    assert!(context.publish_action_credentials(rustfs_credentials::Credentials {
+        access_key: ROOT_ACCESS_KEY.to_owned(),
+        secret_key: ROOT_SECRET_KEY.to_owned(),
+        status: "on".to_owned(),
+        ..Default::default()
+    }));
+    publish_test_app_context(context.clone());
+    let assembly = assembly();
+    assert!(assembly.server_ctx.install(context));
+    let router = crate::admin::make_admin_router(false, assembly.server_ctx.clone()).expect("production router");
+    let stack = GatewayStack::assemble_control_plane(assembly, Arc::new(router)).expect("control-plane stack");
+    for row in rustfs_gateway_dialect_rustfs_admin::native::extensions::control_plane::ROWS {
+        assert!(stack.service.operations().any(|registered| registered == row.name), "{}", row.name);
+    }
+
+    for prefix in ["/rustfs/admin", "/minio/admin"] {
+        let request = signed_body_request(
+            Method::POST,
+            &format!("{prefix}/v4/account/permissions"),
+            "",
+            USER,
+            SECRET,
+            Bytes::from_static(br#"{"checks":[{"id":"capabilities","action":"admin:SiteReplicationRemove"}]}"#),
+        );
+        let (status, _, body) = answer_request_full(&stack, request).await;
+        assert_eq!(status, StatusCode::OK, "{prefix}: {body}");
+        assert_eq!(
+            serde_json::from_str::<Value>(&body).expect("permission results"),
+            json!({"results":[{"id":"capabilities","decision":"allowed"}]})
+        );
+    }
+
+    let root_put = signed_body_request(
+        Method::PUT,
+        &format!("/rustfs/admin/v3/bucket-etag/{BUCKET}"),
+        "",
+        ROOT_ACCESS_KEY,
+        ROOT_SECRET_KEY,
+        Bytes::from_static(br#"{"algorithm":"xxh3"}"#),
+    );
+    let (status, _, body) = answer_request_full(&stack, root_put).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        serde_json::from_str::<Value>(&body).expect("set bucket etag"),
+        json!({"bucket": BUCKET, "algorithm": "xxh3"})
+    );
+
+    let payload = Bytes::from_static(b"aaaa");
+    let unauth_delete = signed_body_request(
+        Method::DELETE,
+        &format!("/rustfs/admin/v3/bucket-etag/{BUCKET}"),
+        "",
+        USER,
+        SECRET,
+        payload.clone(),
+    );
+    let (status, _, _) = answer_request_full(&stack, unauth_delete).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+
+    // Unused payload on a control-plane DELETE is buffered and verified before the handler answers.
+    let root_delete = signed_body_request(
+        Method::DELETE,
+        &format!("/rustfs/admin/v3/bucket-etag/{BUCKET}"),
+        "",
+        ROOT_ACCESS_KEY,
+        ROOT_SECRET_KEY,
+        payload.clone(),
+    );
+    let (counted, bytes_read) = CountedBody::new(payload.len());
+    let response = stack.call(root_delete.map(|_| counted)).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(bytes_read.load(Ordering::SeqCst), payload.len());
+    let deleted = response.into_body().collect().await.expect("delete etag body").to_bytes();
+    assert_eq!(
+        serde_json::from_slice::<Value>(&deleted).expect("deleted bucket etag"),
+        json!({"bucket": BUCKET, "algorithm": null})
+    );
+
+    // Admin GET paths preserve header-signed and presigned Object Lambda priority (#1577).
+    let expected = json!({"contractVersion":2,"durableCleanup":true});
+    for prefix in ["/rustfs/admin", "/minio/admin"] {
+        let path = format!("{prefix}/v3/site-replication/remove-v2/capabilities");
+        let admin_get = signed_request(Signed::Header, Method::GET, &path, "local=true", USER, SECRET);
+        let (status, _, body) = answer_request(&stack, admin_get).await;
+        assert_eq!(status, StatusCode::OK, "{path}: {body}");
+        assert_eq!(serde_json::from_str::<Value>(&body).expect("removal capabilities"), expected);
+
+        let lambda_query = "lambdaArn=arn%3Aacme%3As3-object-lambda%3A%3Atransformer%3Awebhook";
+        for form in [Signed::Header, Signed::Query] {
+            let lambda_get = signed_request(form, Method::GET, &path, lambda_query, USER, SECRET);
+            let (status, _, body) = answer_request(&stack, lambda_get).await;
+            assert_eq!(status, StatusCode::NOT_FOUND, "{path}?{lambda_query}: {body}");
+            assert!(body.contains("<Code>NoSuchBucket</Code>"), "{path}?{lambda_query}: {body}");
+        }
+
+        let encoded_query = "lambda%41rn=arn%3Aacme%3As3-object-lambda%3A%3Atransformer%3Awebhook";
+        let encoded_get = signed_request(Signed::Query, Method::GET, &path, encoded_query, USER, SECRET);
+        let (status, _, body) = answer_request(&stack, encoded_get).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{path}?{encoded_query}: {body}");
+        assert!(body.contains("<Code>InvalidArgument</Code>"), "{path}?{encoded_query}: {body}");
+    }
+}

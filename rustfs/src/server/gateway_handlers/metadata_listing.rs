@@ -26,25 +26,23 @@ use super::{access, handler_error};
 use crate::app::metadata_listing::{self, MetadataListing};
 use crate::runtime_sources::ServerContextSlot;
 use rustfs_gateway::{Handler, HandlerResult, Req, Resp, ServiceBuilder};
-use rustfs_gateway_core::dialect::{Dialect, DialectError, DialectOverlay, DialectRoute, OverlayRow};
-use rustfs_gateway_core::route::ShadowingDecl;
+use rustfs_gateway_core::dialect::{Dialect, DialectError, DialectOverlay};
+use rustfs_gateway_dialect_rustfs_admin::native::extensions::s3;
 use rustfs_gateway_dialect_rustfs_admin::ops::list_object_versions_with_metadata::{
     self as versions, ListObjectVersionsWithMetadata,
 };
 use rustfs_gateway_dialect_rustfs_admin::ops::list_objects_v2_with_metadata::{self as objects, ListObjectsV2WithMetadata};
 use rustfs_gateway_dialect_rustfs_admin::{AdminResponse, ExtensionOperation};
 use rustfs_s3_types::{S3Result, s3_error};
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 
 /// The two operations, as the gateway names them.
 pub(crate) const NAMES: [&str; 2] = [versions::NAME, objects::NAME];
 
-static ROWS: [OverlayRow; 2] = [versions::OVERLAY_ROW, objects::OVERLAY_ROW];
-
 static RECORD: DialectOverlay = DialectOverlay {
     name: "rustfs-metadata-listings",
     vendor: "rustfs",
-    operations: &ROWS,
+    operations: s3::ROWS,
     claims: &[],
 };
 
@@ -54,29 +52,7 @@ static RECORD: DialectOverlay = DialectOverlay {
 ///
 /// What the gateway refuses in the record or the declarations.
 pub(crate) fn dialect() -> Result<Dialect, Vec<DialectError>> {
-    static VERSIONS: OnceLock<Vec<ShadowingDecl>> = OnceLock::new();
-    static OBJECTS: OnceLock<Vec<ShadowingDecl>> = OnceLock::new();
-    Dialect::assemble(&RECORD)
-        .declare::<ListObjectVersionsWithMetadata>(on_the_s3_table(ListObjectVersionsWithMetadata::ROUTE, &VERSIONS))
-        .declare::<ListObjectsV2WithMetadata>(on_the_s3_table(ListObjectsV2WithMetadata::ROUTE, &OBJECTS))
-        .build()
-}
-
-/// `route` as the S3 table carries it: the same row, declaring the overlaps with the standard
-/// operations and the other listing it stands in front of. The admin router's extension rows it
-/// also shadows in the
-/// gateway's one-table dialect are served by the control-plane host, not by this table, and a
-/// declaration naming an operation the table does not hold is refused as stale.
-fn on_the_s3_table(route: DialectRoute, shadows: &'static OnceLock<Vec<ShadowingDecl>>) -> DialectRoute {
-    let shadows = shadows.get_or_init(|| {
-        route
-            .shadows
-            .iter()
-            .filter(|decl| !decl.shadowed.starts_with("rustfs:") || NAMES.contains(&decl.shadowed))
-            .copied()
-            .collect()
-    });
-    DialectRoute { shadows, ..route }
+    s3::declare(Dialect::assemble(&RECORD)).build()
 }
 
 /// Registers the handler of both listings on `builder`.

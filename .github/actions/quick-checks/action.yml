@@ -44,6 +44,33 @@ runs:
       with:
         python-version: "3.12"
 
+    - name: Read the gateway pin
+      id: gateway-pin
+      shell: bash
+      run: python3 scripts/gateway_corpus_capture.py pins >> "$GITHUB_OUTPUT"
+
+    - name: Checkout the pinned admin route inventory and collector
+      uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7
+      with:
+        repository: rustfs/gateway
+        ref: ${{ steps.gateway-pin.outputs.rev }}
+        # The collector requires a clean RustFS checkout.
+        path: target/gateway-admin-census
+        persist-credentials: false
+        sparse-checkout-cone-mode: false
+        sparse-checkout: |
+          /scripts/
+          /crates/goldens/src/migration_inventory/rustfs_admin_routes_native.json
+          /crates/dialect-rustfs-admin/Cargo.toml
+          /crates/dialect-rustfs-admin/src/lib.rs
+          /crates/dialect-rustfs-admin/src/native.rs
+          /crates/dialect-rustfs-admin/src/native/extensions.rs
+          /crates/dialect-rustfs-admin/src/ops/
+
+    - name: Compare registered admin routes with the gateway native inventory
+      shell: bash
+      run: python3 scripts/check_gateway_admin_census.py --gateway target/gateway-admin-census
+
     - name: Install workflow parser
       shell: bash
       run: python3 -m pip install --disable-pip-version-check PyYAML==6.0.3

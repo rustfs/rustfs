@@ -987,6 +987,65 @@ fn test_admin_route_matrix_matches_registered_routes() {
     }
 }
 
+/// Compare actual registrations with the gateway's public declarations. Multiple query forms
+/// share one registered path; a MinIO admin alias canonicalizes to the same path, while a table
+/// catalog alias is registered separately.
+#[test]
+#[serial]
+fn admin_route_census() {
+    use rustfs_gateway_dialect_rustfs_admin::{EXTENSION_ROUTES, native, ops};
+
+    let router = registered_admin_router();
+    let actual: BTreeSet<_> = router.registered_routes().iter().cloned().collect();
+    let mut declared = BTreeSet::new();
+    let mut register = |method: &str, path: &str| {
+        let path = super::route_table::canonicalize_admin_path(path);
+        declared.insert(format!("{method}|{path}"));
+    };
+    for row in native::ROUTES {
+        register(row.method, row.path);
+        if let Some(alias) = row.alias {
+            register(row.method, alias);
+        }
+    }
+    for row in native::STAYING {
+        register(row.method, row.path);
+    }
+    for row in native::FORM_ROUTES {
+        register(row.method, row.path);
+    }
+    for overlay in native::extensions::control_plane::ROWS {
+        // Object Lambda dispatches directly to its handler, outside the internal admin router.
+        if overlay.name == ops::invoke_object_lambda::NAME {
+            continue;
+        }
+        let row = EXTENSION_ROUTES
+            .iter()
+            .find(|row| row.operation == overlay.name)
+            .expect("the native control-plane extension has a route record");
+        let target = match row.target {
+            "service" => "",
+            "bucket" => "{bucket}",
+            target => panic!("unknown admin registration target {target} for {}", row.operation),
+        };
+        let (key, rule) = row.query;
+        let value = match rule {
+            "present" | "equals:" => String::new(),
+            rule => format!("={}", rule.strip_prefix("equals:").expect("known query discriminator")),
+        };
+        register(row.method, &format!("?{key}{value}/{target}"));
+    }
+    let missing: Vec<_> = actual.difference(&declared).collect();
+    let extra: Vec<_> = declared.difference(&actual).collect();
+    assert!(
+        missing.is_empty() && extra.is_empty(),
+        "gateway admin census: {} registered, {} declared; missing {missing:?}; extra {extra:?}",
+        actual.len(),
+        declared.len()
+    );
+    println!("gateway admin census: {} registered, {} declared", actual.len(), declared.len());
+}
+
 #[test]
 #[serial]
 fn test_admin_route_matrix_preserves_minio_admin_aliases() {

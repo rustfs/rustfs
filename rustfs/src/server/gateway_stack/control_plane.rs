@@ -48,6 +48,7 @@ use rustfs_gateway_core::op::{AuthRequirement, ResourceShape};
 use rustfs_gateway_core::registry::{HandlerDeadlineClass, OperationSpec};
 use rustfs_gateway_core::route::{FormClaim, ShadowingDecl};
 use rustfs_gateway_core::{DerivedResourceError, NoDerived};
+use rustfs_gateway_dialect_rustfs_admin::native::extensions::control_plane;
 use rustfs_gateway_dialect_rustfs_admin::ops::{
     check_replication::CheckReplication, get_replication_metrics::GetReplicationMetrics,
     get_replication_metrics_v2::GetReplicationMetricsV2, get_replication_reset_status::GetReplicationResetStatus,
@@ -56,8 +57,7 @@ use rustfs_gateway_dialect_rustfs_admin::ops::{
     reset_bucket_replication::ResetBucketReplication,
 };
 use rustfs_gateway_dialect_rustfs_admin::{
-    AdminOperation as DialectAdminOperation, AdminResponse as WireResponse, CLAIMS, ExtensionOperation, OVERLAY,
-    TABLE_CATALOG_PREFIXES, admin,
+    AdminOperation as DialectAdminOperation, AdminResponse as WireResponse, CLAIMS, OVERLAY, TABLE_CATALOG_PREFIXES, admin,
 };
 use rustfs_gateway_stream::{ByteStream, PayloadCaps, PayloadRead, PayloadStream, StreamError, TrailingHeaders};
 use rustfs_s3_types::{Body, s3_error};
@@ -208,8 +208,7 @@ impl OperationCodec for StsForm {
     }
 }
 
-/// The gateway's query-discriminated extension rows and streamed speedtest row this host serves,
-/// recorded in the gateway's own overlay.
+/// Operations with explicit handlers that this host admits after its router's access check.
 const BORROWED: [&str; 9] = [
     PostV3SpeedtestClientDevnull::NAME,
     ResetBucketReplication::NAME,
@@ -256,16 +255,20 @@ fn dialect() -> Result<Dialect, GatewayAssemblyError> {
         anonymous: true,
         evidence: &[ROUTER],
     });
-    for name in BORROWED {
-        rows.push(OVERLAY.row(name).copied().ok_or(GatewayAssemblyError::AdminOverlayMissing)?);
-    }
+    rows.push(
+        OVERLAY
+            .row(PostV3SpeedtestClientDevnull::NAME)
+            .copied()
+            .ok_or(GatewayAssemblyError::AdminOverlayMissing)?,
+    );
+    rows.extend_from_slice(control_plane::ROWS);
     let record = RECORD.get_or_init(|| DialectOverlay {
         name: "rustfs-control-plane",
         vendor: OVERLAY.vendor,
         claims: CLAIMS,
         operations: ROWS.get_or_init(|| rows),
     });
-    Dialect::assemble(record)
+    let builder = Dialect::assemble(record)
         .declare_claimed::<ControlPlane>(ROUTE)
         .declare_claimed::<PostV3SpeedtestClientDevnull>(ClaimedRoute {
             precedence: PostV3SpeedtestClientDevnull::PRECEDENCE,
@@ -273,15 +276,8 @@ fn dialect() -> Result<Dialect, GatewayAssemblyError> {
             shadows: SPEEDTEST_SHADOWS,
             bucket_param: PostV3SpeedtestClientDevnull::BUCKET,
         })
-        .declare_form::<StsForm>(STS_ROUTE)
-        .declare::<ResetBucketReplication>(ResetBucketReplication::ROUTE)
-        .declare::<GetReplicationResetStatus>(GetReplicationResetStatus::ROUTE)
-        .declare::<GetReplicationMetricsV2>(GetReplicationMetricsV2::ROUTE)
-        .declare::<GetReplicationMetrics>(GetReplicationMetrics::ROUTE)
-        .declare::<CheckReplication>(CheckReplication::ROUTE)
-        .declare::<InvokeObjectLambda>(InvokeObjectLambda::ROUTE)
-        .declare::<ListenNotification>(ListenNotification::ROUTE)
-        .declare::<ListenBucketNotification>(ListenBucketNotification::ROUTE)
+        .declare_form::<StsForm>(STS_ROUTE);
+    control_plane::declare(builder)
         .build()
         .map_err(GatewayAssemblyError::AdminDialect)
 }
