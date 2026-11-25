@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Pre-body IAM admission for the mounted non-GET native admin operations.
+//! Pre-body IAM admission for the mounted native admin operations.
 
 use super::ClaimedHead;
 use crate::admin::handlers::site_replication::reject_site_replicator_on_public_admin;
@@ -88,14 +88,17 @@ fn permission<'a>(request: &AuthzRequest<'a>) -> S3Result<Permission<'a>> {
         return Err(s3_error!(AccessDenied, "permission queries require the caller subject"));
     }
     let (action, shape) = match request.operation {
-        ops::delete_v3_bucket_etag_by_bucket::NAME | ops::put_v3_bucket_etag_by_bucket::NAME => {
-            (AdminAction::ConfigUpdateAdminAction, ResourceShape::Bucket)
-        }
-        ops::put_v3_site_replication_peer_remove_v2::NAME | ops::put_v3_site_replication_remove_v2::NAME => {
-            (AdminAction::SiteReplicationRemoveAction, ResourceShape::Service)
-        }
+        ops::delete_v3_bucket_etag_by_bucket::NAME
+        | ops::get_v3_bucket_etag_by_bucket::NAME
+        | ops::put_v3_bucket_etag_by_bucket::NAME => (AdminAction::ConfigUpdateAdminAction, ResourceShape::Bucket),
+        ops::get_v3_site_replication_remove_v2_capabilities::NAME
+        | ops::put_v3_site_replication_peer_remove_v2::NAME
+        | ops::put_v3_site_replication_remove_v2::NAME => (AdminAction::SiteReplicationRemoveAction, ResourceShape::Service),
         ops::delete_v3_target_by_target_type_by_target_name::NAME => (AdminAction::SetBucketTargetAction, ResourceShape::Service),
-        ops::post_v4_heal_mrf_cluster_responsibilities_actions::NAME => (AdminAction::HealAdminAction, ResourceShape::Service),
+        ops::get_v4_heal_mrf_cluster::NAME
+        | ops::get_v4_heal_mrf_cluster_responsibilities::NAME
+        | ops::get_v4_heal_mrf_cluster_responsibilities_by_node_id_by_id::NAME
+        | ops::post_v4_heal_mrf_cluster_responsibilities_actions::NAME => (AdminAction::HealAdminAction, ResourceShape::Service),
         _ => return Err(s3_error!(InternalError, "unregistered native admin operation")),
     };
     let action = Action::AdminAction(action);
@@ -141,14 +144,15 @@ mod tests {
     }
 
     #[test]
-    fn etag_write_permissions_use_the_bucket_bound_by_each_operation() {
+    fn etag_permissions_use_the_bucket_bound_by_each_operation() {
         for (operation, auth) in [
+            (ops::get_v3_bucket_etag_by_bucket::NAME, ops::get_v3_bucket_etag_by_bucket::AUTH),
             (ops::put_v3_bucket_etag_by_bucket::NAME, ops::put_v3_bucket_etag_by_bucket::AUTH),
             (ops::delete_v3_bucket_etag_by_bucket::NAME, ops::delete_v3_bucket_etag_by_bucket::AUTH),
         ] {
             for name in ["first-bucket", "second-bucket"] {
                 let bucket = BucketName::new(name).expect("valid bucket name");
-                let request = route(operation, auth, Some(&bucket));
+                let mut request = route(operation, auth, Some(&bucket));
                 assert_eq!(
                     permission(&request).unwrap(),
                     Permission::Admin {
@@ -156,14 +160,34 @@ mod tests {
                         bucket: Some(name),
                     }
                 );
+                request.action = "admin:Heal";
+                assert_eq!(permission(&request).unwrap_err().code(), &S3ErrorCode::AccessDenied);
+                request.action = auth.action;
+                request.subject = Some(&Subject::Caller);
+                assert_eq!(permission(&request).unwrap_err().code(), &S3ErrorCode::AccessDenied);
             }
             assert_eq!(permission(&route(operation, auth, None)).unwrap_err().code(), &S3ErrorCode::AccessDenied);
         }
     }
 
     #[test]
-    fn service_caller_and_deferred_get_permissions_stay_fail_closed() {
+    fn service_caller_and_unknown_permissions_stay_fail_closed() {
         for (operation, auth, expected) in [
+            (
+                ops::get_v4_heal_mrf_cluster::NAME,
+                ops::get_v4_heal_mrf_cluster::AUTH,
+                AdminAction::HealAdminAction,
+            ),
+            (
+                ops::get_v4_heal_mrf_cluster_responsibilities::NAME,
+                ops::get_v4_heal_mrf_cluster_responsibilities::AUTH,
+                AdminAction::HealAdminAction,
+            ),
+            (
+                ops::get_v4_heal_mrf_cluster_responsibilities_by_node_id_by_id::NAME,
+                ops::get_v4_heal_mrf_cluster_responsibilities_by_node_id_by_id::AUTH,
+                AdminAction::HealAdminAction,
+            ),
             (
                 ops::post_v4_heal_mrf_cluster_responsibilities_actions::NAME,
                 ops::post_v4_heal_mrf_cluster_responsibilities_actions::AUTH,
@@ -173,6 +197,11 @@ mod tests {
                 ops::delete_v3_target_by_target_type_by_target_name::NAME,
                 ops::delete_v3_target_by_target_type_by_target_name::AUTH,
                 AdminAction::SetBucketTargetAction,
+            ),
+            (
+                ops::get_v3_site_replication_remove_v2_capabilities::NAME,
+                ops::get_v3_site_replication_remove_v2_capabilities::AUTH,
+                AdminAction::SiteReplicationRemoveAction,
             ),
             (
                 ops::put_v3_site_replication_peer_remove_v2::NAME,
@@ -193,6 +222,9 @@ mod tests {
                     bucket: None,
                 }
             );
+            req.action = "admin:ServerInfo";
+            assert_eq!(permission(&req).unwrap_err().code(), &S3ErrorCode::AccessDenied);
+            req.action = auth.action;
             req.subject = Some(&Subject::Caller);
             assert_eq!(permission(&req).unwrap_err().code(), &S3ErrorCode::AccessDenied);
         }
@@ -201,11 +233,11 @@ mod tests {
         assert_eq!(permission(&permissions).unwrap_err().code(), &S3ErrorCode::AccessDenied);
         permissions.subject = Some(&Subject::Caller);
         assert_eq!(permission(&permissions).unwrap(), Permission::Caller);
+        permissions.action = "admin:Heal";
+        assert_eq!(permission(&permissions).unwrap_err().code(), &S3ErrorCode::AccessDenied);
 
-        for (unmounted, auth) in [
-            (ops::get_v3_bucket_etag_by_bucket::NAME, ops::get_v3_bucket_etag_by_bucket::AUTH),
-            (ops::get_v4_heal_mrf_cluster::NAME, ops::get_v4_heal_mrf_cluster::AUTH),
-        ] {
+        for unmounted in ["rustfs:UnknownNativeAdmin", super::super::NAME] {
+            let auth = AuthRequirement::new("admin:ServerInfo", ResourceShape::Service);
             assert_eq!(permission(&route(unmounted, auth, None)).unwrap_err().code(), &S3ErrorCode::InternalError);
         }
     }

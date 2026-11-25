@@ -287,6 +287,93 @@ fn dialect() -> Result<Dialect, GatewayAssemblyError> {
         .map_err(GatewayAssemblyError::AdminDialect)
 }
 
+fn object_lambda_dialect() -> Result<Dialect, GatewayAssemblyError> {
+    static ROWS: OnceLock<Vec<OverlayRow>> = OnceLock::new();
+    static SELECTOR: OnceLock<String> = OnceLock::new();
+    static ACTION: OnceLock<String> = OnceLock::new();
+    static STS_SELECTOR: OnceLock<String> = OnceLock::new();
+    static STS_ACTION: OnceLock<String> = OnceLock::new();
+    static RECORD: OnceLock<DialectOverlay> = OnceLock::new();
+    let mut rows = vec![OverlayRow {
+        name: NAME,
+        precedence: ROUTE.precedence,
+        selector: SELECTOR.get_or_init(|| render_claimed_route(&ROUTE)),
+        action: ACTION.get_or_init(|| SPEC.auth.map(|auth| auth.render()).unwrap_or_default()),
+        resource: ResourceShape::Service,
+        success_status: 200,
+        anonymous: true,
+        evidence: &[ROUTER],
+    }];
+    rows.push(OverlayRow {
+        name: STS_NAME,
+        precedence: STS_ROUTE.precedence,
+        selector: STS_SELECTOR.get_or_init(|| STS_CLAIM.render()),
+        action: STS_ACTION.get_or_init(|| STS_SPEC.auth.map(|auth| auth.render()).unwrap_or_default()),
+        resource: ResourceShape::Service,
+        success_status: 200,
+        anonymous: true,
+        evidence: &[ROUTER],
+    });
+    rows.push(
+        OVERLAY
+            .row(PostV3SpeedtestClientDevnull::NAME)
+            .copied()
+            .ok_or(GatewayAssemblyError::AdminOverlayMissing)?,
+    );
+    rows.extend_from_slice(control_plane::ROWS);
+    let record = RECORD.get_or_init(|| DialectOverlay {
+        name: "rustfs-control-plane-object-lambda",
+        vendor: OVERLAY.vendor,
+        claims: CLAIMS,
+        operations: ROWS.get_or_init(|| rows),
+    });
+    let builder = Dialect::assemble(record)
+        .declare_claimed::<ControlPlane>(ROUTE)
+        .declare_claimed::<PostV3SpeedtestClientDevnull>(ClaimedRoute {
+            precedence: PostV3SpeedtestClientDevnull::PRECEDENCE,
+            rows: PostV3SpeedtestClientDevnull::rows(),
+            shadows: SPEEDTEST_SHADOWS,
+            bucket_param: PostV3SpeedtestClientDevnull::BUCKET,
+        })
+        .declare_form::<StsForm>(STS_ROUTE);
+    control_plane::declare(builder)
+        .build()
+        .map_err(GatewayAssemblyError::AdminDialect)
+}
+
+fn assemble_object_lambda_fallback(
+    assembly: &GatewayAssembly,
+    iam: Arc<dyn IamKeyLookup>,
+    root: Arc<dyn RootSource>,
+    router: Arc<S3Router<AdminOperation>>,
+    host: Arc<Host>,
+) -> Result<rustfs_gateway::S3Service, GatewayAssemblyError> {
+    let gate = Admission { router };
+    let authenticator = |authenticator: SigV4Authenticator| {
+        authenticator
+            .hand_caller_secret_to_handlers()
+            .verify_paths_double_encoded_under(TABLE_CATALOG_PREFIXES)
+    };
+    let (builder, _settings) = GatewayStack::configured_builder(assembly, iam, root, gate, authenticator)?
+        .config(super::service_config(assembly.body_read_timeout, CLAIMED_ROUTE_BODY_BYTES));
+    builder
+        .hand_caller_secret_to_every_operation_after_listing_in_the_posture_report()
+        .dialect(&object_lambda_dialect()?)
+        .register::<ControlPlane, _>(Arc::clone(&host))
+        .register::<PostV3SpeedtestClientDevnull, _>(Arc::clone(&host))
+        .register::<StsForm, _>(Arc::clone(&host))
+        .register::<ResetBucketReplication, _>(Arc::clone(&host))
+        .register::<GetReplicationResetStatus, _>(Arc::clone(&host))
+        .register::<GetReplicationMetricsV2, _>(Arc::clone(&host))
+        .register::<GetReplicationMetrics, _>(Arc::clone(&host))
+        .register::<CheckReplication, _>(Arc::clone(&host))
+        .register::<InvokeObjectLambda, _>(Arc::clone(&host))
+        .register::<ListenNotification, _>(Arc::clone(&host))
+        .register::<ListenBucketNotification, _>(host)
+        .build()
+        .map_err(GatewayAssemblyError::Service)
+}
+
 /// Assembles the host over `router`, the admin router the legacy stack mounts.
 pub(super) fn assemble(
     assembly: GatewayAssembly,
@@ -305,11 +392,12 @@ pub(super) fn assemble(
             .verify_paths_double_encoded_under(TABLE_CATALOG_PREFIXES)
     };
     let host = Arc::new(Host {
-        router,
+        router: Arc::clone(&router),
         server_ctx: Arc::clone(&assembly.server_ctx),
     });
-    let (builder, _settings) = GatewayStack::configured_builder(&assembly, iam, root, gate, authenticator)?
-        .config(super::service_config(assembly.body_read_timeout, CLAIMED_ROUTE_BODY_BYTES));
+    let (builder, _settings) =
+        GatewayStack::configured_builder(&assembly, Arc::clone(&iam), Arc::clone(&root), gate, authenticator)?
+            .config(super::service_config(assembly.body_read_timeout, CLAIMED_ROUTE_BODY_BYTES));
     let builder = native_routes::register(builder, &host);
     let service = builder
         .hand_caller_secret_to_every_operation_after_listing_in_the_posture_report()
@@ -324,13 +412,15 @@ pub(super) fn assemble(
         .register::<CheckReplication, _>(Arc::clone(&host))
         .register::<InvokeObjectLambda, _>(Arc::clone(&host))
         .register::<ListenNotification, _>(Arc::clone(&host))
-        .register::<ListenBucketNotification, _>(host)
+        .register::<ListenBucketNotification, _>(Arc::clone(&host))
         .build()
         .map_err(GatewayAssemblyError::Service)?;
+    let object_lambda_fallback = assemble_object_lambda_fallback(&assembly, iam, root, router, host)?;
     Ok(GatewayStack {
         service,
         keystone_auth: assembly.keystone_auth,
         control_plane: true,
+        object_lambda_fallback: Some(object_lambda_fallback),
     })
 }
 

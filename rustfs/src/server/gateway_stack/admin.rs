@@ -147,6 +147,7 @@ pub(super) fn assemble(
         service,
         keystone_auth: assembly.keystone_auth,
         control_plane: false,
+        object_lambda_fallback: None,
     })
 }
 

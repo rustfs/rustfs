@@ -166,6 +166,8 @@ pub(crate) struct GatewayStack {
     keystone_auth: Option<Arc<rustfs_keystone::KeystoneAuthProvider>>,
     /// Whether this is the control-plane host, which reads each request's head before the gateway.
     control_plane: bool,
+    /// Companion control-plane service without GET native admin routes, used for Object Lambda requests.
+    object_lambda_fallback: Option<rustfs_gateway::S3Service>,
 }
 
 impl GatewayStack {
@@ -222,6 +224,7 @@ impl GatewayStack {
             service,
             keystone_auth: assembly.keystone_auth,
             control_plane: false,
+            object_lambda_fallback: None,
         })
     }
 
@@ -242,6 +245,7 @@ impl GatewayStack {
             service,
             keystone_auth: assembly.keystone_auth,
             control_plane: false,
+            object_lambda_fallback: None,
         })
     }
 
@@ -334,7 +338,12 @@ impl GatewayStack {
         attach_host_facts(extensions);
         // `Connection` is an HTTP/1 header; HTTP/2 and HTTP/3 forbid it and end only the stream.
         let http1 = request.version() < http::Version::HTTP_2;
-        let service = self.service.clone();
+        let service = match self.object_lambda_fallback.as_ref() {
+            Some(fallback) if crate::admin::router::object_lambda_target(request.method(), request.uri()).is_some() => {
+                fallback.clone()
+            }
+            _ => self.service.clone(),
+        };
         async move {
             if !valid {
                 let mut response = Response::new(rustfs_gateway::Body::empty());

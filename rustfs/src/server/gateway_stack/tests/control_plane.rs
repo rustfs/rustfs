@@ -634,24 +634,23 @@ async fn an_unsigned_amz_header_is_refused_before_any_control_plane_handler() {
     }
 }
 
-#[tokio::test]
-#[serial_test::serial]
-async fn typed_admin_routes_enforce_pre_body_iam_target_validation_and_presigned_object_lambda() {
+const TYPED_ADMIN_USER: &str = "typed-admin-caller";
+const TYPED_ADMIN_SECRET: &str = "typed-admin-caller-test-secret";
+const TYPED_ADMIN_DENIED_USER: &str = "typed-admin-denied";
+const TYPED_ADMIN_DENIED_SECRET: &str = "typed-admin-denied-test-secret";
+const TYPED_ADMIN_REPLICATOR_SECRET: &str = "siteReplicatorSecretKeyForTest1234567890";
+const TYPED_ADMIN_ALLOWED_BUCKET: &str = "typed-etag-allowed";
+const TYPED_ADMIN_DENIED_BUCKET: &str = "typed-etag-denied";
+
+async fn build_typed_admin_fixture() -> (rustfs_test_utils::TestECStoreEnv, GatewayStack) {
     use crate::app::storage_api::test::contract::bucket::{BucketOperations as _, MakeBucketOptions};
     use crate::runtime_sources::{AppContext, publish_test_app_context};
-    use rustfs_gateway_dialect_rustfs_admin::native::{extensions, ops as native_ops};
     use rustfs_iam::store::object::{IAM_CONFIG_PREFIX, ObjectStore};
     use rustfs_iam::store::{Store as _, UserType};
     use rustfs_iam::sys::{NewServiceAccountOpts, SITE_REPLICATOR_SERVICE_ACCOUNT};
     use rustfs_madmin::{AccountStatus, AddOrUpdateUserReq};
     use rustfs_policy::policy::Policy;
-    use serde_json::{Value, json};
-
-    const USER: &str = "typed-admin-caller";
-    const SECRET: &str = "typed-admin-caller-test-secret";
-    const REPLICATOR_SECRET: &str = "siteReplicatorSecretKeyForTest1234567890";
-    const ALLOWED_BUCKET: &str = "typed-etag-allowed";
-    const DENIED_BUCKET: &str = "typed-etag-denied";
+    use serde_json::json;
 
     let env = rustfs_test_utils::TestECStoreEnv::builder()
         .prefix("typed_admin_routes")
@@ -659,7 +658,7 @@ async fn typed_admin_routes_enforce_pre_body_iam_target_validation_and_presigned
         .init_bucket_metadata(true)
         .build()
         .await;
-    for bucket in [ALLOWED_BUCKET, DENIED_BUCKET] {
+    for bucket in [TYPED_ADMIN_ALLOWED_BUCKET, TYPED_ADMIN_DENIED_BUCKET] {
         env.ecstore
             .make_bucket(bucket, &MakeBucketOptions::default())
             .await
@@ -670,29 +669,34 @@ async fn typed_admin_routes_enforce_pre_body_iam_target_validation_and_presigned
         .await
         .expect("IAM format");
     let iam = rustfs_iam::build_iam_sys(env.ecstore.clone()).await.expect("ready IAM");
-    iam.create_user(
-        USER,
-        &AddOrUpdateUserReq {
-            secret_key: SECRET.to_owned(),
-            policy: None,
-            status: AccountStatus::Enabled,
-        },
-    )
-    .await
-    .expect("create caller");
+    for (name, secret) in [
+        (TYPED_ADMIN_USER, TYPED_ADMIN_SECRET),
+        (TYPED_ADMIN_DENIED_USER, TYPED_ADMIN_DENIED_SECRET),
+    ] {
+        iam.create_user(
+            name,
+            &AddOrUpdateUserReq {
+                secret_key: secret.to_owned(),
+                policy: None,
+                status: AccountStatus::Enabled,
+            },
+        )
+        .await
+        .expect("create caller");
+    }
     let policy = Policy::parse_config(
         format!(
             r#"{{"Version":"2012-10-17","Statement":[
                 {{"Effect":"Allow","Action":["admin:SiteReplicationRemove","admin:ConfigUpdate"]}},
-                {{"Effect":"Deny","Action":"*","Resource":["arn:aws:s3:::{DENIED_BUCKET}","arn:aws:s3:::{DENIED_BUCKET}/*"]}},
+                {{"Effect":"Deny","Action":"*","Resource":["arn:aws:s3:::{TYPED_ADMIN_DENIED_BUCKET}","arn:aws:s3:::{TYPED_ADMIN_DENIED_BUCKET}/*"]}},
                 {{"Effect":"Allow","Action":"s3:GetObject","Resource":["arn:aws:s3:::rustfs/*","arn:aws:s3:::minio/*"]}}
             ]}}"#
         )
         .as_bytes(),
     )
     .expect("caller policy");
-    iam.set_policy(USER, policy).await.expect("save caller policy");
-    iam.policy_db_set(USER, UserType::Reg, false, USER)
+    iam.set_policy(TYPED_ADMIN_USER, policy).await.expect("save caller policy");
+    iam.policy_db_set(TYPED_ADMIN_USER, UserType::Reg, false, TYPED_ADMIN_USER)
         .await
         .expect("attach caller policy");
 
@@ -719,7 +723,7 @@ async fn typed_admin_routes_enforce_pre_body_iam_target_validation_and_presigned
         None,
         NewServiceAccountOpts {
             access_key: SITE_REPLICATOR_SERVICE_ACCOUNT.to_owned(),
-            secret_key: REPLICATOR_SECRET.to_owned(),
+            secret_key: TYPED_ADMIN_REPLICATOR_SECRET.to_owned(),
             session_policy: Some(replicator_policy),
             allow_site_replicator_account: true,
             ..Default::default()
@@ -732,35 +736,11 @@ async fn typed_admin_routes_enforce_pre_body_iam_target_validation_and_presigned
     assert!(assembly.server_ctx.install(context));
     let router = crate::admin::make_admin_router(false, assembly.server_ctx.clone()).expect("production router");
     let stack = GatewayStack::assemble_control_plane(assembly, Arc::new(router)).expect("control-plane stack");
+    (env, stack)
+}
 
-    // All 8 extension rows and all 7 non-GET native claimed routes are registered on the service,
-    // while the 5 GET native routes stay on ControlPlane so Object Lambda presigned URLs work.
-    for row in extensions::control_plane::ROWS {
-        assert!(stack.service.operations().any(|registered| registered == row.name), "{}", row.name);
-    }
-    for mounted in [
-        native_ops::delete_v3_bucket_etag_by_bucket::NAME,
-        native_ops::delete_v3_target_by_target_type_by_target_name::NAME,
-        native_ops::post_v4_account_permissions::NAME,
-        native_ops::post_v4_heal_mrf_cluster_responsibilities_actions::NAME,
-        native_ops::put_v3_bucket_etag_by_bucket::NAME,
-        native_ops::put_v3_site_replication_peer_remove_v2::NAME,
-        native_ops::put_v3_site_replication_remove_v2::NAME,
-    ] {
-        assert!(stack.service.operations().any(|registered| registered == mounted), "{mounted}");
-    }
-    for deferred_get in [
-        native_ops::get_v3_bucket_etag_by_bucket::NAME,
-        native_ops::get_v3_site_replication_remove_v2_capabilities::NAME,
-        native_ops::get_v4_heal_mrf_cluster::NAME,
-        native_ops::get_v4_heal_mrf_cluster_responsibilities::NAME,
-        native_ops::get_v4_heal_mrf_cluster_responsibilities_by_node_id_by_id::NAME,
-    ] {
-        assert!(
-            !stack.service.operations().any(|registered| registered == deferred_get),
-            "{deferred_get} must stay deferred"
-        );
-    }
+async fn assert_typed_admin_permissions_and_etag(stack: &GatewayStack) {
+    use serde_json::{Value, json};
 
     // 1. Subject::Caller self-query on PostV4AccountPermissions (canonical and MinIO alias).
     for prefix in ["/rustfs/admin", "/minio/admin"] {
@@ -768,13 +748,13 @@ async fn typed_admin_routes_enforce_pre_body_iam_target_validation_and_presigned
             Method::POST,
             &format!("{prefix}/v4/account/permissions"),
             "",
-            USER,
-            SECRET,
+            TYPED_ADMIN_USER,
+            TYPED_ADMIN_SECRET,
             Bytes::from_static(
                 br#"{"checks":[{"id":"capabilities","action":"admin:SiteReplicationRemove"},{"id":"heal","action":"admin:Heal"}]}"#,
             ),
         );
-        let (status, _, body) = answer_request_full(&stack, request).await;
+        let (status, _, body) = Box::pin(answer_request_full(stack, request)).await;
         assert_eq!(status, StatusCode::OK, "{prefix}: {body}");
         assert_eq!(
             serde_json::from_str::<Value>(&body).expect("permission results"),
@@ -785,33 +765,33 @@ async fn typed_admin_routes_enforce_pre_body_iam_target_validation_and_presigned
         );
     }
 
-    // 2. Bucket-scoped ConfigUpdateAdminAction + pre-body IAM denial on Put/DeleteV3BucketEtagByBucket.
+    // 2. Bucket-scoped ConfigUpdateAdminAction + pre-body IAM denial on Put/Get/DeleteV3BucketEtagByBucket.
     let etag_body = Bytes::from_static(br#"{"algorithm":"xxh3"}"#);
     let unused_delete_body = Bytes::from_static(b"aaaa");
     for prefix in ["/rustfs/admin", "/minio/admin"] {
         let denied_put = signed_body_request(
             Method::PUT,
-            &format!("{prefix}/v3/bucket-etag/{DENIED_BUCKET}"),
+            &format!("{prefix}/v3/bucket-etag/{TYPED_ADMIN_DENIED_BUCKET}"),
             "",
-            USER,
-            SECRET,
+            TYPED_ADMIN_USER,
+            TYPED_ADMIN_SECRET,
             etag_body.clone(),
         );
         let (counted_put, put_bytes_read) = CountedBody::new(etag_body.len());
-        let response = stack.call(denied_put.map(|_| counted_put)).await;
+        let response = Box::pin(stack.call(denied_put.map(|_| counted_put))).await;
         assert_eq!(response.status(), StatusCode::FORBIDDEN, "{prefix} denied PUT");
         assert_eq!(put_bytes_read.load(Ordering::SeqCst), 0, "{prefix} denied PUT read body");
 
         let denied_delete = signed_body_request(
             Method::DELETE,
-            &format!("{prefix}/v3/bucket-etag/{DENIED_BUCKET}"),
+            &format!("{prefix}/v3/bucket-etag/{TYPED_ADMIN_DENIED_BUCKET}"),
             "",
-            USER,
-            SECRET,
+            TYPED_ADMIN_USER,
+            TYPED_ADMIN_SECRET,
             unused_delete_body.clone(),
         );
         let (counted_delete, delete_bytes_read) = CountedBody::new(unused_delete_body.len());
-        let response = stack.call(denied_delete.map(|_| counted_delete)).await;
+        let response = Box::pin(stack.call(denied_delete.map(|_| counted_delete))).await;
         assert_eq!(response.status(), StatusCode::FORBIDDEN, "{prefix} denied DELETE");
         assert_eq!(delete_bytes_read.load(Ordering::SeqCst), 0, "{prefix} denied DELETE read body");
 
@@ -819,61 +799,104 @@ async fn typed_admin_routes_enforce_pre_body_iam_target_validation_and_presigned
         let presigned_delete = signed_request(
             Signed::Query,
             Method::DELETE,
-            &format!("{prefix}/v3/bucket-etag/{ALLOWED_BUCKET}"),
+            &format!("{prefix}/v3/bucket-etag/{TYPED_ADMIN_ALLOWED_BUCKET}"),
             "",
-            USER,
-            SECRET,
+            TYPED_ADMIN_USER,
+            TYPED_ADMIN_SECRET,
         );
-        let (status, _, _) = answer_request(&stack, presigned_delete).await;
+        let (status, _, _) = Box::pin(answer_request(stack, presigned_delete)).await;
         assert_eq!(status, StatusCode::FORBIDDEN, "{prefix} presigned native DELETE");
 
-        // Allowed bucket succeeds on both PUT and body-draining DELETE for both prefixes.
+        // Allowed bucket succeeds on PUT, GET, and body-draining DELETE for both prefixes;
+        // GET enforces bucket-scoped IAM and the header-only floor.
         let allowed_put = signed_body_request(
             Method::PUT,
-            &format!("{prefix}/v3/bucket-etag/{ALLOWED_BUCKET}"),
+            &format!("{prefix}/v3/bucket-etag/{TYPED_ADMIN_ALLOWED_BUCKET}"),
             "",
-            USER,
-            SECRET,
+            TYPED_ADMIN_USER,
+            TYPED_ADMIN_SECRET,
             etag_body.clone(),
         );
-        let (status, _, body) = answer_request_full(&stack, allowed_put).await;
+        let (status, _, body) = Box::pin(answer_request_full(stack, allowed_put)).await;
         assert_eq!(status, StatusCode::OK, "{prefix} allowed PUT: {body}");
         assert_eq!(
             serde_json::from_str::<Value>(&body).expect("set bucket etag"),
-            json!({"bucket": ALLOWED_BUCKET, "algorithm": "xxh3"})
+            json!({"bucket": TYPED_ADMIN_ALLOWED_BUCKET, "algorithm": "xxh3"})
         );
+
+        let allowed_get = signed_request(
+            Signed::Header,
+            Method::GET,
+            &format!("{prefix}/v3/bucket-etag/{TYPED_ADMIN_ALLOWED_BUCKET}"),
+            "",
+            TYPED_ADMIN_USER,
+            TYPED_ADMIN_SECRET,
+        );
+        let (status, _, body) = Box::pin(answer_request(stack, allowed_get)).await;
+        assert_eq!(status, StatusCode::OK, "{prefix} allowed GET: {body}");
+        assert_eq!(
+            serde_json::from_str::<Value>(&body).expect("get bucket etag"),
+            json!({"bucket": TYPED_ADMIN_ALLOWED_BUCKET, "algorithm": "xxh3"})
+        );
+
+        let denied_get = signed_request(
+            Signed::Header,
+            Method::GET,
+            &format!("{prefix}/v3/bucket-etag/{TYPED_ADMIN_DENIED_BUCKET}"),
+            "",
+            TYPED_ADMIN_USER,
+            TYPED_ADMIN_SECRET,
+        );
+        let (status, _, body) = Box::pin(answer_request(stack, denied_get)).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{prefix} denied GET: {body}");
+
+        let presigned_get = signed_request(
+            Signed::Query,
+            Method::GET,
+            &format!("{prefix}/v3/bucket-etag/{TYPED_ADMIN_ALLOWED_BUCKET}"),
+            "",
+            TYPED_ADMIN_USER,
+            TYPED_ADMIN_SECRET,
+        );
+        let (status, _, body) = Box::pin(answer_request(stack, presigned_get)).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{prefix} presigned native GET: {body}");
 
         let allowed_delete = signed_body_request(
             Method::DELETE,
-            &format!("{prefix}/v3/bucket-etag/{ALLOWED_BUCKET}"),
+            &format!("{prefix}/v3/bucket-etag/{TYPED_ADMIN_ALLOWED_BUCKET}"),
             "",
-            USER,
-            SECRET,
+            TYPED_ADMIN_USER,
+            TYPED_ADMIN_SECRET,
             unused_delete_body.clone(),
         );
         let (counted, bytes_read) = CountedBody::new(unused_delete_body.len());
-        let response = stack.call(allowed_delete.map(|_| counted)).await;
+        let response = Box::pin(stack.call(allowed_delete.map(|_| counted))).await;
         assert_eq!(response.status(), StatusCode::OK, "{prefix} allowed DELETE");
         assert_eq!(bytes_read.load(Ordering::SeqCst), unused_delete_body.len());
         let deleted = response.into_body().collect().await.expect("delete etag body").to_bytes();
         assert_eq!(
             serde_json::from_slice::<Value>(&deleted).expect("deleted bucket etag"),
-            json!({"bucket": ALLOWED_BUCKET, "algorithm": null})
+            json!({"bucket": TYPED_ADMIN_ALLOWED_BUCKET, "algorithm": null})
         );
     }
+}
+
+async fn assert_typed_admin_target_replication_and_heal_writes(stack: &GatewayStack) {
+    use rustfs_iam::sys::SITE_REPLICATOR_SERVICE_ACCOUNT;
 
     // 3. Notification target parameter validation runs BEFORE IAM on DeleteV3TargetByTargetTypeByTargetName.
+    let unused_delete_body = Bytes::from_static(b"aaaa");
     for prefix in ["/rustfs/admin", "/minio/admin"] {
         let invalid_target = signed_body_request(
             Method::DELETE,
             &format!("{prefix}/v3/target/not-a-supported-target/test-name"),
             "",
-            USER,
-            SECRET,
+            TYPED_ADMIN_USER,
+            TYPED_ADMIN_SECRET,
             unused_delete_body.clone(),
         );
         let (counted_invalid, invalid_read) = CountedBody::new(unused_delete_body.len());
-        let response = stack.call(invalid_target.map(|_| counted_invalid)).await;
+        let response = Box::pin(stack.call(invalid_target.map(|_| counted_invalid))).await;
         let status = response.status();
         let body = String::from_utf8_lossy(&response.into_body().collect().await.expect("error body").to_bytes()).into_owned();
         assert_eq!(status, StatusCode::BAD_REQUEST, "{prefix} invalid target: {body}");
@@ -884,12 +907,12 @@ async fn typed_admin_routes_enforce_pre_body_iam_target_validation_and_presigned
             Method::DELETE,
             &format!("{prefix}/v3/target/{}/test-name", rustfs_config::notify::NOTIFY_WEBHOOK_SUB_SYS),
             "",
-            USER,
-            SECRET,
+            TYPED_ADMIN_USER,
+            TYPED_ADMIN_SECRET,
             unused_delete_body.clone(),
         );
         let (counted_unauth, unauth_read) = CountedBody::new(unused_delete_body.len());
-        let response = stack.call(valid_target_unauth.map(|_| counted_unauth)).await;
+        let response = Box::pin(stack.call(valid_target_unauth.map(|_| counted_unauth))).await;
         assert_eq!(response.status(), StatusCode::FORBIDDEN, "{prefix} valid target unauthorized");
         assert_eq!(unauth_read.load(Ordering::SeqCst), 0);
     }
@@ -903,11 +926,11 @@ async fn typed_admin_routes_enforce_pre_body_iam_target_validation_and_presigned
             &format!("{prefix}/v3/site-replication/remove-v2"),
             "",
             SITE_REPLICATOR_SERVICE_ACCOUNT,
-            REPLICATOR_SECRET,
+            TYPED_ADMIN_REPLICATOR_SECRET,
             removal_payload.clone(),
         );
         let (counted_public, public_read) = CountedBody::new(removal_payload.len());
-        let response = stack.call(public_remove.map(|_| counted_public)).await;
+        let response = Box::pin(stack.call(public_remove.map(|_| counted_public))).await;
         assert_eq!(response.status(), StatusCode::FORBIDDEN, "{prefix} public remove-v2");
         assert_eq!(public_read.load(Ordering::SeqCst), 0, "{prefix} public remove-v2 read body");
 
@@ -916,11 +939,11 @@ async fn typed_admin_routes_enforce_pre_body_iam_target_validation_and_presigned
             &format!("{prefix}/v3/site-replication/peer/remove-v2"),
             "",
             SITE_REPLICATOR_SERVICE_ACCOUNT,
-            REPLICATOR_SECRET,
+            TYPED_ADMIN_REPLICATOR_SECRET,
             removal_payload.clone(),
         );
         let (counted_peer, peer_read) = CountedBody::new(removal_payload.len());
-        let _response = stack.call(peer_remove.map(|_| counted_peer)).await;
+        let _response = Box::pin(stack.call(peer_remove.map(|_| counted_peer))).await;
         assert_eq!(peer_read.load(Ordering::SeqCst), removal_payload.len(), "{prefix} peer remove-v2");
     }
 
@@ -930,12 +953,12 @@ async fn typed_admin_routes_enforce_pre_body_iam_target_validation_and_presigned
         Method::POST,
         "/rustfs/admin/v4/heal/mrf/cluster/responsibilities/actions",
         "",
-        USER,
-        SECRET,
+        TYPED_ADMIN_USER,
+        TYPED_ADMIN_SECRET,
         heal_payload.clone(),
     );
     let (counted_heal, heal_read) = CountedBody::new(heal_payload.len());
-    let response = stack.call(unauth_heal.map(|_| counted_heal)).await;
+    let response = Box::pin(stack.call(unauth_heal.map(|_| counted_heal))).await;
     assert_eq!(response.status(), StatusCode::FORBIDDEN);
     assert_eq!(heal_read.load(Ordering::SeqCst), 0);
 
@@ -948,36 +971,160 @@ async fn typed_admin_routes_enforce_pre_body_iam_target_validation_and_presigned
         heal_payload.clone(),
     );
     let (counted_root_heal, root_heal_read) = CountedBody::new(heal_payload.len());
-    let _response = stack.call(root_heal.map(|_| counted_root_heal)).await;
+    let _response = Box::pin(stack.call(root_heal.map(|_| counted_root_heal))).await;
     assert_eq!(root_heal_read.load(Ordering::SeqCst), heal_payload.len());
+}
 
-    // 6. Deferred GET paths stay on ControlPlane so admin GETs and presigned Object Lambda (#1577) both work.
+async fn assert_typed_admin_gets_and_object_lambda_fallback(stack: &GatewayStack) {
+    use rustfs_iam::sys::SITE_REPLICATOR_SERVICE_ACCOUNT;
+    use serde_json::{Value, json};
+
+    // 6. Mounted GET native routes enforce header-only floor and IAM while Object Lambda (#1577)
+    // routes through object_lambda_fallback on all 5 overlapping GET paths.
     let expected = json!({"contractVersion":2,"durableCleanup":true});
     for prefix in ["/rustfs/admin", "/minio/admin"] {
-        let path = format!("{prefix}/v3/site-replication/remove-v2/capabilities");
-        let admin_get = signed_request(Signed::Header, Method::GET, &path, "local=true", USER, SECRET);
-        let (status, _, body) = answer_request(&stack, admin_get).await;
-        assert_eq!(status, StatusCode::OK, "{path}: {body}");
+        let capabilities_path = format!("{prefix}/v3/site-replication/remove-v2/capabilities");
+
+        let user_capabilities = signed_request(
+            Signed::Header,
+            Method::GET,
+            &capabilities_path,
+            "local=true",
+            TYPED_ADMIN_USER,
+            TYPED_ADMIN_SECRET,
+        );
+        let (status, _, body) = Box::pin(answer_request(stack, user_capabilities)).await;
+        assert_eq!(status, StatusCode::OK, "{capabilities_path} USER: {body}");
         assert_eq!(serde_json::from_str::<Value>(&body).expect("removal capabilities"), expected);
 
-        let lambda_query = "lambdaArn=arn%3Aacme%3As3-object-lambda%3A%3Atransformer%3Awebhook";
-        for lambda_path in [
-            path.clone(),
-            format!("{prefix}/v3/bucket-etag/{ALLOWED_BUCKET}"),
+        let replicator_capabilities = signed_request(
+            Signed::Header,
+            Method::GET,
+            &capabilities_path,
+            "local=true",
+            SITE_REPLICATOR_SERVICE_ACCOUNT,
+            TYPED_ADMIN_REPLICATOR_SECRET,
+        );
+        let (status, _, body) = Box::pin(answer_request(stack, replicator_capabilities)).await;
+        assert_eq!(status, StatusCode::OK, "{capabilities_path} replicator: {body}");
+        assert_eq!(serde_json::from_str::<Value>(&body).expect("replicator removal capabilities"), expected);
+
+        let denied_capabilities = signed_request(
+            Signed::Header,
+            Method::GET,
+            &capabilities_path,
+            "local=true",
+            TYPED_ADMIN_DENIED_USER,
+            TYPED_ADMIN_DENIED_SECRET,
+        );
+        let (status, _, body) = Box::pin(answer_request(stack, denied_capabilities)).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{capabilities_path} unauthorized: {body}");
+
+        let presigned_capabilities = signed_request(
+            Signed::Query,
+            Method::GET,
+            &capabilities_path,
+            "local=true",
+            TYPED_ADMIN_USER,
+            TYPED_ADMIN_SECRET,
+        );
+        let (status, _, body) = Box::pin(answer_request(stack, presigned_capabilities)).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{capabilities_path} presigned: {body}");
+
+        for heal_path in [
             format!("{prefix}/v4/heal/mrf/cluster"),
+            format!("{prefix}/v4/heal/mrf/cluster/responsibilities"),
+            format!("{prefix}/v4/heal/mrf/cluster/responsibilities/node1/id1"),
         ] {
+            let unauth_heal_get =
+                signed_request(Signed::Header, Method::GET, &heal_path, "", TYPED_ADMIN_USER, TYPED_ADMIN_SECRET);
+            let (status, _, body) = Box::pin(answer_request(stack, unauth_heal_get)).await;
+            assert_eq!(status, StatusCode::FORBIDDEN, "{heal_path} unauthorized: {body}");
+
+            let presigned_heal_get = signed_request(Signed::Query, Method::GET, &heal_path, "", ROOT_ACCESS_KEY, ROOT_SECRET_KEY);
+            let (status, _, body) = Box::pin(answer_request(stack, presigned_heal_get)).await;
+            assert_eq!(status, StatusCode::FORBIDDEN, "{heal_path} presigned: {body}");
+
+            let root_heal_get = signed_request(Signed::Header, Method::GET, &heal_path, "", ROOT_ACCESS_KEY, ROOT_SECRET_KEY);
+            let (status, _, body) = Box::pin(answer_request(stack, root_heal_get)).await;
+            assert_ne!(status, StatusCode::FORBIDDEN, "{heal_path} root must be admitted: {body}");
+            assert_ne!(status, StatusCode::UNAUTHORIZED, "{heal_path} root must be admitted: {body}");
+        }
+
+        let lambda_query = "lambdaArn=arn%3Aacme%3As3-object-lambda%3A%3Atransformer%3Awebhook";
+        let overlapping_paths = [
+            capabilities_path.clone(),
+            format!("{prefix}/v3/bucket-etag/{TYPED_ADMIN_ALLOWED_BUCKET}"),
+            format!("{prefix}/v4/heal/mrf/cluster"),
+            format!("{prefix}/v4/heal/mrf/cluster/responsibilities"),
+            format!("{prefix}/v4/heal/mrf/cluster/responsibilities/node1/id1"),
+        ];
+        for lambda_path in &overlapping_paths {
             for form in [Signed::Header, Signed::Query] {
-                let lambda_get = signed_request(form, Method::GET, &lambda_path, lambda_query, USER, SECRET);
-                let (status, _, body) = answer_request(&stack, lambda_get).await;
+                let lambda_get =
+                    signed_request(form, Method::GET, lambda_path, lambda_query, TYPED_ADMIN_USER, TYPED_ADMIN_SECRET);
+                let (status, _, body) = Box::pin(answer_request(stack, lambda_get)).await;
                 assert_eq!(status, StatusCode::NOT_FOUND, "{lambda_path}?{lambda_query}: {body}");
                 assert!(body.contains("<Code>NoSuchBucket</Code>"), "{lambda_path}?{lambda_query}: {body}");
             }
         }
 
         let encoded_query = "lambda%41rn=arn%3Aacme%3As3-object-lambda%3A%3Atransformer%3Awebhook";
-        let encoded_get = signed_request(Signed::Query, Method::GET, &path, encoded_query, USER, SECRET);
-        let (status, _, body) = answer_request(&stack, encoded_get).await;
-        assert_eq!(status, StatusCode::BAD_REQUEST, "{path}?{encoded_query}: {body}");
-        assert!(body.contains("<Code>InvalidArgument</Code>"), "{path}?{encoded_query}: {body}");
+        let encoded_get = signed_request(
+            Signed::Query,
+            Method::GET,
+            &capabilities_path,
+            encoded_query,
+            TYPED_ADMIN_USER,
+            TYPED_ADMIN_SECRET,
+        );
+        let (status, _, body) = Box::pin(answer_request(stack, encoded_get)).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{capabilities_path}?{encoded_query}: {body}");
+        assert!(
+            body.contains("<Code>InvalidArgument</Code>"),
+            "{capabilities_path}?{encoded_query}: {body}"
+        );
     }
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn typed_admin_routes_enforce_pre_body_iam_target_validation_and_presigned_object_lambda() {
+    use rustfs_gateway_dialect_rustfs_admin::native::{extensions, ops as native_ops};
+
+    let (_env, stack) = Box::pin(build_typed_admin_fixture()).await;
+
+    // All 8 extension rows and all 12 native claimed routes are registered on the primary service,
+    // while the companion Object Lambda fallback service omits all 12 native claimed routes.
+    let fallback = stack.object_lambda_fallback.as_ref().expect("object lambda fallback");
+    for row in extensions::control_plane::ROWS {
+        assert!(stack.service.operations().any(|registered| registered == row.name), "{}", row.name);
+        assert!(fallback.operations().any(|registered| registered == row.name), "fallback {}", row.name);
+    }
+    let all_native_ops = [
+        native_ops::delete_v3_bucket_etag_by_bucket::NAME,
+        native_ops::delete_v3_target_by_target_type_by_target_name::NAME,
+        native_ops::get_v3_bucket_etag_by_bucket::NAME,
+        native_ops::get_v3_site_replication_remove_v2_capabilities::NAME,
+        native_ops::get_v4_heal_mrf_cluster::NAME,
+        native_ops::get_v4_heal_mrf_cluster_responsibilities::NAME,
+        native_ops::get_v4_heal_mrf_cluster_responsibilities_by_node_id_by_id::NAME,
+        native_ops::post_v4_account_permissions::NAME,
+        native_ops::post_v4_heal_mrf_cluster_responsibilities_actions::NAME,
+        native_ops::put_v3_bucket_etag_by_bucket::NAME,
+        native_ops::put_v3_site_replication_peer_remove_v2::NAME,
+        native_ops::put_v3_site_replication_remove_v2::NAME,
+    ];
+    assert_eq!(all_native_ops.len(), 12);
+    for mounted in all_native_ops {
+        assert!(stack.service.operations().any(|registered| registered == mounted), "{mounted}");
+        assert!(
+            !fallback.operations().any(|registered| registered == mounted),
+            "{mounted} must not be registered on object lambda fallback"
+        );
+    }
+
+    Box::pin(assert_typed_admin_permissions_and_etag(&stack)).await;
+    Box::pin(assert_typed_admin_target_replication_and_heal_writes(&stack)).await;
+    Box::pin(assert_typed_admin_gets_and_object_lambda_fallback(&stack)).await;
 }

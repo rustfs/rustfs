@@ -12,10 +12,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Non-GET native admin routes served ahead of the host's control-plane catch-all.
+//! Native admin routes served ahead of the host's control-plane catch-all.
 //!
-//! GET admin routes stay on [`super::ControlPlane`] until `GatewayStack` carries a dedicated
-//! Object Lambda fallback, preserving presigned `?lambdaArn=...` requests (#1577).
+//! All 12 native control-plane admin routes are mounted here; Object Lambda requests route
+//! through `GatewayStack::object_lambda_fallback`, preserving header-signed and presigned
+//! `?lambdaArn=...` requests (#1577).
 
 use super::{Host, NAME, ROUTER};
 use rustfs_gateway::ServiceBuilder;
@@ -58,6 +59,11 @@ macro_rules! native_routes {
 native_routes!(
     delete_v3_bucket_etag_by_bucket::DeleteV3BucketEtagByBucket,
     delete_v3_target_by_target_type_by_target_name::DeleteV3TargetByTargetTypeByTargetName,
+    get_v3_bucket_etag_by_bucket::GetV3BucketEtagByBucket,
+    get_v3_site_replication_remove_v2_capabilities::GetV3SiteReplicationRemoveV2Capabilities,
+    get_v4_heal_mrf_cluster::GetV4HealMrfCluster,
+    get_v4_heal_mrf_cluster_responsibilities::GetV4HealMrfClusterResponsibilities,
+    get_v4_heal_mrf_cluster_responsibilities_by_node_id_by_id::GetV4HealMrfClusterResponsibilitiesByNodeIdById,
     post_v4_account_permissions::PostV4AccountPermissions,
     post_v4_heal_mrf_cluster_responsibilities_actions::PostV4HealMrfClusterResponsibilitiesActions,
     put_v3_bucket_etag_by_bucket::PutV3BucketEtagByBucket,
@@ -79,8 +85,9 @@ mod tests {
     use rustfs_gateway_dialect_rustfs_admin::{ROUTES, native};
 
     #[test]
-    fn non_get_native_admin_routes_precede_the_control_plane_and_get_routes_stay_deferred() {
+    fn all_native_admin_routes_precede_the_control_plane_and_are_absent_from_object_lambda_fallback() {
         let dialect = super::super::dialect().expect("control-plane dialect");
+        let object_lambda_dialect = super::super::object_lambda_dialect().expect("object-lambda dialect");
         let fallback = dialect
             .claimed_operations()
             .iter()
@@ -90,23 +97,24 @@ mod tests {
             .iter()
             .filter(|record| !ROUTES.iter().any(|old| old.operation == record.operation))
             .collect();
-        let deferred_reads: Vec<_> = added.iter().copied().filter(|record| record.method == "GET").collect();
-        let mounted_writes: Vec<_> = added.iter().copied().filter(|record| record.method != "GET").collect();
+        let deferred: Vec<_> = added.iter().copied().filter(|record| !contains(record.operation)).collect();
 
-        assert_eq!(deferred_reads.len(), 5);
-        for record in deferred_reads {
-            assert!(!contains(record.operation), "{}", record.operation);
+        assert_eq!(added.iter().filter(|record| record.method == "GET").count(), 5);
+        assert_eq!(added.iter().filter(|record| record.method != "GET").count(), 7);
+        assert_eq!(added.len(), 12);
+        assert!(deferred.is_empty(), "deferred native routes remain: {deferred:?}");
+        assert_eq!(ROWS.len(), added.len());
+
+        for record in added {
+            assert!(contains(record.operation), "{}", record.operation);
             assert!(
-                !dialect.claimed_operations().iter().any(|op| op.name() == record.operation),
-                "{}",
+                !object_lambda_dialect
+                    .claimed_operations()
+                    .iter()
+                    .any(|op| op.name() == record.operation),
+                "{} must not be declared on object-lambda fallback dialect",
                 record.operation
             );
-        }
-
-        assert_eq!(mounted_writes.len(), 7);
-        assert_eq!(ROWS.len(), mounted_writes.len());
-        for record in mounted_writes {
-            assert!(contains(record.operation), "{}", record.operation);
             let op = dialect
                 .claimed_operations()
                 .iter()
