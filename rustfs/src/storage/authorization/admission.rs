@@ -136,9 +136,16 @@ fn validate_post_object_metadata(headers: &HeaderMap, raw_query: Option<&str>) -
     fn object_property(name: &str) -> bool {
         name == "x-amz-storage-class"
             || name == "x-amz-snowball-auto-extract"
-            || ["x-amz-meta-", "x-minio-meta-", "x-rustfs-meta-"]
-                .iter()
-                .any(|prefix| name.starts_with(prefix))
+            || name == "x-amz-server-side-encryption"
+            || [
+                "x-amz-meta-",
+                "x-minio-meta-",
+                "x-rustfs-meta-",
+                "x-amz-object-lock-",
+                "x-amz-server-side-encryption-",
+            ]
+            .iter()
+            .any(|prefix| name.starts_with(prefix))
     }
     if headers.keys().any(|name| object_property(name.as_str()))
         || raw_query.is_some_and(|query| {
@@ -246,10 +253,34 @@ mod access_phase_tests {
             "x-amz-storage-class",
             "x-amz-snowball-auto-extract",
             "x-amz-meta-snowball-auto-extract",
+            "x-amz-object-lock-mode",
+            "x-amz-object-lock-retain-until-date",
+            "x-amz-object-lock-legal-hold",
+            "x-amz-server-side-encryption",
+            "x-amz-server-side-encryption-aws-kms-key-id",
+            "x-amz-server-side-encryption-context",
+            "x-amz-server-side-encryption-bucket-key-enabled",
+            "x-amz-server-side-encryption-customer-algorithm",
+            "x-amz-server-side-encryption-customer-key",
+            "x-amz-server-side-encryption-customer-key-md5",
         ] {
             headers.insert(name, "test".parse().unwrap());
-            assert!(super::validate_post_object_metadata(&headers, None).is_err());
+            let err = super::admit_operation(&http::Method::POST, &headers, None, "PostObject", VerifiedSignature::default())
+                .expect_err("out-of-form POST wire property must be rejected");
+            assert_eq!(err.code(), &rustfs_s3_types::S3ErrorCode::AccessDenied, "{name}");
             headers.remove(name);
+        }
+        for query in [
+            "X-Amz-Object-Lock-Mode=COMPLIANCE",
+            "X%2DAmz%2DObject%2DLock%2DLegal%2DHold=ON",
+            "x-amz-object-lock-retain-until-date=2099-01-01T00:00:00Z",
+            "X-Amz-Server-Side-Encryption=AES256",
+            "X%2DAmz%2DServer%2DSide%2DEncryption%2DCustomer%2DAlgorithm=AES256",
+        ] {
+            let err =
+                super::admit_operation(&http::Method::POST, &headers, Some(query), "PostObject", VerifiedSignature::default())
+                    .expect_err("out-of-form POST query property must be rejected");
+            assert_eq!(err.code(), &rustfs_s3_types::S3ErrorCode::AccessDenied, "{query}");
         }
     }
 

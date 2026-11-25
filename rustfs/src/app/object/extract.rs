@@ -2112,8 +2112,16 @@ impl DefaultObjectUsecase {
         let helper = OperationHelper::from_view(&envelope.audit_view(), EventName::ObjectCreatedPut, S3Operation::PutObject)
             .suppress_event();
         let request_context = helper.request_context_or_from_view(&envelope.audit_view());
+        let is_post_object = envelope.post_object().is_some() || envelope.is_gateway_post();
         let extract_options = resolve_put_object_extract_options(envelope.headers())?;
-        let member_request_headers = snowball_member_headers(envelope.headers());
+        let member_request_headers = if let Some(metadata_headers) = input.metadata_headers.as_ref() {
+            snowball_member_headers(metadata_headers)
+        } else if is_post_object {
+            HeaderMap::new()
+        } else {
+            snowball_member_headers(envelope.headers())
+        };
+        let checksum_headers = input.checksum_headers.as_ref().unwrap_or_else(|| envelope.headers());
         // Extract uploads reject SSE-KMS before reaching the SSE layer, so the principal is
         // only carried for the day that restriction lifts; the NotImplemented answer below
         // deliberately stays ahead of any key authorization.
@@ -2121,7 +2129,7 @@ impl DefaultObjectUsecase {
         if is_sse_kms_requested(&input, envelope.headers()) {
             return Err(s3_error!(NotImplemented, "SSE-KMS is not supported for extract uploads"));
         }
-        let replication_authorized = replication_request_authorized(&envelope);
+        let replication_authorized = !is_post_object && replication_request_authorized(&envelope);
         let mut bucket_generation_opts = ObjectOptions::default();
         apply_bucket_generation_guard(&envelope, &input.bucket, &mut bucket_generation_opts)?;
         let expected_bucket_incarnation_id = bucket_generation_opts.expected_bucket_incarnation_id;
@@ -2155,12 +2163,19 @@ impl DefaultObjectUsecase {
         } = input;
 
         let outer_version_id = resolve_extract_outer_version_id(version_id, envelope.headers(), replication_authorized);
-        let (h_algo, h_key, h_md5) = extract_ssec_params_from_headers(envelope.headers())?;
-        let sse_customer_algorithm = sse_customer_algorithm.or(h_algo);
-        let sse_customer_key = sse_customer_key.or(h_key);
-        let sse_customer_key_md5 = sse_customer_key_md5.or(h_md5);
-
-        let original_sse = server_side_encryption.or(extract_server_side_encryption_from_headers(envelope.headers())?);
+        let (sse_customer_algorithm, sse_customer_key, sse_customer_key_md5, original_sse) = if is_post_object {
+            if super::put::has_wire_sse_headers(envelope.headers()) {
+                return Err(s3_error!(AccessDenied, "POST encryption parameters must be supplied as form fields"));
+            }
+            (sse_customer_algorithm, sse_customer_key, sse_customer_key_md5, server_side_encryption)
+        } else {
+            let (h_algo, h_key, h_md5) = extract_ssec_params_from_headers(envelope.headers())?;
+            let sse_customer_algorithm = sse_customer_algorithm.or(h_algo);
+            let sse_customer_key = sse_customer_key.or(h_key);
+            let sse_customer_key_md5 = sse_customer_key_md5.or(h_md5);
+            let original_sse = server_side_encryption.or(extract_server_side_encryption_from_headers(envelope.headers())?);
+            (sse_customer_algorithm, sse_customer_key, sse_customer_key_md5, original_sse)
+        };
         let bucket_sse_config = load_bucket_default_sse_config(&bucket).await?;
         let (mut effective_sse, mut effective_kms_key_id) = resolve_bucket_default_sse(
             bucket_sse_config.as_ref().map(|(config, _timestamp)| config),
@@ -2174,10 +2189,15 @@ impl DefaultObjectUsecase {
         {
             return Err(s3_error!(NotImplemented, "SSE-KMS is not supported for extract uploads"));
         }
+        let ssekms_context = if is_post_object {
+            None
+        } else {
+            extract_ssekms_context_from_headers(envelope.headers())?
+        };
         validate_sse_headers_for_write(
             effective_sse.as_deref(),
             effective_kms_key_id.as_ref(),
-            extract_ssekms_context_from_headers(envelope.headers())?.as_ref(),
+            ssekms_context.as_ref(),
             sse_customer_algorithm.as_ref(),
             sse_customer_key.as_ref(),
             sse_customer_key_md5.as_ref(),
@@ -2279,7 +2299,7 @@ impl DefaultObjectUsecase {
         let mut archive_reader =
             HashReader::from_stream(body, size, actual_size, md5hex, sha256hex, false).map_err(ApiError::from)?;
 
-        if let Err(err) = archive_reader.add_checksum(envelope.headers(), trailing_headers.clone(), false) {
+        if let Err(err) = archive_reader.add_checksum(checksum_headers, trailing_headers.clone(), false) {
             return Err(ApiError::from(err).into());
         }
 
@@ -2633,7 +2653,7 @@ impl DefaultObjectUsecase {
                     key: &fpath,
                     server_side_encryption: effective_sse.clone(),
                     ssekms_key_id: effective_kms_key_id.clone(),
-                    ssekms_context: extract_try!(extract_ssekms_context_from_headers(envelope.headers())),
+                    ssekms_context: ssekms_context.clone(),
                     sse_customer_algorithm: sse_customer_algorithm.clone(),
                     sse_customer_key: sse_customer_key.clone(),
                     sse_customer_key_md5: sse_customer_key_md5.clone(),
@@ -5897,5 +5917,251 @@ mod tests {
             .await
             .expect_err("UUID source-version-id must be rejected on unversioned bucket");
         assert_eq!(err.code(), &S3ErrorCode::InvalidArgument);
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn snowball_post_extract_uses_metadata_headers_and_preserves_bucket_default_retention() {
+        use crate::app::storage_api::context::{PostObjectPolicyHeaders, PostObjectRequestMarker};
+        use crate::app::storage_api::test::ReqInfo;
+        use crate::app::storage_api::test::bucket::metadata::{BUCKET_POLICY_CONFIG, OBJECT_LOCK_CONFIG};
+        use crate::app::storage_api::test::contract::bucket::{BucketOperations as _, MakeBucketOptions};
+        use http::Method;
+
+        let (store, context) = real_store_test_context().await;
+        let bucket = format!("post-extract-meta-{}", Uuid::new_v4());
+        store
+            .make_bucket(
+                &bucket,
+                &MakeBucketOptions {
+                    lock_enabled: true,
+                    versioning_enabled: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("create object-lock bucket");
+        metadata_sys::update(
+            &bucket,
+            OBJECT_LOCK_CONFIG,
+            b"<ObjectLockConfiguration><ObjectLockEnabled>Enabled</ObjectLockEnabled><Rule><DefaultRetention><Mode>COMPLIANCE</Mode><Days>1</Days></DefaultRetention></Rule></ObjectLockConfiguration>".to_vec(),
+        )
+        .await
+        .expect("install bucket default retention");
+        let policy = serde_json::json!({
+            "Version": "2012-10-17",
+            "Statement": [{
+                "Effect": "Allow",
+                "Principal": "*",
+                "Action": ["s3:PutObject"],
+                "Resource": format!("arn:aws:s3:::{bucket}/*")
+            }]
+        });
+        metadata_sys::update(&bucket, BUCKET_POLICY_CONFIG, serde_json::to_vec(&policy).expect("policy JSON"))
+            .await
+            .expect("install bucket policy");
+
+        let usecase = DefaultObjectUsecase::with_context(Some(context));
+        for (member, with_projected_headers) in [("projected.txt", true), ("fallback-empty.txt", false)] {
+            let mut builder = Builder::new(Vec::new());
+            let mut header = Header::new_gnu();
+            header.set_size(4);
+            header.set_mode(0o644);
+            header.set_cksum();
+            builder
+                .append_data(&mut header, member, &b"data"[..])
+                .await
+                .expect("append archive member");
+            let archive = builder.into_inner().await.expect("finish archive");
+
+            let mut wire_headers = HeaderMap::new();
+            wire_headers.insert(AMZ_SNOWBALL_EXTRACT, HeaderValue::from_static("true"));
+            wire_headers.insert(AMZ_OBJECT_LOCK_MODE_LOWER, HeaderValue::from_static("GOVERNANCE"));
+            wire_headers.insert(AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE_LOWER, HeaderValue::from_static("2000-01-01T00:00:00Z"));
+            wire_headers.insert(AMZ_OBJECT_LOCK_LEGAL_HOLD_LOWER, HeaderValue::from_static("ON"));
+            wire_headers.insert("content-disposition", HeaderValue::from_static("inline"));
+            wire_headers.insert("cache-control", HeaderValue::from_static("no-store"));
+            wire_headers.insert("content-encoding", HeaderValue::from_static("gzip"));
+            wire_headers.insert("content-language", HeaderValue::from_static("fr"));
+            wire_headers.insert("expires", HeaderValue::from_static("Wed, 21 Oct 2015 07:28:00 GMT"));
+            wire_headers.insert("x-amz-tagging", HeaderValue::from_static("injected=wire"));
+
+            let mut extensions = http::Extensions::new();
+            extensions.insert(ReqInfo::default());
+            extensions.insert(PostObjectRequestMarker);
+            extensions.insert(PostObjectPolicyHeaders(HeaderMap::new()));
+            let envelope = RequestEnvelope::from_parts(
+                crate::app::RequestHead {
+                    method: Method::POST,
+                    uri: http::Uri::from_static("/"),
+                    headers: wire_headers,
+                    credentials: None,
+                    region: None,
+                    service: None,
+                },
+                extensions,
+            );
+
+            let mut input = archive_input(&bucket, "archive.tar", archive);
+            if with_projected_headers {
+                let mut projected = HeaderMap::new();
+                projected.insert(AMZ_STORAGE_CLASS, HeaderValue::from_static("STANDARD"));
+                input.metadata_headers = Some(projected);
+                input.content_disposition = Some("attachment".to_owned());
+            }
+
+            Box::pin(usecase.execute_put_object_extract_inner(envelope, input))
+                .await
+                .expect("POST archive member extraction should succeed without wire metadata injection");
+
+            let stored = store
+                .get_object_info(&bucket, member, &ObjectOptions::default())
+                .await
+                .expect("read extracted member");
+            let expected_disposition = with_projected_headers.then_some("attachment");
+            assert_eq!(
+                stored.user_defined.get("content-disposition").map(String::as_str),
+                expected_disposition,
+                "{member}: wire content-disposition must not be persisted"
+            );
+            for blocked in [
+                "cache-control",
+                "content-encoding",
+                "content-language",
+                "expires",
+                AMZ_OBJECT_LOCK_LEGAL_HOLD_LOWER,
+            ] {
+                assert!(
+                    !stored.user_defined.contains_key(blocked),
+                    "{member}: unsigned wire header {blocked} must not persist"
+                );
+            }
+            assert!(
+                stored.user_tags.is_empty(),
+                "{member}: unsigned wire x-amz-tagging must not persist: {}",
+                stored.user_tags
+            );
+            assert_eq!(
+                stored.user_defined.get(AMZ_OBJECT_LOCK_MODE_LOWER).map(String::as_str),
+                Some("COMPLIANCE"),
+                "{member}: bucket default retention mode must not be suppressed by wire headers"
+            );
+            let retain_until = stored
+                .user_defined
+                .get(AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE_LOWER)
+                .expect("bucket default retain-until date");
+            let parsed = OffsetDateTime::parse(retain_until, &Rfc3339).expect("valid RFC3339 retain-until date");
+            assert!(
+                parsed > OffsetDateTime::now_utc(),
+                "{member}: wire past retain-until date must not suppress bucket default retention: {retain_until}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn snowball_post_extract_rejects_unsigned_wire_sse_headers() {
+        use crate::app::storage_api::context::PostObjectRequestMarker;
+        use crate::app::storage_api::test::ReqInfo;
+        use crate::app::storage_api::test::contract::bucket::{BucketOperations as _, MakeBucketOptions};
+        use http::Method;
+
+        let (store, context) = real_store_test_context().await;
+        let bucket = format!("post-extract-sse-{}", Uuid::new_v4());
+        store
+            .make_bucket(&bucket, &MakeBucketOptions::default())
+            .await
+            .expect("create bucket");
+
+        let key_b64 = base64_simd::STANDARD.encode_to_string([0x22_u8; 32]);
+        let key_md5 = base64_simd::STANDARD.encode_to_string(Md5::digest([0x22_u8; 32]));
+        let cases: &[(&str, Vec<(&str, &str)>)] = &[
+            ("sse-s3", vec![("x-amz-server-side-encryption", "AES256")]),
+            (
+                "sse-c",
+                vec![
+                    ("x-amz-server-side-encryption-customer-algorithm", "AES256"),
+                    ("x-amz-server-side-encryption-customer-key", key_b64.as_str()),
+                    ("x-amz-server-side-encryption-customer-key-md5", key_md5.as_str()),
+                ],
+            ),
+            ("sse-context", vec![("x-amz-server-side-encryption-context", "e30=")]),
+        ];
+        let usecase = DefaultObjectUsecase::with_context(Some(context));
+
+        for (label, wire_sse) in cases {
+            let member = format!("blocked-{label}.txt");
+            let mut builder = Builder::new(Vec::new());
+            let mut header = Header::new_gnu();
+            header.set_size(4);
+            header.set_mode(0o644);
+            header.set_cksum();
+            builder
+                .append_data(&mut header, &member, &b"data"[..])
+                .await
+                .expect("append archive member");
+            let archive = builder.into_inner().await.expect("finish archive");
+
+            let mut headers = HeaderMap::new();
+            headers.insert(AMZ_SNOWBALL_EXTRACT, HeaderValue::from_static("true"));
+            for (name, value) in wire_sse {
+                headers.insert(
+                    http::HeaderName::from_bytes(name.as_bytes()).expect("header name"),
+                    HeaderValue::from_str(value).expect("header value"),
+                );
+            }
+            let mut extensions = http::Extensions::new();
+            extensions.insert(ReqInfo::default());
+            extensions.insert(PostObjectRequestMarker);
+            let envelope = RequestEnvelope::from_parts(
+                crate::app::RequestHead {
+                    method: Method::POST,
+                    uri: http::Uri::from_static("/"),
+                    headers,
+                    credentials: None,
+                    region: None,
+                    service: None,
+                },
+                extensions,
+            );
+            let input = archive_input(&bucket, "archive.tar", archive);
+            let err = Box::pin(usecase.execute_put_object_extract_inner(envelope, input))
+                .await
+                .expect_err("unsigned wire SSE on POST archive extract must be rejected");
+            assert_eq!(err.code(), &S3ErrorCode::AccessDenied, "{label}");
+            let missing = store
+                .get_object_info(&bucket, &member, &ObjectOptions::default())
+                .await
+                .expect_err("rejected archive member must not be stored");
+            assert!(is_err_object_not_found(&missing), "{label}: {missing}");
+        }
+
+        // Positive control: form-supplied SSE-S3 without wire SSE headers passes SSE validation and reaches body checks.
+        let mut headers = HeaderMap::new();
+        headers.insert(AMZ_SNOWBALL_EXTRACT, HeaderValue::from_static("true"));
+        let mut extensions = http::Extensions::new();
+        extensions.insert(ReqInfo::default());
+        extensions.insert(PostObjectRequestMarker);
+        let envelope = RequestEnvelope::from_parts(
+            crate::app::RequestHead {
+                method: Method::POST,
+                uri: http::Uri::from_static("/"),
+                headers,
+                credentials: None,
+                region: None,
+                service: None,
+            },
+            extensions,
+        );
+        let input = PutObjectWriteInput {
+            bucket,
+            key: "archive.tar".to_owned(),
+            server_side_encryption: Some("AES256".to_owned()),
+            ..Default::default()
+        };
+        let err = Box::pin(usecase.execute_put_object_extract_inner(envelope, input))
+            .await
+            .expect_err("positive control without body stops at IncompleteBody");
+        assert_eq!(err.code(), &S3ErrorCode::IncompleteBody);
     }
 }

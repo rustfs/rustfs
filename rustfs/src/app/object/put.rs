@@ -988,6 +988,16 @@ fn is_post_object_sse_kms_requested(input: &PutObjectWriteInput, headers: &Heade
     is_sse_kms_requested(input, headers)
 }
 
+/// Returns true when raw request headers carry any `x-amz-server-side-encryption*`
+/// header. POST uploads sign form fields rather than HTTP headers, so wire SSE
+/// headers must be rejected instead of merged or silently downgraded to plaintext.
+pub(super) fn has_wire_sse_headers(headers: &HeaderMap) -> bool {
+    headers.keys().any(|name| {
+        let name = name.as_str();
+        name == "x-amz-server-side-encryption" || name.starts_with("x-amz-server-side-encryption-")
+    })
+}
+
 /// Standard content headers and the tagging / storage-class values of a PUT
 /// that become object metadata through [`apply_put_request_metadata_native`].
 pub(super) struct PutObjectContentInput {
@@ -1320,7 +1330,8 @@ impl DefaultObjectUsecase {
             envelope.uri().query(),
             envelope.verified_presigned().is_some(),
         )?;
-        if envelope.post_object().is_some() && is_post_object_sse_kms_requested(&input, envelope.headers()) {
+        let is_post_object = envelope.post_object().is_some() || envelope.is_gateway_post();
+        if is_post_object && is_post_object_sse_kms_requested(&input, envelope.headers()) {
             return Err(rustfs_s3_types::s3_error!(
                 NotImplemented,
                 "SSE-KMS is not supported for POST object uploads"
@@ -1371,7 +1382,14 @@ impl DefaultObjectUsecase {
             inbound_replication_put && rustfs_utils::http::ssec_transport_to_stored_metadata(envelope.headers()).is_some();
 
         let trailing_headers = input.trailing_headers.clone();
-        let metadata_headers = input.metadata_headers.as_ref().unwrap_or_else(|| envelope.headers());
+        let empty_metadata_headers = HeaderMap::new();
+        let metadata_headers = input.metadata_headers.as_ref().unwrap_or_else(|| {
+            if is_post_object {
+                &empty_metadata_headers
+            } else {
+                envelope.headers()
+            }
+        });
         let checksum_headers = input.checksum_headers.as_ref().unwrap_or_else(|| envelope.headers());
 
         let PutObjectWriteInput {
@@ -1405,20 +1423,32 @@ impl DefaultObjectUsecase {
         // POST form uploads share the storage path but are a distinct S3
         // operation.  The V1 hint is defined for direct PutObject only, so a
         // POST field remains ordinary user metadata and never selects layout.
-        let ec_block_size_hint = if envelope.post_object().is_some() {
+        let ec_block_size_hint = if is_post_object {
             None
         } else {
             extract_ec_block_size_hint(envelope.headers(), metadata.as_ref())?
         };
 
-        // Merge SSE-C params from headers (fallback when S3 layer does not populate input)
-        let (h_algo, h_key, h_md5) = extract_ssec_params_from_headers(envelope.headers())?;
-        let sse_customer_algorithm = sse_customer_algorithm.or(h_algo);
-        let sse_customer_key = sse_customer_key.or(h_key);
-        let sse_customer_key_md5 = sse_customer_key_md5.or(h_md5);
+        let (sse_customer_algorithm, sse_customer_key, sse_customer_key_md5, server_side_encryption) = if is_post_object {
+            if has_wire_sse_headers(envelope.headers()) {
+                return Err(rustfs_s3_types::s3_error!(
+                    AccessDenied,
+                    "POST encryption parameters must be supplied as form fields"
+                ));
+            }
+            (sse_customer_algorithm, sse_customer_key, sse_customer_key_md5, server_side_encryption)
+        } else {
+            // Merge SSE-C params from headers (fallback when S3 layer does not populate input)
+            let (h_algo, h_key, h_md5) = extract_ssec_params_from_headers(envelope.headers())?;
+            let sse_customer_algorithm = sse_customer_algorithm.or(h_algo);
+            let sse_customer_key = sse_customer_key.or(h_key);
+            let sse_customer_key_md5 = sse_customer_key_md5.or(h_md5);
 
-        // Merge server_side_encryption from headers (fallback when S3 layer does not populate input)
-        let server_side_encryption = server_side_encryption.or(extract_server_side_encryption_from_headers(envelope.headers())?);
+            // Merge server_side_encryption from headers (fallback when S3 layer does not populate input)
+            let server_side_encryption =
+                server_side_encryption.or(extract_server_side_encryption_from_headers(envelope.headers())?);
+            (sse_customer_algorithm, sse_customer_key, sse_customer_key_md5, server_side_encryption)
+        };
 
         // Validate object key
         validate_new_object_key(&key, request_method_name)?;
@@ -4670,6 +4700,164 @@ mod tests {
 
         let err = Box::pin(usecase.execute_put_object_owned(envelope, input)).await.unwrap_err();
         assert_eq!(err.code(), &OwnedS3ErrorCode::NotImplemented);
+    }
+
+    #[tokio::test]
+    async fn execute_put_object_rejects_post_object_unsigned_wire_sse_headers() {
+        let key_b64 = base64_simd::STANDARD.encode_to_string([0x11_u8; 32]);
+        let key_md5 = base64_simd::STANDARD.encode_to_string(Md5::digest([0x11_u8; 32]));
+        let cases: &[(&str, Vec<(&str, &str)>)] = &[
+            ("sse-s3", vec![("x-amz-server-side-encryption", "AES256")]),
+            (
+                "sse-c",
+                vec![
+                    ("x-amz-server-side-encryption-customer-algorithm", "AES256"),
+                    ("x-amz-server-side-encryption-customer-key", key_b64.as_str()),
+                    ("x-amz-server-side-encryption-customer-key-md5", key_md5.as_str()),
+                ],
+            ),
+            ("sse-context", vec![("x-amz-server-side-encryption-context", "e30=")]),
+            ("sse-bucket-key", vec![("x-amz-server-side-encryption-bucket-key-enabled", "true")]),
+        ];
+        let usecase = DefaultObjectUsecase::without_context();
+
+        for (label, wire_headers) in cases {
+            let mut headers = HeaderMap::new();
+            for (name, value) in wire_headers {
+                headers.insert(
+                    HeaderName::from_bytes(name.as_bytes()).expect("header name"),
+                    HeaderValue::from_str(value).expect("header value"),
+                );
+            }
+            let input = PutObjectWriteInput {
+                bucket: "test-bucket".to_owned(),
+                key: "test-key".to_owned(),
+                ..Default::default()
+            };
+            let envelope = write_envelope(Method::POST, http::Uri::from_static("/"), headers.clone(), http::Extensions::new());
+            let err = Box::pin(usecase.execute_put_object_owned(envelope, input))
+                .await
+                .expect_err("unsigned wire SSE on POST must be rejected, not downgraded");
+            assert_eq!(err.code(), &OwnedS3ErrorCode::AccessDenied, "{label}");
+
+            // Even when the form specifies SSE-S3, additional unsigned wire SSE headers must be rejected.
+            let combined_input = PutObjectWriteInput {
+                bucket: "test-bucket".to_owned(),
+                key: "test-key".to_owned(),
+                server_side_encryption: Some("AES256".to_owned()),
+                ..Default::default()
+            };
+            let mut gateway_envelope = RequestEnvelope::from_parts(
+                crate::app::RequestHead {
+                    method: Method::POST,
+                    uri: http::Uri::from_static("/"),
+                    headers,
+                    credentials: None,
+                    region: None,
+                    service: None,
+                },
+                http::Extensions::new(),
+            );
+            gateway_envelope.mark_gateway_post();
+            let err = Box::pin(usecase.execute_put_object_owned(gateway_envelope, combined_input))
+                .await
+                .expect_err("wire SSE alongside form SSE must be rejected");
+            assert_eq!(err.code(), &OwnedS3ErrorCode::AccessDenied, "{label} (gateway)");
+        }
+
+        // Positive control: form-supplied SSE-S3 without wire SSE headers passes the POST wire-SSE guard.
+        let form_sse_input = PutObjectWriteInput {
+            bucket: "test-bucket".to_owned(),
+            key: "test-key".to_owned(),
+            server_side_encryption: Some("AES256".to_owned()),
+            ..Default::default()
+        };
+        let envelope = write_envelope(Method::POST, http::Uri::from_static("/"), HeaderMap::new(), http::Extensions::new());
+        let err = Box::pin(usecase.execute_put_object_owned(envelope, form_sse_input))
+            .await
+            .expect_err("without_context stops at missing body");
+        assert_eq!(err.code(), &OwnedS3ErrorCode::IncompleteBody);
+
+        // Positive control: PUT keeps honoring signed wire SSE headers.
+        let mut put_headers = HeaderMap::new();
+        put_headers.insert(AMZ_SERVER_SIDE_ENCRYPTION, HeaderValue::from_static("AES256"));
+        let put_input = PutObjectWriteInput {
+            bucket: "test-bucket".to_owned(),
+            key: "test-key".to_owned(),
+            ..Default::default()
+        };
+        let put_envelope = write_envelope(Method::PUT, http::Uri::from_static("/"), put_headers, http::Extensions::new());
+        let err = Box::pin(usecase.execute_put_object_owned(put_envelope, put_input))
+            .await
+            .expect_err("without_context stops at missing body");
+        assert_eq!(err.code(), &OwnedS3ErrorCode::IncompleteBody);
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn execute_put_object_post_ignores_wire_lock_and_content_headers_without_projection() {
+        use crate::app::storage_api::test::bucket::metadata::OBJECT_LOCK_CONFIG;
+        use crate::app::storage_api::test::contract::bucket::{BucketOperations as _, MakeBucketOptions};
+
+        let (store, context) = real_store_test_context().await;
+        let bucket = format!("post-wire-lock-{}", Uuid::new_v4());
+        store
+            .make_bucket(
+                &bucket,
+                &MakeBucketOptions {
+                    lock_enabled: true,
+                    versioning_enabled: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("create object-lock bucket");
+        metadata_sys::update(
+            &bucket,
+            OBJECT_LOCK_CONFIG,
+            b"<ObjectLockConfiguration><ObjectLockEnabled>Enabled</ObjectLockEnabled><Rule><DefaultRetention><Mode>COMPLIANCE</Mode><Days>1</Days></DefaultRetention></Rule></ObjectLockConfiguration>".to_vec(),
+        )
+        .await
+        .expect("install bucket default retention");
+
+        let mut headers = HeaderMap::new();
+        headers.insert(AMZ_OBJECT_LOCK_MODE_LOWER, HeaderValue::from_static("GOVERNANCE"));
+        headers.insert(AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE_LOWER, HeaderValue::from_static("2000-01-01T00:00:00Z"));
+        headers.insert(AMZ_OBJECT_LOCK_LEGAL_HOLD_LOWER, HeaderValue::from_static("ON"));
+        headers.insert("content-disposition", HeaderValue::from_static("inline"));
+        headers.insert("cache-control", HeaderValue::from_static("no-store"));
+        headers.insert("x-amz-tagging", HeaderValue::from_static("injected=wire"));
+
+        let envelope = write_envelope(Method::POST, http::Uri::from_static("/"), headers, http::Extensions::new());
+        let input = put_bytes(bucket.clone(), "post-object.txt", Bytes::from_static(b"hello"));
+        let usecase = DefaultObjectUsecase::with_context(Some(context));
+        Box::pin(usecase.execute_put_object_owned(envelope, input))
+            .await
+            .expect("POST upload should commit with bucket defaults");
+
+        let stored = store
+            .get_object_info(&bucket, "post-object.txt", &ObjectOptions::default())
+            .await
+            .expect("read stored POST object");
+        assert!(!stored.user_defined.contains_key("content-disposition"));
+        assert!(!stored.user_defined.contains_key("cache-control"));
+        assert!(!stored.user_defined.contains_key(AMZ_OBJECT_LOCK_LEGAL_HOLD_LOWER));
+        assert!(stored.user_tags.is_empty(), "wire tags must not persist: {}", stored.user_tags);
+        assert_eq!(
+            stored.user_defined.get(AMZ_OBJECT_LOCK_MODE_LOWER).map(String::as_str),
+            Some("COMPLIANCE"),
+            "bucket default retention mode must not be suppressed by wire headers"
+        );
+        let retain_until = stored
+            .user_defined
+            .get(AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE_LOWER)
+            .expect("bucket default retain-until date");
+        let parsed = time::OffsetDateTime::parse(retain_until, &time::format_description::well_known::Rfc3339)
+            .expect("valid RFC3339 default retain-until date");
+        assert!(
+            parsed > time::OffsetDateTime::now_utc(),
+            "wire past retain-until date must not suppress bucket default retention: {retain_until}"
+        );
     }
 
     #[tokio::test]
