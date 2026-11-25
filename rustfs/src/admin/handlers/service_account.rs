@@ -205,13 +205,25 @@ fn add_service_account_parent_within_scope(
     owner || (effective_parent != root_access_key && (target_user == req_user || target_user == req_parent_user))
 }
 
+/// Whether `cred` may use the owning user's self-service fallback on
+/// service-account read, list, and delete handlers when the caller lacks an
+/// explicit admin `Allow`.
+///
+/// Only the user itself and unrestricted STS sessions (such as Console logins)
+/// qualify. Service accounts and credentials narrowed by a session policy or
+/// policy boundary must pass the full `Allow`/`Deny` IAM evaluation instead of
+/// acting as their parent identity.
+fn may_use_owner_self_service_fallback(cred: &StoredCredentials) -> bool {
+    !cred.is_service_account() && !claims_have_policy_boundary(cred.claims_or_empty())
+}
+
 /// Fail-closed ownership check used by non-admin service-account read/delete
 /// fallbacks after the primary `is_allowed(..., deny_only: false)` check fails.
 ///
 /// Returns `true` only when:
 /// 1. The caller has no explicit `Deny` on the required admin action (`no_explicit_deny`),
-/// 2. The caller is not itself a service account (preventing a restricted
-///    service account from impersonating its parent against sibling or own keys, #9514),
+/// 2. The caller qualifies for owner self-service fallback (not a service
+///    account and not narrowed by a session policy or policy boundary),
 /// 3. The target service account was successfully loaded (`Some(parent)`) with a
 ///    non-empty parent matching the caller's resolved identity (`request_user_name`).
 ///    A `None` target — meaning `get_service_account` failed with a not-found or
@@ -222,7 +234,7 @@ fn non_admin_may_access_owned_service_account(
     no_explicit_deny: bool,
 ) -> bool {
     no_explicit_deny
-        && !caller.is_service_account()
+        && may_use_owner_self_service_fallback(caller)
         && matches!(target_parent_user, Some(parent) if !parent.is_empty() && parent == request_user_name(caller))
 }
 
@@ -622,7 +634,7 @@ fn request_user_name(cred: &StoredCredentials) -> &str {
 }
 
 fn can_fallback_view_access_key_info(requester: &StoredCredentials, target: &StoredCredentials) -> bool {
-    if requester.is_service_account() {
+    if !may_use_owner_self_service_fallback(requester) {
         return false;
     }
 
@@ -839,7 +851,7 @@ impl Operation for InfoServiceAccount {
             })
             .await
         {
-            let no_explicit_deny = if cred.is_service_account() {
+            let no_explicit_deny = if !may_use_owner_self_service_fallback(&cred) {
                 false
             } else {
                 iam_store
@@ -992,19 +1004,23 @@ impl Operation for InfoAccessKey {
             })
             .await
         {
-            let no_explicit_deny = iam_store
-                .is_allowed(&Args {
-                    account: &cred.access_key,
-                    groups: &cred.groups,
-                    action: Action::AdminAction(AdminAction::ListServiceAccountsAdminAction),
-                    bucket: "",
-                    conditions: &conditions,
-                    is_owner: owner,
-                    object: "",
-                    claims,
-                    deny_only: true,
-                })
-                .await;
+            let no_explicit_deny = if !may_use_owner_self_service_fallback(&cred) {
+                false
+            } else {
+                iam_store
+                    .is_allowed(&Args {
+                        account: &cred.access_key,
+                        groups: &cred.groups,
+                        action: Action::AdminAction(AdminAction::ListServiceAccountsAdminAction),
+                        bucket: "",
+                        conditions: &conditions,
+                        is_owner: owner,
+                        object: "",
+                        claims,
+                        deny_only: true,
+                    })
+                    .await
+            };
             if !no_explicit_deny {
                 return Err(s3_error!(AccessDenied, "access denied"));
             }
@@ -1090,11 +1106,12 @@ impl Operation for ListServiceAccount {
             return Err(s3_error!(InvalidRequest, "iam not init"));
         };
 
-        // Cross-user listing and any service-account caller must be explicitly
-        // authorized by ListServiceAccounts; self-listing by a non-service-account
-        // caller still enforces explicit Deny statements (deny_only).
+        // Cross-user listing, service accounts, and policy-bounded STS sessions
+        // must be explicitly authorized by ListServiceAccounts; self-listing by
+        // the user or an unrestricted STS session still enforces explicit Deny
+        // statements (deny_only).
         let cross_user = query.user.as_ref().is_some_and(|v| v != &cred.access_key);
-        let deny_only = !cross_user && !cred.is_service_account();
+        let deny_only = !cross_user && may_use_owner_self_service_fallback(&cred);
         if !iam_store
             .is_allowed(&Args {
                 account: &cred.access_key,
@@ -1259,7 +1276,7 @@ impl Operation for ListAccessKeysBulk {
                 is_owner: owner,
                 object: "",
                 claims: cred.claims_or_empty(),
-                deny_only: self_only && !cred.is_service_account(),
+                deny_only: self_only && may_use_owner_self_service_fallback(&cred),
             })
             .await
         {
@@ -1471,7 +1488,7 @@ impl Operation for DeleteServiceAccount {
                     s3_error!(InternalError, "delete service account failed")
                 })?
         } else {
-            let no_explicit_deny = if cred.is_service_account() {
+            let no_explicit_deny = if !may_use_owner_self_service_fallback(&cred) {
                 false
             } else {
                 iam_store
@@ -1490,10 +1507,12 @@ impl Operation for DeleteServiceAccount {
             };
 
             // Fail closed: a caller without RemoveServiceAccount may delete a
-            // service account only when it is not itself a service account, has no
-            // explicit Deny on RemoveServiceAccount, and owns the loaded target
-            // (backlog#806, #9514). Bind deletion to the authorized target revision
-            // so concurrent replacement cannot be deleted under a stale check.
+            // service account only when it qualifies for owner self-service
+            // fallback (neither a service account nor a policy-bounded STS
+            // session), has no explicit Deny on RemoveServiceAccount, and owns
+            // the loaded target (backlog#806, #9514). Bind deletion to the
+            // authorized target revision so concurrent replacement cannot be
+            // deleted under a stale check.
             if !no_explicit_deny {
                 return Err(s3_error!(AccessDenied, "access denied"));
             }
@@ -1799,12 +1818,25 @@ mod tests {
         );
         assert!(
             non_admin_may_access_owned_service_account(&alice_sts, Some("alice"), true),
-            "non-service-account STS session without explicit Deny retains parent owner fallback"
+            "unrestricted STS session without explicit Deny retains parent owner fallback"
         );
         assert!(
             !non_admin_may_access_owned_service_account(&alice_sts, Some("alice"), false),
             "STS session with explicit Deny must be denied"
         );
+        for claim_key in [
+            rustfs_iam::sys::SESSION_POLICY_NAME,
+            rustfs_iam::sys::SESSION_POLICY_NAME_EXTRACTED,
+        ] {
+            let restricted_sts = StoredCredentials {
+                claims: Some(HashMap::from([(claim_key.to_string(), json!("e30"))])),
+                ..alice_sts.clone()
+            };
+            assert!(
+                !non_admin_may_access_owned_service_account(&restricted_sts, Some("alice"), true),
+                "session-policy-restricted STS ({claim_key}) must not use parent owner fallback"
+            );
+        }
     }
 
     #[test]
@@ -2443,6 +2475,30 @@ mod tests {
     }
 
     #[test]
+    fn fallback_access_key_info_denies_session_policy_restricted_sts() {
+        let target = StoredCredentials {
+            access_key: "owner-user".to_string(),
+            ..Default::default()
+        };
+        for claim_key in [
+            rustfs_iam::sys::SESSION_POLICY_NAME,
+            rustfs_iam::sys::SESSION_POLICY_NAME_EXTRACTED,
+        ] {
+            let requester = StoredCredentials {
+                access_key: "sts-user".to_string(),
+                session_token: "session-token".to_string(),
+                parent_user: "owner-user".to_string(),
+                claims: Some(HashMap::from([(claim_key.to_string(), json!("e30"))])),
+                ..Default::default()
+            };
+            assert!(
+                !can_fallback_view_access_key_info(&requester, &target),
+                "restricted STS ({claim_key}) must not fall back to viewing parent access key info"
+            );
+        }
+    }
+
+    #[test]
     fn fallback_access_key_info_denies_other_regular_user() {
         let requester = StoredCredentials {
             access_key: "alice".to_string(),
@@ -2772,12 +2828,37 @@ mod tests {
                 .await
                 .expect("create admin sibling target");
 
+            let (alice_console_target, _) = iam
+                .new_service_account(
+                    "alice-9514",
+                    None,
+                    NewServiceAccountOpts {
+                        access_key: "sa-console-target-9514".to_owned(),
+                        secret_key: secret.to_owned(),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect("create console STS delete target");
+            let (root_sa, _) = iam
+                .new_service_account(
+                    &active_root.access_key,
+                    None,
+                    NewServiceAccountOpts {
+                        access_key: "root-sa-9514".to_owned(),
+                        secret_key: secret.to_owned(),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect("create root-owned service account");
+
             let alice_cred = iam.get_user("alice-9514").await.expect("alice user exists").credentials;
             let exp_ts = (OffsetDateTime::now_utc() + time::Duration::hours(1)).unix_timestamp();
             let mut sts_claims = HashMap::from([
                 ("parent".to_owned(), serde_json::Value::String("alice-9514".to_owned())),
                 ("exp".to_owned(), json!(exp_ts)),
-                (SESSION_POLICY_NAME.to_owned(), serde_json::Value::String(s3_only_policy_b64)),
+                (SESSION_POLICY_NAME.to_owned(), serde_json::Value::String(s3_only_policy_b64.clone())),
                 (PLUGIN_ATTEMPT_CREDENTIAL_CLAIM.to_owned(), json!(true)),
             ]);
             let mut plugin_sts =
@@ -2788,12 +2869,35 @@ mod tests {
                 .expect("persist plugin-attempt sts");
 
             sts_claims.remove(PLUGIN_ATTEMPT_CREDENTIAL_CLAIM);
-            let mut ordinary_sts =
-                get_new_credentials_with_metadata(&sts_claims, &active_root.secret_key).expect("mint ordinary sts");
-            ordinary_sts.parent_user = "alice-9514".to_owned();
-            iam.set_temp_user_from_parent(&ordinary_sts, &alice_cred)
+            let mut restricted_sts =
+                get_new_credentials_with_metadata(&sts_claims, &active_root.secret_key).expect("mint restricted sts");
+            restricted_sts.parent_user = "alice-9514".to_owned();
+            iam.set_temp_user_from_parent(&restricted_sts, &alice_cred)
                 .await
-                .expect("persist ordinary sts");
+                .expect("persist restricted sts");
+
+            let root_sts_claims = HashMap::from([
+                ("parent".to_owned(), serde_json::Value::String(active_root.access_key.clone())),
+                ("exp".to_owned(), json!(exp_ts)),
+                (SESSION_POLICY_NAME.to_owned(), serde_json::Value::String(s3_only_policy_b64)),
+            ]);
+            let mut root_restricted_sts = get_new_credentials_with_metadata(&root_sts_claims, &active_root.secret_key)
+                .expect("mint root-derived restricted sts");
+            root_restricted_sts.parent_user = active_root.access_key.clone();
+            iam.set_temp_user(&root_restricted_sts.access_key, &root_restricted_sts, None)
+                .await
+                .expect("persist root-derived restricted sts");
+
+            let console_sts_claims = HashMap::from([
+                ("parent".to_owned(), serde_json::Value::String("alice-9514".to_owned())),
+                ("exp".to_owned(), json!(exp_ts)),
+            ]);
+            let mut console_sts = get_new_credentials_with_metadata(&console_sts_claims, &active_root.secret_key)
+                .expect("mint unrestricted console sts");
+            console_sts.parent_user = "alice-9514".to_owned();
+            iam.set_temp_user_from_parent(&console_sts, &alice_cred)
+                .await
+                .expect("persist unrestricted console sts");
 
             // Restricted service accounts (both explicit Deny admin:* and least-privilege S3-only,
             // under either a regular parent or an admin parent) must be denied from deleting,
@@ -2991,49 +3095,180 @@ mod tests {
                 &S3ErrorCode::AccessDenied
             );
 
-            // An unmarked STS session with the same S3 session policy retains self-service fallback
-            // when neither parent nor session policy contains an explicit admin Deny.
-            let ord_list_req = TestRequest::new(http::Method::GET, "/rustfs/admin/v3/list-service-accounts")
-                .header("x-amz-security-token", &ordinary_sts.session_token)
-                .credentials(&ordinary_sts.access_key, &ordinary_sts.secret_key, Some(&ordinary_sts.session_token))
+            // Allowlist-restricted STS sessions (carrying sessionPolicy with no explicit admin Deny,
+            // whether derived from a regular IAM user or from root) must not use owner self-service
+            // fallback to list, inspect, or delete their parent's service accounts.
+            for (label, sts_caller, target_sa) in [
+                ("alice-restricted-sts", &restricted_sts, sa_sibling.access_key.as_str()),
+                ("root-restricted-sts", &root_restricted_sts, root_sa.access_key.as_str()),
+            ] {
+                for target in [target_sa, "missing-sa-9514"] {
+                    let delete_req = TestRequest::new(
+                        http::Method::DELETE,
+                        format!("/rustfs/admin/v3/delete-service-account?accessKey={target}").as_str(),
+                    )
+                    .header("x-amz-security-token", &sts_caller.session_token)
+                    .credentials(&sts_caller.access_key, &sts_caller.secret_key, Some(&sts_caller.session_token))
+                    .build();
+                    assert_eq!(
+                        DeleteServiceAccount {}
+                            .call(delete_req, Params::new())
+                            .await
+                            .expect_err("restricted STS delete must fail")
+                            .code(),
+                        &S3ErrorCode::AccessDenied,
+                        "{label} delete {target}"
+                    );
+
+                    let info_req = TestRequest::new(
+                        http::Method::GET,
+                        format!("/rustfs/admin/v3/info-service-account?accessKey={target}").as_str(),
+                    )
+                    .header("x-amz-security-token", &sts_caller.session_token)
+                    .credentials(&sts_caller.access_key, &sts_caller.secret_key, Some(&sts_caller.session_token))
+                    .build();
+                    assert_eq!(
+                        InfoServiceAccount {}
+                            .call(info_req, Params::new())
+                            .await
+                            .expect_err("restricted STS info must fail")
+                            .code(),
+                        &S3ErrorCode::AccessDenied,
+                        "{label} info {target}"
+                    );
+                }
+                assert!(
+                    iam.get_service_account(target_sa).await.is_ok(),
+                    "target service account {target_sa} must remain after rejected delete by {label}"
+                );
+
+                let access_key_info_req = TestRequest::new(
+                    http::Method::GET,
+                    format!("/rustfs/admin/v3/info-access-key?accessKey={target_sa}").as_str(),
+                )
+                .header("x-amz-security-token", &sts_caller.session_token)
+                .credentials(&sts_caller.access_key, &sts_caller.secret_key, Some(&sts_caller.session_token))
+                .build();
+                assert_eq!(
+                    InfoAccessKey {}
+                        .call(access_key_info_req, Params::new())
+                        .await
+                        .expect_err("restricted STS info-access-key must fail")
+                        .code(),
+                    &S3ErrorCode::AccessDenied,
+                    "{label} info-access-key {target_sa}"
+                );
+
+                let list_req = TestRequest::new(http::Method::GET, "/rustfs/admin/v3/list-service-accounts")
+                    .header("x-amz-security-token", &sts_caller.session_token)
+                    .credentials(&sts_caller.access_key, &sts_caller.secret_key, Some(&sts_caller.session_token))
+                    .build();
+                assert_eq!(
+                    ListServiceAccount {}
+                        .call(list_req, Params::new())
+                        .await
+                        .expect_err("restricted STS list must fail")
+                        .code(),
+                    &S3ErrorCode::AccessDenied,
+                    "{label} list"
+                );
+
+                let bulk_req = TestRequest::new(http::Method::GET, "/rustfs/admin/v3/list-access-keys-bulk")
+                    .header("x-amz-security-token", &sts_caller.session_token)
+                    .credentials(&sts_caller.access_key, &sts_caller.secret_key, Some(&sts_caller.session_token))
+                    .build();
+                assert_eq!(
+                    ListAccessKeysBulk {}
+                        .call(bulk_req, Params::new())
+                        .await
+                        .expect_err("restricted STS bulk list must fail")
+                        .code(),
+                    &S3ErrorCode::AccessDenied,
+                    "{label} bulk list"
+                );
+            }
+
+            // An unrestricted Console STS session (no sessionPolicy claim) retains owner self-service
+            // fallback when neither parent nor session carries an explicit admin Deny.
+            let console_list_req = TestRequest::new(http::Method::GET, "/rustfs/admin/v3/list-service-accounts")
+                .header("x-amz-security-token", &console_sts.session_token)
+                .credentials(&console_sts.access_key, &console_sts.secret_key, Some(&console_sts.session_token))
                 .build();
             assert_eq!(
                 ListServiceAccount {}
-                    .call(ord_list_req, Params::new())
+                    .call(console_list_req, Params::new())
                     .await
-                    .expect("unmarked STS list should succeed")
+                    .expect("unrestricted console STS list should succeed")
                     .into_parts()
                     .0,
                 StatusCode::OK
             );
-            let ord_info_req = TestRequest::new(
+            let console_info_req = TestRequest::new(
                 http::Method::GET,
                 format!("/rustfs/admin/v3/info-service-account?accessKey={}", sa_sibling.access_key).as_str(),
             )
-            .header("x-amz-security-token", &ordinary_sts.session_token)
-            .credentials(&ordinary_sts.access_key, &ordinary_sts.secret_key, Some(&ordinary_sts.session_token))
+            .header("x-amz-security-token", &console_sts.session_token)
+            .credentials(&console_sts.access_key, &console_sts.secret_key, Some(&console_sts.session_token))
             .build();
             assert_eq!(
                 InfoServiceAccount {}
-                    .call(ord_info_req, Params::new())
+                    .call(console_info_req, Params::new())
                     .await
-                    .expect("unmarked STS info should succeed")
+                    .expect("unrestricted console STS info should succeed")
                     .into_parts()
                     .0,
                 StatusCode::OK
             );
-            let ord_bulk_req = TestRequest::new(http::Method::GET, "/rustfs/admin/v3/list-access-keys-bulk")
-                .header("x-amz-security-token", &ordinary_sts.session_token)
-                .credentials(&ordinary_sts.access_key, &ordinary_sts.secret_key, Some(&ordinary_sts.session_token))
-                .build();
+            let console_ak_info_req = TestRequest::new(
+                http::Method::GET,
+                format!("/rustfs/admin/v3/info-access-key?accessKey={}", sa_sibling.access_key).as_str(),
+            )
+            .header("x-amz-security-token", &console_sts.session_token)
+            .credentials(&console_sts.access_key, &console_sts.secret_key, Some(&console_sts.session_token))
+            .build();
             assert_eq!(
-                ListAccessKeysBulk {}
-                    .call(ord_bulk_req, Params::new())
+                InfoAccessKey {}
+                    .call(console_ak_info_req, Params::new())
                     .await
-                    .expect("unmarked STS bulk list should succeed")
+                    .expect("unrestricted console STS info-access-key should succeed")
                     .into_parts()
                     .0,
                 StatusCode::OK
+            );
+            let console_bulk_req = TestRequest::new(http::Method::GET, "/rustfs/admin/v3/list-access-keys-bulk")
+                .header("x-amz-security-token", &console_sts.session_token)
+                .credentials(&console_sts.access_key, &console_sts.secret_key, Some(&console_sts.session_token))
+                .build();
+            assert_eq!(
+                ListAccessKeysBulk {}
+                    .call(console_bulk_req, Params::new())
+                    .await
+                    .expect("unrestricted console STS bulk list should succeed")
+                    .into_parts()
+                    .0,
+                StatusCode::OK
+            );
+            let console_delete_req = TestRequest::new(
+                http::Method::DELETE,
+                format!("/rustfs/admin/v3/delete-service-account?accessKey={}", alice_console_target.access_key).as_str(),
+            )
+            .header("x-amz-security-token", &console_sts.session_token)
+            .credentials(&console_sts.access_key, &console_sts.secret_key, Some(&console_sts.session_token))
+            .build();
+            assert_eq!(
+                DeleteServiceAccount {}
+                    .call(console_delete_req, Params::new())
+                    .await
+                    .expect("unrestricted console STS delete should succeed")
+                    .into_parts()
+                    .0,
+                StatusCode::OK
+            );
+            assert!(
+                iam.get_service_account(&alice_console_target.access_key)
+                    .await
+                    .is_err_and(|err| is_err_no_such_service_account(&err)),
+                "unrestricted console STS delete must remove owned service account"
             );
 
             // An active regular owner with NO attached policies retains self-service over own accounts
