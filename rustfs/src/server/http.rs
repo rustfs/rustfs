@@ -10320,7 +10320,7 @@ mod tests {
                     assert_eq!(info.real_ip, peer.ip());
                     assert_eq!(info.forwarded_proto.as_deref(), Some("https"));
                     let identity = rustfs_keystone::KEYSTONE_CREDENTIALS.try_with(Clone::clone).ok().flatten().map(|credentials| credentials.parent_user).unwrap_or_else(|| "anonymous".to_owned());
-                    if request.headers().contains_key("x-auth-token") { assert_eq!(identity, "test-user"); }
+                    if request.headers().contains_key("x-auth-token") { assert_eq!(identity, "keystone:user-id"); }
                     Ok::<_, Box<dyn std::error::Error + Send + Sync>>(Response::new(HybridBody::<EdgeBody, http_body_util::Empty<Bytes>>::Rest { rest_body: EdgeBody::from(Bytes::from(identity)) }))
                 });
                 let inner = Http3CoreService::new(inner);
@@ -10336,7 +10336,7 @@ mod tests {
             assert_eq!(request(&mut client, HttpRequest::builder().uri("https://localhost/bucket/key").header("x-auth-token", "invalid-token").body(())?, Bytes::new()).await?.0, http::StatusCode::UNAUTHORIZED);
             let (status, headers, body) = request(&mut client, HttpRequest::builder().uri("https://localhost/bucket/key").header("x-auth-token", "valid-token").header("x-forwarded-for", "203.0.113.1").body(())?, Bytes::new()).await?;
             assert_eq!(status, http::StatusCode::OK);
-            assert_eq!(body, "test-user");
+            assert_eq!(body, "keystone:user-id");
             assert!(headers.contains_key("x-amz-request-id"), "request context must survive HTTP/3 dispatch");
             assert_eq!(request(&mut client, make_request()?, Bytes::new()).await?.2, "anonymous", "Keystone task-local credentials must not leak between streams");
             assert_eq!(request(&mut client, make_request()?, Bytes::new()).await?.0, http::StatusCode::TOO_MANY_REQUESTS);
