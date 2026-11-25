@@ -2106,12 +2106,17 @@ impl LocalDisk {
                 if !observed.commit_data_safe {
                     return Err(DiskError::OutdatedXLMeta);
                 }
-                if matches!(observed.state, DeleteRecoveryState::QuorumCommitted | DeleteRecoveryState::CommitFinished) {
+                // A prior rename can be visible after the directory fsync failed. A retry
+                // that supplies a quorum vote must durably publish the decision again.
+                let finished = observed.state == DeleteRecoveryState::CommitFinished;
+                if (finished || observed.state == DeleteRecoveryState::QuorumCommitted)
+                    && !effective_durability(volume).syncs_commit_metadata()
+                {
                     return Ok(observed);
                 }
                 let receipt = CommitReceipt {
                     journal: journal.clone(),
-                    finished: false,
+                    finished,
                 };
                 let inspect_after = (!cfg!(feature = "e2e-test-hooks")).then_some(object);
                 let inspected = write_delete_rollback_files(
@@ -6499,6 +6504,44 @@ mod tests {
             .await
             .expect("unchanged proof");
         assert_eq!(full.inspection.fingerprint, unchanged.fingerprint);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn delete_recovery_visible_receipt_must_be_durable_to_confirm_a_retry() {
+        let (_temp, disk, _, _) = fixture().await;
+        let transaction = Uuid::new_v4();
+        apply(&disk, transaction).await;
+        let inspect = || disk.delete_recovery_inspect("recovery", "object", transaction);
+        let publish = |fingerprint| {
+            disk.delete_recovery_settle("recovery", "object", transaction, fingerprint, DeleteRecoveryAction::PublishCommit, None)
+        };
+        let directory = disk.io_get_object_path("recovery", &format!("object/{transaction}")).unwrap();
+        let receipt = directory.join(DELETE_QUORUM_COMMITTED_FILE);
+
+        for _ in 0..2 {
+            let state = inspect().await.unwrap();
+            os::fsync_dir_recorder::set_failure(&directory, ErrorKind::PermissionDenied);
+            assert_eq!(publish(state.fingerprint).await.unwrap_err(), DiskError::FileAccessDenied);
+            assert!(receipt.is_file(), "rename can succeed before its directory sync fails");
+        }
+        let state = publish(inspect().await.unwrap().fingerprint).await.unwrap();
+        assert_eq!(state.state, DeleteRecoveryState::QuorumCommitted);
+        let finished = disk
+            .delete_recovery_settle(
+                "recovery",
+                "object",
+                transaction,
+                state.fingerprint,
+                DeleteRecoveryAction::FinishCommit,
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(finished.state, DeleteRecoveryState::CommitFinished);
+        assert_eq!(publish(finished.fingerprint).await.unwrap().state, DeleteRecoveryState::CommitFinished);
+        let record: CommitReceipt = serde_json::from_slice(&tokio::fs::read(receipt).await.unwrap()).unwrap();
+        assert!(record.finished, "a retried vote must preserve existing completion");
     }
 
     #[tokio::test]
