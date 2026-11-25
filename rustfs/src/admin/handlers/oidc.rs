@@ -101,9 +101,13 @@ fn oidc_authorize_rate_limited_response(limit_rpm: u32, throttle: &ThrottleInfo)
 
 fn callback_federation_error(error: FederationError) -> S3Error {
     match error {
-        FederationError::CodeExchange(message) => {
-            S3Error::with_message(S3ErrorCode::AccessDenied, format!("code exchange failed: {message}"))
+        // Operator diagnostics in `CodeExchange` embed internal provider configuration
+        // (`config_url`, `token_endpoint`, `client_id`). The handler logs the full
+        // diagnostic; the unauthenticated callback response returns fixed messages only.
+        FederationError::CodeExchange(message) if is_invalid_oidc_state_error(&message) => {
+            s3_error!(AccessDenied, "code exchange failed: invalid or expired OIDC state")
         }
+        FederationError::CodeExchange(_) => s3_error!(AccessDenied, "code exchange failed"),
         FederationError::Logout(message) => {
             S3Error::with_message(S3ErrorCode::InternalError, format!("logout session creation failed: {message}"))
         }
@@ -1065,9 +1069,27 @@ mod tests {
     fn callback_errors_preserve_existing_s3_semantics() {
         let cases = [
             (
-                FederationError::CodeExchange("invalid state".to_string()),
+                FederationError::CodeExchange("invalid or expired OIDC state".to_string()),
                 S3ErrorCode::AccessDenied,
-                "code exchange failed: invalid state",
+                "code exchange failed: invalid or expired OIDC state",
+            ),
+            (
+                FederationError::CodeExchange(
+                    "token exchange failed: invalid_grant: stage=token_server_response, provider_id=default, \
+                     config_url=http://keycloak.keycloak.svc.cluster.local:8080/realms/rustfs, \
+                     issuer=https://auth.example.com/realms/rustfs, \
+                     token_endpoint=http://keycloak.keycloak.svc.cluster.local:8080/realms/rustfs/token, \
+                     redirect_uri=https://console.example.com/rustfs/admin/v3/oidc/callback/default, \
+                     client_id=rustfs-console"
+                        .to_string(),
+                ),
+                S3ErrorCode::AccessDenied,
+                "code exchange failed",
+            ),
+            (
+                FederationError::CodeExchange("OIDC state was issued for a different provider".to_string()),
+                S3ErrorCode::AccessDenied,
+                "code exchange failed",
             ),
             (
                 FederationError::Logout("session unavailable".to_string()),
@@ -1091,6 +1113,26 @@ mod tests {
             assert_eq!(error.code(), &expected_code);
             assert_eq!(error.message(), Some(expected_message));
         }
+    }
+
+    #[test]
+    fn callback_errors_never_echo_internal_provider_urls() {
+        let internal_url = "http://keycloak.keycloak.svc.cluster.local:8080/realms/rustfs";
+        let diagnostic = format!(
+            "token exchange failed: stage=token_request_failed, provider_id=corp, config_url={internal_url}, \
+             token_endpoint={internal_url}/protocol/openid-connect/token, client_id=rustfs-console"
+        );
+        assert!(!is_invalid_oidc_state_error(&diagnostic));
+        assert!(is_invalid_oidc_state_error("invalid or expired OIDC state"));
+
+        let err = callback_federation_error(FederationError::CodeExchange(diagnostic));
+        assert_eq!(err.code(), &S3ErrorCode::AccessDenied);
+        let msg = err.message().expect("error should have a message");
+        assert_eq!(msg, "code exchange failed");
+        assert!(!msg.contains(internal_url));
+        assert!(!msg.contains("config_url"));
+        assert!(!msg.contains("token_endpoint"));
+        assert!(!msg.contains("rustfs-console"));
     }
 
     #[test]
