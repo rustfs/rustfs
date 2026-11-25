@@ -1868,8 +1868,8 @@ async fn ghsa_unknown_or_empty_secret_rejected_both_stacks() -> TestResult {
     let valid_exp = (now.unix_timestamp() + 300).to_string();
 
     for (unknown_ak, forged_secret) in [
-        ("AKIAUNKNOWNEMPTY0001", ""),
-        ("AKIAUNKNOWNFORGED002", "attacker-chosen-secret-key"),
+        ("TESTUNKNOWNEMPTY0001", ""),
+        ("TESTUNKNOWNFORGED002", "attacker-chosen-secret-key"),
     ] {
         // SigV4 header
         let (leg, gw) = send_pair(&pair, |env| {
@@ -2416,7 +2416,7 @@ async fn ghsa_sts_forged_or_wrong_secret_rejected_both_stacks() -> TestResult {
         let mut p = SigV4Params::get_probe(env);
         p.method = "POST";
         p.path = "/";
-        p.access_key = "AKIASTSUNKNOWN000001";
+        p.access_key = "TESTSTSUNKNOWN000001";
         p.secret_key = "forged-sts-secret";
         p.service = "sts";
         p.extra_signed_headers = vec![("content-type", "application/x-www-form-urlencoded")];
