@@ -169,6 +169,10 @@ pub(crate) fn admit_operation(
     request_validation::validate_method_subresource(method, raw_query).map_err(|violation| match violation {
         request_validation::RequestViolation::DeleteAcl => S3Error::new(S3ErrorCode::MethodNotAllowed),
     })?;
+    crate::auth::reject_unsigned_amz_headers_on_sigv4_request(headers, raw_query)?;
+    if (signature.presigned || operation == "PostObject") && super::decision::has_replication_only_put_headers(headers) {
+        return Err(s3_error!(AccessDenied, "Access Denied"));
+    }
     if operation == "PostObject" {
         validate_post_object_metadata(headers, raw_query)?;
     }
@@ -285,5 +289,78 @@ mod access_phase_tests {
             assert_eq!(extensions.get::<VerifiedSigV4Request>().is_some(), sigv4, "{operation}");
             assert_eq!(extensions.get::<VerifiedPresignedRequest>().is_some(), presigned, "{operation}");
         }
+    }
+
+    #[test]
+    fn admission_rejects_unsigned_extension_headers_and_presigned_replication_headers() {
+        let presigned_host_only = "X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Date=20260827T000000Z&X-Amz-Expires=900&X-Amz-SignedHeaders=host&X-Amz-Credential=test/20260827/us-east-1/s3/aws4_request&X-Amz-Signature=signature";
+
+        for header in [
+            "x-rustfs-force-delete",
+            "x-rustfs-source-version-id",
+            "x-rustfs-meta-owner",
+            "x-minio-meta-owner",
+        ] {
+            let mut headers = http::HeaderMap::new();
+            headers.insert(header, "true".parse().unwrap());
+            let err = super::admit_operation(
+                &http::Method::PUT,
+                &headers,
+                Some(presigned_host_only),
+                "PutObject",
+                VerifiedSignature {
+                    sigv4: true,
+                    presigned: true,
+                },
+            )
+            .expect_err("unsigned extension header must be denied at admission");
+            assert_eq!(err.code(), &rustfs_s3_types::S3ErrorCode::AccessDenied, "{header}");
+        }
+
+        // Even when listed in X-Amz-SignedHeaders, replication-only headers are rejected on presigned requests.
+        for (operation, header_name, header_value) in [
+            ("PutObject", "x-rustfs-source-version-id", "v1"),
+            ("UploadPart", "x-rustfs-replication-part-actual-size", "1024"),
+        ] {
+            let signed_replication =
+                presigned_host_only.replace("SignedHeaders=host", &format!("SignedHeaders=host%3B{header_name}"));
+            let mut headers = http::HeaderMap::new();
+            headers.insert(header_name, header_value.parse().unwrap());
+            let err = super::admit_operation(
+                &http::Method::PUT,
+                &headers,
+                Some(&signed_replication),
+                operation,
+                VerifiedSignature {
+                    sigv4: true,
+                    presigned: true,
+                },
+            )
+            .expect_err("presigned request must never pass replication-only headers");
+            assert_eq!(err.code(), &rustfs_s3_types::S3ErrorCode::AccessDenied, "{operation} {header_name}");
+        }
+
+        // Browser POST policy requests do not sign HTTP headers, so replication-only headers are rejected too.
+        let mut post_headers = http::HeaderMap::new();
+        post_headers.insert("x-rustfs-source-version-id", "v1".parse().unwrap());
+        let err = super::admit_operation(&http::Method::POST, &post_headers, None, "PostObject", VerifiedSignature::default())
+            .expect_err("PostObject must never pass replication-only HTTP headers");
+        assert_eq!(err.code(), &rustfs_s3_types::S3ErrorCode::AccessDenied);
+
+        // Positive control: signed non-replication extension metadata on a presigned request passes admission.
+        let signed_meta = presigned_host_only.replace("SignedHeaders=host", "SignedHeaders=host%3Bx-rustfs-meta-owner");
+        let mut headers = http::HeaderMap::new();
+        headers.insert("x-rustfs-meta-owner", "alice".parse().unwrap());
+        super::admit_operation(
+            &http::Method::PUT,
+            &headers,
+            Some(&signed_meta),
+            "PutObject",
+            VerifiedSignature {
+                sigv4: true,
+                presigned: true,
+            },
+        )
+        .expect("signed user metadata alias on presigned request must pass admission");
     }
 }

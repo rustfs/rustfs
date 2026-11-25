@@ -309,6 +309,10 @@ impl GatewayStack {
         B::Data: Send,
         B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
     {
+        let unsigned_extension_refusal =
+            crate::auth::reject_unsigned_extension_headers_on_signed_request(request.headers(), request.uri().query())
+                .err()
+                .map(|err| err.message().unwrap_or(crate::auth::UNSIGNED_HEADERS_MESSAGE).to_owned());
         if self.control_plane {
             control_plane::attach_head(&mut request);
         }
@@ -336,8 +340,16 @@ impl GatewayStack {
             (None, _) => true,
         };
         attach_host_facts(extensions);
+        let refusal_request_id = unsigned_extension_refusal.as_ref().map(|_| {
+            extensions
+                .get::<RequestContext>()
+                .and_then(host_request_id)
+                .map(|id| id.request_id().as_str().to_owned())
+                .unwrap_or_else(|| uuid::Uuid::new_v4().simple().to_string())
+        });
         // `Connection` is an HTTP/1 header; HTTP/2 and HTTP/3 forbid it and end only the stream.
         let http1 = request.version() < http::Version::HTTP_2;
+        let is_head = request.method() == http::Method::HEAD;
         let service = match self.object_lambda_fallback.as_ref() {
             Some(fallback) if crate::admin::router::object_lambda_target(request.method(), request.uri()).is_some() => {
                 fallback.clone()
@@ -349,6 +361,10 @@ impl GatewayStack {
                 let mut response = Response::new(rustfs_gateway::Body::empty());
                 *response.status_mut() = http::StatusCode::FORBIDDEN;
                 return response;
+            }
+            if let Some(message) = unsigned_extension_refusal {
+                let request_id = refusal_request_id.unwrap_or_else(|| uuid::Uuid::new_v4().simple().to_string());
+                return unsigned_extension_header_response(&message, &request_id, is_head, http1);
             }
             // The service's own entry, not its tower adapter: the adapter reads a body the handler
             // left unread in a detached task of its own, which takes the body away from
@@ -363,6 +379,37 @@ impl GatewayStack {
             response
         }
     }
+}
+
+/// Renders an S3 `403 AccessDenied` refusal matching the gateway's header guard format when a
+/// signed request carries an unsigned `x-rustfs-*` or `x-minio-*` extension header.
+fn unsigned_extension_header_response(
+    message: &str,
+    request_id: &str,
+    is_head: bool,
+    http1: bool,
+) -> Response<rustfs_gateway::Body> {
+    let xml = format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<Error><Code>AccessDenied</Code><Message>{message}</Message><RequestId>{request_id}</RequestId></Error>"
+    );
+    let content_length = xml.len();
+    let body = if is_head {
+        rustfs_gateway::Body::empty()
+    } else {
+        rustfs_gateway::Body::from_bytes(bytes::Bytes::from(xml))
+    };
+    let mut response = Response::new(body);
+    *response.status_mut() = http::StatusCode::FORBIDDEN;
+    let headers = response.headers_mut();
+    headers.insert(http::header::CONTENT_TYPE, http::HeaderValue::from_static("application/xml"));
+    headers.insert(http::header::CONTENT_LENGTH, http::HeaderValue::from(content_length));
+    if let Ok(value) = http::HeaderValue::from_str(request_id) {
+        headers.insert(http::header::HeaderName::from_static("x-amz-request-id"), value);
+    }
+    if http1 {
+        headers.insert(http::header::CONNECTION, http::HeaderValue::from_static("close"));
+    }
+    response
 }
 
 /// The gateway stack over a server context, with requests signed by a root it publishes on that

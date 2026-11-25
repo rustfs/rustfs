@@ -49,9 +49,11 @@ use rustfs_policy::policy::BucketPolicyArgs;
 use rustfs_policy::policy::action::{Action, S3Action};
 use rustfs_s3_types::{S3Error, S3Result, s3_error};
 use rustfs_utils::http::{
-    AMZ_BUCKET_REPLICATION_STATUS, SUFFIX_REPLICATION_ACTUAL_OBJECT_SIZE, SUFFIX_REPLICATION_SSEC_CRC, SUFFIX_SOURCE_ETAG,
-    SUFFIX_SOURCE_MTIME, SUFFIX_SOURCE_REPLICATION_CHECK, SUFFIX_SOURCE_REPLICATION_REQUEST, SUFFIX_SOURCE_VERSION_ID,
-    get_header,
+    AMZ_BUCKET_REPLICATION_STATUS, SUFFIX_REPLICATION_ACTUAL_OBJECT_SIZE, SUFFIX_REPLICATION_COMPRESSION,
+    SUFFIX_REPLICATION_COMPRESSION_ACTUAL_SIZE, SUFFIX_REPLICATION_PART_ACTUAL_SIZE, SUFFIX_REPLICATION_SSEC_CRC,
+    SUFFIX_SOURCE_ETAG, SUFFIX_SOURCE_MTIME, SUFFIX_SOURCE_REPLICATION_CHECK, SUFFIX_SOURCE_REPLICATION_LEGALHOLD_TIMESTAMP,
+    SUFFIX_SOURCE_REPLICATION_REQUEST, SUFFIX_SOURCE_REPLICATION_RETENTION_TIMESTAMP,
+    SUFFIX_SOURCE_REPLICATION_TAGGING_TIMESTAMP, SUFFIX_SOURCE_VERSION_ID, get_header,
 };
 
 pub(crate) fn iam_authorization_error(err: IamError) -> ApiError {
@@ -65,14 +67,20 @@ const EVENT_OBJECT_TAG_AUTHORIZATION: &str = "object_tag_authorization";
 const LOG_COMPONENT_ACCESS: &str = "storage_access";
 const LOG_SUBSYSTEM_AUTHORIZATION: &str = "authorization";
 
-fn has_replication_only_put_headers(headers: &HeaderMap) -> bool {
+pub(super) fn has_replication_only_put_headers(headers: &HeaderMap) -> bool {
     headers.contains_key(AMZ_BUCKET_REPLICATION_STATUS)
         || get_header(headers, SUFFIX_REPLICATION_ACTUAL_OBJECT_SIZE).is_some()
+        || get_header(headers, SUFFIX_REPLICATION_COMPRESSION).is_some()
+        || get_header(headers, SUFFIX_REPLICATION_COMPRESSION_ACTUAL_SIZE).is_some()
+        || get_header(headers, SUFFIX_REPLICATION_PART_ACTUAL_SIZE).is_some()
         || get_header(headers, SUFFIX_REPLICATION_SSEC_CRC).is_some()
         || get_header(headers, SUFFIX_SOURCE_ETAG).is_some()
         || get_header(headers, SUFFIX_SOURCE_MTIME).is_some()
         || get_header(headers, SUFFIX_SOURCE_REPLICATION_CHECK).is_some()
+        || get_header(headers, SUFFIX_SOURCE_REPLICATION_LEGALHOLD_TIMESTAMP).is_some()
         || get_header(headers, SUFFIX_SOURCE_REPLICATION_REQUEST).is_some()
+        || get_header(headers, SUFFIX_SOURCE_REPLICATION_RETENTION_TIMESTAMP).is_some()
+        || get_header(headers, SUFFIX_SOURCE_REPLICATION_TAGGING_TIMESTAMP).is_some()
         || get_header(headers, SUFFIX_SOURCE_VERSION_ID).is_some()
         || rustfs_utils::http::has_ssec_transport_headers(headers)
 }
@@ -80,12 +88,36 @@ fn has_replication_only_put_headers(headers: &HeaderMap) -> bool {
 /// Asks `s3:ReplicateObject` when the request headers carry a replication-only header, and on
 /// Allow marks the request as an authorized replication request for the use case. A POST form
 /// cannot carry these headers, so the request headers are read, not the policy headers.
+/// Presigned requests may never exercise replication-only write headers.
 pub(crate) async fn authorize_replication_only_put_headers<R: AuthorizationRequest + ?Sized>(req: &mut R) -> S3Result<()> {
     if !has_replication_only_put_headers(req.headers()) {
         return Ok(());
     }
+    if crate::auth::is_presigned_request_head(req.headers(), req.uri().query()) {
+        let action = Action::S3Action(S3Action::ReplicateObjectAction);
+        if let Some(req_info) = req.req_info() {
+            let denial = DenialContext {
+                quiet: req_info.suppress_denial_log,
+                suppress_audit: req_info.suppress_denial_audit,
+                auditor: DenialAuditor::global(),
+                bucket: req_info.bucket.as_deref().unwrap_or_default(),
+                object: req_info.object.as_deref().unwrap_or_default(),
+                version_id: req_info.version_id.as_deref(),
+                account: req_info.cred.as_ref().map(|c| c.access_key.as_str()),
+                is_owner: req_info.is_owner,
+            };
+            return Err(denial.deny(req, "presigned_replication_headers", action));
+        }
+        return Err(s3_error!(AccessDenied, "Access Denied"));
+    }
 
     authorize_request(req, Action::S3Action(S3Action::ReplicateObjectAction)).await?;
+    if get_header(req.headers(), SUFFIX_SOURCE_REPLICATION_RETENTION_TIMESTAMP).is_some() {
+        authorize_request(req, Action::S3Action(S3Action::PutObjectRetentionAction)).await?;
+    }
+    if get_header(req.headers(), SUFFIX_SOURCE_REPLICATION_LEGALHOLD_TIMESTAMP).is_some() {
+        authorize_request(req, Action::S3Action(S3Action::PutObjectLegalHoldAction)).await?;
+    }
     req_info_mut(req)?.replication_request_authorized = true;
     Ok(())
 }

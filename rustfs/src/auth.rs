@@ -51,6 +51,7 @@ const EVENT_KEYSTONE_CONTEXT_MISSING: &str = "keystone_context_missing";
 const EVENT_SESSION_TOKEN_EXTRACTION: &str = "session_token_extraction";
 const EVENT_PRESIGNED_UNSIGNED_AMZ_HEADER: &str = "presigned_unsigned_amz_header";
 const EVENT_SIGV4_UNSIGNED_AMZ_HEADER: &str = "sigv4_unsigned_amz_header";
+const EVENT_SIGV2_EXTENSION_HEADER: &str = "sigv2_extension_header";
 const EVENT_SIGV4_UNSUPPORTED_ALGORITHM: &str = "sigv4_unsupported_algorithm";
 
 /// RustFS-specific query capability for a single presigned PutObject request.
@@ -845,27 +846,70 @@ const SIGV4_UNSIGNED_ENVELOPE_HEADERS: &[&str] = &[
     "x-amz-checksum-algorithm",
 ];
 
-/// GHSA-xm99-m3gq-83g8: reject `x-amz-*` request headers that the request's
-/// SigV4 signature does not cover, for both SigV4 authentication forms.
+/// RustFS extension request headers and their MinIO aliases
+/// (`rustfs_utils::http::get_header` reads both spellings).
+///
+/// Handlers act on these headers like `x-amz-*`: user metadata aliases,
+/// replication-only write options (source version id, mtime, ETag, SSE-C
+/// ciphertext passthrough, lock timestamps), and force-delete arrive under
+/// these prefixes.
+const EXTENSION_HEADER_PREFIXES: &[&str] = &["x-rustfs-", "x-minio-"];
+
+/// `name` must already be lowercase, as `HeaderName` is.
+fn is_extension_header(name: &str) -> bool {
+    EXTENSION_HEADER_PREFIXES.iter().any(|prefix| name.starts_with(prefix))
+}
+
+/// True for a request header that can change how RustFS handles the request, so
+/// the authenticating signature must cover it.
+fn is_signature_bound_header(name: &str) -> bool {
+    name.starts_with("x-amz-") || is_extension_header(name)
+}
+
+/// True when the request head carries SigV4 or SigV2 presigned query/header
+/// markers. Used as defense in depth so replication-only write headers cannot
+/// take effect on presigned URLs even if signed.
+pub(crate) fn is_presigned_request_head(header: &HeaderMap, query: Option<&str>) -> bool {
+    if is_request_presigned_signature_v4_with_query(header, query) || is_request_presigned_signature_v2(header, query) {
+        return true;
+    }
+    query.is_some_and(|query| {
+        form_urlencoded::parse(query.as_bytes()).any(|(name, _)| {
+            name.eq_ignore_ascii_case("x-amz-signature")
+                || name.eq_ignore_ascii_case("signature")
+                || name.eq_ignore_ascii_case("awsaccesskeyid")
+        })
+    })
+}
+
+/// GHSA-xm99-m3gq-83g8: reject `x-amz-*`, `x-rustfs-*`, and `x-minio-*` request
+/// headers that the request's signature does not cover, across SigV4 (header
+/// and presigned) and SigV2 authentication forms.
 ///
 /// The upstream verifier only proves that the headers named in `SignedHeaders`
-/// match; every other `x-amz-*` header still reaches the handlers. Anyone who
-/// captures one header-signed `PutObject` could replay it with an unsigned
-/// `x-amz-copy-source` and turn it into a `CopyObject` that runs with the
-/// signer's permissions, reading any object the signer can read. AWS S3 rejects
-/// unsigned `x-amz-*` headers on header-signed requests as well as presigned
-/// ones.
-///
-/// Every signed-header list the request carries must cover every `x-amz-*`
-/// header, so an `Authorization` header can never widen a presigned URL and a
-/// query can never widen a header signature. The gateway reads the verifier's
-/// header grammar so both sides see the same `SignedHeaders` list, and
-/// the algorithm token is pinned because the verifier accepts any token there.
-/// A header the parser rejects never authenticates as SigV4 upstream, but one
-/// that claims the SigV4 algorithm still fails closed here. SigV2 signs every
-/// `x-amz-*` header itself; JWT and anonymous requests carry no SigV4 list.
+/// match; every other `x-amz-*`, `x-rustfs-*`, or `x-minio-*` header would still
+/// reach handlers unsigned. Every signed-header list the request carries must
+/// cover every signature-bound header, so an `Authorization` header can never
+/// widen a presigned URL and a query can never widen a header signature. SigV2
+/// canonicalizes `x-amz-*` headers itself but cannot sign extension headers, so
+/// any SigV2 request carrying `x-rustfs-*` or `x-minio-*` is rejected. JWT and
+/// anonymous requests carry no HTTP request signature.
 pub(crate) fn reject_unsigned_amz_headers_on_sigv4_request(header: &HeaderMap, query: Option<&str>) -> OwnedResult<()> {
-    reject_unsigned_amz_headers_on_presigned_request(header, query)?;
+    reject_unsigned_headers_matching(header, query, is_signature_bound_header)
+}
+
+/// Enforce the signed-header rule for `x-rustfs-*` and `x-minio-*` extension
+/// headers on SigV4 (header-signed and presigned) and SigV2 requests at the
+/// gateway entry, complementing the upstream `x-amz-*` guard.
+pub(crate) fn reject_unsigned_extension_headers_on_signed_request(header: &HeaderMap, query: Option<&str>) -> OwnedResult<()> {
+    if !header.keys().any(|name| is_extension_header(name.as_str())) {
+        return Ok(());
+    }
+    reject_unsigned_headers_matching(header, query, is_extension_header)
+}
+
+fn reject_unsigned_headers_matching(header: &HeaderMap, query: Option<&str>, check_header: fn(&str) -> bool) -> OwnedResult<()> {
+    reject_unsigned_presigned_headers_matching(header, query, check_header)?;
 
     for value in header.get_all(http::header::AUTHORIZATION) {
         let Ok(value) = value.to_str() else {
@@ -875,6 +919,10 @@ pub(crate) fn reject_unsigned_amz_headers_on_sigv4_request(header: &HeaderMap, q
             Some(authorization) => authorization,
             None if value.starts_with(SIGN_V4_ALGORITHM) => {
                 return Err(owned_error!(AccessDenied, "Invalid SigV4 authorization header"));
+            }
+            None if value.trim_start().starts_with(SIGN_V2_ALGORITHM) => {
+                reject_extension_headers_on_sigv2_request(header)?;
+                continue;
             }
             None => continue,
         };
@@ -892,7 +940,7 @@ pub(crate) fn reject_unsigned_amz_headers_on_sigv4_request(header: &HeaderMap, q
             // `HeaderName` is already lowercase; the verifier looks signed
             // names up case-insensitively, so compare them the same way.
             let name = name.as_str();
-            if !name.starts_with("x-amz-")
+            if !check_header(name)
                 || SIGV4_UNSIGNED_ENVELOPE_HEADERS.contains(&name)
                 || PRESIGNED_UNSIGNED_AMZ_HEADER_ALLOWLIST.contains(&name)
                 || authorization.covers_header(name)
@@ -924,31 +972,44 @@ const PRESIGNED_UNSIGNED_AMZ_HEADER_ALLOWLIST: &[&str] = &["x-amz-cf-id"];
 
 pub(crate) const UNSIGNED_HEADERS_MESSAGE: &str = "There were headers present in the request which were not signed";
 
-/// GHSA-g8w9-qw9q-fghr: reject `x-amz-*` request headers that a SigV4 presigned
-/// URL did not sign.
+/// Reject `x-rustfs-*` / `x-minio-*` request headers on a SigV2 request.
 ///
-/// A presigned URL is a bounded capability: the presigner authorises one
-/// method, key, expiry and the header set named in `X-Amz-SignedHeaders`. The
-/// upstream verifier only proves that the signed headers match; any other
-/// `x-amz-*` header (tagging, storage class, ACL, metadata, website redirect,
-/// Object Lock, SSE selection) would still reach the handlers and take effect,
-/// so the untrusted holder of an upload URL could set object properties the
-/// presign never covered. AWS S3 rejects such a request with `AccessDenied`
-/// ("There were headers present in the request which were not signed"); this
-/// check mirrors that at the access boundary, before any handler reads a
-/// header.
+/// SigV2 canonicalizes `x-amz-*` headers only and has no signed-header list, so
+/// neither a SigV2 presigned URL nor a SigV2 `Authorization` header can cover
+/// an extension header.
+fn reject_extension_headers_on_sigv2_request(header: &HeaderMap) -> OwnedResult<()> {
+    let Some(name) = header.keys().map(HeaderName::as_str).find(|name| is_extension_header(name)) else {
+        return Ok(());
+    };
+    warn!(
+        event = EVENT_SIGV2_EXTENSION_HEADER,
+        component = LOG_COMPONENT_AUTH,
+        subsystem = LOG_SUBSYSTEM_REQUEST,
+        reason = "unsigned_extension_header",
+        header = name,
+        "SigV2 request rejected"
+    );
+    Err(owned_error!(AccessDenied, "{UNSIGNED_HEADERS_MESSAGE}"))
+}
+
+/// GHSA-g8w9-qw9q-fghr: reject `x-amz-*`, `x-rustfs-*`, and `x-minio-*` request
+/// headers that a presigned URL did not sign.
 ///
-/// This helper checks query-string SigV4 requests. SigV2 canonicalises every
-/// `x-amz-*` header into the string to sign, so adding one there already breaks
-/// the signature. The outer guard checks header-signed SigV4 requests.
-///
-/// Detection keys on the query, not on the derived [`AuthType`], because the
-/// upstream verifier dispatches to the presigned path whenever the query
-/// carries `X-Amz-Signature`, even if an `Authorization` header is present too.
-/// The rule relies on the verifier signing every query parameter except the
-/// signature itself, so neither `X-Amz-SignedHeaders` nor a property-carrying
-/// query parameter can be added after presigning.
+/// SigV4 presigned requests must list every signature-bound header in
+/// `X-Amz-SignedHeaders` (or match a same-named signed query parameter). SigV2
+/// canonicalizes `x-amz-*` headers into its string to sign, so any `x-rustfs-*`
+/// or `x-minio-*` extension header is outside the SigV2 signature and is
+/// refused outright.
+#[cfg(test)]
 pub(crate) fn reject_unsigned_amz_headers_on_presigned_request(header: &HeaderMap, query: Option<&str>) -> OwnedResult<()> {
+    reject_unsigned_presigned_headers_matching(header, query, is_signature_bound_header)
+}
+
+fn reject_unsigned_presigned_headers_matching(
+    header: &HeaderMap,
+    query: Option<&str>,
+    check_header: fn(&str) -> bool,
+) -> OwnedResult<()> {
     let Some(query) = query else {
         return Ok(());
     };
@@ -959,17 +1020,26 @@ pub(crate) fn reject_unsigned_amz_headers_on_presigned_request(header: &HeaderMa
     // so both sides always see the same list. A duplicate or missing key
     // yields an empty list, which signs nothing.
     let mut is_presigned_v4 = false;
+    let mut is_presigned_v2 = false;
     let mut signed_headers: Option<String> = None;
     let mut duplicate_signed_headers = false;
     for (name, value) in form_urlencoded::parse(query.as_bytes()) {
         if name.eq_ignore_ascii_case("x-amz-signature") {
             is_presigned_v4 = true;
+        } else if name.eq_ignore_ascii_case("signature") || name.eq_ignore_ascii_case("awsaccesskeyid") {
+            is_presigned_v2 = true;
         } else if name == "X-Amz-SignedHeaders" {
             if signed_headers.is_some() {
                 duplicate_signed_headers = true;
             }
             signed_headers = Some(value.into_owned());
         }
+    }
+    // SigV2 leaves ordinary query parameters unsigned and takes precedence in
+    // presigned verification, so appending SigV4 parameters to a SigV2 URL must
+    // never cover an extension header.
+    if is_presigned_v2 {
+        reject_extension_headers_on_sigv2_request(header)?;
     }
     if !is_presigned_v4 {
         return Ok(());
@@ -989,18 +1059,17 @@ pub(crate) fn reject_unsigned_amz_headers_on_presigned_request(header: &HeaderMa
     for name in header.keys() {
         // `HeaderName` is already lowercase.
         let name = name.as_str();
-        if !name.starts_with("x-amz-") || PRESIGNED_UNSIGNED_AMZ_HEADER_ALLOWLIST.contains(&name) {
+        if !check_header(name) || PRESIGNED_UNSIGNED_AMZ_HEADER_ALLOWLIST.contains(&name) {
             continue;
         }
         if signed.iter().any(|signed_name| signed_name == name) {
             continue;
         }
-        // The query-hoist layer restores a signed `x-amz-*` query parameter as
-        // a header before this rule runs a second time at the access boundary.
-        // Such a header carries exactly the value the signature covers, so it
-        // is as signed as the parameter itself; a header the signer did not
-        // sign cannot match one.
-        if header_as_signed_query_value(header, query, name) {
+        // The query-hoist layer restores a signed `x-amz-meta-*` query parameter
+        // as a header before this rule runs a second time at the access boundary.
+        // Extension headers (`x-rustfs-*`, `x-minio-*`) are never hoisted from
+        // the query string, so they must always appear in `X-Amz-SignedHeaders`.
+        if !is_extension_header(name) && header_as_signed_query_value(header, query, name) {
             continue;
         }
         warn!(
@@ -2514,6 +2583,127 @@ mod tests {
             reject_unsigned_amz_headers_on_sigv4_request(&headers, None)
                 .expect("non-SigV4 authorization carries no signed-header list");
         }
+    }
+
+    const EXTENSION_HEADERS: [&str; 10] = [
+        "x-rustfs-source-replication-request",
+        "x-rustfs-source-version-id",
+        "x-rustfs-source-mtime",
+        "x-rustfs-source-etag",
+        "x-rustfs-replication-ssec-original-size",
+        "x-rustfs-force-delete",
+        "x-rustfs-meta-owner",
+        "x-minio-force-delete",
+        "x-minio-meta-owner",
+        "x-minio-source-version-id",
+    ];
+
+    #[test]
+    fn presigned_request_rejects_unsigned_extension_headers() {
+        let presigned_host_only = "X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Date=20260827T000000Z&X-Amz-Expires=900&X-Amz-SignedHeaders=host&X-Amz-Credential=test/20260827/us-east-1/s3/aws4_request&X-Amz-Signature=signature";
+
+        for name in EXTENSION_HEADERS {
+            let mut headers = HeaderMap::new();
+            headers.insert("content-type", HeaderValue::from_static("text/plain"));
+            headers.insert(name, HeaderValue::from_static("true"));
+            assert_unsigned_headers_denied(reject_unsigned_amz_headers_on_presigned_request(&headers, Some(presigned_host_only)));
+            assert_unsigned_headers_denied(reject_unsigned_amz_headers_on_sigv4_request(&headers, Some(presigned_host_only)));
+            assert_unsigned_headers_denied(reject_unsigned_extension_headers_on_signed_request(
+                &headers,
+                Some(presigned_host_only),
+            ));
+
+            let signed = presigned_host_only.replace("SignedHeaders=host", &format!("SignedHeaders=host%3B{name}"));
+            reject_unsigned_amz_headers_on_presigned_request(&headers, Some(&signed))
+                .expect("signed extension header is allowed");
+            reject_unsigned_extension_headers_on_signed_request(&headers, Some(&signed))
+                .expect("signed extension header is allowed on gateway guard");
+
+            // Extension headers are never hoisted from query parameters, so matching
+            // a query parameter cannot substitute for listing them in X-Amz-SignedHeaders.
+            let as_query = format!("{presigned_host_only}&{name}=true");
+            assert_unsigned_headers_denied(reject_unsigned_amz_headers_on_presigned_request(&headers, Some(&as_query)));
+            assert_unsigned_headers_denied(reject_unsigned_extension_headers_on_signed_request(&headers, Some(&as_query)));
+        }
+    }
+
+    #[test]
+    fn header_sigv4_rejects_unsigned_extension_headers() {
+        for name in EXTENSION_HEADERS {
+            let mut headers = header_sigv4_headers("host;x-amz-content-sha256;x-amz-date");
+            headers.insert(name, HeaderValue::from_static("true"));
+            assert_unsigned_headers_denied(reject_unsigned_amz_headers_on_sigv4_request(&headers, None));
+            assert_unsigned_headers_denied(reject_unsigned_extension_headers_on_signed_request(&headers, None));
+
+            let mut headers = header_sigv4_headers(&format!("host;x-amz-content-sha256;x-amz-date;{name}"));
+            headers.insert(name, HeaderValue::from_static("true"));
+            reject_unsigned_amz_headers_on_sigv4_request(&headers, None).expect("signed extension header is allowed");
+            reject_unsigned_extension_headers_on_signed_request(&headers, None)
+                .expect("signed extension header is allowed on gateway guard");
+        }
+    }
+
+    #[test]
+    fn sigv2_request_rejects_extension_headers() {
+        let sigv2_query = "AWSAccessKeyId=test&Expires=1893456000&Signature=abc";
+
+        for name in EXTENSION_HEADERS {
+            let mut headers = HeaderMap::new();
+            headers.insert(name, HeaderValue::from_static("true"));
+            assert_unsigned_headers_denied(reject_unsigned_amz_headers_on_presigned_request(&headers, Some(sigv2_query)));
+            assert_unsigned_headers_denied(reject_unsigned_extension_headers_on_signed_request(&headers, Some(sigv2_query)));
+
+            // Appending SigV4 query parameters to a SigV2 URL must not allow an extension header.
+            let widened = format!("{sigv2_query}&X-Amz-Signature=abc&X-Amz-SignedHeaders=host%3B{name}");
+            assert_unsigned_headers_denied(reject_unsigned_amz_headers_on_sigv4_request(&headers, Some(&widened)));
+            assert_unsigned_headers_denied(reject_unsigned_extension_headers_on_signed_request(&headers, Some(&widened)));
+
+            headers.insert("authorization", HeaderValue::from_static("AWS key:signature"));
+            assert_unsigned_headers_denied(reject_unsigned_amz_headers_on_sigv4_request(&headers, None));
+            assert_unsigned_headers_denied(reject_unsigned_extension_headers_on_signed_request(&headers, None));
+        }
+
+        // Plain SigV2 requests without extension headers remain accepted.
+        let mut headers = HeaderMap::new();
+        headers.insert("content-type", HeaderValue::from_static("text/plain"));
+        headers.insert("x-amz-meta-owner", HeaderValue::from_static("app"));
+        reject_unsigned_amz_headers_on_sigv4_request(&headers, Some(sigv2_query)).expect("SigV2 signs x-amz-* itself");
+        reject_unsigned_extension_headers_on_signed_request(&headers, Some(sigv2_query))
+            .expect("gateway guard ignores plain SigV2");
+        headers.insert("authorization", HeaderValue::from_static("AWS key:signature"));
+        reject_unsigned_amz_headers_on_sigv4_request(&headers, None).expect("SigV2 signs x-amz-* itself");
+        reject_unsigned_extension_headers_on_signed_request(&headers, None).expect("gateway guard ignores plain SigV2");
+    }
+
+    #[test]
+    fn extension_header_check_ignores_jwt_and_anonymous_requests() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-rustfs-force-delete", HeaderValue::from_static("true"));
+        reject_unsigned_amz_headers_on_sigv4_request(&headers, None).expect("anonymous auth is handled downstream");
+        reject_unsigned_extension_headers_on_signed_request(&headers, None).expect("anonymous auth is handled downstream");
+        reject_unsigned_amz_headers_on_sigv4_request(&headers, Some("versionId=null")).expect("no signature in the query");
+
+        headers.insert("authorization", HeaderValue::from_static("Bearer token"));
+        reject_unsigned_amz_headers_on_sigv4_request(&headers, None).expect("JWT carries no request signature");
+        reject_unsigned_extension_headers_on_signed_request(&headers, None).expect("JWT carries no request signature");
+    }
+
+    #[test]
+    fn is_presigned_request_head_detects_sigv4_and_sigv2_presigned_requests() {
+        let headers = HeaderMap::new();
+        assert!(!is_presigned_request_head(&headers, None));
+        assert!(!is_presigned_request_head(&headers, Some("versionId=null")));
+        assert!(is_presigned_request_head(&headers, Some("X-Amz-Signature=deadbeef")));
+        assert!(is_presigned_request_head(&headers, Some("Signature=abc&AWSAccessKeyId=test")));
+        assert!(is_presigned_request_head(
+            &headers,
+            Some("x-amz-credential=test/20260827/us-east-1/s3/aws4_request")
+        ));
+
+        // Mixed header + presigned query is still detected as presigned.
+        let signed = header_sigv4_headers("host;x-amz-content-sha256;x-amz-date");
+        assert!(!is_presigned_request_head(&signed, None));
+        assert!(is_presigned_request_head(&signed, Some("X-Amz-Signature=deadbeef")));
     }
 
     #[test]
