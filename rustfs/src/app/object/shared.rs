@@ -17,10 +17,6 @@
 use super::*;
 use crate::app::RequestEnvelope;
 use crate::app::storage_api::object_usecase::access::authorize_missing_object_disclosure;
-#[cfg(test)]
-use crate::app::storage_api::s3::dto::ObjectLockRetentionMode;
-#[cfg(test)]
-use crate::app::storage_api::s3::dto::{ObjectLockLegalHoldStatus, ObjectLockMode, Timestamp};
 use crate::on_demand_migration::{OdmStateError, PolicyConfig, SourceErrorPolicy, SourceHead};
 use rustfs_gateway_types::ChecksumAlgorithm;
 use rustfs_s3_client::constants::{X_AMZ_DELETE_MARKER, X_AMZ_VERSION_ID};
@@ -857,23 +853,6 @@ pub(super) fn response_storage_class_for_object_attributes(
 pub(crate) const ERR_OBJECT_LOCK_RETENTION_HEADERS_MUST_BE_PAIRED: &str =
     "x-amz-object-lock-retain-until-date and x-amz-object-lock-mode must both be supplied";
 
-#[cfg(test)]
-fn build_put_like_object_lock_metadata(
-    bucket: &str,
-    object_lock_config_state: &metadata_sys::ObjectLockConfigState,
-    object_lock_legal_hold_status: Option<ObjectLockLegalHoldStatus>,
-    object_lock_mode: Option<ObjectLockMode>,
-    object_lock_retain_until_date: Option<Timestamp>,
-) -> S3Result<Option<HashMap<String, String>>> {
-    build_put_like_object_lock_metadata_native(
-        bucket,
-        object_lock_config_state,
-        object_lock_legal_hold_status.map(|value| value.as_str().to_owned()),
-        object_lock_mode.map(|value| value.as_str().to_owned()),
-        object_lock_retain_until_date.map(time::OffsetDateTime::from),
-    )
-}
-
 pub(crate) fn build_put_like_object_lock_metadata_native(
     bucket: &str,
     object_lock_config_state: &metadata_sys::ObjectLockConfigState,
@@ -1190,11 +1169,11 @@ pub(crate) fn reject_non_wildcard_write_if_none_match(specific_if_none_match: bo
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::app::storage_api::s3::dto::ServerSideEncryption;
     use http::{HeaderMap, HeaderValue};
     use rustfs_gateway_types::persistence::{
         PersistedBucketEncryptionRule as ServerSideEncryptionRule, PersistedEncryptionByDefault as ServerSideEncryptionByDefault,
     };
+    use rustfs_utils::http::headers::AMZ_ENCRYPTION_AES;
     use std::sync::Arc;
 
     #[test]
@@ -1701,37 +1680,36 @@ mod tests {
 
     #[test]
     fn resolve_bucket_default_sse_prefers_the_request_over_the_bucket_default() {
-        let config = bucket_sse_config_with(ServerSideEncryption::AWS_KMS, Some("bucket-key"));
+        let config = bucket_sse_config_with(AMZ_ENCRYPTION_KMS, Some("bucket-key"));
 
         let (sse, kms_key_id) = resolve_bucket_default_sse(
             Some(&config),
-            Some(String::from(ServerSideEncryption::AES256)),
+            Some(String::from(AMZ_ENCRYPTION_AES)),
             Some("request-key".to_string()),
             false,
         );
 
-        assert_eq!(sse.as_deref(), Some(ServerSideEncryption::AES256));
+        assert_eq!(sse.as_deref(), Some(AMZ_ENCRYPTION_AES));
         assert_eq!(kms_key_id.as_deref(), Some("request-key"));
     }
 
     #[test]
     fn resolve_bucket_default_sse_does_not_inherit_a_kms_key_for_an_explicit_sse_s3_request() {
-        let config = bucket_sse_config_with(ServerSideEncryption::AWS_KMS, Some("bucket-key"));
+        let config = bucket_sse_config_with(AMZ_ENCRYPTION_KMS, Some("bucket-key"));
 
-        let (sse, kms_key_id) =
-            resolve_bucket_default_sse(Some(&config), Some(String::from(ServerSideEncryption::AES256)), None, false);
+        let (sse, kms_key_id) = resolve_bucket_default_sse(Some(&config), Some(String::from(AMZ_ENCRYPTION_AES)), None, false);
 
-        assert_eq!(sse.as_deref(), Some(ServerSideEncryption::AES256));
+        assert_eq!(sse.as_deref(), Some(AMZ_ENCRYPTION_AES));
         assert!(kms_key_id.is_none(), "an SSE-S3 request must not inherit the bucket KMS key");
     }
 
     #[test]
     fn resolve_bucket_default_sse_fills_gaps_from_the_bucket_default() {
-        let config = bucket_sse_config_with(ServerSideEncryption::AWS_KMS, Some("bucket-key"));
+        let config = bucket_sse_config_with(AMZ_ENCRYPTION_KMS, Some("bucket-key"));
 
         let (sse, kms_key_id) = resolve_bucket_default_sse(Some(&config), None, None, false);
 
-        assert_eq!(sse.as_deref(), Some(ServerSideEncryption::AWS_KMS));
+        assert_eq!(sse.as_deref(), Some(AMZ_ENCRYPTION_KMS));
         assert_eq!(kms_key_id.as_deref(), Some("bucket-key"));
     }
 
@@ -1745,13 +1723,13 @@ mod tests {
 
         let (sse, kms_key_id) = resolve_bucket_default_sse(Some(&config), None, None, false);
 
-        assert_eq!(sse.as_deref(), Some(ServerSideEncryption::AES256));
+        assert_eq!(sse.as_deref(), Some(AMZ_ENCRYPTION_AES));
         assert!(kms_key_id.is_none());
     }
 
     #[test]
     fn resolve_bucket_default_sse_suppresses_the_default_for_explicit_ssec() {
-        let config = bucket_sse_config_with(ServerSideEncryption::AES256, Some("bucket-key"));
+        let config = bucket_sse_config_with(AMZ_ENCRYPTION_AES, Some("bucket-key"));
 
         let (sse, kms_key_id) = resolve_bucket_default_sse(Some(&config), None, None, true);
 
@@ -1769,11 +1747,11 @@ mod tests {
 
     #[test]
     fn build_put_like_object_lock_metadata_rejects_mode_without_retain_until_date() {
-        let err = build_put_like_object_lock_metadata(
+        let err = build_put_like_object_lock_metadata_native(
             "test-bucket",
             &metadata_sys::ObjectLockConfigState::ConfirmedAbsent,
             None,
-            Some(ObjectLockMode::from_static(ObjectLockMode::GOVERNANCE)),
+            Some("GOVERNANCE".to_owned()),
             None,
         )
         .unwrap_err();
@@ -1801,8 +1779,8 @@ mod tests {
 
     #[test]
     fn build_put_like_object_lock_metadata_rejects_retain_until_date_without_mode() {
-        let retain_until = Timestamp::from(OffsetDateTime::now_utc() + time::Duration::days(1));
-        let err = build_put_like_object_lock_metadata(
+        let retain_until = OffsetDateTime::now_utc() + time::Duration::days(1);
+        let err = build_put_like_object_lock_metadata_native(
             "test-bucket",
             &metadata_sys::ObjectLockConfigState::ConfirmedAbsent,
             None,
@@ -1843,14 +1821,14 @@ mod tests {
 
     fn compliance_retained_object_info() -> ObjectInfo {
         let mut metadata = HashMap::new();
-        metadata.insert(AMZ_OBJECT_LOCK_MODE_LOWER.to_string(), ObjectLockRetentionMode::COMPLIANCE.to_string());
+        metadata.insert(AMZ_OBJECT_LOCK_MODE_LOWER.to_string(), "COMPLIANCE".to_string());
         metadata.insert(AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE_LOWER.to_string(), "2030-01-01T00:00:00Z".to_string());
         object_info_with_lock_metadata(metadata)
     }
 
     fn legal_hold_object_info() -> ObjectInfo {
         let mut metadata = HashMap::new();
-        metadata.insert(AMZ_OBJECT_LOCK_LEGAL_HOLD_LOWER.to_string(), ObjectLockLegalHoldStatus::ON.to_string());
+        metadata.insert(AMZ_OBJECT_LOCK_LEGAL_HOLD_LOWER.to_string(), "ON".to_string());
         object_info_with_lock_metadata(metadata)
     }
 
@@ -1977,7 +1955,7 @@ mod tests {
             ..tagging_only.clone()
         };
 
-        for mode in [ObjectLockRetentionMode::COMPLIANCE, ObjectLockRetentionMode::GOVERNANCE] {
+        for mode in ["COMPLIANCE", "GOVERNANCE"] {
             let state = bucket_default_retention_state(mode);
             let err = validate_existing_object_lock_for_write(&state, &default_protected, &tagging_only)
                 .expect_err("bucket default retention must hold without a retention source timestamp");
@@ -2013,12 +1991,15 @@ mod tests {
 
     #[test]
     fn s3s_body_error_to_io_preserves_upload_stream_error_source() {
-        let error = s3s_body_error_to_io(Box::new(UploadStreamError::Sha256Mismatch));
+        let error = s3s_body_error_to_io(Box::new(rustfs_rio::IncompleteBody { remaining: 7 }));
 
-        assert!(matches!(
-            error.get_ref().and_then(|source| source.downcast_ref::<UploadStreamError>()),
-            Some(UploadStreamError::Sha256Mismatch)
-        ));
+        assert_eq!(
+            error
+                .get_ref()
+                .and_then(|source| source.downcast_ref::<rustfs_rio::IncompleteBody>())
+                .map(|err| err.remaining),
+            Some(7)
+        );
     }
 
     #[test]

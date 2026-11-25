@@ -813,12 +813,13 @@ impl DefaultObjectUsecase {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::app::storage_api::s3::{
-        PersistedOptionalReplicationStatus, PersistedReplicationConfiguration, PersistedReplicationDestination,
-        PersistedReplicationFilter, PersistedReplicationRule, PersistedReplicationTag, Status,
-    };
     use crate::app::storage_api::test::contract::bucket::{BucketOperations as _, MakeBucketOptions};
     use crate::app::storage_api::test::{get_global_bucket_metadata_sys, set_bucket_metadata};
+    use rustfs_gateway_types::dto::Status;
+    use rustfs_gateway_types::persistence::{
+        PersistedOptionalReplicationStatus, PersistedReplicationConfiguration, PersistedReplicationDestination,
+        PersistedReplicationFilter, PersistedReplicationRule, PersistedReplicationTag,
+    };
     use rustfs_utils::http::{
         MINIO_INTERNAL_PREFIX, RUSTFS_INTERNAL_PREFIX, SUFFIX_ODM_PULLED_AT, SUFFIX_ODM_SOURCE, SUFFIX_ODM_SOURCE_ETAG,
         SUFFIX_ODM_SOURCE_LAST_MODIFIED, SUFFIX_ODM_SOURCE_VERSION_ID, contains_key_str, get_consistent_str, get_str,

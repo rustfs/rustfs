@@ -2857,10 +2857,9 @@ pub(super) mod post_archive_preflight;
 mod tests {
     use super::*;
 
-    use crate::app::storage_api::s3::StdError;
-    use crate::app::storage_api::s3::dto::ObjectLockRetentionMode;
     use http::{HeaderMap, HeaderName, HeaderValue};
     use rustfs_gateway_stream::Body;
+    use rustfs_s3_types::StdError;
     use tokio::io::AsyncReadExt;
     use tokio_tar::{Builder, EntryType, Header};
 
@@ -4391,7 +4390,7 @@ mod tests {
         let mut entries = archive.entries().unwrap();
         let mut entry = entries.next().await.unwrap().unwrap();
         let mut metadata = HashMap::from([
-            (AMZ_OBJECT_LOCK_MODE_LOWER.to_string(), ObjectLockRetentionMode::COMPLIANCE.to_string()),
+            (AMZ_OBJECT_LOCK_MODE_LOWER.to_string(), "COMPLIANCE".to_string()),
             (AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE_LOWER.to_string(), "2030-01-01T00:00:00Z".to_string()),
         ]);
         let mut opts = ObjectOptions::default();
@@ -4580,7 +4579,7 @@ mod tests {
         let mut entries = archive.entries().unwrap();
         let mut entry = entries.next().await.unwrap().unwrap();
         let mut metadata = HashMap::from([
-            (AMZ_OBJECT_LOCK_MODE_LOWER.to_string(), ObjectLockRetentionMode::COMPLIANCE.to_string()),
+            (AMZ_OBJECT_LOCK_MODE_LOWER.to_string(), "COMPLIANCE".to_string()),
             (AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE_LOWER.to_string(), "2030-01-01T00:00:00Z".to_string()),
         ]);
         let mut opts = ObjectOptions::default();
