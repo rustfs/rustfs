@@ -441,7 +441,21 @@ pub(crate) fn is_valid_table_metadata_file_name(metadata_file_name: &str) -> boo
         .all(|byte| is_lower_ascii_alnum(*byte) || matches!(*byte, b'.' | b'_' | b'-'))
 }
 
+/// Whether `object_key` names the bucket-wide publication fence.
+///
+/// The fence is a namespace-lock identity, not a writable object: every content
+/// mutation holds it shared in every bucket, table-enabled or not, so mutating
+/// that key would wait on its own shared lock for the object write lock and
+/// stall concurrent mutations in the bucket until the lock timeout.
+pub(crate) fn is_table_bucket_publication_lock_key(object_key: &str) -> bool {
+    object_key == rustfs_common::table_catalog::TABLE_BUCKET_PUBLICATION_LOCK_PATH
+}
+
 pub fn validate_object_mutation(table_bucket_enabled: bool, object_key: &str) -> Result<(), TableObjectMutationError> {
+    if is_table_bucket_publication_lock_key(object_key) {
+        return Err(TableObjectMutationError::ReservedCatalogObject);
+    }
+
     if table_bucket_enabled && is_reserved_table_object_key(object_key) {
         return Err(TableObjectMutationError::ReservedCatalogObject);
     }
@@ -450,6 +464,10 @@ pub fn validate_object_mutation(table_bucket_enabled: bool, object_key: &str) ->
 }
 
 pub(crate) async fn validate_bucket_object_mutation(bucket: &str, object_key: &str) -> Result<(), TableObjectMutationError> {
+    if is_table_bucket_publication_lock_key(object_key) {
+        return Err(TableObjectMutationError::ReservedCatalogObject);
+    }
+
     if !is_reserved_table_object_key(object_key) {
         return Ok(());
     }
