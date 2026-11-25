@@ -24,6 +24,9 @@
 //! (the admin router), or the ten system reads `admin.rs` serves natively.
 //! Upstream: `server/stack.rs`. Downstream: the gateway signature verifier and the admin router.
 
+mod native_authority;
+mod native_routes;
+
 use super::{GatewayAssembly, GatewayAssemblyError, GatewayStack};
 use crate::admin::operation::AdminResponse;
 use crate::admin::router::{AdminOperation, S3Router, dispatch, object_lambda_target, serve_object_lambda};
@@ -262,6 +265,7 @@ fn dialect() -> Result<Dialect, GatewayAssemblyError> {
             .ok_or(GatewayAssemblyError::AdminOverlayMissing)?,
     );
     rows.extend_from_slice(control_plane::ROWS);
+    native_routes::append_rows(&mut rows);
     let record = RECORD.get_or_init(|| DialectOverlay {
         name: "rustfs-control-plane",
         vendor: OVERLAY.vendor,
@@ -277,7 +281,8 @@ fn dialect() -> Result<Dialect, GatewayAssemblyError> {
             bucket_param: PostV3SpeedtestClientDevnull::BUCKET,
         })
         .declare_form::<StsForm>(STS_ROUTE);
-    control_plane::declare(builder)
+    let builder = control_plane::declare(builder);
+    native_routes::declare(builder)
         .build()
         .map_err(GatewayAssemblyError::AdminDialect)
 }
@@ -305,6 +310,7 @@ pub(super) fn assemble(
     });
     let (builder, _settings) = GatewayStack::configured_builder(&assembly, iam, root, gate, authenticator)?
         .config(super::service_config(assembly.body_read_timeout, CLAIMED_ROUTE_BODY_BYTES));
+    let builder = native_routes::register(builder, &host);
     let service = builder
         .hand_caller_secret_to_every_operation_after_listing_in_the_posture_report()
         .dialect(&dialect()?)
@@ -371,7 +377,7 @@ struct Admission {
 
 /// Whether this host has a handler for `operation`.
 fn served(operation: &str) -> bool {
-    [NAME, STS_NAME].contains(&operation) || BORROWED.contains(&operation)
+    [NAME, STS_NAME].contains(&operation) || BORROWED.contains(&operation) || native_routes::contains(operation)
 }
 
 /// The decision once the rule has admitted a request: a served operation, or any signed request,
@@ -385,7 +391,7 @@ fn routed(request: &AuthzRequest<'_>) -> Decision {
 }
 
 impl Admission {
-    fn route(&self, context: &AuthzContext<'_>, request: &AuthzRequest<'_>) -> Result<Decision, HandlerError> {
+    async fn route(&self, context: &AuthzContext<'_>, request: &AuthzRequest<'_>) -> Result<Decision, HandlerError> {
         if !served(request.operation) {
             return Ok(routed(request));
         }
@@ -397,18 +403,31 @@ impl Admission {
         self.router
             .admit(&head.method, &head.uri, &head.headers, signed)
             .map_err(handler_error)?;
-        Ok(if head.repeated_authorization {
-            Decision::Deny
-        } else {
-            Decision::Allow
-        })
+        if head.repeated_authorization {
+            return Ok(Decision::Deny);
+        }
+        if native_routes::contains(request.operation) {
+            if request.operation
+                == rustfs_gateway_dialect_rustfs_admin::native::ops::delete_v3_target_by_target_type_by_target_name::NAME
+            {
+                self.router
+                    .validate_notification_target_params(&head.method, &head.uri)
+                    .map_err(handler_error)?;
+            }
+            if let Err(error) = native_authority::authorize(context, request, head).await {
+                if error.code() == &rustfs_s3_types::S3ErrorCode::AccessDenied {
+                    return Ok(Decision::Deny);
+                }
+                return Err(handler_error(error));
+            }
+        }
+        Ok(Decision::Allow)
     }
 }
 
 impl Authorizer for Admission {
     fn authorize_route<'a>(&'a self, context: &'a AuthzContext<'a>, request: &'a AuthzRequest<'a>) -> BoxFuture<'a, Decision> {
-        let decision = self.route(context, request).unwrap_or(Decision::Deny);
-        Box::pin(async move { decision })
+        Box::pin(async move { self.route(context, request).await.unwrap_or(Decision::Deny) })
     }
 
     fn authorize_route_result<'a>(
@@ -416,8 +435,7 @@ impl Authorizer for Admission {
         context: &'a AuthzContext<'a>,
         request: &'a AuthzRequest<'a>,
     ) -> BoxFuture<'a, Result<Decision, HandlerError>> {
-        let decision = self.route(context, request);
-        Box::pin(async move { decision })
+        Box::pin(self.route(context, request))
     }
 
     fn authorize_input<'a>(

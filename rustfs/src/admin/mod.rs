@@ -14,6 +14,7 @@
 
 pub(crate) mod access_key_identity;
 mod auth;
+pub(crate) use auth::{authenticate_envelope_credentials, validate_admin_request, validate_admin_request_with_bucket};
 pub mod console;
 pub mod handlers;
 pub(crate) mod operation;

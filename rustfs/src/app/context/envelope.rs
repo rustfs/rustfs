@@ -441,9 +441,11 @@ impl RequestEnvelope {
     /// The client address for policy evaluation: the verified proxy client
     /// when one is recorded, otherwise the connection peer (keeping its port).
     pub fn policy_source_addr(&self) -> Option<SocketAddr> {
-        let peer = self.remote_addr;
-        self.client_info
-            .as_ref()
+        Self::policy_source_addr_from(self.remote_addr, self.client_info.as_ref())
+    }
+
+    pub(crate) fn policy_source_addr_from(peer: Option<SocketAddr>, client_info: Option<&ClientInfo>) -> Option<SocketAddr> {
+        client_info
             .map(|client| SocketAddr::new(client.real_ip, peer.map_or(0, |addr| addr.port())))
             .or(peer)
     }

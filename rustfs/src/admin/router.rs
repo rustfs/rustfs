@@ -1106,6 +1106,14 @@ where
 }
 
 impl<T> S3Router<T> {
+    /// Validates notification target path parameters before the native route asks IAM.
+    pub(crate) fn validate_notification_target_params(&self, method: &Method, uri: &Uri) -> S3Result<()> {
+        let key = route_key_canonical(method, uri.path());
+        let matched = self.table.at(&key).map_err(|_| S3Error::new(S3ErrorCode::NotImplemented))?;
+        super::handlers::event::extract_target_params(&matched.params)?;
+        Ok(())
+    }
+
     /// The access rule of every route this router claims, whichever edge verified the request:
     /// `signed` is whether a signature was verified for it. The legacy `check_access` and the
     /// gateway stack's control-plane host both decide by this one function.
