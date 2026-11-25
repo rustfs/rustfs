@@ -48,8 +48,8 @@ pub(crate) mod diagnostic {
 #[cfg(test)]
 pub(crate) mod s3 {
     pub(crate) use crate::storage::storage_api::test_consumer::legacy_s3_test_types::s3::{
-        Body, Credentials, PutObjectInput, S3Error, S3ErrorCode, S3Request, S3Response, S3Result, StreamingBlob, TrailingHeaders,
-        UploadStreamError, dto, stream, xml,
+        Body, Credentials, PutObjectInput, S3Error, S3ErrorCode, S3Request, S3Result, StreamingBlob, TrailingHeaders,
+        UploadStreamError, dto, xml,
     };
     pub(crate) use rustfs_gateway_types::dto::Status;
     pub(crate) use rustfs_gateway_types::persistence::{

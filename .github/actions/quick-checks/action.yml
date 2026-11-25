@@ -107,6 +107,10 @@ runs:
         git cat-file -e "$FOOTPRINT_BASE^{commit}" 2>/dev/null || git fetch --no-tags --depth=1 origin "$FOOTPRINT_BASE"
         ./scripts/check_s3s_footprint.sh --base "$FOOTPRINT_BASE"
 
+    - name: Check s3s edge allowlist
+      shell: bash
+      run: ./scripts/check_s3s_footprint.sh --mode allowlist
+
     - name: Check release feature boundaries
       shell: bash
       run: python3 scripts/check_connect_release_boundary.py --features-only
