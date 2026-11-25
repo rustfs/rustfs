@@ -1114,8 +1114,8 @@ mod tests {
 
         async fn list_objects_v2(
             &self,
+            _session: &SessionContext,
             _input: ListObjectsV2Input,
-            _credentials: &Credentials,
         ) -> Result<ListObjectsV2Output, Self::Error> {
             unreachable!("connection tests should not hit storage")
         }

@@ -918,8 +918,8 @@ impl StorageBackend for DummyBackend {
 
     async fn list_objects_v2(
         &self,
+        _session: &SessionContext,
         input: ListObjectsV2Input,
-        _credentials: &Credentials,
     ) -> Result<ListObjectsV2Output, Self::Error> {
         // Decide control flow while holding the lock. Release before
         // awaiting so the stall path does not hold the Mutex across

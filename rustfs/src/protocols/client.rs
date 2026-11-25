@@ -585,22 +585,36 @@ impl rustfs_protocols::common::client::s3::StorageBackend for ProtocolStorageCli
 
     async fn list_objects_v2(
         &self,
+        session: &SessionContext,
         input: gateway_dto::ListObjectsV2Input,
-        credentials: &rustfs_credentials::Credentials,
     ) -> Result<gateway_dto::ListObjectsV2Output, Self::Error> {
         trace_protocol_request("list_objects_v2", Some(input.bucket.as_str()), None);
 
+        if !is_operation_supported(session.protocol, &S3Action::ListBucket) {
+            return Err(rustfs_s3_types::S3Error::new(rustfs_s3_types::S3ErrorCode::AccessDenied));
+        }
+
         let bucket = input.bucket.as_str().to_owned();
-        let uri = build_list_objects_uri(&input)?;
-        let envelope = Self::create_envelope(
-            Method::GET,
-            uri,
-            RequestParams {
-                bucket: Some(bucket),
-                object: None,
-                credentials,
-            },
-        );
+        let context = self.server_ctx.installed_app_context().ok_or_else(|| {
+            rustfs_s3_types::S3Error::with_message(
+                rustfs_s3_types::S3ErrorCode::InternalError,
+                "protocol server application context is not initialized",
+            )
+        })?;
+        let (credentials, is_owner) =
+            crate::auth::check_key_valid_with_context("", session.access_key(), Some(context.as_ref())).await?;
+        let mut envelope = self.protocol_authorization_envelope(
+            session,
+            &S3Action::ListBucket,
+            &bucket,
+            None,
+            Some(&input),
+            (credentials, is_owner),
+        )?;
+        // A listing can be filtered per principal (such as table-bucket list isolation),
+        // so authorization must run on the exact envelope handed to the list use case.
+        crate::storage::access_owned::listing_multipart::authorize_list_objects_v2(&self.server_ctx, &mut envelope, &bucket)
+            .await?;
         rustfs_io_metrics::record_s3_op(rustfs_s3_ops::S3Operation::ListObjectsV2);
         self.owned_bucket_usecase()
             .execute_list_objects_v2(envelope, input)
@@ -2513,17 +2527,29 @@ mod listing_tests {
         (temp, root, backend)
     }
 
+    fn session_for(credentials: &rustfs_credentials::Credentials, source_ip: &str) -> SessionContext {
+        SessionContext::new(
+            rustfs_protocols::common::ProtocolPrincipal::new(std::sync::Arc::new(rustfs_policy::auth::UserIdentity {
+                credentials: credentials.clone(),
+                ..Default::default()
+            })),
+            rustfs_protocols::Protocol::WebDav,
+            source_ip.parse().expect("valid IP"),
+        )
+    }
+
     #[test]
     #[serial_test::serial]
     fn protocol_listing_pages_and_encoding() {
         crate::app::gating_test_env::run_large_stack_test("protocol-listing-pages", || async {
             let (_temp, root, backend) = listing_client().await;
+            let root_session = session_for(&root, "127.0.0.1");
             let bucket = "listing-runtime";
             let mut first = input(bucket);
             first.max_keys = Some(1);
             first.encoding_type = Some(gateway_dto::EncodingType::URL);
             let before = count(rustfs_s3_ops::S3Operation::ListObjectsV2);
-            let first = backend.list_objects_v2(first, &root).await.expect("first page");
+            let first = backend.list_objects_v2(&root_session, first).await.expect("first page");
             assert_eq!(count(rustfs_s3_ops::S3Operation::ListObjectsV2) - before, 1);
             assert!(first.is_truncated);
             assert_eq!(first.contents[0].key.as_str(), "a%20space%26/one");
@@ -2531,7 +2557,7 @@ mod listing_tests {
             let token = first.next_continuation_token.expect("next page token");
             let mut second = input(bucket);
             second.continuation_token = Some(token.clone());
-            let second = backend.list_objects_v2(second, &root).await.expect("second page");
+            let second = backend.list_objects_v2(&root_session, second).await.expect("second page");
             assert_eq!(second.continuation_token.as_ref(), Some(&token));
             assert_eq!(
                 second.contents.iter().map(|object| object.key.as_str()).collect::<Vec<_>>(),
@@ -2539,7 +2565,10 @@ mod listing_tests {
             );
             let mut delimited = input(bucket);
             delimited.delimiter = Some("/".into());
-            let delimited = backend.list_objects_v2(delimited, &root).await.expect("delimited page");
+            let delimited = backend
+                .list_objects_v2(&root_session, delimited)
+                .await
+                .expect("delimited page");
             assert_eq!(
                 delimited
                     .common_prefixes
@@ -2556,6 +2585,7 @@ mod listing_tests {
     fn protocol_listing_refusals_and_limits() {
         crate::app::gating_test_env::run_large_stack_test("protocol-listing-errors", || async {
             let (_temp, root, backend) = listing_client().await;
+            let root_session = session_for(&root, "127.0.0.1");
             let bucket = "listing-runtime";
             let mut observations = Vec::new();
             for case in ["missing", "negative", "token", "zero", "large"] {
@@ -2568,7 +2598,7 @@ mod listing_tests {
                     _ => {}
                 }
                 let before = count(rustfs_s3_ops::S3Operation::ListObjectsV2);
-                let result = backend.list_objects_v2(request, &root).await;
+                let result = backend.list_objects_v2(&root_session, request).await;
                 let observed = match result {
                     Ok(output) => format!("ok:{}:{}:{}", output.max_keys, output.contents.len(), output.is_truncated),
                     Err(error) => format!("{:?}:{:?}:{:?}", error.code(), error.status_code(), error.message()),
@@ -2855,5 +2885,213 @@ mod listing_tests {
             .await
             .expect_err("uninitialized server context must report IamUnavailable");
         assert!(matches!(err, AuthorizationError::IamUnavailable), "expected IamUnavailable, got {err:?}");
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn protocol_listing_applies_table_bucket_list_isolation() {
+        crate::app::gating_test_env::run_large_stack_test("protocol-listing-table-isolation", || async {
+            use crate::table_catalog::{
+                EcStoreTableCatalogObjectBackend, IdentifierSegment, Namespace, ObjectTableCatalogStore,
+                TABLE_BUCKET_CATALOG_TYPE, TABLE_BUCKET_MARKER_CONFIG, TABLE_CATALOG_ENTRY_VERSION, TableBucketEntry,
+                TableCatalogEntryState, TableCatalogStore as _, TableEntry, default_table_metadata_file_path,
+                synthetic_namespace_entry, table_bucket_marker_json,
+            };
+            use rustfs_iam::store::UserType;
+            use rustfs_madmin::{AccountStatus, AddOrUpdateUserReq};
+            use rustfs_policy::policy::Policy;
+            use serde_json::json;
+
+            let root = rustfs_credentials::Credentials {
+                access_key: "table-proto-root".into(),
+                secret_key: "table-proto-root-secret".into(),
+                status: "on".into(),
+                ..Default::default()
+            };
+            let (_temp, context, iam) = crate::protocols::policy_test::protocol_test_context(root.clone()).await;
+            let _ambient = crate::runtime_sources::publish_test_app_context(context.clone());
+            let store = context.object_store();
+            let bucket = "proto-table-wh";
+            store
+                .make_bucket(bucket, &MakeBucketOptions::default())
+                .await
+                .expect("create table bucket");
+            store
+                .update_bucket_metadata_config(
+                    bucket,
+                    TABLE_BUCKET_MARKER_CONFIG,
+                    table_bucket_marker_json().expect("table marker"),
+                )
+                .await
+                .expect("enable table bucket");
+
+            let catalog = ObjectTableCatalogStore::new(EcStoreTableCatalogObjectBackend::new(store.clone()));
+            catalog
+                .put_table_bucket(TableBucketEntry {
+                    version: TABLE_CATALOG_ENTRY_VERSION,
+                    table_bucket: bucket.to_owned(),
+                    catalog_type: TABLE_BUCKET_CATALOG_TYPE.into(),
+                    warehouse_root: format!("s3://{bucket}/"),
+                    state: TableCatalogEntryState::Active,
+                    properties: Default::default(),
+                    active_rename_id: None,
+                    created_at: None,
+                    updated_at: None,
+                })
+                .await
+                .expect("register warehouse");
+            let namespace = Namespace::parse("analytics").expect("namespace");
+            catalog
+                .create_namespace(synthetic_namespace_entry(bucket, &namespace))
+                .await
+                .expect("create namespace");
+
+            for (table_name, table_id) in [("orders", "orders-id"), ("payroll", "payroll-id")] {
+                let table = IdentifierSegment::parse(table_name).expect("table name");
+                let metadata_path = default_table_metadata_file_path(&namespace, &table, "00001.metadata.json");
+                catalog
+                    .create_table(TableEntry {
+                        version: TABLE_CATALOG_ENTRY_VERSION,
+                        table_bucket: bucket.to_owned(),
+                        namespace: namespace.public_name(),
+                        table: table.as_str().into(),
+                        table_id: table_id.into(),
+                        table_uuid: format!("{table_id}-uuid"),
+                        format: "ICEBERG".into(),
+                        format_version: 2,
+                        warehouse_location: format!("s3://{bucket}/tables/{table_id}"),
+                        metadata_location: metadata_path.clone(),
+                        version_token: "token-v1".into(),
+                        generation: 1,
+                        state: TableCatalogEntryState::Active,
+                        properties: Default::default(),
+                        created_at: None,
+                        updated_at: None,
+                    })
+                    .await
+                    .expect("register table");
+                for key in [metadata_path, format!("tables/{table_id}/data/part-0.parquet")] {
+                    store
+                        .put_object(
+                            bucket,
+                            &key,
+                            &mut StoragePutObjReader::from_vec(b"table-bytes".to_vec()),
+                            &StorageObjectOptions::default(),
+                        )
+                        .await
+                        .expect("seed table object");
+                }
+            }
+            store
+                .put_object(
+                    bucket,
+                    "plain.txt",
+                    &mut StoragePutObjReader::from_vec(b"plain".to_vec()),
+                    &StorageObjectOptions::default(),
+                )
+                .await
+                .expect("seed plain object");
+
+            let create_user_with_policy = |name: &str, policy: serde_json::Value| {
+                let iam = iam.clone();
+                let name = name.to_owned();
+                async move {
+                    iam.create_user(
+                        &name,
+                        &AddOrUpdateUserReq {
+                            secret_key: format!("{name}-secret-key"),
+                            policy: None,
+                            status: AccountStatus::Enabled,
+                        },
+                    )
+                    .await
+                    .expect("create user");
+                    let parsed = Policy::parse_config(&serde_json::to_vec(&policy).expect("json")).expect("policy");
+                    iam.set_policy(&name, parsed).await.expect("store policy");
+                    iam.policy_db_set(&name, UserType::Reg, false, &name)
+                        .await
+                        .expect("attach policy");
+                    iam.get_user(&name).await.expect("load user").credentials
+                }
+            };
+
+            let list_only = create_user_with_policy(
+                "proto-list-only",
+                json!({
+                    "Version": "2012-10-17",
+                    "Statement": [{
+                        "Effect": "Allow",
+                        "Action": ["s3:ListBucket"],
+                        "Resource": [format!("arn:aws:s3:::{bucket}")]
+                    }]
+                }),
+            )
+            .await;
+            let orders_only = create_user_with_policy(
+                "proto-orders-only",
+                json!({
+                    "Version": "2012-10-17",
+                    "Statement": [
+                        {
+                            "Effect": "Allow",
+                            "Action": ["s3:ListBucket"],
+                            "Resource": [format!("arn:aws:s3:::{bucket}")]
+                        },
+                        {
+                            "Effect": "Allow",
+                            "Action": ["admin:GetTableMetadata"],
+                            "Resource": [format!("arn:aws:s3:::{bucket}/namespaces/analytics/tables/orders")],
+                            "Condition": {"IpAddress": {"aws:SourceIp": "203.0.113.10/32"}}
+                        }
+                    ]
+                }),
+            )
+            .await;
+
+            let slot = ServerContextSlot::new();
+            assert!(slot.install(context));
+            let backend = ProtocolStorageClient::new(slot);
+
+            let listed_keys = |session: SessionContext, prefix: Option<&str>| {
+                let backend = backend.clone();
+                let prefix = prefix.map(str::to_owned);
+                async move {
+                    let mut req = input(bucket);
+                    req.prefix = prefix;
+                    let out = backend.list_objects_v2(&session, req).await.expect("list_objects_v2");
+                    out.contents
+                        .into_iter()
+                        .map(|obj| obj.key.as_str().to_owned())
+                        .collect::<Vec<_>>()
+                }
+            };
+
+            // List-only user sees only plain.txt; catalog keys and all table objects stay hidden.
+            let list_only_session = session_for(&list_only, "203.0.113.10");
+            assert_eq!(listed_keys(list_only_session.clone(), None).await, vec!["plain.txt"]);
+            assert!(
+                listed_keys(list_only_session.clone(), Some(".rustfs-table/"))
+                    .await
+                    .is_empty()
+            );
+            assert!(listed_keys(list_only_session, Some("tables/orders-id/")).await.is_empty());
+
+            // Session-scoped IAM condition applies to admin:GetTableMetadata.
+            let allowed_ip_keys = listed_keys(session_for(&orders_only, "203.0.113.10"), None).await;
+            assert_eq!(allowed_ip_keys, vec!["plain.txt", "tables/orders-id/data/part-0.parquet"]);
+            let denied_ip_keys = listed_keys(session_for(&orders_only, "198.51.100.20"), None).await;
+            assert_eq!(denied_ip_keys, vec!["plain.txt"]);
+
+            // Root sees both tables' data files, but reserved .rustfs-table/ keys remain hidden.
+            let root_keys = listed_keys(session_for(&root, "127.0.0.1"), None).await;
+            assert_eq!(
+                root_keys,
+                vec![
+                    "plain.txt",
+                    "tables/orders-id/data/part-0.parquet",
+                    "tables/payroll-id/data/part-0.parquet",
+                ]
+            );
+        });
     }
 }

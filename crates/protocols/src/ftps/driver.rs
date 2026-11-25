@@ -299,7 +299,7 @@ where
                 .await
                 .map_err(|_| Error::new(ErrorKind::PermanentFileNotAvailable, "Access denied"))?;
 
-            if let Ok(output) = self.storage.list_objects_v2(list_input, session_context.credentials()).await {
+            if let Ok(output) = self.storage.list_objects_v2(session_context, list_input).await {
                 // Delete all objects in this page
                 for obj in output.contents {
                     let obj_key = obj.key;
@@ -461,7 +461,7 @@ where
             .await
             .map_err(|_| Error::new(ErrorKind::PermanentFileNotAvailable, "Access denied"))?;
 
-        match self.storage.list_objects_v2(list_input, session_context.credentials()).await {
+        match self.storage.list_objects_v2(session_context, list_input).await {
             Ok(output) => {
                 let mut fileinfos = Vec::new();
 
@@ -859,7 +859,7 @@ where
 
             let output = self
                 .storage
-                .list_objects_v2(list_input, session_context.credentials())
+                .list_objects_v2(session_context, list_input)
                 .await
                 .map_err(|e| {
                     error!(
