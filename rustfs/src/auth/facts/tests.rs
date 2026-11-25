@@ -1157,3 +1157,136 @@ async fn signature_age_policy_denies_old_presigned_url_and_allows_fresh_one() {
         "30-second-old presigned URL must be allowed"
     );
 }
+
+#[test]
+fn unsigned_headers_cannot_relabel_presigned_post_or_anonymous_auth_type_conditions() {
+    let now = OffsetDateTime::from_unix_timestamp(1_791_504_000).expect("instant");
+    let user = credentials(Who::User);
+    let anon = Credentials::default();
+
+    // 1. SigV4 presigned query with unsigned AWSAccessKeyId header remains REST-QUERY-STRING / AWS4-HMAC-SHA256.
+    let mut headers = HeaderMap::new();
+    headers.insert("awsaccesskeyid", HeaderValue::from_static("x"));
+    let sigv4_query = "X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=facts-user%2F20261009%2Fus-east-1%2Fs3%2Faws4_request&X-Amz-SignedHeaders=host&X-Amz-Signature=deadbeef";
+    let facts = AuthzFacts::from_request_parts_with_method(
+        Some(&http::Method::PUT),
+        &headers,
+        Some(sigv4_query),
+        None,
+        None,
+        AuthzTarget {
+            action: Action::S3Action(S3Action::PutObjectAction),
+            bucket: "facts-bucket",
+            object: "upload.bin",
+            version_id: None,
+            location_constraint: None,
+        },
+        now,
+    );
+    let conditions = build_conditions(&AuthzPrincipal::new(&user, ""), &facts);
+    assert_eq!(conditions.get("authType"), Some(&vec!["REST-QUERY-STRING".to_owned()]));
+    assert_eq!(conditions.get("signatureversion"), Some(&vec!["AWS4-HMAC-SHA256".to_owned()]));
+
+    // 2. SigV2 presigned query with empty AWSAccessKeyId header or percent-encoded AWSAccessKey%49d stays REST-QUERY-STRING / AWS2.
+    let mut empty_ak_headers = HeaderMap::new();
+    empty_ak_headers.insert("awsaccesskeyid", HeaderValue::from_static(""));
+    for sigv2_query in [
+        "AWSAccessKeyId=facts-user&Expires=1791504000&Signature=example",
+        "AWSAccessKey%49d=facts-user&Expires=1791504000&Signature=example",
+        "AWSAccessKey%49d=facts-user&Expires=1791504000&%53ignature=example",
+    ] {
+        let facts = AuthzFacts::from_request_parts_with_method(
+            Some(&http::Method::GET),
+            &empty_ak_headers,
+            Some(sigv2_query),
+            None,
+            None,
+            AuthzTarget {
+                action: Action::S3Action(S3Action::GetObjectAction),
+                bucket: "facts-bucket",
+                object: "report.csv",
+                version_id: None,
+                location_constraint: None,
+            },
+            now,
+        );
+        let conditions = build_conditions(&AuthzPrincipal::new(&user, ""), &facts);
+        assert_eq!(conditions.get("authType"), Some(&vec!["REST-QUERY-STRING".to_owned()]), "{sigv2_query}");
+        assert_eq!(conditions.get("signatureversion"), Some(&vec!["AWS2".to_owned()]), "{sigv2_query}");
+    }
+
+    // 3. Signed POST form with AWSAccessKeyId header stays POST with no signatureversion.
+    let mut post_headers = HeaderMap::new();
+    post_headers.insert("content-type", HeaderValue::from_static("multipart/form-data; boundary=form"));
+    post_headers.insert("awsaccesskeyid", HeaderValue::from_static("x"));
+    let facts = AuthzFacts::from_request_parts_with_method(
+        Some(&http::Method::POST),
+        &post_headers,
+        None,
+        None,
+        None,
+        AuthzTarget {
+            action: Action::S3Action(S3Action::PutObjectAction),
+            bucket: "facts-bucket",
+            object: "post.bin",
+            version_id: None,
+            location_constraint: None,
+        },
+        now,
+    );
+    let conditions = build_conditions(&AuthzPrincipal::new(&user, ""), &facts);
+    assert_eq!(conditions.get("authType"), Some(&vec!["POST".to_owned()]));
+    assert!(!conditions.contains_key("signatureversion"));
+
+    // 4. Anonymous request with standalone STREAMING-* header stays Anonymous (never REST-HEADER).
+    for value in [
+        "STREAMING-AWS4-HMAC-SHA256-PAYLOAD",
+        "STREAMING-AWS4-HMAC-SHA256-PAYLOAD-TRAILER",
+        "STREAMING-UNSIGNED-PAYLOAD-TRAILER",
+    ] {
+        let mut streaming_headers = HeaderMap::new();
+        streaming_headers.insert("x-amz-content-sha256", HeaderValue::from_static(value));
+        let facts = AuthzFacts::from_request_parts_with_method(
+            Some(&http::Method::GET),
+            &streaming_headers,
+            None,
+            None,
+            None,
+            AuthzTarget {
+                action: Action::S3Action(S3Action::GetObjectAction),
+                bucket: "facts-bucket",
+                object: "secret.csv",
+                version_id: None,
+                location_constraint: None,
+            },
+            now,
+        );
+        let conditions = build_conditions(&AuthzPrincipal::new(&anon, ""), &facts);
+        assert_eq!(conditions.get("authType"), Some(&vec!["Anonymous".to_owned()]), "{value}");
+        assert!(!conditions.contains_key("signatureversion"), "{value}");
+    }
+
+    // 5. Anonymous GET with multipart/form-data or bare Action header stays Anonymous on S3 requests.
+    let mut non_post_headers = HeaderMap::new();
+    non_post_headers.insert("content-type", HeaderValue::from_static("multipart/form-data; boundary=form"));
+    non_post_headers.insert("action", HeaderValue::from_static("AssumeRole"));
+    let facts = AuthzFacts::from_request_parts_with_method(
+        Some(&http::Method::GET),
+        &non_post_headers,
+        None,
+        None,
+        None,
+        AuthzTarget {
+            action: Action::S3Action(S3Action::GetObjectAction),
+            bucket: "facts-bucket",
+            object: "secret.csv",
+            version_id: None,
+            location_constraint: None,
+        },
+        now,
+    )
+    .without_s3_header_sts();
+    let conditions = build_conditions(&AuthzPrincipal::new(&anon, ""), &facts);
+    assert_eq!(conditions.get("authType"), Some(&vec!["Anonymous".to_owned()]));
+    assert!(!conditions.contains_key("signatureversion"));
+}

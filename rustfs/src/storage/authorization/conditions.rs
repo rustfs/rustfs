@@ -209,8 +209,13 @@ pub(crate) fn request_authz_facts<R: AuthorizationRequest + ?Sized>(req: &R, mut
         target.location_constraint = None;
     }
     // A POST upload applies its form fields, not its headers, so the policy
-    // decision must read the values the handler stores.
-    AuthzFacts::from_request_parts(
+    // decision must read the values the handler stores. When no POST form
+    // projection is installed, a `multipart/form-data` or bare `Action` header
+    // on an S3 request must not relabel it as POST or STS.
+    let is_post_form = !std::ptr::eq(req.policy_headers(), req.headers());
+    let method = if is_post_form { http::Method::POST } else { http::Method::GET };
+    AuthzFacts::from_request_parts_with_method(
+        Some(&method),
         req.policy_headers(),
         req.uri().query(),
         req.remote_addr(),
@@ -218,6 +223,7 @@ pub(crate) fn request_authz_facts<R: AuthorizationRequest + ?Sized>(req: &R, mut
         target,
         OffsetDateTime::now_utc(),
     )
+    .without_s3_header_sts()
     .with_caller_authentication(if req.permission_probe() {
         req.permission_probe_caller_authentication()
     } else {

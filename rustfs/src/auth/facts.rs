@@ -33,11 +33,12 @@
 //! the listing keys is copied, and `Debug` prints names and counts only.
 
 use crate::auth::{
-    AuthType, OBJECT_CREATION_OPERATION_CONDITION, constant_time_eq, extract_string_list_claim, get_request_auth_type_with_query,
+    AuthType, OBJECT_CREATION_OPERATION_CONDITION, constant_time_eq, extract_string_list_claim,
+    get_request_auth_type_with_method_and_query, get_request_auth_type_with_query,
 };
 use crate::runtime_sources::current_ready_iam_handle;
 use http::header::{IF_MATCH, IF_NONE_MATCH};
-use http::{HeaderMap, HeaderName};
+use http::{HeaderMap, HeaderName, Method};
 use rustfs_credentials::Credentials;
 use rustfs_iam::sys::{OIDC_ISSUER_CLAIM, is_rustfs_oidc_claims};
 use rustfs_policy::policy::action::{Action, S3Action};
@@ -238,13 +239,28 @@ impl AuthzFacts {
         target: AuthzTarget<'_>,
         now: OffsetDateTime,
     ) -> Self {
+        Self::from_request_parts_with_method(None, headers, raw_query, remote_addr, client_info, target, now)
+    }
+
+    /// Same as [`Self::from_request_parts`], with the HTTP method when the caller knows it so
+    /// `multipart/form-data` only classifies `POST` form uploads as `POST`.
+    pub(crate) fn from_request_parts_with_method(
+        method: Option<&Method>,
+        headers: &HeaderMap,
+        raw_query: Option<&str>,
+        remote_addr: Option<SocketAddr>,
+        client_info: Option<&ClientInfo>,
+        target: AuthzTarget<'_>,
+        now: OffsetDateTime,
+    ) -> Self {
         let source_ip = client_info
             .map(|info| info.real_ip)
             .or_else(|| remote_addr.map(|addr| addr.ip()));
         let transport_secure = client_info
             .and_then(|info| info.forwarded_proto.as_deref())
             .is_some_and(|proto| proto.eq_ignore_ascii_case("https"));
-        let (auth_type, signature_version) = scheme_conditions(&get_request_auth_type_with_query(headers, raw_query));
+        let (auth_type, signature_version) =
+            scheme_conditions(&get_request_auth_type_with_method_and_query(method, headers, raw_query));
         let presigned_signature_age_ms = presigned_signature_age_millis(headers, raw_query, now);
         let mut headers = headers.clone();
         for name in SECRET_HEADERS {
@@ -265,6 +281,14 @@ impl AuthzFacts {
             list_query: list_query_pairs(raw_query),
             now,
         }
+    }
+
+    /// An unauthenticated S3 request carrying a bare `Action` header is still anonymous, not STS.
+    pub(crate) fn without_s3_header_sts(mut self) -> Self {
+        if matches!(self.action, Action::S3Action(_)) && self.auth_type == Some(AuthTypeCondition::Sts) {
+            self.auth_type = Some(AuthTypeCondition::Anonymous);
+        }
+        self
     }
 
     /// A listing key the query names more than once. Policy conditions must

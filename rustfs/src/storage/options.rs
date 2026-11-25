@@ -44,7 +44,6 @@ use tracing::error;
 use uuid::Uuid;
 
 use crate::auth::AuthType;
-use crate::auth::get_query_param;
 use crate::auth::get_request_auth_type_with_query;
 use crate::auth::is_request_presigned_signature_v4_with_query;
 use crate::storage::storage_api::ecstore_bucket::versioning::VersioningApi as _;
@@ -1211,7 +1210,7 @@ fn get_content_sha256_cksum_with_query(
         return "sts-body-sha256-placeholder".to_string();
     }
 
-    let (default_sha256_cksum, content_sha256) = if is_request_presigned_signature_v4_with_query(headers, query) {
+    let (default_sha256_cksum, content_sha256) = if is_request_presigned_signature_v4_with_query(query) {
         // For a presigned request we look at the query param for sha256.
         // X-Amz-Content-Sha256, if not set in presigned requests, checksum
         // will default to 'UNSIGNED-PAYLOAD'.
@@ -1241,11 +1240,19 @@ fn get_content_sha256_value(
     query: Option<&str>,
     include_query_for_presigned: bool,
 ) -> Option<String> {
-    if include_query_for_presigned && is_request_presigned_signature_v4_with_query(headers, query) {
+    if include_query_for_presigned && is_request_presigned_signature_v4_with_query(query) {
         return query
-            .and_then(|q| get_query_param(q, "x-amz-content-sha256"))
-            .or_else(|| headers.get(AMZ_CONTENT_SHA256).and_then(|v| v.to_str().ok()))
-            .map(str::to_owned);
+            .and_then(|q| {
+                url::form_urlencoded::parse(q.as_bytes())
+                    .find(|(name, _)| name.eq_ignore_ascii_case("x-amz-content-sha256"))
+                    .map(|(_, value)| value.into_owned())
+            })
+            .or_else(|| {
+                headers
+                    .get(AMZ_CONTENT_SHA256)
+                    .and_then(|v| v.to_str().ok())
+                    .map(str::to_owned)
+            });
     }
 
     headers
@@ -3242,6 +3249,38 @@ mod tests {
 
         let query = format!("{PRESIGNED_QUERY}&x-amz-content-sha256=UNSIGNED-PAYLOAD");
         assert_eq!(super::get_content_sha256_with_query(&headers, Some(&query)), None);
+    }
+
+    #[test]
+    fn presigned_request_query_digest_survives_unsigned_headers_and_percent_encoded_param_name() {
+        let sigv4 = "AWS4-HMAC-SHA256 Credential=x/20260916/us-east-1/s3/aws4_request, SignedHeaders=host, Signature=00";
+        let queries = [
+            format!("{PRESIGNED_QUERY}&X-Amz-Content-Sha256={PAYLOAD_SHA256}"),
+            format!("{PRESIGNED_QUERY}&X-Amz-Content-Sh%61256={PAYLOAD_SHA256}"),
+            format!("{PRESIGNED_QUERY}&%58-Amz-Content-Sha256={PAYLOAD_SHA256}"),
+        ];
+        let unsigned: [&[(&str, &str)]; 7] = [
+            &[],
+            &[("awsaccesskeyid", "x")],
+            &[("x-amz-credential", "")],
+            &[("authorization", "AWS x")],
+            &[("authorization", "AWS ak:signature"), ("authorization", "AWS ak:signature")],
+            &[("authorization", sigv4), ("authorization", sigv4)],
+            &[("content-type", "multipart/form-data; boundary=boundary")],
+        ];
+        for query in &queries {
+            for pairs in unsigned {
+                let mut headers = HeaderMap::new();
+                for (name, value) in pairs {
+                    headers.append(*name, HeaderValue::from_static(value));
+                }
+                assert_eq!(
+                    super::get_content_sha256_with_query(&headers, Some(query)),
+                    Some(PAYLOAD_SHA256.to_string()),
+                    "query={query} headers={pairs:?}"
+                );
+            }
+        }
     }
 
     #[test]

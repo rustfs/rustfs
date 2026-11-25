@@ -16,8 +16,10 @@ use crate::runtime_sources::{AppContext, current_action_credentials, current_rea
 use facts::{AuthzFacts, AuthzPrincipal, AuthzTarget};
 use http::HeaderMap;
 use http::HeaderValue;
+use http::Method;
 use http::Uri;
 use http::header::HeaderName;
+use mime_guess::mime::{self, Mime};
 use rustfs_credentials::Credentials;
 use rustfs_iam::error::Error as IamError;
 use rustfs_iam::sys::{
@@ -102,8 +104,6 @@ const STREAMING_CONTENT_SHA256: &str = "STREAMING-AWS4-HMAC-SHA256-PAYLOAD";
 const STREAMING_CONTENT_SHA256_TRAILER: &str = "STREAMING-AWS4-HMAC-SHA256-PAYLOAD-TRAILER";
 pub(crate) const UNSIGNED_PAYLOAD_TRAILER: &str = "STREAMING-UNSIGNED-PAYLOAD-TRAILER";
 const ACTION_HEADER: &str = "Action";
-const AMZ_CREDENTIAL: &str = "X-Amz-Credential";
-const AMZ_ACCESS_KEY_ID: &str = "AWSAccessKeyId";
 pub const UNSIGNED_PAYLOAD: &str = "UNSIGNED-PAYLOAD";
 
 // Authentication type enum
@@ -541,23 +541,40 @@ pub fn get_request_auth_type(header: &HeaderMap) -> AuthType {
 }
 
 pub(crate) fn get_request_auth_type_with_query(header: &HeaderMap, query: Option<&str>) -> AuthType {
-    if is_request_signature_v2(header) {
-        AuthType::SignedV2
-    } else if is_request_presigned_signature_v2(header, query) {
+    get_request_auth_type_with_method_and_query(None, header, query)
+}
+
+/// Classify a request according to the authentication mechanism verified by the gateway.
+///
+/// Unsigned headers (`AWSAccessKeyId`, `X-Amz-Credential`, standalone `STREAMING-*`
+/// `x-amz-content-sha256`, or repeated `Authorization` / `Content-Type` headers) must not
+/// relabel a presigned query, signed POST policy form, or anonymous request.
+pub(crate) fn get_request_auth_type_with_method_and_query(
+    method: Option<&Method>,
+    header: &HeaderMap,
+    query: Option<&str>,
+) -> AuthType {
+    if method == Some(&Method::POST) && is_request_post_policy_signature_v4(header) {
+        AuthType::PostPolicy
+    } else if is_request_presigned_signature_v2(query) {
         AuthType::PresignedV2
-    } else if is_request_sign_streaming_v4(header) {
-        AuthType::StreamingSigned
-    } else if is_request_sign_streaming_trailer_v4(header) {
-        AuthType::StreamingSignedTrailer
-    } else if is_request_unsigned_trailer_v4(header) {
-        AuthType::StreamingUnsignedTrailer
-    } else if is_request_signature_v4(header) {
-        AuthType::Signed
-    } else if is_request_presigned_signature_v4_with_query(header, query) {
+    } else if is_request_presigned_signature_v4_with_query(query) {
         AuthType::Presigned
+    } else if is_request_signature_v2(header) {
+        AuthType::SignedV2
+    } else if is_request_signature_v4(header) {
+        if is_request_sign_streaming_v4(header) {
+            AuthType::StreamingSigned
+        } else if is_request_sign_streaming_trailer_v4(header) {
+            AuthType::StreamingSignedTrailer
+        } else if is_request_unsigned_trailer_v4(header) {
+            AuthType::StreamingUnsignedTrailer
+        } else {
+            AuthType::Signed
+        }
     } else if is_request_jwt(header) {
         AuthType::JWT
-    } else if is_request_post_policy_signature_v4(header) {
+    } else if method.is_none() && is_request_post_policy_signature_v4(header) {
         AuthType::PostPolicy
     } else if is_request_sts(header) {
         AuthType::STS
@@ -568,6 +585,21 @@ pub(crate) fn get_request_auth_type_with_query(header: &HeaderMap, query: Option
     }
 }
 
+/// Returns the header value only when the header appears exactly once and is valid UTF-8.
+fn get_unique_header_str<'a>(header: &'a HeaderMap, name: &str) -> Option<&'a str> {
+    let mut values = header.get_all(name).iter();
+    let value = values.next()?;
+    if values.next().is_some() {
+        return None;
+    }
+    std::str::from_utf8(value.as_bytes()).ok()
+}
+
+/// Returns true when the percent-decoded query string contains `param`.
+fn query_has_param(query: Option<&str>, param: &str) -> bool {
+    query.is_some_and(|query| form_urlencoded::parse(query.as_bytes()).any(|(name, _)| name == param))
+}
+
 /// Verify if request has JWT
 ///
 /// # Arguments
@@ -576,12 +608,7 @@ pub(crate) fn get_request_auth_type_with_query(header: &HeaderMap, query: Option
 /// # Returns
 /// * `bool` - True if request has JWT, false otherwise
 fn is_request_jwt(header: &HeaderMap) -> bool {
-    if let Some(auth) = header.get("authorization")
-        && let Ok(auth_str) = auth.to_str()
-    {
-        return auth_str.starts_with(JWT_ALGORITHM);
-    }
-    false
+    get_unique_header_str(header, "authorization").is_some_and(|auth| auth.starts_with(JWT_ALGORITHM))
 }
 
 /// Verify if request has AWS Signature Version '4'
@@ -592,12 +619,7 @@ fn is_request_jwt(header: &HeaderMap) -> bool {
 /// # Returns
 /// * `bool` - True if request has AWS Signature Version '4', false otherwise
 fn is_request_signature_v4(header: &HeaderMap) -> bool {
-    if let Some(auth) = header.get("authorization")
-        && let Ok(auth_str) = auth.to_str()
-    {
-        return auth_str.starts_with(SIGN_V4_ALGORITHM);
-    }
-    false
+    get_unique_header_str(header, "authorization").is_some_and(|auth| auth.starts_with(SIGN_V4_ALGORITHM))
 }
 
 /// Verify if request has AWS Signature Version '2'
@@ -608,12 +630,9 @@ fn is_request_signature_v4(header: &HeaderMap) -> bool {
 /// # Returns
 /// * `bool` - True if request has AWS Signature Version '2', false otherwise
 fn is_request_signature_v2(header: &HeaderMap) -> bool {
-    if let Some(auth) = header.get("authorization")
-        && let Ok(auth_str) = auth.to_str()
-    {
-        return !auth_str.starts_with(SIGN_V4_ALGORITHM) && auth_str.starts_with(SIGN_V2_ALGORITHM);
-    }
-    false
+    get_unique_header_str(header, "authorization")
+        .and_then(|auth| auth.strip_prefix(SIGN_V2_ALGORITHM))
+        .is_some_and(|credential| credential.contains(':'))
 }
 
 /// True when `query` can name a user-metadata parameter at all. A single ASCII
@@ -730,31 +749,14 @@ pub fn hoist_signed_query_params(headers: &mut HeaderMap, query: Option<&str>) -
     Ok(())
 }
 
-pub(crate) fn is_request_presigned_signature_v4_with_query(header: &HeaderMap, query: Option<&str>) -> bool {
-    if let Some(credential) = header.get(AMZ_CREDENTIAL) {
-        return !credential.to_str().unwrap_or("").is_empty();
-    }
-    query.is_some_and(|query| {
-        form_urlencoded::parse(query.as_bytes())
-            .find(|(name, _)| name.eq_ignore_ascii_case("x-amz-credential"))
-            .is_some_and(|(_, credential)| !credential.is_empty())
-    })
+/// Verify request has AWS PreSign Version '4' from the decoded query string.
+pub(crate) fn is_request_presigned_signature_v4_with_query(query: Option<&str>) -> bool {
+    query_has_param(query, "X-Amz-Signature")
 }
 
-/// Verify request has AWS PreSign Version '2'
-///
-/// # Arguments
-/// * `header` - HTTP headers of the request
-///
-/// # Returns
-/// * `bool` - True if request has AWS PreSign Version '2', false otherwise
-fn is_request_presigned_signature_v2(header: &HeaderMap, query: Option<&str>) -> bool {
-    if let Some(access_key) = header.get(AMZ_ACCESS_KEY_ID) {
-        return !access_key.to_str().unwrap_or("").is_empty();
-    }
-    query
-        .and_then(|query| get_query_param(query, "awsaccesskeyid"))
-        .is_some_and(|access_key| !access_key.is_empty())
+/// Verify request has AWS PreSign Version '2' from the decoded query string.
+fn is_request_presigned_signature_v2(query: Option<&str>) -> bool {
+    query_has_param(query, "Signature")
 }
 
 /// Verify if request has AWS Post policy Signature Version '4'
@@ -765,12 +767,9 @@ fn is_request_presigned_signature_v2(header: &HeaderMap, query: Option<&str>) ->
 /// # Returns
 /// * `bool` - True if request has AWS Post policy Signature Version '4', false otherwise
 fn is_request_post_policy_signature_v4(header: &HeaderMap) -> bool {
-    if let Some(content_type) = header.get("content-type")
-        && let Ok(ct) = content_type.to_str()
-    {
-        return ct.contains("multipart/form-data");
-    }
-    false
+    get_unique_header_str(header, "content-type")
+        .and_then(|content_type| content_type.parse::<Mime>().ok())
+        .is_some_and(|mime| mime.type_() == mime::MULTIPART && mime.subtype() == mime::FORM_DATA)
 }
 
 /// Verify if the request has AWS Streaming Signature Version '4'
@@ -813,7 +812,7 @@ fn is_request_sts(header: &HeaderMap) -> bool {
 
 // Verify if request is anonymous
 fn is_request_anonymous(header: &HeaderMap) -> bool {
-    header.get("authorization").is_none()
+    header.get_all("authorization").iter().count() != 1
 }
 
 pub fn get_query_param<'a>(query: &'a str, param_name: &str) -> Option<&'a str> {
@@ -1752,14 +1751,55 @@ mod tests {
     fn test_get_condition_values_with_presigned_query() {
         let cred = create_test_credentials();
         let headers = HeaderMap::new();
-        let uri: Uri = "https://example.com/?X-Amz-Credential=AKIAIOSFODNN7EXAMPLE%2F20130524%2Fus-east-1%2Fs3%2Faws4_request"
-            .parse()
-            .unwrap();
+        let uri: Uri = format!("https://example.com/?{SIGV4_PRESIGNED_QUERY}").parse().unwrap();
 
         let conditions = get_condition_values_with_query(&headers, &cred, None, None, None, uri.query());
 
         assert_eq!(conditions.get("signatureversion"), Some(&vec!["AWS4-HMAC-SHA256".to_string()]));
         assert_eq!(conditions.get("authType"), Some(&vec!["REST-QUERY-STRING".to_string()]));
+    }
+
+    #[test]
+    fn test_get_condition_values_presigned_query_ignores_unsigned_headers() {
+        let cred = create_test_credentials();
+
+        for (name, value) in [
+            ("awsaccesskeyid", "x"),
+            ("awsaccesskeyid", ""),
+            ("x-amz-credential", ""),
+            ("authorization", "AWS x"),
+            ("x-amz-content-sha256", STREAMING_CONTENT_SHA256),
+        ] {
+            let mut headers = HeaderMap::new();
+            headers.insert(name, HeaderValue::from_static(value));
+            let conditions = get_condition_values_with_query(&headers, &cred, None, None, None, Some(SIGV4_PRESIGNED_QUERY));
+            assert_eq!(
+                conditions.get("authType"),
+                Some(&vec!["REST-QUERY-STRING".to_string()]),
+                "{name}: {value}"
+            );
+            assert_eq!(
+                conditions.get("signatureversion"),
+                Some(&vec!["AWS4-HMAC-SHA256".to_string()]),
+                "{name}: {value}"
+            );
+        }
+
+        for (name, value) in [
+            ("awsaccesskeyid", ""),
+            ("authorization", "AWS x"),
+            ("authorization", DUMMY_SIGV4_AUTHORIZATION),
+        ] {
+            let mut headers = HeaderMap::new();
+            headers.insert(name, HeaderValue::from_static(value));
+            let conditions = get_condition_values_with_query(&headers, &cred, None, None, None, Some(SIGV2_PRESIGNED_QUERY));
+            assert_eq!(
+                conditions.get("authType"),
+                Some(&vec!["REST-QUERY-STRING".to_string()]),
+                "{name}: {value}"
+            );
+            assert_eq!(conditions.get("signatureversion"), Some(&vec!["AWS2".to_string()]), "{name}: {value}");
+        }
     }
 
     #[test]
@@ -2873,22 +2913,35 @@ mod tests {
         assert_eq!(auth_type, AuthType::Signed);
     }
 
+    const SIGV2_PRESIGNED_QUERY: &str = "AWSAccessKeyId=AKIAIOSFODNN7EXAMPLE&Signature=example&Expires=1672531200";
+    const SIGV4_PRESIGNED_QUERY: &str = "X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=AKIAIOSFODNN7EXAMPLE%2F20130524%2Fus-east-1%2Fs3%2Faws4_request&X-Amz-SignedHeaders=host&X-Amz-Signature=example";
+    const SIGV2_AUTHORIZATION: &str = "AWS AKIAIOSFODNN7EXAMPLE:frJIUN8DYpKDtOLCwo//bqJZQ1iY=";
+    const DUMMY_SIGV4_AUTHORIZATION: &str =
+        "AWS4-HMAC-SHA256 Credential=x/20130524/us-east-1/s3/aws4_request, SignedHeaders=host, Signature=00";
+    const FORM_CONTENT_TYPE: &str = "multipart/form-data; boundary=----WebKitFormBoundary7MA4YWxkTrZu0gW";
+
+    fn headers_from(pairs: &[(&'static str, &'static str)]) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        for (name, value) in pairs {
+            headers.append(*name, HeaderValue::from_static(value));
+        }
+        headers
+    }
+
     #[test]
-    fn test_get_request_auth_type_presigned_v2() {
+    fn test_get_request_auth_type_presigned_v2_header_is_not_read() {
         let mut headers = HeaderMap::new();
         headers.insert("AWSAccessKeyId", HeaderValue::from_static("AKIAIOSFODNN7EXAMPLE"));
 
         let auth_type = get_request_auth_type(&headers);
 
-        assert_eq!(auth_type, AuthType::PresignedV2);
+        assert_eq!(auth_type, AuthType::Anonymous);
     }
 
     #[test]
     fn test_get_request_auth_type_presigned_v2_from_query() {
         let headers = HeaderMap::new();
-        let uri: Uri = "https://example.com/?AWSAccessKeyId=AKIAIOSFODNN7EXAMPLE&Signature=example&Expires=1672531200"
-            .parse()
-            .unwrap();
+        let uri: Uri = format!("https://example.com/?{SIGV2_PRESIGNED_QUERY}").parse().unwrap();
 
         let auth_type = get_request_auth_type_with_query(&headers, uri.query());
 
@@ -2896,7 +2949,7 @@ mod tests {
     }
 
     #[test]
-    fn test_get_request_auth_type_presigned_v4() {
+    fn test_get_request_auth_type_presigned_v4_header_is_not_read() {
         let mut headers = HeaderMap::new();
         headers.insert(
             "X-Amz-Credential",
@@ -2905,15 +2958,13 @@ mod tests {
 
         let auth_type = get_request_auth_type(&headers);
 
-        assert_eq!(auth_type, AuthType::Presigned);
+        assert_eq!(auth_type, AuthType::Anonymous);
     }
 
     #[test]
     fn test_get_request_auth_type_presigned_v4_from_query() {
         let headers = HeaderMap::new();
-        let uri: Uri = "https://example.com/?X-Amz-Credential=AKIAIOSFODNN7EXAMPLE%2F20130524%2Fus-east-1%2Fs3%2Faws4_request"
-            .parse()
-            .unwrap();
+        let uri: Uri = format!("https://example.com/?{SIGV4_PRESIGNED_QUERY}").parse().unwrap();
 
         let auth_type = get_request_auth_type_with_query(&headers, uri.query());
 
@@ -2921,12 +2972,99 @@ mod tests {
     }
 
     #[test]
+    fn test_get_request_auth_type_presigned_query_ignores_unsigned_headers() {
+        let unsigned: [&[(&str, &str)]; 10] = [
+            &[("awsaccesskeyid", "")],
+            &[("awsaccesskeyid", "x")],
+            &[("x-amz-credential", "")],
+            &[("authorization", "AWS x")],
+            &[("authorization", "Basic dXNlcjpwYXNz")],
+            &[("authorization", SIGV2_AUTHORIZATION), ("authorization", SIGV2_AUTHORIZATION)],
+            &[
+                ("authorization", DUMMY_SIGV4_AUTHORIZATION),
+                ("authorization", DUMMY_SIGV4_AUTHORIZATION),
+            ],
+            &[("x-amz-content-sha256", STREAMING_CONTENT_SHA256)],
+            &[("content-type", FORM_CONTENT_TYPE)],
+            &[("action", "AssumeRole")],
+        ];
+        for pairs in unsigned {
+            let headers = headers_from(pairs);
+            for method in [None, Some(&Method::GET), Some(&Method::PUT)] {
+                assert_eq!(
+                    get_request_auth_type_with_method_and_query(method, &headers, Some(SIGV2_PRESIGNED_QUERY)),
+                    AuthType::PresignedV2,
+                    "{method:?} {pairs:?}"
+                );
+                assert_eq!(
+                    get_request_auth_type_with_method_and_query(method, &headers, Some(SIGV4_PRESIGNED_QUERY)),
+                    AuthType::Presigned,
+                    "{method:?} {pairs:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_get_request_auth_type_presigned_query_decodes_signature_parameter() {
+        let headers = HeaderMap::new();
+        for (query, expected) in [
+            ("X%2DAmz-Signature=example", AuthType::Presigned),
+            ("Signature=example", AuthType::PresignedV2),
+            (
+                "AWSAccessKey%49d=AKIAIOSFODNN7EXAMPLE&Expires=1672531200&Signature=example",
+                AuthType::PresignedV2,
+            ),
+            (
+                "AWSAccessKey%49d=AKIAIOSFODNN7EXAMPLE&Expires=1672531200&%53ignature=example",
+                AuthType::PresignedV2,
+            ),
+            (
+                "X-Amz-Credential=AKIAIOSFODNN7EXAMPLE%2F20130524%2Fus-east-1%2Fs3%2Faws4_request",
+                AuthType::Anonymous,
+            ),
+            ("x-amz-signature=example", AuthType::Anonymous),
+            ("AWSAccessKeyId=AKIAIOSFODNN7EXAMPLE", AuthType::Anonymous),
+            ("signature=example", AuthType::Anonymous),
+        ] {
+            assert_eq!(get_request_auth_type_with_query(&headers, Some(query)), expected, "{query}");
+        }
+    }
+
+    #[test]
+    fn test_get_request_auth_type_anonymous_ignores_unverified_streaming_and_duplicate_headers() {
+        let unverified: [&[(&str, &str)]; 5] = [
+            &[("x-amz-content-sha256", STREAMING_CONTENT_SHA256)],
+            &[("x-amz-content-sha256", STREAMING_CONTENT_SHA256_TRAILER)],
+            &[("x-amz-content-sha256", UNSIGNED_PAYLOAD_TRAILER)],
+            &[
+                ("authorization", DUMMY_SIGV4_AUTHORIZATION),
+                ("authorization", DUMMY_SIGV4_AUTHORIZATION),
+            ],
+            &[("authorization", SIGV2_AUTHORIZATION), ("authorization", SIGV2_AUTHORIZATION)],
+        ];
+        for pairs in unverified {
+            let headers = headers_from(pairs);
+            for method in [None, Some(&Method::GET)] {
+                assert_eq!(
+                    get_request_auth_type_with_method_and_query(method, &headers, None),
+                    AuthType::Anonymous,
+                    "{method:?} {pairs:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_get_request_auth_type_malformed_signature_v2() {
+        let headers = headers_from(&[("authorization", "AWS x")]);
+        assert_eq!(get_request_auth_type(&headers), AuthType::Unknown);
+    }
+
+    #[test]
     fn test_get_request_auth_type_post_policy() {
         let mut headers = HeaderMap::new();
-        headers.insert(
-            "content-type",
-            HeaderValue::from_static("multipart/form-data; boundary=----WebKitFormBoundary7MA4YWxkTrZu0gW"),
-        );
+        headers.insert("content-type", HeaderValue::from_static(FORM_CONTENT_TYPE));
 
         let auth_type = get_request_auth_type(&headers);
 
@@ -2934,8 +3072,61 @@ mod tests {
     }
 
     #[test]
+    fn test_get_request_auth_type_post_policy_ignores_unsigned_headers_and_checks_method() {
+        for pairs in [
+            &[("content-type", FORM_CONTENT_TYPE), ("awsaccesskeyid", "x")][..],
+            &[("content-type", FORM_CONTENT_TYPE), ("x-amz-credential", "x")][..],
+            &[
+                ("content-type", FORM_CONTENT_TYPE),
+                ("authorization", DUMMY_SIGV4_AUTHORIZATION),
+            ][..],
+            &[
+                ("content-type", FORM_CONTENT_TYPE),
+                ("x-amz-content-sha256", STREAMING_CONTENT_SHA256),
+            ][..],
+        ] {
+            let headers = headers_from(pairs);
+            assert_eq!(
+                get_request_auth_type_with_method_and_query(Some(&Method::POST), &headers, None),
+                AuthType::PostPolicy,
+                "{pairs:?}"
+            );
+        }
+
+        // Without method, a POST form with unsigned AWSAccessKeyId still stays PostPolicy.
+        let headers = headers_from(&[("content-type", FORM_CONTENT_TYPE), ("awsaccesskeyid", "x")]);
+        assert_eq!(get_request_auth_type_with_query(&headers, None), AuthType::PostPolicy);
+
+        // A multipart/form-data Content-Type on a non-POST method is not a POST policy form.
+        let headers = headers_from(&[("content-type", FORM_CONTENT_TYPE)]);
+        assert_eq!(
+            get_request_auth_type_with_method_and_query(Some(&Method::GET), &headers, None),
+            AuthType::Anonymous
+        );
+        assert_eq!(
+            get_request_auth_type_with_method_and_query(Some(&Method::PUT), &headers, None),
+            AuthType::Anonymous
+        );
+
+        // Non-multipart/form-data or repeated Content-Type values are not POST policy forms.
+        for pairs in [
+            &[("content-type", "text/plain; note=\"multipart/form-data\"")][..],
+            &[("content-type", "multipart/form-data; boundary")][..],
+            &[("content-type", FORM_CONTENT_TYPE), ("content-type", FORM_CONTENT_TYPE)][..],
+        ] {
+            let headers = headers_from(pairs);
+            assert_eq!(
+                get_request_auth_type_with_method_and_query(Some(&Method::POST), &headers, None),
+                AuthType::Anonymous,
+                "{pairs:?}"
+            );
+        }
+    }
+
+    #[test]
     fn test_get_request_auth_type_streaming_signed() {
         let mut headers = HeaderMap::new();
+        headers.insert("authorization", HeaderValue::from_static(DUMMY_SIGV4_AUTHORIZATION));
         headers.insert("x-amz-content-sha256", HeaderValue::from_static("STREAMING-AWS4-HMAC-SHA256-PAYLOAD"));
 
         let auth_type = get_request_auth_type(&headers);
@@ -2946,6 +3137,7 @@ mod tests {
     #[test]
     fn test_get_request_auth_type_streaming_signed_trailer() {
         let mut headers = HeaderMap::new();
+        headers.insert("authorization", HeaderValue::from_static(DUMMY_SIGV4_AUTHORIZATION));
         headers.insert(
             "x-amz-content-sha256",
             HeaderValue::from_static("STREAMING-AWS4-HMAC-SHA256-PAYLOAD-TRAILER"),
@@ -2959,6 +3151,7 @@ mod tests {
     #[test]
     fn test_get_request_auth_type_streaming_unsigned_trailer() {
         let mut headers = HeaderMap::new();
+        headers.insert("authorization", HeaderValue::from_static(DUMMY_SIGV4_AUTHORIZATION));
         headers.insert("x-amz-content-sha256", HeaderValue::from_static("STREAMING-UNSIGNED-PAYLOAD-TRAILER"));
 
         let auth_type = get_request_auth_type(&headers);
