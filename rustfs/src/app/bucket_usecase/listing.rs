@@ -17,6 +17,7 @@
 use super::list_objects::listed_etag;
 use super::*;
 use crate::app::metadata_listing::{MetadataListQuery, ObjectsQuery, VersionsQuery};
+use crate::app::storage_api::bucket_usecase::access::{versioned_read_action, versioned_tagging_action};
 use crate::app::storage_api::bucket_usecase::contract::list::ListOperations as _;
 use quick_xml::{
     Writer,
@@ -294,6 +295,29 @@ struct ObjectMetadataPermissions {
     tags_allowed: bool,
 }
 
+/// Metadata permissions for a version listing, keyed per `(object key, version id)` so
+/// permissions for one version never expose metadata or tags of another version.
+type ObjectVersionMetadataPermissions = HashMap<(String, Option<uuid::Uuid>), ObjectMetadataPermissions>;
+
+/// The version id a version listing advertises for an entry. A null version
+/// surfaces as `Some(Uuid::nil())` on the client-facing `ObjectInfo`; AWS
+/// advertises it as the literal string `null`, and a nil UUID must never reach
+/// the wire (issue #6745).
+fn list_object_version_id(version_id: Option<uuid::Uuid>) -> String {
+    version_id
+        .filter(|version| !version.is_nil())
+        .map(|version| version.to_string())
+        .unwrap_or_else(|| "null".to_string())
+}
+
+/// The version selector a version-listing entry authorizes against. The
+/// `IsLatest` entry matches what a plain GET/HEAD returns, so it authorizes as
+/// a current-object read (`None`); a noncurrent entry is only reachable via
+/// `?versionId=`, so it authorizes as a versioned read of that version.
+fn list_object_version_authorized_version(object: &ObjectInfo) -> Option<String> {
+    (!object.is_latest).then(|| list_object_version_id(object.version_id))
+}
+
 fn encode_list_versions_value(value: &str, encoding_type: Option<&EncodingType>) -> String {
     if encoding_type == Some(&EncodingType::URL) {
         encode(value).into_owned()
@@ -338,22 +362,48 @@ async fn is_list_objects_metadata_action_allowed(
     envelope: &RequestEnvelope,
     bucket: &str,
     object: &str,
-    action: S3Action,
+    version_id: Option<&str>,
+    action: Action,
 ) -> S3Result<bool> {
     let mut auth_req = envelope.fork_for_authorization();
     let mut req_info = req_info_ref(envelope)?.clone();
     req_info.bucket = Some(bucket.to_string());
     req_info.object = Some(object.to_string());
-    req_info.version_id = None;
+    req_info.version_id = version_id.map(str::to_string);
     // Denial here is an expected filter outcome, not an error (issue #5740).
     req_info.suppress_denial_log = true;
     auth_req.install_req_info(req_info);
 
-    match authorize_request(&mut auth_req, Action::S3Action(action)).await {
+    match authorize_request(&mut auth_req, action).await {
         Ok(()) => Ok(true),
         Err(err) if err.code() == &rustfs_s3_types::S3ErrorCode::AccessDenied => Ok(false),
         Err(err) => Err(err),
     }
+}
+
+/// Authorizes metadata and tag disclosure for a single listing entry using the
+/// same read/tagging actions as a direct read of that object or version.
+async fn list_objects_metadata_permissions(
+    envelope: &RequestEnvelope,
+    bucket: &str,
+    object: &str,
+    version_id: Option<&str>,
+) -> S3Result<ObjectMetadataPermissions> {
+    let metadata_allowed =
+        is_list_objects_metadata_action_allowed(envelope, bucket, object, version_id, versioned_read_action(version_id)).await?;
+    let tags_allowed = is_list_objects_metadata_action_allowed(
+        envelope,
+        bucket,
+        object,
+        version_id,
+        versioned_tagging_action(S3Action::GetObjectTaggingAction, version_id),
+    )
+    .await?;
+
+    Ok(ObjectMetadataPermissions {
+        metadata_allowed,
+        tags_allowed,
+    })
 }
 
 async fn collect_list_objects_metadata_permissions(
@@ -368,18 +418,35 @@ async fn collect_list_objects_metadata_permissions(
             continue;
         }
 
-        let metadata_allowed =
-            is_list_objects_metadata_action_allowed(envelope, bucket, &object.name, S3Action::GetObjectAction).await?;
-        let tags_allowed =
-            is_list_objects_metadata_action_allowed(envelope, bucket, &object.name, S3Action::GetObjectTaggingAction).await?;
+        let permission = list_objects_metadata_permissions(envelope, bucket, &object.name, None).await?;
+        permissions.insert(object.name.clone(), permission);
+    }
 
-        permissions.insert(
-            object.name.clone(),
-            ObjectMetadataPermissions {
-                metadata_allowed,
-                tags_allowed,
-            },
-        );
+    Ok(permissions)
+}
+
+async fn collect_list_object_versions_metadata_permissions(
+    envelope: &RequestEnvelope,
+    bucket: &str,
+    objects: &[ObjectInfo],
+) -> S3Result<ObjectVersionMetadataPermissions> {
+    let mut permissions = HashMap::new();
+
+    for object in objects {
+        // Delete markers carry no user metadata, tags, or erasure layout, so
+        // skip per-entry metadata/tag authorization checks for them.
+        if object.name.is_empty() || object.delete_marker {
+            continue;
+        }
+
+        let key = (object.name.clone(), object.version_id);
+        if permissions.contains_key(&key) {
+            continue;
+        }
+
+        let version_id = list_object_version_authorized_version(object);
+        let permission = list_objects_metadata_permissions(envelope, bucket, &object.name, version_id.as_deref()).await?;
+        permissions.insert(key, permission);
     }
 
     Ok(permissions)
@@ -390,7 +457,7 @@ fn build_list_object_versions_metadata_output(
     bucket: &str,
     params: &ListObjectVersionsParams,
     encoding_type: Option<&EncodingType>,
-    permissions: &HashMap<String, ObjectMetadataPermissions>,
+    permissions: &ObjectVersionMetadataPermissions,
 ) -> ListObjectVersionsMetadataOutput {
     let owner = rustfs_owner();
     let common_prefixes = object_infos
@@ -405,16 +472,11 @@ fn build_list_object_versions_metadata_output(
         .filter(|object| !object.name.is_empty())
         .map(|object| {
             let object_name = encode_list_versions_value(&object.name, encoding_type);
-            // A null version surfaces as `Some(Uuid::nil())` on the
-            // client-facing `ObjectInfo`; AWS advertises it as the literal
-            // string `null`, and a nil UUID must never reach the wire
-            // (issue #6745).
-            let version_id = object
-                .version_id
-                .filter(|version| !version.is_nil())
-                .map(|version| version.to_string())
-                .unwrap_or_else(|| "null".to_string());
-            let permission = permissions.get(&object.name).copied().unwrap_or_default();
+            let version_id = list_object_version_id(object.version_id);
+            let permission = permissions
+                .get(&(object.name.clone(), object.version_id))
+                .copied()
+                .unwrap_or_default();
             let user_metadata = if permission.metadata_allowed {
                 build_metadata_extension_user_metadata(&object.user_defined)
             } else {
@@ -718,7 +780,7 @@ impl DefaultBucketUsecase {
                 .map_err(ApiError::from)?,
         };
 
-        let permissions = collect_list_objects_metadata_permissions(envelope, &bucket, &object_infos.objects).await?;
+        let permissions = collect_list_object_versions_metadata_permissions(envelope, &bucket, &object_infos.objects).await?;
         Ok(build_list_object_versions_metadata_output(
             object_infos,
             &bucket,
@@ -1137,6 +1199,18 @@ mod tests {
         assert!(listings.contents[1].extension.user_metadata.is_none());
         assert!(listings.contents[2].extension.user_metadata.is_some());
         assert!(listings.contents[3].extension.user_metadata.is_some());
+        let version_permissions = objects
+            .iter()
+            .map(|object| {
+                (
+                    (object.name.clone(), object.version_id),
+                    ObjectMetadataPermissions {
+                        metadata_allowed: true,
+                        tags_allowed: true,
+                    },
+                )
+            })
+            .collect::<ObjectVersionMetadataPermissions>();
         let versions = build_list_object_versions_metadata_output(
             ListObjectVersionsInfo {
                 objects,
@@ -1151,7 +1225,7 @@ mod tests {
                 version_id_marker: None,
             },
             None,
-            &permissions,
+            &version_permissions,
         );
         for (index, entry) in versions.entries.iter().enumerate() {
             let ListObjectVersionMetadataEntry::Version(ObjectMetadataEntry { extension, .. }) = entry else {
@@ -1200,14 +1274,14 @@ mod tests {
 
         let permissions = HashMap::from([
             (
-                "obj-a".to_string(),
+                ("obj-a".to_string(), Some(Uuid::nil())),
                 ObjectMetadataPermissions {
                     metadata_allowed: true,
                     tags_allowed: true,
                 },
             ),
             (
-                "obj-b".to_string(),
+                ("obj-b".to_string(), None),
                 ObjectMetadataPermissions {
                     metadata_allowed: true,
                     tags_allowed: false,
@@ -1669,5 +1743,426 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(err.code(), &S3ErrorCode::InvalidArgument);
+    }
+
+    #[test]
+    fn version_listing_noncurrent_entries_are_versioned_reads() {
+        use uuid::Uuid;
+
+        let entry = |version_id: Option<Uuid>, is_latest: bool| ObjectInfo {
+            name: "report.txt".to_string(),
+            version_id,
+            is_latest,
+            ..Default::default()
+        };
+        let noncurrent = Uuid::from_u128(2);
+
+        assert_eq!(
+            list_object_version_authorized_version(&entry(Some(Uuid::from_u128(1)), true)),
+            None,
+            "the IsLatest entry matches a plain GET and authorizes as a current-object read"
+        );
+        assert_eq!(
+            list_object_version_authorized_version(&entry(Some(noncurrent), false)),
+            Some(noncurrent.to_string()),
+            "a noncurrent entry authorizes as a read of that explicit version"
+        );
+        assert_eq!(
+            list_object_version_authorized_version(&entry(Some(Uuid::nil()), false)),
+            Some("null".to_string()),
+            "a noncurrent null version authorizes with the explicit `null` version selector"
+        );
+        assert_eq!(
+            list_object_version_authorized_version(&entry(None, false)),
+            Some("null".to_string()),
+            "a noncurrent entry without a version id still authorizes as a versioned read"
+        );
+
+        let version_id = list_object_version_authorized_version(&entry(Some(noncurrent), false));
+        assert_eq!(
+            versioned_read_action(version_id.as_deref()),
+            Action::S3Action(S3Action::GetObjectVersionAction)
+        );
+        assert_eq!(
+            versioned_tagging_action(S3Action::GetObjectTaggingAction, version_id.as_deref()),
+            Action::S3Action(S3Action::GetObjectVersionTaggingAction)
+        );
+    }
+
+    #[test]
+    fn version_listing_metadata_permissions_are_keyed_by_version() {
+        use uuid::Uuid;
+
+        let current = Uuid::from_u128(1);
+        let noncurrent = Uuid::from_u128(2);
+        let version = |version_id: Uuid, is_latest: bool, note: &str| ObjectInfo {
+            bucket: "demo-bucket".to_string(),
+            name: "report.txt".to_string(),
+            version_id: Some(version_id),
+            is_latest,
+            user_defined: Arc::new(HashMap::from([("note".to_string(), note.to_string())])),
+            user_tags: Arc::new(format!("stage={note}")),
+            parity_blocks: 1,
+            data_blocks: 2,
+            ..Default::default()
+        };
+        let object_infos = ListObjectVersionsInfo {
+            objects: vec![version(current, true, "current"), version(noncurrent, false, "old-secret")],
+            ..Default::default()
+        };
+        let permissions = HashMap::from([(
+            ("report.txt".to_string(), Some(current)),
+            ObjectMetadataPermissions {
+                metadata_allowed: true,
+                tags_allowed: true,
+            },
+        )]);
+        let params = ListObjectVersionsParams {
+            prefix: String::new(),
+            delimiter: None,
+            key_marker: None,
+            version_id_marker: None,
+            max_keys: 1000,
+        };
+
+        let output = build_list_object_versions_metadata_output(object_infos, "demo-bucket", &params, None, &permissions);
+
+        assert_eq!(output.entries.len(), 2);
+        match &output.entries[0] {
+            ListObjectVersionMetadataEntry::Version(ObjectMetadataEntry {
+                object: version,
+                extension,
+                ..
+            }) => {
+                assert_eq!(version.version_id, Some(current.to_string()));
+                assert_eq!(extension.user_metadata.clone(), Some(vec![("note".to_string(), "current".to_string())]));
+                assert_eq!(extension.user_tags.as_deref(), Some("stage=current"));
+                assert_eq!(extension.internal, Some(ObjectInternalInfo { k: 2, m: 1 }));
+            }
+            other => panic!("expected version entry, got {other:?}"),
+        }
+        match &output.entries[1] {
+            ListObjectVersionMetadataEntry::Version(ObjectMetadataEntry {
+                object: version,
+                extension,
+                ..
+            }) => {
+                assert_eq!(version.version_id, Some(noncurrent.to_string()));
+                assert!(extension.user_metadata.is_none());
+                assert!(extension.user_tags.is_none());
+                assert!(extension.internal.is_none());
+            }
+            other => panic!("expected version entry, got {other:?}"),
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn version_listing_metadata_permissions_enforce_version_actions_and_conditions() {
+        // Real ECStore + IAM futures exceed libtest's 2 MiB default stack in unoptimized builds.
+        let handle = std::thread::Builder::new()
+            .name("version-listing-authz-test".to_owned())
+            .stack_size(8 * 1024 * 1024)
+            .spawn(|| {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("build test tokio runtime");
+                runtime.block_on(Box::pin(run_version_listing_metadata_permissions_enforce_version_actions_and_conditions()));
+            })
+            .expect("spawn version listing authz test thread");
+        handle.join().expect("version listing authz test thread must succeed");
+    }
+
+    async fn run_version_listing_metadata_permissions_enforce_version_actions_and_conditions() {
+        use crate::app::runtime_sources::ServerContextSlot;
+        use crate::app::storage_api::test::{
+            StorageObjectOptions, StoragePutObjReader,
+            contract::object::{ObjectIO as _, ObjectOperations as _},
+        };
+        use http::{Extensions, HeaderMap, Uri};
+        use rustfs_iam::store::{Store as _, UserType, object::ObjectStore};
+        use rustfs_madmin::{AccountStatus, AddOrUpdateUserReq};
+        use rustfs_policy::policy::Policy;
+
+        const BUCKET: &str = "versioned-meta-listing";
+
+        let temp = tempfile::tempdir().expect("create versioned metadata listing test root");
+        let env = rustfs_test_utils::TestECStoreEnv::builder()
+            .base_dir(temp.path())
+            .disk_count(1)
+            .build()
+            .await;
+        env.make_bucket(BUCKET, true).await;
+
+        let put_version = |key: &str, body: &[u8], note: &str, tags: &str| {
+            let store = Arc::clone(&env.ecstore);
+            let key = key.to_owned();
+            let body = body.to_vec();
+            let note = note.to_owned();
+            let tags = tags.to_owned();
+            async move {
+                let mut reader = StoragePutObjReader::from_vec(body);
+                let opts = StorageObjectOptions {
+                    versioned: true,
+                    user_defined: HashMap::from([
+                        ("x-amz-meta-note".to_owned(), note),
+                        (rustfs_utils::http::AMZ_OBJECT_TAGGING.to_owned(), tags),
+                    ]),
+                    ..Default::default()
+                };
+                store
+                    .put_object(BUCKET, &key, &mut reader, &opts)
+                    .await
+                    .expect("put versioned test object")
+            }
+        };
+
+        let old_report = put_version("report.txt", b"v1", "old-secret", "stage=old-secret").await;
+        let current_report = put_version("report.txt", b"v2", "current-public", "stage=current").await;
+        let deleted_v1 = put_version("deleted.txt", b"gone", "deleted-secret", "stage=old-secret").await;
+        env.ecstore
+            .delete_object(
+                BUCKET,
+                "deleted.txt",
+                StorageObjectOptions {
+                    versioned: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("create delete marker");
+
+        let old_report_vid = old_report
+            .version_id
+            .expect("old report version id must be populated")
+            .to_string();
+        let current_report_vid = current_report
+            .version_id
+            .expect("current report version id must be populated")
+            .to_string();
+        let deleted_v1_vid = deleted_v1
+            .version_id
+            .expect("deleted object version id must be populated")
+            .to_string();
+
+        ObjectStore::new(Arc::clone(&env.ecstore))
+            .save_iam_config(
+                serde_json::json!({"version": 1}),
+                format!("{}/format.json", *rustfs_iam::store::object::IAM_CONFIG_PREFIX),
+            )
+            .await
+            .expect("seed IAM format");
+        let iam = rustfs_iam::build_iam_sys(Arc::clone(&env.ecstore))
+            .await
+            .expect("build test IAM");
+
+        let create_user_with_policy = |access_key: &str, policy_name: &str, policy_json: String| {
+            let iam = Arc::clone(&iam);
+            let access_key = access_key.to_owned();
+            let policy_name = policy_name.to_owned();
+            async move {
+                iam.create_user(
+                    &access_key,
+                    &AddOrUpdateUserReq {
+                        secret_key: format!("{access_key}-secret-key"),
+                        policy: None,
+                        status: AccountStatus::Enabled,
+                    },
+                )
+                .await
+                .expect("create IAM test user");
+                iam.set_policy(&policy_name, Policy::parse_config(policy_json.as_bytes()).expect("parse IAM test policy"))
+                    .await
+                    .expect("store IAM test policy");
+                iam.policy_db_set(&access_key, UserType::Reg, false, &policy_name)
+                    .await
+                    .expect("attach IAM test policy");
+                iam.get_user(&access_key).await.expect("load IAM test user").credentials
+            }
+        };
+
+        let current_only_cred = create_user_with_policy(
+            "current-only-reader",
+            "current-only-policy",
+            format!(
+                r#"{{"Version":"2012-10-17","Statement":[
+                    {{"Effect":"Allow","Action":["s3:ListBucket","s3:ListBucketVersions"],"Resource":["arn:aws:s3:::{BUCKET}"]}},
+                    {{"Effect":"Allow","Action":["s3:GetObject","s3:GetObjectTagging"],"Resource":["arn:aws:s3:::{BUCKET}/*"]}}
+                ]}}"#
+            ),
+        )
+        .await;
+
+        let tag_conditioned_cred = create_user_with_policy(
+            "tag-conditioned-reader",
+            "tag-conditioned-policy",
+            format!(
+                r#"{{"Version":"2012-10-17","Statement":[
+                    {{"Effect":"Allow","Action":["s3:ListBucket","s3:ListBucketVersions"],"Resource":["arn:aws:s3:::{BUCKET}"]}},
+                    {{"Effect":"Allow","Action":["s3:GetObject","s3:GetObjectVersion","s3:GetObjectTagging","s3:GetObjectVersionTagging"],"Resource":["arn:aws:s3:::{BUCKET}/*"],"Condition":{{"StringEquals":{{"s3:ExistingObjectTag/stage":"current"}}}}}}
+                ]}}"#
+            ),
+        )
+        .await;
+
+        let versionid_denied_cred = create_user_with_policy(
+            "versionid-denied-reader",
+            "versionid-denied-policy",
+            format!(
+                r#"{{"Version":"2012-10-17","Statement":[
+                    {{"Effect":"Allow","Action":["s3:ListBucket","s3:ListBucketVersions"],"Resource":["arn:aws:s3:::{BUCKET}"]}},
+                    {{"Effect":"Allow","Action":["s3:GetObject","s3:GetObjectVersion","s3:GetObjectTagging","s3:GetObjectVersionTagging"],"Resource":["arn:aws:s3:::{BUCKET}/*"]}},
+                    {{"Effect":"Deny","Action":["s3:GetObjectVersion","s3:GetObjectVersionTagging"],"Resource":["arn:aws:s3:::{BUCKET}/*"],"Condition":{{"StringEquals":{{"s3:versionid":"{old_report_vid}"}}}}}}
+                ]}}"#
+            ),
+        )
+        .await;
+
+        let full_version_cred = create_user_with_policy(
+            "full-version-reader",
+            "full-version-policy",
+            format!(
+                r#"{{"Version":"2012-10-17","Statement":[
+                    {{"Effect":"Allow","Action":["s3:ListBucket","s3:ListBucketVersions"],"Resource":["arn:aws:s3:::{BUCKET}"]}},
+                    {{"Effect":"Allow","Action":["s3:GetObject","s3:GetObjectVersion","s3:GetObjectTagging","s3:GetObjectVersionTagging"],"Resource":["arn:aws:s3:::{BUCKET}/*"]}}
+                ]}}"#
+            ),
+        )
+        .await;
+
+        let context = Arc::new(AppContext::with_default_interfaces(
+            Arc::clone(&env.ecstore),
+            iam,
+            Arc::new(rustfs_kms::KmsServiceManager::new()),
+        ));
+        let slot = ServerContextSlot::new();
+        assert!(slot.install(context), "install server context slot");
+
+        let listed = env
+            .ecstore
+            .list_object_versions(BUCKET, "", None, None, None, 1000)
+            .await
+            .expect("list object versions");
+
+        let run_for_cred = |cred: rustfs_credentials::Credentials| {
+            let slot = Arc::clone(&slot);
+            let listed = listed.clone();
+            let params = ListObjectVersionsParams {
+                prefix: String::new(),
+                delimiter: None,
+                key_marker: None,
+                version_id_marker: None,
+                max_keys: 1000,
+            };
+            async move {
+                let mut extensions = Extensions::new();
+                extensions.insert(slot);
+                extensions.insert(ReqInfo {
+                    cred: Some(cred),
+                    bucket: Some(BUCKET.to_owned()),
+                    ..Default::default()
+                });
+                let envelope = RequestEnvelope::from_parts(
+                    crate::app::RequestHead {
+                        method: Method::GET,
+                        uri: Uri::from_static("/versioned-meta-listing?versions&metadata=true"),
+                        headers: HeaderMap::new(),
+                        credentials: None,
+                        region: None,
+                        service: None,
+                    },
+                    extensions,
+                );
+                let permissions = collect_list_object_versions_metadata_permissions(&envelope, BUCKET, &listed.objects)
+                    .await
+                    .expect("collect version listing metadata permissions");
+                // Delete markers must be skipped and never populate the permission map.
+                assert!(
+                    !listed
+                        .objects
+                        .iter()
+                        .filter(|obj| obj.delete_marker)
+                        .any(|obj| permissions.contains_key(&(obj.name.clone(), obj.version_id))),
+                    "delete markers must not require metadata/tag authorization entries"
+                );
+                build_list_object_versions_metadata_output(listed, BUCKET, &params, None, &permissions)
+            }
+        };
+
+        let find_version = |output: &ListObjectVersionsMetadataOutput, key: &str, vid: &str| -> ObjectMetadataExtension {
+            output
+                .entries
+                .iter()
+                .find_map(|entry| match entry {
+                    ListObjectVersionMetadataEntry::Version(v)
+                        if v.object.key == key && v.object.version_id.as_deref() == Some(vid) =>
+                    {
+                        Some(v.extension.clone())
+                    }
+                    _ => None,
+                })
+                .unwrap_or_else(|| panic!("missing version entry for {key}@{vid}"))
+        };
+
+        // 1. Caller with only s3:GetObject + s3:GetObjectTagging: latest is visible, noncurrent versions are withheld.
+        let current_only_out = run_for_cred(current_only_cred).await;
+        let current_ext = find_version(&current_only_out, "report.txt", &current_report_vid);
+        assert_eq!(current_ext.user_metadata, Some(vec![("note".to_owned(), "current-public".to_owned())]));
+        assert_eq!(current_ext.user_tags.as_deref(), Some("stage=current"));
+        assert!(current_ext.internal.is_some());
+
+        let old_ext = find_version(&current_only_out, "report.txt", &old_report_vid);
+        assert_eq!(old_ext, ObjectMetadataExtension::default());
+        let deleted_ext = find_version(&current_only_out, "deleted.txt", &deleted_v1_vid);
+        assert_eq!(deleted_ext, ObjectMetadataExtension::default());
+
+        // 2. Caller with s3:ExistingObjectTag/stage == current condition: noncurrent version's own tags are checked.
+        let tag_cond_out = run_for_cred(tag_conditioned_cred).await;
+        assert_eq!(
+            find_version(&tag_cond_out, "report.txt", &current_report_vid).user_metadata,
+            Some(vec![("note".to_owned(), "current-public".to_owned())])
+        );
+        assert_eq!(
+            find_version(&tag_cond_out, "report.txt", &old_report_vid),
+            ObjectMetadataExtension::default()
+        );
+        assert_eq!(
+            find_version(&tag_cond_out, "deleted.txt", &deleted_v1_vid),
+            ObjectMetadataExtension::default()
+        );
+
+        // 3. Caller denied specifically on s3:versionid == old_report_vid: only that version is withheld.
+        let vid_denied_out = run_for_cred(versionid_denied_cred).await;
+        assert_eq!(
+            find_version(&vid_denied_out, "report.txt", &current_report_vid).user_metadata,
+            Some(vec![("note".to_owned(), "current-public".to_owned())])
+        );
+        assert_eq!(
+            find_version(&vid_denied_out, "report.txt", &old_report_vid),
+            ObjectMetadataExtension::default()
+        );
+        let allowed_deleted_ext = find_version(&vid_denied_out, "deleted.txt", &deleted_v1_vid);
+        assert_eq!(
+            allowed_deleted_ext.user_metadata,
+            Some(vec![("note".to_owned(), "deleted-secret".to_owned())])
+        );
+        assert_eq!(allowed_deleted_ext.user_tags.as_deref(), Some("stage=old-secret"));
+        assert!(allowed_deleted_ext.internal.is_some());
+
+        // 4. Caller with full version read/tagging permissions: both latest and noncurrent metadata are returned.
+        let full_out = run_for_cred(full_version_cred).await;
+        let full_old_ext = find_version(&full_out, "report.txt", &old_report_vid);
+        assert_eq!(full_old_ext.user_metadata, Some(vec![("note".to_owned(), "old-secret".to_owned())]));
+        assert_eq!(full_old_ext.user_tags.as_deref(), Some("stage=old-secret"));
+        assert!(full_old_ext.internal.is_some());
+        assert!(
+            full_out.entries.iter().any(|entry| matches!(
+                entry,
+                ListObjectVersionMetadataEntry::DeleteMarker(marker, ext)
+                    if marker.key == "deleted.txt" && *ext == ObjectMetadataExtension::default()
+            )),
+            "delete marker entry must be present with empty metadata extension"
+        );
     }
 }
