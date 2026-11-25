@@ -718,6 +718,11 @@ async fn write_delete_rollback_files(
             reject_local_disk_symlink_components(&io_root, path).map_err(std::io::Error::from)?;
         }
         reject_local_disk_symlink_components(&io_root, &staging_root).map_err(std::io::Error::from)?;
+        let backup_dir_existed = backup_dir.is_dir();
+        std::fs::create_dir_all(&backup_dir)?;
+        if sync && let Some(through) = sync_preparation_through.as_deref() {
+            delete_recovery::sync_preparation_parents(&object_dir_buf, through)?;
+        }
         for (path, _) in &removed_entries {
             #[cfg(all(any(test, feature = "test-util"), not(windows)))]
             os::prepared_publication_test_hooks::run(os::prepared_publication_test_hooks::Stage::Remove, path);
@@ -726,11 +731,6 @@ async fn write_delete_rollback_files(
                 Err(err) if err.kind() == ErrorKind::NotFound => {}
                 Err(err) => return Err(err),
             }
-        }
-        let backup_dir_existed = backup_dir.is_dir();
-        std::fs::create_dir_all(&backup_dir)?;
-        if sync && let Some(through) = sync_preparation_through.as_deref() {
-            delete_recovery::sync_preparation_parents(&object_dir_buf, through)?;
         }
         std::fs::create_dir_all(&staging_root)?;
         // tempfile's Windows `persist` hands both the staged and the final path

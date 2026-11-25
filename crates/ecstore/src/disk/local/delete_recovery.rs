@@ -2897,6 +2897,12 @@ impl LocalDisk {
             lease,
             sync,
             move || -> std::io::Result<Result<Option<(DeleteRecoveryJournal, bool, bool)>>> {
+                // The ordinary publisher preserves a physical completion record on a retry.
+                match regular_file_exists(&receipt_path) {
+                    Ok(true) => return Ok(Ok(None)),
+                    Ok(false) => {}
+                    Err(error) => return Ok(Err(error)),
+                }
                 if let Some((journal_raw, journal, sole_transaction)) = cached_receipt
                     && rollback.join(PREPARED).is_file()
                 {
@@ -2921,12 +2927,6 @@ impl LocalDisk {
                         },
                     );
                     return Ok(Ok(Some((journal, sole_transaction, true))));
-                }
-                // The ordinary publisher preserves a physical completion record on a retry.
-                match regular_file_exists(&receipt_path) {
-                    Ok(true) => return Ok(Ok(None)),
-                    Ok(false) => {}
-                    Err(error) => return Ok(Err(error)),
                 }
                 let prepared = match regular_bytes(&rollback.join(PREPARED)) {
                     Ok(Some(bytes)) => bytes,
@@ -6551,6 +6551,49 @@ mod tests {
         assert_eq!(publish(finished.fingerprint).await.unwrap().state, DeleteRecoveryState::CommitFinished);
         let record: CommitReceipt = serde_json::from_slice(&tokio::fs::read(receipt).await.unwrap()).unwrap();
         assert!(record.finished, "a retried vote must preserve existing completion");
+    }
+
+    #[tokio::test]
+    async fn delete_recovery_cached_preparation_cannot_regress_a_finished_receipt() {
+        let (_temp, disk, info, _) = fixture().await;
+        let transaction = Uuid::new_v4();
+        let errors = disk
+            .delete_versions_recoverable(
+                "recovery",
+                vec![FileInfoVersions {
+                    name: "object".into(),
+                    volume: "recovery".into(),
+                    versions: vec![info],
+                    ..Default::default()
+                }],
+                DeleteOptions {
+                    old_data_dir: Some(transaction),
+                    ..Default::default()
+                },
+            )
+            .await;
+        assert_eq!(errors, vec![None]);
+        let directory = disk.io_get_object_path("recovery", &format!("object/{transaction}")).unwrap();
+        let stale = take_prepared_delete_receipt(&directory).expect("prepared cache entry");
+        let mut state = disk.delete_recovery_inspect("recovery", "object", transaction).await.unwrap();
+        for action in [DeleteRecoveryAction::PublishCommit, DeleteRecoveryAction::FinishCommit] {
+            state = disk
+                .delete_recovery_settle("recovery", "object", transaction, state.fingerprint, action, None)
+                .await
+                .unwrap();
+        }
+        assert_eq!(state.state, DeleteRecoveryState::CommitFinished);
+        // Model a publisher that took its prepared hint before waiting for the metadata lease.
+        put_prepared_delete_receipt(&directory, stale);
+        assert!(
+            disk.try_publish_prepared_delete_local("recovery", "object", transaction, None)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let receipt: CommitReceipt =
+            serde_json::from_slice(&fs::read(directory.join(DELETE_QUORUM_COMMITTED_FILE)).await.unwrap()).unwrap();
+        assert!(receipt.finished);
     }
 
     #[cfg(unix)]
