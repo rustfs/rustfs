@@ -46,7 +46,7 @@ use super::super::{
     is_err_version_not_found, is_min_allowed_part_size, log_multipart_write_quorum_failure, multipart_part_logical_size,
     parts_after_marker, path_join_buf, prepare_complete_multipart_parts, record_compression_total_memory,
     record_multipart_write_quorum_failure, reduce_read_quorum_errs, reduce_write_quorum_errs, remove_header_map,
-    replication_write_may_pass_worm_gate, resolve_write_layout, restore_commit_operation_id_from_metadata,
+    replication_write_may_pass_worm_gate_with_inbound_metadata, resolve_write_layout, restore_commit_operation_id_from_metadata,
     restore_operation_id_from_metadata, should_persist_encryption_original_size, strip_internal_multipart_metadata,
     to_object_err, warn,
 };
@@ -3792,7 +3792,7 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
                     .await?,
             );
         }
-        let upload_guard = self
+        let mut upload_guard = self
             .acquire_multipart_upload_write_lock("complete_multipart_upload_commit", bucket, object, upload_id, opts)
             .await?;
 
@@ -4559,8 +4559,9 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
             && !crate::bucket::utils::is_meta_bucketname(bucket)
             && snapshot_state.is_some_and(|state| !matches!(state, ObjectLockConfigState::ConfirmedAbsent));
         let replication_lww_applicable = crate::set_disk::ops::object::replication_lww_applicable(opts);
+        let target_version_id = fi.version_id.or_else(|| need_worm_lookup.then(Uuid::nil));
         if (need_worm_lookup || replication_lww_applicable)
-            && let Some(version_id) = fi.version_id
+            && let Some(version_id) = target_version_id
         {
             match self
                 .get_object_info(
@@ -4578,14 +4579,130 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
                 .await
             {
                 Ok(existing) => {
-                    if !opts.data_movement
-                        && !opts.restore_copyback
-                        && !crate::bucket::utils::is_meta_bucketname(bucket)
-                        && let Some(state) = snapshot_state
-                        && check_object_lock_for_deletion_with_state(state, &existing, false)?.is_some()
-                        && !replication_write_may_pass_worm_gate(state, &existing, opts)?
-                    {
-                        return Err(StorageError::PrefixAccessDenied(bucket.to_string(), object.to_string()));
+                    if !opts.data_movement && !opts.restore_copyback && !crate::bucket::utils::is_meta_bucketname(bucket) {
+                        let effective_state = snapshot_state.unwrap_or(&ObjectLockConfigState::ConfirmedAbsent);
+                        if check_object_lock_for_deletion_with_state(effective_state, &existing, false)?.is_some() {
+                            if !replication_write_may_pass_worm_gate_with_inbound_metadata(
+                                effective_state,
+                                &existing,
+                                opts,
+                                &fi.metadata,
+                            )? {
+                                return Err(StorageError::PrefixAccessDenied(bucket.to_string(), object.to_string()));
+                            }
+
+                            // A WORM-locked existing version's payload, `data_dir`,
+                            // ETag, and `mod_time` are immutable. Commit only the
+                            // LWW-judged metadata categories via
+                            // `update_object_meta_with_opts` instead of `rename_data`.
+                            let metadata_lookup_opts = ObjectOptions {
+                                version_id: Some(version_id.to_string()),
+                                no_lock: true,
+                                metadata_cache_safe: false,
+                                versioned: opts.versioned,
+                                version_suspended: opts.version_suspended,
+                                include_part_checksums: true,
+                                ..Default::default()
+                            };
+                            let (mut existing_fi, _, existing_disks) = self
+                                .get_object_fileinfo_for_metadata_update(bucket, object, &metadata_lookup_opts)
+                                .await?
+                                .into_owned();
+                            let metadata_changed =
+                                crate::set_disk::ops::object::apply_replication_lww_categories_to_locked_metadata(
+                                    &mut existing_fi.metadata,
+                                    &fi.metadata,
+                                    opts,
+                                );
+
+                            #[cfg(test)]
+                            pause_multipart_commit(bucket, object, MultipartCommitPause::BeforeLockLost).await;
+                            if object_lock_guard.as_ref().is_some_and(|guard| guard.is_lock_lost())
+                                || decommission_object_lock_guard
+                                    .as_ref()
+                                    .is_some_and(|guard| guard.is_lock_lost())
+                            {
+                                return Err(StorageError::NamespaceLockQuorumUnavailable {
+                                    mode: "complete_multipart_upload_commit",
+                                    bucket: bucket.to_string(),
+                                    object: object.to_string(),
+                                    required: 1,
+                                    achieved: 0,
+                                });
+                            }
+                            if opts
+                                .namespace_lock_fence
+                                .as_ref()
+                                .is_some_and(NamespaceLockFence::is_lock_lost)
+                            {
+                                return Err(StorageError::NamespaceLockQuorumUnavailable {
+                                    mode: "complete_multipart_upload_outer_lock",
+                                    bucket: bucket.to_string(),
+                                    object: object.to_string(),
+                                    required: 1,
+                                    achieved: 0,
+                                });
+                            }
+                            if upload_guard.as_ref().is_some_and(|guard| guard.is_lock_lost()) {
+                                return Err(StorageError::NamespaceLockQuorumUnavailable {
+                                    mode: "complete_multipart_upload_commit",
+                                    bucket: RUSTFS_META_MULTIPART_BUCKET.to_string(),
+                                    object: upload_id_path.clone(),
+                                    required: 1,
+                                    achieved: 0,
+                                });
+                            }
+                            ensure_multipart_bucket_lifecycle_lock_held(bucket, object, opts)?;
+                            self.require_current_restore_operation_id(
+                                bucket,
+                                object,
+                                opts,
+                                expected_restore_operation_id,
+                                "complete_multipart_upload_commit",
+                            )
+                            .await?;
+
+                            if metadata_changed {
+                                self.update_object_meta_with_opts(
+                                    bucket,
+                                    object,
+                                    existing_fi.clone(),
+                                    &existing_disks,
+                                    &crate::disk::UpdateMetadataOpts {
+                                        replace_user_metadata: true,
+                                        ..Default::default()
+                                    },
+                                )
+                                .await
+                                .map_err(|e| to_object_err(e.into(), vec![bucket, object]))?;
+                                self.invalidate_get_object_metadata_cache(bucket, object).await;
+                            }
+
+                            drop(object_lock_guard.take());
+                            drop(decommission_object_lock_guard.take());
+                            drop(decommission_capacity_guard.take());
+                            if let Err(err) = self
+                                .delete_all_with_quorum(RUSTFS_META_MULTIPART_BUCKET, &upload_id_path, write_quorum)
+                                .await
+                            {
+                                warn!(
+                                    bucket = %bucket,
+                                    object = %object,
+                                    upload_id = %upload_id,
+                                    error = ?err,
+                                    "completed multipart upload staging cleanup did not reach write quorum"
+                                );
+                            }
+                            drop(upload_guard.take());
+                            remove_capped_multipart_staging_semaphore(&upload_id_path);
+
+                            return Ok(ObjectInfo::from_file_info(
+                                &existing_fi,
+                                bucket,
+                                object,
+                                opts.versioned || opts.version_suspended,
+                            ));
+                        }
                     }
                     if replication_lww_applicable {
                         let stored = crate::set_disk::ops::object::stored_replication_category_metadata(&existing);
@@ -14720,6 +14837,170 @@ mod tests {
                 let (body, _) = read_object(&set_disks, bucket, object).await;
                 assert_eq!(body, b"locked body", "{case}: the locked version bytes must be untouched");
             }
+        }
+
+        /// Forged replication multipart completions cannot unlock a COMPLIANCE
+        /// or LegalHold-ON version with future timestamps, and even when an
+        /// authorized replication completion passes the WORM gate (stale
+        /// timestamps or valid lock extension/release), the existing locked
+        /// version's payload bytes, ETag, `data_dir`, and `mod_time` stay
+        /// completely immutable.
+        #[tokio::test]
+        #[serial]
+        async fn forged_replication_multipart_cannot_unlock_or_overwrite_locked_version() {
+            use time::format_description::well_known::Rfc3339;
+
+            let parse_ts = |value: &str| OffsetDateTime::parse(value, &Rfc3339).expect("valid timestamp");
+            let snapshot = Arc::new(crate::set_disk::ObjectLockConfigSnapshot::new(ObjectLockConfigState::Configured {
+                config: rustfs_gateway_types::persistence::PersistedObjectLockConfiguration {
+                    object_lock_enabled: Some("Enabled".to_owned()),
+                    rule: None,
+                },
+                updated_at: OffsetDateTime::now_utc(),
+            }));
+
+            let (_temp_dirs, disk_stores, set_disks) = hermetic_set_disks(4).await;
+            let bucket = "multipart-worm-immutable-bucket";
+            let object = "evidence.bin";
+            make_bucket_on_all(&disk_stores, bucket).await;
+
+            let version_id = Uuid::new_v4();
+            let mut lock = HashMap::from([
+                (metadata_keys::OBJECT_LOCK_MODE.to_string(), "COMPLIANCE".to_string()),
+                (
+                    metadata_keys::OBJECT_LOCK_RETAIN_UNTIL_DATE.to_string(),
+                    "2099-01-01T00:00:00Z".to_string(),
+                ),
+                (metadata_keys::OBJECT_LOCK_LEGAL_HOLD.to_string(), "ON".to_string()),
+            ]);
+            insert_str(
+                &mut lock,
+                rustfs_utils::http::SUFFIX_OBJECTLOCK_RETENTION_TIMESTAMP,
+                "2026-02-01T00:00:00Z".to_string(),
+            );
+            insert_str(
+                &mut lock,
+                rustfs_utils::http::SUFFIX_OBJECTLOCK_LEGALHOLD_TIMESTAMP,
+                "2026-02-01T00:00:00Z".to_string(),
+            );
+            let version_opts = ObjectOptions {
+                versioned: true,
+                version_id: Some(version_id.to_string()),
+                object_lock_config_snapshot: Some(snapshot.clone()),
+                ..Default::default()
+            };
+            let mut original_reader = PutObjReader::from_vec(b"original evidence".to_vec());
+            let original = set_disks
+                .put_object(
+                    bucket,
+                    object,
+                    &mut original_reader,
+                    &ObjectOptions {
+                        user_defined: lock,
+                        ..version_opts.clone()
+                    },
+                )
+                .await
+                .expect("seed locked version");
+
+            // 1. Future timestamps trying to clear COMPLIANCE + LegalHold must be rejected.
+            let (forged_upload, forged_parts) = stage_upload_with_create_opts(
+                &set_disks,
+                bucket,
+                object,
+                &payload(0x5a),
+                &ObjectOptions {
+                    versioned: true,
+                    version_id: Some(version_id.to_string()),
+                    ..Default::default()
+                },
+            )
+            .await;
+            let forged_future_opts = ObjectOptions {
+                versioned: true,
+                replication_request: true,
+                replication_retention_timestamp: Some(parse_ts("2098-01-01T00:00:00Z")),
+                replication_legalhold_timestamp: Some(parse_ts("2098-01-01T00:00:00Z")),
+                object_lock_config_snapshot: Some(snapshot.clone()),
+                ..Default::default()
+            };
+            let err = set_disks
+                .clone()
+                .complete_multipart_upload(bucket, object, &forged_upload, forged_parts.clone(), &forged_future_opts)
+                .await
+                .expect_err("forged future-timestamp multipart completion must not clear COMPLIANCE/LegalHold");
+            assert!(matches!(err, StorageError::PrefixAccessDenied(_, _)), "unexpected error: {err}");
+
+            // 2. Stale timestamps trying to replace bytes in place must keep payload, ETag,
+            //    data_dir, mod_time, and locks immutable.
+            let stale_opts = ObjectOptions {
+                versioned: true,
+                replication_request: true,
+                replication_retention_timestamp: Some(parse_ts("2026-01-01T00:00:00Z")),
+                replication_legalhold_timestamp: Some(parse_ts("2026-01-01T00:00:00Z")),
+                object_lock_config_snapshot: Some(snapshot.clone()),
+                ..Default::default()
+            };
+            set_disks
+                .clone()
+                .complete_multipart_upload(bucket, object, &forged_upload, forged_parts, &stale_opts)
+                .await
+                .expect("stale replication completion succeeds as metadata no-op without touching payload");
+
+            // 3. Authorized extension + legal-hold release via multipart with different part bytes
+            //    updates ONLY metadata while keeping original payload bytes and ETag immutable.
+            let extending_create_opts = ObjectOptions {
+                versioned: true,
+                version_id: Some(version_id.to_string()),
+                user_defined: HashMap::from([
+                    (metadata_keys::OBJECT_LOCK_MODE.to_string(), "COMPLIANCE".to_string()),
+                    (
+                        metadata_keys::OBJECT_LOCK_RETAIN_UNTIL_DATE.to_string(),
+                        "2100-01-01T00:00:00Z".to_string(),
+                    ),
+                    (metadata_keys::OBJECT_LOCK_LEGAL_HOLD.to_string(), "OFF".to_string()),
+                ]),
+                ..Default::default()
+            };
+            let (ext_upload, ext_parts) =
+                stage_upload_with_create_opts(&set_disks, bucket, object, &payload(0x7b), &extending_create_opts).await;
+            let ext_complete_opts = ObjectOptions {
+                versioned: true,
+                replication_request: true,
+                replication_retention_timestamp: Some(parse_ts("2026-03-01T00:00:00Z")),
+                replication_legalhold_timestamp: Some(parse_ts("2026-03-01T00:00:00Z")),
+                object_lock_config_snapshot: Some(snapshot),
+                ..Default::default()
+            };
+            let updated = set_disks
+                .clone()
+                .complete_multipart_upload(bucket, object, &ext_upload, ext_parts, &ext_complete_opts)
+                .await
+                .expect("authorized COMPLIANCE extension + legal-hold release should update metadata only");
+
+            let info = set_disks
+                .get_object_info(bucket, object, &version_opts)
+                .await
+                .expect("locked version should stay readable");
+            assert_eq!(updated.etag, original.etag, "returned ETag must remain original");
+            assert_eq!(info.etag, original.etag, "persisted ETag must remain immutable");
+            assert_eq!(info.data_dir, original.data_dir, "data_dir must remain immutable");
+            assert_eq!(info.mod_time, original.mod_time, "mod_time must remain immutable");
+            assert_eq!(info.size, original.size, "size must remain immutable");
+            assert_eq!(
+                info.user_defined
+                    .get(metadata_keys::OBJECT_LOCK_RETAIN_UNTIL_DATE)
+                    .map(String::as_str),
+                Some("2100-01-01T00:00:00Z")
+            );
+            assert_eq!(
+                info.user_defined
+                    .get(metadata_keys::OBJECT_LOCK_LEGAL_HOLD)
+                    .map(String::as_str),
+                Some("OFF")
+            );
+            let (body, _) = read_object(&set_disks, bucket, object).await;
+            assert_eq!(body, b"original evidence", "payload bytes must remain byte-for-byte immutable");
         }
 
         #[tokio::test]

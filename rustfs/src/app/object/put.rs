@@ -1038,6 +1038,7 @@ pub(super) enum PutObjectOrigin<'a> {
         req: &'a RequestEnvelope,
         event_name: EventName,
         registered_body: bool,
+        replication_bypass_governance: bool,
     },
     /// A trusted in-process caller writing on the server's behalf. There is no
     /// request and no credential: managed-SSE authorization treats the write
@@ -1277,9 +1278,20 @@ impl DefaultObjectUsecase {
         Box::pin(self.execute_put_object_inner(envelope, input)).await
     }
 
+    async fn replication_put_may_bypass_governance(envelope: &mut RequestEnvelope) -> S3Result<bool> {
+        let suppress_denial_log = std::mem::replace(&mut req_info_mut(envelope)?.suppress_denial_log, true);
+        let auth_res = authorize_request(envelope, Action::S3Action(S3Action::BypassGovernanceRetentionAction)).await;
+        req_info_mut(envelope)?.suppress_denial_log = suppress_denial_log;
+        match auth_res {
+            Ok(()) => Ok(true),
+            Err(err) if err.code() == &S3ErrorCode::AccessDenied => Ok(false),
+            Err(err) => Err(err),
+        }
+    }
+
     async fn execute_put_object_inner(
         &self,
-        envelope: RequestEnvelope,
+        mut envelope: RequestEnvelope,
         input: PutObjectWriteInput,
     ) -> rustfs_s3_types::S3Result<PutObjectWriteOutput> {
         let start_time = std::time::Instant::now();
@@ -1326,6 +1338,22 @@ impl DefaultObjectUsecase {
         // historical user metadata as a request to untar the member again.
         let inbound_replication_put = replication_request_authorized(&envelope)
             && get_header(envelope.headers(), SUFFIX_SOURCE_REPLICATION_REQUEST).as_deref() == Some("true");
+        // A source lock timestamp header lets an inbound replication PUT update
+        // that lock category on an existing version (including when the
+        // matching `x-amz-object-lock-*` header is omitted). Require the same
+        // Object Lock permissions as the explicit lock headers, and quietly
+        // probe `s3:BypassGovernanceRetention` so weakening active GOVERNANCE
+        // retention requires explicit authorization rather than `s3:ReplicateObject`.
+        let mut replication_bypass_governance = false;
+        if inbound_replication_put {
+            if get_header(envelope.headers(), rustfs_utils::http::SUFFIX_SOURCE_REPLICATION_LEGALHOLD_TIMESTAMP).is_some() {
+                authorize_request(&mut envelope, Action::S3Action(S3Action::PutObjectLegalHoldAction)).await?;
+            }
+            if get_header(envelope.headers(), rustfs_utils::http::SUFFIX_SOURCE_REPLICATION_RETENTION_TIMESTAMP).is_some() {
+                authorize_request(&mut envelope, Action::S3Action(S3Action::PutObjectRetentionAction)).await?;
+                replication_bypass_governance = Self::replication_put_may_bypass_governance(&mut envelope).await?;
+            }
+        }
         if max_content_length.is_some() && is_put_object_extract_requested(envelope.headers()) {
             return Err(S3Error::with_message(
                 S3ErrorCode::InvalidRequest,
@@ -1483,6 +1511,7 @@ impl DefaultObjectUsecase {
                 req: &envelope,
                 event_name,
                 registered_body: rdma_put.is_some(),
+                replication_bypass_governance,
             },
         };
         #[cfg_attr(
@@ -1856,6 +1885,20 @@ impl DefaultObjectUsecase {
             object_lock.retain_until_date,
             &mut opts,
         )?;
+        if matches!(
+            origin,
+            PutObjectOrigin::S3 {
+                replication_bypass_governance: true,
+                ..
+            }
+        ) {
+            opts.object_lock_retention =
+                Some(crate::app::storage_api::object_meta_usecase::contract::ObjectLockRetentionOptions {
+                    mode: None,
+                    retain_until: None,
+                    bypass_governance: true,
+                });
+        }
         // A lockless cache bucket commits without distributed locks. Every feature
         // those locks protect sends the PUT down the locked path instead.
         if matches!(origin, PutObjectOrigin::S3 { .. })
@@ -1959,8 +2002,15 @@ impl DefaultObjectUsecase {
         // response (#1256); captured at want_checksum set points before opts is moved.
         let mut put_extra_checksum_headers: Vec<(&'static str, String)> = Vec::new();
         let cache_adapter = self.object_data_cache();
-        let fill_on_put_collector =
-            put_body_cache_collector(&cache_adapter, size, should_compress, ciphertext_passthrough, headers);
+        // Skip fill-on-put for inbound replication PUTs: a replication write
+        // targeting an actively locked version commits metadata-only and
+        // preserves the existing payload on disk, so caching the incoming wire
+        // body under the preserved ETag/version would poison cache reads.
+        let fill_on_put_collector = if inbound_replication_put {
+            None
+        } else {
+            put_body_cache_collector(&cache_adapter, size, should_compress, ciphertext_passthrough, headers)
+        };
         let reader_prepare_stage_start = put_stage_metrics_enabled.then(Instant::now);
         let registered_body = matches!(
             origin,
@@ -5639,6 +5689,322 @@ mod tests {
             .await
             .expect_err("a refused extract upload must not leave an object behind");
         assert!(is_err_object_not_found(&lookup_err), "{lookup_err}");
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn forged_replication_put_cannot_unlock_or_overwrite_locked_version() {
+        crate::app::gating_test_env::run_large_stack_test("forged-replication-put-worm", || async {
+            use crate::app::storage_api::object_usecase::StoragePutObjReader;
+            use crate::app::storage_api::test::contract::bucket::{BucketOperations as _, MakeBucketOptions};
+            use crate::app::storage_api::test::contract::object::ObjectIO as _;
+            use rustfs_utils::http::metadata_compat::{
+                SUFFIX_OBJECTLOCK_LEGALHOLD_TIMESTAMP, SUFFIX_OBJECTLOCK_RETENTION_TIMESTAMP, insert_str,
+            };
+            use rustfs_utils::http::{
+                SUFFIX_SOURCE_ETAG, SUFFIX_SOURCE_MTIME, SUFFIX_SOURCE_REPLICATION_LEGALHOLD_TIMESTAMP,
+                SUFFIX_SOURCE_REPLICATION_RETENTION_TIMESTAMP,
+            };
+            use tokio::io::AsyncReadExt as _;
+
+            async fn set_policy(bucket: &str, statements: &str) {
+                let policy_json = format!(r#"{{"Version":"2012-10-17","Statement":[{statements}]}}"#).replace("BUCKET", bucket);
+                let mut metadata = (*crate::storage::get_bucket_metadata(bucket)
+                    .await
+                    .expect("load bucket metadata"))
+                .clone();
+                metadata.policy_config = Some(serde_json::from_str(&policy_json).expect("parse bucket policy"));
+                metadata.policy_config_json = policy_json.into_bytes();
+                crate::storage::storage_api::set_bucket_metadata(bucket.to_owned(), metadata)
+                    .await
+                    .expect("publish bucket policy");
+            }
+
+            async fn read_version_bytes(store: &Arc<ECStore>, bucket: &str, key: &str, version_id: &str) -> Vec<u8> {
+                let opts = ObjectOptions {
+                    versioned: true,
+                    version_id: Some(version_id.to_owned()),
+                    ..Default::default()
+                };
+                let mut reader = store
+                    .get_object_reader(bucket, key, None, HeaderMap::new(), &opts)
+                    .await
+                    .expect("read locked object version");
+                let mut bytes = Vec::new();
+                reader.stream.read_to_end(&mut bytes).await.expect("read object bytes");
+                bytes
+            }
+
+            fn replication_put_envelope(bucket: &str, key: &str, version_id: &str, headers: HeaderMap) -> RequestEnvelope {
+                let mut envelope = write_envelope(Method::PUT, http::Uri::from_static("/"), headers, http::Extensions::new());
+                envelope.install_req_info(crate::storage::req_info::ReqInfo {
+                    bucket: Some(bucket.to_owned()),
+                    object: Some(key.to_owned()),
+                    version_id: Some(version_id.to_owned()),
+                    replication_request_authorized: true,
+                    ..Default::default()
+                });
+                envelope
+            }
+
+            const T_OLD: &str = "2026-01-01T00:00:00Z";
+            const T_STALE: &str = "2025-01-01T00:00:00Z";
+            const T_NEW: &str = "2099-01-01T00:00:00Z";
+            const ALLOW_PUT_AND_REPLICATE: &str = r#"{"Effect":"Allow","Principal":{"AWS":"*"},"Action":["s3:PutObject","s3:ReplicateObject"],"Resource":["arn:aws:s3:::BUCKET/*"]}"#;
+            const ALLOW_ALL: &str =
+                r#"{"Effect":"Allow","Principal":{"AWS":"*"},"Action":["s3:*"],"Resource":["arn:aws:s3:::BUCKET/*"]}"#;
+            const DENY_BYPASS: &str = r#"{"Effect":"Deny","Principal":{"AWS":"*"},"Action":["s3:BypassGovernanceRetention"],"Resource":["arn:aws:s3:::BUCKET/*"]}"#;
+
+            let (store, context) = real_store_test_context().await;
+            let bucket = format!("forged-repl-worm-{}", Uuid::new_v4().simple());
+            store
+                .make_bucket(
+                    &bucket,
+                    &MakeBucketOptions {
+                        lock_enabled: true,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect("create Object Lock bucket");
+            let usecase = DefaultObjectUsecase::with_context(Some(Arc::clone(&context)));
+
+            // Seed a COMPLIANCE + LegalHold ON version.
+            let compliance_key = "compliance-evidence.bin";
+            let compliance_payload = b"original compliance evidence";
+            let mut compliance_meta = HashMap::new();
+            compliance_meta.insert(AMZ_OBJECT_LOCK_MODE_LOWER.to_owned(), "COMPLIANCE".to_owned());
+            compliance_meta.insert(AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE_LOWER.to_owned(), "2099-01-01T00:00:00Z".to_owned());
+            compliance_meta.insert(AMZ_OBJECT_LOCK_LEGAL_HOLD_LOWER.to_owned(), "ON".to_owned());
+            insert_str(&mut compliance_meta, SUFFIX_OBJECTLOCK_RETENTION_TIMESTAMP, T_OLD.to_owned());
+            insert_str(&mut compliance_meta, SUFFIX_OBJECTLOCK_LEGALHOLD_TIMESTAMP, T_OLD.to_owned());
+            let mut compliance_reader = StoragePutObjReader::from_vec(compliance_payload.to_vec());
+            let seeded_compliance = store
+                .put_object(
+                    &bucket,
+                    compliance_key,
+                    &mut compliance_reader,
+                    &ObjectOptions {
+                        versioned: true,
+                        user_defined: compliance_meta,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect("seed COMPLIANCE + LegalHold version");
+            let compliance_vid = seeded_compliance.version_id.expect("compliance version id").to_string();
+
+            // Seed a GOVERNANCE-retained version.
+            let governance_key = "governance-evidence.bin";
+            let governance_payload = b"original governance evidence";
+            let mut governance_meta = HashMap::new();
+            governance_meta.insert(AMZ_OBJECT_LOCK_MODE_LOWER.to_owned(), "GOVERNANCE".to_owned());
+            governance_meta.insert(AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE_LOWER.to_owned(), "2099-01-01T00:00:00Z".to_owned());
+            insert_str(&mut governance_meta, SUFFIX_OBJECTLOCK_RETENTION_TIMESTAMP, T_OLD.to_owned());
+            let mut governance_reader = StoragePutObjReader::from_vec(governance_payload.to_vec());
+            let seeded_governance = store
+                .put_object(
+                    &bucket,
+                    governance_key,
+                    &mut governance_reader,
+                    &ObjectOptions {
+                        versioned: true,
+                        user_defined: governance_meta,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect("seed GOVERNANCE version");
+            let governance_vid = seeded_governance.version_id.expect("governance version id").to_string();
+
+            // 1. Caller with only PutObject + ReplicateObject cannot send source lock timestamp headers
+            //    (via either x-rustfs-* or x-minio-* alias) without PutObjectRetention / PutObjectLegalHold.
+            set_policy(&bucket, ALLOW_PUT_AND_REPLICATE).await;
+            for (header_name, header_val) in [
+                ("x-rustfs-source-replication-retention-timestamp", T_NEW),
+                ("x-minio-source-replication-legalhold-timestamp", T_NEW),
+            ] {
+                let mut headers = HeaderMap::new();
+                insert_header(&mut headers, SUFFIX_SOURCE_REPLICATION_REQUEST, "true");
+                headers.insert(HeaderName::from_static(header_name), HeaderValue::from_static(header_val));
+                let mut input = put_bytes(bucket.clone(), compliance_key, Bytes::from_static(b"forged"));
+                input.version_id = Some(compliance_vid.clone());
+                let err = Box::pin(usecase.execute_put_object_owned(
+                    replication_put_envelope(&bucket, compliance_key, &compliance_vid, headers),
+                    input,
+                ))
+                .await
+                .expect_err("source lock timestamp headers must require PutObjectRetention/PutObjectLegalHold");
+                assert_eq!(err.code(), &OwnedS3ErrorCode::AccessDenied, "{header_name}");
+            }
+
+            // 2. Even with full s3:* permissions, forged future timestamps omitting lock headers or
+            //    attempting to downgrade/shorten COMPLIANCE retention must be rejected.
+            set_policy(&bucket, ALLOW_ALL).await;
+            {
+                let mut headers = HeaderMap::new();
+                insert_header(&mut headers, SUFFIX_SOURCE_REPLICATION_REQUEST, "true");
+                insert_header(&mut headers, SUFFIX_SOURCE_REPLICATION_RETENTION_TIMESTAMP, T_NEW);
+                insert_header(&mut headers, SUFFIX_SOURCE_REPLICATION_LEGALHOLD_TIMESTAMP, T_NEW);
+                let mut input = put_bytes(bucket.clone(), compliance_key, Bytes::from_static(b"forged"));
+                input.version_id = Some(compliance_vid.clone());
+                let err = Box::pin(usecase.execute_put_object_owned(
+                    replication_put_envelope(&bucket, compliance_key, &compliance_vid, headers),
+                    input,
+                ))
+                .await
+                .expect_err("forged future timestamps must not clear COMPLIANCE or LegalHold");
+                assert_eq!(err.code(), &OwnedS3ErrorCode::AccessDenied);
+            }
+            {
+                let mut headers = HeaderMap::new();
+                insert_header(&mut headers, SUFFIX_SOURCE_REPLICATION_REQUEST, "true");
+                insert_header(&mut headers, SUFFIX_SOURCE_REPLICATION_RETENTION_TIMESTAMP, T_NEW);
+                insert_header(&mut headers, SUFFIX_SOURCE_REPLICATION_LEGALHOLD_TIMESTAMP, T_NEW);
+                let mut input = put_bytes(bucket.clone(), compliance_key, Bytes::from_static(b"forged"));
+                input.version_id = Some(compliance_vid.clone());
+                input.object_lock_mode = Some("GOVERNANCE".to_owned());
+                input.object_lock_retain_until_date = Some(
+                    time::OffsetDateTime::parse("2099-01-01T00:00:00Z", &time::format_description::well_known::Rfc3339)
+                        .expect("valid RFC3339 date"),
+                );
+                input.object_lock_legal_hold_status = Some("ON".to_owned());
+                let err = Box::pin(usecase.execute_put_object_owned(
+                    replication_put_envelope(&bucket, compliance_key, &compliance_vid, headers),
+                    input,
+                ))
+                .await
+                .expect_err("replication PUT must not downgrade COMPLIANCE to GOVERNANCE");
+                assert_eq!(err.code(), &OwnedS3ErrorCode::AccessDenied);
+            }
+
+            // 3. Stale timestamps and legitimate COMPLIANCE extension + LegalHold OFF updates must
+            //    never overwrite payload bytes, ETag, or mod_time on the locked version.
+            {
+                let mut headers = HeaderMap::new();
+                insert_header(&mut headers, SUFFIX_SOURCE_REPLICATION_REQUEST, "true");
+                insert_header(&mut headers, SUFFIX_SOURCE_REPLICATION_RETENTION_TIMESTAMP, T_STALE);
+                insert_header(&mut headers, SUFFIX_SOURCE_REPLICATION_LEGALHOLD_TIMESTAMP, T_STALE);
+                insert_header(&mut headers, SUFFIX_SOURCE_MTIME, "2001-01-01T00:00:00Z");
+                insert_header(&mut headers, SUFFIX_SOURCE_ETAG, "deadbeefdeadbeefdeadbeefdeadbeef");
+                let mut input = put_bytes(bucket.clone(), compliance_key, Bytes::from_static(b"forged stale body 28 bytes!!"));
+                input.version_id = Some(compliance_vid.clone());
+                let out = Box::pin(usecase.execute_put_object_owned(
+                    replication_put_envelope(&bucket, compliance_key, &compliance_vid, headers),
+                    input,
+                ))
+                .await
+                .expect("stale replication PUT stays idempotent without mutating locked bytes");
+                assert_eq!(out.e_tag.as_deref().map(|s| s.trim_matches('"')), seeded_compliance.etag.as_deref());
+                assert_eq!(
+                    read_version_bytes(&store, &bucket, compliance_key, &compliance_vid).await,
+                    compliance_payload
+                );
+            }
+            {
+                let mut headers = HeaderMap::new();
+                insert_header(&mut headers, SUFFIX_SOURCE_REPLICATION_REQUEST, "true");
+                insert_header(&mut headers, SUFFIX_SOURCE_REPLICATION_RETENTION_TIMESTAMP, T_NEW);
+                insert_header(&mut headers, SUFFIX_SOURCE_REPLICATION_LEGALHOLD_TIMESTAMP, T_NEW);
+                insert_header(&mut headers, SUFFIX_SOURCE_MTIME, "2001-01-01T00:00:00Z");
+                insert_header(&mut headers, SUFFIX_SOURCE_ETAG, "0123456789abcdef0123456789abcdef");
+                let mut input = put_bytes(bucket.clone(), compliance_key, Bytes::from_static(b"forged same-len payload!!!!!"));
+                input.version_id = Some(compliance_vid.clone());
+                input.object_lock_mode = Some("COMPLIANCE".to_owned());
+                input.object_lock_retain_until_date = Some(
+                    time::OffsetDateTime::parse("2100-01-01T00:00:00Z", &time::format_description::well_known::Rfc3339)
+                        .expect("valid RFC3339 date"),
+                );
+                input.object_lock_legal_hold_status = Some("OFF".to_owned());
+                let out = Box::pin(usecase.execute_put_object_owned(
+                    replication_put_envelope(&bucket, compliance_key, &compliance_vid, headers),
+                    input,
+                ))
+                .await
+                .expect("authorized COMPLIANCE extension + LegalHold release updates metadata only");
+                assert_eq!(out.e_tag.as_deref().map(|s| s.trim_matches('"')), seeded_compliance.etag.as_deref());
+
+                let info = store
+                    .get_object_info(
+                        &bucket,
+                        compliance_key,
+                        &ObjectOptions {
+                            versioned: true,
+                            version_id: Some(compliance_vid.clone()),
+                            ..Default::default()
+                        },
+                    )
+                    .await
+                    .expect("load updated compliance object info");
+                assert_eq!(info.etag, seeded_compliance.etag);
+                assert_eq!(info.mod_time, seeded_compliance.mod_time);
+                assert_eq!(info.size, seeded_compliance.size);
+                assert_eq!(info.user_defined.get(AMZ_OBJECT_LOCK_MODE_LOWER).map(String::as_str), Some("COMPLIANCE"));
+                assert_eq!(
+                    info.user_defined
+                        .get(AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE_LOWER)
+                        .map(String::as_str),
+                    Some("2100-01-01T00:00:00Z")
+                );
+                assert_eq!(info.user_defined.get(AMZ_OBJECT_LOCK_LEGAL_HOLD_LOWER).map(String::as_str), Some("OFF"));
+                assert_eq!(
+                    read_version_bytes(&store, &bucket, compliance_key, &compliance_vid).await,
+                    compliance_payload,
+                    "locked version payload bytes must remain byte-for-byte immutable"
+                );
+            }
+
+            // 4. Clearing/weakening active GOVERNANCE via replication PUT requires s3:BypassGovernanceRetention.
+            set_policy(&bucket, &format!("{ALLOW_ALL},{DENY_BYPASS}")).await;
+            {
+                let mut headers = HeaderMap::new();
+                insert_header(&mut headers, SUFFIX_SOURCE_REPLICATION_REQUEST, "true");
+                insert_header(&mut headers, SUFFIX_SOURCE_REPLICATION_RETENTION_TIMESTAMP, T_NEW);
+                let mut input = put_bytes(bucket.clone(), governance_key, Bytes::from_static(b"forged"));
+                input.version_id = Some(governance_vid.clone());
+                let err = Box::pin(usecase.execute_put_object_owned(
+                    replication_put_envelope(&bucket, governance_key, &governance_vid, headers),
+                    input,
+                ))
+                .await
+                .expect_err("clearing GOVERNANCE via replication PUT without BypassGovernanceRetention must be denied");
+                assert_eq!(err.code(), &OwnedS3ErrorCode::AccessDenied);
+            }
+            set_policy(&bucket, ALLOW_ALL).await;
+            {
+                let mut headers = HeaderMap::new();
+                insert_header(&mut headers, SUFFIX_SOURCE_REPLICATION_REQUEST, "true");
+                insert_header(&mut headers, SUFFIX_SOURCE_REPLICATION_RETENTION_TIMESTAMP, T_NEW);
+                let mut input = put_bytes(bucket.clone(), governance_key, Bytes::from_static(b"forged"));
+                input.version_id = Some(governance_vid.clone());
+                Box::pin(usecase.execute_put_object_owned(
+                    replication_put_envelope(&bucket, governance_key, &governance_vid, headers),
+                    input,
+                ))
+                .await
+                .expect("clearing GOVERNANCE via replication PUT with BypassGovernanceRetention updates metadata only");
+                let info = store
+                    .get_object_info(
+                        &bucket,
+                        governance_key,
+                        &ObjectOptions {
+                            versioned: true,
+                            version_id: Some(governance_vid.clone()),
+                            ..Default::default()
+                        },
+                    )
+                    .await
+                    .expect("load updated governance object info");
+                assert_eq!(info.etag, seeded_governance.etag);
+                assert_eq!(info.mod_time, seeded_governance.mod_time);
+                assert_eq!(info.user_defined.get(AMZ_OBJECT_LOCK_MODE_LOWER).map(String::as_str), None);
+                assert_eq!(
+                    read_version_bytes(&store, &bucket, governance_key, &governance_vid).await,
+                    governance_payload,
+                    "governance-locked version payload bytes must remain immutable on metadata-only LWW clear"
+                );
+            }
+        });
     }
 }
 

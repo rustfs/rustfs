@@ -20,8 +20,12 @@ use crate::bucket::object_lock::types::{DefaultRetention, LegalHoldStatus, Objec
 use crate::error::{Error, Result, StorageError};
 use crate::object_api::{ObjectInfo, ObjectOptions};
 use rustfs_filemeta::metadata_keys;
+use rustfs_utils::http::metadata_compat::{
+    SUFFIX_OBJECTLOCK_LEGALHOLD_TIMESTAMP, SUFFIX_OBJECTLOCK_RETENTION_TIMESTAMP, get_str,
+};
 use std::sync::Arc;
 use time::OffsetDateTime;
+use time::format_description::well_known::Rfc3339;
 
 pub struct BucketObjectLockSys {}
 
@@ -161,28 +165,52 @@ fn has_legal_hold(user_defined: &std::collections::HashMap<String, String>) -> b
 }
 
 /// Whether an authorized replication write (`ObjectOptions::replication_request`)
-/// may overwrite a locked destination version.
+/// may update metadata on a locked destination version.
 ///
-/// The source's lock state governs a replica (MinIO `checkPutObjectLockAllowed`
-/// skips the existing-version check for replicas), and a source-side hold
-/// release or retention change reaches this site only through this write. The
-/// overwrite is allowed only when the write carries the source timestamp of
-/// every category that currently locks the version, so receiver-side LWW
-/// (`merge_replication_metadata_lww`) judges each of them: a category locked
-/// more recently here is kept, otherwise the source's newer state wins. A write
-/// without that timestamp carries no source decision for the category — the
-/// metadata replace would lift the lock unjudged — so it stays WORM-rejected.
+/// The source's lock state governs a replica, and a source-side hold release
+/// or retention change reaches this site through the replication write path.
+/// The write is admitted only when it carries the source timestamp of every
+/// category that currently locks the version, AND when an LWW-winning inbound
+/// state cannot violate WORM guarantees:
+/// - Active `COMPLIANCE` retention (explicit or bucket default) can never be
+///   cleared, downgraded, or shortened — an inbound write that wins LWW must
+///   carry `COMPLIANCE` with a retain-until date at least as late as the
+///   existing retention.
+/// - Active `LegalHold: ON` can only be updated by an LWW-winning write that
+///   explicitly carries `x-amz-object-lock-legal-hold: ON|OFF` (requiring
+///   `s3:PutObjectLegalHold` at the request boundary). Absent/empty values can
+///   never silently strip an active hold.
+/// - Active `GOVERNANCE` retention (explicit or bucket default) may be kept or
+///   extended freely, or weakened/cleared only when the serving layer
+///   authorized `s3:BypassGovernanceRetention` (`opts.object_lock_retention.bypass_governance`).
 ///
-/// The locking categories come from the same authoritative evaluation as the
-/// commit-time WORM gate (`check_object_lock_for_deletion_with_state`): the
-/// bucket default retention locks a version that carries no explicit
-/// retention keys, so it is judged here too rather than read off the keys.
+/// Stale writes whose source timestamp loses receiver-side LWW keep the
+/// existing lock state, and the set layer preserves payload bytes, `etag`,
+/// `data_dir`, and `mod_time` on all locked versions.
+///
 /// Malformed persisted lock metadata or a non-authoritative bucket
 /// configuration is an error, never a pass.
 pub fn replication_write_may_pass_worm_gate(
     state: &ObjectLockConfigState,
     obj_info: &ObjectInfo,
     opts: &ObjectOptions,
+) -> Result<bool> {
+    let mut inbound = opts.user_defined.clone();
+    if let Some(eval_metadata) = opts.eval_metadata.as_ref() {
+        inbound.extend(eval_metadata.iter().map(|(key, value)| (key.clone(), value.clone())));
+    }
+    replication_write_may_pass_worm_gate_with_inbound_metadata(state, obj_info, opts, &inbound)
+}
+
+/// Variant of [`replication_write_may_pass_worm_gate`] that judges an already
+/// merged inbound metadata map (for example, staged multipart metadata in
+/// `SetDisks::complete_multipart_upload` or merged PUT metadata in
+/// `SetDisks::put_object`).
+pub fn replication_write_may_pass_worm_gate_with_inbound_metadata(
+    state: &ObjectLockConfigState,
+    obj_info: &ObjectInfo,
+    opts: &ObjectOptions,
+    inbound_metadata: &std::collections::HashMap<String, String>,
 ) -> Result<bool> {
     if !opts.replication_request {
         return Ok(false);
@@ -192,11 +220,49 @@ pub fn replication_write_may_pass_worm_gate(
         return Ok(true);
     }
     let default_retention = default_retention_from_state(state)?;
-    if legal_hold_locks(obj_info)? && opts.replication_legalhold_timestamp.is_none() {
-        return Ok(false);
+
+    if legal_hold_locks(obj_info)? {
+        let Some(inbound_timestamp) = opts.replication_legalhold_timestamp else {
+            return Ok(false);
+        };
+        let stored_timestamp = get_str(&obj_info.user_defined, SUFFIX_OBJECTLOCK_LEGALHOLD_TIMESTAMP)
+            .and_then(|value| OffsetDateTime::parse(&value, &Rfc3339).ok());
+        if !stored_timestamp.is_some_and(|stored| stored > inbound_timestamp) {
+            let inbound_hold = objectlock::get_object_legalhold_meta(inbound_metadata).status;
+            if !matches!(inbound_hold, Some(LegalHoldStatus::On | LegalHoldStatus::Off)) {
+                return Ok(false);
+            }
+        }
     }
-    let retention_locked = active_retention(default_retention.as_ref(), obj_info)?.is_some();
-    Ok(!(retention_locked && opts.replication_retention_timestamp.is_none()))
+
+    let Some((mode, retain_until)) = active_retention(default_retention.as_ref(), obj_info)? else {
+        return Ok(true);
+    };
+    let Some(inbound_timestamp) = opts.replication_retention_timestamp else {
+        return Ok(false);
+    };
+    // Same comparison as `merge_replication_metadata_lww`: a retention stored
+    // more recently here is kept, whatever the stale write carries.
+    let stored_timestamp = get_str(&obj_info.user_defined, SUFFIX_OBJECTLOCK_RETENTION_TIMESTAMP)
+        .and_then(|value| OffsetDateTime::parse(&value, &Rfc3339).ok());
+    if stored_timestamp.is_some_and(|stored| stored > inbound_timestamp) {
+        return Ok(true);
+    }
+
+    let inbound = objectlock::get_object_retention_meta(inbound_metadata);
+    match mode {
+        RetentionMode::Compliance => Ok(inbound.mode == Some(RetentionMode::Compliance)
+            && inbound.retain_until_date.is_some_and(|until| until >= retain_until)),
+        RetentionMode::Governance => {
+            let keeps_or_extends = inbound.mode == Some(RetentionMode::Governance)
+                && inbound.retain_until_date.is_some_and(|until| until >= retain_until);
+            let bypass_governance = opts
+                .object_lock_retention
+                .as_ref()
+                .is_some_and(|retention| retention.bypass_governance);
+            Ok(keeps_or_extends || bypass_governance)
+        }
+    }
 }
 
 /// Check if an object is locked based on its metadata.
@@ -580,7 +646,8 @@ mod tests {
     }
 
     /// A replication write passes the WORM gate only when it carries the
-    /// source timestamp of every category that currently locks the version.
+    /// source timestamp and a valid lock state for every category that
+    /// currently locks the version.
     #[test]
     fn replication_write_passes_worm_gate_only_with_every_locking_category_timestamp() {
         let hold = [(metadata_keys::OBJECT_LOCK_LEGAL_HOLD, "ON")];
@@ -597,15 +664,19 @@ mod tests {
             replication_write_may_pass_worm_gate(state, &lock_object_info(lock_metadata(entries)), opts)
                 .expect("well-formed lock metadata must be judged")
         };
+        let with_source_state = |opts: ObjectOptions| ObjectOptions {
+            user_defined: lock_metadata(&[&[(metadata_keys::OBJECT_LOCK_LEGAL_HOLD, "OFF")], &retention]),
+            ..opts
+        };
 
-        assert!(passes(&absent, &[&hold, &retention], &replication_opts(true, true)));
-        assert!(!passes(&absent, &[&hold, &retention], &replication_opts(true, false)));
-        assert!(!passes(&absent, &[&hold, &retention], &replication_opts(false, true)));
+        assert!(passes(&absent, &[&hold, &retention], &with_source_state(replication_opts(true, true))));
+        assert!(!passes(&absent, &[&hold, &retention], &with_source_state(replication_opts(true, false))));
+        assert!(!passes(&absent, &[&hold, &retention], &with_source_state(replication_opts(false, true))));
 
-        assert!(passes(&absent, &[&hold], &replication_opts(true, false)));
-        assert!(!passes(&absent, &[&hold], &replication_opts(false, true)));
-        assert!(passes(&absent, &[&retention], &replication_opts(false, true)));
-        assert!(!passes(&absent, &[&retention], &replication_opts(true, false)));
+        assert!(passes(&absent, &[&hold], &with_source_state(replication_opts(true, false))));
+        assert!(!passes(&absent, &[&hold], &with_source_state(replication_opts(false, true))));
+        assert!(passes(&absent, &[&retention], &with_source_state(replication_opts(false, true))));
+        assert!(!passes(&absent, &[&retention], &with_source_state(replication_opts(true, false))));
 
         // Expired retention and a released hold no longer lock anything.
         assert!(passes(
@@ -617,17 +688,15 @@ mod tests {
         // Never for a non-replication write, whatever it carries.
         let local = ObjectOptions {
             replication_request: false,
-            ..replication_opts(true, true)
+            ..with_source_state(replication_opts(true, true))
         };
         assert!(!passes(&absent, &[&hold], &local));
     }
 
     /// The bucket default retention locks a version that carries no explicit
     /// retention keys (`check_object_lock_for_deletion_with_default_retention`
-    /// judges it from the modification time), so the replication bypass must
-    /// demand the retention source timestamp for it too — a tagging-only
-    /// replication write must not overwrite the default-protected version
-    /// unjudged.
+    /// judges it from the modification time), so the replication gate demands
+    /// both the retention source timestamp and a compatible retention outcome.
     #[test]
     fn replication_write_under_bucket_default_retention_requires_retention_timestamp() {
         for mode in [RetentionMode::Compliance, RetentionMode::Governance] {
@@ -649,16 +718,54 @@ mod tests {
                 !replication_write_may_pass_worm_gate(&state, &no_keys, &tagging_only).expect("judged"),
                 "{mode}: a tagging-only replication write must not pass the default retention lock"
             );
+
+            let source_preserving = |opts: ObjectOptions| ObjectOptions {
+                user_defined: lock_metadata(&[&[
+                    (metadata_keys::OBJECT_LOCK_MODE, mode.as_str()),
+                    (metadata_keys::OBJECT_LOCK_RETAIN_UNTIL_DATE, "2099-01-01T00:00:00Z"),
+                    (metadata_keys::OBJECT_LOCK_LEGAL_HOLD, "OFF"),
+                ]]),
+                ..opts
+            };
             assert!(
-                replication_write_may_pass_worm_gate(&state, &no_keys, &replication_opts(false, true)).expect("judged"),
-                "{mode}: the retention source timestamp lets LWW judge the default retention"
+                replication_write_may_pass_worm_gate(&state, &no_keys, &source_preserving(replication_opts(false, true)))
+                    .expect("judged"),
+                "{mode}: preserving/extending retention passes LWW"
+            );
+            assert!(
+                !replication_write_may_pass_worm_gate(&state, &no_keys, &replication_opts(false, true)).expect("judged"),
+                "{mode}: clearing default retention without bypass must stay blocked"
             );
 
-            // Default retention plus a legal hold: both categories need a timestamp.
+            // With authorized bypass, only GOVERNANCE default retention may be cleared.
+            let clear_with_bypass = ObjectOptions {
+                object_lock_retention: Some(crate::storage_api_contracts::object::ObjectLockRetentionOptions {
+                    mode: None,
+                    retain_until: None,
+                    bypass_governance: true,
+                }),
+                ..replication_opts(false, true)
+            };
+            assert_eq!(
+                replication_write_may_pass_worm_gate(&state, &no_keys, &clear_with_bypass).expect("judged"),
+                mode == RetentionMode::Governance,
+                "{mode}: COMPLIANCE default retention can never be cleared even with bypass"
+            );
+
+            // Default retention plus a legal hold: both categories need a timestamp and valid values.
             let held = lock_object_info(lock_metadata(&[&[(metadata_keys::OBJECT_LOCK_LEGAL_HOLD, "ON")]]));
-            assert!(!replication_write_may_pass_worm_gate(&state, &held, &replication_opts(false, true)).expect("judged"));
-            assert!(!replication_write_may_pass_worm_gate(&state, &held, &replication_opts(true, false)).expect("judged"));
-            assert!(replication_write_may_pass_worm_gate(&state, &held, &replication_opts(true, true)).expect("judged"));
+            assert!(
+                !replication_write_may_pass_worm_gate(&state, &held, &source_preserving(replication_opts(false, true)))
+                    .expect("judged")
+            );
+            assert!(
+                !replication_write_may_pass_worm_gate(&state, &held, &source_preserving(replication_opts(true, false)))
+                    .expect("judged")
+            );
+            assert!(
+                replication_write_may_pass_worm_gate(&state, &held, &source_preserving(replication_opts(true, true)))
+                    .expect("judged")
+            );
 
             // A version whose default retention has already expired (old
             // mod_time) is not locked by the default any more.
@@ -679,6 +786,141 @@ mod tests {
             let cleared = lock_object_info(lock_metadata(&[&[(metadata_keys::OBJECT_LOCK_MODE, "")]]));
             assert!(!replication_write_may_pass_worm_gate(&state, &cleared, &tagging_only).expect("judged"));
         }
+    }
+
+    #[test]
+    fn replication_write_never_weakens_active_compliance_retention() {
+        let absent = ObjectLockConfigState::ConfirmedAbsent;
+        let retention = |mode: &'static str, until: &'static str| {
+            lock_metadata(&[&[
+                (metadata_keys::OBJECT_LOCK_MODE, mode),
+                (metadata_keys::OBJECT_LOCK_RETAIN_UNTIL_DATE, until),
+            ]])
+        };
+        let mut stored = retention("COMPLIANCE", "2099-01-01T00:00:00Z");
+        rustfs_utils::http::insert_str(&mut stored, SUFFIX_OBJECTLOCK_RETENTION_TIMESTAMP, "2026-01-01T00:00:00Z".to_string());
+        let stored = lock_object_info(stored);
+        let newest = ObjectOptions {
+            replication_retention_timestamp: Some(make_datetime(2098, 1, 1)),
+            object_lock_retention: Some(crate::storage_api_contracts::object::ObjectLockRetentionOptions {
+                mode: None,
+                retain_until: None,
+                bypass_governance: true,
+            }),
+            ..replication_opts(true, true)
+        };
+        let passes = |opts: &ObjectOptions| replication_write_may_pass_worm_gate(&absent, &stored, opts).expect("judged");
+        let inbound = |user_defined| ObjectOptions {
+            user_defined,
+            ..newest.clone()
+        };
+
+        assert!(!passes(&newest), "cleared COMPLIANCE must be rejected");
+        assert!(!passes(&inbound(retention("", ""))), "empty-cleared COMPLIANCE must be rejected");
+        assert!(
+            !passes(&inbound(retention("GOVERNANCE", "2100-01-01T00:00:00Z"))),
+            "downgrading COMPLIANCE to GOVERNANCE must be rejected"
+        );
+        assert!(
+            !passes(&inbound(retention("COMPLIANCE", "2098-12-31T00:00:00Z"))),
+            "shortening COMPLIANCE must be rejected"
+        );
+        assert!(
+            passes(&inbound(retention("COMPLIANCE", "2099-01-01T00:00:00Z"))),
+            "preserving COMPLIANCE should pass"
+        );
+        assert!(
+            passes(&inbound(retention("COMPLIANCE", "2100-01-01T00:00:00Z"))),
+            "extending COMPLIANCE should pass"
+        );
+
+        // `eval_metadata` overlays `user_defined` at commit, so it is what counts.
+        let overlaid = ObjectOptions {
+            eval_metadata: Some(retention("COMPLIANCE", "2027-01-01T00:00:00Z")),
+            ..inbound(retention("COMPLIANCE", "2100-01-01T00:00:00Z"))
+        };
+        assert!(!passes(&overlaid), "shortening via eval_metadata must be rejected");
+
+        // A stale write loses LWW: the stored COMPLIANCE retention is kept.
+        assert!(passes(&replication_opts(true, true)), "stale write losing LWW should pass");
+    }
+
+    #[test]
+    fn replication_write_requires_explicit_legal_hold_status_to_update_held_version() {
+        let absent = ObjectLockConfigState::ConfirmedAbsent;
+        let mut stored = lock_metadata(&[&[(metadata_keys::OBJECT_LOCK_LEGAL_HOLD, "ON")]]);
+        rustfs_utils::http::insert_str(&mut stored, SUFFIX_OBJECTLOCK_LEGALHOLD_TIMESTAMP, "2026-01-01T00:00:00Z".to_string());
+        let stored = lock_object_info(stored);
+        let newest = ObjectOptions {
+            replication_legalhold_timestamp: Some(make_datetime(2098, 1, 1)),
+            ..replication_opts(true, false)
+        };
+        let passes = |opts: &ObjectOptions| replication_write_may_pass_worm_gate(&absent, &stored, opts).expect("judged");
+        let with_hold = |status: &str| ObjectOptions {
+            user_defined: lock_metadata(&[&[(metadata_keys::OBJECT_LOCK_LEGAL_HOLD, status)]]),
+            ..newest.clone()
+        };
+
+        assert!(!passes(&newest), "absent legal hold header must not strip active hold");
+        assert!(!passes(&with_hold("")), "empty legal hold header must not strip active hold");
+        assert!(!passes(&with_hold("INVALID")), "invalid legal hold header must not strip active hold");
+        assert!(passes(&with_hold("ON")), "explicit ON should pass");
+        assert!(passes(&with_hold("OFF")), "explicit OFF should pass");
+        assert!(passes(&replication_opts(true, false)), "stale write losing LWW should pass");
+    }
+
+    #[test]
+    fn replication_write_requires_bypass_to_weaken_active_governance_retention() {
+        let absent = ObjectLockConfigState::ConfirmedAbsent;
+        let retention = |mode: &'static str, until: &'static str| {
+            lock_metadata(&[&[
+                (metadata_keys::OBJECT_LOCK_MODE, mode),
+                (metadata_keys::OBJECT_LOCK_RETAIN_UNTIL_DATE, until),
+            ]])
+        };
+        let mut stored = retention("GOVERNANCE", "2099-01-01T00:00:00Z");
+        rustfs_utils::http::insert_str(&mut stored, SUFFIX_OBJECTLOCK_RETENTION_TIMESTAMP, "2026-01-01T00:00:00Z".to_string());
+        let stored = lock_object_info(stored);
+        let newest = ObjectOptions {
+            replication_retention_timestamp: Some(make_datetime(2098, 1, 1)),
+            ..replication_opts(false, true)
+        };
+        let passes = |opts: &ObjectOptions| replication_write_may_pass_worm_gate(&absent, &stored, opts).expect("judged");
+
+        // Without bypass: clearing or shortening GOVERNANCE must be rejected.
+        assert!(!passes(&newest), "clearing GOVERNANCE without bypass must be rejected");
+        assert!(
+            !passes(&ObjectOptions {
+                user_defined: retention("GOVERNANCE", "2098-12-31T00:00:00Z"),
+                ..newest.clone()
+            }),
+            "shortening GOVERNANCE without bypass must be rejected"
+        );
+        // Preserving/extending GOVERNANCE does not require bypass.
+        assert!(
+            passes(&ObjectOptions {
+                user_defined: retention("GOVERNANCE", "2099-01-01T00:00:00Z"),
+                ..newest.clone()
+            }),
+            "preserving GOVERNANCE should pass without bypass"
+        );
+        assert!(
+            passes(&ObjectOptions {
+                user_defined: retention("GOVERNANCE", "2100-01-01T00:00:00Z"),
+                ..newest.clone()
+            }),
+            "extending GOVERNANCE should pass without bypass"
+        );
+        // With authorized bypass, clearing/shortening GOVERNANCE is allowed.
+        let with_bypass = ObjectOptions {
+            object_lock_retention: Some(crate::storage_api_contracts::object::ObjectLockRetentionOptions {
+                mode: None,
+                retain_until: None,
+                bypass_governance: true,
+            }),
+            ..newest
+        };
+        assert!(passes(&with_bypass), "clearing GOVERNANCE with authorized bypass should pass");
     }
 
     /// The replication bypass never judges from a non-authoritative bucket

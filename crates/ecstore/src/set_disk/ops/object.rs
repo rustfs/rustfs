@@ -57,9 +57,9 @@ use super::super::{
     record_compression_total_memory, record_get_codec_streaming_gate_decision, record_get_direct_memory_decision,
     record_get_object_pipeline_failure, record_get_object_pipeline_failure_for_path, record_get_object_reader_path_observation,
     record_get_stage_duration_if_enabled, record_lock_acquire, reduce_write_quorum_errs, release_materialized_read_lock,
-    replication_write_may_pass_worm_gate, republishes_data_movement_delete_marker, require_restore_operation_id,
-    resolve_delete_version_state, resolve_tiered_decommission_write_quorum_result, resolve_write_layout,
-    restore_commit_operation_id_from_metadata, restore_operation_id_from_metadata, send_event,
+    replication_write_may_pass_worm_gate_with_inbound_metadata, republishes_data_movement_delete_marker,
+    require_restore_operation_id, resolve_delete_version_state, resolve_tiered_decommission_write_quorum_result,
+    resolve_write_layout, restore_commit_operation_id_from_metadata, restore_operation_id_from_metadata, send_event,
     set_disk_delete_creates_delete_marker, should_force_delete_marker_for_missing_version, should_inline_put,
     should_persist_encryption_original_size, should_preserve_delete_replication_state, should_use_inline_fast_path_with_plan,
     take_prepared_get_object_metadata, to_object_err, try_decode_inline_data_shards, warn,
@@ -4160,6 +4160,95 @@ pub(in crate::set_disk) fn merge_replication_metadata_lww(
     changed
 }
 
+/// Applies only the LWW-judged replication metadata categories (tags, Object
+/// Lock retention, Object Lock legal hold) from `inbound` onto a WORM-locked
+/// existing version's `FileInfo::metadata`.
+///
+/// All non-category user/internal metadata (including `etag`, content headers,
+/// encryption/compression headers, and payload identity) stays untouched so a
+/// replication metadata update onto an actively locked version can never alter
+/// its data, ETag, or `mod_time`.
+pub(in crate::set_disk) fn apply_replication_lww_categories_to_locked_metadata(
+    target: &mut HashMap<String, String>,
+    inbound: &HashMap<String, String>,
+    opts: &ObjectOptions,
+) -> bool {
+    use rustfs_utils::http::headers::AMZ_OBJECT_TAGGING;
+    use rustfs_utils::http::metadata_compat::{
+        SUFFIX_OBJECTLOCK_LEGALHOLD_TIMESTAMP, SUFFIX_OBJECTLOCK_RETENTION_TIMESTAMP, SUFFIX_TAGGING_TIMESTAMP, get_str,
+        insert_str,
+    };
+    use time::format_description::well_known::Rfc3339;
+
+    let categories: [(Option<OffsetDateTime>, &str, &[&str]); 3] = [
+        (opts.replication_tagging_timestamp, SUFFIX_TAGGING_TIMESTAMP, &[AMZ_OBJECT_TAGGING]),
+        (
+            opts.replication_retention_timestamp,
+            SUFFIX_OBJECTLOCK_RETENTION_TIMESTAMP,
+            &[metadata_keys::OBJECT_LOCK_MODE, metadata_keys::OBJECT_LOCK_RETAIN_UNTIL_DATE],
+        ),
+        (
+            opts.replication_legalhold_timestamp,
+            SUFFIX_OBJECTLOCK_LEGALHOLD_TIMESTAMP,
+            &[metadata_keys::OBJECT_LOCK_LEGAL_HOLD],
+        ),
+    ];
+
+    let mut changed = false;
+    for (inbound_timestamp, timestamp_suffix, value_keys) in categories {
+        let Some(inbound_timestamp) = inbound_timestamp else { continue };
+        let is_category_value_key = |key: &str| value_keys.iter().any(|value_key| key.eq_ignore_ascii_case(value_key));
+        let stored_timestamp = get_str(target, timestamp_suffix).and_then(|value| OffsetDateTime::parse(&value, &Rfc3339).ok());
+        if stored_timestamp.is_some_and(|stored| stored > inbound_timestamp) {
+            if let Some(stored_value) = get_str(target, timestamp_suffix) {
+                let rustfs_key = format!("{}{timestamp_suffix}", rustfs_utils::http::RUSTFS_INTERNAL_PREFIX);
+                let minio_key = format!("{}{timestamp_suffix}", rustfs_utils::http::MINIO_INTERNAL_PREFIX);
+                if target.get(&rustfs_key).map(String::as_str) != Some(stored_value.as_str())
+                    || target.get(&minio_key).map(String::as_str) != Some(stored_value.as_str())
+                {
+                    insert_str(target, timestamp_suffix, stored_value);
+                    changed = true;
+                }
+            }
+            continue;
+        }
+
+        let mut next_values: Vec<(&str, String)> = Vec::new();
+        for &canonical_key in value_keys {
+            if let Some(value) = inbound.get(canonical_key) {
+                if canonical_key == AMZ_OBJECT_TAGGING && value.is_empty() {
+                    continue;
+                }
+                next_values.push((canonical_key, value.clone()));
+            }
+        }
+        let existing_matches = target.iter().filter(|(key, _)| is_category_value_key(key)).count() == next_values.len()
+            && next_values
+                .iter()
+                .all(|(key, value)| target.get(*key).is_some_and(|stored| stored == value));
+        if !existing_matches {
+            target.retain(|key, _| !is_category_value_key(key));
+            for (key, value) in next_values {
+                target.insert(key.to_string(), value);
+            }
+            changed = true;
+        }
+
+        if let Ok(source_authored) = inbound_timestamp.format(&Rfc3339) {
+            let rustfs_key = format!("{}{timestamp_suffix}", rustfs_utils::http::RUSTFS_INTERNAL_PREFIX);
+            let minio_key = format!("{}{timestamp_suffix}", rustfs_utils::http::MINIO_INTERNAL_PREFIX);
+            if target.get(&rustfs_key).map(String::as_str) != Some(source_authored.as_str())
+                || target.get(&minio_key).map(String::as_str) != Some(source_authored.as_str())
+            {
+                insert_str(target, timestamp_suffix, source_authored);
+                changed = true;
+            }
+        }
+    }
+
+    changed
+}
+
 struct CommittedPutOutcome {
     // Namespace publication succeeded even if its writer must retain repair
     // responsibility. Completion errors must not select rollback cleanup.
@@ -5378,19 +5467,145 @@ impl SetDisks {
                             .object_lock_config_snapshot
                             .as_deref()
                             .ok_or_else(|| Error::other("destructive PUT is missing its Object Lock configuration snapshot"))?;
-                        // The WORM gate protects the locked version from local
-                        // overwrites; an authorized replication write passes it
-                        // only when the LWW merge below will judge every
-                        // locking category (see
-                        // `replication_write_may_pass_worm_gate`, which judges
-                        // the same authoritative lock state as the gate,
-                        // bucket default retention included). Gate first so
-                        // malformed lock metadata still fails closed.
-                        if check_object_lock_for_deletion_with_state(object_lock_config.state(), &existing, false)?.is_some()
-                            && !replication_write_may_pass_worm_gate(object_lock_config.state(), &existing, opts)?
-                        {
-                            return Err(StorageError::PrefixAccessDenied(bucket.to_string(), object.to_string()));
+                        // The WORM gate protects an actively locked version
+                        // from local overwrites; an authorized replication
+                        // write passes it only when every locking category has
+                        // a valid LWW decision. Even when admitted, a locked
+                        // version's payload, `data_dir`, ETag, and `mod_time`
+                        // stay immutable: commit only the LWW-judged metadata
+                        // categories via `update_object_meta_with_opts`.
+                        let is_locked =
+                            check_object_lock_for_deletion_with_state(object_lock_config.state(), &existing, false)?.is_some();
+                        if is_locked {
+                            let inbound_metadata = &parts_metadatas[response_metadata_slot].metadata;
+                            if !replication_write_may_pass_worm_gate_with_inbound_metadata(
+                                object_lock_config.state(),
+                                &existing,
+                                opts,
+                                inbound_metadata,
+                            )? {
+                                return Err(StorageError::PrefixAccessDenied(bucket.to_string(), object.to_string()));
+                            }
+
+                            let metadata_lookup_opts = ObjectOptions {
+                                version_id: Some(version_id.to_string()),
+                                no_lock: true,
+                                metadata_cache_safe: false,
+                                versioned: opts.versioned,
+                                version_suspended: opts.version_suspended,
+                                include_part_checksums: true,
+                                ..Default::default()
+                            };
+                            let (mut existing_fi, _, existing_disks) = self
+                                .get_object_fileinfo_for_metadata_update(bucket, object, &metadata_lookup_opts)
+                                .await?
+                                .into_owned();
+                            let metadata_changed = apply_replication_lww_categories_to_locked_metadata(
+                                &mut existing_fi.metadata,
+                                inbound_metadata,
+                                opts,
+                            );
+
+                            self.require_current_restore_operation_id(
+                                bucket,
+                                object,
+                                opts,
+                                expected_restore_operation_id,
+                                "put_object_commit",
+                            )
+                            .await?;
+                            if object_lock_guard.as_ref().is_some_and(|guard| guard.is_lock_lost())
+                                || publication_commit_guard
+                                    .as_ref()
+                                    .is_some_and(RemoteTuplePublicationCommitGuard::is_lock_lost)
+                            {
+                                return Err(StorageError::NamespaceLockQuorumUnavailable {
+                                    mode: "put_object_commit",
+                                    bucket: bucket.to_string(),
+                                    object: object.to_string(),
+                                    required: 1,
+                                    achieved: 0,
+                                });
+                            }
+                            if opts
+                                .namespace_lock_fence
+                                .as_ref()
+                                .is_some_and(NamespaceLockFence::is_lock_lost)
+                            {
+                                return Err(StorageError::NamespaceLockQuorumUnavailable {
+                                    mode: "put_object_outer_lock",
+                                    bucket: bucket.to_string(),
+                                    object: object.to_string(),
+                                    required: 1,
+                                    achieved: 0,
+                                });
+                            }
+                            if opts
+                                .bucket_lifecycle_lock_fence
+                                .as_ref()
+                                .is_some_and(NamespaceLockFence::is_lock_lost)
+                                || bucket_lifecycle_guard.as_ref().is_some_and(|guard| guard.is_lock_lost())
+                            {
+                                return Err(StorageError::NamespaceLockQuorumUnavailable {
+                                    mode: "put_object_bucket_generation",
+                                    bucket: bucket.to_string(),
+                                    object: object.to_string(),
+                                    required: 1,
+                                    achieved: 0,
+                                });
+                            }
+                            if decommission_object_lock_guard
+                                .as_ref()
+                                .is_some_and(|guard| guard.is_lock_lost())
+                            {
+                                return Err(StorageError::NamespaceLockQuorumUnavailable {
+                                    mode: "put_object_external_namespace",
+                                    bucket: bucket.to_string(),
+                                    object: object.to_string(),
+                                    required: 1,
+                                    achieved: 0,
+                                });
+                            }
+
+                            if metadata_changed {
+                                self.update_object_meta_with_opts(
+                                    bucket,
+                                    object,
+                                    existing_fi.clone(),
+                                    &existing_disks,
+                                    &UpdateMetadataOpts {
+                                        replace_user_metadata: true,
+                                        ..Default::default()
+                                    },
+                                )
+                                .await
+                                .map_err(|e| to_object_err(e.into(), vec![bucket, object]))?;
+                                self.invalidate_get_object_metadata_cache(bucket, object).await;
+                            }
+
+                            if !direct_inline_commit {
+                                staging_cleanup.runtime = None;
+                                tmp_cleanup_owned = true;
+                                if let Err(cleanup_err) = self.delete_put_tmp_with_budget(&tmp_dir, &cleanup_reservation).await {
+                                    warn!(
+                                        tmp_dir = %tmp_dir,
+                                        error = ?cleanup_err,
+                                        "failed to cleanup put_object temporary data"
+                                    );
+                                }
+                            }
+
+                            let committed_info = ObjectInfo::from_file_info(
+                                &existing_fi,
+                                bucket,
+                                object,
+                                opts.versioned || opts.version_suspended,
+                            );
+                            return Ok(CommittedPutOutcome {
+                                completion: Ok((committed_info, None)),
+                            });
                         }
+
                         // Receiver-side LWW (rustfs/backlog#1953): reuse this
                         // commit-lock read of the destination version so a
                         // category (tags / retention / legal hold) modified
@@ -15006,17 +15221,173 @@ mod replication_lww_tests {
                 "{mode}: the default-protected version must be untouched"
             );
 
+            let with_retention_timestamp_only = ObjectOptions {
+                replication_retention_timestamp: Some(parse_ts(T_NEW)),
+                ..tagging_only.clone()
+            };
+            let mut reader = PutObjReader::from_vec(b"forged-body".to_vec());
+            let err = set_disks
+                .put_object(bucket, object, &mut reader, &with_retention_timestamp_only)
+                .await
+                .expect_err("{mode}: a retention timestamp without compatible retention must not clear bucket default retention");
+            assert!(matches!(err, StorageError::PrefixAccessDenied(_, _)), "{mode}: unexpected error: {err}");
+
+            let mut preserving_meta = tagging_only.user_defined.clone();
+            preserving_meta.insert(metadata_keys::OBJECT_LOCK_MODE.to_string(), mode.to_string());
+            preserving_meta.insert(
+                metadata_keys::OBJECT_LOCK_RETAIN_UNTIL_DATE.to_string(),
+                "2099-01-01T00:00:00Z".to_string(),
+            );
             let with_retention_decision = ObjectOptions {
+                user_defined: preserving_meta,
                 replication_retention_timestamp: Some(parse_ts(T_NEW)),
                 ..tagging_only
             };
-            put_version(&set_disks, bucket, object, &version_id, &with_retention_decision).await;
+            let mut forged_reader = PutObjReader::from_vec(b"forged-body".to_vec());
+            set_disks
+                .put_object(bucket, object, &mut forged_reader, &with_retention_decision)
+                .await
+                .expect("preserving retention allows LWW tagging update");
             let info = version_info(&set_disks, bucket, object, &version_id).await;
             assert_eq!(
                 info.user_tags.as_str(),
                 "site=remote",
-                "{mode}: with the retention source timestamp the newer inbound tags win"
+                "{mode}: with compatible retention metadata the newer inbound tags win"
             );
+            assert_eq!(info.etag, seeded.etag, "{mode}: locked version ETag must stay immutable");
+            assert_eq!(info.mod_time, seeded.mod_time, "{mode}: locked version mod_time must stay immutable");
+            let mut body_reader = set_disks
+                .get_object_reader(bucket, object, None, http::HeaderMap::new(), &versioned_opts(&version_id, HashMap::new()))
+                .await
+                .expect("locked version body should remain readable");
+            let mut body = Vec::new();
+            tokio::io::AsyncReadExt::read_to_end(&mut body_reader.stream, &mut body)
+                .await
+                .expect("read locked version body");
+            assert_eq!(body, b"lww-body", "{mode}: locked version payload bytes must stay immutable");
+        }
+    }
+
+    #[tokio::test]
+    async fn forged_replication_put_cannot_unlock_or_overwrite_locked_version_payload() {
+        for (case, original_payload) in [
+            ("inline-object", b"original evidence".to_vec()),
+            ("non-inline-object", vec![0x41u8; 256 * 1024]),
+        ] {
+            let (_temp_dirs, disk_stores, set_disks) = hermetic_set_disks(4).await;
+            let bucket = format!("worm-immutable-{case}");
+            let object = "evidence.bin";
+            let version_id = Uuid::new_v4().to_string();
+            make_bucket(&disk_stores, &bucket).await;
+
+            let mut local = HashMap::new();
+            local.insert(metadata_keys::OBJECT_LOCK_LEGAL_HOLD.to_string(), "ON".to_string());
+            insert_str(&mut local, SUFFIX_OBJECTLOCK_LEGALHOLD_TIMESTAMP, T_LOCAL.to_string());
+            local.insert(metadata_keys::OBJECT_LOCK_MODE.to_string(), "COMPLIANCE".to_string());
+            local.insert(
+                metadata_keys::OBJECT_LOCK_RETAIN_UNTIL_DATE.to_string(),
+                "2099-01-01T00:00:00Z".to_string(),
+            );
+            insert_str(&mut local, SUFFIX_OBJECTLOCK_RETENTION_TIMESTAMP, T_LOCAL.to_string());
+            let mut seed_reader = PutObjReader::from_vec(original_payload.clone());
+            let seeded = set_disks
+                .put_object(&bucket, object, &mut seed_reader, &versioned_opts(&version_id, local))
+                .await
+                .expect("seed locked version");
+
+            // 1. Future timestamps trying to clear COMPLIANCE + LegalHold must be rejected.
+            let forged_unlock_opts = ObjectOptions {
+                replication_request: true,
+                replication_retention_timestamp: Some(parse_ts("2098-01-01T00:00:00Z")),
+                replication_legalhold_timestamp: Some(parse_ts("2098-01-01T00:00:00Z")),
+                mod_time: Some(parse_ts("2001-01-01T00:00:00Z")),
+                preserve_etag: Some("forged-etag".to_string()),
+                ..versioned_opts(&version_id, HashMap::new())
+            };
+            let mut forged_reader = PutObjReader::from_vec(b"forged".to_vec());
+            let err = set_disks
+                .put_object(&bucket, object, &mut forged_reader, &forged_unlock_opts)
+                .await
+                .expect_err("forged future-timestamp replication PUT must not unlock COMPLIANCE/LegalHold");
+            assert!(matches!(err, StorageError::PrefixAccessDenied(_, _)), "{case}: {err}");
+
+            // 2. Stale timestamps trying to overwrite bytes in place must leave payload, ETag,
+            //    data_dir, mod_time, and locks completely immutable.
+            let stale_overwrite_opts = ObjectOptions {
+                replication_request: true,
+                replication_retention_timestamp: Some(parse_ts(T_OLD)),
+                replication_legalhold_timestamp: Some(parse_ts(T_OLD)),
+                mod_time: Some(parse_ts("2001-01-01T00:00:00Z")),
+                preserve_etag: Some("forged-stale-etag".to_string()),
+                ..versioned_opts(&version_id, HashMap::new())
+            };
+            let mut stale_reader = PutObjReader::from_vec(b"forged-stale".to_vec());
+            set_disks
+                .put_object(&bucket, object, &mut stale_reader, &stale_overwrite_opts)
+                .await
+                .expect("stale replication PUT stays idempotent at object level without altering payload");
+
+            // 3. Matching/extending COMPLIANCE + LegalHold release (OFF) with forged body bytes
+            //    updates ONLY the LWW-winning lock metadata; bytes, ETag, data_dir, and mod_time stay immutable.
+            let mut extending_meta = HashMap::new();
+            extending_meta.insert(metadata_keys::OBJECT_LOCK_MODE.to_string(), "COMPLIANCE".to_string());
+            extending_meta.insert(
+                metadata_keys::OBJECT_LOCK_RETAIN_UNTIL_DATE.to_string(),
+                "2100-01-01T00:00:00Z".to_string(),
+            );
+            extending_meta.insert(metadata_keys::OBJECT_LOCK_LEGAL_HOLD.to_string(), "OFF".to_string());
+            let extending_opts = ObjectOptions {
+                replication_request: true,
+                replication_retention_timestamp: Some(parse_ts(T_NEW)),
+                replication_legalhold_timestamp: Some(parse_ts(T_NEW)),
+                mod_time: Some(parse_ts("2001-01-01T00:00:00Z")),
+                preserve_etag: Some("forged-ext-etag".to_string()),
+                ..versioned_opts(&version_id, extending_meta)
+            };
+            let mut ext_reader = PutObjReader::from_vec(b"forged-replacement".to_vec());
+            let updated = set_disks
+                .put_object(&bucket, object, &mut ext_reader, &extending_opts)
+                .await
+                .expect("authorized COMPLIANCE extension + legal-hold release should update metadata only");
+
+            let info = version_info(&set_disks, &bucket, object, &version_id).await;
+            assert_eq!(updated.etag, seeded.etag, "{case}: returned ETag must match original");
+            assert_eq!(info.etag, seeded.etag, "{case}: persisted ETag must remain immutable");
+            assert_eq!(info.data_dir, seeded.data_dir, "{case}: data_dir must remain immutable");
+            assert_eq!(info.mod_time, seeded.mod_time, "{case}: mod_time must remain immutable");
+            assert_eq!(info.size, seeded.size, "{case}: size must remain immutable");
+            assert_eq!(
+                info.user_defined.get(metadata_keys::OBJECT_LOCK_MODE).map(String::as_str),
+                Some("COMPLIANCE")
+            );
+            assert_eq!(
+                info.user_defined
+                    .get(metadata_keys::OBJECT_LOCK_RETAIN_UNTIL_DATE)
+                    .map(String::as_str),
+                Some("2100-01-01T00:00:00Z")
+            );
+            assert_eq!(
+                info.user_defined
+                    .get(metadata_keys::OBJECT_LOCK_LEGAL_HOLD)
+                    .map(String::as_str),
+                Some("OFF")
+            );
+
+            let mut reader = set_disks
+                .get_object_reader(
+                    &bucket,
+                    object,
+                    None,
+                    http::HeaderMap::new(),
+                    &versioned_opts(&version_id, HashMap::new()),
+                )
+                .await
+                .expect("original locked payload must remain readable");
+            let mut actual_body = Vec::new();
+            tokio::io::AsyncReadExt::read_to_end(&mut reader.stream, &mut actual_body)
+                .await
+                .expect("read original locked payload");
+            assert_eq!(actual_body, original_payload, "{case}: payload bytes must remain byte-for-byte immutable");
         }
     }
 
