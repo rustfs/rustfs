@@ -60,7 +60,10 @@ impl OwnedOperation for Ignoring {
 static IGNORING: Ignoring = Ignoring;
 
 fn host() -> GatewayStack {
-    let mut router = S3Router::new(false);
+    host_with_router(S3Router::new(false))
+}
+
+fn host_with_router(mut router: S3Router<AdminOperation>) -> GatewayStack {
     for (method, path) in [
         (Method::GET, "/rustfs/admin/v3/probe"),
         (Method::PUT, "/rustfs/admin/v3/probe"),
@@ -88,6 +91,125 @@ async fn served(request: Request<Empty<Bytes>>) -> ((StatusCode, String), Vec<St
     SEEN.lock().expect("probe lock").clear();
     let (status, _, body) = answer_request(&host(), request).await;
     ((status, body), std::mem::take(&mut *SEEN.lock().expect("probe lock")))
+}
+
+fn not_ready_host() -> GatewayStack {
+    let mut router = S3Router::new(false);
+    router.set_server_ctx(ServerContextSlot::new());
+    host_with_router(router)
+}
+
+async fn admission_response(stack: GatewayStack, finish: bool) -> (StatusCode, Option<String>) {
+    use crate::server::layer::{ExternalRequestContextLayer, RequestLoggingLayer};
+    use rustfs_utils::http::headers::REQUEST_ID_HEADER;
+    use tower::{Layer, ServiceExt};
+
+    let mut request = signed(Method::GET, "/rustfs/admin/v3/probe", "");
+    request
+        .headers_mut()
+        .insert(REQUEST_ID_HEADER, "audit.contract.503".parse().expect("test id"));
+    let peer = "127.0.0.7:7000".parse::<SocketAddr>().expect("test peer");
+    request.extensions_mut().insert(Some(RemoteAddr(peer)));
+    request.extensions_mut().insert(peer);
+    let service = RequestLoggingLayer.layer(tower::service_fn(move |request| {
+        let stack = stack.clone();
+        async move { Ok::<_, std::convert::Infallible>(stack.call(request).await) }
+    }));
+    if finish {
+        let response = ExternalRequestContextLayer::new(false)
+            .layer(service)
+            .oneshot(request)
+            .await
+            .expect("response");
+        let id = response
+            .headers()
+            .get(REQUEST_ID_HEADER)
+            .and_then(|header| header.to_str().ok())
+            .map(str::to_owned);
+        (response.status(), id)
+    } else {
+        // Drop a real matched decision before the final response boundary can send it.
+        (service.oneshot(request).await.expect("inner response").status(), None)
+    }
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn indeterminate_admission_is_audited_with_the_returned_status_and_id() {
+    use crate::server::gateway_stack::indeterminate_audit::TEST_AUDITOR;
+    use crate::storage_api::server::http::access::DenialAuditor;
+
+    SEEN.lock().expect("probe lock").clear();
+    let entries = Arc::new(Mutex::new(Vec::new()));
+    let captured = Arc::clone(&entries);
+    let auditor = DenialAuditor::collecting(10, std::time::Instant::now, move |_, entry| {
+        captured.lock().expect("audit entries").push(entry)
+    });
+    TEST_AUDITOR
+        .scope(Arc::new(auditor), async {
+            for (stack, expected) in [(not_ready_host(), StatusCode::SERVICE_UNAVAILABLE), (host(), StatusCode::OK)] {
+                let (status, id) = admission_response(stack, true).await;
+                assert_eq!(status, expected);
+                assert_eq!(id.as_deref(), Some("audit.contract.503"));
+            }
+        })
+        .await;
+    assert_eq!(
+        std::mem::take(&mut *SEEN.lock().expect("probe lock")).len(),
+        1,
+        "only the ready route dispatched"
+    );
+    let entries = entries.lock().expect("audit entries");
+    let [entry] = entries.as_slice() else {
+        panic!("expected one decision audit, got {}", entries.len())
+    };
+    let entry = serde_json::to_value(entry).expect("audit JSON");
+    assert_eq!(entry["tags"]["decision"], "indeterminate");
+    assert_eq!(entry["tags"]["denialReason"], "authorization_indeterminate");
+    assert_eq!(entry["api"]["status_code"], 503);
+    assert_eq!(entry["error"], "ServiceUnavailable");
+    assert_eq!(entry["requestID"], "audit.contract.503");
+    assert_eq!(entry["requestPath"], "/rustfs/admin/v3/probe");
+    assert_eq!(entry["remotehost"], "127.0.0.7");
+    assert_eq!(entry["accessKey"], ROOT_ACCESS_KEY);
+}
+
+#[tokio::test]
+async fn discarded_indeterminate_admission_preserves_suppressed_denials() {
+    use crate::server::gateway_stack::indeterminate_audit::TEST_AUDITOR;
+    use crate::storage_api::server::http::access::DenialAuditor;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::{Duration, Instant};
+
+    let seconds = Arc::new(AtomicU64::new(0));
+    let clock = Arc::clone(&seconds);
+    let start = Instant::now();
+    let entries = Arc::new(Mutex::new(Vec::new()));
+    let captured = Arc::clone(&entries);
+    let auditor = DenialAuditor::collecting(
+        1,
+        move || start + Duration::from_secs(clock.load(Ordering::Relaxed)),
+        move |_, entry| {
+            captured.lock().expect("audit entries").push(entry);
+        },
+    );
+    TEST_AUDITOR
+        .scope(Arc::new(auditor), async {
+            let host = not_ready_host();
+            for (elapsed, finish) in [(0, true), (0, true), (1, false), (1, true)] {
+                seconds.store(elapsed, Ordering::Relaxed);
+                assert_eq!(admission_response(host.clone(), finish).await.0, StatusCode::SERVICE_UNAVAILABLE);
+            }
+        })
+        .await;
+    let entries = entries.lock().expect("audit entries");
+    assert_eq!(
+        entries.len(),
+        2,
+        "a discarded decision must leave the refilled token for a completed response"
+    );
+    let last = serde_json::to_value(&entries[1]).expect("audit JSON");
+    assert_eq!(last["tags"]["suppressedDenials"], 1);
 }
 
 #[tokio::test]

@@ -50,6 +50,7 @@
 
 mod admin;
 mod control_plane;
+pub(in crate::server) mod indeterminate_audit;
 
 #[cfg(test)]
 pub(crate) static CONFIG_HANDLER_CALLS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
@@ -271,6 +272,8 @@ impl GatewayStack {
             .defer_encryption_header_refusals_to_handlers()
             .authenticator(authenticator(SigV4Authenticator::new(credentials, regions).rustfs_profile()))
             .authorizer(authorizer)
+            .authz_audit(indeterminate_audit::IndeterminateAudit)
+            .observer(indeterminate_audit::IndeterminateAudit)
             .bucket_owner_source(ReportedOwner(owner().id.map(Arc::from)))
             // Both gates follow the deployment setting; transport facts remain per request.
             .sse_config(if require_tls() {
