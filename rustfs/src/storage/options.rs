@@ -521,6 +521,15 @@ pub(crate) fn has_replication_retention_update(headers: &HeaderMap<HeaderValue>,
         && replication_timestamp_header(headers, SUFFIX_SOURCE_REPLICATION_RETENTION_TIMESTAMP).is_some()
 }
 
+fn has_valid_replicated_ssec_metadata(restored: &HashMap<String, String>) -> bool {
+    restored
+        .get(rustfs_utils::http::SSEC_ALGORITHM_HEADER)
+        .is_some_and(|value| value == rustfs_utils::http::AMZ_ENCRYPTION_AES)
+        && restored
+            .get(rustfs_utils::http::SSEC_KEY_MD5_HEADER)
+            .is_some_and(|value| !value.trim().is_empty())
+}
+
 pub fn put_opts_from_headers_with_replication_authorization(
     headers: &HeaderMap<HeaderValue>,
     metadata: HashMap<String, String>,
@@ -534,8 +543,17 @@ pub fn put_opts_from_headers_with_replication_authorization(
         opts.preserve_etag = replication_source_etag(headers)?;
         // SSE-C ciphertext passthrough: restore the stored encryption metadata
         // from the transport headers and mark the body as already encrypted so
-        // the write path stores it verbatim.
+        // the write path stores it verbatim. Require valid SSE-C metadata
+        // (algorithm + key MD5) so partial transport headers cannot mark an
+        // unencrypted object as ciphertext passthrough or compressed.
         if let Some(restored) = rustfs_utils::http::ssec_transport_to_stored_metadata(headers) {
+            if !has_valid_replicated_ssec_metadata(&restored) {
+                return Err(StorageError::InvalidArgument(
+                    String::new(),
+                    String::new(),
+                    "Incomplete replicated SSE-C metadata".to_string(),
+                ));
+            }
             if restored
                 .get(rustfs_utils::http::object_encryption_keys::SSEC_ORIGINAL_SIZE_HEADER)
                 .is_some_and(|value| !value.parse::<i64>().is_ok_and(|size| size >= 0))
@@ -1794,7 +1812,9 @@ mod tests {
 
     #[test]
     fn put_opts_from_headers_restores_the_compression_layout_only_for_ssec_passthrough() {
-        use rustfs_utils::http::object_encryption_keys::REPLICATION_SSEC_ALGORITHM_HEADER;
+        use rustfs_utils::http::object_encryption_keys::{
+            REPLICATION_SSEC_ALGORITHM_HEADER, REPLICATION_SSEC_KEY_MD5_HEADER, REPLICATION_SSEC_ORIGINAL_SIZE_HEADER,
+        };
         use rustfs_utils::http::{
             SUFFIX_ACTUAL_SIZE, SUFFIX_COMPRESSION, SUFFIX_REPLICATION_COMPRESSION, SUFFIX_REPLICATION_COMPRESSION_ACTUAL_SIZE,
             get_str,
@@ -1815,9 +1835,43 @@ mod tests {
         assert!(get_str(&plain.user_defined, SUFFIX_COMPRESSION).is_none());
         assert!(get_str(&plain.user_defined, SUFFIX_ACTUAL_SIZE).is_none());
 
+        // Partial SSE-C transport headers (for example original size alone or
+        // algorithm without key MD5) must not activate ciphertext passthrough
+        // or compression metadata on an unencrypted object.
+        let mut partial_size_only = headers.clone();
+        partial_size_only.insert(
+            REPLICATION_SSEC_ORIGINAL_SIZE_HEADER
+                .parse::<http::HeaderName>()
+                .expect("header name"),
+            HeaderValue::from_static("6295552"),
+        );
+        assert!(
+            matches!(
+                put_opts_from_headers_with_replication_authorization(&partial_size_only, HashMap::new(), true),
+                Err(StorageError::InvalidArgument(_, _, _))
+            ),
+            "original-size header alone must not activate SSE-C passthrough compression"
+        );
+
         headers.insert(
-            REPLICATION_SSEC_ALGORITHM_HEADER.parse::<http::HeaderName>().unwrap(),
+            REPLICATION_SSEC_ALGORITHM_HEADER
+                .parse::<http::HeaderName>()
+                .expect("header name"),
             HeaderValue::from_static("AES256"),
+        );
+        assert!(
+            matches!(
+                put_opts_from_headers_with_replication_authorization(&headers, HashMap::new(), true),
+                Err(StorageError::InvalidArgument(_, _, _))
+            ),
+            "SSE-C algorithm without key MD5 must not activate passthrough"
+        );
+
+        headers.insert(
+            REPLICATION_SSEC_KEY_MD5_HEADER
+                .parse::<http::HeaderName>()
+                .expect("header name"),
+            HeaderValue::from_static("AAAAAAAAAAAAAAAAAAAAAA=="),
         );
 
         // Unauthorized: inert, like the SSE-C transport itself.
@@ -1843,15 +1897,35 @@ mod tests {
 
     #[test]
     fn replicated_encryption_metadata_rejects_invalid_sizes_and_compression() {
-        use rustfs_utils::http::object_encryption_keys::REPLICATION_SSEC_ORIGINAL_SIZE_HEADER;
+        use rustfs_utils::http::object_encryption_keys::{
+            REPLICATION_SSEC_ALGORITHM_HEADER, REPLICATION_SSEC_KEY_MD5_HEADER, REPLICATION_SSEC_ORIGINAL_SIZE_HEADER,
+        };
         use rustfs_utils::http::{SUFFIX_REPLICATION_COMPRESSION, SUFFIX_REPLICATION_COMPRESSION_ACTUAL_SIZE};
+
+        let with_valid_ssec = || {
+            let mut headers = HeaderMap::new();
+            insert_header(&mut headers, SUFFIX_SOURCE_REPLICATION_REQUEST, "true");
+            headers.insert(
+                REPLICATION_SSEC_ALGORITHM_HEADER
+                    .parse::<http::HeaderName>()
+                    .expect("algorithm header"),
+                HeaderValue::from_static("AES256"),
+            );
+            headers.insert(
+                REPLICATION_SSEC_KEY_MD5_HEADER
+                    .parse::<http::HeaderName>()
+                    .expect("key md5 header"),
+                HeaderValue::from_static("AAAAAAAAAAAAAAAAAAAAAA=="),
+            );
+            headers
+        };
+
         for (header, value) in [
             (REPLICATION_SSEC_ORIGINAL_SIZE_HEADER, "abc"),
             (REPLICATION_SSEC_ORIGINAL_SIZE_HEADER, "-1"),
             (REPLICATION_SSEC_ORIGINAL_SIZE_HEADER, "9223372036854775808"),
         ] {
-            let mut headers = HeaderMap::new();
-            insert_header(&mut headers, SUFFIX_SOURCE_REPLICATION_REQUEST, "true");
+            let mut headers = with_valid_ssec();
             headers.insert(
                 http::HeaderName::from_bytes(header.as_bytes()).expect("header name"),
                 HeaderValue::from_static(value),
@@ -1863,8 +1937,7 @@ mod tests {
             );
         }
         for size in ["0", "5", "9223372036854775807"] {
-            let mut headers = HeaderMap::new();
-            insert_header(&mut headers, SUFFIX_SOURCE_REPLICATION_REQUEST, "true");
+            let mut headers = with_valid_ssec();
             headers.insert(
                 http::HeaderName::from_bytes(REPLICATION_SSEC_ORIGINAL_SIZE_HEADER.as_bytes()).expect("size header"),
                 HeaderValue::from_static(size),
@@ -1874,22 +1947,72 @@ mod tests {
             insert_header(&mut headers, SUFFIX_REPLICATION_COMPRESSION_ACTUAL_SIZE, "5");
             assert!(put_opts_from_headers_with_replication_authorization(&headers, HashMap::new(), true).is_err());
         }
+
+        // Incomplete or malformed SSE-C identity headers must be rejected when authorized.
+        for (algorithm, key_md5) in [
+            (None, Some("AAAAAAAAAAAAAAAAAAAAAA==")),
+            (Some("AES256"), None),
+            (Some("AES256"), Some("   ")),
+            (Some("AES128"), Some("AAAAAAAAAAAAAAAAAAAAAA==")),
+            (Some("aes256"), Some("AAAAAAAAAAAAAAAAAAAAAA==")),
+        ] {
+            let mut headers = HeaderMap::new();
+            insert_header(&mut headers, SUFFIX_SOURCE_REPLICATION_REQUEST, "true");
+            if let Some(algorithm) = algorithm {
+                headers.insert(
+                    REPLICATION_SSEC_ALGORITHM_HEADER
+                        .parse::<http::HeaderName>()
+                        .expect("algorithm header"),
+                    HeaderValue::from_str(algorithm).expect("algorithm value"),
+                );
+            }
+            if let Some(key_md5) = key_md5 {
+                headers.insert(
+                    REPLICATION_SSEC_KEY_MD5_HEADER
+                        .parse::<http::HeaderName>()
+                        .expect("key md5 header"),
+                    HeaderValue::from_str(key_md5).expect("key md5 value"),
+                );
+            }
+            assert!(
+                matches!(
+                    put_opts_from_headers_with_replication_authorization(&headers, HashMap::new(), true),
+                    Err(StorageError::InvalidArgument(_, _, _))
+                ),
+                "invalid SSE-C metadata ({algorithm:?}, {key_md5:?}) must fail closed"
+            );
+            assert!(
+                put_opts_from_headers_with_replication_authorization(&headers, HashMap::new(), false).is_ok(),
+                "untrusted transport headers stay inert"
+            );
+        }
     }
 
     #[test]
     fn test_put_opts_from_headers_gates_ssec_passthrough_on_authorization() {
         use rustfs_utils::http::object_encryption_keys::{
             INTERNAL_ENCRYPTION_IV_HEADER, REPLICATION_ENCRYPTION_IV_HEADER, REPLICATION_SSEC_ALGORITHM_HEADER,
+            REPLICATION_SSEC_KEY_MD5_HEADER,
         };
 
         let mut headers = HeaderMap::new();
         insert_header(&mut headers, SUFFIX_SOURCE_REPLICATION_REQUEST, "true");
         headers.insert(
-            REPLICATION_SSEC_ALGORITHM_HEADER.parse::<http::HeaderName>().unwrap(),
+            REPLICATION_SSEC_ALGORITHM_HEADER
+                .parse::<http::HeaderName>()
+                .expect("header name"),
             HeaderValue::from_static("AES256"),
         );
         headers.insert(
-            REPLICATION_ENCRYPTION_IV_HEADER.parse::<http::HeaderName>().unwrap(),
+            REPLICATION_SSEC_KEY_MD5_HEADER
+                .parse::<http::HeaderName>()
+                .expect("header name"),
+            HeaderValue::from_static("AAAAAAAAAAAAAAAAAAAAAA=="),
+        );
+        headers.insert(
+            REPLICATION_ENCRYPTION_IV_HEADER
+                .parse::<http::HeaderName>()
+                .expect("header name"),
             HeaderValue::from_static("iv-value"),
         );
 
