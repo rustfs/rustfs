@@ -506,19 +506,7 @@ async fn authorize_request_with_facts<R: AuthorizationRequest + ?Sized>(
         .await?;
         let bucket_name = bucket.as_str();
 
-        let check_explicit_iam_deny = matches!(
-            action,
-            Action::S3Action(
-                S3Action::DeleteObjectAction
-                    | S3Action::DeleteObjectVersionAction
-                    | S3Action::ForceDeleteBucketAction
-                    | S3Action::ForceDeleteObjectAction
-                    | S3Action::ListBucketAction
-                    | S3Action::ListBucketVersionsAction
-                    | S3Action::BypassGovernanceRetentionAction
-                    | S3Action::ReplicateDeleteAction
-            )
-        ) && prepared.combined_policy_for_view().is_some();
+        let check_explicit_iam_deny = prepared.combined_policy_for_view().is_some();
 
         let probe_bucket_policy = if req.permission_probe() && !bucket.is_empty() {
             match store.get_bucket_policy(&bucket).await {
