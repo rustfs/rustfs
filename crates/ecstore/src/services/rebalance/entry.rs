@@ -2443,6 +2443,197 @@ mod tests {
         });
     }
 
+    /// A stopped run left a multipart version committed on the target pool
+    /// and still present on the source. Its metadata reads back from two of
+    /// the four target drives, but a copy held only there is one drive loss
+    /// from unreadable: while the target set is below write quorum the retry
+    /// must keep the source. Once the drives are back it settles on the
+    /// committed copy without writing it again.
+    #[test]
+    #[serial_test::serial]
+    fn real_rebalance_retry_keeps_the_source_while_the_committed_target_is_below_write_quorum() {
+        run_large_stack_async_test("rebalance-degraded-equivalent-target", || async {
+            const REBALANCE_ID: &str = "rebalance-degraded-equivalent-target";
+            let (_temp_dirs, store, _peer) = super::super::test_pool_stores_with_contexts(None, true, 2, 4).await;
+            let bucket = "rebalance-degraded-target";
+            let object = "multipart.bin";
+            Box::pin(store.make_bucket(
+                bucket,
+                &MakeBucketOptions {
+                    versioning_enabled: true,
+                    ..Default::default()
+                },
+            ))
+            .await
+            .expect("create bucket");
+            prepare_rebalance_test_volumes(&store).await;
+            let incarnation = store.bucket_incarnation_id(bucket).await.expect("bucket incarnation");
+            let rebalance_meta = active_rebalance_meta(REBALANCE_ID);
+            rebalance_meta
+                .save(Arc::clone(&store.pools[0]))
+                .await
+                .expect("persist the active rebalance run");
+            *store.rebalance_meta.write().await = Some(rebalance_meta);
+
+            let source_set = store.pools[0].get_disks_by_key(object);
+            let target_set = store.pools[1].get_disks_by_key(object);
+            // Four drives per set written as 2+2: read quorum 2, write quorum 3.
+            let storage_class = crate::config::storageclass::lookup_config_for_pools_without_env(
+                &rustfs_config::server_config::KVS::new(),
+                &[4, 4],
+            )
+            .expect("the automatic storage class resolves for both pools");
+            source_set.set_test_storage_class_config(storage_class.clone());
+            target_set.set_test_storage_class_config(storage_class);
+            let write_opts = ObjectOptions {
+                versioned: true,
+                ..Default::default()
+            };
+            let upload = Box::pin(source_set.new_multipart_upload(bucket, object, &write_opts))
+                .await
+                .expect("create the source multipart upload");
+            let parts = [vec![0x5a; 5 << 20], vec![0xa5; 1024]];
+            let mut completed = Vec::with_capacity(parts.len());
+            for (index, bytes) in parts.iter().enumerate() {
+                let part = Box::pin(source_set.put_object_part(
+                    bucket,
+                    object,
+                    &upload.upload_id,
+                    index + 1,
+                    &mut PutObjReader::from_vec(bytes.clone()),
+                    &write_opts,
+                ))
+                .await
+                .expect("write a source part");
+                completed.push(CompletePart {
+                    part_num: part.part_num,
+                    etag: part.etag,
+                    ..Default::default()
+                });
+            }
+            let written = Box::pin(Arc::clone(&source_set).complete_multipart_upload(
+                bucket,
+                object,
+                &upload.upload_id,
+                completed,
+                &write_opts,
+            ))
+            .await
+            .expect("complete the source multipart upload");
+            assert!(written.is_multipart(), "the migration must use its multipart path");
+            let version_id = written.version_id.expect("the source version id");
+            let source_versions = || async {
+                source_set
+                    .load_file_info_versions_exact(bucket, object)
+                    .await
+                    .expect("read source versions")
+            };
+            let version = source_versions().await.expect("the source version").versions.remove(0);
+            assert_eq!(version.version_id, Some(version_id));
+
+            // The stopped run: the copy commits on the target and the source
+            // cleanup never runs.
+            let read_opts = super::super::migration::rebalance_object_migration_read_opts(&version);
+            let reader = Box::pin(source_set.get_object_reader(bucket, object, None, HeaderMap::new(), &read_opts))
+                .await
+                .expect("read the source version");
+            let copied = Box::pin(Arc::clone(&store).rebalance_object(0, bucket.to_owned(), reader, Some(incarnation), None))
+                .await
+                .expect("commit the copy on the target pool");
+            assert_eq!(copied, data_movement::DataMovementCopy::Committed);
+            let committed = target_set
+                .get_object_info(bucket, object, &read_opts)
+                .await
+                .expect("the target holds the committed copy");
+            assert!(committed.data_dir.is_some());
+            assert_eq!((committed.data_blocks, committed.parity_blocks), (2, 2), "the target copy must be 2+2");
+            assert!(source_versions().await.is_some(), "the stopped run left the source in place");
+
+            let run_entry = || async {
+                let entry = metacache_entry_from_source(&source_set, bucket, object).await;
+                tokio::time::timeout(
+                    StdDuration::from_secs(60),
+                    Box::pin(Arc::clone(&store).rebalance_entry(
+                        RebalanceEntryTarget {
+                            bucket: bucket.to_owned(),
+                            pool_index: 0,
+                        },
+                        entry,
+                        Arc::clone(&source_set),
+                        Arc::new(RebalanceBucketConfigs {
+                            bucket_incarnation_id: Some(incarnation),
+                            ..Default::default()
+                        }),
+                        Arc::from(REBALANCE_ID),
+                        CancellationToken::new(),
+                    )),
+                )
+                .await
+                .expect("the entry must finish within the test deadline")
+            };
+
+            let offline = {
+                let mut disks = target_set.disks.write().await;
+                [disks[0].take(), disks[1].take()]
+            };
+            assert!(offline.iter().all(Option::is_some), "the fixture drives must have been online");
+            let degraded = target_set
+                .get_object_info(bucket, object, &read_opts)
+                .await
+                .expect("two drives still serve the committed copy's metadata");
+            assert_eq!(degraded.data_dir, committed.data_dir);
+
+            let outcome = run_entry().await;
+            assert!(
+                !matches!(outcome, Ok(RebalanceEntryOutcome::Completed)),
+                "the entry must not complete on a target below write quorum: {outcome:?}"
+            );
+            let kept = source_versions()
+                .await
+                .expect("the source must survive a target below write quorum");
+            assert_eq!(kept.versions.len(), 1, "{:?}", kept.versions);
+            assert_eq!(kept.versions[0].version_id, Some(version_id));
+            let mut source_reader = Box::pin(source_set.get_object_reader(bucket, object, None, HeaderMap::new(), &read_opts))
+                .await
+                .expect("the source version must stay readable");
+            let mut source_bytes = Vec::new();
+            source_reader
+                .stream
+                .read_to_end(&mut source_bytes)
+                .await
+                .expect("drain the source version");
+            assert_eq!(source_bytes, parts.concat());
+
+            {
+                let mut disks = target_set.disks.write().await;
+                let [first, second] = offline;
+                disks[0] = first;
+                disks[1] = second;
+            }
+            let outcome = run_entry().await.expect("rebalance entry on a healthy target");
+            assert_eq!(outcome, RebalanceEntryOutcome::Completed);
+            assert!(
+                source_versions().await.is_none(),
+                "the source is removed once the target holds the version on write quorum"
+            );
+            let settled = target_set
+                .get_object_info(bucket, object, &read_opts)
+                .await
+                .expect("the target still holds the committed copy");
+            assert_eq!(settled.data_dir, committed.data_dir, "the retry must not rewrite the committed copy");
+            let mut target_reader = Box::pin(target_set.get_object_reader(bucket, object, None, HeaderMap::new(), &read_opts))
+                .await
+                .expect("the committed copy must be readable");
+            let mut target_bytes = Vec::new();
+            target_reader
+                .stream
+                .read_to_end(&mut target_bytes)
+                .await
+                .expect("drain the committed copy");
+            assert_eq!(target_bytes, parts.concat());
+        });
+    }
+
     const TRANSITIONED_REBALANCE_ID: &str = "rebalance-transitioned-source-cleanup";
 
     /// One transitioned source version on pool 0 of a two-pool store with an

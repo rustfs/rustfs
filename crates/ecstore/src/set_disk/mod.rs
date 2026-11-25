@@ -7190,6 +7190,41 @@ impl SetDisks {
             .any(|copy| FileMeta::load(&copy.buf).is_ok_and(|meta| meta.find_version(Some(version_id)).is_ok()))
     }
 
+    /// Whether a write quorum of this set's drives hold `version_id` of the
+    /// key as the committed copy in `data_dir`. An object read answers from
+    /// read quorum, which on a data = parity set is one drive loss away from
+    /// unreadable; a data-movement caller that removes the source on this
+    /// answer needs the drives a new copy would have been written to. Every
+    /// drive is asked in one fanout, and a drive counts only for the shard
+    /// its own slot is assigned.
+    pub(crate) async fn holds_version_on_write_quorum(
+        &self,
+        bucket: &str,
+        object: &str,
+        version_id: Uuid,
+        data_dir: Option<Uuid>,
+    ) -> Result<bool> {
+        let disks = self.disk_inventory().await;
+        let (copies, _) =
+            Self::read_all_fileinfo(&disks, "", bucket, object, &version_id.to_string(), false, false, false).await?;
+        let mut holders: HashMap<[u8; 32], (usize, usize)> = HashMap::new();
+        for (slot, copy) in copies.iter().enumerate() {
+            if !file_info_is_valid_for_metadata(copy)
+                || copy.deleted
+                || copy.version_id.unwrap_or_else(Uuid::nil) != version_id
+                || copy.data_dir != data_dir
+                || !copy.has_valid_erasure_geometry()
+                || copy.erasure.distribution.len() != copies.len()
+                || copy.erasure.distribution.get(slot) != Some(&copy.erasure.index)
+            {
+                continue;
+            }
+            let required = copy.write_quorum(self.default_write_quorum());
+            holders.entry(Self::file_info_quorum_hash(copy)).or_insert((0, required)).0 += 1;
+        }
+        Ok(holders.into_values().any(|(drives, required)| drives >= required))
+    }
+
     /// Publish an internal tier free-version record without changing its
     /// delete-marker shape or remote-tier identity. The caller holds the
     /// source and target object locks; a write quorum is required before the
