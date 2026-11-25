@@ -25,6 +25,7 @@ use crate::app::storage_api::object_usecase::concurrency::SNOWBALL_MEMBER_COMMIT
 use crate::app::storage_api::object_usecase::concurrency::SNOWBALL_STAGING_BYTES_LIMIT;
 use futures::stream::FuturesUnordered;
 use rustfs_s3_types::{S3Error, S3ErrorCode, S3Result, s3_error};
+use rustfs_utils::http::SUFFIX_SOURCE_VERSION_ID;
 use rustfs_utils::http::headers::AMZ_ENCRYPTION_KMS;
 use std::collections::HashSet;
 
@@ -1123,17 +1124,48 @@ pub(super) fn is_snowball_transport_header(key: &str) -> bool {
             || key.ends_with(SNOWBALL_IGNORE_ERRORS_SUFFIX_LOWER))
 }
 
+fn is_snowball_excluded_replication_header(key: &str) -> bool {
+    key.starts_with("x-rustfs-source-")
+        || key.starts_with("x-minio-source-")
+        || key.starts_with("x-rustfs-replication-")
+        || key.starts_with("x-minio-replication-")
+}
+
 fn snowball_member_headers(headers: &HeaderMap) -> HeaderMap {
     let mut member_headers = headers.clone();
-    let transport_headers: Vec<_> = member_headers
+    let excluded_headers: Vec<_> = member_headers
         .keys()
-        .filter(|name| is_snowball_transport_header(name.as_str()))
+        .filter(|name| is_snowball_transport_header(name.as_str()) || is_snowball_excluded_replication_header(name.as_str()))
         .cloned()
         .collect();
-    for name in transport_headers {
+    for name in excluded_headers {
         member_headers.remove(name);
     }
     member_headers
+}
+
+/// Resolves the archive-level destination version so every extracted member is
+/// authorized against the same version ID that storage will write. Query
+/// `versionId` takes precedence over the replication source-version-id header.
+fn resolve_extract_outer_version_id(
+    version_id: Option<String>,
+    headers: &HeaderMap,
+    replication_authorized: bool,
+) -> Option<String> {
+    let raw = version_id.or_else(|| {
+        replication_authorized
+            .then(|| get_header(headers, SUFFIX_SOURCE_VERSION_ID).map(std::borrow::Cow::into_owned))
+            .flatten()
+    })?;
+    let trimmed = raw.trim();
+    if trimmed.eq_ignore_ascii_case("null") {
+        return Some("null".to_owned());
+    }
+    Some(match Uuid::parse_str(trimmed) {
+        Ok(id) if id.is_nil() => "null".to_owned(),
+        Ok(id) => id.to_string(),
+        Err(_) => trimmed.to_owned(),
+    })
 }
 
 fn normalize_extract_version_id(value: &str) -> S3Result<ExtractNormalizedVersion> {
@@ -1638,7 +1670,7 @@ fn extract_member_iam_requirements(
         tagging: metadata.contains_key(AMZ_OBJECT_TAGGING),
         retention: object_lock_mode.is_some() || object_lock_retain_until_date.is_some(),
         legal_hold: object_lock_legal_hold_status.is_some(),
-        replication: explicit_version_id.is_some() || replica,
+        replication: explicit_version_id.is_some() || replica || metadata.contains_key(AMZ_BUCKET_REPLICATION_STATUS),
     }
 }
 
@@ -2122,7 +2154,7 @@ impl DefaultObjectUsecase {
             ..
         } = input;
 
-        let outer_version_id = version_id;
+        let outer_version_id = resolve_extract_outer_version_id(version_id, envelope.headers(), replication_authorized);
         let (h_algo, h_key, h_md5) = extract_ssec_params_from_headers(envelope.headers())?;
         let sse_customer_algorithm = sse_customer_algorithm.or(h_algo);
         let sse_customer_key = sse_customer_key.or(h_key);
@@ -5586,5 +5618,284 @@ mod tests {
             ..legacy
         };
         assert!(ensure_legacy_archive_size_within_quota(&maxed, 1).is_err());
+    }
+
+    #[test]
+    fn snowball_member_headers_strip_replication_source_headers() {
+        let version_id = Uuid::new_v4().to_string();
+        let mut headers = HeaderMap::new();
+        headers.insert("x-rustfs-source-version-id", HeaderValue::from_str(&version_id).expect("version header"));
+        headers.insert("x-minio-source-version-id", HeaderValue::from_str(&version_id).expect("version header"));
+        headers.insert("x-rustfs-source-replication-request", HeaderValue::from_static("true"));
+        headers.insert("x-minio-source-etag", HeaderValue::from_static("deadbeef"));
+        headers.insert("x-rustfs-source-mtime", HeaderValue::from_static("2025-01-01T00:00:00Z"));
+        headers.insert("x-rustfs-replication-actual-object-size", HeaderValue::from_static("42"));
+        headers.insert("x-minio-replication-ssec-crc", HeaderValue::from_static("0"));
+        headers.insert("x-amz-meta-owner", HeaderValue::from_static("alice"));
+        headers.insert("cache-control", HeaderValue::from_static("max-age=60"));
+
+        let member_headers = snowball_member_headers(&headers);
+        for excluded in [
+            "x-rustfs-source-version-id",
+            "x-minio-source-version-id",
+            "x-rustfs-source-replication-request",
+            "x-minio-source-etag",
+            "x-rustfs-source-mtime",
+            "x-rustfs-replication-actual-object-size",
+            "x-minio-replication-ssec-crc",
+        ] {
+            assert!(!member_headers.contains_key(excluded), "{excluded} must be stripped from member headers");
+        }
+        assert_eq!(member_headers.get("x-amz-meta-owner"), Some(&HeaderValue::from_static("alice")));
+        assert_eq!(member_headers.get("cache-control"), Some(&HeaderValue::from_static("max-age=60")));
+
+        // Outer version resolution matches destination_version_id semantics.
+        assert_eq!(resolve_extract_outer_version_id(None, &headers, false), None);
+        assert_eq!(
+            resolve_extract_outer_version_id(None, &headers, true).as_deref(),
+            Some(version_id.as_str())
+        );
+
+        let query_version = Uuid::new_v4().to_string();
+        assert_eq!(
+            resolve_extract_outer_version_id(Some(query_version.clone()), &headers, true).as_deref(),
+            Some(query_version.as_str())
+        );
+
+        for (header, raw) in [
+            ("x-minio-source-version-id", version_id.as_str()),
+            ("x-rustfs-source-version-id", "NULL"),
+            ("x-minio-source-version-id", "00000000-0000-0000-0000-000000000000"),
+        ] {
+            let mut single = HeaderMap::new();
+            single.insert(header, HeaderValue::from_str(raw).expect("version header"));
+            let expected = if raw == version_id { version_id.as_str() } else { "null" };
+            assert_eq!(
+                resolve_extract_outer_version_id(None, &single, true).as_deref(),
+                Some(expected),
+                "{header}={raw}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn snowball_source_version_header_authorizes_member_version_and_replication() {
+        use crate::app::storage_api::test::bucket::metadata::{BUCKET_POLICY_CONFIG, BUCKET_VERSIONING_CONFIG};
+        use crate::app::storage_api::test::contract::bucket::{BucketOperations as _, MakeBucketOptions};
+        use crate::app::storage_api::test::contract::object::ObjectIO as _;
+        use crate::app::storage_api::test::{ReqInfo, StorageObjectOptions, StoragePutObjReader};
+        use http::Method;
+        use tokio::io::AsyncReadExt as _;
+
+        let (store, context) = real_store_test_context().await;
+        let bucket = format!("extract-source-version-{}", Uuid::new_v4());
+        store
+            .make_bucket(&bucket, &MakeBucketOptions::default())
+            .await
+            .expect("create bucket");
+        metadata_sys::update(
+            &bucket,
+            BUCKET_VERSIONING_CONFIG,
+            b"<VersioningConfiguration><Status>Enabled</Status></VersioningConfiguration>".to_vec(),
+        )
+        .await
+        .expect("enable versioning");
+
+        let v1_body = b"first-draft-protected".to_vec();
+        let v1 = store
+            .put_object(
+                &bucket,
+                "ledger.csv",
+                &mut StoragePutObjReader::from_vec(v1_body.clone()),
+                &StorageObjectOptions {
+                    versioned: true,
+                    user_defined: HashMap::from([(AMZ_OBJECT_TAGGING.to_owned(), "frozen=true".to_owned())]),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("seed protected version");
+        let v1_id = v1.version_id.expect("v1 UUID").to_string();
+
+        let v2_body = b"second-draft-current".to_vec();
+        let v2 = store
+            .put_object(
+                &bucket,
+                "ledger.csv",
+                &mut StoragePutObjReader::from_vec(v2_body.clone()),
+                &StorageObjectOptions {
+                    versioned: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("seed current version");
+        let v2_id = v2.version_id.expect("v2 UUID").to_string();
+
+        let build_archive = |payload: &[u8]| {
+            let payload = payload.to_vec();
+            async move {
+                let mut builder = Builder::new(Vec::new());
+                let mut header = Header::new_gnu();
+                header.set_size(u64::try_from(payload.len()).expect("payload len"));
+                header.set_mode(0o644);
+                header.set_cksum();
+                builder
+                    .append_data(&mut header, "ledger.csv", &payload[..])
+                    .await
+                    .expect("append archive member");
+                builder.into_inner().await.expect("finish archive")
+            }
+        };
+
+        let make_envelope = |header_name: &'static str, target_version: &str| {
+            let mut headers = HeaderMap::new();
+            headers.insert(AMZ_SNOWBALL_EXTRACT, HeaderValue::from_static("true"));
+            headers.insert(header_name, HeaderValue::from_str(target_version).expect("version header"));
+            let mut extensions = http::Extensions::new();
+            extensions.insert(ReqInfo {
+                replication_request_authorized: true,
+                ..ReqInfo::default()
+            });
+            RequestEnvelope::from_parts(
+                crate::app::RequestHead {
+                    method: Method::PUT,
+                    uri: http::Uri::from_static("/"),
+                    headers,
+                    credentials: None,
+                    region: None,
+                    service: None,
+                },
+                extensions,
+            )
+        };
+
+        let read_version = |store: Arc<ECStore>, bucket: String, version_id: String| async move {
+            let mut reader = store
+                .get_object_reader(
+                    &bucket,
+                    "ledger.csv",
+                    None,
+                    HeaderMap::new(),
+                    &ObjectOptions {
+                        version_id: Some(version_id),
+                        versioned: true,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect("read version");
+            let mut data = Vec::new();
+            reader.stream.read_to_end(&mut data).await.expect("read body");
+            data
+        };
+
+        let usecase = DefaultObjectUsecase::with_context(Some(context));
+        let denied_policies = [
+            (
+                "versionid-deny",
+                serde_json::json!({
+                    "Version": "2012-10-17",
+                    "Statement": [
+                        {"Effect":"Allow", "Principal":"*", "Action":["s3:*"], "Resource":format!("arn:aws:s3:::{bucket}/*")},
+                        {"Effect":"Deny", "Principal":"*", "Action":["s3:PutObject"], "Resource":format!("arn:aws:s3:::{bucket}/ledger.csv"),
+                         "Condition":{"StringEquals":{"s3:versionid":v1_id}}}
+                    ]
+                }),
+            ),
+            (
+                "existing-object-tag-deny",
+                serde_json::json!({
+                    "Version": "2012-10-17",
+                    "Statement": [
+                        {"Effect":"Allow", "Principal":"*", "Action":["s3:*"], "Resource":format!("arn:aws:s3:::{bucket}/*")},
+                        {"Effect":"Deny", "Principal":"*", "Action":["s3:PutObject"], "Resource":format!("arn:aws:s3:::{bucket}/ledger.csv"),
+                         "Condition":{"StringEquals":{"s3:ExistingObjectTag/frozen":"true"}}}
+                    ]
+                }),
+            ),
+            (
+                "missing-member-replicate-object",
+                serde_json::json!({
+                    "Version": "2012-10-17",
+                    "Statement": [
+                        {"Effect":"Allow", "Principal":"*", "Action":["s3:PutObject"], "Resource":format!("arn:aws:s3:::{bucket}/*")},
+                        {"Effect":"Allow", "Principal":"*", "Action":["s3:ReplicateObject"], "Resource":format!("arn:aws:s3:::{bucket}/archive.tar")}
+                    ]
+                }),
+            ),
+        ];
+
+        for (case, policy) in denied_policies {
+            metadata_sys::update(&bucket, BUCKET_POLICY_CONFIG, serde_json::to_vec(&policy).expect("policy JSON"))
+                .await
+                .expect("install policy");
+            for header_name in ["x-rustfs-source-version-id", "x-minio-source-version-id"] {
+                let archive = build_archive(b"tampered").await;
+                let input = archive_input(&bucket, "archive.tar", archive);
+                let err = Box::pin(usecase.execute_put_object_extract_owned(make_envelope(header_name, &v1_id), input))
+                    .await
+                    .expect_err("protected or unauthorized version must be denied");
+                assert_eq!(err.code(), &S3ErrorCode::AccessDenied, "{case}: {header_name}");
+                assert_eq!(
+                    read_version(Arc::clone(&store), bucket.clone(), v1_id.clone()).await,
+                    v1_body,
+                    "{case}: {header_name} must not modify protected version"
+                );
+            }
+        }
+
+        // Positive control: overwriting an unprotected version remains allowed when member PutObject + ReplicateObject are permitted.
+        let allow_v2_policy = serde_json::json!({
+            "Version": "2012-10-17",
+            "Statement": [
+                {"Effect":"Allow", "Principal":"*", "Action":["s3:PutObject", "s3:ReplicateObject"], "Resource":format!("arn:aws:s3:::{bucket}/*")},
+                {"Effect":"Deny", "Principal":"*", "Action":["s3:PutObject"], "Resource":format!("arn:aws:s3:::{bucket}/ledger.csv"),
+                 "Condition":{"StringEquals":{"s3:versionid":v1_id}}}
+            ]
+        });
+        metadata_sys::update(&bucket, BUCKET_POLICY_CONFIG, serde_json::to_vec(&allow_v2_policy).expect("policy JSON"))
+            .await
+            .expect("install allow policy");
+        let replacement = b"authorized-v2-update".to_vec();
+        let archive = build_archive(&replacement).await;
+        let input = archive_input(&bucket, "archive.tar", archive);
+        Box::pin(usecase.execute_put_object_extract_owned(make_envelope("x-rustfs-source-version-id", &v2_id), input))
+            .await
+            .expect("authorized write to unprotected version should succeed");
+        assert_eq!(read_version(Arc::clone(&store), bucket.clone(), v2_id).await, replacement);
+        assert_eq!(read_version(Arc::clone(&store), bucket.clone(), v1_id).await, v1_body);
+
+        // Unversioned bucket must reject a UUID passed via source-version-id header.
+        let unversioned_bucket = format!("extract-sv-unver-{}", Uuid::new_v4());
+        store
+            .make_bucket(&unversioned_bucket, &MakeBucketOptions::default())
+            .await
+            .expect("create unversioned bucket");
+        let open_policy = serde_json::json!({
+            "Version": "2012-10-17",
+            "Statement": [{
+                "Effect":"Allow", "Principal":"*", "Action":["s3:PutObject", "s3:ReplicateObject"],
+                "Resource":format!("arn:aws:s3:::{unversioned_bucket}/*")
+            }]
+        });
+        metadata_sys::update(
+            &unversioned_bucket,
+            BUCKET_POLICY_CONFIG,
+            serde_json::to_vec(&open_policy).expect("policy JSON"),
+        )
+        .await
+        .expect("install open policy");
+        let archive = build_archive(b"unversioned").await;
+        let input = archive_input(&unversioned_bucket, "archive.tar", archive);
+        let err =
+            Box::pin(usecase.execute_put_object_extract_owned(
+                make_envelope("x-rustfs-source-version-id", &Uuid::new_v4().to_string()),
+                input,
+            ))
+            .await
+            .expect_err("UUID source-version-id must be rejected on unversioned bucket");
+        assert_eq!(err.code(), &S3ErrorCode::InvalidArgument);
     }
 }
