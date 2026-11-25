@@ -16,7 +16,7 @@ use crate::bucket::metadata_sys::{
     ObjectLockConfigState, default_retention_from_object_lock_config, get_object_lock_config, get_object_lock_config_state,
 };
 use crate::bucket::object_lock::objectlock;
-use crate::bucket::object_lock::types::{DefaultRetention, LegalHoldStatus, RetentionMode};
+use crate::bucket::object_lock::types::{DefaultRetention, LegalHoldStatus, ObjectRetention, RetentionMode};
 use crate::error::{Error, Result, StorageError};
 use crate::object_api::{ObjectInfo, ObjectOptions};
 use rustfs_filemeta::metadata_keys;
@@ -66,18 +66,42 @@ pub fn is_retention_active(_mode: RetentionMode, retain_until_date: Option<Offse
 }
 
 /// Check if retention modification is blocked for the given object.
+///
+/// A version that carries no explicit retention keys is locked by the bucket
+/// default retention, so the existing retention is resolved through
+/// `active_retention` just like the deletion gate rather than read off keys
+/// alone. A non-authoritative bucket configuration is an error, never a pass.
+///
+/// Explicit keys keep the lenient parse so `PutObjectRetention` can still
+/// repair a version whose persisted retention metadata is incomplete.
 pub fn check_retention_for_modification(
-    user_defined: &std::collections::HashMap<String, String>,
+    state: &ObjectLockConfigState,
+    obj_info: &ObjectInfo,
     new_mode: Option<RetentionMode>,
     new_retain_until: Option<OffsetDateTime>,
     bypass_governance: bool,
-) -> Option<ObjectLockBlockReason> {
-    let retention = objectlock::get_object_retention_meta(user_defined);
+) -> Result<Option<ObjectLockBlockReason>> {
+    let default_retention = default_retention_from_state(state)?;
+    if obj_info.delete_marker {
+        return Ok(None);
+    }
 
-    let mode = retention.mode?;
+    let retention = if has_persisted_retention(obj_info) {
+        objectlock::get_object_retention_meta(&obj_info.user_defined)
+    } else {
+        let active = active_retention(default_retention.as_ref(), obj_info)?;
+        ObjectRetention {
+            mode: active.map(|(mode, _)| mode),
+            retain_until_date: active.map(|(_, retain_until)| retain_until),
+        }
+    };
+
+    let Some(mode) = retention.mode else {
+        return Ok(None);
+    };
 
     if !is_retention_active(mode, retention.retain_until_date) {
-        return None;
+        return Ok(None);
     }
 
     let existing_retain_until = retention.retain_until_date;
@@ -95,13 +119,13 @@ pub fn check_retention_for_modification(
         // Can only extend the retention period
         RetentionMode::Compliance => {
             if mode_changed || is_shortening {
-                return Some(ObjectLockBlockReason::Retention {
+                return Ok(Some(ObjectLockBlockReason::Retention {
                     mode,
                     retain_until: existing_retain_until,
-                });
+                }));
             }
             // Extending retention in COMPLIANCE mode is allowed
-            None
+            Ok(None)
         }
         // GOVERNANCE mode: extending is always allowed, shortening requires bypass
         // This matches AWS S3 behavior where:
@@ -109,13 +133,13 @@ pub fn check_retention_for_modification(
         // - Shortening/removing retention: requires bypass permission
         RetentionMode::Governance => {
             if (mode_changed || is_shortening) && !bypass_governance {
-                return Some(ObjectLockBlockReason::Retention {
+                return Ok(Some(ObjectLockBlockReason::Retention {
                     mode,
                     retain_until: existing_retain_until,
-                });
+                }));
             }
             // Extending retention or shortening with bypass is allowed
-            None
+            Ok(None)
         }
     }
 }
@@ -310,6 +334,13 @@ pub(crate) fn check_object_lock_for_deletion_with_default_retention(
 /// than as corrupt metadata.
 fn persisted_lock_value<'a>(obj_info: &'a ObjectInfo, key: &str) -> Option<&'a String> {
     obj_info.user_defined.get(key).filter(|value| !value.is_empty())
+}
+
+/// Whether the version carries explicit retention keys. Without them the bucket
+/// default retention governs the version (`active_retention`).
+fn has_persisted_retention(obj_info: &ObjectInfo) -> bool {
+    persisted_lock_value(obj_info, metadata_keys::OBJECT_LOCK_MODE).is_some()
+        || persisted_lock_value(obj_info, metadata_keys::OBJECT_LOCK_RETAIN_UNTIL_DATE).is_some()
 }
 
 /// Whether the version's persisted legal hold is ON. Any other non-empty
@@ -858,12 +889,33 @@ mod tests {
         assert!(!is_retention_active(RetentionMode::Governance, Some(past_date)));
     }
 
+    /// Judge the explicit retention keys alone, on a bucket without default retention.
+    fn check_explicit_keys_modification(
+        user_defined: &std::collections::HashMap<String, String>,
+        new_mode: Option<RetentionMode>,
+        new_retain_until: Option<OffsetDateTime>,
+        bypass_governance: bool,
+    ) -> Option<ObjectLockBlockReason> {
+        let obj_info = ObjectInfo {
+            user_defined: Arc::new(user_defined.clone()),
+            ..Default::default()
+        };
+        check_retention_for_modification(
+            &ObjectLockConfigState::ConfirmedAbsent,
+            &obj_info,
+            new_mode,
+            new_retain_until,
+            bypass_governance,
+        )
+        .expect("explicit retention metadata should be judged")
+    }
+
     #[test]
     fn test_check_retention_for_modification_no_existing_retention() {
         // No existing retention - modification should be allowed
         let user_defined = std::collections::HashMap::new();
         let new_retain = Some(OffsetDateTime::now_utc() + time::Duration::days(30));
-        assert!(check_retention_for_modification(&user_defined, None, new_retain, false).is_none());
+        assert!(check_explicit_keys_modification(&user_defined, None, new_retain, false).is_none());
     }
 
     #[test]
@@ -881,7 +933,7 @@ mod tests {
 
         // Extending by another 30 days should be allowed
         let new_retain = Some(existing_retain + time::Duration::days(30));
-        assert!(check_retention_for_modification(&user_defined, Some(RetentionMode::Compliance), new_retain, false).is_none());
+        assert!(check_explicit_keys_modification(&user_defined, Some(RetentionMode::Compliance), new_retain, false).is_none());
     }
 
     #[test]
@@ -899,7 +951,7 @@ mod tests {
 
         // Shortening to 30 days should be blocked
         let new_retain = Some(OffsetDateTime::now_utc() + time::Duration::days(30));
-        let result = check_retention_for_modification(&user_defined, Some(RetentionMode::Compliance), new_retain, false);
+        let result = check_explicit_keys_modification(&user_defined, Some(RetentionMode::Compliance), new_retain, false);
         assert!(result.is_some());
         assert!(matches!(result, Some(ObjectLockBlockReason::Retention { .. })));
     }
@@ -918,7 +970,7 @@ mod tests {
         );
 
         // Clearing (None) should be blocked
-        let result = check_retention_for_modification(&user_defined, None, None, false);
+        let result = check_explicit_keys_modification(&user_defined, None, None, false);
         assert!(result.is_some());
     }
 
@@ -937,7 +989,7 @@ mod tests {
 
         // Shortening from 30 days to 15 days without bypass should be blocked
         let new_retain = Some(OffsetDateTime::now_utc() + time::Duration::days(15));
-        let result = check_retention_for_modification(&user_defined, Some(RetentionMode::Governance), new_retain, false);
+        let result = check_explicit_keys_modification(&user_defined, Some(RetentionMode::Governance), new_retain, false);
         assert!(result.is_some());
     }
 
@@ -957,7 +1009,7 @@ mod tests {
 
         // Extending from 30 days to 60 days without bypass should be allowed
         let new_retain = Some(OffsetDateTime::now_utc() + time::Duration::days(60));
-        assert!(check_retention_for_modification(&user_defined, Some(RetentionMode::Governance), new_retain, false).is_none());
+        assert!(check_explicit_keys_modification(&user_defined, Some(RetentionMode::Governance), new_retain, false).is_none());
     }
 
     #[test]
@@ -975,7 +1027,7 @@ mod tests {
 
         // Shortening from 30 days to 15 days with bypass should be allowed
         let new_retain = Some(OffsetDateTime::now_utc() + time::Duration::days(15));
-        assert!(check_retention_for_modification(&user_defined, Some(RetentionMode::Governance), new_retain, true).is_none());
+        assert!(check_explicit_keys_modification(&user_defined, Some(RetentionMode::Governance), new_retain, true).is_none());
     }
 
     #[test]
@@ -991,7 +1043,7 @@ mod tests {
         );
 
         let result =
-            check_retention_for_modification(&user_defined, Some(RetentionMode::Compliance), Some(existing_retain), false);
+            check_explicit_keys_modification(&user_defined, Some(RetentionMode::Compliance), Some(existing_retain), false);
         assert!(result.is_some());
     }
 
@@ -1008,7 +1060,7 @@ mod tests {
         );
 
         assert!(
-            check_retention_for_modification(&user_defined, Some(RetentionMode::Compliance), Some(existing_retain), true)
+            check_explicit_keys_modification(&user_defined, Some(RetentionMode::Compliance), Some(existing_retain), true)
                 .is_none()
         );
     }
@@ -1026,8 +1078,127 @@ mod tests {
         );
 
         let result =
-            check_retention_for_modification(&user_defined, Some(RetentionMode::Governance), Some(existing_retain), true);
+            check_explicit_keys_modification(&user_defined, Some(RetentionMode::Governance), Some(existing_retain), true);
         assert!(result.is_some());
+    }
+
+    #[test]
+    fn modification_judges_bucket_default_compliance_retention_for_keyless_version() {
+        let state = configured_object_lock_state_for_tests(RetentionMode::Compliance, 30);
+        let mod_time = OffsetDateTime::now_utc();
+        let default_until = mod_time + time::Duration::days(30);
+        let obj_info = ObjectInfo {
+            mod_time: Some(mod_time),
+            ..Default::default()
+        };
+
+        for (new_mode, new_retain_until) in [
+            (Some(RetentionMode::Governance), Some(default_until + time::Duration::days(30))),
+            (Some(RetentionMode::Compliance), Some(mod_time + time::Duration::days(1))),
+            (Some(RetentionMode::Compliance), None),
+            (None, None),
+        ] {
+            let result = check_retention_for_modification(&state, &obj_info, new_mode, new_retain_until, true);
+            assert!(
+                matches!(
+                    result,
+                    Ok(Some(ObjectLockBlockReason::Retention {
+                        mode: RetentionMode::Compliance,
+                        ..
+                    }))
+                ),
+                "{new_mode:?}/{new_retain_until:?} must stay blocked by the bucket default retention: {result:?}"
+            );
+        }
+
+        assert!(matches!(
+            check_retention_for_modification(
+                &state,
+                &obj_info,
+                Some(RetentionMode::Compliance),
+                Some(default_until + time::Duration::days(30)),
+                false
+            ),
+            Ok(None)
+        ));
+    }
+
+    #[test]
+    fn modification_judges_bucket_default_retention_for_cleared_retention_keys() {
+        let state = configured_object_lock_state_for_tests(RetentionMode::Compliance, 30);
+        let mut user_defined = std::collections::HashMap::new();
+        user_defined.insert(metadata_keys::OBJECT_LOCK_MODE.to_string(), String::new());
+        user_defined.insert(metadata_keys::OBJECT_LOCK_RETAIN_UNTIL_DATE.to_string(), String::new());
+        let obj_info = ObjectInfo {
+            user_defined: Arc::new(user_defined),
+            mod_time: Some(OffsetDateTime::now_utc()),
+            ..Default::default()
+        };
+        let new_retain = Some(OffsetDateTime::now_utc() + time::Duration::days(60));
+
+        let result = check_retention_for_modification(&state, &obj_info, Some(RetentionMode::Governance), new_retain, true);
+
+        assert!(matches!(result, Ok(Some(ObjectLockBlockReason::Retention { .. }))));
+    }
+
+    #[test]
+    fn modification_of_bucket_default_governance_retention_requires_bypass() {
+        let state = configured_object_lock_state_for_tests(RetentionMode::Governance, 30);
+        let obj_info = ObjectInfo {
+            mod_time: Some(OffsetDateTime::now_utc()),
+            ..Default::default()
+        };
+        let new_retain = Some(OffsetDateTime::now_utc() + time::Duration::days(1));
+
+        assert!(matches!(
+            check_retention_for_modification(&state, &obj_info, Some(RetentionMode::Governance), new_retain, false),
+            Ok(Some(ObjectLockBlockReason::Retention { .. }))
+        ));
+        assert!(matches!(
+            check_retention_for_modification(&state, &obj_info, Some(RetentionMode::Governance), new_retain, true),
+            Ok(None)
+        ));
+    }
+
+    #[test]
+    fn modification_allows_keyless_version_past_bucket_default_retention() {
+        let state = configured_object_lock_state_for_tests(RetentionMode::Compliance, 30);
+        let obj_info = ObjectInfo {
+            mod_time: Some(OffsetDateTime::now_utc() - time::Duration::days(31)),
+            ..Default::default()
+        };
+        let new_retain = Some(OffsetDateTime::now_utc() + time::Duration::days(1));
+
+        assert!(matches!(
+            check_retention_for_modification(&state, &obj_info, Some(RetentionMode::Governance), new_retain, false),
+            Ok(None)
+        ));
+    }
+
+    #[test]
+    fn modification_can_repair_incomplete_persisted_retention_metadata() {
+        let state = configured_object_lock_state_for_tests(RetentionMode::Compliance, 30);
+        let mut user_defined = std::collections::HashMap::new();
+        user_defined.insert(metadata_keys::OBJECT_LOCK_MODE.to_string(), RetentionMode::COMPLIANCE.to_string());
+        let obj_info = ObjectInfo {
+            user_defined: Arc::new(user_defined),
+            mod_time: Some(OffsetDateTime::now_utc()),
+            ..Default::default()
+        };
+        let new_retain = Some(OffsetDateTime::now_utc() + time::Duration::days(1));
+
+        assert!(matches!(
+            check_retention_for_modification(&state, &obj_info, Some(RetentionMode::Compliance), new_retain, false),
+            Ok(None)
+        ));
+    }
+
+    #[test]
+    fn modification_with_fabricated_bucket_metadata_fails_closed() {
+        let err = check_retention_for_modification(&ObjectLockConfigState::Fabricated, &ObjectInfo::default(), None, None, false)
+            .expect_err("non-authoritative Object Lock metadata must block retention modification");
+
+        assert!(err.to_string().contains("not authoritative"));
     }
 
     #[test]

@@ -12423,7 +12423,7 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
             return Err(Error::PreconditionFailed);
         }
 
-        check_object_lock_retention_update(bucket, object, &obj_info, opts)?;
+        check_object_lock_retention_update(&self.ctx, bucket, object, &obj_info, opts).await?;
 
         if let Some(expected_incarnation_id) = opts.expected_bucket_incarnation_id {
             self.validate_bucket_incarnation(bucket, expected_incarnation_id, opts)

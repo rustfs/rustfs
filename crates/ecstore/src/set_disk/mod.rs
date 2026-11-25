@@ -6916,19 +6916,37 @@ impl SetDisks {
     }
 }
 
-fn check_object_lock_retention_update(bucket: &str, object: &str, obj_info: &ObjectInfo, opts: &ObjectOptions) -> Result<()> {
-    if let Some(retention) = &opts.object_lock_retention
-        && check_retention_for_modification(
-            &obj_info.user_defined,
-            retention
-                .mode
-                .as_deref()
-                .and_then(crate::bucket::object_lock::types::RetentionMode::parse_exact),
+async fn check_object_lock_retention_update(
+    ctx: &InstanceContext,
+    bucket: &str,
+    object: &str,
+    obj_info: &ObjectInfo,
+    opts: &ObjectOptions,
+) -> Result<()> {
+    let Some(retention) = &opts.object_lock_retention else {
+        return Ok(());
+    };
+
+    let new_mode = retention
+        .mode
+        .as_deref()
+        .and_then(crate::bucket::object_lock::types::RetentionMode::parse_exact);
+    let blocked = match opts.object_lock_config_snapshot.as_deref() {
+        Some(snapshot) => check_retention_for_modification(
+            snapshot.state(),
+            obj_info,
+            new_mode,
             retention.retain_until,
             retention.bypass_governance,
-        )
-        .is_some()
-    {
+        )?
+        .is_some(),
+        None => {
+            let state = metadata_sys::get_object_lock_config_state_in(ctx, bucket).await?;
+            check_retention_for_modification(&state, obj_info, new_mode, retention.retain_until, retention.bypass_governance)?
+                .is_some()
+        }
+    };
+    if blocked {
         return Err(StorageError::PrefixAccessDenied(bucket.to_string(), object.to_string()));
     }
 
@@ -14370,8 +14388,8 @@ mod tests {
         assert!(rendered.contains("object"), "{rendered}");
     }
 
-    #[test]
-    fn test_check_object_lock_retention_update_blocks_compliance_shorten() {
+    #[tokio::test]
+    async fn test_check_object_lock_retention_update_blocks_compliance_shorten() {
         let now = OffsetDateTime::now_utc();
         let existing_until = now + Duration::from_secs(60 * 60 * 24 * 60);
         let requested_until = now + Duration::from_secs(60 * 60 * 24);
@@ -14393,17 +14411,19 @@ mod tests {
                 retain_until: Some(requested_until),
                 bypass_governance: true,
             }),
+            object_lock_config_snapshot: Some(Arc::new(ObjectLockConfigSnapshot::new(ObjectLockConfigState::ConfirmedAbsent))),
             ..Default::default()
         };
 
-        let err = check_object_lock_retention_update("bucket", "object", &obj_info, &opts)
+        let err = check_object_lock_retention_update(&bootstrap_ctx(), "bucket", "object", &obj_info, &opts)
+            .await
             .expect_err("COMPLIANCE shortening must be blocked");
 
         assert!(matches!(err, StorageError::PrefixAccessDenied(_, _)));
     }
 
-    #[test]
-    fn test_check_object_lock_retention_update_allows_governance_shorten_with_bypass() {
+    #[tokio::test]
+    async fn test_check_object_lock_retention_update_allows_governance_shorten_with_bypass() {
         let now = OffsetDateTime::now_utc();
         let existing_until = now + Duration::from_secs(60 * 60 * 24 * 60);
         let requested_until = now + Duration::from_secs(60 * 60 * 24);
@@ -14425,11 +14445,91 @@ mod tests {
                 retain_until: Some(requested_until),
                 bypass_governance: true,
             }),
+            object_lock_config_snapshot: Some(Arc::new(ObjectLockConfigSnapshot::new(ObjectLockConfigState::ConfirmedAbsent))),
             ..Default::default()
         };
 
-        check_object_lock_retention_update("bucket", "object", &obj_info, &opts)
+        check_object_lock_retention_update(&bootstrap_ctx(), "bucket", "object", &obj_info, &opts)
+            .await
             .expect("GOVERNANCE shortening with bypass should remain allowed");
+    }
+
+    #[tokio::test]
+    async fn test_check_object_lock_retention_update_blocks_bucket_default_compliance_downgrade() {
+        let now = OffsetDateTime::now_utc();
+        let obj_info = ObjectInfo {
+            mod_time: Some(now),
+            ..Default::default()
+        };
+        let default_compliance_snapshot =
+            Arc::new(ObjectLockConfigSnapshot::new(metadata_sys::configured_object_lock_state_for_tests(
+                crate::bucket::object_lock::types::RetentionMode::Compliance,
+                30,
+            )));
+
+        let downgrade_opts = ObjectOptions {
+            object_lock_retention: Some(crate::storage_api_contracts::object::ObjectLockRetentionOptions {
+                mode: Some("GOVERNANCE".to_string()),
+                retain_until: Some(now + Duration::from_secs(60 * 60 * 24 * 60)),
+                bypass_governance: true,
+            }),
+            object_lock_config_snapshot: Some(Arc::clone(&default_compliance_snapshot)),
+            ..Default::default()
+        };
+        let err = check_object_lock_retention_update(&bootstrap_ctx(), "bucket", "object", &obj_info, &downgrade_opts)
+            .await
+            .expect_err("a version locked by the bucket default COMPLIANCE retention must not be downgraded");
+        assert!(matches!(err, StorageError::PrefixAccessDenied(_, _)));
+
+        let shorten_opts = ObjectOptions {
+            object_lock_retention: Some(crate::storage_api_contracts::object::ObjectLockRetentionOptions {
+                mode: Some("COMPLIANCE".to_string()),
+                retain_until: Some(now + Duration::from_secs(60 * 60 * 24)),
+                bypass_governance: true,
+            }),
+            object_lock_config_snapshot: Some(Arc::clone(&default_compliance_snapshot)),
+            ..Default::default()
+        };
+        let err = check_object_lock_retention_update(&bootstrap_ctx(), "bucket", "object", &obj_info, &shorten_opts)
+            .await
+            .expect_err("a version locked by the bucket default COMPLIANCE retention must not be shortened");
+        assert!(matches!(err, StorageError::PrefixAccessDenied(_, _)));
+
+        let extend_opts = ObjectOptions {
+            object_lock_retention: Some(crate::storage_api_contracts::object::ObjectLockRetentionOptions {
+                mode: Some("COMPLIANCE".to_string()),
+                retain_until: Some(now + Duration::from_secs(60 * 60 * 24 * 60)),
+                bypass_governance: false,
+            }),
+            object_lock_config_snapshot: Some(default_compliance_snapshot),
+            ..Default::default()
+        };
+        check_object_lock_retention_update(&bootstrap_ctx(), "bucket", "object", &obj_info, &extend_opts)
+            .await
+            .expect("extending bucket default COMPLIANCE retention must remain allowed");
+    }
+
+    #[tokio::test]
+    async fn test_check_object_lock_retention_update_fails_closed_on_fabricated_state() {
+        let now = OffsetDateTime::now_utc();
+        let obj_info = ObjectInfo {
+            mod_time: Some(now),
+            ..Default::default()
+        };
+        let opts = ObjectOptions {
+            object_lock_retention: Some(crate::storage_api_contracts::object::ObjectLockRetentionOptions {
+                mode: Some("GOVERNANCE".to_string()),
+                retain_until: Some(now + Duration::from_secs(60 * 60 * 24)),
+                bypass_governance: true,
+            }),
+            object_lock_config_snapshot: Some(Arc::new(ObjectLockConfigSnapshot::new(ObjectLockConfigState::Fabricated))),
+            ..Default::default()
+        };
+
+        let err = check_object_lock_retention_update(&bootstrap_ctx(), "bucket", "object", &obj_info, &opts)
+            .await
+            .expect_err("non-authoritative bucket Object Lock state must fail closed");
+        assert!(err.to_string().contains("not authoritative"), "unexpected error: {err}");
     }
 
     #[tokio::test]
