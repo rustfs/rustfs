@@ -998,6 +998,7 @@ pub(crate) mod bucket {
     };
 
     pub(crate) mod utils {
+        pub(crate) use super::super::ecstore_bucket::utils::check_valid_bucket_name_strict;
         pub(crate) use super::super::ecstore_utils::{deserialize, is_valid_object_prefix, serialize};
     }
 }
@@ -1067,6 +1068,8 @@ pub(crate) mod metrics {
 
 pub(crate) mod object {
     pub(crate) use crate::storage::storage_api::StorageObjectOptions;
+    #[cfg(test)]
+    pub(crate) use crate::storage::storage_api::StoragePutObjReader;
     pub(crate) use crate::storage::storage_api::ecstore_object::WriteCommitGuard;
 }
 

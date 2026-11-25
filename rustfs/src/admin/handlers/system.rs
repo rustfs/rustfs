@@ -539,6 +539,15 @@ fn inspect_data_target(uri: &http::Uri) -> Option<(String, String)> {
     }
 }
 
+/// The object layer exempts reserved system buckets (`.rustfs.sys`, `.minio.sys`)
+/// from its own bucket-name check so internal subsystems can read IAM and config
+/// objects. Any admin handler accepting a caller-chosen bucket must refuse them
+/// before calling into the object store, matching v4 `inspect/archive`.
+fn check_inspect_data_volume(bucket: &str) -> S3Result<()> {
+    crate::admin::storage_api::bucket::utils::check_valid_bucket_name_strict(bucket)
+        .map_err(|_| s3_error!(InvalidArgument, "invalid inspect-data volume"))
+}
+
 #[async_trait::async_trait]
 impl Operation for InspectDataHandler {
     async fn call(&self, req: AdminRequest, _params: Params<'_, '_>) -> S3Result<AdminResponse> {
@@ -564,6 +573,7 @@ impl Operation for InspectDataHandler {
                 "inspect-data requires `volume` (bucket) and `file` (object) query parameters"
             ));
         };
+        check_inspect_data_volume(&bucket)?;
 
         let Some(store) = object_store_from_envelope(req.envelope()) else {
             log_system_request_failed!("inspect_data", "object_store_unavailable", "not initialized");
@@ -1261,8 +1271,8 @@ mod tests {
         SITE_REPLICATION_REPAIR_ROUTE, SITE_REPLICATION_REPAIR_STATUS_ROUTE, SITE_REPLICATION_RESYNC_ROUTE, ServerInfoHandler,
         ServerInfoResponse, ServiceHandle, StorageInfoHandler, TOPOLOGY_SNAPSHOT_NOT_AVAILABLE, TOPOLOGY_SUMMARY_RESOLVED,
         UpdateHandler, admin_route_capability_from_inventory, build_runtime_capabilities_response,
-        build_runtime_capabilities_summary, data_usage_info_gate_actions, runtime_capabilities_gate_actions,
-        system_admin_discovery,
+        build_runtime_capabilities_summary, check_inspect_data_volume, data_usage_info_gate_actions, inspect_data_target,
+        runtime_capabilities_gate_actions, system_admin_discovery,
     };
     use crate::admin::operation::AdminRequest;
     use crate::admin::operation::Operation;
@@ -2089,6 +2099,165 @@ mod tests {
         assert_missing_credentials(&StorageInfoHandler {}, Method::GET, "/rustfs/admin/v3/storageinfo").await;
         assert_missing_credentials(&RuntimeCapabilitiesHandler {}, Method::GET, "/rustfs/admin/v4/runtime/capabilities").await;
         assert_missing_credentials(&DataUsageInfoHandler {}, Method::GET, "/rustfs/admin/v3/datausageinfo").await;
+    }
+
+    #[test]
+    fn inspect_data_refuses_reserved_and_invalid_volumes() {
+        for volume in [
+            ".rustfs.sys",
+            ".minio.sys",
+            ".rustfs.sys/buckets",
+            ".rustfs.sys/config/iam/users/admin/identity.json",
+            "../secret",
+            "bucket/sub",
+            "rustfs",
+        ] {
+            for query in [
+                format!("/rustfs/admin/v3/inspect-data?volume={volume}&file=config/iam/users/admin/identity.json"),
+                format!("/minio/admin/v3/inspect-data?bucket={volume}&object=config/iam/users/admin/identity.json"),
+            ] {
+                let uri: Uri = query.parse().expect("uri should parse");
+                let (bucket, _object) = inspect_data_target(&uri).expect("target should parse");
+                let err = check_inspect_data_volume(&bucket).expect_err("reserved or invalid volume must be refused");
+                assert_eq!(err.code(), &S3ErrorCode::InvalidArgument, "{volume}");
+                assert_eq!(err.message(), Some("invalid inspect-data volume"), "{volume}");
+            }
+        }
+
+        for volume in ["data", "my-bucket", "logs.2026"] {
+            check_inspect_data_volume(volume).unwrap_or_else(|err| panic!("{volume} must stay readable: {err}"));
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn inspect_data_handler_rejects_reserved_buckets_and_reads_ordinary_bucket() {
+        crate::app::gating_test_env::run_large_stack_test("inspect-data-bucket-validation", || async {
+            use crate::admin::operation::test_support::TestRequest;
+            use crate::admin::runtime_sources::{AppContext, IamInterface, KmsInterface, publish_test_app_context};
+            use crate::admin::storage_api::contract::bucket::{BucketOperations as _, MakeBucketOptions};
+            use crate::admin::storage_api::contract::object::ObjectIO as _;
+            use crate::admin::storage_api::object::{StorageObjectOptions, StoragePutObjReader};
+            use rustfs_iam::store::{Store as _, UserType};
+            use rustfs_madmin::{AccountStatus, AddOrUpdateUserReq};
+            use rustfs_policy::policy::Policy;
+            use std::sync::Arc;
+
+            struct ReadyIam(Arc<rustfs_iam::sys::IamSys<rustfs_iam::store::object::ObjectStore>>);
+            impl IamInterface for ReadyIam {
+                fn handle(&self) -> Arc<rustfs_iam::sys::IamSys<rustfs_iam::store::object::ObjectStore>> {
+                    Arc::clone(&self.0)
+                }
+                fn is_ready(&self) -> bool {
+                    true
+                }
+            }
+            struct TestKms;
+            impl KmsInterface for TestKms {
+                fn handle(&self) -> Arc<rustfs_kms::KmsServiceManager> {
+                    Arc::new(rustfs_kms::KmsServiceManager::new())
+                }
+            }
+
+            let previous = crate::runtime_sources::current_app_context();
+            let (_dir, _paths, store) = crate::app::gating_test_env::isolated_multi_pool_ecstore().await;
+            rustfs_iam::store::object::ObjectStore::new(Arc::clone(&store))
+                .save_iam_config(
+                    serde_json::json!({"version": 1}),
+                    format!("{}/format.json", *rustfs_iam::store::object::IAM_CONFIG_PREFIX),
+                )
+                .await
+                .expect("seed IAM format");
+            store
+                .make_bucket("app-data", &MakeBucketOptions::default())
+                .await
+                .expect("create normal bucket");
+            store
+                .put_object(
+                    "app-data",
+                    "hello.txt",
+                    &mut StoragePutObjReader::from_vec(b"hello inspect".to_vec()),
+                    &StorageObjectOptions::default(),
+                )
+                .await
+                .expect("write normal object");
+
+            let iam = rustfs_iam::build_iam_sys(Arc::clone(&store)).await.expect("init IAM");
+            let support_key = "inspect-support";
+            let support_secret = "inspect-support-secret";
+            iam.create_user(
+                support_key,
+                &AddOrUpdateUserReq {
+                    secret_key: support_secret.to_owned(),
+                    policy: None,
+                    status: AccountStatus::Enabled,
+                },
+            )
+            .await
+            .expect("create support user");
+            iam.set_policy(
+                "inspect-only",
+                Policy::parse_config(
+                    br#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":["admin:InspectData"]}]}"#,
+                )
+                .expect("parse policy"),
+            )
+            .await
+            .expect("store policy");
+            iam.policy_db_set(support_key, UserType::Reg, false, "inspect-only")
+                .await
+                .expect("attach policy");
+
+            let context = Arc::new(AppContext::new(store, Arc::new(ReadyIam(iam)), Arc::new(TestKms)));
+            assert!(context.publish_action_credentials(rustfs_credentials::Credentials {
+                access_key: "inspect-test-root".to_owned(),
+                secret_key: "inspect-root-secret".to_owned(),
+                status: "on".to_owned(),
+                ..Default::default()
+            }));
+            publish_test_app_context(context);
+
+            for (method, uri) in [
+                (
+                    Method::GET,
+                    "/rustfs/admin/v3/inspect-data?volume=.rustfs.sys&file=config/iam/format.json",
+                ),
+                (
+                    Method::POST,
+                    "/minio/admin/v3/inspect-data?bucket=.minio.sys&object=config/iam/format.json",
+                ),
+                (
+                    Method::GET,
+                    "/rustfs/admin/v3/inspect-data?volume=.rustfs.sys/config&file=iam/format.json",
+                ),
+            ] {
+                let req = TestRequest::new(method, uri)
+                    .credentials(support_key, support_secret, None)
+                    .build();
+                let err = InspectDataHandler {}
+                    .call(req, Params::new())
+                    .await
+                    .expect_err("reserved system bucket must be rejected");
+                assert_eq!(err.code(), &S3ErrorCode::InvalidArgument, "{uri}");
+                assert_eq!(err.message(), Some("invalid inspect-data volume"), "{uri}");
+            }
+
+            let ok_req = TestRequest::new(Method::GET, "/rustfs/admin/v3/inspect-data?volume=app-data&file=hello.txt")
+                .credentials(support_key, support_secret, None)
+                .build();
+            let resp = InspectDataHandler {}
+                .call(ok_req, Params::new())
+                .await
+                .expect("ordinary bucket object should remain readable");
+            let (status, _headers, mut body) = resp.into_parts();
+            assert_eq!(status, http::StatusCode::OK);
+            let bytes = body.store_all_limited(4096).await.expect("read body");
+            assert_eq!(bytes.as_ref(), b"hello inspect");
+
+            if let Some(previous) = previous {
+                publish_test_app_context(previous);
+            }
+        });
     }
 
     fn source_block<'a>(production: &'a str, marker: &str) -> &'a str {
