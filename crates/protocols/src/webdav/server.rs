@@ -21,12 +21,12 @@ use dav_server::DavHandler;
 use dav_server::fakels::FakeLs;
 use http::header::{
     ACCESS_CONTROL_ALLOW_CREDENTIALS, ACCESS_CONTROL_ALLOW_HEADERS, ACCESS_CONTROL_ALLOW_METHODS, ACCESS_CONTROL_ALLOW_ORIGIN,
-    ACCESS_CONTROL_EXPOSE_HEADERS, ACCESS_CONTROL_REQUEST_HEADERS, ACCESS_CONTROL_REQUEST_METHOD, AUTHORIZATION, ORIGIN, REFERER,
-    USER_AGENT, VARY,
+    ACCESS_CONTROL_EXPOSE_HEADERS, ACCESS_CONTROL_REQUEST_HEADERS, ACCESS_CONTROL_REQUEST_METHOD, AUTHORIZATION, CONNECTION,
+    ORIGIN, REFERER, USER_AGENT, VARY,
 };
 use http::{HeaderMap, HeaderValue, Method};
 use http_body_util::{BodyExt, Full, LengthLimitError, Limited};
-use hyper::body::Body as HttpBody;
+use hyper::body::{Body as HttpBody, Frame, SizeHint};
 use hyper::server::conn::http1;
 use hyper::service::service_fn;
 use hyper::{Request, Response, StatusCode};
@@ -39,8 +39,9 @@ use std::future::Future;
 use std::io;
 use std::net::IpAddr;
 use std::pin::Pin;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, OnceLock};
+use std::task::{Context, Poll};
 use std::time::Duration;
 use subtle::ConstantTimeEq;
 use tokio::net::TcpListener;
@@ -809,12 +810,111 @@ where
     }
 }
 
-/// Read the request body and run it through the dav handler.
+/// Why the request body could not be read to completion.
+///
+/// dav-server turns arbitrary body errors into 502, so [`DavRequestBody`]
+/// records the underlying cause and `dispatch_dav` selects 413 or 400.
+enum BodyReadFailure {
+    /// More than `max_body_size` bytes were received.
+    TooLarge,
+    /// The transport failed mid-body.
+    ReadFailed(Box<dyn std::error::Error + Send + Sync>),
+}
+
+struct DavBodyState {
+    failure: OnceLock<BodyReadFailure>,
+    complete: AtomicBool,
+}
+
+/// Streams a size-limited HTTP request body directly into dav-server.
+///
+/// Ownership moves into dav-server so an early rejection (such as 403 from
+/// `WebDavDriver::open()` or 413 from dav-server's 64 KiB metadata cap) drops
+/// the transport body immediately without buffering or spawning detached drain
+/// tasks that could outlive server shutdown or connection permits.
+struct DavRequestBody<B> {
+    inner: Pin<Box<Limited<B>>>,
+    state: Arc<DavBodyState>,
+}
+
+impl<B> DavRequestBody<B>
+where
+    B: HttpBody<Data = Bytes>,
+    B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
+{
+    fn new(body: B, limit: usize) -> (Self, Arc<DavBodyState>) {
+        let limited = Limited::new(body, limit);
+        let state = Arc::new(DavBodyState {
+            failure: OnceLock::new(),
+            complete: AtomicBool::new(limited.is_end_stream()),
+        });
+        (
+            Self {
+                inner: Box::pin(limited),
+                state: Arc::clone(&state),
+            },
+            state,
+        )
+    }
+}
+
+impl<B> HttpBody for DavRequestBody<B>
+where
+    B: HttpBody<Data = Bytes>,
+    B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
+{
+    type Data = Bytes;
+    type Error = io::Error;
+
+    fn poll_frame(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Result<Frame<Bytes>, io::Error>>> {
+        match self.inner.as_mut().poll_frame(cx) {
+            Poll::Pending => Poll::Pending,
+            Poll::Ready(Some(Ok(frame))) => {
+                if self.inner.is_end_stream() {
+                    self.state.complete.store(true, Ordering::Release);
+                }
+                Poll::Ready(Some(Ok(frame)))
+            }
+            Poll::Ready(None) => {
+                self.state.complete.store(true, Ordering::Release);
+                Poll::Ready(None)
+            }
+            Poll::Ready(Some(Err(e))) => {
+                let failure = if e.downcast_ref::<LengthLimitError>().is_some() {
+                    BodyReadFailure::TooLarge
+                } else {
+                    BodyReadFailure::ReadFailed(e)
+                };
+                let _ = self.state.failure.set(failure);
+                Poll::Ready(Some(Err(io::Error::other("request body failed"))))
+            }
+        }
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.state.complete.load(Ordering::Acquire) || self.inner.is_end_stream()
+    }
+
+    fn size_hint(&self) -> SizeHint {
+        self.inner.size_hint()
+    }
+}
+
+fn close_connection(mut response: Response<WebDavBody>) -> Response<WebDavBody> {
+    response.headers_mut().insert(CONNECTION, HeaderValue::from_static("close"));
+    response
+}
+
+/// Run the request through the dav handler while streaming its body.
 ///
 /// Both limits configured for the listener are enforced here: the body is
 /// truncated at `max_body_size` bytes actually received (a chunked upload
-/// declares no length, so a header check cannot bound it), and neither the
-/// body read nor the dav handler may run past `request_timeout`.
+/// declares no length, so a header check cannot bound it), and body reads plus
+/// DAV handling together may not run past `request_timeout`.
+///
+/// Handing the live limited body to dav-server lets `handle_put` open — and
+/// authorize — the destination before polling a single frame, and lets every
+/// non-upload method stop at dav-server's 64 KiB cap.
 async fn dispatch_dav<B>(
     req: Request<B>,
     dav_handler: DavHandler,
@@ -829,51 +929,8 @@ where
     let (parts, body) = req.into_parts();
     let limit = usize::try_from(max_body_size).unwrap_or(usize::MAX);
 
-    let body_bytes = match timeout(request_timeout, Limited::new(body, limit).collect()).await {
-        Ok(Ok(collected)) => collected.to_bytes(),
-        Ok(Err(e)) if e.downcast_ref::<LengthLimitError>().is_some() => {
-            warn!(
-                event = EVENT_WEBDAV_REQUEST_VALIDATION_FAILED,
-                component = LOG_COMPONENT_PROTOCOLS,
-                subsystem = LOG_SUBSYSTEM_WEBDAV_SERVER,
-                result = "payload_too_large",
-                max_body_size,
-                source_ip = %source_ip,
-                "webdav request validation failed"
-            );
-            return error_response(
-                StatusCode::PAYLOAD_TOO_LARGE,
-                &format!("Request body too large. Maximum size is {} bytes", max_body_size),
-            );
-        }
-        Ok(Err(e)) => {
-            error!(
-                event = EVENT_WEBDAV_REQUEST_BODY_FAILED,
-                component = LOG_COMPONENT_PROTOCOLS,
-                subsystem = LOG_SUBSYSTEM_WEBDAV_SERVER,
-                result = "request_body_read_failed",
-                source_ip = %source_ip,
-                error = %e,
-                "webdav request body failed"
-            );
-            return error_response(StatusCode::BAD_REQUEST, "Failed to read request body");
-        }
-        Err(_) => {
-            warn!(
-                event = EVENT_WEBDAV_REQUEST_VALIDATION_FAILED,
-                component = LOG_COMPONENT_PROTOCOLS,
-                subsystem = LOG_SUBSYSTEM_WEBDAV_SERVER,
-                result = "request_body_read_timeout",
-                timeout_secs = request_timeout.as_secs(),
-                source_ip = %source_ip,
-                "webdav request validation failed"
-            );
-            return error_response(StatusCode::REQUEST_TIMEOUT, "Request timed out");
-        }
-    };
-
-    // Create request for dav-server using Bytes
-    let dav_req = Request::from_parts(parts, dav_server::body::Body::from(body_bytes));
+    let (dav_body, body_state) = DavRequestBody::new(body, limit);
+    let dav_req = Request::from_parts(parts, dav_body);
 
     let dav_resp = match timeout(request_timeout, dav_handler.handle(dav_req)).await {
         Ok(resp) => resp,
@@ -887,14 +944,52 @@ where
                 source_ip = %source_ip,
                 "webdav request validation failed"
             );
-            return error_response(StatusCode::REQUEST_TIMEOUT, "Request timed out");
+            return close_connection(error_response(StatusCode::REQUEST_TIMEOUT, "Request timed out"));
         }
     };
 
+    match body_state.failure.get() {
+        Some(BodyReadFailure::TooLarge) => {
+            warn!(
+                event = EVENT_WEBDAV_REQUEST_VALIDATION_FAILED,
+                component = LOG_COMPONENT_PROTOCOLS,
+                subsystem = LOG_SUBSYSTEM_WEBDAV_SERVER,
+                result = "payload_too_large",
+                max_body_size,
+                source_ip = %source_ip,
+                "webdav request validation failed"
+            );
+            return close_connection(error_response(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                &format!("Request body too large. Maximum size is {} bytes", max_body_size),
+            ));
+        }
+        Some(BodyReadFailure::ReadFailed(e)) => {
+            error!(
+                event = EVENT_WEBDAV_REQUEST_BODY_FAILED,
+                component = LOG_COMPONENT_PROTOCOLS,
+                subsystem = LOG_SUBSYSTEM_WEBDAV_SERVER,
+                result = "request_body_read_failed",
+                source_ip = %source_ip,
+                error = %e,
+                "webdav request body failed"
+            );
+            return close_connection(error_response(StatusCode::BAD_REQUEST, "Failed to read request body"));
+        }
+        None => {}
+    }
+
     // Streamed straight to Hyper: collecting here would hold the whole
     // object in memory for the duration of a GET.
-    let (parts, body) = dav_resp.into_parts();
-    Response::from_parts(parts, Box::pin(body) as WebDavBody)
+    let (mut parts, resp_body) = dav_resp.into_parts();
+    if !body_state.complete.load(Ordering::Acquire) {
+        // The handler answered without reading the request body to EOF (e.g.
+        // 403 from WebDavDriver::open or 413 from dav-server's metadata cap).
+        // Close the connection cleanly so unread bytes cannot desynchronize
+        // an HTTP/1.1 keep-alive stream.
+        parts.headers.insert(CONNECTION, HeaderValue::from_static("close"));
+    }
+    Response::from_parts(parts, Box::pin(resp_body) as WebDavBody)
 }
 
 /// Create unauthorized response with WWW-Authenticate header
@@ -1517,10 +1612,214 @@ mod tests {
 
         let resp = dispatch_dav(chunked_request(8, 8), handler.clone(), TEST_IP, 16, Duration::from_secs(30)).await;
         assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        assert_eq!(resp.headers().get(CONNECTION), Some(&HeaderValue::from_static("close")));
 
-        // The oversized body must not have reached the filesystem.
+        // Because the body streams live, MemFs may see frames within the limit
+        // before the cut-off, but never more than `max_body_size`.
         let stored = dispatch_dav(get_request("/upload.bin"), handler, TEST_IP, 16, Duration::from_secs(30)).await;
-        assert_eq!(stored.status(), StatusCode::NOT_FOUND);
+        if stored.status() == StatusCode::OK {
+            let bytes = stored.into_body().collect().await.expect("collect body").to_bytes();
+            assert!(bytes.len() <= 16, "filesystem received {} bytes, over the limit of 16", bytes.len());
+        } else {
+            assert_eq!(stored.status(), StatusCode::NOT_FOUND);
+        }
+
+        // Against the real WebDavDriver, an over-limit chunked PUT fails before
+        // flush() so nothing is persisted to storage.
+        let backend = crate::common::dummy_storage::DummyBackend::new();
+        let driver = WebDavDriver::new(
+            backend.clone(),
+            Arc::new(crate::common::session::test_session(crate::common::session::Protocol::WebDav)),
+        );
+        let dav_handler = DavHandler::builder()
+            .filesystem(Box::new(driver))
+            .locksystem(FakeLs::new())
+            .build_handler();
+        let req = Request::builder()
+            .method("PUT")
+            .uri("/bucket/upload.bin")
+            .body(StreamBody::new(stream::iter(
+                (0..8).map(|_| Ok::<_, io::Error>(Frame::data(Bytes::from(vec![b'a'; 8])))),
+            )))
+            .expect("build chunked request");
+        let resp = crate::common::gateway::with_test_auth_override(
+            |_, _, _| true,
+            dispatch_dav(req, dav_handler, TEST_IP, 16, Duration::from_secs(30)),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        assert_eq!(resp.headers().get(CONNECTION), Some(&HeaderValue::from_static("close")));
+        assert!(
+            backend.put_object_calls().is_empty(),
+            "oversized chunked PUT must not flush to S3 storage"
+        );
+    }
+
+    /// An unauthorized / deny-all PUT with a large or stalled streaming body
+    /// must fail with 403 before polling a single frame and drop the body
+    /// immediately without spawning a detached drain task.
+    #[tokio::test]
+    async fn unauthorized_put_rejects_without_reading_streaming_body() {
+        use futures_util::StreamExt;
+
+        let backend = crate::common::dummy_storage::DummyBackend::new().deny_authorization();
+        let driver = WebDavDriver::new(
+            backend.clone(),
+            Arc::new(crate::common::session::test_session(crate::common::session::Protocol::WebDav)),
+        );
+        let handler = DavHandler::builder()
+            .filesystem(Box::new(driver))
+            .locksystem(FakeLs::new())
+            .build_handler();
+
+        let frames_read = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&frames_read);
+        let sentinel = Arc::new(());
+        let sentinel_weak = Arc::downgrade(&sentinel);
+        let chunk = Bytes::from(vec![b'A'; 64 * 1024]);
+        let frames = stream::iter((0..1024).map(move |_| {
+            let _keep_alive = Arc::clone(&sentinel);
+            Ok::<_, io::Error>(Frame::data(chunk.clone()))
+        }))
+        .inspect(move |_| {
+            counter.fetch_add(1, Ordering::Relaxed);
+        });
+        let req = Request::builder()
+            .method("PUT")
+            .uri("/victim-bucket/huge.bin")
+            .body(StreamBody::new(frames))
+            .expect("build unauthorized streaming PUT");
+
+        let resp = dispatch_dav(req, handler.clone(), TEST_IP, 5 * 1024 * 1024 * 1024, Duration::from_secs(30)).await;
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        assert_eq!(
+            frames_read.load(Ordering::Relaxed),
+            0,
+            "body of an unauthorized PUT must not be read or buffered"
+        );
+        assert_eq!(resp.headers().get(CONNECTION), Some(&HeaderValue::from_static("close")));
+        assert!(
+            sentinel_weak.upgrade().is_none(),
+            "request body must be dropped immediately without an untracked background drain task"
+        );
+        assert!(backend.put_object_calls().is_empty());
+
+        // A stalled body on an unauthorized PUT must also fail immediately with
+        // 403 rather than blocking on body collection until request timeout.
+        let stalled_req = Request::builder()
+            .method("PUT")
+            .uri("/victim-bucket/stalled.bin")
+            .body(StalledBody)
+            .expect("build unauthorized stalled PUT");
+        let stalled_resp = timeout(
+            Duration::from_secs(5),
+            dispatch_dav(stalled_req, handler, TEST_IP, 5 * 1024 * 1024 * 1024, Duration::from_secs(30)),
+        )
+        .await
+        .expect("unauthorized stalled PUT must not wait for body frames");
+        assert_eq!(stalled_resp.status(), StatusCode::FORBIDDEN);
+        assert_eq!(stalled_resp.headers().get(CONNECTION), Some(&HeaderValue::from_static("close")));
+    }
+
+    /// Non-upload methods such as PROPFIND must stop at dav-server's 64 KiB
+    /// cap instead of buffering gigabytes up to `max_body_size`.
+    #[tokio::test]
+    async fn oversized_propfind_stops_at_dav_server_cap_without_buffering_full_body() {
+        use futures_util::StreamExt;
+
+        let bytes_read = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&bytes_read);
+        let sentinel = Arc::new(());
+        let sentinel_weak = Arc::downgrade(&sentinel);
+        let chunk = Bytes::from(vec![b'X'; 16 * 1024]);
+        let frames = stream::iter((0..256).map(move |_| {
+            let _keep_alive = Arc::clone(&sentinel);
+            Ok::<_, io::Error>(Frame::data(chunk.clone()))
+        }))
+        .inspect(move |frame| {
+            if let Ok(frame) = frame
+                && let Some(data) = frame.data_ref()
+            {
+                counter.fetch_add(data.len(), Ordering::Relaxed);
+            }
+        });
+        let req = Request::builder()
+            .method("PROPFIND")
+            .uri("/")
+            .body(StreamBody::new(frames))
+            .expect("build oversized PROPFIND");
+
+        let resp = dispatch_dav(req, memfs_handler(), TEST_IP, 64 * 1024 * 1024, Duration::from_secs(30)).await;
+        assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        assert_eq!(resp.headers().get(CONNECTION), Some(&HeaderValue::from_static("close")));
+        assert!(
+            bytes_read.load(Ordering::Relaxed) <= 128 * 1024,
+            "PROPFIND read {} bytes instead of stopping at dav-server's 64 KiB cap",
+            bytes_read.load(Ordering::Relaxed)
+        );
+        assert!(sentinel_weak.upgrade().is_none(), "oversized PROPFIND body must be dropped immediately");
+    }
+
+    /// An early rejection on a request with no unread body bytes (e.g. empty PUT)
+    /// must not force Connection: close.
+    #[tokio::test]
+    async fn empty_body_early_rejection_preserves_keep_alive() {
+        let backend = crate::common::dummy_storage::DummyBackend::new().deny_authorization();
+        let driver = WebDavDriver::new(
+            backend,
+            Arc::new(crate::common::session::test_session(crate::common::session::Protocol::WebDav)),
+        );
+        let handler = DavHandler::builder()
+            .filesystem(Box::new(driver))
+            .locksystem(FakeLs::new())
+            .build_handler();
+
+        let req = Request::builder()
+            .method("PUT")
+            .uri("/victim-bucket/empty.bin")
+            .body(Full::new(Bytes::new()))
+            .expect("build empty unauthorized PUT");
+
+        let resp = dispatch_dav(req, handler, TEST_IP, 1024, Duration::from_secs(30)).await;
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        assert!(
+            resp.headers().get(CONNECTION).is_none(),
+            "bodyless 403 should keep HTTP/1.1 keep-alive intact"
+        );
+    }
+
+    /// A mid-body transport failure must map to 400 Bad Request (not 502) with
+    /// Connection: close and without persisting a partial object.
+    #[tokio::test]
+    async fn body_transport_error_maps_to_400_with_connection_close() {
+        let backend = crate::common::dummy_storage::DummyBackend::new();
+        let driver = WebDavDriver::new(
+            backend.clone(),
+            Arc::new(crate::common::session::test_session(crate::common::session::Protocol::WebDav)),
+        );
+        let handler = DavHandler::builder()
+            .filesystem(Box::new(driver))
+            .locksystem(FakeLs::new())
+            .build_handler();
+
+        let frames = stream::iter(vec![
+            Ok(Frame::data(Bytes::from_static(b"partial"))),
+            Err(io::Error::new(io::ErrorKind::ConnectionReset, "peer reset")),
+        ]);
+        let req = Request::builder()
+            .method("PUT")
+            .uri("/bucket/broken.bin")
+            .body(StreamBody::new(frames))
+            .expect("build broken PUT");
+
+        let resp = crate::common::gateway::with_test_auth_override(
+            |_, _, _| true,
+            dispatch_dav(req, handler, TEST_IP, 1024, Duration::from_secs(30)),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(resp.headers().get(CONNECTION), Some(&HeaderValue::from_static("close")));
+        assert!(backend.put_object_calls().is_empty());
     }
 
     #[tokio::test]
