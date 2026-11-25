@@ -932,7 +932,11 @@ impl DistributedLock {
         // keeps retrying in the background instead of parking the request
         // on the deferred unlock schedule.
         if !orphaned_entries.is_empty() {
-            Self::release_entries_bounded(orphaned_entries, "distributed_lock_batch_quorum_rollback").await;
+            // The caller waits for the first pass. If it disconnects during an
+            // unlock, the task still owns every minority vote until cleanup finishes.
+            let rollback =
+                tokio::spawn(Self::release_entries_bounded(orphaned_entries, "distributed_lock_batch_quorum_rollback"));
+            let _ = rollback.await;
         }
         results
     }
@@ -4235,6 +4239,7 @@ mod tests {
         grants: Vec<String>,
         releases: Arc<Mutex<Vec<String>>>,
         gate: Option<Arc<tokio::sync::Semaphore>>,
+        cleanup_gate: Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Semaphore>)>,
         grants_returned: Arc<std::sync::atomic::AtomicUsize>,
     }
 
@@ -4253,6 +4258,7 @@ mod tests {
                 grants: grants.iter().map(|object| (*object).to_string()).collect(),
                 releases: Arc::clone(&releases),
                 gate,
+                cleanup_gate: None,
                 grants_returned,
             }) as Arc<dyn LockClient>;
             (client, releases)
@@ -4287,6 +4293,10 @@ mod tests {
         }
 
         async fn release(&self, lock_id: &LockId) -> crate::Result<bool> {
+            if let Some((entered, resume)) = &self.cleanup_gate {
+                entered.notify_one();
+                drop(resume.acquire().await.expect("rollback gate stays open"));
+            }
             self.releases
                 .lock()
                 .expect("release log")
@@ -4321,6 +4331,45 @@ mod tests {
         async fn is_local(&self) -> bool {
             false
         }
+    }
+
+    #[tokio::test]
+    async fn cancelling_a_batch_during_quorum_rollback_still_returns_the_partial_vote() {
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let resume = Arc::new(tokio::sync::Semaphore::new(0));
+        let releases = Arc::new(Mutex::new(Vec::new()));
+        let voter = Arc::new(ScriptedBatchClient {
+            grants: vec!["lost".to_string()],
+            releases: Arc::clone(&releases),
+            gate: None,
+            grants_returned: Arc::default(),
+            cleanup_gate: Some((Arc::clone(&entered), Arc::clone(&resume))),
+        }) as Arc<dyn LockClient>;
+        let (denied, _) = ScriptedBatchClient::build(&[]);
+        let lock = DistributedLock::new("batch-rollback-cancel".into(), vec![voter, denied], 2);
+        let task = tokio::spawn(async move {
+            lock.acquire_guard_batch(
+                &[ObjectKey::new("bucket", "lost")],
+                "owner",
+                Duration::from_secs(5),
+                Duration::from_secs(30),
+            )
+            .await
+        });
+        tokio::time::timeout(Duration::from_secs(2), entered.notified())
+            .await
+            .expect("the partial vote must reach rollback");
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        resume.add_permits(1);
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while releases.lock().unwrap().is_empty() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("cancelling the caller must not abandon the only owner of a partial vote");
+        assert_eq!(*releases.lock().unwrap(), ["lost"]);
     }
 
     #[tokio::test]
