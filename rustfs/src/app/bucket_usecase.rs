@@ -1273,22 +1273,25 @@ fn build_list_objects_v2_metadata_output(
     }
 }
 
-/// Answer a `CreateBucket` for a bucket that already exists.
-///
-/// A deployment owns one bucket namespace, so every requester that passed
-/// authorization belongs to the same owner as the bucket's creator; there is no
-/// second account that could trigger `BucketAlreadyExists`. That leaves the AWS
-/// account-owner semantics: the default region returns the legacy idempotent
-/// `200 OK`, any other region returns `BucketAlreadyOwnedByYou`.
-fn create_bucket_exists_response(region: &str) -> S3Result<S3Response<CreateBucketOutput>> {
-    if region == RUSTFS_REGION {
-        return Ok(S3Response::new(CreateBucketOutput::default()));
+fn create_bucket_response(
+    region: &str,
+    bucket: &str,
+    path: &str,
+    already_exists: bool,
+) -> S3Result<S3Response<CreateBucketOutput>> {
+    // A deployment has one bucket owner. Only the default region treats a repeated create as idempotent.
+    if already_exists && region != RUSTFS_REGION {
+        return Err(S3Error::with_message(
+            S3ErrorCode::BucketAlreadyOwnedByYou,
+            "The requested bucket already exists.",
+        ));
     }
-
-    Err(S3Error::with_message(
-        S3ErrorCode::BucketAlreadyOwnedByYou,
-        "The requested bucket already exists.",
-    ))
+    // On a bucket-level request the virtual-hosted form has an empty path after the leading slash.
+    let location = (region == RUSTFS_REGION && !path.trim_matches('/').is_empty()).then(|| format!("/{bucket}"));
+    Ok(S3Response::new(CreateBucketOutput {
+        location,
+        ..Default::default()
+    }))
 }
 
 fn resolve_notification_region(global_region: Option<Region>, request_region: Option<Region>) -> String {
@@ -1489,12 +1492,9 @@ impl DefaultBucketUsecase {
         current_object_store_handle_for_context(self.context.as_deref())
     }
 
-    fn create_bucket_exists_result(&self) -> S3Result<S3Response<CreateBucketOutput>> {
-        let region = self
-            .global_region()
-            .map(|region| region.to_string())
-            .unwrap_or_else(|| RUSTFS_REGION.to_string());
-        create_bucket_exists_response(&region)
+    fn create_bucket_result(&self, bucket: &str, path: &str, already_exists: bool) -> S3Result<S3Response<CreateBucketOutput>> {
+        let region = self.global_region();
+        create_bucket_response(region.as_ref().map_or(RUSTFS_REGION, Region::as_str), bucket, path, already_exists)
     }
 
     #[instrument(
@@ -1532,7 +1532,7 @@ impl DefaultBucketUsecase {
                 .is_ok()
         {
             let helper = OperationHelper::new(&req, EventName::BucketCreated, S3Operation::CreateBucket);
-            let result = self.create_bucket_exists_result();
+            let result = self.create_bucket_result(&req.input.bucket, req.uri.path(), true);
             let _ = helper.complete(&result);
             return result;
         }
@@ -1612,16 +1612,15 @@ impl DefaultBucketUsecase {
                 .await;
             }
             Err(StorageError::BucketExists(_)) => {
-                let result = self.create_bucket_exists_result();
+                let result = self.create_bucket_result(&bucket, req.uri.path(), true);
                 let _ = helper.complete(&result);
                 return result;
             }
             Err(e) => return Err(ApiError::from(e).into()),
         }
 
-        let output = CreateBucketOutput::default();
         counter!("rustfs_create_bucket_total").increment(1);
-        let result = Ok(S3Response::new(output));
+        let result = self.create_bucket_result(&bucket, req.uri.path(), false);
         let _ = helper.complete(&result);
         rustfs_scanner::record_dirty_usage_bucket_from_producer(
             &bucket,
@@ -4500,14 +4499,20 @@ mod tests {
     }
 
     #[test]
-    fn create_bucket_exists_response_returns_ok_in_default_region() {
-        let response = create_bucket_exists_response(RUSTFS_REGION).expect("recreate in us-east-1 should succeed");
-        assert_eq!(response.output.location, None);
-    }
+    fn create_bucket_location_preserves_region_and_addressing_style() {
+        for already_exists in [false, true] {
+            for path in ["/bucket-name", "/bucket-name/"] {
+                let response = create_bucket_response(RUSTFS_REGION, "bucket-name", path, already_exists).unwrap();
+                assert_eq!(response.output.location.as_deref(), Some("/bucket-name"));
+            }
+            let response = create_bucket_response(RUSTFS_REGION, "bucket-name", "/", already_exists).unwrap();
+            assert_eq!(response.output.location, None);
+        }
 
-    #[test]
-    fn create_bucket_exists_response_returns_owned_by_you_outside_default_region() {
-        let err = create_bucket_exists_response("eu-west-1").expect_err("recreate outside us-east-1 should report ownership");
+        let response = create_bucket_response("eu-west-1", "bucket-name", "/bucket-name", false).unwrap();
+        assert_eq!(response.output.location, None);
+        let err = create_bucket_response("eu-west-1", "bucket-name", "/bucket-name", true)
+            .expect_err("recreate outside us-east-1 should report ownership");
         assert_eq!(err.code(), &S3ErrorCode::BucketAlreadyOwnedByYou);
     }
 
@@ -4627,7 +4632,7 @@ mod tests {
             let store = crate::app::gating_test_env::shared_gating_ecstore().await;
             let bucket = format!("create-missing-{}", uuid::Uuid::new_v4().simple());
             let input = CreateBucketInput::builder().bucket(bucket.clone()).build().unwrap();
-            let req = build_request_with_req_info(
+            let mut req = build_request_with_req_info(
                 input,
                 Method::PUT,
                 ReqInfo {
@@ -4635,8 +4640,10 @@ mod tests {
                     ..Default::default()
                 },
             );
+            req.uri = format!("/{bucket}").parse().unwrap();
             let usecase = DefaultBucketUsecase::with_context(Some(context));
-            usecase.execute_create_bucket(req).await.expect("create a missing bucket");
+            let response = usecase.execute_create_bucket(req).await.expect("create a missing bucket");
+            assert_eq!(response.output.location, Some(format!("/{bucket}")));
             let info = store
                 .get_bucket_info(&bucket, &BucketOptions::default())
                 .await

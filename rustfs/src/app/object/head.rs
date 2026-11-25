@@ -306,6 +306,7 @@ impl DefaultObjectUsecase {
             content_disposition: remote.content_disposition,
             content_language: remote.content_language,
             cache_control: remote.cache_control,
+            expires: remote.expires_string,
             accept_ranges: Some(ACCEPT_RANGES_BYTES.to_string()),
             e_tag: remote.e_tag.as_deref().and_then(|v| ETag::from_str(v).ok()),
             last_modified: remote

@@ -1585,8 +1585,14 @@ impl S3 for FS {
             .await
             .map_err(crate::error::ApiError::from)?;
 
-        let accelerate_config = serialize(&req.input.accelerate_configuration)
-            .map_err(|err| S3Error::with_message(S3ErrorCode::MalformedXML, format!("{err}")))?;
+        let config = &req.input.accelerate_configuration;
+        if let Some(status) = &config.status
+            && !matches!(status.as_str(), BucketAccelerateStatus::ENABLED | BucketAccelerateStatus::SUSPENDED)
+        {
+            return Err(s3_error!(MalformedXML, "Invalid bucket acceleration status"));
+        }
+        let accelerate_config =
+            serialize(config).map_err(|err| S3Error::with_message(S3ErrorCode::MalformedXML, format!("{err}")))?;
         update_bucket_metadata_config_if_incarnation(
             &req.input.bucket,
             BUCKET_ACCELERATE_CONFIG,
@@ -1684,8 +1690,12 @@ impl S3 for FS {
             .await
             .map_err(crate::error::ApiError::from)?;
 
-        let payment_config = serialize(&req.input.request_payment_configuration)
-            .map_err(|err| S3Error::with_message(S3ErrorCode::MalformedXML, format!("{err}")))?;
+        let config = &req.input.request_payment_configuration;
+        if !matches!(config.payer.as_str(), Payer::BUCKET_OWNER | Payer::REQUESTER) {
+            return Err(s3_error!(InvalidArgument, "Invalid request payer"));
+        }
+        let payment_config =
+            serialize(config).map_err(|err| S3Error::with_message(S3ErrorCode::MalformedXML, format!("{err}")))?;
         update_bucket_metadata_config_if_incarnation(
             &req.input.bucket,
             BUCKET_REQUEST_PAYMENT_CONFIG,

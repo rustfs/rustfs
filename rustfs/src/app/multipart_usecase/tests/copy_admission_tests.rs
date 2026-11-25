@@ -74,6 +74,12 @@ fn upload_part_copy_shares_foreground_admission_with_upload_part() {
                         .any(|label| label.key() == "size_bucket" && label.value() == source_size_bucket)
             })
         };
+        let mut guarded = input.clone();
+        guarded.copy_source_if_unmodified_since = Some(Timestamp::from(time::OffsetDateTime::UNIX_EPOCH));
+        let error = Box::pin(usecase.execute_upload_part_copy(build_request(guarded, Method::PUT)))
+            .await
+            .expect_err("source date must be evaluated before admitting the write");
+        assert_eq!(error.code(), &S3ErrorCode::PreconditionFailed);
         let error = Box::pin(usecase.execute_upload_part_copy(build_request(input.clone(), Method::PUT)))
             .await
             .expect_err("copy must not bypass the occupied UploadPart pool");

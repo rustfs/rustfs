@@ -562,11 +562,11 @@ mod tests {
             multipart_body
         );
 
-        assert_versioned_content_language_round_trip(&client, bucket).await;
+        assert_versioned_response_headers_round_trip(&client, bucket).await;
         env.stop_server();
     }
 
-    async fn assert_versioned_content_language_round_trip(client: &aws_sdk_s3::Client, bucket: &str) {
+    async fn assert_versioned_response_headers_round_trip(client: &aws_sdk_s3::Client, bucket: &str) {
         let http = reqwest::Client::builder()
             .no_proxy()
             .no_gzip()
@@ -583,7 +583,11 @@ mod tests {
                 original.to_vec()
             };
             let mut versions = Vec::new();
-            for language in [Some("zh-CN"), None, Some("en-US")] {
+            for (language, expires) in [
+                (Some("zh-CN"), Some(1_893_456_000)),
+                (None, Some(1_924_992_000)),
+                (Some("en-US"), None),
+            ] {
                 let put = client
                     .put_object()
                     .bucket(bucket)
@@ -591,18 +595,27 @@ mod tests {
                     .content_type("application/octet-stream")
                     .set_content_encoding(encoding.map(str::to_string))
                     .set_content_language(language.map(str::to_string))
+                    .set_expires(expires.map(DateTime::from_secs))
                     .metadata("content-language", "user-language")
                     .body(ByteStream::from(payload.clone()))
                     .send()
                     .await
                     .expect("Failed to write versioned language fixture");
-                versions.push((put.version_id().expect("PUT must return a version ID").to_string(), language));
+                versions.push((put.version_id().expect("PUT must return a version ID").to_string(), language, expires));
             }
 
             let current_version = &versions.last().expect("Fixture has three versions").0;
-            let reads = std::iter::once((None, Some("en-US")))
-                .chain(versions.iter().map(|(version, language)| (Some(version.as_str()), *language)));
-            for (version, language) in reads {
+            let reads = std::iter::once((None, Some("en-US"), None)).chain(
+                versions
+                    .iter()
+                    .map(|(version, language, expires)| (Some(version.as_str()), *language, *expires)),
+            );
+            for (version, language, expires) in reads {
+                let expected_expires = expires.map(|secs| {
+                    DateTime::from_secs(secs)
+                        .fmt(DateTimeFormat::HttpDate)
+                        .expect("valid HTTP date")
+                });
                 let expected_version = version.unwrap_or(current_version);
                 let head = client
                     .head_object()
@@ -613,6 +626,7 @@ mod tests {
                     .await
                     .expect("HEAD failed for language fixture");
                 assert_eq!(head.content_language(), language);
+                assert_eq!(head.expires_string(), expected_expires.as_deref());
                 assert_eq!(head.version_id(), Some(expected_version));
 
                 for range in [None, Some("bytes=1-7")] {
@@ -626,6 +640,7 @@ mod tests {
                         .set_range(range.map(str::to_string));
                     let get = request.clone().send().await.expect("GET failed for language fixture");
                     assert_eq!(get.content_language(), language);
+                    assert_eq!(get.expires_string(), expected_expires.as_deref());
                     assert_eq!(get.content_type(), Some("application/octet-stream"));
                     assert_eq!(get.content_encoding(), encoding);
                     assert_eq!(

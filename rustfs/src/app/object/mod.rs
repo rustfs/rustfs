@@ -226,6 +226,8 @@ pub(crate) mod shared;
 mod test_support;
 mod veeam_sosapi;
 
+pub(crate) use self::copy::check_copy_source_preconditions;
+
 #[cfg(test)]
 pub(crate) use self::delete::*;
 pub(crate) use self::extract::*;

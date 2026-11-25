@@ -159,6 +159,17 @@ mod tests {
             "PutBucketAccelerateConfiguration should return success for existing bucket, got: {:?}",
             put_accelerate.err()
         );
+        let invalid = client
+            .put_bucket_accelerate_configuration()
+            .bucket(bucket)
+            .accelerate_configuration(
+                AccelerateConfiguration::builder()
+                    .status(BucketAccelerateStatus::from("Bogus"))
+                    .build(),
+            )
+            .send()
+            .await;
+        assert_s3_error(invalid, 400, "MalformedXML", "unknown acceleration status");
 
         let put_request_payment = client
             .put_bucket_request_payment()
@@ -176,6 +187,18 @@ mod tests {
             "PutBucketRequestPayment should return success for existing bucket, got: {:?}",
             put_request_payment.err()
         );
+        let invalid = client
+            .put_bucket_request_payment()
+            .bucket(bucket)
+            .request_payment_configuration(
+                RequestPaymentConfiguration::builder()
+                    .payer(Payer::from("Nobody"))
+                    .build()
+                    .expect("build request with an unknown payer"),
+            )
+            .send()
+            .await;
+        assert_s3_error(invalid, 400, "InvalidArgument", "unknown request payer");
 
         let accelerate_after_put = client
             .get_bucket_accelerate_configuration()

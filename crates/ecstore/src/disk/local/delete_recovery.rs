@@ -5,6 +5,11 @@ use crate::disk::{
 };
 use sha2::{Digest, Sha256};
 
+pub(super) enum FusedDeleteRequest<'a> {
+    Single(&'a FileInfo),
+    BatchEntry(&'a FileInfo),
+}
+
 pub(super) struct RecoveryOperationScope {
     pub(super) budget: Arc<crate::object_api::DeleteRecoveryWorkBudget>,
     may_publish_receipt: bool,
@@ -2465,8 +2470,16 @@ impl LocalDisk {
         transaction: Uuid,
         owner: Option<Arc<dyn Send + Sync>>,
     ) -> Result<Option<()>> {
-        self.try_fused_recoverable_delete_version_with_paths(volume, object, fi, opts, transaction, owner, None)
-            .await
+        self.try_fused_recoverable_delete_version_with_paths(
+            volume,
+            object,
+            FusedDeleteRequest::Single(fi),
+            opts,
+            transaction,
+            owner,
+            None,
+        )
+        .await
     }
 
     #[expect(clippy::too_many_arguments)]
@@ -2474,7 +2487,7 @@ impl LocalDisk {
         &self,
         volume: &str,
         object: &str,
-        fi: &FileInfo,
+        request: FusedDeleteRequest<'_>,
         opts: &DeleteOptions,
         transaction: Uuid,
         owner: Option<Arc<dyn Send + Sync>>,
@@ -2510,7 +2523,10 @@ impl LocalDisk {
         let sync = effective_durability(volume).syncs_commit_metadata();
         let incarnation = opts.delete_recovery_bucket_incarnation;
         let lease = os::acquire_namespace_mutation_lease_with_owner(&destination, owner).await;
-        let fi_clone = fi.clone();
+        let (fi_clone, batch_entry) = match request {
+            FusedDeleteRequest::Single(fi) => (fi.clone(), false),
+            FusedDeleteRequest::BatchEntry(fi) => (fi.clone(), true),
+        };
         let volume_str = volume.to_owned();
         let object_str = object.to_owned();
 
@@ -2538,12 +2554,21 @@ impl LocalDisk {
                             .iter()
                             .map(|v| generation(v.into_fileinfo(&volume_str, &object_str, true)?))
                             .collect::<Result<_>>()?;
-                        let old_dir = meta.delete_version(&fi_clone)?;
+                        // Batch deletion ignores an already absent version and performs
+                        // its own inline-data cleanup before deriving the journal target.
+                        let old_dir = if batch_entry {
+                            meta.delete_versions(std::slice::from_ref(&fi_clone))?.pop().flatten()
+                        } else {
+                            let old_dir = meta.delete_version(&fi_clone)?;
+                            if let Some(uuid) = old_dir {
+                                meta.data.remove(vec![fi_clone.version_id.unwrap_or_default(), uuid])?;
+                            }
+                            old_dir
+                        };
                         if old_dir.is_some_and(|dir| dir == transaction || dir.is_nil()) {
                             return Err(DiskError::FileCorrupt);
                         }
                         if let Some(uuid) = old_dir {
-                            meta.data.remove(vec![fi_clone.version_id.unwrap_or_default(), uuid])?;
                             let old_path = path_join(&[file_path.as_path(), Path::new(uuid.to_string().as_str())]);
                             check_path_length(old_path.to_string_lossy().as_ref())?;
                             if old_path.join(STORAGE_FORMAT_FILE).exists() {
@@ -7221,6 +7246,50 @@ mod tests {
                 .expect("outside remains intact"),
             b"outside bytes"
         );
+    }
+
+    #[tokio::test]
+    async fn delete_recovery_bulk_single_version_prepares_cached_receipt_and_keeps_missing_version_idempotent() {
+        for missing_version in [false, true] {
+            let (_temp, disk, mut info, original) = fixture().await;
+            let transaction = Uuid::new_v4();
+            if missing_version {
+                info.version_id = Some(Uuid::new_v4());
+            }
+            let errors = disk
+                .delete_versions_recoverable(
+                    "recovery",
+                    vec![FileInfoVersions {
+                        name: "object".into(),
+                        volume: "recovery".into(),
+                        versions: vec![info],
+                        ..Default::default()
+                    }],
+                    DeleteOptions {
+                        old_data_dir: Some(transaction),
+                        ..Default::default()
+                    },
+                )
+                .await;
+            assert_eq!(errors, vec![None]);
+            let root = disk.io_get_object_path("recovery", "object").expect("object root");
+            let transaction_dir = root.join(transaction.to_string());
+            let prepared = take_prepared_delete_receipt(&transaction_dir).expect("singleton batch should use fused preparation");
+            assert_eq!(prepared.journal.original_digest, Some(digest(&original)));
+            assert_eq!(prepared.journal.target_digest.is_some(), missing_version);
+            let state = disk
+                .inspect_delete_transaction("recovery", "object", transaction)
+                .await
+                .expect("inspect durable preparation without cached receipt");
+            disk.settle_delete_transaction("recovery", "object", transaction, state.fingerprint, DeleteRecoveryAction::Rollback)
+                .await
+                .expect("recover from journal");
+            let bytes = disk
+                .read_all("recovery", "object/xl.meta")
+                .await
+                .expect("rolled back metadata");
+            assert_eq!(bytes.as_ref(), original);
+        }
     }
 
     #[tokio::test]

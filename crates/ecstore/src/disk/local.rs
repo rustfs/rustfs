@@ -9345,7 +9345,7 @@ impl LocalDisk {
                 .try_fused_recoverable_delete_version_with_paths(
                     volume,
                     path,
-                    &fi,
+                    delete_recovery::FusedDeleteRequest::Single(&fi),
                     &opts,
                     rollback_dir,
                     namespace_owner.clone(),
@@ -10966,6 +10966,24 @@ impl LocalDisk {
                 namespace_owner.clone(),
             )
             .await;
+        }
+
+        if let [fi] = fis
+            && expected_current.is_none()
+            && let Some(transaction) = opts.old_data_dir
+            && let Some(()) = self
+                .try_fused_recoverable_delete_version_with_paths(
+                    volume,
+                    path,
+                    delete_recovery::FusedDeleteRequest::BatchEntry(fi),
+                    opts,
+                    transaction,
+                    namespace_owner.clone(),
+                    Some((object_path, volume_dir.clone(), object_dir.to_path_buf())),
+                )
+                .await?
+        {
+            return Ok(());
         }
 
         let (data, _) = match self

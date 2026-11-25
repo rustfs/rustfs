@@ -18,6 +18,7 @@ use super::*;
 use crate::app::storage_api::object_usecase::object_utils::to_s3s_xml_etag;
 use futures::FutureExt;
 use rustfs_utils::path::fold_object_name_path_separators;
+use s3s::dto::ETagCondition;
 use tracing::Instrument;
 
 use crate::auth::{VerifiedPresignedRequest, reject_presigned_put_max_content_length_for_other_operation};
@@ -110,6 +111,41 @@ fn copy_namespace_lock_object(key: &str, backslash_is_separator: bool) -> String
     fold_object_name_path_separators(&encode_dir_object(key), backslash_is_separator).into_owned()
 }
 
+pub(crate) fn check_copy_source_preconditions(
+    source: &ObjectInfo,
+    if_match: Option<ETagCondition>,
+    if_unmodified_since: Option<Timestamp>,
+    if_none_match: Option<ETagCondition>,
+    if_modified_since: Option<Timestamp>,
+) -> S3Result<()> {
+    // The caller has resolved the source version. Each ETag condition takes
+    // precedence over its paired date; HTTP dates have whole-second precision.
+    let etag_matches = |condition: &ETagCondition, compare: fn(&ETag, &ETag) -> bool| match condition {
+        ETagCondition::Any => true,
+        ETagCondition::ETag(expected) => source.etag.as_deref().is_some_and(|raw| compare(&to_s3s_etag(raw), expected)),
+    };
+    let modified = source.mod_time.map(OffsetDateTime::unix_timestamp);
+    if let Some(condition) = if_match {
+        if !etag_matches(&condition, ETag::strong_cmp) {
+            return Err(s3_error!(PreconditionFailed));
+        }
+    } else if let (Some(actual), Some(limit)) = (modified, if_unmodified_since)
+        && actual > OffsetDateTime::from(limit).unix_timestamp()
+    {
+        return Err(s3_error!(PreconditionFailed));
+    }
+    if let Some(condition) = if_none_match {
+        if etag_matches(&condition, ETag::weak_cmp) {
+            return Err(s3_error!(PreconditionFailed));
+        }
+    } else if let (Some(actual), Some(limit)) = (modified, if_modified_since)
+        && actual <= OffsetDateTime::from(limit).unix_timestamp()
+    {
+        return Err(s3_error!(PreconditionFailed));
+    }
+    Ok(())
+}
+
 async fn acquire_self_copy_namespace_lock<S>(
     store: &S,
     bucket: &str,
@@ -173,7 +209,9 @@ impl DefaultObjectUsecase {
             tagging,
             tagging_directive,
             copy_source_if_match,
+            copy_source_if_unmodified_since,
             copy_source_if_none_match,
+            copy_source_if_modified_since,
             cache_control,
             content_disposition,
             content_encoding,
@@ -502,6 +540,14 @@ impl DefaultObjectUsecase {
         // happens here.
         authorize_sse_kms_object_read(copy_principal.as_ref(), &src_info.user_defined).await?;
 
+        check_copy_source_preconditions(
+            &src_info,
+            copy_source_if_match,
+            copy_source_if_unmodified_since,
+            copy_source_if_none_match,
+            copy_source_if_modified_since,
+        )?;
+
         // Capture the version actually read from the source before src_info is mutated/consumed
         // below. This is the exact source version copied (issue #4976): the response must echo it
         // via x-amz-copy-source-version-id, distinct from the destination version_id.
@@ -517,30 +563,6 @@ impl DefaultObjectUsecase {
                 .into_iter()
                 .find_map(|(k, v)| rustfs_rio::Checksum::new_from_string(&k, &v))
         });
-
-        // Validate copy source conditions
-        if let Some(if_match) = copy_source_if_match {
-            if let Some(ref etag) = src_info.etag {
-                if let Some(strong_etag) = if_match.into_etag() {
-                    if ETag::Strong(etag.clone()) != strong_etag {
-                        return Err(s3_error!(PreconditionFailed));
-                    }
-                } else {
-                    // Weak ETag or Any (*) in If-Match should fail per RFC 9110
-                    return Err(s3_error!(PreconditionFailed));
-                }
-            } else {
-                return Err(s3_error!(PreconditionFailed));
-            }
-        }
-
-        if let Some(if_none_match) = copy_source_if_none_match
-            && let Some(ref etag) = src_info.etag
-            && let Some(strong_etag) = if_none_match.into_etag()
-            && ETag::Strong(etag.clone()) == strong_etag
-        {
-            return Err(s3_error!(PreconditionFailed));
-        }
 
         // A same-name copy is normally serviced as a metadata-only update: the store layer
         // rewrites xl.meta in place and leaves the data blocks alone. That shortcut is only sound
@@ -941,6 +963,47 @@ mod tests {
     use tokio::io::AsyncReadExt;
 
     #[test]
+    fn copy_source_preconditions_use_http_seconds_and_paired_etag_precedence() {
+        let source = ObjectInfo {
+            etag: Some("\"source\"".to_owned()),
+            mod_time: Some(
+                OffsetDateTime::UNIX_EPOCH
+                    .replace_nanosecond(750_000_000)
+                    .expect("valid nanoseconds"),
+            ),
+            ..Default::default()
+        };
+        let date = |second| Timestamp::from(OffsetDateTime::from_unix_timestamp(second).expect("valid test timestamp"));
+        let etag = |value: &str| value.parse::<ETagCondition>().expect("valid test ETag");
+        for (if_match, unmodified, if_none_match, modified, allowed) in [
+            (None, Some(-1), None, None, false),
+            (None, Some(0), None, Some(-1), true),
+            (None, None, None, Some(0), false),
+            (Some("\"source\""), Some(-1), None, None, true),
+            (Some("\"other\""), Some(1), None, None, false),
+            (Some("W/\"source\""), None, None, None, false),
+            (None, None, Some("W/\"source\""), Some(-1), false),
+            (None, None, Some("\"other\""), Some(1), true),
+            (Some("*"), None, None, Some(1), false),
+            (Some("*"), None, None, None, true),
+            (None, None, Some("*"), None, false),
+        ] {
+            let result = check_copy_source_preconditions(
+                &source,
+                if_match.map(etag),
+                unmodified.map(date),
+                if_none_match.map(etag),
+                modified.map(date),
+            );
+            assert_eq!(
+                result.err().as_ref().map(S3Error::code),
+                (!allowed).then_some(&S3ErrorCode::PreconditionFailed),
+                "{if_match:?}, {unmodified:?}, {if_none_match:?}, {modified:?}",
+            );
+        }
+    }
+
+    #[test]
     fn copy_namespace_lock_object_folds_backslash_spellings_only_as_separators() {
         // `a\b\` is not a same-object copy of `a/b` by `path_join_buf` (the
         // trailing separator survives), yet on Windows both are the xl.meta
@@ -1321,16 +1384,29 @@ mod tests {
         let source_version_id = old.version_id.expect("historical source should have a version id");
         let current_version_id = current.version_id.expect("current destination should have a version id");
 
-        let input = CopyObjectInput::builder()
+        let mut input = CopyObjectInput::builder()
             .copy_source(CopySource::Bucket {
                 bucket: bucket.clone().into(),
                 key: object.to_string().into(),
                 version_id: Some(source_version_id.to_string().into()),
             })
+            .copy_source_if_unmodified_since(Some(Timestamp::from(OffsetDateTime::UNIX_EPOCH)))
             .bucket(bucket.clone())
             .key(object.to_string())
             .build()
             .expect("expected-current historical copy input should build");
+        let usecase = DefaultObjectUsecase::with_context(Some(context));
+        let error = usecase
+            .execute_copy_object(build_request(input.clone(), Method::PUT))
+            .await
+            .expect_err("a stale source date must reject the copy");
+        assert_eq!(error.code(), &S3ErrorCode::PreconditionFailed);
+        let after = store
+            .get_object_info(&bucket, object, &ObjectOptions::default())
+            .await
+            .expect("current version");
+        assert_eq!(after.version_id, Some(current_version_id), "rejected copy must not create a version");
+        input.copy_source_if_match = Some(ETagCondition::ETag(to_s3s_etag(old.etag.as_deref().expect("source ETag"))));
         let mut req = build_request(input, Method::PUT);
         req.headers.insert(
             RUSTFS_EXPECTED_CURRENT_VERSION_ID,
@@ -1338,10 +1414,7 @@ mod tests {
         );
         let response = temp_env::async_with_vars(
             [(rustfs_config::ENV_OBJECT_LOCK_OPTIMIZATION_ENABLE, Some("false"))],
-            tokio::time::timeout(
-                Duration::from_secs(10),
-                DefaultObjectUsecase::with_context(Some(context)).execute_copy_object(req),
-            ),
+            tokio::time::timeout(Duration::from_secs(10), usecase.execute_copy_object(req)),
         )
         .await
         .expect("nonbuffered source reader must not deadlock behind the self-copy write lock")

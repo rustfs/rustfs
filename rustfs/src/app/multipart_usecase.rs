@@ -74,8 +74,9 @@ use super::storage_api::multipart_usecase::{
 };
 use super::trailer_adapter::trailer_source;
 use crate::app::object::{
-    ConcurrencyManager, ForegroundWriteAdmission, get_concurrency_manager, put_object_body_read_timeout,
-    reject_non_wildcard_write_if_none_match, reject_oversize_single_upload, reject_veeam_sosapi_mutation,
+    ConcurrencyManager, ForegroundWriteAdmission, check_copy_source_preconditions, get_concurrency_manager,
+    put_object_body_read_timeout, reject_non_wildcard_write_if_none_match, reject_oversize_single_upload,
+    reject_veeam_sosapi_mutation,
 };
 use crate::app::object_data_cache::{
     ObjectDataCacheAdapter, invalidate_object_data_cache_after_complete_multipart_success,
@@ -1749,7 +1750,9 @@ impl DefaultMultipartUsecase {
             part_number,
             upload_id,
             copy_source_if_match,
+            copy_source_if_unmodified_since,
             copy_source_if_none_match,
+            copy_source_if_modified_since,
             sse_customer_algorithm,
             sse_customer_key,
             sse_customer_key_md5,
@@ -1892,27 +1895,13 @@ impl DefaultMultipartUsecase {
 
         let resolved_src_version_id = format_copy_source_version_id(src_info.version_id, src_versioned, src_version_suspended);
 
-        if let Some(if_match) = copy_source_if_match {
-            if let Some(ref etag) = src_info.etag {
-                if let Some(strong_etag) = if_match.into_etag() {
-                    if ETag::Strong(etag.clone()) != strong_etag {
-                        return Err(s3_error!(PreconditionFailed));
-                    }
-                } else {
-                    return Err(s3_error!(PreconditionFailed));
-                }
-            } else {
-                return Err(s3_error!(PreconditionFailed));
-            }
-        }
-
-        if let Some(if_none_match) = copy_source_if_none_match
-            && let Some(ref etag) = src_info.etag
-            && let Some(strong_etag) = if_none_match.into_etag()
-            && ETag::Strong(etag.clone()) == strong_etag
-        {
-            return Err(s3_error!(PreconditionFailed));
-        }
+        check_copy_source_preconditions(
+            src_info,
+            copy_source_if_match,
+            copy_source_if_unmodified_since,
+            copy_source_if_none_match,
+            copy_source_if_modified_since,
+        )?;
 
         let source_actual_size = src_info.get_actual_size().ok().filter(|size| *size >= 0);
         let source_logical_size = match source_actual_size {
