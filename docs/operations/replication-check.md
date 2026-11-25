@@ -32,7 +32,7 @@ The route returns HTTP 200 with JSON after all configured targets have been chec
       "Arn": "arn:minio:replication::target",
       "Bucket": "replica",
       "Status": "FAILED",
-      "Error": "probe cleanup failed: target delete object version check failed: AccessDenied",
+      "Error": "probe cleanup failed: delete probe object version: HTTP 403 AccessDenied",
       "Phases": {
         "Bucket": { "Status": "OK" },
         "Versioning": { "Status": "OK" },
@@ -43,7 +43,7 @@ The route returns HTTP 200 with JSON after all configured targets have been chec
         "VersionDelete": { "Status": "OK" },
         "Cleanup": {
           "Status": "FAILED",
-          "Error": "target delete object version check failed: AccessDenied"
+          "Error": "delete probe object version: HTTP 403 AccessDenied"
         }
       }
     }
@@ -55,8 +55,15 @@ The route returns HTTP 200 with JSON after all configured targets have been chec
 | --- | --- |
 | `Phases.*.Status` | `OK`, `FAILED`, or `SKIPPED`. |
 | `Error` | Single line, bounded to `REPLICATION_CHECK_ERROR_MAX_BYTES` (512 bytes); omits remote messages, endpoints, credentials, signatures, and authorization material. |
-| `Cleanup` | A cleanup failure is always explicit; it is never reported as a successful check. |
+| `ActiveMutation` | Always `true` for this check, including when cleanup succeeds. The probe writes to the target. |
+| `Cleanup` | Reports whether the probe could account for its writes and verify that its exact key has no remaining versions or delete markers. |
 | `Code` | Appears only on failures callers are expected to branch on (currently `BucketRemoteTargetVersionMismatch`). Go decoders ignore the unknown key. |
+
+## Cleanup phase
+
+If a version DELETE loses its response, the target may already have removed that version. Cleanup lists versions and delete markers for the exact probe key. It can retry a version still present once and verifies the result with a fresh listing. A definitive rejection such as HTTP 403, a listing that cannot be completed, or a remaining artifact makes cleanup fail.
+
+When investigating a failure, capture the target's DELETE responses and list both versions and delete markers before an external test or operator removes the test bucket. Keep the request times and target request IDs so they can be matched to the target service log.
 
 ## VersionFidelity phase
 
