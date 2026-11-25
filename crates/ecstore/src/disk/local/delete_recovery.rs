@@ -3095,7 +3095,6 @@ impl LocalDisk {
         }
 
         let data_dirs = journal.data_dirs.clone();
-        let has_target = journal.target_digest.is_some();
         let journal_for_receipt = cached_journal_raw.is_none().then(|| journal.clone());
         let lease = os::acquire_namespace_mutation_lease_with_owner(&receipt_path, owner).await;
         let prune_paths: Vec<_> = rollback
@@ -3105,31 +3104,6 @@ impl LocalDisk {
             .collect();
 
         let res = os::run_blocking_namespace_operation_with_sync(lease, sync, move || -> std::io::Result<()> {
-            let persist_receipt = |finished: bool| -> std::io::Result<()> {
-                let receipt_bytes = match &cached_journal_raw {
-                    Some(raw) => format_commit_receipt_bytes(raw, finished),
-                    None => {
-                        let receipt = CommitReceipt {
-                            journal: journal_for_receipt
-                                .clone()
-                                .ok_or_else(|| std::io::Error::other("missing journal for receipt"))?,
-                            finished,
-                        };
-                        serde_json::to_vec(&receipt).map_err(std::io::Error::other)?
-                    }
-                };
-                std::fs::create_dir_all(&staging_root)?;
-                let mut staged_receipt = tempfile::NamedTempFile::new_in(&staging_root)?;
-                std::io::Write::write_all(staged_receipt.as_file_mut(), &receipt_bytes)?;
-                if sync && !receipt_bytes.is_empty() {
-                    staged_receipt.as_file().sync_data()?;
-                }
-                std::fs::rename(staged_receipt.path(), &receipt_path)?;
-                if sync {
-                    let _ = os::fsync_dir_std(&rollback);
-                }
-                Ok(())
-            };
             let committed = format!("{DELETE_DATA_DIR_MARKER_PREFIX}{transaction}");
             let recovery_committed = format!("{RECOVERY_DELETE_DATA_DIR_MARKER_PREFIX}{transaction}");
             let reserved = format!("{RESERVED_DELETE_DATA_DIR_MARKER_PREFIX}{transaction}");
@@ -3183,39 +3157,44 @@ impl LocalDisk {
             if had_physical_data_dirs && sync && root.is_dir() {
                 os::fsync_dir_std(&root)?;
             }
-            for name in [STORAGE_FORMAT_FILE_BACKUP, DELETE_MARKER_ROLLBACK_FILE] {
-                if let Err(err) = ignore_not_found(std::fs::remove_file(rollback.join(name))) {
-                    if has_target || had_physical_data_dirs {
-                        let _ = persist_receipt(true);
-                    }
-                    return Err(err);
+            // Once a proof file is removed, a later heal can restore byte-identical
+            // original metadata. Recovery must already know that this delete finished.
+            let receipt_bytes = match cached_journal_raw {
+                Some(raw) => format_commit_receipt_bytes(&raw, true),
+                None => {
+                    let receipt = CommitReceipt {
+                        journal: journal_for_receipt.ok_or_else(|| std::io::Error::other("missing journal for receipt"))?,
+                        finished: true,
+                    };
+                    serde_json::to_vec(&receipt).map_err(std::io::Error::other)?
                 }
+            };
+            std::fs::create_dir_all(&staging_root)?;
+            let mut staged_receipt = tempfile::NamedTempFile::new_in(&staging_root)?;
+            std::io::Write::write_all(staged_receipt.as_file_mut(), &receipt_bytes)?;
+            if sync {
+                staged_receipt.as_file().sync_data()?;
+            }
+            std::fs::rename(staged_receipt.path(), &receipt_path)?;
+            drop(staged_receipt);
+            if sync {
+                os::fsync_dir_std(&rollback)?;
+            }
+            for name in [STORAGE_FORMAT_FILE_BACKUP, DELETE_MARKER_ROLLBACK_FILE] {
+                ignore_not_found(std::fs::remove_file(rollback.join(name)))?;
             }
             for name in [PREPARED, TARGET, FINISHED] {
                 let path = rollback.join(name);
                 #[cfg(all(any(test, feature = "test-util"), not(windows)))]
                 os::prepared_publication_test_hooks::run(os::prepared_publication_test_hooks::Stage::Remove, &path);
-                if let Err(err) = ignore_not_found(std::fs::remove_file(path)) {
-                    if has_target || had_physical_data_dirs {
-                        let _ = persist_receipt(true);
-                    }
-                    return Err(err);
-                }
+                ignore_not_found(std::fs::remove_file(path))?;
             }
-            if sync && let Err(err) = os::fsync_dir_std(&rollback) {
-                if has_target || had_physical_data_dirs {
-                    let _ = persist_receipt(true);
-                }
-                return Err(err);
+            if sync {
+                os::fsync_dir_std(&rollback)?;
             }
             #[cfg(all(any(test, feature = "test-util"), not(windows)))]
             os::prepared_publication_test_hooks::run(os::prepared_publication_test_hooks::Stage::Remove, &receipt_path);
-            if let Err(err) = ignore_not_found(std::fs::remove_file(&receipt_path)) {
-                if has_target || had_physical_data_dirs {
-                    let _ = persist_receipt(true);
-                }
-                return Err(err);
-            }
+            ignore_not_found(std::fs::remove_file(&receipt_path))?;
             for dir_path in &prune_paths {
                 #[cfg(all(any(test, feature = "test-util"), not(windows)))]
                 os::prepared_publication_test_hooks::run(os::prepared_publication_test_hooks::Stage::Remove, dir_path);
@@ -7692,6 +7671,97 @@ mod tests {
         assert!(!rollback.exists(), "rollback directory must be pruned");
         assert!(!root.join(data_dir.to_string()).exists(), "physical data_dir must be removed");
         assert!(!root.exists(), "empty object directory must be pruned");
+    }
+
+    #[cfg(not(windows))]
+    #[tokio::test]
+    async fn delete_recovery_local_batch_retirement_keeps_restored_head_after_interruption() {
+        for versioned in [false, true] {
+            let (_temp, disk, info, original) = fixture().await;
+            let root = disk.io_get_object_path("recovery", "object").unwrap();
+            let transaction = Uuid::new_v4();
+            let rollback = root.join(transaction.to_string());
+            let fi = if versioned {
+                FileInfo {
+                    name: "object".to_owned(),
+                    version_id: Some(Uuid::new_v4()),
+                    deleted: true,
+                    mark_deleted: true,
+                    mod_time: info.mod_time.map(|time| time + time::Duration::seconds(1)),
+                    ..Default::default()
+                }
+            } else {
+                request()
+            };
+            let opts = DeleteOptions {
+                old_data_dir: Some(transaction),
+                recoverable_delete: true,
+                ..Default::default()
+            };
+            assert_eq!(
+                disk.try_fused_recoverable_delete_version_with_paths(
+                    "recovery",
+                    "object",
+                    FusedDeleteRequest::BatchEntry(&fi),
+                    &opts,
+                    transaction,
+                    None,
+                    None,
+                )
+                .await
+                .unwrap(),
+                Some(())
+            );
+            let (journal, sole, satisfied) = disk
+                .try_publish_prepared_delete_local("recovery", "object", transaction, None)
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(sole && satisfied);
+            assert_eq!(journal.target_digest.is_some(), versioned);
+
+            os::fsync_dir_recorder::set_failure(&rollback, ErrorKind::Other);
+            assert!(
+                disk.try_finish_and_finalize_prepared_delete_local("recovery", "object", transaction, &journal, None)
+                    .await
+                    .is_err()
+            );
+            assert!(rollback.join(PREPARED).is_file());
+            assert!(rollback.join(STORAGE_FORMAT_FILE_BACKUP).is_file());
+            assert_eq!(rollback.join(TARGET).is_file(), versioned);
+
+            let failed_dir = rollback.clone();
+            let _hook = os::prepared_publication_test_hooks::install_at(
+                os::prepared_publication_test_hooks::Stage::Remove,
+                &rollback.join(FINISHED),
+                move || os::fsync_dir_recorder::set_failure(&failed_dir, ErrorKind::Other),
+            );
+            assert!(
+                disk.try_finish_and_finalize_prepared_delete_local("recovery", "object", transaction, &journal, None)
+                    .await
+                    .is_err()
+            );
+            assert!(!rollback.join(PREPARED).exists());
+            assert!(!rollback.join(TARGET).exists());
+            assert!(rollback.join(DELETE_QUORUM_COMMITTED_FILE).is_file());
+
+            // An independent repair restored the exact pre-delete xl.meta before this retry.
+            fs::write(root.join(STORAGE_FORMAT_FILE), &original).await.unwrap();
+            let mut state = disk
+                .inspect_delete_transaction("recovery", "object", transaction)
+                .await
+                .unwrap();
+            assert_eq!(state.state, DeleteRecoveryState::CommitFinished);
+            for action in [DeleteRecoveryAction::FinishCommit, DeleteRecoveryAction::FinalizeCommit] {
+                state = disk
+                    .delete_recovery_settle("recovery", "object", transaction, state.fingerprint, action, None)
+                    .await
+                    .unwrap();
+                assert_eq!(fs::read(root.join(STORAGE_FORMAT_FILE)).await.unwrap(), original);
+            }
+            assert_eq!(state.state, DeleteRecoveryState::Absent);
+            assert!(!rollback.exists());
+        }
     }
 
     #[cfg(all(any(test, feature = "test-util"), not(windows)))]
