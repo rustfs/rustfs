@@ -1467,6 +1467,100 @@ mod test {
     }
 
     #[tokio::test]
+    async fn test_aws_userid_policy_variable_is_issuer_scoped_for_federated_sessions() -> Result<()> {
+        let resource_policy = Policy::parse_config(
+            br#"{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": ["s3:GetObject"],
+      "Resource": ["arn:aws:s3:::homes/${aws:userid}/*"]
+    }
+  ]
+}"#,
+        )?;
+        let condition_policy = Policy::parse_config(
+            br#"{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": ["s3:ListBucket"],
+      "Resource": ["arn:aws:s3:::homes"],
+      "Condition": {
+        "StringLike": {
+          "s3:prefix": ["${aws:userid}/*"]
+        }
+      }
+    }
+  ]
+}"#,
+        )?;
+        let empty_conditions = HashMap::new();
+
+        // Two federated issuers can emit the same (or wildcard) `sub`; `parent` separates them.
+        for sub in ["1001", "*"] {
+            let mut claims = HashMap::new();
+            claims.insert("sub".to_string(), Value::String(sub.to_string()));
+            claims.insert("parent".to_string(), Value::String("partner-parent".to_string()));
+
+            let get_args = |object| Args {
+                account: "sts-access-key",
+                groups: &None,
+                action: Action::S3Action(crate::policy::action::S3Action::GetObjectAction),
+                bucket: "homes",
+                conditions: &empty_conditions,
+                is_owner: false,
+                object,
+                claims: &claims,
+                deny_only: false,
+            };
+
+            assert!(resource_policy.is_allowed(&get_args("partner-parent/file")).await);
+            assert!(!resource_policy.is_allowed(&get_args("corporate-parent/file")).await);
+            assert!(!resource_policy.is_allowed(&get_args("1001/file")).await);
+
+            for (prefix, expected) in [
+                ("partner-parent/file", true),
+                ("corporate-parent/file", false),
+                ("1001/file", false),
+            ] {
+                let conditions = HashMap::from([("prefix".to_string(), vec![prefix.to_string()])]);
+                let list_args = Args {
+                    account: "sts-access-key",
+                    groups: &None,
+                    action: Action::S3Action(crate::policy::action::S3Action::ListBucketAction),
+                    bucket: "homes",
+                    conditions: &conditions,
+                    is_owner: false,
+                    object: "",
+                    claims: &claims,
+                    deny_only: false,
+                };
+                assert_eq!(condition_policy.is_allowed(&list_args).await, expected, "sub={sub} prefix={prefix}");
+            }
+        }
+
+        // When `parent` is absent, `${aws:userid}` still falls back to `sub`.
+        let sub_only_claims = HashMap::from([("sub".to_string(), Value::String("legacy-sub".to_string()))]);
+        let fallback_args = Args {
+            account: "sts-access-key",
+            groups: &None,
+            action: Action::S3Action(crate::policy::action::S3Action::GetObjectAction),
+            bucket: "homes",
+            conditions: &empty_conditions,
+            is_owner: false,
+            object: "legacy-sub/file",
+            claims: &sub_only_claims,
+            deny_only: false,
+        };
+        assert!(resource_policy.is_allowed(&fallback_args).await);
+
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn test_aws_policy_variables_concatenation() -> Result<()> {
         let data = r#"
 {
