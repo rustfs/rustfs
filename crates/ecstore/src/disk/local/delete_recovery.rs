@@ -2530,6 +2530,7 @@ impl LocalDisk {
         let volume_str = volume.to_owned();
         let object_str = object.to_owned();
 
+        let publication_root = self.publication_root.clone();
         let recovery_scope = recovery_operation_scope();
         let res = os::run_blocking_namespace_operation_with_sync(
             lease,
@@ -2718,9 +2719,18 @@ impl LocalDisk {
                     let _ = std::fs::remove_dir_all(&staged_dir);
                     return Err(err);
                 }
+                // Once published this directory can also hold independent child objects.
+                let discard_staged_proofs = || {
+                    let names: &[&str] = if target.is_some() {
+                        &[STORAGE_FORMAT_FILE_BACKUP, TARGET, PREPARED]
+                    } else {
+                        &[STORAGE_FORMAT_FILE_BACKUP, PREPARED]
+                    };
+                    let _ = os::discard_staged_files(&file_path, &bucket_path, &publication_root, &transaction.to_string(), names);
+                };
                 let old_data_path = old_dir.map(|uuid| file_path.join(uuid.to_string())).filter(|p| p.is_dir());
                 if sync && let Err(err) = os::fsync_dir_std(&file_path) {
-                    let _ = std::fs::remove_dir_all(&destination);
+                    discard_staged_proofs();
                     return Err(err);
                 }
                 #[cfg(all(test, unix))]
@@ -2738,7 +2748,7 @@ impl LocalDisk {
                     })();
                     if let Err(err) = reserve_res {
                         let _ = std::fs::remove_file(&reserved_marker);
-                        let _ = std::fs::remove_dir_all(&destination);
+                        discard_staged_proofs();
                         return Err(err);
                     }
                     reserved_data_path = Some((old_path, reserved_marker));
@@ -2765,7 +2775,7 @@ impl LocalDisk {
                         if let Some((_, reserved_marker)) = &reserved_data_path {
                             let _ = std::fs::remove_file(reserved_marker);
                         }
-                        let _ = std::fs::remove_dir_all(&destination);
+                        discard_staged_proofs();
                         return Err(err);
                     }
                 } else if let Err(err) = std::fs::remove_file(&xl_path)
@@ -2774,7 +2784,7 @@ impl LocalDisk {
                     if let Some((_, reserved_marker)) = &reserved_data_path {
                         let _ = std::fs::remove_file(reserved_marker);
                     }
-                    let _ = std::fs::remove_dir_all(&destination);
+                    discard_staged_proofs();
                     return Err(err);
                 }
                 if sync {
@@ -3706,6 +3716,41 @@ mod tests {
             prepared.is_ok(),
             "one key's metadata lease cannot serialize unrelated transaction preparation"
         );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn delete_recovery_failed_prepare_preserves_independent_child_files() {
+        let (_temp, disk, _original, source) = fixture().await;
+        let root = disk.io_get_object_path("recovery", "object").unwrap();
+        let transaction = Uuid::new_v4();
+        let directory = root.join(transaction.to_string());
+        let child = directory.join("child");
+        let marker = child.join(STORAGE_FORMAT_FILE);
+        let write_marker = marker.clone();
+        let _hook = os::prepared_publication_test_hooks::install_at(
+            os::prepared_publication_test_hooks::Stage::DirFsync,
+            &root,
+            move || {
+                std::fs::create_dir(&child).unwrap();
+                std::fs::write(&write_marker, b"independent child metadata").unwrap();
+            },
+        );
+        os::fsync_dir_recorder::set_failure(&root, ErrorKind::PermissionDenied);
+        let opts = DeleteOptions {
+            recoverable_delete: true,
+            old_data_dir: Some(transaction),
+            ..Default::default()
+        };
+        let action = request();
+        let result = disk
+            .delete_versions_internal("recovery", "object", std::slice::from_ref(&action), &opts, None)
+            .await;
+        assert!(matches!(result, Err(DiskError::FileAccessDenied)), "{result:?}");
+        assert_eq!(std::fs::read(root.join(STORAGE_FORMAT_FILE)).unwrap(), source);
+        assert_eq!(std::fs::read(marker).unwrap(), b"independent child metadata");
+        assert!(!directory.join(STORAGE_FORMAT_FILE_BACKUP).exists());
+        assert!(!directory.join(PREPARED).exists());
     }
 
     #[tokio::test]
