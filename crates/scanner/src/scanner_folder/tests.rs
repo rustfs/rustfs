@@ -617,22 +617,9 @@ async fn checkpoint_ancestor_depth_limit_preserves_suspended_accounting() {
         size: 7,
         ..Default::default()
     };
-    let mut child = DataUsageEntry::default();
     let error = scanner
-        .scan_child_folder(
-            CancellationToken::new(),
-            CachedFolder {
-                name: "bucket/parent/child".to_string(),
-                parent: Some(hash.clone()),
-                object_heal_prob_div: 1,
-            },
-            &mut hash,
-            &mut parent,
-            &mut child,
-            FolderScanMode::Namespace,
-        )
-        .await
-        .expect_err("unsupported depth must stop before recursion");
+        .suspend_checkpoint_parent(&mut hash, &mut parent)
+        .expect_err("unsupported checkpoint depth must preserve the parent");
     assert!(matches!(error, ScannerError::Other(message) if message.contains("depth limit")));
     assert_eq!(hash, hash_path("bucket/parent"));
     assert_eq!((parent.objects, parent.size), (3, 7));
