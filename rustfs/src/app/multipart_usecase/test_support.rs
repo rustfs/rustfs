@@ -15,9 +15,6 @@
 //! Fixtures and test-only imports shared by the multipart use-case tests.
 
 use super::*;
-// Retained while `complete.rs` still imports this legacy XML fixture across parallel Wave 1 branches.
-#[allow(unused_imports)]
-pub(super) use crate::app::storage_api::s3::dto::CompletedMultipartUpload;
 use crate::app::{RequestEnvelope, RequestHead};
 pub(super) use http::Extensions;
 pub(super) use http::Method;

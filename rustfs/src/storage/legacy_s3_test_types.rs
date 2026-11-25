@@ -36,6 +36,5 @@ pub(crate) mod s3 {
     pub(crate) use s3s::dto::PutObjectInput;
     pub(crate) use s3s::dto::StreamingBlob;
     pub(crate) use s3s::stream::upload_stream::UploadStreamError;
-    pub(crate) use s3s::xml;
     pub(crate) use s3s::{S3Error, S3ErrorCode, S3Result};
 }

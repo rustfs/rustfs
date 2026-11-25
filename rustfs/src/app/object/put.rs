@@ -5649,14 +5649,6 @@ impl PollCountingBody {
         }));
         (body, polls)
     }
-
-    pub(crate) fn streaming_blob() -> (StreamingBlob, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
-        let polls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let body = StreamingBlob::new(Self {
-            polls: std::sync::Arc::clone(&polls),
-        });
-        (body, polls)
-    }
 }
 
 #[cfg(test)]
@@ -5668,9 +5660,6 @@ impl Stream for PollCountingBody {
         Poll::Ready(Some(Ok(Bytes::from_static(b"x"))))
     }
 }
-
-#[cfg(test)]
-impl ByteStream for PollCountingBody {}
 
 #[cfg(test)]
 mod oversize_single_upload_tests {
