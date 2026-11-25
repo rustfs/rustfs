@@ -19,6 +19,7 @@ use crate::admin::runtime_sources::current_federated_identity_service;
 use crate::admin::service::federated_identity::DefaultFederatedSessionBinding;
 use crate::admin::service::oidc_config;
 use crate::admin::utils::owned_json_response;
+use crate::auth::constant_time_eq;
 use crate::server::rate_limit::{RateLimitDecision, RateLimitQuota, RateLimiter, ThrottleInfo, apply_throttle_headers};
 use crate::server::{ADMIN_PREFIX, MINIO_ADMIN_PREFIX, console_prefix};
 use http::StatusCode;
@@ -49,6 +50,13 @@ const CONSOLE_OIDC_CALLBACK_SUFFIX: &str = "/auth/oidc-callback/";
 const CONSOLE_LOGIN_SUFFIX: &str = "/auth/login";
 const OIDC_STATE_LB_HINT: &str =
     "check load balancer session affinity for OIDC authorize/callback requests or configure RUSTFS_BROWSER_REDIRECT_URL";
+/// Cookie that binds an in-flight login to the browser that started it. It carries the
+/// `state` issued by the authorize handler and is scoped to the callback URL.
+const OIDC_STATE_COOKIE: &str = "rustfs_oidc_state";
+/// Matches the TTL of the in-flight state store in `rustfs_iam::oidc`.
+const OIDC_STATE_COOKIE_MAX_AGE_SECS: u64 = 300;
+const OIDC_STATE_COOKIE_MISMATCH: &str =
+    "OIDC login was not started by this browser; start the login again and use the same host for authorize and callback";
 /// Per-client-IP rate limit on `/oidc/authorize/{provider_id}` so a single unauthenticated
 /// client cannot roll over the 10,000-entry OIDC state store during another user's IdP
 /// round-trip even under LRU eviction. Shared across S3 and Console listeners and bounded in
@@ -457,6 +465,11 @@ impl Operation for OidcAuthorizeHandler {
             "admin oidc state"
         );
 
+        // Bind the login to this browser: the callback only accepts a `state`
+        // that returns alongside the cookie set here.
+        let state = extract_authorize_state(&auth_url)?;
+        let state_cookie = build_oidc_state_cookie(&state, &redirect_uri, OIDC_STATE_COOKIE_MAX_AGE_SECS)?;
+
         // Return 302 redirect
         let mut headers = http::HeaderMap::new();
         headers.insert(
@@ -465,6 +478,7 @@ impl Operation for OidcAuthorizeHandler {
                 .parse()
                 .map_err(|_| s3_error!(InternalError, "failed to construct authorization URL"))?,
         );
+        headers.insert(http::header::SET_COOKIE, state_cookie);
         Ok(AdminResponse::with_headers(StatusCode::FOUND, Body::empty(), headers))
     }
 }
@@ -507,6 +521,24 @@ impl Operation for OidcCallbackHandler {
             extract_query_param(req.uri(), "code").ok_or_else(|| s3_error!(InvalidRequest, "missing 'code' query parameter"))?;
         let state = extract_query_param(req.uri(), "state")
             .ok_or_else(|| s3_error!(InvalidRequest, "missing 'state' query parameter"))?;
+
+        // A stored `state` alone does not prove which browser started the login. Refuse
+        // requests without the matching browser cookie before consulting the federation
+        // service so an unauthenticated caller cannot consume another user's pending state
+        // or complete a login CSRF.
+        if !oidc_state_cookie_matches(req.headers(), &state) {
+            warn!(
+                event = EVENT_ADMIN_OIDC_STATE,
+                component = LOG_COMPONENT_ADMIN,
+                subsystem = LOG_SUBSYSTEM_OIDC,
+                result = "state_cookie_mismatch",
+                requested_provider_id = %provider_id,
+                code_len = code.len(),
+                state_len = state.len(),
+                "admin oidc state"
+            );
+            return Err(S3Error::with_message(S3ErrorCode::AccessDenied, OIDC_STATE_COOKIE_MISMATCH));
+        }
 
         let federation = current_federated_identity_service().ok_or_else(|| s3_error!(InternalError, "OIDC not initialized"))?;
 
@@ -591,6 +623,8 @@ impl Operation for OidcCallbackHandler {
                 .parse()
                 .map_err(|_| s3_error!(InternalError, "failed to construct console redirect URL"))?,
         );
+        // The state is consumed; clear the browser cookie that carried it.
+        headers.insert(http::header::SET_COOKIE, build_oidc_state_cookie("", &redirect_uri, 0)?);
         Ok(AdminResponse::with_headers(StatusCode::FOUND, Body::empty(), headers))
     }
 }
@@ -709,6 +743,65 @@ fn extract_safe_redirect_after(uri: &http::Uri) -> S3Result<Option<String>> {
         Some(value) => Ok(Some(value)),
         None => Ok(None),
     }
+}
+
+/// Read back the `state` generated for the authorization request.
+fn extract_authorize_state(auth_url: &str) -> S3Result<String> {
+    Url::parse(auth_url)
+        .ok()
+        .and_then(|url| {
+            url.query_pairs()
+                .find(|(key, _)| key == "state")
+                .map(|(_, value)| value.into_owned())
+        })
+        .filter(|state| !state.is_empty())
+        .ok_or_else(|| s3_error!(InternalError, "authorization URL has no state parameter"))
+}
+
+/// True if `value` contains only RFC 6265 cookie-value-safe ASCII characters
+/// (no whitespace, control characters, quotes, commas, semicolons, or backslashes).
+fn is_safe_cookie_value(value: &str) -> bool {
+    value
+        .bytes()
+        .all(|b| b.is_ascii_graphic() && !matches!(b, b'"' | b',' | b';' | b'\\'))
+}
+
+/// Build the `Set-Cookie` value that carries the login state. `Path` is scoped to the
+/// callback URL's path so the cookie accompanies no other request; `Max-Age=0` clears it.
+fn build_oidc_state_cookie(state: &str, callback_uri: &str, max_age_secs: u64) -> S3Result<http::HeaderValue> {
+    if !is_safe_cookie_value(state) {
+        return Err(s3_error!(InternalError, "invalid OIDC state for cookie"));
+    }
+    let callback = Url::parse(callback_uri).map_err(|_| s3_error!(InternalError, "invalid OIDC callback URI"))?;
+    let path = callback.path();
+    if path.contains(';') || path.bytes().any(|b| b.is_ascii_control()) {
+        return Err(s3_error!(InternalError, "invalid OIDC callback path for cookie"));
+    }
+    let mut cookie = format!("{OIDC_STATE_COOKIE}={state}; Path={path}; Max-Age={max_age_secs}; HttpOnly; SameSite=Lax");
+    if callback.scheme() == "https" {
+        cookie.push_str("; Secure");
+    }
+    cookie
+        .parse()
+        .map_err(|_| s3_error!(InternalError, "failed to construct OIDC state cookie"))
+}
+
+/// The login state cookie presented by the browser, from any of its `Cookie` headers.
+fn extract_oidc_state_cookie(headers: &http::HeaderMap) -> Option<&str> {
+    headers
+        .get_all(http::header::COOKIE)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .flat_map(|value| value.split(';'))
+        .find_map(|pair| {
+            let (name, value) = pair.trim().split_once('=')?;
+            (name == OIDC_STATE_COOKIE).then_some(value)
+        })
+}
+
+/// True when the browser presents the cookie the authorize handler set for this `state`.
+fn oidc_state_cookie_matches(headers: &http::HeaderMap, state: &str) -> bool {
+    !state.is_empty() && extract_oidc_state_cookie(headers).is_some_and(|cookie| constant_time_eq(cookie, state))
 }
 
 /// Build the console redirect URL with STS credentials in the hash fragment.
@@ -1688,5 +1781,437 @@ mod tests {
         if let Ok(resp) = other_outcome {
             assert_ne!(resp.into_parts().0, StatusCode::TOO_MANY_REQUESTS);
         }
+    }
+
+    #[test]
+    fn test_extract_authorize_state() {
+        assert_eq!(
+            extract_authorize_state("https://idp.example.com/authorize?response_type=code&state=abc-123&nonce=n")
+                .expect("state should be found"),
+            "abc-123"
+        );
+        assert!(extract_authorize_state("https://idp.example.com/authorize?response_type=code").is_err());
+        assert!(extract_authorize_state("https://idp.example.com/authorize?state=").is_err());
+    }
+
+    #[test]
+    fn test_build_oidc_state_cookie_is_scoped_to_callback() {
+        let cookie = build_oidc_state_cookie("abc-123", "https://rustfs.example.com/rustfs/admin/v3/oidc/callback/default", 300)
+            .expect("https cookie should build");
+        assert_eq!(
+            cookie.to_str().expect("cookie should be ASCII"),
+            "rustfs_oidc_state=abc-123; Path=/rustfs/admin/v3/oidc/callback/default; Max-Age=300; HttpOnly; SameSite=Lax; Secure"
+        );
+
+        let cookie = build_oidc_state_cookie("", "http://localhost:9000/rustfs/admin/v3/oidc/callback/default", 0)
+            .expect("clearing cookie should build");
+        assert_eq!(
+            cookie.to_str().expect("cookie should be ASCII"),
+            "rustfs_oidc_state=; Path=/rustfs/admin/v3/oidc/callback/default; Max-Age=0; HttpOnly; SameSite=Lax"
+        );
+
+        // Reject unsafe cookie-attribute injection characters in state or path.
+        assert!(
+            build_oidc_state_cookie(
+                "abc;Domain=evil.example",
+                "https://rustfs.example.com/rustfs/admin/v3/oidc/callback/default",
+                300,
+            )
+            .is_err()
+        );
+        assert!(
+            build_oidc_state_cookie(
+                "abc-123",
+                "https://rustfs.example.com/rustfs/admin/v3/oidc/callback/default;Domain=evil.example",
+                300,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn test_oidc_state_cookie_must_match_callback_state() {
+        let state = "abc-123";
+
+        // No cookie: a browser that never started this login.
+        assert!(!oidc_state_cookie_matches(&HeaderMap::new(), state));
+
+        // Cookie from a different login.
+        let mut headers = HeaderMap::new();
+        headers.insert(http::header::COOKIE, HeaderValue::from_static("rustfs_oidc_state=other"));
+        assert!(!oidc_state_cookie_matches(&headers, state));
+
+        // An empty state never matches, even against an empty cookie.
+        let mut headers = HeaderMap::new();
+        headers.insert(http::header::COOKIE, HeaderValue::from_static("rustfs_oidc_state="));
+        assert!(!oidc_state_cookie_matches(&headers, ""));
+
+        // Matching cookie, among other cookies and across multiple Cookie header lines.
+        let mut headers = HeaderMap::new();
+        headers.append(http::header::COOKIE, HeaderValue::from_static("session=1; theme=dark"));
+        headers.append(http::header::COOKIE, HeaderValue::from_static("lang=en; rustfs_oidc_state=abc-123"));
+        assert!(oidc_state_cookie_matches(&headers, state));
+    }
+
+    #[tokio::test]
+    async fn callback_rejects_state_without_matching_browser_cookie() {
+        const CALLBACK: &str = "http://localhost:9000/rustfs/admin/v3/oidc/callback/default?code=abc123&state=xyz789";
+        let mut router = matchit::Router::new();
+        router
+            .insert("/rustfs/admin/v3/oidc/callback/{provider_id}", ())
+            .expect("route should insert");
+
+        for cookie in [None, Some("rustfs_oidc_state=another-login")] {
+            let matched = router
+                .at("/rustfs/admin/v3/oidc/callback/default")
+                .expect("route should match");
+            let mut req = crate::admin::operation::test_support::TestRequest::new(Method::GET, Uri::from_static(CALLBACK))
+                .header("host", "localhost:9000");
+            if let Some(cookie) = cookie {
+                req = req.header("cookie", cookie);
+            }
+
+            let Err(err) = OidcCallbackHandler {}.call(req.build(), matched.params).await else {
+                panic!("a callback without the matching state cookie must be rejected");
+            };
+            assert_eq!(err.code(), &S3ErrorCode::AccessDenied);
+            assert_eq!(err.message(), Some(OIDC_STATE_COOKIE_MISMATCH));
+        }
+
+        // With the matching cookie, the binding check passes; this synthetic state was never
+        // issued so the request still fails later for a different reason.
+        let matched = router
+            .at("/rustfs/admin/v3/oidc/callback/default")
+            .expect("route should match");
+        let req = crate::admin::operation::test_support::TestRequest::new(Method::GET, Uri::from_static(CALLBACK))
+            .header("host", "localhost:9000")
+            .header("cookie", "rustfs_oidc_state=xyz789")
+            .build();
+        let Err(err) = OidcCallbackHandler {}.call(req, matched.params).await else {
+            panic!("an unknown state must not complete a login");
+        };
+        assert_ne!(err.message(), Some(OIDC_STATE_COOKIE_MISMATCH));
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn authorize_and_callback_handlers_enforce_browser_state_cookie_lifecycle() {
+        use crate::admin::runtime_sources::{AppContext, publish_test_app_context};
+        use base64_simd::URL_SAFE_NO_PAD as B64URL;
+        use p256::ecdsa::{Signature, SigningKey, signature::Signer as _};
+        use p256::elliptic_curve::Generate as _;
+        use p256::pkcs8::EncodePublicKey as _;
+        use rustfs_iam::store::{Store as _, object::IAM_CONFIG_PREFIX};
+        use std::sync::Arc;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let signing_key = SigningKey::generate();
+        let spki = signing_key
+            .verifying_key()
+            .to_public_key_der()
+            .expect("P-256 verifying key should encode as SPKI");
+        let spki_bytes = spki.as_bytes();
+        let sec1 = &spki_bytes[spki_bytes.len() - 65..];
+        assert_eq!(sec1[0], 0x04, "SPKI payload must hold an uncompressed P-256 point");
+        let jwk = serde_json::json!({
+            "kty": "EC",
+            "crv": "P-256",
+            "kid": "oidc-cookie-test-key",
+            "use": "sig",
+            "alg": "ES256",
+            "x": B64URL.encode_to_string(&sec1[1..33]),
+            "y": B64URL.encode_to_string(&sec1[33..65]),
+        });
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind mock OIDC IdP");
+        let base = format!("http://{}", listener.local_addr().expect("mock IdP addr"));
+        let (nonce_tx, nonce_rx) = tokio::sync::oneshot::channel::<String>();
+        let server_base = base.clone();
+
+        let idp_task = tokio::spawn(async move {
+            let mut nonce_rx = Some(nonce_rx);
+            for expected_path in ["/.well-known/openid-configuration", "/jwks", "/token"] {
+                let (mut stream, _) = tokio::time::timeout(std::time::Duration::from_secs(15), listener.accept())
+                    .await
+                    .expect("mock IdP accept timeout")
+                    .expect("mock IdP accept");
+                let mut raw = Vec::new();
+                while !raw.ends_with(b"\r\n\r\n") {
+                    raw.push(stream.read_u8().await.expect("read request header byte"));
+                    assert!(raw.len() < 16_384);
+                }
+                let header_text = String::from_utf8(raw).expect("HTTP headers UTF-8");
+                let request_line = header_text.lines().next().expect("HTTP request line");
+                let path = request_line.split_whitespace().nth(1).expect("HTTP request path");
+                assert_eq!(path, expected_path);
+
+                let content_len = header_text
+                    .lines()
+                    .find_map(|line| {
+                        let (name, value) = line.split_once(':')?;
+                        name.eq_ignore_ascii_case("content-length")
+                            .then(|| value.trim().parse::<usize>().ok())
+                            .flatten()
+                    })
+                    .unwrap_or(0);
+                if content_len > 0 {
+                    let mut body_buf = vec![0u8; content_len];
+                    stream.read_exact(&mut body_buf).await.expect("read POST body");
+                }
+
+                let response_body = match expected_path {
+                    "/.well-known/openid-configuration" => serde_json::json!({
+                        "issuer": server_base,
+                        "authorization_endpoint": format!("{server_base}/authorize"),
+                        "token_endpoint": format!("{server_base}/token"),
+                        "jwks_uri": format!("{server_base}/jwks"),
+                        "response_types_supported": ["code"],
+                        "subject_types_supported": ["public"],
+                        "id_token_signing_alg_values_supported": ["ES256"],
+                    })
+                    .to_string(),
+                    "/jwks" => serde_json::json!({ "keys": [jwk] }).to_string(),
+                    "/token" => {
+                        let nonce = nonce_rx
+                            .take()
+                            .expect("nonce receiver should exist once")
+                            .await
+                            .expect("nonce should arrive from authorize response");
+                        let now = OffsetDateTime::now_utc().unix_timestamp();
+                        let header = serde_json::json!({
+                            "alg": "ES256",
+                            "typ": "JWT",
+                            "kid": "oidc-cookie-test-key",
+                        });
+                        let payload = serde_json::json!({
+                            "iss": server_base,
+                            "sub": "alice-cookie-test",
+                            "aud": "rustfs-cookie-test",
+                            "nonce": nonce,
+                            "iat": now,
+                            "exp": now + 300,
+                            "groups": ["readonly"],
+                        });
+                        let signing_input = format!(
+                            "{}.{}",
+                            B64URL.encode_to_string(serde_json::to_vec(&header).expect("header json")),
+                            B64URL.encode_to_string(serde_json::to_vec(&payload).expect("payload json")),
+                        );
+                        let sig: Signature = signing_key.sign(signing_input.as_bytes());
+                        let id_token = format!("{signing_input}.{}", B64URL.encode_to_string(sig.to_bytes()));
+                        serde_json::json!({
+                            "access_token": "mock-access-token",
+                            "token_type": "Bearer",
+                            "id_token": id_token,
+                        })
+                        .to_string()
+                    }
+                    _ => unreachable!(),
+                };
+
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    response_body.len(),
+                    response_body
+                );
+                stream.write_all(response.as_bytes()).await.expect("write mock IdP response");
+            }
+        });
+
+        let callback_uri = "http://localhost:9000/rustfs/admin/v3/oidc/callback/default";
+        temp_env::async_with_vars(
+            [
+                ("RUSTFS_IDENTITY_OPENID_ENABLE", Some("on")),
+                ("RUSTFS_IDENTITY_OPENID_CONFIG_URL", Some(base.as_str())),
+                ("RUSTFS_IDENTITY_OPENID_CLIENT_ID", Some("rustfs-cookie-test")),
+                ("RUSTFS_IDENTITY_OPENID_CLIENT_SECRET", Some("rustfs-cookie-secret")),
+                ("RUSTFS_IDENTITY_OPENID_REDIRECT_URI", Some(callback_uri)),
+                ("RUSTFS_IDENTITY_OPENID_REDIRECT_URI_DYNAMIC", Some("off")),
+                (ENV_RUSTFS_BROWSER_REDIRECT_URL, Some("http://localhost:9000")),
+                ("RUSTFS_OUTBOUND_ALLOW_ORIGINS", Some(base.as_str())),
+                ("HTTP_PROXY", None),
+                ("http_proxy", None),
+                ("HTTPS_PROXY", None),
+                ("https_proxy", None),
+                ("ALL_PROXY", None),
+                ("all_proxy", None),
+                ("NO_PROXY", None),
+                ("no_proxy", None),
+            ],
+            async {
+                let _ = rustfs_credentials::init_global_action_credentials(
+                    Some("OIDCCOOKIEROOT".into()),
+                    Some("oidcCookieRootSecret123".into()),
+                );
+                let env = rustfs_test_utils::TestECStoreEnv::builder()
+                    .prefix("oidc_state_cookie_lifecycle")
+                    .disk_count(1)
+                    .init_bucket_metadata(false)
+                    .build()
+                    .await;
+                rustfs_iam::store::object::ObjectStore::new(Arc::clone(&env.ecstore))
+                    .save_iam_config(serde_json::json!({"version": 1}), format!("{}/format.json", *IAM_CONFIG_PREFIX))
+                    .await
+                    .expect("save IAM format");
+                let iam = rustfs_iam::init_iam_sys(Arc::clone(&env.ecstore))
+                    .await
+                    .expect("init IAM sys");
+                let context = Arc::new(AppContext::with_default_interfaces(
+                    Arc::clone(&env.ecstore),
+                    iam,
+                    Arc::new(rustfs_kms::KmsServiceManager::new()),
+                ));
+                let oidc = rustfs_iam::build_oidc_sys_with_extra_root_ca_provider(
+                    rustfs_iam::oidc::OidcExtraRootCaProvider::new(|| async {
+                        Ok(rustfs_iam::oidc::OidcExtraRootCaMaterial::default())
+                    }),
+                )
+                .await
+                .expect("build OIDC sys against mock IdP");
+                let adapter = Arc::new(rustfs_iam::oidc::StandardOidcAdapter::new(oidc));
+                let oidc_config_query: Arc<dyn rustfs_iam::oidc::OidcConfigQuery> = adapter.clone();
+                let mapper = rustfs_iam::federation::CoreFederatedAuthorizationMapper::new(adapter.authorization_rules());
+                let service = Arc::new(adapter.into_service(mapper));
+                assert!(context.publish_federated_identity_runtime(service, oidc_config_query));
+                publish_test_app_context(context);
+
+                let mut authorize_router = matchit::Router::new();
+                authorize_router
+                    .insert("/rustfs/admin/v3/oidc/authorize/{provider_id}", ())
+                    .expect("authorize route should insert");
+                let mut callback_router = matchit::Router::new();
+                callback_router
+                    .insert("/rustfs/admin/v3/oidc/callback/{provider_id}", ())
+                    .expect("callback route should insert");
+
+                // 1. Authorize sets the browser-bound state cookie scoped to the callback path.
+                let auth_matched = authorize_router
+                    .at("/rustfs/admin/v3/oidc/authorize/default")
+                    .expect("authorize route should match");
+                let auth_req = build_oidc_request_from_peer(
+                    "http://localhost:9000/rustfs/admin/v3/oidc/authorize/default",
+                    "198.51.100.210:40000".parse().expect("valid peer"),
+                    None,
+                    None,
+                );
+                let (auth_status, auth_headers, _) = OidcAuthorizeHandler {}
+                    .call(auth_req, auth_matched.params)
+                    .await
+                    .expect("authorize should succeed")
+                    .into_parts();
+                assert_eq!(auth_status, StatusCode::FOUND);
+                let location = auth_headers
+                    .get(http::header::LOCATION)
+                    .and_then(|v| v.to_str().ok())
+                    .expect("authorize redirect location");
+                let parsed_location = Url::parse(location).expect("valid IdP authorize URL");
+                let state = parsed_location
+                    .query_pairs()
+                    .find_map(|(k, v)| (k == "state").then(|| v.into_owned()))
+                    .expect("authorize URL should carry state");
+                let nonce = parsed_location
+                    .query_pairs()
+                    .find_map(|(k, v)| (k == "nonce").then(|| v.into_owned()))
+                    .expect("authorize URL should carry nonce");
+                nonce_tx.send(nonce).expect("deliver nonce to mock IdP");
+
+                let set_cookie = auth_headers
+                    .get(http::header::SET_COOKIE)
+                    .and_then(|v| v.to_str().ok())
+                    .expect("authorize must emit Set-Cookie");
+                assert_eq!(
+                    set_cookie,
+                    format!(
+                        "{OIDC_STATE_COOKIE}={state}; Path=/rustfs/admin/v3/oidc/callback/default; Max-Age={OIDC_STATE_COOKIE_MAX_AGE_SECS}; HttpOnly; SameSite=Lax"
+                    )
+                );
+
+                // 2. Callback without a cookie or with a mismatched cookie is rejected WITHOUT consuming state.
+                let callback_uri_with_query = format!("{callback_uri}?code=test-code&state={state}");
+                for bad_cookie in [None, Some("rustfs_oidc_state=wrong-browser-state")] {
+                    let cb_matched = callback_router
+                        .at("/rustfs/admin/v3/oidc/callback/default")
+                        .expect("callback route should match");
+                    let mut req = crate::admin::operation::test_support::TestRequest::new(
+                        Method::GET,
+                        callback_uri_with_query.clone(),
+                    )
+                    .header("host", "localhost:9000");
+                    if let Some(cookie) = bad_cookie {
+                        req = req.header("cookie", cookie);
+                    }
+                    let err = OidcCallbackHandler {}
+                        .call(req.build(), cb_matched.params)
+                        .await
+                        .expect_err("callback without matching cookie must fail");
+                    assert_eq!(err.code(), &S3ErrorCode::AccessDenied);
+                    assert_eq!(err.message(), Some(OIDC_STATE_COOKIE_MISMATCH));
+                }
+
+                // 3. Callback with the matching cookie succeeds (state was preserved) and clears the cookie.
+                let cb_matched = callback_router
+                    .at("/rustfs/admin/v3/oidc/callback/default")
+                    .expect("callback route should match");
+                let ok_req = crate::admin::operation::test_support::TestRequest::new(
+                    Method::GET,
+                    callback_uri_with_query.clone(),
+                )
+                .header("host", "localhost:9000")
+                .header("cookie", &format!("{OIDC_STATE_COOKIE}={state}"))
+                .build();
+                let (cb_status, cb_headers, _) = OidcCallbackHandler {}
+                    .call(ok_req, cb_matched.params)
+                    .await
+                    .expect("callback with matching cookie should succeed")
+                    .into_parts();
+                assert_eq!(cb_status, StatusCode::FOUND);
+                let console_location = cb_headers
+                    .get(http::header::LOCATION)
+                    .and_then(|v| v.to_str().ok())
+                    .expect("callback redirect location");
+                assert!(console_location.starts_with(&format!(
+                    "http://localhost:9000{}/auth/oidc-callback/#",
+                    console_prefix()
+                )));
+                assert!(console_location.contains("accessKey="));
+                assert!(console_location.contains("sessionToken="));
+                let cleared_cookie = cb_headers
+                    .get(http::header::SET_COOKIE)
+                    .and_then(|v| v.to_str().ok())
+                    .expect("callback must clear state cookie");
+                assert_eq!(
+                    cleared_cookie,
+                    format!(
+                        "{OIDC_STATE_COOKIE}=; Path=/rustfs/admin/v3/oidc/callback/default; Max-Age=0; HttpOnly; SameSite=Lax"
+                    )
+                );
+
+                // 4. Replaying the same callback with the cookie now fails because state is single-use.
+                let cb_matched = callback_router
+                    .at("/rustfs/admin/v3/oidc/callback/default")
+                    .expect("callback route should match");
+                let replay_req = crate::admin::operation::test_support::TestRequest::new(
+                    Method::GET,
+                    callback_uri_with_query,
+                )
+                .header("host", "localhost:9000")
+                .header("cookie", &format!("{OIDC_STATE_COOKIE}={state}"))
+                .build();
+                let replay_err = OidcCallbackHandler {}
+                    .call(replay_req, cb_matched.params)
+                    .await
+                    .expect_err("replayed callback must be rejected");
+                assert_eq!(replay_err.code(), &S3ErrorCode::AccessDenied);
+                assert_eq!(
+                    replay_err.message(),
+                    Some("code exchange failed: invalid or expired OIDC state")
+                );
+            },
+        )
+        .await;
+
+        idp_task.await.expect("mock IdP server should complete cleanly");
     }
 }
