@@ -317,7 +317,6 @@ e2e = [
     "storage_class_capability_test::tests::historical_label_only_metadata_is_standard_without_hiding_a_real_transition_tier",
     "storage_class_capability_test::tests::label_only_aws_classes_fail_before_put_copy_or_multipart_mutation",
     "storage_class_capability_test::tests::standard_and_rrs_are_supported_across_put_copy_and_multipart",
-    "sts_query_compat_test::test_bucket_tags_opa_contract",
     "version_id_regression_test::tests::test_basic_s3_operations_no_regression",
     "version_id_regression_test::tests::test_copy_object_omits_version_id_with_suspended_versioning",
     "version_id_regression_test::tests::test_copy_object_returns_version_id_with_versioning",
