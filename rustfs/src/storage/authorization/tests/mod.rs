@@ -17,6 +17,7 @@
 mod actions;
 mod conditions;
 mod denial_audit;
+mod derived_credential_deny;
 pub(crate) mod fixture;
 mod permission_auth;
 mod readers;

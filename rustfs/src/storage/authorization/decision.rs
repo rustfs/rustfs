@@ -143,6 +143,20 @@ pub(crate) fn owner_can_bypass_policy_deny(is_owner: bool, action: &Action) -> b
         )
 }
 
+/// Accounts a bucket-policy `Principal` is matched against for explicit-Deny checks.
+///
+/// An STS session or service account signs with its own derived access key while IAM authorizes
+/// it with the policies of its parent user. Matching both the signing key and a distinct
+/// non-empty `parent_user` ensures a `Deny` naming the user binds derived credentials as well,
+/// while statements naming a derived key directly continue to match.
+pub(crate) fn bucket_policy_deny_accounts(cred: &rustfs_credentials::Credentials) -> Vec<&str> {
+    let mut accounts = vec![cred.access_key.as_str()];
+    if !cred.parent_user.is_empty() && cred.parent_user != cred.access_key {
+        accounts.push(cred.parent_user.as_str());
+    }
+    accounts
+}
+
 /// Context shared by every denial exit of [`authorize_request`] (issue #5740).
 ///
 /// The wire response intentionally stays the bare "Access Denied" so no policy
@@ -407,25 +421,32 @@ async fn authorize_request_with_facts<R: AuthorizationRequest + ?Sized>(
         let prepared = iam_store.prepare_auth(&action_args).await;
         let needs_tag_from_iam = prepared.needs_existing_object_tag;
 
+        let deny_accounts = bucket_policy_deny_accounts(cred);
         let bucket_tag_hint = if !bucket.is_empty() && !object.is_empty() {
             Some(load_bucket_policy_existing_object_tag_hint(store.as_ref(), bucket.as_str(), action).await)
         } else {
             None
         };
-        let needs_tag_from_bucket = if let Some(hint) = bucket_tag_hint.as_ref() {
-            let bucket_args = BucketPolicyArgs {
-                bucket: bucket.as_str(),
-                action,
-                is_owner,
-                account: cred.access_key.as_str(),
-                groups: &cred.groups,
-                conditions: &conditions,
-                object: object.as_str(),
-            };
-            bucket_policy_needs_existing_object_tag_from_hint(hint, &bucket_args).await
-        } else {
-            false
-        };
+        let mut needs_tag_from_bucket = false;
+        if let Some(hint) = bucket_tag_hint.as_ref() {
+            // Check the same accounts as the explicit-Deny gate below so a tag-conditioned Deny
+            // naming the parent user loads object tags before evaluation.
+            for &account in &deny_accounts {
+                let bucket_args = BucketPolicyArgs {
+                    bucket: bucket.as_str(),
+                    action,
+                    is_owner,
+                    account,
+                    groups: &cred.groups,
+                    conditions: &conditions,
+                    object: object.as_str(),
+                };
+                if bucket_policy_needs_existing_object_tag_from_hint(hint, &bucket_args).await {
+                    needs_tag_from_bucket = true;
+                    break;
+                }
+            }
+        }
 
         let needs_tag = needs_tag_from_iam || needs_tag_from_bucket;
         if needs_tag {
@@ -494,14 +515,27 @@ async fn authorize_request_with_facts<R: AuthorizationRequest + ?Sized>(
             let guard = if owner_can_bypass_policy_deny(is_owner, &action) {
                 Some(true)
             } else if let Some(policy) = &probe_bucket_policy {
-                bucket_policy_probe_decision(
-                    policy,
-                    &BucketPolicyArgs {
-                        is_owner: true,
-                        ..bucket_args.clone()
-                    },
-                )
-                .await
+                let mut combined = Some(true);
+                for &account in &deny_accounts {
+                    match bucket_policy_probe_decision(
+                        policy,
+                        &BucketPolicyArgs {
+                            is_owner: true,
+                            account,
+                            ..bucket_args.clone()
+                        },
+                    )
+                    .await
+                    {
+                        Some(false) => {
+                            combined = Some(false);
+                            break;
+                        }
+                        None => combined = None,
+                        Some(true) => {}
+                    }
+                }
+                combined
             } else {
                 Some(true)
             };
@@ -532,26 +566,29 @@ async fn authorize_request_with_facts<R: AuthorizationRequest + ?Sized>(
         // subject to bucket policy Deny for root as well. See: repost.aws/knowledge-center/s3-accidentally-denied-access
         // Here "owner" means root or credentials whose parent_user is root (e.g. Console admin via STS).
         let owner_can_bypass_deny = owner_can_bypass_policy_deny(is_owner, &action);
-        if !bucket_name.is_empty()
-            && !owner_can_bypass_deny
-            && !PolicySys::try_is_allowed_for_store(
-                store.as_ref(),
-                &BucketPolicyArgs {
-                    bucket: bucket_name,
-                    action,
-                    // Early explicit-deny gate for bucket policy: use owner short-circuit path so
-                    // deny statements are enforced before IAM/bucket allow fallback evaluation.
-                    is_owner: true,
-                    account: &cred.access_key,
-                    groups: &cred.groups,
-                    conditions: &conditions,
-                    object: object.as_str(),
-                },
-            )
-            .await
-            .map_err(ApiError::from)?
-        {
-            return Err(denial.deny(req, "bucket_policy_explicit_deny", action));
+        if !bucket_name.is_empty() && !owner_can_bypass_deny {
+            // A bucket-policy Deny naming a user also binds their STS sessions and service accounts.
+            for &account in &deny_accounts {
+                if !PolicySys::try_is_allowed_for_store(
+                    store.as_ref(),
+                    &BucketPolicyArgs {
+                        bucket: bucket_name,
+                        action,
+                        // Early explicit-deny gate for bucket policy: use owner short-circuit path so
+                        // deny statements are enforced before IAM/bucket allow fallback evaluation.
+                        is_owner: true,
+                        account,
+                        groups: &cred.groups,
+                        conditions: &conditions,
+                        object: object.as_str(),
+                    },
+                )
+                .await
+                .map_err(ApiError::from)?
+                {
+                    return Err(denial.deny(req, "bucket_policy_explicit_deny", action));
+                }
+            }
         }
 
         let probe_evaluation_conditions = if req.permission_probe() {

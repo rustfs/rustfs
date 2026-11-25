@@ -55,7 +55,7 @@ pub(crate) use conditions::{
     maybe_merge_object_tag_conditions,
 };
 #[cfg(test)]
-pub(crate) use decision::{DenialContext, owner_can_bypass_policy_deny};
+pub(crate) use decision::{DenialContext, bucket_policy_deny_accounts, owner_can_bypass_policy_deny};
 pub(crate) use decision::{
     audit_request_denial, authorize_bucket_config_mutation, authorize_bucket_request, authorize_bucket_tag_deletion,
     authorize_missing_object_disclosure, authorize_object_request, authorize_replication_only_put_headers, authorize_request,
