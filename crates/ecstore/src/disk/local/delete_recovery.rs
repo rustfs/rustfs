@@ -3175,8 +3175,8 @@ impl LocalDisk {
             if sync {
                 staged_receipt.as_file().sync_data()?;
             }
-            std::fs::rename(staged_receipt.path(), &receipt_path)?;
-            drop(staged_receipt);
+            let staged_path = staged_receipt.into_temp_path();
+            std::fs::rename(&staged_path, &receipt_path)?;
             if sync {
                 os::fsync_dir_std(&rollback)?;
             }
@@ -7698,20 +7698,13 @@ mod tests {
                 recoverable_delete: true,
                 ..Default::default()
             };
-            assert_eq!(
-                disk.try_fused_recoverable_delete_version_with_paths(
-                    "recovery",
-                    "object",
-                    FusedDeleteRequest::BatchEntry(&fi),
-                    &opts,
-                    transaction,
-                    None,
-                    None,
-                )
-                .await
-                .unwrap(),
-                Some(())
-            );
+            let group = super::super::FileInfoVersions {
+                name: "object".to_owned(),
+                versions: vec![fi],
+                ..Default::default()
+            };
+            let errors = disk.delete_versions_recoverable("recovery", vec![group], opts).await;
+            assert!(matches!(errors.as_slice(), [None]), "{errors:?}");
             let (journal, sole, satisfied) = disk
                 .try_publish_prepared_delete_local("recovery", "object", transaction, None)
                 .await
