@@ -26,8 +26,8 @@ use crate::storage::ObjectOptions;
 use crate::storage::authorization::{
     AuthorizationRequest, CopySourceBucketGenerationGuard, ObjectTagConditions, authorize_replication_only_put_headers,
     authorize_request, authorize_staged_multipart_part, authorize_write_etag_condition, get_or_fetch_object_tag_conditions,
-    load_bucket_generation, missing_req_info_error, req_info_mut, req_info_ref, request_object_store,
-    set_requested_object_lock_retain_until,
+    load_bucket_generation, missing_req_info_error, replication_request_authorized, req_info_mut, req_info_ref,
+    request_object_store, set_requested_object_lock_retain_until,
 };
 use crate::storage::authorization_actions::{
     complete_multipart_upload_authorize_action, versioned_read_action, versioned_tagging_action,
@@ -36,6 +36,47 @@ use crate::storage::request_markers::{RequestedCopySource, RequestedObjectTags};
 use crate::storage::storage_api::runtime_sources_consumer::ServerContextSlot;
 use rustfs_policy::policy::action::{Action, S3Action};
 use rustfs_s3_types::{S3Result, s3_error};
+use rustfs_utils::http::{SUFFIX_SOURCE_REPLICATION_REQUEST, get_header};
+
+/// Returns true when `x-amz-tagging` carries at least one tag (or fails closed on duplicate/invalid
+/// header values so authorization never silently skips a tagging check).
+pub(crate) fn has_non_empty_request_tags(headers: &http::HeaderMap) -> bool {
+    let mut values = headers.get_all("x-amz-tagging").iter();
+    let Some(first) = values.next() else {
+        return false;
+    };
+    if values.next().is_some() {
+        return true;
+    }
+    let Ok(raw) = first.to_str() else {
+        return true;
+    };
+    crate::storage::s3_api::tagging::parse_object_tag_header(raw).map_or(true, |tags| !tags.is_empty())
+}
+
+/// Action required to write object tags during an object-write operation.
+///
+/// Authorized inbound replication requests (never browser POST forms) require `s3:ReplicateTags`;
+/// all other tagged writes require `s3:PutObjectTagging`.
+pub(crate) fn write_tagging_action<R: AuthorizationRequest + ?Sized>(req: &R, post: bool) -> Action {
+    let inbound_replication = !post
+        && replication_request_authorized(req)
+        && get_header(req.headers(), SUFFIX_SOURCE_REPLICATION_REQUEST).as_deref() == Some("true");
+    if inbound_replication {
+        Action::S3Action(S3Action::ReplicateTagsAction)
+    } else {
+        Action::S3Action(S3Action::PutObjectTaggingAction)
+    }
+}
+
+/// Authorizes object tagging requested via `x-amz-tagging` on PutObject, PostObject, or
+/// CreateMultipartUpload.
+pub(crate) async fn authorize_write_request_tagging<R: AuthorizationRequest + ?Sized>(req: &mut R, post: bool) -> S3Result<()> {
+    if !has_non_empty_request_tags(req.policy_headers()) {
+        return Ok(());
+    }
+    authorize_request(req, write_tagging_action(req, post)).await
+}
 
 /// Authorizes completion and records the bucket generation before publication.
 pub(crate) async fn authorize_complete_multipart_upload<R: AuthorizationRequest + ?Sized>(
@@ -140,7 +181,8 @@ pub(crate) async fn authorize_copy_object_tags<R: AuthorizationRequest + ?Sized>
         return Ok(());
     }
     let tag_set = crate::storage::s3_api::tagging::parse_object_tag_header(effective_tags)?;
-    if copies_tags && !tag_set.is_empty() {
+    let writes_tags = !tag_set.is_empty();
+    if copies_tags && writes_tags {
         let destination = req_info_ref(req)?.clone();
         // Reuse the reader's metadata instead of reopening the source under its
         // read guard (or the self-copy write guard). These are the tags being copied.
@@ -176,7 +218,14 @@ pub(crate) async fn authorize_copy_object_tags<R: AuthorizationRequest + ?Sized>
     req.install_requested_object_tags(RequestedObjectTags(
         tag_set.into_iter().filter_map(|tag| Some((tag.key?, tag.value?))).collect(),
     ));
-    authorize_request(req, Action::S3Action(S3Action::PutObjectAction)).await
+    authorize_request(req, Action::S3Action(S3Action::PutObjectAction)).await?;
+    if writes_tags {
+        if !replication_request_authorized(req) {
+            authorize_replication_only_put_headers(req).await?;
+        }
+        authorize_request(req, write_tagging_action(req, false)).await?;
+    }
+    Ok(())
 }
 
 /// Authorizes both resources and records the generation and tag snapshots for the copy.
@@ -244,7 +293,9 @@ pub(crate) async fn authorize_copy_object<R: AuthorizationRequest + ?Sized>(
     }
     req.install_requested_object_tags(RequestedObjectTags::default());
     authorize_copy_object_tags(req, source, copies_tags, &source_tags, replacement.as_deref().unwrap_or(&source_tags)).await?;
-    authorize_replication_only_put_headers(req).await?;
+    if !replication_request_authorized(req) {
+        authorize_replication_only_put_headers(req).await?;
+    }
     if facts.legal_hold {
         authorize_request(req, Action::S3Action(S3Action::PutObjectLegalHoldAction)).await?;
     }
@@ -289,4 +340,688 @@ async fn load_copy_source_bucket_generation(
         bucket: bucket.to_string(),
         incarnation_id,
     })
+}
+
+#[cfg(test)]
+mod tagging_authz_tests {
+    use super::*;
+    use crate::storage::access_owned::listing_multipart::{CreateMultipartAuthorization, authorize_create_multipart_upload};
+    use crate::storage::access_owned::object_write::{
+        PostObjectFormPolicy, PostObjectPolicyFields, PutObjectAuthorization, authorize_put_object,
+    };
+    use crate::storage::authorization::tests::fixture::{request, server_context};
+    use crate::storage::storage_api::contract::bucket::{BucketOperations as _, MakeBucketOptions};
+    use crate::storage::storage_api::contract::object::ObjectIO as _;
+    use http::Method;
+    use rustfs_s3_types::S3ErrorCode;
+    use std::collections::HashMap;
+
+    async fn publish_policy(store: &crate::storage::ECStore, bucket: &str, statements: Vec<serde_json::Value>) {
+        let policy = serde_json::json!({
+            "Version": "2012-10-17",
+            "Statement": statements,
+        });
+        store
+            .update_bucket_metadata_config(
+                bucket,
+                crate::storage::storage_api::ecstore_bucket::metadata::BUCKET_POLICY_CONFIG,
+                serde_json::to_vec(&policy).expect("serialize policy"),
+            )
+            .await
+            .expect("publish policy");
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn tagged_object_writes_require_put_object_tagging_and_evaluate_request_tag_conditions() {
+        crate::app::gating_test_env::run_large_stack_test("tagged-writes-authz", || async {
+            let store = crate::app::gating_test_env::shared_gating_ecstore().await;
+            let slot = server_context(store.clone());
+            let bucket = format!("tagged-writes-{}", uuid::Uuid::new_v4().simple());
+            store
+                .make_bucket(&bucket, &MakeBucketOptions::default())
+                .await
+                .expect("create bucket");
+
+            for (key, tags) in [("src-untagged", ""), ("src-dev", "env=dev"), ("src-prod", "env=prod")] {
+                let mut reader = crate::storage::PutObjReader::from_vec(b"data".to_vec());
+                let mut user_defined = HashMap::new();
+                if !tags.is_empty() {
+                    user_defined.insert(rustfs_utils::http::AMZ_OBJECT_TAGGING.to_string(), tags.to_string());
+                }
+                store
+                    .put_object(
+                        &bucket,
+                        key,
+                        &mut reader,
+                        &ObjectOptions {
+                            user_defined,
+                            ..Default::default()
+                        },
+                    )
+                    .await
+                    .expect("seed source object");
+            }
+
+            let base_statements = vec![serde_json::json!({
+                "Effect": "Allow",
+                "Principal": {"AWS": "*"},
+                "Action": ["s3:PutObject", "s3:GetObject", "s3:GetObjectTagging"],
+                "Resource": format!("arn:aws:s3:::{bucket}/*"),
+            })];
+
+            // Both "missing s3:PutObjectTagging" and "explicit Deny s3:PutObjectTagging" must
+            // block tagged writes while continuing to allow untagged writes.
+            for with_explicit_deny in [false, true] {
+                let mut statements = base_statements.clone();
+                if with_explicit_deny {
+                    statements.push(serde_json::json!({
+                        "Effect": "Deny",
+                        "Principal": {"AWS": "*"},
+                        "Action": "s3:PutObjectTagging",
+                        "Resource": format!("arn:aws:s3:::{bucket}/*"),
+                    }));
+                }
+                publish_policy(&store, &bucket, statements).await;
+
+                // PutObject: tagged denied, untagged and empty tagging header allowed.
+                let mut put_tagged = request(Method::PUT)
+                    .header("x-amz-tagging", "env=dev")
+                    .req_info()
+                    .server_context(&slot)
+                    .build();
+                let err = authorize_put_object(
+                    &mut put_tagged,
+                    &slot,
+                    PutObjectAuthorization {
+                        bucket: &bucket,
+                        key: "dst-put",
+                        version_id: None,
+                        retain_until: None,
+                        specific_etag: false,
+                        legal_hold: false,
+                        retention: false,
+                        post: false,
+                    },
+                    |_| Ok(()),
+                )
+                .await
+                .expect_err("tagged PutObject without PutObjectTagging must be denied");
+                assert_eq!(err.code(), &S3ErrorCode::AccessDenied);
+
+                for empty_tagging in [None, Some("")] {
+                    let mut builder = request(Method::PUT).req_info().server_context(&slot);
+                    if let Some(value) = empty_tagging {
+                        builder = builder.header("x-amz-tagging", value);
+                    }
+                    let mut put_untagged = builder.build();
+                    authorize_put_object(
+                        &mut put_untagged,
+                        &slot,
+                        PutObjectAuthorization {
+                            bucket: &bucket,
+                            key: "dst-put",
+                            version_id: None,
+                            retain_until: None,
+                            specific_etag: false,
+                            legal_hold: false,
+                            retention: false,
+                            post: false,
+                        },
+                        |_| Ok(()),
+                    )
+                    .await
+                    .expect("untagged PutObject must still succeed");
+                }
+
+                // PostObject: form x-amz-tagging denied; spoofed wire header without form field allowed.
+                let mut post_tagged = request(Method::POST).req_info().server_context(&slot).build();
+                let err = authorize_put_object(
+                    &mut post_tagged,
+                    &slot,
+                    PutObjectAuthorization {
+                        bucket: &bucket,
+                        key: "dst-post",
+                        version_id: None,
+                        retain_until: None,
+                        specific_etag: false,
+                        legal_hold: false,
+                        retention: false,
+                        post: true,
+                    },
+                    |req| {
+                        PostObjectFormPolicy::new(PostObjectPolicyFields {
+                            tagging: Some("env=dev"),
+                            ..Default::default()
+                        })?
+                        .install(req);
+                        Ok(())
+                    },
+                )
+                .await
+                .expect_err("tagged PostObject without PutObjectTagging must be denied");
+                assert_eq!(err.code(), &S3ErrorCode::AccessDenied);
+
+                let mut post_untagged = request(Method::POST)
+                    .header("x-amz-tagging", "env=spoofed-wire")
+                    .req_info()
+                    .server_context(&slot)
+                    .build();
+                authorize_put_object(
+                    &mut post_untagged,
+                    &slot,
+                    PutObjectAuthorization {
+                        bucket: &bucket,
+                        key: "dst-post",
+                        version_id: None,
+                        retain_until: None,
+                        specific_etag: false,
+                        legal_hold: false,
+                        retention: false,
+                        post: true,
+                    },
+                    |req| {
+                        PostObjectFormPolicy::new(PostObjectPolicyFields::default())?.install(req);
+                        Ok(())
+                    },
+                )
+                .await
+                .expect("untagged PostObject ignores wire x-amz-tagging and succeeds");
+
+                // CreateMultipartUpload: tagged denied, untagged allowed.
+                let mut mpu_tagged = request(Method::POST)
+                    .header("x-amz-tagging", "env=dev")
+                    .req_info()
+                    .server_context(&slot)
+                    .build();
+                let err = authorize_create_multipart_upload(
+                    &slot,
+                    &mut mpu_tagged,
+                    CreateMultipartAuthorization {
+                        bucket: &bucket,
+                        key: "dst-mpu",
+                        query_version: None,
+                        retain_until: None,
+                        legal_hold_present: false,
+                        retention_present: false,
+                    },
+                )
+                .await
+                .expect_err("tagged CreateMultipartUpload without PutObjectTagging must be denied");
+                assert_eq!(err.code(), &S3ErrorCode::AccessDenied);
+
+                let mut mpu_untagged = request(Method::POST).req_info().server_context(&slot).build();
+                authorize_create_multipart_upload(
+                    &slot,
+                    &mut mpu_untagged,
+                    CreateMultipartAuthorization {
+                        bucket: &bucket,
+                        key: "dst-mpu",
+                        query_version: None,
+                        retain_until: None,
+                        legal_hold_present: false,
+                        retention_present: false,
+                    },
+                )
+                .await
+                .expect("untagged CreateMultipartUpload must still succeed");
+
+                // CopyObject REPLACE with non-empty tags denied; REPLACE empty allowed.
+                let mut copy_replace = request(Method::PUT).req_info().server_context(&slot).build();
+                let err = authorize_copy_object(
+                    &mut copy_replace,
+                    &slot,
+                    CopyObjectAuthorization {
+                        bucket: &bucket,
+                        key: "dst-copy",
+                        source: Some(CopySourceObject {
+                            bucket: &bucket,
+                            key: "src-untagged",
+                            version_id: None,
+                        }),
+                        query_version: None,
+                        tagging: Some("env=dev"),
+                        tagging_directive: Some("REPLACE"),
+                        retain_until: None,
+                        legal_hold: false,
+                        retention: false,
+                    },
+                )
+                .await
+                .expect_err("CopyObject REPLACE with tags without PutObjectTagging must be denied");
+                assert_eq!(err.code(), &S3ErrorCode::AccessDenied);
+
+                let mut copy_replace_empty = request(Method::PUT).req_info().server_context(&slot).build();
+                authorize_copy_object(
+                    &mut copy_replace_empty,
+                    &slot,
+                    CopyObjectAuthorization {
+                        bucket: &bucket,
+                        key: "dst-copy",
+                        source: Some(CopySourceObject {
+                            bucket: &bucket,
+                            key: "src-dev",
+                            version_id: None,
+                        }),
+                        query_version: None,
+                        tagging: Some(""),
+                        tagging_directive: Some("REPLACE"),
+                        retain_until: None,
+                        legal_hold: false,
+                        retention: false,
+                    },
+                )
+                .await
+                .expect("CopyObject REPLACE clearing tags must still succeed");
+
+                // CopyObject COPY from tagged source denied; COPY from untagged source allowed.
+                let mut copy_tagged_src = request(Method::PUT).req_info().server_context(&slot).build();
+                let err = authorize_copy_object(
+                    &mut copy_tagged_src,
+                    &slot,
+                    CopyObjectAuthorization {
+                        bucket: &bucket,
+                        key: "dst-copy",
+                        source: Some(CopySourceObject {
+                            bucket: &bucket,
+                            key: "src-dev",
+                            version_id: None,
+                        }),
+                        query_version: None,
+                        tagging: None,
+                        tagging_directive: Some("COPY"),
+                        retain_until: None,
+                        legal_hold: false,
+                        retention: false,
+                    },
+                )
+                .await
+                .expect_err("CopyObject COPY of tagged source without PutObjectTagging must be denied");
+                assert_eq!(err.code(), &S3ErrorCode::AccessDenied);
+
+                let mut copy_untagged_src = request(Method::PUT).req_info().server_context(&slot).build();
+                authorize_copy_object(
+                    &mut copy_untagged_src,
+                    &slot,
+                    CopyObjectAuthorization {
+                        bucket: &bucket,
+                        key: "dst-copy",
+                        source: Some(CopySourceObject {
+                            bucket: &bucket,
+                            key: "src-untagged",
+                            version_id: None,
+                        }),
+                        query_version: None,
+                        tagging: None,
+                        tagging_directive: Some("COPY"),
+                        retain_until: None,
+                        legal_hold: false,
+                        retention: false,
+                    },
+                )
+                .await
+                .expect("CopyObject COPY of untagged source must still succeed");
+            }
+
+            // Grant s3:PutObjectTagging conditioned on s3:RequestObjectTag/env == "dev".
+            let mut conditioned = base_statements;
+            conditioned.push(serde_json::json!({
+                "Effect": "Allow",
+                "Principal": {"AWS": "*"},
+                "Action": "s3:PutObjectTagging",
+                "Resource": format!("arn:aws:s3:::{bucket}/*"),
+                "Condition": {"StringEquals": {"s3:RequestObjectTag/env": "dev"}},
+            }));
+            publish_policy(&store, &bucket, conditioned).await;
+
+            for (tag, source_key, expected_ok) in [("env=dev", "src-dev", true), ("env=prod", "src-prod", false)] {
+                let mut put_req = request(Method::PUT)
+                    .header("x-amz-tagging", tag)
+                    .req_info()
+                    .server_context(&slot)
+                    .build();
+                let res = authorize_put_object(
+                    &mut put_req,
+                    &slot,
+                    PutObjectAuthorization {
+                        bucket: &bucket,
+                        key: "dst-put",
+                        version_id: None,
+                        retain_until: None,
+                        specific_etag: false,
+                        legal_hold: false,
+                        retention: false,
+                        post: false,
+                    },
+                    |_| Ok(()),
+                )
+                .await;
+                assert_eq!(res.is_ok(), expected_ok, "PutObject with {tag}");
+
+                let mut post_req = request(Method::POST).req_info().server_context(&slot).build();
+                let res = authorize_put_object(
+                    &mut post_req,
+                    &slot,
+                    PutObjectAuthorization {
+                        bucket: &bucket,
+                        key: "dst-post",
+                        version_id: None,
+                        retain_until: None,
+                        specific_etag: false,
+                        legal_hold: false,
+                        retention: false,
+                        post: true,
+                    },
+                    |req| {
+                        PostObjectFormPolicy::new(PostObjectPolicyFields {
+                            tagging: Some(tag),
+                            ..Default::default()
+                        })?
+                        .install(req);
+                        Ok(())
+                    },
+                )
+                .await;
+                assert_eq!(res.is_ok(), expected_ok, "PostObject with {tag}");
+
+                let mut mpu_req = request(Method::POST)
+                    .header("x-amz-tagging", tag)
+                    .req_info()
+                    .server_context(&slot)
+                    .build();
+                let res = authorize_create_multipart_upload(
+                    &slot,
+                    &mut mpu_req,
+                    CreateMultipartAuthorization {
+                        bucket: &bucket,
+                        key: "dst-mpu",
+                        query_version: None,
+                        retain_until: None,
+                        legal_hold_present: false,
+                        retention_present: false,
+                    },
+                )
+                .await;
+                assert_eq!(res.is_ok(), expected_ok, "CreateMultipartUpload with {tag}");
+
+                let mut copy_replace = request(Method::PUT).req_info().server_context(&slot).build();
+                let res = authorize_copy_object(
+                    &mut copy_replace,
+                    &slot,
+                    CopyObjectAuthorization {
+                        bucket: &bucket,
+                        key: "dst-copy",
+                        source: Some(CopySourceObject {
+                            bucket: &bucket,
+                            key: "src-untagged",
+                            version_id: None,
+                        }),
+                        query_version: None,
+                        tagging: Some(tag),
+                        tagging_directive: Some("REPLACE"),
+                        retain_until: None,
+                        legal_hold: false,
+                        retention: false,
+                    },
+                )
+                .await;
+                assert_eq!(res.is_ok(), expected_ok, "CopyObject REPLACE with {tag}");
+
+                let mut copy_preserve = request(Method::PUT).req_info().server_context(&slot).build();
+                let res = authorize_copy_object(
+                    &mut copy_preserve,
+                    &slot,
+                    CopyObjectAuthorization {
+                        bucket: &bucket,
+                        key: "dst-copy",
+                        source: Some(CopySourceObject {
+                            bucket: &bucket,
+                            key: source_key,
+                            version_id: None,
+                        }),
+                        query_version: None,
+                        tagging: None,
+                        tagging_directive: Some("COPY"),
+                        retain_until: None,
+                        legal_hold: false,
+                        retention: false,
+                    },
+                )
+                .await;
+                assert_eq!(res.is_ok(), expected_ok, "CopyObject COPY with {source_key}");
+            }
+        });
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn inbound_replication_tagged_writes_require_replicate_tags() {
+        crate::app::gating_test_env::run_large_stack_test("replication-tagged-writes", || async {
+            let store = crate::app::gating_test_env::shared_gating_ecstore().await;
+            let slot = server_context(store.clone());
+            let bucket = format!("repl-tagged-writes-{}", uuid::Uuid::new_v4().simple());
+            store
+                .make_bucket(&bucket, &MakeBucketOptions::default())
+                .await
+                .expect("create bucket");
+
+            let mut reader = crate::storage::PutObjReader::from_vec(b"data".to_vec());
+            store
+                .put_object(&bucket, "src", &mut reader, &ObjectOptions::default())
+                .await
+                .expect("seed source");
+
+            // Authorized replicator: has ReplicateObject + ReplicateTags, but PutObjectTagging is denied.
+            publish_policy(
+                &store,
+                &bucket,
+                vec![
+                    serde_json::json!({
+                        "Effect": "Allow",
+                        "Principal": {"AWS": "*"},
+                        "Action": ["s3:PutObject", "s3:GetObject", "s3:ReplicateObject", "s3:ReplicateTags"],
+                        "Resource": format!("arn:aws:s3:::{bucket}/*"),
+                    }),
+                    serde_json::json!({
+                        "Effect": "Deny",
+                        "Principal": {"AWS": "*"},
+                        "Action": "s3:PutObjectTagging",
+                        "Resource": format!("arn:aws:s3:::{bucket}/*"),
+                    }),
+                ],
+            )
+            .await;
+
+            for repl_header in ["x-rustfs-source-replication-request", "x-minio-source-replication-request"] {
+                let mut put_repl = request(Method::PUT)
+                    .header(repl_header, "true")
+                    .header("x-amz-tagging", "env=replica")
+                    .req_info()
+                    .server_context(&slot)
+                    .build();
+                authorize_put_object(
+                    &mut put_repl,
+                    &slot,
+                    PutObjectAuthorization {
+                        bucket: &bucket,
+                        key: "dst-put",
+                        version_id: None,
+                        retain_until: None,
+                        specific_etag: false,
+                        legal_hold: false,
+                        retention: false,
+                        post: false,
+                    },
+                    |_| Ok(()),
+                )
+                .await
+                .expect("inbound replication tagged PutObject with ReplicateTags must succeed");
+            }
+
+            let mut mpu_repl = request(Method::POST)
+                .header("x-rustfs-source-replication-request", "true")
+                .header("x-amz-tagging", "env=replica")
+                .req_info()
+                .server_context(&slot)
+                .build();
+            authorize_create_multipart_upload(
+                &slot,
+                &mut mpu_repl,
+                CreateMultipartAuthorization {
+                    bucket: &bucket,
+                    key: "dst-mpu",
+                    query_version: None,
+                    retain_until: None,
+                    legal_hold_present: false,
+                    retention_present: false,
+                },
+            )
+            .await
+            .expect("inbound replication tagged CreateMultipartUpload with ReplicateTags must succeed");
+
+            let mut copy_repl = request(Method::PUT)
+                .header("x-rustfs-source-replication-request", "true")
+                .req_info()
+                .server_context(&slot)
+                .build();
+            authorize_copy_object(
+                &mut copy_repl,
+                &slot,
+                CopyObjectAuthorization {
+                    bucket: &bucket,
+                    key: "dst-copy",
+                    source: Some(CopySourceObject {
+                        bucket: &bucket,
+                        key: "src",
+                        version_id: None,
+                    }),
+                    query_version: None,
+                    tagging: Some("env=replica"),
+                    tagging_directive: Some("REPLACE"),
+                    retain_until: None,
+                    legal_hold: false,
+                    retention: false,
+                },
+            )
+            .await
+            .expect("inbound replication tagged CopyObject with ReplicateTags must succeed");
+
+            // Browser POST form must never use the replication exception even if the header is set.
+            let mut post_repl = request(Method::POST)
+                .header("x-rustfs-source-replication-request", "true")
+                .req_info()
+                .server_context(&slot)
+                .build();
+            let err = authorize_put_object(
+                &mut post_repl,
+                &slot,
+                PutObjectAuthorization {
+                    bucket: &bucket,
+                    key: "dst-post",
+                    version_id: None,
+                    retain_until: None,
+                    specific_etag: false,
+                    legal_hold: false,
+                    retention: false,
+                    post: true,
+                },
+                |req| {
+                    PostObjectFormPolicy::new(PostObjectPolicyFields {
+                        tagging: Some("env=replica"),
+                        ..Default::default()
+                    })?
+                    .install(req);
+                    Ok(())
+                },
+            )
+            .await
+            .expect_err("PostObject must require PutObjectTagging even with replication header");
+            assert_eq!(err.code(), &S3ErrorCode::AccessDenied);
+
+            // Without the inbound replication header, the same principal is still denied PutObjectTagging.
+            let mut put_normal = request(Method::PUT)
+                .header("x-amz-tagging", "env=replica")
+                .req_info()
+                .server_context(&slot)
+                .build();
+            let err = authorize_put_object(
+                &mut put_normal,
+                &slot,
+                PutObjectAuthorization {
+                    bucket: &bucket,
+                    key: "dst-put",
+                    version_id: None,
+                    retain_until: None,
+                    specific_etag: false,
+                    legal_hold: false,
+                    retention: false,
+                    post: false,
+                },
+                |_| Ok(()),
+            )
+            .await
+            .expect_err("non-replication tagged PutObject must still require PutObjectTagging");
+            assert_eq!(err.code(), &S3ErrorCode::AccessDenied);
+
+            // Replicator missing s3:ReplicateTags must be denied tagged inbound replication writes.
+            publish_policy(
+                &store,
+                &bucket,
+                vec![serde_json::json!({
+                    "Effect": "Allow",
+                    "Principal": {"AWS": "*"},
+                    "Action": ["s3:PutObject", "s3:ReplicateObject"],
+                    "Resource": format!("arn:aws:s3:::{bucket}/*"),
+                })],
+            )
+            .await;
+
+            let mut put_missing_repl_tags = request(Method::PUT)
+                .header("x-rustfs-source-replication-request", "true")
+                .header("x-amz-tagging", "env=replica")
+                .req_info()
+                .server_context(&slot)
+                .build();
+            let err = authorize_put_object(
+                &mut put_missing_repl_tags,
+                &slot,
+                PutObjectAuthorization {
+                    bucket: &bucket,
+                    key: "dst-put",
+                    version_id: None,
+                    retain_until: None,
+                    specific_etag: false,
+                    legal_hold: false,
+                    retention: false,
+                    post: false,
+                },
+                |_| Ok(()),
+            )
+            .await
+            .expect_err("inbound replication tagged PutObject without ReplicateTags must be denied");
+            assert_eq!(err.code(), &S3ErrorCode::AccessDenied);
+
+            let mut mpu_missing_repl_tags = request(Method::POST)
+                .header("x-rustfs-source-replication-request", "true")
+                .header("x-amz-tagging", "env=replica")
+                .req_info()
+                .server_context(&slot)
+                .build();
+            let err = authorize_create_multipart_upload(
+                &slot,
+                &mut mpu_missing_repl_tags,
+                CreateMultipartAuthorization {
+                    bucket: &bucket,
+                    key: "dst-mpu",
+                    query_version: None,
+                    retain_until: None,
+                    legal_hold_present: false,
+                    retention_present: false,
+                },
+            )
+            .await
+            .expect_err("inbound replication tagged CreateMultipartUpload without ReplicateTags must be denied");
+            assert_eq!(err.code(), &S3ErrorCode::AccessDenied);
+        });
+    }
 }

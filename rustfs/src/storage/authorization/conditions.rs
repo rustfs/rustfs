@@ -180,13 +180,26 @@ pub(crate) fn merge_request_object_tag_conditions(
     headers: &HeaderMap,
     conditions: &mut HashMap<String, Vec<String>>,
 ) -> S3Result<()> {
-    if action != Action::S3Action(S3Action::PutObjectAction) {
+    if !matches!(
+        action,
+        Action::S3Action(S3Action::PutObjectAction | S3Action::PutObjectTaggingAction | S3Action::ReplicateTagsAction)
+    ) {
         return Ok(());
     }
 
-    let Some(tagging) = headers.get("x-amz-tagging").and_then(|value| value.to_str().ok()) else {
+    let mut values = headers.get_all("x-amz-tagging").iter();
+    let Some(first) = values.next() else {
         return Ok(());
     };
+    if values.next().is_some() {
+        return Err(S3Error::with_message(
+            S3ErrorCode::InvalidTag,
+            "Multiple x-amz-tagging headers are not allowed".to_string(),
+        ));
+    }
+    let tagging = first
+        .to_str()
+        .map_err(|_| S3Error::with_message(S3ErrorCode::InvalidTag, "The Tagging header contains invalid UTF-8".to_string()))?;
 
     let mut tag_keys = Vec::new();
     for tag in crate::storage::s3_api::tagging::parse_object_tag_header(tagging)? {
@@ -293,7 +306,9 @@ pub(crate) fn authorization_conditions_with_internal<R: AuthorizationRequest + ?
     if internal_object_authorization {
         return Ok(conditions);
     }
-    merge_request_object_tag_conditions(facts.action(), req.policy_headers(), &mut conditions)?;
+    if req.requested_object_tags().is_none() {
+        merge_request_object_tag_conditions(facts.action(), req.policy_headers(), &mut conditions)?;
+    }
     if let Some(RequestedCopySource(source)) = req.requested_copy_source() {
         conditions.insert("x-amz-copy-source".to_string(), vec![source.clone()]);
     }
@@ -626,5 +641,84 @@ mod signature_age_post_tests {
             !keystone_conditions.contains_key("signatureAge"),
             "Keystone header-token request must not derive signatureAge from unverified query parameters"
         );
+    }
+}
+
+#[cfg(test)]
+mod tagging_condition_tests {
+    use super::*;
+    use crate::storage::authorization::tests::fixture::request;
+    use http::{HeaderValue, Method};
+
+    #[test]
+    fn merge_request_object_tag_conditions_applies_to_tagging_and_replication_write_actions() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-amz-tagging", HeaderValue::from_static("env=dev&owner=team%20a"));
+
+        for action in [
+            Action::S3Action(S3Action::PutObjectAction),
+            Action::S3Action(S3Action::PutObjectTaggingAction),
+            Action::S3Action(S3Action::ReplicateTagsAction),
+        ] {
+            let mut conditions = HashMap::new();
+            merge_request_object_tag_conditions(action, &headers, &mut conditions)
+                .expect("request tag conditions should populate");
+            assert_eq!(conditions.get("RequestObjectTag/env"), Some(&vec!["dev".to_string()]));
+            assert_eq!(conditions.get("RequestObjectTag/owner"), Some(&vec!["team a".to_string()]));
+            assert_eq!(
+                conditions.get("RequestObjectTagKeys"),
+                Some(&vec!["env".to_string(), "owner".to_string()])
+            );
+        }
+
+        let mut get_conditions = HashMap::new();
+        merge_request_object_tag_conditions(Action::S3Action(S3Action::GetObjectAction), &headers, &mut get_conditions)
+            .expect("GetObject ignores x-amz-tagging");
+        assert!(get_conditions.is_empty());
+
+        let mut duplicate = HeaderMap::new();
+        duplicate.append("x-amz-tagging", HeaderValue::from_static("env=dev"));
+        duplicate.append("x-amz-tagging", HeaderValue::from_static("env=prod"));
+        let err = merge_request_object_tag_conditions(
+            Action::S3Action(S3Action::PutObjectTaggingAction),
+            &duplicate,
+            &mut HashMap::new(),
+        )
+        .expect_err("duplicate x-amz-tagging headers must be rejected");
+        assert_eq!(err.code(), &S3ErrorCode::InvalidTag);
+
+        let mut non_utf8 = HeaderMap::new();
+        non_utf8.insert("x-amz-tagging", HeaderValue::from_bytes(&[0xff, b'=', b'a']).expect("header bytes"));
+        let err = merge_request_object_tag_conditions(
+            Action::S3Action(S3Action::PutObjectTaggingAction),
+            &non_utf8,
+            &mut HashMap::new(),
+        )
+        .expect_err("non-UTF-8 x-amz-tagging header must be rejected");
+        assert_eq!(err.code(), &S3ErrorCode::InvalidTag);
+    }
+
+    #[test]
+    fn authorization_conditions_skips_wire_tagging_header_when_requested_object_tags_installed() {
+        let mut req = request(Method::PUT).header("x-amz-tagging", "classification=%ZZ").build();
+        req.install_requested_object_tags(RequestedObjectTags(vec![("env".to_owned(), "dev".to_owned())]));
+
+        let credentials = rustfs_credentials::Credentials::default();
+        let principal = AuthzPrincipal::new(&credentials, "");
+        let facts = request_authz_facts(
+            &req,
+            AuthzTarget {
+                action: Action::S3Action(S3Action::PutObjectTaggingAction),
+                bucket: "bucket",
+                object: "key",
+                version_id: None,
+                location_constraint: None,
+            },
+        );
+        let conditions = authorization_conditions(&req, &principal, &facts)
+            .expect("installed RequestedObjectTags must take precedence over wire x-amz-tagging");
+        assert_eq!(conditions.get("RequestObjectTag/env"), Some(&vec!["dev".to_string()]));
+        assert_eq!(conditions.get("RequestObjectTagKeys"), Some(&vec!["env".to_string()]));
+        assert!(!conditions.contains_key("RequestObjectTag/classification"));
     }
 }
