@@ -18,8 +18,6 @@ use super::copy_input::{CopyObjectWriteInput, CopyObjectWriteOutput};
 use super::*;
 use crate::app::RequestEnvelope;
 use crate::app::storage_api::object_usecase::access::CopySourceObject;
-#[cfg(test)]
-use crate::app::storage_api::s3::dto::{CopyObjectInput, CopySource, MetadataDirective, StorageClass};
 use futures::FutureExt;
 use rustfs_gateway_types::CopySourceValue;
 use rustfs_s3_types::{S3Error, S3ErrorCode, S3Result, s3_error};
@@ -958,16 +956,6 @@ mod tests {
         )
     }
 
-    async fn copy_method_only(
-        usecase: &DefaultObjectUsecase,
-        input: CopyObjectInput,
-    ) -> crate::app::storage_api::s3::S3Result<crate::app::object_usecase::CopyObjectWriteOutput> {
-        let input = crate::app::object_usecase::CopyObjectWriteInput::from_legacy(input);
-        usecase
-            .execute_copy_object_owned(copy_envelope(HeaderMap::new()), input)
-            .await
-            .map_err(crate::error::legacy_error_for_test)
-    }
     use crate::app::storage_api::s3::S3ErrorCode;
     use crate::app::storage_api::s3::dto::ServerSideEncryption;
     use http::{HeaderValue, Method};
@@ -1154,23 +1142,19 @@ mod tests {
 
     #[tokio::test]
     async fn execute_copy_object_allows_self_copy_with_storage_class_change() {
-        let input = CopyObjectInput::builder()
-            .copy_source(CopySource::Bucket {
-                bucket: "test-bucket".into(),
-                key: "test-key".into(),
-                version_id: None,
-            })
-            .bucket("test-bucket".to_string())
-            .key("test-key".to_string())
-            .storage_class(Some(StorageClass::from_static(storageclass::RRS)))
-            .build()
-            .unwrap();
+        // Same facts the legacy builder carried: only the storage class is set.
+        let input = CopyObjectWriteInput {
+            storage_class: Some(storageclass::RRS.to_owned()),
+            ..copy_input("test-bucket", "test-key", "test-key", None)
+        };
 
         let usecase = DefaultObjectUsecase::without_context();
 
-        let err = Box::pin(copy_method_only(&usecase, input)).await.unwrap_err();
+        let err = Box::pin(usecase.execute_copy_object_owned(copy_envelope(HeaderMap::new()), input))
+            .await
+            .unwrap_err();
         // Self-copy with explicit storage class change must pass the self-copy guard.
-        assert_ne!(err.code(), &S3ErrorCode::InvalidRequest);
+        assert_ne!(err.code(), &rustfs_s3_types::S3ErrorCode::InvalidRequest);
     }
 
     #[tokio::test]
@@ -1272,48 +1256,42 @@ mod tests {
 
     #[tokio::test]
     async fn execute_copy_object_allows_tiered_self_copy_with_storage_class_change() {
-        let input = CopyObjectInput::builder()
-            .copy_source(CopySource::Bucket {
-                bucket: "test-bucket".into(),
-                key: "test-key".into(),
-                version_id: None,
-            })
-            .bucket("test-bucket".to_string())
-            .key("test-key".to_string())
-            .storage_class(Some(StorageClass::from_static(storageclass::STANDARD)))
-            .metadata_directive(Some(MetadataDirective::from_static(MetadataDirective::REPLACE)))
-            .build()
-            .unwrap();
+        // Same facts the legacy builder carried: STANDARD storage class and REPLACE directive.
+        let input = CopyObjectWriteInput {
+            storage_class: Some(storageclass::STANDARD.to_owned()),
+            metadata_directive: Some("REPLACE".to_owned()),
+            ..copy_input("test-bucket", "test-key", "test-key", None)
+        };
 
         let usecase = DefaultObjectUsecase::without_context();
 
-        let err = Box::pin(copy_method_only(&usecase, input)).await.unwrap_err();
+        let err = Box::pin(usecase.execute_copy_object_owned(copy_envelope(HeaderMap::new()), input))
+            .await
+            .unwrap_err();
         // Tiered self-copy with STANDARD storage class must pass all validation checks.
         // The call fails at store init (no store in unit tests), not at validation.
-        assert_ne!(err.code(), &S3ErrorCode::InvalidRequest);
-        assert_ne!(err.code(), &S3ErrorCode::NotImplemented);
+        assert_ne!(err.code(), &rustfs_s3_types::S3ErrorCode::InvalidRequest);
+        assert_ne!(err.code(), &rustfs_s3_types::S3ErrorCode::NotImplemented);
     }
 
     #[tokio::test]
     async fn execute_copy_object_allows_self_copy_of_historical_version() {
         // Restoring a specific historical version onto the current key (same bucket/key with a
         // source versionId, default COPY directive) must pass the self-copy guard (issue #4238).
-        let input = CopyObjectInput::builder()
-            .copy_source(CopySource::Bucket {
-                bucket: "test-bucket".into(),
-                key: "test-key".into(),
-                version_id: Some("11111111-1111-1111-1111-111111111111".into()),
-            })
-            .bucket("test-bucket".to_string())
-            .key("test-key".to_string())
-            .build()
-            .unwrap();
+        let input = copy_input(
+            "test-bucket",
+            "test-key",
+            "test-key",
+            Some("11111111-1111-1111-1111-111111111111".to_owned()),
+        );
 
         let usecase = DefaultObjectUsecase::without_context();
 
-        let err = Box::pin(copy_method_only(&usecase, input)).await.unwrap_err();
+        let err = Box::pin(usecase.execute_copy_object_owned(copy_envelope(HeaderMap::new()), input))
+            .await
+            .unwrap_err();
         // Must not be rejected by the self-copy guard; it fails later at store init instead.
-        assert_ne!(err.code(), &S3ErrorCode::InvalidRequest);
+        assert_ne!(err.code(), &rustfs_s3_types::S3ErrorCode::InvalidRequest);
     }
 
     #[tokio::test]
@@ -1469,17 +1447,9 @@ mod tests {
             .await
             .expect("copy source should be written");
 
-        let input = CopyObjectInput::builder()
-            .copy_source(CopySource::Bucket {
-                bucket: bucket.clone().into(),
-                key: source.to_string().into(),
-                version_id: None,
-            })
-            .bucket(bucket.clone())
-            .key(destination.to_string())
-            .build()
-            .expect("directory copy input should build");
-        let response = copy_method_only(&DefaultObjectUsecase::with_context(Some(context)), input)
+        let input = copy_input(&bucket, source, destination, None);
+        let response = DefaultObjectUsecase::with_context(Some(context))
+            .execute_copy_object_owned(copy_envelope(HeaderMap::new()), input)
             .await
             .expect("copying to a directory marker should succeed");
 
@@ -1566,21 +1536,14 @@ mod tests {
     #[tokio::test]
     async fn execute_copy_object_allows_self_copy_of_null_version() {
         // A "null" source version id is a restore of the null version, not a no-op self-copy.
-        let input = CopyObjectInput::builder()
-            .copy_source(CopySource::Bucket {
-                bucket: "test-bucket".into(),
-                key: "test-key".into(),
-                version_id: Some("null".into()),
-            })
-            .bucket("test-bucket".to_string())
-            .key("test-key".to_string())
-            .build()
-            .unwrap();
+        let input = copy_input("test-bucket", "test-key", "test-key", Some("null".to_owned()));
 
         let usecase = DefaultObjectUsecase::without_context();
 
-        let err = Box::pin(copy_method_only(&usecase, input)).await.unwrap_err();
-        assert_ne!(err.code(), &S3ErrorCode::InvalidRequest);
+        let err = Box::pin(usecase.execute_copy_object_owned(copy_envelope(HeaderMap::new()), input))
+            .await
+            .unwrap_err();
+        assert_ne!(err.code(), &rustfs_s3_types::S3ErrorCode::InvalidRequest);
     }
 
     #[tokio::test]
@@ -1704,23 +1667,14 @@ mod tests {
             .expect("copy source object must be written");
         install_unreadable_bucket_sse_config(&bucket).await;
 
-        let input = CopyObjectInput::builder()
-            .copy_source(CopySource::Bucket {
-                bucket: bucket.clone().into(),
-                key: source.into(),
-                version_id: None,
-            })
-            .bucket(bucket.clone())
-            .key(destination.to_string())
-            .build()
-            .expect("copy input must build");
+        let input = copy_input(&bucket, source, destination, None);
         let usecase = DefaultObjectUsecase::with_context(Some(Arc::clone(&context)));
 
-        let err = Box::pin(copy_method_only(&usecase, input))
+        let err = Box::pin(usecase.execute_copy_object_owned(copy_envelope(HeaderMap::new()), input))
             .await
             .expect_err("an unreadable bucket encryption configuration must refuse the copy");
 
-        assert_eq!(err.code(), &S3ErrorCode::ServiceUnavailable);
+        assert_eq!(err.code(), &rustfs_s3_types::S3ErrorCode::ServiceUnavailable);
         let lookup_err = store
             .get_object_info(&bucket, destination, &ObjectOptions::default())
             .await
