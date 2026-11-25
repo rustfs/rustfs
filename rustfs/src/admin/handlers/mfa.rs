@@ -51,6 +51,7 @@ use crate::admin::service::caller_identity::CallerIdentity;
 use crate::admin::storage_api::runtime::ECStore;
 use crate::admin::storage_api::s3::{self, S3Error, S3ErrorCode, S3Result};
 use crate::admin::utils::read_compatible_admin_body;
+use crate::app::RequestEnvelope;
 use crate::auth::constant_time_eq;
 use http::StatusCode;
 use hyper::Method;
@@ -170,6 +171,56 @@ async fn resolve_self_service_caller(req: &AdminRequest) -> S3Result<CallerIdent
     Ok(caller)
 }
 
+/// Step-up: confirm the caller knows the identity's long-term secret key.
+///
+/// The console signs with a short-lived STS session, so a signature alone does
+/// not prove it. Shared by every operation that removes or replaces an active
+/// second factor.
+async fn ensure_current_secret_key(
+    envelope: &RequestEnvelope,
+    caller: &CallerIdentity,
+    audit: &AccountAuditContext,
+    operation: AccountAuditOperation,
+    current_secret_key: &str,
+) -> S3Result<()> {
+    let stored_secret = if caller.credentials_source == rustfs_madmin::account::CredentialsSource::Env {
+        crate::admin::runtime_sources::app_context_from_envelope(envelope)
+            .and_then(|ctx| ctx.action_credentials().get())
+            .filter(|root| constant_time_eq(&root.access_key, &caller.access_key))
+            .map(|root| root.secret_key)
+    } else {
+        None
+    };
+    let stored_secret = match stored_secret {
+        Some(secret) => secret,
+        None => {
+            let iam_store = crate::admin::runtime_sources::app_context_from_envelope(envelope)
+                .filter(|ctx| ctx.iam().is_ready())
+                .map(|ctx| ctx.iam().handle())
+                .ok_or_else(|| s3::error(S3ErrorCode::InternalError, "iam is not initialized"))?;
+            let Some(stored) = iam_store.get_user(&caller.access_key).await else {
+                return Err(s3::error(S3ErrorCode::InvalidRequest, "the calling identity no longer exists"));
+            };
+            stored.credentials.secret_key
+        }
+    };
+
+    if !constant_time_eq(current_secret_key, &stored_secret) {
+        emit_audit(
+            audit,
+            AccountAuditRecord::failure(
+                operation,
+                &caller.access_key,
+                caller.identity_type,
+                AccountAuditFailure::InvalidCurrentSecret,
+            )
+            .with_session_access_key(caller.session_access_key.as_deref()),
+        );
+        return Err(s3::error(S3ErrorCode::AccessDenied, "the current secret key is incorrect"));
+    }
+    Ok(())
+}
+
 /// `GET /rustfs/admin/v3/account/mfa`
 pub struct AccountMfaStatusHandler {}
 
@@ -195,12 +246,44 @@ pub struct AccountMfaEnrollHandler {}
 
 #[async_trait::async_trait]
 impl Operation for AccountMfaEnrollHandler {
-    async fn call(&self, req: AdminRequest, _params: Params<'_, '_>) -> S3Result<AdminResponse> {
+    async fn call(&self, mut req: AdminRequest, _params: Params<'_, '_>) -> S3Result<AdminResponse> {
         let caller = resolve_self_service_caller(&req).await?;
         let audit = AccountAuditContext::from_envelope(req.envelope());
         let store = store_from_req(&req)?;
+        let path = req.uri().path().to_string();
+        let now = OffsetDateTime::now_utc();
 
-        let response = match mfa_service::enroll(store, &caller.access_key, OffsetDateTime::now_utc()).await {
+        // Step-up: confirming the new secret replaces the active factor and its
+        // recovery codes, so starting a replacement over an active factor
+        // requires the same proof (`code` + `current_secret_key`) as `disable`.
+        // The service re-checks the code inside the CAS update against live state.
+        let current_code = if mfa_service::is_enabled(store.clone(), &caller.access_key, now)
+            .await
+            .map_err(map_service_error)?
+        {
+            let body =
+                read_compatible_admin_body(req.take_body(), MAX_ADMIN_REQUEST_BODY_SIZE, &path, &caller.credentials.secret_key)
+                    .await?;
+            let request: MfaDisableRequest = serde_json::from_slice(&body).map_err(|e| {
+                s3::error(
+                    S3ErrorCode::InvalidRequest,
+                    format!("replacing an active second factor requires a code from it and the current secret key: {e}"),
+                )
+            })?;
+            ensure_current_secret_key(
+                req.envelope(),
+                &caller,
+                &audit,
+                AccountAuditOperation::MfaEnroll,
+                &request.current_secret_key,
+            )
+            .await?;
+            Some(request.code)
+        } else {
+            None
+        };
+
+        let response = match mfa_service::enroll(store, &caller.access_key, current_code.as_deref(), now).await {
             Ok(response) => response,
             Err(err) => {
                 emit_audit(
@@ -232,7 +315,7 @@ impl Operation for AccountMfaEnrollHandler {
             "admin mfa state"
         );
 
-        owned_admin_json_response(req.uri().path(), &caller.credentials.secret_key, StatusCode::OK, &response)
+        owned_admin_json_response(&path, &caller.credentials.secret_key, StatusCode::OK, &response)
     }
 }
 
@@ -311,24 +394,14 @@ impl Operation for AccountMfaDisableHandler {
         // factor. The console signs with a short-lived STS session, so a
         // hijacked tab would otherwise be able to strip the protection using
         // only a code shoulder-surfed once.
-        let iam_store = crate::admin::runtime_sources::current_ready_iam_handle()
-            .map_err(|_| s3::error(S3ErrorCode::InternalError, "iam is not initialized"))?;
-        let Some(stored) = iam_store.get_user(&caller.access_key).await else {
-            return Err(s3::error(S3ErrorCode::InvalidRequest, "the calling identity no longer exists"));
-        };
-        if !constant_time_eq(&request.current_secret_key, &stored.credentials.secret_key) {
-            emit_audit(
-                &audit,
-                AccountAuditRecord::failure(
-                    AccountAuditOperation::MfaDisable,
-                    &caller.access_key,
-                    caller.identity_type,
-                    AccountAuditFailure::InvalidCurrentSecret,
-                )
-                .with_session_access_key(caller.session_access_key.as_deref()),
-            );
-            return Err(s3::error(S3ErrorCode::AccessDenied, "the current secret key is incorrect"));
-        }
+        ensure_current_secret_key(
+            req.envelope(),
+            &caller,
+            &audit,
+            AccountAuditOperation::MfaDisable,
+            &request.current_secret_key,
+        )
+        .await?;
 
         if let Err(err) = mfa_service::disable(store, &caller.access_key, &request.code, OffsetDateTime::now_utc()).await {
             emit_audit(
@@ -730,6 +803,7 @@ mod tests {
         for error in [
             MfaServiceError::NotEnabled,
             MfaServiceError::NoPendingEnrollment,
+            MfaServiceError::AlreadyEnabled,
             MfaServiceError::InvalidCode,
             MfaServiceError::Locked { retry_after_seconds: 1 },
             MfaServiceError::InvalidChallenge,
@@ -755,5 +829,247 @@ mod tests {
             parse_user_mfa_query(&request("http://localhost/rustfs/admin/v3/user/mfa?accessKey=sinan")).expect("parse"),
             "sinan"
         );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn reenroll_requires_step_up_and_enforces_lockout() {
+        crate::app::gating_test_env::run_large_stack_test("admin-mfa-reenroll-step-up", || async {
+            use crate::admin::operation::test_support::TestRequest;
+            use rustfs_iam::mfa::TotpSecret;
+            use rustfs_iam::sys::SESSION_POLICY_NAME;
+            use rustfs_madmin::account::{MfaEnrollResponse, RecoveryCodesResponse};
+            use rustfs_policy::auth::get_new_credentials_with_metadata;
+            use serde_json::json;
+            use std::collections::HashMap;
+
+            temp_env::async_with_vars([("RUSTFS_IAM_MASTER_KEY", Some("mfa-handler-step-up-master-key"))], async {
+                let root_cred = rustfs_credentials::get_global_action_cred().unwrap_or_else(|| {
+                    let _ = rustfs_credentials::init_global_action_credentials(
+                        Some("root-mfa-test".to_owned()),
+                        Some("root-secret-mfa-test".to_owned()),
+                    );
+                    rustfs_credentials::get_global_action_cred().expect("global action credentials initialized")
+                });
+                let canonical = crate::app::gating_test_env::shared_gating_ambient().await;
+                if canonical.action_credentials().get().is_none() {
+                    let _ = canonical.publish_action_credentials(root_cred.clone());
+                }
+                let iam = canonical.iam().handle();
+                let active_root = canonical
+                    .action_credentials()
+                    .get()
+                    .expect("canonical AppContext must expose action credentials");
+
+                let suffix = uuid::Uuid::new_v4().simple().to_string();
+                let user_a = format!("mfa-lock-user-{suffix}");
+                let user_b = format!("mfa-reenroll-user-{suffix}");
+                let secret = "mfa-user-secret-0123456789";
+
+                for user in [&user_a, &user_b] {
+                    iam.create_user(
+                        user,
+                        &rustfs_madmin::AddOrUpdateUserReq {
+                            secret_key: secret.to_owned(),
+                            policy: None,
+                            status: rustfs_madmin::AccountStatus::Enabled,
+                        },
+                    )
+                    .await
+                    .expect("create MFA test user");
+                }
+
+                let exp_ts = (OffsetDateTime::now_utc() + time::Duration::hours(1)).unix_timestamp();
+                let user_a_cred = iam.get_user(&user_a).await.expect("user_a exists").credentials;
+                let user_b_cred = iam.get_user(&user_b).await.expect("user_b exists").credentials;
+
+                // Restricted STS session must be refused enrollment outright (#3353).
+                let s3_only_b64 = base64_simd::URL_SAFE_NO_PAD.encode_to_string(
+                    br#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":["s3:GetObject"],"Resource":["arn:aws:s3:::public/*"]}]}"#,
+                );
+                let restricted_claims = HashMap::from([
+                    ("parent".to_owned(), json!(user_a)),
+                    ("exp".to_owned(), json!(exp_ts)),
+                    (SESSION_POLICY_NAME.to_owned(), json!(s3_only_b64)),
+                ]);
+                let mut restricted_sts = get_new_credentials_with_metadata(&restricted_claims, &active_root.secret_key)
+                    .expect("mint restricted sts");
+                restricted_sts.parent_user = user_a.clone();
+                iam.set_temp_user_from_parent(&restricted_sts, &user_a_cred)
+                    .await
+                    .expect("persist restricted sts");
+
+                let restricted_enroll_req = TestRequest::new(Method::POST, ACCOUNT_MFA_ENROLL_ROUTE)
+                    .header("x-amz-security-token", &restricted_sts.session_token)
+                    .credentials(
+                        &restricted_sts.access_key,
+                        &restricted_sts.secret_key,
+                        Some(&restricted_sts.session_token),
+                    )
+                    .build();
+                assert_eq!(
+                    AccountMfaEnrollHandler {}
+                        .call(restricted_enroll_req, Params::new())
+                        .await
+                        .expect_err("restricted STS must not enroll parent MFA")
+                        .code(),
+                    &S3ErrorCode::InvalidRequest
+                );
+
+                // Unrestricted Console STS sessions for user_a and user_b.
+                let mut console_a = get_new_credentials_with_metadata(
+                    &HashMap::from([("parent".to_owned(), json!(user_a)), ("exp".to_owned(), json!(exp_ts))]),
+                    &active_root.secret_key,
+                )
+                .expect("mint console_a sts");
+                console_a.parent_user = user_a.clone();
+                iam.set_temp_user_from_parent(&console_a, &user_a_cred)
+                    .await
+                    .expect("persist console_a sts");
+
+                let mut console_b = get_new_credentials_with_metadata(
+                    &HashMap::from([("parent".to_owned(), json!(user_b)), ("exp".to_owned(), json!(exp_ts))]),
+                    &active_root.secret_key,
+                )
+                .expect("mint console_b sts");
+                console_b.parent_user = user_b.clone();
+                iam.set_temp_user_from_parent(&console_b, &user_b_cred)
+                    .await
+                    .expect("persist console_b sts");
+
+                // First-time enrollment works without a body for an unrestricted Console STS session.
+                let enroll_first = async |sts: &rustfs_credentials::Credentials| -> RecoveryCodesResponse {
+                    let req = TestRequest::new(Method::POST, ACCOUNT_MFA_ENROLL_ROUTE)
+                        .header("x-amz-security-token", &sts.session_token)
+                        .credentials(&sts.access_key, &sts.secret_key, Some(&sts.session_token))
+                        .build();
+                    let (status, _, mut body) = AccountMfaEnrollHandler {}
+                        .call(req, Params::new())
+                        .await
+                        .expect("first-time enroll should succeed")
+                        .into_parts();
+                    assert_eq!(status, StatusCode::OK);
+                    let bytes = body.store_all_limited(65536).await.expect("read enroll response");
+                    let enrolled: MfaEnrollResponse = serde_json::from_slice(&bytes).expect("parse enroll response");
+                    let totp = TotpSecret::from_base32(&enrolled.secret_base32).expect("valid base32 secret");
+                    let code = totp.code_at(OffsetDateTime::now_utc().unix_timestamp() as u64);
+
+                    let activate_req = TestRequest::new(Method::POST, ACCOUNT_MFA_ACTIVATE_ROUTE)
+                        .header("x-amz-security-token", &sts.session_token)
+                        .credentials(&sts.access_key, &sts.secret_key, Some(&sts.session_token))
+                        .body(serde_json::to_vec(&json!({ "code": code })).expect("serialize activate"))
+                        .build();
+                    let (status, _, mut body) = AccountMfaActivateHandler {}
+                        .call(activate_req, Params::new())
+                        .await
+                        .expect("activate should succeed")
+                        .into_parts();
+                    assert_eq!(status, StatusCode::OK);
+                    let bytes = body.store_all_limited(65536).await.expect("read activate response");
+                    serde_json::from_slice(&bytes).expect("parse recovery codes")
+                };
+
+                let codes_a = enroll_first(&console_a).await;
+                let codes_b = enroll_first(&console_b).await;
+
+                // Re-enrolling without a body is refused with 400 InvalidRequest.
+                let empty_reenroll = TestRequest::new(Method::POST, ACCOUNT_MFA_ENROLL_ROUTE)
+                    .header("x-amz-security-token", &console_a.session_token)
+                    .credentials(&console_a.access_key, &console_a.secret_key, Some(&console_a.session_token))
+                    .body(b"{}".to_vec())
+                    .build();
+                assert_eq!(
+                    AccountMfaEnrollHandler {}
+                        .call(empty_reenroll, Params::new())
+                        .await
+                        .expect_err("re-enroll without step-up payload must fail")
+                        .code(),
+                    &S3ErrorCode::InvalidRequest
+                );
+
+                // Re-enrolling with a wrong current_secret_key is refused with 403 AccessDenied.
+                let wrong_secret_reenroll = TestRequest::new(Method::POST, ACCOUNT_MFA_ENROLL_ROUTE)
+                    .header("x-amz-security-token", &console_a.session_token)
+                    .credentials(&console_a.access_key, &console_a.secret_key, Some(&console_a.session_token))
+                    .body(
+                        serde_json::to_vec(&json!({
+                            "code": codes_a.recovery_codes[0],
+                            "current_secret_key": "wrong-secret-0123456789",
+                        }))
+                        .expect("serialize wrong-secret payload"),
+                    )
+                    .build();
+                assert_eq!(
+                    AccountMfaEnrollHandler {}
+                        .call(wrong_secret_reenroll, Params::new())
+                        .await
+                        .expect_err("re-enroll with wrong secret key must fail")
+                        .code(),
+                    &S3ErrorCode::AccessDenied
+                );
+
+                // Five wrong step-up codes during re-enroll persist failures and trigger 503 SlowDown.
+                for attempt in 1..=5 {
+                    let wrong_code_req = TestRequest::new(Method::POST, ACCOUNT_MFA_ENROLL_ROUTE)
+                        .header("x-amz-security-token", &console_a.session_token)
+                        .credentials(&console_a.access_key, &console_a.secret_key, Some(&console_a.session_token))
+                        .body(
+                            serde_json::to_vec(&json!({
+                                "code": "ZZZZ-ZZZZ-ZZZZ-ZZZZ-ZZZZ",
+                                "current_secret_key": secret,
+                            }))
+                            .expect("serialize wrong-code payload"),
+                        )
+                        .build();
+                    let err = AccountMfaEnrollHandler {}
+                        .call(wrong_code_req, Params::new())
+                        .await
+                        .expect_err("wrong step-up code must fail");
+                    assert_eq!(err.code(), &S3ErrorCode::AccessDenied, "attempt {attempt}");
+                }
+                let locked_req = TestRequest::new(Method::POST, ACCOUNT_MFA_ENROLL_ROUTE)
+                    .header("x-amz-security-token", &console_a.session_token)
+                    .credentials(&console_a.access_key, &console_a.secret_key, Some(&console_a.session_token))
+                    .body(
+                        serde_json::to_vec(&json!({
+                            "code": codes_a.recovery_codes[0],
+                            "current_secret_key": secret,
+                        }))
+                        .expect("serialize locked payload"),
+                    )
+                    .build();
+                assert_eq!(
+                    AccountMfaEnrollHandler {}
+                        .call(locked_req, Params::new())
+                        .await
+                        .expect_err("locked identity must receive SlowDown even with a valid code")
+                        .code(),
+                    &S3ErrorCode::SlowDown
+                );
+
+                // Valid step-up proof (current_secret_key + valid recovery code) succeeds on user_b.
+                let valid_reenroll = TestRequest::new(Method::POST, ACCOUNT_MFA_ENROLL_ROUTE)
+                    .header("x-amz-security-token", &console_b.session_token)
+                    .credentials(&console_b.access_key, &console_b.secret_key, Some(&console_b.session_token))
+                    .body(
+                        serde_json::to_vec(&json!({
+                            "code": codes_b.recovery_codes[0],
+                            "current_secret_key": secret,
+                        }))
+                        .expect("serialize valid re-enroll payload"),
+                    )
+                    .build();
+                let (status, _, mut body) = AccountMfaEnrollHandler {}
+                    .call(valid_reenroll, Params::new())
+                    .await
+                    .expect("proven re-enrollment should succeed")
+                    .into_parts();
+                assert_eq!(status, StatusCode::OK);
+                let bytes = body.store_all_limited(65536).await.expect("read re-enroll response");
+                let replacement: MfaEnrollResponse = serde_json::from_slice(&bytes).expect("parse replacement response");
+                assert!(!replacement.secret_base32.is_empty());
+            })
+            .await;
+        });
     }
 }

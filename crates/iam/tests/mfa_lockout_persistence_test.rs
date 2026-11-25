@@ -37,7 +37,7 @@ async fn failed_verifications_are_persisted_and_lock_the_identity() {
             .ecstore;
 
         let now = OffsetDateTime::from_unix_timestamp(1_700_000_000).expect("valid timestamp");
-        let enrollment = service::enroll(ecstore.clone(), ACCESS_KEY, now).await.expect("enroll");
+        let enrollment = service::enroll(ecstore.clone(), ACCESS_KEY, None, now).await.expect("enroll");
         let secret = TotpSecret::from_base32(&enrollment.secret_base32).expect("server-issued secret");
         let issued = service::activate(ecstore.clone(), ACCESS_KEY, &secret.code_at(now.unix_timestamp() as u64), now)
             .await

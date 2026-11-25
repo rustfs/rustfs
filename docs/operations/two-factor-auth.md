@@ -120,7 +120,7 @@ A challenge is `HMAC-SHA256(root_secret, "rustfs-mfa-challenge:v1" ‖ access_ke
 | `GET /v3/account/info` | possession of the credential |
 | `POST /v3/account/password` | credential + knowledge of the current secret |
 | `GET /v3/account/mfa` | possession of the credential |
-| `POST /v3/account/mfa/enroll` | credential, and the credential kind must be mutable (not a service account, federated session, table storage session, or session-policy-restricted session) |
+| `POST /v3/account/mfa/enroll` | credential, and the credential kind must be mutable (not a service account, federated session, table storage session, or session-policy-restricted session); with a factor already active, also a valid code from it and the account password |
 | `POST /v3/account/mfa/activate` | credential + a valid code from the pending secret |
 | `POST /v3/account/mfa/disable` | credential + a valid code and the account password |
 | `POST /v3/account/mfa/recovery-codes` | credential + a valid code |
@@ -131,7 +131,7 @@ A challenge is `HMAC-SHA256(root_secret, "rustfs-mfa-challenge:v1" ‖ access_ke
 
 Eligible callers need no explicit Allow to rotate their password or manage their MFA. A matching Deny on `admin:ChangeOwnPassword` or `admin:CreateUser` blocks self-rotation (including via `add-user`); a Deny on `admin:ManageOwnMFA` blocks enrollment, activation, disabling and recovery-code replacement. The checks use the signing credential, including its applicable session policy. Administrative reset routes still require their ordinary admin permission and also honor the self-service deny when targeting the caller's own identity. Allowing a self-service action grants no authority over another identity.
 
-`POST /v3/account/password` and `POST /v3/account/mfa/disable` require a proof-of-knowledge step because a signature only proves a credential was used. The Console signs with a short-lived session, so without it a hijacked browser tab could rewrite the account's credentials or strip its second factor; requiring the password makes disabling the factor as hard as the thing the factor protects.
+`POST /v3/account/password` and `POST /v3/account/mfa/disable` require a proof-of-knowledge step because a signature only proves a credential was used. The Console signs with a short-lived session, so without it a hijacked browser tab could rewrite the account's credentials or strip its second factor; requiring the password makes disabling the factor as hard as the thing the factor protects. `POST /v3/account/mfa/enroll` on an identity whose factor is already active requires the same two proofs (`code` and `current_secret_key`): confirming the new secret replaces the active factor and its recovery codes, so starting a replacement without step-up would let a hijacked session displace the owner's authenticator.
 
 Break-glass: `DELETE /v3/user/mfa` clears another identity's factor, for a user who lost both their authenticator and their recovery codes. It is gated on `admin:EnableUser` rather than a bespoke action because that capability can already re-enable a disabled account, and anyone who can do that can already take the identity over. The record is deleted outright rather than disabled, so no stale lockout counter survives to block the user's next enrollment. The acting administrator is recorded in the audit entry.
 
