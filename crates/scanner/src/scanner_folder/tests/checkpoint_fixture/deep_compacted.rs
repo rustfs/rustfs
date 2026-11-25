@@ -225,6 +225,105 @@ async fn large_prefix_deep_resumes_after_budget_across_cycles_and_leaders() {
     check_large_prefix_resumption(HealScanMode::Deep).await;
 }
 
+tokio::task_local! {
+    static MAX_FOLDER_FRAMES: std::cell::Cell<usize>;
+}
+
+pub(in crate::scanner_folder) fn observe_folder_frame_depth(depth: usize) {
+    let _ = MAX_FOLDER_FRAMES.try_with(|peak| peak.set(peak.get().max(depth)));
+}
+
+#[test]
+#[serial]
+fn nested_folder_sweep_resumes_with_exact_usage() {
+    // Match the Linux server profiles even when nextest sets a larger libtest stack.
+    let stack_size = if cfg!(debug_assertions) {
+        8 * rustfs_config::DEFAULT_THREAD_STACK_SIZE
+    } else {
+        rustfs_config::DEFAULT_THREAD_STACK_SIZE
+    };
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(1)
+        .thread_stack_size(stack_size)
+        .enable_all()
+        .build()
+        .expect("build scanner worker runtime");
+    let worker = runtime.spawn(MAX_FOLDER_FRAMES.scope(std::cell::Cell::new(0), check_nested_folder_sweep()));
+    runtime
+        .block_on(worker)
+        .expect("scanner worker must complete the folder sweep");
+}
+
+async fn check_nested_folder_sweep() {
+    let (scanner, root) = build_test_scanner().await;
+    let _cleanup = TestGuard {
+        temp_dir: Some(root.clone()),
+    };
+    write_checkpoint_object(
+        &root,
+        "documents/archive/2024/quarter-1/finance/receipts/first",
+        &[(Some(Uuid::from_u128(1)), 3), (Some(Uuid::from_u128(2)), 7)],
+    )
+    .await;
+    for (key, bytes) in [
+        ("documents/archive/2024/quarter-1/finance/receipts/second", 11),
+        ("documents/archive/2025/quarter-2/finance/reports/first", 13),
+        ("pictures/archive/2024/quarter-2/projects/meeting/first", 17),
+    ] {
+        write_checkpoint_object(&root, key, &[(None, bytes)]).await;
+    }
+    let identity = crate::DataUsageScanIdentity {
+        tier_registry_generation: crate::runtime_tier_registry_for_cycle(11, 7).await.generation,
+        ..bound_checkpoint().1
+    };
+    let mut initial = DataUsageCache::default();
+    initial.prepare_bucket_checkpoint("bucket", 11, 7, SOURCE, PLAN, identity);
+    initial.info.skip_healing = true;
+
+    let mode = HealScanMode::Normal;
+    let (fresh, visits) = scan(&scanner.local_disk, initial.clone(), mode, 5).await;
+    let ScannerDiskScanOutcome::Complete(fresh) = fresh else {
+        panic!("the uninterrupted sweep must visit all sibling prefixes");
+    };
+    assert!(
+        MAX_FOLDER_FRAMES.with(|peak| peak.replace(0)) >= 8,
+        "the driver must own all ancestor frames"
+    );
+    assert_eq!(visits.progress().0, 4);
+    let expected = (4, 2, 51);
+    let totals = fresh.checked_flatten("bucket").expect("complete fresh bucket tree");
+    assert_eq!((totals.objects, totals.versions, totals.size), expected);
+
+    let (interrupted, visits) = scan(&scanner.local_disk, initial, mode, 2).await;
+    let ScannerDiskScanOutcome::Partial(partial) = interrupted else {
+        panic!("the two-object budget must stop inside the folder walk");
+    };
+    assert!(
+        MAX_FOLDER_FRAMES.with(|peak| peak.replace(0)) >= 8,
+        "the budget must interrupt a nested walk"
+    );
+    assert_eq!(visits.reason(), Some(ScannerCycleBudgetReason::Objects));
+    let store = FixtureStore::new();
+    let mut resumed = save_reload(&store, &partial).await;
+    assert!(!resumed.info.snapshot_complete);
+    assert!(resumed.has_scan_position());
+    resumed.prepare_bucket_checkpoint("bucket", 12, 8, SOURCE, PLAN, identity);
+    resumed.info.skip_healing = true;
+    let (finished, _) = scan(&scanner.local_disk, resumed, mode, 5).await;
+    let ScannerDiskScanOutcome::Complete(finished) = finished else {
+        panic!("the resumed walk must finish the remaining sibling prefixes");
+    };
+    assert!(
+        MAX_FOLDER_FRAMES.with(|peak| peak.get()) >= 8,
+        "the driver must revisit nested work after reload"
+    );
+    let persisted = save_reload(&store, &finished).await;
+    assert!(persisted.info.snapshot_complete);
+    assert!(persisted.info.scan_checkpoint.is_none());
+    let totals = persisted.checked_flatten("bucket").expect("complete resumed bucket tree");
+    assert_eq!((totals.objects, totals.versions, totals.size), expected);
+}
+
 async fn check_large_prefix_resumption(mode: HealScanMode) {
     let (scanner, root) = build_test_scanner().await;
     let _cleanup = TestGuard {
