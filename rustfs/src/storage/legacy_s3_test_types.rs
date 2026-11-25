@@ -28,13 +28,9 @@ pub(crate) mod request_body {
 }
 
 pub(crate) mod s3 {
-    pub(crate) use s3s::Body;
     pub(crate) use s3s::S3Request;
     pub(crate) use s3s::TrailingHeaders;
     pub(crate) use s3s::auth::Credentials;
     pub(crate) use s3s::dto;
-    pub(crate) use s3s::dto::PutObjectInput;
-    pub(crate) use s3s::dto::StreamingBlob;
-    pub(crate) use s3s::stream::upload_stream::UploadStreamError;
-    pub(crate) use s3s::{S3Error, S3ErrorCode, S3Result};
+    pub(crate) use s3s::{S3ErrorCode, S3Result};
 }

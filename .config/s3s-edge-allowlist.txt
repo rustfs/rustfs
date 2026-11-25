@@ -23,7 +23,6 @@ rustfs/src/error.rs
 rustfs/src/storage/legacy_s3_test_types.rs
 rustfs/src/admin/router.rs
 rustfs/src/server/http.rs
-rustfs/src/protocols/client.rs
 
 # e2e oracle: reviewed test targets that compare S3 behaviour against s3s
 crates/e2e_test/src/access_request_validation_test.rs
