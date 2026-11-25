@@ -19,6 +19,7 @@ use crate::admin::runtime_sources::current_federated_identity_service;
 use crate::admin::service::federated_identity::DefaultFederatedSessionBinding;
 use crate::admin::service::oidc_config;
 use crate::admin::utils::owned_json_response;
+use crate::server::rate_limit::{RateLimitDecision, RateLimitQuota, RateLimiter, ThrottleInfo, apply_throttle_headers};
 use crate::server::{ADMIN_PREFIX, MINIO_ADMIN_PREFIX, console_prefix};
 use http::StatusCode;
 use hyper::Method;
@@ -30,6 +31,8 @@ use rustfs_policy::policy::action::{Action, AdminAction};
 use rustfs_s3_types::{Body, S3Error, S3ErrorCode, S3Result, s3_error};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
+use std::net::IpAddr;
+use std::sync::LazyLock;
 use time::OffsetDateTime;
 use tracing::{debug, error, warn};
 use url::Url;
@@ -46,6 +49,55 @@ const CONSOLE_OIDC_CALLBACK_SUFFIX: &str = "/auth/oidc-callback/";
 const CONSOLE_LOGIN_SUFFIX: &str = "/auth/login";
 const OIDC_STATE_LB_HINT: &str =
     "check load balancer session affinity for OIDC authorize/callback requests or configure RUSTFS_BROWSER_REDIRECT_URL";
+/// Per-client-IP rate limit on `/oidc/authorize/{provider_id}` so a single unauthenticated
+/// client cannot roll over the 10,000-entry OIDC state store during another user's IdP
+/// round-trip even under LRU eviction. Shared across S3 and Console listeners and bounded in
+/// memory by `RateLimiter`'s sharded cap and idle-bucket sweep.
+const OIDC_AUTHORIZE_RATE_LIMIT_RPM: u32 = 120;
+const OIDC_AUTHORIZE_RATE_LIMIT_BURST: u32 = 30;
+static OIDC_AUTHORIZE_RATE_LIMITER: LazyLock<RateLimiter<Option<IpAddr>>> = LazyLock::new(|| {
+    RateLimiter::new(RateLimitQuota {
+        requests_per_minute: OIDC_AUTHORIZE_RATE_LIMIT_RPM,
+        burst: OIDC_AUTHORIZE_RATE_LIMIT_BURST,
+    })
+});
+
+fn oidc_authorize_client_ip(req: &AdminRequest) -> Option<IpAddr> {
+    req.policy_source_addr().map(|addr| addr.ip().to_canonical())
+}
+
+fn check_oidc_authorize_rate_limit(
+    limiter: &RateLimiter<Option<IpAddr>>,
+    req: &AdminRequest,
+    provider_id: &str,
+) -> Option<AdminResponse> {
+    let client_ip = oidc_authorize_client_ip(req);
+    match limiter.check(&client_ip) {
+        RateLimitDecision::Allowed => None,
+        RateLimitDecision::Limited(throttle) => {
+            warn!(
+                event = EVENT_ADMIN_OIDC_STATE,
+                component = LOG_COMPONENT_ADMIN,
+                subsystem = LOG_SUBSYSTEM_OIDC,
+                result = "authorize_rate_limited",
+                provider_id = %provider_id,
+                retry_after_secs = throttle.retry_after_secs,
+                "admin oidc state"
+            );
+            Some(oidc_authorize_rate_limited_response(limiter.quota().requests_per_minute, &throttle))
+        }
+    }
+}
+
+fn oidc_authorize_rate_limited_response(limit_rpm: u32, throttle: &ThrottleInfo) -> AdminResponse {
+    let mut headers = http::HeaderMap::new();
+    headers.insert(http::header::CONTENT_TYPE, http::HeaderValue::from_static("application/xml"));
+    apply_throttle_headers(&mut headers, limit_rpm, throttle);
+    let body = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\
+        <Error><Code>TooManyRequests</Code>\
+        <Message>Too many OIDC authorization requests. Please retry after the indicated delay.</Message></Error>";
+    AdminResponse::with_headers(StatusCode::TOO_MANY_REQUESTS, Body::from(body), headers)
+}
 
 fn callback_federation_error(error: FederationError) -> S3Error {
     match error {
@@ -356,6 +408,10 @@ impl Operation for OidcAuthorizeHandler {
 
         if !is_valid_provider_id(provider_id) {
             return Err(s3_error!(InvalidRequest, "invalid provider_id"));
+        }
+
+        if let Some(throttled) = check_oidc_authorize_rate_limit(&OIDC_AUTHORIZE_RATE_LIMITER, &req, provider_id) {
+            return Ok(throttled);
         }
 
         let federation = current_federated_identity_service().ok_or_else(|| s3_error!(InternalError, "OIDC not initialized"))?;
@@ -1411,5 +1467,177 @@ mod tests {
             !callback.contains(".complete_authorization_code(&state,&code,&redirect_uri,3600,"),
             "the callback must not hard-code the session duration"
         );
+    }
+
+    fn build_oidc_request_from_peer(
+        uri: &'static str,
+        peer: std::net::SocketAddr,
+        forwarded_for: Option<&'static str>,
+        trusted_client_ip: Option<IpAddr>,
+    ) -> AdminRequest {
+        let mut headers = HeaderMap::new();
+        headers.insert(http::header::HOST, HeaderValue::from_static("localhost:9000"));
+        if let Some(xff) = forwarded_for {
+            headers.insert("x-forwarded-for", HeaderValue::from_static(xff));
+        }
+
+        let mut req = crate::admin::operation::test_support::TestRequest::new(Method::GET, Uri::from_static(uri))
+            .headers(headers)
+            .extension(Some(crate::server::RemoteAddr(peer)));
+        if let Some(real_ip) = trusted_client_ip {
+            req = req.extension(rustfs_trusted_proxies::ClientInfo::from_trusted_proxy(
+                real_ip,
+                None,
+                None,
+                peer.ip(),
+                1,
+                rustfs_trusted_proxies::ValidationMode::Strict,
+                Vec::new(),
+            ));
+        }
+        req.body(Body::empty()).build()
+    }
+
+    #[tokio::test]
+    async fn oidc_authorize_rate_limit_caps_single_ip_and_isolates_others() {
+        use http_body_util::BodyExt as _;
+
+        let limiter = RateLimiter::new(RateLimitQuota {
+            requests_per_minute: 60,
+            burst: 2,
+        });
+        let attacker_ip: IpAddr = "198.51.100.1".parse().expect("valid test IP");
+        let victim_ip: IpAddr = "198.51.100.2".parse().expect("valid test IP");
+        let proxied_ip: IpAddr = "203.0.113.77".parse().expect("valid test IP");
+
+        // Distinct ephemeral ports from the same client IP share one budget.
+        for port in [41000, 41001] {
+            let req = build_oidc_request_from_peer(
+                "http://localhost:9000/rustfs/admin/v3/oidc/authorize/default",
+                std::net::SocketAddr::new(attacker_ip, port),
+                None,
+                None,
+            );
+            assert!(
+                check_oidc_authorize_rate_limit(&limiter, &req, "default").is_none(),
+                "requests within burst must be allowed"
+            );
+        }
+
+        // Next request from the same IP is throttled with 429 and retry headers.
+        let throttled_req = build_oidc_request_from_peer(
+            "http://localhost:9000/rustfs/admin/v3/oidc/authorize/default",
+            std::net::SocketAddr::new(attacker_ip, 41002),
+            None,
+            None,
+        );
+        let throttled = check_oidc_authorize_rate_limit(&limiter, &throttled_req, "default")
+            .expect("request exceeding burst must be rate-limited");
+        let (status, headers, body) = throttled.into_parts();
+        assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+        assert!(headers.contains_key(http::header::RETRY_AFTER));
+        assert_eq!(headers.get("x-ratelimit-remaining").and_then(|v| v.to_str().ok()), Some("0"));
+        let body = body.collect().await.expect("rate limit body should read").to_bytes();
+        let body_text = std::str::from_utf8(&body).expect("rate limit body should be UTF-8");
+        assert!(body_text.contains("<Code>TooManyRequests</Code>"));
+
+        // Spoofed X-Forwarded-For without trusted-proxy ClientInfo cannot bypass the peer IP cap.
+        let spoofed_req = build_oidc_request_from_peer(
+            "http://localhost:9000/rustfs/admin/v3/oidc/authorize/default",
+            std::net::SocketAddr::new(attacker_ip, 41003),
+            Some("203.0.113.99"),
+            None,
+        );
+        let spoofed = check_oidc_authorize_rate_limit(&limiter, &spoofed_req, "default")
+            .expect("spoofed X-Forwarded-For must not escape the peer IP rate limit");
+        assert_eq!(spoofed.into_parts().0, StatusCode::TOO_MANY_REQUESTS);
+
+        // Another client IP retains its own independent budget.
+        let victim_req = build_oidc_request_from_peer(
+            "http://localhost:9000/rustfs/admin/v3/oidc/authorize/default",
+            std::net::SocketAddr::new(victim_ip, 42000),
+            None,
+            None,
+        );
+        assert!(
+            check_oidc_authorize_rate_limit(&limiter, &victim_req, "default").is_none(),
+            "throttling one IP must not affect other clients"
+        );
+
+        // Verified ClientInfo from a trusted proxy keys on the resolved client IP.
+        let proxied_req = build_oidc_request_from_peer(
+            "http://localhost:9000/rustfs/admin/v3/oidc/authorize/default",
+            std::net::SocketAddr::new(attacker_ip, 41004),
+            Some("203.0.113.77"),
+            Some(proxied_ip),
+        );
+        assert!(
+            check_oidc_authorize_rate_limit(&limiter, &proxied_req, "default").is_none(),
+            "verified trusted-proxy client IP must receive its own bucket"
+        );
+    }
+
+    #[tokio::test]
+    async fn oidc_authorize_handler_throttles_excessive_requests_per_ip() {
+        let mut router = matchit::Router::new();
+        router
+            .insert("/rustfs/admin/v3/oidc/authorize/{provider_id}", ())
+            .expect("route should insert");
+
+        let flood_ip: IpAddr = "198.51.100.200".parse().expect("valid test IP");
+        let other_ip: IpAddr = "198.51.100.201".parse().expect("valid test IP");
+
+        for i in 0..OIDC_AUTHORIZE_RATE_LIMIT_BURST {
+            let matched = router
+                .at("/rustfs/admin/v3/oidc/authorize/default")
+                .expect("route should match");
+            let req = build_oidc_request_from_peer(
+                "http://localhost:9000/rustfs/admin/v3/oidc/authorize/default",
+                std::net::SocketAddr::new(flood_ip, 50000 + u16::try_from(i).expect("burst fits in u16")),
+                None,
+                None,
+            );
+            let outcome = OidcAuthorizeHandler {}.call(req, matched.params).await;
+            if let Ok(resp) = outcome {
+                assert_ne!(
+                    resp.into_parts().0,
+                    StatusCode::TOO_MANY_REQUESTS,
+                    "request {i} within burst should not be rate-limited"
+                );
+            }
+        }
+
+        // Next request from the same IP is rejected with 429 before state allocation.
+        let matched = router
+            .at("/rustfs/admin/v3/oidc/authorize/default")
+            .expect("route should match");
+        let req = build_oidc_request_from_peer(
+            "http://localhost:9000/rustfs/admin/v3/oidc/authorize/default",
+            std::net::SocketAddr::new(flood_ip, 51000),
+            None,
+            None,
+        );
+        let resp = OidcAuthorizeHandler {}
+            .call(req, matched.params)
+            .await
+            .expect("rate-limited request should return a 429 AdminResponse");
+        let (status, headers, _) = resp.into_parts();
+        assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+        assert!(headers.contains_key(http::header::RETRY_AFTER));
+
+        // Another client IP is unaffected by the first IP's flood.
+        let matched = router
+            .at("/rustfs/admin/v3/oidc/authorize/default")
+            .expect("route should match");
+        let other_req = build_oidc_request_from_peer(
+            "http://localhost:9000/rustfs/admin/v3/oidc/authorize/default",
+            std::net::SocketAddr::new(other_ip, 52000),
+            None,
+            None,
+        );
+        let other_outcome = OidcAuthorizeHandler {}.call(other_req, matched.params).await;
+        if let Ok(resp) = other_outcome {
+            assert_ne!(resp.into_parts().0, StatusCode::TOO_MANY_REQUESTS);
+        }
     }
 }
