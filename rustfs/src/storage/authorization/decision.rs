@@ -40,6 +40,7 @@ use crate::auth::facts::{AuthzFacts, AuthzTarget, base_conditions, build_args};
 use crate::error::ApiError;
 use crate::storage::authorization_actions::versioned_read_action;
 use crate::storage::denial_audit::DenialAuditor;
+use crate::storage::storage_api::ecstore_bucket::utils::is_meta_bucketname;
 use crate::storage::storage_api::runtime_sources_consumer::ServerContextSlot;
 use crate::storage::{PolicySys, StorageError, is_err_bucket_not_found};
 use http::HeaderMap;
@@ -347,6 +348,19 @@ fn policy_request_facts<R: AuthorizationRequest + ?Sized>(
     ))
 }
 
+/// Returns true when `bucket` targets a reserved internal metadata bucket (`.rustfs.sys` or
+/// `.minio.sys`, including sub-paths or case variants). These namespaces hold IAM records,
+/// server configuration, and bucket metadata and are never an S3 resource.
+pub(super) fn is_reserved_meta_bucket(bucket: &str) -> bool {
+    let trimmed = bucket.trim();
+    if is_meta_bucketname(trimmed) {
+        return true;
+    }
+    let bytes = trimmed.as_bytes();
+    (bytes.len() >= 11 && bytes[..11].eq_ignore_ascii_case(b".rustfs.sys"))
+        || (bytes.len() >= 10 && bytes[..10].eq_ignore_ascii_case(b".minio.sys"))
+}
+
 async fn authorize_request_with_facts<R: AuthorizationRequest + ?Sized>(
     req: &mut R,
     facts: &AuthzFacts,
@@ -361,7 +375,6 @@ async fn authorize_request_with_facts<R: AuthorizationRequest + ?Sized>(
     let version_id = req_info.version_id.clone();
     let quiet_denial = req_info.suppress_denial_log;
     let suppress_denial_audit = req_info.suppress_denial_audit;
-    let store = request_object_store(req)?;
     let denial = DenialContext {
         quiet: quiet_denial,
         suppress_audit: suppress_denial_audit,
@@ -372,6 +385,16 @@ async fn authorize_request_with_facts<R: AuthorizationRequest + ?Sized>(
         account: cred.as_ref().map(|c| c.access_key.as_str()),
         is_owner,
     };
+
+    // Reserved system buckets hold IAM, configuration, and bucket metadata and are never an S3
+    // resource, even for the owner. Callers that derive the bucket outside the gateway path parser
+    // (admin routes, alternate protocols) reach this gate directly, where wildcard resource
+    // policies (`arn:aws:s3:::*`) would otherwise match them.
+    if is_reserved_meta_bucket(bucket.as_str()) {
+        return Err(denial.deny(req, "reserved_bucket", action));
+    }
+
+    let store = request_object_store(req)?;
 
     if let Some(cred) = &cred {
         let iam_store = request_iam_store(req)?;

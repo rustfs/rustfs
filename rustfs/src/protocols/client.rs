@@ -277,6 +277,15 @@ struct RequestParams<'a> {
     credentials: &'a rustfs_credentials::Credentials,
 }
 
+/// Rejects reserved internal system buckets (`.rustfs.sys`, `.minio.sys`, and their sub-paths)
+/// at the protocol boundary before IAM or policy evaluation runs.
+fn is_reserved_meta_bucket(bucket: &str) -> bool {
+    let trimmed = bucket.trim();
+    let bytes = trimmed.as_bytes();
+    (bytes.len() >= 11 && bytes[..11].eq_ignore_ascii_case(b".rustfs.sys"))
+        || (bytes.len() >= 10 && bytes[..10].eq_ignore_ascii_case(b".minio.sys"))
+}
+
 /// The policy action a protocol operation is authorized as; HeadBucket is judged as ListBucket.
 fn protocol_policy_action(action: &S3Action) -> rustfs_policy::policy::action::Action {
     if matches!(action, S3Action::HeadBucket) {
@@ -309,6 +318,9 @@ impl ProtocolStorageClient {
         object: Option<&str>,
         listing: Option<&gateway_dto::ListObjectsV2Input>,
     ) -> rustfs_s3_types::S3Result<()> {
+        if is_reserved_meta_bucket(bucket) {
+            return Err(rustfs_s3_types::s3_error!(AccessDenied, "Access Denied"));
+        }
         let context = self.server_ctx.installed_app_context().ok_or_else(|| {
             rustfs_s3_types::S3Error::with_message(
                 rustfs_s3_types::S3ErrorCode::InternalError,
@@ -2791,5 +2803,57 @@ mod listing_tests {
                 assert_eq!(info.cred.as_ref().expect("session credentials").session_token, "identity-token");
             }
         }
+    }
+
+    #[tokio::test]
+    async fn protocol_client_rejects_reserved_meta_buckets_before_iam() {
+        use rustfs_protocols::common::client::s3::StorageBackend as _;
+
+        let client = ProtocolStorageClient::new(ServerContextSlot::new());
+        let session = SessionContext::new(
+            rustfs_protocols::common::ProtocolPrincipal::new(std::sync::Arc::new(rustfs_policy::auth::UserIdentity {
+                credentials: rustfs_credentials::Credentials {
+                    access_key: "wildcard-protocol-user".into(),
+                    secret_key: "secret".into(),
+                    status: "on".into(),
+                    ..Default::default()
+                },
+                ..Default::default()
+            })),
+            rustfs_protocols::Protocol::WebDav,
+            "127.0.0.1".parse().expect("loopback"),
+        );
+
+        for reserved in [
+            ".rustfs.sys",
+            ".rustfs.sys/multipart",
+            ".minio.sys",
+            ".RUSTFS.SYS",
+            " .minio.sys ",
+        ] {
+            for action in [
+                S3Action::GetObject,
+                S3Action::PutObject,
+                S3Action::DeleteObject,
+                S3Action::HeadBucket,
+            ] {
+                let err = client
+                    .authorize_operation(&session, &action, reserved, Some("config/iam/users/admin/identity.json"))
+                    .await
+                    .expect_err("reserved meta bucket must be denied at protocol boundary");
+                assert!(
+                    matches!(err, AuthorizationError::AccessDenied),
+                    "{reserved} {action:?}: expected AccessDenied, got {err:?}"
+                );
+            }
+        }
+
+        // Control: an ordinary bucket reaches the uninitialized context check (IamUnavailable),
+        // proving the guard only short-circuits reserved buckets.
+        let err = client
+            .authorize_operation(&session, &S3Action::GetObject, "ordinary-bucket", Some("file.txt"))
+            .await
+            .expect_err("uninitialized server context must report IamUnavailable");
+        assert!(matches!(err, AuthorizationError::IamUnavailable), "expected IamUnavailable, got {err:?}");
     }
 }

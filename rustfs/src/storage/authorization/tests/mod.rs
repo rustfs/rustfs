@@ -20,4 +20,5 @@ mod denial_audit;
 pub(crate) mod fixture;
 mod permission_auth;
 mod readers;
+mod reserved_buckets;
 mod table_data_plane;

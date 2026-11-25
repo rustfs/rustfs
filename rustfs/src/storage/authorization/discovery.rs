@@ -23,7 +23,7 @@
 //! IAM and the bucket policy system.
 
 use super::conditions::{authorization_conditions, request_authz_facts, request_principal, root_access_key};
-use super::decision::{DenialContext, owner_can_bypass_policy_deny};
+use super::decision::{DenialContext, is_reserved_meta_bucket, owner_can_bypass_policy_deny};
 use super::{AuthorizationRequest, missing_req_info_error, request_iam_store, request_object_store};
 use crate::auth::facts::{AuthzTarget, build_args};
 use crate::error::ApiError;
@@ -213,6 +213,9 @@ pub(crate) async fn s3_action_potential<R: AuthorizationRequest + ?Sized>(req: &
         .as_ref()
         .ok_or_else(|| rustfs_s3_types::s3_error!(AccessDenied, "authentication required"))?;
     let bucket = info.bucket.as_deref().unwrap_or_default();
+    if is_reserved_meta_bucket(bucket) {
+        return Ok(false);
+    }
     let root = root_access_key();
     let principal = request_principal(req, cred, &root).with_owner(info.is_owner);
     let facts = request_authz_facts(
