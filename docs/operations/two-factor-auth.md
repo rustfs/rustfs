@@ -34,6 +34,7 @@ Without a `TokenCode`, `AssumeRole` fails with `AccessDenied` and a message carr
 | A request signed directly with a long-term access key is not gated. | Gating it would break every script, SDK client, and `rc` invocation the moment a human enabled 2FA on their own account, and it would add no protection: whoever holds the secret key already has full access and never needs to mint a session. AWS draws the same line: MFA gates `AssumeRole` and is enforced for API calls through the `aws:MultiFactorAuthPresent` policy condition, not by refusing signed requests. |
 | OIDC and Keystone sessions are not gated. | Those identities are authenticated by their provider; a RustFS-side enrollment would not be consulted at login and would give a false impression of protection. `CallerIdentity` reports such sessions as `FederatedIdentity` and refuses enrollment. |
 | Service-account credentials cannot manage their parent's factor. | A machine credential must not be able to take over the human identity it was minted from. |
+| Sessions restricted by a session policy cannot manage their parent's factor. | A session minted by `AssumeRole` with a `Policy` parameter is a delegated subset of the parent's rights and must not enroll, replace, or disable the parent's factor. `CallerIdentity` reports such sessions as `RestrictedSession` and refuses enrollment; a plain unrestricted Console session is unaffected. |
 
 Consequence to state plainly: 2FA raises the cost of a stolen password; it does not contain a stolen secret key. Because in RustFS the password is the S3 secret key (below), those are the same string, so 2FA protects the console login path against credential reuse and phishing, and nothing more, until the policy-condition work lands. The tracked follow-up is an `aws:MultiFactorAuthPresent` condition key populated from the `x-rustfs-mfa-verified` session claim, which would let an operator deny administrative actions to a session that presented no second factor. That is the mechanism that makes 2FA meaningful for API access; it is not implemented yet.
 
@@ -119,7 +120,7 @@ A challenge is `HMAC-SHA256(root_secret, "rustfs-mfa-challenge:v1" ‖ access_ke
 | `GET /v3/account/info` | possession of the credential |
 | `POST /v3/account/password` | credential + knowledge of the current secret |
 | `GET /v3/account/mfa` | possession of the credential |
-| `POST /v3/account/mfa/enroll` | credential, and the credential kind must be mutable |
+| `POST /v3/account/mfa/enroll` | credential, and the credential kind must be mutable (not a service account, federated session, table storage session, or session-policy-restricted session) |
 | `POST /v3/account/mfa/activate` | credential + a valid code from the pending secret |
 | `POST /v3/account/mfa/disable` | credential + a valid code and the account password |
 | `POST /v3/account/mfa/recovery-codes` | credential + a valid code |
