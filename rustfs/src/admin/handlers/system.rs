@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use super::{cluster_snapshot, realtime};
-use crate::admin::auth::authorize_admin_envelope;
+use crate::admin::auth::{authorize_admin_envelope, resolve_admin_object_read_sse_kms_principal};
 use crate::admin::handlers::account::{ACCOUNT_INFO_ROUTE, ACCOUNT_PASSWORD_ROUTE};
 use crate::admin::handlers::mfa::{ACCOUNT_MFA_ROUTE, MFA_CHALLENGE_ROUTE, USER_MFA_ROUTE};
 use crate::admin::operation::{AdminRequest, AdminResponse, Operation};
@@ -550,9 +550,10 @@ fn check_inspect_data_volume(bucket: &str) -> S3Result<()> {
 
 #[async_trait::async_trait]
 impl Operation for InspectDataHandler {
-    async fn call(&self, req: AdminRequest, _params: Params<'_, '_>) -> S3Result<AdminResponse> {
-        use crate::admin::storage_api::contract::object::ObjectIO as _;
+    async fn call(&self, mut req: AdminRequest, _params: Params<'_, '_>) -> S3Result<AdminResponse> {
+        use crate::admin::storage_api::contract::object::{ObjectIO as _, ObjectOperations as _};
         use crate::admin::storage_api::object::StorageObjectOptions;
+        use crate::admin::storage_api::sse::authorize_sse_kms_object_read;
         use tokio::io::AsyncReadExt;
 
         if req.credentials().is_none() {
@@ -574,11 +575,25 @@ impl Operation for InspectDataHandler {
             ));
         };
         check_inspect_data_volume(&bucket)?;
+        // The object layer unwraps SSE-KMS data keys without a request identity,
+        // so enforce per-key `kms:Decrypt` as the authenticated caller before
+        // opening the reader (to avoid leaking key state) and again on the
+        // reader actually opened before returning any bytes.
+        let read_principal = resolve_admin_object_read_sse_kms_principal(req.envelope_mut()).await?;
 
         let Some(store) = object_store_from_envelope(req.envelope()) else {
             log_system_request_failed!("inspect_data", "object_store_unavailable", "not initialized");
             return Err(S3Error::with_message(S3ErrorCode::InternalError, "object store is not initialized"));
         };
+
+        let info = store
+            .get_object_info(&bucket, &object, &StorageObjectOptions::default())
+            .await
+            .map_err(|err| {
+                log_system_request_failed!("inspect_data", "open_object_reader_failed", err);
+                S3Error::with_message(S3ErrorCode::NoSuchKey, format!("failed to open object `{bucket}/{object}`: {err}"))
+            })?;
+        authorize_sse_kms_object_read(Some(&read_principal), &info.user_defined).await?;
 
         let mut reader = store
             .get_object_reader(&bucket, &object, None, HeaderMap::new(), &StorageObjectOptions::default())
@@ -587,6 +602,7 @@ impl Operation for InspectDataHandler {
                 log_system_request_failed!("inspect_data", "open_object_reader_failed", err);
                 S3Error::with_message(S3ErrorCode::NoSuchKey, format!("failed to open object `{bucket}/{object}`: {err}"))
             })?;
+        authorize_sse_kms_object_read(Some(&read_principal), &reader.object_info.user_defined).await?;
 
         // Read up to the cap + 1 so we can detect and reject over-large targets.
         let mut buf = Vec::new();
@@ -2260,6 +2276,169 @@ mod tests {
         });
     }
 
+    #[test]
+    #[serial_test::serial]
+    fn inspect_data_handler_enforces_sse_kms_key_authorization() {
+        crate::app::gating_test_env::run_large_stack_test("inspect-data-kms-authz", || async {
+            use crate::admin::operation::test_support::TestRequest;
+            use crate::admin::runtime_sources::{AppContext, IamInterface, KmsInterface, publish_test_app_context};
+            use crate::admin::storage_api::contract::bucket::{BucketOperations as _, MakeBucketOptions};
+            use crate::admin::storage_api::contract::object::ObjectIO as _;
+            use crate::admin::storage_api::object::{StorageObjectOptions, StoragePutObjReader};
+            use rustfs_iam::store::{Store as _, UserType};
+            use rustfs_madmin::{AccountStatus, AddOrUpdateUserReq};
+            use rustfs_policy::policy::Policy;
+            use rustfs_policy::policy::action::KmsAction;
+            use rustfs_sse::TestAuthorizationHooks;
+            use rustfs_sse::testing::{RecordingKmsKeyAuthorizer, sse_kms_object_metadata};
+            use std::sync::Arc;
+
+            struct ReadyIam(Arc<rustfs_iam::sys::IamSys<rustfs_iam::store::object::ObjectStore>>);
+            impl IamInterface for ReadyIam {
+                fn handle(&self) -> Arc<rustfs_iam::sys::IamSys<rustfs_iam::store::object::ObjectStore>> {
+                    Arc::clone(&self.0)
+                }
+                fn is_ready(&self) -> bool {
+                    true
+                }
+            }
+            struct TestKms;
+            impl KmsInterface for TestKms {
+                fn handle(&self) -> Arc<rustfs_kms::KmsServiceManager> {
+                    Arc::new(rustfs_kms::KmsServiceManager::new())
+                }
+            }
+
+            let previous = crate::runtime_sources::current_app_context();
+            let (_dir, _paths, store) = crate::app::gating_test_env::isolated_multi_pool_ecstore().await;
+            rustfs_iam::store::object::ObjectStore::new(Arc::clone(&store))
+                .save_iam_config(
+                    serde_json::json!({"version": 1}),
+                    format!("{}/format.json", *rustfs_iam::store::object::IAM_CONFIG_PREFIX),
+                )
+                .await
+                .expect("seed IAM format");
+            store
+                .make_bucket("tenant", &MakeBucketOptions::default())
+                .await
+                .expect("create bucket");
+            store
+                .put_object(
+                    "tenant",
+                    "plain.txt",
+                    &mut StoragePutObjReader::from_vec(b"plain bytes".to_vec()),
+                    &StorageObjectOptions::default(),
+                )
+                .await
+                .expect("write plain object");
+            store
+                .put_object(
+                    "tenant",
+                    "salaries.csv",
+                    &mut StoragePutObjReader::from_vec(b"encrypted payload".to_vec()),
+                    &StorageObjectOptions {
+                        user_defined: sse_kms_object_metadata(),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect("write SSE-KMS object");
+
+            let iam = rustfs_iam::build_iam_sys(Arc::clone(&store)).await.expect("init IAM");
+            let inspector_key = "kms-inspector";
+            let inspector_secret = "kms-inspector-secret";
+            iam.create_user(
+                inspector_key,
+                &AddOrUpdateUserReq {
+                    secret_key: inspector_secret.to_owned(),
+                    policy: None,
+                    status: AccountStatus::Enabled,
+                },
+            )
+            .await
+            .expect("create inspector user");
+            iam.set_policy(
+                "inspect-only",
+                Policy::parse_config(
+                    br#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":["admin:InspectData"]}]}"#,
+                )
+                .expect("parse policy"),
+            )
+            .await
+            .expect("store policy");
+            iam.policy_db_set(inspector_key, UserType::Reg, false, "inspect-only")
+                .await
+                .expect("attach policy");
+
+            let context = Arc::new(AppContext::new(store, Arc::new(ReadyIam(iam)), Arc::new(TestKms)));
+            assert!(context.publish_action_credentials(rustfs_credentials::Credentials {
+                access_key: "inspect-kms-root".to_owned(),
+                secret_key: "inspect-kms-root-secret".to_owned(),
+                status: "on".to_owned(),
+                ..Default::default()
+            }));
+            publish_test_app_context(context);
+
+            // Denied KMS key policy must refuse SSE-KMS reads with AccessDenied
+            // before opening the reader.
+            let deny_authorizer = RecordingKmsKeyAuthorizer::new(false);
+            let denied_req = TestRequest::new(Method::GET, "/rustfs/admin/v3/inspect-data?volume=tenant&file=salaries.csv")
+                .credentials(inspector_key, inspector_secret, None)
+                .extension(TestAuthorizationHooks {
+                    enforced: true,
+                    authorizer: deny_authorizer.clone(),
+                })
+                .build();
+            let err = InspectDataHandler {}
+                .call(denied_req, Params::new())
+                .await
+                .expect_err("denied KMS key must block inspect-data");
+            assert_eq!(err.code(), &S3ErrorCode::AccessDenied);
+            assert_eq!(deny_authorizer.calls(), vec![(KmsAction::DecryptAction, "finance-key".to_string())]);
+
+            // Unencrypted objects remain readable under KMS key-policy enforcement.
+            let plain_authorizer = RecordingKmsKeyAuthorizer::new(false);
+            let plain_req = TestRequest::new(Method::GET, "/rustfs/admin/v3/inspect-data?volume=tenant&file=plain.txt")
+                .credentials(inspector_key, inspector_secret, None)
+                .extension(TestAuthorizationHooks {
+                    enforced: true,
+                    authorizer: plain_authorizer.clone(),
+                })
+                .build();
+            let resp = InspectDataHandler {}
+                .call(plain_req, Params::new())
+                .await
+                .expect("unencrypted object should remain readable");
+            let (status, _headers, mut body) = resp.into_parts();
+            assert_eq!(status, http::StatusCode::OK);
+            assert_eq!(body.store_all_limited(4096).await.expect("read body").as_ref(), b"plain bytes");
+            assert!(plain_authorizer.calls().is_empty());
+
+            // Allowed KMS key policy passes the authorization gate (and checks the key).
+            let allow_authorizer = RecordingKmsKeyAuthorizer::new(true);
+            let allowed_req = TestRequest::new(Method::GET, "/rustfs/admin/v3/inspect-data?volume=tenant&file=salaries.csv")
+                .credentials(inspector_key, inspector_secret, None)
+                .extension(TestAuthorizationHooks {
+                    enforced: true,
+                    authorizer: allow_authorizer.clone(),
+                })
+                .build();
+            let allowed_res = InspectDataHandler {}.call(allowed_req, Params::new()).await;
+            if let Err(err) = allowed_res {
+                assert_ne!(
+                    err.code(),
+                    &S3ErrorCode::AccessDenied,
+                    "allowed KMS key policy must not fail with AccessDenied"
+                );
+            }
+            assert_eq!(allow_authorizer.calls(), vec![(KmsAction::DecryptAction, "finance-key".to_string())]);
+
+            if let Some(previous) = previous {
+                publish_test_app_context(previous);
+            }
+        });
+    }
+
     fn source_block<'a>(production: &'a str, marker: &str) -> &'a str {
         let block = production
             .split_once(marker)
@@ -2337,5 +2516,16 @@ mod tests {
 
         assert!(!production.contains("check_key_valid(get_session_token"));
         assert!(!production.contains("validate_admin_request("));
+
+        let inspect_data = source_block(production, "impl Operation for InspectDataHandler");
+        assert!(
+            inspect_data.contains("authorize_sse_kms_object_read(Some(&read_principal), &info.user_defined).await?;"),
+            "InspectDataHandler must authorize kms:Decrypt before opening the object reader"
+        );
+        assert!(
+            inspect_data
+                .contains("authorize_sse_kms_object_read(Some(&read_principal), &reader.object_info.user_defined).await?;"),
+            "InspectDataHandler must authorize kms:Decrypt on the opened reader before returning bytes"
+        );
     }
 }

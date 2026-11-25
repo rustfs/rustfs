@@ -1106,6 +1106,12 @@ pub(crate) mod s3 {
     }
 }
 
+pub(crate) mod sse {
+    pub(crate) use crate::storage::storage_api::sse_consumer::{
+        SseKmsPrincipal, SseKmsPrincipalExt, authorize_sse_kms_object_read,
+    };
+}
+
 pub(crate) mod tier {
     pub(crate) use super::ecstore_bucket::lifecycle::tier_free_version_recovery::retry_tier_free_version_cleanup;
     pub(crate) use super::{
