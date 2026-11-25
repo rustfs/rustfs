@@ -837,17 +837,13 @@ const CANONICAL_USER_METADATA_PREFIX: &str = "x-amz-meta-";
 fn is_reserved_user_metadata_key(key: &str) -> bool {
     SUPPORTED_HEADERS.iter().any(|header| key.eq_ignore_ascii_case(header))
         || starts_with_ignore_ascii_case(key, "x-amz-")
-        || starts_with_ignore_ascii_case(key, RUSTFS_INTERNAL_PREFIX)
-        || starts_with_ignore_ascii_case(key, MINIO_INTERNAL_PREFIX)
-        || starts_with_ignore_ascii_case(key, RUSTFS_ENCRYPTION_PREFIX)
-        || starts_with_ignore_ascii_case(key, MINIO_ENCRYPTION_PREFIX)
-        // Replication transport names (source-replication timestamps,
-        // source-mtime/-etag/-version-id, ...). A bare stored key with one of
-        // these names is forwarded verbatim by the outbound replication
-        // header builder on a server-authorized request, so the receiver
-        // would persist attacker-chosen values as trusted internal LWW state.
-        || starts_with_ignore_ascii_case(key, "x-rustfs-source-")
-        || starts_with_ignore_ascii_case(key, "x-minio-source-")
+        // Reserve the entire vendor namespaces rather than individual
+        // sub-prefixes (internal, encryption, source, replication, ...): the
+        // outbound replication header builder forwards bare stored `x-rustfs-*`
+        // and `x-minio-*` keys verbatim on a server-authorized request, and
+        // storage-layer helpers also inspect bare vendor keys in `user_defined`.
+        || starts_with_ignore_ascii_case(key, "x-rustfs-")
+        || starts_with_ignore_ascii_case(key, "x-minio-")
 }
 
 fn stored_user_metadata_key(key: &str) -> String {
@@ -2098,12 +2094,10 @@ mod tests {
         }
     }
 
-    /// A client PUT must not materialize the replication transport names as
-    /// bare stored user-metadata keys: the outbound replication header
-    /// builder forwards user metadata verbatim on a server-authorized
-    /// request, so a bare `x-rustfs-source-replication-*-timestamp` key would
-    /// deliver an attacker-chosen value into the replica's trusted internal
-    /// LWW state (for a tagless object nothing later overwrites it).
+    /// A client PUT must not materialize replication transport or storage
+    /// vendor names as bare stored user-metadata keys: outbound replication
+    /// forwards bare vendor keys verbatim on a server-authorized request, and
+    /// storage-layer helpers inspect bare replication keys in `user_defined`.
     #[test]
     fn test_replication_transport_names_cannot_be_forged_via_user_metadata() {
         let mut headers = HeaderMap::new();
@@ -2112,6 +2106,12 @@ mod tests {
             "x-amz-meta-x-minio-source-replication-legalhold-timestamp",
             "x-rustfs-meta-x-rustfs-source-replication-retention-timestamp",
             "x-amz-meta-x-rustfs-source-mtime",
+            "x-amz-meta-x-rustfs-replication-ssec-crc",
+            "x-minio-meta-x-minio-replication-ssec-crc",
+            "x-amz-meta-x-rustfs-replication-ssec-original-size",
+            "x-amz-meta-x-rustfs-replication-compression",
+            "x-amz-meta-x-minio-replication-compression-actual-size",
+            "x-rustfs-meta-x-rustfs-multipart-checksum",
         ] {
             headers.insert(
                 http::header::HeaderName::from_static(name),
@@ -2126,19 +2126,60 @@ mod tests {
             "x-minio-source-replication-legalhold-timestamp",
             "x-rustfs-source-replication-retention-timestamp",
             "x-rustfs-source-mtime",
+            "x-rustfs-replication-ssec-crc",
+            "x-minio-replication-ssec-crc",
+            "x-rustfs-replication-ssec-original-size",
+            "x-rustfs-replication-compression",
+            "x-minio-replication-compression-actual-size",
+            "x-rustfs-multipart-checksum",
         ] {
             assert!(
                 !metadata.contains_key(forged),
                 "{forged} must not be storable as a bare user-metadata key"
             );
+            assert_eq!(
+                metadata.get(&format!("x-amz-meta-{forged}")).map(String::as_str),
+                Some("2026-01-02T03:04:05Z"),
+                "{forged} must remain namespaced under x-amz-meta-"
+            );
         }
-        // The values survive, namespaced back under the user-metadata prefix.
-        assert_eq!(
-            metadata
-                .get("x-amz-meta-x-rustfs-source-replication-tagging-timestamp")
-                .map(String::as_str),
-            Some("2026-01-02T03:04:05Z")
-        );
+
+        // Namespaced keys still round-trip back to the client under their original names.
+        let filtered = filter_object_metadata(&metadata).expect("user metadata should round-trip");
+        for original in [
+            "x-rustfs-replication-ssec-crc",
+            "x-rustfs-replication-ssec-original-size",
+            "x-rustfs-replication-compression",
+        ] {
+            assert_eq!(
+                filtered.get(original).map(String::as_str),
+                Some("2026-01-02T03:04:05Z"),
+                "{original} must round-trip in client-visible metadata"
+            );
+        }
+
+        // CopyObject REPLACE / DTO metadata path applies the same case-insensitive namespacing.
+        let mut copied = HashMap::from([
+            ("X-Rustfs-Replication-Ssec-Crc".to_string(), "forged-crc".to_string()),
+            ("X-Rustfs-Replication-Ssec-Original-Size".to_string(), "777".to_string()),
+            ("X-Rustfs-Replication-Compression".to_string(), "zstd".to_string()),
+            ("x-minio-replication-ssec-crc".to_string(), "forged-minio-crc".to_string()),
+            ("department".to_string(), "finance".to_string()),
+        ]);
+        namespace_reserved_user_metadata(&mut copied);
+        for bare in [
+            "X-Rustfs-Replication-Ssec-Crc",
+            "X-Rustfs-Replication-Ssec-Original-Size",
+            "X-Rustfs-Replication-Compression",
+            "x-minio-replication-ssec-crc",
+        ] {
+            assert!(!copied.contains_key(bare), "{bare} must not remain bare");
+            assert!(
+                copied.contains_key(&format!("x-amz-meta-{bare}")),
+                "{bare} must be namespaced under x-amz-meta-"
+            );
+        }
+        assert_eq!(copied.get("department").map(String::as_str), Some("finance"));
     }
 
     #[test]
@@ -2779,6 +2820,17 @@ mod tests {
                 !should_skip_object_metadata_key(key, "value", NO_EXCLUSIONS),
                 "{key:?} is shorter than any internal prefix and must not be skipped"
             );
+        }
+        // The write side reserves the full `x-rustfs-` / `x-minio-` vendor
+        // namespaces, so truncated internal prefixes remain namespaced under
+        // `x-amz-meta-`; only keys outside those namespaces stay bare.
+        for key in ["x-rustfs-interna", "x-minio-interna", short_encryption_prefix] {
+            assert!(
+                is_reserved_user_metadata_key(key),
+                "{key:?} is in a vendor namespace and must stay reserved"
+            );
+        }
+        for key in ["", "x", "x-am", "x-rustfs", "x-minio"] {
             assert!(!is_reserved_user_metadata_key(key), "{key:?} must not be treated as reserved");
         }
 
@@ -3099,8 +3151,8 @@ mod tests {
 
     /// Pin that the source-proxy-request transport family cannot be
     /// materialized as bare stored metadata via an `x-*-meta-` disguise: the
-    /// reserved-key namespacing (`x-rustfs-source-` / `x-minio-source-`
-    /// prefixes in `is_reserved_user_metadata_key`) must keep covering it.
+    /// reserved-key namespacing (`x-rustfs-` / `x-minio-` prefixes in
+    /// `is_reserved_user_metadata_key`) must keep covering it.
     #[test]
     fn test_source_proxy_request_family_is_reserved_user_metadata() {
         let mut headers = HeaderMap::new();
