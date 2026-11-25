@@ -46,18 +46,33 @@ use rustfs_trusted_proxies::{ClientInfo, ValidationMode};
 use rustfs_utils::{base64_decode_url_safe_no_pad, base64_encode_url_safe_no_pad};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::io;
 use std::net::{IpAddr, SocketAddr};
-use std::sync::Arc;
+use std::pin::Pin;
+use std::sync::{Arc, Mutex};
+use std::task::{Context, Poll, ready};
 use time::{Duration, OffsetDateTime, format_description::well_known::Rfc3339};
 use tokio::fs::File;
-use tokio::io::{AsyncReadExt, AsyncSeekExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncSeekExt, AsyncWrite, ReadBuf};
+use tokio::time::Instant;
 use tokio_util::io::ReaderStream;
 use url::form_urlencoded;
 use uuid::Uuid;
 
 const OBJECT_ZIP_DOWNLOAD_TOKEN_TTL: Duration = Duration::minutes(5);
+/// Maximum number of staged ZIP archives held on local temp storage per node.
+pub(crate) const OBJECT_ZIP_DOWNLOAD_MAX_CONCURRENCY: usize = 4;
+/// Maximum number of concurrent staged ZIP archives per authenticated principal,
+/// preventing one slow client or replayed link from starving all global slots.
+pub(crate) const OBJECT_ZIP_DOWNLOAD_MAX_CONCURRENCY_PER_PRINCIPAL: usize = 2;
+/// Hard cap on the staged ZIP archive byte size on disk.
+pub(crate) const OBJECT_ZIP_DOWNLOAD_MAX_ARCHIVE_BYTES: u64 = 4 * 1024 * 1024 * 1024;
+/// Idle duration after which an unread staged ZIP response stream releases its
+/// unlinked temp file and concurrency permit.
+pub(crate) const OBJECT_ZIP_DOWNLOAD_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+static OBJECT_ZIP_DOWNLOAD_ADMISSION: ZipDownloadAdmission =
+    ZipDownloadAdmission::const_new(OBJECT_ZIP_DOWNLOAD_MAX_CONCURRENCY, OBJECT_ZIP_DOWNLOAD_MAX_CONCURRENCY_PER_PRINCIPAL);
 const ZIP_STREAM_BUFFER_SIZE: usize = 1024 * 1024;
 const ZIP_OBJECT_BUFFER_SIZE: usize = 128 * 1024;
 const ZIP_LIST_MAX_KEYS: i32 = 1000;
@@ -188,8 +203,243 @@ struct CreatedObjectZipDownloadToken {
     expires_at: OffsetDateTime,
 }
 
+#[derive(Debug)]
+struct ZipDownloadAdmissionState {
+    active_total: usize,
+    active_by_principal: BTreeMap<String, usize>,
+}
+
+#[derive(Debug)]
+struct ZipDownloadAdmission {
+    max_global: usize,
+    max_per_principal: usize,
+    state: Mutex<ZipDownloadAdmissionState>,
+}
+
+#[derive(Debug)]
+struct ZipDownloadPermit {
+    admission: &'static ZipDownloadAdmission,
+    principal: String,
+}
+
+impl ZipDownloadAdmission {
+    const fn const_new(max_global: usize, max_per_principal: usize) -> Self {
+        Self {
+            max_global,
+            max_per_principal,
+            state: Mutex::new(ZipDownloadAdmissionState {
+                active_total: 0,
+                active_by_principal: BTreeMap::new(),
+            }),
+        }
+    }
+
+    fn try_acquire(&'static self, principal: &str) -> S3Result<ZipDownloadPermit> {
+        let mut state = self.state.lock().unwrap_or_else(|err| err.into_inner());
+        let principal_active = state.active_by_principal.get(principal).copied().unwrap_or(0);
+        if principal_active >= self.max_per_principal {
+            return Err(s3_error!(
+                SlowDown,
+                "object ZIP download per-principal concurrency limit of {} is exhausted",
+                self.max_per_principal
+            ));
+        }
+        if state.active_total >= self.max_global {
+            return Err(s3_error!(
+                SlowDown,
+                "object ZIP download concurrency limit of {} is exhausted",
+                self.max_global
+            ));
+        }
+        state.active_total += 1;
+        *state.active_by_principal.entry(principal.to_owned()).or_insert(0) += 1;
+        Ok(ZipDownloadPermit {
+            admission: self,
+            principal: principal.to_owned(),
+        })
+    }
+
+    #[cfg(test)]
+    fn active_total(&self) -> usize {
+        self.state.lock().unwrap_or_else(|err| err.into_inner()).active_total
+    }
+
+    #[cfg(test)]
+    fn active_for_principal(&self, principal: &str) -> usize {
+        self.state
+            .lock()
+            .unwrap_or_else(|err| err.into_inner())
+            .active_by_principal
+            .get(principal)
+            .copied()
+            .unwrap_or(0)
+    }
+}
+
+impl Drop for ZipDownloadPermit {
+    fn drop(&mut self) {
+        let mut state = self.admission.state.lock().unwrap_or_else(|err| err.into_inner());
+        state.active_total = state.active_total.saturating_sub(1);
+        if let Some(count) = state.active_by_principal.get_mut(&self.principal) {
+            if *count <= 1 {
+                state.active_by_principal.remove(&self.principal);
+            } else {
+                *count -= 1;
+            }
+        }
+    }
+}
+
+/// A fully staged archive. The admission permit travels with the temp file so
+/// both global and per-principal slots are released together with the file.
 struct PreparedZipArchive {
     file: File,
+    _permit: ZipDownloadPermit,
+}
+
+impl AsyncRead for PreparedZipArchive {
+    fn poll_read(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.get_mut().file).poll_read(cx, buf)
+    }
+}
+
+struct StagedZipArchiveState {
+    archive: Option<PreparedZipArchive>,
+    last_polled: Instant,
+    finished: bool,
+}
+
+/// Streams a staged archive to the HTTP response body while bounding how long an
+/// unread response can pin its unlinked temp file and concurrency slot.
+struct StagedZipArchiveStream {
+    state: Arc<Mutex<StagedZipArchiveState>>,
+}
+
+impl StagedZipArchiveStream {
+    fn new(prepared: PreparedZipArchive) -> Self {
+        Self {
+            state: Arc::new(Mutex::new(StagedZipArchiveState {
+                archive: Some(prepared),
+                last_polled: Instant::now(),
+                finished: false,
+            })),
+        }
+    }
+
+    fn spawn_idle_release(&self, idle_timeout: std::time::Duration) {
+        let state = Arc::downgrade(&self.state);
+        tokio::spawn(async move {
+            loop {
+                let sleep_for = {
+                    let Some(state) = state.upgrade() else {
+                        return;
+                    };
+                    let mut released = None;
+                    let next_sleep = {
+                        let mut guard = state.lock().unwrap_or_else(|err| err.into_inner());
+                        if guard.archive.is_none() {
+                            return;
+                        }
+                        let idle = guard.last_polled.elapsed();
+                        if idle >= idle_timeout {
+                            released = guard.archive.take();
+                            None
+                        } else {
+                            Some(idle_timeout.saturating_sub(idle))
+                        }
+                    };
+                    drop(released);
+                    match next_sleep {
+                        Some(duration) => duration,
+                        None => return,
+                    }
+                };
+                tokio::time::sleep(sleep_for).await;
+            }
+        });
+    }
+
+    #[cfg(test)]
+    fn released(&self) -> bool {
+        self.state.lock().unwrap_or_else(|err| err.into_inner()).archive.is_none()
+    }
+}
+
+impl AsyncRead for StagedZipArchiveStream {
+    fn poll_read(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<io::Result<()>> {
+        let this = self.get_mut();
+        let had_capacity = buf.remaining() > 0;
+        let mut released = None;
+        let result = {
+            let mut guard = this.state.lock().unwrap_or_else(|err| err.into_inner());
+            guard.last_polled = Instant::now();
+            if guard.finished {
+                Poll::Ready(Ok(()))
+            } else if let Some(prepared) = guard.archive.as_mut() {
+                let before = buf.filled().len();
+                let poll = Pin::new(prepared).poll_read(cx, buf);
+                if let Poll::Ready(Ok(())) = &poll
+                    && had_capacity
+                    && buf.filled().len() == before
+                {
+                    guard.finished = true;
+                    released = guard.archive.take();
+                }
+                poll
+            } else {
+                Poll::Ready(Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "ZIP download was released after the client stopped reading it",
+                )))
+            }
+        };
+        drop(released);
+        result
+    }
+}
+
+/// Bounds total bytes written to a staged ZIP temp file; any write that would
+/// cross the remaining budget is rejected before touching the underlying writer.
+struct BoundedZipWriter<W> {
+    inner: W,
+    remaining: u64,
+    exceeded: bool,
+}
+
+impl<W: AsyncWrite + Unpin> BoundedZipWriter<W> {
+    fn new(inner: W, limit: u64) -> Self {
+        Self {
+            inner,
+            remaining: limit,
+            exceeded: false,
+        }
+    }
+
+    fn exceeded(&self) -> bool {
+        self.exceeded
+    }
+}
+
+impl<W: AsyncWrite + Unpin> AsyncWrite for BoundedZipWriter<W> {
+    fn poll_write(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &[u8]) -> Poll<io::Result<usize>> {
+        let this = self.get_mut();
+        let len = u64::try_from(buf.len()).unwrap_or(u64::MAX);
+        if len > this.remaining {
+            this.exceeded = true;
+            return Poll::Ready(Err(io::Error::other("ZIP archive exceeds the maximum staged size")));
+        }
+        let written = ready!(Pin::new(&mut this.inner).poll_write(cx, buf))?;
+        this.remaining = this.remaining.saturating_sub(written as u64);
+        Poll::Ready(Ok(written))
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.get_mut().inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.get_mut().inner).poll_shutdown(cx)
+    }
 }
 
 impl From<&ReqInfo> for ObjectZipDownloadReqInfoSnapshot {
@@ -657,7 +907,6 @@ impl Operation for DownloadObjectZipHandler {
         let credentials = current_download_token_credentials()?;
         let record = validate_download_token(id, &token, OffsetDateTime::now_utc(), &credentials)?;
         let _token_id = &record.id;
-        let _principal = &record.principal;
         let prepared = prepare_zip_download_archive(&record).await?;
         let body = build_zip_stream_body(prepared);
 
@@ -719,6 +968,7 @@ async fn preflight_zip_items(
     items: &[ZipDownloadItem],
 ) -> S3Result<()> {
     let store = current_object_store_handle().ok_or_else(|| s3_error!(InternalError, "object store not initialized"))?;
+    let mut total_bytes: u64 = 0;
     for item in items {
         let info = store
             .get_object_info(&request.bucket, &item.key, &ObjectOptions::default())
@@ -728,6 +978,14 @@ async fn preflight_zip_items(
         // key. Enforce the key policy here before building any archive so a
         // denied key returns AccessDenied like GetObject.
         authorize_sse_kms_object_read(Some(read_principal), &info.user_defined).await?;
+        total_bytes = total_bytes.saturating_add(u64::try_from(info.size).unwrap_or(0));
+        if total_bytes > OBJECT_ZIP_DOWNLOAD_MAX_ARCHIVE_BYTES {
+            return Err(s3_error!(
+                InvalidRequest,
+                "ZIP download exceeds the maximum archive size of {} bytes",
+                OBJECT_ZIP_DOWNLOAD_MAX_ARCHIVE_BYTES
+            ));
+        }
     }
     Ok(())
 }
@@ -845,8 +1103,14 @@ fn normalized_listing_prefixes(request: &CreateObjectZipDownloadRequest) -> Vec<
 }
 
 fn build_zip_stream_body(prepared: PreparedZipArchive) -> Body {
-    let stream = ReaderStream::with_capacity(prepared.file, ZIP_STREAM_BUFFER_SIZE);
+    let staged = StagedZipArchiveStream::new(prepared);
+    staged.spawn_idle_release(OBJECT_ZIP_DOWNLOAD_IDLE_TIMEOUT);
+    let stream = ReaderStream::with_capacity(staged, ZIP_STREAM_BUFFER_SIZE);
     Body::from_stream(stream)
+}
+
+fn acquire_object_zip_download_permit(principal: &str) -> S3Result<ZipDownloadPermit> {
+    OBJECT_ZIP_DOWNLOAD_ADMISSION.try_acquire(principal)
 }
 
 enum ZipArchiveError {
@@ -874,24 +1138,39 @@ impl From<ApiError> for ZipArchiveError {
 
 async fn prepare_zip_download_archive(record: &ObjectZipDownloadToken) -> S3Result<PreparedZipArchive> {
     validate_zip_download_request(record).await?;
+    let permit = acquire_object_zip_download_permit(&record.principal)?;
 
     let temp_file = tempfile::tempfile().map_err(|err| s3_error!(InternalError, "failed to create ZIP temp file: {}", err))?;
     let std_file = temp_file;
     let mut file = File::from_std(std_file);
 
-    generate_zip_archive(record, &mut file).await.map_err(|err| match err {
-        ZipArchiveError::S3(s3_err) => s3_err,
-        ZipArchiveError::Io(io_err) => s3_error!(InternalError, "failed to prepare ZIP download: {}", io_err),
+    let mut writer = BoundedZipWriter::new(&mut file, OBJECT_ZIP_DOWNLOAD_MAX_ARCHIVE_BYTES);
+    generate_zip_archive(record, &mut writer).await.map_err(|err| {
+        if writer.exceeded() {
+            s3_error!(
+                InvalidRequest,
+                "ZIP download exceeds the maximum archive size of {} bytes",
+                OBJECT_ZIP_DOWNLOAD_MAX_ARCHIVE_BYTES
+            )
+        } else {
+            match err {
+                ZipArchiveError::S3(s3_err) => s3_err,
+                ZipArchiveError::Io(io_err) => s3_error!(InternalError, "failed to prepare ZIP download: {}", io_err),
+            }
+        }
     })?;
     file.seek(std::io::SeekFrom::Start(0))
         .await
         .map_err(|err| s3_error!(InternalError, "failed to rewind ZIP temp file: {}", err))?;
 
-    Ok(PreparedZipArchive { file })
+    Ok(PreparedZipArchive { file, _permit: permit })
 }
 
-async fn generate_zip_archive(record: &ObjectZipDownloadToken, file: &mut File) -> Result<(), ZipArchiveError> {
-    let mut zip = ZipFileWriter::with_tokio(file).force_zip64();
+async fn generate_zip_archive<W>(record: &ObjectZipDownloadToken, writer: W) -> Result<(), ZipArchiveError>
+where
+    W: AsyncWrite + Unpin,
+{
+    let mut zip = ZipFileWriter::with_tokio(writer).force_zip64();
     let store = current_object_store_handle().ok_or_else(|| io::Error::other("object store not initialized"))?;
     let read_principal = zip_download_sse_kms_principal(record)?;
 
@@ -1735,6 +2014,162 @@ mod tests {
             .find("entry_writer.write_all")
             .expect("ZIP entry writer should copy object bytes");
         assert!(authorized < copied, "the key check must run before any object bytes reach the archive");
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn object_zip_download_admission_enforces_global_and_per_principal_caps() {
+        // One principal cannot exhaust all global slots and starve other tenants.
+        let alice_permits = (0..OBJECT_ZIP_DOWNLOAD_MAX_CONCURRENCY_PER_PRINCIPAL)
+            .map(|_| acquire_object_zip_download_permit("alice").expect("alice admission slot"))
+            .collect::<Vec<_>>();
+        let err = acquire_object_zip_download_permit("alice").expect_err("per-principal cap must reject alice");
+        assert_eq!(err.code(), &S3ErrorCode::SlowDown);
+
+        // Another principal still gets the remaining global slots.
+        let bob_permits = (0..(OBJECT_ZIP_DOWNLOAD_MAX_CONCURRENCY - OBJECT_ZIP_DOWNLOAD_MAX_CONCURRENCY_PER_PRINCIPAL))
+            .map(|_| acquire_object_zip_download_permit("bob").expect("bob admission slot"))
+            .collect::<Vec<_>>();
+        let err = acquire_object_zip_download_permit("charlie").expect_err("global cap must reject charlie");
+        assert_eq!(err.code(), &S3ErrorCode::SlowDown);
+        assert_eq!(OBJECT_ZIP_DOWNLOAD_ADMISSION.active_total(), OBJECT_ZIP_DOWNLOAD_MAX_CONCURRENCY);
+
+        // Releasing one slot frees capacity for another principal.
+        drop(alice_permits);
+        assert_eq!(OBJECT_ZIP_DOWNLOAD_ADMISSION.active_for_principal("alice"), 0);
+        let charlie = acquire_object_zip_download_permit("charlie").expect("released slot must be reusable");
+        drop(charlie);
+        drop(bob_permits);
+        assert_eq!(OBJECT_ZIP_DOWNLOAD_ADMISSION.active_total(), 0);
+        assert_eq!(OBJECT_ZIP_DOWNLOAD_ADMISSION.active_for_principal("bob"), 0);
+    }
+
+    #[tokio::test]
+    async fn bounded_zip_writer_rejects_writes_past_the_archive_cap() {
+        use tokio::io::AsyncWriteExt as _;
+
+        let mut writer = BoundedZipWriter::new(Vec::new(), 8);
+        writer
+            .write_all(b"12345")
+            .await
+            .expect("writes within the cap should succeed");
+        assert!(!writer.exceeded());
+
+        writer
+            .write_all(b"6789")
+            .await
+            .expect_err("a write crossing the cap must fail");
+        assert!(writer.exceeded());
+        assert_eq!(writer.inner, b"12345", "a rejected write must not be applied");
+
+        writer.write_all(b"678").await.expect("the remaining budget stays usable");
+        assert_eq!(writer.inner, b"12345678");
+    }
+
+    async fn staged_test_archive(
+        admission: &'static ZipDownloadAdmission,
+        principal: &str,
+        contents: &[u8],
+    ) -> PreparedZipArchive {
+        let permit = admission.try_acquire(principal).expect("test admission slot");
+        let mut file = File::from_std(tempfile::tempfile().expect("temp file"));
+        tokio::io::AsyncWriteExt::write_all(&mut file, contents)
+            .await
+            .expect("seed temp file");
+        file.seek(std::io::SeekFrom::Start(0)).await.expect("rewind temp file");
+        PreparedZipArchive { file, _permit: permit }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn staged_archive_is_released_after_idle_timeout() {
+        static ADMISSION: ZipDownloadAdmission = ZipDownloadAdmission::const_new(1, 1);
+        let staged = StagedZipArchiveStream::new(staged_test_archive(&ADMISSION, "alice", b"zip").await);
+        staged.spawn_idle_release(OBJECT_ZIP_DOWNLOAD_IDLE_TIMEOUT);
+
+        tokio::task::yield_now().await;
+        tokio::time::advance(OBJECT_ZIP_DOWNLOAD_IDLE_TIMEOUT / 2).await;
+        assert!(!staged.released(), "an archive within the idle timeout must stay staged");
+        assert_eq!(ADMISSION.active_total(), 1, "the staging slot is still held");
+        assert_eq!(ADMISSION.active_for_principal("alice"), 1);
+
+        tokio::time::advance(OBJECT_ZIP_DOWNLOAD_IDLE_TIMEOUT).await;
+        tokio::task::yield_now().await;
+        assert!(staged.released(), "an idle archive must be released after the idle timeout");
+        assert_eq!(ADMISSION.active_total(), 0, "releasing the archive frees its global slot");
+        assert_eq!(
+            ADMISSION.active_for_principal("alice"),
+            0,
+            "releasing the archive frees its per-principal slot"
+        );
+
+        let mut buf = [0_u8; 8];
+        let err = tokio::io::AsyncReadExt::read(&mut tokio::io::BufReader::new(staged), &mut buf)
+            .await
+            .expect_err("reading a released archive must fail");
+        assert_eq!(err.kind(), io::ErrorKind::TimedOut);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn staged_archive_stays_while_client_reads_and_releases_on_eof() {
+        static ADMISSION: ZipDownloadAdmission = ZipDownloadAdmission::const_new(1, 1);
+        let mut staged = StagedZipArchiveStream::new(staged_test_archive(&ADMISSION, "alice", b"zip").await);
+        staged.spawn_idle_release(OBJECT_ZIP_DOWNLOAD_IDLE_TIMEOUT);
+
+        let mut buf = [0_u8; 1];
+        for expected in *b"zip" {
+            tokio::time::advance(OBJECT_ZIP_DOWNLOAD_IDLE_TIMEOUT / 2 + std::time::Duration::from_secs(1)).await;
+            tokio::task::yield_now().await;
+            let read = tokio::io::AsyncReadExt::read(&mut staged, &mut buf)
+                .await
+                .expect("active download keeps streaming");
+            assert_eq!(read, 1);
+            assert_eq!(buf[0], expected);
+        }
+        assert!(!staged.released(), "archive stays staged until EOF or drop");
+
+        // Reaching EOF immediately releases the temp file and concurrency slot.
+        let eof = tokio::io::AsyncReadExt::read(&mut staged, &mut buf)
+            .await
+            .expect("EOF read must succeed");
+        assert_eq!(eof, 0);
+        assert!(staged.released(), "EOF releases staged temp file immediately");
+        assert_eq!(ADMISSION.active_total(), 0, "EOF frees the staging slot immediately");
+
+        // Polling again after EOF still yields clean EOF rather than TimedOut.
+        let eof_again = tokio::io::AsyncReadExt::read(&mut staged, &mut buf)
+            .await
+            .expect("subsequent EOF poll must stay clean");
+        assert_eq!(eof_again, 0);
+    }
+
+    #[test]
+    fn download_handler_bounds_staging_concurrency_size_and_idle_lifetime() {
+        let src = include_str!("object_zip_download.rs");
+        let prepare_block =
+            extract_block_between_markers(src, "async fn prepare_zip_download_archive", "async fn generate_zip_archive");
+        let stream_block = extract_block_between_markers(
+            src,
+            "fn build_zip_stream_body(prepared: PreparedZipArchive) -> Body",
+            "fn acquire_object_zip_download_permit",
+        );
+
+        assert!(
+            prepare_block.contains("acquire_object_zip_download_permit(&record.principal)?;"),
+            "archive staging should enforce global and per-principal concurrency caps"
+        );
+        assert!(
+            prepare_block.contains("BoundedZipWriter::new(&mut file, OBJECT_ZIP_DOWNLOAD_MAX_ARCHIVE_BYTES)"),
+            "archive staging should enforce the hard staged archive byte cap"
+        );
+        assert!(
+            prepare_block.contains("PreparedZipArchive { file, _permit: permit }"),
+            "the admission permit must live until the staged temp file is released"
+        );
+        assert!(
+            stream_block.contains("staged.spawn_idle_release(OBJECT_ZIP_DOWNLOAD_IDLE_TIMEOUT);")
+                && stream_block.contains("Body::from_stream(stream)"),
+            "response streaming should spawn the idle reaper and stream via rustfs_s3_types::Body::from_stream"
+        );
     }
 
     #[test]
