@@ -631,6 +631,32 @@ impl DummyBackend {
         self.inner.lock().expect("lock").get_object.push_back(Ok(output));
     }
 
+    /// Queue a get_object Ok response whose body emits one initial chunk and
+    /// then stalls indefinitely on the next poll.
+    pub fn queue_get_object_stalling_after_chunk(&self, initial_chunk: Vec<u8>, reported_content_length: i64) {
+        let head = Bytes::from(initial_chunk);
+        let body_stream = stream::once(async move { Ok::<Bytes, std::io::Error>(head) })
+            .chain(stream::pending::<Result<Bytes, std::io::Error>>());
+        let out = GetObjectOutput {
+            body: Some(stream_body(body_stream)),
+            content_length: Some(reported_content_length),
+            ..Default::default()
+        };
+        self.inner.lock().expect("lock").get_object.push_back(Ok(out));
+    }
+
+    /// Queue a get_object Ok response backed by a scripted sequence of chunk
+    /// results (chunks and/or mid-stream I/O errors).
+    pub fn queue_get_object_chunks(&self, chunks: Vec<Result<Vec<u8>, std::io::Error>>, reported_content_length: i64) {
+        let items = chunks.into_iter().map(|chunk| chunk.map(Bytes::from));
+        let out = GetObjectOutput {
+            body: Some(stream_body(stream::iter(items))),
+            content_length: Some(reported_content_length),
+            ..Default::default()
+        };
+        self.inner.lock().expect("lock").get_object.push_back(Ok(out));
+    }
+
     /// Queue a get_object_range Ok response carrying the given bytes as
     /// the streaming body. content_length is set to bytes.len().
     pub fn queue_get_object_range_bytes(&self, payload: Vec<u8>) {

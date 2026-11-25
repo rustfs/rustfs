@@ -15,16 +15,18 @@
 use crate::common::client::s3::StorageBackend as S3StorageBackend;
 use crate::common::gateway::S3Action;
 use async_trait::async_trait;
-use bytes::Bytes;
-use rustfs_gateway_stream::ByteStream;
+use bytes::{Buf as _, Bytes};
+use rustfs_gateway_stream::{ByteStream, PayloadRead, PayloadStream, StreamError, StreamErrorKind};
 use rustfs_gateway_types::dto::*;
 use rustfs_gateway_types::{BucketName, ObjectKey, OpaqueString};
 use rustfs_utils::MaskedAccessKey;
 use rustfs_utils::path;
 use std::fmt::Debug;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
-use tokio::io::AsyncRead;
+use std::pin::Pin;
+use std::sync::{Arc, Mutex, PoisonError};
+use std::task::{Context, Poll};
+use tokio::io::{AsyncRead, ReadBuf};
 use tracing::{debug, error};
 use unftp_core::storage::{Error, ErrorKind, Fileinfo, Metadata, Result, StorageBackend};
 
@@ -55,6 +57,115 @@ fn parse_s3_path(path_input: &str) -> std::result::Result<(String, Option<String
 
     let key = if object.is_empty() { None } else { Some(object) };
     Ok((bucket, key))
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum StreamReadState {
+    Open,
+    Eof,
+    Failed,
+}
+
+/// Adapts a push-model [`ByteStream`] to `tokio::io::AsyncRead` for FTPS `RETR`.
+///
+/// Holds at most one in-flight chunk from the storage backend and releases it
+/// as soon as its last byte has been copied into the caller's buffer. Wrapping
+/// the `Send`-only stream in a `Mutex` lends `Sync` (required by
+/// `unftp_core::storage::StorageBackend::get`) without `unsafe`; `poll_read`
+/// accesses the stream through `Mutex::get_mut()` under `&mut self`.
+struct FtpsBodyReader {
+    stream: Mutex<ByteStream>,
+    current: Bytes,
+    state: StreamReadState,
+    username: String,
+    path: String,
+    bucket: String,
+    key: String,
+}
+
+impl FtpsBodyReader {
+    fn new(stream: ByteStream, username: String, path: String, bucket: String, key: String) -> Self {
+        Self {
+            stream: Mutex::new(stream),
+            current: Bytes::new(),
+            state: StreamReadState::Open,
+            username,
+            path,
+            bucket,
+            key,
+        }
+    }
+}
+
+fn stream_error_to_io(err: StreamError) -> std::io::Error {
+    let kind = match err.kind() {
+        StreamErrorKind::Io(inner) => inner.kind(),
+        StreamErrorKind::IncompleteBody => std::io::ErrorKind::UnexpectedEof,
+        StreamErrorKind::LengthMismatch { .. } => std::io::ErrorKind::InvalidData,
+        StreamErrorKind::PolledAfterEof | StreamErrorKind::Upstream(_) => std::io::ErrorKind::Other,
+    };
+    let bytes_before_error = err.bytes_before_error();
+    match err.into_kind() {
+        StreamErrorKind::Io(inner) => inner,
+        other => std::io::Error::new(kind, StreamError::new(other).with_bytes_before_error(bytes_before_error)),
+    }
+}
+
+impl AsyncRead for FtpsBodyReader {
+    fn poll_read(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<std::io::Result<()>> {
+        let this = self.get_mut();
+        if buf.remaining() == 0 {
+            return Poll::Ready(Ok(()));
+        }
+
+        loop {
+            if !this.current.is_empty() {
+                let n = buf.remaining().min(this.current.len());
+                buf.put_slice(&this.current[..n]);
+                this.current.advance(n);
+                if this.current.is_empty() {
+                    // Release the producer's chunk allocation as soon as its last byte is copied.
+                    this.current = Bytes::new();
+                }
+                return Poll::Ready(Ok(()));
+            }
+
+            match this.state {
+                StreamReadState::Eof => return Poll::Ready(Ok(())),
+                StreamReadState::Failed => {
+                    return Poll::Ready(Err(std::io::Error::other("ftps object stream already failed")));
+                }
+                StreamReadState::Open => {}
+            }
+
+            let stream = this.stream.get_mut().unwrap_or_else(PoisonError::into_inner);
+            match Pin::new(stream).poll_read(cx) {
+                Poll::Pending => return Poll::Pending,
+                Poll::Ready(Ok(PayloadRead::Chunk(chunk))) => {
+                    this.current = chunk;
+                }
+                Poll::Ready(Ok(PayloadRead::Eof { .. })) => {
+                    this.state = StreamReadState::Eof;
+                    return Poll::Ready(Ok(()));
+                }
+                Poll::Ready(Err(e)) => {
+                    this.state = StreamReadState::Failed;
+                    error!(
+                        event = EVENT_FTPS_STREAM_READ_FAILED,
+                        component = LOG_COMPONENT_PROTOCOLS,
+                        subsystem = LOG_SUBSYSTEM_FTPS_DRIVER,
+                        username = %MaskedAccessKey(&this.username),
+                        path = %this.path,
+                        bucket = %this.bucket,
+                        object = %this.key,
+                        error = %e,
+                        "ftps stream read failed"
+                    );
+                    return Poll::Ready(Err(stream_error_to_io(e)));
+                }
+            }
+        }
+    }
 }
 
 /// FTPS metadata implementation
@@ -472,33 +583,15 @@ where
                     .body
                     .ok_or_else(|| Error::new(ErrorKind::PermanentFileNotAvailable, "No body in response"))?;
 
-                use futures_util::future::poll_fn;
-                use rustfs_gateway_stream::{PayloadRead, PayloadStream};
-                use std::pin::Pin;
-                let mut data = Vec::new();
-                let mut stream = body;
-                loop {
-                    match poll_fn(|cx| Pin::new(&mut stream).poll_read(cx)).await {
-                        Ok(PayloadRead::Chunk(bytes)) => data.extend_from_slice(&bytes),
-                        Ok(PayloadRead::Eof { .. }) => break,
-                        Err(e) => {
-                            error!(
-                                event = EVENT_FTPS_STREAM_READ_FAILED,
-                                component = LOG_COMPONENT_PROTOCOLS,
-                                subsystem = LOG_SUBSYSTEM_FTPS_DRIVER,
-                                username = %masked_username,
-                                path = %path_str,
-                                bucket = %bucket,
-                                object = %key,
-                                error = %e,
-                                "ftps stream read failed"
-                            );
-                            return Err(Error::new(ErrorKind::PermanentFileNotAvailable, format!("Stream error: {}", e)));
-                        }
-                    }
-                }
-
-                Ok(Box::new(std::io::Cursor::new(data)))
+                // Stream chunks directly to libunftp's data channel rather than buffering
+                // the full object in memory before the first byte is written.
+                Ok(Box::new(FtpsBodyReader::new(
+                    body,
+                    user.username.clone(),
+                    path_str.into_owned(),
+                    bucket,
+                    key,
+                )))
             }
             Err(e) => {
                 error!(
@@ -1019,6 +1112,129 @@ mod tests {
         assert!(result.is_err(), "backend policy deny must override identity allow");
         let result = with_test_auth_override(|_, _, _| true, driver.get(&user, "/bucket/secret.txt", 0)).await;
         assert!(result.is_err(), "backend policy denial must prevent returning the queued object body");
+    }
+
+    /// RETR must stream the object body without buffering the whole object in
+    /// RAM first. The backend yields one chunk and then stalls forever, so a
+    /// driver that collects before returning never completes `get()`, whereas a
+    /// streaming driver returns immediately and yields the first chunk.
+    #[tokio::test]
+    async fn ftps_get_streams_body_without_buffering_whole_object() {
+        use super::FtpsDriver;
+        use crate::common::dummy_storage::DummyBackend;
+        use crate::common::gateway::with_test_auth_override;
+        use crate::common::session::{Protocol, test_session};
+        use std::time::Duration;
+        use tokio::io::AsyncReadExt;
+        use unftp_core::storage::StorageBackend as _;
+
+        let backend = DummyBackend::new();
+        backend.queue_get_object_stalling_after_chunk(b"head".to_vec(), 1 << 30);
+        let driver = FtpsDriver::new(backend);
+        let user = super::super::server::FtpsUser {
+            username: "protocol-user".into(),
+            name: None,
+            session_context: test_session(Protocol::Ftps),
+        };
+
+        let mut reader = tokio::time::timeout(
+            Duration::from_secs(5),
+            with_test_auth_override(|_, _, _| true, driver.get(&user, "/bucket/big.bin", 0)),
+        )
+        .await
+        .expect("RETR must return before the entire body has been read")
+        .expect("RETR");
+
+        let mut head = [0u8; 4];
+        tokio::time::timeout(Duration::from_secs(5), reader.read_exact(&mut head))
+            .await
+            .expect("first chunk must be readable while the backend stalls")
+            .expect("read first chunk");
+        assert_eq!(&head, b"head");
+    }
+
+    /// Multi-chunk streaming with small caller buffers must preserve all bytes
+    /// across chunk splits and return clean EOF on repeated trailing reads.
+    #[tokio::test]
+    async fn ftps_get_streams_multi_chunk_and_partial_reads_byte_exact() {
+        use super::FtpsDriver;
+        use crate::common::dummy_storage::DummyBackend;
+        use crate::common::gateway::with_test_auth_override;
+        use crate::common::session::{Protocol, test_session};
+        use tokio::io::AsyncReadExt;
+        use unftp_core::storage::StorageBackend as _;
+
+        let backend = DummyBackend::new();
+        backend.queue_get_object_chunks(vec![Ok(b"abcdefg".to_vec()), Ok(b"".to_vec()), Ok(b"12345".to_vec())], 12);
+        let driver = FtpsDriver::new(backend);
+        let user = super::super::server::FtpsUser {
+            username: "protocol-user".into(),
+            name: None,
+            session_context: test_session(Protocol::Ftps),
+        };
+
+        let mut reader = with_test_auth_override(|_, _, _| true, driver.get(&user, "/bucket/multi.bin", 0))
+            .await
+            .expect("RETR");
+
+        let mut out = Vec::new();
+        let mut buf = [0u8; 3];
+        loop {
+            let n = reader.read(&mut buf).await.expect("read chunk");
+            if n == 0 {
+                break;
+            }
+            out.extend_from_slice(&buf[..n]);
+        }
+        assert_eq!(out, b"abcdefg12345");
+        assert_eq!(reader.read(&mut buf).await.expect("repeated EOF read"), 0);
+    }
+
+    /// Mid-stream backend I/O errors must surface on the returned AsyncRead
+    /// after already-delivered bytes, preserving error kind and never turning
+    /// subsequent polls into silent EOF.
+    #[tokio::test]
+    async fn ftps_get_propagates_mid_stream_backend_error() {
+        use super::FtpsDriver;
+        use crate::common::dummy_storage::DummyBackend;
+        use crate::common::gateway::with_test_auth_override;
+        use crate::common::session::{Protocol, test_session};
+        use tokio::io::AsyncReadExt;
+        use unftp_core::storage::StorageBackend as _;
+
+        let backend = DummyBackend::new();
+        backend.queue_get_object_chunks(
+            vec![
+                Ok(b"part".to_vec()),
+                Err(std::io::Error::new(std::io::ErrorKind::ConnectionReset, "disk read failed")),
+            ],
+            8,
+        );
+        let driver = FtpsDriver::new(backend);
+        let user = super::super::server::FtpsUser {
+            username: "protocol-user".into(),
+            name: None,
+            session_context: test_session(Protocol::Ftps),
+        };
+
+        let mut reader = with_test_auth_override(|_, _, _| true, driver.get(&user, "/bucket/broken.bin", 0))
+            .await
+            .expect("RETR starts streaming");
+
+        let mut head = [0u8; 4];
+        reader.read_exact(&mut head).await.expect("initial chunk delivered");
+        assert_eq!(&head, b"part");
+
+        let mut tail = [0u8; 4];
+        let err = reader
+            .read(&mut tail)
+            .await
+            .expect_err("mid-stream backend error must propagate");
+        assert_eq!(err.kind(), std::io::ErrorKind::ConnectionReset);
+        assert!(
+            reader.read(&mut tail).await.is_err(),
+            "polling a failed stream again must keep failing instead of returning EOF"
+        );
     }
 
     /// RMD deletes every object in the bucket, so `s3:DeleteBucket` alone must
