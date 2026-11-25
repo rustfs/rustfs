@@ -40,14 +40,6 @@ pub(crate) mod diagnostic {
     };
 }
 
-/// Legacy wire types used by app-layer compatibility tests.
-#[cfg(test)]
-pub(crate) mod s3 {
-    pub(crate) use crate::storage::storage_api::test_consumer::legacy_s3_test_types::s3::{
-        Credentials, S3ErrorCode, S3Request, TrailingHeaders, dto,
-    };
-}
-
 pub(crate) mod admin {
     pub(crate) async fn get_server_info(
         get_pools: bool,
