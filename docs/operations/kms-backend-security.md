@@ -143,7 +143,7 @@ The verdict is per connection: a listener that terminates TLS satisfies it, and 
 
 ## Object ciphertext format: what the v1 frame layout does and does not authenticate
 
-Every object RustFS writes today uses the **v1** frame layout (the v2 layout exists and is read automatically, but its write switch `RUSTFS_ENCRYPTION_FRAME_V2` is off by default). Each frame is authenticated with AES-256-GCM under a nonce derived from the object's base nonce and the frame's index. Three properties do **not** follow from that, and an operator's threat model has to account for them:
+Every object RustFS writes today uses the **v1** frame layout (the v2 layout exists and is read automatically, but its write switch `RUSTFS_ENCRYPTION_FRAME_V2` is off by default). Each frame is authenticated with AES-256-GCM under a nonce derived from the object's base nonce (or, for multipart parts written with `RUSTFS_ENCRYPTION_MULTIPART_SEGMENT_NONCE=true`, from the random per-upload segment nonce announced in the opening `0x03` frame) and the frame's index. Three properties do **not** follow from that, and an operator's threat model has to account for them:
 
 - **No frame-index binding.** A frame's index is not part of its associated data. Authentication proves a frame was produced under this object's key; it does not by itself prove the frame belongs at the position it occupies.
 - **No final-frame authentication.** Nothing in a v1 stream marks the last frame, so a stream that has been cut short is not distinguishable from a shorter object by cryptographic means.
@@ -151,12 +151,13 @@ Every object RustFS writes today uses the **v1** frame layout (the v2 layout exi
 
 These matter only to an attacker who can already rewrite the underlying shards. Shard integrity uses a keyed-hash-free checksum (HighwayHash), which such an attacker can recompute, so it is not a barrier.
 
-Two historical shapes additionally reuse a GCM nonce and cannot be repaired by any read-side change:
+Three historical shapes additionally reuse a GCM nonce and cannot be repaired by any read-side change:
 
 | Shape | Written by | Consequence | Migration |
 | --- | --- | --- | --- |
 | Multipart objects written before `1.0.0-alpha.91` | The pre-alpha.91 writer reused a segment's part nonce for every block in it | The whole segment shares one nonce; a frame from index zero authenticates anywhere in that segment | Rewrite in place with CopyObject; then set `RUSTFS_ENCRYPTION_LEGACY_NONCE_FALLBACK=false` |
 | SSE-C objects written before `1.0.0-beta.9` that carry no stored IV | The nonce was derived deterministically from bucket and key | Historical versions of the same key share a nonce, which affects confidentiality as well as forgeability | Rewrite in place with CopyObject |
+| Multipart parts uploaded more than once at the same part number before enabling `RUSTFS_ENCRYPTION_MULTIPART_SEGMENT_NONCE` | The writer derived every part's nonces solely from the session nonce and part number, so a replaced part's old and new ciphertext shared every frame nonce | Anyone retaining raw drive snapshots from both before and after the replacement holds two ciphertexts under the same `(key, nonce)` pair | Complete cluster upgrade to a release with `0x03` read support, then set `RUSTFS_ENCRYPTION_MULTIPART_SEGMENT_NONCE=true`; the final stored object keeps only the last upload |
 
 The decrypt reader locks each segment to whichever nonce layout decoded its first non-zero-index frame, so a replayed frame is rejected as soon as any later frame disagrees. A stream that is nothing but repeats of frame zero has no later frame to disagree, so a deployment that holds no pre-alpha.91 objects should set `RUSTFS_ENCRYPTION_LEGACY_NONCE_FALLBACK=false` (default `true`) to drop that layout entirely. Turning it off refuses to decrypt pre-alpha.91 objects, so migrate first.
 
@@ -180,6 +181,12 @@ No coordinated format cutover is required; the compatibility is deliberate and c
 Historically the KV2 and Local backends sealed only the DEK plaintext; the `encryption_context` rode in the envelope unauthenticated and was checked by field comparison alone, so a party able to rewrite the stored envelope could rewrite the context. With `RUSTFS_KMS_ENVELOPE_AAD=true`, newly wrapped envelopes bind the canonical context bytes as AES-GCM additional data and carry `context_binding: 1`; rewriting the stored context, or stripping the flag, then fails authentication. Static, Vault Transit and AWS already bound the context through their own mechanisms and are unaffected.
 
 Rollout constraint: reading bound envelopes needs no switch, but **a node that predates the field cannot open them** — its unwrap runs without the additional data and fails authentication. The switch defaults off (`ENV_KMS_ENVELOPE_AAD` in `crates/kms/src/config.rs`); enable it only after every node runs a release that understands `context_binding`, mirroring the `RUSTFS_ENCRYPTION_FRAME_V2` rollout. With the switch on, a rewrap sweep upgrades unbound envelopes to the bound format (converging to zero writes on re-run); a bound envelope never regresses to the unbound shape, and an envelope carrying an unrecognized `context_binding` value is refused rather than decrypted without its binding.
+
+### Multipart segment nonces (`RUSTFS_ENCRYPTION_MULTIPART_SEGMENT_NONCE`)
+
+With `RUSTFS_ENCRYPTION_MULTIPART_SEGMENT_NONCE=true`, every encrypted multipart part written in either v1 or v2 frame layout opens with an authenticated 37-byte segment-nonce frame (`0x03`) carrying a fresh random 96-bit nonce bound to the upload's session nonce and part number. Re-uploading a part number inside the same multipart session then draws a fresh segment nonce instead of repeating frame nonces, and the segment is locked to the current nonce layout with no pre-`1.0.0-alpha.91` fallback.
+
+Rollout and rollback constraints: reading `0x03` segments is unconditional and requires no switch (even when a multipart object mixes legacy and `0x03` parts), but **a node without `0x03` read support rejects them** (`unknown encrypted frame type 0x03`), and encrypted ciphertext travels verbatim through transition, decommission, heal, and SSE-C replication passthrough. The write switch (`ENV_RUSTFS_ENCRYPTION_MULTIPART_SEGMENT_NONCE` in `crates/config/src/constants/app.rs`) therefore defaults to `false`, mirroring the `RUSTFS_ENCRYPTION_FRAME_V2` rollout: enable it only after every cluster node — and every RustFS warm or replication target receiving raw ciphertext — runs a release with `0x03` read support. Once any object has been written with `RUSTFS_ENCRYPTION_MULTIPART_SEGMENT_NONCE=true`, do not roll back nodes to a release predating `0x03` read support without first disabling the switch and rewriting those objects.
 
 ### Location entry in the encryption context
 

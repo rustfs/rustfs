@@ -16,6 +16,8 @@ use crate::compress_index::{Index, TryGetIndex};
 use aes_gcm::aead::{Aead, Payload};
 use aes_gcm::{Aes256Gcm, KeyInit, Nonce};
 use pin_project_lite::pin_project;
+use rand::Rng;
+pub use rustfs_config::{DEFAULT_RUSTFS_ENCRYPTION_MULTIPART_SEGMENT_NONCE, ENV_RUSTFS_ENCRYPTION_MULTIPART_SEGMENT_NONCE};
 use rustfs_utils::{put_uvarint, put_uvarint_len};
 use std::io::Error;
 use std::pin::Pin;
@@ -41,10 +43,74 @@ const ENCRYPTION_BLOCK_SIZE: usize = 8 * 1024;
 ///   as the segment delimiter;
 /// - every non-final frame carries exactly [`ENCRYPTION_BLOCK_SIZE`] plaintext
 ///   bytes, giving fixed-length frames a closed-form offset mapping.
+///
+/// A segment-nonce (`0x03`) frame opens a multipart part segment when
+/// [`ENV_RUSTFS_ENCRYPTION_MULTIPART_SEGMENT_NONCE`] is enabled (or via the
+/// explicit `*_with_segment_nonce` constructors). It carries a fresh random
+/// 12-byte segment nonce in the clear together with an AES-256-GCM tag over
+/// the empty message binding the frame header, announced nonce, session base
+/// nonce, mode, and part number as associated data. The reader derives the
+/// segment's frame nonces from the announced nonce offset by `part_number`, so
+/// re-uploading the same part number never reuses an AES-GCM `(key, nonce)`
+/// pair. Segments without a `0x03` frame keep session-derived nonces so
+/// existing objects remain readable without any configuration switch.
 const FRAME_TYPE_V1: u8 = 0x00;
 const FRAME_TYPE_V2: u8 = 0x01;
 const FRAME_TYPE_V2_FINAL: u8 = 0x02;
+const FRAME_TYPE_SEGMENT_NONCE: u8 = 0x03;
 const FRAME_TYPE_END: u8 = 0xFF;
+
+const SEGMENT_NONCE_LEN: usize = 12;
+const GCM_TAG_LEN: usize = 16;
+/// Header length field of a segment-nonce (`0x03`) frame: 1-byte uvarint(12),
+/// 12-byte nonce, 16-byte GCM tag, and the 4 bytes every frame length accounts
+/// for its header CRC field.
+const SEGMENT_NONCE_FRAME_LEN: usize = 1 + SEGMENT_NONCE_LEN + GCM_TAG_LEN + 4;
+/// Total serialized byte length of a segment-nonce (`0x03`) frame:
+/// 8-byte header + 1-byte length prefix + 12-byte nonce + 16-byte GCM tag = 37 bytes.
+pub const SEGMENT_NONCE_FRAME_TOTAL_LEN: usize = 8 + SEGMENT_NONCE_FRAME_LEN - 4;
+/// Plaintext bytes carried by each full non-final v2 frame.
+pub const V2_FRAME_PLAINTEXT_LEN: usize = ENCRYPTION_BLOCK_SIZE;
+/// Ciphertext bytes of one full non-final v2 frame:
+/// 8-byte header + 2-byte uvarint(8192) + 8192-byte plaintext + 16-byte GCM tag = 8218 bytes.
+pub const V2_FULL_FRAME_LEN: usize = 8 + 2 + ENCRYPTION_BLOCK_SIZE + GCM_TAG_LEN;
+
+/// Closed-form ciphertext byte offset of frame `block_index` within a v2
+/// fixed-frame segment.
+///
+/// When `has_segment_nonce` is `true`, the segment opens with a
+/// [`SEGMENT_NONCE_FRAME_TOTAL_LEN`]-byte (37-byte) `0x03` frame, placing
+/// frame `block_index` at `37 + block_index * 8218`. When `false`, frame
+/// `block_index` starts at `block_index * 8218`.
+///
+/// Returns `None` on arithmetic overflow.
+pub const fn v2_frame_ciphertext_offset(block_index: usize, has_segment_nonce: bool) -> Option<usize> {
+    let prefix = if has_segment_nonce { SEGMENT_NONCE_FRAME_TOTAL_LEN } else { 0 };
+    match block_index.checked_mul(V2_FULL_FRAME_LEN) {
+        Some(frames_bytes) => prefix.checked_add(frames_bytes),
+        None => None,
+    }
+}
+
+fn multipart_segment_nonce_enabled() -> bool {
+    #[cfg(test)]
+    {
+        rustfs_utils::get_env_bool(
+            ENV_RUSTFS_ENCRYPTION_MULTIPART_SEGMENT_NONCE,
+            DEFAULT_RUSTFS_ENCRYPTION_MULTIPART_SEGMENT_NONCE,
+        )
+    }
+    #[cfg(not(test))]
+    {
+        static CACHED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *CACHED.get_or_init(|| {
+            rustfs_utils::get_env_bool(
+                ENV_RUSTFS_ENCRYPTION_MULTIPART_SEGMENT_NONCE,
+                DEFAULT_RUSTFS_ENCRYPTION_MULTIPART_SEGMENT_NONCE,
+            )
+        })
+    }
+}
 
 /// AEAD associated data of a v2 frame: the 8-byte header followed by the
 /// frame index within its segment, little-endian.
@@ -53,6 +119,13 @@ fn v2_frame_aad(header: &[u8; 8], block_index: usize) -> [u8; 16] {
     aad[..8].copy_from_slice(header);
     aad[8..].copy_from_slice(&(block_index as u64).to_le_bytes());
     aad
+}
+
+#[derive(Clone, Copy)]
+struct SegmentNonceAnnouncement {
+    segment_nonce: [u8; 12],
+    session_base_nonce: [u8; 12],
+    part_number: Option<usize>,
 }
 
 pin_project! {
@@ -72,6 +145,8 @@ pin_project! {
         frame_v2: bool,
         pending: usize,
         input_done: bool,
+        // Segment nonce waiting to be emitted as the segment's opening `0x03` frame
+        pending_segment_nonce: Option<SegmentNonceAnnouncement>,
     }
 }
 
@@ -92,11 +167,44 @@ where
             frame_v2: false,
             pending: 0,
             input_done: false,
+            pending_segment_nonce: None,
         }
     }
 
+    /// Writer for one part of a multipart upload.
+    ///
+    /// When [`ENV_RUSTFS_ENCRYPTION_MULTIPART_SEGMENT_NONCE`] is enabled, each
+    /// part stream draws a fresh random 12-byte segment nonce, announces it in
+    /// an authenticated [`FRAME_TYPE_SEGMENT_NONCE`] (`0x03`) opening frame
+    /// bound to `(base_nonce, part_number)`, and derives its frame nonces from
+    /// `multipart_part_nonce(segment_nonce, part_number)`. Re-uploading the
+    /// same part number with different plaintext therefore never reuses an
+    /// AES-256-GCM `(key, nonce)` pair.
+    ///
+    /// When the write switch is off (the default during mixed-version rolling
+    /// upgrades), nonces are derived directly from `(base_nonce, part_number)`
+    /// so nodes predating `0x03` read support can still decrypt newly written
+    /// parts.
     pub fn new_multipart(inner: R, key: [u8; 32], base_nonce: [u8; 12], part_number: usize) -> Self {
-        Self::new(inner, key, multipart_part_nonce(base_nonce, part_number))
+        if multipart_segment_nonce_enabled() {
+            Self::new_multipart_with_segment_nonce(inner, key, base_nonce, part_number)
+        } else {
+            Self::new(inner, key, multipart_part_nonce(base_nonce, part_number))
+        }
+    }
+
+    /// Multipart writer that always opens the segment with an authenticated
+    /// random [`FRAME_TYPE_SEGMENT_NONCE`] (`0x03`) frame, regardless of
+    /// [`ENV_RUSTFS_ENCRYPTION_MULTIPART_SEGMENT_NONCE`].
+    pub fn new_multipart_with_segment_nonce(inner: R, key: [u8; 32], base_nonce: [u8; 12], part_number: usize) -> Self {
+        let segment_nonce = random_segment_nonce();
+        let mut reader = Self::new(inner, key, multipart_part_nonce(segment_nonce, part_number));
+        reader.pending_segment_nonce = Some(SegmentNonceAnnouncement {
+            segment_nonce,
+            session_base_nonce: base_nonce,
+            part_number: Some(part_number),
+        });
+        reader
     }
 
     /// Writer for the authenticated, fixed-frame v2 layout.
@@ -110,9 +218,18 @@ where
         reader
     }
 
-    /// Multipart writer for the v2 layout; see [`EncryptReader::new_v2`].
+    /// Multipart writer for the v2 layout; see [`EncryptReader::new_v2`] and
+    /// [`EncryptReader::new_multipart`].
     pub fn new_multipart_v2(inner: R, key: [u8; 32], base_nonce: [u8; 12], part_number: usize) -> Self {
         let mut reader = Self::new_multipart(inner, key, base_nonce, part_number);
+        reader.frame_v2 = true;
+        reader
+    }
+
+    /// Multipart writer for the v2 layout that always emits an authenticated
+    /// random [`FRAME_TYPE_SEGMENT_NONCE`] (`0x03`) opening frame.
+    pub fn new_multipart_v2_with_segment_nonce(inner: R, key: [u8; 32], base_nonce: [u8; 12], part_number: usize) -> Self {
+        let mut reader = Self::new_multipart_with_segment_nonce(inner, key, base_nonce, part_number);
         reader.frame_v2 = true;
         reader
     }
@@ -172,6 +289,171 @@ fn build_frame(
     Ok(out)
 }
 
+/// Header of a segment-nonce (`0x03`) frame: type, length, and CRC32 of the
+/// announced 12-byte nonce, laid out like a v1/v2 frame header.
+fn segment_nonce_frame_header(segment_nonce: &[u8; 12]) -> [u8; 8] {
+    let crc = {
+        let mut hasher = crc_fast::Digest::new(crc_fast::CrcAlgorithm::Crc32IsoHdlc);
+        hasher.update(segment_nonce);
+        hasher.finalize() as u32
+    };
+    let mut header = [0u8; 8];
+    header[0] = FRAME_TYPE_SEGMENT_NONCE;
+    header[1] = (SEGMENT_NONCE_FRAME_LEN & 0xFF) as u8;
+    header[2] = ((SEGMENT_NONCE_FRAME_LEN >> 8) & 0xFF) as u8;
+    header[3] = ((SEGMENT_NONCE_FRAME_LEN >> 16) & 0xFF) as u8;
+    header[4..].copy_from_slice(&crc.to_le_bytes());
+    header
+}
+
+/// AEAD associated data of a segment-nonce (`0x03`) frame:
+/// - `[0..8]`: 8-byte header
+/// - `[8..20]`: announced 12-byte `segment_nonce`
+/// - `[20..32]`: 12-byte session `base_nonce` (prevents cross-object part
+///   splicing under a shared key)
+/// - `[32]`: mode byte (`1` for multipart, `0` for single-part)
+/// - `[33..41]`: `part_number` (little-endian `u64`; `0` for single-part)
+fn segment_nonce_aad(
+    header: &[u8; 8],
+    segment_nonce: &[u8; 12],
+    session_base_nonce: &[u8; 12],
+    part_number: Option<usize>,
+) -> [u8; 41] {
+    let mut aad = [0u8; 41];
+    aad[..8].copy_from_slice(header);
+    aad[8..20].copy_from_slice(segment_nonce);
+    aad[20..32].copy_from_slice(session_base_nonce);
+    aad[32] = u8::from(part_number.is_some());
+    aad[33..41].copy_from_slice(&(part_number.unwrap_or(0) as u64).to_le_bytes());
+    aad
+}
+
+/// Nonce under which a segment-nonce frame's authentication tag is computed:
+/// the segment base with the block counter saturated (`u32::MAX`), which no
+/// data frame in the segment is permitted to reach.
+fn segment_nonce_tag_nonce(segment_base: &[u8; 12]) -> [u8; 12] {
+    derive_block_nonce(segment_base, u32::MAX as usize)
+}
+
+/// Build the 37-byte segment-nonce (`0x03`) frame: 8-byte header, 1-byte
+/// length uvarint (`12`), the 12-byte random nonce in the clear, and the
+/// 16-byte AES-256-GCM tag of the empty message authenticating header, nonce,
+/// session base nonce, mode, and part number.
+fn build_segment_nonce_frame(
+    cipher: &Aes256Gcm,
+    segment_base: &[u8; 12],
+    segment_nonce: &[u8; 12],
+    session_base_nonce: &[u8; 12],
+    part_number: Option<usize>,
+) -> std::io::Result<Vec<u8>> {
+    let header = segment_nonce_frame_header(segment_nonce);
+    let tag_nonce = segment_nonce_tag_nonce(segment_base);
+    let nonce = Nonce::try_from(tag_nonce.as_slice()).map_err(|_| Error::other("invalid nonce length"))?;
+    let aad = segment_nonce_aad(&header, segment_nonce, session_base_nonce, part_number);
+    let tag = cipher
+        .encrypt(&nonce, Payload { msg: &[], aad: &aad })
+        .map_err(|e| Error::other(format!("encrypt error: {e}")))?;
+
+    let mut out = Vec::with_capacity(SEGMENT_NONCE_FRAME_TOTAL_LEN);
+    out.extend_from_slice(&header);
+    let mut len_buf = [0u8; 10];
+    let encoded_len = put_uvarint(&mut len_buf, SEGMENT_NONCE_LEN as u64);
+    out.extend_from_slice(&len_buf[..encoded_len]);
+    out.extend_from_slice(segment_nonce);
+    out.extend_from_slice(&tag);
+    Ok(out)
+}
+
+/// Verify a segment-nonce (`0x03`) frame payload (the 29 bytes after the
+/// 8-byte header) and return the derived segment base nonce.
+fn parse_segment_nonce_frame(
+    cipher: &Aes256Gcm,
+    header: &[u8; 8],
+    payload: &[u8],
+    session_base_nonce: &[u8; 12],
+    part_number: Option<usize>,
+) -> std::io::Result<[u8; 12]> {
+    let invalid = |msg: &str| Error::new(std::io::ErrorKind::InvalidData, msg.to_string());
+    if header[0] != FRAME_TYPE_SEGMENT_NONCE {
+        return Err(invalid("unexpected frame type for segment nonce frame"));
+    }
+    let declared_len = (header[1] as usize) | ((header[2] as usize) << 8) | ((header[3] as usize) << 16);
+    if declared_len != SEGMENT_NONCE_FRAME_LEN || payload.len() != SEGMENT_NONCE_FRAME_LEN - 4 {
+        return Err(invalid("invalid segment nonce frame length"));
+    }
+    let (nonce_len, uvarint_len) = rustfs_utils::uvarint(payload);
+    if uvarint_len != 1 || nonce_len != SEGMENT_NONCE_LEN as u64 {
+        return Err(invalid("invalid segment nonce frame length prefix"));
+    }
+    let body = &payload[1..];
+    if body.len() != SEGMENT_NONCE_LEN + GCM_TAG_LEN {
+        return Err(invalid("invalid segment nonce frame length"));
+    }
+    let (segment_nonce, tag) = body.split_at(SEGMENT_NONCE_LEN);
+    let segment_nonce: [u8; 12] = segment_nonce
+        .try_into()
+        .map_err(|_| invalid("invalid segment nonce length"))?;
+
+    let segment_base = match part_number {
+        Some(part_number) => derive_part_nonce(&segment_nonce, part_number),
+        None => segment_nonce,
+    };
+    let tag_nonce = segment_nonce_tag_nonce(&segment_base);
+    let nonce = Nonce::try_from(tag_nonce.as_slice()).map_err(|_| Error::other("invalid nonce length"))?;
+    let aad = segment_nonce_aad(header, &segment_nonce, session_base_nonce, part_number);
+    cipher
+        .decrypt(&nonce, Payload { msg: tag, aad: &aad })
+        .map_err(|_| invalid("segment nonce frame failed authentication"))?;
+
+    let expected_crc = u32::from_le_bytes([header[4], header[5], header[6], header[7]]);
+    let actual_crc = {
+        let mut hasher = crc_fast::Digest::new(crc_fast::CrcAlgorithm::Crc32IsoHdlc);
+        hasher.update(&segment_nonce);
+        hasher.finalize() as u32
+    };
+    if actual_crc != expected_crc {
+        return Err(Error::new(std::io::ErrorKind::InvalidData, "CRC32 mismatch"));
+    }
+    Ok(segment_base)
+}
+
+/// Authenticate a complete 37-byte [`FRAME_TYPE_SEGMENT_NONCE`] (`0x03`)
+/// opening frame and return the segment's active base nonce.
+///
+/// Callers performing closed-form v2 fixed-frame seeks inside a multipart part
+/// read the part's first [`SEGMENT_NONCE_FRAME_TOTAL_LEN`] (37) bytes, verify
+/// them with this helper against `(key, session_base_nonce, Some(part_number))`,
+/// compute the target frame offset via
+/// `v2_frame_ciphertext_offset(block_index, true)`, and pass the returned base
+/// nonce to [`DecryptReader::new_multipart_at_block`].
+///
+/// # Errors
+/// Returns [`std::io::ErrorKind::InvalidData`] if `frame` is not a valid,
+/// authentic 37-byte segment-nonce frame for `(key, session_base_nonce,
+/// part_number)`.
+pub fn authenticate_segment_nonce_frame(
+    frame: &[u8],
+    key: [u8; 32],
+    session_base_nonce: [u8; 12],
+    part_number: Option<usize>,
+) -> std::io::Result<[u8; 12]> {
+    if frame.len() != SEGMENT_NONCE_FRAME_TOTAL_LEN {
+        return Err(Error::new(std::io::ErrorKind::InvalidData, "invalid segment nonce frame length"));
+    }
+    let cipher = Aes256Gcm::new_from_slice(&key).map_err(|_| Error::other("invalid key length"))?;
+    let (header_slice, payload) = frame.split_at(8);
+    let header: &[u8; 8] = header_slice
+        .try_into()
+        .map_err(|_| Error::new(std::io::ErrorKind::InvalidData, "invalid segment nonce frame header"))?;
+    parse_segment_nonce_frame(&cipher, header, payload, &session_base_nonce, part_number)
+}
+
+fn random_segment_nonce() -> [u8; 12] {
+    let mut nonce = [0u8; 12];
+    rand::rng().fill_bytes(&mut nonce);
+    nonce
+}
+
 impl<R> AsyncRead for EncryptReader<R>
 where
     R: AsyncRead + Unpin + Send + Sync,
@@ -190,6 +472,26 @@ where
             return Poll::Ready(Ok(()));
         }
         if *this.finished {
+            return Poll::Ready(Ok(()));
+        }
+
+        // Emit the segment's authenticated random nonce announcement before frame 0.
+        if let Some(announcement) = this.pending_segment_nonce.take() {
+            *this.buffer = build_segment_nonce_frame(
+                this.cipher,
+                this.base_nonce,
+                &announcement.segment_nonce,
+                &announcement.session_base_nonce,
+                announcement.part_number,
+            )?;
+            *this.buffer_pos = 0;
+            let to_copy = std::cmp::min(buf.remaining(), this.buffer.len());
+            buf.put_slice(&this.buffer[..to_copy]);
+            *this.buffer_pos += to_copy;
+            if *this.buffer_pos == this.buffer.len() {
+                this.buffer.clear();
+                *this.buffer_pos = 0;
+            }
             return Poll::Ready(Ok(()));
         }
 
@@ -213,6 +515,9 @@ where
                 }
             }
 
+            if *this.block_index >= u32::MAX as usize {
+                return Poll::Ready(Err(Error::other("encrypted segment exceeded maximum frame count")));
+            }
             // A short block is only ever the stream tail; EOF exactly on a block
             // boundary emits that full block as non-final and an empty final
             // frame on the next poll, so emptiness is always authenticated.
@@ -260,6 +565,9 @@ where
                     *this.buffer_pos += to_copy;
                     Poll::Ready(Ok(()))
                 } else {
+                    if *this.block_index >= u32::MAX as usize {
+                        return Poll::Ready(Err(Error::other("encrypted segment exceeded maximum frame count")));
+                    }
                     // Encrypt the chunk
                     let block_nonce = derive_block_nonce(this.base_nonce, *this.block_index);
                     let nonce = Nonce::try_from(block_nonce.as_slice()).map_err(|_| Error::other("invalid nonce length"))?;
@@ -409,6 +717,9 @@ pin_project! {
         segments_completed: usize,
         v1_nonce_layout: Option<V1NonceLayout>,
         legacy_nonce_fallback: bool,
+        // True once the current segment's active base nonce was announced via
+        // a `0x03` frame (or supplied explicitly by a mid-segment seek).
+        explicit_segment_nonce: bool,
     }
 }
 
@@ -444,6 +755,7 @@ where
             segments_completed: 0,
             v1_nonce_layout: None,
             legacy_nonce_fallback: legacy_nonce_fallback_enabled(),
+            explicit_segment_nonce: false,
         }
     }
 
@@ -496,7 +808,39 @@ where
             segments_completed: 0,
             v1_nonce_layout: None,
             legacy_nonce_fallback: legacy_nonce_fallback_enabled(),
+            explicit_segment_nonce: false,
         }
+    }
+
+    /// Decrypt a multipart v2 stream starting at an arbitrary frame boundary
+    /// (`starting_block_index`) of the first part in `multipart_parts`.
+    ///
+    /// `base_nonce` is the upload's session nonce used to authenticate any
+    /// subsequent parts' `0x03` frames (or derive legacy nonces for parts
+    /// without one). `first_segment_base_nonce` is the active base nonce for
+    /// the opening part: either the result of
+    /// [`authenticate_segment_nonce_frame`] when the part starts with a 37-byte
+    /// `0x03` frame, or `multipart_part_nonce(base_nonce, first_part)` when it
+    /// does not.
+    ///
+    /// Because the opening part's base nonce is already established, the stream
+    /// must begin directly at frame `starting_block_index` and any `0x03` frame
+    /// in the opening segment is rejected. After the opening segment's `0xFF`
+    /// end marker, subsequent parts in `multipart_parts` read their own opening
+    /// `0x03` frames (or fall back to session-derived nonces) normally.
+    pub fn new_multipart_at_block(
+        inner: R,
+        key: [u8; 32],
+        base_nonce: [u8; 12],
+        first_segment_base_nonce: [u8; 12],
+        multipart_parts: Vec<usize>,
+        starting_block_index: usize,
+    ) -> Self {
+        let mut reader = Self::new_multipart(inner, key, base_nonce, multipart_parts);
+        reader.current_nonce_base = first_segment_base_nonce;
+        reader.block_index = starting_block_index;
+        reader.explicit_segment_nonce = true;
+        reader
     }
 }
 
@@ -535,6 +879,16 @@ where
                             let n = temp_buf.filled().len();
                             if n == 0 {
                                 if *this.header_read == 0 {
+                                    // A segment that opened with a `0x03` frame
+                                    // must contain at least one data frame or a
+                                    // `0xFF` end marker; immediate EOF means the
+                                    // segment was truncated right after its nonce.
+                                    if *this.explicit_segment_nonce && *this.segment_frames == 0 {
+                                        return Poll::Ready(Err(Error::new(
+                                            std::io::ErrorKind::UnexpectedEof,
+                                            "encrypted stream truncated after segment nonce frame",
+                                        )));
+                                    }
                                     // v2 segments end with an authenticated final
                                     // frame; a clean EOF before it means trailing
                                     // frames were dropped.
@@ -603,6 +957,7 @@ where
                     *this.saw_final_frame = false;
                     *this.segment_frames = 0;
                     *this.v1_nonce_layout = None;
+                    *this.explicit_segment_nonce = false;
 
                     if *this.multipart_mode {
                         let next_part = if *this.current_part_index + 1 < this.multipart_parts.len() {
@@ -627,6 +982,36 @@ where
                     *this.block_index = 0;
                     *this.ciphertext_read = 0;
                     *this.ciphertext_len = 0;
+                    continue;
+                }
+
+                if typ == FRAME_TYPE_SEGMENT_NONCE {
+                    // Only the very first frame of a segment may announce its
+                    // nonce; anywhere later it would re-key frames already
+                    // authenticated under another nonce.
+                    if *this.block_index != 0
+                        || *this.segment_frames != 0
+                        || this.segment_frame_version.is_some()
+                        || *this.explicit_segment_nonce
+                    {
+                        return Poll::Ready(Err(Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            "segment nonce frame after the segment began",
+                        )));
+                    }
+                    if len != SEGMENT_NONCE_FRAME_LEN {
+                        return Poll::Ready(Err(Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            "invalid segment nonce frame length",
+                        )));
+                    }
+                    *this.current_frame_type = typ;
+                    let payload_len = len - 4;
+                    if this.ciphertext_buf.len() < payload_len {
+                        this.ciphertext_buf.resize(payload_len, 0);
+                    }
+                    *this.ciphertext_len = payload_len;
+                    *this.ciphertext_read = 0;
                     continue;
                 }
 
@@ -715,6 +1100,33 @@ where
             }
 
             let ciphertext_buf = &this.ciphertext_buf[..*this.ciphertext_len];
+            if *this.current_frame_type == FRAME_TYPE_SEGMENT_NONCE {
+                let part_number = (*this.multipart_mode).then_some(*this.current_part);
+                let segment_base =
+                    match parse_segment_nonce_frame(this.cipher, this.header_buf, ciphertext_buf, this.base_nonce, part_number) {
+                        Ok(segment_base) => segment_base,
+                        Err(err) => {
+                            *this.ciphertext_read = 0;
+                            *this.ciphertext_len = 0;
+                            *this.current_frame_type = FRAME_TYPE_V1;
+                            return Poll::Ready(Err(err));
+                        }
+                    };
+                *this.current_nonce_base = segment_base;
+                *this.explicit_segment_nonce = true;
+                *this.current_frame_type = FRAME_TYPE_V1;
+                *this.ciphertext_read = 0;
+                *this.ciphertext_len = 0;
+                continue;
+            }
+            if *this.block_index >= u32::MAX as usize {
+                *this.ciphertext_read = 0;
+                *this.ciphertext_len = 0;
+                return Poll::Ready(Err(Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "encrypted segment exceeded maximum frame count",
+                )));
+            }
             // `ciphertext_buf`'s length derives from the untrusted 24-bit header length field, so
             // it can be shorter than 16 bytes. `uvarint` is safe on any slice length, so pass the
             // whole slice instead of a fixed `[0..16]` index that panics on corrupted/truncated
@@ -745,6 +1157,13 @@ where
                         },
                     )
                     .map_err(|_| Error::new(std::io::ErrorKind::InvalidData, "v2 encrypted frame failed authentication"))?
+            } else if *this.explicit_segment_nonce {
+                // A segment that announced its nonce has no historical nonce
+                // layout to fall back to, so it is locked to the current layout
+                // from frame 0.
+                this.cipher
+                    .decrypt(&nonce, ciphertext)
+                    .map_err(|error| Error::new(std::io::ErrorKind::InvalidData, format!("decrypt error: {error}")))?
             } else {
                 let legacy_part_nonce = if *this.multipart_mode {
                     derive_legacy_part_nonce(this.base_nonce, *this.current_part)
@@ -1568,10 +1987,6 @@ mod tests {
 
     // ======================= v2 frame format =======================
 
-    /// Byte cost of one full v2 frame: 8B header + 2B uvarint(8192) + 8192B
-    /// plaintext + 16B GCM tag.
-    const V2_FULL_FRAME_LEN: usize = 8 + 2 + super::ENCRYPTION_BLOCK_SIZE + 16;
-
     async fn v2_encrypt(data: &[u8], key: [u8; 32], nonce: [u8; 12]) -> Vec<u8> {
         let mut encrypt_reader = EncryptReader::new_v2(BufReader::new(data), key, nonce);
         let mut encrypted = Vec::new();
@@ -1818,5 +2233,787 @@ mod tests {
             .read_to_end(&mut decrypted)
             .await
             .expect_err("a wrong absolute frame index must fail authentication");
+    }
+
+    // ======================= segment-nonce (0x03) frame format =======================
+
+    async fn decrypt_multipart(
+        combined: Vec<u8>,
+        key: [u8; 32],
+        base_nonce: [u8; 12],
+        parts: Vec<usize>,
+    ) -> std::io::Result<Vec<u8>> {
+        let mut decrypt_reader = DecryptReader::new_multipart(Cursor::new(combined), key, base_nonce, parts);
+        let mut decrypted = Vec::new();
+        decrypt_reader.read_to_end(&mut decrypted).await?;
+        Ok(decrypted)
+    }
+
+    async fn encrypt_multipart_part(data: &[u8], key: [u8; 32], base_nonce: [u8; 12], part_number: usize, v2: bool) -> Vec<u8> {
+        let mut out = Vec::new();
+        if v2 {
+            let mut reader = EncryptReader::new_multipart_v2(BufReader::new(data), key, base_nonce, part_number);
+            reader.read_to_end(&mut out).await.expect("v2 part encryption succeeds");
+        } else {
+            let mut reader = EncryptReader::new_multipart(BufReader::new(data), key, base_nonce, part_number);
+            reader.read_to_end(&mut out).await.expect("v1 part encryption succeeds");
+        }
+        out
+    }
+
+    async fn encrypt_multipart_part_explicit_nonce(
+        data: &[u8],
+        key: [u8; 32],
+        base_nonce: [u8; 12],
+        part_number: usize,
+        v2: bool,
+    ) -> Vec<u8> {
+        let mut out = Vec::new();
+        if v2 {
+            let mut reader =
+                EncryptReader::new_multipart_v2_with_segment_nonce(BufReader::new(data), key, base_nonce, part_number);
+            reader
+                .read_to_end(&mut out)
+                .await
+                .expect("v2 segment-nonce part encryption succeeds");
+        } else {
+            let mut reader = EncryptReader::new_multipart_with_segment_nonce(BufReader::new(data), key, base_nonce, part_number);
+            reader
+                .read_to_end(&mut out)
+                .await
+                .expect("v1 segment-nonce part encryption succeeds");
+        }
+        out
+    }
+
+    async fn read_in_tiny_chunks<R: AsyncRead + Unpin>(mut reader: R, chunk_size: usize) -> std::io::Result<Vec<u8>> {
+        let mut out = Vec::new();
+        let mut buf = vec![0u8; chunk_size];
+        loop {
+            let n = reader.read(&mut buf).await?;
+            if n == 0 {
+                break;
+            }
+            out.extend_from_slice(&buf[..n]);
+        }
+        Ok(out)
+    }
+
+    #[tokio::test]
+    async fn multipart_segment_nonce_write_switch_defaults_off_and_honors_env() {
+        let mut key = [0u8; 32];
+        let mut base_nonce = [0u8; 12];
+        rand::rng().fill_bytes(&mut key);
+        rand::rng().fill_bytes(&mut base_nonce);
+        let part_data: Vec<u8> = (0..ENCRYPTION_BLOCK_SIZE + 55).map(|i| (i % 251) as u8).collect();
+
+        // Default (unset): off for rolling-upgrade compatibility with older nodes.
+        temp_env::async_with_vars([(ENV_RUSTFS_ENCRYPTION_MULTIPART_SEGMENT_NONCE, None::<&str>)], async {
+            assert!(
+                !multipart_segment_nonce_enabled(),
+                "write switch must default off for mixed-version rolling upgrades"
+            );
+            let enc_v1 = encrypt_multipart_part(&part_data, key, base_nonce, 1, false).await;
+            assert_eq!(enc_v1[0], FRAME_TYPE_V1, "default v1 write must not emit 0x03");
+            assert_eq!(
+                decrypt_multipart(enc_v1, key, base_nonce, vec![1])
+                    .await
+                    .expect("default v1 decrypts"),
+                part_data
+            );
+
+            let enc_v2 = encrypt_multipart_part(&part_data, key, base_nonce, 1, true).await;
+            assert_eq!(enc_v2[0], FRAME_TYPE_V2, "default v2 write must not emit 0x03");
+            assert_eq!(
+                decrypt_multipart(enc_v2, key, base_nonce, vec![1])
+                    .await
+                    .expect("default v2 decrypts"),
+                part_data
+            );
+        })
+        .await;
+
+        // Enabled: writes open with authenticated 37-byte 0x03 segment-nonce frames.
+        let (enc_v1_03, enc_v2_03) =
+            temp_env::async_with_vars([(ENV_RUSTFS_ENCRYPTION_MULTIPART_SEGMENT_NONCE, Some("true"))], async {
+                assert!(multipart_segment_nonce_enabled(), "write switch must observe true");
+                let enc_v1 = encrypt_multipart_part(&part_data, key, base_nonce, 1, false).await;
+                assert_eq!(enc_v1[0], FRAME_TYPE_SEGMENT_NONCE);
+                assert_eq!(enc_v1[1] as usize, SEGMENT_NONCE_FRAME_LEN);
+                assert_eq!(enc_v1[SEGMENT_NONCE_FRAME_TOTAL_LEN], FRAME_TYPE_V1);
+
+                let enc_v2 = encrypt_multipart_part(&part_data, key, base_nonce, 1, true).await;
+                assert_eq!(enc_v2[0], FRAME_TYPE_SEGMENT_NONCE);
+                assert_eq!(enc_v2[1] as usize, SEGMENT_NONCE_FRAME_LEN);
+                assert_eq!(enc_v2[SEGMENT_NONCE_FRAME_TOTAL_LEN], FRAME_TYPE_V2);
+                (enc_v1, enc_v2)
+            })
+            .await;
+
+        // Read support is unconditional: even with the write switch explicitly false,
+        // both v1 and v2 segments prefixed with 0x03 decrypt seamlessly.
+        temp_env::async_with_vars([(ENV_RUSTFS_ENCRYPTION_MULTIPART_SEGMENT_NONCE, Some("false"))], async {
+            assert!(!multipart_segment_nonce_enabled(), "write switch must observe false");
+            assert_eq!(
+                decrypt_multipart(enc_v1_03, key, base_nonce, vec![1])
+                    .await
+                    .expect("0x03 v1 decrypts with write switch off"),
+                part_data
+            );
+            assert_eq!(
+                decrypt_multipart(enc_v2_03, key, base_nonce, vec![1])
+                    .await
+                    .expect("0x03 v2 decrypts with write switch off"),
+                part_data
+            );
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn multipart_part_reupload_never_reuses_nonce_v1_and_v2() {
+        let mut key = [0u8; 32];
+        let mut base_nonce = [0u8; 12];
+        rand::rng().fill_bytes(&mut key);
+        rand::rng().fill_bytes(&mut base_nonce);
+
+        let mut first = vec![0u8; ENCRYPTION_BLOCK_SIZE * 2 + 123];
+        let mut second = vec![0u8; first.len()];
+        rand::rng().fill(&mut first[..]);
+        rand::rng().fill(&mut second[..]);
+
+        temp_env::async_with_vars([(ENV_RUSTFS_ENCRYPTION_MULTIPART_SEGMENT_NONCE, Some("true"))], async {
+            for v2 in [false, true] {
+                let encrypted_first = encrypt_multipart_part(&first, key, base_nonce, 1, v2).await;
+                let encrypted_second = encrypt_multipart_part(&second, key, base_nonce, 1, v2).await;
+
+                assert_eq!(encrypted_first[0], FRAME_TYPE_SEGMENT_NONCE);
+                assert_eq!(encrypted_second[0], FRAME_TYPE_SEGMENT_NONCE);
+
+                let payloads_first = extract_encrypted_payloads(&encrypted_first);
+                let payloads_second = extract_encrypted_payloads(&encrypted_second);
+                assert_eq!(payloads_first.len(), payloads_second.len());
+                // Frame 0 is the 0x03 segment-nonce frame: distinct random nonces per upload.
+                assert_ne!(payloads_first[0], payloads_second[0]);
+
+                // XOR of corresponding data frame ciphertexts must not reveal the XOR of
+                // the two plaintexts (no shared AES-GCM keystream).
+                let mut ciphertext_xor = Vec::new();
+                for (a, b) in payloads_first.iter().zip(payloads_second.iter()).skip(1) {
+                    let (_, prefix) = rustfs_utils::uvarint(a);
+                    let prefix = prefix as usize;
+                    ciphertext_xor.extend(
+                        a[prefix..a.len() - GCM_TAG_LEN]
+                            .iter()
+                            .zip(&b[prefix..b.len() - GCM_TAG_LEN])
+                            .map(|(x, y)| x ^ y),
+                    );
+                }
+                assert_eq!(ciphertext_xor.len(), first.len());
+                let plaintext_xor: Vec<u8> = first.iter().zip(&second).map(|(x, y)| x ^ y).collect();
+                let matching = ciphertext_xor.iter().zip(&plaintext_xor).filter(|(x, y)| x == y).count();
+                assert!(
+                    matching < first.len() / 16,
+                    "v2={v2}: {matching} of {} keystream bytes repeated",
+                    first.len()
+                );
+
+                // Even re-uploading identical plaintext draws a fresh segment nonce and distinct ciphertext.
+                let encrypted_same = encrypt_multipart_part(&first, key, base_nonce, 1, v2).await;
+                assert_ne!(
+                    &encrypted_first[..SEGMENT_NONCE_FRAME_TOTAL_LEN],
+                    &encrypted_same[..SEGMENT_NONCE_FRAME_TOTAL_LEN]
+                );
+                assert_ne!(encrypted_first, encrypted_same);
+
+                for (encrypted, plaintext) in [
+                    (encrypted_first, &first),
+                    (encrypted_second, &second),
+                    (encrypted_same, &first),
+                ] {
+                    let decrypted = decrypt_multipart(encrypted, key, base_nonce, vec![1])
+                        .await
+                        .expect("each re-upload of the part decrypts cleanly");
+                    assert_eq!(&decrypted, plaintext);
+                }
+            }
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn multipart_segment_nonce_round_trips_boundaries_chunked_and_noncontiguous_parts() {
+        let mut key = [0u8; 32];
+        let mut base_nonce = [0u8; 12];
+        rand::rng().fill_bytes(&mut key);
+        rand::rng().fill_bytes(&mut base_nonce);
+
+        let block = ENCRYPTION_BLOCK_SIZE;
+        let lengths = [0usize, 1, 127, 128, block - 1, block, block + 1, 2 * block + 19];
+
+        for v2 in [false, true] {
+            for &len in &lengths {
+                let data: Vec<u8> = (0..len).map(|i| ((i * 13 + 5) % 251) as u8).collect();
+                let encrypted = encrypt_multipart_part_explicit_nonce(&data, key, base_nonce, 4, v2).await;
+                assert_eq!(encrypted[0], FRAME_TYPE_SEGMENT_NONCE);
+
+                // Round-trip through normal, 3-byte chunked, and pending-chunked readers.
+                let decrypted = decrypt_multipart(encrypted.clone(), key, base_nonce, vec![4])
+                    .await
+                    .expect("boundary length decrypts");
+                assert_eq!(decrypted, data, "v2={v2}, len={len}");
+
+                let mut chunked_decrypt =
+                    DecryptReader::new_multipart(ChunkedCursor::new(encrypted.clone(), 3), key, base_nonce, vec![4]);
+                let mut chunked_out = Vec::new();
+                chunked_decrypt
+                    .read_to_end(&mut chunked_out)
+                    .await
+                    .expect("chunked decrypt succeeds");
+                assert_eq!(chunked_out, data, "chunked v2={v2}, len={len}");
+
+                let mut pending_decrypt =
+                    DecryptReader::new_multipart(PendingChunkedCursor::new(encrypted, 3), key, base_nonce, vec![4]);
+                let mut pending_out = Vec::new();
+                pending_decrypt
+                    .read_to_end(&mut pending_out)
+                    .await
+                    .expect("pending chunked decrypt succeeds");
+                assert_eq!(pending_out, data, "pending v2={v2}, len={len}");
+            }
+
+            // Tiny output buffer on EncryptReader (3 bytes at a time, splitting the 37-byte 0x03 frame).
+            let data: Vec<u8> = (0..block + 33).map(|i| (i % 239) as u8).collect();
+            let encrypted_tiny = if v2 {
+                read_in_tiny_chunks(
+                    EncryptReader::new_multipart_v2_with_segment_nonce(Cursor::new(data.clone()), key, base_nonce, 2),
+                    3,
+                )
+                .await
+                .expect("tiny-chunk v2 encrypt")
+            } else {
+                read_in_tiny_chunks(
+                    EncryptReader::new_multipart_with_segment_nonce(Cursor::new(data.clone()), key, base_nonce, 2),
+                    3,
+                )
+                .await
+                .expect("tiny-chunk v1 encrypt")
+            };
+            assert_eq!(encrypted_tiny[0], FRAME_TYPE_SEGMENT_NONCE);
+            assert_eq!(
+                decrypt_multipart(encrypted_tiny, key, base_nonce, vec![2])
+                    .await
+                    .expect("tiny-chunk encrypted stream decrypts"),
+                data
+            );
+
+            // Non-contiguous part numbers [1, 3, 7], including a block-aligned middle part and empty tail.
+            let p1: Vec<u8> = (0..block + 17).map(|i| (i % 251) as u8).collect();
+            let p3: Vec<u8> = (0..2 * block).map(|i| ((i + 11) % 241) as u8).collect();
+            let p7: Vec<u8> = Vec::new();
+            let mut combined = Vec::new();
+            combined.extend_from_slice(&encrypt_multipart_part_explicit_nonce(&p1, key, base_nonce, 1, v2).await);
+            combined.extend_from_slice(&encrypt_multipart_part_explicit_nonce(&p3, key, base_nonce, 3, v2).await);
+            combined.extend_from_slice(&encrypt_multipart_part_explicit_nonce(&p7, key, base_nonce, 7, v2).await);
+
+            let decrypted = decrypt_multipart(combined, key, base_nonce, vec![1, 3, 7])
+                .await
+                .expect("non-contiguous parts decrypt");
+            let mut expected = p1;
+            expected.extend_from_slice(&p3);
+            expected.extend_from_slice(&p7);
+            assert_eq!(decrypted, expected, "non-contiguous parts v2={v2}");
+        }
+    }
+
+    #[tokio::test]
+    async fn multipart_segment_nonce_mixed_rolling_upgrade_segments() {
+        let mut key = [0u8; 32];
+        let mut base_nonce = [0u8; 12];
+        rand::rng().fill_bytes(&mut key);
+        rand::rng().fill_bytes(&mut base_nonce);
+
+        let part_one: Vec<u8> = (0..ENCRYPTION_BLOCK_SIZE + 91).map(|i| (i % 251) as u8).collect();
+        let part_two: Vec<u8> = (0..ENCRYPTION_BLOCK_SIZE + 43).map(|i| ((i + 9) % 239) as u8).collect();
+        let mut expected = part_one.clone();
+        expected.extend_from_slice(&part_two);
+
+        // Encrypt legacy (no 0x03) parts directly.
+        let mut legacy_p1_v1 = Vec::new();
+        EncryptReader::new(Cursor::new(part_one.clone()), key, multipart_part_nonce(base_nonce, 1))
+            .read_to_end(&mut legacy_p1_v1)
+            .await
+            .expect("legacy p1 v1");
+        let mut legacy_p2_v1 = Vec::new();
+        EncryptReader::new(Cursor::new(part_two.clone()), key, multipart_part_nonce(base_nonce, 2))
+            .read_to_end(&mut legacy_p2_v1)
+            .await
+            .expect("legacy p2 v1");
+        let mut legacy_p1_v2 = Vec::new();
+        EncryptReader::new_v2(Cursor::new(part_one.clone()), key, multipart_part_nonce(base_nonce, 1))
+            .read_to_end(&mut legacy_p1_v2)
+            .await
+            .expect("legacy p1 v2");
+        let mut legacy_p2_v2 = Vec::new();
+        EncryptReader::new_v2(Cursor::new(part_two.clone()), key, multipart_part_nonce(base_nonce, 2))
+            .read_to_end(&mut legacy_p2_v2)
+            .await
+            .expect("legacy p2 v2");
+
+        let seg_p1_v1 = encrypt_multipart_part_explicit_nonce(&part_one, key, base_nonce, 1, false).await;
+        let seg_p2_v1 = encrypt_multipart_part_explicit_nonce(&part_two, key, base_nonce, 2, false).await;
+        let seg_p1_v2 = encrypt_multipart_part_explicit_nonce(&part_one, key, base_nonce, 1, true).await;
+        let seg_p2_v2 = encrypt_multipart_part_explicit_nonce(&part_two, key, base_nonce, 2, true).await;
+
+        let mixes = [
+            ("0x03-v1 + legacy-v1", &seg_p1_v1, &legacy_p2_v1),
+            ("legacy-v1 + 0x03-v1", &legacy_p1_v1, &seg_p2_v1),
+            ("0x03-v2 + legacy-v2", &seg_p1_v2, &legacy_p2_v2),
+            ("legacy-v2 + 0x03-v2", &legacy_p1_v2, &seg_p2_v2),
+            ("0x03-v1 + 0x03-v2", &seg_p1_v1, &seg_p2_v2),
+            ("0x03-v2 + 0x03-v1", &seg_p1_v2, &seg_p2_v1),
+        ];
+        for (label, first_part, second_part) in mixes {
+            let mut combined = first_part.clone();
+            combined.extend_from_slice(second_part);
+            let decrypted = decrypt_multipart(combined, key, base_nonce, vec![1, 2])
+                .await
+                .unwrap_or_else(|e| panic!("{label}: mixed rolling-upgrade stream must decrypt: {e}"));
+            assert_eq!(decrypted, expected, "{label}");
+        }
+    }
+
+    #[tokio::test]
+    async fn segment_nonce_frame_security_invariants() {
+        let mut key = [0u8; 32];
+        let mut base_nonce_a = [0u8; 12];
+        let mut base_nonce_b = [0u8; 12];
+        rand::rng().fill_bytes(&mut key);
+        rand::rng().fill_bytes(&mut base_nonce_a);
+        rand::rng().fill_bytes(&mut base_nonce_b);
+        if base_nonce_a == base_nonce_b {
+            base_nonce_b[0] ^= 0xFF;
+        }
+
+        let data = vec![0x5A; ENCRYPTION_BLOCK_SIZE * 2 + 5];
+        let encrypted_v1 = encrypt_multipart_part_explicit_nonce(&data, key, base_nonce_a, 1, false).await;
+        let encrypted_v2 = encrypt_multipart_part_explicit_nonce(&data, key, base_nonce_a, 1, true).await;
+
+        // 1. Flipping header CRC, uvarint prefix, nonce byte, or tag byte fails authentication.
+        for offset in [4, 5, 8, 9, 8 + 1 + SEGMENT_NONCE_LEN, SEGMENT_NONCE_FRAME_TOTAL_LEN - 1] {
+            let mut tampered = encrypted_v1.clone();
+            tampered[offset] ^= 0x01;
+            let err = decrypt_multipart(tampered, key, base_nonce_a, vec![1])
+                .await
+                .expect_err("tampered segment nonce frame must fail");
+            assert_eq!(err.kind(), std::io::ErrorKind::InvalidData, "offset={offset}");
+        }
+
+        // 2. Serving part 1 in part 2's position fails authentication.
+        let err = decrypt_multipart(encrypted_v1.clone(), key, base_nonce_a, vec![2])
+            .await
+            .expect_err("segment moved to another part number must fail");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("segment nonce frame failed authentication"), "{err}");
+
+        // 3. Cross-session / cross-object splicing under the same key fails authentication.
+        let err = decrypt_multipart(encrypted_v1.clone(), key, base_nonce_b, vec![1])
+            .await
+            .expect_err("segment spliced into another upload session must fail");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("segment nonce frame failed authentication"), "{err}");
+
+        // 4. Cross-mode splicing (multipart segment served to single-part reader) fails authentication.
+        let err = DecryptReader::new(Cursor::new(encrypted_v1.clone()), key, base_nonce_a)
+            .read_to_end(&mut Vec::new())
+            .await
+            .expect_err("multipart segment served to single-part reader must fail");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+
+        // 5. Double 0x03 frame at segment start is rejected.
+        let nonce_frame = encrypted_v1[..SEGMENT_NONCE_FRAME_TOTAL_LEN].to_vec();
+        let mut doubled = nonce_frame.clone();
+        doubled.extend_from_slice(&encrypted_v1);
+        let err = decrypt_multipart(doubled, key, base_nonce_a, vec![1])
+            .await
+            .expect_err("second segment nonce frame at start must fail");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("segment nonce frame after the segment began"), "{err}");
+
+        // 6. Announcing a 0x03 frame after the first data frame is rejected.
+        let first_data_frame_len = {
+            let header = &encrypted_v1[SEGMENT_NONCE_FRAME_TOTAL_LEN..SEGMENT_NONCE_FRAME_TOTAL_LEN + 8];
+            8 + ((header[1] as usize) | ((header[2] as usize) << 8) | ((header[3] as usize) << 16)) - 4
+        };
+        let mut reannounced = encrypted_v1[..SEGMENT_NONCE_FRAME_TOTAL_LEN + first_data_frame_len].to_vec();
+        reannounced.extend_from_slice(&nonce_frame);
+        reannounced.extend_from_slice(&encrypted_v1[SEGMENT_NONCE_FRAME_TOTAL_LEN + first_data_frame_len..]);
+        let err = decrypt_multipart(reannounced, key, base_nonce_a, vec![1])
+            .await
+            .expect_err("segment nonce frame after frame 0 must fail");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("segment nonce frame after the segment began"), "{err}");
+
+        // 7. Invalid declared header lengths (including 0, 4, 32, 34, and 0xFFFFFF) fail cleanly without panic.
+        for bad_len in [
+            0usize,
+            4,
+            SEGMENT_NONCE_FRAME_LEN - 1,
+            SEGMENT_NONCE_FRAME_LEN + 1,
+            0x00FF_FFFF,
+        ] {
+            let bad_header = vec![
+                FRAME_TYPE_SEGMENT_NONCE,
+                (bad_len & 0xFF) as u8,
+                ((bad_len >> 8) & 0xFF) as u8,
+                ((bad_len >> 16) & 0xFF) as u8,
+                0,
+                0,
+                0,
+                0,
+            ];
+            let err = decrypt_multipart(bad_header, key, base_nonce_a, vec![1])
+                .await
+                .expect_err("invalid segment nonce frame length must fail");
+            assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+            assert!(err.to_string().contains("invalid segment nonce frame length"), "{err}");
+        }
+
+        // 8. Truncation immediately after 0x03 (no data frame and no 0xFF terminator) fails with UnexpectedEof.
+        let err = decrypt_multipart(nonce_frame.clone(), key, base_nonce_a, vec![1])
+            .await
+            .expect_err("EOF immediately after 0x03 frame must fail");
+        assert_eq!(err.kind(), std::io::ErrorKind::UnexpectedEof);
+        assert!(err.to_string().contains("truncated after segment nonce frame"), "{err}");
+
+        // 9. Truncation mid-0x03 payload fails with UnexpectedEof.
+        let err = decrypt_multipart(nonce_frame[..15].to_vec(), key, base_nonce_a, vec![1])
+            .await
+            .expect_err("truncated 0x03 payload must fail");
+        assert_eq!(err.kind(), std::io::ErrorKind::UnexpectedEof);
+
+        // 10. Stripping the 0x03 frame from either v1 or v2 fails authentication.
+        for stripped in [
+            encrypted_v1[SEGMENT_NONCE_FRAME_TOTAL_LEN..].to_vec(),
+            encrypted_v2[SEGMENT_NONCE_FRAME_TOTAL_LEN..].to_vec(),
+        ] {
+            let err = decrypt_multipart(stripped, key, base_nonce_a, vec![1])
+                .await
+                .expect_err("stripping the 0x03 frame must fail authentication");
+            assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        }
+
+        // 11. A 0x03 v1 segment is locked to the current nonce layout from frame 0 even when
+        // RUSTFS_ENCRYPTION_LEGACY_NONCE_FALLBACK=true: replaying frame 0 at index 1 in a
+        // 2-frame segment fails authentication.
+        let two_blocks = vec![0x42; ENCRYPTION_BLOCK_SIZE * 2];
+        let enc_two = encrypt_multipart_part_explicit_nonce(&two_blocks, key, base_nonce_a, 1, false).await;
+        let frame0_start = SEGMENT_NONCE_FRAME_TOTAL_LEN;
+        let frame0_len = {
+            let h = &enc_two[frame0_start..frame0_start + 8];
+            8 + ((h[1] as usize) | ((h[2] as usize) << 8) | ((h[3] as usize) << 16)) - 4
+        };
+        let mut replayed = enc_two[..frame0_start + frame0_len].to_vec();
+        replayed.extend_from_slice(&enc_two[frame0_start..frame0_start + frame0_len]);
+        replayed.extend_from_slice(&[FRAME_TYPE_END, 0, 0, 0, 0, 0, 0, 0]);
+        temp_env::async_with_vars([(ENV_RUSTFS_ENCRYPTION_LEGACY_NONCE_FALLBACK, Some("true"))], async {
+            let err = decrypt_multipart(replayed, key, base_nonce_a, vec![1])
+                .await
+                .expect_err("0x03 segment must never accept legacy reused-part nonce fallback");
+            assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn v2_segment_nonce_fixed_frame_layout_and_ranged_get_seek() {
+        let mut key = [0u8; 32];
+        let mut base_nonce = [0u8; 12];
+        rand::rng().fill_bytes(&mut key);
+        rand::rng().fill_bytes(&mut base_nonce);
+
+        let block = V2_FRAME_PLAINTEXT_LEN;
+        assert_eq!(SEGMENT_NONCE_FRAME_TOTAL_LEN, 37);
+        assert_eq!(V2_FULL_FRAME_LEN, 8218);
+        assert_eq!(v2_frame_ciphertext_offset(0, false), Some(0));
+        assert_eq!(v2_frame_ciphertext_offset(0, true), Some(37));
+        assert_eq!(v2_frame_ciphertext_offset(2, true), Some(37 + 2 * 8218));
+        assert_eq!(v2_frame_ciphertext_offset(usize::MAX, true), None);
+
+        // 3-part v2 object with 0x03 segment-nonce prefixes:
+        // - Part 1: 3 full frames + 500-byte short final frame
+        // - Part 2: 2 full frames (exact block multiple -> 25-byte empty final frame)
+        // - Part 3: 1 full frame + 123-byte short final frame
+        let part_plaintexts: Vec<Vec<u8>> = vec![
+            (0..3 * block + 500).map(|i| ((i * 17 + 1) % 251) as u8).collect(),
+            (0..2 * block).map(|i| ((i * 23 + 2) % 247) as u8).collect(),
+            (0..block + 123).map(|i| ((i * 29 + 3) % 241) as u8).collect(),
+        ];
+
+        let mut part_ciphertexts = Vec::with_capacity(part_plaintexts.len());
+        let mut combined_plaintext = Vec::new();
+        let mut combined_ciphertext = Vec::new();
+        let mut part_plain_starts = Vec::new();
+        let mut part_cipher_starts = Vec::new();
+
+        for (idx, pt) in part_plaintexts.iter().enumerate() {
+            let part_number = idx + 1;
+            part_plain_starts.push(combined_plaintext.len());
+            part_cipher_starts.push(combined_ciphertext.len());
+
+            let ct = encrypt_multipart_part_explicit_nonce(pt, key, base_nonce, part_number, true).await;
+
+            // Verify exact fixed-frame offsets after the 37-byte 0x03 prefix.
+            assert_eq!(ct[0], FRAME_TYPE_SEGMENT_NONCE);
+            let full_frames = pt.len() / block;
+            let tail_len = pt.len() % block;
+            let final_frame_len = 8 + put_uvarint_len(tail_len as u64) + tail_len + GCM_TAG_LEN;
+            let expected_len = SEGMENT_NONCE_FRAME_TOTAL_LEN + full_frames * V2_FULL_FRAME_LEN + final_frame_len + 8;
+            assert_eq!(ct.len(), expected_len, "part {part_number} exact ciphertext size");
+            for k in 0..full_frames {
+                let off = v2_frame_ciphertext_offset(k, true).expect("frame offset fits");
+                assert_eq!(ct[off], FRAME_TYPE_V2, "part {part_number} frame {k} type");
+            }
+            let final_off = v2_frame_ciphertext_offset(full_frames, true).expect("final frame offset fits");
+            assert_eq!(ct[final_off], FRAME_TYPE_V2_FINAL, "part {part_number} final frame type");
+            assert_eq!(ct[ct.len() - 8], FRAME_TYPE_END, "part {part_number} end marker");
+
+            combined_plaintext.extend_from_slice(pt);
+            combined_ciphertext.extend_from_slice(&ct);
+            part_ciphertexts.push(ct);
+        }
+
+        // Empty v2 part with 0x03 prefix: 37 (0x03) + 25 (empty 0x02) + 8 (0xFF) = 70 bytes.
+        let empty_v2 = encrypt_multipart_part_explicit_nonce(&[], key, base_nonce, 9, true).await;
+        assert_eq!(empty_v2.len(), SEGMENT_NONCE_FRAME_TOTAL_LEN + (8 + 1 + GCM_TAG_LEN) + 8);
+        assert_eq!(
+            decrypt_multipart(empty_v2, key, base_nonce, vec![9])
+                .await
+                .expect("empty v2 0x03 part decrypts"),
+            Vec::<u8>::new()
+        );
+
+        let total_plain = combined_plaintext.len();
+        let p2_start = part_plain_starts[1];
+        let p3_start = part_plain_starts[2];
+
+        // Inclusive plaintext ranges covering offsets before, at, inside, and across every
+        // frame boundary and every part boundary.
+        let ranges: Vec<(usize, usize)> = vec![
+            // Part 1 frame 0 head, interior, and exact end.
+            (0, 0),
+            (0, 99),
+            (17, block - 1),
+            // Crossing Part 1 frame 0 -> frame 1.
+            (block - 1, block),
+            (block - 13, block + 29),
+            // Exact Part 1 frame 1 start, interior, and crossing into frame 2.
+            (block, block),
+            (block, block + 63),
+            (block + 5, 2 * block + 100),
+            // Crossing Part 1 frame 2 into short final frame 3 and ending at Part 1's last byte.
+            (2 * block + 8000, p2_start - 1),
+            // Entirely inside Part 1's short final frame 3.
+            (3 * block, p2_start - 1),
+            (3 * block + 100, p2_start - 1),
+            (p2_start - 1, p2_start - 1),
+            // Crossing Part 1 -> Part 2 (0x03 prefix boundary).
+            (p2_start - 1, p2_start),
+            (p2_start - 200, p2_start + 300),
+            // Starting mid-frame in Part 1 frame 2, spanning all of block-aligned Part 2 into Part 3.
+            (2 * block + 4096, p3_start + block + 50),
+            // Inside block-aligned Part 2: frame 0, frame 0->1 boundary, exact frame 1, and last byte
+            // (which sits right before the authenticated empty final frame).
+            (p2_start, p2_start + 100),
+            (p2_start + block - 1, p2_start + block),
+            (p2_start + block, p3_start - 1),
+            (p3_start - 1, p3_start - 1),
+            // Crossing Part 2 -> Part 3.
+            (p3_start - 1, p3_start),
+            (p3_start - 50, total_plain - 1),
+            // Inside Part 3 frame 0, frame 0->final boundary, and suffix tail ranges.
+            (p3_start, p3_start + block + 10),
+            (p3_start + block - 1, p3_start + block),
+            (p3_start + block, total_plain - 1),
+            (total_plain - 123, total_plain - 1),
+            (total_plain - 1, total_plain - 1),
+            // Full object range.
+            (0, total_plain - 1),
+        ];
+
+        for &(start, end) in &ranges {
+            let expected = &combined_plaintext[start..=end];
+            let req_len = end - start + 1;
+
+            // Locate start and end parts.
+            let start_part_idx = (0..part_plaintexts.len())
+                .rfind(|&i| part_plain_starts[i] <= start)
+                .expect("start part exists");
+            let end_part_idx = (0..part_plaintexts.len())
+                .rfind(|&i| part_plain_starts[i] <= end)
+                .expect("end part exists");
+            let covering_parts: Vec<usize> = (start_part_idx + 1..=end_part_idx + 1).collect();
+
+            // Strategy 1: part-boundary seek (reads from byte 0 of covering start part,
+            // landing directly on its 0x03 segment-nonce frame).
+            let part_seek_start = part_cipher_starts[start_part_idx];
+            let part_seek_end = part_cipher_starts[end_part_idx] + part_ciphertexts[end_part_idx].len();
+            let skip_in_part = start - part_plain_starts[start_part_idx];
+            let decrypt_part = DecryptReader::new_multipart(
+                Cursor::new(combined_ciphertext[part_seek_start..part_seek_end].to_vec()),
+                key,
+                base_nonce,
+                covering_parts.clone(),
+            );
+            let mut buf = Vec::new();
+            let end_hits_part_end = end + 1 == part_plain_starts[end_part_idx] + part_plaintexts[end_part_idx].len();
+            if end_hits_part_end {
+                // Drain to true EOF so the final authenticated v2 frame (including an
+                // empty final frame on a block-aligned part) and END marker are verified.
+                let mut reader = decrypt_part;
+                reader
+                    .read_to_end(&mut buf)
+                    .await
+                    .unwrap_or_else(|e| panic!("part-seek EOF range {start}..={end} failed: {e}"));
+                assert_eq!(buf.len(), skip_in_part + req_len, "part-seek EOF length for {start}..={end}");
+            } else {
+                let mut limited = crate::LimitReader::new(decrypt_part, skip_in_part + req_len);
+                limited
+                    .read_to_end(&mut buf)
+                    .await
+                    .unwrap_or_else(|e| panic!("part-seek range {start}..={end} failed: {e}"));
+            }
+            assert_eq!(&buf[skip_in_part..], expected, "part-seek mismatch for range {start}..={end}");
+
+            // Strategy 2: closed-form v2 fixed-frame sub-part seek using the 37-byte 0x03 prefix.
+            let start_part_num = start_part_idx + 1;
+            let start_part_ct = &part_ciphertexts[start_part_idx];
+            let first_seg_base = authenticate_segment_nonce_frame(
+                &start_part_ct[..SEGMENT_NONCE_FRAME_TOTAL_LEN],
+                key,
+                base_nonce,
+                Some(start_part_num),
+            )
+            .expect("opening part 0x03 frame authenticates");
+
+            let start_frame = skip_in_part / block;
+            let skip_in_frame = skip_in_part % block;
+            let frame_seek_rel = v2_frame_ciphertext_offset(start_frame, true).expect("start frame offset");
+            let window_start = part_cipher_starts[start_part_idx] + frame_seek_rel;
+
+            let end_in_end_part = end - part_plain_starts[end_part_idx];
+            let end_frame = end_in_end_part / block;
+            let end_part_full_frames = part_plaintexts[end_part_idx].len() / block;
+            let end_rel = if end_frame + 1 < end_part_full_frames {
+                v2_frame_ciphertext_offset(end_frame + 1, true).expect("end frame offset")
+            } else {
+                part_ciphertexts[end_part_idx].len()
+            };
+            let window_end = part_cipher_starts[end_part_idx] + end_rel;
+
+            let decrypt_frame = DecryptReader::new_multipart_at_block(
+                Cursor::new(combined_ciphertext[window_start..window_end].to_vec()),
+                key,
+                base_nonce,
+                first_seg_base,
+                covering_parts,
+                start_frame,
+            );
+            let mut buf = Vec::new();
+            if end_hits_part_end {
+                let mut reader = decrypt_frame;
+                reader
+                    .read_to_end(&mut buf)
+                    .await
+                    .unwrap_or_else(|e| panic!("frame-seek EOF range {start}..={end} failed: {e}"));
+                assert_eq!(buf.len(), skip_in_frame + req_len, "frame-seek EOF length for {start}..={end}");
+            } else {
+                let mut limited = crate::LimitReader::new(decrypt_frame, skip_in_frame + req_len);
+                limited
+                    .read_to_end(&mut buf)
+                    .await
+                    .unwrap_or_else(|e| panic!("frame-seek range {start}..={end} failed: {e}"));
+            }
+            assert_eq!(&buf[skip_in_frame..], expected, "frame-seek mismatch for range {start}..={end}");
+        }
+
+        // Negative seek checks:
+        let part1_ct = &part_ciphertexts[0];
+        let seg1_base = authenticate_segment_nonce_frame(&part1_ct[..SEGMENT_NONCE_FRAME_TOTAL_LEN], key, base_nonce, Some(1))
+            .expect("part 1 0x03 frame authenticates");
+
+        // 1. Seeking without accounting for the 37-byte 0x03 prefix fails closed.
+        let mispositioned = part1_ct[V2_FULL_FRAME_LEN..].to_vec();
+        DecryptReader::new_multipart_at_block(Cursor::new(mispositioned), key, base_nonce, seg1_base, vec![1], 1)
+            .read_to_end(&mut Vec::new())
+            .await
+            .expect_err("seeking without 37-byte 0x03 prefix offset must fail");
+
+        // 2. Correct offset with wrong starting_block_index fails authentication.
+        let frame1_off = v2_frame_ciphertext_offset(1, true).expect("frame 1 offset");
+        DecryptReader::new_multipart_at_block(
+            Cursor::new(part1_ct[frame1_off..].to_vec()),
+            key,
+            base_nonce,
+            seg1_base,
+            vec![1],
+            2,
+        )
+        .read_to_end(&mut Vec::new())
+        .await
+        .expect_err("wrong starting_block_index must fail authentication");
+
+        // 3. Passing the unstripped 0x03 frame into new_multipart_at_block (even at block 0) is rejected.
+        let err = DecryptReader::new_multipart_at_block(Cursor::new(part1_ct.clone()), key, base_nonce, seg1_base, vec![1], 0)
+            .read_to_end(&mut Vec::new())
+            .await
+            .expect_err("new_multipart_at_block must reject a 0x03 frame in the opening segment");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("segment nonce frame after the segment began"), "{err}");
+
+        // 4. new_at_block with starting_block_index > 0 rejects a 0x03 frame.
+        let err = DecryptReader::new_at_block(Cursor::new(part1_ct.clone()), key, seg1_base, 1)
+            .read_to_end(&mut Vec::new())
+            .await
+            .expect_err("new_at_block at non-zero block must reject a 0x03 frame");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+
+        // 5. authenticate_segment_nonce_frame rejects wrong length, wrong part, wrong session nonce, wrong key, and tampering.
+        assert_eq!(
+            authenticate_segment_nonce_frame(&part1_ct[..SEGMENT_NONCE_FRAME_TOTAL_LEN - 1], key, base_nonce, Some(1))
+                .expect_err("short slice must fail")
+                .kind(),
+            std::io::ErrorKind::InvalidData
+        );
+        assert_eq!(
+            authenticate_segment_nonce_frame(&part1_ct[..SEGMENT_NONCE_FRAME_TOTAL_LEN], key, base_nonce, Some(2))
+                .expect_err("wrong part number must fail")
+                .kind(),
+            std::io::ErrorKind::InvalidData
+        );
+        let mut other_nonce = base_nonce;
+        other_nonce[0] ^= 0x01;
+        assert_eq!(
+            authenticate_segment_nonce_frame(&part1_ct[..SEGMENT_NONCE_FRAME_TOTAL_LEN], key, other_nonce, Some(1))
+                .expect_err("wrong session base_nonce must fail")
+                .kind(),
+            std::io::ErrorKind::InvalidData
+        );
+        let mut other_key = key;
+        other_key[0] ^= 0x01;
+        assert_eq!(
+            authenticate_segment_nonce_frame(&part1_ct[..SEGMENT_NONCE_FRAME_TOTAL_LEN], other_key, base_nonce, Some(1))
+                .expect_err("wrong key must fail")
+                .kind(),
+            std::io::ErrorKind::InvalidData
+        );
+        let mut tampered_prefix = part1_ct[..SEGMENT_NONCE_FRAME_TOTAL_LEN].to_vec();
+        tampered_prefix[10] ^= 0x80;
+        assert_eq!(
+            authenticate_segment_nonce_frame(&tampered_prefix, key, base_nonce, Some(1))
+                .expect_err("tampered prefix must fail")
+                .kind(),
+            std::io::ErrorKind::InvalidData
+        );
     }
 }
