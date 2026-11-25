@@ -1586,20 +1586,26 @@ mod tests {
     #[tokio::test]
     async fn execute_copy_object_rejects_malformed_copy_source_version_id() {
         // A malformed (non-null, non-UUID) source version id is rejected up front.
-        let input = CopyObjectInput::builder()
-            .copy_source(CopySource::Bucket {
-                bucket: "src-bucket".into(),
-                key: "src-key".into(),
-                version_id: Some("not-a-uuid".into()),
-            })
-            .bucket("dst-bucket".to_string())
-            .key("dst-key".to_string())
-            .build()
-            .unwrap();
-
+        // Same facts `from_legacy` carried. Metadata directive, storage class, SSE, and tagging stay absent.
+        let input = CopyObjectWriteInput {
+            bucket: "dst-bucket".to_owned(),
+            key: "dst-key".to_owned(),
+            copy_source: Some(CopySourceValue::Bucket {
+                bucket: "src-bucket".to_owned(),
+                key: "src-key".to_owned(),
+                version_id: Some("not-a-uuid".to_owned()),
+            }),
+            ..Default::default()
+        };
         let usecase = DefaultObjectUsecase::without_context();
-
-        let err = Box::pin(copy_method_only(&usecase, input)).await.unwrap_err();
+        let err = Box::pin(async {
+            usecase
+                .execute_copy_object_owned(copy_envelope(HeaderMap::new()), input)
+                .await
+                .map_err(crate::error::legacy_error_for_test)
+        })
+        .await
+        .unwrap_err();
         assert_eq!(err.code(), &S3ErrorCode::InvalidArgument);
     }
 
