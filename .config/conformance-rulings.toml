@@ -34,6 +34,13 @@ failure = "[expect/connection_after] at /expect/connection_after: exchange #1, a
 expires = 2027-02-01
 
 [[ruling]]
+case = "c-cred-0021"
+ledger = "rustfs/gateway#1120"
+reason = "The released and native hosts both close this HTTP/1 connection after serving the expected refusal."
+failure = "[expect/connection_after] at /expect/connection_after: exchange #1, attempt 1: expected the connection to be `open` afterwards, observed `closed`"
+expires = 2027-02-01
+
+[[ruling]]
 case = "c-cred-0026"
 ledger = "rustfs/gateway#1120"
 reason = "The released and native hosts both close this HTTP/1 connection after serving the expected refusal."
