@@ -302,6 +302,23 @@ struct RpcRequestTarget {
     method: Method,
 }
 
+/// Set by `check_auth` once the caller's internode request HMAC has been verified.
+///
+/// Boot-epoch and capability response proofs are HMACs keyed with the internode RPC secret over
+/// caller-known values, so `RpcRequestPathService` only emits them when this marker is raised.
+#[derive(Clone, Debug, Default)]
+struct RpcSignatureVerified(Arc<AtomicBool>);
+
+impl RpcSignatureVerified {
+    fn mark_verified(&self) {
+        self.0.store(true, Ordering::Release);
+    }
+
+    fn is_verified(&self) -> bool {
+        self.0.load(Ordering::Acquire)
+    }
+}
+
 #[derive(Clone)]
 struct RpcRequestPathService<S> {
     inner: S,
@@ -434,22 +451,10 @@ where
             method: req.method().clone(),
         };
         req.extensions_mut().insert(target);
+        let signature_verified = RpcSignatureVerified::default();
+        req.extensions_mut().insert(signature_verified.clone());
         let msgpack_manifest_capability_requested = storage::tonic_msgpack_manifest_capability_requested(req.headers());
-        let response_headers = tonic_boot_epoch_challenge(req.headers())
-            .ok()
-            .flatten()
-            .and_then(|challenge| {
-                storage::try_current_local_node_name()
-                    .and_then(|node| normalize_tonic_rpc_audience(&node).ok())
-                    .and_then(|audience| {
-                        storage::tonic_boot_epoch_response_headers_with_msgpack_capability(
-                            &audience,
-                            challenge,
-                            msgpack_manifest_capability_requested,
-                        )
-                        .ok()
-                    })
-            });
+        let challenge = tonic_boot_epoch_challenge(req.headers()).ok().flatten();
         let future = self.inner.call(req);
         Box::pin(async move {
             let mut response = storage::with_remote_background_io(resource_context, async move {
@@ -463,6 +468,20 @@ where
                 result
             })
             .await?;
+            // Answer the challenge only after `check_auth` verified the caller's request HMAC.
+            // Unauthenticated, forged, or unrouted requests must never receive secret-keyed proofs.
+            let response_headers = challenge.filter(|_| signature_verified.is_verified()).and_then(|challenge| {
+                storage::try_current_local_node_name()
+                    .and_then(|node| normalize_tonic_rpc_audience(&node).ok())
+                    .and_then(|audience| {
+                        storage::tonic_boot_epoch_response_headers_with_msgpack_capability(
+                            &audience,
+                            challenge,
+                            msgpack_manifest_capability_requested,
+                        )
+                        .ok()
+                    })
+            });
             if let Some(headers) = response_headers {
                 response.headers_mut().extend(headers);
             }
@@ -3624,6 +3643,34 @@ fn hyper_body_write_close_kind(debug: &str) -> Option<&'static str> {
     }
 }
 
+fn mark_rpc_signature_verified(req: &Request<()>) {
+    if let Some(verified) = req.extensions().get::<RpcSignatureVerified>() {
+        verified.mark_verified();
+    }
+}
+
+/// Whether an error from `verify_tonic_rpc_signature_with_bootstrap` was raised only after the
+/// caller's request HMAC verified.
+///
+/// Only post-HMAC rejections may receive secret-keyed boot-epoch and capability proofs so cluster
+/// restart recovery, strict replay-scope bootstrap, and replay-cache overload retries keep working
+/// without emitting secret-keyed proofs to unauthenticated callers.
+fn rpc_auth_failure_verified_signature(error: &std::io::Error, failure_reason: &str) -> bool {
+    storage::rpc_auth_is_resource_exhausted(error)
+        || matches!(
+            failure_reason,
+            "stale_boot_epoch"
+                | "replay_scope_required"
+                | "replay_detected"
+                | "replay_cache_capacity"
+                | "replay_cache_memory"
+                | "replay_cache_allocation"
+                | "replay_cache_unavailable"
+                | "replay_expiry_overflow"
+                | "timestamp_expired_after_clock_regression"
+        )
+}
+
 fn rpc_auth_failure_status(error: &std::io::Error) -> Status {
     if storage::rpc_auth_is_resource_exhausted(error) {
         crate::error::rpc_replay_admission_exhausted_status()
@@ -3685,6 +3732,9 @@ fn check_auth(req: Request<()>) -> std::result::Result<Request<()>, Status> {
             .map(|addr| addr.0.to_string())
             .unwrap_or_else(|| "unknown".to_string());
         let failure_reason = storage::tonic_rpc_auth_failure_reason(&e);
+        if rpc_auth_failure_verified_signature(&e, failure_reason) {
+            mark_rpc_signature_verified(&req);
+        }
         let operation = match rpc_method {
             "ReadAll" => INTERNODE_OPERATION_GRPC_READ_ALL,
             "ReadMultiple" => INTERNODE_OPERATION_GRPC_READ_MULTIPLE,
@@ -3741,6 +3791,7 @@ fn check_auth(req: Request<()>) -> std::result::Result<Request<()>, Status> {
             rejection
         }
     })?;
+    mark_rpc_signature_verified(&req);
 
     if storage::rpc_background_admission(req.metadata().as_ref())
         .map_err(|_| Status::unauthenticated("Invalid background admission request"))?
@@ -8527,30 +8578,40 @@ mod tests {
         let audience = "127.0.0.1:9000";
         rustfs_common::set_global_local_node_name(audience).await;
         let challenge = uuid::Uuid::new_v4();
+        let node = InterceptedService::new(NodeServiceServer::new(make_server()), check_auth);
+        let service = RpcRequestPathService::new(Routes::new(node).prepare());
 
-        let response_for = |request_capability: bool| async move {
-            let mut request = HttpRequest::builder()
-                .method(Method::POST)
-                .uri("/node_service.NodeService/Ping")
-                .body(())
-                .expect("capability request");
-            request.headers_mut().insert(
-                "x-rustfs-rpc-boot-epoch-challenge",
-                challenge.to_string().parse().expect("challenge header"),
-            );
-            if request_capability {
+        let response_for = |signed: bool, request_capability: bool| {
+            let mut service = service.clone();
+            async move {
+                let mut request = HttpRequest::builder()
+                    .method(Method::POST)
+                    .uri(format!("http://{audience}/node_service.NodeService/Ping"))
+                    .header("content-type", "application/grpc")
+                    .body(Empty::<Bytes>::new())
+                    .expect("capability request");
+                if signed {
+                    let auth = storage::gen_tonic_signature_headers(audience, "node_service.NodeService", "Ping", None)
+                        .expect("signed capability request");
+                    request.headers_mut().extend(auth);
+                }
                 request.headers_mut().insert(
-                    "x-rustfs-rpc-msgpack-manifest-request",
-                    HeaderValue::from_static("msgpack-compat-manifest-v1"),
+                    "x-rustfs-rpc-boot-epoch-challenge",
+                    challenge.to_string().parse().expect("challenge header"),
                 );
+                if request_capability {
+                    request.headers_mut().insert(
+                        "x-rustfs-rpc-msgpack-manifest-request",
+                        HeaderValue::from_static("msgpack-compat-manifest-v1"),
+                    );
+                }
+                service.call(request).await.expect("capability response")
             }
-            RpcRequestPathService::new(RpcPathObserver)
-                .call(request)
-                .await
-                .expect("capability response")
         };
 
-        let legacy = response_for(false).await;
+        let legacy = response_for(true, false).await;
+        storage::verify_tonic_boot_epoch_response(audience, challenge, legacy.headers())
+            .expect("signed legacy request must still receive boot-epoch proof");
         assert!(!legacy.headers().contains_key("x-rustfs-rpc-msgpack-manifest-capability"));
         assert!(
             !legacy
@@ -8558,7 +8619,9 @@ mod tests {
                 .contains_key("x-rustfs-rpc-msgpack-manifest-capability-proof")
         );
 
-        let capable = response_for(true).await;
+        let capable = response_for(true, true).await;
+        storage::verify_tonic_boot_epoch_response(audience, challenge, capable.headers())
+            .expect("signed capable request must receive boot-epoch proof");
         assert_eq!(
             capable
                 .headers()
@@ -8571,6 +8634,18 @@ mod tests {
                 .headers()
                 .contains_key("x-rustfs-rpc-msgpack-manifest-capability-proof")
         );
+
+        let unsigned = response_for(false, true).await;
+        for name in [
+            "x-rustfs-rpc-boot-epoch",
+            "x-rustfs-rpc-boot-epoch-proof",
+            "x-rustfs-rpc-replay-cache-capability",
+            "x-rustfs-rpc-replay-cache-capability-proof",
+            "x-rustfs-rpc-msgpack-manifest-capability",
+            "x-rustfs-rpc-msgpack-manifest-capability-proof",
+        ] {
+            assert!(!unsigned.headers().contains_key(name), "unsigned request must not receive {name}");
+        }
 
         rustfs_common::set_global_local_node_name(&previous_node_name).await;
     }
@@ -9548,6 +9623,178 @@ mod tests {
             rpc_auth_failure_status(&std::io::Error::other("RPC boot epoch is stale")).code(),
             tonic::Code::Unavailable
         );
+    }
+
+    #[test]
+    fn rpc_auth_failure_verified_signature_classifies_post_hmac_errors_only() {
+        for error in [
+            std::io::Error::new(std::io::ErrorKind::WouldBlock, storage::RpcReplayCacheAdmissionError::Capacity),
+            std::io::Error::new(std::io::ErrorKind::WouldBlock, storage::RpcReplayCacheAdmissionError::MemoryBudget),
+            std::io::Error::new(std::io::ErrorKind::OutOfMemory, "replay cache allocation failed"),
+            std::io::Error::other("RPC boot epoch is stale"),
+            std::io::Error::other("RPC replay-scoped authentication required"),
+            std::io::Error::other("RPC request replay detected"),
+            std::io::Error::other("RPC replay cache unavailable"),
+            std::io::Error::other("RPC request timestamp expired after clock regression"),
+        ] {
+            let reason = storage::tonic_rpc_auth_failure_reason(&error);
+            assert!(
+                rpc_auth_failure_verified_signature(&error, reason),
+                "post-HMAC error ({reason}) must allow boot-epoch/capability proofs"
+            );
+        }
+
+        for error in [
+            std::io::Error::other("Missing signature header"),
+            std::io::Error::other("Invalid signature"),
+            std::io::Error::other("RPC v2 authentication required"),
+            std::io::Error::other("Invalid RPC v2 signature"),
+            std::io::Error::other("Invalid RPC replay scope signature"),
+            std::io::Error::other("Request timestamp expired"),
+            std::io::Error::other("Missing RPC boot epoch"),
+            std::io::Error::other("RPC background admission requires v2 authentication"),
+            std::io::Error::other("opaque failure"),
+        ] {
+            let reason = storage::tonic_rpc_auth_failure_reason(&error);
+            assert!(
+                !rpc_auth_failure_verified_signature(&error, reason),
+                "pre-HMAC error ({reason}) must never receive boot-epoch/capability proofs"
+            );
+        }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn rpc_boot_epoch_proof_requires_verified_request_signature() {
+        let _ = rustfs_credentials::set_global_rpc_secret("rpc-http-test-secret".to_string());
+        let previous_node_name = rustfs_common::get_global_local_node_name().await;
+        let audience = "127.0.0.1:9000";
+        let ping = "/node_service.NodeService/Ping";
+        let read_all = "/node_service.NodeService/ReadAll";
+        rustfs_common::set_global_local_node_name(audience).await;
+
+        let node = InterceptedService::new(NodeServiceServer::new(make_server()), check_auth);
+        let mut service = RpcRequestPathService::new(Routes::new(node).prepare());
+
+        let epoch_probe_challenge = uuid::Uuid::new_v4();
+        let current_epoch = storage::verify_tonic_boot_epoch_response(
+            audience,
+            epoch_probe_challenge,
+            &storage::tonic_boot_epoch_response_headers(audience, epoch_probe_challenge).expect("current epoch proof"),
+        )
+        .expect("current boot epoch");
+        let stale_epoch = uuid::Uuid::from_u128(current_epoch.as_u128() ^ 1);
+
+        let signed_v2 = storage::gen_tonic_signature_headers(audience, "node_service.NodeService", "Ping", None)
+            .expect("method-bound signature");
+        let mut signed_v3_current = signed_v2.clone();
+        signed_v3_current.extend(
+            storage::gen_tonic_replay_scope_headers(
+                audience,
+                ping,
+                signed_v2["x-rustfs-timestamp"].to_str().expect("timestamp"),
+                signed_v2["x-rustfs-content-sha256"].to_str().expect("body digest"),
+                current_epoch,
+            )
+            .expect("current-epoch replay-scoped signature"),
+        );
+        let signed_v3_replay = signed_v3_current.clone();
+        let mut signed_v3_stale = signed_v2.clone();
+        signed_v3_stale.extend(
+            storage::gen_tonic_replay_scope_headers(
+                audience,
+                ping,
+                signed_v2["x-rustfs-timestamp"].to_str().expect("timestamp"),
+                signed_v2["x-rustfs-content-sha256"].to_str().expect("body digest"),
+                stale_epoch,
+            )
+            .expect("stale-epoch replay-scoped signature"),
+        );
+        let mut forged_v2 = signed_v2.clone();
+        forged_v2.insert("x-rustfs-rpc-signature-v2", HeaderValue::from_static("invalid"));
+        let mut forged_v3 = signed_v3_stale.clone();
+        forged_v3.insert("x-rustfs-rpc-signature-v3", HeaderValue::from_static("invalid"));
+        let cross_method = signed_v2.clone();
+        let unrouted_signed = signed_v2.clone();
+
+        for (label, path, headers, expect_proof) in [
+            ("signed v2 ping", ping, signed_v2, true),
+            ("signed v3 current epoch ping", ping, signed_v3_current, true),
+            ("replayed signed v3 ping", ping, signed_v3_replay, true),
+            ("signed v3 stale epoch ping", ping, signed_v3_stale, true),
+            ("forged v2 ping", ping, forged_v2, false),
+            ("forged v3 ping", ping, forged_v3, false),
+            ("cross-method v2 read_all", read_all, cross_method, false),
+            ("unsigned ping", ping, HeaderMap::new(), false),
+            ("unrouted unsigned", "/unrouted.Service/Method", HeaderMap::new(), false),
+            ("unrouted signed", "/unrouted.Service/Method", unrouted_signed, false),
+        ] {
+            let challenge = uuid::Uuid::new_v4();
+            let mut request = HttpRequest::builder()
+                .method(Method::POST)
+                .uri(format!("http://{audience}{path}"))
+                .header("content-type", "application/grpc")
+                .header("x-rustfs-rpc-boot-epoch-challenge", challenge.to_string())
+                .header("x-rustfs-rpc-msgpack-manifest-request", "msgpack-compat-manifest-v1")
+                .body(Empty::<Bytes>::new())
+                .expect("request");
+            request.headers_mut().extend(headers);
+            let response = service.call(request).await.expect("response");
+            if expect_proof {
+                let verified_epoch = storage::verify_tonic_boot_epoch_response(audience, challenge, response.headers())
+                    .unwrap_or_else(|err| panic!("{label} must receive verifiable boot-epoch proof: {err}"));
+                assert_eq!(verified_epoch, current_epoch, "{label} must return current boot epoch");
+                assert!(
+                    response.headers().contains_key("x-rustfs-rpc-replay-cache-capability-proof"),
+                    "{label} must receive replay-cache capability proof"
+                );
+                assert!(
+                    response
+                        .headers()
+                        .contains_key("x-rustfs-rpc-msgpack-manifest-capability-proof"),
+                    "{label} must receive requested msgpack capability proof"
+                );
+                continue;
+            }
+            for name in [
+                "x-rustfs-rpc-boot-epoch",
+                "x-rustfs-rpc-boot-epoch-proof",
+                "x-rustfs-rpc-replay-cache-capability",
+                "x-rustfs-rpc-replay-cache-capability-proof",
+                "x-rustfs-rpc-msgpack-manifest-capability",
+                "x-rustfs-rpc-msgpack-manifest-capability-proof",
+            ] {
+                assert!(
+                    !response.headers().contains_key(name),
+                    "{label} ({path}) must not return {name} to an unverified caller"
+                );
+            }
+        }
+
+        // Verify that a post-HMAC ResourceExhausted rejection from background admission still
+        // raises `RpcSignatureVerified` so the peer does not falsely revoke capabilities.
+        let bg_owner = rustfs_concurrency::adaptive::NodeAdmission::new(std::num::NonZeroU16::MIN);
+        let bg_headers = storage::with_remote_background_io(Some(storage::RemoteBackgroundIo::new(bg_owner)), async {
+            storage::gen_tonic_signature_headers(audience, "node_service.NodeService", "ReadAll", None)
+        })
+        .await
+        .expect("signed background RPC headers");
+        let verified_marker = RpcSignatureVerified::default();
+        let mut bg_request = Request::new(());
+        bg_request.metadata_mut().as_mut().extend(bg_headers);
+        bg_request.extensions_mut().insert(RpcRequestTarget {
+            uri: format!("http://{audience}{read_all}").parse().expect("RPC URI"),
+            method: Method::POST,
+        });
+        bg_request.extensions_mut().insert(verified_marker.clone());
+        let bg_error = check_auth(bg_request).expect_err("background request without admission token must reject");
+        assert_eq!(bg_error.code(), tonic::Code::ResourceExhausted);
+        assert!(
+            verified_marker.is_verified(),
+            "post-HMAC ResourceExhausted rejection must still mark RpcSignatureVerified"
+        );
+
+        rustfs_common::set_global_local_node_name(&previous_node_name).await;
     }
 
     #[tokio::test]
