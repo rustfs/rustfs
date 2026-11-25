@@ -4897,6 +4897,8 @@ mod heal_result_report_tests {
 
     /// A two-part object whose shards were removed from the first two disks,
     /// ready to be healed onto them.
+    // Only the rename test reads every field, and Windows does not build it.
+    #[cfg_attr(windows, allow(dead_code))]
     struct StagedHealFixture {
         dirs: Vec<TempDir>,
         disks: Vec<DiskStore>,
@@ -5030,6 +5032,8 @@ mod heal_result_report_tests {
     /// The removal must stop before the rename phase. A heal dropped while a
     /// rename is in flight leaves the staged data to that rename: removing the
     /// prefix under it could publish a data directory with missing parts.
+    // The rename pause hook is not built on Windows.
+    #[cfg(not(windows))]
     #[tokio::test]
     #[serial_test::serial]
     async fn heal_dropped_during_rename_leaves_staged_parts_to_the_rename() {
@@ -5039,6 +5043,24 @@ mod heal_result_report_tests {
         let fixture = staged_heal_fixture().await;
         let (bucket, object) = (STAGED_HEAL_BUCKET, STAGED_HEAL_OBJECT);
         let (options, heal_options) = staged_heal_options();
+        // Both targets start without a metadata head, so a head on the paused
+        // target can only come from the rename.
+        for dir in &fixture.dirs[..2] {
+            tokio::fs::remove_dir_all(dir.path().join(bucket).join(object))
+                .await
+                .expect("remove the target metadata head");
+        }
+        let metadata_head = |index: usize| {
+            let disk = &fixture.disks[index];
+            async move { disk.read_version("", bucket, object, "", &ReadOptions::default()).await }
+        };
+        for index in 0..2 {
+            let head = metadata_head(index).await;
+            assert!(
+                matches!(head, Err(DiskError::FileNotFound)),
+                "target {index} must start without a metadata head: {head:?}"
+            );
+        }
         let cleanups_before = super::STAGED_HEAL_TMP_CLEANUPS.load(std::sync::atomic::Ordering::Relaxed);
 
         // Pause the physical rename on whichever target the heal publishes first.
@@ -5079,23 +5101,31 @@ mod heal_result_report_tests {
             "no staged-prefix removal may be dispatched once the rename phase has started"
         );
 
+        let head = metadata_head(paused).await;
+        assert!(
+            matches!(head, Err(DiskError::FileNotFound)),
+            "the paused rename must not have published a metadata head yet: {head:?}"
+        );
+
         releases[paused].send(()).expect("release the paused rename");
         let healed = fixture.dirs[paused].path().join(bucket).join(object).join(&fixture.data_dir);
         let source = fixture.dirs[2].path().join(bucket).join(object).join(&fixture.data_dir);
-        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        let published = tokio::time::timeout(std::time::Duration::from_secs(10), async {
             loop {
-                let published = fixture.disks[paused]
-                    .read_version("", bucket, object, "", &ReadOptions::default())
-                    .await
-                    .is_ok_and(|version| version.data_dir.is_some_and(|dir| dir.to_string() == fixture.data_dir));
-                if published {
-                    break;
+                match metadata_head(paused).await {
+                    Ok(version) => break version,
+                    Err(DiskError::FileNotFound) => tokio::task::yield_now().await,
+                    Err(err) => panic!("the healed target's metadata head must be readable: {err:?}"),
                 }
-                tokio::task::yield_now().await;
             }
         })
         .await
         .expect("the detached rename must still publish the healed target");
+        assert_eq!(
+            published.data_dir.map(|dir| dir.to_string()),
+            Some(fixture.data_dir.clone()),
+            "the published head must point at the healed data directory"
+        );
         for part in ["part.1", "part.2"] {
             let healed_len = tokio::fs::metadata(healed.join(part))
                 .await
