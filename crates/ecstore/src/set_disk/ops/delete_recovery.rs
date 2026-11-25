@@ -150,8 +150,6 @@ pub(crate) struct DeleteRecoveryContext<'a> {
     pub namespace_owner: Option<Arc<dyn Send + Sync>>,
     pub transaction_guard: Option<Arc<rustfs_lock::NamespaceLockGuard>>,
     pub recovery_ticket: Option<crate::store::delete_recovery_runtime::DeleteRecoveryTicket>,
-    /// Return after a durable receipt quorum when the recovery hint can carry cleanup.
-    pub defer_cleanup: bool,
     pub published_hint: Option<(Uuid, &'a [Result<DeleteRecoveryInspection>])>,
     pub can_commit: &'a (dyn Fn() -> bool + Sync),
 }
@@ -167,7 +165,6 @@ impl<'a> DeleteRecoveryContext<'a> {
             namespace_owner: None,
             transaction_guard: None,
             recovery_ticket: None,
-            defer_cleanup: false,
             published_hint: None,
             can_commit,
         }
@@ -691,14 +688,6 @@ impl SetDisks {
                 },
             );
         }
-        if context.defer_cleanup
-            && context
-                .recovery_ticket
-                .as_ref()
-                .is_some_and(|ticket| self.ctx.delete_recovery_hints().can_defer_cleanup(ticket))
-        {
-            return Ok(());
-        }
         if published.iter().any(|outcome| {
             matches!(
                 outcome,
@@ -876,7 +865,8 @@ impl SetDisks {
             namespace_owner,
             published_hint,
             can_commit,
-            ..
+            recovery_ticket: _,
+            transaction_guard: _,
         } = context;
         let disks = self.disk_inventory().await;
         let complete_inventory = disks.len() == self.set_drive_count && disks.iter().all(Option::is_some);
@@ -1638,101 +1628,6 @@ mod tests {
             .await
             .expect("read exact recovered bytes");
         body
-    }
-
-    #[tokio::test]
-    async fn delete_recovery_acknowledges_marker_before_inline_cleanup() {
-        let bucket = "recover-deferred-marker";
-        let (_dirs, store, disks) = fixture(bucket).await;
-        let payload = vec![42; 4096];
-        let version = put(&store, bucket, &payload, true).await.expect("historical version");
-        let incarnation = store
-            .bucket_incarnation_id_from_disk(bucket)
-            .await
-            .expect("bucket incarnation");
-        let transaction = Uuid::new_v4();
-        let mut marker = FileInfo {
-            name: "object".into(),
-            version_id: Some(Uuid::new_v4()),
-            mod_time: Some(time::OffsetDateTime::now_utc()),
-            deleted: true,
-            mark_deleted: true,
-            ..Default::default()
-        };
-        marker.set_delete_marker_incarnation(incarnation);
-        for disk in &disks {
-            let errors = disk
-                .delete_versions_recoverable(
-                    bucket,
-                    vec![crate::disk::FileInfoVersions {
-                        name: "object".into(),
-                        versions: vec![marker.clone()],
-                        ..Default::default()
-                    }],
-                    DeleteOptions {
-                        old_data_dir: Some(transaction),
-                        delete_recovery_bucket_incarnation: Some(incarnation),
-                        ..Default::default()
-                    },
-                )
-                .await;
-            assert_eq!(errors, vec![None], "each drive stages the delete marker");
-        }
-        let set = &store.pools[0].disk_set[0];
-        let key = crate::store::delete_recovery_runtime::DeleteRecoveryKey {
-            pool: 0,
-            set: 0,
-            bucket: bucket.into(),
-            object: "object".into(),
-            incarnation: Some(incarnation),
-        };
-        let ticket = set.ctx.delete_recovery_hints().register(key.clone()).expect("recovery hint");
-        // Force the same publication path distributed drives use.
-        test_hooks::before_gc_finalize(bucket, "object", Arc::new(|| Box::pin(async {})));
-        set.publish_delete_commit(
-            bucket,
-            "object",
-            transaction,
-            &set.disk_inventory().await,
-            set.set_drive_count / 2 + 1,
-            DeleteRecoveryContext {
-                work_budget: Some(Arc::new(crate::object_api::DeleteRecoveryWorkBudget::default())),
-                recovery_ticket: Some(ticket),
-                defer_cleanup: true,
-                ..DeleteRecoveryContext::new(Some(incarnation), &|| true)
-            },
-        )
-        .await
-        .expect("durable marker publication");
-        assert_eq!(test_hooks::cleanup_attempts(bucket, "object"), 0, "response bypasses inline cleanup");
-        assert!(set.ctx.delete_recovery_hints().is_pending(&key));
-        for disk in &disks {
-            let observed = disk
-                .inspect_delete_transaction(bucket, "object", transaction)
-                .await
-                .expect("durable receipt");
-            assert_eq!(observed.state, DeleteRecoveryState::QuorumCommitted);
-        }
-        let latest = store
-            .get_object_reader(bucket, "object", None, http::HeaderMap::new(), &ObjectOptions::default())
-            .await;
-        assert!(
-            matches!(latest, Err(ref error) if crate::error::is_err_object_not_found(error)),
-            "a current version GET observes the committed delete marker"
-        );
-        assert_eq!(body(&store, bucket, Some(version)).await, payload);
-        store
-            .recover_delete_transactions_at_incarnation(bucket, Some("object"), Some(incarnation), &HealOpts::default())
-            .await
-            .expect("worker-compatible replay");
-        for disk in &disks {
-            let observed = disk
-                .inspect_delete_transaction(bucket, "object", transaction)
-                .await
-                .expect("inspect after cleanup");
-            assert_eq!(observed.state, DeleteRecoveryState::Absent);
-        }
-        assert_eq!(body(&store, bucket, Some(version)).await, payload);
     }
 
     #[tokio::test]
