@@ -1327,9 +1327,11 @@ impl ECStore {
         let encoded_object = encode_dir_object_ref(object);
         let object = encoded_object.as_ref();
         let (mut opts, _bucket_lifecycle_guard) = self.guard_multipart_bucket_incarnation(bucket, opts).await?;
-        if opts.overwrites_existing_version() && !is_meta_bucketname(bucket) {
-            // The set-level commit judges the null version this completion
-            // replaces; give it the same authoritative snapshot a PUT carries.
+        if !is_meta_bucketname(bucket) {
+            // The set-level commit judges the version this completion
+            // replaces: the null version, or the version id the session staged
+            // at CreateMultipartUpload, which these options do not name. Give
+            // it the same authoritative snapshot a destructive PUT carries.
             let expected_incarnation_id = opts
                 .expected_bucket_incarnation_id
                 .ok_or_else(|| Error::other("multipart completion is missing its bucket incarnation"))?;

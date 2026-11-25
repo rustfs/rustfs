@@ -46,8 +46,9 @@ use super::super::{
     is_err_version_not_found, is_min_allowed_part_size, log_multipart_write_quorum_failure, multipart_part_logical_size,
     parts_after_marker, path_join_buf, prepare_complete_multipart_parts, record_compression_total_memory,
     record_multipart_write_quorum_failure, reduce_read_quorum_errs, reduce_write_quorum_errs, remove_header_map,
-    resolve_write_layout, restore_commit_operation_id_from_metadata, restore_operation_id_from_metadata,
-    should_persist_encryption_original_size, strip_internal_multipart_metadata, to_object_err, warn,
+    replication_write_may_pass_worm_gate, resolve_write_layout, restore_commit_operation_id_from_metadata,
+    restore_operation_id_from_metadata, should_persist_encryption_original_size, strip_internal_multipart_metadata,
+    to_object_err, warn,
 };
 use super::bitrot_self_verify::{
     BitrotSelfVerifyTarget, WrittenBitrotShards, drop_failed_writer_disks, verify_written_bitrot_shards,
@@ -4546,7 +4547,19 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
         // recently. Only an absent version has no local state to compare;
         // other read failures must leave the upload retryable rather than
         // committing inbound metadata without the LWW check.
-        if crate::set_disk::ops::object::replication_lww_applicable(opts)
+        //
+        // The same read enforces the commit-time WORM gate on the staged
+        // `fi.version_id`, which the completion request does not name. An
+        // ordinary upload stages a fresh UUID and finds no version here;
+        // `opts.restore_copyback` and `opts.data_movement` run their stricter
+        // checks below.
+        let snapshot_state = opts.object_lock_config_snapshot.as_deref().map(|snapshot| snapshot.state());
+        let need_worm_lookup = !opts.data_movement
+            && !opts.restore_copyback
+            && !crate::bucket::utils::is_meta_bucketname(bucket)
+            && snapshot_state.is_some_and(|state| !matches!(state, ObjectLockConfigState::ConfirmedAbsent));
+        let replication_lww_applicable = crate::set_disk::ops::object::replication_lww_applicable(opts);
+        if (need_worm_lookup || replication_lww_applicable)
             && let Some(version_id) = fi.version_id
         {
             match self
@@ -4565,11 +4578,25 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
                 .await
             {
                 Ok(existing) => {
-                    let stored = crate::set_disk::ops::object::stored_replication_category_metadata(&existing);
-                    crate::set_disk::ops::object::merge_replication_metadata_lww(&mut fi.metadata, &stored, opts);
+                    if !opts.data_movement
+                        && !opts.restore_copyback
+                        && !crate::bucket::utils::is_meta_bucketname(bucket)
+                        && let Some(state) = snapshot_state
+                        && check_object_lock_for_deletion_with_state(state, &existing, false)?.is_some()
+                        && !replication_write_may_pass_worm_gate(state, &existing, opts)?
+                    {
+                        return Err(StorageError::PrefixAccessDenied(bucket.to_string(), object.to_string()));
+                    }
+                    if replication_lww_applicable {
+                        let stored = crate::set_disk::ops::object::stored_replication_category_metadata(&existing);
+                        crate::set_disk::ops::object::merge_replication_metadata_lww(&mut fi.metadata, &stored, opts);
+                    }
                 }
-                // Version absent: first replication of this version, nothing
-                // local to compare — the normal path, not a degraded one.
+                // A null delete marker has no protected payload to replace.
+                Err(StorageError::MethodNotAllowed) if version_id.is_nil() => {}
+                // Version absent: a fresh version id or the first replication
+                // of this version, nothing local to judge or compare — the
+                // normal path, not a degraded one.
                 Err(err) if is_err_object_not_found(&err) || is_err_version_not_found(&err) => {}
                 Err(err) => return Err(err),
             }
@@ -14578,6 +14605,121 @@ mod tests {
                 "older inbound multipart tags must not overwrite newer local tags"
             );
             assert_eq!(get_str(&info.user_defined, SUFFIX_TAGGING_TIMESTAMP).as_deref(), Some(T_LOCAL));
+        }
+
+        /// The staged version id is chosen at CreateMultipartUpload, so the
+        /// version it names may be locked before or after the session opens.
+        /// CompleteMultipartUpload must enforce the commit-time WORM gate on
+        /// the staged version under the held object write lock.
+        #[tokio::test]
+        #[serial]
+        async fn complete_multipart_upload_rejects_locked_staged_version() {
+            let enabled_snapshot = Arc::new(crate::set_disk::ObjectLockConfigSnapshot::new(ObjectLockConfigState::Configured {
+                config: rustfs_gateway_types::persistence::PersistedObjectLockConfiguration {
+                    object_lock_enabled: Some("Enabled".to_owned()),
+                    rule: None,
+                },
+                updated_at: OffsetDateTime::now_utc(),
+            }));
+            let default_compliance_snapshot =
+                Arc::new(crate::set_disk::ObjectLockConfigSnapshot::new(ObjectLockConfigState::Configured {
+                    config: rustfs_gateway_types::persistence::PersistedObjectLockConfiguration {
+                        object_lock_enabled: Some("Enabled".to_owned()),
+                        rule: Some(rustfs_gateway_types::persistence::PersistedObjectLockRule {
+                            default_retention: Some(rustfs_gateway_types::persistence::PersistedDefaultRetention {
+                                mode: Some("COMPLIANCE".to_owned()),
+                                days: Some(30),
+                                years: None,
+                            }),
+                        }),
+                    },
+                    updated_at: OffsetDateTime::now_utc(),
+                }));
+            let retention = |mode: &str| {
+                HashMap::from([
+                    (metadata_keys::OBJECT_LOCK_MODE.to_string(), mode.to_string()),
+                    (
+                        metadata_keys::OBJECT_LOCK_RETAIN_UNTIL_DATE.to_string(),
+                        "2099-01-01T00:00:00Z".to_string(),
+                    ),
+                ])
+            };
+            let cases: [(&str, Arc<crate::set_disk::ObjectLockConfigSnapshot>, HashMap<String, String>); 4] = [
+                ("explicit GOVERNANCE", enabled_snapshot.clone(), retention("GOVERNANCE")),
+                ("explicit COMPLIANCE", enabled_snapshot.clone(), retention("COMPLIANCE")),
+                (
+                    "explicit LegalHold ON",
+                    enabled_snapshot,
+                    HashMap::from([(metadata_keys::OBJECT_LOCK_LEGAL_HOLD.to_string(), "ON".to_string())]),
+                ),
+                ("bucket default COMPLIANCE", default_compliance_snapshot, HashMap::new()),
+            ];
+
+            for (case, snapshot, lock) in cases {
+                let (_temp_dirs, disk_stores, set_disks) = hermetic_set_disks(4).await;
+                let bucket = "multipart-locked-staged-version-bucket";
+                let object = "object";
+                make_bucket_on_all(&disk_stores, bucket).await;
+
+                let version_id = Uuid::new_v4();
+                let version_opts = ObjectOptions {
+                    versioned: true,
+                    version_id: Some(version_id.to_string()),
+                    object_lock_config_snapshot: Some(snapshot.clone()),
+                    ..Default::default()
+                };
+                let mut locked_reader = PutObjReader::from_vec(b"locked body".to_vec());
+                let locked = set_disks
+                    .put_object(
+                        bucket,
+                        object,
+                        &mut locked_reader,
+                        &ObjectOptions {
+                            user_defined: lock.clone(),
+                            ..version_opts.clone()
+                        },
+                    )
+                    .await
+                    .expect("locked version should commit");
+
+                let staged_onto_locked_version = ObjectOptions {
+                    versioned: true,
+                    version_id: Some(version_id.to_string()),
+                    ..Default::default()
+                };
+                let (upload_id, parts) =
+                    stage_upload_with_create_opts(&set_disks, bucket, object, &payload(0x5a), &staged_onto_locked_version).await;
+
+                let local = ObjectOptions {
+                    versioned: true,
+                    object_lock_config_snapshot: Some(snapshot.clone()),
+                    ..Default::default()
+                };
+                let replication_without_lock_decision = ObjectOptions {
+                    replication_request: true,
+                    replication_tagging_timestamp: Some(OffsetDateTime::now_utc()),
+                    ..local.clone()
+                };
+                for complete_opts in [&local, &replication_without_lock_decision] {
+                    let err = set_disks
+                        .clone()
+                        .complete_multipart_upload(bucket, object, &upload_id, parts.clone(), complete_opts)
+                        .await
+                        .expect_err("completion must not replace a locked staged version");
+                    assert!(matches!(err, StorageError::PrefixAccessDenied(_, _)), "{case}: unexpected error: {err}");
+                }
+
+                let info = set_disks
+                    .get_object_info(bucket, object, &version_opts)
+                    .await
+                    .expect("locked version should stay readable");
+                assert_eq!(info.etag, locked.etag, "{case}: the locked version ETag must be untouched");
+                for (key, value) in &lock {
+                    assert_eq!(info.user_defined.get(key), Some(value), "{case}: the lock must be untouched");
+                }
+                let (body, _) = read_object(&set_disks, bucket, object).await;
+                assert_eq!(body, b"locked body", "{case}: the locked version bytes must be untouched");
+            }
         }
 
         #[tokio::test]
