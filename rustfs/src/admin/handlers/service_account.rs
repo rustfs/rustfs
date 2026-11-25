@@ -33,7 +33,7 @@ use rustfs_config::MAX_ADMIN_REQUEST_BODY_SIZE;
 use rustfs_credentials::Credentials as StoredCredentials;
 use rustfs_iam::error::{is_err_no_such_service_account, is_err_no_such_temp_account};
 use rustfs_iam::store::Store as IamStore;
-use rustfs_iam::sys::{NewServiceAccountOpts, UpdateServiceAccountOpts};
+use rustfs_iam::sys::{NewServiceAccountOpts, UpdateServiceAccountOpts, claims_have_policy_boundary};
 use rustfs_madmin::{
     ACCESS_KEY_LIST_ALL, ACCESS_KEY_LIST_STS_ONLY, ACCESS_KEY_LIST_SVCACC_ONLY, ACCESS_KEY_LIST_USERS_ONLY, AddServiceAccountReq,
     AddServiceAccountResp, Credentials, InfoServiceAccountResp, ListAccessKeysResp, ListServiceAccountsResp,
@@ -86,10 +86,24 @@ fn parse_new_service_account_policy(policy: Option<&serde_json::Value>) -> S3Res
     Ok((!policy.id.is_empty() || !policy.version.is_empty() || !policy.statements.is_empty()).then_some(policy))
 }
 
-/// Service accounts cannot delegate beyond their own lifetime. STS sessions
-/// retain the existing ability to create independently expiring service accounts.
+/// Service accounts and policy-bounded STS sessions cannot delegate beyond
+/// their own lifetime. Unrestricted STS sessions (such as Console logins)
+/// retain the ability to create independently expiring service accounts.
 fn bounded_service_account_expiration(caller: &StoredCredentials, requested: Option<OffsetDateTime>) -> Option<OffsetDateTime> {
-    match caller.expiration.filter(|_| caller.is_service_account()) {
+    let should_bound = caller.is_service_account() || claims_have_policy_boundary(caller.claims_or_empty());
+    if !should_bound {
+        return requested;
+    }
+
+    let caller_expiration = caller.expiration.or_else(|| {
+        caller
+            .claims_or_empty()
+            .get("exp")
+            .and_then(serde_json::Value::as_i64)
+            .and_then(|ts| OffsetDateTime::from_unix_timestamp(ts).ok())
+    });
+
+    match caller_expiration {
         Some(limit) => Some(requested.map_or(limit, |expiration| expiration.min(limit))),
         None => requested,
     }
@@ -137,6 +151,41 @@ fn is_service_account_owner_of(caller: &StoredCredentials, target_parent_user: &
     };
 
     caller_parent == target_parent_user
+}
+
+/// Scope guard for `UpdateServiceAccount`: only an owner may cross parent
+/// boundaries or update root-parented service accounts.
+fn update_service_account_parent_within_scope(
+    root_access_key: &str,
+    caller: &StoredCredentials,
+    target_parent_user: &str,
+    owner: bool,
+) -> bool {
+    owner || (!constant_time_eq(target_parent_user, root_access_key) && is_service_account_owner_of(caller, target_parent_user))
+}
+
+/// Whether `update` would let a policy-bounded caller (an STS session carrying
+/// a session policy, an embedded-policy service account, or an OIDC service
+/// account with a persisted federated boundary) act beyond its policy boundary.
+///
+/// A bounded caller may only update its own key (preventing sibling takeover
+/// via `newSecretKey` or sibling disruption/widening), and even on its own key
+/// may not replace its policy, alter its expiration, or change its status.
+/// Rotating its own secret key and editing its own name or description remain
+/// permitted.
+fn session_bounded_caller_escapes_through_update(
+    caller: &StoredCredentials,
+    target_access_key: &str,
+    update: &UpdateServiceAccountReq,
+) -> bool {
+    if !claims_have_policy_boundary(caller.claims_or_empty()) {
+        return false;
+    }
+
+    target_access_key != caller.access_key
+        || update.new_policy.is_some()
+        || update.new_expiration.is_some()
+        || update.new_status.is_some()
 }
 
 /// Scope available with the base create permission. Creating for another local
@@ -677,11 +726,20 @@ impl Operation for UpdateServiceAccount {
             return Err(s3_error!(AccessDenied, "access denied"));
         }
 
+        if !owner && session_bounded_caller_escapes_through_update(&cred, &access_key, &update_req) {
+            return Err(s3_error!(AccessDenied, "access denied"));
+        }
+
         let (svc_account, _) = existing_account.map_err(|e| map_service_account_lookup_error(e, "get service account failed"))?;
 
+        let Some(sys_cred) = current_action_credentials() else {
+            return Err(s3_error!(InvalidRequest, "get sys cred failed"));
+        };
+
         // The admin action permits updates within a caller's scope; only an
-        // owner may cross service-account parent boundaries.
-        if !owner && !is_service_account_owner_of(&cred, &svc_account.parent_user) {
+        // owner may cross service-account parent boundaries or modify
+        // root-parented service accounts.
+        if !update_service_account_parent_within_scope(&sys_cred.access_key, &cred, &svc_account.parent_user, owner) {
             return Err(s3_error!(AccessDenied, "access denied"));
         }
 
@@ -1609,9 +1667,37 @@ mod tests {
         assert_eq!(
             bounded_service_account_expiration(&caller, None),
             None,
-            "STS retains independent service lifetime"
+            "unrestricted STS retains independent service lifetime"
         );
         assert_eq!(bounded_service_account_expiration(&caller, Some(later)), Some(later));
+
+        // A policy-bounded STS session must cap created/updated service accounts at its own lifetime.
+        for claim_key in [
+            rustfs_iam::sys::SESSION_POLICY_NAME,
+            rustfs_iam::sys::SESSION_POLICY_NAME_EXTRACTED,
+        ] {
+            let mut bounded_sts = StoredCredentials {
+                access_key: "bounded-sts".to_string(),
+                parent_user: "parent".to_string(),
+                session_token: "signed-sts".to_string(),
+                expiration: Some(deadline),
+                claims: Some(HashMap::from([(claim_key.to_string(), json!("e30"))])),
+                ..Default::default()
+            };
+            assert_eq!(bounded_service_account_expiration(&bounded_sts, None), Some(deadline));
+            assert_eq!(bounded_service_account_expiration(&bounded_sts, Some(later)), Some(deadline));
+            assert_eq!(bounded_service_account_expiration(&bounded_sts, Some(earlier)), Some(earlier));
+
+            // Also falls back to the JWT `exp` claim if `expiration` was not populated on the struct.
+            bounded_sts.expiration = None;
+            bounded_sts
+                .claims
+                .as_mut()
+                .expect("claims")
+                .insert("exp".to_string(), json!(deadline.unix_timestamp()));
+            assert_eq!(bounded_service_account_expiration(&bounded_sts, None), Some(deadline));
+            assert_eq!(bounded_service_account_expiration(&bounded_sts, Some(later)), Some(deadline));
+        }
     }
 
     #[tokio::test]
@@ -2199,6 +2285,114 @@ mod tests {
         assert!(is_service_account_owner_of(&parent_owner, "owner-user"));
         assert!(is_service_account_owner_of(&derived_owner, "owner-user"));
         assert!(!is_service_account_owner_of(&foreign_user, "owner-user"));
+    }
+
+    #[test]
+    fn update_service_account_denies_non_owner_root_parented_updates() {
+        let root = "deployment-root";
+        let root_derived_sa = StoredCredentials {
+            access_key: "bounded-root-sa".to_string(),
+            parent_user: root.to_string(),
+            ..Default::default()
+        };
+        let alice_sa = StoredCredentials {
+            access_key: "alice-sa".to_string(),
+            parent_user: "alice".to_string(),
+            ..Default::default()
+        };
+
+        assert!(
+            !update_service_account_parent_within_scope(root, &root_derived_sa, root, false),
+            "non-owner root-derived credential must not update a root-parented service account"
+        );
+        assert!(
+            update_service_account_parent_within_scope(root, &root_derived_sa, root, true),
+            "owner retains updates on root-parented service accounts"
+        );
+        assert!(
+            update_service_account_parent_within_scope(root, &alice_sa, "alice", false),
+            "non-root parent match remains in scope"
+        );
+        assert!(
+            !update_service_account_parent_within_scope(root, &alice_sa, "bob", false),
+            "cross-parent update remains denied for non-owner"
+        );
+    }
+
+    #[test]
+    fn session_bounded_caller_cannot_escape_through_update() {
+        let update = |new_policy: Option<serde_json::Value>,
+                      new_secret_key: Option<&str>,
+                      new_status: Option<&str>,
+                      new_name: Option<&str>,
+                      new_expiration: Option<OffsetDateTime>| UpdateServiceAccountReq {
+            new_policy,
+            new_secret_key: new_secret_key.map(str::to_string),
+            new_status: new_status.map(str::to_string),
+            new_name: new_name.map(str::to_string),
+            new_description: None,
+            new_expiration,
+        };
+        let deadline = OffsetDateTime::UNIX_EPOCH + time::Duration::days(30);
+        let new_policy = update(Some(json!({})), None, None, None, None);
+        let new_secret = update(None, Some("rotatedSecretKey123"), None, None, None);
+        let new_status = update(None, None, Some("off"), None, None);
+        let new_name = update(None, None, None, Some("renamed"), None);
+        let new_expiration = update(None, None, None, None, Some(deadline));
+
+        let bounded_callers = [
+            StoredCredentials {
+                access_key: "bounded-sa".to_string(),
+                parent_user: "owner-user".to_string(),
+                claims: Some(HashMap::from([(
+                    rustfs_iam::sys::SESSION_POLICY_NAME.to_string(),
+                    json!("eyJWZXJzaW9uIjoiMjAxMi0xMC0xNyJ9"),
+                )])),
+                ..Default::default()
+            },
+            StoredCredentials {
+                access_key: "bounded-sa".to_string(),
+                parent_user: "owner-user".to_string(),
+                claims: Some(HashMap::from([(
+                    rustfs_iam::sys::SESSION_POLICY_NAME_EXTRACTED.to_string(),
+                    json!(r#"{"Version":"2012-10-17"}"#),
+                )])),
+                ..Default::default()
+            },
+            StoredCredentials {
+                access_key: "bounded-sa".to_string(),
+                parent_user: "openid=parent".to_string(),
+                claims: Some(HashMap::from([(
+                    "x-rustfs-internal-federated-boundary".to_string(),
+                    json!("eyJWZXJzaW9uIjoiMjAxMi0xMC0xNyJ9"),
+                )])),
+                ..Default::default()
+            },
+        ];
+
+        for bounded in &bounded_callers {
+            // Self-modifications that widen/alter policy, expiration, or status are denied.
+            assert!(session_bounded_caller_escapes_through_update(bounded, "bounded-sa", &new_policy));
+            assert!(session_bounded_caller_escapes_through_update(bounded, "bounded-sa", &new_expiration));
+            assert!(session_bounded_caller_escapes_through_update(bounded, "bounded-sa", &new_status));
+            // Rotating own secret key and updating own name remain permitted.
+            assert!(!session_bounded_caller_escapes_through_update(bounded, "bounded-sa", &new_secret));
+            assert!(!session_bounded_caller_escapes_through_update(bounded, "bounded-sa", &new_name));
+
+            // Any mutation targeting a sibling service account is denied.
+            for req in [&new_policy, &new_secret, &new_status, &new_name, &new_expiration] {
+                assert!(session_bounded_caller_escapes_through_update(bounded, "sibling-sa", req));
+            }
+        }
+
+        let unbounded = StoredCredentials {
+            access_key: "plain-sa".to_string(),
+            parent_user: "owner-user".to_string(),
+            ..Default::default()
+        };
+        for req in [&new_policy, &new_secret, &new_status, &new_name, &new_expiration] {
+            assert!(!session_bounded_caller_escapes_through_update(&unbounded, "sibling-sa", req));
+        }
     }
 
     #[test]
@@ -3149,6 +3343,343 @@ mod tests {
                     .is_err(),
                 "corrupt service account mapped policy must be removed by unrestricted admin delete"
             );
+        });
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn bounded_caller_cannot_escape_session_policy_via_create_or_update() {
+        crate::app::gating_test_env::run_large_stack_test("service-account-session-policy-escape", || async {
+            use crate::admin::operation::test_support::TestRequest;
+            use rustfs_credentials::EMBEDDED_POLICY_TYPE;
+            use rustfs_iam::store::UserType;
+            use rustfs_iam::sys::SESSION_POLICY_NAME;
+            use rustfs_policy::auth::get_new_credentials_with_metadata;
+            use rustfs_policy::policy::action::S3Action;
+
+            let root_cred = rustfs_credentials::get_global_action_cred().unwrap_or_else(|| {
+                let _ = rustfs_credentials::init_global_action_credentials(
+                    Some("root-sa-bound".to_owned()),
+                    Some("root-secret-sa-bound".to_owned()),
+                );
+                rustfs_credentials::get_global_action_cred().expect("global action credentials initialized")
+            });
+
+            let canonical = crate::app::gating_test_env::shared_gating_ambient().await;
+            if canonical.action_credentials().get().is_none() {
+                let _ = canonical.publish_action_credentials(root_cred.clone());
+            }
+            let iam = canonical.iam().handle();
+            let active_root = canonical
+                .action_credentials()
+                .get()
+                .expect("canonical AppContext must expose action credentials");
+
+            let suffix = uuid::Uuid::new_v4().simple().to_string();
+            let user_name = format!("alice-bound-{suffix}");
+            let policy_name = format!("alice-parent-policy-{suffix}");
+            let secret = "secret-bound-0123456789";
+
+            let parent_policy = Policy::parse_config(
+                br#"{"Version":"2012-10-17","Statement":[
+                    {"Effect":"Allow","Action":["s3:*"],"Resource":["arn:aws:s3:::bucket-a/*","arn:aws:s3:::bucket-b/*"]},
+                    {"Effect":"Allow","Action":["admin:CreateServiceAccount","admin:UpdateServiceAccount","admin:ListUsers"]}
+                ]}"#,
+            )
+            .expect("parent policy");
+            iam.set_policy(&policy_name, parent_policy).await.expect("set parent policy");
+            iam.create_user(
+                &user_name,
+                &rustfs_madmin::AddOrUpdateUserReq {
+                    secret_key: secret.to_owned(),
+                    policy: None,
+                    status: rustfs_madmin::AccountStatus::Enabled,
+                },
+            )
+            .await
+            .expect("create user");
+            iam.policy_db_set(&user_name, UserType::Reg, false, &policy_name)
+                .await
+                .expect("attach parent policy");
+
+            let bounded_policy = Policy::parse_config(
+                br#"{"Version":"2012-10-17","Statement":[
+                    {"Effect":"Allow","Action":["s3:GetObject"],"Resource":["arn:aws:s3:::bucket-a/*"]},
+                    {"Effect":"Allow","Action":["admin:CreateServiceAccount","admin:UpdateServiceAccount"]}
+                ]}"#,
+            )
+            .expect("bounded policy");
+            let bounded_policy_b64 = base64_simd::URL_SAFE_NO_PAD
+                .encode_to_string(serde_json::to_vec(&bounded_policy).expect("serialize bounded policy"));
+
+            let sibling_ak = format!("sib-{suffix}");
+            let (sibling_sa, _) = iam
+                .new_service_account(
+                    &user_name,
+                    None,
+                    NewServiceAccountOpts {
+                        access_key: sibling_ak.clone(),
+                        secret_key: secret.to_owned(),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect("create unbounded sibling service account");
+
+            let bounded_sa_ak = format!("bsa-{suffix}");
+            let (bounded_sa, _) = iam
+                .new_service_account(
+                    &user_name,
+                    None,
+                    NewServiceAccountOpts {
+                        access_key: bounded_sa_ak.clone(),
+                        secret_key: secret.to_owned(),
+                        session_policy: Some(bounded_policy.clone()),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect("create bounded service account");
+
+            let root_bounded_sa_ak = format!("rbsa-{suffix}");
+            let (root_bounded_sa, _) = iam
+                .new_service_account(
+                    &active_root.access_key,
+                    None,
+                    NewServiceAccountOpts {
+                        access_key: root_bounded_sa_ak.clone(),
+                        secret_key: secret.to_owned(),
+                        session_policy: Some(bounded_policy.clone()),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect("create root-derived bounded service account");
+
+            let alice_cred = iam.get_user(&user_name).await.expect("alice exists").credentials;
+            let session_exp = OffsetDateTime::now_utc() + time::Duration::minutes(15);
+            let session_exp_ts = session_exp.unix_timestamp();
+            let sts_claims = HashMap::from([
+                ("parent".to_owned(), json!(user_name)),
+                ("exp".to_owned(), json!(session_exp_ts)),
+                (SESSION_POLICY_NAME.to_owned(), json!(bounded_policy_b64)),
+            ]);
+            let mut bounded_sts =
+                get_new_credentials_with_metadata(&sts_claims, &active_root.secret_key).expect("mint bounded sts");
+            bounded_sts.parent_user = user_name.clone();
+            iam.set_temp_user_from_parent(&bounded_sts, &alice_cred)
+                .await
+                .expect("persist bounded sts");
+
+            // 1. Bounded STS creating a service account with no policy inherits the session policy and expiration cap.
+            let child_ak = format!("child-sts-{suffix}");
+            let create_body = serde_json::to_vec(&json!({
+                "accessKey": child_ak,
+                "secretKey": "child-secret-0123456789"
+            }))
+            .expect("serialize create body");
+            let create_req = TestRequest::new(http::Method::PUT, "/rustfs/admin/v3/add-service-account")
+                .header("x-amz-security-token", &bounded_sts.session_token)
+                .credentials(&bounded_sts.access_key, &bounded_sts.secret_key, Some(&bounded_sts.session_token))
+                .body(create_body)
+                .build();
+            assert_eq!(
+                AddServiceAccount {}
+                    .call(create_req, Params::new())
+                    .await
+                    .expect("bounded STS create without policy should succeed with inherited bounds")
+                    .into_parts()
+                    .0,
+                StatusCode::OK
+            );
+            let child_claims = iam.get_claims_for_svc_acc(&child_ak).await.expect("child claims");
+            assert_eq!(
+                child_claims.get(IAM_POLICY_CLAIM_NAME_SA),
+                Some(&json!(EMBEDDED_POLICY_TYPE)),
+                "created service account must embed creator sessionPolicy"
+            );
+            let (child_sa, _) = iam.get_service_account(&child_ak).await.expect("child service account");
+            assert_eq!(
+                child_sa.expiration.map(OffsetDateTime::unix_timestamp),
+                Some(session_exp_ts),
+                "service account created by bounded STS must be capped at the STS session expiration"
+            );
+            let empty_conditions = HashMap::new();
+            assert!(
+                iam.is_allowed(&Args {
+                    account: &child_ak,
+                    groups: &None,
+                    action: Action::S3Action(S3Action::GetObjectAction),
+                    bucket: "bucket-a",
+                    object: "ok.txt",
+                    conditions: &empty_conditions,
+                    is_owner: false,
+                    claims: &child_claims,
+                    deny_only: false,
+                })
+                .await
+            );
+            assert!(
+                !iam.is_allowed(&Args {
+                    account: &child_ak,
+                    groups: &None,
+                    action: Action::S3Action(S3Action::GetObjectAction),
+                    bucket: "bucket-b",
+                    object: "secret.txt",
+                    conditions: &empty_conditions,
+                    is_owner: false,
+                    claims: &child_claims,
+                    deny_only: false,
+                })
+                .await,
+                "service account created by bounded STS must not access buckets outside session policy"
+            );
+            assert!(
+                !iam.is_allowed(&Args {
+                    account: &child_ak,
+                    groups: &None,
+                    action: Action::AdminAction(AdminAction::ListUsersAdminAction),
+                    bucket: "",
+                    object: "",
+                    conditions: &empty_conditions,
+                    is_owner: false,
+                    claims: &child_claims,
+                    deny_only: false,
+                })
+                .await,
+                "service account created by bounded STS must not gain parent admin actions"
+            );
+
+            // 2. Bounded STS attempting to supply a wider policy on create is denied.
+            let wider_ak = format!("child-wide-{suffix}");
+            let wide_body = serde_json::to_vec(&json!({
+                "accessKey": wider_ak,
+                "secretKey": "child-secret-0123456789",
+                "policy": {"Version": "2012-10-17", "Statement": [{"Effect": "Allow", "Action": ["s3:*"], "Resource": ["arn:aws:s3:::*"]}]}
+            }))
+            .expect("serialize wide create body");
+            let wide_req = TestRequest::new(http::Method::PUT, "/rustfs/admin/v3/add-service-account")
+                .header("x-amz-security-token", &bounded_sts.session_token)
+                .credentials(&bounded_sts.access_key, &bounded_sts.secret_key, Some(&bounded_sts.session_token))
+                .body(wide_body)
+                .build();
+            assert_eq!(
+                AddServiceAccount {}
+                    .call(wide_req, Params::new())
+                    .await
+                    .expect_err("bounded STS must not replace its session policy on create")
+                    .code(),
+                &S3ErrorCode::AccessDenied
+            );
+
+            // 3. Bounded STS and bounded SA cannot update an unbounded sibling (secret, policy, status, expiration).
+            for payload in [
+                json!({"newSecretKey": "hijacked-secret-0123456789"}),
+                json!({"newPolicy": {}}),
+                json!({"newStatus": "off"}),
+                json!({"newExpiration": (OffsetDateTime::now_utc() + time::Duration::days(30)).format(&time::format_description::well_known::Rfc3339).expect("rfc3339")}),
+            ] {
+                let body = serde_json::to_vec(&payload).expect("serialize update payload");
+                let sts_update = TestRequest::new(
+                    http::Method::POST,
+                    format!("/rustfs/admin/v3/update-service-account?accessKey={}", sibling_sa.access_key).as_str(),
+                )
+                .header("x-amz-security-token", &bounded_sts.session_token)
+                .credentials(&bounded_sts.access_key, &bounded_sts.secret_key, Some(&bounded_sts.session_token))
+                .body(body.clone())
+                .build();
+                assert_eq!(
+                    UpdateServiceAccount {}
+                        .call(sts_update, Params::new())
+                        .await
+                        .expect_err("bounded STS must not update sibling service account")
+                        .code(),
+                    &S3ErrorCode::AccessDenied,
+                    "bounded STS update sibling payload {payload}"
+                );
+
+                let sa_update = TestRequest::new(
+                    http::Method::POST,
+                    format!("/rustfs/admin/v3/update-service-account?accessKey={}", sibling_sa.access_key).as_str(),
+                )
+                .credentials(&bounded_sa.access_key, secret, None)
+                .body(body)
+                .build();
+                assert_eq!(
+                    UpdateServiceAccount {}
+                        .call(sa_update, Params::new())
+                        .await
+                        .expect_err("bounded SA must not update sibling service account")
+                        .code(),
+                    &S3ErrorCode::AccessDenied,
+                    "bounded SA update sibling payload {payload}"
+                );
+            }
+
+            // 4. Bounded SA cannot rewrite its own policy, expiration, or status, but may rotate its own secret.
+            for payload in [
+                json!({"newPolicy": {}}),
+                json!({"newPolicy": {"Version": "2012-10-17", "Statement": [{"Effect": "Allow", "Action": ["s3:*"], "Resource": ["arn:aws:s3:::*"]}]}}),
+                json!({"newStatus": "off"}),
+                json!({"newExpiration": (OffsetDateTime::now_utc() + time::Duration::days(30)).format(&time::format_description::well_known::Rfc3339).expect("rfc3339")}),
+            ] {
+                let body = serde_json::to_vec(&payload).expect("serialize self update payload");
+                let req = TestRequest::new(
+                    http::Method::POST,
+                    format!("/rustfs/admin/v3/update-service-account?accessKey={}", bounded_sa.access_key).as_str(),
+                )
+                .credentials(&bounded_sa.access_key, secret, None)
+                .body(body)
+                .build();
+                assert_eq!(
+                    UpdateServiceAccount {}
+                        .call(req, Params::new())
+                        .await
+                        .expect_err("bounded SA must not widen/modify own policy, expiration, or status")
+                        .code(),
+                    &S3ErrorCode::AccessDenied,
+                    "bounded SA self payload {payload}"
+                );
+            }
+            let rotate_self = TestRequest::new(
+                http::Method::POST,
+                format!("/rustfs/admin/v3/update-service-account?accessKey={}", bounded_sa.access_key).as_str(),
+            )
+            .credentials(&bounded_sa.access_key, secret, None)
+            .body(serde_json::to_vec(&json!({"newSecretKey": "rotated-secret-0123456789"})).expect("serialize rotate"))
+            .build();
+            assert_eq!(
+                UpdateServiceAccount {}
+                    .call(rotate_self, Params::new())
+                    .await
+                    .expect("bounded SA rotating its own secret should remain allowed")
+                    .into_parts()
+                    .0,
+                StatusCode::NO_CONTENT
+            );
+
+            // 5. Root-derived non-owner bounded SA is denied even when rotating its own secret or policy.
+            for payload in [
+                json!({"newPolicy": {}}),
+                json!({"newSecretKey": "root-rotated-secret-0123456789"}),
+            ] {
+                let req = TestRequest::new(
+                    http::Method::POST,
+                    format!("/rustfs/admin/v3/update-service-account?accessKey={}", root_bounded_sa.access_key).as_str(),
+                )
+                .credentials(&root_bounded_sa.access_key, secret, None)
+                .body(serde_json::to_vec(&payload).expect("serialize root update"))
+                .build();
+                assert_eq!(
+                    UpdateServiceAccount {}
+                        .call(req, Params::new())
+                        .await
+                        .expect_err("non-owner root-derived SA must not update root-parented service account")
+                        .code(),
+                    &S3ErrorCode::AccessDenied,
+                    "root-derived bounded SA self payload {payload}"
+                );
+            }
         });
     }
 }
