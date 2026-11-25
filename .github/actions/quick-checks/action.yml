@@ -64,7 +64,7 @@ runs:
           /crates/dialect-rustfs-admin/Cargo.toml
           /crates/dialect-rustfs-admin/src/lib.rs
           /crates/dialect-rustfs-admin/src/native.rs
-          /crates/dialect-rustfs-admin/src/native/extensions.rs
+          /crates/dialect-rustfs-admin/src/native/
           /crates/dialect-rustfs-admin/src/ops/
 
     - name: Compare registered admin routes with the gateway native inventory

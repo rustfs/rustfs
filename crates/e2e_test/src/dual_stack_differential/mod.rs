@@ -33,7 +33,10 @@ pub(crate) mod reference;
 mod scenarios;
 
 use crate::common::{RustFSTestEnvironment, init_logging, rustfs_binary_path, workspace_root};
-use compare::{Difference, Observation, PairedReceipts, Report, compare, compared_cases, compared_ops, render};
+use compare::{
+    ACCEPTED_REFERENCE_CHANGES, ComparisonMode, Difference, Observation, PairedReceipts, Report, compare, compared_cases,
+    compared_ops, partition_differences, render, render_accepted,
+};
 use reference::{SideA, binary_version};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -78,6 +81,13 @@ impl PairConfig {
         match self.side_a {
             SideA::SameBinary => UNDER_TEST,
             SideA::Reference(_) => STACK_A_REFERENCE,
+        }
+    }
+
+    fn comparison_mode(&self) -> ComparisonMode {
+        match self.side_a {
+            SideA::SameBinary => ComparisonMode::SameBinary,
+            SideA::Reference(_) => ComparisonMode::Reference,
         }
     }
 }
@@ -154,6 +164,8 @@ async fn run_differential(label: &str, config: &PairConfig) -> Run {
     let millis = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |elapsed| elapsed.as_millis());
+    let (differences, accepted_differences) =
+        partition_differences(compare(&a, &b), config.comparison_mode(), ACCEPTED_REFERENCE_CHANGES);
     let report = Report {
         schema: 2,
         run: format!("{label}-{millis}-{}", std::process::id()),
@@ -166,7 +178,8 @@ async fn run_differential(label: &str, config: &PairConfig) -> Run {
         region_b: config.region_b.clone(),
         compared_ops: compared_ops(&a, &b).len(),
         compared_cases: compared_cases(&a, &b),
-        differences: compare(&a, &b),
+        differences,
+        accepted_differences,
         responses: PairedReceipts::new(&a, &b),
     };
     let path = report.write_to(&report_directory()).expect("write the dual-stack report");
@@ -193,6 +206,23 @@ mod tests {
             "the script must drive exactly the operations of impl S3 for FS"
         );
         assert_eq!(report.compared_ops, scenarios::OPERATIONS.len(), "report: {}", run.path.display());
+        if config.comparison_mode() == ComparisonMode::SameBinary {
+            assert!(
+                report.accepted_differences.is_empty(),
+                "same-binary comparison must never accept differences (report: {}):\n{}",
+                run.path.display(),
+                render_accepted(&report.accepted_differences)
+            );
+        }
+        if !report.accepted_differences.is_empty() {
+            println!(
+                "accepted reference differences ({} of {} cases, report: {}):\n{}",
+                report.accepted_differences.len(),
+                report.compared_cases,
+                run.path.display(),
+                render_accepted(&report.accepted_differences)
+            );
+        }
         assert!(
             report.differences.is_empty(),
             "stack {} ({}) and stack {} ({}) differ on {} of {} cases (report: {}):\n{}",
@@ -245,6 +275,12 @@ mod tests {
             a: CONTROL_REGION_A.to_owned(),
             b: CONTROL_REGION_B.to_owned(),
         };
+        assert!(
+            run.report.accepted_differences.is_empty(),
+            "same-binary negative control must never accept differences (report: {}):\n{}",
+            run.path.display(),
+            render_accepted(&run.report.accepted_differences)
+        );
         assert!(
             run.report.differences.contains(&expected),
             "B started in {CONTROL_REGION_B} but GetBucketLocation was not reported (report: {}):\n{}",

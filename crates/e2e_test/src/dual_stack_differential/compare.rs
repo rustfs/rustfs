@@ -129,6 +129,106 @@ pub(crate) struct Difference {
     pub b: String,
 }
 
+/// Whether side A is the same binary under test or a pinned released reference binary.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ComparisonMode {
+    SameBinary,
+    Reference,
+}
+
+/// A maintainer-signed behavior change between a released reference binary (side A) and the
+/// current candidate binary (side B).
+///
+/// Exemptions apply only in [`ComparisonMode::Reference`] and must match the exact
+/// `(op, case, field, a, b)` tuple with no other unruled difference on the same `(op, case)`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct AcceptedChange {
+    pub op: &'static str,
+    pub case: &'static str,
+    pub field: &'static str,
+    pub reference_value: &'static str,
+    pub candidate_value: &'static str,
+    pub ruling: &'static str,
+}
+
+impl AcceptedChange {
+    pub(crate) fn matches(&self, diff: &Difference) -> bool {
+        diff.op == self.op
+            && diff.case == self.case
+            && diff.field == self.field
+            && diff.a == self.reference_value
+            && diff.b == self.candidate_value
+    }
+}
+
+/// Maintainer-signed accepted differences for external reference-binary parity runs.
+pub(crate) const ACCEPTED_REFERENCE_CHANGES: &[AcceptedChange] = &[
+    // Signed off in rustfs/backlog#2684#issuecomment-7163283798:
+    // Commit 8f81762a6 aligned PutBucketPolicy on malformed JSON with AWS S3 (`400 MalformedPolicy`)
+    // instead of official 1.0.5's `400 InvalidArgument`.
+    AcceptedChange {
+        op: "PutBucketPolicy",
+        case: "negative",
+        field: "error_code",
+        reference_value: "InvalidArgument",
+        candidate_value: "MalformedPolicy",
+        ruling: "rustfs/backlog#2684#issuecomment-7163283798 (commit 8f81762a6)",
+    },
+];
+
+/// One difference explicitly exempted by an [`AcceptedChange`] ruling in reference mode.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub(crate) struct AcceptedDifference {
+    #[serde(flatten)]
+    pub difference: Difference,
+    pub ruling: String,
+}
+
+/// Separates raw differences into unruled failures and maintainer-signed accepted changes.
+///
+/// Accepted changes are evaluated only in [`ComparisonMode::Reference`]. In
+/// [`ComparisonMode::SameBinary`], every difference stays unruled even when rules are supplied.
+/// Evaluation is also atomic per `(op, case)`: if any field of a case has an unruled difference
+/// (for example, `status` also differs), no field on that case is accepted.
+pub(crate) fn partition_differences(
+    raw: Vec<Difference>,
+    mode: ComparisonMode,
+    accepted_changes: &[AcceptedChange],
+) -> (Vec<Difference>, Vec<AcceptedDifference>) {
+    if mode != ComparisonMode::Reference || accepted_changes.is_empty() {
+        return (raw, Vec::new());
+    }
+    let matched: Vec<Option<&AcceptedChange>> = raw
+        .iter()
+        .map(|diff| accepted_changes.iter().find(|rule| rule.matches(diff)))
+        .collect();
+    let unruled_cases: BTreeSet<(&str, &str)> = raw
+        .iter()
+        .zip(&matched)
+        .filter_map(|(diff, rule)| rule.is_none().then_some((diff.op.as_str(), diff.case.as_str())))
+        .collect();
+    let rulings: Vec<Option<&'static str>> = raw
+        .iter()
+        .zip(&matched)
+        .map(|(diff, rule)| {
+            rule.filter(|_| !unruled_cases.contains(&(diff.op.as_str(), diff.case.as_str())))
+                .map(|rule| rule.ruling)
+        })
+        .collect();
+    let mut unruled = Vec::new();
+    let mut accepted = Vec::new();
+    for (diff, ruling) in raw.into_iter().zip(rulings) {
+        match ruling {
+            Some(ruling) => accepted.push(AcceptedDifference {
+                difference: diff,
+                ruling: ruling.to_owned(),
+            }),
+            None => unruled.push(diff),
+        }
+    }
+    (unruled, accepted)
+}
+
 /// Every difference between two transcripts of the same script, matched by `(op, case)`.
 pub(crate) fn compare(a: &[Observation], b: &[Observation]) -> Vec<Difference> {
     let mut differences = Vec::new();
@@ -307,6 +407,7 @@ pub(crate) struct Report {
     pub compared_ops: usize,
     pub compared_cases: usize,
     pub differences: Vec<Difference>,
+    pub accepted_differences: Vec<AcceptedDifference>,
     #[serde(flatten)]
     pub(super) responses: PairedReceipts,
 }
@@ -327,6 +428,18 @@ pub(crate) fn render(differences: &[Difference]) -> String {
     differences
         .iter()
         .map(|d| format!("({}, {}, {}, a={:?}, b={:?})", d.op, d.case, d.field, d.a, d.b))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// One line per accepted difference, for run diagnostics.
+pub(crate) fn render_accepted(differences: &[AcceptedDifference]) -> String {
+    differences
+        .iter()
+        .map(|entry| {
+            let d = &entry.difference;
+            format!("({}, {}, {}, a={:?}, b={:?}, ruling={:?})", d.op, d.case, d.field, d.a, d.b, entry.ruling)
+        })
         .collect::<Vec<_>>()
         .join("\n")
 }
@@ -578,6 +691,7 @@ mod tests {
             compared_ops: 1,
             compared_cases: 1,
             differences: compare(&a, &b),
+            accepted_differences: Vec::new(),
             responses: PairedReceipts::new(&a, &b),
         };
         let path = report.write_to(&directory).expect("write the report");
@@ -611,5 +725,203 @@ mod tests {
                 "b": "eu-west-1",
             }])
         );
+        assert_eq!(json["accepted_differences"], serde_json::json!([]));
+    }
+
+    #[test]
+    fn accepted_reference_change_exempts_only_exact_put_bucket_policy_tuple() {
+        let a = vec![Observation::new(
+            "PutBucketPolicy",
+            "negative",
+            400,
+            Some("InvalidArgument".into()),
+            [("content-type", "application/xml")],
+        )];
+        let b = vec![Observation::new(
+            "PutBucketPolicy",
+            "negative",
+            400,
+            Some("MalformedPolicy".into()),
+            [("content-type", "application/xml")],
+        )];
+
+        let (unruled, accepted) = partition_differences(compare(&a, &b), ComparisonMode::Reference, ACCEPTED_REFERENCE_CHANGES);
+        assert!(unruled.is_empty(), "expected 0 unruled differences, got: {unruled:?}");
+        assert_eq!(
+            accepted,
+            vec![AcceptedDifference {
+                difference: Difference {
+                    op: "PutBucketPolicy".into(),
+                    case: "negative".into(),
+                    field: "error_code".into(),
+                    a: "InvalidArgument".into(),
+                    b: "MalformedPolicy".into(),
+                },
+                ruling: "rustfs/backlog#2684#issuecomment-7163283798 (commit 8f81762a6)".into(),
+            }]
+        );
+
+        let directory = std::env::temp_dir().join(format!("dual-stack-accepted-report-{}", uuid::Uuid::new_v4()));
+        let report = Report {
+            schema: 2,
+            run: "accepted".into(),
+            stack_a: "reference".into(),
+            stack_b: "under-test".into(),
+            reference_side: Some("a"),
+            version_a: "rustfs 1.0.5".into(),
+            version_b: "rustfs 1.0.6".into(),
+            region_a: None,
+            region_b: None,
+            compared_ops: 1,
+            compared_cases: 1,
+            differences: unruled,
+            accepted_differences: accepted,
+            responses: PairedReceipts::new(&a, &b),
+        };
+        let path = report.write_to(&directory).expect("write accepted report");
+        let json: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).expect("read accepted report")).expect("parse");
+        let _ = std::fs::remove_dir_all(&directory);
+        assert_eq!(json["differences"], serde_json::json!([]));
+        assert_eq!(
+            json["accepted_differences"],
+            serde_json::json!([{
+                "op": "PutBucketPolicy",
+                "case": "negative",
+                "field": "error_code",
+                "a": "InvalidArgument",
+                "b": "MalformedPolicy",
+                "ruling": "rustfs/backlog#2684#issuecomment-7163283798 (commit 8f81762a6)",
+            }])
+        );
+    }
+
+    #[test]
+    fn accepted_reference_changes_never_apply_in_same_binary_mode() {
+        let a = vec![Observation::new(
+            "PutBucketPolicy",
+            "negative",
+            400,
+            Some("InvalidArgument".into()),
+            [("content-type", "application/xml")],
+        )];
+        let b = vec![Observation::new(
+            "PutBucketPolicy",
+            "negative",
+            400,
+            Some("MalformedPolicy".into()),
+            [("content-type", "application/xml")],
+        )];
+
+        let (unruled, accepted) = partition_differences(compare(&a, &b), ComparisonMode::SameBinary, ACCEPTED_REFERENCE_CHANGES);
+        assert!(accepted.is_empty(), "same-binary mode must never accept differences: {accepted:?}");
+        assert_eq!(
+            unruled,
+            vec![Difference {
+                op: "PutBucketPolicy".into(),
+                case: "negative".into(),
+                field: "error_code".into(),
+                a: "InvalidArgument".into(),
+                b: "MalformedPolicy".into(),
+            }]
+        );
+    }
+
+    #[test]
+    fn accepted_reference_change_fails_closed_on_any_mutation_or_extra_field_diff() {
+        let cases: &[(&str, Observation, Observation, &[&str])] = &[
+            (
+                "wrong candidate error code",
+                Observation::new("PutBucketPolicy", "negative", 400, Some("InvalidArgument".into()), []),
+                Observation::new("PutBucketPolicy", "negative", 400, Some("AccessDenied".into()), []),
+                &["error_code"],
+            ),
+            (
+                "missing candidate error code",
+                Observation::new("PutBucketPolicy", "negative", 400, Some("InvalidArgument".into()), []),
+                Observation::new("PutBucketPolicy", "negative", 400, None, []),
+                &["error_code"],
+            ),
+            (
+                "wrong reference error code",
+                Observation::new("PutBucketPolicy", "negative", 400, Some("MalformedXML".into()), []),
+                Observation::new("PutBucketPolicy", "negative", 400, Some("MalformedPolicy".into()), []),
+                &["error_code"],
+            ),
+            (
+                "swapped reference and candidate error codes",
+                Observation::new("PutBucketPolicy", "negative", 400, Some("MalformedPolicy".into()), []),
+                Observation::new("PutBucketPolicy", "negative", 400, Some("InvalidArgument".into()), []),
+                &["error_code"],
+            ),
+            (
+                "different operation",
+                Observation::new("GetBucketPolicy", "negative", 400, Some("InvalidArgument".into()), []),
+                Observation::new("GetBucketPolicy", "negative", 400, Some("MalformedPolicy".into()), []),
+                &["error_code"],
+            ),
+            (
+                "different case",
+                Observation::new("PutBucketPolicy", "normal", 400, Some("InvalidArgument".into()), []),
+                Observation::new("PutBucketPolicy", "normal", 400, Some("MalformedPolicy".into()), []),
+                &["error_code"],
+            ),
+            (
+                "status differs alone",
+                Observation::new("PutBucketPolicy", "negative", 400, Some("InvalidArgument".into()), []),
+                Observation::new("PutBucketPolicy", "negative", 500, Some("InvalidArgument".into()), []),
+                &["status"],
+            ),
+            (
+                "status also differs alongside matching error_code",
+                Observation::new("PutBucketPolicy", "negative", 400, Some("InvalidArgument".into()), []),
+                Observation::new("PutBucketPolicy", "negative", 500, Some("MalformedPolicy".into()), []),
+                &["status", "error_code"],
+            ),
+            (
+                "header also differs alongside matching error_code",
+                Observation::new(
+                    "PutBucketPolicy",
+                    "negative",
+                    400,
+                    Some("InvalidArgument".into()),
+                    [("content-type", "application/xml")],
+                ),
+                Observation::new(
+                    "PutBucketPolicy",
+                    "negative",
+                    400,
+                    Some("MalformedPolicy".into()),
+                    [("content-type", "text/plain")],
+                ),
+                &["error_code", "header.content-type"],
+            ),
+        ];
+
+        for (label, obs_a, obs_b, expected_fields) in cases {
+            let (unruled, accepted) = partition_differences(
+                compare(std::slice::from_ref(obs_a), std::slice::from_ref(obs_b)),
+                ComparisonMode::Reference,
+                ACCEPTED_REFERENCE_CHANGES,
+            );
+            assert!(accepted.is_empty(), "case `{label}` must not be accepted, got accepted={accepted:?}");
+            assert_eq!(fields(&unruled), *expected_fields, "case `{label}` must preserve all unruled differences");
+        }
+
+        // An accepted difference on PutBucketPolicy must never mask an unrelated regression.
+        let a = vec![
+            Observation::new("PutBucketPolicy", "negative", 400, Some("InvalidArgument".into()), []),
+            Observation::new("GetObject", "negative", 404, Some("NoSuchKey".into()), []),
+        ];
+        let b = vec![
+            Observation::new("PutBucketPolicy", "negative", 400, Some("MalformedPolicy".into()), []),
+            Observation::new("GetObject", "negative", 404, Some("NoSuchBucket".into()), []),
+        ];
+        let (unruled, accepted) = partition_differences(compare(&a, &b), ComparisonMode::Reference, ACCEPTED_REFERENCE_CHANGES);
+        assert_eq!(accepted.len(), 1);
+        assert_eq!(accepted[0].difference.op, "PutBucketPolicy");
+        assert_eq!(unruled.len(), 1);
+        assert_eq!(unruled[0].op, "GetObject");
+        assert_eq!(unruled[0].field, "error_code");
     }
 }

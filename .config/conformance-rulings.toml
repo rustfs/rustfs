@@ -1,4 +1,4 @@
-# Rulings for the gateway conformance lane. Each row covers one complete diagnostic.
+# Rulings for the gateway conformance lane. Each row covers the exact failure diagnostic(s) for one case.
 # Remove a row when the case passes. Review the referenced compatibility decision before expiry.
 # Backlog #2684 registers both R/K entries and the legacy response heads in rustfs/gateway#1159.
 # Official RustFS 1.0.5 and the gateway candidate both omit the region on a successful HeadBucket.
@@ -45,4 +45,456 @@ case = "c-cred-0026"
 ledger = "rustfs/gateway#1120"
 reason = "The released and native hosts both close this HTTP/1 connection after serving the expected refusal."
 failure = "[expect/connection_after] at /expect/connection_after: exchange #1, attempt 1: expected the connection to be `open` afterwards, observed `closed`"
+expires = 2027-02-01
+
+# Maintainer-signed accepted change: https://github.com/rustfs/backlog/issues/2684#issuecomment-7163283798
+
+[[ruling]]
+case = "c-sig-0598"
+ledger = "rustfs/gateway#1349"
+reason = "Accepted change (R-053, rustfs/backlog#2684): unreadable access key grammar returns 403 AccessDenied instead of InvalidAccessKeyId."
+failures = [
+  "[expect/error.code] at /expect/error/code: exchange #1, attempt 1: expected <Code>InvalidAccessKeyId</Code>, the body carried <Code>AccessDenied</Code>",
+  "[expect/body.contains_utf8] at /expect/body: exchange #1, attempt 1: the body does not contain \"<Code>InvalidAccessKeyId</Code>\"",
+]
+expires = 2027-02-01
+
+# Tracked IAM gap (R-065): https://github.com/rustfs/backlog/issues/2684#issuecomment-7163283798
+
+[[ruling]]
+case = "c-cred-0020"
+ledger = "R-065"
+reason = "Tracked IAM gap (rustfs/rustfs#9559, rustfs/backlog#2684): expired STS session token returns 403 InvalidAccessKeyId instead of 400 ExpiredToken."
+failures = [
+  "[expect/status] at /expect/status: exchange #1, attempt 1: expected status 400, observed 403",
+  "[expect/error.code] at /expect/error/code: exchange #1, attempt 1: expected <Code>ExpiredToken</Code>, the body carried <Code>InvalidAccessKeyId</Code>",
+  "[expect/body.exact_utf8] at /expect/body: exchange #1, attempt 1: bodies differ at byte 52 (expected 196 bytes, observed 200 bytes)\n    expected: …F-8\\\"?>\\n<Error><Code>ExpiredToken</Code><Message>the session …\n    observed: …F-8\\\"?>\\n<Error><Code>InvalidAccessKeyId</Code><Message>The Ac…",
+  "[expect/body.not_contains_utf8] at /expect/body: exchange #1, attempt 1: the body must not contain \"InvalidAccessKeyId\", found at byte 52",
+]
+expires = 2027-02-01
+
+# Outer CORS middleware and HTTP/2 OPTIONS parity: https://github.com/rustfs/backlog/issues/2684#issuecomment-7163283798
+
+[[ruling]]
+case = "c-cors-0034"
+ledger = "rustfs/gateway#1120"
+reason = "Official 1.0.5 parity (rustfs/backlog#2684): outer CORS middleware answers OPTIONS preflight 200 before bucket routing."
+failures = [
+  "[expect/status] at /expect/status: exchange #1, attempt 1: expected status 403, observed 200",
+  "[expect/error.code] at /expect/error/code: exchange #1, attempt 1: expected <Code>AccessForbidden</Code>, the body carried no <Code> element at all",
+  "[expect/error.request_id_present] at /expect/error/request_id_present: exchange #1, attempt 1: expected <RequestId> to be present and non-empty, it was absent",
+  "[expect/headers_present] at /expect/headers_present/content-type: exchange #1, attempt 1: expected `content-type: application/xml`, observed no such header",
+  "[expect/headers_present] at /expect/headers_present/vary: exchange #1, attempt 1: expected `vary: origin`, observed `Origin, Access-Control-Request-Method, Access-Control-Request-Headers, Authorization, Cookie, X-Amz-Security-Token, X-Amz-Content-Sha256`",
+  "[expect/body.exact_utf8] at /expect/body: exchange #1, attempt 1: bodies differ at byte 0 (expected 211 bytes, observed 0 bytes)\n    expected: <?xml version=\\\"1.0\\\" encoding=\\\"UTF-8\\\"?>\\n<…\n    observed: ",
+]
+expires = 2027-02-01
+
+[[ruling]]
+case = "c-cors-0035"
+ledger = "rustfs/gateway#1120"
+reason = "Official 1.0.5 parity (rustfs/backlog#2684): outer CORS middleware answers OPTIONS preflight 200 before bucket routing."
+failures = [
+  "[expect/status] at /expect/status: exchange #1, attempt 1: expected status 403, observed 200",
+  "[expect/error.code] at /expect/error/code: exchange #1, attempt 1: expected <Code>AccessForbidden</Code>, the body carried no <Code> element at all",
+  "[expect/error.request_id_present] at /expect/error/request_id_present: exchange #1, attempt 1: expected <RequestId> to be present and non-empty, it was absent",
+  "[expect/headers_present] at /expect/headers_present/content-type: exchange #1, attempt 1: expected `content-type: application/xml`, observed no such header",
+  "[expect/headers_present] at /expect/headers_present/vary: exchange #1, attempt 1: expected `vary: origin`, observed `Origin, Access-Control-Request-Method, Access-Control-Request-Headers, Authorization, Cookie, X-Amz-Security-Token, X-Amz-Content-Sha256`",
+  "[expect/body.exact_utf8] at /expect/body: exchange #1, attempt 1: bodies differ at byte 0 (expected 211 bytes, observed 0 bytes)\n    expected: <?xml version=\\\"1.0\\\" encoding=\\\"UTF-8\\\"?>\\n<…\n    observed: ",
+]
+expires = 2027-02-01
+
+[[ruling]]
+case = "c-cors-0036"
+ledger = "rustfs/gateway#1120"
+reason = "Official 1.0.5 parity (rustfs/backlog#2684): outer CORS middleware answers OPTIONS preflight 200 before bucket routing."
+failures = [
+  "[expect/status] at /expect/status: exchange #1, attempt 1: expected status 403, observed 200",
+  "[expect/error.code] at /expect/error/code: exchange #1, attempt 1: expected <Code>AccessForbidden</Code>, the body carried no <Code> element at all",
+  "[expect/error.request_id_present] at /expect/error/request_id_present: exchange #1, attempt 1: expected <RequestId> to be present and non-empty, it was absent",
+  "[expect/headers_present] at /expect/headers_present/content-type: exchange #1, attempt 1: expected `content-type: application/xml`, observed no such header",
+  "[expect/headers_present] at /expect/headers_present/vary: exchange #1, attempt 1: expected `vary: origin`, observed `Origin, Access-Control-Request-Method, Access-Control-Request-Headers, Authorization, Cookie, X-Amz-Security-Token, X-Amz-Content-Sha256`",
+  "[expect/body.exact_utf8] at /expect/body: exchange #1, attempt 1: bodies differ at byte 0 (expected 211 bytes, observed 0 bytes)\n    expected: <?xml version=\\\"1.0\\\" encoding=\\\"UTF-8\\\"?>\\n<…\n    observed: ",
+]
+expires = 2027-02-01
+
+[[ruling]]
+case = "c-cors-0043"
+ledger = "rustfs/gateway#1120"
+reason = "Official 1.0.5 parity (rustfs/backlog#2684): outer CORS middleware handles OPTIONS without CORS headers without returning an S3 XML BadRequest body."
+failure = "[expect/error.code] at /expect/error/code: exchange #1, attempt 1: expected <Code>BadRequest</Code>, the body carried no <Code> element at all"
+expires = 2027-02-01
+
+[[ruling]]
+case = "c-cors-0058"
+ledger = "rustfs/gateway#1120"
+reason = "Official 1.0.5 parity (rustfs/backlog#2684): outer CORS middleware answers half-preflight OPTIONS with empty 400 instead of S3 403 AccessForbidden XML."
+failures = [
+  "[expect/status] at /exchanges/0/expect/status: exchange #1, attempt 1: expected status 403, observed 400",
+  "[expect/error.code] at /exchanges/0/expect/error/code: exchange #1, attempt 1: expected <Code>AccessForbidden</Code>, the body carried no <Code> element at all",
+  "[expect/error.request_id_present] at /exchanges/0/expect/error/request_id_present: exchange #1, attempt 1: expected <RequestId> to be present and non-empty, it was absent",
+  "[expect/status] at /exchanges/1/expect/status: exchange #2, attempt 1: expected status 403, observed 400",
+  "[expect/error.code] at /exchanges/1/expect/error/code: exchange #2, attempt 1: expected <Code>AccessForbidden</Code>, the body carried no <Code> element at all",
+  "[expect/error.request_id_present] at /exchanges/1/expect/error/request_id_present: exchange #2, attempt 1: expected <RequestId> to be present and non-empty, it was absent",
+]
+expires = 2027-02-01
+
+[[ruling]]
+case = "c-h2-0001"
+ledger = "rustfs/gateway#1120"
+reason = "Official 1.0.5 parity (rustfs/backlog#2684): outer CORS middleware serves OPTIONS over HTTP/2 with an empty body instead of S3 XML BadRequest."
+failure = "[expect/body.contains_utf8] at /expect/body: exchange #1, attempt 1: the body does not contain \"<Code>BadRequest</Code>\""
+expires = 2027-02-01
+
+[[ruling]]
+case = "c-h2-0002"
+ledger = "rustfs/gateway#1120"
+reason = "Official 1.0.5 parity (rustfs/backlog#2684): outer CORS middleware serves OPTIONS over HTTP/2 with an empty body instead of S3 XML BadRequest."
+failure = "[expect/body.contains_utf8] at /expect/body: exchange #1, attempt 1: the body does not contain \"<Code>BadRequest</Code>\""
+expires = 2027-02-01
+
+[[ruling]]
+case = "c-h2-0003"
+ledger = "rustfs/gateway#1120"
+reason = "Official 1.0.5 parity (rustfs/backlog#2684): outer CORS middleware answers OPTIONS with an empty body, so a 1-byte HTTP/2 flow-control window finishes immediately."
+failures = [
+  "[expect/kind] at /expect/kind: exchange #1, attempt 1: expected the exchange to end as `hang`, it ended as `response`",
+  "[expect/body.exact_utf8] at /expect/body: exchange #1, attempt 1: bodies differ at byte 0 (expected 1 bytes, observed 0 bytes)\n    expected: <\n    observed: ",
+]
+expires = 2027-02-01
+
+[[ruling]]
+case = "c-h2-0008"
+ledger = "rustfs/gateway#1120"
+reason = "Official 1.0.5 parity (rustfs/backlog#2684): outer CORS middleware serves OPTIONS over HTTP/2 with an empty body instead of S3 XML BadRequest."
+failure = "[expect/body.contains_utf8] at /expect/body: exchange #1, attempt 1: the body does not contain \"<Code>BadRequest</Code>\""
+expires = 2027-02-01
+
+[[ruling]]
+case = "c-h2-0010"
+ledger = "rustfs/gateway#1120"
+reason = "Official 1.0.5 parity (rustfs/backlog#2684): outer CORS middleware serves OPTIONS over HTTP/2 with an empty body instead of S3 XML BadRequest."
+failure = "[expect/body.contains_utf8] at /expect/body: exchange #1, attempt 1: the body does not contain \"<Code>BadRequest</Code>\""
+expires = 2027-02-01
+
+[[ruling]]
+case = "c-h2-0017"
+ledger = "rustfs/gateway#1120"
+reason = "Official 1.0.5 parity (rustfs/backlog#2684): outer CORS middleware serves OPTIONS over HTTP/2 with an empty body instead of S3 XML BadRequest."
+failure = "[expect/body.contains_utf8] at /expect/body: exchange #1, attempt 1: the body does not contain \"<Code>BadRequest</Code>\""
+expires = 2027-02-01
+
+[[ruling]]
+case = "c-h2-0018"
+ledger = "rustfs/gateway#1120"
+reason = "Official 1.0.5 parity (rustfs/backlog#2684): outer CORS middleware serves OPTIONS over HTTP/2 with an empty body instead of S3 XML BadRequest."
+failure = "[expect/body.contains_utf8] at /expect/body: exchange #1, attempt 1: the body does not contain \"<Code>BadRequest</Code>\""
+expires = 2027-02-01
+
+[[ruling]]
+case = "c-h2-0019"
+ledger = "rustfs/gateway#1120"
+reason = "Official 1.0.5 parity (rustfs/backlog#2684): outer CORS middleware answers OPTIONS with an empty body before the client RST_STREAM interrupts a response body."
+failures = [
+  "[expect/kind] at /expect/kind: exchange #1, attempt 1: expected the exchange to end as `client_reset`, it ended as `response`",
+  "[expect/h2_control_frames] at /expect/h2_control_frames: exchange #1, attempt 1: received HTTP/2 control frames differ in count, order, or fields",
+  "[expect/body.exact_utf8] at /expect/body: exchange #1, attempt 1: bodies differ at byte 0 (expected 1 bytes, observed 0 bytes)\n    expected: <\n    observed: ",
+]
+expires = 2027-02-01
+
+[[ruling]]
+case = "c-h2-0020"
+ledger = "rustfs/gateway#1120"
+reason = "Official 1.0.5 parity (rustfs/backlog#2684): outer CORS middleware answers OPTIONS with an empty body before the malformed RST_STREAM triggers a mid-body stream error."
+failures = [
+  "[expect/kind] at /expect/kind: exchange #1, attempt 1: expected the exchange to end as `stream_error`, it ended as `response`",
+  "[expect/stream_termination] at /expect/stream_termination: exchange #1, attempt 1: expected `abrupt_close`, observed `nothing`",
+  "[expect/h2_control_frames] at /expect/h2_control_frames: exchange #1, attempt 1: received HTTP/2 control frames differ in count, order, or fields",
+  "[expect/socket_read_after] at /expect/socket_read_after: exchange #1, attempt 1: receive-side termination: expected eof, observed no_termination_observed",
+  "[expect/body_bytes_before_error] at /expect/body_bytes_before_error: exchange #1, attempt 1: expected 1 response bytes before the error, the transport did not record any",
+]
+expires = 2027-02-01
+
+# Cleartext SSE-C error parity: https://github.com/rustfs/backlog/issues/2684#issuecomment-7163283798
+
+[[ruling]]
+case = "c-ssec-0002"
+ledger = "rustfs/backlog#2762"
+reason = "Official 1.0.5 parity (rustfs/backlog#2684): cleartext GET with SSE-C headers on an absent object returns 404 NoSuchKey instead of 400 InvalidRequest."
+failures = [
+  "[expect/status] at /expect/status: exchange #1, attempt 1: expected status 400, observed 404",
+  "[expect/error.code] at /expect/error/code: exchange #1, attempt 1: expected <Code>InvalidRequest</Code>, the body carried <Code>NoSuchKey</Code>",
+  "[expect/body.exact_utf8] at /expect/body: exchange #1, attempt 1: bodies differ at byte 52 (expected 256 bytes, observed 163 bytes)\n    expected: …F-8\\\"?>\\n<Error><Code>InvalidRequest</Code><Message>requests s…\n    observed: …F-8\\\"?>\\n<Error><Code>NoSuchKey</Code><Message>The specified k…",
+]
+expires = 2027-02-01
+
+# Maintainer-signed 1.0.5-identical compatibility rulings: https://github.com/rustfs/backlog/issues/2684#issuecomment-7163283798
+
+[[ruling]]
+case = "c-acl-0001"
+ledger = "rustfs/backlog#2684"
+reason = "Official 1.0.5 parity: default bucket ACL reports the RustFS owner display name and canonical ID instead of the conformance fixture owner."
+failures = [
+  "[expect/body.golden] at /expect/body: exchange #1, attempt 1: bodies differ at byte 234 (expected 555 bytes, observed 545 bytes)\n    expected: …lUser\\\"><DisplayName>conformance</DisplayName><ID>3f6e2b1c4a8…\n    observed: …lUser\\\"><DisplayName>rustfs</DisplayName><ID>c19050dbcee97fda…",
+]
+expires = 2027-02-01
+
+[[ruling]]
+case = "c-acl-0028"
+ledger = "rustfs/backlog#2684"
+reason = "Official 1.0.5 parity: bucket ACL XML omits the newline after the XML declaration and uses the RustFS default owner."
+failures = [
+  "[expect/body.golden] at /expect/body: exchange #1, attempt 1: bodies differ at byte 38 (expected 556 bytes, observed 545 bytes)\n    expected: …\\\" encoding=\\\"UTF-8\\\"?>\\n<AccessControlPolicy xmlns=\\\"http://s3.a…\n    observed: …\\\" encoding=\\\"UTF-8\\\"?><AccessControlPolicy xmlns=\\\"http://s3.am…",
+]
+expires = 2027-02-01
+
+[[ruling]]
+case = "c-acl-0029"
+ledger = "rustfs/backlog#2684"
+reason = "Official 1.0.5 parity: object ACL XML omits the newline after the XML declaration and uses the RustFS default owner."
+failures = [
+  "[expect/body.golden] at /expect/body: exchange #1, attempt 1: bodies differ at byte 38 (expected 556 bytes, observed 545 bytes)\n    expected: …\\\" encoding=\\\"UTF-8\\\"?>\\n<AccessControlPolicy xmlns=\\\"http://s3.a…\n    observed: …\\\" encoding=\\\"UTF-8\\\"?><AccessControlPolicy xmlns=\\\"http://s3.am…",
+]
+expires = 2027-02-01
+
+[[ruling]]
+case = "c-bkt-0026"
+ledger = "rustfs/backlog#2684"
+reason = "Official 1.0.5 parity: single-region server rejects creating the foreign-region fixture bucket with status 400."
+failure = "[runner/fixture-refused] at /setup: external fixture PUT for bucket `conf-bkt-far` returned status 400; the failed create is not owned"
+expires = 2027-02-01
+
+[[ruling]]
+case = "c-bucketconfig-0030"
+ledger = "rustfs/backlog#2684"
+reason = "Official 1.0.5 parity: GetBucketPolicyStatus on a bucket without a policy returns 200 instead of 404 NoSuchBucketPolicy."
+failures = [
+  "[expect/status] at /expect/status: exchange #1, attempt 1: expected status 404, observed 200",
+  "[expect/error.code] at /expect/error/code: exchange #1, attempt 1: expected <Code>NoSuchBucketPolicy</Code>, the body carried no <Code> element at all",
+  "[expect/error.request_id_present] at /expect/error/request_id_present: exchange #1, attempt 1: expected <RequestId> to be present and non-empty, it was absent",
+]
+expires = 2027-02-01
+
+[[ruling]]
+case = "c-bucketconfig-0031"
+ledger = "rustfs/backlog#2684"
+reason = "Official 1.0.5 parity: GetPublicAccessBlock on an unconfigured bucket returns 500 instead of 404 NoSuchPublicAccessBlockConfiguration."
+failure = "[expect/status] at /expect/status: exchange #1, attempt 1: expected status 404, observed 500"
+expires = 2027-02-01
+
+[[ruling]]
+case = "c-cred-0003"
+ledger = "rustfs/backlog#2684"
+reason = "Official 1.0.5 parity: static external-endpoint server has no fixture STS session token and returns 403."
+failures = [
+  "[expect/status] at /expect/status: exchange #1, attempt 1: expected status 200, observed 403",
+  "[expect/body.exact_utf8] at /expect/body: exchange #1, attempt 1: bodies differ at byte 0 (expected 16 bytes, observed 224 bytes)\n    expected: credential-probe\n    observed: <?xml version=\\\"1.0\\\" encoding=\\\"UTF-8\\\"?>\\n<…",
+]
+expires = 2027-02-01
+
+[[ruling]]
+case = "c-cred-0008"
+ledger = "rustfs/backlog#2684"
+reason = "Official 1.0.5 parity: unknown access key returns the standard S3 InvalidAccessKeyId error message instead of the redacted conformance text."
+failures = [
+  "[expect/body.exact_utf8] at /expect/body: exchange #1, attempt 1: bodies differ at byte 86 (expected 201 bytes, observed 200 bytes)\n    expected: …eyId</Code><Message>the request was not authenticated</Messa…\n    observed: …eyId</Code><Message>The Access Key Id you provided does not …",
+  "[expect/body.not_contains_utf8] at /expect/body: exchange #1, attempt 1: the body must not contain \"does not exist\", found at byte 117",
+]
+expires = 2027-02-01
+
+[[ruling]]
+case = "c-cred-0009"
+ledger = "rustfs/backlog#2684"
+reason = "Official 1.0.5 parity: wrong secret key returns the standard S3 SignatureDoesNotMatch error message instead of the redacted conformance text."
+failures = [
+  "[expect/body.exact_utf8] at /expect/body: exchange #1, attempt 1: bodies differ at byte 89 (expected 204 bytes, observed 356 bytes)\n    expected: …atch</Code><Message>the request was not authenticated</Messa…\n    observed: …atch</Code><Message>The request signature we calculated does…",
+]
+expires = 2027-02-01
+
+[[ruling]]
+case = "c-cred-0010"
+ledger = "rustfs/backlog#2684"
+reason = "Official 1.0.5 parity: unknown or disabled credential returns the standard S3 InvalidAccessKeyId error message instead of the redacted conformance text."
+failures = [
+  "[expect/body.exact_utf8] at /expect/body: exchange #1, attempt 1: bodies differ at byte 86 (expected 201 bytes, observed 200 bytes)\n    expected: …eyId</Code><Message>the request was not authenticated</Messa…\n    observed: …eyId</Code><Message>The Access Key Id you provided does not …",
+]
+expires = 2027-02-01
+
+[[ruling]]
+case = "c-encryption-0012"
+ledger = "rustfs/backlog#2684"
+reason = "Official 1.0.5 parity: GetBucketEncryption on an unconfigured bucket returns 400 with hyphenated server-side wording instead of 404."
+failures = [
+  "[expect/status] at /expect/status: exchange #1, attempt 1: expected status 404, observed 400",
+  "[expect/body.exact_utf8] at /expect/body: exchange #1, attempt 1: bodies differ at byte 124 (expected 250 bytes, observed 222 bytes)\n    expected: …><Message>The server side encryption configuration was not f…\n    observed: …><Message>The server-side encryption configuration was not f…",
+]
+expires = 2027-02-01
+
+[[ruling]]
+case = "c-host-0006"
+ledger = "rustfs/backlog#2684"
+reason = "Official 1.0.5 parity: virtual-host routing does not resolve this mid-domain Host header to path style and returns 404 XML."
+failures = [
+  "[expect/status] at /expect/status: exchange #1, attempt 1: expected status 200, observed 404",
+  "[expect/headers_present] at /expect/headers_present/content-type: exchange #1, attempt 1: expected `content-type: text/plain; charset=utf-8`, observed `application/xml`",
+  "[expect/body.exact_utf8] at /expect/body: exchange #1, attempt 1: bodies differ at byte 0 (expected 14 bytes, observed 192 bytes)\n    expected: virtual hosted\n    observed: <?xml version=\\\"1.0\\\" encoding=\\\"UTF-8\\\"?>\\n<…",
+]
+expires = 2027-02-01
+
+[[ruling]]
+case = "c-host-0009"
+ledger = "rustfs/backlog#2684"
+reason = "Official 1.0.5 parity: unrecognized multi-label Host prefix returns 404 XML instead of path-style 200."
+failures = [
+  "[expect/status] at /expect/status: exchange #1, attempt 1: expected status 200, observed 404",
+  "[expect/headers_present] at /expect/headers_present/content-type: exchange #1, attempt 1: expected `content-type: text/plain; charset=utf-8`, observed `application/xml`",
+  "[expect/body.exact_utf8] at /expect/body: exchange #1, attempt 1: bodies differ at byte 0 (expected 14 bytes, observed 192 bytes)\n    expected: virtual hosted\n    observed: <?xml version=\\\"1.0\\\" encoding=\\\"UTF-8\\\"?>\\n<…",
+]
+expires = 2027-02-01
+
+[[ruling]]
+case = "c-host-0010"
+ledger = "rustfs/backlog#2684"
+reason = "Official 1.0.5 parity: punycode Host bucket label is rejected with 400 XML instead of falling back to path style."
+failures = [
+  "[expect/status] at /expect/status: exchange #1, attempt 1: expected status 200, observed 400",
+  "[expect/headers_present] at /expect/headers_present/content-type: exchange #1, attempt 1: expected `content-type: text/plain; charset=utf-8`, observed `application/xml`",
+  "[expect/body.exact_utf8] at /expect/body: exchange #1, attempt 1: bodies differ at byte 0 (expected 14 bytes, observed 222 bytes)\n    expected: virtual hosted\n    observed: <?xml version=\\\"1.0\\\" encoding=\\\"UTF-8\\\"?>\\n<…",
+]
+expires = 2027-02-01
+
+[[ruling]]
+case = "c-host-0011"
+ledger = "rustfs/backlog#2684"
+reason = "Official 1.0.5 parity: illegal Host bucket label is rejected with 400 XML instead of falling back to path style."
+failures = [
+  "[expect/status] at /expect/status: exchange #1, attempt 1: expected status 200, observed 400",
+  "[expect/headers_present] at /expect/headers_present/content-type: exchange #1, attempt 1: expected `content-type: text/plain; charset=utf-8`, observed `application/xml`",
+  "[expect/body.exact_utf8] at /expect/body: exchange #1, attempt 1: bodies differ at byte 0 (expected 14 bytes, observed 222 bytes)\n    expected: virtual hosted\n    observed: <?xml version=\\\"1.0\\\" encoding=\\\"UTF-8\\\"?>\\n<…",
+]
+expires = 2027-02-01
+
+[[ruling]]
+case = "c-lifecycle-0013"
+ledger = "rustfs/backlog#2684"
+reason = "Official 1.0.5 parity: NoSuchLifecycleConfiguration message includes a trailing period and omits HostId."
+failures = [
+  "[expect/body.exact_utf8] at /expect/body: exchange #1, attempt 1: bodies differ at byte 138 (expected 220 bytes, observed 192 bytes)\n    expected: …ation does not exist</Message><RequestId>__REDACTED__</Reque…\n    observed: …ation does not exist.</Message><RequestId>__REDACTED__</Requ…",
+]
+expires = 2027-02-01
+
+[[ruling]]
+case = "c-location-0001"
+ledger = "rustfs/backlog#2684"
+reason = "Official 1.0.5 parity: single-region server rejects creating the foreign-region fixture bucket with status 400."
+failure = "[runner/fixture-refused] at /setup: external fixture PUT for bucket `conf-location-far` returned status 400; the failed create is not owned"
+expires = 2027-02-01
+
+[[ruling]]
+case = "c-location-0005"
+ledger = "rustfs/backlog#2684"
+reason = "Official 1.0.5 parity: GetBucketLocation accepts the request and returns 200 LocationConstraint instead of 400 AuthorizationHeaderMalformed."
+failures = [
+  "[expect/status] at /expect/status: exchange #1, attempt 1: expected status 400, observed 200",
+  "[expect/error.code] at /expect/error/code: exchange #1, attempt 1: expected <Code>AuthorizationHeaderMalformed</Code>, the body carried no <Code> element at all",
+  "[expect/error.request_id_present] at /expect/error/request_id_present: exchange #1, attempt 1: expected <RequestId> to be present and non-empty, it was absent",
+  "[expect/body.contains_utf8] at /expect/body: exchange #1, attempt 1: the body does not contain \"<Code>AuthorizationHeaderMalformed</Code>\"",
+  "[expect/body.contains_utf8] at /expect/body: exchange #1, attempt 1: the body does not contain \"<Region>us-east-1</Region>\"",
+  "[expect/body.not_contains_utf8] at /expect/body: exchange #1, attempt 1: the body must not contain \"<LocationConstraint\", found at byte 38",
+]
+expires = 2027-02-01
+
+[[ruling]]
+case = "c-lock-0011"
+ledger = "rustfs/backlog#2684"
+reason = "Official 1.0.5 parity: ObjectLockConfigurationNotFoundError XML omits the HostId element."
+failures = [
+  "[expect/body.exact_utf8] at /expect/body: exchange #1, attempt 1: bodies differ at byte 206 (expected 242 bytes, observed 213 bytes)\n    expected: …ACTED__</RequestId><HostId>__REDACTED__</HostId></Error>\n    observed: …ACTED__</RequestId></Error>",
+]
+expires = 2027-02-01
+
+[[ruling]]
+case = "c-lock-0029"
+ledger = "rustfs/backlog#2684"
+reason = "Official 1.0.5 parity: NoSuchBucket XML on GetObjectLockConfiguration omits the HostId element."
+failures = [
+  "[expect/body.exact_utf8] at /expect/body: exchange #1, attempt 1: bodies differ at byte 161 (expected 197 bytes, observed 168 bytes)\n    expected: …ACTED__</RequestId><HostId>__REDACTED__</HostId></Error>\n    observed: …ACTED__</RequestId></Error>",
+]
+expires = 2027-02-01
+
+[[ruling]]
+case = "c-naming-0033"
+ledger = "rustfs/backlog#2684"
+reason = "Official 1.0.5 parity: escaped slash in the first path segment fails signature verification (403 SignatureDoesNotMatch) before bucket-name validation."
+failures = [
+  "[expect/status] at /expect/status: exchange #1, attempt 1: expected status 400, observed 403",
+  "[expect/error.code] at /expect/error/code: exchange #1, attempt 1: expected <Code>InvalidBucketName</Code>, the body carried <Code>SignatureDoesNotMatch</Code>",
+  "[expect/body.contains_utf8] at /expect/body: exchange #1, attempt 1: the body does not contain \"<Code>InvalidBucketName</Code>\"",
+]
+expires = 2027-02-01
+
+[[ruling]]
+case = "c-replication-0013"
+ledger = "rustfs/backlog#2684"
+reason = "Official 1.0.5 parity: ReplicationConfigurationNotFoundError carries the legacy 'replication not found' message."
+failures = [
+  "[expect/body.exact_utf8] at /expect/body: exchange #1, attempt 1: bodies differ at byte 105 (expected 230 bytes, observed 179 bytes)\n    expected: …rror</Code><Message>The replication configuration was not fo…\n    observed: …rror</Code><Message>replication not found</Message><RequestI…",
+]
+expires = 2027-02-01
+
+[[ruling]]
+case = "c-sig-0506"
+ledger = "rustfs/backlog#2684"
+reason = "Official 1.0.5 parity: SigV2 request using x-amz-date with an empty Date slot is rejected with 400."
+failures = [
+  "[expect/status] at /expect/status: exchange #1, attempt 1: expected status 200, observed 400",
+  "[expect/body.contains_utf8] at /expect/body: exchange #1, attempt 1: the body does not contain \"<ListAllMyBucketsResult\"",
+]
+expires = 2027-02-01
+
+[[ruling]]
+case = "c-sig-0597"
+ledger = "rustfs/backlog#2684"
+reason = "Official 1.0.5 parity: empty credential scope region returns SignatureDoesNotMatch for both header and presigned exchanges."
+failures = [
+  "[expect/error.code] at /exchanges/0/expect/error/code: exchange #1 header, attempt 1: expected <Code>InvalidAccessKeyId</Code>, the body carried <Code>SignatureDoesNotMatch</Code>",
+  "[expect/body.contains_utf8] at /exchanges/0/expect/body: exchange #1 header, attempt 1: the body does not contain \"<Code>InvalidAccessKeyId</Code>\"",
+  "[expect/error.code] at /exchanges/1/expect/error/code: exchange #2 presigned, attempt 1: expected <Code>AccessDenied</Code>, the body carried <Code>SignatureDoesNotMatch</Code>",
+  "[expect/body.contains_utf8] at /exchanges/1/expect/body: exchange #2 presigned, attempt 1: the body does not contain \"<Code>AccessDenied</Code>\"",
+]
+expires = 2027-02-01
+
+[[ruling]]
+case = "c-sig-0599"
+ledger = "rustfs/backlog#2684"
+reason = "Official 1.0.5 parity: out-of-grammar credential scope region returns 403 SignatureDoesNotMatch instead of 400 AuthorizationHeaderMalformed."
+failures = [
+  "[expect/status] at /expect/status: exchange #1, attempt 1: expected status 400, observed 403",
+  "[expect/error.code] at /expect/error/code: exchange #1, attempt 1: expected <Code>AuthorizationHeaderMalformed</Code>, the body carried <Code>SignatureDoesNotMatch</Code>",
+  "[expect/body.contains_utf8] at /expect/body: exchange #1, attempt 1: the body does not contain \"<Code>AuthorizationHeaderMalformed</Code>\"",
+  "[expect/body.contains_utf8] at /expect/body: exchange #1, attempt 1: the body does not contain \"<Region>us-east-1</Region>\"",
+]
+expires = 2027-02-01
+
+[[ruling]]
+case = "c-sig-0600"
+ledger = "rustfs/backlog#2684"
+reason = "Official 1.0.5 parity: overlong credential scope region returns SignatureDoesNotMatch instead of InvalidAccessKeyId."
+failures = [
+  "[expect/error.code] at /expect/error/code: exchange #1, attempt 1: expected <Code>InvalidAccessKeyId</Code>, the body carried <Code>SignatureDoesNotMatch</Code>",
+  "[expect/body.contains_utf8] at /expect/body: exchange #1, attempt 1: the body does not contain \"<Code>InvalidAccessKeyId</Code>\"",
+]
+expires = 2027-02-01
+
+[[ruling]]
+case = "c-sig-0604"
+ledger = "rustfs/backlog#2684"
+reason = "Official 1.0.5 parity: unsigned x-amz-* metadata header returns AccessDenied after credential lookup instead of SignatureDoesNotMatch."
+failure = "[expect/error.code] at /expect/error/code: exchange #1, attempt 1: expected <Code>SignatureDoesNotMatch</Code>, the body carried <Code>AccessDenied</Code>"
+expires = 2027-02-01
+
+[[ruling]]
+case = "c-sig-0605"
+ledger = "rustfs/backlog#2684"
+reason = "Official 1.0.5 parity: presigned URL with unlisted payload declaration header returns AccessDenied instead of SignatureDoesNotMatch."
+failure = "[expect/error.code] at /expect/error/code: exchange #1, attempt 1: expected <Code>SignatureDoesNotMatch</Code>, the body carried <Code>AccessDenied</Code>"
 expires = 2027-02-01
