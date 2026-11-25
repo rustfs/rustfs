@@ -42,8 +42,7 @@ use crate::bucket::lifecycle::lifecycle::TRANSITION_COMPLETE;
 use crate::bucket::metadata_sys;
 use crate::bucket::metadata_sys::ObjectLockConfigState;
 use crate::bucket::object_lock::objectlock_sys::{
-    check_object_lock_for_deletion_with_state, check_retention_for_modification, replication_delete_may_bypass_governance,
-    replication_write_may_pass_worm_gate,
+    check_object_lock_for_deletion_with_state, check_retention_for_modification, replication_write_may_pass_worm_gate,
 };
 #[cfg(test)]
 use crate::bucket::replication::ReplicationState;
@@ -7016,15 +7015,14 @@ async fn check_object_lock_delete(
         return Ok(());
     }
 
-    // An authorized replicated version purge already passed this gate on the
-    // source with the bypass it carried there, so it clears GOVERNANCE
-    // retention here without the header; COMPLIANCE and legal hold still
-    // block below (see `replication_delete_may_bypass_governance`, #6850).
+    // The serving layer decides GOVERNANCE bypass for both explicit bypass
+    // headers and replicated version purges (#6850) after authorizing the
+    // caller for `s3:BypassGovernanceRetention`. `replication_request` alone
+    // does not confer bypass; COMPLIANCE and legal hold always block below.
     let bypass_governance = opts
         .object_lock_delete
         .as_ref()
-        .is_some_and(|delete_opts| delete_opts.bypass_governance)
-        || replication_delete_may_bypass_governance(opts);
+        .is_some_and(|delete_opts| delete_opts.bypass_governance);
     let blocked = match opts.object_lock_config_snapshot.as_deref() {
         Some(snapshot) => check_object_lock_for_deletion_with_state(snapshot.state(), obj_info, bypass_governance)?.is_some(),
         None => {
@@ -14695,17 +14693,36 @@ mod tests {
         }
     }
 
+    fn replicated_version_purge_opts_with_bypass() -> ObjectOptions {
+        ObjectOptions {
+            object_lock_delete: Some(crate::storage_api_contracts::object::ObjectLockDeleteOptions { bypass_governance: true }),
+            ..explicit_version_delete_opts(true)
+        }
+    }
+
     // Issue #6850: a replicated version purge carries no bypass header, so the
-    // GOVERNANCE gate must honor the source's already-judged bypass instead of
-    // keeping the sites permanently diverged.
+    // GOVERNANCE gate honors the bypass granted by the serving layer after
+    // authorizing `s3:BypassGovernanceRetention`.
     #[tokio::test]
     async fn test_check_object_lock_delete_allows_replicated_governance_version_purge() {
         let obj_info = governance_retained_obj_info();
-        let opts = explicit_version_delete_opts(true);
+        let opts = replicated_version_purge_opts_with_bypass();
 
         check_object_lock_delete(&bootstrap_ctx(), "bucket", "object", &obj_info, &opts)
             .await
             .expect("an authorized replicated version purge must pass GOVERNANCE retention (#6850)");
+    }
+
+    #[tokio::test]
+    async fn test_check_object_lock_delete_blocks_replicated_governance_version_purge_without_bypass() {
+        let obj_info = governance_retained_obj_info();
+        let opts = explicit_version_delete_opts(true);
+
+        let err = check_object_lock_delete(&bootstrap_ctx(), "bucket", "object", &obj_info, &opts)
+            .await
+            .expect_err("the replication flag alone must not clear GOVERNANCE retention");
+
+        assert!(matches!(err, StorageError::PrefixAccessDenied(_, _)));
     }
 
     #[tokio::test]
@@ -14733,7 +14750,7 @@ mod tests {
             user_defined: Arc::new(user_defined),
             ..Default::default()
         };
-        let opts = explicit_version_delete_opts(true);
+        let opts = replicated_version_purge_opts_with_bypass();
 
         let err = check_object_lock_delete(&bootstrap_ctx(), "bucket", "object", &obj_info, &opts)
             .await
@@ -14750,7 +14767,7 @@ mod tests {
             user_defined: Arc::new(user_defined),
             ..Default::default()
         };
-        let opts = explicit_version_delete_opts(true);
+        let opts = replicated_version_purge_opts_with_bypass();
 
         let err = check_object_lock_delete(&bootstrap_ctx(), "bucket", "object", &obj_info, &opts)
             .await
