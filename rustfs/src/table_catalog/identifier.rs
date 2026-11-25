@@ -180,8 +180,9 @@ impl TablePathResolver {
 }
 
 pub fn is_reserved_table_object_key(object_key: &str) -> bool {
-    object_key == TABLE_RESERVED_PREFIX
-        || object_key
+    let normalized = object_key.trim_start_matches('/');
+    normalized == TABLE_RESERVED_PREFIX
+        || normalized
             .strip_prefix(TABLE_RESERVED_PREFIX)
             .is_some_and(|rest| rest.starts_with('/'))
 }
@@ -448,7 +449,7 @@ pub(crate) fn is_valid_table_metadata_file_name(metadata_file_name: &str) -> boo
 /// that key would wait on its own shared lock for the object write lock and
 /// stall concurrent mutations in the bucket until the lock timeout.
 pub(crate) fn is_table_bucket_publication_lock_key(object_key: &str) -> bool {
-    object_key == rustfs_common::table_catalog::TABLE_BUCKET_PUBLICATION_LOCK_PATH
+    object_key.trim_start_matches('/') == rustfs_common::table_catalog::TABLE_BUCKET_PUBLICATION_LOCK_PATH
 }
 
 pub fn validate_object_mutation(table_bucket_enabled: bool, object_key: &str) -> Result<(), TableObjectMutationError> {
