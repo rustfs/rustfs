@@ -2726,15 +2726,18 @@ impl LocalDisk {
                     } else {
                         &[STORAGE_FORMAT_FILE_BACKUP, PREPARED]
                     };
-                    let _ = os::discard_staged_files(&file_path, &bucket_path, &publication_root, &transaction.to_string(), names);
+                    let _ =
+                        os::discard_staged_files(&file_path, &bucket_path, &publication_root, &transaction.to_string(), names);
                 };
                 let old_data_path = old_dir.map(|uuid| file_path.join(uuid.to_string())).filter(|p| p.is_dir());
+                #[cfg(all(test, unix))]
+                fused_prepare_checkpoint::Stage::BeforePublicationSync.run(&file_path);
                 if sync && let Err(err) = os::fsync_dir_std(&file_path) {
                     discard_staged_proofs();
                     return Err(err);
                 }
                 #[cfg(all(test, unix))]
-                fused_prepare_checkpoint::run(&file_path);
+                fused_prepare_checkpoint::Stage::BeforeHeadChange.run(&file_path);
                 let mut reserved_data_path = None;
                 if let Some(old_path) = old_data_path {
                     let reserved_marker = old_path.join(format!("{RESERVED_DELETE_DATA_DIR_MARKER_PREFIX}{transaction}"));
@@ -2753,13 +2756,13 @@ impl LocalDisk {
                     }
                     reserved_data_path = Some((old_path, reserved_marker));
                 }
-                if let Some(ref target_bytes) = target {
+                let head_change = if let Some(ref target_bytes) = target {
                     // A provisional head must stay outside the published recovery transaction.
                     let target_in_rollback = destination.join(TARGET);
                     let linked_xl = tempfile::Builder::new()
                         .prefix("delete-xl-")
                         .make_in(&staging_root, |path| std::fs::hard_link(&target_in_rollback, path));
-                    let write_res = if let Ok(linked_xl) = linked_xl {
+                    if let Ok(linked_xl) = linked_xl {
                         linked_xl.persist(&xl_path).map_err(|err| err.error)
                     } else {
                         (|| -> std::io::Result<()> {
@@ -2770,21 +2773,22 @@ impl LocalDisk {
                             }
                             std::fs::rename(staged_xl.path(), &xl_path)
                         })()
-                    };
-                    if let Err(err) = write_res {
+                    }
+                } else {
+                    match std::fs::remove_file(&xl_path) {
+                        Err(err) if err.kind() == ErrorKind::NotFound => Ok(()),
+                        result => result,
+                    }
+                };
+                if let Err(err) = head_change {
+                    // A rename or unlink may have taken effect despite returning an error.
+                    // Keep the journal and backup unless this drive still has the original head.
+                    if regular_metadata_bytes(&xl_path).is_ok_and(|head| head.as_deref() == Some(buf.as_slice())) {
                         if let Some((_, reserved_marker)) = &reserved_data_path {
                             let _ = std::fs::remove_file(reserved_marker);
                         }
                         discard_staged_proofs();
-                        return Err(err);
                     }
-                } else if let Err(err) = std::fs::remove_file(&xl_path)
-                    && err.kind() != ErrorKind::NotFound
-                {
-                    if let Some((_, reserved_marker)) = &reserved_data_path {
-                        let _ = std::fs::remove_file(reserved_marker);
-                    }
-                    discard_staged_proofs();
                     return Err(err);
                 }
                 if sync {
@@ -3334,9 +3338,16 @@ mod fused_prepare_checkpoint {
     use std::sync::{LazyLock, Mutex};
 
     type Hook = Box<dyn FnOnce() + Send>;
-    static HOOKS: LazyLock<Mutex<HashMap<PathBuf, Hook>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
+    type Key = (PathBuf, Stage);
+    static HOOKS: LazyLock<Mutex<HashMap<Key, Hook>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
 
-    pub(super) struct Guard(PathBuf);
+    #[derive(Clone, Copy, Eq, Hash, PartialEq)]
+    pub(super) enum Stage {
+        BeforePublicationSync,
+        BeforeHeadChange,
+    }
+
+    pub(super) struct Guard(Key);
 
     impl Drop for Guard {
         fn drop(&mut self) {
@@ -3344,21 +3355,24 @@ mod fused_prepare_checkpoint {
         }
     }
 
-    pub(super) fn install(root: &Path, hook: impl FnOnce() + Send + 'static) -> Guard {
-        assert!(
-            HOOKS
-                .lock()
-                .expect("checkpoint hooks")
-                .insert(root.to_path_buf(), Box::new(hook))
-                .is_none()
-        );
-        Guard(root.to_path_buf())
-    }
+    impl Stage {
+        pub(super) fn install(self, root: &Path, hook: impl FnOnce() + Send + 'static) -> Guard {
+            let key = (root.to_path_buf(), self);
+            assert!(
+                HOOKS
+                    .lock()
+                    .expect("checkpoint hooks")
+                    .insert(key.clone(), Box::new(hook))
+                    .is_none()
+            );
+            Guard(key)
+        }
 
-    pub(super) fn run(root: &Path) {
-        let hook = HOOKS.lock().expect("checkpoint hooks").remove(root);
-        if let Some(hook) = hook {
-            hook();
+        pub(super) fn run(self, root: &Path) {
+            let hook = HOOKS.lock().expect("checkpoint hooks").remove(&(root.to_path_buf(), self));
+            if let Some(hook) = hook {
+                hook();
+            }
         }
     }
 }
@@ -3728,14 +3742,10 @@ mod tests {
         let child = directory.join("child");
         let marker = child.join(STORAGE_FORMAT_FILE);
         let write_marker = marker.clone();
-        let _hook = os::prepared_publication_test_hooks::install_at(
-            os::prepared_publication_test_hooks::Stage::DirFsync,
-            &root,
-            move || {
-                std::fs::create_dir(&child).unwrap();
-                std::fs::write(&write_marker, b"independent child metadata").unwrap();
-            },
-        );
+        let _hook = fused_prepare_checkpoint::Stage::BeforePublicationSync.install(&root, move || {
+            std::fs::create_dir(&child).unwrap();
+            std::fs::write(&write_marker, b"independent child metadata").unwrap();
+        });
         os::fsync_dir_recorder::set_failure(&root, ErrorKind::PermissionDenied);
         let opts = DeleteOptions {
             recoverable_delete: true,
@@ -3751,6 +3761,32 @@ mod tests {
         assert_eq!(std::fs::read(marker).unwrap(), b"independent child metadata");
         assert!(!directory.join(STORAGE_FORMAT_FILE_BACKUP).exists());
         assert!(!directory.join(PREPARED).exists());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn delete_recovery_failed_head_change_retains_proofs_if_head_cannot_be_verified() {
+        let (_temp, disk, _original, source) = fixture().await;
+        let root = disk.io_get_object_path("recovery", "object").unwrap();
+        let head = root.join(STORAGE_FORMAT_FILE);
+        let transaction = Uuid::new_v4();
+        let directory = root.join(transaction.to_string());
+        let _hook = fused_prepare_checkpoint::Stage::BeforeHeadChange.install(&root, move || {
+            std::fs::remove_file(&head).unwrap();
+            std::fs::create_dir(&head).unwrap();
+        });
+        let opts = DeleteOptions {
+            recoverable_delete: true,
+            old_data_dir: Some(transaction),
+            ..Default::default()
+        };
+        let result = disk
+            .delete_versions_internal("recovery", "object", &[request()], &opts, None)
+            .await;
+        assert!(result.is_err());
+        assert_eq!(std::fs::read(directory.join(STORAGE_FORMAT_FILE_BACKUP)).unwrap(), source);
+        assert!(directory.join(PREPARED).is_file());
+        assert!(root.join(STORAGE_FORMAT_FILE).is_dir());
     }
 
     #[tokio::test]
@@ -7467,7 +7503,7 @@ mod tests {
         let transaction = Uuid::new_v4();
         let source_root = root.clone();
         let copy_root = checkpoint_root.clone();
-        let _capture = fused_prepare_checkpoint::install(&root, move || {
+        let _capture = fused_prepare_checkpoint::Stage::BeforeHeadChange.install(&root, move || {
             let source = source_root.join(transaction.to_string());
             let destination = copy_root.join(transaction.to_string());
             std::fs::create_dir(&destination).expect("create checkpoint transaction");
