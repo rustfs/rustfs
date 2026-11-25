@@ -192,7 +192,7 @@ pub enum WalkVersionsSortOrder {
 /// `version_id` identifies the S3 version while these fields identify the
 /// concrete generation observed before the delete was queued. This matters for
 /// the reusable null version ID in versioning-suspended buckets.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ObjectToDeleteIdentity {
     pub data_dir: Option<Uuid>,
     pub mod_time: Option<OffsetDateTime>,
@@ -267,7 +267,7 @@ impl DeleteObjectCondition {
     }
 }
 
-#[derive(Debug, Default, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Default, Clone)]
 pub struct ObjectToDelete {
     pub object_name: String,
     pub version_id: Option<Uuid>,

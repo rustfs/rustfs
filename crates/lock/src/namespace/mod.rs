@@ -67,14 +67,6 @@ impl NamespaceLockWrapper {
         self.lock.namespace()
     }
 
-    /// Let contended distributed writers retry through the first voter in
-    /// topology order. Other voters can still form quorum without that voter.
-    pub fn prefer_first_voter_on_contention(&mut self) {
-        if let NamespaceLock::Distributed(lock) = &mut self.lock {
-            lock.prefer_first_voter_on_contention();
-        }
-    }
-
     /// Acquire write lock (exclusive lock) with timeout
     /// Returns the guard if acquisition succeeds, or an error if it fails
     pub async fn get_write_lock(&self, timeout: Duration) -> std::result::Result<NamespaceLockGuard, crate::error::LockError> {

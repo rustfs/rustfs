@@ -7163,58 +7163,6 @@ mod multipart_orphan_control_probe_tests {
     }
 }
 
-/// Reclaim the named files from a published staging directory. Other entries
-/// can be live child objects. Leave the directory in place when it is nonempty.
-pub(in crate::disk) fn discard_staged_files(
-    parent: &Path,
-    base: &Path,
-    publication_root: &PublicationRoot,
-    directory_name: &str,
-    files: &[&str],
-) -> io::Result<()> {
-    #[cfg(unix)]
-    {
-        use rustix::fs::{AtFlags, Mode, OFlags, openat, unlinkat};
-        let parents = open_existing_directory_below_base_std(parent, base, publication_root)?;
-        let parent = parents.last().ok_or_else(|| io::Error::other("missing staging parent"))?;
-        let directory = openat(
-            parent,
-            directory_name,
-            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-            Mode::empty(),
-        )?;
-        for &name in files {
-            match unlinkat(&directory, name, AtFlags::empty()) {
-                Ok(()) | Err(rustix::io::Errno::NOENT) => {}
-                Err(error) => return Err(error.into()),
-            }
-        }
-        unlinkat(parent, directory_name, AtFlags::REMOVEDIR)?;
-        Ok(())
-    }
-    #[cfg(windows)]
-    {
-        existing_base_directory_suffix(parent, base)?;
-        let _parent = lock_windows_directory_tree(parent, publication_root)?;
-        let path = parent.join(directory_name);
-        let directory = lock_windows_directory_tree(&path, publication_root)?;
-        for &name in files {
-            match std::fs::remove_file(path.join(name)) {
-                Ok(()) => {}
-                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-                Err(error) => return Err(error),
-            }
-        }
-        drop(directory);
-        std::fs::remove_dir(path)
-    }
-    #[cfg(not(any(unix, windows)))]
-    {
-        let _ = (parent, base, publication_root, directory_name, files);
-        Err(io::ErrorKind::Unsupported.into())
-    }
-}
-
 /// Pin an existing MPU tree without creating any missing source directory.
 pub(crate) fn pin_multipart_source_directory(
     directory: &Path,

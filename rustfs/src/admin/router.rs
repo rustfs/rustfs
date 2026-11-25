@@ -12,6 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+mod replication_probe_cleanup;
+
+use self::replication_probe_cleanup::cleanup_replication_probe;
 use super::storage_api::bucket::bandwidth::monitor::BandwidthDetails;
 use super::storage_api::bucket::metadata_sys;
 use super::storage_api::bucket::replication::{self, BucketReplicationResyncStatus, BucketStats, ReplicationStatusType};
@@ -3002,118 +3005,6 @@ async fn delete_replication_probe_object(
         .await
         .map(|output| output.version_id().map(ToOwned::to_owned))
         .map_err(S3ClientError::from)
-}
-
-async fn delete_replication_probe_version(
-    target_client: &TargetClient,
-    target_bucket: &str,
-    probe_key: &str,
-    version_id: &str,
-) -> Result<(), S3ClientError> {
-    target_client
-        .client
-        .delete_object()
-        .bucket(target_bucket)
-        .key(probe_key)
-        .version_id(version_id)
-        .send()
-        .await
-        .map(|_| ())
-        .map_err(S3ClientError::from)
-}
-
-/// The VersionDelete phase already removed the probe version the cleanup is
-/// handed, and a strict S3 target (Wasabi) answers a second DELETE of that
-/// id with `NoSuchVersion` where RustFS/MinIO answer 204: the goal is met
-/// either way.
-fn probe_version_already_gone(err: &S3ClientError) -> bool {
-    matches!(err.code.as_deref(), Some("NoSuchKey" | "NoSuchVersion"))
-}
-
-async fn cleanup_replication_probe<'a>(
-    target_client: &TargetClient,
-    target_bucket: &str,
-    probe_key: &str,
-    known_version_ids: impl IntoIterator<Item = Option<&'a str>>,
-) -> Result<(), String> {
-    let mut errors = Vec::new();
-    let mut deleted_ids = HashSet::new();
-    for version_id in known_version_ids.into_iter().flatten() {
-        if deleted_ids.insert(version_id.to_string())
-            && let Err(err) = delete_replication_probe_version(target_client, target_bucket, probe_key, version_id).await
-            && !probe_version_already_gone(&err)
-        {
-            errors.push(format_replication_check_client_error(
-                &err,
-                ReplicationCheckFailureContext::DeleteObjectVersion,
-            ));
-        }
-    }
-
-    let mut key_marker = None;
-    let mut version_id_marker = None;
-    loop {
-        let output = target_client
-            .client
-            .list_object_versions()
-            .bucket(target_bucket)
-            .prefix(probe_key)
-            .set_key_marker(key_marker.clone())
-            .set_version_id_marker(version_id_marker.clone())
-            .send()
-            .await
-            .map_err(|err| {
-                format_replication_check_client_error(
-                    &S3ClientError::from(err),
-                    ReplicationCheckFailureContext::DeleteObjectVersion,
-                )
-            })?;
-
-        let mut discovered_ids = Vec::new();
-        discovered_ids.extend(
-            output
-                .versions()
-                .iter()
-                .filter(|version| version.key() == Some(probe_key))
-                .filter_map(|version| version.version_id().map(ToOwned::to_owned)),
-        );
-        discovered_ids.extend(
-            output
-                .delete_markers()
-                .iter()
-                .filter(|marker| marker.key() == Some(probe_key))
-                .filter_map(|marker| marker.version_id().map(ToOwned::to_owned)),
-        );
-        for version_id in discovered_ids {
-            if deleted_ids.insert(version_id.clone())
-                && let Err(err) = delete_replication_probe_version(target_client, target_bucket, probe_key, &version_id).await
-                && !probe_version_already_gone(&err)
-            {
-                errors.push(format_replication_check_client_error(
-                    &err,
-                    ReplicationCheckFailureContext::DeleteObjectVersion,
-                ));
-            }
-        }
-
-        if output.is_truncated() != Some(true) {
-            break;
-        }
-        let next_key_marker = output.next_key_marker().map(ToOwned::to_owned);
-        let next_version_id_marker = output.next_version_id_marker().map(ToOwned::to_owned);
-        if next_key_marker.is_none() || next_key_marker == key_marker {
-            errors.push("target returned an invalid cleanup pagination marker".to_string());
-            break;
-        }
-        key_marker = next_key_marker;
-        version_id_marker = next_version_id_marker;
-    }
-
-    if errors.is_empty() {
-        Ok(())
-    } else {
-        Err(bound_replication_check_error(errors.join("; ")))
-    }
 }
 
 async fn source_bucket_requires_object_lock(bucket: &str) -> S3Result<bool> {

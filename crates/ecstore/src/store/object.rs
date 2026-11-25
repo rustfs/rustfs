@@ -2065,6 +2065,10 @@ fn batch_delete_creates_latest_marker(object: &ObjectToDelete, delete_config_sna
     versioned || version_suspended
 }
 
+fn batch_delete_action_key(object: &ObjectToDelete) -> (&str, Option<Uuid>) {
+    (object.object_name.as_str(), object.version_id)
+}
+
 fn batch_delete_targets_pool(creates_latest_marker: bool, marker_target_pool_idx: Option<usize>, pool_idx: usize) -> bool {
     !creates_latest_marker || marker_target_pool_idx == Some(pool_idx)
 }
@@ -6519,15 +6523,34 @@ impl ECStore {
         #[cfg(test)]
         inject_conditional_delete_post_admission_mutations(self, bucket).await;
 
-        // Conditions have already been evaluated per input. Equal remaining actions
-        // include the version, synthetic null semantics, identity guard and replication
-        // fields. Run each action once and return its committed result to every alias.
-        let mut actions = HashMap::with_capacity(objects.len());
-        if has_conditions {
+        if !has_conditions {
+            // Keys whose write lock failed are already reported in `del_errs`;
+            // the phase only runs for the keys this batch actually holds, and
+            // only its outcomes replace the outer per-key state.
+            let indices = (0..objects.len()).filter(|idx| del_errs[*idx].is_none()).collect::<Vec<_>>();
+            let (phase_deleted, mut phase_errors, mut phase_accounting) = self
+                .run_batch_delete_phase(
+                    bucket,
+                    &objects,
+                    &opts,
+                    BatchDeletePhasePlan {
+                        indices: &indices,
+                        pool_generations,
+                        marker_targets: &conditional_marker_targets,
+                    },
+                )
+                .await;
+            for idx in indices {
+                del_objects[idx] = phase_deleted[idx].clone();
+                del_errs[idx] = phase_errors[idx].take();
+                accounting[idx] = phase_accounting[idx].take();
+            }
+        } else {
+            let mut conditional_actions = HashMap::with_capacity(objects.len());
             let mut conditional_indices = Vec::with_capacity(objects.len());
             for (idx, object) in objects.iter().enumerate() {
                 if admitted_conditions[idx] && del_errs[idx].is_none() {
-                    let representative = *actions.entry(object).or_insert(idx);
+                    let representative = *conditional_actions.entry(batch_delete_action_key(object)).or_insert(idx);
                     representatives[idx] = representative;
                     if representative == idx {
                         conditional_indices.push(idx);
@@ -6553,54 +6576,66 @@ impl ECStore {
                     accounting[*idx] = receipts[*idx].take();
                 }
             }
-            // Only a successful guarded mutation can satisfy an ordinary alias.
-            // Callers providing their own generation guard still get an independent check.
-            actions.retain(|object, index| object.expected_identity.is_none() && del_errs[*index].is_none());
-        }
-        let mut ordinary_indices = Vec::with_capacity(objects.len());
-        for (idx, object) in objects.iter().enumerate() {
-            if requested_conditions[idx] || del_errs[idx].is_some() {
-                continue;
+            let successful_conditional_actions = conditional_actions
+                .into_iter()
+                .filter(|(_, idx)| del_errs[*idx].is_none())
+                .collect::<HashMap<_, _>>();
+            let mut ordinary_actions = HashMap::with_capacity(objects.len());
+            let mut ordinary_indices = Vec::with_capacity(objects.len());
+            for (idx, object) in objects.iter().enumerate() {
+                if requested_conditions[idx] || del_errs[idx].is_some() {
+                    continue;
+                }
+                let action = batch_delete_action_key(object);
+                if object.expected_identity.is_none()
+                    && let Some(representative) = successful_conditional_actions.get(&action)
+                {
+                    // Only a committed conditional action can satisfy its
+                    // unconditional alias. A CAS failure grants no deletion.
+                    representatives[idx] = *representative;
+                    continue;
+                }
+                let representative = *ordinary_actions.entry(action).or_insert(idx);
+                representatives[idx] = representative;
+                if representative == idx {
+                    ordinary_indices.push(idx);
+                }
             }
-            let representative = *actions.entry(object).or_insert(idx);
-            representatives[idx] = representative;
-            if representative == idx {
-                ordinary_indices.push(idx);
-            }
-        }
-        if !ordinary_indices.is_empty() {
-            // The guarded phase has finished all rollback/receipt work.
-            // These actions receive neither its CAS nor its transaction.
-            let (deleted, mut errors, mut receipts) = self
-                .run_batch_delete_phase(
-                    bucket,
-                    &objects,
-                    &opts,
-                    BatchDeletePhasePlan {
-                        indices: &ordinary_indices,
-                        pool_generations: HashMap::new(),
-                        marker_targets: &HashMap::new(),
-                    },
-                )
-                .await;
-            for idx in ordinary_indices {
-                del_objects[idx] = deleted[idx].clone();
-                del_errs[idx] = errors[idx].take();
-                accounting[idx] = receipts[idx].take();
+            if !ordinary_indices.is_empty() {
+                // The guarded phase has finished all rollback/receipt work.
+                // These actions receive neither its CAS nor its transaction.
+                let (deleted, mut errors, mut receipts) = self
+                    .run_batch_delete_phase(
+                        bucket,
+                        &objects,
+                        &opts,
+                        BatchDeletePhasePlan {
+                            indices: &ordinary_indices,
+                            pool_generations: HashMap::new(),
+                            marker_targets: &HashMap::new(),
+                        },
+                    )
+                    .await;
+                for idx in ordinary_indices {
+                    del_objects[idx] = deleted[idx].clone();
+                    del_errs[idx] = errors[idx].take();
+                    accounting[idx] = receipts[idx].take();
+                }
             }
         }
 
-        for (idx, representative) in representatives.into_iter().enumerate() {
-            if representative != idx {
-                del_objects[idx] = del_objects[representative].clone();
-                del_errs[idx] = del_errs[representative].clone();
-            }
-        }
         if has_conditions {
+            for (idx, representative) in representatives.into_iter().enumerate() {
+                if representative != idx {
+                    del_objects[idx] = del_objects[representative].clone();
+                    del_errs[idx] = del_errs[representative].clone();
+                    accounting[idx] = None;
+                }
+            }
             let mut first_successes = HashMap::with_capacity(objects.len());
             for (idx, object) in objects.iter().enumerate() {
                 if del_errs[idx].is_none() {
-                    let first = *first_successes.entry(object).or_insert(idx);
+                    let first = *first_successes.entry(batch_delete_action_key(object)).or_insert(idx);
                     if first != idx && accounting[idx].is_some() {
                         accounting[first] = accounting[idx].take();
                     }
@@ -11010,46 +11045,6 @@ mod tests {
                 assert_eq!(body, b"replacement");
             }
         }
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn ordinary_batch_delete_returns_the_stored_marker_to_every_duplicate() {
-        let bucket = "ordinary-duplicate-markers";
-        let key = "target";
-        let (_dirs, store) = multipool_delete_test_store(bucket, true).await;
-        let options = ObjectOptions {
-            versioned: true,
-            ..Default::default()
-        };
-        let original = store.pools[1]
-            .put_object(bucket, key, &mut PutObjReader::from_vec(b"original".to_vec()), &options)
-            .await
-            .expect("write version before marker");
-        let action = ObjectToDelete {
-            object_name: key.to_owned(),
-            ..Default::default()
-        };
-        let (deleted, errors) = store.handle_delete_objects(bucket, vec![action; 16], options).await;
-        assert!(errors.iter().all(Option::is_none), "all input slots succeed: {errors:?}");
-        let versions = store
-            .inner_list_object_versions(bucket, key, None, None, None, 20)
-            .await
-            .expect("list actual marker and retained version");
-        let markers: Vec<_> = versions.objects.iter().filter(|entry| entry.delete_marker).collect();
-        assert_eq!(markers.len(), 1);
-        let marker = markers[0].version_id.expect("stored marker has an ID");
-        assert!(
-            versions
-                .objects
-                .iter()
-                .any(|entry| !entry.delete_marker && entry.version_id == original.version_id)
-        );
-        assert_eq!(deleted.len(), 16);
-        assert!(
-            deleted
-                .iter()
-                .all(|row| row.object_name == key && row.delete_marker_version_id == Some(marker))
-        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

@@ -119,7 +119,7 @@ impl From<VersionPurgeStatusType> for ReplicationStatusType {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum VersionPurgeStatusType {
     Pending,
     Complete,
