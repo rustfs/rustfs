@@ -217,6 +217,7 @@ struct Inner {
     complete_multipart_calls: Vec<CompleteCall>,
     head_object_calls: Vec<HeadObjectCall>,
     delete_object_calls: Vec<DeleteObjectCall>,
+    create_bucket_calls: Vec<String>,
     delete_bucket_calls: Vec<String>,
 
     // Cancellation-test support. When stall_upload_part is true every
@@ -276,6 +277,7 @@ impl Inner {
             complete_multipart_calls: Vec::new(),
             head_object_calls: Vec::new(),
             delete_object_calls: Vec::new(),
+            create_bucket_calls: Vec::new(),
             delete_bucket_calls: Vec::new(),
             stall_upload_part: false,
             upload_part_entered: None,
@@ -563,6 +565,11 @@ impl DummyBackend {
             .push_back(Ok(ListObjectsV2Output::default()));
     }
 
+    /// Queue a custom list_objects_v2 Ok response.
+    pub fn queue_list_objects_v2_ok(&self, out: ListObjectsV2Output) {
+        self.inner.lock().expect("lock").list_objects_v2.push_back(Ok(out));
+    }
+
     /// Queue a list_objects_v2 Ok response listing the given keys as a
     /// single, non-truncated page. Recursive-delete tests use this to give
     /// the delete loop something to iterate over.
@@ -732,6 +739,11 @@ impl DummyBackend {
     /// Snapshot the recorded delete_object invocations.
     pub fn delete_object_calls(&self) -> Vec<DeleteObjectCall> {
         self.inner.lock().expect("lock").delete_object_calls.clone()
+    }
+
+    /// Snapshot the buckets passed to create_bucket.
+    pub fn create_bucket_calls(&self) -> Vec<String> {
+        self.inner.lock().expect("lock").create_bucket_calls.clone()
     }
 
     /// Snapshot the buckets passed to delete_bucket.
@@ -954,8 +966,10 @@ impl StorageBackend for DummyBackend {
             .unwrap_or(Ok(None))
     }
 
-    async fn create_bucket(&self, _bucket: &str, _credentials: &Credentials) -> Result<CreateBucketOutput, Self::Error> {
-        match self.inner.lock().expect("lock").create_bucket.pop_front() {
+    async fn create_bucket(&self, bucket: &str, _credentials: &Credentials) -> Result<CreateBucketOutput, Self::Error> {
+        let mut inner = self.inner.lock().expect("lock");
+        inner.create_bucket_calls.push(bucket.to_string());
+        match inner.create_bucket.pop_front() {
             Some(r) => r,
             None => Err(DummyError::Unconfigured("create_bucket")),
         }

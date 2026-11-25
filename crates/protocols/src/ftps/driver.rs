@@ -15,8 +15,10 @@
 use crate::common::client::s3::StorageBackend as S3StorageBackend;
 use crate::common::gateway::S3Action;
 use async_trait::async_trait;
+use bytes::Bytes;
+use rustfs_gateway_stream::ByteStream;
 use rustfs_gateway_types::dto::*;
-use rustfs_gateway_types::{BucketName, OpaqueString};
+use rustfs_gateway_types::{BucketName, ObjectKey, OpaqueString};
 use rustfs_utils::MaskedAccessKey;
 use rustfs_utils::path;
 use std::fmt::Debug;
@@ -357,12 +359,16 @@ where
                     let key = obj.key;
                     // Filter: only show files directly in current directory
                     // Skip files in subdirectories (they should be accessed via cd)
-                    let should_show = if prefix.is_none() {
-                        // Root directory: only show files without "/"
-                        !key.as_str().contains('/')
-                    } else {
-                        // Subdirectory: show files starting with prefix
-                        key.as_str().starts_with(&prefix_with_slash.clone().unwrap_or_default())
+                    let should_show = match prefix_with_slash.as_deref() {
+                        None => {
+                            // Root directory: only show files without "/"
+                            !key.as_str().contains('/')
+                        }
+                        Some(prefix_with_slash) => {
+                            // Subdirectory: show files starting with prefix, excluding the
+                            // directory's own marker object (MKD creates one)
+                            key.as_str().starts_with(prefix_with_slash) && key.as_str() != prefix_with_slash
+                        }
                     };
 
                     if !should_show {
@@ -600,19 +606,12 @@ where
                 }
             }
         } else {
-            // Delete directory (bucket)
-            // If path ends with '/', treat it as bucket deletion request
-            if path_str.ends_with('/') {
-                // Authorize delete bucket
-                self.storage
-                    .authorize_operation(session_context, &S3Action::DeleteBucket, &bucket, None)
-                    .await
-                    .map_err(|_| Error::new(ErrorKind::PermanentFileNotAvailable, "Access denied"))?;
-
-                self.delete_bucket_recursively(&bucket, session_context).await
-            } else {
-                Err(Error::new(ErrorKind::PermanentFileNotAvailable, "Directory deletion not supported"))
-            }
+            // DELE is strictly a file-deletion verb (RFC 959); bucket/directory paths
+            // must never recursively wipe a bucket via DELE.
+            Err(Error::new(
+                ErrorKind::PermanentFileNotAvailable,
+                "Directory deletion not supported via DELE; use RMD",
+            ))
         }
     }
 
@@ -630,11 +629,70 @@ where
             "ftps directory state changed"
         );
 
-        let (bucket, _key) = parse_s3_path(&path_str)
+        let (bucket, key) = parse_s3_path(&path_str)
             .map_err(|e| Error::new(ErrorKind::PermanentFileNotAvailable, format!("{}: {}", "Invalid path", e)))?;
 
-        // MKD creates a bucket, so it has to clear the same authorization boundary as
-        // an S3 CreateBucket call.
+        if bucket.is_empty() {
+            return Err(Error::new(ErrorKind::PermanentFileNotAvailable, "Invalid path: empty bucket name"));
+        }
+
+        if let Some(key) = key {
+            // A path below the bucket names a subdirectory: represent it as a
+            // zero-byte marker object with a trailing slash rather than a bucket.
+            let dir_key = if key.ends_with('/') { key } else { format!("{key}/") };
+
+            self.storage
+                .authorize_operation(session_context, &S3Action::PutObject, &bucket, Some(&dir_key))
+                .await
+                .map_err(|_| Error::new(ErrorKind::PermanentFileNotAvailable, "Access denied"))?;
+
+            let put_input = PutObjectInput::builder()
+                .bucket(BucketName::new(bucket.clone()).map_err(|e| {
+                    Error::new(ErrorKind::PermanentFileNotAvailable, format!("Failed to build PutObjectInput: {e}"))
+                })?)
+                .key(ObjectKey::new(dir_key.clone()).map_err(|e| {
+                    Error::new(ErrorKind::PermanentFileNotAvailable, format!("Failed to build PutObjectInput: {e}"))
+                })?)
+                .content_length(0)
+                .content_type("application/x-directory".to_string())
+                .body(ByteStream::from_bytes(Bytes::new()))
+                .build();
+
+            return match self.storage.put_object(put_input, session_context.credentials()).await {
+                Ok(_) => {
+                    debug!(
+                        event = EVENT_FTPS_DIRECTORY_STATE,
+                        component = LOG_COMPONENT_PROTOCOLS,
+                        subsystem = LOG_SUBSYSTEM_FTPS_DRIVER,
+                        state = "created",
+                        username = %masked_username,
+                        path = %path_str,
+                        bucket = %bucket,
+                        object = %dir_key,
+                        "FTPS directory marker created"
+                    );
+                    Ok(())
+                }
+                Err(e) => {
+                    error!(
+                        event = EVENT_FTPS_DIRECTORY_STATE,
+                        component = LOG_COMPONENT_PROTOCOLS,
+                        subsystem = LOG_SUBSYSTEM_FTPS_DRIVER,
+                        state = "create_failed",
+                        username = %masked_username,
+                        path = %path_str,
+                        bucket = %bucket,
+                        object = %dir_key,
+                        error = %e,
+                        "ftps directory state changed"
+                    );
+                    Err(Error::new(ErrorKind::PermanentFileNotAvailable, format!("Mkdir failed: {e}")))
+                }
+            };
+        }
+
+        // MKD at bucket level creates a bucket, so it must clear the same authorization
+        // boundary as an S3 CreateBucket call.
         self.storage
             .authorize_operation(session_context, &S3Action::CreateBucket, &bucket, None)
             .await
@@ -676,8 +734,99 @@ where
         let path_str = path.as_ref().to_string_lossy();
         let session_context = &user.session_context;
 
-        let (bucket, _key) = parse_s3_path(&path_str)
+        let (bucket, key) = parse_s3_path(&path_str)
             .map_err(|e| Error::new(ErrorKind::PermanentFileNotAvailable, format!("{}: {}", "Invalid path", e)))?;
+
+        if bucket.is_empty() {
+            return Err(Error::new(ErrorKind::PermanentFileNotAvailable, "Invalid path: empty bucket name"));
+        }
+
+        if let Some(key) = key {
+            // A path below the bucket names a subdirectory prefix. Follow RFC 959 and
+            // the sibling SFTP driver: refuse non-empty directories with 550 and
+            // delete only the directory's own marker object, leaving the bucket and
+            // every sibling prefix untouched.
+            let prefix_with_slash = if key.ends_with('/') { key } else { format!("{key}/") };
+
+            // max_keys=2 because the listing may return the directory's own marker
+            // (decoded to "prefix/") as a content entry alongside a real child.
+            let list_input = ListObjectsV2Input::builder()
+                .bucket(BucketName::new(bucket.clone()).map_err(|e| {
+                    Error::new(ErrorKind::PermanentFileNotAvailable, format!("Failed to build ListObjectsV2Input: {e}"))
+                })?)
+                .prefix(prefix_with_slash.clone())
+                .delimiter("/".to_string())
+                .max_keys(2)
+                .build();
+
+            self.storage
+                .authorize_list_objects(session_context, &list_input)
+                .await
+                .map_err(|_| Error::new(ErrorKind::PermanentFileNotAvailable, "Access denied"))?;
+
+            let output = self
+                .storage
+                .list_objects_v2(list_input, session_context.credentials())
+                .await
+                .map_err(|e| {
+                    error!(
+                        event = EVENT_FTPS_DIRECTORY_STATE,
+                        component = LOG_COMPONENT_PROTOCOLS,
+                        subsystem = LOG_SUBSYSTEM_FTPS_DRIVER,
+                        state = "remove_failed",
+                        path = %path_str,
+                        bucket = %bucket,
+                        object = %prefix_with_slash,
+                        error = %e,
+                        "ftps directory state changed"
+                    );
+                    Error::new(ErrorKind::PermanentFileNotAvailable, format!("List failed: {e}"))
+                })?;
+
+            let has_content = output
+                .contents
+                .iter()
+                .any(|obj| obj.key.as_str() != prefix_with_slash.as_str());
+            let has_subdirs = !output.common_prefixes.is_empty();
+            if has_content || has_subdirs || output.is_truncated {
+                return Err(Error::new(ErrorKind::PermanentDirectoryNotEmpty, "Directory not empty"));
+            }
+
+            self.storage
+                .authorize_operation(session_context, &S3Action::DeleteObject, &bucket, Some(&prefix_with_slash))
+                .await
+                .map_err(|_| Error::new(ErrorKind::PermanentFileNotAvailable, "Access denied"))?;
+
+            self.storage
+                .delete_object(&bucket, &prefix_with_slash, session_context.credentials())
+                .await
+                .map_err(|e| {
+                    error!(
+                        event = EVENT_FTPS_DIRECTORY_STATE,
+                        component = LOG_COMPONENT_PROTOCOLS,
+                        subsystem = LOG_SUBSYSTEM_FTPS_DRIVER,
+                        state = "remove_failed",
+                        path = %path_str,
+                        bucket = %bucket,
+                        object = %prefix_with_slash,
+                        error = %e,
+                        "ftps directory state changed"
+                    );
+                    Error::new(ErrorKind::PermanentFileNotAvailable, format!("Delete failed: {e}"))
+                })?;
+
+            debug!(
+                event = EVENT_FTPS_DIRECTORY_STATE,
+                component = LOG_COMPONENT_PROTOCOLS,
+                subsystem = LOG_SUBSYSTEM_FTPS_DRIVER,
+                state = "removed",
+                path = %path_str,
+                bucket = %bucket,
+                object = %prefix_with_slash,
+                "FTPS directory removed"
+            );
+            return Ok(());
+        }
 
         // Authorize delete bucket
         self.storage
@@ -912,6 +1061,206 @@ mod tests {
             backend.delete_bucket_calls().is_empty(),
             "the bucket must survive when its contents could not be authorized for deletion"
         );
+    }
+
+    /// RMD on a path below a bucket must confine itself to that subdirectory:
+    /// refuse non-empty directories (objects, child prefixes, or truncated pages)
+    /// with 550, fail closed on list errors, and otherwise delete only the
+    /// directory's own marker without touching the bucket or sibling prefixes.
+    #[tokio::test]
+    async fn ftps_rmd_subdirectory_only_removes_its_marker() {
+        use super::FtpsDriver;
+        use crate::common::dummy_storage::{DummyBackend, DummyError};
+        use crate::common::gateway::{S3Action, with_test_auth_override};
+        use crate::common::session::{Protocol, test_session};
+        use rustfs_gateway_types::ObjectKey;
+        use rustfs_gateway_types::dto::{CommonPrefix, ListObjectsV2Output, Object};
+        use unftp_core::storage::{ErrorKind, StorageBackend as _};
+
+        let backend = DummyBackend::new();
+        backend.queue_list_objects_v2_ok_with_keys(&["scratch/", "scratch/tmp.txt"]);
+        backend.queue_delete_object_ok();
+        backend.queue_delete_object_ok();
+        backend.queue_delete_bucket_ok();
+
+        let driver = FtpsDriver::new(backend.clone());
+        let user = super::super::server::FtpsUser {
+            username: "member".to_string(),
+            name: None,
+            session_context: test_session(Protocol::Ftps),
+        };
+
+        // Non-empty directory with a file must be refused with 550.
+        let err = with_test_auth_override(|_, _, _| true, driver.rmd(&user, "/team-bucket/scratch"))
+            .await
+            .expect_err("RMD of a directory containing a file must be refused");
+        assert_eq!(err.kind(), ErrorKind::PermanentDirectoryNotEmpty);
+        assert!(backend.delete_object_calls().is_empty());
+        assert!(backend.delete_bucket_calls().is_empty());
+
+        // Non-empty directory with a nested subdirectory must be refused with 550.
+        backend.queue_list_objects_v2_ok(ListObjectsV2Output {
+            contents: vec![Object {
+                key: ObjectKey::new("scratch/".to_string()).expect("valid key"),
+                ..Default::default()
+            }],
+            common_prefixes: vec![CommonPrefix {
+                prefix: "scratch/nested/".to_string(),
+            }],
+            ..Default::default()
+        });
+        let err = with_test_auth_override(|_, _, _| true, driver.rmd(&user, "/team-bucket/scratch"))
+            .await
+            .expect_err("RMD of a directory with child prefixes must be refused");
+        assert_eq!(err.kind(), ErrorKind::PermanentDirectoryNotEmpty);
+        assert!(backend.delete_object_calls().is_empty());
+
+        // A truncated listing must fail closed as non-empty.
+        backend.queue_list_objects_v2_ok(ListObjectsV2Output {
+            contents: vec![Object {
+                key: ObjectKey::new("scratch/".to_string()).expect("valid key"),
+                ..Default::default()
+            }],
+            is_truncated: true,
+            ..Default::default()
+        });
+        let err = with_test_auth_override(|_, _, _| true, driver.rmd(&user, "/team-bucket/scratch"))
+            .await
+            .expect_err("RMD must fail closed on a truncated listing");
+        assert_eq!(err.kind(), ErrorKind::PermanentDirectoryNotEmpty);
+        assert!(backend.delete_object_calls().is_empty());
+
+        // A backend list error must not fall through to any delete.
+        backend.queue_list_objects_v2_err(DummyError::Injected("backend list failed".into()));
+        let err = with_test_auth_override(|_, _, _| true, driver.rmd(&user, "/team-bucket/scratch"))
+            .await
+            .expect_err("RMD must fail closed when list_objects_v2 errors");
+        assert_eq!(err.kind(), ErrorKind::PermanentFileNotAvailable);
+        assert!(backend.delete_object_calls().is_empty());
+
+        // Empty subdirectory removes only its marker under ListBucket + DeleteObject
+        // without needing DeleteBucket.
+        backend.queue_list_objects_v2_ok_with_keys(&["scratch/"]);
+        with_test_auth_override(
+            |action, bucket, object| {
+                bucket == "team-bucket"
+                    && matches!(action, S3Action::ListBucket | S3Action::DeleteObject)
+                    && object == Some("scratch/")
+            },
+            driver.rmd(&user, "/team-bucket/scratch"),
+        )
+        .await
+        .expect("RMD of an empty subdirectory succeeds");
+
+        // Trailing-slash path removes the same normalized marker.
+        backend.queue_list_objects_v2_ok_with_keys(&["scratch/"]);
+        with_test_auth_override(|_, _, _| true, driver.rmd(&user, "/team-bucket/scratch/"))
+            .await
+            .expect("RMD with trailing slash succeeds");
+
+        let listed = backend.list_objects_calls();
+        assert_eq!(listed.len(), 6);
+        for input in &listed {
+            assert_eq!(
+                input.prefix.as_deref(),
+                Some("scratch/"),
+                "listing must be confined to the directory prefix"
+            );
+            assert_eq!(input.delimiter.as_deref(), Some("/"));
+            assert_eq!(input.max_keys, Some(2));
+        }
+        let deleted: Vec<String> = backend.delete_object_calls().into_iter().map(|c| c.key).collect();
+        assert_eq!(deleted, vec!["scratch/".to_string(), "scratch/".to_string()]);
+        assert!(
+            backend.delete_bucket_calls().is_empty(),
+            "RMD below the bucket root must never delete the bucket"
+        );
+    }
+
+    /// MKD on a path below a bucket creates a zero-byte directory marker object
+    /// under `s3:PutObject` instead of creating a bucket, and LIST hides that
+    /// marker inside the directory.
+    #[tokio::test]
+    async fn ftps_mkd_subdirectory_creates_marker_not_bucket() {
+        use super::FtpsDriver;
+        use crate::common::dummy_storage::DummyBackend;
+        use crate::common::gateway::{S3Action, with_test_auth_override};
+        use crate::common::session::{Protocol, test_session};
+        use unftp_core::storage::StorageBackend as _;
+
+        let backend = DummyBackend::new();
+        backend.capture_upload_bodies();
+        backend.queue_put_object_ok();
+        backend.queue_create_bucket_ok();
+
+        let driver = FtpsDriver::new(backend.clone());
+        let user = super::super::server::FtpsUser {
+            username: "member".to_string(),
+            name: None,
+            session_context: test_session(Protocol::Ftps),
+        };
+
+        with_test_auth_override(
+            |action, bucket, object| {
+                matches!(action, S3Action::PutObject) && bucket == "team-bucket" && object == Some("newdir/")
+            },
+            driver.mkd(&user, "/team-bucket/newdir"),
+        )
+        .await
+        .expect("MKD of a subdirectory succeeds under s3:PutObject");
+
+        let puts = backend.put_object_calls();
+        assert_eq!(puts.len(), 1);
+        assert_eq!((puts[0].bucket.as_str(), puts[0].key.as_str()), ("team-bucket", "newdir/"));
+        assert_eq!(backend.upload_bodies(), vec![Vec::<u8>::new()]);
+        assert!(
+            backend.create_bucket_calls().is_empty(),
+            "MKD below a bucket must never call create_bucket"
+        );
+        assert!(
+            with_test_auth_override(|_, _, _| false, driver.mkd(&user, "/team-bucket/denied"))
+                .await
+                .is_err(),
+            "MKD must fail closed when s3:PutObject is denied"
+        );
+
+        // Listing the directory must not present its own marker as a file.
+        backend.queue_list_objects_v2_ok_with_keys(&["newdir/", "newdir/a.txt"]);
+        let entries = with_test_auth_override(|_, _, _| true, driver.list(&user, "/team-bucket/newdir"))
+            .await
+            .expect("LIST of the new directory succeeds");
+        let names: Vec<_> = entries.iter().map(|e| e.path.to_string_lossy().into_owned()).collect();
+        assert_eq!(names, vec!["a.txt".to_string()]);
+    }
+
+    /// DELE must refuse bucket paths with or without a trailing slash so it can
+    /// never silently wipe a whole bucket.
+    #[tokio::test]
+    async fn ftps_del_refuses_bucket_paths() {
+        use super::FtpsDriver;
+        use crate::common::dummy_storage::DummyBackend;
+        use crate::common::gateway::with_test_auth_override;
+        use crate::common::session::{Protocol, test_session};
+        use unftp_core::storage::StorageBackend as _;
+
+        let backend = DummyBackend::new();
+        backend.queue_list_objects_v2_ok_with_keys(&["reports/q3.pdf"]);
+        backend.queue_delete_object_ok();
+        backend.queue_delete_bucket_ok();
+
+        let driver = FtpsDriver::new(backend.clone());
+        let user = super::super::server::FtpsUser {
+            username: "member".to_string(),
+            name: None,
+            session_context: test_session(Protocol::Ftps),
+        };
+
+        for path in ["/team-bucket/", "/team-bucket", "/"] {
+            let result = with_test_auth_override(|_, _, _| true, driver.del(&user, path)).await;
+            assert!(result.is_err(), "DELE on bucket/root path {path:?} must be refused");
+        }
+        assert!(backend.delete_object_calls().is_empty());
+        assert!(backend.delete_bucket_calls().is_empty());
     }
 
     proptest::proptest! {
