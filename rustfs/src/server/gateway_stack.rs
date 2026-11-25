@@ -58,7 +58,7 @@ pub(crate) static CONFIG_HANDLER_CALLS: std::sync::atomic::AtomicUsize = std::sy
 use crate::app::dto_values::owner;
 use crate::runtime_sources::{ServerContextSlot, current_action_credentials};
 use crate::server::gateway_handlers::{GatewayBackend, OPERATIONS, OperationTable, metadata_listing, register};
-use crate::server::ssec_transport::{is_secure_transport, require_tls};
+use crate::server::ssec_transport::{carries_ssec_headers, is_secure_transport, report_plaintext_ssec, require_tls};
 use crate::shared_types::{NativeTlsTransport, RemoteAddr};
 use crate::storage_api::server::http::request_context::RequestContext;
 use http::{Extensions, Request, Response};
@@ -339,7 +339,9 @@ impl GatewayStack {
             (Some(_), None) => false,
             (None, _) => true,
         };
-        attach_host_facts(extensions);
+        let secure_transport = attach_host_facts(extensions);
+        let track_plaintext_post_ssec =
+            !secure_transport && *request.method() == http::Method::POST && !carries_ssec_headers(request.headers());
         let refusal_request_id = unsigned_extension_refusal.as_ref().map(|_| {
             extensions
                 .get::<RequestContext>()
@@ -371,6 +373,9 @@ impl GatewayStack {
             // `EarlyResponseBodyService`, the drain the HTTP/1-2 shutdown accounting owns. The
             // adapter's connection verdict is kept.
             let mut response = service.call(request).await;
+            if track_plaintext_post_ssec && is_plaintext_ssec_refusal_response(&response) {
+                report_plaintext_ssec();
+            }
             if http1 && connection_intent_of(&response).is_some_and(ConnectionIntent::must_close) {
                 response
                     .headers_mut()
@@ -527,13 +532,39 @@ fn body_deadlines(read_timeout: Duration) -> RequestBodyDeadlineConfig {
         .without_throughput_floor()
 }
 
+fn is_plaintext_ssec_refusal_response(response: &Response<rustfs_gateway::Body>) -> bool {
+    if response.status() != http::StatusCode::BAD_REQUEST {
+        return false;
+    }
+    let Some(segments) = response.body().try_as_vectored() else {
+        return false;
+    };
+    let matches =
+        |body: &str| body.contains("<Code>InvalidRequest</Code>") && body.contains("must be made over a secure connection");
+    match segments {
+        [single] => std::str::from_utf8(single).is_ok_and(matches),
+        multiple => {
+            let total: usize = multiple.iter().map(bytes::Bytes::len).sum();
+            if total > 4096 {
+                return false;
+            }
+            let mut buf = Vec::with_capacity(total);
+            for segment in multiple {
+                buf.extend_from_slice(segment);
+            }
+            std::str::from_utf8(&buf).is_ok_and(matches)
+        }
+    }
+}
+
 /// Attaches what the gateway reads about a request from its host: whether the transport was
 /// secure, the client address after RustFS's trusted-proxy correction, and RustFS's request
 /// identifier. Each is derived from what RustFS's own layers already attached; no header is read.
-fn attach_host_facts(extensions: &mut Extensions) {
+fn attach_host_facts(extensions: &mut Extensions) -> bool {
     let client_info = extensions.get::<ClientInfo>();
     let native_tls = extensions.get::<NativeTlsTransport>().is_some_and(|transport| transport.0);
-    let security = if is_secure_transport(native_tls, client_info) {
+    let secure = is_secure_transport(native_tls, client_info);
+    let security = if secure {
         TransportSecurity::Encrypted
     } else {
         TransportSecurity::Plaintext
@@ -553,6 +584,7 @@ fn attach_host_facts(extensions: &mut Extensions) {
     if let Some(request_id) = request_id {
         extensions.insert(request_id);
     }
+    secure
 }
 
 /// The identifier the outer layer assigned is the one the gateway is handed.
@@ -800,6 +832,45 @@ mod object_lock_tests {
         assert_eq!(retention.mode.as_deref(), Some("GOVERNANCE"));
         assert_eq!(retention.days, Some(30));
         assert_eq!(retention.years, None);
+    }
+}
+
+#[cfg(test)]
+mod plaintext_ssec_tests {
+    use super::is_plaintext_ssec_refusal_response;
+    use bytes::Bytes;
+    use http::{Response, StatusCode};
+
+    fn response(status: StatusCode, body: &'static str) -> Response<rustfs_gateway::Body> {
+        let mut resp = Response::new(rustfs_gateway::Body::from_bytes(Bytes::from_static(body.as_bytes())));
+        *resp.status_mut() = status;
+        resp
+    }
+
+    #[test]
+    fn detects_only_gateway_plaintext_ssec_refusals() {
+        let gateway_refusal = response(
+            StatusCode::BAD_REQUEST,
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?><Error><Code>InvalidRequest</Code>\
+             <Message>requests specifying a customer-provided encryption key must be made over a secure connection</Message></Error>",
+        );
+        assert!(is_plaintext_ssec_refusal_response(&gateway_refusal));
+
+        let aws_wording = response(
+            StatusCode::BAD_REQUEST,
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?><Error><Code>InvalidRequest</Code>\
+             <Message>Requests specifying Server Side Encryption with Customer provided keys must be made over a secure connection.</Message></Error>",
+        );
+        assert!(is_plaintext_ssec_refusal_response(&aws_wording));
+
+        let other_400 = response(
+            StatusCode::BAD_REQUEST,
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?><Error><Code>InvalidRequest</Code><Message>other error</Message></Error>",
+        );
+        assert!(!is_plaintext_ssec_refusal_response(&other_400));
+
+        let ok = response(StatusCode::NO_CONTENT, "");
+        assert!(!is_plaintext_ssec_refusal_response(&ok));
     }
 }
 
