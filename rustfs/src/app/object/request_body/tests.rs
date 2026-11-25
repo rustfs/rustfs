@@ -293,16 +293,36 @@ async fn native_body_errors_preserve_their_original_source() {
     assert_eq!(ApiError::from(error).code, S3ErrorCode::InternalError);
 }
 
-fn progress_reader() -> (mpsc::UnboundedSender<Result<Bytes, io::Error>>, impl AsyncRead + Unpin) {
+/// `UploadChunks` is `Sync`, but `mpsc::UnboundedReceiver` is not.
+struct SyncByteChunks {
+    receiver: std::sync::Mutex<mpsc::UnboundedReceiver<Result<Bytes, io::Error>>>,
+}
+
+impl futures::Stream for SyncByteChunks {
+    type Item = Result<Bytes, StdError>;
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let mut receiver = self.receiver.lock().expect("progress chunk channel");
+        receiver
+            .poll_recv(cx)
+            .map(|ready| ready.map(|item| item.map_err(|error| Box::new(error) as StdError)))
+    }
+}
+
+fn guarded_progress_chunks(
+    timeout: Duration,
+    expected: u64,
+) -> (mpsc::UnboundedSender<Result<Bytes, io::Error>>, UploadChunks, BodyReadControl) {
     let (sender, receiver) = mpsc::unbounded_channel();
-    let (stream, control) = guard_upload_progress(
-        StreamingBlob::wrap(UnboundedReceiverStream::new(receiver)),
-        Duration::ZERO,
-        "bucket",
-        "object",
-        "request",
-        1024 * 1024,
-    );
+    let chunks: UploadChunks = Box::new(SyncByteChunks {
+        receiver: std::sync::Mutex::new(receiver),
+    });
+    let (chunks, control) = guard_native_upload_progress(chunks, timeout, "bucket", "object", "request", expected);
+    (sender, chunks, control)
+}
+
+fn progress_reader() -> (mpsc::UnboundedSender<Result<Bytes, io::Error>>, impl AsyncRead + Unpin) {
+    let (sender, stream, control) = guarded_progress_chunks(Duration::ZERO, 1024 * 1024);
     let inner = StreamReader::new(stream.map(|item| item.map_err(io::Error::other)));
     (sender, DemandReader::new(inner, control))
 }
@@ -377,15 +397,7 @@ async fn upload_progress_excludes_storage_and_buffered_transform_backpressure() 
             result
         }
     }
-    let (sender, receiver) = mpsc::unbounded_channel::<Result<Bytes, io::Error>>();
-    let (stream, control) = guard_upload_progress(
-        StreamingBlob::wrap(UnboundedReceiverStream::new(receiver)),
-        Duration::from_secs(300),
-        "bucket",
-        "object",
-        "request",
-        8,
-    );
+    let (sender, stream, control) = guarded_progress_chunks(Duration::from_secs(300), 8);
     let inner = StreamReader::new(stream.map(|item| item.map_err(io::Error::other)));
     let mut reader = DemandReader::new(BufferedOutput { inner, first: true }, control);
     let mut buffer = [0; 8];
