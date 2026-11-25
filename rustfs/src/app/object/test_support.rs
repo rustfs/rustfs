@@ -17,6 +17,8 @@
 use super::*;
 use std::sync::Arc;
 
+// Retained while `shared.rs` still imports this legacy stream error across parallel Wave 3 branches.
+#[allow(unused_imports)]
 pub(super) use crate::app::storage_api::s3::UploadStreamError;
 
 pub(super) async fn real_cold_fill_test_context() -> (Arc<ECStore>, Arc<AppContext>) {
