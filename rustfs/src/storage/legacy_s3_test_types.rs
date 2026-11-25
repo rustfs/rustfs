@@ -28,9 +28,9 @@ pub(crate) mod request_body {
 }
 
 pub(crate) mod s3 {
+    pub(crate) use s3s::S3ErrorCode;
     pub(crate) use s3s::S3Request;
     pub(crate) use s3s::TrailingHeaders;
     pub(crate) use s3s::auth::Credentials;
     pub(crate) use s3s::dto;
-    pub(crate) use s3s::{S3ErrorCode, S3Result};
 }
