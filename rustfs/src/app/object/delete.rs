@@ -2704,8 +2704,8 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn execute_plain_unversioned_bulk_delete_reaches_storage_while_writer_holds_key() {
+        use crate::app::storage_api::test::DeleteAfterObjectLockSnapshotBarrier;
         use crate::app::storage_api::test::contract::bucket::{BucketOperations as _, DeleteBucketOptions, MakeBucketOptions};
-        use rustfs_ecstore::store::DeleteAfterObjectLockSnapshotBarrier;
 
         let store = crate::app::gating_test_env::shared_gating_ecstore().await;
         let ambient = crate::app::gating_test_env::shared_gating_ambient().await;
