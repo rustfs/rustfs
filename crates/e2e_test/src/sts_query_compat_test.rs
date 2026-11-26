@@ -829,6 +829,8 @@ async fn test_bucket_tags_opa_contract() -> TestResult {
         .send()
         .await?;
     opa.expect_bucket_tags("s3:PutObject", source, Some("finance")).await?;
+    // A non-empty x-amz-tagging header is authorized after PutObject.
+    opa.expect_bucket_tags("s3:PutObjectTagging", source, Some("finance")).await?;
     let version = written.version_id().ok_or("versioned PUT must return a version ID")?;
     let read = client
         .get_object()
@@ -904,6 +906,7 @@ async fn test_bucket_tags_opa_contract() -> TestResult {
                 opa.expect_versioned_tag_permission(source, "report", version).await?;
             }
             opa.expect_bucket_tags("s3:PutObject", destination, Some("finance")).await?;
+            opa.expect_bucket_tags("s3:PutObjectTagging", destination, Some("finance")).await?;
         }
         let tags = admin.get_object_tagging().bucket(destination).key("copied").send().await?;
         assert_eq!(tags.tag_set().len(), 1);
