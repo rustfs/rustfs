@@ -51,6 +51,7 @@
 mod admin;
 mod control_plane;
 pub(in crate::server) mod indeterminate_audit;
+mod reserved_console;
 
 #[cfg(test)]
 pub(crate) static CONFIG_HANDLER_CALLS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
@@ -207,6 +208,16 @@ impl GatewayStack {
         control_plane::assemble(assembly, iam, root, router)
     }
 
+    /// Assembles the independent S3-signed host for reserved console paths when the native console
+    /// is not mounted on this listener.
+    pub(crate) fn assemble_reserved_console(assembly: GatewayAssembly) -> Result<Self, GatewayAssemblyError> {
+        let iam = Arc::new(ServerIam {
+            server_ctx: Arc::clone(&assembly.server_ctx),
+        });
+        let root = Arc::new(live_root(Arc::clone(&assembly.server_ctx)));
+        reserved_console::assemble(assembly, iam, root)
+    }
+
     /// The stack as [`GatewayStack::assemble`] configures it, admitting every caller to the
     /// handlers `register` adds instead of RustFS's: for tests of the host layers around it.
     #[cfg(test)]
@@ -256,6 +267,17 @@ impl GatewayStack {
         authorizer: impl Authorizer,
         authenticator: impl FnOnce(SigV4Authenticator) -> SigV4Authenticator,
     ) -> Result<ServiceBuilder, GatewayAssemblyError> {
+        Self::configured_builder_on(ServiceBuilder::new(), assembly, iam, root, authorizer, authenticator)
+    }
+
+    fn configured_builder_on(
+        base: ServiceBuilder,
+        assembly: &GatewayAssembly,
+        iam: Arc<dyn IamKeyLookup>,
+        root: Arc<dyn RootSource>,
+        authorizer: impl Authorizer,
+        authenticator: impl FnOnce(SigV4Authenticator) -> SigV4Authenticator,
+    ) -> Result<ServiceBuilder, GatewayAssemblyError> {
         // A root the gateway could not verify a signature with is a startup error, never a
         // server that silently has no root. Requests read the live root from `root`.
         RootCredentials::new(&assembly.root_access_key, &assembly.root_secret_key, &assembly.root_secret_key)
@@ -269,7 +291,7 @@ impl GatewayStack {
         // Every legacy RustFS reading of a request, a credential scope and an answer, in the
         // gateway's one reviewable preset; its other half is on the authenticator.
         let credentials = Arc::new(IamCredentials::new(iam, root));
-        let builder = ServiceBuilder::new()
+        let builder = base
             .rustfs_profile()
             // Shipped RustFS authorizes before it judges an SSE header; the handler entry answers
             // the refusal once authorization succeeds.
