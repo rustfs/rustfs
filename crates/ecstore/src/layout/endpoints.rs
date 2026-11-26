@@ -21,10 +21,11 @@ use rustfs_config::{
     ENV_KUBERNETES_SERVICE_HOST, ENV_LOCAL_ENDPOINT_HOST, ENV_MINIO_CI, ENV_STARTUP_TOPOLOGY_RETRY_MAX_DELAY,
     ENV_STARTUP_TOPOLOGY_WAIT_MODE, ENV_STARTUP_TOPOLOGY_WAIT_TIMEOUT, ENV_UNSAFE_BYPASS_DISK_CHECK,
 };
-use rustfs_utils::{XHost, check_local_server_addr, get_env_opt_str, get_host_ip, is_local_host};
+use rustfs_utils::{XHost, check_local_server_addr, get_env_opt_str, is_local_ip};
 #[cfg(test)]
 use std::sync::{LazyLock, Mutex};
 use std::{
+    borrow::Cow,
     collections::{BTreeMap, BTreeSet, HashMap, HashSet, hash_map::Entry},
     future::Future,
     io::{Error, ErrorKind, Result},
@@ -32,7 +33,7 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use tokio::time::sleep as async_sleep;
-use tracing::{error, info, instrument, warn};
+use tracing::{info, instrument, warn};
 use url::Host;
 
 /// enum for setup type.
@@ -196,15 +197,14 @@ struct PoolEndpointList {
     setup_type: SetupType,
 }
 
+struct ResolvedStartupHost {
+    addresses: HashSet<IpAddr>,
+    is_local: bool,
+}
+
 impl AsRef<Vec<Endpoints>> for PoolEndpointList {
     fn as_ref(&self) -> &Vec<Endpoints> {
         &self.inner
-    }
-}
-
-impl AsMut<Vec<Endpoints>> for PoolEndpointList {
-    fn as_mut(&mut self) -> &mut Vec<Endpoints> {
-        &mut self.inner
     }
 }
 
@@ -322,76 +322,41 @@ impl PoolEndpointList {
 
         let convergence_started = Instant::now();
         let dns_retry_deadline = DnsRetryDeadline::new(policy.wait_timeout, policy.retry_max_delay);
-        if let Some(local_endpoint_host) = local_endpoint_host {
+        let resolved_hosts = if let Some(local_endpoint_host) = local_endpoint_host {
             pool_endpoint_list.update_is_local_from_explicit_host(disks_layout, server_addr.port(), local_endpoint_host)?;
+            HashMap::new()
         } else {
             pool_endpoint_list
-                .update_is_local(server_addr.port(), &dns_retry_deadline)
-                .await?;
+                .resolve_startup_hosts(server_addr.port(), &dns_retry_deadline, lookup_startup_host_ips)
+                .await?
+        };
 
-            // Collapse divergent local/remote verdicts for the same host:port that
-            // orchestrated DNS churn can produce during startup, before any check
-            // relies on the local flag.
-            normalize_same_host_local_state(pool_endpoint_list.as_mut());
-        }
-
+        let mut total_endpoints = 0;
+        let mut local_endpoints = 0;
         for endpoints in pool_endpoint_list.inner.iter_mut() {
             // Check whether same path is not used in endpoints of a host on different port.
             // This relies on resolving every host to its IP set, which can flap while a
             // Kubernetes headless service is still publishing records; defer it in
             // orchestrated mode and re-run the DNS-independent checks below.
             if !policy.is_orchestrated() {
-                let mut path_ip_map: HashMap<String, HashSet<IpAddr>> = HashMap::new();
-                let mut host_ip_cache: HashMap<Host<&str>, HashSet<IpAddr>> = HashMap::new();
+                let mut path_ip_map: HashMap<String, Cow<'_, HashSet<IpAddr>>> = HashMap::new();
                 for ep in endpoints.as_ref() {
-                    let Some(host) = ep.url.host() else {
+                    let Some(host) = ep.url.host_str().and_then(|host| resolved_hosts.get(host)) else {
                         continue;
                     };
-
-                    let host_ip_set = if let Some(set) = host_ip_cache.get(&host) {
-                        info!(
-                            target: "rustfs::ecstore::endpoints",
-                            host = %host,
-                            endpoint = %ep.to_string(),
-                            from = "cache",
-                            "Create pool endpoints host '{}' found in cache for endpoint '{}'", host, ep.to_string()
-                        );
-                        set.clone()
-                    } else {
-                        let ips = match resolve_host_ips_with_retry(host.clone(), &ep.to_string(), &dns_retry_deadline).await {
-                            Ok(ips) => ips,
-                            Err(e) => {
-                                error!("Create pool endpoints host {} not found, error:{}", host, e);
-                                return Err(e);
-                            }
-                        };
-                        info!(
-                            target: "rustfs::ecstore::endpoints",
-                            host = %host,
-                            endpoint = %ep.to_string(),
-                            from = "get_host_ip",
-                            "Create pool endpoints host '{}' resolved to ips {:?} for endpoint '{}'",
-                            host,
-                            ips,
-                            ep.to_string()
-                        );
-                        host_ip_cache.insert(host.clone(), ips.clone());
-                        ips
-                    };
-
                     let path = ep.get_file_path();
                     match path_ip_map.entry(path) {
                         Entry::Occupied(mut e) => {
-                            if e.get().intersection(&host_ip_set).count() > 0 {
-                                let path_key = e.key().clone();
+                            if !e.get().is_disjoint(&host.addresses) {
                                 return Err(Error::other(format!(
-                                    "same path '{path_key}' can not be served by different port on same address"
+                                    "same path '{}' can not be served by different port on same address",
+                                    e.key()
                                 )));
                             }
-                            e.get_mut().extend(host_ip_set.iter());
+                            e.get_mut().to_mut().extend(&host.addresses);
                         }
                         Entry::Vacant(e) => {
-                            e.insert(host_ip_set);
+                            e.insert(Cow::Borrowed(&host.addresses));
                         }
                     }
                 }
@@ -414,13 +379,11 @@ impl PoolEndpointList {
             }
 
             // Here all endpoints are URL style.
-            let mut ep_path_set = HashSet::new();
             let mut local_server_host_set = HashSet::new();
             let mut local_port_set = HashSet::new();
             let mut local_endpoint_count = 0;
 
             for ep in endpoints.as_ref() {
-                ep_path_set.insert(ep.get_file_path());
                 if ep.is_local && ep.url.has_host() {
                     local_server_host_set.insert(ep.url.host());
                     local_port_set.insert(ep.url.port());
@@ -438,23 +401,15 @@ impl PoolEndpointList {
             }
 
             // Add missing port in all endpoints.
+            total_endpoints += endpoints.as_ref().len();
             for ep in endpoints.as_mut() {
+                local_endpoints += usize::from(ep.is_local);
                 if !ep.url.has_host() {
                     unique_args.insert(format!("localhost:{}", server_addr.port()));
                     continue;
                 }
-                match ep.url.port() {
-                    None => {
-                        if local_endpoint_host.is_none() {
-                            let _ = ep.url.set_port(Some(server_addr.port()));
-                        }
-                    }
-                    Some(port) => {
-                        // If endpoint is local, but port is different than serverAddrPort, then make it as remote.
-                        if ep.is_local && server_addr.port() != port {
-                            ep.is_local = false;
-                        }
-                    }
+                if ep.url.port().is_none() && local_endpoint_host.is_none() {
+                    let _ = ep.url.set_port(Some(server_addr.port()));
                 }
                 unique_args.insert(ep.host_port());
             }
@@ -468,13 +423,6 @@ impl PoolEndpointList {
             },
         };
 
-        let total_endpoints: usize = pool_endpoint_list.inner.iter().map(|eps| eps.as_ref().len()).sum();
-        let local_endpoints = pool_endpoint_list
-            .inner
-            .iter()
-            .flat_map(|eps| eps.as_ref())
-            .filter(|ep| ep.is_local)
-            .count();
         // A storage member can belong to just one pool, but it must own a slot somewhere in the topology.
         if local_endpoints == 0 {
             let local_port = server_addr.port();
@@ -507,34 +455,33 @@ impl PoolEndpointList {
         Ok(pool_endpoint_list)
     }
 
-    /// resolves all hosts and discovers which are local
-    async fn update_is_local(&mut self, local_port: u16, dns_retry_deadline: &DnsRetryDeadline) -> Result<()> {
-        self._update_is_local(local_port, dns_retry_deadline).await
-    }
-
-    /// resolves all hosts and discovers which are local
-    async fn _update_is_local(&mut self, local_port: u16, dns_retry_deadline: &DnsRetryDeadline) -> Result<()> {
+    // Keep each successful answer for the whole startup so all drives and path checks agree.
+    async fn resolve_startup_hosts(
+        &mut self,
+        local_port: u16,
+        dns_retry_deadline: &DnsRetryDeadline,
+        resolve: impl for<'a> AsyncFn(Host<&'a str>) -> Result<HashSet<IpAddr>>,
+    ) -> Result<HashMap<String, ResolvedStartupHost>> {
+        let mut resolved_hosts: HashMap<String, ResolvedStartupHost> = HashMap::new();
         for endpoints in self.inner.iter_mut() {
             for ep in endpoints.as_mut() {
-                match ep.url.host() {
-                    None => {
-                        ep.is_local = true;
-                    }
-                    Some(host) => {
-                        ep.is_local = resolve_local_host_with_retry(
-                            host,
-                            ep.url.port().unwrap_or_default(),
-                            local_port,
-                            &ep.to_string(),
-                            dns_retry_deadline,
-                        )
-                        .await?;
-                    }
-                }
+                let (Some(host_name), Some(host)) = (ep.url.host_str(), ep.url.host()) else {
+                    ep.is_local = true;
+                    continue;
+                };
+                let is_local = if let Some(resolved) = resolved_hosts.get(host_name) {
+                    resolved.is_local
+                } else {
+                    let addresses = resolve_startup_host_with_retry(host, &ep.to_string(), dns_retry_deadline, &resolve).await?;
+                    let is_local = addresses.iter().any(is_local_ip);
+                    resolved_hosts.insert(host_name.to_owned(), ResolvedStartupHost { addresses, is_local });
+                    is_local
+                };
+                ep.is_local = is_local && ep.url.port().is_none_or(|port| port == local_port);
             }
         }
 
-        Ok(())
+        Ok(resolved_hosts)
     }
 
     fn update_is_local_from_explicit_host(
@@ -692,13 +639,17 @@ fn kernel_hostname_for_endpoint_identity() -> Result<String> {
         .map_err(|_| Error::new(ErrorKind::InvalidData, "kernel hostname is not valid UTF-8"))
 }
 
-fn endpoint_is_local_host(host: Host<&str>, port: u16, local_port: u16) -> Result<bool> {
+async fn lookup_startup_host_ips(host: Host<&str>) -> Result<HashSet<IpAddr>> {
     #[cfg(test)]
     if local_host_resolution_timeout_forced(&host) {
         return Err(Error::new(ErrorKind::TimedOut, "resolver timeout"));
     }
 
-    is_local_host(host, port, local_port)
+    match host {
+        Host::Domain(domain) => Ok(tokio::net::lookup_host((domain, 0)).await?.map(|addr| addr.ip()).collect()),
+        Host::Ipv4(ip) => Ok(HashSet::from([IpAddr::V4(ip)])),
+        Host::Ipv6(ip) => Ok(HashSet::from([IpAddr::V6(ip)])),
+    }
 }
 
 struct DnsRetryDeadline {
@@ -787,18 +738,14 @@ const TOPOLOGY_TIMEOUT_HINT: &str = "check DNS and /etc/hosts resolution, the ht
 and that all peer nodes have started; on Kubernetes/orchestrated deployments set \
 RUSTFS_STARTUP_TOPOLOGY_WAIT_MODE=orchestrated to keep waiting instead of exiting";
 
-async fn resolve_local_host_with_retry(
+async fn resolve_startup_host_with_retry(
     host: Host<&str>,
-    port: u16,
-    local_port: u16,
     context: &str,
     dns_retry_deadline: &DnsRetryDeadline,
-) -> Result<bool> {
+    resolve: &impl for<'a> AsyncFn(Host<&'a str>) -> Result<HashSet<IpAddr>>,
+) -> Result<HashSet<IpAddr>> {
     retry_dns_operation(
-        || {
-            let host = host.clone();
-            async move { endpoint_is_local_host(host, port, local_port) }
-        },
+        || resolve(host.clone()),
         async_sleep,
         dns_retry_deadline,
         |err| Error::other(format!("endpoint '{context}' local-host detection failed for host '{host}': {err}")),
@@ -819,42 +766,6 @@ over {timeout:?} (stage=local_host_detection): {err}. {TOPOLOGY_TIMEOUT_HINT}"
                 elapsed_ms = elapsed.as_millis(),
                 error = %err,
                 "retrying endpoint local-host detection after temporary DNS error"
-            );
-        },
-    )
-    .await
-}
-
-async fn resolve_host_ips_with_retry(
-    host: Host<&str>,
-    context: &str,
-    dns_retry_deadline: &DnsRetryDeadline,
-) -> Result<HashSet<IpAddr>> {
-    retry_dns_operation(
-        || {
-            let host = host.clone();
-            async move { get_host_ip(host).await }
-        },
-        async_sleep,
-        dns_retry_deadline,
-        |err| Error::other(format!("endpoint '{context}' host '{host}' cannot resolve: {err}")),
-        |attempts, timeout, err| {
-            Error::other(format!(
-                "endpoint '{context}' host '{host}' DNS resolution did not converge after {attempts} attempts over \
-{timeout:?} (stage=host_ip_resolution): {err}. {TOPOLOGY_TIMEOUT_HINT}"
-            ))
-        },
-        |attempts, delay, elapsed, err| {
-            warn!(
-                target = "rustfs::ecstore::endpoints",
-                stage = "host_ip_resolution",
-                context = %context,
-                host = %host,
-                attempt = attempts,
-                delay_ms = delay.as_millis(),
-                elapsed_ms = elapsed.as_millis(),
-                error = %err,
-                "retrying endpoint DNS resolution after temporary error"
             );
         },
     )
@@ -1192,34 +1103,6 @@ fn parse_wait_duration(raw: &str) -> Option<Duration> {
         "m" | "min" | "mins" => value.checked_mul(60).map(Duration::from_secs),
         "h" | "hr" | "hrs" => value.checked_mul(3600).map(Duration::from_secs),
         _ => None,
-    }
-}
-
-/// Collapses divergent local/remote verdicts for endpoints that share the same
-/// `host:port`. A `host:port` is a single network identity, so if any endpoint
-/// of the group resolved as local, all of them are local. This absorbs the
-/// transient inconsistency that orchestrated DNS churn can produce across the
-/// several drives exported by one host.
-fn normalize_same_host_local_state(pools: &mut [Endpoints]) {
-    let mut local_hosts: HashSet<String> = HashSet::new();
-    for endpoints in pools.iter() {
-        for ep in endpoints.as_ref() {
-            if ep.is_local && ep.url.has_host() {
-                local_hosts.insert(ep.host_port());
-            }
-        }
-    }
-
-    if local_hosts.is_empty() {
-        return;
-    }
-
-    for endpoints in pools.iter_mut() {
-        for ep in endpoints.as_mut() {
-            if !ep.is_local && ep.url.has_host() && local_hosts.contains(&ep.host_port()) {
-                ep.is_local = true;
-            }
-        }
     }
 }
 
@@ -1794,7 +1677,7 @@ mod test {
 
     #[tokio::test]
     async fn system_resolver_negative_result_reaches_the_dns_allowlist() {
-        let Err(err) = get_host_ip(Host::Domain("rustfs-startup-negative.invalid")).await else {
+        let Err(err) = lookup_startup_host_ips(Host::Domain("rustfs-startup-negative.invalid")).await else {
             // Some corporate and ISP resolvers synthesize an address for
             // unknown names, including the reserved .invalid suffix.
             return;
@@ -1965,22 +1848,48 @@ mod test {
         );
     }
 
-    #[test]
-    fn normalize_same_host_local_state_unifies_divergent_verdicts() {
-        let mut d1 = Endpoint::try_from("http://node1:9000/d1").unwrap();
-        let mut d2 = Endpoint::try_from("http://node1:9000/d2").unwrap();
-        d1.is_local = true;
-        d2.is_local = false; // divergent verdict for the same host:port
-        let mut remote = Endpoint::try_from("http://node2:9000/d1").unwrap();
-        remote.is_local = false;
+    #[tokio::test]
+    async fn startup_reuses_one_dns_answer_per_host_across_ports_and_pools() {
+        let mut pools = PoolEndpointList {
+            inner: vec![
+                Endpoints::try_from(["http://node1:9000/d1", "http://node1:9000/d2", "http://node2:9000/d1"].as_slice())
+                    .expect("first pool endpoints should parse"),
+                Endpoints::try_from(["http://node1:9000/d3", "http://node1:9001/d4"].as_slice())
+                    .expect("second pool endpoints should parse"),
+            ],
+            setup_type: SetupType::Unknown,
+        };
+        let deadline = DnsRetryDeadline::new(Duration::ZERO, DNS_RETRY_MAX_DELAY);
+        let node1_lookups = std::cell::Cell::new(0);
+        let local_ip = IpAddr::V4(std::net::Ipv4Addr::LOCALHOST);
+        let stale_ip = IpAddr::V4(std::net::Ipv4Addr::new(192, 0, 2, 10));
+        let resolve = async |host: Host<&str>| match host {
+            Host::Domain("node1") => {
+                let lookups = node1_lookups.get();
+                node1_lookups.set(lookups + 1);
+                Ok(HashSet::from([if lookups == 0 { stale_ip } else { local_ip }]))
+            }
+            Host::Domain("node2") => Ok(HashSet::from([stale_ip])),
+            _ => panic!("unexpected hostname in test: {host}"),
+        };
 
-        let mut pools = vec![Endpoints::from(vec![d1, d2, remote])];
-        normalize_same_host_local_state(&mut pools);
+        let first_start = pools
+            .resolve_startup_hosts(9000, &deadline, resolve)
+            .await
+            .expect("first lookup");
+        assert_eq!(node1_lookups.get(), 1);
+        assert_eq!(first_start["node1"].addresses, HashSet::from([stale_ip]));
+        assert_eq!(local_flags(&pools.inner[0]), [false, false, false]);
+        assert_eq!(local_flags(&pools.inner[1]), [false, false]);
 
-        let eps = pools[0].as_ref();
-        assert!(eps[0].is_local);
-        assert!(eps[1].is_local, "same host:port must inherit the local verdict");
-        assert!(!eps[2].is_local, "a genuinely remote host must stay remote");
+        let restart = pools
+            .resolve_startup_hosts(9000, &deadline, resolve)
+            .await
+            .expect("fresh lookup");
+        assert_eq!(node1_lookups.get(), 2);
+        assert_eq!(restart["node1"].addresses, HashSet::from([local_ip]));
+        assert_eq!(local_flags(&pools.inner[0]), [true, true, false]);
+        assert_eq!(local_flags(&pools.inner[1]), [true, false]);
     }
 
     #[test]
