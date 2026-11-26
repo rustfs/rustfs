@@ -100,7 +100,6 @@ mod multipart_copy_heal_tests {
                 .collect::<Vec<_>>();
             let options = ObjectOptions {
                 versioned: true,
-                mod_time: Some(OffsetDateTime::from_unix_timestamp(1_700_000_000).expect("fixed native C timestamp")),
                 write_completion: WriteCompletion::TailDrained,
                 ..Default::default()
             };
@@ -130,7 +129,11 @@ mod multipart_copy_heal_tests {
                         etag: part.etag,
                         ..Default::default()
                     }],
-                    &options,
+                    &ObjectOptions {
+                        // Pin the committed timestamp without backdating the staged upload.
+                        mod_time: Some(OffsetDateTime::from_unix_timestamp(1_700_000_000).expect("fixed native C timestamp")),
+                        ..options
+                    },
                 )
                 .await
                 .expect("actual native C quorum publication");
