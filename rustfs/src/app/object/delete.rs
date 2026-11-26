@@ -405,11 +405,7 @@ fn can_skip_delete_objects_pre_stat(
 ) -> bool {
     !bucket_lock_enabled
         && ((delete_creates_delete_marker(opts) && accounting_creates_delete_marker)
-            || (!opts.versioned
-                && !opts.version_suspended
-                && opts.version_id.is_none()
-                && opts.http_preconditions.is_none()
-                && !has_entry_condition))
+            || (!opts.versioned && opts.version_id.is_none() && opts.http_preconditions.is_none() && !has_entry_condition))
 }
 
 fn complete_delete_noop(
@@ -2703,84 +2699,108 @@ mod tests {
 
     #[tokio::test]
     #[serial_test::serial]
-    async fn execute_plain_unversioned_bulk_delete_reaches_storage_while_writer_holds_key() {
+    async fn execute_plain_unversioned_bulk_delete_reaches_storage_for_disabled_and_suspended_buckets() {
         use crate::app::storage_api::test::DeleteAfterObjectLockSnapshotBarrier;
         use crate::app::storage_api::test::contract::bucket::{BucketOperations as _, DeleteBucketOptions, MakeBucketOptions};
 
         let store = crate::app::gating_test_env::shared_gating_ecstore().await;
         let ambient = crate::app::gating_test_env::shared_gating_ambient().await;
         let context = Arc::new(AppContext::new(Arc::clone(&store), ambient.iam(), ambient.kms()));
-        let bucket = format!("delete-objects-contended-{}", Uuid::new_v4());
-        store
-            .make_bucket(&bucket, &MakeBucketOptions::default())
-            .await
-            .expect("create authorized bucket");
-        let mut reader = PutObjReader::from_vec(b"contended object".to_vec());
-        store
-            .put_object(&bucket, "object", &mut reader, &ObjectOptions::default())
-            .await
-            .expect("put contended object");
+        for suspended in [false, true] {
+            let bucket = format!("delete-objects-contended-{}", Uuid::new_v4());
+            store
+                .make_bucket(&bucket, &MakeBucketOptions::default())
+                .await
+                .expect("create authorized bucket");
+            let mut reader = PutObjReader::from_vec(b"contended object".to_vec());
+            store
+                .put_object(&bucket, "object", &mut reader, &ObjectOptions::default())
+                .await
+                .expect("put contended object");
+            if suspended {
+                store
+                    .update_bucket_metadata_config(
+                        &bucket,
+                        crate::app::storage_api::test::bucket::metadata::BUCKET_VERSIONING_CONFIG,
+                        b"<VersioningConfiguration><Status>Suspended</Status></VersioningConfiguration>".to_vec(),
+                    )
+                    .await
+                    .expect("suspend fixture versioning");
+            }
 
-        let policy_json = format!(
-            r#"{{"Version":"2012-10-17","Statement":[{{"Effect":"Allow","Principal":{{"AWS":"*"}},"Action":["s3:DeleteObject"],"Resource":["arn:aws:s3:::{bucket}/*"]}}]}}"#
-        );
-        let mut metadata = (*crate::storage::get_bucket_metadata(&bucket)
-            .await
-            .expect("authorized bucket metadata should be cached"))
-        .clone();
-        metadata.policy_config = Some(serde_json::from_str(&policy_json).expect("test policy should parse"));
-        metadata.policy_config_json = policy_json.clone().into_bytes();
-        crate::storage::storage_api::set_bucket_metadata(bucket.clone(), metadata)
-            .await
-            .expect("publish test bucket policy");
+            let policy_json = format!(
+                r#"{{"Version":"2012-10-17","Statement":[{{"Effect":"Allow","Principal":{{"AWS":"*"}},"Action":["s3:DeleteObject"],"Resource":["arn:aws:s3:::{bucket}/*"]}}]}}"#
+            );
+            let mut metadata = (*store
+                .get_bucket_metadata(&bucket)
+                .await
+                .expect("authorized bucket metadata should be cached"))
+            .clone();
+            metadata.policy_config = Some(serde_json::from_str(&policy_json).expect("test policy should parse"));
+            metadata.policy_config_json = policy_json.clone().into_bytes();
+            crate::storage::storage_api::set_bucket_metadata(bucket.clone(), metadata)
+                .await
+                .expect("publish test bucket policy");
 
-        let writer = store
-            .new_ns_lock(&bucket, "object")
-            .await
-            .expect("open object namespace lock")
-            .get_write_lock(tokio::time::Duration::from_secs(5))
-            .await
-            .expect("hold a concurrent writer's lock");
-        let admission = DeleteAfterObjectLockSnapshotBarrier::install(&bucket);
-        let usecase = DefaultObjectUsecase::with_context(Some(context));
-        let input = DeleteObjectsInput::builder()
-            .bucket(bucket.clone())
-            .delete(Delete {
-                objects: (0..16)
-                    .map(|_| ObjectIdentifier {
-                        key: "object".to_owned(),
+            let writer = store
+                .new_ns_lock(&bucket, "object")
+                .await
+                .expect("open object namespace lock")
+                .get_write_lock(tokio::time::Duration::from_secs(5))
+                .await
+                .expect("hold a concurrent writer's lock");
+            let admission = DeleteAfterObjectLockSnapshotBarrier::install(&bucket);
+            let usecase = DefaultObjectUsecase::with_context(Some(Arc::clone(&context)));
+            let input = DeleteObjectsInput::builder()
+                .bucket(bucket.clone())
+                .delete(Delete {
+                    objects: (0..16)
+                        .map(|_| ObjectIdentifier {
+                            key: "object".to_owned(),
+                            ..Default::default()
+                        })
+                        .collect(),
+                    quiet: None,
+                })
+                .build()
+                .expect("build duplicate delete request");
+            let mut req = build_request(input, Method::POST);
+            req.extensions.insert(crate::storage::access::ReqInfo::default());
+            let delete = tokio::spawn(async move { usecase.execute_delete_objects(req).await });
+
+            tokio::time::timeout(tokio::time::Duration::from_secs(5), admission.wait_until_paused())
+                .await
+                .expect("a plain batch must reach storage admission without acquiring an advisory read lock");
+            drop(writer);
+            admission.release();
+            let response = tokio::time::timeout(tokio::time::Duration::from_secs(10), delete)
+                .await
+                .expect("delete finishes once the writer releases the key")
+                .expect("delete task joins")
+                .expect("delete returns per-entry results");
+            let deleted = response.output.deleted.expect("non-quiet delete");
+            assert_eq!(deleted.len(), 16);
+            assert!(
+                deleted
+                    .iter()
+                    .all(|entry| entry.delete_marker.unwrap_or_default() == suspended)
+            );
+            assert!(response.output.errors.is_none_or(|errors| errors.is_empty()));
+            let read = store
+                .get_object_reader(&bucket, "object", None, HeaderMap::new(), &ObjectOptions::default())
+                .await;
+            assert!(matches!(read, Err(ref error) if is_err_object_not_found(error) || is_err_version_not_found(error)));
+            store
+                .delete_bucket(
+                    &bucket,
+                    &DeleteBucketOptions {
+                        force: suspended,
                         ..Default::default()
-                    })
-                    .collect(),
-                quiet: None,
-            })
-            .build()
-            .expect("build duplicate delete request");
-        let mut req = build_request(input, Method::POST);
-        req.extensions.insert(crate::storage::access::ReqInfo::default());
-        let delete = tokio::spawn(async move { usecase.execute_delete_objects(req).await });
-
-        tokio::time::timeout(tokio::time::Duration::from_secs(5), admission.wait_until_paused())
-            .await
-            .expect("a plain batch must reach storage admission without acquiring an advisory read lock");
-        drop(writer);
-        admission.release();
-        let response = tokio::time::timeout(tokio::time::Duration::from_secs(10), delete)
-            .await
-            .expect("delete finishes once the writer releases the key")
-            .expect("delete task joins")
-            .expect("delete returns per-entry results");
-        assert_eq!(response.output.deleted.expect("non-quiet delete").len(), 16);
-        assert!(response.output.errors.is_none_or(|errors| errors.is_empty()));
-        let error = store
-            .get_object_info(&bucket, "object", &ObjectOptions::default())
-            .await
-            .expect_err("the object must be deleted");
-        assert!(is_err_object_not_found(&error) || is_err_version_not_found(&error));
-        store
-            .delete_bucket(&bucket, &DeleteBucketOptions::default())
-            .await
-            .expect("remove verification bucket");
+                    },
+                )
+                .await
+                .expect("remove verification bucket");
+        }
     }
 
     #[tokio::test]
@@ -3578,14 +3598,14 @@ mod tests {
     }
 
     #[test]
-    fn delete_objects_pre_stat_kept_for_suspended_versioning() {
+    fn delete_objects_pre_stat_skips_plain_suspended_entries() {
         let opts = ObjectOptions {
-            version_id: None,
-            versioned: true,
             version_suspended: true,
             ..Default::default()
         };
-        assert!(!can_skip_delete_objects_pre_stat(false, &opts, false, false));
+        assert!(can_skip_delete_objects_pre_stat(false, &opts, false, false));
+        assert!(!can_skip_delete_objects_pre_stat(true, &opts, false, false));
+        assert!(!can_skip_delete_objects_pre_stat(false, &opts, false, true));
     }
 
     #[test]
