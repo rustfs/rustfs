@@ -558,6 +558,8 @@ class GateTests(unittest.TestCase):
             jobs[job] = {'name': job, 'if': expression, 'steps': []}
         jobs['classify-changes']['outputs'] = {'mode': '${{ steps.scope.outputs.mode }}'}
         jobs[gate.LINT_JOB]['steps'] = [{'run': 'cargo clippy --all-targets -- -D warnings'}]
+        jobs[gate.ADVISORIES_JOB]['runs-on'] = 'ubuntu-latest'
+        jobs[gate.ADVISORIES_JOB]['steps'] = [{'run': 'python3 scripts/security/check_advisories.py --output artifacts/advisories/advisories-gate.json'}]
         jobs['workspace-tests']['needs'] = [gate.ARCHIVE_PRODUCER]
         jobs['classify-changes']['steps'] = [{'id': 'scope', 'run': f"grep -q '^plan_contract={gate.PLAN_CONTRACT}$' \"$GITHUB_OUTPUT\""}]
         jobs['test-and-lint-protocols']['strategy'] = {'matrix': {'features': [
@@ -748,6 +750,35 @@ class GateTests(unittest.TestCase):
             self.assertIn(message, self.check(changed), case)
         # The checked-in workflow satisfies the same contract.
         self.assertEqual(gate.check_workflow(Path(gate.__file__).resolve().parent.parent), [])
+
+    def test_security_advisories_lane_gates_every_event_including_docs_and_proven(self):
+        advisories = gate.ADVISORIES_JOB
+        self.assertIn(advisories, gate.ALWAYS_JOBS)
+        for event, mode in (('pull_request', 'docs'), ('pull_request', 'e2e'), ('pull_request', 'full'),
+                            ('push', 'full'), ('push', 'proven'), ('merge_group', 'full'),
+                            ('schedule', 'full'), ('workflow_dispatch', 'full')):
+            plan = self.plan(event, mode)
+            self.assertEqual(plan['jobs'][advisories], 'success', (event, mode))
+            self.assertEqual(gate.verify_results(self.needs(plan), event, plan['ref']), [])
+            for bad in ('failure', 'cancelled', 'skipped', None):
+                needs = self.needs(plan)
+                needs[advisories]['result'] = bad
+                errors = gate.verify_results(needs, event, plan['ref'])
+                self.assertTrue(any(error.startswith(f'{advisories}: expected success') for error in errors), (event, mode, bad, errors))
+        workflow = self.workflow()
+        self.assertEqual(self.check(workflow), [])
+        for case, (mutate, message) in enumerate((
+            (lambda w: w['jobs']['required-checks']['needs'].remove(advisories), 'required-checks must directly depend on every verification job exactly once'),
+            (lambda w: w['jobs'][advisories].update({'runs-on': 'sm-standard-4'}), f'{advisories} must run on ubuntu-latest'),
+            (lambda w: w['jobs'][advisories].update({'steps': []}), f'{advisories} must unconditionally run {gate.ADVISORIES_COMMAND}'),
+            (lambda w: w['jobs'][advisories]['steps'][0].update({'if': "github.event_name != 'pull_request'"}), f'{advisories} must unconditionally run {gate.ADVISORIES_COMMAND}'),
+            (lambda w: w['jobs'][advisories]['steps'][0].update({'run': f'{gate.ADVISORIES_COMMAND} || true'}), f'{advisories} must not mask failures or override the CI clock'),
+            (lambda w: w['jobs'][advisories]['steps'][0].update({'run': f'{gate.ADVISORIES_COMMAND} --now 2026-01-01T00:00:00Z'}), f'{advisories} must not mask failures or override the CI clock'),
+            (lambda w: w['jobs'][advisories].update({'continue-on-error': 'true'}), f'{advisories} cannot convert a validation failure into success'),
+        )):
+            changed = copy.deepcopy(workflow)
+            mutate(changed)
+            self.assertIn(message, self.check(changed), case)
 
     def test_semantic_yaml_equivalence_and_wiring_boundaries(self):
         workflow = self.workflow()

@@ -93,6 +93,7 @@ script-tests: ## Run shell script tests
 	$(RUSTFS_PYTHON_BIN) ./scripts/test_ci_merge_queue.py
 	$(RUSTFS_PYTHON_BIN) -m unittest discover -s scripts/ci -p 'test_*.py'
 	$(RUSTFS_PYTHON_BIN) ./scripts/check_security_coverage.py --self-test
+	$(RUSTFS_PYTHON_BIN) ./scripts/security/check_advisories.py --self-test
 	$(RUSTFS_PYTHON_BIN) ./scripts/check_scheduled_validation_freshness.py --self-test
 	$(RUSTFS_PYTHON_BIN) ./scripts/test_security_workflow.py
 	$(RUSTFS_PYTHON_BIN) ./scripts/test_nightly_candidate.py
