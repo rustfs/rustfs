@@ -2328,9 +2328,10 @@ static FSYNC_RUNTIME: LazyLock<Option<tokio::runtime::Runtime>> = LazyLock::new(
     if threads <= 1 {
         return None;
     }
+    let workers = crate::runtime::detect_worker_parallelism().get().min(8);
     let mut builder = tokio::runtime::Builder::new_multi_thread();
     builder
-        .worker_threads(num_cpus::get().min(8))
+        .worker_threads(workers)
         .max_blocking_threads(threads)
         .thread_name("rustfs-fsync")
         .thread_stack_size(512 * 1024)
@@ -2666,7 +2667,7 @@ fn default_global_file_sync_limit(cpu_count: usize, max_blocking_threads: usize)
 fn global_file_sync_limit() -> usize {
     let max_blocking_threads =
         rustfs_utils::get_env_usize(rustfs_config::ENV_MAX_BLOCKING_THREADS, rustfs_config::DEFAULT_MAX_BLOCKING_THREADS);
-    default_global_file_sync_limit(num_cpus::get(), max_blocking_threads)
+    default_global_file_sync_limit(crate::runtime::detect_worker_parallelism().get(), max_blocking_threads)
 }
 
 #[cfg(test)]
@@ -14665,8 +14666,17 @@ mod tests {
         q_fsync
             .run_fsync_cancellable(|is_cancelled| {
                 assert!(!is_cancelled());
-                if FSYNC_RUNTIME.is_some() {
+                let blocking_threads = rustfs_utils::get_env_usize(
+                    rustfs_config::ENV_FSYNC_BLOCKING_THREADS,
+                    rustfs_config::DEFAULT_FSYNC_BLOCKING_THREADS,
+                );
+                if blocking_threads > 1 {
+                    let runtime = FSYNC_RUNTIME.as_ref().expect("configured dedicated fsync runtime");
                     assert_eq!(std::thread::current().name(), Some("rustfs-fsync"));
+                    let expected = std::thread::available_parallelism().map_or(1, usize::from).min(8);
+                    assert_eq!(runtime.metrics().num_workers(), expected);
+                } else {
+                    assert!(FSYNC_RUNTIME.is_none());
                 }
                 Ok(())
             })

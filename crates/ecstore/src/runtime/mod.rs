@@ -18,3 +18,7 @@ pub(crate) mod global;
 pub(crate) mod instance;
 pub(crate) mod sources;
 pub(crate) mod usage_watch;
+
+pub(crate) fn detect_worker_parallelism() -> std::num::NonZeroUsize {
+    std::thread::available_parallelism().unwrap_or(std::num::NonZeroUsize::MIN)
+}

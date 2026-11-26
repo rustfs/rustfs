@@ -2197,52 +2197,33 @@ fn inject_batch_delete_pool_errors(
     }
 }
 
-fn resolve_batch_delete_pool_results<'a>(
-    initial_error: Option<Error>,
-    pool_results: impl IntoIterator<Item = (&'a DeletedObject, &'a Option<Error>)>,
-) -> (Option<DeletedObject>, Option<Error>, bool) {
-    let mut failure = initial_error.map(|err| (None, err));
-    let mut deleted = None;
-    let mut fallback: Option<(DeletedObject, Option<Error>)> = None;
-    let mut attempted = false;
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum BatchDeleteOutcome {
+    SilentMiss,
+    Missing,
+    Deleted,
+    Failed,
+}
 
-    for (pool_delete, pool_error) in pool_results {
-        attempted = true;
-        match pool_error {
-            Some(err) if is_err_object_not_found(err) || is_err_version_not_found(err) => {
-                if fallback.as_ref().is_none_or(|(_, error)| error.is_none()) {
-                    fallback = Some(((*pool_delete).clone(), Some(err.clone())));
-                }
-            }
-            Some(err) => {
-                if failure.is_none() {
-                    failure = Some((Some((*pool_delete).clone()), err.clone()));
-                }
-            }
-            None if pool_delete.found => {
-                if deleted.is_none() {
-                    deleted = Some((*pool_delete).clone());
-                }
-            }
-            None => {
-                if fallback.is_none() {
-                    fallback = Some(((*pool_delete).clone(), None));
-                }
-            }
-        }
+fn apply_batch_delete_pool_result(
+    selected: &mut Option<BatchDeleteOutcome>,
+    deleted: &mut DeletedObject,
+    error: &mut Option<Error>,
+    pool_delete: DeletedObject,
+    pool_error: Option<Error>,
+) {
+    let outcome = match &pool_error {
+        Some(err) if is_err_object_not_found(err) || is_err_version_not_found(err) => BatchDeleteOutcome::Missing,
+        Some(_) => BatchDeleteOutcome::Failed,
+        None if pool_delete.found => BatchDeleteOutcome::Deleted,
+        None => BatchDeleteOutcome::SilentMiss,
+    };
+    // Results arrive in pool order. Equal priorities keep the first result.
+    if selected.is_none_or(|current| outcome > current) {
+        *selected = Some(outcome);
+        *deleted = pool_delete;
+        *error = pool_error;
     }
-
-    if let Some((failed_delete, err)) = failure {
-        return (failed_delete, Some(err), attempted);
-    }
-    if let Some(deleted) = deleted {
-        return (Some(deleted), None, attempted);
-    }
-    if let Some((deleted, err)) = fallback {
-        return (Some(deleted), err, attempted);
-    }
-
-    (None, None, attempted)
 }
 
 fn transition_restore_pool_opts(opts: &ObjectOptions) -> ObjectOptions {
@@ -6315,32 +6296,29 @@ impl ECStore {
             });
         }
 
-        let results = join_all(futures).await;
-
-        for idx in 0..del_objects.len() {
-            let pool_results = results.iter().filter_map(|(object_indices, (dels, errs, _))| {
-                let pool_object_idx = object_indices.binary_search(&idx).ok()?;
-                Some((&dels[pool_object_idx], &errs[pool_object_idx]))
-            });
-            let (deleted, error, attempted) = resolve_batch_delete_pool_results(del_errs[idx].take(), pool_results);
-            if let Some(deleted) = deleted {
-                del_objects[idx] = deleted;
+        let mut selected: Vec<_> = del_errs
+            .iter()
+            .map(|error| error.as_ref().map(|_| BatchDeleteOutcome::Failed))
+            .collect();
+        for (object_indices, (pool_deleted, pool_errors, pool_accounting)) in join_all(futures).await {
+            debug_assert_eq!(object_indices.len(), pool_deleted.len());
+            debug_assert_eq!(object_indices.len(), pool_errors.len());
+            let mut pool_accounting = pool_accounting.into_iter();
+            for (idx, (deleted, error)) in object_indices.into_iter().zip(pool_deleted.into_iter().zip(pool_errors)) {
+                apply_batch_delete_pool_result(&mut selected[idx], &mut del_objects[idx], &mut del_errs[idx], deleted, error);
+                // Accounting follows the last pool that attempted this index.
+                accounting[idx] = pool_accounting.next().flatten();
             }
-            del_errs[idx] = error;
+        }
 
-            if !attempted && del_errs[idx].is_none() && latest_marker_objects[idx] {
+        for (idx, creates_marker) in latest_marker_objects.into_iter().enumerate() {
+            if creates_marker && selected[idx].is_none() {
                 del_objects[idx] = DeletedObject {
                     object_name: objects[idx].object_name.clone(),
                     version_id: objects[idx].version_id,
                     ..Default::default()
                 };
                 del_errs[idx] = Some(StorageError::ObjectNotFound(bucket.to_owned(), objects[idx].object_name.clone()));
-            }
-        }
-
-        for (object_indices, (_, _, pool_accounting)) in &results {
-            for (pool_object_idx, object_idx) in object_indices.iter().enumerate() {
-                accounting[*object_idx] = pool_accounting.get(pool_object_idx).cloned().flatten();
             }
         }
 
@@ -9775,6 +9753,18 @@ mod tests {
         assert!(batch_delete_targets_pool(false, None, 0));
     }
 
+    fn reduce_test_pool_results(
+        mut error: Option<Error>,
+        pool_results: impl IntoIterator<Item = (DeletedObject, Option<Error>)>,
+    ) -> (DeletedObject, Option<Error>, Option<BatchDeleteOutcome>) {
+        let mut selected = error.as_ref().map(|_| BatchDeleteOutcome::Failed);
+        let mut deleted = DeletedObject::default();
+        for (pool_delete, pool_error) in pool_results {
+            apply_batch_delete_pool_result(&mut selected, &mut deleted, &mut error, pool_delete, pool_error);
+        }
+        (deleted, error, selected)
+    }
+
     #[test]
     fn batch_delete_pool_failures_override_success_in_any_pool_order() {
         let success = DeletedObject {
@@ -9798,15 +9788,14 @@ mod tests {
                 let failed = (DeletedObject::default(), Some(source_error.clone()));
                 let succeeded = (success.clone(), None);
                 let pool_results = if source_first {
-                    vec![failed, succeeded]
+                    [failed, succeeded]
                 } else {
-                    vec![succeeded, failed]
+                    [succeeded, failed]
                 };
 
-                let (_, error, attempted) =
-                    resolve_batch_delete_pool_results(None, pool_results.iter().map(|(deleted, error)| (deleted, error)));
+                let (_, error, selected) = reduce_test_pool_results(None, pool_results);
 
-                assert!(attempted);
+                assert!(matches!(selected, Some(BatchDeleteOutcome::Failed)));
                 assert_eq!(error, Some(source_error.clone()));
             }
         }
@@ -9829,32 +9818,52 @@ mod tests {
             for missing_first in [true, false] {
                 let succeeded = (success.clone(), None);
                 let pool_results = if missing_first {
-                    vec![missing.clone(), succeeded]
+                    [missing.clone(), succeeded]
                 } else {
-                    vec![succeeded, missing.clone()]
+                    [succeeded, missing.clone()]
                 };
-                let (deleted, error, attempted) =
-                    resolve_batch_delete_pool_results(None, pool_results.iter().map(|(deleted, error)| (deleted, error)));
+                let (deleted, error, selected) = reduce_test_pool_results(None, pool_results);
 
-                assert!(attempted);
-                let deleted = deleted.expect("successful pool result should be retained");
+                assert!(matches!(selected, Some(BatchDeleteOutcome::Deleted)));
                 assert!(deleted.found);
                 assert_eq!(deleted.object_name, success.object_name.as_str());
                 assert!(error.is_none());
             }
 
-            let missing_only = [missing];
-            let (_, error, attempted) =
-                resolve_batch_delete_pool_results(None, missing_only.iter().map(|(deleted, error)| (deleted, error)));
-            assert!(attempted);
+            let (_, error, selected) = reduce_test_pool_results(None, [missing]);
+            assert!(matches!(selected, Some(BatchDeleteOutcome::Missing)));
             assert_eq!(error, Some(missing_error));
         }
 
-        let silent_missing = [(DeletedObject::default(), None)];
-        let (_, error, attempted) =
-            resolve_batch_delete_pool_results(None, silent_missing.iter().map(|(deleted, error)| (deleted, error)));
-        assert!(attempted);
+        let (_, error, selected) = reduce_test_pool_results(None, [(DeletedObject::default(), None)]);
+        assert!(matches!(selected, Some(BatchDeleteOutcome::SilentMiss)));
         assert!(error.is_none());
+    }
+
+    #[test]
+    fn batch_delete_pool_reduction_keeps_the_first_equal_outcome_and_preflight_error() {
+        let miss = |name: &str| {
+            (
+                DeletedObject {
+                    object_name: name.to_owned(),
+                    ..Default::default()
+                },
+                Some(StorageError::ObjectNotFound("bucket".to_owned(), name.to_owned())),
+            )
+        };
+        let silent = (DeletedObject::default(), None);
+        let (deleted, error, selected) = reduce_test_pool_results(None, [silent, miss("first"), miss("second")]);
+        assert!(matches!(selected, Some(BatchDeleteOutcome::Missing)));
+        assert_eq!(deleted.object_name, "first");
+        assert_eq!(error, miss("first").1);
+
+        let (deleted, error, _) = reduce_test_pool_results(
+            Some(StorageError::PreconditionFailed),
+            [(miss("pool").0, Some(StorageError::ErasureWriteQuorum))],
+        );
+        assert!(deleted.object_name.is_empty());
+        assert_eq!(error, Some(StorageError::PreconditionFailed));
+        assert!(reduce_test_pool_results(None, []).2.is_none());
     }
 
     #[tokio::test]
@@ -13110,6 +13119,67 @@ mod tests {
             error,
             PrepareSelectObjectSnapshotError::Storage(ref error) if is_err_object_not_found(error)
         ));
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(storage_class_env)]
+    async fn batch_delete_preserves_results_and_accounting_across_sets() {
+        let ctx = Arc::new(crate::runtime::instance::InstanceContext::new());
+        ctx.update_erasure_type(SetupType::Erasure).await;
+        let (_temp_dirs, sets) = make_local_two_set_sets_with_ctx(Arc::clone(&ctx)).await;
+        let store = Arc::new(new_prepared_reader_test_store_from_pools(
+            vec![Arc::clone(&sets)],
+            vec![sets.endpoints.clone()],
+            ctx,
+        ));
+        crate::bucket::metadata_sys::init_bucket_metadata_sys(Arc::clone(&store), Vec::new()).await;
+        let bucket = format!("batch-delete-{}", Uuid::new_v4().simple());
+        store
+            .make_bucket(&bucket, &MakeBucketOptions::default())
+            .await
+            .expect("create bucket on both sets");
+        let keys: Vec<_> = [1, 0, 1]
+            .into_iter()
+            .enumerate()
+            .map(|(index, set)| {
+                (0..100)
+                    .map(|suffix| format!("{index}-{suffix}"))
+                    .find(|key| Arc::ptr_eq(&sets.get_disks_by_key(key), &sets.disk_set[set]))
+                    .expect("fixture key routed to the selected set")
+            })
+            .collect();
+        for indices in [&[0, 1, 2][..], &[0, 2, 1], &[0, 2], &[1]] {
+            for &index in indices {
+                let mut data = PutObjReader::from_vec(vec![0; index + 1]);
+                sets.put_object(&bucket, &keys[index], &mut data, &ObjectOptions::default())
+                    .await
+                    .expect("seed an object with a distinct size");
+            }
+            let batch = indices
+                .iter()
+                .map(|&index| ObjectToDelete {
+                    object_name: keys[index].clone(),
+                    ..Default::default()
+                })
+                .collect();
+            let (deleted, errors, accounting) = sets
+                .delete_objects_with_accounting(&bucket, batch, ObjectOptions::default())
+                .await;
+
+            assert_eq!(errors.len(), indices.len());
+            assert!(errors.iter().all(Option::is_none), "{errors:?}");
+            assert_eq!(
+                deleted.iter().map(|object| object.object_name.as_str()).collect::<Vec<_>>(),
+                indices.iter().map(|&index| keys[index].as_str()).collect::<Vec<_>>()
+            );
+            assert_eq!(
+                accounting
+                    .into_iter()
+                    .map(|receipt| receipt.and_then(|receipt| receipt.size))
+                    .collect::<Vec<_>>(),
+                indices.iter().map(|&index| u64::try_from(index + 1).ok()).collect::<Vec<_>>()
+            );
+        }
     }
 
     #[tokio::test]
