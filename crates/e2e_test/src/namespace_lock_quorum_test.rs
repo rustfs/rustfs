@@ -15,6 +15,7 @@
 use crate::common::{ClusterTopology, RustFSTestClusterEnvironment};
 use aws_sdk_s3::Client;
 use aws_sdk_s3::error::SdkError;
+use aws_sdk_s3::types::{CompletedMultipartUpload, CompletedPart};
 use bytes::Bytes;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -27,6 +28,7 @@ const KEY: &str = "thumb/79/concurrent-overwrite.jpg";
 type TestResult = Result<(), Box<dyn std::error::Error + Send + Sync>>;
 
 async fn assert_degraded_cluster_publication_guard_errors_are_retryable() -> TestResult {
+    const PART_BODY: &[u8] = b"multipart publication guard regression";
     let mut cluster = RustFSTestClusterEnvironment::new(4).await?;
     cluster.set_env("RUSTFS_STORAGE_CLASS_STANDARD", "EC:2");
     cluster.set_env("RUSTFS_PUT_RENAME_EARLY_ACK_ENABLE", "false");
@@ -48,6 +50,7 @@ async fn assert_degraded_cluster_publication_guard_errors_are_retryable() -> Tes
         })
         .collect();
 
+    let mut retained_uploads = Vec::new();
     for alive in (1..=4).rev() {
         if alive < 4 {
             cluster.stop_node(alive)?;
@@ -89,13 +92,24 @@ async fn assert_degraded_cluster_publication_guard_errors_are_retryable() -> Tes
                 let upload_id = upload
                     .upload_id()
                     .expect("successful multipart initialization must return an upload ID");
-                client
+                let abort = client
                     .abort_multipart_upload()
                     .bucket(BUCKET)
                     .key(&multipart_key)
                     .upload_id(upload_id)
                     .send()
-                    .await?;
+                    .await;
+                if alive == 4 {
+                    abort?;
+                } else {
+                    // A native Abort needs a closure certificate from every original participant.
+                    let err = abort.expect_err("an upload created with one node down cannot certify Abort");
+                    let response = err.raw_response().expect("Abort must return an S3 response");
+                    assert_eq!(response.status().as_u16(), 503);
+                    assert_eq!(err.as_service_error().and_then(|error| error.meta().code()), Some("ServiceUnavailable"));
+                    assert_eq!(response.headers().get("x-rustfs-error-cause"), Some("storage_write_quorum"));
+                    retained_uploads.push((multipart_key, upload_id.to_owned()));
+                }
             } else {
                 let err = multipart.expect_err("multipart initialization must reject writes without a write quorum");
                 assert_eq!(
@@ -114,7 +128,33 @@ async fn assert_degraded_cluster_publication_guard_errors_are_retryable() -> Tes
 
     cluster.stop();
     cluster.start().await?;
+    for (key, upload_id) in &retained_uploads {
+        let part = clients[0]
+            .upload_part()
+            .bucket(BUCKET)
+            .key(key)
+            .upload_id(upload_id)
+            .part_number(1)
+            .body(Bytes::from_static(PART_BODY).into())
+            .send()
+            .await?;
+        let part = CompletedPart::builder()
+            .part_number(1)
+            .e_tag(part.e_tag().expect("uploaded part must have an ETag"))
+            .build();
+        clients[0]
+            .complete_multipart_upload()
+            .bucket(BUCKET)
+            .key(key)
+            .upload_id(upload_id)
+            .multipart_upload(CompletedMultipartUpload::builder().parts(part).build())
+            .send()
+            .await?;
+    }
     for client in &clients {
+        for (key, _) in &retained_uploads {
+            assert_quorum_object_body(client, BUCKET, key, PART_BODY).await?;
+        }
         for alive in [1, 3, 4] {
             for node in 0..alive {
                 let key = format!("publication-put-{alive}-{node}");
