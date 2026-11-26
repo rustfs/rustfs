@@ -25,7 +25,7 @@ use super::super::{
     reduce_write_quorum_errs,
 };
 use crate::api::bucket::metadata_sys;
-use crate::disk::{DiskAPI, VolumeInfo};
+use crate::disk::{DiskAPI, DiskStore, VolumeInfo};
 use futures::{Stream, StreamExt, stream::FuturesUnordered};
 
 #[derive(Clone, Copy)]
@@ -35,34 +35,34 @@ pub(crate) enum BucketInfoQuorum {
     HealCandidates,
 }
 
-#[derive(Clone, Copy)]
-pub(crate) enum BucketStatMode {
-    ReadInfo,
-    ReadPresence,
-    WriteInfo,
+async fn stat_bucket_volume(disk: Option<DiskStore>, bucket: &str) -> crate::disk::error::Result<VolumeInfo> {
+    match disk {
+        Some(disk) => disk.stat_volume(bucket).await,
+        None => Err(DiskError::DiskNotFound),
+    }
 }
 
 async fn collect_bucket_presence(
-    mut probes: impl Stream<Item = crate::disk::error::Result<VolumeInfo>> + Unpin,
+    mut probes: impl Stream<Item = crate::disk::error::Result<()>> + Unpin,
     disk_count: usize,
-) -> Result<VolumeInfo> {
+) -> Result<()> {
     let required = disk_count.div_ceil(2).max(1);
     let mut successes = 0;
-    let mut errors = Vec::with_capacity(disk_count);
+    let mut errors = Vec::new();
     while let Some(result) = probes.next().await {
         match result {
-            Ok(info) => {
+            Ok(()) => {
                 successes += 1;
                 // The reducer favors success on ties, so the remaining disks
                 // cannot change this decision. Presence doesn't use timestamps.
                 if successes == required {
-                    return Ok(info);
+                    return Ok(());
                 }
-                errors.push(None);
             }
             Err(err) => errors.push(Some(err)),
         }
     }
+    errors.resize_with(errors.len() + successes, || None);
     Err(reduce_read_quorum_errs(&errors, BUCKET_OP_IGNORED_ERRS, required)
         .unwrap_or(DiskError::ErasureReadQuorum)
         .into())
@@ -77,12 +77,9 @@ impl SetDisks {
             return Err(Error::ErasureReadQuorum);
         }
 
-        let futures = disks.into_iter().map(|disk| async move {
-            match disk {
-                Some(disk) => disk.stat_volume(bucket).await.map(|_| ()),
-                None => Err(DiskError::DiskNotFound),
-            }
-        });
+        let futures = disks
+            .into_iter()
+            .map(|disk| async move { stat_bucket_volume(disk, bucket).await.map(|_| ()) });
         let results = join_all(futures).await;
         let mut volume_present = false;
         let mut first_unknown = None;
@@ -104,56 +101,51 @@ impl SetDisks {
         Ok(())
     }
 
-    pub(crate) async fn stat_bucket_with_quorum(&self, bucket: &str, mode: BucketStatMode) -> Result<BucketInfo> {
+    pub(crate) async fn check_bucket_presence_at_read_quorum(&self, bucket: &str) -> Result<()> {
         let disks = self.disk_inventory().await;
         let disk_count = disks.len();
-        let probes = disks.into_iter().map(|disk| async move {
-            match disk {
-                Some(disk) => disk.stat_volume(bucket).await,
-                None => Err(DiskError::DiskNotFound),
-            }
-        });
-        if matches!(mode, BucketStatMode::ReadPresence) {
-            let info = collect_bucket_presence(probes.collect::<FuturesUnordered<_>>(), disk_count).await?;
-            return Ok(BucketInfo {
-                name: info.name,
-                ..Default::default()
-            });
-        }
+        let probes = disks
+            .into_iter()
+            .map(|disk| async move { stat_bucket_volume(disk, bucket).await.map(|_| ()) })
+            .collect::<FuturesUnordered<_>>();
+        collect_bucket_presence(probes, disk_count).await
+    }
 
+    pub(crate) async fn stat_bucket_with_quorum(&self, bucket: &str, quorum: BucketInfoQuorum) -> Result<BucketInfo> {
+        let disks = self.disk_inventory().await;
+        let disk_count = disks.len();
+        let probes = disks.into_iter().map(|disk| stat_bucket_volume(disk, bucket));
         let results = join_all(probes).await;
-        let mut infos = Vec::with_capacity(results.len());
+        let mut first_info = None;
         let mut errs = Vec::with_capacity(results.len());
         for result in results {
             match result {
                 Ok(info) => {
-                    infos.push(Some(info));
+                    if first_info.is_none() {
+                        first_info = Some(info);
+                    }
                     errs.push(None);
                 }
                 Err(err) => {
-                    infos.push(None);
                     errs.push(Some(err));
                 }
             }
         }
 
-        let error = match mode {
+        let error = match quorum {
             // Bucket mutations use a majority regardless of object storage
             // class. A namespace read must intersect that majority; object
             // readers still enforce the persisted layout's data-shard quorum.
-            BucketStatMode::ReadInfo | BucketStatMode::ReadPresence => {
-                reduce_read_quorum_errs(&errs, BUCKET_OP_IGNORED_ERRS, disk_count.div_ceil(2).max(1))
+            BucketInfoQuorum::Read => reduce_read_quorum_errs(&errs, BUCKET_OP_IGNORED_ERRS, disk_count.div_ceil(2).max(1)),
+            BucketInfoQuorum::Write | BucketInfoQuorum::HealCandidates => {
+                reduce_write_quorum_errs(&errs, BUCKET_OP_IGNORED_ERRS, disk_count / 2 + 1)
             }
-            BucketStatMode::WriteInfo => reduce_write_quorum_errs(&errs, BUCKET_OP_IGNORED_ERRS, disk_count / 2 + 1),
         };
         if let Some(err) = error {
             return Err(err.into());
         }
 
-        infos
-            .into_iter()
-            .flatten()
-            .next()
+        first_info
             .map(|info| BucketInfo {
                 name: info.name,
                 created: info.created,
@@ -313,7 +305,7 @@ impl BucketOperations for SetDisks {
 
     #[tracing::instrument(skip(self))]
     async fn get_bucket_info(&self, bucket: &str, _opts: &BucketOptions) -> Result<BucketInfo> {
-        let mut info = self.stat_bucket_with_quorum(bucket, BucketStatMode::WriteInfo).await?;
+        let mut info = self.stat_bucket_with_quorum(bucket, BucketInfoQuorum::Write).await?;
         if let Ok(sys) = metadata_sys::get(bucket).await {
             info.versioning = sys.versioning();
             info.object_locking = sys.object_locking();
@@ -384,27 +376,19 @@ mod tests {
     use super::*;
     use futures::{FutureExt, stream};
 
-    fn volume() -> VolumeInfo {
-        VolumeInfo {
-            name: "bucket".to_owned(),
-            created: None,
-        }
-    }
-
     #[test]
     fn bucket_presence_returns_with_a_silent_peer() {
-        let probes = stream::iter([Err(DiskError::VolumeNotFound), Ok(volume()), Ok(volume())]).chain(stream::pending());
+        let probes = stream::iter([Err(DiskError::VolumeNotFound), Ok(()), Ok(())]).chain(stream::pending());
 
-        let info = collect_bucket_presence(probes, 4)
+        collect_bucket_presence(probes, 4)
             .now_or_never()
             .expect("read quorum must return before the fourth probe replies")
             .expect("two successes win even if both other disks report a missing volume");
-        assert_eq!(info.name, "bucket");
     }
 
     #[tokio::test]
     async fn bucket_presence_preserves_absence_and_read_quorum_errors() {
-        let probes = stream::iter([Ok(volume()), Err(DiskError::VolumeNotFound), Err(DiskError::DiskNotFound)]);
+        let probes = stream::iter([Ok(()), Err(DiskError::VolumeNotFound), Err(DiskError::DiskNotFound)]);
         assert!(
             collect_bucket_presence(probes.chain(stream::pending()), 4)
                 .now_or_never()
@@ -413,7 +397,7 @@ mod tests {
         );
 
         let missing = stream::iter([
-            Ok(volume()),
+            Ok(()),
             Err(DiskError::VolumeNotFound),
             Err(DiskError::DiskNotFound),
             Err(DiskError::VolumeNotFound),
@@ -421,7 +405,7 @@ mod tests {
         assert!(matches!(collect_bucket_presence(missing, 4).await, Err(Error::VolumeNotFound)));
 
         let unavailable = stream::iter([
-            Ok(volume()),
+            Ok(()),
             Err(DiskError::VolumeNotFound),
             Err(DiskError::DiskNotFound),
             Err(DiskError::DiskNotFound),

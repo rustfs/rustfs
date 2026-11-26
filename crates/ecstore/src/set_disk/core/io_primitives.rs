@@ -3306,12 +3306,22 @@ struct RenameBatchGroup {
     slots: Vec<usize>,
 }
 
-#[derive(Clone)]
 struct RenameSlotPaths {
-    src_bucket: Arc<String>,
-    src_object: Arc<String>,
-    dst_bucket: Arc<String>,
-    dst_object: Arc<String>,
+    src_bucket: String,
+    src_object: String,
+    dst_bucket: String,
+    dst_object: String,
+}
+
+impl RenameSlotPaths {
+    fn new(src_bucket: &str, src_object: &str, dst_bucket: &str, dst_object: &str) -> Self {
+        Self {
+            src_bucket: src_bucket.to_owned(),
+            src_object: src_object.to_owned(),
+            dst_bucket: dst_bucket.to_owned(),
+            dst_object: dst_object.to_owned(),
+        }
+    }
 }
 
 struct RenameSlotContext {
@@ -3321,7 +3331,7 @@ struct RenameSlotContext {
     scanner_token: Option<Uuid>,
     namespace_owner: Option<Arc<dyn Send + Sync>>,
     publication_scope: Option<crate::object_api::ScannerPublicationCommitScope>,
-    paths: RenameSlotPaths,
+    paths: Arc<RenameSlotPaths>,
     successful_completion_rank: Option<Arc<AtomicUsize>>,
     write_quorum: usize,
     connect_deadline: Option<disk::RenameConnectDeadline>,
@@ -3331,7 +3341,7 @@ struct RenameOutcomeProducerArgs {
     disks: Arc<Vec<Option<DiskStore>>>,
     file_infos: Arc<Vec<FileInfo>>,
     fence_tokens: Arc<Vec<Option<Uuid>>>,
-    paths: RenameSlotPaths,
+    paths: Arc<RenameSlotPaths>,
     namespace_owner: Option<Arc<dyn Send + Sync>>,
     publication_scope: Option<crate::object_api::ScannerPublicationCommitScope>,
     write_quorum: usize,
@@ -4638,6 +4648,10 @@ impl SetDisks {
                 continue;
             }
             let outcome_tx = outcome_tx.clone();
+            let connect_deadline = connect_deadline
+                .as_ref()
+                .filter(|_| disk.as_ref().is_some_and(|disk| !disk.is_local()))
+                .cloned();
             let context = RenameSlotContext {
                 slot,
                 disk,
@@ -4648,7 +4662,7 @@ impl SetDisks {
                 paths: paths.clone(),
                 successful_completion_rank: successful_completion_rank.clone(),
                 write_quorum,
-                connect_deadline: connect_deadline.clone(),
+                connect_deadline,
             };
             let resource_unit = resource_unit.clone();
             let producer = crate::disk::with_optional_resource_unit(resource_unit, async move {
@@ -4881,19 +4895,13 @@ impl SetDisks {
             Arc::new(Self::scanner_publication_lease_tokens_for_disks(disks, scanner_publication_lease_tokens)?);
         Self::record_rename_batch_candidates(disks, &file_infos, &fanout_fence_tokens, src_bucket, dst_bucket, dst_object);
         let coordinator_disks = fanout_disks.clone();
-        let src_bucket = Arc::new(src_bucket.to_string());
-        let src_object = Arc::new(src_object.to_string());
-        let dst_bucket = Arc::new(dst_bucket.to_string());
-        let dst_object = Arc::new(dst_object.to_string());
+        let paths = Arc::new(RenameSlotPaths::new(src_bucket, src_object, dst_bucket, dst_object));
         let (commit_tx, commit_rx) = oneshot::channel();
 
         let coordinator_failure_receipt = rollback_receipt.clone();
         let early_ack_spawn_to_quorum_wait_started = rustfs_io_metrics::put_stage_timer();
         let tail_drain = tokio::spawn(crate::disk::with_detached_disk_io_context({
-            let fanout_src_bucket = src_bucket.clone();
-            let fanout_src_object = src_object.clone();
-            let fanout_dst_bucket = dst_bucket.clone();
-            let fanout_dst_object = dst_object.clone();
+            let paths = paths.clone();
             async move {
                 let allow_batch = scanner_publication_commit_scope.is_none();
                 let RenameOutcomeProducers {
@@ -4903,12 +4911,7 @@ impl SetDisks {
                     disks: fanout_disks.clone(),
                     file_infos: file_infos.clone(),
                     fence_tokens: fanout_fence_tokens.clone(),
-                    paths: RenameSlotPaths {
-                        src_bucket: fanout_src_bucket.clone(),
-                        src_object: fanout_src_object.clone(),
-                        dst_bucket: fanout_dst_bucket.clone(),
-                        dst_object: fanout_dst_object.clone(),
-                    },
+                    paths: paths.clone(),
                     namespace_owner: namespace_commit_guard.clone().map(|owner| owner as Arc<dyn Send + Sync>),
                     publication_scope: scanner_publication_commit_scope,
                     write_quorum,
@@ -4998,7 +5001,7 @@ impl SetDisks {
                         }
                         if let Some(commit_tx) = commit_tx.take() {
                             #[cfg(test)]
-                            rename_fanout_barrier::wait_for_armed_rename_before_early_ack(&fanout_dst_object).await;
+                            rename_fanout_barrier::wait_for_armed_rename_before_early_ack(&paths.dst_object).await;
                             let _ = commit_tx.send(snapshot_commit);
                         }
                         sent_commit = true;
@@ -5016,7 +5019,7 @@ impl SetDisks {
                 );
 
                 #[cfg(test)]
-                rollback_fault_injection::after_fanout(&fanout_dst_object);
+                rollback_fault_injection::after_fanout(&paths.dst_object);
                 if rustfs_io_metrics::put_stage_metrics_enabled() {
                     let fanout_success = errs.iter().filter(|err| err.is_none()).count();
                     let fanout_error = errs.len().saturating_sub(fanout_success + fanout_panic);
@@ -5039,7 +5042,7 @@ impl SetDisks {
                         &errs,
                         &dispatch_states,
                         &data_dirs,
-                        (&fanout_dst_bucket, &fanout_dst_object),
+                        (&paths.dst_bucket, &paths.dst_object),
                         RenameRollbackOwnership {
                             receipt: rollback_receipt,
                             namespace_commit_guard,
@@ -5086,11 +5089,10 @@ impl SetDisks {
                     let Some(disk) = disk.clone() else {
                         continue;
                     };
-                    let dst_bucket = fanout_dst_bucket.clone();
-                    let dst_object = fanout_dst_object.clone();
+                    let paths = paths.clone();
                     backup_reclaims.push(tokio::spawn(async move {
-                        let backup_path = format!("{dst_object}/{rollback_dir}/{STORAGE_FORMAT_FILE_BACKUP}");
-                        disk.delete(&dst_bucket, &backup_path, DeleteOptions::default()).await
+                        let backup_path = format!("{}/{rollback_dir}/{STORAGE_FORMAT_FILE_BACKUP}", paths.dst_object);
+                        disk.delete(&paths.dst_bucket, &backup_path, DeleteOptions::default()).await
                     }));
                 }
                 for result in join_all(backup_reclaims).await {
@@ -5099,16 +5101,16 @@ impl SetDisks {
                         Ok(Err(DiskError::FileNotFound | DiskError::VolumeNotFound)) => {}
                         Ok(Err(err)) => {
                             warn!(
-                                dst_bucket = %fanout_dst_bucket,
-                                dst_object = %fanout_dst_object,
+                                dst_bucket = %paths.dst_bucket,
+                                dst_object = %paths.dst_object,
                                 error = %err,
                                 "rollback backup reclamation failed after committed rename"
                             );
                         }
                         Err(join_err) => {
                             warn!(
-                                dst_bucket = %fanout_dst_bucket,
-                                dst_object = %fanout_dst_object,
+                                dst_bucket = %paths.dst_bucket,
+                                dst_object = %paths.dst_object,
                                 error = %join_err,
                                 "rollback backup reclamation task failed after committed rename"
                             );
@@ -5154,7 +5156,7 @@ impl SetDisks {
         let commit = match commit_rx.await {
             Ok(commit) => commit,
             Err(_) => {
-                record_indeterminate_rename(disks, (&dst_bucket, &dst_object), coordinator_failure_receipt).await;
+                record_indeterminate_rename(disks, (dst_bucket, dst_object), coordinator_failure_receipt).await;
                 return Err(DiskError::Unexpected);
             }
         };
@@ -5258,28 +5260,15 @@ impl SetDisks {
         };
         let mut errs = vec![Some(DiskError::Unexpected); disks.len()];
 
-        let src_bucket = Arc::new(src_bucket.to_string());
-        let src_object = Arc::new(src_object.to_string());
-        let dst_bucket = Arc::new(dst_bucket.to_string());
-        let dst_object = Arc::new(dst_object.to_string());
+        let paths = Arc::new(RenameSlotPaths::new(src_bucket, src_object, dst_bucket, dst_object));
 
         let disk_count = disks.len();
         let fanout_disks = Arc::new(disks.to_vec());
         let fanout_file_infos = Arc::new(file_infos);
         let fanout_fence_tokens =
             Arc::new(Self::scanner_publication_lease_tokens_for_disks(disks, scanner_publication_lease_tokens)?);
-        Self::record_rename_batch_candidates(
-            disks,
-            &fanout_file_infos,
-            &fanout_fence_tokens,
-            src_bucket.as_str(),
-            dst_bucket.as_str(),
-            dst_object.as_str(),
-        );
-        let fanout_src_bucket = src_bucket.clone();
-        let fanout_src_object = src_object.clone();
-        let fanout_dst_bucket = dst_bucket.clone();
-        let fanout_dst_object = dst_object.clone();
+        Self::record_rename_batch_candidates(disks, &fanout_file_infos, &fanout_fence_tokens, src_bucket, dst_bucket, dst_object);
+        let fanout_paths = paths.clone();
         let fanout_publication_scope = scanner_publication_commit_scope.clone();
         let logical_guards = multipart_commit_owner;
         let multipart_commit_owner = logical_guards
@@ -5297,20 +5286,16 @@ impl SetDisks {
             // fan-out owner, even if the caller future is cancelled.
             let _fanout_publication_scope = fanout_publication_scope;
             let _namespace_commit_guard = fanout_namespace_commit_guard.clone();
-            let paths = RenameSlotPaths {
-                src_bucket: fanout_src_bucket,
-                src_object: fanout_src_object,
-                dst_bucket: fanout_dst_bucket,
-                dst_object: fanout_dst_object.clone(),
-            };
             let allow_batch = !protected_multipart && scanner_publication_commit_scope.is_none();
-            let (connect_deadline_tx, connect_deadline) =
-                if bound_connect_after_quorum && fanout_disks.iter().flatten().any(|disk| !disk.is_local()) {
-                    let (tx, rx) = watch::channel(None);
-                    (Some(tx), Some(rx))
-                } else {
-                    (None, None)
-                };
+            let (connect_deadline_tx, connect_deadline) = if bound_connect_after_quorum
+                && fanout_disks.iter().flatten().count() > write_quorum
+                && fanout_disks.iter().flatten().any(|disk| !disk.is_local())
+            {
+                let (tx, rx) = watch::channel(None);
+                (Some(tx), Some(rx))
+            } else {
+                (None, None)
+            };
             let RenameOutcomeProducers {
                 outcomes: mut outcome_rx,
                 mut tasks,
@@ -5318,7 +5303,7 @@ impl SetDisks {
                 disks: fanout_disks,
                 file_infos: fanout_file_infos.clone(),
                 fence_tokens: fanout_fence_tokens,
-                paths,
+                paths: fanout_paths.clone(),
                 namespace_owner: fanout_namespace_owner,
                 publication_scope: scanner_publication_commit_scope,
                 write_quorum,
@@ -5340,7 +5325,7 @@ impl SetDisks {
             }
             while tasks.join_next().await.is_some() {}
             #[cfg(test)]
-            rollback_fault_injection::after_fanout(&fanout_dst_object);
+            rollback_fault_injection::after_fanout(&fanout_paths.dst_object);
             (results, fanout_file_infos)
         };
         let fanout_future = crate::disk::with_detached_disk_io_context(fanout_future);
@@ -5374,7 +5359,7 @@ impl SetDisks {
         let (results, file_infos) = match fanout_result {
             Ok(result) => result,
             Err(_) => {
-                record_indeterminate_rename(disks, (&dst_bucket, &dst_object), rollback_receipt).await;
+                record_indeterminate_rename(disks, (dst_bucket, dst_object), rollback_receipt).await;
                 return Err(DiskError::Unexpected);
             }
         };
@@ -5507,7 +5492,7 @@ impl SetDisks {
                 // Destination-only Undo cannot restore a consumed MPU head.
                 // Only this failed owner can spend the original native caps.
                 owner
-                    .failed_owned(disks, &file_infos, &src_object, (&dst_bucket, &dst_object), namespace_commit_guard)
+                    .failed_owned(disks, &file_infos, src_object, (dst_bucket, dst_object), namespace_commit_guard)
                     .await;
             } else {
                 rollback_failed_rename(
@@ -5516,7 +5501,7 @@ impl SetDisks {
                     &errs,
                     &dispatch_states,
                     &data_dirs,
-                    (&dst_bucket, &dst_object),
+                    (dst_bucket, dst_object),
                     RenameRollbackOwnership {
                         receipt: rollback_receipt,
                         namespace_commit_guard,
@@ -5562,11 +5547,10 @@ impl SetDisks {
             let Some(disk) = disk.clone() else {
                 continue;
             };
-            let dst_bucket = dst_bucket.clone();
-            let dst_object = dst_object.clone();
+            let paths = paths.clone();
             backup_reclaims.push(tokio::spawn(async move {
-                let backup_path = format!("{dst_object}/{rollback_dir}/{STORAGE_FORMAT_FILE_BACKUP}");
-                disk.delete(&dst_bucket, &backup_path, DeleteOptions::default()).await
+                let backup_path = format!("{}/{rollback_dir}/{STORAGE_FORMAT_FILE_BACKUP}", paths.dst_object);
+                disk.delete(&paths.dst_bucket, &backup_path, DeleteOptions::default()).await
             }));
         }
         for result in join_all(backup_reclaims).await {
