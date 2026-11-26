@@ -181,9 +181,11 @@ impl ObjectMetaUsecase {
     ///
     /// # Errors
     ///
-    /// `MethodNotAllowed` for a Veeam SOSAPI system object; `InternalError` before the store is up,
-    /// when the object cannot be read, or for a stored date outside the answerable range; the
-    /// Object Lock refusal of a bucket without Object Lock.
+    /// `MethodNotAllowed` for a Veeam SOSAPI system object or an explicitly selected delete marker.
+    /// `NoSuchBucket`, `NoSuchKey`, or `NoSuchVersion` for an absent resource.
+    /// `InvalidRequest` if Object Lock is disabled and `NoSuchObjectLockConfiguration` if no
+    /// retention is stored for the object version. Storage failures and out-of-range dates can
+    /// return `InternalError`.
     pub async fn execute_get_object_retention(
         &self,
         envelope: RequestEnvelope,
@@ -220,14 +222,22 @@ impl ObjectMetaUsecase {
     }
 }
 
-/// The retention `metadata` stores. An unparseable date is answered as absent, as before.
+/// Decode stored retention, preserving a legacy mode even if its date cannot be parsed.
 fn stored_retention(metadata: &HashMap<String, String>) -> S3Result<ObjectLockRetention> {
-    let mode = metadata
-        .get(AMZ_OBJECT_LOCK_MODE_LOWER)
-        .map(|mode| Mode::custom(mode.clone()));
-    let retain_until_date = metadata
+    let mode = metadata.get(AMZ_OBJECT_LOCK_MODE_LOWER).filter(|mode| !mode.is_empty());
+    let retain_until = metadata
         .get(AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE_LOWER)
-        .and_then(|value| OffsetDateTime::parse(value, &Rfc3339).ok())
+        .filter(|date| !date.is_empty());
+    // PutObjectRetention clears both fields by storing empty strings.
+    if mode.is_none() && retain_until.is_none() {
+        return Err(S3Error::new(S3ErrorCode::NoSuchObjectLockConfiguration));
+    }
+    let parsed_date = match retain_until.map(|value| OffsetDateTime::parse(value, &Rfc3339)).transpose() {
+        Ok(date) => date,
+        Err(_) if mode.is_some() => None,
+        Err(_) => return Err(S3Error::with_message(S3ErrorCode::InternalError, "Stored retention date is invalid")),
+    };
+    let retain_until_date = parsed_date
         .map(|date| {
             date.checked_to_offset(time::UtcOffset::UTC)
                 .filter(|date| (0..=9999).contains(&date.year()))
@@ -241,7 +251,7 @@ fn stored_retention(metadata: &HashMap<String, String>) -> S3Result<ObjectLockRe
         })
         .transpose()?;
     Ok(ObjectLockRetention {
-        mode,
+        mode: mode.map(|mode| Mode::custom(mode.clone())),
         retain_until_date,
         ..Default::default()
     })

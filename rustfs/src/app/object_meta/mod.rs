@@ -32,8 +32,8 @@ use crate::app::RequestEnvelope;
 use crate::app::object::shared::reject_veeam_sosapi_mutation;
 use crate::app::runtime_sources::{AppContext, current_object_store_handle_for_context};
 use crate::app::storage_api::object_meta_usecase::contract::ObjectOperations as _;
-use crate::app::storage_api::object_meta_usecase::validate_bucket_object_lock_enabled;
-use crate::app::storage_api::object_usecase::error::is_err_version_not_found;
+use crate::app::storage_api::object_meta_usecase::validate_bucket_object_lock_enabled_for_read;
+use crate::app::storage_api::object_usecase::error::{StorageError, is_err_object_not_found, is_err_version_not_found};
 use crate::app::storage_api::object_usecase::options::get_opts;
 use crate::app::storage_api::object_usecase::{ECStore, StorageObjectInfo as ObjectInfo};
 use crate::error::ApiError;
@@ -72,26 +72,44 @@ async fn locked_object_info(
     key: &str,
     version_id: Option<String>,
 ) -> S3Result<ObjectInfo> {
-    validate_bucket_object_lock_enabled(bucket).await?;
+    validate_bucket_object_lock_enabled_for_read(bucket).await?;
     let explicit_version = version_id.is_some();
     let opts = get_opts(bucket, key, version_id, None, envelope.headers())
         .await
         .map_err(ApiError::from)?;
-    store.get_object_info(bucket, key, &opts).await.map_err(|error| {
-        if explicit_version && is_err_version_not_found(&error) {
-            return ApiError::from(error).into();
+    let code = match store.get_object_info(bucket, key, &opts).await {
+        Ok(info) if !info.delete_marker => return Ok(info),
+        // A single pool can return the marker snapshot, while multi-pool lookup can reject it.
+        Ok(_) | Err(StorageError::MethodNotAllowed) => {
+            if explicit_version {
+                S3ErrorCode::MethodNotAllowed
+            } else {
+                S3ErrorCode::NoSuchKey
+            }
         }
-        error!(
-            component = "storage",
-            subsystem = "object",
-            event = "object_info_load_failed",
-            bucket = %bucket,
-            object = %key,
-            error = %error,
-            "Failed to load object info"
-        );
-        s3_error!(InternalError, "{}", error.to_string())
-    })
+        Err(error) if is_err_object_not_found(&error) || is_err_version_not_found(&error) => {
+            if explicit_version {
+                S3ErrorCode::NoSuchVersion
+            } else {
+                S3ErrorCode::NoSuchKey
+            }
+        }
+        Err(StorageError::BucketNotFound(_) | StorageError::VolumeNotFound) => S3ErrorCode::NoSuchBucket,
+        Err(error) => {
+            error!(
+                component = "storage",
+                subsystem = "object",
+                event = "object_info_load_failed",
+                bucket = %bucket,
+                object = %key,
+                error = %error,
+                "Failed to load object info"
+            );
+            return Err(s3_error!(InternalError, "{}", error.to_string()));
+        }
+    };
+    let message = ApiError::error_code_to_message(&code);
+    Err(S3Error::with_message(code, message))
 }
 
 #[cfg(test)]

@@ -14,8 +14,8 @@
 
 //! GetObjectLegalHold: the legal hold status an object's metadata stores.
 //!
-//! Responsible for: reading the stored status, `OFF` when none is stored, on a bucket with Object
-//! Lock enabled. A stored status outside the model's set is answered as stored.
+//! Responsible for: reading the stored status on a bucket with Object Lock enabled. Missing hold
+//! metadata produces `NoSuchObjectLockConfiguration`. Other statuses are answered as stored.
 //! Also writes lock metadata to the requested version and schedules metadata replication.
 //! NOT responsible for: authorization.
 //! Upstream: both edges. Downstream: the object store and the bucket's Object Lock configuration.
@@ -154,9 +154,10 @@ impl ObjectMetaUsecase {
     ///
     /// # Errors
     ///
-    /// `MethodNotAllowed` for a Veeam SOSAPI system object; `InternalError` before the store is up
-    /// or when the object cannot be read; `NoSuchBucket`; the Object Lock refusal of a bucket
-    /// without Object Lock.
+    /// `MethodNotAllowed` for a Veeam SOSAPI system object or an explicitly selected delete marker.
+    /// `NoSuchBucket`, `NoSuchKey`, or `NoSuchVersion` for a missing resource.
+    /// `InvalidRequest` if Object Lock is disabled and `NoSuchObjectLockConfiguration` if no hold
+    /// status is stored for the object version. Storage failures can return `InternalError`.
     pub async fn execute_get_object_legal_hold(
         &self,
         envelope: RequestEnvelope,
@@ -180,18 +181,17 @@ impl ObjectMetaUsecase {
         )
         .suppress_event();
         let store = self.store_outside_veeam_sosapi(bucket, key).await?;
-        store
-            .get_bucket_info(bucket, &BucketOptions::default())
-            .await
-            .map_err(ApiError::from)?;
         let object_info = locked_object_info(&store, &envelope, bucket, key, version_id.clone()).await?;
 
         let status = object_info
             .user_defined
             .get(AMZ_OBJECT_LOCK_LEGAL_HOLD_LOWER)
-            .map_or(Status::OFF, |status| Status::custom(status.clone()));
+            .filter(|status| !status.is_empty())
+            .ok_or_else(|| S3Error::new(S3ErrorCode::NoSuchObjectLockConfiguration))?;
         let output = GetObjectLegalHoldOutput {
-            legal_hold: Some(ObjectLockLegalHold { status: Some(status) }),
+            legal_hold: Some(ObjectLockLegalHold {
+                status: Some(Status::custom(status.clone())),
+            }),
         };
 
         let version_id = version_id.unwrap_or_else(|| Uuid::new_v4().to_string());
