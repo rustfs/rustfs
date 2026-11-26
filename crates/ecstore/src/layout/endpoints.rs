@@ -885,6 +885,26 @@ fn explicit_url_port(raw: &str) -> Result<Option<u16>> {
     port.parse().map(Some).map_err(|_| invalid())
 }
 
+fn is_url_topology_with_non_literal_hosts(disks_layout: &DisksLayout) -> Result<bool> {
+    let mut endpoints = disks_layout
+        .pools
+        .iter()
+        .flat_map(|pool| pool.iter().flatten())
+        .map(|endpoint| Endpoint::try_from(endpoint.as_str()));
+    let Some(first) = endpoints.next().transpose()? else {
+        return Ok(false);
+    };
+    if first.get_type() != EndpointType::Url {
+        return Ok(false);
+    }
+    for endpoint in std::iter::once(Ok(first)).chain(endpoints) {
+        if !matches!(endpoint?.url.host(), Some(Host::Ipv4(_) | Host::Ipv6(_))) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 fn infer_kubernetes_local_endpoint_host(
     disks_layout: &DisksLayout,
     local_port: u16,
@@ -1201,32 +1221,11 @@ impl EndpointServerPools {
     ) -> Result<(EndpointServerPools, SetupType)> {
         let mut local_endpoint_host = get_env_opt_str(ENV_LOCAL_ENDPOINT_HOST);
         let mut policy_override = None;
-        let first_endpoint = disks_layout
-            .pools
-            .iter()
-            .flat_map(|pool| pool.iter().flatten())
-            .next()
-            .map(|endpoint| Endpoint::try_from(endpoint.as_str()))
-            .transpose()?;
-        let distributed = first_endpoint
-            .as_ref()
-            .is_some_and(|endpoint| endpoint.get_type() == EndpointType::Url);
-        let mut all_distributed_hosts_are_ip_literals = distributed;
-        if distributed {
-            for raw_endpoint in disks_layout.pools.iter().flat_map(|pool| pool.iter().flatten()) {
-                let endpoint = Endpoint::try_from(raw_endpoint.as_str())?;
-                if !matches!(endpoint.url.host(), Some(Host::Ipv4(_) | Host::Ipv6(_))) {
-                    all_distributed_hosts_are_ip_literals = false;
-                    break;
-                }
-            }
-        }
         let wait_mode = get_env_opt_str(ENV_STARTUP_TOPOLOGY_WAIT_MODE).map(|value| value.trim().to_ascii_lowercase());
         let infer_kubernetes_host = local_endpoint_host.is_none()
-            && distributed
-            && !all_distributed_hosts_are_ip_literals
             && std::env::var_os(ENV_KUBERNETES_SERVICE_HOST).is_some()
-            && matches!(wait_mode.as_deref(), None | Some("") | Some("auto") | Some("orchestrated"));
+            && matches!(wait_mode.as_deref(), None | Some("") | Some("auto") | Some("orchestrated"))
+            && is_url_topology_with_non_literal_hosts(disks_layout)?;
         if infer_kubernetes_host {
             let kernel_hostname = kernel_hostname_for_endpoint_identity()?;
             let local_port = check_local_server_addr(server_addr)?.port();
@@ -1238,7 +1237,7 @@ impl EndpointServerPools {
                         policy_override = Some(StartupTopologyPolicy::resolve_from(
                             Some("bounded"),
                             true,
-                            distributed,
+                            true,
                             get_env_opt_str(ENV_STARTUP_TOPOLOGY_WAIT_TIMEOUT).as_deref(),
                             get_env_opt_str(ENV_STARTUP_TOPOLOGY_RETRY_MAX_DELAY).as_deref(),
                             false,
@@ -2239,7 +2238,7 @@ mod test {
 
     #[serial]
     #[tokio::test]
-    async fn create_server_endpoints_infers_kubernetes_pod_host_without_peer_dns() {
+    async fn create_server_endpoints_infers_kubernetes_host_after_literal_peer_without_dns() {
         let _kernel_hostname = force_kernel_hostname_for_test("rustfs-0");
         let local_host = "rustfs-0.rustfs-headless.ns.svc.cluster.local";
 
@@ -2253,14 +2252,16 @@ mod test {
                 let (pools, setup_type) = EndpointServerPools::from_volumes(
                     "0.0.0.0:9000",
                     vec![
+                        "http://192.0.2.10:9000/data2".to_string(),
                         format!("http://{local_host}:9000/data0"),
                         "http://permanently-missing.invalid:9000/data1".to_string(),
+                        "http://192.0.2.11:9000/data3".to_string(),
                     ],
                 )
                 .await
                 .expect("kernel hostname inference should avoid resolving the missing peer");
 
-                assert_eq!(local_flags(&pools.0[0].endpoints), vec![true, false]);
+                assert_eq!(local_flags(&pools.0[0].endpoints), vec![false, true, false, false]);
                 assert_eq!(setup_type, SetupType::DistErasure);
             },
         )
