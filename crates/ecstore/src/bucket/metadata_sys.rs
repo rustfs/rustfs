@@ -3072,12 +3072,11 @@ impl BucketMetadataSys {
                     Box::pin(async {
                         let store = self.object_store();
                         let options = crate::storage_api_contracts::bucket::BucketOptions::default();
-                        let info = if require_write_quorum {
-                            store.get_bucket_info_from_sets(bucket, &options).await
+                        if require_write_quorum {
+                            store.get_bucket_info_from_sets(bucket, &options).await.map(|_| ())
                         } else {
-                            store.get_bucket_info_from_sets_at_read_quorum(bucket, &options).await
-                        };
-                        info.map(|_| ())
+                            store.check_bucket_presence_at_read_quorum(bucket).await
+                        }
                     }),
                 )
                 .await?;
@@ -3640,19 +3639,12 @@ impl BucketMetadataSys {
         #[cfg(test)]
         self.authority_disk_loads.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
-        let (bucket_info_res, metadata_res) = tokio::join!(
+        let (bucket_presence_res, metadata_res) = tokio::join!(
             Box::pin(await_bucket_namespace_operation(
                 Some(guard),
                 bucket,
                 "bucket metadata snapshot existence check",
-                async {
-                    store
-                        .get_bucket_info_from_sets_at_read_quorum(
-                            bucket,
-                            &crate::storage_api_contracts::bucket::BucketOptions::default(),
-                        )
-                        .await
-                },
+                store.check_bucket_presence_at_read_quorum(bucket),
             )),
             Box::pin(await_bucket_namespace_operation(
                 Some(guard),
@@ -3661,8 +3653,8 @@ impl BucketMetadataSys {
                 load_bucket_metadata_parse_with_presence(Arc::clone(&store), bucket, false),
             )),
         );
-        match bucket_info_res {
-            Ok(_) => {}
+        match bucket_presence_res {
+            Ok(()) => {}
             Err(Error::VolumeNotFound) => return Ok(BucketMetadataAuthority::MissingBucket),
             Err(err) => return Err(err),
         }

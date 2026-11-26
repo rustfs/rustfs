@@ -24,7 +24,7 @@ use crate::disk::{
 };
 use crate::error::is_err_bucket_not_found;
 use crate::runtime::sources as runtime_sources;
-use crate::set_disk::{BucketInfoQuorum, get_lock_acquire_timeout};
+use crate::set_disk::{BucketInfoQuorum, BucketStatMode, get_lock_acquire_timeout};
 use crate::storage_api_contracts::admin::DiskSetSelector;
 use crate::storage_api_contracts::bucket::{BUCKET_LIFECYCLE_LOCK_OBJECT, SRBucketDeleteOp};
 use crate::storage_api_contracts::namespace::NamespaceLocking as _;
@@ -1702,24 +1702,21 @@ impl ECStore {
 
     #[instrument(skip(self))]
     pub(crate) async fn get_bucket_info_from_sets(&self, bucket: &str, opts: &BucketOptions) -> Result<BucketInfo> {
-        self.get_bucket_info_from_sets_with_quorum(bucket, opts, BucketInfoQuorum::Write)
+        self.get_bucket_info_from_sets_with_quorum(bucket, opts, BucketStatMode::WriteInfo)
             .await
     }
 
-    pub(crate) async fn get_bucket_info_from_sets_at_read_quorum(
-        &self,
-        bucket: &str,
-        opts: &BucketOptions,
-    ) -> Result<BucketInfo> {
-        self.get_bucket_info_from_sets_with_quorum(bucket, opts, BucketInfoQuorum::Read)
+    pub(crate) async fn check_bucket_presence_at_read_quorum(&self, bucket: &str) -> Result<()> {
+        self.get_bucket_info_from_sets_with_quorum(bucket, &BucketOptions::default(), BucketStatMode::ReadPresence)
             .await
+            .map(|_| ())
     }
 
     async fn get_bucket_info_from_sets_with_quorum(
         &self,
         bucket: &str,
         opts: &BucketOptions,
-        quorum: BucketInfoQuorum,
+        mode: BucketStatMode,
     ) -> Result<BucketInfo> {
         // One host may participate in several pools after expansion. Resolve the
         // namespace against each erasure set so disks from different pools can
@@ -1728,9 +1725,9 @@ impl ECStore {
         // latency shape by probing every set concurrently; scanner listings use
         // a separate bounded path below because they run continuously.
         let mut scoped_results = futures::future::join_all(self.bucket_sets().map(|(pool_index, set_index, set)| async move {
-            let result = match quorum {
-                BucketInfoQuorum::Read => set.stat_bucket_with_quorum(bucket, quorum).await,
-                BucketInfoQuorum::Write | BucketInfoQuorum::HealCandidates => set.get_bucket_info(bucket, opts).await,
+            let result = match mode {
+                BucketStatMode::ReadInfo | BucketStatMode::ReadPresence => set.stat_bucket_with_quorum(bucket, mode).await,
+                BucketStatMode::WriteInfo => set.get_bucket_info(bucket, opts).await,
             };
             (pool_index, set_index, result)
         }))
@@ -1782,7 +1779,7 @@ impl ECStore {
         let guard = self.acquire_bucket_lifecycle_read_lock(bucket).await?;
         await_bucket_namespace_operation(Some(&guard), bucket, "bucket read quorum validation", async {
             let mut info = self
-                .get_bucket_info_from_sets_with_quorum(bucket, opts, BucketInfoQuorum::Read)
+                .get_bucket_info_from_sets_with_quorum(bucket, opts, BucketStatMode::ReadInfo)
                 .await?;
             let (metadata, persisted) = metadata_sys::get_config_from_disk_with_presence_in(&self.ctx, bucket).await?;
             if !persisted {

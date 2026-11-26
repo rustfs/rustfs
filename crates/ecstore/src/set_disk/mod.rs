@@ -920,7 +920,7 @@ pub(crate) use core::io_primitives::{ENV_RUSTFS_PUT_RENAME_EARLY_ACK_ENABLE, ren
 mod ctx;
 mod metadata;
 mod ops;
-pub(crate) use ops::bucket::BucketInfoQuorum;
+pub(crate) use ops::bucket::{BucketInfoQuorum, BucketStatMode};
 pub(crate) use ops::delete_recovery::{DeleteRecoveryContext, DeleteRecoverySummary};
 pub(crate) use ops::heal::AbsenceProofRequest;
 #[cfg(test)]
