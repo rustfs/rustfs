@@ -86,7 +86,6 @@ use crate::set_disk::core::multipart_source::{
 use crate::set_disk::mem;
 use crate::set_disk::metadata_sys;
 use crate::set_disk::runtime_sources;
-#[cfg(test)]
 use crate::storage_api_contracts::multipart::MultipartOperations;
 use crate::storage_api_contracts::multipart::{ListPartsOwner, MultipartOwner};
 #[cfg(test)]
@@ -103,14 +102,13 @@ use rustfs_utils::http::SSEC_ALGORITHM_HEADER;
 #[cfg(test)]
 use rustfs_utils::http::SUFFIX_COMPRESSION;
 use rustfs_utils::http::{SUFFIX_INLINE_DATA, SUFFIX_MAX_TOTAL_OBJECT_SIZE, get_consistent_str};
-use rustfs_utils::path::{decode_dir_object, encode_dir_object};
+use rustfs_utils::path::{decode_dir_object, encode_dir_object, encode_dir_object_ref};
 use std::future::Future;
 #[cfg(test)]
 use std::sync::atomic::AtomicBool;
 #[cfg(any(test, feature = "test-util"))]
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Mutex, OnceLock};
-#[cfg(any(test, feature = "test-util"))]
+use std::sync::{Mutex, OnceLock, Weak};
 use std::time::Duration;
 #[cfg(test)]
 use tokio::io::AsyncReadExt;
@@ -172,6 +170,399 @@ async fn create_part_writers(
 }
 
 const MULTIPART_LIST_IO_CONCURRENCY: usize = 16;
+const STAGED_QUOTA_SCAN_PAGE_SIZE: usize = 1000;
+const STAGED_QUOTA_RESCAN_COST_FACTOR: u32 = 10;
+
+fn staged_part_budget_bytes(physical_size: usize, actual_size: i64) -> u64 {
+    let physical = u64::try_from(physical_size).unwrap_or(u64::MAX);
+    let logical = u64::try_from(actual_size).unwrap_or(0);
+    physical.max(logical)
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Hash)]
+struct BucketStagingBudgetKey {
+    ctx_ptr: usize,
+    bucket: String,
+}
+
+struct BucketStagingBudgetEntry {
+    ctx: Weak<crate::runtime::instance::InstanceContext>,
+    budget: Arc<BucketStagingBudget>,
+}
+
+static BUCKET_STAGING_BUDGETS: OnceLock<Mutex<HashMap<BucketStagingBudgetKey, BucketStagingBudgetEntry>>> = OnceLock::new();
+
+#[derive(Debug)]
+enum StagingScanEvent {
+    Commit {
+        upload_path: String,
+        part_id: usize,
+        bytes: u64,
+    },
+    RemoveUpload(String),
+}
+
+#[derive(Default)]
+struct BucketStagingState {
+    epoch: u64,
+    incarnation: Option<Uuid>,
+    initialized_from_disk: bool,
+    truncated_above_limit: bool,
+    last_reconciled: Option<(Instant, Duration)>,
+    rescan_hint: bool,
+    uploads: HashMap<String, HashMap<usize, u64>>,
+    staged_total: u64,
+    in_flight: u64,
+    scan_active: bool,
+    scan_events: Vec<StagingScanEvent>,
+}
+
+impl BucketStagingState {
+    fn sync_incarnation(&mut self, incarnation: Option<Uuid>) {
+        if let Some(incarnation) = incarnation
+            && self.incarnation.is_some_and(|existing| existing != incarnation)
+        {
+            self.epoch = self.epoch.wrapping_add(1);
+            self.incarnation = Some(incarnation);
+            self.initialized_from_disk = false;
+            self.truncated_above_limit = false;
+            self.last_reconciled = None;
+            self.rescan_hint = false;
+            self.uploads.clear();
+            self.staged_total = 0;
+            self.in_flight = 0;
+            self.scan_active = false;
+            self.scan_events.clear();
+        } else if self.incarnation.is_none() {
+            self.incarnation = incarnation;
+        }
+    }
+
+    fn replaced_bytes(&self, upload_path: &str, part_id: usize) -> u64 {
+        self.uploads
+            .get(upload_path)
+            .and_then(|parts| parts.get(&part_id))
+            .copied()
+            .unwrap_or(0)
+    }
+
+    fn needs_scan(&self, limit: u64, upload_path: &str, part_id: usize, bytes: u64) -> bool {
+        if !self.initialized_from_disk {
+            return true;
+        }
+        let replaced = self.replaced_bytes(upload_path, part_id);
+        let effective = self
+            .staged_total
+            .saturating_sub(replaced)
+            .saturating_add(self.in_flight)
+            .saturating_add(bytes);
+        if effective <= limit {
+            return false;
+        }
+        if self.staged_total == 0 {
+            return false;
+        }
+        if self.rescan_hint {
+            return true;
+        }
+        self.last_reconciled
+            .is_none_or(|(finished, cost)| finished.elapsed() >= cost.saturating_mul(STAGED_QUOTA_RESCAN_COST_FACTOR))
+    }
+
+    fn record_committed_part(&mut self, upload_path: String, part_id: usize, bytes: u64) {
+        let prev = self
+            .uploads
+            .entry(upload_path.clone())
+            .or_default()
+            .insert(part_id, bytes)
+            .unwrap_or(0);
+        self.staged_total = self.staged_total.saturating_sub(prev).saturating_add(bytes);
+        if self.scan_active {
+            self.scan_events.push(StagingScanEvent::Commit {
+                upload_path,
+                part_id,
+                bytes,
+            });
+        }
+    }
+
+    fn remove_upload(&mut self, upload_path: &str) {
+        if let Some(parts) = self.uploads.remove(upload_path) {
+            let upload_bytes = parts.values().copied().fold(0_u64, u64::saturating_add);
+            self.staged_total = self.staged_total.saturating_sub(upload_bytes);
+            if self.truncated_above_limit {
+                self.rescan_hint = true;
+            }
+        } else if self.staged_total > 0 || self.truncated_above_limit {
+            self.rescan_hint = true;
+        }
+        if self.scan_active {
+            self.scan_events.push(StagingScanEvent::RemoveUpload(upload_path.to_owned()));
+        }
+    }
+}
+
+#[derive(Default)]
+struct BucketStagingBudget {
+    scan_gate: tokio::sync::Mutex<()>,
+    state: Mutex<BucketStagingState>,
+}
+
+struct StagingScanActiveGuard<'a> {
+    budget: &'a BucketStagingBudget,
+    epoch: u64,
+    finished: bool,
+}
+
+impl Drop for StagingScanActiveGuard<'_> {
+    fn drop(&mut self) {
+        if !self.finished {
+            let mut state = self.budget.lock_state();
+            if state.epoch == self.epoch {
+                state.scan_active = false;
+                state.scan_events.clear();
+            }
+        }
+    }
+}
+
+impl BucketStagingBudget {
+    fn lock_state(&self) -> std::sync::MutexGuard<'_, BucketStagingState> {
+        self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    async fn refresh_for<F, Fut>(
+        &self,
+        incarnation: Option<Uuid>,
+        limit: u64,
+        upload_path: &str,
+        part_id: usize,
+        bytes: u64,
+        scan: F,
+    ) -> Result<()>
+    where
+        F: FnOnce() -> Fut,
+        Fut: Future<Output = Result<(HashMap<String, HashMap<usize, u64>>, bool)>>,
+    {
+        {
+            let mut state = self.lock_state();
+            state.sync_incarnation(incarnation);
+            if !state.needs_scan(limit, upload_path, part_id, bytes) {
+                return Ok(());
+            }
+        }
+
+        let _scan_gate = self.scan_gate.lock().await;
+        let scan_epoch = {
+            let mut state = self.lock_state();
+            state.sync_incarnation(incarnation);
+            if !state.needs_scan(limit, upload_path, part_id, bytes) {
+                return Ok(());
+            }
+            state.scan_active = true;
+            state.scan_events.clear();
+            state.rescan_hint = false;
+            state.epoch
+        };
+
+        let mut active_guard = StagingScanActiveGuard {
+            budget: self,
+            epoch: scan_epoch,
+            finished: false,
+        };
+        let started = Instant::now();
+        let (mut scanned_uploads, truncated_above_limit) = scan().await?;
+
+        let mut state = self.lock_state();
+        active_guard.finished = true;
+        if state.epoch != scan_epoch {
+            return Ok(());
+        }
+        state.scan_active = false;
+        let events = std::mem::take(&mut state.scan_events);
+        for event in events {
+            match event {
+                StagingScanEvent::Commit {
+                    upload_path,
+                    part_id,
+                    bytes,
+                } => {
+                    scanned_uploads.entry(upload_path).or_default().insert(part_id, bytes);
+                }
+                StagingScanEvent::RemoveUpload(upload_path) => {
+                    scanned_uploads.remove(&upload_path);
+                }
+            }
+        }
+        let staged_total = scanned_uploads
+            .values()
+            .flat_map(|parts| parts.values().copied())
+            .fold(0_u64, u64::saturating_add);
+        state.uploads = scanned_uploads;
+        state.staged_total = staged_total;
+        state.truncated_above_limit = truncated_above_limit;
+        state.initialized_from_disk = true;
+        state.last_reconciled = Some((Instant::now(), started.elapsed()));
+        Ok(())
+    }
+
+    fn try_admit(
+        self: &Arc<Self>,
+        incarnation: Option<Uuid>,
+        limit: u64,
+        upload_path: &str,
+        part_id: usize,
+        declared_bytes: u64,
+    ) -> Result<StagedPartReservation> {
+        let mut state = self.lock_state();
+        state.sync_incarnation(incarnation);
+        let current = state.staged_total.saturating_add(state.in_flight);
+        if declared_bytes > limit {
+            return Err(StorageError::QuotaExceeded { current, limit });
+        }
+        let replaced = state.replaced_bytes(upload_path, part_id);
+        let effective = state
+            .staged_total
+            .saturating_sub(replaced)
+            .saturating_add(state.in_flight)
+            .saturating_add(declared_bytes);
+        if effective > limit {
+            return Err(StorageError::QuotaExceeded { current, limit });
+        }
+        state.in_flight = state.in_flight.saturating_add(declared_bytes);
+        Ok(StagedPartReservation {
+            budget: Arc::clone(self),
+            epoch: state.epoch,
+            upload_path: upload_path.to_owned(),
+            part_id,
+            reserved_bytes: declared_bytes,
+            committed: false,
+        })
+    }
+}
+
+/// In-flight multipart staging reservation owned by `put_object_part` and moved
+/// into its detached commit task so a client disconnect after staging cannot
+/// refund bytes that subsequently rename into `.rustfs.sys/multipart`.
+struct StagedPartReservation {
+    budget: Arc<BucketStagingBudget>,
+    epoch: u64,
+    upload_path: String,
+    part_id: usize,
+    reserved_bytes: u64,
+    committed: bool,
+}
+
+impl StagedPartReservation {
+    fn prepare_commit(&mut self, limit: u64, committed_bytes: u64) -> Result<()> {
+        let mut state = self.budget.lock_state();
+        if state.epoch != self.epoch {
+            return Err(StorageError::QuotaExceeded {
+                current: state.staged_total.saturating_add(state.in_flight),
+                limit,
+            });
+        }
+        let other_in_flight = state.in_flight.saturating_sub(self.reserved_bytes);
+        let current = state.staged_total.saturating_add(other_in_flight);
+        if committed_bytes > limit {
+            return Err(StorageError::QuotaExceeded { current, limit });
+        }
+        let replaced = state.replaced_bytes(&self.upload_path, self.part_id);
+        let effective = state
+            .staged_total
+            .saturating_sub(replaced)
+            .saturating_add(other_in_flight)
+            .saturating_add(committed_bytes);
+        if effective > limit {
+            return Err(StorageError::QuotaExceeded { current, limit });
+        }
+        if committed_bytes > self.reserved_bytes {
+            let extra = committed_bytes.saturating_sub(self.reserved_bytes);
+            state.in_flight = state.in_flight.saturating_add(extra);
+            self.reserved_bytes = committed_bytes;
+        }
+        Ok(())
+    }
+
+    fn commit(mut self, committed_bytes: u64) {
+        self.committed = true;
+        let reserved = std::mem::take(&mut self.reserved_bytes);
+        let upload_path = std::mem::take(&mut self.upload_path);
+        let mut state = self.budget.lock_state();
+        if state.epoch == self.epoch {
+            state.in_flight = state.in_flight.saturating_sub(reserved);
+            state.record_committed_part(upload_path, self.part_id, committed_bytes);
+        }
+    }
+}
+
+impl Drop for StagedPartReservation {
+    fn drop(&mut self) {
+        if !self.committed && self.reserved_bytes > 0 {
+            let mut state = self.budget.lock_state();
+            if state.epoch == self.epoch {
+                state.in_flight = state.in_flight.saturating_sub(self.reserved_bytes);
+            }
+        }
+    }
+}
+
+fn bucket_staging_budget(ctx: &Arc<crate::runtime::instance::InstanceContext>, bucket: &str) -> Arc<BucketStagingBudget> {
+    let key = BucketStagingBudgetKey {
+        ctx_ptr: Arc::as_ptr(ctx) as usize,
+        bucket: bucket.to_owned(),
+    };
+    let mut budgets = BUCKET_STAGING_BUDGETS
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some(entry) = budgets.get(&key)
+        && entry.ctx.upgrade().is_some_and(|existing| Arc::ptr_eq(&existing, ctx))
+    {
+        return Arc::clone(&entry.budget);
+    }
+    budgets.retain(|_, entry| entry.ctx.strong_count() > 0);
+    let budget = Arc::new(BucketStagingBudget::default());
+    budgets.insert(
+        key,
+        BucketStagingBudgetEntry {
+            ctx: Arc::downgrade(ctx),
+            budget: Arc::clone(&budget),
+        },
+    );
+    budget
+}
+
+fn release_multipart_staging_upload(ctx: &Arc<crate::runtime::instance::InstanceContext>, bucket: &str, upload_path: &str) {
+    let Some(map) = BUCKET_STAGING_BUDGETS.get() else {
+        return;
+    };
+    let key = BucketStagingBudgetKey {
+        ctx_ptr: Arc::as_ptr(ctx) as usize,
+        bucket: bucket.to_owned(),
+    };
+    let budget = {
+        let budgets = map.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        budgets
+            .get(&key)
+            .filter(|entry| entry.ctx.upgrade().is_some_and(|existing| Arc::ptr_eq(&existing, ctx)))
+            .map(|entry| Arc::clone(&entry.budget))
+    };
+    if let Some(budget) = budget {
+        budget.lock_state().remove_upload(upload_path);
+    }
+}
+
+#[cfg(test)]
+fn reset_bucket_staging_budget_for_test(ctx: &Arc<crate::runtime::instance::InstanceContext>, bucket: &str) {
+    if let Some(map) = BUCKET_STAGING_BUDGETS.get() {
+        let key = BucketStagingBudgetKey {
+            ctx_ptr: Arc::as_ptr(ctx) as usize,
+            bucket: bucket.to_owned(),
+        };
+        map.lock().unwrap_or_else(std::sync::PoisonError::into_inner).remove(&key);
+    }
+}
 
 static CAPPED_MULTIPART_STAGING: OnceLock<Mutex<HashMap<String, Arc<tokio::sync::Semaphore>>>> = OnceLock::new();
 
@@ -387,6 +778,7 @@ impl DataMovementMultipartAbortGuard {
             ensure_multipart_bucket_lifecycle_lock_held(bucket, object, opts)?;
             set.delete_multipart_source_with_authority(&disks, (bucket, object, &self.upload_path), cleanup, write_quorum)
                 .await?;
+            release_multipart_staging_upload(&set.ctx, bucket, &self.upload_path);
             #[cfg(any(test, feature = "test-util"))]
             pause_multipart_commit(bucket, object, MultipartCommitPause::AbortAfterDelete).await;
         }
@@ -432,6 +824,7 @@ impl StaleMultipartCleanupGuard {
             .await;
         if result.is_ok() {
             remove_capped_multipart_staging_semaphore(&self.upload_path);
+            release_multipart_staging_upload(&set.ctx, bucket, &self.upload_path);
         }
         result
     }
@@ -2015,6 +2408,125 @@ impl SetDisks {
         Ok(!result.uploads.is_empty())
     }
 
+    /// Scan staged multipart part sizes belonging to `bucket` in this set without
+    /// acquiring upload or object locks, stopping early once `total` exceeds `limit`.
+    pub(crate) async fn scan_set_staged_multipart_parts(
+        &self,
+        bucket: &str,
+        expected_incarnation_id: Option<Uuid>,
+        bucket_lifecycle_lock_fence: Option<&NamespaceLockFence>,
+        limit: u64,
+        uploads: &mut HashMap<String, HashMap<usize, u64>>,
+        total: &mut u64,
+    ) -> Result<bool> {
+        let no_lock_opts = ObjectOptions {
+            no_lock: true,
+            expected_bucket_incarnation_id: bucket_lifecycle_lock_fence.and(expected_incarnation_id),
+            bucket_lifecycle_lock_fence: bucket_lifecycle_lock_fence.cloned(),
+            ..Default::default()
+        };
+        let mut key_marker = None;
+        let mut upload_id_marker = None;
+        loop {
+            let page = self
+                .list_multipart_uploads_for_incarnation(
+                    bucket,
+                    "",
+                    key_marker,
+                    upload_id_marker,
+                    None,
+                    STAGED_QUOTA_SCAN_PAGE_SIZE,
+                    expected_incarnation_id,
+                )
+                .await?;
+            for upload in &page.uploads {
+                let encoded_object = encode_dir_object_ref(&upload.object);
+                let upload_path =
+                    Self::validated_multipart_upload_path(bucket, encoded_object.as_ref(), &upload.upload_id, false)?;
+                let mut part_marker = None;
+                loop {
+                    let parts = match self
+                        .list_object_parts(
+                            bucket,
+                            encoded_object.as_ref(),
+                            &upload.upload_id,
+                            part_marker,
+                            STAGED_QUOTA_SCAN_PAGE_SIZE,
+                            &no_lock_opts,
+                        )
+                        .await
+                    {
+                        Ok(parts) => parts,
+                        Err(err) if crate::error::is_err_invalid_upload_id(&err) => break,
+                        Err(err) => return Err(err),
+                    };
+                    let upload_parts = uploads.entry(upload_path.clone()).or_default();
+                    for part in &parts.parts {
+                        let bytes = staged_part_budget_bytes(part.size, part.actual_size);
+                        let prev = upload_parts.insert(part.part_num, bytes).unwrap_or(0);
+                        *total = total.saturating_sub(prev).saturating_add(bytes);
+                        if *total > limit {
+                            return Ok(true);
+                        }
+                    }
+                    if !parts.is_truncated || parts.next_part_number_marker.is_none() {
+                        break;
+                    }
+                    part_marker = parts.next_part_number_marker;
+                }
+            }
+            if !page.is_truncated || page.next_key_marker.is_none() {
+                return Ok(false);
+            }
+            key_marker = page.next_key_marker;
+            upload_id_marker = page.next_upload_id_marker;
+        }
+    }
+
+    async fn admit_bucket_staging_part(
+        &self,
+        bucket: &str,
+        incarnation: Option<Uuid>,
+        opts: &ObjectOptions,
+        part: (&str, usize, u64, u64),
+    ) -> Result<StagedPartReservation> {
+        let (upload_path, part_id, declared_bytes, limit) = part;
+        let bucket_lifecycle_lock_fence = opts.bucket_lifecycle_lock_fence.as_ref();
+        let budget = bucket_staging_budget(&self.ctx, bucket);
+        if declared_bytes > limit {
+            let current = {
+                let mut state = budget.lock_state();
+                state.sync_incarnation(incarnation);
+                state.staged_total.saturating_add(state.in_flight)
+            };
+            return Err(StorageError::QuotaExceeded { current, limit });
+        }
+        budget
+            .refresh_for(incarnation, limit, upload_path, part_id, declared_bytes, || async {
+                if let Some(store) = metadata_sys::object_store_if_initialized_in(&self.ctx).await {
+                    store
+                        .scan_bucket_staged_multipart_parts(bucket, incarnation, bucket_lifecycle_lock_fence, limit)
+                        .await
+                } else {
+                    let mut uploads = HashMap::new();
+                    let mut total = 0_u64;
+                    let truncated = self
+                        .scan_set_staged_multipart_parts(
+                            bucket,
+                            incarnation,
+                            bucket_lifecycle_lock_fence,
+                            limit,
+                            &mut uploads,
+                            &mut total,
+                        )
+                        .await?;
+                    Ok((uploads, truncated))
+                }
+            })
+            .await?;
+        budget.try_admit(incarnation, limit, upload_path, part_id, declared_bytes)
+    }
+
     /// Index coverage only locates candidates. Every candidate still traverses
     /// the original directory and metadata quorum checks on this disk snapshot.
     async fn multipart_index_roots(
@@ -2748,6 +3260,7 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
             Ok(value) => value,
             Err(err @ Error::InvalidUploadID(..)) => {
                 remove_capped_multipart_staging_semaphore(&upload_id_path);
+                release_multipart_staging_upload(&self.ctx, bucket, &upload_id_path);
                 return Err(err);
             }
             Err(err) => return Err(err),
@@ -2756,6 +3269,33 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
         ensure_data_movement_upload_access(&fi, bucket, object, upload_id, opts)?;
         ensure_multipart_bucket_incarnation(&self.ctx, &fi, bucket, object, upload_id, opts.expected_bucket_incarnation_id)
             .await?;
+
+        // Enforce bucket hard quota against staged multipart bytes before writing
+        // temp shards. The reservation guard moves into the detached commit task
+        // below so a client disconnect after staging cannot drop it uncounted.
+        let mut staged_quota_reservation = if !opts.data_movement && !crate::bucket::utils::is_meta_bucketname(bucket) {
+            if let Some((quota_limit, bucket_incarnation)) =
+                metadata_sys::get_bucket_quota_limit_and_incarnation_in(&self.ctx, bucket).await?
+            {
+                let incarnation = opts.expected_bucket_incarnation_id.or(bucket_incarnation);
+                let declared_bytes = u64::try_from(data.size())
+                    .unwrap_or(0)
+                    .max(u64::try_from(data.actual_size()).unwrap_or(0));
+                Some(
+                    self.admit_bucket_staging_part(
+                        bucket,
+                        incarnation,
+                        opts,
+                        (&upload_id_path, part_id, declared_bytes, quota_limit),
+                    )
+                    .await?,
+                )
+            } else {
+                None
+            }
+        } else {
+            None
+        };
 
         let write_quorum = fi.write_quorum(self.default_write_quorum());
 
@@ -3079,6 +3619,7 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
             let commit_upload_id_path = upload_id_path.clone();
             let commit_tmp_part = tmp_part.clone();
             let commit_opts = opts.clone();
+            let commit_staged_quota_reservation = staged_quota_reservation.take();
             commit_owns_cleanup = true;
             // The body is already staged. Keep every commit guard through the
             // prepare, publish, settlement/rollback and temporary cleanup I/O,
@@ -3087,6 +3628,7 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
                 let _upload_commit_guard = _upload_commit_guard;
                 let _part_commit_guard = _part_commit_guard;
                 let _capped_staging_guard = _capped_staging_guard;
+                let mut staged_quota_reservation = commit_staged_quota_reservation;
                 let bucket = commit_bucket.as_str();
                 let object = commit_object.as_str();
                 let upload_id = commit_upload_id.as_str();
@@ -3143,6 +3685,27 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
                         admitted_multipart_size(current_size, candidate_size, limit)?;
                     }
 
+                    let committed_staged_bytes = staged_part_budget_bytes(w_size, actual_size);
+                    if !opts.data_movement
+                        && !crate::bucket::utils::is_meta_bucketname(bucket)
+                        && let Some((quota_limit, bucket_incarnation)) =
+                            metadata_sys::get_bucket_quota_limit_and_incarnation_in(&commit_set.ctx, bucket).await?
+                    {
+                        let incarnation = opts.expected_bucket_incarnation_id.or(bucket_incarnation);
+                        if let Some(reservation) = staged_quota_reservation.as_mut() {
+                            reservation.prepare_commit(quota_limit, committed_staged_bytes)?;
+                        } else {
+                            let budget = bucket_staging_budget(&commit_set.ctx, bucket);
+                            staged_quota_reservation = Some(budget.try_admit(
+                                incarnation,
+                                quota_limit,
+                                &upload_id_path,
+                                part_id,
+                                committed_staged_bytes,
+                            )?);
+                        }
+                    }
+
                     let decommission_capacity_guard = if let Some(store) = opts.decommission_capacity_admission.as_ref() {
                         Some(
                             store
@@ -3188,6 +3751,9 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
                     rustfs_io_metrics::record_put_object_stage_duration_from("multipart_set_disk_rename_part", rename_started);
                     drop(decommission_capacity_guard);
                     let _ = rename_result?;
+                    if let Some(reservation) = staged_quota_reservation.take() {
+                        reservation.commit(committed_staged_bytes);
+                    }
                     #[cfg(test)]
                     observe_multipart_commit(bucket, object, MultipartCommitPause::PutPartBeforeLockLost);
 
@@ -3727,6 +4293,7 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
             .await;
         if result.is_ok() {
             remove_capped_multipart_staging_semaphore(&upload_id_path);
+            release_multipart_staging_upload(&self.ctx, bucket, &upload_id_path);
             #[cfg(any(test, feature = "test-util"))]
             pause_multipart_commit(bucket, object, MultipartCommitPause::AbortAfterDelete).await;
         }
@@ -5333,6 +5900,7 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
                     "completed multipart upload staging cleanup did not reach write quorum"
                 );
             }
+            release_multipart_staging_upload(&commit_set.ctx, &commit_bucket, &commit_upload_id_path);
 
             drop(_upload_guard.take());
 
@@ -18870,5 +19438,308 @@ mod tests {
             .await
             .expect("unconfigured upload with empty-buffer CRC32 should preserve legacy compatibility");
         assert_eq!(completed_plain.size, i64::try_from(payload.len()).expect("test payload length fits i64"));
+    }
+}
+
+#[cfg(test)]
+mod multipart_staging_quota_tests {
+    use super::*;
+    use crate::bucket::quota::BucketQuota;
+    use crate::storage_api_contracts::bucket::{BucketOperations, MakeBucketOptions};
+    use serial_test::serial;
+
+    async fn setup_quota_store_and_bucket(limit: Option<u64>) -> (Vec<tempfile::TempDir>, Arc<crate::store::ECStore>, String) {
+        let (dirs, store) = crate::bucket::metadata_sys::test_support::isolated_store_over_temp_disks().await;
+        crate::bucket::metadata_sys::init_bucket_metadata_sys(store.clone(), Vec::new()).await;
+        let bucket = format!("mpu-staging-quota-{}", Uuid::new_v4().simple());
+        store
+            .make_bucket(&bucket, &MakeBucketOptions::default())
+            .await
+            .expect("create bucket for staging quota test");
+        if let Some(limit) = limit {
+            let quota = BucketQuota::new(Some(limit));
+            let payload = quota.marshal_msg().expect("serialize hard quota");
+            store
+                .update_bucket_metadata_config(&bucket, rustfs_config::QUOTA_CONFIG_FILE, payload)
+                .await
+                .expect("persist hard quota config");
+            crate::bucket::quota::reservation::initialize_quota_ledger_for_test(store.clone(), &bucket)
+                .await
+                .expect("initialize durable quota ledger");
+        }
+        (dirs, store, bucket)
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn hard_quota_bounds_staged_parts_across_uploads_overwrites_abort_complete_and_restart() {
+        const QUOTA: u64 = 4096;
+        let (_dirs, store, bucket) = setup_quota_store_and_bucket(Some(QUOTA)).await;
+
+        let upload_a = store
+            .new_multipart_upload(&bucket, "obj-a", &ObjectOptions::default())
+            .await
+            .expect("create upload A");
+        let upload_b = store
+            .new_multipart_upload(&bucket, "obj-b", &ObjectOptions::default())
+            .await
+            .expect("create upload B");
+
+        // A single part larger than the hard quota must be rejected before staging.
+        let mut oversize_reader = PutObjReader::from_vec(vec![0x11; 4097]);
+        let oversize_err = store
+            .put_object_part(&bucket, "obj-a", &upload_a.upload_id, 1, &mut oversize_reader, &ObjectOptions::default())
+            .await
+            .expect_err("single part exceeding hard quota must be rejected");
+        assert!(
+            matches!(oversize_err, StorageError::QuotaExceeded { limit: QUOTA, .. }),
+            "{oversize_err:?}"
+        );
+
+        // Stage 3072 bytes on upload A and 1024 bytes on upload B (exact quota = 4096).
+        let mut reader_a1 = PutObjReader::from_vec(vec![0x22; 3072]);
+        let part_a1 = store
+            .put_object_part(&bucket, "obj-a", &upload_a.upload_id, 1, &mut reader_a1, &ObjectOptions::default())
+            .await
+            .expect("3072 bytes should fit within 4096 staging quota");
+        let mut reader_b1 = PutObjReader::from_vec(vec![0x33; 1024]);
+        let _part_b1 = store
+            .put_object_part(&bucket, "obj-b", &upload_b.upload_id, 1, &mut reader_b1, &ObjectOptions::default())
+            .await
+            .expect("cumulative 4096 bytes across uploads should fit");
+
+        // Any additional byte on either upload must now fail with QuotaExceeded.
+        let mut extra_a = PutObjReader::from_vec(vec![0x44; 1]);
+        let err_a = store
+            .put_object_part(&bucket, "obj-a", &upload_a.upload_id, 2, &mut extra_a, &ObjectOptions::default())
+            .await
+            .expect_err("second part exceeding cumulative staging quota must fail");
+        assert!(matches!(err_a, StorageError::QuotaExceeded { limit: QUOTA, .. }), "{err_a:?}");
+
+        let mut extra_b = PutObjReader::from_vec(vec![0x45; 1]);
+        let err_b = store
+            .put_object_part(&bucket, "obj-b", &upload_b.upload_id, 2, &mut extra_b, &ObjectOptions::default())
+            .await
+            .expect_err("second upload sharing bucket must fail when staging quota is exhausted");
+        assert!(matches!(err_b, StorageError::QuotaExceeded { limit: QUOTA, .. }), "{err_b:?}");
+
+        // Re-uploading the same part number with the same size must succeed, and shrinking frees space.
+        let mut retry_b1 = PutObjReader::from_vec(vec![0x34; 1024]);
+        store
+            .put_object_part(&bucket, "obj-b", &upload_b.upload_id, 1, &mut retry_b1, &ObjectOptions::default())
+            .await
+            .expect("same-size part retry must succeed at staging limit");
+        let mut grow_b1 = PutObjReader::from_vec(vec![0x35; 1025]);
+        let grow_err = store
+            .put_object_part(&bucket, "obj-b", &upload_b.upload_id, 1, &mut grow_b1, &ObjectOptions::default())
+            .await
+            .expect_err("growing a part beyond the staging limit must fail");
+        assert!(matches!(grow_err, StorageError::QuotaExceeded { limit: QUOTA, .. }), "{grow_err:?}");
+
+        let mut shrink_b1 = PutObjReader::from_vec(vec![0x36; 512]);
+        let part_b1 = store
+            .put_object_part(&bucket, "obj-b", &upload_b.upload_id, 1, &mut shrink_b1, &ObjectOptions::default())
+            .await
+            .expect("shrinking an existing part must succeed");
+        let mut part_b2_reader = PutObjReader::from_vec(vec![0x37; 512]);
+        let part_b2 = store
+            .put_object_part(&bucket, "obj-b", &upload_b.upload_id, 2, &mut part_b2_reader, &ObjectOptions::default())
+            .await
+            .expect("bytes freed by shrinking part 1 must be reusable");
+
+        // Simulate a node restart by clearing the in-memory budget; disk bootstrap must still enforce quota.
+        reset_bucket_staging_budget_for_test(&store.ctx, &bucket);
+        let mut post_restart = PutObjReader::from_vec(vec![0x46; 1]);
+        let post_restart_err = store
+            .put_object_part(&bucket, "obj-a", &upload_a.upload_id, 2, &mut post_restart, &ObjectOptions::default())
+            .await
+            .expect_err("cold staging budget must reconcile existing staged parts from disk");
+        assert!(
+            matches!(post_restart_err, StorageError::QuotaExceeded { limit: QUOTA, .. }),
+            "{post_restart_err:?}"
+        );
+
+        // Aborting upload A releases its 3072 staged bytes immediately.
+        store
+            .abort_multipart_upload(&bucket, "obj-a", &upload_a.upload_id, &ObjectOptions::default())
+            .await
+            .expect("abort upload A");
+        let mut reader_b3 = PutObjReader::from_vec(vec![0x38; 3072]);
+        let part_b3 = store
+            .put_object_part(&bucket, "obj-b", &upload_b.upload_id, 3, &mut reader_b3, &ObjectOptions::default())
+            .await
+            .expect("aborted upload bytes must be released for subsequent uploads");
+
+        // Completing upload B releases its staged bytes so another upload of size QUOTA can be staged.
+        // Use a single-part upload for completion below the 5 MiB S3 multi-part minimum.
+        store
+            .abort_multipart_upload(&bucket, "obj-b", &upload_b.upload_id, &ObjectOptions::default())
+            .await
+            .expect("abort upload B");
+        let _ = (part_a1, part_b1, part_b2, part_b3);
+
+        let upload_c = store
+            .new_multipart_upload(&bucket, "obj-c", &ObjectOptions::default())
+            .await
+            .expect("create upload C");
+        let mut reader_c1 = PutObjReader::from_vec(vec![0x55; 2048]);
+        let part_c1 = store
+            .put_object_part(&bucket, "obj-c", &upload_c.upload_id, 1, &mut reader_c1, &ObjectOptions::default())
+            .await
+            .expect("stage upload C");
+        store
+            .clone()
+            .complete_multipart_upload(
+                &bucket,
+                "obj-c",
+                &upload_c.upload_id,
+                vec![CompletePart {
+                    part_num: part_c1.part_num,
+                    etag: part_c1.etag,
+                    ..Default::default()
+                }],
+                &ObjectOptions::default(),
+            )
+            .await
+            .expect("complete upload C");
+
+        let upload_d = store
+            .new_multipart_upload(&bucket, "obj-d", &ObjectOptions::default())
+            .await
+            .expect("create upload D");
+        let mut reader_d1 = PutObjReader::from_vec(vec![0x66; 4096]);
+        store
+            .put_object_part(&bucket, "obj-d", &upload_d.upload_id, 1, &mut reader_d1, &ObjectOptions::default())
+            .await
+            .expect("completed upload must release staged quota cleanly");
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn detached_put_object_part_commit_retains_staging_quota_after_caller_disconnect() {
+        const QUOTA: u64 = 4096;
+        let (_dirs, store, bucket) = setup_quota_store_and_bucket(Some(QUOTA)).await;
+        let object = "disconnect-target";
+        let upload = store
+            .new_multipart_upload(&bucket, object, &ObjectOptions::default())
+            .await
+            .expect("create upload");
+
+        // Pause inside put_object_part's detached tokio::spawn(commit) task,
+        // drop the caller task to simulate a client HTTP disconnect, then let
+        // the detached commit finish and verify the staged bytes stay accounted.
+        let barrier = MultipartCommitBarrier::install(&bucket, object, MultipartCommitPause::PutPartBeforeLockLost);
+        let caller_store = Arc::clone(&store);
+        let caller_bucket = bucket.clone();
+        let caller_upload_id = upload.upload_id.clone();
+        let caller = tokio::spawn(async move {
+            let mut reader = PutObjReader::from_vec(vec![0x77; 4096]);
+            caller_store
+                .put_object_part(&caller_bucket, object, &caller_upload_id, 1, &mut reader, &ObjectOptions::default())
+                .await
+        });
+
+        barrier.wait_until_paused().await;
+        caller.abort();
+        let _ = caller.await;
+        barrier.release();
+
+        // Wait for the detached commit task to finish rename_part and settle its reservation.
+        let upload_path = SetDisks::get_upload_id_dir(&bucket, object, &upload.upload_id);
+        let budget = bucket_staging_budget(&store.ctx, &bucket);
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while tokio::time::Instant::now() < deadline {
+            if barrier.commit_observed() {
+                let state = budget.lock_state();
+                if state.uploads.get(&upload_path).and_then(|parts| parts.get(&1)) == Some(&4096) && state.in_flight == 0 {
+                    break;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            barrier.commit_observed(),
+            "detached commit task should finish rename_part after caller disconnect"
+        );
+        {
+            let state = budget.lock_state();
+            assert_eq!(
+                state.staged_total, 4096,
+                "detached commit after caller disconnect must keep staged bytes counted"
+            );
+            assert_eq!(state.in_flight, 0, "in-flight bytes must settle once detached commit finishes");
+        }
+
+        // A subsequent part must be rejected because the disconnected part filled the quota.
+        let mut second_reader = PutObjReader::from_vec(vec![0x88; 1]);
+        let err = store
+            .put_object_part(&bucket, object, &upload.upload_id, 2, &mut second_reader, &ObjectOptions::default())
+            .await
+            .expect_err("part after disconnected full-quota commit must be rejected");
+        assert!(matches!(err, StorageError::QuotaExceeded { limit: QUOTA, .. }), "{err:?}");
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn non_quota_bucket_staging_is_unaffected() {
+        let (_dirs, store, bucket) = setup_quota_store_and_bucket(None).await;
+        let upload = store
+            .new_multipart_upload(&bucket, "unconstrained", &ObjectOptions::default())
+            .await
+            .expect("create upload in non-quota bucket");
+        for part_num in 1..=3 {
+            let mut reader = PutObjReader::from_vec(vec![part_num as u8; 8192]);
+            store
+                .put_object_part(
+                    &bucket,
+                    "unconstrained",
+                    &upload.upload_id,
+                    part_num,
+                    &mut reader,
+                    &ObjectOptions::default(),
+                )
+                .await
+                .expect("non-quota bucket must stage parts without staging quota rejection");
+        }
+    }
+
+    #[tokio::test]
+    async fn staging_budget_replays_concurrent_commit_and_remove_events_idempotently() {
+        const LIMIT: u64 = 4096;
+        let budget = Arc::new(BucketStagingBudget::default());
+
+        // Seed an in-flight part that commits while the initial disk scan runs,
+        // plus an upload that the scan sees on disk before it is aborted concurrently.
+        let racing = budget
+            .try_admit(None, LIMIT, "upload-new", 1, 2048)
+            .expect("admit racing part");
+        budget
+            .refresh_for(None, LIMIT, "upload-other", 1, 1024, || async {
+                // Commit happens concurrently with the scan, and upload-aborted is removed concurrently.
+                racing.commit(2048);
+                budget.lock_state().remove_upload("upload-aborted");
+                // Suppose the disk scan saw BOTH upload-new/part-1 and upload-aborted/part-1.
+                Ok((
+                    HashMap::from([
+                        ("upload-new".to_string(), HashMap::from([(1, 2048)])),
+                        ("upload-aborted".to_string(), HashMap::from([(1, 3072)])),
+                    ]),
+                    false,
+                ))
+            })
+            .await
+            .expect("disk refresh succeeds");
+
+        // upload-new must be counted once (2048, not 4096) and upload-aborted must be absent.
+        assert_eq!(budget.lock_state().staged_total, 2048);
+        assert!(
+            budget.try_admit(None, LIMIT, "upload-other", 1, 2049).is_err(),
+            "2048 + 2049 must exceed 4096"
+        );
+        budget
+            .try_admit(None, LIMIT, "upload-other", 1, 2048)
+            .expect("2048 + 2048 must fit exactly")
+            .commit(2048);
+        assert_eq!(budget.lock_state().staged_total, 4096);
     }
 }

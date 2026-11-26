@@ -1948,6 +1948,48 @@ pub(crate) async fn get_cached_quota_config_and_incarnation_in(
     bucket_meta_sys.cached_quota_config_and_incarnation(bucket).await
 }
 
+/// Resolve the bucket's hard quota limit (if configured) and bucket incarnation
+/// for multipart staging admission. Uses the warm metadata cache on the hot path
+/// and falls back to loading bucket metadata on a cold cache; unsupported quota
+/// reservation protocols fail closed.
+pub(crate) async fn get_bucket_quota_limit_and_incarnation_in(
+    ctx: &crate::runtime::instance::InstanceContext,
+    bucket: &str,
+) -> Result<Option<(u64, Option<Uuid>)>> {
+    #[cfg(any(test, feature = "test-util"))]
+    if ctx.bucket_metadata_sys().is_none() {
+        return Ok(None);
+    }
+
+    let bucket_meta_sys_lock = bucket_metadata_sys_of(ctx)?;
+    let bucket_meta_sys = bucket_meta_sys_lock.read().await.clone();
+    if let Some(snapshot) = bucket_meta_sys.cached_quota_config_and_incarnation(bucket).await? {
+        let Some(quota) = snapshot.quota else {
+            return Ok(None);
+        };
+        if quota.has_unsupported_reservation_protocol() {
+            return Err(Error::PartMissingOrCorrupt);
+        }
+        return Ok(quota
+            .get_quota_limit()
+            .map(|limit| (limit, (!snapshot.bucket_incarnation.is_nil()).then_some(snapshot.bucket_incarnation))));
+    }
+
+    let (bm, _) = bucket_meta_sys.get_config(bucket).await?;
+    if !bm.quota_config_json.is_empty() && bm.quota_config.is_none() {
+        return Err(Error::other("persisted bucket quota configuration is invalid"));
+    }
+    let Some(quota) = &bm.quota_config else {
+        return Ok(None);
+    };
+    if quota.has_unsupported_reservation_protocol() {
+        return Err(Error::PartMissingOrCorrupt);
+    }
+    Ok(quota
+        .get_quota_limit()
+        .map(|limit| (limit, (!bm.bucket_incarnation_id.is_nil()).then_some(bm.bucket_incarnation_id))))
+}
+
 pub async fn get_replication_config(bucket: &str) -> Result<(PersistedReplicationConfiguration, OffsetDateTime)> {
     let bucket_meta_sys_lock = get_bucket_metadata_sys()?;
     let bucket_meta_sys = bucket_meta_sys_lock.read().await;

@@ -42,6 +42,40 @@ impl crate::storage_api_contracts::multipart::MultipartUploadInspection for ECSt
     }
 }
 
+impl ECStore {
+    /// Scan staged multipart part sizes for `bucket` across every pool and erasure
+    /// set without acquiring object or upload locks, stopping early once `limit`
+    /// is exceeded.
+    pub(crate) async fn scan_bucket_staged_multipart_parts(
+        &self,
+        bucket: &str,
+        expected_incarnation_id: Option<Uuid>,
+        bucket_lifecycle_lock_fence: Option<&crate::object_api::NamespaceLockFence>,
+        limit: u64,
+    ) -> Result<(HashMap<String, HashMap<usize, u64>>, bool)> {
+        let mut uploads = HashMap::new();
+        let mut total = 0_u64;
+        for pool in &self.pools {
+            for set in &pool.disk_set {
+                let exceeded = set
+                    .scan_set_staged_multipart_parts(
+                        bucket,
+                        expected_incarnation_id,
+                        bucket_lifecycle_lock_fence,
+                        limit,
+                        &mut uploads,
+                        &mut total,
+                    )
+                    .await?;
+                if exceeded {
+                    return Ok((uploads, true));
+                }
+            }
+        }
+        Ok((uploads, false))
+    }
+}
+
 #[cfg(test)]
 static DATA_MOVEMENT_MULTIPART_DISCOVERY_COUNTS: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<Uuid, usize>>> =
     std::sync::OnceLock::new();
