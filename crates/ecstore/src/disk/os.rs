@@ -2751,7 +2751,7 @@ impl DiskBlockingLane {
 #[derive(Default)]
 struct DiskBlockingQueueState {
     jobs: VecDeque<Box<dyn FnOnce() + Send>>,
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     submitted_jobs: usize,
     active_workers: usize,
     idle_workers: usize,
@@ -2879,7 +2879,7 @@ impl DiskBlockingQueue {
         let should_spawn = {
             let mut state = self.lane(lane).state.lock();
             state.jobs.push_back(job);
-            #[cfg(test)]
+            #[cfg(all(test, unix))]
             {
                 state.submitted_jobs += 1;
             }
@@ -2897,7 +2897,7 @@ impl DiskBlockingQueue {
         }
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     pub(crate) fn submitted_jobs_for_test(&self) -> usize {
         self.lanes.iter().map(|lane| lane.state.lock().submitted_jobs).sum()
     }
@@ -3326,8 +3326,8 @@ static DISK_METADATA_MUTATION_LOCKS: LazyLock<ShardedPathLockRegistry<NamespaceM
 #[derive(Clone)]
 pub(crate) struct MetadataMutationLockHandle(Arc<NamespaceMutationLock>);
 
+#[cfg(all(test, unix))]
 impl MetadataMutationLockHandle {
-    #[cfg(test)]
     pub(crate) fn ptr_eq(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.0, &other.0)
     }
@@ -3337,8 +3337,8 @@ impl MetadataMutationLockHandle {
 #[derive(Clone)]
 pub(in crate::disk) struct NamespaceMutationLockHandle(Arc<NamespaceMutationLock>);
 
+#[cfg(all(test, unix))]
 impl NamespaceMutationLockHandle {
-    #[cfg(test)]
     pub(crate) fn ptr_eq(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.0, &other.0)
     }
