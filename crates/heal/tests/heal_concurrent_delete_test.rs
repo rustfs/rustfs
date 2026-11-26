@@ -522,7 +522,7 @@ async fn delete_during_root(case: DeleteCase) {
     assert_version(&env, &control, false).await;
 }
 
-fn run_heal_scenario(scenario: impl Future<Output = ()> + Send + 'static) {
+fn run_heal_scenario<F: Future<Output = ()>>(scenario: impl FnOnce() -> F + Send + 'static) {
     // Incarnation-bound repairs use a spawned owner; retain the server's stack
     // budget for the whole scenario, including its foreground DELETE. block_on
     // alone would poll that future on libtest's smaller calling-thread stack.
@@ -537,7 +537,7 @@ fn run_heal_scenario(scenario: impl Future<Output = ()> + Send + 'static) {
                 .enable_all()
                 .build()
                 .expect("concurrent delete runtime");
-            runtime.block_on(scenario);
+            runtime.block_on(scenario());
         })
         .expect("concurrent delete scenario thread starts")
         .join()
@@ -545,7 +545,7 @@ fn run_heal_scenario(scenario: impl Future<Output = ()> + Send + 'static) {
 }
 
 fn run_delete_case(case: DeleteCase) {
-    run_heal_scenario(delete_during_root(case));
+    run_heal_scenario(move || delete_during_root(case));
 }
 
 #[test]
@@ -581,7 +581,7 @@ fn admin_root_completes_after_unversioned_delete() {
 #[test]
 #[serial]
 fn admin_root_rejects_recreated_bucket_before_successor_repair() {
-    run_heal_scenario(recreated_bucket_repair());
+    run_heal_scenario(recreated_bucket_repair);
 }
 
 async fn recreated_bucket_repair() {
@@ -634,7 +634,7 @@ async fn recreated_bucket_repair() {
 #[test]
 #[serial]
 fn crash_recovery_skips_deleted_bucket_and_repairs_live_bucket() {
-    run_heal_scenario(async {
+    run_heal_scenario(|| async {
         let directory = tempfile::tempdir().expect("crash recovery fixture");
         let env = TestECStoreEnv::builder().base_dir(directory.path()).build().await;
         let deleted = "a-deleted";
