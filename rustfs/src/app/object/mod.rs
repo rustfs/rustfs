@@ -230,8 +230,6 @@ pub(crate) mod post_body;
 pub(crate) mod post_headers;
 mod put;
 mod put_input;
-#[cfg(test)]
-pub(crate) use native_body::from_legacy as legacy_put_body;
 pub(crate) use native_body::{BodyChunks, FrameTrailers, upload_frame_reader};
 pub(crate) use put_input::{PutObjectWriteInput, PutObjectWriteOutput};
 pub(crate) mod request_body;

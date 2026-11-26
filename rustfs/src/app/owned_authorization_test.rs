@@ -25,10 +25,6 @@ use crate::app::storage_api::owned_parity::{
     RequestedObjectLockRetainUntil, RequestedObjectLockRetention, RequestedObjectTags,
 };
 use crate::app::storage_api::owned_parity::{authorize_create_bucket, authorize_delete_bucket};
-use crate::app::storage_api::s3::{
-    BucketLocationConstraint, CreateBucketConfiguration, CreateBucketInput, CreateMultipartUploadInput, DeleteObjectInput,
-    ObjectLockRetention, PutObjectInput, S3ErrorCode, S3Request,
-};
 use crate::app::{RequestEnvelope, RequestHead};
 use crate::auth::facts::{AuthzPrincipal, AuthzTarget};
 use crate::storage::storage_api::contract::bucket::{BucketOperations as _, MakeBucketOptions};
@@ -38,6 +34,7 @@ use http::{Extensions, HeaderMap, HeaderValue, Method, Uri};
 use rustfs_iam::{store::object::ObjectStore, sys::IamSys};
 use rustfs_kms::KmsServiceManager;
 use rustfs_policy::policy::action::{Action, S3Action};
+use rustfs_s3_types::S3ErrorCode;
 use serial_test::serial;
 use std::time::Instant;
 use std::{collections::HashMap, sync::Arc};
@@ -62,51 +59,24 @@ impl KmsInterface for TestKms {
     }
 }
 
-fn build_request<T>(input: T, method: Method) -> S3Request<T> {
-    S3Request {
-        input,
+/// Anonymous request head with empty headers, region, and service.
+fn request_head(method: Method, uri: Uri) -> RequestHead {
+    RequestHead {
         method,
-        uri: Uri::from_static("/"),
+        uri,
         headers: HeaderMap::new(),
-        extensions: Extensions::new(),
         credentials: None,
         region: None,
         service: None,
-        trailing_headers: None,
     }
 }
 
-/// Method, URI, headers, extensions, region, and service. These fixtures leave credentials absent.
-fn envelope_from_request<T>(req: &S3Request<T>) -> RequestEnvelope {
-    RequestEnvelope::from_parts(
-        RequestHead {
-            method: req.method.clone(),
-            uri: req.uri.clone(),
-            headers: req.headers.clone(),
-            credentials: None,
-            region: req.region.as_ref().map(|region| region.as_str().to_owned()),
-            service: req.service.clone(),
-        },
-        req.extensions.clone(),
-    )
-}
-
-fn ensure_req_info<T>(req: &mut S3Request<T>) {
-    req.extensions.insert(ReqInfo::default());
-}
-
 fn denial_envelope(method: Method, uri: Uri, extensions: Extensions) -> RequestEnvelope {
-    RequestEnvelope::from_parts(
-        RequestHead {
-            method,
-            uri,
-            headers: HeaderMap::new(),
-            credentials: None,
-            region: None,
-            service: None,
-        },
-        extensions,
-    )
+    RequestEnvelope::from_parts(request_head(method, uri), extensions)
+}
+
+fn root_envelope(method: Method, extensions: Extensions) -> RequestEnvelope {
+    denial_envelope(method, Uri::from_static("/"), extensions)
 }
 
 #[test]
@@ -326,14 +296,14 @@ async fn owned_authorization_reloads_tags_when_version_changes() {
         .expect("set policy");
     let slot = ServerContextSlot::new();
     assert!(slot.install(Arc::new(AppContext::new(store, Arc::new(UnreadyIam), Arc::new(TestKms)))));
-    let mut legacy = build_request((), Method::PUT);
-    legacy.extensions.insert(ReqInfo {
+    let mut extensions = Extensions::new();
+    extensions.insert(ReqInfo {
         bucket: Some(bucket.clone()),
         object: Some("object".to_owned()),
         ..Default::default()
     });
-    legacy.extensions.insert(slot);
-    let mut owned = envelope_from_request(&legacy);
+    extensions.insert(slot);
+    let mut owned = root_envelope(Method::PUT, extensions);
     for (index, allowed, expected_tag) in [(0, true, "allowed"), (1, false, "denied"), (0, true, "allowed")] {
         let version = &versions[index];
         owned.req_info_mut().expect("owned info").version_id = Some(version.clone());
@@ -392,48 +362,19 @@ async fn table_publication_guard_timeout_blocks_put_delete_and_multipart_authori
         .get_write_lock(Duration::from_secs(1))
         .await
         .expect("publication writer should hold the fence");
-    let mut put_req = build_request(
-        PutObjectInput::builder()
-            .bucket(bucket.clone())
-            .key("object".to_string())
-            .build()
-            .expect("PUT input should build"),
-        Method::PUT,
-    );
-    let mut multipart_req = build_request(
-        CreateMultipartUploadInput::builder()
-            .bucket(bucket.clone())
-            .key("multipart-object".to_string())
-            .build()
-            .expect("multipart input should build"),
-        Method::POST,
-    );
-    let mut delete_req = build_request(
-        DeleteObjectInput::builder()
-            .bucket(bucket.clone())
-            .key("object".to_string())
-            .build()
-            .expect("DELETE input should build"),
-        Method::DELETE,
-    );
-    ensure_req_info(&mut put_req);
-    ensure_req_info(&mut delete_req);
-    ensure_req_info(&mut multipart_req);
-    put_req.extensions.insert(server_ctx.clone());
-    delete_req.extensions.insert(server_ctx.clone());
-    multipart_req.extensions.insert(server_ctx);
-    let mut owned_put = envelope_from_request(&put_req);
-    let owned_info = owned_put.req_info_mut().expect("owned request info");
-    owned_info.bucket = Some(bucket.clone());
-    owned_info.object = Some("object".to_string());
-    let mut owned_delete = envelope_from_request(&delete_req);
-    let delete_info = owned_delete.req_info_mut().expect("owned delete info");
-    delete_info.bucket = Some(bucket.clone());
-    delete_info.object = Some("object".to_string());
-    let mut owned_multipart = envelope_from_request(&multipart_req);
-    let multipart_info = owned_multipart.req_info_mut().expect("owned multipart info");
-    multipart_info.bucket = Some(bucket.clone());
-    multipart_info.object = Some("object".to_string());
+    let publication_envelope = |method: Method, ctx: Arc<ServerContextSlot>| {
+        let mut extensions = Extensions::new();
+        extensions.insert(ReqInfo {
+            bucket: Some(bucket.clone()),
+            object: Some("object".to_string()),
+            ..Default::default()
+        });
+        extensions.insert(ctx);
+        root_envelope(method, extensions)
+    };
+    let mut owned_put = publication_envelope(Method::PUT, Arc::clone(&server_ctx));
+    let mut owned_delete = publication_envelope(Method::DELETE, Arc::clone(&server_ctx));
+    let mut owned_multipart = publication_envelope(Method::POST, server_ctx);
 
     for (operation, err) in [
         (
@@ -566,31 +507,22 @@ async fn owned_and_legacy_create_bucket_authorization_use_location_constraint() 
     .await;
 
     for (region, allowed) in [("eu-west-1", true), ("us-west-2", false)] {
-        let mut legacy = build_request(
-            CreateBucketInput {
-                bucket: "location-policy-bucket".to_owned(),
-                create_bucket_configuration: Some(CreateBucketConfiguration {
-                    location_constraint: Some(BucketLocationConstraint::from(region.to_owned())),
-                    ..Default::default()
-                }),
-                ..Default::default()
-            },
-            Method::PUT,
-        );
-        legacy.uri = Uri::from_static("/location-policy-bucket");
-        legacy.extensions.insert(Arc::clone(&slot));
-        legacy.extensions.insert(ReqInfo {
+        let input = rustfs_gateway_types::dto::CreateBucketInput {
+            bucket: rustfs_gateway_types::BucketName::new("location-policy-bucket").expect("valid bucket name"),
+            create_bucket_configuration: Some(rustfs_gateway_types::dto::CreateBucketConfiguration {
+                location_constraint: Some(rustfs_gateway_types::dto::LocationConstraint::custom(region.to_owned())),
+            }),
+            ..Default::default()
+        };
+        let location = crate::app::bucket_usecase::requested_location_constraint(&input).map(str::to_owned);
+        let mut extensions = Extensions::new();
+        extensions.insert(Arc::clone(&slot));
+        extensions.insert(ReqInfo {
             cred: Some(credentials.clone()),
             bucket: Some("location-policy-bucket".to_owned()),
             ..Default::default()
         });
-        let location = legacy
-            .input
-            .create_bucket_configuration
-            .as_ref()
-            .and_then(|c| c.location_constraint.as_ref())
-            .map(|l| l.as_str().to_owned());
-        let mut owned = envelope_from_request(&legacy);
+        let mut owned = denial_envelope(Method::PUT, Uri::from_static("/location-policy-bucket"), extensions);
         let action = Action::S3Action(S3Action::CreateBucketAction);
         let owned_result = crate::app::authorize_owned_request(&mut owned, action, location).await;
         if allowed {
@@ -611,24 +543,13 @@ async fn owned_and_legacy_create_bucket_authorization_use_location_constraint() 
         ("location-lock-bucket", Some("eu-west-1"), true, true),
         ("location-lock-bucket", Some("us-west-2"), true, false),
     ] {
-        let mut legacy = build_request(
-            CreateBucketInput {
-                bucket: bucket.to_owned(),
-                create_bucket_configuration: region.map(|region| CreateBucketConfiguration {
-                    location_constraint: Some(BucketLocationConstraint::from(region.to_owned())),
-                    ..Default::default()
-                }),
-                object_lock_enabled_for_bucket: Some(object_lock),
-                ..Default::default()
-            },
-            Method::PUT,
-        );
-        legacy.extensions.insert(Arc::clone(&slot));
-        legacy.extensions.insert(ReqInfo {
+        let mut extensions = Extensions::new();
+        extensions.insert(Arc::clone(&slot));
+        extensions.insert(ReqInfo {
             cred: Some(credentials.clone()),
             ..Default::default()
         });
-        let mut owned = envelope_from_request(&legacy);
+        let mut owned = root_envelope(Method::PUT, extensions);
         let input = rustfs_gateway_types::dto::CreateBucketInput {
             bucket: rustfs_gateway_types::BucketName::new(bucket).expect("valid bucket name"),
             create_bucket_configuration: region.map(|region| rustfs_gateway_types::dto::CreateBucketConfiguration {
@@ -711,33 +632,39 @@ fn owned_and_legacy_conditions_read_the_same_request_body_policy_inputs() {
         version_id: None,
         location_constraint: None,
     };
-    let conditions_of = |req: &S3Request<()>, action| {
-        let owned = envelope_from_request(req);
-        support::authorization_conditions(&owned, &principal, &support::request_authz_facts(&owned, target(action)))
+    let conditions_of = |owned: &RequestEnvelope, action| {
+        support::authorization_conditions(owned, &principal, &support::request_authz_facts(owned, target(action)))
             .expect("owned conditions")
     };
     let values = |conditions: &HashMap<String, Vec<String>>, key: &str| conditions.get(key).cloned();
 
     // A POST upload's form fields and a resolved copy source replace what the headers say.
-    let mut post = build_request((), Method::POST);
-    post.headers
+    let mut post_head = request_head(Method::POST, Uri::from_static("/"));
+    post_head
+        .headers
         .insert("x-amz-tagging", HeaderValue::from_static("source=header"));
-    let mut form = post.headers.clone();
+    let mut form = post_head.headers.clone();
     form.insert("x-amz-tagging", HeaderValue::from_static("source=form"));
-    post.extensions.insert(PostObjectPolicyHeaders(form));
-    post.extensions.insert(RequestedCopySource("src-bucket/src-key".to_owned()));
+    let mut post_extensions = Extensions::new();
+    post_extensions.insert(PostObjectPolicyHeaders(form));
+    post_extensions.insert(RequestedCopySource("src-bucket/src-key".to_owned()));
+    let post = RequestEnvelope::from_parts(post_head, post_extensions);
     let owned = conditions_of(&post, S3Action::PutObjectAction);
     assert_eq!(values(&owned, "RequestObjectTag/source"), Some(vec!["form".to_owned()]));
     assert_eq!(values(&owned, "x-amz-copy-source"), Some(vec!["src-bucket/src-key".to_owned()]));
 
     // Standalone legal hold and tagging writes apply their XML bodies, not the headers.
-    let mut body = build_request((), Method::PUT);
-    body.headers.insert("x-amz-tagging", HeaderValue::from_static("body=header"));
-    body.headers
+    let mut body_head = request_head(Method::PUT, Uri::from_static("/"));
+    body_head
+        .headers
+        .insert("x-amz-tagging", HeaderValue::from_static("body=header"));
+    body_head
+        .headers
         .insert("x-amz-object-lock-legal-hold", HeaderValue::from_static("OFF"));
-    body.extensions.insert(RequestedObjectLegalHold(Some("ON".to_owned())));
-    body.extensions
-        .insert(RequestedObjectTags(vec![("body".to_owned(), "xml".to_owned())]));
+    let mut body_extensions = Extensions::new();
+    body_extensions.insert(RequestedObjectLegalHold(Some("ON".to_owned())));
+    body_extensions.insert(RequestedObjectTags(vec![("body".to_owned(), "xml".to_owned())]));
+    let body = RequestEnvelope::from_parts(body_head, body_extensions);
     let owned = conditions_of(&body, S3Action::PutObjectAction);
     assert_eq!(values(&owned, "object-lock-legal-hold"), Some(vec!["ON".to_owned()]));
     assert_eq!(values(&owned, "RequestObjectTag/body"), Some(vec!["xml".to_owned()]));
@@ -757,17 +684,13 @@ fn installed_body_inputs_describe_the_request_the_same_on_both_forms() {
         location_constraint: None,
     };
     // The headers name other values; only the installed bodies may describe the request.
-    let mut legacy = build_request((), Method::PUT);
-    legacy
-        .headers
-        .insert("x-amz-tagging", HeaderValue::from_static("from=header"));
-    legacy
-        .headers
+    let mut head = request_head(Method::PUT, Uri::from_static("/"));
+    head.headers.insert("x-amz-tagging", HeaderValue::from_static("from=header"));
+    head.headers
         .insert("x-amz-object-lock-legal-hold", HeaderValue::from_static("ON"));
-    legacy
-        .headers
+    head.headers
         .insert("x-amz-object-lock-mode", HeaderValue::from_static("COMPLIANCE"));
-    let mut owned = envelope_from_request(&legacy);
+    let mut owned = RequestEnvelope::from_parts(head, Extensions::new());
     owned.install_requested_object_tags(RequestedObjectTags(vec![("class".to_owned(), "public".to_owned())]));
     owned.install_requested_legal_hold(RequestedObjectLegalHold::default());
     owned.install_requested_retention(RequestedObjectLockRetention {
@@ -794,29 +717,28 @@ fn installed_body_inputs_describe_the_request_the_same_on_both_forms() {
 
 #[test]
 fn create_bucket_location_constraint_conditions_use_only_xml() {
-    let configuration = |region: &str| CreateBucketConfiguration {
-        location_constraint: Some(BucketLocationConstraint::from(region.to_owned())),
-        ..Default::default()
+    let configuration = |region: &str| rustfs_gateway_types::dto::CreateBucketConfiguration {
+        location_constraint: Some(rustfs_gateway_types::dto::LocationConstraint::custom(region.to_owned())),
     };
     for (configuration, expected) in [
         (None, None),
-        (Some(CreateBucketConfiguration::default()), None),
+        (Some(rustfs_gateway_types::dto::CreateBucketConfiguration::default()), None),
         (Some(configuration("")), None),
         (Some(configuration("eu-west-1")), Some("eu-west-1")),
         (Some(configuration("EU")), Some("EU")),
         (Some(configuration("tenant-region-1")), Some("tenant-region-1")),
     ] {
-        let mut req = build_request(
-            CreateBucketInput {
-                bucket: "location-policy-bucket".to_string(),
-                create_bucket_configuration: configuration,
-                ..Default::default()
-            },
+        let input = rustfs_gateway_types::dto::CreateBucketInput {
+            bucket: rustfs_gateway_types::BucketName::new("location-policy-bucket").expect("valid bucket name"),
+            create_bucket_configuration: configuration,
+            ..Default::default()
+        };
+        let mut head = request_head(
             Method::PUT,
+            Uri::from_static("/location-policy-bucket?LocationConstraint=forged&s3%3ALocationConstraint=forged"),
         );
-        req.region = Some("us-east-1".parse().expect("signing region"));
-        req.uri = Uri::from_static("/location-policy-bucket?LocationConstraint=forged&s3%3ALocationConstraint=forged");
-        req.headers.insert("locationconstraint", HeaderValue::from_static("forged"));
+        head.region = Some("us-east-1".to_owned());
+        head.headers.insert("locationconstraint", HeaderValue::from_static("forged"));
         let credentials = rustfs_credentials::Credentials {
             claims: Some(
                 [
@@ -828,14 +750,13 @@ fn create_bucket_location_constraint_conditions_use_only_xml() {
             ),
             ..Default::default()
         };
-        let location = req
-            .input
+        let location = input
             .create_bucket_configuration
             .as_ref()
             .and_then(|c| c.location_constraint.as_ref())
             .map(|l| l.as_str().to_owned());
         let principal = AuthzPrincipal::new(&credentials, "");
-        let owned = envelope_from_request(&req);
+        let owned = RequestEnvelope::from_parts(head, Extensions::new());
         let owned_facts = support::request_authz_facts(
             &owned,
             AuthzTarget {
@@ -912,26 +833,23 @@ async fn request_slot_keeps_bucket_policy_bound_to_its_store() {
     let slot_b = ServerContextSlot::new();
     assert!(slot_b.install(Arc::new(AppContext::new(Arc::clone(&store_b), Arc::new(UnreadyIam), Arc::new(TestKms),))));
 
-    let mut request_a = build_request((), Method::PUT);
-    request_a.extensions.insert(ReqInfo {
-        bucket: Some(bucket.clone()),
-        object: Some("object".to_string()),
-        ..Default::default()
-    });
-    request_a.extensions.insert(slot_a);
-    let mut owned_a = envelope_from_request(&request_a);
+    let object_envelope = |bucket: &str, slot: Arc<ServerContextSlot>| {
+        let mut extensions = Extensions::new();
+        extensions.insert(ReqInfo {
+            bucket: Some(bucket.to_string()),
+            object: Some("object".to_string()),
+            ..Default::default()
+        });
+        extensions.insert(slot);
+        root_envelope(Method::PUT, extensions)
+    };
+
+    let mut owned_a = object_envelope(&bucket, slot_a);
     crate::app::authorize_owned_request(&mut owned_a, Action::S3Action(S3Action::PutObjectAction), None)
         .await
         .expect("store A policy should authorize owned request");
 
-    let mut request_b = build_request((), Method::PUT);
-    request_b.extensions.insert(ReqInfo {
-        bucket: Some(bucket.clone()),
-        object: Some("object".to_string()),
-        ..Default::default()
-    });
-    request_b.extensions.insert(slot_b);
-    let mut owned_b = envelope_from_request(&request_b);
+    let mut owned_b = object_envelope(&bucket, slot_b);
     let owned_err = crate::app::authorize_owned_request(&mut owned_b, Action::S3Action(S3Action::PutObjectAction), None)
         .await
         .expect_err("store B policy must deny owned request");
@@ -950,14 +868,7 @@ async fn request_slot_keeps_bucket_policy_bound_to_its_store() {
         .expect("replace store B bucket policy");
     let slot_b = ServerContextSlot::new();
     assert!(slot_b.install(Arc::new(AppContext::new(Arc::clone(&store_b), Arc::new(UnreadyIam), Arc::new(TestKms),))));
-    let mut allowed_request_b = build_request((), Method::PUT);
-    allowed_request_b.extensions.insert(ReqInfo {
-        bucket: Some(bucket.clone()),
-        object: Some("object".to_string()),
-        ..Default::default()
-    });
-    allowed_request_b.extensions.insert(slot_b);
-    let mut owned_allowed_b = envelope_from_request(&allowed_request_b);
+    let mut owned_allowed_b = object_envelope(&bucket, slot_b);
     crate::app::authorize_owned_request(&mut owned_allowed_b, Action::S3Action(S3Action::PutObjectAction), None)
         .await
         .expect("store B policy should authorize owned request before public access block");
@@ -973,14 +884,7 @@ async fn request_slot_keeps_bucket_policy_bound_to_its_store() {
         .expect("publish store B public access block configuration");
     let slot_b = ServerContextSlot::new();
     assert!(slot_b.install(Arc::new(AppContext::new(Arc::clone(&store_b), Arc::new(UnreadyIam), Arc::new(TestKms),))));
-    let mut restricted_request_b = build_request((), Method::PUT);
-    restricted_request_b.extensions.insert(ReqInfo {
-        bucket: Some(bucket.clone()),
-        object: Some("object".to_string()),
-        ..Default::default()
-    });
-    restricted_request_b.extensions.insert(slot_b);
-    let mut owned_restricted_b = envelope_from_request(&restricted_request_b);
+    let mut owned_restricted_b = object_envelope(&bucket, slot_b);
     let owned_err =
         crate::app::authorize_owned_request(&mut owned_restricted_b, Action::S3Action(S3Action::PutObjectAction), None)
             .await
@@ -1016,14 +920,7 @@ async fn request_slot_keeps_bucket_policy_bound_to_its_store() {
         .expect("publish store B tag-conditioned policy");
     let slot_b = ServerContextSlot::new();
     assert!(slot_b.install(Arc::new(AppContext::new(Arc::clone(&store_b), Arc::new(UnreadyIam), Arc::new(TestKms),))));
-    let mut tagged_request_b = build_request((), Method::PUT);
-    tagged_request_b.extensions.insert(ReqInfo {
-        bucket: Some(tag_bucket),
-        object: Some("object".to_string()),
-        ..Default::default()
-    });
-    tagged_request_b.extensions.insert(slot_b);
-    let mut owned_tagged_b = envelope_from_request(&tagged_request_b);
+    let mut owned_tagged_b = object_envelope(&tag_bucket, slot_b);
     crate::app::authorize_owned_request(&mut owned_tagged_b, Action::S3Action(S3Action::PutObjectAction), None)
         .await
         .expect("store B existing object tags should authorize owned request");
@@ -1035,10 +932,10 @@ async fn request_slot_keeps_bucket_policy_bound_to_its_store() {
         Some(&vec!["request".to_string()])
     );
 
-    let mut unready_request = build_request((), Method::PUT);
-    unready_request.extensions.insert(ServerContextSlot::new());
-    ensure_req_info(&mut unready_request);
-    let mut owned_unready = envelope_from_request(&unready_request);
+    let mut unready_extensions = Extensions::new();
+    unready_extensions.insert(ServerContextSlot::new());
+    unready_extensions.insert(ReqInfo::default());
+    let mut owned_unready = root_envelope(Method::PUT, unready_extensions);
     let err = support::request_object_store(&owned_unready).expect_err("an unready request slot must not use an ambient store");
     assert_eq!(err.code(), &rustfs_s3_types::S3ErrorCode::InternalError);
     let owned_err = crate::app::authorize_owned_request(&mut owned_unready, Action::S3Action(S3Action::PutObjectAction), None)
@@ -1047,28 +944,22 @@ async fn request_slot_keeps_bucket_policy_bound_to_its_store() {
     assert_eq!(owned_err.code(), &rustfs_s3_types::S3ErrorCode::InternalError);
 }
 
-/// Case name, request, action, and how to supply the missing body input.
-type FailClosedCase = (&'static str, S3Request<()>, Action, fn(&mut Extensions));
-
-fn request(extensions: Extensions) -> S3Request<()> {
-    let mut req = build_request((), Method::PUT);
-    req.uri = Uri::from_static("/bucket/key");
-    req.extensions = extensions;
-    req
-}
+/// Case name, request headers and extensions, action, and how to supply the missing body input.
+type FailClosedCase = (&'static str, HeaderMap, Extensions, Action, fn(&mut Extensions));
 
 const SIGV4_HEADER: &str =
     "AWS4-HMAC-SHA256 Credential=AKIAENVELOPE/20260101/us-east-1/s3/aws4_request, SignedHeaders=host, Signature=0123";
 
-fn signed_zip_request(query: &str) -> S3Request<()> {
-    let mut req = request(Extensions::new());
-    req.method = Method::POST;
-    req.uri = format!("/rustfs/admin/v3/object-zip-downloads?{query}")
-        .parse()
-        .expect("static uri");
-    req.headers
+fn signed_zip_envelope(query: &str) -> RequestEnvelope {
+    let mut head = request_head(
+        Method::POST,
+        format!("/rustfs/admin/v3/object-zip-downloads?{query}")
+            .parse()
+            .expect("static uri"),
+    );
+    head.headers
         .insert(http::header::AUTHORIZATION, HeaderValue::from_static(SIGV4_HEADER));
-    req
+    RequestEnvelope::from_parts(head, Extensions::new())
 }
 
 fn get_object() -> rustfs_policy::policy::action::Action {
@@ -1078,13 +969,13 @@ fn get_object() -> rustfs_policy::policy::action::Action {
 #[tokio::test]
 async fn owned_entry_points_reject_duplicate_signed_metadata_like_the_legacy_edge() {
     let query = "x-amz-meta-a=1&x-amz-meta-a=2";
-    let mut owned = envelope_from_request(&signed_zip_request(query));
+    let mut owned = signed_zip_envelope(query);
     let owned_err = crate::app::authorize_owned_request(&mut owned, get_object(), None)
         .await
         .expect_err("owned rejects a repeated metadata key");
     assert_eq!(owned_err.code(), &rustfs_s3_types::S3ErrorCode::InvalidArgument);
 
-    let mut internal = envelope_from_request(&signed_zip_request(query));
+    let mut internal = signed_zip_envelope(query);
     let internal_err = crate::app::authorize_owned_internal_object_request(&mut internal, get_object())
         .await
         .expect_err("owned internal rejects a repeated metadata key");
@@ -1094,7 +985,7 @@ async fn owned_entry_points_reject_duplicate_signed_metadata_like_the_legacy_edg
 #[tokio::test]
 async fn owned_entry_points_hoist_signed_metadata_into_the_headers_policy_reads() {
     let query = "x-amz-meta-a=1";
-    let mut owned = envelope_from_request(&signed_zip_request(query));
+    let mut owned = signed_zip_envelope(query);
     let owned_err = crate::app::authorize_owned_request(&mut owned, get_object(), None)
         .await
         .expect_err("no ReqInfo");
@@ -1111,21 +1002,21 @@ async fn owned_entry_point_fails_closed_without_a_body_policy_input() {
     use rustfs_policy::policy::action::{Action, S3Action};
 
     let put_object = Action::S3Action(S3Action::PutObjectAction);
-    let copy = || {
-        let mut req = request(Extensions::new());
-        req.headers
-            .insert("x-amz-copy-source", HeaderValue::from_static("source/key"));
-        req
+    let copy_headers = {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-amz-copy-source", HeaderValue::from_static("source/key"));
+        headers
     };
-    let post = || {
+    let post_extensions = {
         let mut extensions = Extensions::new();
         extensions.insert(PostObjectRequestMarker);
-        request(extensions)
+        extensions
     };
     let cases: Vec<FailClosedCase> = vec![
         (
             "legal hold",
-            request(Extensions::new()),
+            HeaderMap::new(),
+            Extensions::new(),
             Action::S3Action(S3Action::PutObjectLegalHoldAction),
             |e| {
                 e.insert(RequestedObjectLegalHold::default());
@@ -1133,7 +1024,8 @@ async fn owned_entry_point_fails_closed_without_a_body_policy_input() {
         ),
         (
             "tagging",
-            request(Extensions::new()),
+            HeaderMap::new(),
+            Extensions::new(),
             Action::S3Action(S3Action::PutObjectTaggingAction),
             |e| {
                 e.insert(RequestedObjectTags::default());
@@ -1141,7 +1033,8 @@ async fn owned_entry_point_fails_closed_without_a_body_policy_input() {
         ),
         (
             "version tagging",
-            request(Extensions::new()),
+            HeaderMap::new(),
+            Extensions::new(),
             Action::S3Action(S3Action::PutObjectVersionTaggingAction),
             |e| {
                 e.insert(RequestedObjectTags::default());
@@ -1149,26 +1042,32 @@ async fn owned_entry_point_fails_closed_without_a_body_policy_input() {
         ),
         (
             "retention",
-            request(Extensions::new()),
+            HeaderMap::new(),
+            Extensions::new(),
             Action::S3Action(S3Action::PutObjectRetentionAction),
             |e| {
                 e.insert(RequestedObjectLockRetention::default());
             },
         ),
-        ("post form", post(), put_object, |e| {
+        ("post form", HeaderMap::new(), post_extensions, put_object, |e| {
             e.insert(PostObjectPolicyHeaders(HeaderMap::new()));
         }),
-        ("copy source", copy(), put_object, |e| {
+        ("copy source", copy_headers, Extensions::new(), put_object, |e| {
             e.insert(RequestedCopySource("source/key".to_owned()));
         }),
     ];
-    for (name, req, action, supply) in cases {
-        let mut missing = envelope_from_request(&req);
+    for (name, headers, mut extensions, action, supply) in cases {
+        let build = |headers: HeaderMap, extensions: Extensions| {
+            let mut head = request_head(Method::PUT, Uri::from_static("/bucket/key"));
+            head.headers = headers;
+            RequestEnvelope::from_parts(head, extensions)
+        };
+        let mut missing = build(headers.clone(), extensions.clone());
         let err = crate::app::authorize_owned_request(&mut missing, action, None)
             .await
             .expect_err(name);
         assert_eq!(err.code(), &rustfs_s3_types::S3ErrorCode::AccessDenied, "{name}: missing input must deny");
-        let mut internal = envelope_from_request(&req);
+        let mut internal = build(headers.clone(), extensions.clone());
         let err = crate::app::authorize_owned_internal_object_request(&mut internal, action)
             .await
             .expect_err(name);
@@ -1179,9 +1078,8 @@ async fn owned_entry_point_fails_closed_without_a_body_policy_input() {
         );
 
         // With the input carried, the request reaches the core, which stops on the absent ReqInfo.
-        let mut supplied_req = req;
-        supply(&mut supplied_req.extensions);
-        let mut supplied = envelope_from_request(&supplied_req);
+        supply(&mut extensions);
+        let mut supplied = build(headers, extensions);
         let err = crate::app::authorize_owned_request(&mut supplied, action, None)
             .await
             .expect_err(name);
@@ -1201,7 +1099,7 @@ struct DecisionCase {
     object: &'static str,
     principal: Principal,
     action: S3Action,
-    facts: fn(&mut S3Request<()>),
+    facts: fn(&mut RequestHead, &mut Extensions),
     allowed: bool,
 }
 
@@ -1212,11 +1110,10 @@ enum Principal {
     Owner,
 }
 
-fn no_facts(_: &mut S3Request<()>) {}
+fn no_facts(_: &mut RequestHead, _: &mut Extensions) {}
 
-fn peer(req: &mut S3Request<()>, addr: [u8; 4]) {
-    req.extensions
-        .insert(Some(crate::shared_types::RemoteAddr(std::net::SocketAddr::from((addr, 40000)))));
+fn peer(extensions: &mut Extensions, addr: [u8; 4]) {
+    extensions.insert(Some(crate::shared_types::RemoteAddr(std::net::SocketAddr::from((addr, 40000)))));
 }
 
 const PRIVATE: &str = "parity-private";
@@ -1398,7 +1295,7 @@ async fn owned_and_legacy_entry_points_reach_the_same_decisions() {
             object: "ip/file",
             principal: Principal::Anonymous,
             action: S3Action::GetObjectAction,
-            facts: |req| peer(req, [203, 0, 113, 9]),
+            facts: |_, extensions| peer(extensions, [203, 0, 113, 9]),
             allowed: true,
         },
         DecisionCase {
@@ -1407,7 +1304,7 @@ async fn owned_and_legacy_entry_points_reach_the_same_decisions() {
             object: "ip/file",
             principal: Principal::Anonymous,
             action: S3Action::GetObjectAction,
-            facts: |req| peer(req, [198, 51, 100, 1]),
+            facts: |_, extensions| peer(extensions, [198, 51, 100, 1]),
             allowed: false,
         },
         DecisionCase {
@@ -1416,13 +1313,12 @@ async fn owned_and_legacy_entry_points_reach_the_same_decisions() {
             object: "ip/file",
             principal: Principal::Anonymous,
             action: S3Action::GetObjectAction,
-            facts: |req| {
-                peer(req, [198, 51, 100, 1]);
-                req.extensions
-                    .insert(rustfs_trusted_proxies::ClientInfo::direct(std::net::SocketAddr::from((
-                        [203, 0, 113, 9],
-                        443,
-                    ))));
+            facts: |_, extensions| {
+                peer(extensions, [198, 51, 100, 1]);
+                extensions.insert(rustfs_trusted_proxies::ClientInfo::direct(std::net::SocketAddr::from((
+                    [203, 0, 113, 9],
+                    443,
+                ))));
             },
             allowed: true,
         },
@@ -1432,10 +1328,10 @@ async fn owned_and_legacy_entry_points_reach_the_same_decisions() {
             object: "body/obj",
             principal: Principal::Anonymous,
             action: S3Action::PutObjectLegalHoldAction,
-            facts: |req| {
-                req.headers
+            facts: |head, extensions| {
+                head.headers
                     .insert("x-amz-object-lock-legal-hold", HeaderValue::from_static("OFF"));
-                req.extensions.insert(RequestedObjectLegalHold(Some("ON".to_owned())));
+                extensions.insert(RequestedObjectLegalHold(Some("ON".to_owned())));
             },
             allowed: true,
         },
@@ -1445,10 +1341,10 @@ async fn owned_and_legacy_entry_points_reach_the_same_decisions() {
             object: "body/obj",
             principal: Principal::Anonymous,
             action: S3Action::PutObjectLegalHoldAction,
-            facts: |req| {
-                req.headers
+            facts: |head, extensions| {
+                head.headers
                     .insert("x-amz-object-lock-legal-hold", HeaderValue::from_static("ON"));
-                req.extensions.insert(RequestedObjectLegalHold(Some("OFF".to_owned())));
+                extensions.insert(RequestedObjectLegalHold(Some("OFF".to_owned())));
             },
             allowed: false,
         },
@@ -1458,10 +1354,9 @@ async fn owned_and_legacy_entry_points_reach_the_same_decisions() {
             object: "body/obj",
             principal: Principal::Anonymous,
             action: S3Action::PutObjectTaggingAction,
-            facts: |req| {
-                req.headers.insert("x-amz-tagging", HeaderValue::from_static("class=secret"));
-                req.extensions
-                    .insert(RequestedObjectTags(vec![("class".to_owned(), "public".to_owned())]));
+            facts: |head, extensions| {
+                head.headers.insert("x-amz-tagging", HeaderValue::from_static("class=secret"));
+                extensions.insert(RequestedObjectTags(vec![("class".to_owned(), "public".to_owned())]));
             },
             allowed: true,
         },
@@ -1471,10 +1366,9 @@ async fn owned_and_legacy_entry_points_reach_the_same_decisions() {
             object: "body/obj",
             principal: Principal::Anonymous,
             action: S3Action::PutObjectTaggingAction,
-            facts: |req| {
-                req.headers.insert("x-amz-tagging", HeaderValue::from_static("class=public"));
-                req.extensions
-                    .insert(RequestedObjectTags(vec![("class".to_owned(), "secret".to_owned())]));
+            facts: |head, extensions| {
+                head.headers.insert("x-amz-tagging", HeaderValue::from_static("class=public"));
+                extensions.insert(RequestedObjectTags(vec![("class".to_owned(), "secret".to_owned())]));
             },
             allowed: false,
         },
@@ -1484,7 +1378,7 @@ async fn owned_and_legacy_entry_points_reach_the_same_decisions() {
             object: "body/obj",
             principal: Principal::Anonymous,
             action: S3Action::PutObjectRetentionAction,
-            facts: |req| retain(req, "GOVERNANCE", 40),
+            facts: |head, extensions| retain(head, extensions, "GOVERNANCE", 40),
             allowed: true,
         },
         DecisionCase {
@@ -1493,7 +1387,7 @@ async fn owned_and_legacy_entry_points_reach_the_same_decisions() {
             object: "body/obj",
             principal: Principal::Anonymous,
             action: S3Action::PutObjectRetentionAction,
-            facts: |req| retain(req, "COMPLIANCE", 40),
+            facts: |head, extensions| retain(head, extensions, "COMPLIANCE", 40),
             allowed: false,
         },
         DecisionCase {
@@ -1502,7 +1396,7 @@ async fn owned_and_legacy_entry_points_reach_the_same_decisions() {
             object: "body/obj",
             principal: Principal::Anonymous,
             action: S3Action::PutObjectRetentionAction,
-            facts: |req| retain(req, "GOVERNANCE", 10),
+            facts: |head, extensions| retain(head, extensions, "GOVERNANCE", 10),
             allowed: false,
         },
         DecisionCase {
@@ -1511,9 +1405,10 @@ async fn owned_and_legacy_entry_points_reach_the_same_decisions() {
             object: "copy/obj",
             principal: Principal::Anonymous,
             action: S3Action::PutObjectAction,
-            facts: |req| {
-                req.headers.insert("x-amz-copy-source", HeaderValue::from_static("other/key"));
-                req.extensions.insert(RequestedCopySource("src/key".to_owned()));
+            facts: |head, extensions| {
+                head.headers
+                    .insert("x-amz-copy-source", HeaderValue::from_static("other/key"));
+                extensions.insert(RequestedCopySource("src/key".to_owned()));
             },
             allowed: true,
         },
@@ -1523,9 +1418,9 @@ async fn owned_and_legacy_entry_points_reach_the_same_decisions() {
             object: "copy/obj",
             principal: Principal::Anonymous,
             action: S3Action::PutObjectAction,
-            facts: |req| {
-                req.headers.insert("x-amz-copy-source", HeaderValue::from_static("src/key"));
-                req.extensions.insert(RequestedCopySource("other/key".to_owned()));
+            facts: |head, extensions| {
+                head.headers.insert("x-amz-copy-source", HeaderValue::from_static("src/key"));
+                extensions.insert(RequestedCopySource("other/key".to_owned()));
             },
             allowed: false,
         },
@@ -1535,7 +1430,7 @@ async fn owned_and_legacy_entry_points_reach_the_same_decisions() {
             object: "post/obj",
             principal: Principal::Anonymous,
             action: S3Action::PutObjectAction,
-            facts: |req| post_form(req, "class=public", "class=secret"),
+            facts: |head, extensions| post_form(head, extensions, "class=public", "class=secret"),
             allowed: true,
         },
         DecisionCase {
@@ -1544,7 +1439,7 @@ async fn owned_and_legacy_entry_points_reach_the_same_decisions() {
             object: "post/obj",
             principal: Principal::Anonymous,
             action: S3Action::PutObjectAction,
-            facts: |req| post_form(req, "class=secret", "class=public"),
+            facts: |head, extensions| post_form(head, extensions, "class=secret", "class=public"),
             allowed: false,
         },
         DecisionCase {
@@ -1553,8 +1448,8 @@ async fn owned_and_legacy_entry_points_reach_the_same_decisions() {
             object: "stage/obj",
             principal: Principal::Anonymous,
             action: S3Action::PutObjectAction,
-            facts: |req| {
-                req.extensions.insert(MultipartStagingOperation);
+            facts: |_, extensions| {
+                extensions.insert(MultipartStagingOperation);
             },
             allowed: true,
         },
@@ -1571,26 +1466,26 @@ async fn owned_and_legacy_entry_points_reach_the_same_decisions() {
 
     let mut mismatches = Vec::new();
     for case in cases {
-        let mut legacy = build_request((), Method::PUT);
-        legacy.uri = format!("/{}/{}", case.bucket, case.object).parse().expect("case uri");
-        legacy.extensions.insert(Arc::clone(&slot));
+        let mut head = request_head(Method::PUT, format!("/{}/{}", case.bucket, case.object).parse().expect("case uri"));
+        let mut extensions = Extensions::new();
+        extensions.insert(Arc::clone(&slot));
         let (cred, is_owner) = match case.principal {
             Principal::Anonymous => (None, false),
             Principal::User => (Some(user.clone()), false),
             Principal::Owner => (Some(owner.clone()), true),
         };
-        legacy.extensions.insert(ReqInfo {
+        extensions.insert(ReqInfo {
             cred,
             is_owner,
             bucket: Some(case.bucket.to_owned()),
             object: Some(case.object.to_owned()),
             ..Default::default()
         });
-        (case.facts)(&mut legacy);
-        let mut owned = envelope_from_request(&legacy);
+        (case.facts)(&mut head, &mut extensions);
+        let mut owned = RequestEnvelope::from_parts(head, extensions);
         // The object shape both edges' access hooks call, on a forked envelope as an archive
         // member is authorized: it must reach the same decision.
-        let mut owned_shape = envelope_from_request(&legacy).fork_for_authorization();
+        let mut owned_shape = owned.fork_for_authorization();
         let action = Action::S3Action(case.action);
         let owned_result = crate::app::authorize_owned_request(&mut owned, action, None).await;
         let shape_result = crate::app::storage_api::owned_parity::authorize_object_request(
@@ -1600,8 +1495,7 @@ async fn owned_and_legacy_entry_points_reach_the_same_decisions() {
             None,
             action,
         )
-        .await
-        .map_err(crate::error::legacy_error_for_test);
+        .await;
         let owned_ok = match &owned_result {
             Ok(()) => case.allowed,
             Err(err) => !case.allowed && err.code() == &rustfs_s3_types::S3ErrorCode::AccessDenied,
@@ -1621,30 +1515,26 @@ async fn owned_and_legacy_entry_points_reach_the_same_decisions() {
     assert!(mismatches.is_empty(), "decision mismatches:\n{}", mismatches.join("\n"));
 }
 
-fn retain(req: &mut S3Request<()>, mode: &'static str, days: i64) {
-    let retention = ObjectLockRetention {
-        mode: Some(mode.to_owned().into()),
-        ..Default::default()
-    };
-    req.extensions.insert(RequestedObjectLockRetention {
-        mode: retention.mode.map(|m| m.as_str().to_owned()),
-        retain_until: retention.retain_until_date.map(time::OffsetDateTime::from),
+fn retain(head: &mut RequestHead, extensions: &mut Extensions, mode: &'static str, days: i64) {
+    extensions.insert(RequestedObjectLockRetention {
+        mode: Some(mode.to_owned()),
+        retain_until: None,
     });
-    req.extensions.insert(RequestedObjectLockRetainUntil(
+    extensions.insert(RequestedObjectLockRetainUntil(
         time::OffsetDateTime::now_utc() + time::Duration::days(days),
     ));
     // Headers name a different mode; only the body may describe the request.
-    req.headers
+    head.headers
         .insert("x-amz-object-lock-mode", HeaderValue::from_static("COMPLIANCE"));
 }
 
-fn post_form(req: &mut S3Request<()>, form_tagging: &'static str, header_tagging: &'static str) {
-    req.method = Method::POST;
-    req.headers.insert("x-amz-tagging", HeaderValue::from_static(header_tagging));
-    let mut form = req.headers.clone();
+fn post_form(head: &mut RequestHead, extensions: &mut Extensions, form_tagging: &'static str, header_tagging: &'static str) {
+    head.method = Method::POST;
+    head.headers.insert("x-amz-tagging", HeaderValue::from_static(header_tagging));
+    let mut form = head.headers.clone();
     form.insert("x-amz-tagging", HeaderValue::from_static(form_tagging));
-    req.extensions.insert(PostObjectRequestMarker);
-    req.extensions.insert(PostObjectPolicyHeaders(form));
+    extensions.insert(PostObjectRequestMarker);
+    extensions.insert(PostObjectPolicyHeaders(form));
 }
 
 /// What a bucket-configuration mutation answered, compared across the two request forms.
@@ -1728,20 +1618,19 @@ async fn owned_and_legacy_bucket_config_mutations_hand_on_the_same_decision_and_
 
     let mut mismatches = Vec::new();
     for (name, bucket, principal, action, expected) in cases {
-        let mut legacy = build_request((), Method::PUT);
-        legacy.uri = format!("/{bucket}").parse().expect("case uri");
-        legacy.extensions.insert(Arc::clone(&slot));
+        let mut extensions = Extensions::new();
+        extensions.insert(Arc::clone(&slot));
         let (cred, is_owner) = match principal {
             Principal::Anonymous => (None, false),
             Principal::User => (Some(user.clone()), false),
             Principal::Owner => (Some(owner.clone()), true),
         };
-        legacy.extensions.insert(ReqInfo {
+        extensions.insert(ReqInfo {
             cred,
             is_owner,
             ..Default::default()
         });
-        let mut owned = envelope_from_request(&legacy);
+        let mut owned = denial_envelope(Method::PUT, format!("/{bucket}").parse().expect("case uri"), extensions);
         let action = Action::S3Action(action);
 
         use rustfs_s3_types::S3ErrorCode as OwnedErrorCode;
@@ -1804,17 +1693,16 @@ async fn run_write_shape<R: crate::app::storage_api::owned_parity::Authorization
 async fn owned_and_legacy_write_checks_hand_on_the_same_decision_and_state() {
     let (_store_dirs, _store, slot, user, owner) = decision_world().await;
     let denied = Some("AccessDenied".to_owned());
-    let replication_status = |req: &mut S3Request<()>| {
-        req.headers
-            .insert("x-amz-replication-status", HeaderValue::from_static("REPLICA"));
+    let replication_status = |headers: &mut HeaderMap, _: &mut Extensions| {
+        headers.insert("x-amz-replication-status", HeaderValue::from_static("REPLICA"));
     };
     // The access phase marks every multipart upload step; a staged part is one.
-    let staging = |req: &mut S3Request<()>| {
-        req.extensions.insert(MultipartStagingOperation);
+    let staging = |_: &mut HeaderMap, extensions: &mut Extensions| {
+        extensions.insert(MultipartStagingOperation);
     };
     let if_match = |value: &'static str| {
-        move |req: &mut S3Request<()>| {
-            req.headers.insert(http::header::IF_MATCH, HeaderValue::from_static(value));
+        move |headers: &mut HeaderMap, _: &mut Extensions| {
+            headers.insert(http::header::IF_MATCH, HeaderValue::from_static(value));
         }
     };
     // (name, shape, bucket, object, principal, request facts, expected decision and state)
@@ -1824,7 +1712,7 @@ async fn owned_and_legacy_write_checks_hand_on_the_same_decision_and_state() {
         &'static str,
         &'static str,
         Principal,
-        Box<dyn Fn(&mut S3Request<()>)>,
+        Box<dyn Fn(&mut HeaderMap, &mut Extensions)>,
         WriteOutcome,
     );
     let cases: Vec<Case> = vec![
@@ -1861,7 +1749,7 @@ async fn owned_and_legacy_write_checks_hand_on_the_same_decision_and_state() {
             PRIVATE,
             "allowed",
             Principal::Anonymous,
-            Box::new(|_: &mut S3Request<()>| {}),
+            Box::new(|_: &mut HeaderMap, _: &mut Extensions| {}),
             (None, false, false),
         ),
         (
@@ -1870,11 +1758,11 @@ async fn owned_and_legacy_write_checks_hand_on_the_same_decision_and_state() {
             PRIVATE,
             "allowed",
             Principal::Anonymous,
-            Box::new(|req: &mut S3Request<()>| {
-                let mut form = req.headers.clone();
+            Box::new(|headers: &mut HeaderMap, extensions: &mut Extensions| {
+                let mut form = headers.clone();
                 form.insert("x-amz-replication-status", HeaderValue::from_static("REPLICA"));
-                req.extensions.insert(PostObjectRequestMarker);
-                req.extensions.insert(PostObjectPolicyHeaders(form));
+                extensions.insert(PostObjectRequestMarker);
+                extensions.insert(PostObjectPolicyHeaders(form));
             }),
             (None, false, false),
         ),
@@ -1917,7 +1805,7 @@ async fn owned_and_legacy_write_checks_hand_on_the_same_decision_and_state() {
             PRIVATE,
             "allowed",
             Principal::Anonymous,
-            Box::new(|_: &mut S3Request<()>| {}),
+            Box::new(|_: &mut HeaderMap, _: &mut Extensions| {}),
             (denied.clone(), false, false),
         ),
         (
@@ -1939,12 +1827,12 @@ async fn owned_and_legacy_write_checks_hand_on_the_same_decision_and_state() {
             PRIVATE,
             "allowed",
             Principal::Anonymous,
-            Box::new(|req: &mut S3Request<()>| {
-                req.headers.insert(http::header::IF_MATCH, HeaderValue::from_static("*"));
-                let mut form = req.headers.clone();
+            Box::new(|headers: &mut HeaderMap, extensions: &mut Extensions| {
+                headers.insert(http::header::IF_MATCH, HeaderValue::from_static("*"));
+                let mut form = headers.clone();
                 form.insert(http::header::IF_MATCH, HeaderValue::from_static("\"abc\""));
-                req.extensions.insert(PostObjectRequestMarker);
-                req.extensions.insert(PostObjectPolicyHeaders(form));
+                extensions.insert(PostObjectRequestMarker);
+                extensions.insert(PostObjectPolicyHeaders(form));
             }),
             (denied.clone(), false, false),
         ),
@@ -1979,23 +1867,23 @@ async fn owned_and_legacy_write_checks_hand_on_the_same_decision_and_state() {
 
     let mut mismatches = Vec::new();
     for (name, shape, bucket, object, principal, facts, expected) in cases {
-        let mut legacy = build_request((), Method::PUT);
-        legacy.uri = format!("/{bucket}/{object}").parse().expect("case uri");
-        legacy.extensions.insert(Arc::clone(&slot));
+        let mut head = request_head(Method::PUT, format!("/{bucket}/{object}").parse().expect("case uri"));
+        let mut extensions = Extensions::new();
+        extensions.insert(Arc::clone(&slot));
         let (cred, is_owner) = match principal {
             Principal::Anonymous => (None, false),
             Principal::User => (Some(user.clone()), false),
             Principal::Owner => (Some(owner.clone()), true),
         };
-        legacy.extensions.insert(ReqInfo {
+        extensions.insert(ReqInfo {
             cred,
             is_owner,
             bucket: Some(bucket.to_owned()),
             object: Some(object.to_owned()),
             ..Default::default()
         });
-        facts(&mut legacy);
-        let mut owned = envelope_from_request(&legacy);
+        facts(&mut head.headers, &mut extensions);
+        let mut owned = RequestEnvelope::from_parts(head, extensions);
         let owned_outcome = run_write_shape(shape, &mut owned).await;
         if owned_outcome != expected {
             mismatches.push(format!("{name}: expected {expected:?}, owned {owned_outcome:?}"));

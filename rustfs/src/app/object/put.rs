@@ -18,10 +18,6 @@ use super::put_input::{PutObjectWriteInput, PutObjectWriteOutput};
 use super::request_body::UploadChunks;
 use super::*;
 use crate::app::RequestEnvelope;
-#[cfg(test)]
-use crate::app::storage_api::s3::dto::{PutObjectInput, ServerSideEncryption, StorageClass, StreamingBlob};
-#[cfg(test)]
-use crate::app::storage_api::s3::stream::ByteStream;
 use futures::FutureExt;
 use rustfs_gateway_stream::Body as NativeBody;
 use rustfs_rio::SharedTrailerSource;
@@ -2600,8 +2596,6 @@ mod tests {
     }
 
     use super::*;
-    use crate::app::storage_api::s3::dto::ObjectLockRetentionMode;
-    use crate::app::storage_api::s3::{S3Error, S3ErrorCode, S3Result};
     use crate::app::test_seams::{
         get_envelope, get_object_gateway, get_object_input, head_envelope, head_object_input, read_get_body,
     };
@@ -2641,18 +2635,15 @@ mod tests {
         }
     }
 
-    async fn put_method_only(usecase: &DefaultObjectUsecase, input: PutObjectInput) -> S3Result<PutObjectWriteOutput> {
-        let input = PutObjectWriteInput::from_legacy(input, None);
-        Box::pin(usecase.execute_put_object_owned(method_only_put_envelope(), input))
-            .await
-            .map_err(crate::error::legacy_error_for_test)
+    async fn put_method_only(usecase: &DefaultObjectUsecase, input: PutObjectWriteInput) -> S3Result<PutObjectWriteOutput> {
+        Box::pin(usecase.execute_put_object_owned(method_only_put_envelope(), input)).await
     }
 
-    async fn put_extract_method_only(usecase: &DefaultObjectUsecase, input: PutObjectInput) -> S3Result<PutObjectWriteOutput> {
-        let input = PutObjectWriteInput::from_legacy(input, None);
-        Box::pin(usecase.execute_put_object_extract_owned(method_only_put_envelope(), input))
-            .await
-            .map_err(crate::error::legacy_error_for_test)
+    async fn put_extract_method_only(
+        usecase: &DefaultObjectUsecase,
+        input: PutObjectWriteInput,
+    ) -> S3Result<PutObjectWriteOutput> {
+        Box::pin(usecase.execute_put_object_extract_owned(method_only_put_envelope(), input)).await
     }
 
     #[tokio::test]
@@ -2668,13 +2659,7 @@ mod tests {
             .await
             .expect("create PUT completion bucket");
         let payload = Bytes::from_static(b"readable after PUT acknowledgement");
-        let input = PutObjectInput::builder()
-            .bucket(bucket.clone())
-            .key("object".to_owned())
-            .content_length(Some(i64::try_from(payload.len()).expect("small payload length")))
-            .body(Some(StreamingBlob::from_bytes(payload.clone())))
-            .build()
-            .expect("PUT completion request");
+        let input = put_bytes(bucket.clone(), "object", payload.clone());
         let usecase = DefaultObjectUsecase::with_context(Some(context));
         let (response, observed) = PUT_STORAGE_TEST_COMPLETION
             .scope(std::cell::Cell::new(None), async {
@@ -2743,13 +2728,9 @@ mod tests {
         let usecase = DefaultObjectUsecase::with_context(Some(context));
         let recorder = DebuggingRecorder::new();
         let snapshotter = recorder.snapshotter();
-        let input = |invalid_class: bool| PutObjectInput {
-            bucket: bucket.clone(),
-            key: "counted".to_owned(),
-            body: Some(StreamingBlob::from_bytes(Bytes::from_static(b"count"))),
-            content_length: Some(5),
-            storage_class: invalid_class.then(|| StorageClass::from_static("INVALID")),
-            ..Default::default()
+        let input = |invalid_class: bool| PutObjectWriteInput {
+            storage_class: invalid_class.then(|| "INVALID".to_owned()),
+            ..put_bytes(bucket.clone(), "counted", Bytes::from_static(b"count"))
         };
         let baseline = official_count();
         let mut observed = 0;
@@ -2768,7 +2749,7 @@ mod tests {
                 .expect("successful PUT");
             assert_eq!(put_count(&snapshotter, &mut observed), 0, "the use case does not count an accepted PUT");
             assert_eq!(official_count() - baseline, 0, "official operation total");
-            let input = PutObjectInput {
+            let input = PutObjectWriteInput {
                 bucket: bucket.clone(),
                 key: "archive.tar".to_owned(),
                 ..Default::default()
@@ -2803,13 +2784,7 @@ mod tests {
         runtime
             .block_on(Box::pin(store.make_bucket(&bucket, &MakeBucketOptions::default())))
             .expect("test bucket");
-        let input = PutObjectInput::builder()
-            .bucket(bucket)
-            .key("test-object".to_string())
-            .body(Some(StreamingBlob::from_bytes(Bytes::from_static(b"payload"))))
-            .content_length(Some(7))
-            .build()
-            .expect("PUT input");
+        let input = put_bytes(bucket, "test-object", Bytes::from_static(b"payload"));
         let usecase = DefaultObjectUsecase::with_context(Some(context));
         let recorder = DebuggingRecorder::new();
         let snapshotter = recorder.snapshotter();
@@ -2951,13 +2926,7 @@ mod tests {
         let usecase = DefaultObjectUsecase::with_context(Some(context));
         for (index, failure) in [StorageError::DiskFull, StorageError::StorageFull].into_iter().enumerate() {
             let key = format!("refused-{index}");
-            let input = PutObjectInput::builder()
-                .bucket(bucket.clone())
-                .key(key.clone())
-                .body(Some(StreamingBlob::from_bytes(Bytes::from_static(b"capacity probe"))))
-                .content_length(Some(14))
-                .build()
-                .expect("capacity PUT input must build");
+            let input = put_bytes(bucket.clone(), &key, Bytes::from_static(b"capacity probe"));
             let error = PUT_STORAGE_TEST_FAILURE
                 .scope((PutStorageTestStage::Commit, failure), put_method_only(&usecase, input))
                 .await
@@ -3113,8 +3082,7 @@ mod tests {
 
     #[test]
     fn put_request_user_metadata_cannot_suppress_bucket_default_retention() {
-        let mut metadata =
-            HashMap::from([(AMZ_OBJECT_LOCK_MODE_LOWER.to_string(), ObjectLockRetentionMode::GOVERNANCE.to_string())]);
+        let mut metadata = HashMap::from([(AMZ_OBJECT_LOCK_MODE_LOWER.to_string(), "GOVERNANCE".to_string())]);
         apply_put_request_metadata_native(
             &mut metadata,
             &HeaderMap::new(),
@@ -3581,25 +3549,38 @@ mod tests {
 
     #[tokio::test]
     async fn put_object_body_read_timeout_guard_preserves_length_and_passes_through() {
-        let body = StreamingBlob::from_bytes(Bytes::from_static(b"hello world"));
-        assert_eq!(body.remaining_length().exact(), Some(11));
+        let body = super::super::native_body::from_io_stream_with_length(
+            futures::stream::iter([Ok(Bytes::from_static(b"hello world"))]),
+            Some(11),
+        );
+        assert_eq!(body.len_hint(), Some(11));
 
-        let (mut guarded, _) = super::super::request_body::guard_upload_progress(
-            body,
+        let (chunks, _) = super::super::native_body::BodyChunks::new(body);
+        let (mut guarded, _) = super::super::request_body::guard_native_upload_progress(
+            Box::new(chunks),
             Duration::from_secs(60),
             "test-bucket",
             "ok-object",
             "req-2",
             11,
         );
-        // remaining_length must be forwarded, not reset to unknown.
-        assert_eq!(guarded.remaining_length().exact(), Some(11));
 
         let mut collected = Vec::new();
         while let Some(chunk) = guarded.next().await {
             collected.extend_from_slice(&chunk.expect("chunk should read"));
         }
         assert_eq!(collected, b"hello world");
+
+        // size_hint on UploadProgressStream must also forward the inner stream's bounds.
+        let (sized_guarded, _) = super::super::request_body::guard_native_upload_progress(
+            Box::new(futures::stream::iter([Ok(Bytes::from_static(b"hello world"))])),
+            Duration::from_secs(60),
+            "test-bucket",
+            "ok-object",
+            "req-3",
+            11,
+        );
+        assert_eq!(sized_guarded.size_hint(), (1, Some(1)));
     }
 
     #[tokio::test]
@@ -3673,10 +3654,7 @@ mod tests {
 
     #[test]
     fn select_put_path_treats_bucket_default_sse_as_encrypted() {
-        for (algorithm, kms_key_id) in [
-            (ServerSideEncryption::AES256, None),
-            (ServerSideEncryption::AWS_KMS, Some("bucket-key")),
-        ] {
+        for (algorithm, kms_key_id) in [("AES256", None), ("aws:kms", Some("bucket-key"))] {
             let config = ServerSideEncryptionConfiguration {
                 rules: vec![ServerSideEncryptionRule {
                     apply_server_side_encryption_by_default: Some(ServerSideEncryptionByDefault {
@@ -4449,13 +4427,13 @@ mod tests {
     #[tokio::test]
     async fn gateway_post_archive_is_refused_before_body_on_both_internal_paths() {
         for direct_extract in [false, true] {
-            let (body, polls) = PollCountingBody::streaming_blob();
-            let input = PutObjectInput::builder()
-                .bucket("test-bucket".to_owned())
-                .key("archive.tar".to_owned())
-                .body(Some(body))
-                .build()
-                .expect("archive input");
+            let (body, polls) = PollCountingBody::native_body();
+            let input = PutObjectWriteInput {
+                bucket: "test-bucket".to_owned(),
+                key: "archive.tar".to_owned(),
+                body: Some(body),
+                ..Default::default()
+            };
             let mut headers = HeaderMap::new();
             headers.insert(AMZ_SNOWBALL_EXTRACT, HeaderValue::from_static("true"));
             // POST `/`, the snowball header, and the post-object marker. Credentials, region, and service stay absent.
@@ -4463,7 +4441,6 @@ mod tests {
             assert!(!envelope.is_gateway_post(), "legacy provenance must remain distinct");
             envelope.mark_gateway_post();
             assert!(envelope.fork_for_authorization().is_gateway_post());
-            let input = PutObjectWriteInput::from_legacy(input, None);
             let usecase = DefaultObjectUsecase::without_context();
             let result = if direct_extract {
                 Box::pin(usecase.execute_put_object_extract_owned(envelope, input)).await
@@ -4485,7 +4462,7 @@ mod tests {
         let input = PutObjectWriteInput {
             bucket: "test-bucket".to_owned(),
             key: "test-key".to_owned(),
-            server_side_encryption: Some(ServerSideEncryption::AWS_KMS.to_owned()),
+            server_side_encryption: Some("aws:kms".to_owned()),
             ..Default::default()
         };
 
@@ -4501,7 +4478,7 @@ mod tests {
         let input = PutObjectWriteInput {
             bucket: "test-bucket".to_owned(),
             key: "archive.tar".to_owned(),
-            server_side_encryption: Some(ServerSideEncryption::AWS_KMS.to_owned()),
+            server_side_encryption: Some("aws:kms".to_owned()),
             ..Default::default()
         };
         let mut headers = HeaderMap::new();
@@ -4858,8 +4835,8 @@ mod tests {
         );
 
         for (algorithm, kms_key_id, prefix) in [
-            (ServerSideEncryption::AES256, None, "ssec-over-aes256-default"),
-            (ServerSideEncryption::AWS_KMS, Some("bucket-key"), "ssec-over-kms-default"),
+            ("AES256", None, "ssec-over-aes256-default"),
+            ("aws:kms", Some("bucket-key"), "ssec-over-kms-default"),
         ] {
             let (store, bucket) = crate::app::gating_test_env::durable_quota_test_bucket(prefix, 1 << 20).await;
             install_bucket_default_sse_for_test(&bucket, algorithm, kms_key_id).await;
@@ -4955,10 +4932,7 @@ mod tests {
                 stored.user_defined
             );
             assert!(
-                !stored
-                    .user_defined
-                    .values()
-                    .any(|value| value == ServerSideEncryption::AWS_KMS),
+                !stored.user_defined.values().any(|value| value == "aws:kms"),
                 "the bucket default must not claim managed encryption on an SSE-C object: {:?}",
                 stored.user_defined
             );
@@ -5033,17 +5007,17 @@ mod tests {
 
         let body_polled = Arc::new(AtomicBool::new(false));
         let body_polled_in_stream = Arc::clone(&body_polled);
-        let body = StreamingBlob::wrap(futures::stream::once(async move {
+        let body = super::super::native_body::from_io_stream(futures::stream::once(async move {
             body_polled_in_stream.store(true, Ordering::Release);
             Ok::<Bytes, std::io::Error>(Bytes::new())
         }));
-        let input = PutObjectInput::builder()
-            .bucket(bucket)
-            .key("object".to_string())
-            .body(Some(body))
-            .content_length(Some(i64::try_from(2 * GI_B).expect("test size should fit i64")))
-            .build()
-            .expect("legacy quota PUT input should build");
+        let input = PutObjectWriteInput {
+            bucket,
+            key: "object".to_string(),
+            body: Some(body),
+            content_length: Some(i64::try_from(2 * GI_B).expect("test size should fit i64")),
+            ..Default::default()
+        };
 
         let err = put_method_only(&DefaultObjectUsecase::from_global(), input)
             .await
@@ -5677,11 +5651,13 @@ pub(crate) struct PollCountingBody {
 
 #[cfg(test)]
 impl PollCountingBody {
-    pub(crate) fn streaming_blob() -> (StreamingBlob, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+    pub(crate) fn native_body() -> (NativeBody, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
         let polls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let body = StreamingBlob::new(Self {
-            polls: std::sync::Arc::clone(&polls),
-        });
+        let body_polls = std::sync::Arc::clone(&polls);
+        let body = super::native_body::from_io_stream(futures::stream::repeat_with(move || {
+            body_polls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(Bytes::from_static(b"x"))
+        }));
         (body, polls)
     }
 }
@@ -5695,9 +5671,6 @@ impl Stream for PollCountingBody {
         Poll::Ready(Some(Ok(Bytes::from_static(b"x"))))
     }
 }
-
-#[cfg(test)]
-impl ByteStream for PollCountingBody {}
 
 #[cfg(test)]
 mod oversize_single_upload_tests {

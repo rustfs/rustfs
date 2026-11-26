@@ -25,7 +25,7 @@ runner's `--json` report). The verdict comes from those observations, never
 from the exit status of an earlier step.
 
 Red: a failed case without a ruling; a ruled case that fails
-differently from its ruling's `failure`; a ruling whose case no longer fails;
+differently from its ruling's `failure` or `failures`; a ruling whose case no longer fails;
 and a skip whose reason is the server's own answer (the endpoint not answering,
 or a fixture it refused). An unimplemented connection control also blocks acceptance and is
 reported as a runner limitation.
@@ -36,7 +36,9 @@ goes to stdout.
 
 import argparse
 from collections import Counter
+import contextlib
 from datetime import UTC, date, datetime, timedelta
+import io
 import json
 from pathlib import Path
 import re
@@ -51,9 +53,11 @@ from acceptance_lane import InputError, read_exit, read_text, served, write_serv
 ROOT = Path(__file__).resolve().parents[1]
 LEDGER = ROOT / ".config/conformance-rulings.toml"
 VERDICTS = ("passed", "failed", "skipped")
-# rustfs/backlog#2684 also links the upstream decisions on response heads and HTTP/1 connection closure.
-LEDGER_ID = re.compile(r"(R-\d{3}|K-\d+|rustfs/gateway#(?:1120|1159))")
-RULING_KEYS = {"case", "ledger", "reason", "failure", "expires"}
+# Compatibility ledger entries and maintainer-signed conformance decisions (rustfs/backlog#2684).
+LEDGER_ID = re.compile(r"(R-\d{3}|K-\d+|rustfs/gateway#(?:1120|1159|1349)|rustfs/backlog#(?:2684|2762))")
+RULING_BASE_KEYS = {"case", "ledger", "reason", "expires"}
+SINGLE_RULING_KEYS = RULING_BASE_KEYS | {"failure"}
+MULTI_RULING_KEYS = RULING_BASE_KEYS | {"failures"}
 NOT_SERVED = "observed 501"
 # External skips that block acceptance, including transport controls the runner cannot drive.
 EXTERNAL_SKIP = re.compile(r"environment: external (endpoint|fixture .* returned status)")
@@ -62,21 +66,41 @@ RUNNER_CONTROL = re.compile(
 )
 
 
+def expected_failures(ruling):
+    if "failures" in ruling:
+        return ruling["failures"]
+    return [ruling["failure"]]
+
+
 def load_rulings(path):
     try:
         rows = tomllib.loads(Path(path).read_text(encoding="utf-8")).get("ruling", [])
     except (OSError, tomllib.TOMLDecodeError) as error:
         raise InputError(f"{path}: {error}") from error
+    if not isinstance(rows, list):
+        raise InputError(f"{path}: ruling table must be an array")
     rulings = {}
     today = datetime.now(UTC).date()
     for row in rows:
-        if not isinstance(row, dict) or set(row) != RULING_KEYS:
-            raise InputError(f"{path}: a ruling has exactly the keys {sorted(RULING_KEYS)}: {row}")
-        if not LEDGER_ID.fullmatch(str(row["ledger"])):
+        if not isinstance(row, dict) or set(row) not in (SINGLE_RULING_KEYS, MULTI_RULING_KEYS):
+            raise InputError(
+                f"{path}: a ruling has exactly the keys {sorted(SINGLE_RULING_KEYS)} or {sorted(MULTI_RULING_KEYS)}: {row}"
+            )
+        if not isinstance(row["case"], str) or not row["case"].strip() or "\n" in row["case"]:
+            raise InputError(f"{path}: case id must be one non-empty line: {row}")
+        if not isinstance(row["ledger"], str) or not LEDGER_ID.fullmatch(row["ledger"]):
             raise InputError(f"{path}: unknown ledger id in {row}")
-        for key in ("reason", "failure"):
-            if not isinstance(row[key], str) or not row[key].strip() or "\n" in row[key]:
-                raise InputError(f"{path}: the {key} of {row['case']} must be one non-empty line")
+        if not isinstance(row["reason"], str) or not row["reason"].strip() or "\n" in row["reason"]:
+            raise InputError(f"{path}: the reason of {row['case']} must be one non-empty line")
+        if "failure" in row:
+            if not isinstance(row["failure"], str) or not row["failure"].strip() or "\n" in row["failure"]:
+                raise InputError(f"{path}: the failure of {row['case']} must be one non-empty line")
+        else:
+            failures = row["failures"]
+            if not isinstance(failures, list) or not failures or any(
+                not isinstance(item, str) or not item.strip() for item in failures
+            ):
+                raise InputError(f"{path}: the failures of {row['case']} must be a non-empty list of non-empty strings")
         expiry = row["expires"]
         if type(expiry) is not date or not today < expiry <= today + timedelta(days=90):
             raise InputError(f"{path}: {row['case']} needs a future expiry within 90 days")
@@ -111,6 +135,17 @@ def read_report(run_dir):
 
 def first_failure(case):
     return (case.get("failures") or ["no failure recorded"])[0]
+
+
+def failure_mismatch(case, expected):
+    actual = case.get("failures") or []
+    for observed, ruled in zip(actual, expected):
+        if observed != ruled:
+            return observed
+    if len(actual) != len(expected):
+        detail = actual[len(expected)] if len(actual) > len(expected) else "missing diagnostic"
+        return f"{len(actual)} diagnostics (expected {len(expected)}): {detail}"
+    return first_failure(case)
 
 
 def judge(rulings, run_dir, case_dir=None):
@@ -155,7 +190,7 @@ def judge(rulings, run_dir, case_dir=None):
     failed = by_verdict["failed"]
     unruled = [case for case in failed if case not in rulings]
     different = [case for case in failed if case in rulings
-                 and cases[case].get("failures") != [rulings[case]["failure"]]]
+                 and cases[case].get("failures") != expected_failures(rulings[case])]
     stale = sorted(case for case in rulings if cases.get(case, {}).get("verdict") != "failed")
     server_skips, runner_controls = [], []
     for case in by_verdict["skipped"]:
@@ -171,7 +206,8 @@ def judge(rulings, run_dir, case_dir=None):
         f"answered 501 {len(not_served)}, skipped {len(by_verdict['skipped'])} (on the server's answer {len(server_skips)})")
     sections = [
         ("Failed without a ruling", unruled, lambda case: first_failure(cases[case])),
-        ("Failing differently from the ruling", different, lambda case: first_failure(cases[case])),
+        ("Failing differently from the ruling", different,
+         lambda case: failure_mismatch(cases[case], expected_failures(rulings[case]))),
         ("Skipped for unavailable runner controls", runner_controls, lambda case: cases[case].get("reason")),
         ("Skipped on the server's answer", server_skips, lambda case: cases[case].get("reason")),
         ("Stale rulings: the case no longer fails; remove the ruling", stale,
@@ -223,7 +259,8 @@ class SelfTest(unittest.TestCase):
             (self.dir / "alive-after-conformance.txt").write_text(alive + "\n")
         if cases is not None:
             report = {"profile": "rustfs", "target_build": None, "cases": [
-                {"id": i, "verdict": v, "reason": f if v == "skipped" else "", "failures": [f] if f and v == "failed" else []}
+                {"id": i, "verdict": v, "reason": f if v == "skipped" else "",
+                 "failures": (f if isinstance(f, list) else ([f] if f else [])) if v == "failed" else []}
                 for i, v, f in cases]}
             (self.dir / "report.json").write_text(json.dumps(report))
 
@@ -264,6 +301,50 @@ class SelfTest(unittest.TestCase):
             report_path.write_text(json.dumps(report))
             with self.subTest(failures=failures):
                 self.assertEqual(self.judged(ruling)[1], ["conformance: c-a-0001 fails differently from its ruling"])
+
+    def test_multi_diagnostic_failures_require_exact_ordered_match(self):
+        expiry = datetime.now(UTC).date() + timedelta(days=7)
+        path = self.dir / "rulings.toml"
+        expected = ["[expect/status] expected 200, observed 400", "line 1\nline 2"]
+        path.write_text(
+            '[[ruling]]\n'
+            'case = "c-a-0001"\n'
+            'ledger = "rustfs/backlog#2684"\n'
+            'reason = "exact multi-diagnostic ruling"\n'
+            'failures = [\n'
+            '  "[expect/status] expected 200, observed 400",\n'
+            '  """line 1\nline 2""",\n'
+            ']\n'
+            f'expires = {expiry}\n'
+        )
+        rulings = load_rulings(path)
+        self.write_run([("c-a-0001", "failed", expected)])
+        lines, problems = self.judged(rulings)
+        self.assertEqual(problems, [])
+        self.assertIn("ruled 1, unruled 0, failing differently 0", "\n".join(lines))
+
+        for bad in (
+            ["[expect/status] expected 200, observed 401", "line 1\nline 2"],
+            ["[expect/status] expected 200, observed 400", "line 1\nline X"],
+            ["line 1\nline 2", "[expect/status] expected 200, observed 400"],
+            ["[expect/status] expected 200, observed 400"],
+            ["[expect/status] expected 200, observed 400", "line 1\nline 2", "extra"],
+        ):
+            with self.subTest(failures=bad):
+                self.write_run([("c-a-0001", "failed", bad)])
+                self.assertEqual(self.judged(rulings)[1], ["conformance: c-a-0001 fails differently from its ruling"])
+
+    def test_sanctioned_ledger_ids_are_accepted(self):
+        expiry = datetime.now(UTC).date() + timedelta(days=7)
+        path = self.dir / "rulings.toml"
+        ids = ("R-065", "K-1", "rustfs/gateway#1120", "rustfs/gateway#1159",
+               "rustfs/gateway#1349", "rustfs/backlog#2684", "rustfs/backlog#2762")
+        path.write_text("".join(
+            f'[[ruling]]\ncase = "c-a-{idx:04d}"\nledger = "{ledger_id}"\nreason = "why"\n'
+            f'failure = "[expect/status]"\nexpires = {expiry}\n'
+            for idx, ledger_id in enumerate(ids, start=1)
+        ))
+        self.assertEqual(len(load_rulings(path)), len(ids))
 
     def test_a_skip_on_the_endpoint_not_answering_is_red(self):
         self.write_run([("c-a-0001", "passed", ""),
@@ -371,8 +452,17 @@ class SelfTest(unittest.TestCase):
             base + 'expires = "x"\n',
             dated + 'stack = "gateway"\n',
             dated.replace('"R-001"', '"2684"'),
+            dated.replace('"R-001"', '"rustfs/backlog#2685"'),
+            dated.replace('"R-001"', '"rustfs/gateway#1350"'),
             dated.replace('reason = "r"', 'reason = ""'),
             dated.replace('failure = "[expect/status]"', 'failure = ""'),
+            dated.replace('failure = "[expect/status]"', 'failure = """a\nb"""'),
+            dated.replace('failure = "[expect/status]"', 'failures = []'),
+            dated.replace('failure = "[expect/status]"', 'failures = [""]'),
+            dated.replace('failure = "[expect/status]"', 'failures = ["   "]'),
+            dated.replace('failure = "[expect/status]"', 'failures = [123]'),
+            dated.replace('failure = "[expect/status]"', 'failures = "[expect/status]"'),
+            dated + 'failures = ["[expect/status]"]\n',
         ):
             path.write_text("[[ruling]]\n" + body)
             with self.subTest(body=body), self.assertRaises(InputError):
@@ -380,6 +470,9 @@ class SelfTest(unittest.TestCase):
         path.write_text(("[[ruling]]\n" + dated) * 2)
         with self.assertRaises(InputError):
             load_rulings(path)
+        path.write_text("[[ruling]]\n" + dated.replace('failure = "[expect/status]"', 'failures = []'))
+        with contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(main(["--run-dir", str(self.dir), "--rulings", str(path)]), 2)
 
     def test_a_malformed_report_or_exit_record_is_refused(self):
         (self.dir / "report.json").write_text('{"cases": [{"id": "c"}]}')

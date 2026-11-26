@@ -538,10 +538,10 @@ mod tests {
             },
         );
         let err = match Box::pin(make_usecase().execute_upload_part_copy_with_audit(owned_envelope(Method::PUT), input)).await {
-            Err(error) => crate::error::legacy_error_for_test(error),
+            Err(error) => error,
             Ok(_) => panic!("uninitialized store must be an internal error"),
         };
-        assert_eq!(err.code(), &crate::app::storage_api::s3::S3ErrorCode::InternalError);
+        assert_eq!(err.code(), &S3ErrorCode::InternalError);
     }
 
     #[tokio::test]
@@ -560,10 +560,10 @@ mod tests {
             );
             let err = match Box::pin(make_usecase().execute_upload_part_copy_with_audit(owned_envelope(Method::PUT), input)).await
             {
-                Err(error) => crate::error::legacy_error_for_test(error),
+                Err(error) => error,
                 Ok(_) => panic!("invalid part number must be rejected"),
             };
-            assert_eq!(err.code(), &crate::app::storage_api::s3::S3ErrorCode::InvalidArgument);
+            assert_eq!(err.code(), &S3ErrorCode::InvalidArgument);
             assert_eq!(err.message(), Some("partNumber must be between 1 and 10000"));
         }
     }

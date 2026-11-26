@@ -1154,17 +1154,17 @@
         "workflow_dispatch",
         "schedule"
       ],
-      "cadence": "weekly",
+      "cadence": "nightly",
       "timezone": "UTC",
       "schedule": [
-        "41 6 * * 0"
+        "41 6 * * *"
       ],
       "owner": "@overtrue",
       "policy": "active",
       "monitor": "workflow",
-      "max_age_hours": 192,
+      "max_age_hours": 36,
       "result_owner": "mint.yml",
-      "disposition": "retained independent entry",
+      "disposition": "nightly dual-stack mint comparison (pinned reference release vs candidate) with fail-closed diff-table gate",
       "failure_owner": "workflow",
       "origin": "baseline",
       "alert_contract": "scheduled-validation"

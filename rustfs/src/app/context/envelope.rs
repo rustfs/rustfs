@@ -22,8 +22,8 @@
 //! keeps whatever is left in a residual bag. The bag exists only while call
 //! sites migrate and must be empty once they have.
 //!
-//! This module names no HTTP-framework type. The legacy s3s edge that builds an
-//! envelope lives in `storage/s3_compat/envelope.rs`.
+//! This module names no HTTP-framework type. The legacy test-only s3s
+//! conversion lives alongside the legacy `S3Route` harness in `admin/router.rs`.
 
 use super::ServerContextSlot;
 use crate::app::object::request_body::BodyReadControl;
@@ -441,9 +441,11 @@ impl RequestEnvelope {
     /// The client address for policy evaluation: the verified proxy client
     /// when one is recorded, otherwise the connection peer (keeping its port).
     pub fn policy_source_addr(&self) -> Option<SocketAddr> {
-        let peer = self.remote_addr;
-        self.client_info
-            .as_ref()
+        Self::policy_source_addr_from(self.remote_addr, self.client_info.as_ref())
+    }
+
+    pub(crate) fn policy_source_addr_from(peer: Option<SocketAddr>, client_info: Option<&ClientInfo>) -> Option<SocketAddr> {
+        client_info
             .map(|client| SocketAddr::new(client.real_ip, peer.map_or(0, |addr| addr.port())))
             .or(peer)
     }
@@ -1140,5 +1142,321 @@ mod tests {
         assert!(debug.contains("AKIAENVELOPE"), "{debug}");
         assert!(!debug.contains("envelope-secret-value"), "{debug}");
         assert!(!debug.contains("envelope-session-token"), "{debug}");
+    }
+
+    const PEER: ([u8; 4], u16) = ([10, 0, 0, 7], 41000);
+    const CLIENT: [u8; 4] = [203, 0, 113, 9];
+    const REQUEST_ID: &str = "envelope-request-id";
+
+    /// A type no envelope field names.
+    #[derive(Clone, Debug, PartialEq)]
+    struct UnrelatedPayload(u8);
+
+    fn default_head() -> RequestHead {
+        RequestHead {
+            method: Method::PUT,
+            uri: "/bucket/key".parse().expect("static uri"),
+            headers: HeaderMap::new(),
+            credentials: None,
+            region: None,
+            service: None,
+        }
+    }
+
+    fn request_context() -> RequestContext {
+        RequestContext {
+            request_id: REQUEST_ID.to_owned(),
+            x_amz_request_id: REQUEST_ID.to_owned(),
+            trace_id: None,
+            span_id: None,
+            start_time: std::time::Instant::now(),
+        }
+    }
+
+    /// One value of every payload type the envelope names, each with a value
+    /// that identifies it.
+    fn every_named_payload(server_context: &Arc<ServerContextSlot>) -> Extensions {
+        use crate::storage::authorization::envelope_payloads;
+
+        let mut extensions = Extensions::new();
+        extensions.insert(Some(RemoteAddr(SocketAddr::from(PEER))));
+        extensions.insert(ClientInfo::direct(SocketAddr::new(std::net::IpAddr::from(CLIENT), 443)));
+        extensions.insert(NativeTlsTransport(true));
+        extensions.insert(request_context());
+        extensions.insert(Arc::clone(server_context));
+        extensions.insert(BodyReadControl::default());
+        extensions.insert(VerifiedSigV4Request);
+        extensions.insert(VerifiedPresignedRequest);
+        extensions.insert(WebsiteRead);
+        extensions.insert(PostObjectRequestMarker);
+        extensions.insert(ReqInfo {
+            bucket: Some("req-info-bucket".to_owned()),
+            ..ReqInfo::default()
+        });
+        extensions.insert(envelope_payloads::bucket_generation("generation-bucket"));
+        extensions.insert(envelope_payloads::pending_delete_bucket_generation("pending-delete-bucket"));
+        extensions.insert(envelope_payloads::copy_source_bucket_generation("copy-source-bucket"));
+        extensions.insert(envelope_payloads::odm_read_generation("odm-read-bucket"));
+        extensions.insert(envelope_payloads::bucket_config_mutation("config-mutation-bucket"));
+        extensions.insert(TableDataPlanePublicationGuards::default());
+        extensions.insert(envelope_payloads::table_list_access("table-list-bucket"));
+        extensions.insert(envelope_payloads::object_tag_conditions("object-tag-bucket"));
+        extensions
+    }
+
+    /// The payload is present and is the instance built for `bucket`.
+    fn assert_payload_for<T: fmt::Debug>(name: &str, payload: Option<&T>, bucket: &str) {
+        let debug = format!("{payload:?}");
+        assert!(payload.is_some() && debug.contains(&format!("\"{bucket}\"")), "{name}: {debug}");
+    }
+
+    fn assert_every_named_payload_absent(envelope: &RequestEnvelope) {
+        assert_eq!(envelope.remote_addr(), None, "remote_addr");
+        assert!(envelope.client_info().is_none(), "client_info");
+        assert_eq!(envelope.native_tls_transport(), None, "native_tls_transport");
+        assert!(envelope.request_context().is_none(), "request_context");
+        assert!(envelope.server_context().is_none(), "server_context");
+        assert!(envelope.body_read_control().is_none(), "body_read_control");
+        assert!(envelope.verified_sigv4().is_none(), "verified_sigv4");
+        assert!(envelope.verified_presigned().is_none(), "verified_presigned");
+        assert!(envelope.website_read().is_none(), "website_read");
+        assert!(envelope.post_object().is_none(), "post_object");
+        assert!(envelope.req_info().is_none(), "req_info");
+        assert!(envelope.bucket_generation().is_none(), "bucket_generation");
+        assert!(envelope.pending_delete_bucket_generation().is_none(), "pending_delete_bucket_generation");
+        assert!(envelope.copy_source_bucket_generation().is_none(), "copy_source_bucket_generation");
+        assert!(envelope.odm_read_generation().is_none(), "odm_read_generation");
+        assert!(envelope.bucket_config_mutation().is_none(), "bucket_config_mutation");
+        assert!(envelope.table_publication_guards().is_none(), "table_publication_guards");
+        assert!(envelope.table_list_access().is_none(), "table_list_access");
+        assert!(envelope.object_tag_conditions().is_none(), "object_tag_conditions");
+    }
+
+    #[test]
+    fn from_parts_copies_every_named_extension() {
+        let server_context = ServerContextSlot::new();
+        let mut head = default_head();
+        head.method = Method::POST;
+        head.uri = "/bucket/key?uploads".parse().expect("static uri");
+        head.headers
+            .insert("x-envelope-probe", http::HeaderValue::from_static("probe"));
+        head.headers
+            .insert("x-amz-security-token", http::HeaderValue::from_static("header-token"));
+        head.credentials = Some(
+            RequestCredentials::new("AKIAENVELOPE".to_owned(), "envelope-secret".to_owned(), Some("header-token".to_owned()))
+                .expect("non-empty secret"),
+        );
+        head.region = Some("eu-west-3".to_owned());
+        head.service = Some("s3".to_owned());
+        let expected_uri = head.uri.clone();
+        let expected_headers = head.headers.clone();
+
+        let envelope = RequestEnvelope::from_parts(head, every_named_payload(&server_context));
+
+        assert_eq!(envelope.method(), Method::POST);
+        assert_eq!(envelope.uri(), &expected_uri);
+        assert_eq!(envelope.headers(), &expected_headers);
+        let credentials = envelope.credentials().expect("credentials");
+        assert_eq!(credentials.access_key(), "AKIAENVELOPE");
+        assert_eq!(credentials.secret_key(), Some("envelope-secret"));
+        assert_eq!(credentials.session_token(), Some("header-token"));
+        assert_eq!(envelope.region(), Some("eu-west-3"));
+        assert_eq!(envelope.service(), Some("s3"));
+
+        assert_eq!(envelope.remote_addr(), Some(SocketAddr::from(PEER)));
+        assert_eq!(envelope.client_info().map(|info| info.real_ip), Some(std::net::IpAddr::from(CLIENT)));
+        assert_eq!(envelope.native_tls_transport(), Some(true));
+        assert_eq!(envelope.request_context().map(|context| context.request_id.as_str()), Some(REQUEST_ID));
+        assert!(
+            envelope
+                .server_context()
+                .is_some_and(|slot| Arc::ptr_eq(slot, &server_context))
+        );
+        assert!(envelope.body_read_control().is_some(), "body_read_control");
+        assert!(envelope.verified_sigv4().is_some(), "verified_sigv4");
+        assert!(envelope.verified_presigned().is_some(), "verified_presigned");
+        assert!(envelope.website_read().is_some(), "website_read");
+        assert!(envelope.post_object().is_some(), "post_object");
+        assert_eq!(envelope.req_info().and_then(|info| info.bucket.as_deref()), Some("req-info-bucket"));
+        assert_payload_for("bucket_generation", envelope.bucket_generation(), "generation-bucket");
+        assert_payload_for(
+            "pending_delete_bucket_generation",
+            envelope.pending_delete_bucket_generation(),
+            "pending-delete-bucket",
+        );
+        assert_payload_for(
+            "copy_source_bucket_generation",
+            envelope.copy_source_bucket_generation(),
+            "copy-source-bucket",
+        );
+        assert_payload_for("odm_read_generation", envelope.odm_read_generation(), "odm-read-bucket");
+        assert_payload_for("bucket_config_mutation", envelope.bucket_config_mutation(), "config-mutation-bucket");
+        assert!(envelope.table_publication_guards().is_some(), "table_publication_guards");
+        assert!(envelope.table_list_access().is_some(), "table_list_access");
+        assert_payload_for("object_tag_conditions", envelope.object_tag_conditions(), "object-tag-bucket");
+    }
+
+    #[test]
+    fn from_parts_leaves_absent_payloads_none() {
+        let mut head = default_head();
+        head.headers
+            .insert("x-amz-security-token", http::HeaderValue::from_static("anonymous-token"));
+
+        let envelope = RequestEnvelope::from_parts(head, Extensions::new());
+
+        assert!(envelope.credentials().is_none(), "credentials");
+        assert_eq!(envelope.region(), None, "region");
+        assert_eq!(envelope.service(), None, "service");
+        assert_every_named_payload_absent(&envelope);
+        assert!(envelope.residual_extensions().is_empty(), "residual bag");
+    }
+
+    #[test]
+    fn from_parts_treats_a_peerless_remote_addr_as_absent() {
+        let mut extensions = Extensions::new();
+        extensions.insert(None::<RemoteAddr>);
+
+        let envelope = RequestEnvelope::from_parts(default_head(), extensions);
+
+        assert_eq!(envelope.remote_addr(), None);
+        assert!(envelope.residual_extensions().is_empty(), "the peerless marker is consumed, not kept");
+    }
+
+    #[test]
+    fn from_parts_keeps_unrelated_types_out_of_named_fields() {
+        // Types adjacent to named payloads: the bare and raw peer addresses the
+        // connection layer also inserts, wrapped variants of named types, and an
+        // unrelated type. Today's readers never see any of them.
+        let peer = SocketAddr::from(PEER);
+        let mut extensions = Extensions::new();
+        extensions.insert(RemoteAddr(peer));
+        extensions.insert(peer);
+        extensions.insert(Arc::new(request_context()));
+        extensions.insert(Some(ClientInfo::direct(peer)));
+        extensions.insert(UnrelatedPayload(7));
+
+        let envelope = RequestEnvelope::from_parts(default_head(), extensions);
+
+        assert_every_named_payload_absent(&envelope);
+        let residual = envelope.residual_extensions();
+        assert_eq!(residual.len(), 5, "every unrelated type stays in the residual bag");
+        assert_eq!(residual.get::<RemoteAddr>().map(|addr| addr.0), Some(peer));
+        assert_eq!(residual.get::<SocketAddr>(), Some(&peer));
+        assert!(residual.get::<Arc<RequestContext>>().is_some());
+        assert!(residual.get::<Option<ClientInfo>>().is_some());
+        assert_eq!(residual.get::<UnrelatedPayload>(), Some(&UnrelatedPayload(7)));
+    }
+
+    #[test]
+    fn from_parts_moves_named_payloads_out_of_the_residual_bag() {
+        let server_context = ServerContextSlot::new();
+        let mut extensions = every_named_payload(&server_context);
+        extensions.insert(UnrelatedPayload(9));
+
+        let envelope = RequestEnvelope::from_parts(default_head(), extensions);
+
+        let residual = envelope.residual_extensions();
+        assert_eq!(residual.len(), 1, "only the unrelated type may remain");
+        assert_eq!(residual.get::<UnrelatedPayload>(), Some(&UnrelatedPayload(9)));
+    }
+
+    #[test]
+    fn envelope_uri_can_be_replaced_and_restored_without_changing_other_request_facts() {
+        let mut head = default_head();
+        head.uri = "/bucket/original?versionId=v1".parse().expect("static URI");
+        head.headers
+            .insert("x-envelope-probe", http::HeaderValue::from_static("present"));
+        let mut envelope = RequestEnvelope::from_parts(head, Extensions::new());
+        let original = envelope.uri().clone();
+
+        *envelope.uri_mut() = "/bucket/prefix-target?versionId=v2".parse().expect("static URI");
+        assert_eq!(envelope.uri().path(), "/bucket/prefix-target");
+        assert_eq!(envelope.uri().query(), Some("versionId=v2"));
+        assert_eq!(
+            envelope
+                .headers()
+                .get("x-envelope-probe")
+                .and_then(|value| value.to_str().ok()),
+            Some("present")
+        );
+
+        *envelope.uri_mut() = original.clone();
+        assert_eq!(envelope.uri(), &original);
+    }
+
+    #[test]
+    fn envelope_req_info_install_mutate_replace_and_restore_preserves_scope_boundaries() {
+        let mut envelope = RequestEnvelope::from_parts(default_head(), Extensions::new());
+        assert!(envelope.req_info_mut().is_none(), "missing ReqInfo must not be created implicitly");
+
+        let previous = envelope.install_req_info(ReqInfo {
+            is_owner: true,
+            bucket: Some("first-bucket".to_owned()),
+            object: Some("first-object".to_owned()),
+            version_id: Some("first-version".to_owned()),
+            ..ReqInfo::default()
+        });
+        assert!(previous.is_none());
+        let installed = envelope.req_info_mut().expect("installed ReqInfo");
+        installed.object = Some("mutated-object".to_owned());
+        assert_eq!(envelope.req_info().and_then(|info| info.object.as_deref()), Some("mutated-object"));
+
+        let first = envelope
+            .install_req_info(ReqInfo {
+                bucket: Some("second-bucket".to_owned()),
+                ..ReqInfo::default()
+            })
+            .expect("replacement returns the previous authorization scope");
+        assert!(first.is_owner);
+        assert_eq!(first.bucket.as_deref(), Some("first-bucket"));
+        assert_eq!(first.object.as_deref(), Some("mutated-object"));
+        assert_eq!(first.version_id.as_deref(), Some("first-version"));
+        let second = envelope.req_info().expect("replacement ReqInfo");
+        assert!(!second.is_owner, "owner state must not leak across replacement");
+        assert_eq!(second.bucket.as_deref(), Some("second-bucket"));
+        assert_eq!(second.object, None, "object scope must not leak across replacement");
+        assert_eq!(second.version_id, None, "version scope must not leak across replacement");
+
+        let replaced = envelope.install_req_info(first).expect("second scope should be returned");
+        assert_eq!(replaced.bucket.as_deref(), Some("second-bucket"));
+        assert_eq!(envelope.req_info().and_then(|info| info.object.as_deref()), Some("mutated-object"));
+    }
+
+    fn envelope_with_transport_claim(native_tls: Option<bool>, forwarded_proto: &str) -> RequestEnvelope {
+        let peer = SocketAddr::from(PEER);
+        let mut extensions = Extensions::new();
+        extensions.insert(ClientInfo::from_trusted_proxy(
+            std::net::IpAddr::from(CLIENT),
+            Some("example.test".to_owned()),
+            Some(forwarded_proto.to_owned()),
+            peer.ip(),
+            1,
+            rustfs_trusted_proxies::ValidationMode::Lenient,
+            Vec::new(),
+        ));
+        if let Some(native_tls) = native_tls {
+            extensions.insert(NativeTlsTransport(native_tls));
+        }
+        let mut head = default_head();
+        head.uri = "https://example.test/bucket/key".parse().expect("static URI");
+        head.headers.insert(
+            "x-forwarded-proto",
+            http::HeaderValue::from_str(forwarded_proto).expect("static protocol"),
+        );
+        RequestEnvelope::from_parts(head, extensions)
+    }
+
+    #[test]
+    fn envelope_native_tls_proof_comes_only_from_the_listener_marker() {
+        let absent = envelope_with_transport_claim(None, "https");
+        assert_eq!(absent.native_tls_transport(), None);
+
+        let plaintext = envelope_with_transport_claim(Some(false), "https");
+        assert_eq!(plaintext.native_tls_transport(), Some(false));
+        assert!(plaintext.residual_extensions().get::<NativeTlsTransport>().is_none());
+
+        let native_tls = envelope_with_transport_claim(Some(true), "http");
+        assert_eq!(native_tls.native_tls_transport(), Some(true));
+        assert!(native_tls.residual_extensions().get::<NativeTlsTransport>().is_none());
     }
 }

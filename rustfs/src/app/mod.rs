@@ -40,7 +40,6 @@ mod select_object;
 pub(crate) mod select_request;
 pub(crate) mod storage_api;
 pub(crate) mod table_list_isolation;
-pub(crate) mod trailer_adapter;
 pub(crate) mod website;
 
 // Request-scoped facts are not AppContext resolution, so consumers import them

@@ -135,6 +135,7 @@ fn capturing_stack(captured: &Arc<Mutex<Vec<serde_json::Value>>>) -> GatewayStac
     GatewayStack {
         keystone_auth: None,
         control_plane: false,
+        object_lambda_fallback: None,
         service: builder
             .host_resolver(PathStyleOnly)
             .dialect(&dialect().unwrap())

@@ -113,7 +113,9 @@ pub(crate) async fn init_startup_runtime_services(
 
     // Audit initialization requires the AppContext (server config + object store)
     // which is published by ensure_startup_after_iam inside init_iam_runtime.
-    init_audit_runtime().await;
+    // When IAM bootstrap is deferred, init_iam_runtime runs init_audit_runtime
+    // once in the recovery task after AppContext is installed and before FullReady.
+    init_audit_runtime_for_iam_bootstrap(iam_bootstrap).await;
     // Unconditional: deferred IAM recovers in the background and has no callback into this
     // scheduler, so gating on the inline disposition would leave a recovered node with
     // self-pointing replication rules until the next restart. The task waits for IAM and
@@ -140,6 +142,26 @@ pub(crate) async fn init_startup_runtime_services(
         iam_bootstrap,
         enable_scanner,
     })
+}
+
+async fn init_audit_runtime_for_iam_bootstrap(disposition: IamBootstrapDisposition) {
+    let _ = init_audit_runtime_for_iam_bootstrap_with(disposition, init_audit_runtime).await;
+}
+
+async fn init_audit_runtime_for_iam_bootstrap_with<InitFn, InitFuture>(
+    disposition: IamBootstrapDisposition,
+    init_audit: InitFn,
+) -> bool
+where
+    InitFn: FnOnce() -> InitFuture,
+    InitFuture: std::future::Future<Output = ()>,
+{
+    if matches!(disposition, IamBootstrapDisposition::ReadyInline(_)) {
+        init_audit().await;
+        true
+    } else {
+        false
+    }
 }
 
 fn start_heartbeat_runtime(
@@ -673,5 +695,33 @@ mod tests {
         };
 
         assert!(matches!(inventory_capacity(&info), Err(InventoryError::Capacity)));
+    }
+
+    #[tokio::test]
+    async fn ready_inline_iam_bootstrap_runs_audit_init_once() {
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let calls_for_closure = Arc::clone(&calls);
+
+        let ran = init_audit_runtime_for_iam_bootstrap_with(IamBootstrapDisposition::test_ready_inline(), move || async move {
+            calls_for_closure.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        })
+        .await;
+
+        assert!(ran);
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn deferred_iam_bootstrap_skips_inline_audit_init() {
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let calls_for_closure = Arc::clone(&calls);
+
+        let ran = init_audit_runtime_for_iam_bootstrap_with(IamBootstrapDisposition::Deferred, move || async move {
+            calls_for_closure.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        })
+        .await;
+
+        assert!(!ran);
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
     }
 }

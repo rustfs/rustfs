@@ -326,7 +326,7 @@ mod tests {
         let err = call_legacy(&router, Method::GET, "/context-probe", http::Extensions::new())
             .await
             .expect_err("empty slot must fail closed");
-        assert_eq!(err.code(), &crate::app::storage_api::s3::S3ErrorCode::ServiceUnavailable);
+        assert_eq!(err.code().as_str(), rustfs_s3_types::S3ErrorCode::ServiceUnavailable.as_str());
 
         assert!(slot.install(distinct_context(&ambient)));
         let response = call_legacy(&router, Method::GET, "/context-probe", http::Extensions::new())

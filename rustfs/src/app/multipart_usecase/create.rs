@@ -458,36 +458,12 @@ impl DefaultMultipartUsecase {
 }
 
 #[cfg(test)]
-impl CreateMultipartUploadFields {
-    pub(crate) fn from_legacy(input: crate::app::storage_api::s3::dto::CreateMultipartUploadInput) -> Self {
-        Self {
-            bucket: input.bucket,
-            key: input.key,
-            metadata: input.metadata,
-            tagging: input.tagging,
-            storage_class: input.storage_class.map(|value| value.as_str().to_owned()),
-            server_side_encryption: input.server_side_encryption.map(|value| value.as_str().to_owned()),
-            sse_customer_algorithm: input.sse_customer_algorithm,
-            sse_customer_key: input.sse_customer_key,
-            sse_customer_key_md5: input.sse_customer_key_md5,
-            ssekms_key_id: input.ssekms_key_id,
-            object_lock_legal_hold_status: input.object_lock_legal_hold_status.map(|value| value.as_str().to_owned()),
-            object_lock_mode: input.object_lock_mode.map(|value| value.as_str().to_owned()),
-            object_lock_retain_until_date: input.object_lock_retain_until_date.map(time::OffsetDateTime::from),
-        }
-    }
-}
-
-#[cfg(test)]
 mod tests {
     use super::super::test_support::*;
     use super::*;
-    use crate::app::storage_api::s3::{S3ErrorCode, dto::CreateMultipartUploadInput};
 
     #[tokio::test]
     async fn create_multipart_baseline_legacy_direct() {
-        use crate::app::storage_api::s3::dto::Timestamp;
-
         let date = time::Date::from_calendar_date(-1, time::Month::January, 1)
             .unwrap()
             .midnight()
@@ -509,7 +485,6 @@ mod tests {
             ("bucket", "object", false, Some(date), ("InternalError", "Not init")),
             ("bucket", "object", true, Some(date), invalid_class),
         ] {
-            // Same facts `from_legacy` carried. Metadata, tagging, SSE, and the other object-lock fields stay absent.
             let fields = CreateMultipartUploadFields {
                 bucket: bucket.to_owned(),
                 key: key.to_owned(),
@@ -523,7 +498,7 @@ mod tests {
                 ssekms_key_id: None,
                 object_lock_legal_hold_status: None,
                 object_lock_mode: None,
-                object_lock_retain_until_date: date.map(|value| time::OffsetDateTime::from(Timestamp::from(value))),
+                object_lock_retain_until_date: date,
             };
             let error = match make_usecase()
                 .execute_create_multipart_upload(owned_envelope(Method::POST), fields, None)
@@ -628,12 +603,6 @@ mod tests {
     async fn create_multipart_rejects_ciphertext_replication_before_parts_are_staged() {
         let (store, bucket) = crate::app::gating_test_env::durable_quota_test_bucket("ciphertext-multipart-quota", 4096).await;
         let usecase = DefaultMultipartUsecase::from_global();
-        let input = CreateMultipartUploadInput::builder()
-            .bucket(bucket.clone())
-            .key("object".to_string())
-            .build()
-            .expect("create multipart request should build");
-        // Same facts `envelope_from_request` copies from `build_request`. Credentials, region, and service stay absent.
         let mut headers = HeaderMap::new();
         insert_header(&mut headers, SUFFIX_SOURCE_REPLICATION_REQUEST, "true");
         headers.insert(rustfs_utils::http::REPLICATION_SSEC_ALGORITHM_HEADER, HeaderValue::from_static("AES256"));
@@ -653,7 +622,21 @@ mod tests {
             },
             extensions,
         );
-        let fields = CreateMultipartUploadFields::from_legacy(input);
+        let fields = CreateMultipartUploadFields {
+            bucket: bucket.clone(),
+            key: "object".to_string(),
+            metadata: None,
+            tagging: None,
+            storage_class: None,
+            server_side_encryption: None,
+            sse_customer_algorithm: None,
+            sse_customer_key: None,
+            sse_customer_key_md5: None,
+            ssekms_key_id: None,
+            object_lock_legal_hold_status: None,
+            object_lock_mode: None,
+            object_lock_retain_until_date: None,
+        };
         let result = usecase.execute_create_multipart_upload(envelope, fields, None).await;
         assert!(
             store
@@ -678,11 +661,11 @@ mod tests {
     #[serial_test::serial]
     fn create_multipart_checks_kms_permission_before_creating_a_session() {
         crate::app::gating_test_env::run_large_stack_test("create-multipart-kms-policy", || async {
-            use crate::app::storage_api::s3::dto::ServerSideEncryption;
             use crate::app::storage_api::test::{
                 ReqInfo,
                 sse::{RecordingKmsKeyAuthorizer, TestAuthorizationHooks},
             };
+            use rustfs_gateway_types::dto::ServerSideEncryption;
             use rustfs_policy::policy::action::KmsAction;
 
             let (store, bucket) = crate::app::gating_test_env::durable_quota_test_bucket("create-multipart-kms", 16_384).await;
@@ -697,15 +680,7 @@ mod tests {
             .await
             .expect("configure test KMS");
             for allowed in [false, true] {
-                let input = CreateMultipartUploadInput {
-                    bucket: bucket.clone(),
-                    key: "object".to_owned(),
-                    server_side_encryption: Some(ServerSideEncryption::from_static("aws:kms")),
-                    ssekms_key_id: Some(key_id.to_owned()),
-                    ..Default::default()
-                };
                 let authorizer = RecordingKmsKeyAuthorizer::new(allowed);
-                // Same facts `build_request` carried. Credentials, region, and service stay absent.
                 let mut extensions = Extensions::new();
                 extensions.insert(ReqInfo {
                     cred: Some(rustfs_credentials::Credentials {
@@ -729,7 +704,21 @@ mod tests {
                     },
                     extensions,
                 );
-                let fields = CreateMultipartUploadFields::from_legacy(input);
+                let fields = CreateMultipartUploadFields {
+                    bucket: bucket.clone(),
+                    key: "object".to_owned(),
+                    metadata: None,
+                    tagging: None,
+                    storage_class: None,
+                    server_side_encryption: Some(ServerSideEncryption::AWS_KMS.as_str().to_owned()),
+                    sse_customer_algorithm: None,
+                    sse_customer_key: None,
+                    sse_customer_key_md5: None,
+                    ssekms_key_id: Some(key_id.to_owned()),
+                    object_lock_legal_hold_status: None,
+                    object_lock_mode: None,
+                    object_lock_retain_until_date: None,
+                };
                 let result = usecase.execute_create_multipart_upload(envelope, fields, None).await;
                 let uploads = store
                     .list_multipart_uploads(&bucket, "", None, None, None, 100)
@@ -756,19 +745,39 @@ mod tests {
 
     #[test]
     fn create_multipart_preserves_legacy_date_precision() {
+        use rustfs_gateway_types::dto;
         use time::{Date, Month, Time};
 
         let date = Date::from_calendar_date(-1, Month::January, 1)
             .unwrap()
             .with_time(Time::from_hms_nano(0, 0, 0, 123_456_789).unwrap())
             .assume_utc();
-        let input = CreateMultipartUploadInput {
-            bucket: "sthree-multipart".to_owned(),
-            key: "object".to_owned(),
-            object_lock_retain_until_date: Some(date.into()),
+        let input = dto::CreateMultipartUploadInput {
+            bucket: crate::app::dto_values::stored_bucket_name("sthree-multipart").unwrap(),
+            key: crate::app::dto_values::stored_object_key("object").unwrap(),
+            object_lock_retain_until_date: Some(crate::app::dto_values::timestamp(date)),
             ..Default::default()
         };
-        let fields = CreateMultipartUploadFields::from_legacy(input);
+        let retain_until = input.object_lock_retain_until_date.map(|ts| {
+            time::OffsetDateTime::from_unix_timestamp_nanos(i128::from(ts.secs()) * 1_000_000_000 + i128::from(ts.subsec_nanos()))
+                .unwrap()
+        });
+        let fields = CreateMultipartUploadFields {
+            bucket: input.bucket.as_str().to_owned(),
+            key: input.key.as_str().to_owned(),
+            metadata: None,
+            tagging: None,
+            storage_class: None,
+            server_side_encryption: None,
+            sse_customer_algorithm: None,
+            sse_customer_key: None,
+            sse_customer_key_md5: None,
+            ssekms_key_id: None,
+            object_lock_legal_hold_status: None,
+            object_lock_mode: None,
+            object_lock_retain_until_date: retain_until,
+        };
+        assert_eq!(fields.bucket, "sthree-multipart");
         assert_eq!(fields.object_lock_retain_until_date, Some(date));
     }
 

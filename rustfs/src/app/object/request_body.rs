@@ -18,8 +18,6 @@
 
 use super::{LOG_COMPONENT_APP, LOG_SUBSYSTEM_OBJECT};
 use crate::app::storage_api::request_body::StdError;
-#[cfg(test)]
-use crate::app::storage_api::request_body::{ByteStream, DynByteStream, RemainingLength, StreamingBlob};
 use crate::error::ClientBodyReadTimeout;
 use bytes::Bytes;
 use futures::{Stream, StreamExt};
@@ -466,27 +464,6 @@ impl<S: Stream<Item = Result<Bytes, StdError>> + Unpin> Stream for DemandStream<
         self.inner.size_hint()
     }
 }
-/// Supplies the read-progress guard to tests using a legacy body.
-#[cfg(test)]
-pub(crate) fn guard_upload_progress(
-    body: StreamingBlob,
-    timeout: Duration,
-    bucket: &str,
-    key: &str,
-    request_id: &str,
-    expected: u64,
-) -> (StreamingBlob, BodyReadControl) {
-    let control = BodyReadControl::default();
-    control.activate_upload(timeout, bucket, key, request_id, expected);
-    let stream = UploadProgressStream {
-        inner: DynByteStream::from(body),
-        control: control.clone(),
-        timer: None,
-        ended: false,
-    };
-    (StreamingBlob::new(stream), control)
-}
-
 struct UploadProgressStream<S> {
     inner: S,
     control: BodyReadControl,
@@ -552,12 +529,6 @@ impl<S: Stream<Item = Result<Bytes, StdError>> + Unpin> Stream for UploadProgres
     }
     fn size_hint(&self) -> (usize, Option<usize>) {
         self.inner.size_hint()
-    }
-}
-#[cfg(test)]
-impl ByteStream for UploadProgressStream<DynByteStream> {
-    fn remaining_length(&self) -> RemainingLength {
-        self.inner.remaining_length()
     }
 }
 impl<S> Drop for UploadProgressStream<S> {

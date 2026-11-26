@@ -50,6 +50,7 @@
 
 mod admin;
 mod control_plane;
+pub(in crate::server) mod indeterminate_audit;
 
 #[cfg(test)]
 pub(crate) static CONFIG_HANDLER_CALLS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
@@ -165,6 +166,8 @@ pub(crate) struct GatewayStack {
     keystone_auth: Option<Arc<rustfs_keystone::KeystoneAuthProvider>>,
     /// Whether this is the control-plane host, which reads each request's head before the gateway.
     control_plane: bool,
+    /// Companion control-plane service without GET native admin routes, used for Object Lambda requests.
+    object_lambda_fallback: Option<rustfs_gateway::S3Service>,
 }
 
 impl GatewayStack {
@@ -221,6 +224,7 @@ impl GatewayStack {
             service,
             keystone_auth: assembly.keystone_auth,
             control_plane: false,
+            object_lambda_fallback: None,
         })
     }
 
@@ -241,6 +245,7 @@ impl GatewayStack {
             service,
             keystone_auth: assembly.keystone_auth,
             control_plane: false,
+            object_lambda_fallback: None,
         })
     }
 
@@ -271,6 +276,8 @@ impl GatewayStack {
             .defer_encryption_header_refusals_to_handlers()
             .authenticator(authenticator(SigV4Authenticator::new(credentials, regions).rustfs_profile()))
             .authorizer(authorizer)
+            .authz_audit(indeterminate_audit::IndeterminateAudit)
+            .observer(indeterminate_audit::IndeterminateAudit)
             .bucket_owner_source(ReportedOwner(owner().id.map(Arc::from)))
             // Both gates follow the deployment setting; transport facts remain per request.
             .sse_config(if require_tls() {
@@ -331,7 +338,12 @@ impl GatewayStack {
         attach_host_facts(extensions);
         // `Connection` is an HTTP/1 header; HTTP/2 and HTTP/3 forbid it and end only the stream.
         let http1 = request.version() < http::Version::HTTP_2;
-        let service = self.service.clone();
+        let service = match self.object_lambda_fallback.as_ref() {
+            Some(fallback) if crate::admin::router::object_lambda_target(request.method(), request.uri()).is_some() => {
+                fallback.clone()
+            }
+            _ => self.service.clone(),
+        };
         async move {
             if !valid {
                 let mut response = Response::new(rustfs_gateway::Body::empty());

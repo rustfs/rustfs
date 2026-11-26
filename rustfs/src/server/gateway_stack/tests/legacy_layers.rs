@@ -141,6 +141,7 @@ pub(super) fn probe_stack_for(probe: &Arc<Probe>, assembly: GatewayAssembly) -> 
         service,
         keystone_auth: None,
         control_plane: false,
+        object_lambda_fallback: None,
     }
 }
 

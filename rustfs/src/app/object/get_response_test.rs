@@ -16,40 +16,35 @@
 //! Expected responses were measured on a279b4b before the owned migration.
 
 use super::*;
-use crate::app::storage_api::s3::dto::Range;
 use crate::app::storage_api::test::ReqInfo;
 use crate::app::test_seams::{get_envelope, get_http_body, get_object_gateway, get_object_input};
 use http::Method;
 use http_body_util::BodyExt as _;
-use rustfs_gateway_types::{BucketName, ObjectKey, RangeSpec, dto};
+use rustfs_gateway_types::{BucketName, ByteRange, ObjectKey, RangeSpec, dto};
 use rustfs_s3_types::S3ErrorCode;
 
 #[test]
 fn website_and_object_lambda_ranges_match_the_legacy_wire_reader() {
-    for value in [
-        "bytes=0-9",
-        "bytes=0-",
-        "bytes=-7",
-        "bytes=-0",
-        "bytes=-",
-        "bytes=-18446744073709551615",
-        "bytes=9223372036854775807-",
-        "bytes=9223372036854775808-",
-        "bytes=0-9223372036854775808",
-        "bytes=-18446744073709551616",
-        "bytes=10-5",
-        "bytes=1-2 ",
-        "bytes=1 -2",
-        "bytes=1-2,3-4",
-        "bytes=-+1",
-        "Bytes=1-2",
-        "bytes=",
+    // Answers measured on s3s 5761ddfe (`Range::parse`).
+    for (value, expected) in [
+        ("bytes=0-9", Some(ByteRange::FromTo { first: 0, last: 9 })),
+        ("bytes=0-", Some(ByteRange::From { first: 0 })),
+        ("bytes=-7", Some(ByteRange::Suffix { length: 7 })),
+        ("bytes=-0", Some(ByteRange::Suffix { length: 0 })),
+        ("bytes=-", Some(ByteRange::Suffix { length: 0 })),
+        ("bytes=-18446744073709551615", Some(ByteRange::Suffix { length: u64::MAX })),
+        ("bytes=9223372036854775807-", Some(ByteRange::From { first: i64::MAX as u64 })),
+        ("bytes=9223372036854775808-", None),
+        ("bytes=0-9223372036854775808", None),
+        ("bytes=-18446744073709551616", None),
+        ("bytes=10-5", None),
+        ("bytes=1-2 ", None),
+        ("bytes=1 -2", None),
+        ("bytes=1-2,3-4", None),
+        ("bytes=-+1", None),
+        ("Bytes=1-2", None),
+        ("bytes=", None),
     ] {
-        let expected = Range::parse(value).ok().map(|range| match range {
-            Range::Int { first, last: Some(last) } => rustfs_gateway_types::ByteRange::FromTo { first, last },
-            Range::Int { first, last: None } => rustfs_gateway_types::ByteRange::From { first },
-            Range::Suffix { length } => rustfs_gateway_types::ByteRange::Suffix { length },
-        });
         assert_eq!(GetObjectFields::parse_range(value), expected, "{value}");
     }
 }

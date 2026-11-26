@@ -15,10 +15,6 @@
 //! UploadPart protocol-client observations against the unchanged legacy dispatch.
 //! These probes observe storage, body demand and responses; they do not define ownership rules.
 
-use super::super::super::{
-    ETag as LegacyETag, LegacyS3Error, LegacyS3ErrorCode, ServerSideEncryption as LegacyEncryption,
-    UploadPartInput as LegacyInput, UploadPartOutput as LegacyOutput,
-};
 use super::*;
 use crate::app::storage_api::test::contract::multipart::MultipartOperations;
 use crate::storage_api::protocols::client::StorageObjectOptions;
@@ -347,35 +343,30 @@ fn upload_part_input_projection_matches_original_fields() {
                     sse_customer_key_md5: Some(value.into()),
                     ..Default::default()
                 };
-                let mut legacy = LegacyInput::builder()
-                    .bucket("sftp_host_keys".to_owned())
-                    .key("directory/a ?#+%.txt".to_owned())
-                    .upload_id("upload/+?=&%".to_owned())
-                    .part_number(10000)
-                    .build()
-                    .expect("legacy input");
-                legacy.content_length = Some(length);
-                let nonempty = (!value.is_empty()).then(|| value.to_owned());
-                legacy.content_md5 = nonempty.clone();
-                legacy.checksum_algorithm = nonempty.clone().map(Into::into);
-                legacy.sse_customer_algorithm = nonempty.clone();
-                legacy.sse_customer_key = Some(value.to_owned());
-                legacy.sse_customer_key_md5 = nonempty;
-                let checksum = match algorithm {
-                    Algorithm::Crc32 => &mut legacy.checksum_crc32,
-                    Algorithm::Crc32c => &mut legacy.checksum_crc32c,
-                    Algorithm::Crc64Nvme => &mut legacy.checksum_crc64nvme,
-                    Algorithm::Sha1 => &mut legacy.checksum_sha1,
-                    Algorithm::Sha256 => &mut legacy.checksum_sha256,
-                    Algorithm::Sha512 => &mut legacy.checksum_sha512,
-                    Algorithm::Md5 => &mut legacy.checksum_md5,
-                    Algorithm::XxHash64 => &mut legacy.checksum_xxhash64,
-                    Algorithm::XxHash3 => &mut legacy.checksum_xxhash3,
-                    Algorithm::XxHash128 => &mut legacy.checksum_xxhash128,
-                    other => panic!("missing legacy test vector for {other:?}"),
+                let nonempty = |field: &str| (!field.is_empty()).then(|| field.to_owned());
+                let digest = base64_simd::STANDARD.encode_to_string(vec![0; algorithm.digest_len()]);
+                let expected = crate::app::multipart_usecase::UploadPartWriteInput {
+                    target: crate::app::multipart_usecase::UploadPartTarget::Legacy {
+                        bucket: "sftp_host_keys".to_owned(),
+                        key: "directory/a ?#+%.txt".to_owned(),
+                        upload_id: "upload/+?=&%".to_owned(),
+                    },
+                    part_number: 10000,
+                    content_length: Some(length),
+                    body: None,
+                    trailing_headers: None,
+                    frame_trailers: None,
+                    content_md5: nonempty(value),
+                    checksum_algorithm: nonempty(value),
+                    checksum_crc32: matches!(algorithm, Algorithm::Crc32).then(|| digest.clone()),
+                    checksum_crc32c: matches!(algorithm, Algorithm::Crc32c).then(|| digest.clone()),
+                    checksum_crc64nvme: matches!(algorithm, Algorithm::Crc64Nvme).then(|| digest.clone()),
+                    checksum_sha1: matches!(algorithm, Algorithm::Sha1).then(|| digest.clone()),
+                    checksum_sha256: matches!(algorithm, Algorithm::Sha256).then_some(digest),
+                    sse_customer_algorithm: nonempty(value),
+                    sse_customer_key: Some(value.to_owned()),
+                    sse_customer_key_md5: nonempty(value),
                 };
-                *checksum = Some(base64_simd::STANDARD.encode_to_string(vec![0; algorithm.digest_len()]));
-                let expected = crate::app::multipart_usecase::UploadPartWriteInput::from_legacy(legacy, None);
                 assert_eq!(
                     input_fields(upload_part_input(native, "upload/+?=&%".into())),
                     input_fields(expected),
@@ -391,15 +382,15 @@ fn upload_part_output_projection_matches_original_fields_and_refusals() {
     use crate::app::multipart_usecase::UploadPartWriteOutput;
     // The refusal order and messages were measured against s3s 5761ddfe and
     // the gateway-types 1c7486f conversion. The SDK fields below remain an independent oracle.
-    for (raw, tag) in [
+    for (raw, tag_value) in [
         (None, None),
-        (Some("abc"), Some(LegacyETag::Strong("abc".into()))),
-        (Some("\"abc\""), Some(LegacyETag::Strong("abc".into()))),
-        (Some("W/\"abc\""), Some(LegacyETag::Weak("abc".into()))),
-        (Some(""), Some(LegacyETag::Strong("".into()))),
-        (Some("\"\""), Some(LegacyETag::Strong("".into()))),
-        (Some("a\nb"), Some(LegacyETag::Strong("a\nb".into()))),
-        (Some("a\"b"), Some(LegacyETag::Strong("a\"b".into()))),
+        (Some("abc"), Some((false, "abc"))),
+        (Some("\"abc\""), Some((false, "abc"))),
+        (Some("W/\"abc\""), Some((true, "abc"))),
+        (Some(""), Some((false, ""))),
+        (Some("\"\""), Some((false, ""))),
+        (Some("a\nb"), Some((false, "a\nb"))),
+        (Some("a\"b"), Some((false, "a\"b"))),
     ] {
         for (index, checksum) in [
             (0, None),
@@ -429,23 +420,6 @@ fn upload_part_output_projection_matches_original_fields_and_refusals() {
                 sse_customer_key_md5: Some("test-md5".into()),
                 headers: HeaderMap::new(),
             };
-            let old = LegacyOutput {
-                e_tag: tag.clone(),
-                checksum_crc32: field(0),
-                checksum_crc32c: field(1),
-                checksum_crc64nvme: field(2),
-                checksum_sha1: field(3),
-                checksum_sha256: field(4),
-                server_side_encryption: Some(LegacyEncryption::from("AES256".to_owned())),
-                ssekms_key_id: Some("test-key-id".into()),
-                sse_customer_algorithm: Some("AES256".into()),
-                sse_customer_key_md5: Some("test-md5".into()),
-                ..Default::default()
-            };
-            let tag_value = old.e_tag.as_ref().map(|tag| match tag {
-                LegacyETag::Strong(value) => (false, value.as_str()),
-                LegacyETag::Weak(value) => (true, value.as_str()),
-            });
             let refusal = match (tag_value, index, checksum) {
                 (None, _, _) => Some("e_tag: the gateway shape requires this member"),
                 (Some((_, "" | "a\nb")), _, _) => Some("e_tag: not an entity tag the gateway can write"),
@@ -479,11 +453,11 @@ fn upload_part_output_projection_matches_original_fields_and_refusals() {
             .expect("recorded valid ETag");
             assert_eq!(format!("{:?}", actual.e_tag), format!("{expected_tag:?}"));
             let expected_checksum = [
-                ("CRC32", old.checksum_crc32),
-                ("CRC32C", old.checksum_crc32c),
-                ("CRC64NVME", old.checksum_crc64nvme),
-                ("SHA1", old.checksum_sha1),
-                ("SHA256", old.checksum_sha256),
+                ("CRC32", field(0)),
+                ("CRC32C", field(1)),
+                ("CRC64NVME", field(2)),
+                ("SHA1", field(3)),
+                ("SHA256", field(4)),
             ]
             .into_iter()
             .find_map(|(name, value)| value.map(|value| (name, value)));
@@ -493,28 +467,22 @@ fn upload_part_output_projection_matches_original_fields_and_refusals() {
                     .map(|spec| (spec.algorithm().wire_name(), spec.render_base64().to_owned())),
                 expected_checksum
             );
-            assert_eq!(
-                actual.server_side_encryption.as_ref().map(|value| value.as_str()),
-                old.server_side_encryption.as_ref().map(|value| value.as_str())
-            );
-            assert_eq!(actual.ssekms_key_id, old.ssekms_key_id);
-            assert_eq!(actual.sse_customer_algorithm, old.sse_customer_algorithm);
-            assert_eq!(actual.sse_customer_key_md5, old.sse_customer_key_md5);
-            assert_eq!(actual.bucket_key_enabled, old.bucket_key_enabled);
-            assert_eq!(
-                actual.request_charged.as_ref().map(|value| value.as_str()),
-                old.request_charged.as_ref().map(|value| value.as_str())
-            );
+            assert_eq!(actual.server_side_encryption.as_ref().map(|value| value.as_str()), Some("AES256"));
+            assert_eq!(actual.ssekms_key_id.as_deref(), Some("test-key-id"));
+            assert_eq!(actual.sse_customer_algorithm.as_deref(), Some("AES256"));
+            assert_eq!(actual.sse_customer_key_md5.as_deref(), Some("test-md5"));
+            assert_eq!(actual.bucket_key_enabled, None);
+            assert_eq!(actual.request_charged, None);
         }
     }
 }
 
 #[test]
 fn upload_part_error_projection_matches_original_defaults() {
-    for (code, legacy_code) in [
-        (S3ErrorCode::IncompleteBody, LegacyS3ErrorCode::IncompleteBody),
-        (S3ErrorCode::UnexpectedContent, LegacyS3ErrorCode::UnexpectedContent),
-        (S3ErrorCode::EntityTooLarge, LegacyS3ErrorCode::EntityTooLarge),
+    for code in [
+        S3ErrorCode::IncompleteBody,
+        S3ErrorCode::UnexpectedContent,
+        S3ErrorCode::EntityTooLarge,
     ] {
         for message in [None, Some("explicit failure")] {
             let actual = match message {
@@ -522,13 +490,10 @@ fn upload_part_error_projection_matches_original_defaults() {
                 None => S3Error::new(code.clone()),
             };
             let expected = match message {
-                Some(message) => LegacyS3Error::with_message(legacy_code.clone(), message),
-                None => LegacyS3Error::new(legacy_code.clone()),
+                Some(message) => S3Error::with_message(code.clone(), message),
+                None => S3Error::with_default_message(code.clone()),
             };
-            assert_eq!(
-                error_facts(upload_part_error(actual)),
-                error_facts(crate::error::owned_error_for_test(expected))
-            );
+            assert_eq!(error_facts(upload_part_error(actual)), error_facts(expected));
         }
     }
 }
