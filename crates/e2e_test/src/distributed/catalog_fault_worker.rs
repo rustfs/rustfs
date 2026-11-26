@@ -14,11 +14,16 @@
 
 //! Private worker transport and evidence for real four-process Catalog tests.
 
+mod owned_linux_block_devices;
+
 use crate::common::RustFSTestClusterEnvironment;
 use crate::rpc_fault_proxy::RpcFaultProxy;
+use owned_linux_block_devices::OwnedLinuxBlockDevices;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
+use std::collections::BTreeMap;
+use std::ffi::{OsStr, OsString};
 use std::io::{self, Read};
 use std::os::unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Component, Path, PathBuf};
@@ -32,6 +37,39 @@ use tokio::net::UnixStream;
 use uuid::Uuid;
 
 pub(crate) type TestResult<T = ()> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
+#[derive(Clone, Copy)]
+pub(crate) enum RecoveryStorage {
+    Directory,
+    OwnedLoopFiles,
+}
+
+pub(crate) async fn recovery_namespace_child(test_name: &str) -> TestResult<bool> {
+    owned_linux_block_devices::namespace_child(test_name).await
+}
+
+#[derive(Debug)]
+struct CaseFailures {
+    original: Box<dyn std::error::Error + Send + Sync>,
+    additional: Box<dyn std::error::Error + Send + Sync>,
+}
+impl std::fmt::Display for CaseFailures {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}; additional failure: {}", self.original, self.additional)
+    }
+}
+impl std::error::Error for CaseFailures {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(self.original.as_ref())
+    }
+}
+fn combine_results(original: TestResult, additional: TestResult) -> TestResult {
+    match (original, additional) {
+        (Err(original), Err(additional)) => Err(Box::new(CaseFailures { original, additional })),
+        (Err(error), _) | (_, Err(error)) => Err(error),
+        (Ok(()), Ok(())) => Ok(()),
+    }
+}
+
 pub(crate) const WORKER_TEST: &str = "startup_entrypoint::tests::catalog_worker_native_lifecycle";
 const MAX_RESPONSE: usize = 4 * 1024 * 1024;
 const MAX_INVENTORY_BYTES: u64 = 512 * 1024 * 1024;
@@ -202,6 +240,103 @@ pub(crate) struct NodeIdentity {
     pub node_id: String,
     pub boot_id: String,
     pub pid: u32,
+}
+
+/// Keep secrets in memory; evidence contains only explicitly selected public settings.
+#[derive(PartialEq, Eq)]
+struct DeploymentConfiguration {
+    common: BTreeMap<OsString, OsString>,
+}
+
+impl DeploymentConfiguration {
+    fn capture(cluster: &RustFSTestClusterEnvironment, ipc_root: &Path, nonces: &[String]) -> TestResult<Self> {
+        check(
+            cluster.nodes.len() == nonces.len() && cluster.node_extra_env.len() == nonces.len(),
+            "node configuration identity count differs",
+        )?;
+        // Match the inherited environment and explicit defaults used by spawn_node.
+        let mut defaults = std::env::vars_os().collect::<BTreeMap<_, _>>();
+        for (key, value) in [
+            ("RUSTFS_VOLUMES", cluster.rustfs_volumes_arg()),
+            ("RUSTFS_ACCESS_KEY", cluster.access_key.clone()),
+            ("RUSTFS_SECRET_KEY", cluster.secret_key.clone()),
+            ("RUSTFS_CONSOLE_ENABLE", "false".into()),
+            ("RUST_LOG", "rustfs=info,rustfs_notify=debug".into()),
+        ] {
+            defaults.insert(key.into(), value.into());
+        }
+        let mut common = defaults.clone();
+        for (key, value) in &cluster.extra_env {
+            common.insert(key.into(), value.into());
+        }
+        for (node, nonce) in nonces.iter().enumerate() {
+            let local = BTreeMap::from([
+                (OsString::from("RUSTFS_ADDRESS"), OsString::from(&cluster.nodes[node].address)),
+                (
+                    OsString::from("RUSTFS_CATALOG_WORKER_SOCKET"),
+                    ipc_root.join(format!("{node}.sock")).into_os_string(),
+                ),
+                (OsString::from("RUSTFS_CATALOG_WORKER_NODE_ID"), OsString::from(format!("node-{node}"))),
+                (OsString::from("RUSTFS_CATALOG_WORKER_NONCE"), OsString::from(nonce)),
+            ]);
+            let mut actual = defaults.clone();
+            actual.insert("RUSTFS_ADDRESS".into(), cluster.nodes[node].address.clone().into());
+            for (key, value) in cluster.extra_env.iter().chain(&cluster.node_extra_env[node]) {
+                actual.insert(key.into(), value.into());
+            }
+            Self::verify_node(&common, actual, &local)?;
+        }
+        Ok(Self { common })
+    }
+
+    fn verify_node(
+        common: &BTreeMap<OsString, OsString>,
+        mut actual: BTreeMap<OsString, OsString>,
+        local: &BTreeMap<OsString, OsString>,
+    ) -> TestResult {
+        for (key, expected) in local {
+            check(
+                actual.get(key) == Some(expected),
+                format!("node-local configuration differs: {}", key.to_string_lossy()),
+            )?;
+            if let Some(value) = common.get(key) {
+                actual.insert(key.clone(), value.clone());
+            } else {
+                actual.remove(key);
+            }
+        }
+        check(actual == *common, "node compatibility settings or build receipt differ")?;
+        Ok(())
+    }
+
+    fn verify_unchanged(&self, current: &Self) -> TestResult {
+        check(self == current, "deployment configuration changed before node restart")?;
+        Ok(())
+    }
+
+    fn evidence(&self) -> TestResult<Value> {
+        let mut settings = BTreeMap::new();
+        for key in [
+            "RUSTFS_VOLUMES",
+            "RUSTFS_REGION",
+            "RUSTFS_CONSOLE_ENABLE",
+            "RUSTFS_STORAGE_CLASS_STANDARD",
+            "RUSTFS_TABLE_CATALOG_BACKING",
+            "TOKIO_WORKER_THREADS",
+            "RAYON_NUM_THREADS",
+        ] {
+            let value = self.common.get(OsStr::new(key));
+            settings.insert(
+                key,
+                value
+                    .map(|v| v.to_str().ok_or("non-UTF8 public deployment setting"))
+                    .transpose()?,
+            );
+        }
+        Ok(json!({"version":1,"non_sensitive_settings":settings,
+            "non_sensitive_settings_sha256":sha256(&serde_json::to_vec(&settings)?),
+            "all_other_environment_compared_in_memory":true}))
+    }
 }
 
 fn validate_response(response: &Value, request_id: &str, identity: &NodeIdentity) -> TestResult {
@@ -403,14 +538,20 @@ pub(crate) struct CatalogCluster {
     pub proxies: Vec<RpcFaultProxy>,
     pub evidence: Arc<Evidence>,
     receipt: WorkerReceipt,
+    deployment_configuration: DeploymentConfiguration,
     ipc_root: PathBuf,
     nonces: Vec<String>,
     finished: bool,
     session_identities: Mutex<Vec<Value>>,
+    recovery_storage: Option<OwnedLinuxBlockDevices>,
 }
 
 impl CatalogCluster {
     pub(crate) async fn start(label: &str) -> TestResult<Self> {
+        Self::start_with_storage(label, RecoveryStorage::Directory).await
+    }
+
+    pub(crate) async fn start_with_storage(label: &str, storage: RecoveryStorage) -> TestResult<Self> {
         let receipt = tokio::task::spawn_blocking(WorkerReceipt::load).await??;
         check(label.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'-'), "unsafe case label")?;
         let artifact_root = std::env::var_os("RUSTFS_CATALOG_FAULT_ARTIFACT_DIR")
@@ -485,27 +626,52 @@ impl CatalogCluster {
             &json!({"access_key":cluster.access_key,"secret_key":cluster.secret_key,"rpc_secret":rpc_secret,"nonces":nonces}),
         )?;
         std::io::Write::write_all(&mut private, b"\n")?;
+        let deployment_configuration = DeploymentConfiguration::capture(&cluster, &ipc_root, &nonces)?;
+        evidence.record("deployment-preflight", &deployment_configuration.evidence()?)?;
         evidence.record("starting", &json!({"cluster_root":cluster.temp_dir,"ipc_root":ipc_root,"nodes":cluster.nodes.iter().map(|n| json!({"address":n.address,"data_dirs":n.data_dirs})).collect::<Vec<_>>(),"physical_device_independence":false}))?;
-        if let Err(error) = cluster.start_with_binary(&receipt.launcher_path).await {
-            evidence.record("start-failed", &json!({"error":error.to_string()}))?;
-            return Err(error);
-        }
+        let recovery_storage = match storage {
+            RecoveryStorage::Directory => None,
+            RecoveryStorage::OwnedLoopFiles => Some(
+                OwnedLinuxBlockDevices::new(
+                    PathBuf::from(&cluster.temp_dir),
+                    cluster.nodes.iter().map(|node| PathBuf::from(&node.data_dirs[0])).collect(),
+                    evidence.clone(),
+                )
+                .await?,
+            ),
+        };
         let mut instance = Self {
             cluster,
             clients: Vec::new(),
             proxies,
             evidence,
             receipt,
+            deployment_configuration,
             ipc_root,
             nonces,
             finished: false,
             session_identities: Mutex::new(Vec::new()),
+            recovery_storage,
         };
-        for node in 0..4 {
-            let client = instance.connect(node).await?;
-            instance.clients.push(client);
+        let startup = async {
+            if let Some(owner) = &instance.recovery_storage {
+                owner.provision().await?;
+            }
+            instance.cluster.start_with_binary(&instance.receipt.launcher_path).await?;
+            for node in 0..4 {
+                let client = instance.connect(node).await?;
+                instance.clients.push(client);
+            }
+            instance.capture("started").await
         }
-        instance.capture("started").await?;
+        .await;
+        if let Err(error) = startup {
+            let recorded = instance.evidence.record("start-failed", &json!({"error":error.to_string()}));
+            let cleanup = instance.cleanup_storage().await;
+            let outcome = combine_results(combine_results(Err(error), recorded), cleanup);
+            instance.finished = true;
+            outcome?;
+        }
         Ok(instance)
     }
 
@@ -558,7 +724,21 @@ impl CatalogCluster {
             endpoints.len() == 4 && endpoints.iter().filter(|e| e["is_local"] == true).count() == 1,
             "worker has an unexpected local/remote endpoint count",
         )?;
+        self.evidence.record(
+            "node-deployment",
+            &json!({"node":client.identity,"build":self.receipt,
+                "configuration":self.deployment_configuration.evidence()?,
+                "node_local":{"address":self.cluster.nodes[node].address,"data_dirs":self.cluster.nodes[node].data_dirs,
+                    "socket":client.path,"nonce_matches_expected":true},
+                "verification":"receipt-verified launcher execve and owned-child IPC identity"}),
+        )?;
         Ok(client)
+    }
+
+    fn verify_deployment_configuration(&self) -> TestResult {
+        let current = DeploymentConfiguration::capture(&self.cluster, &self.ipc_root, &self.nonces)?;
+        self.deployment_configuration.verify_unchanged(&current)?;
+        self.evidence.record("deployment-preflight", &current.evidence()?)
     }
 
     pub(crate) async fn create(&self) -> TestResult<Session> {
@@ -624,7 +804,8 @@ impl CatalogCluster {
     pub(crate) async fn restart(&mut self, node: usize) -> TestResult {
         let previous = self.clients[node].identity.clone();
         self.receipt.verify_async().await?;
-        self.cluster.stop_node(node)?;
+        self.verify_deployment_configuration()?;
+        self.stop_owned_node(node)?;
         self.evidence
             .record("node-exited", &json!({"identity":previous,"owned_child_reaped":true}))?;
         self.cluster.start_node_from_binary(node, &self.receipt.launcher_path).await?;
@@ -656,9 +837,19 @@ impl CatalogCluster {
     }
 
     pub(crate) async fn finish(mut self, result: TestResult) -> TestResult {
-        if let Err(error) = &result {
-            self.evidence.record("first-failure", &json!({"error":error.to_string()}))?;
-        }
+        let recorded = match &result {
+            Err(error) => self.evidence.record("first-failure", &json!({"error":error.to_string()})),
+            Ok(()) => Ok(()),
+        };
+        let diagnostics = self.final_checks().await;
+        let cleanup = self.cleanup_storage().await;
+        let result = combine_results(combine_results(combine_results(result, recorded), diagnostics), cleanup);
+        let recorded = self.evidence.record("result", &json!({"status":if result.is_ok(){"passed"}else{"failed"},"error":result.as_ref().err().map(ToString::to_string),"cluster_root":self.cluster.temp_dir,"evidence":self.evidence.root}));
+        self.finished = true;
+        combine_results(result, recorded)
+    }
+
+    async fn final_checks(&self) -> TestResult {
         let mut diagnostics: TestResult = Ok(());
         let identity = self.session_identities.lock().expect("session evidence").last().cloned();
         if let Some(identity) = identity {
@@ -699,10 +890,53 @@ impl CatalogCluster {
         }
         let capture = self.capture("final-physical-state").await;
         let verification = self.receipt.verify_async().await;
-        let result = result.and(diagnostics).and(capture).and(verification);
-        self.evidence.record("result", &json!({"status":if result.is_ok(){"passed"}else{"failed"},"error":result.as_ref().err().map(ToString::to_string),"cluster_root":self.cluster.temp_dir,"evidence":self.evidence.root}))?;
-        self.finished = true;
+        combine_results(combine_results(diagnostics, capture), verification)
+    }
+
+    fn reap_owned_child(process: &mut Option<std::process::Child>, require_running: bool) -> TestResult {
+        if let Some(child) = process.as_mut() {
+            let exited = child.try_wait()?;
+            check(
+                !require_running || exited.is_none(),
+                format!("owned worker exited before requested stop: {exited:?}"),
+            )?;
+            if exited.is_none() {
+                child.kill()?;
+            }
+            child.wait()?;
+        } else {
+            check(!require_running, "requested stop has no owned worker")?;
+        }
+        *process = None;
+        Ok(())
+    }
+
+    fn stop_owned_node(&mut self, node: usize) -> TestResult {
+        if self.recovery_storage.is_none() {
+            return self.cluster.stop_node(node);
+        }
+        Self::reap_owned_child(&mut self.cluster.nodes.get_mut(node).ok_or("invalid owned node")?.process, true)
+    }
+
+    fn stop_owned_workers(&mut self) -> TestResult {
+        let mut result = Ok(());
+        for node in &mut self.cluster.nodes {
+            result = combine_results(result, Self::reap_owned_child(&mut node.process, false));
+        }
         result
+    }
+
+    async fn cleanup_storage(&mut self) -> TestResult {
+        if self.recovery_storage.is_none() {
+            return Ok(());
+        }
+        self.stop_owned_workers()?;
+        let result = self.recovery_storage.as_ref().ok_or("missing storage owner")?.cleanup().await;
+        let recorded = self.evidence.record(
+            "device-cleanup",
+            &json!({"status":if result.is_ok(){"complete"}else{"failed"},"error":result.as_ref().err().map(ToString::to_string)}),
+        );
+        combine_results(result, recorded)
     }
 
     pub(crate) fn validate_disk(&self, node: usize) -> TestResult<PathBuf> {
@@ -723,7 +957,18 @@ impl CatalogCluster {
 impl Drop for CatalogCluster {
     fn drop(&mut self) {
         if !self.finished {
-            let _ = self.evidence.record("unfinished", &json!({"status":"failed","reason":"case exited without a completed result","cluster_root":self.cluster.temp_dir}));
+            let cleanup = if self.recovery_storage.is_some() {
+                self.stop_owned_workers()
+                    .and_then(|()| self.recovery_storage.as_ref().ok_or("missing storage owner")?.cleanup_sync())
+            } else {
+                Ok(())
+            };
+            if let Err(error) = &cleanup {
+                eprintln!("unfinished D07 device cleanup failed: {error}");
+            }
+            if let Err(error) = self.evidence.record("unfinished", &json!({"status":"failed","reason":"case exited without a completed result","cluster_root":self.cluster.temp_dir,"cleanup_error":cleanup.as_ref().err().map(ToString::to_string)})) {
+                eprintln!("unfinished Catalog evidence failed: {error}");
+            }
         }
     }
 }
@@ -735,7 +980,7 @@ impl CatalogCluster {
             "fault requires a running owned node",
         )?;
         let identity = self.clients[node].identity.clone();
-        self.cluster.stop_node(node)?;
+        self.stop_owned_node(node)?;
         self.evidence
             .record("node-exited", &json!({"identity":identity,"owned_child_reaped":true}))
     }
@@ -744,6 +989,7 @@ impl CatalogCluster {
         check(self.cluster.nodes[node].process.is_none(), "node must be stopped before restart")?;
         let previous = self.clients[node].identity.clone();
         self.receipt.verify_async().await?;
+        self.verify_deployment_configuration()?;
         self.cluster.start_node_from_binary(node, &self.receipt.launcher_path).await?;
         let current = self.connect(node).await?;
         check(
@@ -763,6 +1009,7 @@ impl CatalogCluster {
         }
         self.capture("all-nodes-stopped").await?;
         self.receipt.verify_async().await?;
+        self.verify_deployment_configuration()?;
         self.cluster.start_with_binary(&self.receipt.launcher_path).await?;
         for (node, old) in previous.iter().enumerate() {
             let client = self.connect(node).await?;
@@ -784,11 +1031,17 @@ impl CatalogCluster {
         let target_copy = target.clone();
         let copied = tokio::task::spawn_blocking(move || copy_owned_tree(&source, &target_copy)).await??;
         self.evidence.record("disk-snapshot", &copied)?;
+        if let Some(owner) = &self.recovery_storage {
+            owner.retain_snapshot(target.clone()).await?;
+        }
         Ok(target)
     }
 
     pub(crate) async fn replace_stopped_disk(&self, node: usize, snapshot: Option<PathBuf>) -> TestResult {
         let original = self.validate_disk(node)?;
+        if let Some(owner) = &self.recovery_storage {
+            return owner.replace(node, snapshot).await;
+        }
         let before = inventory(&original)?;
         let parent = original.parent().ok_or("disk has no parent")?.to_path_buf();
         let retired = parent.join(format!("retired-{node}-{}", Uuid::new_v4()));
@@ -824,6 +1077,17 @@ fn copy_owned_tree(source: &Path, target: &Path) -> TestResult<Value> {
     check(!target.exists(), "snapshot destination already exists")?;
     let before = inventory(source)?;
     std::fs::create_dir(target)?;
+    copy_owned_contents_from_inventory(source, target, before)
+}
+
+#[cfg(target_os = "linux")]
+fn copy_owned_contents(source: &Path, target: &Path) -> TestResult<Value> {
+    let before = inventory(source)?;
+    check(std::fs::read_dir(target)?.next().is_none(), "copy target is not empty")?;
+    copy_owned_contents_from_inventory(source, target, before)
+}
+
+fn copy_owned_contents_from_inventory(source: &Path, target: &Path, before: Value) -> TestResult<Value> {
     for item in walkdir::WalkDir::new(source).follow_links(false).min_depth(1).max_depth(64) {
         let item = item?;
         check(!item.file_type().is_symlink(), "snapshot encountered a symlink")?;
@@ -1223,6 +1487,131 @@ pub(crate) fn assert_late_commit_proof(proof: LateCommitProof<'_>) -> TestResult
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn deployment_fixture() -> (DeploymentConfiguration, BTreeMap<OsString, OsString>) {
+        let common = [
+            ("RUSTFS_VOLUMES", "http://127.0.0.1:9000/disk"),
+            ("RUSTFS_STORAGE_CLASS_STANDARD", "EC:2"),
+            ("RUSTFS_TABLE_CATALOG_BACKING", "object"),
+            ("RUSTFS_CATALOG_WORKER_RECEIPT", "/private/receipt.json"),
+            ("RUSTFS_CATALOG_WORKER_LAUNCHER", "/private/launcher"),
+            ("RUSTFS_SECRET_KEY", "private-secret"),
+            ("RUSTFS_RPC_SECRET", "private-rpc-secret"),
+        ]
+        .into_iter()
+        .map(|(key, value)| (key.into(), value.into()))
+        .collect();
+        let local = [
+            ("RUSTFS_ADDRESS", "127.0.0.1:9000"),
+            ("RUSTFS_CATALOG_WORKER_SOCKET", "/private/0.sock"),
+            ("RUSTFS_CATALOG_WORKER_NODE_ID", "node-0"),
+            ("RUSTFS_CATALOG_WORKER_NONCE", "private-nonce"),
+        ]
+        .into_iter()
+        .map(|(key, value)| (key.into(), value.into()))
+        .collect();
+        (DeploymentConfiguration { common }, local)
+    }
+
+    #[test]
+    fn deployment_accepts_exact_local_identity_with_uniform_settings() -> TestResult {
+        let (configuration, local) = deployment_fixture();
+        let mut actual = configuration.common.clone();
+        actual.extend(local.clone());
+        DeploymentConfiguration::verify_node(&configuration.common, actual, &local)?;
+        configuration.verify_unchanged(&configuration)
+    }
+
+    #[test]
+    fn deployment_rejects_changed_compatibility_credentials_or_build_receipt() {
+        let (configuration, local) = deployment_fixture();
+        for key in [
+            "RUSTFS_REGION",
+            "RUSTFS_STORAGE_CLASS_STANDARD",
+            "RUSTFS_TABLE_CATALOG_BACKING",
+            "RUSTFS_CATALOG_WORKER_RECEIPT",
+            "RUSTFS_CATALOG_WORKER_LAUNCHER",
+            "RUSTFS_SECRET_KEY",
+            "RUSTFS_RPC_SECRET",
+            "RAYON_NUM_THREADS",
+            "HTTPS_PROXY",
+        ] {
+            let mut actual = configuration.common.clone();
+            actual.extend(local.clone());
+            actual.insert(key.into(), "different-private-value".into());
+            let error = DeploymentConfiguration::verify_node(&configuration.common, actual, &local)
+                .expect_err("node-specific common settings must be rejected");
+            assert!(
+                !error.to_string().contains("different-private-value"),
+                "configuration values must stay private"
+            );
+        }
+    }
+
+    #[test]
+    fn deployment_rejects_wrong_local_identity() {
+        let (configuration, local) = deployment_fixture();
+        for key in local.keys() {
+            let mut actual = configuration.common.clone();
+            actual.extend(local.clone());
+            actual.insert(key.clone(), "different-private-value".into());
+            let error = DeploymentConfiguration::verify_node(&configuration.common, actual, &local)
+                .expect_err("local differences require the expected node identity");
+            assert!(!error.to_string().contains("different-private-value"), "local values must stay private");
+        }
+    }
+
+    #[test]
+    fn deployment_rejects_common_changes_on_restart_without_persisting_secrets() -> TestResult {
+        let (configuration, _) = deployment_fixture();
+        let mut changed = DeploymentConfiguration {
+            common: configuration.common.clone(),
+        };
+        changed.common.insert("RUSTFS_SECRET_KEY".into(), "replacement-secret".into());
+        assert!(configuration.verify_unchanged(&changed).is_err());
+        assert_eq!(
+            configuration.evidence()?,
+            changed.evidence()?,
+            "secret values must not affect a public digest"
+        );
+        let evidence = serde_json::to_string(&configuration.evidence()?)?;
+        for secret in ["private-secret", "private-rpc-secret"] {
+            assert!(!evidence.contains(secret));
+            assert!(!evidence.contains(&sha256(secret.as_bytes())));
+        }
+        changed.common.insert("RUSTFS_STORAGE_CLASS_STANDARD".into(), "EC:3".into());
+        assert!(configuration.verify_unchanged(&changed).is_err());
+        assert_ne!(configuration.evidence()?, changed.evidence()?);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn deployment_capture_preserves_node_defaults_and_rejects_global_address_override() -> TestResult {
+        let mut cluster = RustFSTestClusterEnvironment::new(2).await?;
+        let directory = tempfile::tempdir()?;
+        let nonces = vec!["private-a".to_owned(), "private-b".to_owned()];
+        for (node, nonce) in nonces.iter().enumerate() {
+            cluster.set_node_env(
+                node,
+                "RUSTFS_CATALOG_WORKER_SOCKET",
+                directory.path().join(format!("{node}.sock")).to_string_lossy(),
+            )?;
+            cluster.set_node_env(node, "RUSTFS_CATALOG_WORKER_NODE_ID", format!("node-{node}"))?;
+            cluster.set_node_env(node, "RUSTFS_CATALOG_WORKER_NONCE", nonce)?;
+        }
+        let configuration = DeploymentConfiguration::capture(&cluster, directory.path(), &nonces)?;
+        let current = DeploymentConfiguration::capture(&cluster, directory.path(), &nonces)?;
+        configuration.verify_unchanged(&current)?;
+        cluster.set_node_env(1, "RUSTFS_STORAGE_CLASS_STANDARD", "EC:3")?;
+        assert!(DeploymentConfiguration::capture(&cluster, directory.path(), &nonces).is_err());
+        assert_eq!(
+            cluster.node_extra_env[1].pop(),
+            Some(("RUSTFS_STORAGE_CLASS_STANDARD".into(), "EC:3".into()))
+        );
+        cluster.set_env("RUSTFS_ADDRESS", "127.0.0.1:1");
+        assert!(DeploymentConfiguration::capture(&cluster, directory.path(), &nonces).is_err());
+        Ok(())
+    }
 
     #[test]
     fn receipt_rejects_unknown_fields() {

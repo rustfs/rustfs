@@ -32,6 +32,16 @@ The scheduler limits queue entries, discovery calls, concurrent work, managed bu
 
 ## Upgrade requirements
 
-Keep maintenance disabled until every participating node supports the required Vector record formats, managed access and maintenance operations, and the deployment's consistency and recovery checks have passed. A version string alone does not prove these capabilities. Optional encryption requires the corresponding key services and permissions.
+Deploy the same binary or container image digest on every participating node, with a consistent region, resource identity rules and compatible configuration. Record each node's identity, executable SHA-256 or immutable image digest, source revision and build configuration. Verify these records before starting the cluster and whenever a node rejoins. Record compatible configuration without exposing credentials or key material. A release name or mutable image tag alone does not identify the deployed artifact.
+
+The current operating scope requires a full-cluster offline upgrade. Rolling upgrades, mixed-version operation and independent node downgrades are unsupported. Automatic node capability checks are unimplemented; deployment records provide the build-consistency evidence for this scope.
+
+1. Stop admission of new business requests and initiate the existing shutdown flow on every node. Maintenance cancellation stops new background admissions.
+2. Wait for the existing request and maintenance shutdown results. Preserve the result of each admitted operation and all uncertain Catalog, candidate and recovery records. A timeout or failed shutdown does not establish that an operation completed successfully.
+3. Confirm that every node has stopped before replacing any binary or image. Keep storage and recovery records available for the replacement processes.
+4. Install the same identified build on every node and verify compatible configuration and access to any configured key services.
+5. Restart the cluster, run the existing recovery flow, inspect its outcomes and verify the deployment's consistency and recovery checks before restoring traffic or admitting maintenance work.
+
+Keep maintenance disabled until the deployed build supports the required Vector record formats, managed access and maintenance operations, and the applicable acceptance requirements have passed. Optional encryption requires the corresponding key services and permissions. Uniform deployment alone does not establish Vector activation readiness.
 
 Upgraded readers retain supported older Vector records. Maintenance writes can introduce newer record versions; rollback therefore requires readers that understand all records already written. Disabling maintenance stops new background admissions after restart and does not downgrade existing records. Verify Table/Iceberg regressions and the deployment's recovery scenarios before enabling maintenance after an upgrade.

@@ -7,6 +7,7 @@ mod catalog_m4_d05_test;
 mod catalog_m4_d06_test;
 mod catalog_m4_d08_test;
 mod catalog_m4_d10_test;
+mod catalog_m4_pagination_test;
 
 use super::{CatalogCluster, TestResult, field, require, sha256};
 use crate::common::{AdminTransport, admin_add_canned_policy_via, admin_attach_user_policy_via, admin_create_user_via};

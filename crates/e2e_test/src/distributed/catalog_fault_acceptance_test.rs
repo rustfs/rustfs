@@ -17,8 +17,8 @@
 mod catalog_m4_acceptance_test;
 
 use super::catalog_fault_worker::{
-    CatalogCluster, LateCommitProof, LateCommitRole, Session, TestResult, assert_late_commit_proof, assert_no_head_regression,
-    assert_retained_record, field, sha256, verify_manifest,
+    CatalogCluster, LateCommitProof, LateCommitRole, RecoveryStorage, Session, TestResult, assert_late_commit_proof,
+    assert_no_head_regression, assert_retained_record, field, recovery_namespace_child, sha256, verify_manifest,
 };
 use serde_json::{Value, json};
 use std::io;
@@ -469,7 +469,7 @@ async fn catalog_commit_response_loss_and_restart_matrix() -> TestResult {
 }
 
 async fn directory_case(kind: &str) -> TestResult {
-    let mut cluster = CatalogCluster::start(kind).await?;
+    let mut cluster = CatalogCluster::start_with_storage(kind, RecoveryStorage::OwnedLoopFiles).await?;
     let result = async {
         let mut session = cluster.create().await?;
         let first = publish(&cluster, &session, 0).await?;
@@ -507,14 +507,23 @@ async fn directory_case(kind: &str) -> TestResult {
 
 #[tokio::test]
 async fn catalog_empty_directory_recovers_from_quorum() -> TestResult {
+    if !recovery_namespace_child(concat!(module_path!(), "::catalog_empty_directory_recovers_from_quorum")).await? {
+        return Ok(());
+    }
     directory_case("empty-directory").await
 }
 #[tokio::test]
 async fn catalog_stale_directory_cannot_replace_later_head() -> TestResult {
+    if !recovery_namespace_child(concat!(module_path!(), "::catalog_stale_directory_cannot_replace_later_head")).await? {
+        return Ok(());
+    }
     directory_case("stale-directory").await
 }
 #[tokio::test]
 async fn catalog_replacement_directory_preserves_acknowledged_data() -> TestResult {
+    if !recovery_namespace_child(concat!(module_path!(), "::catalog_replacement_directory_preserves_acknowledged_data")).await? {
+        return Ok(());
+    }
     directory_case("replacement-directory").await
 }
 
