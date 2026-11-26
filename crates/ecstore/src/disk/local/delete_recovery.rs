@@ -1181,6 +1181,16 @@ fn format_commit_receipt_bytes(journal_raw: &[u8], finished: bool) -> Vec<u8> {
     out
 }
 
+fn stage_recovery_file(root: &Path, bytes: &[u8], sync: bool) -> std::io::Result<tempfile::TempPath> {
+    std::fs::create_dir_all(root)?;
+    let mut file = tempfile::NamedTempFile::new_in(root)?;
+    std::io::Write::write_all(file.as_file_mut(), bytes)?;
+    if sync && !bytes.is_empty() {
+        file.as_file().sync_data()?;
+    }
+    Ok(file.into_temp_path())
+}
+
 // A visible transaction directory can survive an earlier failed parent fsync in the page cache.
 pub(super) fn sync_preparation_parents(object: &Path, through: &Path) -> std::io::Result<()> {
     if !object.starts_with(through) {
@@ -1580,34 +1590,40 @@ impl LocalDisk {
         let record_destination = destination.clone();
         let staging_root = temporary;
         let lease = os::acquire_namespace_mutation_lease_with_owner(&destination, owner.clone()).await;
+        let reserve = self.delete_reserve.clone();
         let (staged, target) = os::run_blocking_namespace_operation_with_sync(lease, sync, move || {
-            std::fs::create_dir_all(&staging_root)?;
-            let staged = Arc::new(
-                tempfile::Builder::new()
-                    .prefix("delete-preparation-")
-                    .tempdir_in(&staging_root)?,
-            );
-            let missing_marker = original.is_none() && target.is_some();
-            for (name, bytes) in [
-                (STORAGE_FORMAT_FILE_BACKUP, original.as_deref()),
-                (TARGET, target.as_deref()),
-                (PREPARED, Some(journal.as_slice())),
-                (DELETE_MARKER_ROLLBACK_FILE, missing_marker.then_some(&[][..])),
-            ] {
-                let Some(bytes) = bytes else {
-                    continue;
-                };
-                #[cfg(test)]
-                run_owned_file_before_open(&record_destination.join(name));
-                let mut file = std::fs::File::create(staged.path().join(name))?;
-                std::io::Write::write_all(&mut file, bytes)?;
-                if sync && !bytes.is_empty() {
-                    file.sync_data()?;
+            let staged = reserve.retry_after_enospc(|| {
+                std::fs::create_dir_all(&staging_root)?;
+                let staged = Arc::new(
+                    tempfile::Builder::new()
+                        .prefix("delete-preparation-")
+                        .tempdir_in(&staging_root)?,
+                );
+                let missing_marker = original.is_none() && target.is_some();
+                for (name, bytes) in [
+                    (STORAGE_FORMAT_FILE_BACKUP, original.as_deref()),
+                    (TARGET, target.as_deref()),
+                    (PREPARED, Some(journal.as_slice())),
+                    (DELETE_MARKER_ROLLBACK_FILE, missing_marker.then_some(&[][..])),
+                ] {
+                    let Some(bytes) = bytes else {
+                        continue;
+                    };
+                    #[cfg(test)]
+                    run_owned_file_before_open(&record_destination.join(name));
+                    let mut file = std::fs::File::create(staged.path().join(name))?;
+                    std::io::Write::write_all(&mut file, bytes)?;
+                    if sync && !bytes.is_empty() {
+                        file.sync_data()?;
+                    }
                 }
-            }
-            if sync {
-                os::fsync_dir_std(staged.path())?;
-            }
+                if sync {
+                    os::fsync_dir_std(staged.path())?;
+                }
+                #[cfg(test)]
+                preparation_io_fault::run(&record_destination)?;
+                Ok(staged)
+            })?;
             Ok((staged, target))
         })
         .await
@@ -2533,6 +2549,7 @@ impl LocalDisk {
         let object_str = object.to_owned();
 
         let publication_root = self.publication_root.clone();
+        let reserve = self.delete_reserve.clone();
         let recovery_scope = recovery_operation_scope();
         let res = os::run_blocking_namespace_operation_with_sync(
             lease,
@@ -2677,34 +2694,39 @@ impl LocalDisk {
                         Ok(None) => return Ok(Ok(None)),
                         Err(err) => return Ok(Err(err)),
                     };
-                std::fs::create_dir_all(&staging_root)?;
-                let staged = tempfile::Builder::new().prefix("delete-prep-").tempdir_in(&staging_root)?;
-                let staged_dir = staged.path().to_path_buf();
-                let backup_path = staged_dir.join(STORAGE_FORMAT_FILE_BACKUP);
-                if std::fs::hard_link(&xl_path, &backup_path).is_err() {
-                    let mut file = std::fs::File::create(&backup_path)?;
-                    std::io::Write::write_all(&mut file, &buf)?;
-                    if sync && !buf.is_empty() {
+                let staged = reserve.retry_after_enospc(|| {
+                    std::fs::create_dir_all(&staging_root)?;
+                    let staged = tempfile::Builder::new().prefix("delete-prep-").tempdir_in(&staging_root)?;
+                    let staged_dir = staged.path().to_path_buf();
+                    let backup_path = staged_dir.join(STORAGE_FORMAT_FILE_BACKUP);
+                    if std::fs::hard_link(&xl_path, &backup_path).is_err() {
+                        let mut file = std::fs::File::create(&backup_path)?;
+                        std::io::Write::write_all(&mut file, &buf)?;
+                        if sync && !buf.is_empty() {
+                            file.sync_data()?;
+                        }
+                    }
+                    let mut written_files = Vec::with_capacity(2);
+                    for (name, bytes) in [(TARGET, target.as_deref()), (PREPARED, Some(journal_raw.as_slice()))] {
+                        let Some(bytes) = bytes else {
+                            continue;
+                        };
+                        let mut file = std::fs::File::create(staged_dir.join(name))?;
+                        std::io::Write::write_all(&mut file, bytes)?;
+                        if sync && !bytes.is_empty() {
+                            written_files.push(file);
+                        }
+                    }
+                    for file in written_files {
                         file.sync_data()?;
                     }
-                }
-                let mut written_files = Vec::with_capacity(2);
-                for (name, bytes) in [(TARGET, target.as_deref()), (PREPARED, Some(journal_raw.as_slice()))] {
-                    let Some(bytes) = bytes else {
-                        continue;
-                    };
-                    let mut file = std::fs::File::create(staged_dir.join(name))?;
-                    std::io::Write::write_all(&mut file, bytes)?;
-                    if sync && !bytes.is_empty() {
-                        written_files.push(file);
+                    if sync {
+                        os::fsync_dir_std(&staged_dir)?;
                     }
-                }
-                for file in written_files {
-                    file.sync_data()?;
-                }
-                if sync {
-                    os::fsync_dir_std(&staged_dir)?;
-                }
+                    #[cfg(test)]
+                    preparation_io_fault::run(&destination)?;
+                    Ok(staged)
+                })?;
                 match std::fs::symlink_metadata(&destination) {
                     Ok(metadata) if metadata.is_dir() => match std::fs::remove_dir(&destination) {
                         Ok(()) => {}
@@ -2717,7 +2739,7 @@ impl LocalDisk {
                     Err(err) => return Err(err),
                 }
                 let staged_dir = staged.keep();
-                if let Err(err) = std::fs::rename(&staged_dir, &destination) {
+                if let Err(err) = reserve.retry_after_enospc(|| std::fs::rename(&staged_dir, &destination)) {
                     let _ = std::fs::remove_dir_all(&staged_dir);
                     return Err(err);
                 }
@@ -2743,14 +2765,16 @@ impl LocalDisk {
                 let mut reserved_data_path = None;
                 if let Some(old_path) = old_data_path {
                     let reserved_marker = old_path.join(format!("{RESERVED_DELETE_DATA_DIR_MARKER_PREFIX}{transaction}"));
-                    let reserve_res = (|| -> std::io::Result<()> {
+                    let reserve_res = reserve.retry_after_enospc(|| {
+                        #[cfg(test)]
+                        preparation_io_fault::run(&reserved_marker)?;
                         let marker = std::fs::File::create(&reserved_marker)?;
                         if sync {
                             marker.sync_all()?;
                             os::fsync_dir_std(&old_path)?;
                         }
                         Ok(())
-                    })();
+                    });
                     if let Err(err) = reserve_res {
                         let _ = std::fs::remove_file(&reserved_marker);
                         discard_staged_proofs();
@@ -2765,15 +2789,12 @@ impl LocalDisk {
                         .prefix("delete-xl-")
                         .make_in(&staging_root, |path| std::fs::hard_link(&target_in_rollback, path));
                     if let Ok(linked_xl) = linked_xl {
-                        linked_xl.persist(&xl_path).map_err(|err| err.error)
+                        reserve.retry_after_enospc(|| std::fs::rename(linked_xl.path(), &xl_path))
                     } else {
                         (|| -> std::io::Result<()> {
-                            let mut staged_xl = tempfile::NamedTempFile::new_in(&staging_root)?;
-                            std::io::Write::write_all(staged_xl.as_file_mut(), target_bytes)?;
-                            if sync && !target_bytes.is_empty() {
-                                staged_xl.as_file().sync_data()?;
-                            }
-                            std::fs::rename(staged_xl.path(), &xl_path)
+                            let staged_xl =
+                                reserve.retry_after_enospc(|| stage_recovery_file(&staging_root, target_bytes, sync))?;
+                            reserve.retry_after_enospc(|| std::fs::rename(&staged_xl, &xl_path))
                         })()
                     }
                 } else {
@@ -2893,6 +2914,7 @@ impl LocalDisk {
         let volume_str = volume.to_owned();
         let object_str = object.to_owned();
 
+        let reserve = self.delete_reserve.clone();
         os::run_blocking_namespace_operation_with_sync(
             lease,
             sync,
@@ -2907,12 +2929,12 @@ impl LocalDisk {
                     && rollback.join(PREPARED).is_file()
                 {
                     let receipt_bytes = format_commit_receipt_bytes(&journal_raw, false);
-                    let mut staged = tempfile::NamedTempFile::new_in(&staging_root)?;
-                    std::io::Write::write_all(staged.as_file_mut(), &receipt_bytes)?;
-                    if sync && !receipt_bytes.is_empty() {
-                        staged.as_file().sync_data()?;
-                    }
-                    staged.persist(&receipt_path).map_err(|err| err.error)?;
+                    let staged = reserve.retry_after_enospc(|| {
+                        #[cfg(test)]
+                        preparation_io_fault::run(&receipt_path)?;
+                        stage_recovery_file(&staging_root, &receipt_bytes, sync)
+                    })?;
+                    reserve.retry_after_enospc(|| std::fs::rename(&staged, &receipt_path))?;
                     if sync {
                         os::fsync_dir_std(&rollback)?;
                     }
@@ -3002,13 +3024,8 @@ impl LocalDisk {
                     finished: false,
                 };
                 let receipt_bytes = serde_json::to_vec(&receipt).map_err(std::io::Error::other)?;
-                std::fs::create_dir_all(&staging_root)?;
-                let mut staged = tempfile::NamedTempFile::new_in(&staging_root)?;
-                std::io::Write::write_all(staged.as_file_mut(), &receipt_bytes)?;
-                if sync && !receipt_bytes.is_empty() {
-                    staged.as_file().sync_data()?;
-                }
-                std::fs::rename(staged.path(), &receipt_path)?;
+                let staged = reserve.retry_after_enospc(|| stage_recovery_file(&staging_root, &receipt_bytes, sync))?;
+                reserve.retry_after_enospc(|| std::fs::rename(&staged, &receipt_path))?;
                 if sync {
                     os::fsync_dir_std(&rollback)?;
                 }
@@ -3126,6 +3143,7 @@ impl LocalDisk {
             .map(Path::to_path_buf)
             .collect();
 
+        let reserve = self.delete_reserve.clone();
         let res = os::run_blocking_namespace_operation_with_sync(lease, sync, move || -> std::io::Result<()> {
             let committed = format!("{DELETE_DATA_DIR_MARKER_PREFIX}{transaction}");
             let recovery_committed = format!("{RECOVERY_DELETE_DATA_DIR_MARKER_PREFIX}{transaction}");
@@ -3192,14 +3210,8 @@ impl LocalDisk {
                     serde_json::to_vec(&receipt).map_err(std::io::Error::other)?
                 }
             };
-            std::fs::create_dir_all(&staging_root)?;
-            let mut staged_receipt = tempfile::NamedTempFile::new_in(&staging_root)?;
-            std::io::Write::write_all(staged_receipt.as_file_mut(), &receipt_bytes)?;
-            if sync {
-                staged_receipt.as_file().sync_data()?;
-            }
-            let staged_path = staged_receipt.into_temp_path();
-            std::fs::rename(&staged_path, &receipt_path)?;
+            let staged = reserve.retry_after_enospc(|| stage_recovery_file(&staging_root, &receipt_bytes, sync))?;
+            reserve.retry_after_enospc(|| std::fs::rename(&staged, &receipt_path))?;
             if sync {
                 os::fsync_dir_std(&rollback)?;
             }
@@ -3240,6 +3252,11 @@ impl LocalDisk {
         let ok = res.is_ok();
         for claim in claims {
             claim.finish(ok);
+        }
+        if ok && !self.delete_reserve.is_armed() {
+            let reserve = self.delete_reserve.clone();
+            let lease = os::acquire_namespace_mutation_lease_with_owner(self.io_root(), None).await;
+            let _ = os::run_blocking_namespace_operation_with_sync(lease, true, move || reserve.replenish()).await;
         }
         res.map(|()| true).map_err(|err| to_file_error(err).into())
     }
@@ -3382,6 +3399,43 @@ mod fused_prepare_checkpoint {
             if let Some(hook) = hook {
                 hook();
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod preparation_io_fault {
+    use std::collections::HashMap;
+    use std::path::{Path, PathBuf};
+    use std::sync::{LazyLock, Mutex};
+
+    type Hook = Box<dyn FnOnce() -> std::io::Result<()> + Send>;
+    static HOOKS: LazyLock<Mutex<HashMap<PathBuf, Hook>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
+
+    pub(super) struct Guard(PathBuf);
+
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            HOOKS.lock().expect("checkpoint hooks").remove(&self.0);
+        }
+    }
+
+    pub(super) fn install(root: &Path, hook: impl FnOnce() -> std::io::Result<()> + Send + 'static) -> Guard {
+        assert!(
+            HOOKS
+                .lock()
+                .expect("checkpoint hooks")
+                .insert(root.to_path_buf(), Box::new(hook))
+                .is_none()
+        );
+        Guard(root.to_path_buf())
+    }
+
+    pub(super) fn run(root: &Path) -> std::io::Result<()> {
+        let hook = HOOKS.lock().expect("checkpoint hooks").remove(root);
+        match hook {
+            Some(hook) => hook(),
+            None => Ok(()),
         }
     }
 }
@@ -7867,6 +7921,55 @@ mod tests {
 
     #[tokio::test]
     async fn delete_recovery_fused_unversioned_physical_delete_retains_receipt_until_finalize() {
+        assert_unversioned_delete_reserve_recovery(None).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn delete_recovery_fused_enospc_recovers_scratch_marker_and_receipt_without_replaying_transaction() {
+        for stage in ["scratch", "marker", "receipt"] {
+            assert_unversioned_delete_reserve_recovery(Some(stage)).await;
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn delete_recovery_fallback_enospc_recovers_before_activation_and_preserves_original() {
+        for kind in [ErrorKind::StorageFull, ErrorKind::PermissionDenied] {
+            let (_temp, disk, info, _) = fixture().await;
+            let root = disk.io_get_object_path("recovery", "object").expect("object path");
+            let original = std::fs::read(root.join(STORAGE_FORMAT_FILE)).expect("original metadata");
+            let transaction = Uuid::new_v4();
+            let destination = root.join(transaction.to_string());
+            let _fault = preparation_io_fault::install(&destination, move || Err(std::io::Error::from(kind)));
+            let result = disk
+                .prepare_delete_recovery(
+                    "recovery",
+                    "object",
+                    Some(&original),
+                    &[info],
+                    None,
+                    DeletePreparationContext {
+                        transaction,
+                        bucket_incarnation: None,
+                        namespace_owner: None,
+                    },
+                )
+                .await;
+            if kind == ErrorKind::StorageFull {
+                assert!(result.is_ok(), "scratch ENOSPC must recover: {result:?}");
+                assert!(destination.join(PREPARED).is_file());
+                assert!(!disk.delete_reserve.is_armed());
+            } else {
+                assert!(result.is_err(), "non-capacity failures must not retry");
+                assert!(!destination.exists());
+                assert!(disk.delete_reserve.is_armed());
+            }
+            assert_eq!(std::fs::read(root.join(STORAGE_FORMAT_FILE)).expect("unchanged metadata"), original);
+        }
+    }
+
+    async fn assert_unversioned_delete_reserve_recovery(fault: Option<&str>) {
         let (_temp, disk, mut info, _) = fixture().await;
         let root = disk.io_get_object_path("recovery", "object").expect("object path");
 
@@ -7889,7 +7992,35 @@ mod tests {
             .await
             .expect("write xl.meta");
 
+        #[cfg(unix)]
+        let reserve_path = disk.io_root().join(".rustfs.sys/delete-reserve");
+        #[cfg(unix)]
+        assert_eq!(
+            std::fs::metadata(&reserve_path).expect("initialized reserve").len(),
+            super::super::delete_reserve::RESERVE_BYTES
+        );
         let transaction = Uuid::new_v4();
+        let rollback = root.join(transaction.to_string());
+        let _fault = fault.map(|stage| {
+            let path = match stage {
+                "scratch" => rollback.clone(),
+                "marker" => root
+                    .join(data_dir.to_string())
+                    .join(format!("{RESERVED_DELETE_DATA_DIR_MARKER_PREFIX}{transaction}")),
+                "receipt" => rollback.join(DELETE_QUORUM_COMMITTED_FILE),
+                _ => panic!("unknown fault stage"),
+            };
+            preparation_io_fault::install(&path, || Err(std::io::Error::from(ErrorKind::StorageFull)))
+        });
+        #[cfg(unix)]
+        let checkpoints = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        #[cfg(unix)]
+        let _checkpoint = {
+            let checkpoints = checkpoints.clone();
+            fused_prepare_checkpoint::Stage::BeforePublicationSync.install(&root, move || {
+                checkpoints.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            })
+        };
         let opts = DeleteOptions {
             recoverable_delete: true,
             ..Default::default()
@@ -7899,6 +8030,32 @@ mod tests {
             .await
             .expect("fused unversioned physical delete must succeed");
         assert_eq!(fused, Some(()));
+        #[cfg(unix)]
+        assert_eq!(
+            std::fs::metadata(&reserve_path).expect("released reserve").len(),
+            if matches!(fault, Some("scratch" | "marker")) {
+                0
+            } else {
+                super::super::delete_reserve::RESERVE_BYTES
+            },
+            "only an actual capacity failure should consume the reserve"
+        );
+        #[cfg(unix)]
+        assert_eq!(
+            checkpoints.load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "transaction publication must not replay"
+        );
+        assert!(
+            std::fs::read_dir(disk.io_root().join(RUSTFS_META_TMP_BUCKET))
+                .expect("staging root")
+                .all(|entry| !entry
+                    .expect("staging entry")
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("delete-prep-")),
+            "failed scratch attempts must be cleaned up"
+        );
 
         let (journal, sole_transaction, target_satisfied) = disk
             .try_publish_prepared_delete_local("recovery", "object", transaction, None)
@@ -7908,6 +8065,15 @@ mod tests {
         assert!(sole_transaction);
         assert!(target_satisfied);
         assert!(journal.target_digest.is_none());
+        #[cfg(unix)]
+        assert_eq!(
+            std::fs::metadata(&reserve_path).expect("reserve after receipt").len(),
+            if fault.is_some() {
+                0
+            } else {
+                super::super::delete_reserve::RESERVE_BYTES
+            }
+        );
 
         let rollback = root.join(transaction.to_string());
         assert!(rollback.join(DELETE_QUORUM_COMMITTED_FILE).is_file());
@@ -7917,6 +8083,11 @@ mod tests {
             .await
             .expect("local finalize must succeed");
         assert!(finalized);
+        #[cfg(unix)]
+        assert_eq!(
+            std::fs::metadata(&reserve_path).expect("replenished reserve").len(),
+            super::super::delete_reserve::RESERVE_BYTES
+        );
         assert!(!rollback.exists(), "rollback directory must be pruned");
         assert!(!root.join(data_dir.to_string()).exists(), "physical data_dir must be removed");
         assert!(!root.exists(), "empty object directory must be pruned");
