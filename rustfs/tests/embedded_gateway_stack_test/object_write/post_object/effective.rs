@@ -147,7 +147,22 @@ fn gateway_post_effective_encryption_policy_observes_wire_fallback() {
             };
             let key = base64_simd::STANDARD.encode_to_string([0_u8; 32]);
             let ssec = [(ALGORITHM, "AES256"), (KEY, key.as_str()), (MD5, "cLyPS3KoaSFGi/joRB3OUQ==")];
-            let denied = caller.post_form(BUCKET, &[("key", "denied")], &ssec, true, true).await;
+            // Unsigned wire SSE-C headers on POST are rejected even for root.
+            for (who, key_name) in [(&caller, "wire-denied"), (&root, "wire-root-denied")] {
+                let wire_denied = who.post_form(BUCKET, &[("key", key_name)], &ssec, true, true).await;
+                assert_eq!(wire_denied.status, 403, "{key_name}: {}", wire_denied.body);
+                assert!(wire_denied.body.contains("<Code>AccessDenied</Code>"), "{key_name}: {}", wire_denied.body);
+                assert_eq!(
+                    root.request("GET", &format!("/{BUCKET}/{key_name}"), b"", &[], Some(0))
+                        .await
+                        .status,
+                    404
+                );
+            }
+            // Signed form-field SSE-C parameters are evaluated against the IAM Deny policy.
+            let denied = caller
+                .post_form(BUCKET, &[("key", "denied"), ssec[0], ssec[1], ssec[2]], &[], true, true)
+                .await;
             assert_eq!(denied.status, 403, "{}", denied.body);
             assert!(denied.body.contains("<Code>AccessDenied</Code>"));
             assert_eq!(
@@ -158,7 +173,9 @@ fn gateway_post_effective_encryption_policy_observes_wire_fallback() {
             );
             let ordinary = caller.post_form(BUCKET, &[("key", "ordinary")], &[], true, true).await;
             assert_eq!(ordinary.status, 204, "{}", ordinary.body);
-            let control = root.post_form(BUCKET, &[("key", "encrypted")], &ssec, true, true).await;
+            let control = root
+                .post_form(BUCKET, &[("key", "encrypted"), ssec[0], ssec[1], ssec[2]], &[], true, true)
+                .await;
             assert_eq!(control.status, 204, "{}", control.body);
             let read = root
                 .request("GET", &format!("/{BUCKET}/encrypted"), b"", &ssec, Some(0))
@@ -207,9 +224,9 @@ fn gateway_post_stores_the_authorized_form_metadata_and_bucket_retention() {
         let document = serde_json::json!({
             "Version": "2012-10-17",
             "Statement": [
-                {"Effect": "Allow", "Action": "s3:PutObject", "Resource": format!("arn:aws:s3:::{BUCKET}/*"),
+                {"Effect": "Allow", "Action": ["s3:PutObject", "s3:PutObjectTagging"], "Resource": format!("arn:aws:s3:::{BUCKET}/*"),
                  "Condition": {"StringEquals": {"s3:x-amz-storage-class": "STANDARD"}}},
-                {"Effect": "Deny", "Action": "s3:PutObject", "Resource": format!("arn:aws:s3:::{BUCKET}/*"),
+                {"Effect": "Deny", "Action": ["s3:PutObject", "s3:PutObjectTagging"], "Resource": format!("arn:aws:s3:::{BUCKET}/*"),
                  "Condition": {"StringEquals": {"s3:RequestObjectTag/classification": "private"}}}
             ]
         });
@@ -230,6 +247,8 @@ fn gateway_post_stores_the_authorized_form_metadata_and_bucket_retention() {
             ("x-amz-storage-class", "REDUCED_REDUNDANCY"),
             ("x-amz-meta-snowball-auto-extract", "true"),
             ("x-amz-snowball-auto-extract", "true"),
+            ("x-amz-object-lock-mode", "GOVERNANCE"),
+            ("x-amz-object-lock-retain-until-date", "2000-01-01T00:00:00Z"),
         ]
         .into_iter()
         .enumerate()
@@ -268,11 +287,7 @@ fn gateway_post_stores_the_authorized_form_metadata_and_bucket_retention() {
                     ("x-amz-tagging", "classification=public"),
                     ("x-amz-meta-purpose", "form"),
                 ],
-                &[
-                    ("x-amz-tagging", "classification=private"),
-                    ("x-amz-object-lock-mode", "GOVERNANCE"),
-                    ("x-amz-object-lock-retain-until-date", "2000-01-01T00:00:00Z"),
-                ],
+                &[("x-amz-tagging", "classification=private")],
                 true,
                 true,
             )

@@ -123,7 +123,7 @@ impl<S: StorageBackend + Send + Sync + 'static> SftpDriver<S> {
         self.authorize_list_objects(&input).await?;
 
         let out = self
-            .run_backend("list_objects_v2", self.storage.list_objects_v2(input, self.credentials()))
+            .run_backend("list_objects_v2", self.storage.list_objects_v2(&self.session_context, input))
             .await?;
 
         let mut entries = Vec::new();
@@ -208,7 +208,7 @@ impl<S: StorageBackend + Send + Sync + 'static> SftpDriver<S> {
         // Issue list_objects_v2. On Err the destructive caller never
         // runs because validate_directory_empty returns the Err.
         let out = self
-            .run_backend("list_objects_v2", self.storage.list_objects_v2(input, self.credentials()))
+            .run_backend("list_objects_v2", self.storage.list_objects_v2(&self.session_context, input))
             .await?;
 
         // Count content entries that are not the directory's own marker.

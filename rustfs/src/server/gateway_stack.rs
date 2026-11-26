@@ -51,6 +51,7 @@
 mod admin;
 mod control_plane;
 pub(in crate::server) mod indeterminate_audit;
+mod reserved_console;
 
 #[cfg(test)]
 pub(crate) static CONFIG_HANDLER_CALLS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
@@ -58,7 +59,7 @@ pub(crate) static CONFIG_HANDLER_CALLS: std::sync::atomic::AtomicUsize = std::sy
 use crate::app::dto_values::owner;
 use crate::runtime_sources::{ServerContextSlot, current_action_credentials};
 use crate::server::gateway_handlers::{GatewayBackend, OPERATIONS, OperationTable, metadata_listing, register};
-use crate::server::ssec_transport::{is_secure_transport, require_tls};
+use crate::server::ssec_transport::{carries_ssec_headers, is_secure_transport, report_plaintext_ssec, require_tls};
 use crate::shared_types::{NativeTlsTransport, RemoteAddr};
 use crate::storage_api::server::http::request_context::RequestContext;
 use http::{Extensions, Request, Response};
@@ -207,6 +208,16 @@ impl GatewayStack {
         control_plane::assemble(assembly, iam, root, router)
     }
 
+    /// Assembles the independent S3-signed host for reserved console paths when the native console
+    /// is not mounted on this listener.
+    pub(crate) fn assemble_reserved_console(assembly: GatewayAssembly) -> Result<Self, GatewayAssemblyError> {
+        let iam = Arc::new(ServerIam {
+            server_ctx: Arc::clone(&assembly.server_ctx),
+        });
+        let root = Arc::new(live_root(Arc::clone(&assembly.server_ctx)));
+        reserved_console::assemble(assembly, iam, root)
+    }
+
     /// The stack as [`GatewayStack::assemble`] configures it, admitting every caller to the
     /// handlers `register` adds instead of RustFS's: for tests of the host layers around it.
     #[cfg(test)]
@@ -256,6 +267,17 @@ impl GatewayStack {
         authorizer: impl Authorizer,
         authenticator: impl FnOnce(SigV4Authenticator) -> SigV4Authenticator,
     ) -> Result<ServiceBuilder, GatewayAssemblyError> {
+        Self::configured_builder_on(ServiceBuilder::new(), assembly, iam, root, authorizer, authenticator)
+    }
+
+    fn configured_builder_on(
+        base: ServiceBuilder,
+        assembly: &GatewayAssembly,
+        iam: Arc<dyn IamKeyLookup>,
+        root: Arc<dyn RootSource>,
+        authorizer: impl Authorizer,
+        authenticator: impl FnOnce(SigV4Authenticator) -> SigV4Authenticator,
+    ) -> Result<ServiceBuilder, GatewayAssemblyError> {
         // A root the gateway could not verify a signature with is a startup error, never a
         // server that silently has no root. Requests read the live root from `root`.
         RootCredentials::new(&assembly.root_access_key, &assembly.root_secret_key, &assembly.root_secret_key)
@@ -269,7 +291,7 @@ impl GatewayStack {
         // Every legacy RustFS reading of a request, a credential scope and an answer, in the
         // gateway's one reviewable preset; its other half is on the authenticator.
         let credentials = Arc::new(IamCredentials::new(iam, root));
-        let builder = ServiceBuilder::new()
+        let builder = base
             .rustfs_profile()
             // Shipped RustFS authorizes before it judges an SSE header; the handler entry answers
             // the refusal once authorization succeeds.
@@ -309,6 +331,10 @@ impl GatewayStack {
         B::Data: Send,
         B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
     {
+        let unsigned_extension_refusal =
+            crate::auth::reject_unsigned_extension_headers_on_signed_request(request.headers(), request.uri().query())
+                .err()
+                .map(|err| err.message().unwrap_or(crate::auth::UNSIGNED_HEADERS_MESSAGE).to_owned());
         if self.control_plane {
             control_plane::attach_head(&mut request);
         }
@@ -335,9 +361,19 @@ impl GatewayStack {
             (Some(_), None) => false,
             (None, _) => true,
         };
-        attach_host_facts(extensions);
+        let secure_transport = attach_host_facts(extensions);
+        let refusal_request_id = unsigned_extension_refusal.as_ref().map(|_| {
+            extensions
+                .get::<RequestContext>()
+                .and_then(host_request_id)
+                .map(|id| id.request_id().as_str().to_owned())
+                .unwrap_or_else(|| uuid::Uuid::new_v4().simple().to_string())
+        });
+        let track_plaintext_post_ssec =
+            !secure_transport && *request.method() == http::Method::POST && !carries_ssec_headers(request.headers());
         // `Connection` is an HTTP/1 header; HTTP/2 and HTTP/3 forbid it and end only the stream.
         let http1 = request.version() < http::Version::HTTP_2;
+        let is_head = request.method() == http::Method::HEAD;
         let service = match self.object_lambda_fallback.as_ref() {
             Some(fallback) if crate::admin::router::object_lambda_target(request.method(), request.uri()).is_some() => {
                 fallback.clone()
@@ -350,11 +386,18 @@ impl GatewayStack {
                 *response.status_mut() = http::StatusCode::FORBIDDEN;
                 return response;
             }
+            if let Some(message) = unsigned_extension_refusal {
+                let request_id = refusal_request_id.unwrap_or_else(|| uuid::Uuid::new_v4().simple().to_string());
+                return unsigned_extension_header_response(&message, &request_id, is_head, http1);
+            }
             // The service's own entry, not its tower adapter: the adapter reads a body the handler
             // left unread in a detached task of its own, which takes the body away from
             // `EarlyResponseBodyService`, the drain the HTTP/1-2 shutdown accounting owns. The
             // adapter's connection verdict is kept.
             let mut response = service.call(request).await;
+            if track_plaintext_post_ssec && is_plaintext_ssec_refusal_response(&response) {
+                report_plaintext_ssec();
+            }
             if http1 && connection_intent_of(&response).is_some_and(ConnectionIntent::must_close) {
                 response
                     .headers_mut()
@@ -363,6 +406,37 @@ impl GatewayStack {
             response
         }
     }
+}
+
+/// Renders an S3 `403 AccessDenied` refusal matching the gateway's header guard format when a
+/// signed request carries an unsigned `x-rustfs-*` or `x-minio-*` extension header.
+fn unsigned_extension_header_response(
+    message: &str,
+    request_id: &str,
+    is_head: bool,
+    http1: bool,
+) -> Response<rustfs_gateway::Body> {
+    let xml = format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<Error><Code>AccessDenied</Code><Message>{message}</Message><RequestId>{request_id}</RequestId></Error>"
+    );
+    let content_length = xml.len();
+    let body = if is_head {
+        rustfs_gateway::Body::empty()
+    } else {
+        rustfs_gateway::Body::from_bytes(bytes::Bytes::from(xml))
+    };
+    let mut response = Response::new(body);
+    *response.status_mut() = http::StatusCode::FORBIDDEN;
+    let headers = response.headers_mut();
+    headers.insert(http::header::CONTENT_TYPE, http::HeaderValue::from_static("application/xml"));
+    headers.insert(http::header::CONTENT_LENGTH, http::HeaderValue::from(content_length));
+    if let Ok(value) = http::HeaderValue::from_str(request_id) {
+        headers.insert(http::header::HeaderName::from_static("x-amz-request-id"), value);
+    }
+    if http1 {
+        headers.insert(http::header::CONNECTION, http::HeaderValue::from_static("close"));
+    }
+    response
 }
 
 /// The gateway stack over a server context, with requests signed by a root it publishes on that
@@ -480,13 +554,39 @@ fn body_deadlines(read_timeout: Duration) -> RequestBodyDeadlineConfig {
         .without_throughput_floor()
 }
 
+fn is_plaintext_ssec_refusal_response(response: &Response<rustfs_gateway::Body>) -> bool {
+    if response.status() != http::StatusCode::BAD_REQUEST {
+        return false;
+    }
+    let Some(segments) = response.body().try_as_vectored() else {
+        return false;
+    };
+    let matches =
+        |body: &str| body.contains("<Code>InvalidRequest</Code>") && body.contains("must be made over a secure connection");
+    match segments {
+        [single] => std::str::from_utf8(single).is_ok_and(matches),
+        multiple => {
+            let total: usize = multiple.iter().map(bytes::Bytes::len).sum();
+            if total > 4096 {
+                return false;
+            }
+            let mut buf = Vec::with_capacity(total);
+            for segment in multiple {
+                buf.extend_from_slice(segment);
+            }
+            std::str::from_utf8(&buf).is_ok_and(matches)
+        }
+    }
+}
+
 /// Attaches what the gateway reads about a request from its host: whether the transport was
 /// secure, the client address after RustFS's trusted-proxy correction, and RustFS's request
 /// identifier. Each is derived from what RustFS's own layers already attached; no header is read.
-fn attach_host_facts(extensions: &mut Extensions) {
+fn attach_host_facts(extensions: &mut Extensions) -> bool {
     let client_info = extensions.get::<ClientInfo>();
     let native_tls = extensions.get::<NativeTlsTransport>().is_some_and(|transport| transport.0);
-    let security = if is_secure_transport(native_tls, client_info) {
+    let secure = is_secure_transport(native_tls, client_info);
+    let security = if secure {
         TransportSecurity::Encrypted
     } else {
         TransportSecurity::Plaintext
@@ -506,6 +606,7 @@ fn attach_host_facts(extensions: &mut Extensions) {
     if let Some(request_id) = request_id {
         extensions.insert(request_id);
     }
+    secure
 }
 
 /// The identifier the outer layer assigned is the one the gateway is handed.
@@ -753,6 +854,45 @@ mod object_lock_tests {
         assert_eq!(retention.mode.as_deref(), Some("GOVERNANCE"));
         assert_eq!(retention.days, Some(30));
         assert_eq!(retention.years, None);
+    }
+}
+
+#[cfg(test)]
+mod plaintext_ssec_tests {
+    use super::is_plaintext_ssec_refusal_response;
+    use bytes::Bytes;
+    use http::{Response, StatusCode};
+
+    fn response(status: StatusCode, body: &'static str) -> Response<rustfs_gateway::Body> {
+        let mut resp = Response::new(rustfs_gateway::Body::from_bytes(Bytes::from_static(body.as_bytes())));
+        *resp.status_mut() = status;
+        resp
+    }
+
+    #[test]
+    fn detects_only_gateway_plaintext_ssec_refusals() {
+        let gateway_refusal = response(
+            StatusCode::BAD_REQUEST,
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?><Error><Code>InvalidRequest</Code>\
+             <Message>requests specifying a customer-provided encryption key must be made over a secure connection</Message></Error>",
+        );
+        assert!(is_plaintext_ssec_refusal_response(&gateway_refusal));
+
+        let aws_wording = response(
+            StatusCode::BAD_REQUEST,
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?><Error><Code>InvalidRequest</Code>\
+             <Message>Requests specifying Server Side Encryption with Customer provided keys must be made over a secure connection.</Message></Error>",
+        );
+        assert!(is_plaintext_ssec_refusal_response(&aws_wording));
+
+        let other_400 = response(
+            StatusCode::BAD_REQUEST,
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?><Error><Code>InvalidRequest</Code><Message>other error</Message></Error>",
+        );
+        assert!(!is_plaintext_ssec_refusal_response(&other_400));
+
+        let ok = response(StatusCode::NO_CONTENT, "");
+        assert!(!is_plaintext_ssec_refusal_response(&ok));
     }
 }
 

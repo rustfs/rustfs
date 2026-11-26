@@ -1179,6 +1179,29 @@ impl<T> S3Router<T> {
     }
 }
 
+/// Access rule for reserved console paths arriving on a listener where the native console is
+/// disabled (for example, the S3 port when a dedicated console port is enabled).
+pub(crate) fn admit_reserved_console(
+    server_ctx: Option<&crate::admin::runtime_sources::ServerContextSlot>,
+    method: &Method,
+    uri: &Uri,
+    headers: &HeaderMap,
+    signed: bool,
+) -> rustfs_s3_types::S3Result<()> {
+    reject_unsigned_amz_headers_on_sigv4_request(headers, uri.query())?;
+    if let Some(server_ctx) = server_ctx
+        && server_ctx.installed_app_context().is_none()
+    {
+        return Err(server_context_not_ready_error());
+    }
+    reject_unbound_custom_route_auth(method, uri, headers, signed)?;
+    if signed {
+        Ok(())
+    } else {
+        Err(access_denied("Signature is required"))
+    }
+}
+
 /// Answers a request `router` admitted from its route table: an extension route by its key,
 /// every other route by its canonical path, an unknown v4 admin path `426`, and anything else
 /// `NotImplemented`. Object Lambda and the console are each edge's own.

@@ -434,7 +434,7 @@ fn copy_tags_authorize_source_and_effective_destination_tags() {
         {
             let mut statements = vec![
                 serde_json::json!({"Effect":"Allow","Principal":{"AWS":"*"},"Action":["s3:GetObject","s3:GetObjectVersion"],"Resource":format!("arn:aws:s3:::{bucket}/source*")}),
-                serde_json::json!({"Effect":"Allow","Principal":{"AWS":"*"},"Action":"s3:PutObject","Resource":format!("arn:aws:s3:::{bucket}/copied-*")}),
+                serde_json::json!({"Effect":"Allow","Principal":{"AWS":"*"},"Action":["s3:PutObject","s3:PutObjectTagging"],"Resource":format!("arn:aws:s3:::{bucket}/copied-*")}),
             ];
             if !matches!(tag_permission, "missing" | "empty") {
                 let action = if tag_permission == "version" {
@@ -556,7 +556,7 @@ fn copy_tags_rechecks_actual_source_after_access_snapshot() {
                 .expect("source");
             let mut statements = vec![
                 serde_json::json!({"Effect":"Allow","Principal":{"AWS":"*"},"Action":"s3:GetObject","Resource":format!("arn:aws:s3:::{bucket}/source")}),
-                serde_json::json!({"Effect":"Allow","Principal":{"AWS":"*"},"Action":"s3:PutObject","Resource":format!("arn:aws:s3:::{bucket}/{destination}")}),
+                serde_json::json!({"Effect":"Allow","Principal":{"AWS":"*"},"Action":["s3:PutObject","s3:PutObjectTagging"],"Resource":format!("arn:aws:s3:::{bucket}/{destination}")}),
                 serde_json::json!({"Effect":"Deny","Principal":{"AWS":"*"},"Action":"s3:PutObject","Resource":format!("arn:aws:s3:::{bucket}/*"),"Condition":{"StringEquals":{"s3:RequestObjectTag/visibility":"public"}}}),
             ];
             if mode != "new-tags" {

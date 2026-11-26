@@ -100,6 +100,7 @@ pub(crate) async fn authorize_put_object<R: AuthorizationRequest + ?Sized>(
     if !input.post {
         authorize_replication_only_put_headers(req).await?;
     }
+    super::object_commit::authorize_write_request_tagging(req, input.post).await?;
     if input.legal_hold {
         authorize_request(req, Action::S3Action(S3Action::PutObjectLegalHoldAction)).await?;
     }
