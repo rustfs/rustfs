@@ -868,13 +868,14 @@ fn is_signature_bound_header(name: &str) -> bool {
 /// True when the request head carries SigV4 or SigV2 presigned query/header
 /// markers. Used as defense in depth so replication-only write headers cannot
 /// take effect on presigned URLs even if signed.
-pub(crate) fn is_presigned_request_head(header: &HeaderMap, query: Option<&str>) -> bool {
-    if is_request_presigned_signature_v4_with_query(header, query) || is_request_presigned_signature_v2(header, query) {
+pub(crate) fn is_presigned_request_head(_header: &HeaderMap, query: Option<&str>) -> bool {
+    if is_request_presigned_signature_v4_with_query(query) || is_request_presigned_signature_v2(query) {
         return true;
     }
     query.is_some_and(|query| {
         form_urlencoded::parse(query.as_bytes()).any(|(name, _)| {
             name.eq_ignore_ascii_case("x-amz-signature")
+                || name.eq_ignore_ascii_case("x-amz-credential")
                 || name.eq_ignore_ascii_case("signature")
                 || name.eq_ignore_ascii_case("awsaccesskeyid")
         })
@@ -2094,7 +2095,6 @@ mod tests {
 
         let conditions = get_condition_values(&headers, &cred, None, None, None);
         for (name, expected) in [
-            ("signatureAge", "300"),
             ("object-lock-mode", "GOVERNANCE"),
             ("object-lock-legal-hold", "ON"),
             ("object-lock-retain-until-date", "2030-01-01T00:00:00Z"),
@@ -2102,6 +2102,10 @@ mod tests {
         ] {
             assert_eq!(conditions.get(name), Some(&vec![expected.to_string()]), "{name}");
         }
+        assert!(
+            !conditions.contains_key("signatureAge"),
+            "client-supplied x-amz-signature-age must not populate signatureAge"
+        );
         for name in [
             "x-amz-signature-age",
             "x-amz-object-lock-mode",
@@ -2131,9 +2135,14 @@ mod tests {
 
         let conditions = get_condition_values(&headers, &cred, None, None, None);
 
-        assert_eq!(conditions.get("signatureAge"), Some(&vec!["300".to_string()]));
-        // Verify the header is removed after processing
-        // (we can't directly test this without changing the function signature)
+        assert!(
+            !conditions.contains_key("signatureAge"),
+            "client-supplied x-amz-signature-age must not populate signatureAge"
+        );
+        assert!(
+            !conditions.contains_key("x-amz-signature-age"),
+            "client-supplied x-amz-signature-age must not be forwarded as a condition"
+        );
     }
 
     #[tokio::test]

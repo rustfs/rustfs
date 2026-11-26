@@ -613,8 +613,7 @@ impl rustfs_protocols::common::client::s3::StorageBackend for ProtocolStorageCli
         )?;
         // A listing can be filtered per principal (such as table-bucket list isolation),
         // so authorization must run on the exact envelope handed to the list use case.
-        crate::storage::access_owned::listing_multipart::authorize_list_objects_v2(&self.server_ctx, &mut envelope, &bucket)
-            .await?;
+        crate::storage_api::protocols::client::authorize_list_objects_v2(&self.server_ctx, &mut envelope, &bucket).await?;
         rustfs_io_metrics::record_s3_op(rustfs_s3_ops::S3Operation::ListObjectsV2);
         self.owned_bucket_usecase()
             .execute_list_objects_v2(envelope, input)

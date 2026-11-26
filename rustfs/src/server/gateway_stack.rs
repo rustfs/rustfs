@@ -340,8 +340,6 @@ impl GatewayStack {
             (None, _) => true,
         };
         let secure_transport = attach_host_facts(extensions);
-        let track_plaintext_post_ssec =
-            !secure_transport && *request.method() == http::Method::POST && !carries_ssec_headers(request.headers());
         let refusal_request_id = unsigned_extension_refusal.as_ref().map(|_| {
             extensions
                 .get::<RequestContext>()
@@ -349,6 +347,8 @@ impl GatewayStack {
                 .map(|id| id.request_id().as_str().to_owned())
                 .unwrap_or_else(|| uuid::Uuid::new_v4().simple().to_string())
         });
+        let track_plaintext_post_ssec =
+            !secure_transport && *request.method() == http::Method::POST && !carries_ssec_headers(request.headers());
         // `Connection` is an HTTP/1 header; HTTP/2 and HTTP/3 forbid it and end only the stream.
         let http1 = request.version() < http::Version::HTTP_2;
         let is_head = request.method() == http::Method::HEAD;

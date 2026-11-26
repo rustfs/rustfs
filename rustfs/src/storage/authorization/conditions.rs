@@ -576,10 +576,11 @@ pub(crate) async fn maybe_merge_object_tag_conditions<R: AuthorizationRequest + 
 
 #[cfg(test)]
 mod signature_age_post_tests {
-    use super::*;
+    use super::{AuthorizationRequest as _, AuthzPrincipal, AuthzTarget, authorization_conditions, request_authz_facts};
     use crate::storage::authorization::tests::fixture::request;
     use crate::storage::request_markers::PostObjectPolicyHeaders;
     use http::{HeaderValue, Method};
+    use rustfs_policy::policy::action::{Action, S3Action};
 
     #[test]
     fn post_object_form_query_does_not_populate_signature_age() {
@@ -646,9 +647,15 @@ mod signature_age_post_tests {
 
 #[cfg(test)]
 mod tagging_condition_tests {
-    use super::*;
+    use super::{
+        AuthorizationRequest as _, AuthzPrincipal, AuthzTarget, RequestedObjectTags, authorization_conditions,
+        merge_request_object_tag_conditions, request_authz_facts,
+    };
     use crate::storage::authorization::tests::fixture::request;
-    use http::{HeaderValue, Method};
+    use http::{HeaderMap, HeaderValue, Method};
+    use rustfs_policy::policy::action::{Action, S3Action};
+    use rustfs_s3_types::S3ErrorCode;
+    use std::collections::HashMap;
 
     #[test]
     fn merge_request_object_tag_conditions_applies_to_tagging_and_replication_write_actions() {

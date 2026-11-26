@@ -344,7 +344,7 @@ async fn load_copy_source_bucket_generation(
 
 #[cfg(test)]
 mod tagging_authz_tests {
-    use super::*;
+    use super::{CopyObjectAuthorization, CopySourceObject, ObjectOptions, authorize_copy_object};
     use crate::storage::access_owned::listing_multipart::{CreateMultipartAuthorization, authorize_create_multipart_upload};
     use crate::storage::access_owned::object_write::{
         PostObjectFormPolicy, PostObjectPolicyFields, PutObjectAuthorization, authorize_put_object,
@@ -352,11 +352,12 @@ mod tagging_authz_tests {
     use crate::storage::authorization::tests::fixture::{request, server_context};
     use crate::storage::storage_api::contract::bucket::{BucketOperations as _, MakeBucketOptions};
     use crate::storage::storage_api::contract::object::ObjectIO as _;
+    use crate::storage::storage_api::runtime_sources_consumer::ECStore;
     use http::Method;
     use rustfs_s3_types::S3ErrorCode;
     use std::collections::HashMap;
 
-    async fn publish_policy(store: &crate::storage::ECStore, bucket: &str, statements: Vec<serde_json::Value>) {
+    async fn publish_policy(store: &ECStore, bucket: &str, statements: Vec<serde_json::Value>) {
         let policy = serde_json::json!({
             "Version": "2012-10-17",
             "Statement": statements,

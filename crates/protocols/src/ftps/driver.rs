@@ -857,24 +857,20 @@ where
                 .await
                 .map_err(|_| Error::new(ErrorKind::PermanentFileNotAvailable, "Access denied"))?;
 
-            let output = self
-                .storage
-                .list_objects_v2(session_context, list_input)
-                .await
-                .map_err(|e| {
-                    error!(
-                        event = EVENT_FTPS_DIRECTORY_STATE,
-                        component = LOG_COMPONENT_PROTOCOLS,
-                        subsystem = LOG_SUBSYSTEM_FTPS_DRIVER,
-                        state = "remove_failed",
-                        path = %path_str,
-                        bucket = %bucket,
-                        object = %prefix_with_slash,
-                        error = %e,
-                        "ftps directory state changed"
-                    );
-                    Error::new(ErrorKind::PermanentFileNotAvailable, format!("List failed: {e}"))
-                })?;
+            let output = self.storage.list_objects_v2(session_context, list_input).await.map_err(|e| {
+                error!(
+                    event = EVENT_FTPS_DIRECTORY_STATE,
+                    component = LOG_COMPONENT_PROTOCOLS,
+                    subsystem = LOG_SUBSYSTEM_FTPS_DRIVER,
+                    state = "remove_failed",
+                    path = %path_str,
+                    bucket = %bucket,
+                    object = %prefix_with_slash,
+                    error = %e,
+                    "ftps directory state changed"
+                );
+                Error::new(ErrorKind::PermanentFileNotAvailable, format!("List failed: {e}"))
+            })?;
 
             let has_content = output
                 .contents

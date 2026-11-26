@@ -1876,10 +1876,8 @@ mod tests {
 
     async fn run_version_listing_metadata_permissions_enforce_version_actions_and_conditions() {
         use crate::app::runtime_sources::ServerContextSlot;
-        use crate::app::storage_api::test::{
-            StorageObjectOptions, StoragePutObjReader,
-            contract::object::{ObjectIO as _, ObjectOperations as _},
-        };
+        use crate::app::storage_api::test::contract::object::{ObjectIO as _, ObjectOperations as _};
+        use crate::app::storage_api::test::{StorageObjectOptions, StoragePutObjReader};
         use http::{Extensions, HeaderMap, Uri};
         use rustfs_iam::store::{Store as _, UserType, object::ObjectStore};
         use rustfs_madmin::{AccountStatus, AddOrUpdateUserReq};
