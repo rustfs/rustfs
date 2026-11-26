@@ -433,7 +433,7 @@ pub(crate) mod tonic_service_consumer {
 
 #[cfg(test)]
 pub(crate) mod test_consumer {
-    pub(crate) use rustfs_ecstore::store::DeleteAfterObjectLockSnapshotBarrier;
+    pub(crate) use rustfs_ecstore::api::object::test_util::DeleteAfterObjectLockSnapshotBarrier;
     pub(crate) mod sse {
         pub(crate) use super::super::super::sse::TestAuthorizationHooks;
         pub(crate) use super::super::super::sse::tests::{RecordingKmsKeyAuthorizer, sse_kms_object_metadata};
