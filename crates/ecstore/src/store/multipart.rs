@@ -42,6 +42,40 @@ impl crate::storage_api_contracts::multipart::MultipartUploadInspection for ECSt
     }
 }
 
+impl ECStore {
+    /// Scan staged multipart part sizes for `bucket` across every pool and erasure
+    /// set without acquiring object or upload locks, stopping early once `limit`
+    /// is exceeded.
+    pub(crate) async fn scan_bucket_staged_multipart_parts(
+        &self,
+        bucket: &str,
+        expected_incarnation_id: Option<Uuid>,
+        bucket_lifecycle_lock_fence: Option<&crate::object_api::NamespaceLockFence>,
+        limit: u64,
+    ) -> Result<(HashMap<String, HashMap<usize, u64>>, bool)> {
+        let mut uploads = HashMap::new();
+        let mut total = 0_u64;
+        for pool in &self.pools {
+            for set in &pool.disk_set {
+                let exceeded = set
+                    .scan_set_staged_multipart_parts(
+                        bucket,
+                        expected_incarnation_id,
+                        bucket_lifecycle_lock_fence,
+                        limit,
+                        &mut uploads,
+                        &mut total,
+                    )
+                    .await?;
+                if exceeded {
+                    return Ok((uploads, true));
+                }
+            }
+        }
+        Ok((uploads, false))
+    }
+}
+
 #[cfg(test)]
 static DATA_MOVEMENT_MULTIPART_DISCOVERY_COUNTS: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<Uuid, usize>>> =
     std::sync::OnceLock::new();
@@ -1327,9 +1361,11 @@ impl ECStore {
         let encoded_object = encode_dir_object_ref(object);
         let object = encoded_object.as_ref();
         let (mut opts, _bucket_lifecycle_guard) = self.guard_multipart_bucket_incarnation(bucket, opts).await?;
-        if opts.overwrites_existing_version() && !is_meta_bucketname(bucket) {
-            // The set-level commit judges the null version this completion
-            // replaces; give it the same authoritative snapshot a PUT carries.
+        if !is_meta_bucketname(bucket) {
+            // Capture the metadata-transaction snapshot before SetDisks acquires
+            // the object namespace write lock so both the Object Lock check on
+            // the version being replaced (null or staged version id) and
+            // reservation::begin reuse it without taking new_ns_lock(bucket, bucket).
             let expected_incarnation_id = opts
                 .expected_bucket_incarnation_id
                 .ok_or_else(|| Error::other("multipart completion is missing its bucket incarnation"))?;
@@ -1467,7 +1503,7 @@ impl ECStore {
         }
         let (mut opts, _bucket_lifecycle_guard) = self.guard_multipart_bucket_incarnation(bucket, opts).await?;
         ensure_decommission_capacity_mutation_id(bucket, object, &mut opts);
-        if opts.overwrites_existing_version() && !is_meta_bucketname(bucket) {
+        if !is_meta_bucketname(bucket) {
             let expected_incarnation_id = opts
                 .expected_bucket_incarnation_id
                 .ok_or_else(|| Error::other("data movement completion is missing its bucket incarnation"))?;

@@ -40,7 +40,9 @@ use http::header::{CONTENT_DISPOSITION, CONTENT_LENGTH, CONTENT_TYPE};
 use http::{HeaderMap, StatusCode};
 use hyper::Method;
 use matchit::Params;
-use rustfs_config::MAX_BUCKET_METADATA_IMPORT_SIZE;
+use rustfs_config::{
+    MAX_BUCKET_METADATA_IMPORT_EXPANDED_SIZE, MAX_BUCKET_METADATA_IMPORT_MEMBER_SIZE, MAX_BUCKET_METADATA_IMPORT_SIZE,
+};
 use rustfs_gateway_types::cors_tagging::PersistedTagging as Tagging;
 use rustfs_gateway_types::persistence::{
     PersistedBucketEncryptionConfiguration as ServerSideEncryptionConfiguration, PersistedNotificationConfiguration,
@@ -70,6 +72,21 @@ const DIAGNOSTIC_EXPORT_MANIFEST: &str = "_diagnostic-manifest.json";
 /// Earlier partial exports omitted configurations and carried this marker.
 /// Reject those archives before import can create an incomplete replacement.
 const EXPORT_UNREADABLE_MANIFEST: &str = "rustfs-unreadable-configs.json";
+
+/// The bucket configuration filenames exported by `ExportBucketMetadata` and
+/// accepted by `ImportBucketMetadata`.
+const BUCKET_METADATA_CONFIG_FILES: &[&str] = &[
+    BUCKET_POLICY_CONFIG,
+    BUCKET_NOTIFICATION_CONFIG,
+    BUCKET_LIFECYCLE_CONFIG,
+    BUCKET_SSECONFIG,
+    BUCKET_TAGGING_CONFIG,
+    BUCKET_QUOTA_CONFIG_FILE,
+    OBJECT_LOCK_CONFIG,
+    BUCKET_VERSIONING_CONFIG,
+    BUCKET_REPLICATION_CONFIG,
+    BUCKET_TARGETS_FILE,
+];
 
 const LOG_COMPONENT_ADMIN: &str = "admin";
 const LOG_SUBSYSTEM_BUCKET_META: &str = "bucket_meta";
@@ -392,21 +409,8 @@ impl Operation for ExportBucketMetadata {
         let mut zip_writer = ZipWriter::new(Cursor::new(Vec::new()));
         let mut errors = Vec::new();
 
-        let confs = [
-            BUCKET_POLICY_CONFIG,
-            BUCKET_NOTIFICATION_CONFIG,
-            BUCKET_LIFECYCLE_CONFIG,
-            BUCKET_SSECONFIG,
-            BUCKET_TAGGING_CONFIG,
-            BUCKET_QUOTA_CONFIG_FILE,
-            OBJECT_LOCK_CONFIG,
-            BUCKET_VERSIONING_CONFIG,
-            BUCKET_REPLICATION_CONFIG,
-            BUCKET_TARGETS_FILE,
-        ];
-
         for bucket in buckets {
-            for &conf in confs.iter() {
+            for &conf in BUCKET_METADATA_CONFIG_FILES {
                 let conf_path = path_join_buf(&[bucket.name.as_str(), conf]);
                 let config = match exported_bucket_config(&bucket.name, conf).await {
                     Ok(Some(config)) => config,
@@ -522,42 +526,15 @@ impl Operation for ImportBucketMetadata {
             }
         };
 
-        let mut zip_reader =
-            ZipArchive::new(Cursor::new(body)).map_err(|e| s3_error!(InternalError, "failed to read import archive: {e}"))?;
-
-        // First pass: read all file contents into memory
-        let mut file_contents = Vec::new();
-        for i in 0..zip_reader.len() {
-            let (mut file, file_path) = zip_reader
-                .by_index(i)
-                .and_then(|file| {
-                    let path = file.name()?.into_owned();
-                    Ok((file, path))
-                })
-                .map_err(|e| s3_error!(InternalError, "failed to read archive entry: {e}"))?;
-
-            let mut content = Vec::new();
-            file.read_to_end(&mut content)
-                .map_err(|e| s3_error!(InternalError, "failed to read archive entry content: {e}"))?;
-
-            file_contents.push((file_path, content));
-        }
-
-        // Reject the whole archive before creating buckets or writing configs,
-        // even when the marker is malformed or follows ordinary config entries.
-        if file_contents.iter().any(|(path, _)| {
-            path == DIAGNOSTIC_EXPORT_MANIFEST
-                || path == DIAGNOSTIC_EXPORT_PREFIX
-                || path
-                    .strip_prefix(DIAGNOSTIC_EXPORT_PREFIX)
-                    .is_some_and(|suffix| suffix.starts_with('/'))
-                || path.rsplit('/').next() == Some(EXPORT_UNREADABLE_MANIFEST)
-        }) {
-            return Err(s3_error!(
-                InvalidRequest,
-                "diagnostic or incomplete bucket metadata archives cannot be imported"
-            ));
-        }
+        let file_contents = tokio::task::spawn_blocking(move || {
+            read_bucket_metadata_import_archive(
+                &body,
+                MAX_BUCKET_METADATA_IMPORT_MEMBER_SIZE,
+                MAX_BUCKET_METADATA_IMPORT_EXPANDED_SIZE,
+            )
+        })
+        .await
+        .map_err(|e| s3_error!(InternalError, "bucket metadata import decompression task failed: {e}"))??;
 
         let durable_quota_import = imported_quota_requires_fleet_proof(&file_contents)?;
         let quota_fleet_proof =
@@ -818,6 +795,111 @@ impl Operation for ImportBucketMetadata {
     }
 }
 
+fn is_non_restorable_export_marker(path: &str) -> bool {
+    path == DIAGNOSTIC_EXPORT_MANIFEST
+        || path == DIAGNOSTIC_EXPORT_PREFIX
+        || path
+            .strip_prefix(DIAGNOSTIC_EXPORT_PREFIX)
+            .is_some_and(|suffix| suffix.starts_with('/'))
+        || path.rsplit('/').next() == Some(EXPORT_UNREADABLE_MANIFEST)
+}
+
+fn is_importable_bucket_config_path(path: &str) -> bool {
+    let mut parts = path.split(SLASH_SEPARATOR);
+    let Some(_bucket_name) = parts.next().filter(|segment| !segment.is_empty()) else {
+        return false;
+    };
+    let Some(conf_name) = parts.next().filter(|segment| !segment.is_empty()) else {
+        return false;
+    };
+    if parts.next().is_some() {
+        return false;
+    }
+    BUCKET_METADATA_CONFIG_FILES.contains(&conf_name)
+}
+
+/// Read one member of a bucket metadata import archive, enforcing both a per-member
+/// expanded size cap and a shared archive-wide expansion budget.
+///
+/// `MAX_BUCKET_METADATA_IMPORT_SIZE` bounds the compressed upload only. Because ZIP
+/// members can expand far beyond their compressed length, reading through `Read::take`
+/// guarantees neither individual config files nor the archive as a whole can exceed
+/// the configured memory and persistence limits.
+fn read_import_member(file: &mut impl std::io::Read, member_limit: u64, remaining_budget: &mut u64) -> S3Result<Vec<u8>> {
+    let allowed = member_limit.min(*remaining_budget);
+    let mut content = Vec::new();
+    // Read one byte past the effective limit: if it arrives, the member exceeded
+    // either the per-member cap or the remaining archive-wide expansion budget.
+    let read_bytes = file
+        .take(allowed.saturating_add(1))
+        .read_to_end(&mut content)
+        .map_err(|e| s3_error!(InternalError, "failed to read archive entry content: {e}"))?;
+    let read = u64::try_from(read_bytes).map_err(|_| {
+        s3_error!(
+            EntityTooLarge,
+            "bucket metadata import archive expands beyond the {MAX_BUCKET_METADATA_IMPORT_EXPANDED_SIZE} byte limit"
+        )
+    })?;
+
+    if read > member_limit {
+        return Err(s3_error!(
+            EntityTooLarge,
+            "bucket metadata import entry exceeds the {member_limit} byte limit"
+        ));
+    }
+
+    if read > *remaining_budget {
+        return Err(s3_error!(
+            EntityTooLarge,
+            "bucket metadata import archive expands beyond the {MAX_BUCKET_METADATA_IMPORT_EXPANDED_SIZE} byte limit"
+        ));
+    }
+
+    *remaining_budget -= read;
+    Ok(content)
+}
+
+fn read_bucket_metadata_import_archive(body: &[u8], member_limit: u64, archive_budget: u64) -> S3Result<Vec<(String, Vec<u8>)>> {
+    let mut zip_reader =
+        ZipArchive::new(Cursor::new(body)).map_err(|e| s3_error!(InternalError, "failed to read import archive: {e}"))?;
+
+    // Reject diagnostic or incomplete archives before decompressing any entry,
+    // even when the marker is malformed or follows ordinary config entries, and
+    // skip unrecognized member paths before allocating or decompressing content.
+    let mut recognized_entries = Vec::new();
+    for i in 0..zip_reader.len() {
+        let (is_dir, file_path) = zip_reader
+            .by_index_raw(i)
+            .and_then(|file| Ok((file.is_dir(), file.name()?.into_owned())))
+            .map_err(|e| s3_error!(InternalError, "failed to read archive entry: {e}"))?;
+
+        if is_non_restorable_export_marker(&file_path) {
+            return Err(s3_error!(
+                InvalidRequest,
+                "diagnostic or incomplete bucket metadata archives cannot be imported"
+            ));
+        }
+
+        if !is_dir && is_importable_bucket_config_path(&file_path) {
+            recognized_entries.push((i, file_path));
+        }
+    }
+
+    // Shared across every recognized member below, so the archive as a whole is
+    // bounded while each individual config file is capped by `member_limit`.
+    let mut remaining_budget = archive_budget;
+    let mut file_contents = Vec::with_capacity(recognized_entries.len());
+    for (i, file_path) in recognized_entries {
+        let mut file = zip_reader
+            .by_index(i)
+            .map_err(|e| s3_error!(InternalError, "failed to read archive entry: {e}"))?;
+        let content = read_import_member(&mut file, member_limit, &mut remaining_budget)?;
+        file_contents.push((file_path, content));
+    }
+
+    Ok(file_contents)
+}
+
 fn imported_quota_requires_fleet_proof(file_contents: &[(String, Vec<u8>)]) -> S3Result<bool> {
     let mut durable = false;
     for (file_path, content) in file_contents {
@@ -1018,6 +1100,181 @@ fn set_imported_config_string(target: &mut Option<String>, config_file: &str, da
             .map_err(|e| s3_error!(InternalError, "imported bucket metadata {config_file} is not valid UTF-8: {e}"))?,
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod import_expansion_tests {
+    use super::*;
+    use rustfs_config::MAX_ADMIN_REQUEST_BODY_SIZE;
+    use rustfs_s3_types::S3ErrorCode;
+
+    fn build_zip(entries: &[(&str, &[u8])]) -> Vec<u8> {
+        let mut writer = ZipWriter::new(Cursor::new(Vec::new()));
+        for (name, payload) in entries {
+            writer
+                .start_file(*name, SimpleFileOptions::default())
+                .expect("start test archive entry");
+            writer.write_all(payload).expect("write test archive entry");
+        }
+        writer.finish().expect("finish test archive").into_inner()
+    }
+
+    #[test]
+    fn import_member_read_enforces_per_member_and_shared_archive_budgets() {
+        let oversized = vec![b'a'; 1024];
+        let mut budget: u64 = 4096;
+        let err = read_import_member(&mut oversized.as_slice(), 512, &mut budget)
+            .expect_err("a member larger than the per-member cap must be rejected");
+        assert_eq!(*err.code(), S3ErrorCode::EntityTooLarge);
+        assert_eq!(budget, 4096, "rejected read must not modify the shared budget");
+
+        let member = vec![b'b'; 400];
+        let mut shared_budget: u64 = 1000;
+        let first = read_import_member(&mut member.as_slice(), 512, &mut shared_budget).expect("first member fits");
+        assert_eq!(first.len(), 400);
+        assert_eq!(shared_budget, 600);
+
+        read_import_member(&mut member.as_slice(), 512, &mut shared_budget).expect("second member fits");
+        assert_eq!(shared_budget, 200);
+
+        let err = read_import_member(&mut member.as_slice(), 512, &mut shared_budget)
+            .expect_err("third member must be rejected once the shared archive budget is exhausted");
+        assert_eq!(*err.code(), S3ErrorCode::EntityTooLarge);
+    }
+
+    #[test]
+    fn compressed_zip_bomb_member_is_rejected_by_expanded_size() {
+        const EXPANDED_SIZE: usize = 256 * 1024;
+        let zeros = vec![0u8; EXPANDED_SIZE];
+        let archive = build_zip(&[(&format!("demo/{BUCKET_POLICY_CONFIG}"), &zeros)]);
+        assert!(
+            archive.len() < EXPANDED_SIZE / 32,
+            "compressed bomb fixture must compress far smaller than its expanded size"
+        );
+
+        let err = read_bucket_metadata_import_archive(&archive, EXPANDED_SIZE as u64 - 1, EXPANDED_SIZE as u64 * 4)
+            .expect_err("compressed member expanding past the per-member cap must be rejected");
+        assert_eq!(*err.code(), S3ErrorCode::EntityTooLarge);
+
+        let err = read_bucket_metadata_import_archive(&archive, EXPANDED_SIZE as u64, EXPANDED_SIZE as u64 - 1)
+            .expect_err("compressed member expanding past the archive budget must be rejected");
+        assert_eq!(*err.code(), S3ErrorCode::EntityTooLarge);
+
+        let entries = read_bucket_metadata_import_archive(&archive, EXPANDED_SIZE as u64, EXPANDED_SIZE as u64)
+            .expect("member exactly matching both limits must be accepted");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].1.len(), EXPANDED_SIZE);
+    }
+
+    #[test]
+    fn total_expanded_budget_is_enforced_across_multiple_members() {
+        let payload = vec![b' '; 64 * 1024];
+        let archive = build_zip(&[
+            (&format!("bucket-a/{BUCKET_POLICY_CONFIG}"), &payload),
+            (&format!("bucket-b/{BUCKET_POLICY_CONFIG}"), &payload),
+            (&format!("bucket-c/{BUCKET_POLICY_CONFIG}"), &payload),
+        ]);
+
+        // Each member fits under the 64 KiB per-member cap, while the combined 192 KiB
+        // exceeds the 150 KiB archive-wide expansion budget.
+        let err = read_bucket_metadata_import_archive(&archive, 64 * 1024, 150 * 1024)
+            .expect_err("combined expanded size exceeding total archive budget must be rejected");
+        assert_eq!(*err.code(), S3ErrorCode::EntityTooLarge);
+    }
+
+    #[test]
+    fn oversized_whitespace_padded_policy_json_member_is_rejected() {
+        let mut padded_policy = br#"{"Version":"2012-10-17","Statement":[]}"#.to_vec();
+        let target_len = usize::try_from(MAX_BUCKET_METADATA_IMPORT_MEMBER_SIZE).expect("1 MiB fits in usize") + 1;
+        padded_policy.resize(target_len, b' ');
+        let archive = build_zip(&[(&format!("demo/{BUCKET_POLICY_CONFIG}"), &padded_policy)]);
+        assert!(archive.len() < 16 * 1024, "whitespace-padded policy compresses well below upload limits");
+
+        let err = read_bucket_metadata_import_archive(
+            &archive,
+            MAX_BUCKET_METADATA_IMPORT_MEMBER_SIZE,
+            MAX_BUCKET_METADATA_IMPORT_EXPANDED_SIZE,
+        )
+        .expect_err("oversized single policy.json member must be rejected by the per-member cap");
+        assert_eq!(*err.code(), S3ErrorCode::EntityTooLarge);
+    }
+
+    #[test]
+    fn unrecognized_archive_members_are_skipped_without_decompression() {
+        let huge_unrecognized = vec![0u8; 4 * 1024 * 1024];
+        let versioning = b"<VersioningConfiguration><Status>Enabled</Status></VersioningConfiguration>";
+        let archive = build_zip(&[
+            ("padding", &huge_unrecognized),
+            ("demo/unknown-extra.bin", &huge_unrecognized),
+            ("demo/policy.json/nested", &huge_unrecognized),
+            (&format!("demo/{BUCKET_VERSIONING_CONFIG}"), versioning),
+        ]);
+
+        let entries = read_bucket_metadata_import_archive(
+            &archive,
+            MAX_BUCKET_METADATA_IMPORT_MEMBER_SIZE,
+            MAX_BUCKET_METADATA_IMPORT_EXPANDED_SIZE,
+        )
+        .expect("unrecognized members must be skipped without exhausting expansion budgets");
+        assert_eq!(entries, vec![(format!("demo/{BUCKET_VERSIONING_CONFIG}"), versioning.to_vec())]);
+    }
+
+    #[test]
+    fn diagnostic_markers_are_rejected_before_decompressing_archive_members() {
+        let oversized_policy = vec![b' '; 2 * 1024 * 1024];
+        for marker in [
+            DIAGNOSTIC_EXPORT_MANIFEST.to_string(),
+            DIAGNOSTIC_EXPORT_PREFIX.to_string(),
+            format!("{DIAGNOSTIC_EXPORT_PREFIX}/demo/{BUCKET_VERSIONING_CONFIG}"),
+            format!("demo/{EXPORT_UNREADABLE_MANIFEST}"),
+        ] {
+            let archive = build_zip(&[(&format!("demo/{BUCKET_POLICY_CONFIG}"), &oversized_policy), (&marker, b"{}")]);
+            let err = read_bucket_metadata_import_archive(
+                &archive,
+                MAX_BUCKET_METADATA_IMPORT_MEMBER_SIZE,
+                MAX_BUCKET_METADATA_IMPORT_EXPANDED_SIZE,
+            )
+            .expect_err("diagnostic or incomplete marker must reject the whole archive up front");
+            assert_eq!(
+                *err.code(),
+                S3ErrorCode::InvalidRequest,
+                "marker {marker:?} must be rejected with InvalidRequest before decompressing earlier entries"
+            );
+        }
+    }
+
+    #[test]
+    fn valid_bucket_metadata_archive_imports_recognized_configs_and_constants_align() {
+        assert!(
+            MAX_BUCKET_METADATA_IMPORT_EXPANDED_SIZE >= MAX_BUCKET_METADATA_IMPORT_SIZE as u64,
+            "expanded archive budget must not be smaller than the compressed upload cap"
+        );
+        assert_eq!(
+            MAX_BUCKET_METADATA_IMPORT_MEMBER_SIZE, MAX_ADMIN_REQUEST_BODY_SIZE as u64,
+            "per-member cap should match MAX_ADMIN_REQUEST_BODY_SIZE"
+        );
+
+        let policy = br#"{"Version":"2012-10-17","Statement":[]}"#;
+        let versioning = b"<VersioningConfiguration><Status>Enabled</Status></VersioningConfiguration>";
+        let archive = build_zip(&[
+            (&format!("alpha/{BUCKET_POLICY_CONFIG}"), policy),
+            (&format!("beta/{BUCKET_VERSIONING_CONFIG}"), versioning),
+        ]);
+
+        let entries = read_bucket_metadata_import_archive(
+            &archive,
+            MAX_BUCKET_METADATA_IMPORT_MEMBER_SIZE,
+            MAX_BUCKET_METADATA_IMPORT_EXPANDED_SIZE,
+        )
+        .expect("valid metadata archive must import cleanly");
+        assert_eq!(
+            entries,
+            vec![
+                (format!("alpha/{BUCKET_POLICY_CONFIG}"), policy.to_vec()),
+                (format!("beta/{BUCKET_VERSIONING_CONFIG}"), versioning.to_vec()),
+            ]
+        );
+    }
 }
 
 #[cfg(test)]

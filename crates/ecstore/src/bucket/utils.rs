@@ -479,6 +479,11 @@ pub fn check_bucket_and_object_names(bucket: &str, object: &str) -> Result<()> {
         return Err(StorageError::ObjectNameInvalid(bucket.to_string(), object.to_string()));
     }
 
+    // Apply the same leading-slash and length rules enforced by write/stat validators
+    // (check_object_args, check_put_object_args) so non-path inputs such as copy sources
+    // cannot alias `key` via `/key` when the disk layer joins `bucket//key`.
+    check_object_name_for_length_and_slash(bucket, object)?;
+
     if !is_valid_object_prefix(object) {
         return Err(StorageError::ObjectNameInvalid(bucket.to_string(), object.to_string()));
     }
@@ -683,6 +688,58 @@ mod tests {
         assert!(matches!(
             check_put_object_args("bucket", &format!("{}/", "e".repeat(dir_budget + 1))),
             Err(StorageError::ObjectNameInvalid(_, _))
+        ));
+    }
+
+    #[test]
+    fn read_copy_delete_args_reject_leading_slash_like_write_args() {
+        for key in [
+            "/a",
+            "//a",
+            "/a/b",
+            "/",
+            "/tables/t1/data/part.parquet",
+            "/.rustfs-table/metadata/current.json",
+        ] {
+            assert!(
+                matches!(check_get_obj_args("bucket", key), Err(StorageError::ObjectNamePrefixAsSlash(_, _))),
+                "check_get_obj_args must reject {key:?}"
+            );
+            assert!(
+                matches!(check_copy_obj_args("bucket", key), Err(StorageError::ObjectNamePrefixAsSlash(_, _))),
+                "check_copy_obj_args must reject {key:?}"
+            );
+            assert!(
+                matches!(check_del_obj_args("bucket", key), Err(StorageError::ObjectNamePrefixAsSlash(_, _))),
+                "check_del_obj_args must reject {key:?}"
+            );
+            assert!(
+                matches!(check_object_args("bucket", key), Err(StorageError::ObjectNamePrefixAsSlash(_, _))),
+                "check_object_args must reject {key:?}"
+            );
+            assert!(
+                matches!(check_put_object_args("bucket", key), Err(StorageError::ObjectNamePrefixAsSlash(_, _))),
+                "check_put_object_args must reject {key:?}"
+            );
+        }
+
+        assert!(check_get_obj_args("bucket", "a/b").is_ok());
+        assert!(check_copy_obj_args("bucket", "a/b/").is_ok());
+        assert!(check_copy_obj_args("bucket", "tables/t1/data/part.parquet").is_ok());
+        assert!(check_del_obj_args("bucket", "a").is_ok());
+
+        // Length cap from check_object_name_for_length_and_slash applies consistently.
+        assert!(matches!(
+            check_get_obj_args("bucket", &"a".repeat(1025)),
+            Err(StorageError::ObjectNameTooLong(_, _))
+        ));
+        assert!(matches!(
+            check_copy_obj_args("bucket", &"a".repeat(1025)),
+            Err(StorageError::ObjectNameTooLong(_, _))
+        ));
+        assert!(matches!(
+            check_del_obj_args("bucket", &"a".repeat(1025)),
+            Err(StorageError::ObjectNameTooLong(_, _))
         ));
     }
 

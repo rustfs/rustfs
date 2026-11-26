@@ -14,7 +14,7 @@
 
 use crate::compress_index::{Index, TryGetIndex};
 use pin_project_lite::pin_project;
-use rustfs_utils::compress::{CompressionAlgorithm, compress_block, decompress_block};
+use rustfs_utils::compress::{CompressionAlgorithm, compress_block, decompress_block_with_limit};
 use rustfs_utils::{put_uvarint, uvarint};
 use std::cmp::min;
 use std::io::{self};
@@ -29,6 +29,11 @@ const COMPRESS_TYPE_END: u8 = 0xFF;
 
 const DEFAULT_BLOCK_SIZE: usize = 1 << 20; // 1MB
 const HEADER_LEN: usize = 8;
+/// Upper bound on the plaintext length a single framed block may declare.
+/// `CompressReader` emits `DEFAULT_BLOCK_SIZE` (1 MiB) blocks and the 24-bit
+/// payload header caps framed blocks below 16 MiB, so this safely accepts all
+/// valid blocks while bounding memory allocated per block decode.
+const MAX_BLOCK_PLAINTEXT_LEN: u64 = 1 << 24;
 
 pin_project! {
     #[derive(Debug)]
@@ -363,9 +368,30 @@ where
             *this.poisoned = true;
             return Poll::Ready(Err(io::Error::new(io::ErrorKind::InvalidData, "Invalid compressed block length prefix")));
         }
+        // Bound the untrusted declared plaintext length up front and enforce it
+        // inside the decoder so a small block cannot expand into GiB before the
+        // post-decode length check runs.
+        if uncompress_len > MAX_BLOCK_PLAINTEXT_LEN {
+            *this.compressed_read = 0;
+            *this.compressed_len = 0;
+            *this.poisoned = true;
+            return Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Compressed block declares an oversized length",
+            )));
+        }
+        let Ok(uncompress_len_usize) = usize::try_from(uncompress_len) else {
+            *this.compressed_read = 0;
+            *this.compressed_len = 0;
+            *this.poisoned = true;
+            return Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Compressed block declares an oversized length",
+            )));
+        };
         let compressed_data = &compressed_buf[uvarint as usize..];
         let decompressed = if typ == COMPRESS_TYPE_COMPRESSED {
-            match decompress_block(compressed_data, *this.compression_algorithm) {
+            match decompress_block_with_limit(compressed_data, *this.compression_algorithm, uncompress_len_usize) {
                 Ok(out) => out,
                 Err(e) => {
                     // error!("DecompressReader decompress_block error: {e}");
@@ -389,7 +415,7 @@ where
             *this.compressed_len = 0;
             return Poll::Ready(Err(io::Error::new(io::ErrorKind::InvalidData, "Empty compressed block")));
         }
-        if decompressed.len() != uncompress_len as usize {
+        if decompressed.len() != uncompress_len_usize {
             // error!("DecompressReader decompressed length mismatch: {} != {}", decompressed.len(), uncompress_len);
             *this.compressed_read = 0;
             *this.compressed_len = 0;
@@ -850,5 +876,105 @@ mod tests {
             .expect_err("unterminated length prefix must error");
         assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
         assert!(err.to_string().contains("length prefix"), "got: {err}");
+    }
+
+    fn build_framed_compressed_block(declared_len: u64, compressed_data: &[u8]) -> Vec<u8> {
+        let mut uvarint_buf = [0u8; 10];
+        let int_len = put_uvarint(&mut uvarint_buf[..], declared_len);
+        let len = compressed_data.len() + int_len;
+        assert!(len < 1 << 24, "fixture must fit the 24-bit length field");
+
+        let mut out = Vec::with_capacity(HEADER_LEN + len);
+        out.push(COMPRESS_TYPE_COMPRESSED);
+        out.push((len & 0xFF) as u8);
+        out.push(((len >> 8) & 0xFF) as u8);
+        out.push(((len >> 16) & 0xFF) as u8);
+        out.extend_from_slice(&[0u8; 4]); // bogus CRC — decoder must reject before CRC
+        out.extend_from_slice(&uvarint_buf[..int_len]);
+        out.extend_from_slice(compressed_data);
+        out
+    }
+
+    fn build_block_declaring(declared_len: u64, plaintext: &[u8], algorithm: CompressionAlgorithm) -> Vec<u8> {
+        let compressed_data = compress_block(plaintext, algorithm);
+        build_framed_compressed_block(declared_len, &compressed_data)
+    }
+
+    #[tokio::test]
+    async fn test_decompress_reader_rejects_block_inflating_past_declared_length() {
+        let plaintext = vec![0u8; 4 << 20];
+        for algorithm in [
+            CompressionAlgorithm::Gzip,
+            CompressionAlgorithm::Deflate,
+            CompressionAlgorithm::Zstd,
+            CompressionAlgorithm::Lz4,
+            CompressionAlgorithm::Brotli,
+            CompressionAlgorithm::Snappy,
+        ] {
+            let input = build_block_declaring(1024, &plaintext, algorithm);
+            let mut decompress_reader = DecompressReader::new(Cursor::new(input), algorithm);
+            let mut out = Vec::new();
+            let err = decompress_reader
+                .read_to_end(&mut out)
+                .await
+                .expect_err("block inflating past its declared length must error");
+            assert_eq!(err.kind(), std::io::ErrorKind::InvalidData, "{algorithm}");
+            assert!(err.to_string().contains("exceeds its declared length"), "{algorithm}: {err}");
+            assert!(out.is_empty(), "no bytes may be produced from a rejected block");
+
+            let mut retry = Vec::new();
+            let second = decompress_reader
+                .read_to_end(&mut retry)
+                .await
+                .expect_err("rejected block must poison the reader");
+            assert_eq!(second.kind(), std::io::ErrorKind::InvalidData, "{algorithm}");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_decompress_reader_rejects_high_ratio_zstd_rle_block() {
+        // 512 x 128 KiB = 64 MiB of zeros encoded in ~2 KiB, declaring only 1 KiB plaintext.
+        let mut zstd_frame = Vec::with_capacity(6 + 512 * 4);
+        zstd_frame.extend_from_slice(&[0x28, 0xB5, 0x2F, 0xFD, 0x00, 0x38]);
+        for idx in 0..512usize {
+            let last_block = u32::from(idx + 1 == 512);
+            let block_header = last_block | (1 << 1) | ((128 * 1024) << 3);
+            zstd_frame.extend_from_slice(&block_header.to_le_bytes()[..3]);
+            zstd_frame.push(0x00);
+        }
+
+        let input = build_framed_compressed_block(1024, &zstd_frame);
+        let mut decompress_reader = DecompressReader::new(Cursor::new(input), CompressionAlgorithm::Zstd);
+        let mut out = Vec::new();
+        let err = decompress_reader
+            .read_to_end(&mut out)
+            .await
+            .expect_err("high-ratio expansion past declared length must error");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("exceeds its declared length"), "got: {err}");
+        assert!(out.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_decompress_reader_rejects_oversized_declared_length() {
+        for declared_len in [MAX_BLOCK_PLAINTEXT_LEN + 1, u64::MAX] {
+            let input = build_block_declaring(declared_len, b"x", CompressionAlgorithm::default());
+            let mut decompress_reader = DecompressReader::new(Cursor::new(input), CompressionAlgorithm::default());
+            let mut out = Vec::new();
+            let err = decompress_reader
+                .read_to_end(&mut out)
+                .await
+                .expect_err("oversized declared length must error");
+            assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+            assert!(err.to_string().contains("oversized length"), "got: {err}");
+            assert!(out.is_empty());
+
+            let mut retry = Vec::new();
+            let second = decompress_reader
+                .read_to_end(&mut retry)
+                .await
+                .expect_err("oversized declaration must poison the reader");
+            assert_eq!(second.kind(), std::io::ErrorKind::InvalidData);
+        }
     }
 }
