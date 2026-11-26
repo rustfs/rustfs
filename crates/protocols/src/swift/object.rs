@@ -72,12 +72,18 @@ const USER_METADATA_PREFIX: &str = "x-amz-meta-";
 /// Maximum object size in bytes (5GB - Swift default)
 const MAX_OBJECT_SIZE: i64 = 5 * 1024 * 1024 * 1024;
 
+fn is_reserved_swift_user_metadata_key(key: &str) -> bool {
+    // Reserve the full vendor namespaces rather than only internal/encryption
+    // sub-prefixes: outbound replication forwards bare stored `x-rustfs-*` /
+    // `x-minio-*` keys verbatim as request headers, and storage paths inspect
+    // bare vendor keys in `user_defined`.
+    rustfs_utils::http::starts_with_ignore_ascii_case(key, "x-amz-")
+        || rustfs_utils::http::starts_with_ignore_ascii_case(key, "x-rustfs-")
+        || rustfs_utils::http::starts_with_ignore_ascii_case(key, "x-minio-")
+}
+
 fn stored_swift_user_metadata_key(key: &str) -> String {
-    if rustfs_utils::http::is_internal_key(key)
-        || rustfs_utils::http::starts_with_ignore_ascii_case(key, "x-amz-")
-        || rustfs_utils::http::starts_with_ignore_ascii_case(key, "x-rustfs-encryption-")
-        || rustfs_utils::http::starts_with_ignore_ascii_case(key, "x-minio-encryption-")
-    {
+    if is_reserved_swift_user_metadata_key(key) {
         format!("{USER_METADATA_PREFIX}{key}")
     } else {
         key.to_string()
@@ -92,10 +98,7 @@ pub(super) fn swift_response_user_metadata_key(key: &str) -> Option<&str> {
         return None;
     }
     if let Some(unescaped) = key.strip_prefix(USER_METADATA_PREFIX)
-        && (rustfs_utils::http::is_internal_key(unescaped)
-            || rustfs_utils::http::starts_with_ignore_ascii_case(unescaped, "x-amz-")
-            || rustfs_utils::http::starts_with_ignore_ascii_case(unescaped, "x-rustfs-encryption-")
-            || rustfs_utils::http::starts_with_ignore_ascii_case(unescaped, "x-minio-encryption-"))
+        && is_reserved_swift_user_metadata_key(unescaped)
     {
         return Some(unescaped);
     }
@@ -1126,16 +1129,56 @@ mod tests {
     fn swift_user_metadata_cannot_materialize_internal_storage_keys() {
         let mut headers = HeaderMap::new();
         headers.insert("x-object-meta-x-rustfs-internal-actual-size", "1".parse().expect("valid metadata value"));
+        headers.insert(
+            "x-object-meta-x-rustfs-replication-ssec-crc",
+            "forged-crc".parse().expect("valid metadata value"),
+        );
+        headers.insert(
+            "x-object-meta-x-rustfs-replication-ssec-original-size",
+            "777".parse().expect("valid metadata value"),
+        );
+        headers.insert(
+            "x-object-meta-x-rustfs-replication-compression",
+            "zstd".parse().expect("valid metadata value"),
+        );
         headers.insert("x-object-meta-description", "safe".parse().expect("valid metadata value"));
         let metadata = swift_user_metadata(&headers).expect("custom metadata should be detected");
 
         assert_eq!(metadata.get("x-amz-meta-x-rustfs-internal-actual-size").map(String::as_str), Some("1"));
+        assert_eq!(
+            metadata.get("x-amz-meta-x-rustfs-replication-ssec-crc").map(String::as_str),
+            Some("forged-crc")
+        );
+        assert_eq!(
+            metadata
+                .get("x-amz-meta-x-rustfs-replication-ssec-original-size")
+                .map(String::as_str),
+            Some("777")
+        );
+        assert_eq!(
+            metadata
+                .get("x-amz-meta-x-rustfs-replication-compression")
+                .map(String::as_str),
+            Some("zstd")
+        );
         assert_eq!(metadata.get("description").map(String::as_str), Some("safe"));
-        assert!(!metadata.contains_key("x-rustfs-internal-actual-size"));
+        for bare in [
+            "x-rustfs-internal-actual-size",
+            "x-rustfs-replication-ssec-crc",
+            "x-rustfs-replication-ssec-original-size",
+            "x-rustfs-replication-compression",
+        ] {
+            assert!(!metadata.contains_key(bare), "{bare} must not be stored bare");
+        }
         assert_eq!(
             stored_swift_user_metadata_key("x-minio-encryption-original-size"),
             "x-amz-meta-x-minio-encryption-original-size"
         );
+        assert_eq!(
+            stored_swift_user_metadata_key("X-Rustfs-Replication-Ssec-Crc"),
+            "x-amz-meta-X-Rustfs-Replication-Ssec-Crc"
+        );
+        assert_eq!(stored_swift_user_metadata_key("x-minio-source-mtime"), "x-amz-meta-x-minio-source-mtime");
         assert_eq!(stored_swift_user_metadata_key("description"), "description");
     }
 
@@ -1144,6 +1187,22 @@ mod tests {
         assert_eq!(
             swift_response_user_metadata_key("x-amz-meta-x-rustfs-internal-actual-size"),
             Some("x-rustfs-internal-actual-size")
+        );
+        assert_eq!(
+            swift_response_user_metadata_key("x-amz-meta-x-rustfs-replication-ssec-crc"),
+            Some("x-rustfs-replication-ssec-crc")
+        );
+        assert_eq!(
+            swift_response_user_metadata_key("x-amz-meta-x-rustfs-replication-ssec-original-size"),
+            Some("x-rustfs-replication-ssec-original-size")
+        );
+        assert_eq!(
+            swift_response_user_metadata_key("x-amz-meta-x-rustfs-replication-compression"),
+            Some("x-rustfs-replication-compression")
+        );
+        assert_eq!(
+            swift_response_user_metadata_key("x-amz-meta-x-minio-source-mtime"),
+            Some("x-minio-source-mtime")
         );
         assert_eq!(swift_response_user_metadata_key("x-amz-meta-x-amz-checksum"), Some("x-amz-checksum"));
         assert_eq!(swift_response_user_metadata_key("x-amz-meta-description"), Some("x-amz-meta-description"));

@@ -244,3 +244,127 @@ async fn the_envelope_headers_and_a_non_sigv4_scheme_are_not_the_guard_s() {
         assert!(!answer.body.contains(sentence), "{}", answer.body);
     }
 }
+
+#[tokio::test]
+async fn unsigned_extension_headers_are_refused_before_the_handler_on_sigv4_and_sigv2() {
+    let probe = Probe::new();
+    let stack = probe_stack(&probe);
+    let extension_headers = [
+        ("x-rustfs-force-delete", "true"),
+        ("x-rustfs-source-version-id", "0194e0f1-0000-7000-8000-000000000000"),
+        ("x-rustfs-source-mtime", "2099-01-01T00:00:00Z"),
+        ("x-rustfs-source-replication-request", "true"),
+        ("x-rustfs-meta-owner", "mallory"),
+        ("x-minio-force-delete", "true"),
+        ("x-minio-meta-owner", "mallory"),
+    ];
+
+    for (name, value) in extension_headers {
+        // SigV4 header-signed PUT with an unsigned extension header.
+        let answer = observe(&stack, with_header(header_signed_put(HeaderMap::new()), name, value)).await;
+        assert_refused_as_the_layer_refuses(&answer, UNSIGNED, &format!("sigv4 header {name}"));
+
+        // SigV4 presigned PUT with an unsigned extension header.
+        let answer = observe(&stack, with_header(presigned_put(HeaderMap::new()), name, value)).await;
+        assert_refused_as_the_layer_refuses(&answer, UNSIGNED, &format!("sigv4 presigned {name}"));
+
+        // SigV4 presigned DELETE with an unsigned extension header.
+        let presigned_delete = signed_request_with_headers(
+            Signed::Query,
+            Method::DELETE,
+            "/photos/key",
+            "",
+            ROOT_ACCESS_KEY,
+            ROOT_SECRET_KEY,
+            HeaderMap::new(),
+        );
+        let answer = observe(&stack, with_header(presigned_delete, name, value)).await;
+        assert_refused_as_the_layer_refuses(&answer, UNSIGNED, &format!("sigv4 presigned delete {name}"));
+
+        // SigV2 header-signed request with an extension header.
+        let v2_header = with_header(
+            with_authorization(header_signed_put(HeaderMap::new()), &format!("AWS {ROOT_ACCESS_KEY}:c2lnbmF0dXJl")),
+            name,
+            value,
+        );
+        let answer = observe(&stack, v2_header).await;
+        assert_refused_as_the_layer_refuses(&answer, UNSIGNED, &format!("sigv2 header {name}"));
+
+        // SigV2 presigned URL (including with appended SigV4 signed-headers query) with an extension header.
+        let v2_presigned = request(
+            Method::PUT,
+            &format!("/photos/key?AWSAccessKeyId={ROOT_ACCESS_KEY}&Expires=2000000000&Signature=abc&X-Amz-Signature=def&X-Amz-SignedHeaders=host%3B{name}"),
+        )
+        .header(name, value)
+        .body(http_body_util::Empty::<Bytes>::new())
+        .expect("sigv2 presigned request");
+        let answer = observe(&stack, v2_presigned).await;
+        assert_refused_as_the_layer_refuses(&answer, UNSIGNED, &format!("sigv2 presigned {name}"));
+    }
+    assert_eq!(probe.calls(), 0, "no handler may run when extension headers are unsigned");
+}
+
+#[tokio::test]
+async fn sigv4_requests_that_sign_extension_headers_are_served() {
+    let probe = Probe::new();
+    let stack = probe_stack(&probe);
+
+    for headers in [
+        headers_of(&[("x-rustfs-meta-owner", "alice")]),
+        headers_of(&[("x-minio-meta-owner", "alice")]),
+        headers_of(&[
+            ("x-rustfs-source-replication-request", "true"),
+            ("x-rustfs-source-version-id", "0194e0f1-0000-7000-8000-000000000000"),
+        ]),
+    ] {
+        let answer = observe(&stack, header_signed_put(headers)).await;
+        assert_eq!(answer.status, StatusCode::OK, "{}", answer.body);
+    }
+
+    for headers in [
+        headers_of(&[("x-rustfs-meta-owner", "alice")]),
+        headers_of(&[("x-minio-meta-owner", "alice")]),
+    ] {
+        let answer = observe(&stack, presigned_put(headers)).await;
+        assert_eq!(answer.status, StatusCode::OK, "{}", answer.body);
+    }
+
+    let signed_delete = signed_request_with_headers(
+        Signed::Header,
+        Method::DELETE,
+        "/photos/key",
+        "",
+        ROOT_ACCESS_KEY,
+        ROOT_SECRET_KEY,
+        headers_of(&[("x-rustfs-force-delete", "true")]),
+    );
+    let answer = observe(&stack, signed_delete).await;
+    assert_eq!(answer.status, StatusCode::NO_CONTENT, "{}", answer.body);
+
+    assert_eq!(probe.calls(), 6, "every signed extension-header request must reach the handler");
+}
+
+#[tokio::test]
+async fn a_head_request_with_an_unsigned_extension_header_answers_forbidden_without_a_body() {
+    let probe = Probe::new();
+    let stack = probe_stack(&probe);
+    let head = signed_request_with_headers(
+        Signed::Query,
+        Method::HEAD,
+        "/photos/key",
+        "",
+        ROOT_ACCESS_KEY,
+        ROOT_SECRET_KEY,
+        HeaderMap::new(),
+    );
+    let answer = observe(&stack, with_header(head, "x-rustfs-meta-owner", "mallory")).await;
+    assert_eq!(answer.status, StatusCode::FORBIDDEN);
+    assert!(answer.body.is_empty(), "HEAD refusal must carry no body: {}", answer.body);
+    assert!(answer.headers.get("x-amz-request-id").is_some());
+    assert_eq!(
+        answer.headers.get(http::header::CONTENT_TYPE),
+        Some(&HeaderValue::from_static("application/xml"))
+    );
+    assert_eq!(answer.headers.get(http::header::CONNECTION), Some(&HeaderValue::from_static("close")));
+    assert_eq!(probe.calls(), 0);
+}

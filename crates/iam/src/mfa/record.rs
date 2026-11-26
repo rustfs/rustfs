@@ -99,7 +99,7 @@ pub enum MfaVerification {
 /// * `pending_secret_b32` present and unexpired means an enrollment awaits
 ///   confirmation. Both may be present at once, which is a re-configuration.
 /// * `last_used_step` is the anti-replay high-water mark, not a timestamp.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct MfaRecord {
     pub version: u8,
     pub access_key: String,

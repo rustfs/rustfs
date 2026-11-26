@@ -39,7 +39,7 @@
 //!   - `POST /v3/idp/ldap/policy/{operation}`
 //!   - `GET /v3/idp/openid/list-access-keys-bulk`
 
-use crate::admin::access_key_identity::guess_user_provider;
+use crate::admin::access_key_identity::{guess_sts_user_provider, guess_user_provider};
 use crate::admin::auth::validate_admin_request;
 use crate::admin::handlers::policies::{ListPolicyEntitiesBuiltin, handle_builtin_policy_association};
 use crate::admin::handlers::service_account::AddServiceAccount;
@@ -231,7 +231,7 @@ where
 
         let access_keys = accounts
             .into_iter()
-            .filter(|credential| guess_user_provider(credential) == user_provider)
+            .filter(|credential| guess_sts_user_provider(credential) == user_provider)
             .map(|credential| credential.access_key)
             .collect::<Vec<_>>();
         let results = futures::stream::iter(access_keys)
@@ -918,7 +918,7 @@ async fn collect_access_keys_for_user(
             .map_err(|e| s3_error!(InternalError, "list sts account failed: {}", e))?;
         resp.sts_keys = sts_keys
             .into_iter()
-            .filter(|cred| provider_matches(cred, provider_filter))
+            .filter(|cred| provider_matches(guess_sts_user_provider(cred), provider_filter))
             .map(|cred| access_key_entry(&cred, path))
             .collect();
     }
@@ -930,7 +930,7 @@ async fn collect_access_keys_for_user(
             .map_err(|e| s3_error!(InternalError, "list service account failed: {}", e))?;
         resp.service_accounts = svc
             .into_iter()
-            .filter(|cred| provider_matches(cred, provider_filter))
+            .filter(|cred| provider_matches(guess_user_provider(cred), provider_filter))
             .map(|cred| access_key_entry(&cred, path))
             .collect();
     }
@@ -938,10 +938,10 @@ async fn collect_access_keys_for_user(
     Ok(resp)
 }
 
-fn provider_matches(cred: &StoredCredentials, provider_filter: Option<&str>) -> bool {
+fn provider_matches(provider: &str, provider_filter: Option<&str>) -> bool {
     match provider_filter {
         None => true,
-        Some(provider) => guess_user_provider(cred) == provider,
+        Some(filter) => provider == filter,
     }
 }
 
@@ -1049,6 +1049,49 @@ mod tests {
             *attempted.lock().expect("attempted revocations mutex poisoned"),
             vec!["first-sts".to_string(), "second-sts".to_string()]
         );
+    }
+
+    #[tokio::test]
+    async fn revoke_tokens_selects_listed_sessions_by_provider_claims() {
+        // Shaped like `list_sts_accounts` output: secrets blanked, decoded claims retained.
+        let listed = |access_key: &str, claims| StoredCredentials {
+            access_key: access_key.to_string(),
+            expiration: Some(OffsetDateTime::now_utc() + time::Duration::hours(1)),
+            parent_user: "parent-user".to_string(),
+            claims: Some(claims),
+            ..Default::default()
+        };
+        let credentials = vec![
+            listed("builtin-sts", HashMap::from([("parent".to_string(), serde_json::json!("parent-user"))])),
+            listed("openid-sts", HashMap::from([("sub".to_string(), serde_json::json!("subject-123"))])),
+            listed("ldap-sts", HashMap::from([("ldap:username".to_string(), serde_json::json!("alice"))])),
+        ];
+
+        for provider in ["builtin", "openid", "ldap"] {
+            let revoked = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            let result = revoke_matching_sts_accounts(credentials.clone(), provider.to_string(), {
+                let revoked = std::sync::Arc::clone(&revoked);
+                move |access_key| {
+                    let revoked = std::sync::Arc::clone(&revoked);
+                    async move {
+                        revoked.lock().expect("revoked mutex poisoned").push(access_key);
+                        Ok::<(), ()>(())
+                    }
+                }
+            })
+            .await
+            .expect("revocation batch task");
+
+            assert_eq!(result, Ok(1));
+            assert_eq!(*revoked.lock().expect("revoked mutex poisoned"), vec![format!("{provider}-sts")]);
+        }
+
+        // Bulk listing provider filter selects only matching listed STS sessions.
+        let listed_openid = &credentials[1];
+        assert!(provider_matches(guess_sts_user_provider(listed_openid), None));
+        assert!(provider_matches(guess_sts_user_provider(listed_openid), Some("openid")));
+        assert!(!provider_matches(guess_sts_user_provider(listed_openid), Some("builtin")));
+        assert!(!provider_matches(guess_sts_user_provider(listed_openid), Some("ldap")));
     }
 
     #[tokio::test]

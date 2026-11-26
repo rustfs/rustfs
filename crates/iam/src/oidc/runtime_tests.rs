@@ -392,7 +392,7 @@ async fn assert_complete_console_login(initially_unavailable: bool) {
             let state = auth["state"].clone();
             auth_tx.send(auth).unwrap();
             let exchange = adapter
-                .exchange_identity(&state, "test-authorization-code", redirect)
+                .exchange_identity("console", &state, "test-authorization-code", redirect)
                 .await
                 .unwrap_or_else(|err| panic!("hidden={hidden}, explicit={explicit}: {err}"));
             let (identity, redirect_after, _) = exchange.into_parts();
@@ -403,7 +403,7 @@ async fn assert_complete_console_login(initially_unavailable: bool) {
             assert_eq!(authorization.email(), "user@example.com");
             assert_eq!(authorization.policies(), ["team/readwrite"]);
             assert_eq!(redirect_after.as_deref(), Some("/buckets"));
-            assert!(matches!(sys.exchange_code(&state, "test-authorization-code", redirect).await,
+            assert!(matches!(sys.exchange_code("console", &state, "test-authorization-code", redirect).await,
                 Err(error) if error == "invalid or expired OIDC state"));
             server.await.unwrap();
         }
@@ -542,7 +542,7 @@ async fn oidc_token_exchange_reports_forbidden_token_endpoint() {
     };
 
     let error = match sys
-        .exchange_code("test-state", "test-code", "https://console.example.com/oauth_callback")
+        .exchange_code(provider_id, "test-state", "test-code", "https://console.example.com/oauth_callback")
         .await
     {
         Ok(_) => panic!("private token endpoint should require an explicit allowlist origin"),
@@ -551,6 +551,114 @@ async fn oidc_token_exchange_reports_forbidden_token_endpoint() {
 
     assert!(error.contains("request_error_kind=forbidden_outbound"));
     assert!(error.contains(&format!("add http://192.168.65.254:8080 to {ENV_OUTBOUND_ALLOW_ORIGINS}")));
+}
+#[tokio::test]
+async fn oidc_token_exchange_rejects_state_issued_for_another_provider_before_contacting_token_endpoint() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let partner_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind partner token listener");
+    let partner_addr = partner_listener.local_addr().expect("partner listener local addr");
+    let partner_hits = Arc::new(AtomicUsize::new(0));
+    let hits_for_task = Arc::clone(&partner_hits);
+    let accept_task = tokio::spawn(async move {
+        if partner_listener.accept().await.is_ok() {
+            hits_for_task.fetch_add(1, Ordering::SeqCst);
+        }
+    });
+
+    let partner_base = format!("http://{partner_addr}");
+    let partner_metadata = serde_json::from_value::<ProviderMetadataWithLogout>(serde_json::json!({
+        "issuer": partner_base,
+        "authorization_endpoint": format!("{partner_base}/authorize"),
+        "token_endpoint": format!("{partner_base}/token"),
+        "jwks_uri": format!("{partner_base}/jwks"),
+        "response_types_supported": ["code"],
+        "subject_types_supported": ["public"],
+        "id_token_signing_alg_values_supported": ["RS256"]
+    }))
+    .expect("partner metadata should parse");
+    let corp_metadata = serde_json::from_value::<ProviderMetadataWithLogout>(serde_json::json!({
+        "issuer": "https://corp.example.com",
+        "authorization_endpoint": "https://corp.example.com/authorize",
+        "token_endpoint": "https://corp.example.com/token",
+        "jwks_uri": "https://corp.example.com/jwks",
+        "response_types_supported": ["code"],
+        "subject_types_supported": ["public"],
+        "id_token_signing_alg_values_supported": ["RS256"]
+    }))
+    .expect("corp metadata should parse");
+
+    let state_store = OidcStateStore::new();
+    state_store
+        .insert(
+            "partner-state".to_string(),
+            OidcAuthSession {
+                provider_id: "partner".to_string(),
+                pkce_verifier: "test-pkce-verifier".to_string(),
+                nonce: "test-nonce".to_string(),
+                redirect_after: None,
+            },
+        )
+        .await;
+
+    let sys = OidcSys {
+        configs: HashMap::from([
+            ("corp".to_string(), test_sourced_config(test_config("corp"))),
+            (
+                "partner".to_string(),
+                test_sourced_config(build_mocked_oidc_provider_config(
+                    "partner",
+                    &format!("{partner_base}/.well-known/openid-configuration"),
+                )),
+            ),
+        ]),
+        provider_runtime: ProviderRuntime::new(
+            ReqwestHttpClient::with_policy(
+                OutboundPolicy::from_allowed_origins(&partner_base).expect("partner test origin should be allowlisted"),
+            ),
+            HashMap::from([
+                (
+                    "corp".to_string(),
+                    ProviderState {
+                        metadata: DiscoveredProviderMetadata::Console(Box::new(corp_metadata)),
+                        discovered_at: Instant::now(),
+                    },
+                ),
+                (
+                    "partner".to_string(),
+                    ProviderState {
+                        metadata: DiscoveredProviderMetadata::Console(Box::new(partner_metadata)),
+                        discovered_at: Instant::now(),
+                    },
+                ),
+            ]),
+        ),
+        state_store,
+        pending_discovery: Default::default(),
+    };
+
+    let error = match sys
+        .exchange_code("corp", "partner-state", "corp-code", "https://console.example.com/callback/corp")
+        .await
+    {
+        Ok(_) => panic!("a code received on corp's callback must not be exchanged with partner"),
+        Err(error) => error,
+    };
+
+    accept_task.abort();
+    assert_eq!(error, "OIDC state was issued for a different provider");
+    assert_eq!(
+        partner_hits.load(Ordering::SeqCst),
+        0,
+        "partner's token endpoint must never be contacted for a mismatched callback provider"
+    );
+    assert!(
+        !sys.state_store.contains("partner-state").await,
+        "a rejected state must still be consumed as single-use"
+    );
 }
 #[test]
 fn test_list_visible_providers_hides_hidden_provider() {
