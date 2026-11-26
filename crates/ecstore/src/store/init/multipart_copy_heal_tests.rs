@@ -104,8 +104,12 @@ mod multipart_copy_heal_tests {
                 write_completion: WriteCompletion::TailDrained,
                 ..Default::default()
             };
+            let init_opts = ObjectOptions {
+                mod_time: None,
+                ..options.clone()
+            };
             let upload = store.pools[0]
-                .new_multipart_upload(&bucket, &object, &options)
+                .new_multipart_upload(&bucket, &object, &init_opts)
                 .await
                 .expect("actual native C Init");
             let part = store.pools[0]
