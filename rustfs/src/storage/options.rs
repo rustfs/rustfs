@@ -44,7 +44,6 @@ use tracing::error;
 use uuid::Uuid;
 
 use crate::auth::AuthType;
-use crate::auth::get_query_param;
 use crate::auth::get_request_auth_type_with_query;
 use crate::auth::is_request_presigned_signature_v4_with_query;
 use crate::storage::storage_api::ecstore_bucket::versioning::VersioningApi as _;
@@ -521,6 +520,15 @@ pub(crate) fn has_replication_retention_update(headers: &HeaderMap<HeaderValue>,
         && replication_timestamp_header(headers, SUFFIX_SOURCE_REPLICATION_RETENTION_TIMESTAMP).is_some()
 }
 
+fn has_valid_replicated_ssec_metadata(restored: &HashMap<String, String>) -> bool {
+    restored
+        .get(rustfs_utils::http::SSEC_ALGORITHM_HEADER)
+        .is_some_and(|value| value == rustfs_utils::http::AMZ_ENCRYPTION_AES)
+        && restored
+            .get(rustfs_utils::http::SSEC_KEY_MD5_HEADER)
+            .is_some_and(|value| !value.trim().is_empty())
+}
+
 pub fn put_opts_from_headers_with_replication_authorization(
     headers: &HeaderMap<HeaderValue>,
     metadata: HashMap<String, String>,
@@ -534,8 +542,17 @@ pub fn put_opts_from_headers_with_replication_authorization(
         opts.preserve_etag = replication_source_etag(headers)?;
         // SSE-C ciphertext passthrough: restore the stored encryption metadata
         // from the transport headers and mark the body as already encrypted so
-        // the write path stores it verbatim.
+        // the write path stores it verbatim. Require valid SSE-C metadata
+        // (algorithm + key MD5) so partial transport headers cannot mark an
+        // unencrypted object as ciphertext passthrough or compressed.
         if let Some(restored) = rustfs_utils::http::ssec_transport_to_stored_metadata(headers) {
+            if !has_valid_replicated_ssec_metadata(&restored) {
+                return Err(StorageError::InvalidArgument(
+                    String::new(),
+                    String::new(),
+                    "Incomplete replicated SSE-C metadata".to_string(),
+                ));
+            }
             if restored
                 .get(rustfs_utils::http::object_encryption_keys::SSEC_ORIGINAL_SIZE_HEADER)
                 .is_some_and(|value| !value.parse::<i64>().is_ok_and(|size| size >= 0))
@@ -819,17 +836,13 @@ const CANONICAL_USER_METADATA_PREFIX: &str = "x-amz-meta-";
 fn is_reserved_user_metadata_key(key: &str) -> bool {
     SUPPORTED_HEADERS.iter().any(|header| key.eq_ignore_ascii_case(header))
         || starts_with_ignore_ascii_case(key, "x-amz-")
-        || starts_with_ignore_ascii_case(key, RUSTFS_INTERNAL_PREFIX)
-        || starts_with_ignore_ascii_case(key, MINIO_INTERNAL_PREFIX)
-        || starts_with_ignore_ascii_case(key, RUSTFS_ENCRYPTION_PREFIX)
-        || starts_with_ignore_ascii_case(key, MINIO_ENCRYPTION_PREFIX)
-        // Replication transport names (source-replication timestamps,
-        // source-mtime/-etag/-version-id, ...). A bare stored key with one of
-        // these names is forwarded verbatim by the outbound replication
-        // header builder on a server-authorized request, so the receiver
-        // would persist attacker-chosen values as trusted internal LWW state.
-        || starts_with_ignore_ascii_case(key, "x-rustfs-source-")
-        || starts_with_ignore_ascii_case(key, "x-minio-source-")
+        // Reserve the entire vendor namespaces rather than individual
+        // sub-prefixes (internal, encryption, source, replication, ...): the
+        // outbound replication header builder forwards bare stored `x-rustfs-*`
+        // and `x-minio-*` keys verbatim on a server-authorized request, and
+        // storage-layer helpers also inspect bare vendor keys in `user_defined`.
+        || starts_with_ignore_ascii_case(key, "x-rustfs-")
+        || starts_with_ignore_ascii_case(key, "x-minio-")
 }
 
 fn stored_user_metadata_key(key: &str) -> String {
@@ -1197,7 +1210,7 @@ fn get_content_sha256_cksum_with_query(
         return "sts-body-sha256-placeholder".to_string();
     }
 
-    let (default_sha256_cksum, content_sha256) = if is_request_presigned_signature_v4_with_query(headers, query) {
+    let (default_sha256_cksum, content_sha256) = if is_request_presigned_signature_v4_with_query(query) {
         // For a presigned request we look at the query param for sha256.
         // X-Amz-Content-Sha256, if not set in presigned requests, checksum
         // will default to 'UNSIGNED-PAYLOAD'.
@@ -1227,11 +1240,19 @@ fn get_content_sha256_value(
     query: Option<&str>,
     include_query_for_presigned: bool,
 ) -> Option<String> {
-    if include_query_for_presigned && is_request_presigned_signature_v4_with_query(headers, query) {
+    if include_query_for_presigned && is_request_presigned_signature_v4_with_query(query) {
         return query
-            .and_then(|q| get_query_param(q, "x-amz-content-sha256"))
-            .or_else(|| headers.get(AMZ_CONTENT_SHA256).and_then(|v| v.to_str().ok()))
-            .map(str::to_owned);
+            .and_then(|q| {
+                url::form_urlencoded::parse(q.as_bytes())
+                    .find(|(name, _)| name.eq_ignore_ascii_case("x-amz-content-sha256"))
+                    .map(|(_, value)| value.into_owned())
+            })
+            .or_else(|| {
+                headers
+                    .get(AMZ_CONTENT_SHA256)
+                    .and_then(|v| v.to_str().ok())
+                    .map(str::to_owned)
+            });
     }
 
     headers
@@ -1794,7 +1815,9 @@ mod tests {
 
     #[test]
     fn put_opts_from_headers_restores_the_compression_layout_only_for_ssec_passthrough() {
-        use rustfs_utils::http::object_encryption_keys::REPLICATION_SSEC_ALGORITHM_HEADER;
+        use rustfs_utils::http::object_encryption_keys::{
+            REPLICATION_SSEC_ALGORITHM_HEADER, REPLICATION_SSEC_KEY_MD5_HEADER, REPLICATION_SSEC_ORIGINAL_SIZE_HEADER,
+        };
         use rustfs_utils::http::{
             SUFFIX_ACTUAL_SIZE, SUFFIX_COMPRESSION, SUFFIX_REPLICATION_COMPRESSION, SUFFIX_REPLICATION_COMPRESSION_ACTUAL_SIZE,
             get_str,
@@ -1815,9 +1838,43 @@ mod tests {
         assert!(get_str(&plain.user_defined, SUFFIX_COMPRESSION).is_none());
         assert!(get_str(&plain.user_defined, SUFFIX_ACTUAL_SIZE).is_none());
 
+        // Partial SSE-C transport headers (for example original size alone or
+        // algorithm without key MD5) must not activate ciphertext passthrough
+        // or compression metadata on an unencrypted object.
+        let mut partial_size_only = headers.clone();
+        partial_size_only.insert(
+            REPLICATION_SSEC_ORIGINAL_SIZE_HEADER
+                .parse::<http::HeaderName>()
+                .expect("header name"),
+            HeaderValue::from_static("6295552"),
+        );
+        assert!(
+            matches!(
+                put_opts_from_headers_with_replication_authorization(&partial_size_only, HashMap::new(), true),
+                Err(StorageError::InvalidArgument(_, _, _))
+            ),
+            "original-size header alone must not activate SSE-C passthrough compression"
+        );
+
         headers.insert(
-            REPLICATION_SSEC_ALGORITHM_HEADER.parse::<http::HeaderName>().unwrap(),
+            REPLICATION_SSEC_ALGORITHM_HEADER
+                .parse::<http::HeaderName>()
+                .expect("header name"),
             HeaderValue::from_static("AES256"),
+        );
+        assert!(
+            matches!(
+                put_opts_from_headers_with_replication_authorization(&headers, HashMap::new(), true),
+                Err(StorageError::InvalidArgument(_, _, _))
+            ),
+            "SSE-C algorithm without key MD5 must not activate passthrough"
+        );
+
+        headers.insert(
+            REPLICATION_SSEC_KEY_MD5_HEADER
+                .parse::<http::HeaderName>()
+                .expect("header name"),
+            HeaderValue::from_static("AAAAAAAAAAAAAAAAAAAAAA=="),
         );
 
         // Unauthorized: inert, like the SSE-C transport itself.
@@ -1843,15 +1900,35 @@ mod tests {
 
     #[test]
     fn replicated_encryption_metadata_rejects_invalid_sizes_and_compression() {
-        use rustfs_utils::http::object_encryption_keys::REPLICATION_SSEC_ORIGINAL_SIZE_HEADER;
+        use rustfs_utils::http::object_encryption_keys::{
+            REPLICATION_SSEC_ALGORITHM_HEADER, REPLICATION_SSEC_KEY_MD5_HEADER, REPLICATION_SSEC_ORIGINAL_SIZE_HEADER,
+        };
         use rustfs_utils::http::{SUFFIX_REPLICATION_COMPRESSION, SUFFIX_REPLICATION_COMPRESSION_ACTUAL_SIZE};
+
+        let with_valid_ssec = || {
+            let mut headers = HeaderMap::new();
+            insert_header(&mut headers, SUFFIX_SOURCE_REPLICATION_REQUEST, "true");
+            headers.insert(
+                REPLICATION_SSEC_ALGORITHM_HEADER
+                    .parse::<http::HeaderName>()
+                    .expect("algorithm header"),
+                HeaderValue::from_static("AES256"),
+            );
+            headers.insert(
+                REPLICATION_SSEC_KEY_MD5_HEADER
+                    .parse::<http::HeaderName>()
+                    .expect("key md5 header"),
+                HeaderValue::from_static("AAAAAAAAAAAAAAAAAAAAAA=="),
+            );
+            headers
+        };
+
         for (header, value) in [
             (REPLICATION_SSEC_ORIGINAL_SIZE_HEADER, "abc"),
             (REPLICATION_SSEC_ORIGINAL_SIZE_HEADER, "-1"),
             (REPLICATION_SSEC_ORIGINAL_SIZE_HEADER, "9223372036854775808"),
         ] {
-            let mut headers = HeaderMap::new();
-            insert_header(&mut headers, SUFFIX_SOURCE_REPLICATION_REQUEST, "true");
+            let mut headers = with_valid_ssec();
             headers.insert(
                 http::HeaderName::from_bytes(header.as_bytes()).expect("header name"),
                 HeaderValue::from_static(value),
@@ -1863,8 +1940,7 @@ mod tests {
             );
         }
         for size in ["0", "5", "9223372036854775807"] {
-            let mut headers = HeaderMap::new();
-            insert_header(&mut headers, SUFFIX_SOURCE_REPLICATION_REQUEST, "true");
+            let mut headers = with_valid_ssec();
             headers.insert(
                 http::HeaderName::from_bytes(REPLICATION_SSEC_ORIGINAL_SIZE_HEADER.as_bytes()).expect("size header"),
                 HeaderValue::from_static(size),
@@ -1874,22 +1950,72 @@ mod tests {
             insert_header(&mut headers, SUFFIX_REPLICATION_COMPRESSION_ACTUAL_SIZE, "5");
             assert!(put_opts_from_headers_with_replication_authorization(&headers, HashMap::new(), true).is_err());
         }
+
+        // Incomplete or malformed SSE-C identity headers must be rejected when authorized.
+        for (algorithm, key_md5) in [
+            (None, Some("AAAAAAAAAAAAAAAAAAAAAA==")),
+            (Some("AES256"), None),
+            (Some("AES256"), Some("   ")),
+            (Some("AES128"), Some("AAAAAAAAAAAAAAAAAAAAAA==")),
+            (Some("aes256"), Some("AAAAAAAAAAAAAAAAAAAAAA==")),
+        ] {
+            let mut headers = HeaderMap::new();
+            insert_header(&mut headers, SUFFIX_SOURCE_REPLICATION_REQUEST, "true");
+            if let Some(algorithm) = algorithm {
+                headers.insert(
+                    REPLICATION_SSEC_ALGORITHM_HEADER
+                        .parse::<http::HeaderName>()
+                        .expect("algorithm header"),
+                    HeaderValue::from_str(algorithm).expect("algorithm value"),
+                );
+            }
+            if let Some(key_md5) = key_md5 {
+                headers.insert(
+                    REPLICATION_SSEC_KEY_MD5_HEADER
+                        .parse::<http::HeaderName>()
+                        .expect("key md5 header"),
+                    HeaderValue::from_str(key_md5).expect("key md5 value"),
+                );
+            }
+            assert!(
+                matches!(
+                    put_opts_from_headers_with_replication_authorization(&headers, HashMap::new(), true),
+                    Err(StorageError::InvalidArgument(_, _, _))
+                ),
+                "invalid SSE-C metadata ({algorithm:?}, {key_md5:?}) must fail closed"
+            );
+            assert!(
+                put_opts_from_headers_with_replication_authorization(&headers, HashMap::new(), false).is_ok(),
+                "untrusted transport headers stay inert"
+            );
+        }
     }
 
     #[test]
     fn test_put_opts_from_headers_gates_ssec_passthrough_on_authorization() {
         use rustfs_utils::http::object_encryption_keys::{
             INTERNAL_ENCRYPTION_IV_HEADER, REPLICATION_ENCRYPTION_IV_HEADER, REPLICATION_SSEC_ALGORITHM_HEADER,
+            REPLICATION_SSEC_KEY_MD5_HEADER,
         };
 
         let mut headers = HeaderMap::new();
         insert_header(&mut headers, SUFFIX_SOURCE_REPLICATION_REQUEST, "true");
         headers.insert(
-            REPLICATION_SSEC_ALGORITHM_HEADER.parse::<http::HeaderName>().unwrap(),
+            REPLICATION_SSEC_ALGORITHM_HEADER
+                .parse::<http::HeaderName>()
+                .expect("header name"),
             HeaderValue::from_static("AES256"),
         );
         headers.insert(
-            REPLICATION_ENCRYPTION_IV_HEADER.parse::<http::HeaderName>().unwrap(),
+            REPLICATION_SSEC_KEY_MD5_HEADER
+                .parse::<http::HeaderName>()
+                .expect("header name"),
+            HeaderValue::from_static("AAAAAAAAAAAAAAAAAAAAAA=="),
+        );
+        headers.insert(
+            REPLICATION_ENCRYPTION_IV_HEADER
+                .parse::<http::HeaderName>()
+                .expect("header name"),
             HeaderValue::from_static("iv-value"),
         );
 
@@ -1975,12 +2101,10 @@ mod tests {
         }
     }
 
-    /// A client PUT must not materialize the replication transport names as
-    /// bare stored user-metadata keys: the outbound replication header
-    /// builder forwards user metadata verbatim on a server-authorized
-    /// request, so a bare `x-rustfs-source-replication-*-timestamp` key would
-    /// deliver an attacker-chosen value into the replica's trusted internal
-    /// LWW state (for a tagless object nothing later overwrites it).
+    /// A client PUT must not materialize replication transport or storage
+    /// vendor names as bare stored user-metadata keys: outbound replication
+    /// forwards bare vendor keys verbatim on a server-authorized request, and
+    /// storage-layer helpers inspect bare replication keys in `user_defined`.
     #[test]
     fn test_replication_transport_names_cannot_be_forged_via_user_metadata() {
         let mut headers = HeaderMap::new();
@@ -1989,6 +2113,12 @@ mod tests {
             "x-amz-meta-x-minio-source-replication-legalhold-timestamp",
             "x-rustfs-meta-x-rustfs-source-replication-retention-timestamp",
             "x-amz-meta-x-rustfs-source-mtime",
+            "x-amz-meta-x-rustfs-replication-ssec-crc",
+            "x-minio-meta-x-minio-replication-ssec-crc",
+            "x-amz-meta-x-rustfs-replication-ssec-original-size",
+            "x-amz-meta-x-rustfs-replication-compression",
+            "x-amz-meta-x-minio-replication-compression-actual-size",
+            "x-rustfs-meta-x-rustfs-multipart-checksum",
         ] {
             headers.insert(
                 http::header::HeaderName::from_static(name),
@@ -2003,19 +2133,60 @@ mod tests {
             "x-minio-source-replication-legalhold-timestamp",
             "x-rustfs-source-replication-retention-timestamp",
             "x-rustfs-source-mtime",
+            "x-rustfs-replication-ssec-crc",
+            "x-minio-replication-ssec-crc",
+            "x-rustfs-replication-ssec-original-size",
+            "x-rustfs-replication-compression",
+            "x-minio-replication-compression-actual-size",
+            "x-rustfs-multipart-checksum",
         ] {
             assert!(
                 !metadata.contains_key(forged),
                 "{forged} must not be storable as a bare user-metadata key"
             );
+            assert_eq!(
+                metadata.get(&format!("x-amz-meta-{forged}")).map(String::as_str),
+                Some("2026-01-02T03:04:05Z"),
+                "{forged} must remain namespaced under x-amz-meta-"
+            );
         }
-        // The values survive, namespaced back under the user-metadata prefix.
-        assert_eq!(
-            metadata
-                .get("x-amz-meta-x-rustfs-source-replication-tagging-timestamp")
-                .map(String::as_str),
-            Some("2026-01-02T03:04:05Z")
-        );
+
+        // Namespaced keys still round-trip back to the client under their original names.
+        let filtered = filter_object_metadata(&metadata).expect("user metadata should round-trip");
+        for original in [
+            "x-rustfs-replication-ssec-crc",
+            "x-rustfs-replication-ssec-original-size",
+            "x-rustfs-replication-compression",
+        ] {
+            assert_eq!(
+                filtered.get(original).map(String::as_str),
+                Some("2026-01-02T03:04:05Z"),
+                "{original} must round-trip in client-visible metadata"
+            );
+        }
+
+        // CopyObject REPLACE / DTO metadata path applies the same case-insensitive namespacing.
+        let mut copied = HashMap::from([
+            ("X-Rustfs-Replication-Ssec-Crc".to_string(), "forged-crc".to_string()),
+            ("X-Rustfs-Replication-Ssec-Original-Size".to_string(), "777".to_string()),
+            ("X-Rustfs-Replication-Compression".to_string(), "zstd".to_string()),
+            ("x-minio-replication-ssec-crc".to_string(), "forged-minio-crc".to_string()),
+            ("department".to_string(), "finance".to_string()),
+        ]);
+        namespace_reserved_user_metadata(&mut copied);
+        for bare in [
+            "X-Rustfs-Replication-Ssec-Crc",
+            "X-Rustfs-Replication-Ssec-Original-Size",
+            "X-Rustfs-Replication-Compression",
+            "x-minio-replication-ssec-crc",
+        ] {
+            assert!(!copied.contains_key(bare), "{bare} must not remain bare");
+            assert!(
+                copied.contains_key(&format!("x-amz-meta-{bare}")),
+                "{bare} must be namespaced under x-amz-meta-"
+            );
+        }
+        assert_eq!(copied.get("department").map(String::as_str), Some("finance"));
     }
 
     #[test]
@@ -2656,6 +2827,17 @@ mod tests {
                 !should_skip_object_metadata_key(key, "value", NO_EXCLUSIONS),
                 "{key:?} is shorter than any internal prefix and must not be skipped"
             );
+        }
+        // The write side reserves the full `x-rustfs-` / `x-minio-` vendor
+        // namespaces, so truncated internal prefixes remain namespaced under
+        // `x-amz-meta-`; only keys outside those namespaces stay bare.
+        for key in ["x-rustfs-interna", "x-minio-interna", short_encryption_prefix] {
+            assert!(
+                is_reserved_user_metadata_key(key),
+                "{key:?} is in a vendor namespace and must stay reserved"
+            );
+        }
+        for key in ["", "x", "x-am", "x-rustfs", "x-minio"] {
             assert!(!is_reserved_user_metadata_key(key), "{key:?} must not be treated as reserved");
         }
 
@@ -2976,8 +3158,8 @@ mod tests {
 
     /// Pin that the source-proxy-request transport family cannot be
     /// materialized as bare stored metadata via an `x-*-meta-` disguise: the
-    /// reserved-key namespacing (`x-rustfs-source-` / `x-minio-source-`
-    /// prefixes in `is_reserved_user_metadata_key`) must keep covering it.
+    /// reserved-key namespacing (`x-rustfs-` / `x-minio-` prefixes in
+    /// `is_reserved_user_metadata_key`) must keep covering it.
     #[test]
     fn test_source_proxy_request_family_is_reserved_user_metadata() {
         let mut headers = HeaderMap::new();
@@ -3067,6 +3249,38 @@ mod tests {
 
         let query = format!("{PRESIGNED_QUERY}&x-amz-content-sha256=UNSIGNED-PAYLOAD");
         assert_eq!(super::get_content_sha256_with_query(&headers, Some(&query)), None);
+    }
+
+    #[test]
+    fn presigned_request_query_digest_survives_unsigned_headers_and_percent_encoded_param_name() {
+        let sigv4 = "AWS4-HMAC-SHA256 Credential=x/20260916/us-east-1/s3/aws4_request, SignedHeaders=host, Signature=00";
+        let queries = [
+            format!("{PRESIGNED_QUERY}&X-Amz-Content-Sha256={PAYLOAD_SHA256}"),
+            format!("{PRESIGNED_QUERY}&X-Amz-Content-Sh%61256={PAYLOAD_SHA256}"),
+            format!("{PRESIGNED_QUERY}&%58-Amz-Content-Sha256={PAYLOAD_SHA256}"),
+        ];
+        let unsigned: [&[(&str, &str)]; 7] = [
+            &[],
+            &[("awsaccesskeyid", "x")],
+            &[("x-amz-credential", "")],
+            &[("authorization", "AWS x")],
+            &[("authorization", "AWS ak:signature"), ("authorization", "AWS ak:signature")],
+            &[("authorization", sigv4), ("authorization", sigv4)],
+            &[("content-type", "multipart/form-data; boundary=boundary")],
+        ];
+        for query in &queries {
+            for pairs in unsigned {
+                let mut headers = HeaderMap::new();
+                for (name, value) in pairs {
+                    headers.append(*name, HeaderValue::from_static(value));
+                }
+                assert_eq!(
+                    super::get_content_sha256_with_query(&headers, Some(query)),
+                    Some(PAYLOAD_SHA256.to_string()),
+                    "query={query} headers={pairs:?}"
+                );
+            }
+        }
     }
 
     #[test]

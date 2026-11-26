@@ -17,7 +17,11 @@
 mod actions;
 mod conditions;
 mod denial_audit;
+mod derived_credential_deny;
+mod explicit_iam_deny;
 pub(crate) mod fixture;
 mod permission_auth;
+mod presigned_replication;
 mod readers;
+mod reserved_buckets;
 mod table_data_plane;

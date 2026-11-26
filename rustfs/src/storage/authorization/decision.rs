@@ -40,6 +40,7 @@ use crate::auth::facts::{AuthzFacts, AuthzTarget, base_conditions, build_args};
 use crate::error::ApiError;
 use crate::storage::authorization_actions::versioned_read_action;
 use crate::storage::denial_audit::DenialAuditor;
+use crate::storage::storage_api::ecstore_bucket::utils::is_meta_bucketname;
 use crate::storage::storage_api::runtime_sources_consumer::ServerContextSlot;
 use crate::storage::{PolicySys, StorageError, is_err_bucket_not_found};
 use http::HeaderMap;
@@ -48,9 +49,11 @@ use rustfs_policy::policy::BucketPolicyArgs;
 use rustfs_policy::policy::action::{Action, S3Action};
 use rustfs_s3_types::{S3Error, S3Result, s3_error};
 use rustfs_utils::http::{
-    AMZ_BUCKET_REPLICATION_STATUS, SUFFIX_REPLICATION_ACTUAL_OBJECT_SIZE, SUFFIX_REPLICATION_SSEC_CRC, SUFFIX_SOURCE_ETAG,
-    SUFFIX_SOURCE_MTIME, SUFFIX_SOURCE_REPLICATION_CHECK, SUFFIX_SOURCE_REPLICATION_REQUEST, SUFFIX_SOURCE_VERSION_ID,
-    get_header,
+    AMZ_BUCKET_REPLICATION_STATUS, SUFFIX_REPLICATION_ACTUAL_OBJECT_SIZE, SUFFIX_REPLICATION_COMPRESSION,
+    SUFFIX_REPLICATION_COMPRESSION_ACTUAL_SIZE, SUFFIX_REPLICATION_PART_ACTUAL_SIZE, SUFFIX_REPLICATION_SSEC_CRC,
+    SUFFIX_SOURCE_ETAG, SUFFIX_SOURCE_MTIME, SUFFIX_SOURCE_REPLICATION_CHECK, SUFFIX_SOURCE_REPLICATION_LEGALHOLD_TIMESTAMP,
+    SUFFIX_SOURCE_REPLICATION_REQUEST, SUFFIX_SOURCE_REPLICATION_RETENTION_TIMESTAMP,
+    SUFFIX_SOURCE_REPLICATION_TAGGING_TIMESTAMP, SUFFIX_SOURCE_VERSION_ID, get_header,
 };
 
 pub(crate) fn iam_authorization_error(err: IamError) -> ApiError {
@@ -64,14 +67,20 @@ const EVENT_OBJECT_TAG_AUTHORIZATION: &str = "object_tag_authorization";
 const LOG_COMPONENT_ACCESS: &str = "storage_access";
 const LOG_SUBSYSTEM_AUTHORIZATION: &str = "authorization";
 
-fn has_replication_only_put_headers(headers: &HeaderMap) -> bool {
+pub(super) fn has_replication_only_put_headers(headers: &HeaderMap) -> bool {
     headers.contains_key(AMZ_BUCKET_REPLICATION_STATUS)
         || get_header(headers, SUFFIX_REPLICATION_ACTUAL_OBJECT_SIZE).is_some()
+        || get_header(headers, SUFFIX_REPLICATION_COMPRESSION).is_some()
+        || get_header(headers, SUFFIX_REPLICATION_COMPRESSION_ACTUAL_SIZE).is_some()
+        || get_header(headers, SUFFIX_REPLICATION_PART_ACTUAL_SIZE).is_some()
         || get_header(headers, SUFFIX_REPLICATION_SSEC_CRC).is_some()
         || get_header(headers, SUFFIX_SOURCE_ETAG).is_some()
         || get_header(headers, SUFFIX_SOURCE_MTIME).is_some()
         || get_header(headers, SUFFIX_SOURCE_REPLICATION_CHECK).is_some()
+        || get_header(headers, SUFFIX_SOURCE_REPLICATION_LEGALHOLD_TIMESTAMP).is_some()
         || get_header(headers, SUFFIX_SOURCE_REPLICATION_REQUEST).is_some()
+        || get_header(headers, SUFFIX_SOURCE_REPLICATION_RETENTION_TIMESTAMP).is_some()
+        || get_header(headers, SUFFIX_SOURCE_REPLICATION_TAGGING_TIMESTAMP).is_some()
         || get_header(headers, SUFFIX_SOURCE_VERSION_ID).is_some()
         || rustfs_utils::http::has_ssec_transport_headers(headers)
 }
@@ -79,12 +88,36 @@ fn has_replication_only_put_headers(headers: &HeaderMap) -> bool {
 /// Asks `s3:ReplicateObject` when the request headers carry a replication-only header, and on
 /// Allow marks the request as an authorized replication request for the use case. A POST form
 /// cannot carry these headers, so the request headers are read, not the policy headers.
+/// Presigned requests may never exercise replication-only write headers.
 pub(crate) async fn authorize_replication_only_put_headers<R: AuthorizationRequest + ?Sized>(req: &mut R) -> S3Result<()> {
     if !has_replication_only_put_headers(req.headers()) {
         return Ok(());
     }
+    if crate::auth::is_presigned_request_head(req.headers(), req.uri().query()) {
+        let action = Action::S3Action(S3Action::ReplicateObjectAction);
+        if let Some(req_info) = req.req_info() {
+            let denial = DenialContext {
+                quiet: req_info.suppress_denial_log,
+                suppress_audit: req_info.suppress_denial_audit,
+                auditor: DenialAuditor::global(),
+                bucket: req_info.bucket.as_deref().unwrap_or_default(),
+                object: req_info.object.as_deref().unwrap_or_default(),
+                version_id: req_info.version_id.as_deref(),
+                account: req_info.cred.as_ref().map(|c| c.access_key.as_str()),
+                is_owner: req_info.is_owner,
+            };
+            return Err(denial.deny(req, "presigned_replication_headers", action));
+        }
+        return Err(s3_error!(AccessDenied, "Access Denied"));
+    }
 
     authorize_request(req, Action::S3Action(S3Action::ReplicateObjectAction)).await?;
+    if get_header(req.headers(), SUFFIX_SOURCE_REPLICATION_RETENTION_TIMESTAMP).is_some() {
+        authorize_request(req, Action::S3Action(S3Action::PutObjectRetentionAction)).await?;
+    }
+    if get_header(req.headers(), SUFFIX_SOURCE_REPLICATION_LEGALHOLD_TIMESTAMP).is_some() {
+        authorize_request(req, Action::S3Action(S3Action::PutObjectLegalHoldAction)).await?;
+    }
     req_info_mut(req)?.replication_request_authorized = true;
     Ok(())
 }
@@ -140,6 +173,20 @@ pub(crate) fn owner_can_bypass_policy_deny(is_owner: bool, action: &Action) -> b
                 | Action::S3Action(S3Action::PutBucketPolicyAction)
                 | Action::S3Action(S3Action::DeleteBucketPolicyAction)
         )
+}
+
+/// Accounts a bucket-policy `Principal` is matched against for explicit-Deny checks.
+///
+/// An STS session or service account signs with its own derived access key while IAM authorizes
+/// it with the policies of its parent user. Matching both the signing key and a distinct
+/// non-empty `parent_user` ensures a `Deny` naming the user binds derived credentials as well,
+/// while statements naming a derived key directly continue to match.
+pub(crate) fn bucket_policy_deny_accounts(cred: &rustfs_credentials::Credentials) -> Vec<&str> {
+    let mut accounts = vec![cred.access_key.as_str()];
+    if !cred.parent_user.is_empty() && cred.parent_user != cred.access_key {
+        accounts.push(cred.parent_user.as_str());
+    }
+    accounts
 }
 
 /// Context shared by every denial exit of [`authorize_request`] (issue #5740).
@@ -347,6 +394,19 @@ fn policy_request_facts<R: AuthorizationRequest + ?Sized>(
     ))
 }
 
+/// Returns true when `bucket` targets a reserved internal metadata bucket (`.rustfs.sys` or
+/// `.minio.sys`, including sub-paths or case variants). These namespaces hold IAM records,
+/// server configuration, and bucket metadata and are never an S3 resource.
+pub(super) fn is_reserved_meta_bucket(bucket: &str) -> bool {
+    let trimmed = bucket.trim();
+    if is_meta_bucketname(trimmed) {
+        return true;
+    }
+    let bytes = trimmed.as_bytes();
+    (bytes.len() >= 11 && bytes[..11].eq_ignore_ascii_case(b".rustfs.sys"))
+        || (bytes.len() >= 10 && bytes[..10].eq_ignore_ascii_case(b".minio.sys"))
+}
+
 async fn authorize_request_with_facts<R: AuthorizationRequest + ?Sized>(
     req: &mut R,
     facts: &AuthzFacts,
@@ -361,7 +421,6 @@ async fn authorize_request_with_facts<R: AuthorizationRequest + ?Sized>(
     let version_id = req_info.version_id.clone();
     let quiet_denial = req_info.suppress_denial_log;
     let suppress_denial_audit = req_info.suppress_denial_audit;
-    let store = request_object_store(req)?;
     let denial = DenialContext {
         quiet: quiet_denial,
         suppress_audit: suppress_denial_audit,
@@ -372,6 +431,16 @@ async fn authorize_request_with_facts<R: AuthorizationRequest + ?Sized>(
         account: cred.as_ref().map(|c| c.access_key.as_str()),
         is_owner,
     };
+
+    // Reserved system buckets hold IAM, configuration, and bucket metadata and are never an S3
+    // resource, even for the owner. Callers that derive the bucket outside the gateway path parser
+    // (admin routes, alternate protocols) reach this gate directly, where wildcard resource
+    // policies (`arn:aws:s3:::*`) would otherwise match them.
+    if is_reserved_meta_bucket(bucket.as_str()) {
+        return Err(denial.deny(req, "reserved_bucket", action));
+    }
+
+    let store = request_object_store(req)?;
 
     if let Some(cred) = &cred {
         let iam_store = request_iam_store(req)?;
@@ -384,25 +453,32 @@ async fn authorize_request_with_facts<R: AuthorizationRequest + ?Sized>(
         let prepared = iam_store.prepare_auth(&action_args).await;
         let needs_tag_from_iam = prepared.needs_existing_object_tag;
 
+        let deny_accounts = bucket_policy_deny_accounts(cred);
         let bucket_tag_hint = if !bucket.is_empty() && !object.is_empty() {
             Some(load_bucket_policy_existing_object_tag_hint(store.as_ref(), bucket.as_str(), action).await)
         } else {
             None
         };
-        let needs_tag_from_bucket = if let Some(hint) = bucket_tag_hint.as_ref() {
-            let bucket_args = BucketPolicyArgs {
-                bucket: bucket.as_str(),
-                action,
-                is_owner,
-                account: cred.access_key.as_str(),
-                groups: &cred.groups,
-                conditions: &conditions,
-                object: object.as_str(),
-            };
-            bucket_policy_needs_existing_object_tag_from_hint(hint, &bucket_args).await
-        } else {
-            false
-        };
+        let mut needs_tag_from_bucket = false;
+        if let Some(hint) = bucket_tag_hint.as_ref() {
+            // Check the same accounts as the explicit-Deny gate below so a tag-conditioned Deny
+            // naming the parent user loads object tags before evaluation.
+            for &account in &deny_accounts {
+                let bucket_args = BucketPolicyArgs {
+                    bucket: bucket.as_str(),
+                    action,
+                    is_owner,
+                    account,
+                    groups: &cred.groups,
+                    conditions: &conditions,
+                    object: object.as_str(),
+                };
+                if bucket_policy_needs_existing_object_tag_from_hint(hint, &bucket_args).await {
+                    needs_tag_from_bucket = true;
+                    break;
+                }
+            }
+        }
 
         let needs_tag = needs_tag_from_iam || needs_tag_from_bucket;
         if needs_tag {
@@ -430,19 +506,7 @@ async fn authorize_request_with_facts<R: AuthorizationRequest + ?Sized>(
         .await?;
         let bucket_name = bucket.as_str();
 
-        let check_explicit_iam_deny = matches!(
-            action,
-            Action::S3Action(
-                S3Action::DeleteObjectAction
-                    | S3Action::DeleteObjectVersionAction
-                    | S3Action::ForceDeleteBucketAction
-                    | S3Action::ForceDeleteObjectAction
-                    | S3Action::ListBucketAction
-                    | S3Action::ListBucketVersionsAction
-                    | S3Action::BypassGovernanceRetentionAction
-                    | S3Action::ReplicateDeleteAction
-            )
-        ) && prepared.combined_policy_for_view().is_some();
+        let check_explicit_iam_deny = prepared.combined_policy_for_view().is_some();
 
         let probe_bucket_policy = if req.permission_probe() && !bucket.is_empty() {
             match store.get_bucket_policy(&bucket).await {
@@ -471,14 +535,27 @@ async fn authorize_request_with_facts<R: AuthorizationRequest + ?Sized>(
             let guard = if owner_can_bypass_policy_deny(is_owner, &action) {
                 Some(true)
             } else if let Some(policy) = &probe_bucket_policy {
-                bucket_policy_probe_decision(
-                    policy,
-                    &BucketPolicyArgs {
-                        is_owner: true,
-                        ..bucket_args.clone()
-                    },
-                )
-                .await
+                let mut combined = Some(true);
+                for &account in &deny_accounts {
+                    match bucket_policy_probe_decision(
+                        policy,
+                        &BucketPolicyArgs {
+                            is_owner: true,
+                            account,
+                            ..bucket_args.clone()
+                        },
+                    )
+                    .await
+                    {
+                        Some(false) => {
+                            combined = Some(false);
+                            break;
+                        }
+                        None => combined = None,
+                        Some(true) => {}
+                    }
+                }
+                combined
             } else {
                 Some(true)
             };
@@ -509,26 +586,29 @@ async fn authorize_request_with_facts<R: AuthorizationRequest + ?Sized>(
         // subject to bucket policy Deny for root as well. See: repost.aws/knowledge-center/s3-accidentally-denied-access
         // Here "owner" means root or credentials whose parent_user is root (e.g. Console admin via STS).
         let owner_can_bypass_deny = owner_can_bypass_policy_deny(is_owner, &action);
-        if !bucket_name.is_empty()
-            && !owner_can_bypass_deny
-            && !PolicySys::try_is_allowed_for_store(
-                store.as_ref(),
-                &BucketPolicyArgs {
-                    bucket: bucket_name,
-                    action,
-                    // Early explicit-deny gate for bucket policy: use owner short-circuit path so
-                    // deny statements are enforced before IAM/bucket allow fallback evaluation.
-                    is_owner: true,
-                    account: &cred.access_key,
-                    groups: &cred.groups,
-                    conditions: &conditions,
-                    object: object.as_str(),
-                },
-            )
-            .await
-            .map_err(ApiError::from)?
-        {
-            return Err(denial.deny(req, "bucket_policy_explicit_deny", action));
+        if !bucket_name.is_empty() && !owner_can_bypass_deny {
+            // A bucket-policy Deny naming a user also binds their STS sessions and service accounts.
+            for &account in &deny_accounts {
+                if !PolicySys::try_is_allowed_for_store(
+                    store.as_ref(),
+                    &BucketPolicyArgs {
+                        bucket: bucket_name,
+                        action,
+                        // Early explicit-deny gate for bucket policy: use owner short-circuit path so
+                        // deny statements are enforced before IAM/bucket allow fallback evaluation.
+                        is_owner: true,
+                        account,
+                        groups: &cred.groups,
+                        conditions: &conditions,
+                        object: object.as_str(),
+                    },
+                )
+                .await
+                .map_err(ApiError::from)?
+                {
+                    return Err(denial.deny(req, "bucket_policy_explicit_deny", action));
+                }
+            }
         }
 
         let probe_evaluation_conditions = if req.permission_probe() {

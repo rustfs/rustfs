@@ -32,7 +32,7 @@ use crate::app::RequestEnvelope;
 use crate::auth::constant_time_eq;
 use rustfs_credentials::Credentials;
 use rustfs_iam::federation::{FederatedProfile, OIDC_PROFILE_CLAIM, OIDC_VIRTUAL_PARENT_CLAIM};
-use rustfs_iam::sys::is_rustfs_oidc_claims;
+use rustfs_iam::sys::{claims_have_policy_boundary, is_rustfs_oidc_claims};
 use rustfs_madmin::account::{AccountMutability, CredentialsSource, IdentityType};
 use serde_json::Value;
 
@@ -113,6 +113,11 @@ pub(crate) enum CredentialMutationDenial {
     /// Machine credentials must not be able to take over the human identity
     /// they were minted from.
     ServiceAccount,
+    /// A session narrowed by a session policy (`AssumeRole` with a `Policy`
+    /// parameter) is a delegated credential just like a service account: it was
+    /// minted to hand a third party a subset of the parent's rights, so it must
+    /// not be able to change its parent's credentials or second factor.
+    RestrictedSession,
     /// A derived credential whose parent could not be determined.
     UnresolvedParent,
     /// A storage delegation has no account-management authority.
@@ -127,6 +132,9 @@ impl CredentialMutationDenial {
             }
             Self::FederatedIdentity => "federated identities are managed by their identity provider",
             Self::ServiceAccount => "service account credentials cannot change the credentials of their parent identity",
+            Self::RestrictedSession => {
+                "sessions restricted by a session policy cannot change the credentials of their parent identity"
+            }
             Self::TableStorageSession => "table-scoped storage credentials cannot manage account credentials",
             Self::UnresolvedParent => "the parent identity of this session could not be resolved",
         }
@@ -178,6 +186,8 @@ impl CallerIdentity {
         let is_service_account = credentials.is_service_account();
         let is_temp = credentials.is_temp();
         let federated = is_federated_session(&credentials);
+        let restricted_session =
+            !credentials.session_token.is_empty() && claims_have_policy_boundary(credentials.claims_or_empty());
 
         let parent = session_parent_identity(&credentials).map(str::to_owned);
 
@@ -218,9 +228,12 @@ impl CallerIdentity {
         // root", and an unresolved parent must never fall through to a
         // permissive answer.
         //
-        // These denials apply to both capabilities: a machine credential
-        // must not take over its parent, a federated identity is owned by its
-        // IdP, and an unresolvable parent fails closed.
+        // These denials apply to both capabilities: a machine credential must
+        // not take over its parent, a federated identity is owned by its IdP,
+        // table storage sessions and policy-restricted STS sessions hold
+        // delegated subsets of their parent's rights, and an unresolvable
+        // parent fails closed. A plain unrestricted STS session (such as a
+        // Console login) passes.
         let shared_denial = if unresolved_parent {
             Some(CredentialMutationDenial::UnresolvedParent)
         } else if is_service_account {
@@ -232,6 +245,8 @@ impl CallerIdentity {
             .any(|claim| credentials.claims_or_empty().contains_key(*claim))
         {
             Some(CredentialMutationDenial::TableStorageSession)
+        } else if restricted_session {
+            Some(CredentialMutationDenial::RestrictedSession)
         } else {
             None
         };
@@ -595,14 +610,58 @@ mod tests {
     fn table_storage_sessions_cannot_manage_parent_credentials() {
         for claim in ["rustfs:table-bucket", "rustfs:table-id", "rustfs:credential-scope-prefix"] {
             let mut credentials = sts_session("TABLEKEY", "table-owner");
-            credentials.claims = Some(HashMap::from([(claim.to_string(), Value::String("scope".to_string()))]));
+            credentials.claims = Some(HashMap::from([
+                (claim.to_string(), Value::String("scope".to_string())),
+                (
+                    rustfs_iam::sys::SESSION_POLICY_NAME.to_string(),
+                    Value::String("eyJWZXJzaW9uIjoiMjAxMi0xMC0xNyJ9".to_string()),
+                ),
+            ]));
             let caller = CallerIdentity::from_credentials(credentials, false);
 
             assert_eq!(caller.mutation_denial, Some(CredentialMutationDenial::TableStorageSession));
+            assert_eq!(caller.mfa_denial, Some(CredentialMutationDenial::TableStorageSession));
             assert!(!caller.mutability().password);
             assert!(caller.ensure_credential_mutation_allowed().is_err());
             assert!(caller.ensure_mfa_management_allowed().is_err());
         }
+    }
+
+    #[test]
+    fn session_confined_by_session_policy_may_manage_neither() {
+        for (claim_key, claim_val) in [
+            (
+                rustfs_iam::sys::SESSION_POLICY_NAME,
+                "eyJWZXJzaW9uIjoiMjAxMi0xMC0xNyIsIlN0YXRlbWVudCI6W3siRWZmZWN0IjoiQWxsb3ciLCJBY3Rpb24iOlsiczM6R2V0T2JqZWN0Il0sIlJlc291cmNlIjpbImFybjphd3M6czM6OjpwdWJsaWMtZGF0YS8qIl19XX0",
+            ),
+            (
+                rustfs_iam::sys::SESSION_POLICY_NAME_EXTRACTED,
+                r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":["s3:GetObject"],"Resource":["arn:aws:s3:::public-data/*"]}]}"#,
+            ),
+        ] {
+            let mut credentials = sts_session("TEMPKEY", "sinan");
+            credentials.claims = Some(HashMap::from([(claim_key.to_string(), Value::String(claim_val.to_string()))]));
+
+            let caller = CallerIdentity::from_credentials(credentials, false);
+
+            assert_eq!(caller.access_key, "sinan");
+            assert_eq!(caller.identity_type, IdentityType::Sts);
+            assert_eq!(caller.mfa_denial, Some(CredentialMutationDenial::RestrictedSession));
+            assert_eq!(caller.mutation_denial, Some(CredentialMutationDenial::RestrictedSession));
+            assert!(!caller.mutability().password);
+            assert!(caller.ensure_mfa_management_allowed().is_err());
+            assert!(caller.ensure_credential_mutation_allowed().is_err());
+        }
+    }
+
+    #[test]
+    fn plain_sts_session_may_still_manage_both() {
+        let caller = CallerIdentity::from_credentials(sts_session("TEMPKEY", "sinan"), false);
+
+        assert!(caller.mfa_denial.is_none());
+        assert!(caller.mutation_denial.is_none());
+        assert!(caller.ensure_mfa_management_allowed().is_ok());
+        assert!(caller.ensure_credential_mutation_allowed().is_ok());
     }
 
     #[test]
