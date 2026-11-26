@@ -14,38 +14,42 @@
 
 use super::*;
 use crate::app::object::request_body::{BodyReadControl, ObservedBody};
-use crate::app::storage_api::s3::Body as S3Body;
-use crate::app::storage_api::s3::dto::{StreamingBlob, UploadPartInput};
-use crate::app::storage_api::s3::{S3ErrorCode, S3Request};
 use crate::app::storage_api::test::contract::bucket::{BucketOperations, MakeBucketOptions};
 use crate::app::storage_api::test::contract::object::ObjectIO;
 use http_body::Frame;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use tokio::sync::{mpsc, oneshot};
 
-fn part_request(bucket: &str, upload: &str, body: StreamingBlob, size: i64) -> S3Request<UploadPartInput> {
-    build_request(
-        UploadPartInput::builder()
-            .bucket(bucket.to_owned())
-            .key("object".to_owned())
-            .upload_id(upload.to_owned())
-            .part_number(1)
-            .content_length(Some(size))
-            .body(Some(body))
-            .build()
-            .expect("part input"),
-        Method::PUT,
-    )
+fn part_write_input(bucket: &str, upload: &str, body: Body, size: i64) -> UploadPartWriteInput {
+    UploadPartWriteInput {
+        target: UploadPartTarget::Legacy {
+            bucket: bucket.to_owned(),
+            key: "object".to_owned(),
+            upload_id: upload.to_owned(),
+        },
+        part_number: 1,
+        content_length: Some(size),
+        body: Some(body),
+        trailing_headers: None,
+        frame_trailers: None,
+        content_md5: None,
+        checksum_algorithm: None,
+        checksum_crc32: None,
+        checksum_crc32c: None,
+        checksum_crc64nvme: None,
+        checksum_sha1: None,
+        checksum_sha256: None,
+        sse_customer_algorithm: None,
+        sse_customer_key: None,
+        sse_customer_key_md5: None,
+    }
 }
 
 type BodySender = mpsc::UnboundedSender<Result<Frame<Bytes>, std::io::Error>>;
 
 /// Method PUT, URI `/`, empty headers. Credentials, region, and service stay absent.
-fn part_envelope(
-    input: UploadPartInput,
-    extensions: http::Extensions,
-) -> (crate::app::RequestEnvelope, crate::app::multipart_usecase::UploadPartWriteInput) {
-    let envelope = crate::app::RequestEnvelope::from_parts(
+fn part_envelope(extensions: http::Extensions) -> crate::app::RequestEnvelope {
+    crate::app::RequestEnvelope::from_parts(
         crate::app::RequestHead {
             method: Method::PUT,
             uri: http::Uri::from_static("/"),
@@ -55,8 +59,7 @@ fn part_envelope(
             service: None,
         },
         extensions,
-    );
-    (envelope, crate::app::multipart_usecase::UploadPartWriteInput::from_legacy(input, None))
+    )
 }
 
 fn observed_request(
@@ -87,19 +90,11 @@ fn observed_request(
         result
     });
     let control = BodyReadControl::default();
-    let body = ObservedBody::new(http_body_util::StreamBody::new(stream), control.clone());
-    let input = UploadPartInput::builder()
-        .bucket(bucket.to_owned())
-        .key("object".to_owned())
-        .upload_id(upload.to_owned())
-        .part_number(1)
-        .content_length(Some(size as i64))
-        .body(Some(StreamingBlob::from(S3Body::http_body_unsync(body))))
-        .build()
-        .expect("part input");
+    let body = http_body_stream(ObservedBody::new(http_body_util::StreamBody::new(stream), control.clone()));
+    let input = part_write_input(bucket, upload, body, size as i64);
     let mut extensions = http::Extensions::new();
     extensions.insert(control.clone());
-    let (envelope, input) = part_envelope(input, extensions);
+    let envelope = part_envelope(extensions);
     (envelope, input, sender, waiting, polls, control)
 }
 
@@ -213,12 +208,7 @@ async fn assert_body_timeout_storage_lifecycle(part_size: usize, partial_size: u
             sender
                 .send(Ok(Frame::data(Bytes::from(vec![7; partial_size]))))
                 .expect("partial body");
-            let mut upload_future = Box::pin(async {
-                usecase
-                    .execute_upload_part_with_audit(envelope, input)
-                    .await
-                    .map_err(crate::error::legacy_error_for_test)
-            });
+            let mut upload_future = Box::pin(usecase.execute_upload_part_with_audit(envelope, input));
             tokio::time::timeout(Duration::from_secs(10), async {
                 tokio::select! {
                     result = &mut upload_future => panic!("upload finished before storage requested raw input: {:?}", result.err().map(|error| error.code().clone())),
@@ -261,26 +251,12 @@ async fn assert_body_timeout_storage_lifecycle(part_size: usize, partial_size: u
                 continue;
             }
             let payload = vec![if replacement { 9 } else { 8 }; part_size];
-            let input = UploadPartInput::builder()
-                .bucket(bucket.clone())
-                .key("object".to_owned())
-                .upload_id(upload.upload_id.clone())
-                .part_number(1)
-                .content_length(Some(part_size as i64))
-                .body(Some(StreamingBlob::from(Bytes::from(payload))))
-                .build()
-                .expect("part input");
-            // Same facts `build_request` carried. Headers and extensions stay empty.
-            let (envelope, input) = part_envelope(input, http::Extensions::new());
-            let retry = tokio::time::timeout(Duration::from_secs(10), async {
-                usecase
-                    .execute_upload_part_with_audit(envelope, input)
-                    .await
-                    .map_err(crate::error::legacy_error_for_test)
-            })
-            .await
-            .expect("foreground and capped staging permits must be released")
-            .expect("same-number retry");
+            let input = part_write_input(&bucket, &upload.upload_id, Body::from(Bytes::from(payload)), part_size as i64);
+            let envelope = part_envelope(http::Extensions::new());
+            let retry = tokio::time::timeout(Duration::from_secs(10), usecase.execute_upload_part_with_audit(envelope, input))
+                .await
+                .expect("foreground and capped staging permits must be released")
+                .expect("same-number retry");
             old_etag = retry.e_tag;
         }
         let parts = store
@@ -346,12 +322,7 @@ async fn assert_foreground_queue() {
         .await
         .expect("upload session");
     let (envelope, input, sender, waiting, polls, _) = observed_request(&bucket, &upload.upload_id, 4096);
-    let task = tokio::spawn(async move {
-        usecase
-            .execute_upload_part_with_audit(envelope, input)
-            .await
-            .map_err(crate::error::legacy_error_for_test)
-    });
+    let task = tokio::spawn(async move { usecase.execute_upload_part_with_audit(envelope, input).await });
     tokio::time::timeout(Duration::from_secs(10), async {
         while manager.put_object_admission_snapshot().queued != Some(1) {
             tokio::task::yield_now().await;
@@ -407,10 +378,23 @@ fn presigned_part_checksum_survives_completion_and_rejects_bad_retry() {
             let upload = store.new_multipart_upload(&bucket, "object", &options).await.unwrap();
             let mut etag = None;
             for payload in [b"abc", b"abd"] {
-                let mut req = part_request(&bucket, &upload.upload_id, StreamingBlob::from(Bytes::copy_from_slice(payload)), 3);
-                req.uri = "/bucket/object?x-amz-checksum-sha256=ungWv48Bz%2BpBQUDeXa4iI7ADYaOWF3qctBD%2FYfIAFa0%3D&x-amz-sdk-checksum-algorithm=SHA256".parse().unwrap();
-                req.extensions.insert(VerifiedPresignedRequest);
-                let result = usecase.execute_upload_part(req).await;
+                let input = part_write_input(&bucket, &upload.upload_id, Body::from(Bytes::copy_from_slice(payload)), 3);
+                let mut extensions = http::Extensions::new();
+                extensions.insert(VerifiedPresignedRequest);
+                let envelope = crate::app::RequestEnvelope::from_parts(
+                    crate::app::RequestHead {
+                        method: Method::PUT,
+                        uri: "/bucket/object?x-amz-checksum-sha256=ungWv48Bz%2BpBQUDeXa4iI7ADYaOWF3qctBD%2FYfIAFa0%3D&x-amz-sdk-checksum-algorithm=SHA256"
+                            .parse()
+                            .unwrap(),
+                        headers: http::HeaderMap::new(),
+                        credentials: None,
+                        region: None,
+                        service: None,
+                    },
+                    extensions,
+                );
+                let result = usecase.execute_upload_part_with_audit(envelope, input).await;
                 if payload == b"abc" {
                     let response = result.expect("hoisted SHA256 part must be accepted");
                     assert_eq!(response.checksum_sha256.as_deref(), Some(checksum));

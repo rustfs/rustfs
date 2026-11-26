@@ -15,8 +15,6 @@
 //! Fixtures and test-only imports shared by the multipart use-case tests.
 
 use super::*;
-use crate::app::storage_api::s3::S3Request;
-pub(super) use crate::app::storage_api::s3::dto::CompletedMultipartUpload;
 use crate::app::{RequestEnvelope, RequestHead};
 pub(super) use http::Extensions;
 pub(super) use http::Method;
@@ -34,20 +32,6 @@ pub(super) fn s3_op_total(op: S3Operation) -> u64 {
         .find(|snapshot| snapshot.op == op.as_str())
         .map(|snapshot| snapshot.total)
         .unwrap_or_default()
-}
-
-pub(super) fn build_request<T>(input: T, method: Method) -> S3Request<T> {
-    S3Request {
-        input,
-        method,
-        uri: Uri::from_static("/"),
-        headers: HeaderMap::new(),
-        extensions: Extensions::new(),
-        credentials: None,
-        region: None,
-        service: None,
-        trailing_headers: None,
-    }
 }
 
 /// The envelope of a request that carries nothing but `method`.

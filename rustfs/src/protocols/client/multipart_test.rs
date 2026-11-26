@@ -15,7 +15,7 @@
 //! Protocol multipart compatibility probes against the original conversion and storage edge.
 //! These tests do not define storage or authorization rules.
 
-use super::super::{ETagCondition, RequestParams, Timestamp as LegacyTimestamp, TimestampFormat};
+use super::super::RequestParams;
 use super::*;
 use http::{HeaderMap, Method};
 use rustfs_protocols::common::client::s3::{MultipartRequest, StorageBackend};
@@ -32,7 +32,7 @@ fn create_input() -> dto::CreateMultipartUploadInput {
 #[test]
 fn multipart_create_projection_matches_original_fields_and_times() {
     for empty in [false, true] {
-        for seconds in [1_800_000_000, -1] {
+        for (seconds, expected_nanos) in [(1_800_000_000, 1_800_000_000_123_456_789_i128), (-1, -876_543_211_i128)] {
             let make = || {
                 let mut input = create_input();
                 input.tagging = Some(if empty { "" } else { "label=value" }.into());
@@ -47,25 +47,23 @@ fn multipart_create_projection_matches_original_fields_and_times() {
                 input
             };
             let text = |value: &str| (!empty).then(|| value.to_owned());
-            let expected = crate::app::multipart_usecase::CreateMultipartUploadFields::from_legacy(
-                super::super::CreateMultipartUploadInput {
-                    bucket: "multipart-fields".into(),
-                    key: "a ?#+%.txt".into(),
-                    tagging: text("label=value"),
-                    storage_class: text("STANDARD").map(Into::into),
-                    object_lock_mode: text("GOVERNANCE").map(Into::into),
-                    object_lock_legal_hold_status: text("ON").map(Into::into),
-                    sse_customer_algorithm: text("AES256"),
-                    ssekms_key_id: text("key-label"),
-                    sse_customer_key_md5: text("digest"),
-                    metadata: Some([("label".into(), "value".into())].into()),
-                    object_lock_retain_until_date: Some(
-                        LegacyTimestamp::parse(TimestampFormat::EpochSeconds, &format!("{seconds}.123456789"))
-                            .expect("legacy timestamp"),
-                    ),
-                    ..Default::default()
-                },
-            );
+            let expected = crate::app::multipart_usecase::CreateMultipartUploadFields {
+                bucket: "multipart-fields".into(),
+                key: "a ?#+%.txt".into(),
+                metadata: Some([("label".into(), "value".into())].into()),
+                tagging: text("label=value"),
+                storage_class: text("STANDARD"),
+                server_side_encryption: None,
+                sse_customer_algorithm: text("AES256"),
+                sse_customer_key: None,
+                sse_customer_key_md5: text("digest"),
+                ssekms_key_id: text("key-label"),
+                object_lock_legal_hold_status: text("ON"),
+                object_lock_mode: text("GOVERNANCE"),
+                object_lock_retain_until_date: Some(
+                    time::OffsetDateTime::from_unix_timestamp_nanos(expected_nanos).expect("timestamp"),
+                ),
+            };
             let actual = create_multipart_input(make()).expect("owned input");
             assert_eq!(
                 (actual.bucket, actual.key, actual.metadata, actual.tagging, actual.storage_class),
@@ -155,16 +153,16 @@ fn complete_input() -> dto::CompleteMultipartUploadInput {
 
 #[test]
 fn multipart_complete_projection_matches_original_parts_and_conditions() {
-    for condition in [
-        None,
-        Some(""),
-        Some("*"),
-        Some("abc-1"),
-        Some("\"abc\""),
-        Some("W/\"abc\""),
-        Some("bad tag"),
-        Some("\"one\", \"two\""),
-        Some("W/\"one\", W/\"two\""),
+    for (condition, expected) in [
+        (None, Ok(None)),
+        (Some(""), Ok(None)),
+        (Some("*"), Ok(Some("*"))),
+        (Some("abc-1"), Ok(Some("\"abc-1\""))),
+        (Some("\"abc\""), Ok(Some("\"abc\""))),
+        (Some("W/\"abc\""), Ok(Some("W/\"abc\""))),
+        (Some("bad tag"), Err(())),
+        (Some("\"one\", \"two\""), Ok(Some("\"one\", \"two\""))),
+        (Some("W/\"one\", W/\"two\""), Ok(Some("W/\"one\", W/\"two\""))),
     ] {
         let make = || {
             let mut input = complete_input();
@@ -181,14 +179,10 @@ fn multipart_complete_projection_matches_original_parts_and_conditions() {
             input
         };
         let actual = complete_multipart_input(make());
-        let expected = condition
-            .filter(|value| !value.is_empty())
-            .map(|value| ETagCondition::parse_http_header(value.as_bytes()))
-            .transpose();
         match expected {
             Ok(parsed) => {
                 let actual = actual.expect("accepted condition");
-                let header = parsed.map(|value| value.to_http_header().expect("condition header").to_str().expect("ASCII condition").to_owned());
+                let header = parsed.map(str::to_owned);
                 assert_eq!(actual.if_match, header);
                 assert_eq!(actual.if_none_match, header);
                 assert!(actual.sse_customer_algorithm.is_none());
@@ -198,7 +192,7 @@ fn multipart_complete_projection_matches_original_parts_and_conditions() {
                 assert_eq!(part.e_tag.as_ref().map(ETag::opaque_tag), Some("a&b"));
                 assert_eq!(part.checksum_crc32.as_deref(), Some(""));
             }
-            Err(_) => assert_eq!(error_facts(actual.expect_err("rejected condition")), ("InternalError".into(), Some("failed to convert CompleteMultipartUpload input through the gateway compatibility seam: if_match: not an entity-tag condition the s3s input can hold".into()), Some(http::StatusCode::INTERNAL_SERVER_ERROR), None)),
+            Err(()) => assert_eq!(error_facts(actual.expect_err("rejected condition")), ("InternalError".into(), Some("failed to convert CompleteMultipartUpload input through the gateway compatibility seam: if_match: not an entity-tag condition the s3s input can hold".into()), Some(http::StatusCode::INTERNAL_SERVER_ERROR), None)),
         }
     }
 }
@@ -334,45 +328,40 @@ fn multipart_envelopes_preserve_original_request_facts() {
         secret_key: "test-secret".into(),
         ..Default::default()
     };
-    for (method, query) in [
-        (Method::POST, vec![("uploads", None)]),
-        (Method::POST, vec![("uploadId", Some("session/+?=&%"))]),
-        (Method::DELETE, vec![("uploadId", Some("session/+?=&%"))]),
+    for (method, query, expected_uri) in [
+        (Method::POST, vec![("uploads", None)], "/multipart-fields/a%20%3F%23+%25.txt?uploads"),
+        (
+            Method::POST,
+            vec![("uploadId", Some("session/+?=&%"))],
+            "/multipart-fields/a%20%3F%23+%25.txt?uploadId=session%2F%2B%3F%3D%26%25",
+        ),
+        (
+            Method::DELETE,
+            vec![("uploadId", Some("session/+?=&%"))],
+            "/multipart-fields/a%20%3F%23+%25.txt?uploadId=session%2F%2B%3F%3D%26%25",
+        ),
     ] {
         let uri = super::super::build_object_uri("multipart-fields", "a ?#+%.txt", &query).expect("URI");
-        let params = || RequestParams {
+        assert_eq!(uri.to_string(), expected_uri);
+        let params = RequestParams {
             bucket: Some("multipart-fields".into()),
             object: Some("a ?#+%.txt".into()),
             credentials: &credentials,
         };
-        let request = ProtocolStorageClient::create_request((), method.clone(), uri.clone(), params()).expect("original request");
-        let envelope = ProtocolStorageClient::create_envelope(method, uri, params());
-        assert_eq!(
-            (envelope.method(), envelope.uri(), envelope.headers()),
-            (&request.method, &request.uri, &request.headers)
-        );
-        let original = request.extensions.get::<super::super::ReqInfo>().expect("original facts");
+        let envelope = ProtocolStorageClient::create_envelope(method.clone(), uri.clone(), params);
+        assert_eq!((envelope.method(), envelope.uri(), envelope.headers().is_empty()), (&method, &uri, true));
         let owned = envelope.req_info().expect("owned facts");
         assert_eq!(
             (
-                &owned.bucket,
-                &owned.object,
-                &owned.version_id,
+                owned.bucket.as_deref(),
+                owned.object.as_deref(),
+                owned.version_id.as_deref(),
                 owned.is_owner,
                 owned.keystone_session_present
             ),
-            (
-                &original.bucket,
-                &original.object,
-                &original.version_id,
-                original.is_owner,
-                original.keystone_session_present
-            )
+            (Some("multipart-fields"), Some("a ?#+%.txt"), None, false, None)
         );
-        assert_eq!(
-            owned.cred.as_ref().map(|value| &value.access_key),
-            original.cred.as_ref().map(|value| &value.access_key)
-        );
+        assert_eq!(owned.cred.as_ref().map(|value| value.access_key.as_str()), Some("multipart-facts"));
         assert!(envelope.server_context().is_none());
     }
 }
@@ -438,15 +427,6 @@ fn multipart_uses_bound_store_with_a_foreign_ambient_context() {
 fn multipart_create_output_matches_original_for_stored_names_and_empty_values() {
     for name in ["multipart-fields", "a-s3alias"] {
         for value in ["", "value"] {
-            let legacy = super::super::CreateMultipartUploadOutput {
-                bucket: Some(name.into()),
-                key: Some("key".into()),
-                upload_id: Some(value.into()),
-                sse_customer_algorithm: Some(value.into()),
-                sse_customer_key_md5: Some(value.into()),
-                ssekms_key_id: Some(value.into()),
-                ..Default::default()
-            };
             let actual = create_multipart_output(crate::app::multipart_usecase::CreateMultipartUploadResult {
                 bucket: name.into(),
                 key: "key".into(),
@@ -472,12 +452,12 @@ fn multipart_create_output_matches_original_for_stored_names_and_empty_values() 
             assert_eq!(
                 snapshot(actual.expect("stored names are representable")),
                 (
-                    legacy.bucket.expect("bucket"),
-                    legacy.key.expect("key"),
-                    legacy.upload_id.expect("upload id"),
-                    legacy.sse_customer_algorithm,
-                    legacy.sse_customer_key_md5,
-                    legacy.ssekms_key_id
+                    name.to_owned(),
+                    "key".to_owned(),
+                    value.to_owned(),
+                    Some(value.to_owned()),
+                    Some(value.to_owned()),
+                    Some(value.to_owned()),
                 )
             );
         }

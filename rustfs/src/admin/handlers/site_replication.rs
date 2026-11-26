@@ -596,7 +596,7 @@ async fn validate_site_replication_admin_request(
     authorize_admin_envelope(req.envelope(), vec![Action::AdminAction(action)]).await
 }
 
-fn reject_site_replicator_on_public_admin(cred: &rustfs_credentials::Credentials) -> S3Result<()> {
+pub(crate) fn reject_site_replicator_on_public_admin(cred: &rustfs_credentials::Credentials) -> S3Result<()> {
     if cred.access_key == SITE_REPLICATOR_SERVICE_ACCOUNT {
         return Err(s3_error!(
             AccessDenied,

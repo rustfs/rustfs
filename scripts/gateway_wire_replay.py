@@ -22,6 +22,7 @@ from email.utils import parsedate_to_datetime
 import hashlib
 import http.client
 import io
+import ipaddress
 import json
 import os
 from pathlib import Path
@@ -48,6 +49,7 @@ HEADERS = {
 }
 HEADER_PREFIXES = ("x-amz-server-side-encryption", "x-amz-meta-", "x-amz-checksum-")
 EXPECTED_CONTROLS = {"changed_error_code": ["error_code", "body"], "changed_object": ["body"]}
+CREATE_BUCKET_LOCATION_RULING = "rustfs/backlog#2684#issuecomment-7163283798"
 
 
 class ReplayError(Exception):
@@ -119,6 +121,137 @@ def header_differences(reference, candidate):
     return {direction: sorted(names) for direction, names in sorted(changes.items())}
 
 
+def _is_ip_literal(host):
+    try:
+        ipaddress.ip_address(host)
+        return True
+    except ValueError:
+        return False
+
+
+def _split_host_port(authority):
+    """Parse an HTTP Host value into (lowercase_host, port_or_None), or (None, None)."""
+    if (not isinstance(authority, str) or not authority
+            or any(ch.isspace() or ch in "/\\?#@," or ord(ch) < 0x20 or ord(ch) == 0x7F for ch in authority)):
+        return None, None
+    if authority.startswith("["):
+        host, sep, rest = authority[1:].partition("]")
+        if not sep or not host or not _is_ip_literal(host):
+            return None, None
+        if not rest:
+            return host.lower(), None
+        if not rest.startswith(":"):
+            return None, None
+        port_text = rest[1:]
+        has_port = True
+    else:
+        if "[" in authority or "]" in authority or authority.count(":") > 1:
+            return None, None
+        host, sep, port_text = authority.partition(":")
+        if not host:
+            return None, None
+        has_port = bool(sep)
+    if has_port:
+        if not port_text or not port_text.isascii() or not port_text.isdigit():
+            return None, None
+        port = int(port_text)
+        if not 1 <= port <= 65535:
+            return None, None
+    else:
+        port = None
+    return host.lower(), port
+
+
+def _normalize_domains(domains):
+    normalized = set()
+    for domain in domains:
+        cleaned = domain.strip().lower().rstrip(".")
+        if (not cleaned or _is_ip_literal(cleaned)
+                or any(ch.isspace() or ch in "/\\?#@:[]" or ord(ch) < 0x20 or ord(ch) == 0x7F for ch in cleaned)
+                or not all(cleaned.split("."))):
+            raise ValueError(f"Invalid virtual-host domain: {domain!r}")
+        normalized.add(cleaned)
+    return tuple(sorted(normalized, key=len, reverse=True))
+
+
+def _virtual_host_bucket(hostname, virtual_host_domains):
+    if not hostname or _is_ip_literal(hostname) or not all(hostname.split(".")):
+        return None
+    for domain in virtual_host_domains:
+        if hostname == domain:
+            return None
+        suffix = "." + domain
+        if hostname.endswith(suffix):
+            bucket = hostname[: -len(suffix)]
+            if bucket and all(bucket.split(".")):
+                return bucket
+            return None
+    return None
+
+
+def extract_create_bucket(target, host, virtual_host_domains=()):
+    """Extract the target bucket name for a CreateBucket HTTP request, or None."""
+    if (not isinstance(target, str) or not target.startswith("/")
+            or any(ch.isspace() or ch in "?#%" or ord(ch) < 0x20 or ord(ch) == 0x7F for ch in target)):
+        return None
+    parsed = urlsplit(target)
+    if parsed.scheme or parsed.netloc or parsed.query or parsed.fragment or parsed.path != target:
+        return None
+    hostname, _port = _split_host_port(host)
+    if hostname is None:
+        return None
+    domains = _normalize_domains(virtual_host_domains) if virtual_host_domains else ()
+    if domains:
+        vhost_bucket = _virtual_host_bucket(hostname, domains)
+        if vhost_bucket is not None:
+            return vhost_bucket if target == "/" else None
+    if target == "/":
+        return None
+    bucket = target[1:]
+    if bucket.endswith("/"):
+        bucket = bucket[:-1]
+    if not bucket or "/" in bucket or bucket in (".", ".."):
+        return None
+    return bucket
+
+
+def accepted_difference(operation, method, target, host, left, right, *, virtual_host_domains=()):
+    """Return signed ruling metadata for an accepted wire difference, or None."""
+    # Maintainer sign-off (#2684#issuecomment-7163283798): gateway returns Location: /<bucket>
+    # on 200 CreateBucket (8676d2f3b), while official rustfs 1.0.5 omits Location.
+    if operation != "CreateBucket" or method != "PUT":
+        return None
+    if left["status"] != 200 or right["status"] != 200 or differences(left, right) != ["headers"]:
+        return None
+    bucket = extract_create_bucket(target, host, virtual_host_domains)
+    if bucket is None:
+        return None
+    if any(name == "location" for name, _ in left["headers"]):
+        return None
+    candidate_locations = [value for name, value in right["headers"] if name == "location"]
+    if candidate_locations != [f"/{bucket}"]:
+        return None
+    if [(name, value) for name, value in right["headers"] if name != "location"] != left["headers"]:
+        return None
+    return {"ruling": "accepted-change", "reference": CREATE_BUCKET_LOCATION_RULING}
+
+
+def _is_valid_accepted_difference(entry, counts):
+    return (
+        isinstance(entry, dict)
+        and set(entry) == {"case", "request", "operation", "fields", "header_differences", "ruling", "reference"}
+        and isinstance(entry["case"], str)
+        and entry["case"] in counts
+        and type(entry["request"]) is int
+        and entry["request"] > 0
+        and entry["ruling"] == "accepted-change"
+        and entry["reference"] == CREATE_BUCKET_LOCATION_RULING
+        and entry["operation"] == "CreateBucket"
+        and entry["fields"] == ["headers"]
+        and entry["header_differences"] == {"candidate_added": ["location"]}
+    )
+
+
 class SdkBody(io.BytesIO):
     def stream(self, amt=65536, decode_content=False):
         while piece := self.read(amt):
@@ -126,8 +259,16 @@ class SdkBody(io.BytesIO):
 
 
 class WireReplay:
-    def __init__(self, reference_port, candidate_port, frozen):
-        self.authority = f"127.0.0.1:{reference_port}"
+    def __init__(self, reference_port, candidate_port, frozen, *, host="127.0.0.1", virtual_host_domains=()):
+        self.host = host.lower()
+        self.authority = f"{self.host}:{reference_port}"
+        if virtual_host_domains:
+            domains = virtual_host_domains
+        elif not _is_ip_literal(self.host) and self.host != "localhost":
+            domains = (self.host,)
+        else:
+            domains = ()
+        self.virtual_host_domains = _normalize_domains(domains) if domains else ()
         self.reference_port = reference_port
         self.candidate_port = candidate_port
         self.frozen = frozen
@@ -137,16 +278,36 @@ class WireReplay:
         self.counts = Counter()
         self.operations = Counter()
         self.diffs = []
+        self.accepted_diffs = []
         self.controls = {}
+
+    def _is_allowed_host(self, host_header):
+        if host_header == self.authority:
+            return True
+        if not self.virtual_host_domains:
+            return False
+        hostname, port = _split_host_port(host_header)
+        if hostname is None or (port is not None and port != self.reference_port):
+            return False
+        if hostname in self.virtual_host_domains:
+            return True
+        return _virtual_host_bucket(hostname, self.virtual_host_domains) is not None
 
     def compare(self, method, wire, response, content):
         head, body = wire.split(b"\r\n\r\n", 1)
         lines = head.decode("latin1").split("\r\n")
-        fields = {k.lower(): v.strip() for k, v in (line.split(":", 1) for line in lines[1:])}
-        if (lines[0].split(" ")[0] != method or fields.get("host") != self.authority or
-                "Credential=rustfsadmin-ci/" not in fields.get("authorization", "") or
-                "transfer-encoding" in fields or int(fields.get("content-length", "0")) != len(body)):
+        request_line = lines[0].split(" ")
+        raw_headers = [line.split(":", 1) for line in lines[1:]]
+        request_headers = {k.lower(): v.strip() for k, v in raw_headers}
+        host_values = [v.strip() for k, v in raw_headers if k.lower() == "host"]
+        if (len(request_line) != 3 or request_line[0] != method or len(host_values) != 1
+                or not self._is_allowed_host(host_values[0])
+                or "Credential=rustfsadmin-ci/" not in request_headers.get("authorization", "")
+                or "transfer-encoding" in request_headers
+                or int(request_headers.get("content-length", "0")) != len(body)):
             raise ReplayError("Unexpected signing identity, authority or request framing")
+        request_target = request_line[1]
+        request_host = host_values[0]
         # The TCP destinations differ. The signed Host, header lines, target and body are untouched.
         with socket.create_connection(("127.0.0.1", self.candidate_port), timeout=15) as sock:
             sock.sendall(wire)
@@ -165,12 +326,21 @@ class WireReplay:
         left = project(self.operation, method, response.status_code, reference_headers, content)
         self.counts[self.case] += 1
         self.operations[self.operation] += 1
-        fields = differences(left, right)
-        if fields:
-            diagnostic = {"case": self.case, "request": self.counts[self.case], "operation": self.operation, "fields": fields}
-            if "headers" in fields:
+        diff_fields = differences(left, right)
+        if diff_fields:
+            diagnostic = {"case": self.case, "request": self.counts[self.case], "operation": self.operation,
+                          "fields": diff_fields}
+            if "headers" in diff_fields:
                 diagnostic["header_differences"] = header_differences(left["headers"], right["headers"])
-            self.diffs.append(diagnostic)
+            ruling = accepted_difference(
+                self.operation, method, request_target, request_host, left, right,
+                virtual_host_domains=self.virtual_host_domains,
+            )
+            if ruling is not None:
+                diagnostic.update(ruling)
+                self.accepted_diffs.append(diagnostic)
+            else:
+                self.diffs.append(diagnostic)
         if "changed_error_code" not in self.controls and left["error_code"] == "NoSuchKey":
             changed = content.replace(b"<Code>NoSuchKey</Code>", b"<Code>NoSuchBucket</Code>", 1)
             headers = [(k, str(len(changed)) if k.lower() == "content-length" else v) for k, v in reference_headers]
@@ -207,7 +377,7 @@ class WireReplay:
 
         def observe(session, request):
             url = urlsplit(request.url)
-            if url.scheme != "http" or url.netloc != self.authority or self.current is not None:
+            if url.scheme != "http" or not self._is_allowed_host(url.netloc) or self.current is not None:
                 raise ReplayError("Unexpected SDK destination or concurrent request")
             self.current = bytearray()
             try:
@@ -285,7 +455,8 @@ def run(args, temp):
             "candidate_sha256": receipt["binary_sha256"], "candidate_revision": receipt["source"]["head"],
             "requests_by_operation": dict(replay.operations),
             "requests_by_case": dict(replay.counts), "requests_compared": sum(replay.counts.values()),
-            "differences": replay.diffs, "negative_controls": replay.controls,
+            "differences": replay.diffs, "accepted_differences": replay.accepted_diffs,
+            "accepted_differences_count": len(replay.accepted_diffs), "negative_controls": replay.controls,
             "other_ceph_cases_not_replayed": sorted(nightly - set(selected)), "e2e_requests_replayed": 0}
 
 
@@ -302,11 +473,22 @@ def main(argv=None):
     args = parser.parse_args(argv)
     if args.cmd == "check":
         report = json.loads(args.summary.read_text())
-        print(f"{report['requests_compared']} requests compared, {len(report['differences'])} differences")
+        diffs = report["differences"]
+        accepted = report.get("accepted_differences", [])
+        accepted_count = report.get("accepted_differences_count", len(accepted) if isinstance(accepted, list) else -1)
+        diff_count = len(diffs) if isinstance(diffs, list) else -1
+        acc_len = len(accepted) if isinstance(accepted, list) else -1
+        print(f"{report['requests_compared']} requests compared, {diff_count} differences, "
+              f"{acc_len} accepted differences")
         counts = report["requests_by_case"]
         complete = (set(counts) == set(replay_cases()) and all(type(n) is int and n > 0 for n in counts.values())
                     and sum(counts.values()) == report["requests_compared"])
-        return int(not complete or bool(report["differences"]) or report["negative_controls"] != EXPECTED_CONTROLS)
+        accepted_valid = (isinstance(accepted, list) and type(accepted_count) is int
+                          and accepted_count == len(accepted)
+                          and accepted_count <= report["requests_compared"]
+                          and all(_is_valid_accepted_difference(entry, counts) for entry in accepted))
+        return int(not complete or not isinstance(diffs, list) or bool(diffs) or not accepted_valid
+                   or report["negative_controls"] != EXPECTED_CONTROLS)
     args.summary.unlink(missing_ok=True)
     with tempfile.TemporaryDirectory(prefix="rustfs-wire-") as directory:
         temp = Path(directory)

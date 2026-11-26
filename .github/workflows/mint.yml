@@ -12,38 +12,45 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# MinIO Mint against RustFS: multi-SDK client compatibility.
+# MinIO Mint dual-stack comparison against RustFS: multi-SDK client compatibility
+# (rustfs/backlog#2774, T3.3).
 #
-# ceph/s3-tests (see e2e-s3tests.yml and the ci.yml PR gate) exercises the S3
-# API semantics through boto3 only. Mint complements it by running the
-# functional test suites of many REAL client SDKs and tools (awscli, mc,
-# aws-sdk-java/go/php/ruby, minio-go/java/js/py, s3cmd, ...), which catches
-# client-specific signing, encoding, and streaming edge cases a single client
-# cannot.
+# ceph/s3-tests (see e2e-s3tests.yml, reference-parity.yml, and the ci.yml PR
+# gate) exercises S3 API semantics through boto3 only. Mint complements it by
+# running the functional test suites of many real client SDKs and tools (awscli,
+# mc, aws-sdk-go-v2/php/ruby, minio-go/java/js/py, s3cmd, versioning, ...),
+# catching client-specific signing, encoding, and streaming edge cases a single
+# client cannot.
 #
-# This job is REPORT-ONLY for test failures: RustFS does not pass every mint
-# suite yet, so failures are inventoried in the job summary instead of turning
-# the run red. The job fails only when mint produces no results at all
-# (infrastructure error). Once a suite passes reliably, tightening this into a
-# baseline gate (like implemented_tests.txt for s3-tests) is the natural next
-# step. Tightening this into a per-suite baseline gate is tracked as ci-3
-# (backlog#1149) and is intentionally NOT done here.
+# Dual-stack nightly gate (rustfs/backlog#2774): runs the pinned minio/mint
+# image against BOTH:
+#   - `legacy`: the pinned reference release in .config/reference-binary.toml,
+#     downloaded and SHA-256 verified by ./.github/actions/reference-binary;
+#   - `gateway`: the candidate binary built from this checkout by
+#     `build-candidate` on `sm-standard-4` (matching `ci.yml` and
+#     `reference-parity.yml`, avoiding release-LTO OOM on 16 GB `ubuntu-latest`).
 #
-# Runner infrastructure (ci-2, backlog#1149): this job needs a working Docker
-# daemon to (a) build the RustFS source image with buildx and (b) run both the
-# RustFS server and the mint image. It previously ran on the self-hosted
-# `sm-standard-4` label, which is served by heterogeneous runners; its single
-# recorded run (28730530597, 2026-07-05) landed on a minimal pod with no
-# `/var/run/docker.sock`, so "Enable buildx" died at `docker buildx create`
-# ("failed to connect to the docker API at unix:///var/run/docker.sock") before
-# any test executed -- the same root cause ci-1 fixed for the weekly s3-tests
-# sweep. The fix is to pin to GitHub-hosted `ubuntu-latest`, which reliably
-# ships a running Docker daemon + buildx + python3, instead of trusting the
-# drifting self-hosted fleet. Tradeoff: the source Rust build is heavier on a
-# GitHub-hosted 4-vCPU runner than on a warm self-hosted host, but it stays
-# well inside the 120-minute budget and buys deterministic infra. The
-# docker-capable self-hosted `dind-sm-standard-2` label was the alternative but
-# has fewer cores and reintroduces fleet-state risk for no reliability gain.
+# Both legs build the same lightweight `ubuntu:26.04` runtime image (glibc
+# >= both `sm-standard-4`'s Ubuntu 24.04 glibc 2.39 and the pinned 1.0.5
+# reference binary's glibc 2.31), symmetrically bind-mount their verified
+# binary read-only at `/usr/bin/rustfs`, run on identical Docker bridge
+# networking (`rustfs-net`, `SERVER_ENDPOINT=rustfs-mint:9000`), and record
+# verified in-container binary provenance (`target.json`). Individual SDK test
+# failures within a leg are data for the comparison, not a leg failure; a
+# missing/empty `log.json` or container startup failure fails the leg. The
+# `compare` job runs `scripts/mint_stack_diff.py` as a fail-closed gate: it
+# verifies distinct binary provenance, writes the Markdown
+# `(sdk, test, legacy, gateway)` diff table to `$GITHUB_STEP_SUMMARY`, uploads
+# `diff.md`/`diff.json`, and fails whenever the diff table is non-empty or
+# either leg lacks valid results.
+#
+# Runner infrastructure (ci-2, backlog#1149; backlog#2774): compiling the RustFS
+# candidate binary needs no Docker daemon and belongs on `sm-standard-4` (28 GB
+# RAM, warmed `ci-dev` cache) because the full release LTO `Dockerfile.source`
+# build OOMs on 16 GB `ubuntu-latest`. Running `rustfs-mint` and `minio/mint`
+# needs a working Docker daemon without self-hosted pod drift (no
+# `/var/run/docker.sock` on `sm-standard-*`), so the `mint` matrix stays on
+# GitHub-hosted `ubuntu-latest`.
 
 name: mint
 
@@ -67,18 +74,21 @@ on:
         required: false
         default: ""
   schedule:
-    # Weekly, after the Sunday s3-tests full sweep (starts 02:00 UTC, up to
-    # 3h) has finished, so the two never contend for the same runner pool.
-    - cron: "41 6 * * 0"
+    # Nightly at 06:41 UTC, clear of the overnight validation lanes
+    # (reference-parity 01:37, e2e-s3tests Sun 02:19, dual-stack-nightly 03:13,
+    # gateway-acceptance 03:29, e2e-nightly 04:29, e2e-distributed 05:53).
+    - cron: "41 6 * * *"
 
 env:
+  # Matches ci.yml, cache-warm.yml, and reference-parity.yml: these variables
+  # are hashed into the rust-cache key, so build-candidate reads the warmed
+  # ci-dev cache on sm-standard-4.
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
   S3_ACCESS_KEY: rustfsadmin-ci
   S3_SECRET_KEY: rustfssecret-ci
   S3_REGION: us-east-1
-
-  RUST_LOG: info
-  PLATFORM: linux/amd64
-  BUILDX_CACHE_SCOPE: rustfs-e2e-s3tests-source
 
   MINT_SUITES: ${{ github.event.inputs.suites || '' }}
   MINT_MODE: ${{ github.event.inputs.mode || 'core' }}
@@ -96,7 +106,7 @@ env:
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.event_name != 'schedule' }}
 
 # Only alert-on-failure needs more than read access; it declares its own
 # job-level `issues: write`.
@@ -108,65 +118,146 @@ defaults:
     shell: bash
 
 jobs:
-  image:
-    name: Build the RustFS image once
-    runs-on: ubuntu-latest
-    timeout-minutes: 120
+  build-candidate:
+    name: Build candidate binary
+    # Disk, critical-path CPU, and cache ownership: the same debug build as
+    # ci.yml's build-rustfs-debug-binary and reference-parity.yml's
+    # build-candidate, reading the ci-dev cache written on sm-standard-4 (and
+    # avoiding release-LTO OOM on 16 GB ubuntu-latest).
+    runs-on: sm-standard-4
+    timeout-minutes: 60
+    env:
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
     steps:
-      - uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7
+      - name: Checkout repository
+        uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7
         with:
           persist-credentials: false
 
-      - name: Enable buildx
-        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+      - name: Setup Rust environment
+        uses: ./.github/actions/setup
+        with:
+          rust-version: stable
+          cache-shared-key: ci-dev-ea7eec74fe14
+          cache-save-if: 'false'
+          install-build-packaging-tools: 'false'
+          install-test-tools: 'false'
 
-      - name: Build RustFS image (source, cached)
-        run: |
-          DOCKER_BUILDKIT=1 docker buildx build --load \
-            --platform "${PLATFORM}" \
-            --cache-from "type=gha,scope=${BUILDX_CACHE_SCOPE}" \
-            --cache-to "type=gha,mode=max,scope=${BUILDX_CACHE_SCOPE}" \
-            -t rustfs-ci \
-            -f Dockerfile.source .
-          docker save rustfs-ci --output "${RUNNER_TEMP}/rustfs-ci.tar"
+      - name: Build debug binary
+        run: python3 scripts/e2e_binary.py build --bins --features e2e-test-hooks
 
-      - name: Upload the image
+      - name: Upload candidate binary
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: mint-image
-          path: ${{ runner.temp }}/rustfs-ci.tar
+          name: mint-candidate-binary
+          overwrite: true
+          path: |
+            target/debug/rustfs
+            target/debug/rustfs.e2e.json
+          if-no-files-found: error
           retention-days: 1
 
   mint:
-    name: mint
-    needs: [image]
-    # GitHub-hosted: reliably provides a running Docker daemon + buildx +
-    # python3. See the header note (ci-2) for why the self-hosted sm-standard-4
-    # label was abandoned (no docker.sock on the pod its only run landed on).
-    # sm-standard-2 has no docker.sock either (weekly runs failed at "Enable
-    # buildx" from 2026-09-27 to 2026-11-08), so keep this job on ubuntu-latest.
-    # TODO(ci-8): scheduled-failure alerting (auto-open issue on a red weekly
-    # run) is added by the ci-8 composite action; do not implement it here.
+    name: mint (${{ matrix.leg }})
+    needs: [build-candidate]
+    # GitHub-hosted: reliably provides a running Docker daemon + python3.
+    # Self-hosted sm-standard-* pods do not provide /var/run/docker.sock.
     runs-on: ubuntu-latest
     timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        leg: [legacy, gateway]
+    env:
+      LEG: ${{ matrix.leg }}
+      NO_PROXY: 127.0.0.1,localhost,::1
     steps:
       - uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7
         with:
           persist-credentials: false
 
-      - name: Download the image
+      - name: Fetch pinned reference binary
+        id: reference
+        if: matrix.leg == 'legacy'
+        uses: ./.github/actions/reference-binary
+
+      - name: Download candidate binary
+        if: matrix.leg == 'gateway'
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
-          name: mint-image
-          path: ${{ runner.temp }}
+          name: mint-candidate-binary
+          path: ${{ runner.temp }}/candidate
 
-      - name: Load the image
-        run: docker load --input "${RUNNER_TEMP}/rustfs-ci.tar"
+      - name: Build lightweight runtime image
+        run: |
+          set -euo pipefail
+          ctx="${RUNNER_TEMP}/mint-runtime-ctx"
+          rm -rf "${ctx}"
+          mkdir -p "${ctx}"
+          cp entrypoint.sh "${ctx}/entrypoint.sh"
+          cp -R bootstrap "${ctx}/bootstrap"
+          cat > "${ctx}/Dockerfile" <<'EOF'
+          FROM ubuntu:26.04
+
+          RUN set -eux; \
+              export DEBIAN_FRONTEND=noninteractive; \
+              apt-get update; \
+              apt-get install -y --no-install-recommends \
+                ca-certificates \
+                curl \
+                jq \
+                tzdata \
+                coreutils; \
+              rm -rf /var/lib/apt/lists/*
+
+          RUN set -eux; \
+              groupadd -g 10001 rustfs; \
+              useradd -u 10001 -g rustfs -M -s /usr/sbin/nologin rustfs; \
+              mkdir -p /data/.rustfs/events /data/.rustfs/audit /logs /opt/rustfs /app; \
+              ln -s /data/.rustfs/events /opt/rustfs/events; \
+              ln -s /data/.rustfs/audit /opt/rustfs/audit; \
+              chown -R rustfs:rustfs /data /logs /app; \
+              chmod 0750 /data /logs
+
+          WORKDIR /app
+          COPY entrypoint.sh /etc/rustfs/entrypoint.sh
+          COPY bootstrap/ /etc/rustfs/bootstrap/
+          RUN chmod +x /etc/rustfs/entrypoint.sh && \
+              ln -s /etc/rustfs/entrypoint.sh /entrypoint.sh
+
+          ENV RUSTFS_VOLUMES="/data" \
+              RUST_LOG="warn" \
+              RUSTFS_USERNAME="rustfs" \
+              RUSTFS_GROUPNAME="rustfs" \
+              RUSTFS_UID="10001" \
+              RUSTFS_GID="10001"
+
+          EXPOSE 9000
+          VOLUME ["/data"]
+
+          ENTRYPOINT ["/etc/rustfs/entrypoint.sh"]
+          CMD ["/usr/bin/rustfs"]
+          EOF
+          docker build -t rustfs-mint-runtime "${ctx}"
 
       - name: Start RustFS
+        env:
+          REFERENCE_PATH: ${{ steps.reference.outputs.path }}
+          CANDIDATE_PATH: ${{ runner.temp }}/candidate/rustfs
         run: |
+          set -euo pipefail
           docker network inspect rustfs-net >/dev/null 2>&1 || docker network create rustfs-net
           docker rm -f rustfs-mint >/dev/null 2>&1 || true
+          rm -rf /tmp/rustfs-mint
+          mkdir -p /tmp/rustfs-mint
+          case "${LEG}" in
+            legacy) binary_path="${REFERENCE_PATH}" ;;
+            gateway) binary_path="${CANDIDATE_PATH}" ;;
+            *) echo "unknown mint leg: ${LEG}" >&2; exit 1 ;;
+          esac
+          test -f "${binary_path}"
+          chmod 0755 "${binary_path}"
+          test -x "${binary_path}"
           # The four disks share one physical device on the runner (a single
           # loopback filesystem), so the local physical-disk-independence guard
           # would refuse to start. Bypass it — this is the CI use case the guard
@@ -181,32 +272,69 @@ jobs:
             -e RUSTFS_UNSAFE_BYPASS_DISK_CHECK=true \
             -e RUST_LOG=rustfs=info \
             -v /tmp/rustfs-mint:/data \
-            rustfs-ci
+            -v "${binary_path}:/usr/bin/rustfs:ro" \
+            rustfs-mint-runtime
 
       - name: Wait for RustFS ready
         run: |
+          export no_proxy="${NO_PROXY}"
           for _ in {1..60}; do
             if curl -sf http://127.0.0.1:9000/health/ready >/dev/null 2>&1; then
-              echo "RustFS is ready"
+              echo "RustFS (${LEG}) is ready"
               exit 0
             fi
             if [ "$(docker inspect -f '{{.State.Running}}' rustfs-mint 2>/dev/null)" != "true" ]; then
-              echo "RustFS container not running" >&2
+              echo "RustFS (${LEG}) container not running" >&2
               docker logs rustfs-mint || true
               exit 1
             fi
             sleep 2
           done
-          echo "Health check timed out" >&2
+          echo "Health check timed out (${LEG})" >&2
           docker logs rustfs-mint || true
           exit 1
+
+      - name: Record server provenance
+        env:
+          REFERENCE_VERSION: ${{ steps.reference.outputs.version }}
+          REFERENCE_SHA256: ${{ steps.reference.outputs.executable-sha256 }}
+          CANDIDATE_RECEIPT: ${{ runner.temp }}/candidate/rustfs.e2e.json
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts
+          actual_sha256="$(docker exec rustfs-mint sha256sum /usr/bin/rustfs | awk '{print $1}')"
+          actual_version="$(docker exec rustfs-mint /usr/bin/rustfs --version | tr '\n' ' ' | sed 's/[[:space:]]*$//')"
+          if [[ "${LEG}" == "legacy" ]]; then
+            expected_sha256="${REFERENCE_SHA256}"
+          else
+            expected_sha256="$(python3 -c 'import json, sys; print(json.load(open(sys.argv[1], encoding="utf-8"))["binary_sha256"])' "${CANDIDATE_RECEIPT}")"
+          fi
+          if [[ "${actual_sha256}" != "${expected_sha256}" ]]; then
+            echo "::error::${LEG} container /usr/bin/rustfs sha256 (${actual_sha256}) != verified binary (${expected_sha256})" >&2
+            exit 1
+          fi
+          ACTUAL_SHA256="${actual_sha256}" EXPECTED_SHA256="${expected_sha256}" ACTUAL_VERSION="${actual_version}" python3 - <<'EOF'
+          import json, os, pathlib
+
+          meta = {
+              "leg": os.environ["LEG"],
+              "binary_sha256": os.environ["ACTUAL_SHA256"],
+              "expected_sha256": os.environ["EXPECTED_SHA256"],
+              "version": os.environ["ACTUAL_VERSION"],
+          }
+          if os.environ["LEG"] == "legacy":
+              meta["expected_version"] = os.environ["REFERENCE_VERSION"]
+          out = pathlib.Path("artifacts/target.json")
+          out.write_text(json.dumps(meta, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+          print(out.read_text(encoding="utf-8"))
+          EOF
 
       - name: Run mint
         run: |
           mkdir -p artifacts/mint-log
-          # Mint exits non-zero when any test fails; that is inventory here,
-          # not a gate (see header comment). Capture the exit code and let the
-          # summary step decide.
+          # Mint exits non-zero when any SDK test fails; individual failures are
+          # comparison data for the fail-closed diff-table gate in `compare`.
+          # Capture the exit code and verify log.json exists in the next step.
           set +e
           # shellcheck disable=SC2086  # MINT_SUITES is intentionally word-split
           docker run --rm --network rustfs-net \
@@ -218,36 +346,42 @@ jobs:
             -e MINT_MODE=${MINT_MODE} \
             -v "${PWD}/artifacts/mint-log:/mint/log" \
             "${MINT_IMAGE}" ${MINT_SUITES}
-          echo "MINT_RC=$?" >> "$GITHUB_ENV"
+          rc=$?
+          echo "MINT_RC=${rc}" >> "$GITHUB_ENV"
+          echo "${rc}" > artifacts/mint-exit-code.txt
 
-      - name: Summarize results
+      - name: Summarize leg results
         run: |
           python3 - <<'EOF'
           import json, os, pathlib, sys
           from collections import Counter
 
+          leg = os.environ["LEG"]
           log = pathlib.Path("artifacts/mint-log/log.json")
           if not log.is_file():
-              print("mint produced no log.json - infrastructure failure", file=sys.stderr)
+              print(f"mint ({leg}) produced no log.json - infrastructure failure", file=sys.stderr)
               sys.exit(int(os.environ.get("MINT_RC", "1")) or 1)
 
           per_suite: dict[str, Counter] = {}
           failures: list[tuple[str, str, str]] = []
+          entries = 0
           for line in log.read_text(encoding="utf-8").splitlines():
               line = line.strip()
-              if not line:
+              if not line or not line.startswith("{"):
                   continue
-              try:
-                  entry = json.loads(line)
-              except json.JSONDecodeError:
-                  continue
+              entry = json.loads(line)
+              entries += 1
               suite = entry.get("name", "unknown")
-              status = entry.get("status", "unknown").upper()
+              status = str(entry.get("status", "unknown")).upper()
               per_suite.setdefault(suite, Counter())[status] += 1
               if status == "FAIL":
-                  failures.append((suite, entry.get("function", ""), entry.get("error") or entry.get("message") or ""))
+                  failures.append((suite, entry.get("function") or "", entry.get("error") or entry.get("message") or ""))
 
-          lines = ["# Mint results", "", "| Suite | Pass | Fail | N/A |", "|-------|------|------|-----|"]
+          if entries == 0:
+              print(f"mint ({leg}) wrote zero JSON test entries - infrastructure failure", file=sys.stderr)
+              sys.exit(1)
+
+          lines = [f"# Mint results ({leg})", "", "| Suite | Pass | Fail | N/A |", "|-------|------|------|-----|"]
           for suite in sorted(per_suite):
               c = per_suite[suite]
               lines.append(f"| {suite} | {c.get('PASS', 0)} | {c.get('FAIL', 0)} | {c.get('NA', 0)} |")
@@ -259,7 +393,6 @@ jobs:
                   first = err.strip().splitlines()[0] if err.strip() else ""
                   lines.append(f"- `{suite}` / `{func}` {first}")
               lines.append("")
-              lines.append("_Report-only: failures are inventory, not a gate (see workflow header)._")
 
           report = "\n".join(lines)
           print(report)
@@ -275,16 +408,70 @@ jobs:
           mkdir -p artifacts/rustfs-mint
           docker logs rustfs-mint > artifacts/rustfs-mint/rustfs.log 2>&1 || true
 
-      - name: Upload artifacts
+      - name: Upload leg artifacts
         if: always() && env.ACT != 'true'
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: mint
+          name: mint-leg-${{ matrix.leg }}
+          overwrite: true
           path: artifacts/**
+          if-no-files-found: error
+          retention-days: 14
+
+  compare:
+    name: Compare legacy vs gateway
+    needs: [build-candidate, mint]
+    if: always() && needs.build-candidate.result == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7
+        with:
+          persist-credentials: false
+
+      - name: Download leg artifacts
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: mint-leg-*
+          path: mint-download
+
+      - name: Compare mint results (fail-closed diff-table gate)
+        env:
+          MINT_JOB_RESULT: ${{ needs.mint.result }}
+        run: |
+          set -uo pipefail
+          mkdir -p mint-diff
+          python3 scripts/mint_stack_diff.py \
+            mint-download/mint-leg-legacy \
+            mint-download/mint-leg-gateway \
+            --require-meta \
+            --markdown mint-diff/diff.md \
+            --json mint-diff/diff.json
+          status=$?
+          if [[ -f mint-diff/diff.md ]]; then
+            cat mint-diff/diff.md >> "$GITHUB_STEP_SUMMARY"
+          fi
+          if [[ "${MINT_JOB_RESULT}" != "success" ]]; then
+            echo "::error::mint leg job finished with '${MINT_JOB_RESULT}'"
+            if [[ "${status}" -eq 0 ]]; then
+              status=1
+            fi
+          fi
+          exit "${status}"
+
+      - name: Upload diff report
+        if: always() && env.ACT != 'true'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: mint-diff
+          overwrite: true
+          path: mint-diff/**
+          if-no-files-found: warn
+          retention-days: 14
 
   alert-on-failure:
     name: Alert on scheduled failure
-    needs: [image, mint]
+    needs: [build-candidate, mint, compare]
     # `always()` is required: without it this job is skipped when a needed
     # job fails. Alerts only for scheduled runs (backlog#1149 ci-8) — manual
     # dispatch failures are already watched by a human.

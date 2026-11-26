@@ -26,10 +26,6 @@ pub(crate) fn EndpointServerPools(
 
 /// Streaming body types the request-body adapters implement against.
 pub(crate) mod request_body {
-    #[cfg(test)]
-    pub(crate) use crate::storage::storage_api::test_consumer::legacy_s3_test_types::request_body::{
-        ByteStream, DynByteStream, RemainingLength, StreamingBlob,
-    };
     pub(crate) use rustfs_s3_types::StdError;
 }
 
@@ -42,22 +38,6 @@ pub(crate) mod diagnostic {
     pub(crate) use crate::storage::storage_api::ecstore_diagnostic::{
         current_read_version_entry_source, with_read_version_entry,
     };
-}
-
-/// Legacy wire types used by app-layer compatibility tests.
-#[cfg(test)]
-pub(crate) mod s3 {
-    pub(crate) use crate::storage::storage_api::test_consumer::legacy_s3_test_types::s3::{
-        Body, BucketLocationConstraint, CreateBucketConfiguration, CreateBucketInput, CreateMultipartUploadInput, Credentials,
-        DeleteObjectInput, ObjectLockRetention, PutObjectInput, S3Error, S3ErrorCode, S3Request, S3Response, S3Result,
-        StreamingBlob, TrailingHeaders, UploadStreamError, dto, stream, xml,
-    };
-    pub(crate) use rustfs_gateway_types::dto::Status;
-    pub(crate) use rustfs_gateway_types::persistence::{
-        PersistedOptionalReplicationStatus, PersistedReplicationConfiguration, PersistedReplicationDestination,
-        PersistedReplicationFilter, PersistedReplicationRule, PersistedReplicationTag,
-    };
-    pub(crate) use rustfs_s3_types::StdError;
 }
 
 pub(crate) mod admin {
@@ -365,116 +345,6 @@ pub(crate) mod bucket {
         crate::storage::storage_api::ecstore_bucket::lifecycle::lifecycle::Lifecycle::predict_expiration(lifecycle, obj).await
     }
 
-    // The legacy edge keeps values that its decoder permits before domain validation.
-    #[cfg(test)]
-    pub(crate) fn restore_request_from_wire(
-        request: crate::storage::storage_api::test_consumer::legacy_s3_test_types::LegacyRestoreRequest,
-    ) -> RestoreRequest {
-        use rustfs_gateway_types::dto;
-
-        RestoreRequest {
-            days: request.days,
-            description: request.description,
-            glacier_job_parameters: request.glacier_job_parameters.map(|parameters| dto::GlacierJobParameters {
-                tier: dto::Tier::custom(parameters.tier.as_str().to_owned()),
-            }),
-            output_location: request.output_location.map(|output| RestoreOutputLocation {
-                s3: output.s3.map(|location| RestoreS3Location {
-                    access_control_list: location.access_control_list.map(|grants| {
-                        grants
-                            .into_iter()
-                            .map(|grant| dto::Grant {
-                                grantee: grant.grantee.map(|grantee| dto::Grantee {
-                                    display_name: grantee.display_name,
-                                    email_address: grantee.email_address,
-                                    id: grantee.id,
-                                    r#type: Some(dto::Type::custom(grantee.type_.as_str().to_owned())),
-                                    uri: grantee.uri,
-                                }),
-                                permission: grant
-                                    .permission
-                                    .map(|value| dto::Permission::custom(value.as_str().to_owned())),
-                            })
-                            .collect()
-                    }),
-                    bucket_name: location.bucket_name,
-                    canned_acl: location
-                        .canned_acl
-                        .map(|value| dto::CannedAcl::custom(value.as_str().to_owned())),
-                    encryption: location.encryption.map(|encryption| dto::Encryption {
-                        encryption_type: dto::EncryptionType::custom(encryption.encryption_type.as_str().to_owned()),
-                        kms_context: encryption.kms_context,
-                        kms_key_id: encryption.kms_key_id,
-                    }),
-                    prefix: location.prefix,
-                    storage_class: location
-                        .storage_class
-                        .map(|value| dto::StorageClass::custom(value.as_str().to_owned())),
-                    tagging: location.tagging.map(|tagging| RestoreTagging {
-                        tag_set: tagging
-                            .tag_set
-                            .into_iter()
-                            .map(|tag| RestoreTag {
-                                key: tag.key,
-                                value: tag.value,
-                            })
-                            .collect(),
-                    }),
-                    user_metadata: location.user_metadata.map(|metadata| {
-                        metadata
-                            .into_iter()
-                            .map(|entry| dto::MetadataEntry {
-                                name: entry.name,
-                                value: entry.value,
-                            })
-                            .collect()
-                    }),
-                }),
-            }),
-            select_parameters: request.select_parameters.map(|parameters| dto::SelectParameters {
-                expression: parameters.expression,
-                expression_type: dto::ExpressionType::custom(parameters.expression_type.as_str().to_owned()),
-                input_serialization: dto::InputSerialization {
-                    csv: parameters.input_serialization.csv.map(|csv| dto::CsvInput {
-                        allow_quoted_record_delimiter: csv.allow_quoted_record_delimiter,
-                        comments: csv.comments,
-                        field_delimiter: csv.field_delimiter,
-                        file_header_info: csv
-                            .file_header_info
-                            .map(|value| dto::FileHeaderInfo::custom(value.as_str().to_owned())),
-                        quote_character: csv.quote_character,
-                        quote_escape_character: csv.quote_escape_character,
-                        record_delimiter: csv.record_delimiter,
-                    }),
-                    compression_type: parameters
-                        .input_serialization
-                        .compression_type
-                        .map(|value| dto::CompressionType::custom(value.as_str().to_owned())),
-                    json: parameters.input_serialization.json.map(|json| dto::JsonInput {
-                        r#type: json.type_.map(|value| dto::Type::custom(value.as_str().to_owned())),
-                    }),
-                    parquet: parameters.input_serialization.parquet.map(|_| dto::ParquetInput {}),
-                },
-                output_serialization: dto::OutputSerialization {
-                    csv: parameters.output_serialization.csv.map(|csv| dto::CsvOutput {
-                        field_delimiter: csv.field_delimiter,
-                        quote_character: csv.quote_character,
-                        quote_escape_character: csv.quote_escape_character,
-                        quote_fields: csv
-                            .quote_fields
-                            .map(|value| dto::QuoteFields::custom(value.as_str().to_owned())),
-                        record_delimiter: csv.record_delimiter,
-                    }),
-                    json: parameters.output_serialization.json.map(|json| dto::JsonOutput {
-                        record_delimiter: json.record_delimiter,
-                    }),
-                },
-            }),
-            tier: request.tier.map(|value| dto::Tier::custom(value.as_str().to_owned())),
-            type_: request.type_.map(|value| value.as_str().to_owned()),
-        }
-    }
-
     pub(crate) fn validate_restore_request(
         request: &RestoreRequest,
         api: Arc<crate::storage::storage_api::ECStore>,
@@ -486,90 +356,89 @@ pub(crate) mod bucket {
 
     #[cfg(test)]
     mod restore_conversion_tests {
-        use super::restore_request_from_wire;
-        use crate::storage::storage_api::test_consumer::legacy_s3_test_types::s3::dto as legacy;
+        use super::{RestoreOutputLocation, RestoreRequest, RestoreS3Location, RestoreTag, RestoreTagging};
         use rustfs_gateway_types::dto;
 
         #[test]
         fn restore_request_conversion_preserves_legacy_output_values() {
-            let request = legacy::RestoreRequest {
-                type_: Some(legacy::RestoreRequestType::from_static("SELECT")),
-                select_parameters: Some(legacy::SelectParameters {
+            let converted = RestoreRequest {
+                type_: Some("SELECT".to_owned()),
+                select_parameters: Some(dto::SelectParameters {
                     expression: "SELECT _1 FROM S3Object".to_owned(),
-                    expression_type: legacy::ExpressionType::from("future/expression".to_owned()),
-                    input_serialization: legacy::InputSerialization {
-                        csv: Some(legacy::CSVInput {
+                    expression_type: dto::ExpressionType::custom("future/expression"),
+                    input_serialization: dto::InputSerialization {
+                        csv: Some(dto::CsvInput {
                             allow_quoted_record_delimiter: Some(true),
                             comments: Some("comment".to_owned()),
                             field_delimiter: Some("|".to_owned()),
-                            file_header_info: Some(legacy::FileHeaderInfo::from("future/header".to_owned())),
+                            file_header_info: Some(dto::FileHeaderInfo::custom("future/header")),
                             quote_character: Some("'".to_owned()),
                             quote_escape_character: Some("\\".to_owned()),
                             record_delimiter: Some("\r\n".to_owned()),
                         }),
-                        compression_type: Some(legacy::CompressionType::from("future/compression".to_owned())),
-                        parquet: Some(legacy::ParquetInput {}),
-                        ..Default::default()
+                        compression_type: Some(dto::CompressionType::custom("future/compression")),
+                        json: None,
+                        parquet: Some(dto::ParquetInput {}),
                     },
-                    output_serialization: legacy::OutputSerialization {
-                        csv: Some(legacy::CSVOutput {
+                    output_serialization: dto::OutputSerialization {
+                        csv: Some(dto::CsvOutput {
                             field_delimiter: Some(";".to_owned()),
                             quote_character: Some("\"".to_owned()),
                             quote_escape_character: Some("\\".to_owned()),
-                            quote_fields: Some(legacy::QuoteFields::from("future/quote-fields".to_owned())),
+                            quote_fields: Some(dto::QuoteFields::custom("future/quote-fields")),
                             record_delimiter: Some("\n".to_owned()),
                         }),
-                        ..Default::default()
+                        json: None,
                     },
                 }),
-                output_location: Some(legacy::OutputLocation {
-                    s3: Some(legacy::S3Location {
-                        access_control_list: Some(vec![legacy::Grant {
-                            grantee: Some(legacy::Grantee {
+                output_location: Some(RestoreOutputLocation {
+                    s3: Some(RestoreS3Location {
+                        access_control_list: Some(vec![dto::Grant {
+                            grantee: Some(dto::Grantee {
                                 display_name: Some("Display Name".to_owned()),
                                 email_address: Some("user@example.com".to_owned()),
                                 id: Some("grantee-id".to_owned()),
-                                type_: legacy::Type::from("future/grantee".to_owned()),
+                                r#type: Some(dto::Type::custom("future/grantee")),
                                 uri: Some("urn:example:grantee".to_owned()),
                             }),
-                            permission: Some(legacy::Permission::from("future/permission".to_owned())),
+                            permission: Some(dto::Permission::custom("future/permission")),
                         }]),
                         bucket_name: "a/b".to_owned(),
-                        canned_acl: Some(legacy::ObjectCannedACL::from("future/canned-acl".to_owned())),
-                        encryption: Some(legacy::Encryption {
-                            encryption_type: legacy::ServerSideEncryption::from("future/encryption".to_owned()),
+                        canned_acl: Some(dto::CannedAcl::custom("future/canned-acl")),
+                        encryption: Some(dto::Encryption {
+                            encryption_type: dto::EncryptionType::custom("future/encryption"),
                             kms_context: Some("kms-context".to_owned()),
                             kms_key_id: Some("kms-key-id".to_owned()),
                         }),
                         prefix: String::new(),
-                        storage_class: Some(legacy::StorageClass::from("future/storage-class".to_owned())),
-                        tagging: Some(legacy::Tagging {
+                        storage_class: Some(dto::StorageClass::custom("future/storage-class")),
+                        tagging: Some(RestoreTagging {
                             tag_set: vec![
-                                legacy::Tag { key: None, value: None },
-                                legacy::Tag {
+                                RestoreTag { key: None, value: None },
+                                RestoreTag {
                                     key: None,
                                     value: Some("value".to_owned()),
                                 },
-                                legacy::Tag {
+                                RestoreTag {
                                     key: Some(String::new()),
                                     value: None,
                                 },
-                                legacy::Tag {
+                                RestoreTag {
                                     key: Some("key".to_owned()),
                                     value: Some(String::new()),
                                 },
-                                legacy::Tag {
+                                RestoreTag {
                                     key: Some("key".to_owned()),
                                     value: Some(String::new()),
                                 },
                             ],
                         }),
                         user_metadata: Some(vec![
-                            legacy::MetadataEntry {
+                            dto::MetadataEntry {
                                 name: None,
                                 value: Some("value".to_owned()),
                             },
-                            legacy::MetadataEntry {
+                            dto::MetadataEntry {
                                 name: Some(String::new()),
                                 value: None,
                             },
@@ -579,7 +448,6 @@ pub(crate) mod bucket {
                 ..Default::default()
             };
 
-            let converted = restore_request_from_wire(request);
             assert_eq!(converted.type_.as_deref(), Some("SELECT"));
 
             let select = converted.select_parameters.expect("select parameters should be preserved");
@@ -694,48 +562,64 @@ pub(crate) mod bucket {
                 (Some("future/Value"), Some(i32::MAX)),
                 (Some("\0"), Some(-1)),
             ] {
-                let request = legacy::RestoreRequest {
+                let converted = RestoreRequest {
                     days,
                     description: raw.map(|_| String::new()),
-                    type_: raw.map(|value| legacy::RestoreRequestType::from(value.to_owned())),
-                    tier: raw.map(|value| legacy::Tier::from(value.to_owned())),
-                    glacier_job_parameters: raw.map(|value| legacy::GlacierJobParameters {
-                        tier: legacy::Tier::from(value.to_owned()),
+                    type_: raw.map(str::to_owned),
+                    tier: raw.map(dto::Tier::custom),
+                    glacier_job_parameters: raw.map(|value| dto::GlacierJobParameters {
+                        tier: dto::Tier::custom(value),
                     }),
-                    select_parameters: raw.map(|value| legacy::SelectParameters {
+                    select_parameters: raw.map(|value| dto::SelectParameters {
                         expression: value.to_owned(),
-                        expression_type: legacy::ExpressionType::from(value.to_owned()),
-                        input_serialization: legacy::InputSerialization {
-                            compression_type: Some(legacy::CompressionType::from(value.to_owned())),
-                            json: Some(legacy::JSONInput {
-                                type_: Some(legacy::JSONType::from(value.to_owned())),
+                        expression_type: dto::ExpressionType::custom(value),
+                        input_serialization: dto::InputSerialization {
+                            csv: None,
+                            compression_type: Some(dto::CompressionType::custom(value)),
+                            json: Some(dto::JsonInput {
+                                r#type: Some(dto::Type::custom(value)),
                             }),
-                            ..Default::default()
+                            parquet: None,
                         },
-                        output_serialization: legacy::OutputSerialization {
-                            json: Some(legacy::JSONOutput {
+                        output_serialization: dto::OutputSerialization {
+                            csv: None,
+                            json: Some(dto::JsonOutput {
                                 record_delimiter: Some(String::new()),
                             }),
-                            ..Default::default()
                         },
                     }),
-                    output_location: raw.map(|_| legacy::OutputLocation { s3: None }),
+                    output_location: raw.map(|_| RestoreOutputLocation { s3: None }),
                 };
 
-                let converted = restore_request_from_wire(request);
+                let expected_enum = raw.map(|value| if value == "\0" { "" } else { value });
                 assert_eq!(
                     (
                         converted.days,
                         converted.description,
                         converted.type_,
-                        converted.tier,
-                        converted.glacier_job_parameters.map(|parameters| parameters.tier),
-                        converted.select_parameters.map(|parameters| (
-                            parameters.expression,
-                            parameters.expression_type,
-                            parameters.input_serialization.compression_type,
-                            parameters.input_serialization.json.map(|json| json.r#type),
-                            parameters.output_serialization.json.map(|json| json.record_delimiter),
+                        converted.tier.as_ref().map(dto::Tier::as_str),
+                        converted
+                            .glacier_job_parameters
+                            .as_ref()
+                            .map(|parameters| parameters.tier.as_str()),
+                        converted.select_parameters.as_ref().map(|parameters| (
+                            parameters.expression.as_str(),
+                            parameters.expression_type.as_str(),
+                            parameters
+                                .input_serialization
+                                .compression_type
+                                .as_ref()
+                                .map(dto::CompressionType::as_str),
+                            parameters
+                                .input_serialization
+                                .json
+                                .as_ref()
+                                .map(|json| json.r#type.as_ref().map(dto::Type::as_str)),
+                            parameters
+                                .output_serialization
+                                .json
+                                .as_ref()
+                                .map(|json| json.record_delimiter.as_deref()),
                         )),
                         converted.output_location.map(|output| output.s3.is_none()),
                     ),
@@ -743,14 +627,14 @@ pub(crate) mod bucket {
                         days,
                         raw.map(|_| String::new()),
                         raw.map(str::to_owned),
-                        raw.map(dto::Tier::custom),
-                        raw.map(dto::Tier::custom),
-                        raw.map(|value| (
-                            value.to_owned(),
-                            dto::ExpressionType::custom(value),
-                            Some(dto::CompressionType::custom(value)),
-                            Some(Some(dto::Type::custom(value))),
-                            Some(Some(String::new())),
+                        expected_enum,
+                        expected_enum,
+                        raw.zip(expected_enum).map(|(value, enum_value)| (
+                            value,
+                            enum_value,
+                            Some(enum_value),
+                            Some(Some(enum_value)),
+                            Some(Some("")),
                         )),
                         raw.map(|_| true),
                     )
@@ -762,15 +646,15 @@ pub(crate) mod bucket {
         fn restore_request_conversion_distinguishes_absent_and_empty_containers() {
             let outputs = [
                 None,
-                Some(legacy::OutputLocation { s3: None }),
-                Some(legacy::OutputLocation {
-                    s3: Some(legacy::S3Location::default()),
+                Some(RestoreOutputLocation { s3: None }),
+                Some(RestoreOutputLocation {
+                    s3: Some(RestoreS3Location::default()),
                 }),
-                Some(legacy::OutputLocation {
-                    s3: Some(legacy::S3Location {
+                Some(RestoreOutputLocation {
+                    s3: Some(RestoreS3Location {
                         access_control_list: Some(Vec::new()),
                         user_metadata: Some(Vec::new()),
-                        tagging: Some(legacy::Tagging { tag_set: Vec::new() }),
+                        tagging: Some(RestoreTagging { tag_set: Vec::new() }),
                         ..Default::default()
                     }),
                 }),
@@ -779,10 +663,10 @@ pub(crate) mod bucket {
             let converted = outputs
                 .into_iter()
                 .map(|output_location| {
-                    restore_request_from_wire(legacy::RestoreRequest {
+                    RestoreRequest {
                         output_location,
                         ..Default::default()
-                    })
+                    }
                     .output_location
                     .map(|output| {
                         output.s3.map(|location| {

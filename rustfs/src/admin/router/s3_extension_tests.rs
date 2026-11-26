@@ -19,16 +19,17 @@
 //! Not responsible for: the helpers behind each route (their own modules test
 //! those) or object lambda, which is still served by the router itself.
 
-use super::{AdminOperation, Body, S3Request, S3Response, S3Route, S3Router};
+use super::{AdminOperation, S3Router};
+use crate::admin::operation::AdminResponse;
 use crate::admin::storage_api::contract::bucket::MakeBucketOptions;
-use crate::app::storage_api::s3::{Credentials, S3ErrorCode, S3Result};
-use http::{Extensions, HeaderMap, Method, StatusCode, header};
+use crate::app::{RequestCredentials, RequestEnvelope, RequestHead};
+use http::{Extensions, HeaderMap, HeaderValue, Method, StatusCode, header};
 use http_body_util::BodyExt;
 use rustfs_iam::store::{Store as _, UserType, object::ObjectStore};
 use rustfs_madmin::{AccountStatus, AddOrUpdateUserReq};
 use rustfs_notify::Event as NotificationEvent;
 use rustfs_policy::policy::Policy;
-use rustfs_s3_types::EventName;
+use rustfs_s3_types::{Body, EventName, S3ErrorCode, S3Result};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -54,35 +55,43 @@ fn router() -> S3Router<AdminOperation> {
     router
 }
 
-fn request(method: Method, uri: &str, access_key: Option<&str>) -> S3Request<Body> {
-    S3Request {
-        input: Body::empty(),
-        method,
-        uri: uri.parse().expect("test uri parses"),
-        headers: HeaderMap::new(),
-        extensions: Extensions::new(),
-        credentials: access_key.map(|access_key| Credentials {
-            access_key: access_key.to_owned(),
-            secret_key: SECRET.into(),
-        }),
-        region: None,
-        service: None,
-        trailing_headers: None,
-    }
+fn request(method: Method, uri: &str, access_key: Option<&str>) -> RequestEnvelope {
+    request_with_headers(method, uri, HeaderMap::new(), access_key)
+}
+
+fn request_with_headers(method: Method, uri: &str, headers: HeaderMap, access_key: Option<&str>) -> RequestEnvelope {
+    let credentials = access_key.map(|access_key| {
+        RequestCredentials::new(access_key.to_owned(), SECRET.to_owned(), None)
+            .expect("test credentials carry a non-empty secret")
+    });
+    RequestEnvelope::from_parts(
+        RequestHead {
+            method,
+            uri: uri.parse().expect("test uri parses"),
+            headers,
+            credentials,
+            region: None,
+            service: None,
+        },
+        Extensions::new(),
+    )
 }
 
 fn uri_for(template: &str, bucket: &str) -> String {
     template.replace("{b}", bucket)
 }
 
-async fn send(router: &S3Router<AdminOperation>, mut req: S3Request<Body>) -> S3Result<S3Response<Body>> {
-    router.check_access(&mut req).await?;
-    router.call(req).await
+async fn send(router: &S3Router<AdminOperation>, envelope: RequestEnvelope) -> S3Result<AdminResponse> {
+    router.admit(envelope.method(), envelope.uri(), envelope.headers(), envelope.credentials().is_some())?;
+    super::dispatch(router, envelope, Body::empty()).await
 }
 
-fn error_code(result: S3Result<S3Response<Body>>, context: &str) -> S3ErrorCode {
+fn error_code(result: S3Result<AdminResponse>, context: &str) -> S3ErrorCode {
     match result {
-        Ok(response) => panic!("{context}: expected a refusal, got status {:?}", response.status),
+        Ok(response) => {
+            let (status, _, _) = response.into_parts();
+            panic!("{context}: expected a refusal, got status {status:?}");
+        }
         Err(error) => error.code().clone(),
     }
 }
@@ -208,28 +217,25 @@ async fn install_identities() -> (Callers, String) {
     (callers, bucket)
 }
 
-#[tokio::test]
-async fn extension_routes_refuse_anonymous_callers_before_dispatch() {
+#[test]
+fn extension_routes_refuse_anonymous_callers_before_dispatch() {
     let router = router();
     for (method, template) in ROUTES {
         let uri = uri_for(template, "demo-bucket");
-        let mut req = request(method.clone(), &uri, None);
+        let envelope = request(method.clone(), &uri, None);
         assert!(
-            router.is_match(&req.method, &req.uri, &req.headers, &mut req.extensions),
+            super::claims_route(envelope.method(), envelope.uri(), envelope.headers()),
             "{method} {uri} must be claimed by the admin router"
         );
         let error = router
-            .check_access(&mut req)
-            .await
+            .admit(envelope.method(), envelope.uri(), envelope.headers(), envelope.credentials().is_some())
             .expect_err("an anonymous extension request is refused");
         assert_eq!(error.code(), &S3ErrorCode::AccessDenied, "{method} {uri}");
     }
 }
 
-#[tokio::test]
-async fn extension_routes_are_not_claimed_for_other_methods_or_sub_resources() {
-    let router = router();
-    let headers = HeaderMap::new();
+#[test]
+fn extension_routes_are_not_claimed_for_other_methods_or_sub_resources() {
     for (method, uri) in [
         (Method::POST, "/demo-bucket?replication-metrics"),
         (Method::PUT, "/demo-bucket?replication-check"),
@@ -243,9 +249,9 @@ async fn extension_routes_are_not_claimed_for_other_methods_or_sub_resources() {
         (Method::PUT, "/?events=s3:ObjectCreated:*"),
         (Method::GET, "/demo-bucket?replication-status"),
     ] {
-        let uri = uri.parse().expect("test uri parses");
+        let envelope = request(method.clone(), uri, None);
         assert!(
-            !router.is_match(&method, &uri, &headers, &mut Extensions::new()),
+            !super::claims_route(envelope.method(), envelope.uri(), envelope.headers()),
             "{method} {uri} must stay with the S3 service"
         );
     }
@@ -319,7 +325,8 @@ fn extension_routes_authorize_each_route_with_its_own_action() {
                     (true, Some(code)) => assert_eq!(error_code(result, &context), code, "{context}"),
                     (true, None) => {
                         let response = result.unwrap_or_else(|error| panic!("{context}: expected the stream, got {error:?}"));
-                        assert_eq!(response.status, Some(StatusCode::OK), "{context}");
+                        let (status, _, _) = response.into_parts();
+                        assert_eq!(status, StatusCode::OK, "{context}");
                     }
                     (false, _) => {
                         let refused = if template.starts_with("/?") {
@@ -371,10 +378,10 @@ fn extension_routes_authorize_each_route_with_its_own_action() {
             (Method::GET, "/{b}?events=s3:ObjectCreated:*"),
         ] {
             let uri = uri_for(template, &bucket);
-            let mut req = request(method.clone(), &uri, Some(&callers.full));
-            req.headers
-                .insert("x-amz-copy-source", http::HeaderValue::from_static("/other-bucket/key"));
-            let code = error_code(send(&router, req).await, &format!("copy-source {method} {uri}"));
+            let mut headers = HeaderMap::new();
+            headers.insert("x-amz-copy-source", HeaderValue::from_static("/other-bucket/key"));
+            let envelope = request_with_headers(method.clone(), &uri, headers, Some(&callers.full));
+            let code = error_code(send(&router, envelope).await, &format!("copy-source {method} {uri}"));
             assert_eq!(code, S3ErrorCode::AccessDenied, "copy-source {method} {uri}");
         }
 
@@ -387,9 +394,10 @@ fn extension_routes_authorize_each_route_with_its_own_action() {
             let response = send(&router, request(Method::GET, &uri, Some(&callers.full)))
                 .await
                 .unwrap_or_else(|error| panic!("full GET {uri} is served: {error:?}"));
-            assert_eq!(response.status, Some(StatusCode::OK), "{uri}");
+            let (status, headers, _) = response.into_parts();
+            assert_eq!(status, StatusCode::OK, "{uri}");
             assert_eq!(
-                response.headers.get(header::CONTENT_TYPE).and_then(|v| v.to_str().ok()),
+                headers.get(header::CONTENT_TYPE).and_then(|v| v.to_str().ok()),
                 Some("text/event-stream"),
                 "{uri}"
             );
@@ -410,14 +418,11 @@ fn listen_stream_stays_open_delivers_a_later_event_and_ends_when_the_client_leav
         let response = send(&router, request(Method::GET, &uri, Some(&callers.full)))
             .await
             .expect("permitted listen request is served");
-        assert_eq!(response.status, Some(StatusCode::OK));
-        assert_eq!(
-            response.headers.get(header::CACHE_CONTROL).and_then(|v| v.to_str().ok()),
-            Some("no-cache")
-        );
-        assert_eq!(response.headers.get("x-accel-buffering").and_then(|v| v.to_str().ok()), Some("no"));
+        let (status, headers, mut body) = response.into_parts();
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(headers.get(header::CACHE_CONTROL).and_then(|v| v.to_str().ok()), Some("no-cache"));
+        assert_eq!(headers.get("x-accel-buffering").and_then(|v| v.to_str().ok()), Some("no"));
         assert!(system.has_live_listeners(), "the open stream subscribes to live events");
-        let mut body = response.output;
 
         // Nothing is due yet: the stream neither ends nor yields on its own.
         assert!(

@@ -21,8 +21,6 @@ mod owned;
 #[cfg(test)]
 mod upload_copy_test;
 
-#[cfg(test)]
-use crate::runtime_sources::current_action_credentials;
 #[cfg(feature = "webdav")]
 use crate::runtime_sources::current_object_store_handle;
 use crate::shared_types::RemoteAddr;
@@ -42,14 +40,6 @@ use rustfs_protocols::common::client::s3::{BucketCapacity, SessionCapacityView};
 use rustfs_protocols::common::gateway::{AuthorizationError, S3Action, is_operation_supported};
 use rustfs_trusted_proxies::ClientInfo;
 use rustfs_utils::MaskedAccessKey;
-#[cfg(test)]
-use s3s::S3Request;
-#[cfg(test)]
-use s3s::S3Result;
-#[cfg(test)]
-use s3s::dto::*;
-#[cfg(test)]
-use s3s::{S3Error as LegacyS3Error, S3ErrorCode as LegacyS3ErrorCode};
 use std::fmt::Display;
 use tracing::trace;
 
@@ -125,20 +115,6 @@ fn conversion_error(operation: &str, error: impl Display) -> rustfs_s3_types::S3
 #[cfg(test)]
 fn format_copy_source(bucket: &str, key: &str) -> String {
     format!("/{bucket}/{}", urlencoding::encode(key))
-}
-
-/// Parses the historical bucket-source header with the pinned protocol parser.
-#[cfg(test)]
-fn legacy_copy_source(source: rustfs_gateway_types::CopySourceValue) -> Result<CopySource, ParseCopySourceError> {
-    let rustfs_gateway_types::CopySourceValue::Bucket { bucket, key, version_id } = source else {
-        panic!("expected a bucket-source fixture");
-    };
-    let mut header = format_copy_source(&bucket, &key);
-    if let Some(version_id) = version_id {
-        header.push_str("?versionId=");
-        header.push_str(&urlencoding::encode(&version_id));
-    }
-    CopySource::parse(&header)
 }
 
 /// Refuses a listing entry without an ETag, as the compatibility seam did while `Object.ETag` was required.
@@ -344,55 +320,6 @@ impl ProtocolStorageClient {
         let mut envelope =
             self.protocol_authorization_envelope(session, action, bucket, object, listing, (credentials, is_owner))?;
         authorize_request(&mut envelope, protocol_policy_action(action)).await
-    }
-
-    /// The retired s3s request builder, kept as the oracle of differential tests.
-    #[cfg(test)]
-    fn create_request<T>(
-        input: T,
-        method: Method,
-        uri: http::Uri,
-        params: RequestParams<'_>,
-    ) -> rustfs_s3_types::S3Result<S3Request<T>> {
-        let mut extensions = http::Extensions::default();
-
-        let is_owner = if let Some(global_cred) = current_action_credentials() {
-            params.credentials.access_key == global_cred.access_key
-        } else {
-            false
-        };
-
-        let credentials = Some(s3s::auth::Credentials {
-            access_key: params.credentials.access_key.clone(),
-            secret_key: params.credentials.secret_key.clone().into(),
-        });
-
-        extensions.insert(ReqInfo {
-            cred: Some(params.credentials.clone()),
-            is_owner,
-            keystone_session_present: None,
-            bucket: params.bucket,
-            object: params.object,
-            version_id: None,
-            replication_request_authorized: false,
-            region: None,
-            request_context: Some(RequestContext::fallback()),
-            suppress_denial_log: false,
-            suppress_denial_audit: false,
-        });
-
-        let req = S3Request {
-            input,
-            method,
-            uri,
-            headers: HeaderMap::default(),
-            extensions,
-            credentials,
-            region: None,
-            service: None,
-            trailing_headers: None,
-        };
-        Ok(req)
     }
 
     /// The request the policy engine judges for one protocol operation: the session's peer,
@@ -1191,35 +1118,33 @@ mod tests {
         }
     }
 
-    fn s3s_bucket(source: s3s::dto::CopySource) -> (String, String, Option<String>) {
+    fn owned_bucket(source: Option<rustfs_gateway_types::CopySourceValue>) -> (String, String, Option<String>) {
         match source {
-            s3s::dto::CopySource::Bucket { bucket, key, version_id } => {
-                (bucket.to_string(), key.to_string(), version_id.map(|v| v.to_string()))
-            }
+            Some(rustfs_gateway_types::CopySourceValue::Bucket { bucket, key, version_id }) => (bucket, key, version_id),
             other => panic!("expected a bucket source, got {other:?}"),
         }
     }
 
     #[test]
     fn legacy_copy_source_keeps_a_plain_bucket_key() {
-        let source = legacy_copy_source(bucket_source("bucket", "dir/object.txt", None)).expect("plain source");
-        assert_eq!(s3s_bucket(source), ("bucket".to_owned(), "dir/object.txt".to_owned(), None));
+        let source = owned::copy_source(bucket_source("bucket", "dir/object.txt", None)).expect("plain source");
+        assert_eq!(owned_bucket(source), ("bucket".to_owned(), "dir/object.txt".to_owned(), None));
     }
 
     #[test]
     fn legacy_copy_source_keeps_keys_that_need_percent_encoding() {
         for key in ["%2F", "foo?versionId=1", "a b+c", "\u{4e2d}\u{6587}", "x&y=z#frag"] {
-            let source = legacy_copy_source(bucket_source("bucket", key, None)).expect("encoded source");
-            assert_eq!(s3s_bucket(source), ("bucket".to_owned(), key.to_owned(), None), "{key}");
+            let source = owned::copy_source(bucket_source("bucket", key, None)).expect("encoded source");
+            assert_eq!(owned_bucket(source), ("bucket".to_owned(), key.to_owned(), None), "{key}");
         }
     }
 
     #[test]
     fn legacy_copy_source_keeps_a_version_id() {
         let source =
-            legacy_copy_source(bucket_source("bucket", "object", Some("3HL4kqtJlcpXroDTDmJ+rmSpXd3dIbrHY"))).expect("versioned");
+            owned::copy_source(bucket_source("bucket", "object", Some("3HL4kqtJlcpXroDTDmJ+rmSpXd3dIbrHY"))).expect("versioned");
         assert_eq!(
-            s3s_bucket(source),
+            owned_bucket(source),
             (
                 "bucket".to_owned(),
                 "object".to_owned(),
@@ -1231,10 +1156,15 @@ mod tests {
     #[test]
     fn legacy_copy_source_rejects_an_invalid_bucket_name_as_before() {
         for bucket in ["", "ab", "Upper", "under_score"] {
-            assert!(
-                matches!(
-                    legacy_copy_source(bucket_source(bucket, "object", None)),
-                    Err(s3s::dto::ParseCopySourceError::InvalidBucketName | s3s::dto::ParseCopySourceError::PatternMismatch)
+            let error = owned::copy_source(bucket_source(bucket, "object", None)).expect_err("invalid bucket source");
+            assert_eq!(
+                (error.code(), error.status_code(), error.message()),
+                (
+                    &rustfs_s3_types::S3ErrorCode::InternalError,
+                    Some(http::StatusCode::INTERNAL_SERVER_ERROR),
+                    Some(
+                        "failed to convert CopyObject copy_source through the gateway compatibility seam: ParseAmzCopySourceError: InvalidBucketName"
+                    )
                 ),
                 "{bucket}"
             );
@@ -1244,10 +1174,17 @@ mod tests {
     #[test]
     fn legacy_copy_source_rejects_an_overlong_key_as_before() {
         let key = "k".repeat(1025);
-        assert!(matches!(
-            legacy_copy_source(bucket_source("bucket", &key, None)),
-            Err(s3s::dto::ParseCopySourceError::InvalidKey)
-        ));
+        let error = owned::copy_source(bucket_source("bucket", &key, None)).expect_err("overlong key source");
+        assert_eq!(
+            (error.code(), error.status_code(), error.message()),
+            (
+                &rustfs_s3_types::S3ErrorCode::InternalError,
+                Some(http::StatusCode::INTERNAL_SERVER_ERROR),
+                Some(
+                    "failed to convert CopyObject copy_source through the gateway compatibility seam: ParseAmzCopySourceError: InvalidKey"
+                )
+            )
+        );
     }
 
     #[test]
@@ -1291,17 +1228,6 @@ mod tests {
             ..Default::default()
         };
 
-        let request = ProtocolStorageClient::create_request(
-            ListObjectsV2Input::default(),
-            Method::GET,
-            http::Uri::from_static("/bucket?list-type=2"),
-            RequestParams {
-                bucket: Some("bucket".to_string()),
-                object: None,
-                credentials: &credentials,
-            },
-        )
-        .expect("request should build");
         let envelope = ProtocolStorageClient::create_envelope(
             Method::GET,
             http::Uri::from_static("/bucket?list-type=2"),
@@ -1311,21 +1237,34 @@ mod tests {
                 credentials: &credentials,
             },
         );
-        assert_eq!(envelope.uri(), &request.uri);
-        assert_eq!(envelope.headers(), &request.headers);
-        for request_info in [
-            request.extensions.get::<ReqInfo>().expect("request info should be present"),
-            envelope.req_info().expect("owned request info"),
-        ] {
-            let copied = request_info.cred.as_ref().expect("credentials should be present");
-            assert_eq!(copied.access_key, credentials.access_key);
-            assert_eq!(copied.secret_key, credentials.secret_key);
-            assert_eq!(copied.session_token, credentials.session_token);
-            assert_eq!(copied.parent_user, credentials.parent_user);
-            assert_eq!(copied.groups, credentials.groups);
-            assert_eq!(copied.claims, Some(claims.clone()));
-            assert!(copied.is_service_account());
-        }
+        assert_eq!(envelope.method(), &Method::GET);
+        assert_eq!(envelope.uri(), &http::Uri::from_static("/bucket?list-type=2"));
+        assert!(envelope.headers().is_empty());
+        let request_credentials = envelope.credentials().expect("request credentials");
+        assert_eq!(
+            (
+                request_credentials.access_key(),
+                request_credentials.secret_key(),
+                request_credentials.session_token()
+            ),
+            ("service-account", Some("secret"), None)
+        );
+        let request_info = envelope.req_info().expect("owned request info");
+        assert_eq!(request_info.bucket.as_deref(), Some("bucket"));
+        assert_eq!(request_info.object, None);
+        assert_eq!(request_info.version_id, None);
+        assert!(!request_info.is_owner);
+        assert!(request_info.request_context.is_some());
+        assert!(!request_info.suppress_denial_log);
+        assert!(!request_info.suppress_denial_audit);
+        let copied = request_info.cred.as_ref().expect("credentials should be present");
+        assert_eq!(copied.access_key, credentials.access_key);
+        assert_eq!(copied.secret_key, credentials.secret_key);
+        assert_eq!(copied.session_token, credentials.session_token);
+        assert_eq!(copied.parent_user, credentials.parent_user);
+        assert_eq!(copied.groups, credentials.groups);
+        assert_eq!(copied.claims, Some(claims));
+        assert!(copied.is_service_account());
     }
 
     #[cfg(any(feature = "webdav", feature = "sftp"))]
@@ -1564,12 +1503,12 @@ mod tests {
             },
             etag: None,
         };
-        let old = Timestamp::parse(TimestampFormat::EpochSeconds, "1700000000.123456789").expect("legacy retention instant");
-        let mut spelling = Vec::new();
-        old.format(TimestampFormat::DateTime, &mut spelling)
-            .expect("legacy retention header");
-        assert_eq!(spelling, b"2023-11-14T22:13:20.123Z");
-        let expected = Some(rustfs_gateway_types::Timestamp::from_secs_nanos(1_700_000_000, 123_000_000).expect("milliseconds"));
+        let truncated = rustfs_gateway_types::Timestamp::from_secs_nanos(1_700_000_000, 123_000_000).expect("milliseconds");
+        assert_eq!(
+            (truncated.secs(), truncated.subsec_millis(), truncated.subsec_nanos()),
+            (1_700_000_000, 123, 123_000_000)
+        );
+        let expected = Some(truncated);
         let current = (
             owned::get_output(get())
                 .expect("protocol GET output")
@@ -1617,21 +1556,40 @@ mod put_tests {
         })
     }
 
-    fn old_input() -> PutObjectInput {
-        PutObjectInput {
-            bucket: "protocol-put-oracle".into(),
-            key: "object".into(),
-            content_length: Some(4),
-            ..Default::default()
-        }
-    }
-
-    fn legacy_fields(input: PutObjectInput) -> serde_json::Value {
-        fields(PutObjectWriteInput::from_legacy(input, None))
+    fn expected_base_fields() -> serde_json::Value {
+        serde_json::json!({
+            "bucket": "protocol-put-oracle", "key": "object", "length": 4,
+            "metadata": null, "specific_if_none_match": false,
+            "retain_until": null,
+            "cache_control": null, "content_disposition": null,
+            "content_encoding": null, "content_language": null,
+            "content_type": null, "expires": null, "tagging": null,
+            "version_id": null, "server_side_encryption": null,
+            "sse_customer_algorithm": null, "sse_customer_key": null,
+            "sse_customer_key_md5": null, "ssekms_key_id": null,
+            "content_md5": null, "legal_hold": null,
+            "lock_mode": null, "storage_class": null,
+            "website_redirect_location": null, "checksum_algorithm": null,
+            "crc32": null, "crc32c": null, "crc64nvme": null,
+            "sha1": null, "sha256": null,
+        })
     }
 
     #[test]
     fn protocol_put_condition_grammar_matches_legacy() {
+        const SPECIFIC_ETAGS: &[&str] = &[
+            "\"*\"",
+            "\"abc\"",
+            "W/\"abc\"",
+            "abc",
+            "\"abc\", \"def\"",
+            "\"\"",
+            "\"a b\"",
+            "\"a\\b\"",
+            "\"a\"b\"",
+            "\"a\t b\"",
+            "\"\t\"",
+        ];
         let mut observations = Vec::new();
         let values = [
             "",
@@ -1675,33 +1633,27 @@ mod put_tests {
                     }
                     request
                 };
-                let old = (!value.is_empty())
-                    .then(|| ETagCondition::parse_http_header(value.as_bytes()))
-                    .transpose()
-                    .map(|parsed| {
-                        let mut old = old_input();
-                        if none {
-                            old.if_none_match = parsed;
-                        } else {
-                            old.if_match = parsed;
-                        }
-                        legacy_fields(old)
-                    })
-                    .map_err(|_| {
-                        let field = if none { "if_none_match" } else { "if_match" };
-                        conversion_error(
-                            "PutObject input",
-                            format!("{field}: not an entity-tag condition the s3s input can hold"),
-                        )
-                        .to_string()
-                    });
+                let expected = if value.is_empty() || value == "*" {
+                    Ok(expected_base_fields())
+                } else if SPECIFIC_ETAGS.contains(&value.as_str()) {
+                    let mut expected = expected_base_fields();
+                    expected["specific_if_none_match"] = serde_json::json!(none);
+                    Ok(expected)
+                } else {
+                    let field = if none { "if_none_match" } else { "if_match" };
+                    Err(conversion_error(
+                        "PutObject input",
+                        format!("{field}: not an entity-tag condition the s3s input can hold"),
+                    )
+                    .to_string())
+                };
                 let current = owned::put_input(make()).map(fields).map_err(|error| error.to_string());
-                observations.push((value.clone(), none, current, old));
+                observations.push((value.clone(), none, current, expected));
             }
         }
         let mismatches: Vec<_> = observations
             .into_iter()
-            .filter(|(_, _, current, old)| current != old)
+            .filter(|(_, _, current, expected)| current != expected)
             .collect();
         assert!(mismatches.is_empty(), "condition projection mismatches: {mismatches:#?}");
     }
@@ -1710,11 +1662,9 @@ mod put_tests {
     fn protocol_put_optional_values_match_legacy() {
         for value in ["", "value"] {
             let mut request = input();
-            let mut old = old_input();
             macro_rules! strings {
                 ($($field:ident),+) => {$(
                     request.$field = Some(value.to_owned());
-                    old.$field = (!value.is_empty()).then(|| value.to_owned());
                 )+};
             }
             strings!(
@@ -1733,7 +1683,6 @@ mod put_tests {
             macro_rules! enums {
                 ($($field:ident => $kind:ident),+) => {$(
                     request.$field = Some(gateway_dto::$kind::custom(value));
-                    old.$field = (!value.is_empty()).then(|| value.to_owned().into());
                 )+};
             }
             enums!(
@@ -1744,24 +1693,45 @@ mod put_tests {
                 checksum_algorithm => ChecksumAlgorithm
             );
             request.expires = Some(OpaqueString::from(value));
-            old.expires = (!value.is_empty()).then(|| value.to_owned());
+            let mut expected = expected_base_fields();
             if !value.is_empty() {
                 request.metadata.insert("key".into(), "value".into());
-                old.metadata = Some([("key".into(), "value".into())].into());
+                for key in [
+                    "cache_control",
+                    "content_disposition",
+                    "content_encoding",
+                    "content_language",
+                    "content_type",
+                    "content_md5",
+                    "tagging",
+                    "sse_customer_algorithm",
+                    "sse_customer_key_md5",
+                    "ssekms_key_id",
+                    "website_redirect_location",
+                    "storage_class",
+                    "server_side_encryption",
+                    "lock_mode",
+                    "legal_hold",
+                    "checksum_algorithm",
+                    "expires",
+                ] {
+                    expected[key] = serde_json::json!(value);
+                }
+                expected["metadata"] = serde_json::json!({ "key": "value" });
             }
-            assert_eq!(fields(owned::put_input(request).expect("optional values")), legacy_fields(old));
+            assert_eq!(fields(owned::put_input(request).expect("optional values")), expected);
         }
     }
 
     #[test]
     fn protocol_put_checksum_input_matches_legacy() {
         let mut observations = Vec::new();
-        for (header, value) in [
-            ("x-amz-checksum-crc32", "AAAAAA=="),
-            ("x-amz-checksum-crc32c", "AAAAAA=="),
-            ("x-amz-checksum-crc64nvme", "AAAAAAAAAAA="),
-            ("x-amz-checksum-sha1", "AAAAAAAAAAAAAAAAAAAAAAAAAAA="),
-            ("x-amz-checksum-sha256", "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="),
+        for (header, json_field, value) in [
+            ("x-amz-checksum-crc32", "crc32", "AAAAAA=="),
+            ("x-amz-checksum-crc32c", "crc32c", "AAAAAA=="),
+            ("x-amz-checksum-crc64nvme", "crc64nvme", "AAAAAAAAAAA="),
+            ("x-amz-checksum-sha1", "sha1", "AAAAAAAAAAAAAAAAAAAAAAAAAAA="),
+            ("x-amz-checksum-sha256", "sha256", "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="),
         ] {
             let make = || {
                 let mut request = input();
@@ -1769,33 +1739,29 @@ mod put_tests {
                     Some(rustfs_gateway_types::ChecksumSpec::parse_header(header, value).expect("test checksum"));
                 request
             };
-            let mut old = old_input();
-            let digest = Some(value.to_owned());
-            match header {
-                "x-amz-checksum-crc32" => old.checksum_crc32 = digest,
-                "x-amz-checksum-crc32c" => old.checksum_crc32c = digest,
-                "x-amz-checksum-crc64nvme" => old.checksum_crc64nvme = digest,
-                "x-amz-checksum-sha1" => old.checksum_sha1 = digest,
-                _ => old.checksum_sha256 = digest,
-            }
+            let mut expected = expected_base_fields();
+            expected[json_field] = serde_json::json!(value);
             observations.push((
                 header,
                 owned::put_input(make()).map(fields).map_err(|error| error.to_string()),
-                Ok(legacy_fields(old)),
+                Ok(expected),
             ));
         }
-        let mismatches: Vec<_> = observations.into_iter().filter(|(_, current, old)| current != old).collect();
+        let mismatches: Vec<_> = observations
+            .into_iter()
+            .filter(|(_, current, expected)| current != expected)
+            .collect();
         assert!(mismatches.is_empty(), "PutObject checksum input mismatches: {mismatches:#?}");
     }
 
     #[test]
     fn protocol_put_retain_until_matches_legacy() {
         let mut observations = Vec::new();
-        for (secs, nanos) in [
-            (1_700_000_000, 123_456_789),
-            (-1, 123_456_789),
-            (0, 123_456_789),
-            (i64::MAX, 0),
+        for (secs, nanos, pinned_nanos) in [
+            (1_700_000_000, 123_456_789, Some("1700000000123456789")),
+            (-1, 123_456_789, Some("-876543211")),
+            (0, 123_456_789, Some("123456789")),
+            (i64::MAX, 0, None),
         ] {
             let make = || {
                 let mut request = input();
@@ -1803,19 +1769,18 @@ mod put_tests {
                     Some(rustfs_gateway_types::Timestamp::from_secs_nanos(secs, nanos).expect("instant"));
                 request
             };
-            let expected = Timestamp::parse(TimestampFormat::EpochSeconds, &format!("{secs}.{nanos:09}"))
-                .map(|date| {
-                    let mut old = old_input();
-                    old.object_lock_retain_until_date = Some(date);
-                    legacy_fields(old)
-                })
-                .map_err(|_| {
-                    conversion_error(
-                        "PutObject input",
-                        "object_lock_retain_until_date: an instant outside what the s3s input can hold",
-                    )
-                    .to_string()
-                });
+            let expected = match pinned_nanos {
+                Some(nanos_str) => {
+                    let mut fields = expected_base_fields();
+                    fields["retain_until"] = serde_json::json!(nanos_str);
+                    Ok(fields)
+                }
+                None => Err(conversion_error(
+                    "PutObject input",
+                    "object_lock_retain_until_date: an instant outside what the s3s input can hold",
+                )
+                .to_string()),
+            };
             observations.push((
                 secs,
                 nanos,
@@ -1825,7 +1790,7 @@ mod put_tests {
         }
         let mismatches: Vec<_> = observations
             .into_iter()
-            .filter(|(_, _, current, old)| current != old)
+            .filter(|(_, _, current, expected)| current != expected)
             .collect();
         assert!(mismatches.is_empty(), "retain-until projection mismatches: {mismatches:#?}");
     }
@@ -1833,16 +1798,20 @@ mod put_tests {
     #[test]
     fn protocol_put_output_matches_legacy() {
         use crate::app::object_usecase::PutObjectWriteOutput;
+        enum ExpectedETag<'a> {
+            Strong(&'a str),
+            Weak(&'a str),
+        }
         let mut observations = Vec::new();
         for (raw, tag) in [
             (None, None),
-            (Some("abc"), Some(s3s::dto::ETag::Strong("abc".to_owned()))),
-            (Some("\"abc\""), Some(s3s::dto::ETag::Strong("abc".to_owned()))),
-            (Some("W/\"abc\""), Some(s3s::dto::ETag::Weak("abc".to_owned()))),
-            (Some("W/\"\"abc\"\""), Some(s3s::dto::ETag::Weak("\"abc\"".to_owned()))),
-            (Some(""), Some(s3s::dto::ETag::Strong(String::new()))),
-            (Some("\"\""), Some(s3s::dto::ETag::Strong(String::new()))),
-            (Some("a\nb"), Some(s3s::dto::ETag::Strong("a\nb".to_owned()))),
+            (Some("abc"), Some(ExpectedETag::Strong("abc"))),
+            (Some("\"abc\""), Some(ExpectedETag::Strong("abc"))),
+            (Some("W/\"abc\""), Some(ExpectedETag::Weak("abc"))),
+            (Some("W/\"\"abc\"\""), Some(ExpectedETag::Weak("\"abc\""))),
+            (Some(""), Some(ExpectedETag::Strong(""))),
+            (Some("\"\""), Some(ExpectedETag::Strong(""))),
+            (Some("a\nb"), Some(ExpectedETag::Strong("a\nb"))),
         ] {
             let old = match tag {
                 None => Err(conversion_error(
@@ -1854,8 +1823,8 @@ mod put_tests {
                 }
                 Some(tag) => {
                     let tag = match tag {
-                        ETag::Weak(value) => rustfs_gateway_types::ETag::new_weak(value.trim_matches('"').to_owned()),
-                        ETag::Strong(value) => rustfs_gateway_types::ETag::new(value),
+                        ExpectedETag::Weak(value) => rustfs_gateway_types::ETag::new_weak(value.trim_matches('"').to_owned()),
+                        ExpectedETag::Strong(value) => rustfs_gateway_types::ETag::new(value.to_owned()),
                     }
                     .expect("recorded entity tag");
                     Ok(gateway_dto::PutObjectOutput {
@@ -2014,17 +1983,37 @@ mod put_tests {
     fn protocol_put_error_projection_matches_legacy() {
         use rustfs_s3_types::S3Error;
         let mut observations = Vec::new();
-        for (code, explicit) in [
-            (S3ErrorCode::InvalidStorageClass, false),
-            (S3ErrorCode::IncompleteBody, false),
-            (S3ErrorCode::UnexpectedContent, false),
-            (S3ErrorCode::Custom("ProtocolPutUnmapped".into()), false),
-            (S3ErrorCode::InvalidStorageClass, true),
-            (S3ErrorCode::IncompleteBody, true),
-            (S3ErrorCode::UnexpectedContent, true),
-            (S3ErrorCode::EntityTooLarge, true),
-            (S3ErrorCode::NotImplemented, true),
-            (S3ErrorCode::Custom("ProtocolPutUnmapped".into()), true),
+        for (code, explicit, expected_status, expected_message) in [
+            (
+                S3ErrorCode::InvalidStorageClass,
+                false,
+                Some(400_u16),
+                Some("The storage class you specified is not valid."),
+            ),
+            (
+                S3ErrorCode::IncompleteBody,
+                false,
+                Some(400),
+                Some("You did not provide the number of bytes specified by the Content-Length HTTP header"),
+            ),
+            (
+                S3ErrorCode::UnexpectedContent,
+                false,
+                Some(400),
+                Some("This request does not support content."),
+            ),
+            (S3ErrorCode::Custom("ProtocolPutUnmapped".into()), false, None, None),
+            (S3ErrorCode::InvalidStorageClass, true, Some(418), Some("explicit protocol error")),
+            (S3ErrorCode::IncompleteBody, true, Some(418), Some("explicit protocol error")),
+            (S3ErrorCode::UnexpectedContent, true, Some(418), Some("explicit protocol error")),
+            (S3ErrorCode::EntityTooLarge, true, Some(418), Some("explicit protocol error")),
+            (S3ErrorCode::NotImplemented, true, Some(418), Some("explicit protocol error")),
+            (
+                S3ErrorCode::Custom("ProtocolPutUnmapped".into()),
+                true,
+                Some(418),
+                Some("explicit protocol error"),
+            ),
         ] {
             let make = || {
                 let mut error = S3Error::new(code.clone());
@@ -2037,14 +2026,18 @@ mod put_tests {
                 }
                 error
             };
-            let old: s3s::S3Error = crate::error::legacy_error_for_test(make());
-            let old = Err(crate::error::owned_error_for_test(old));
+            let expected = serde_json::json!({
+                "code": format!("{code:?}"),
+                "status": expected_status,
+                "message": expected_message,
+                "headers": if explicit { "Some({\"x-protocol-test\": \"preserved\"})" } else { "None" },
+            });
             let current = Err(owned::put_error(make()));
-            observations.push((code, explicit, outcome(&old), outcome(&current)));
+            observations.push((code, explicit, expected, outcome(&current)));
         }
         let mismatches: Vec<_> = observations
             .into_iter()
-            .filter(|(_, _, old, current)| old != current)
+            .filter(|(_, _, expected, current)| expected != current)
             .collect();
         assert!(mismatches.is_empty(), "PutObject error projection mismatches: {mismatches:#?}");
     }
@@ -2763,31 +2756,6 @@ mod listing_tests {
         assert_eq!(current.buckets[0].creation_date.subsec_nanos(), 123000000);
     }
 
-    /// Same facts `RequestEnvelope::from_s3s` copies: method, URI, headers, extensions, region, service, and credentials.
-    #[cfg(any(feature = "webdav", feature = "sftp"))]
-    fn envelope_from_legacy_listing_request<T>(req: &S3Request<T>) -> crate::app::RequestEnvelope {
-        let credentials = req.credentials.as_ref().map(|credentials| {
-            let session_token = crate::auth::get_session_token(&req.uri, &req.headers).map(str::to_owned);
-            crate::app::RequestCredentials::new(
-                credentials.access_key.clone(),
-                credentials.secret_key.expose().to_owned(),
-                session_token.clone(),
-            )
-            .unwrap_or_else(|_| crate::app::RequestCredentials::without_secret_key(credentials.access_key.clone(), session_token))
-        });
-        crate::app::RequestEnvelope::from_parts(
-            crate::app::RequestHead {
-                method: req.method.clone(),
-                uri: req.uri.clone(),
-                headers: req.headers.clone(),
-                credentials,
-                region: req.region.as_ref().map(|region| region.as_str().to_owned()),
-                service: req.service.clone(),
-            },
-            req.extensions.clone(),
-        )
-    }
-
     #[cfg(any(feature = "webdav", feature = "sftp"))]
     #[test]
     fn protocol_listing_session_credential_projection_matches_legacy() {
@@ -2811,27 +2779,16 @@ mod listing_tests {
                 if let Some(token) = token {
                     headers.insert("x-amz-security-token", token.parse().expect("token header"));
                 }
-                let mut legacy = ProtocolStorageClient::create_request(
-                    ListBucketsInput::default(),
-                    Method::GET,
-                    http::Uri::from_static("/"),
-                    RequestParams {
-                        bucket: None,
-                        object: None,
-                        credentials: &credentials,
-                    },
-                )
-                .expect("legacy request");
-                legacy.headers = headers.clone();
-                let legacy = envelope_from_legacy_listing_request(&legacy);
-                let current =
+                let envelope =
                     session_list_buckets_envelope(ServerContextSlot::new(), &session, &headers, true, credentials, false);
-                let legacy = legacy.credentials().expect("legacy credentials");
-                let current = current.credentials().expect("owned credentials");
+                assert_eq!((envelope.method(), envelope.uri()), (&Method::GET, &http::Uri::from_static("/")));
+                let projected = envelope.credentials().expect("owned credentials");
                 assert_eq!(
-                    (legacy.access_key(), legacy.secret_key(), legacy.session_token()),
-                    (current.access_key(), current.secret_key(), current.session_token())
+                    (projected.access_key(), projected.secret_key(), projected.session_token()),
+                    ("listing-session", (!secret.is_empty()).then_some(secret), token)
                 );
+                let info = envelope.req_info().expect("request info");
+                assert_eq!(info.cred.as_ref().expect("session credentials").session_token, "identity-token");
             }
         }
     }

@@ -115,6 +115,28 @@ pub struct GatewayDenialRecord {
     pub suppressed_denials: u64,
 }
 
+impl GatewayDenialRecord {
+    /// Only the facts of an enforcing indeterminate event, for hosts that admit an audit
+    /// entry once the HTTP response is known. No rate limit admission has been consumed.
+    #[must_use]
+    pub fn pending_indeterminate(event: &AuthzAuditEvent<'_>) -> Option<Self> {
+        (event.decision == Decision::Indeterminate && !is_visibility_probe(event))
+            .then(|| Self::from_event(event, INDETERMINATE_REASON, 0))
+    }
+
+    fn from_event(event: &AuthzAuditEvent<'_>, denial_reason: &'static str, suppressed: u64) -> Self {
+        Self {
+            action: event.action.to_owned(),
+            bucket: event.bucket.map(|bucket| bucket.as_str().to_owned()),
+            object: event.key.map(|key| key.as_str().to_owned()),
+            request_id: event.request_id.as_str().to_owned(),
+            access_key: event.identity.map(|identity| identity.access_key_id().to_owned()),
+            denial_reason,
+            suppressed_denials: suppressed,
+        }
+    }
+}
+
 /// Where admitted refusals go. Implemented by the binary over the legacy denial auditor.
 ///
 /// The three methods are called in order, at most once each per refusal, on the request's task,
@@ -170,15 +192,8 @@ impl<S: DenialAuditSink> AuthzAuditSink for RustfsAuthzAudit<S> {
         let DenialAdmission::Emit { suppressed } = self.sink.admit(anonymous) else {
             return;
         };
-        self.sink.record(GatewayDenialRecord {
-            action: event.action.to_owned(),
-            bucket: event.bucket.map(|bucket| bucket.as_str().to_owned()),
-            object: event.key.map(|key| key.as_str().to_owned()),
-            request_id: event.request_id.as_str().to_owned(),
-            access_key: event.identity.map(|identity| identity.access_key_id().to_owned()),
-            denial_reason,
-            suppressed_denials: suppressed,
-        });
+        self.sink
+            .record(GatewayDenialRecord::from_event(event, denial_reason, suppressed));
     }
 }
 
@@ -401,6 +416,28 @@ mod tests {
             assert_eq!(audit.sink.records(), [expected(reason, Some(ACCESS_KEY), 0)], "{decision:?}");
             assert_eq!(audit.sink.limiter_asked(), [false], "{decision:?}");
         }
+    }
+
+    #[test]
+    fn pending_indeterminate_excludes_other_decisions_and_visibility_probes() {
+        let f = fixture();
+        let caller = Some(&f.identity);
+        let route = target(&f, caller);
+        let resources = [route];
+        let refused = event(&f, AuthzStage::Route, Decision::Indeterminate, &resources, caller);
+        assert_eq!(
+            GatewayDenialRecord::pending_indeterminate(&refused),
+            Some(expected(INDETERMINATE_REASON, Some(ACCESS_KEY), 0))
+        );
+        for decision in [Decision::Allow, Decision::Deny] {
+            assert!(
+                GatewayDenialRecord::pending_indeterminate(&event(&f, AuthzStage::Route, decision, &resources, caller)).is_none()
+            );
+        }
+        let question = visibility(&route);
+        assert!(
+            GatewayDenialRecord::pending_indeterminate(&visibility_event(&refused, &question, Decision::Indeterminate)).is_none()
+        );
     }
 
     /// Positive — an input-stage refusal of a GetObject is exactly one record, though its

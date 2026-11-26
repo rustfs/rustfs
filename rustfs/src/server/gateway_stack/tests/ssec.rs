@@ -65,6 +65,7 @@ fn ssec_deployment_policy_and_key_handoff() {
                 let stack = GatewayStack {
                     keystone_auth: None,
                     control_plane: false,
+                    object_lambda_fallback: None,
                     service: builder
                         .register::<dto::GetObject, _>(Arc::clone(&probe))
                         .build()

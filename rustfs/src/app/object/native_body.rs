@@ -16,8 +16,6 @@
 //! This adapter preserves trailers and source errors without applying another length check.
 
 use crate::app::storage_api::request_body::StdError;
-#[cfg(test)]
-use crate::app::storage_api::request_body::{ByteStream, StreamingBlob};
 use bytes::{Buf, Bytes};
 #[cfg(test)]
 use futures::StreamExt;
@@ -62,13 +60,6 @@ where
     tokio_util::io::StreamReader::new(stream.map_ok(UploadFrame))
 }
 
-/// The legacy edge preserves the producer's length hint without enforcing it a second time.
-#[cfg(test)]
-pub(crate) fn from_legacy(body: StreamingBlob) -> Body {
-    let stream = LegacyPayload { body, ended: false };
-    Body::from_payload(Payload::Stream(Box::pin(stream)))
-}
-
 #[derive(Debug)]
 struct ProducerSource(StdError);
 
@@ -80,51 +71,6 @@ impl std::fmt::Display for ProducerSource {
 impl std::error::Error for ProducerSource {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         Some(self.0.as_ref())
-    }
-}
-
-#[cfg(test)]
-struct LegacyPayload {
-    body: StreamingBlob,
-    ended: bool,
-}
-
-#[cfg(test)]
-impl PayloadStream for LegacyPayload {
-    fn poll_read(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<PayloadRead, StreamError>> {
-        if self.ended {
-            return Poll::Ready(Err(StreamError::polled_after_eof()));
-        }
-        // Empty transport frames are not progress. Bound each poll without reading ahead.
-        for _ in 0..32 {
-            match self.body.poll_next_unpin(cx) {
-                Poll::Pending => return Poll::Pending,
-                Poll::Ready(Some(Ok(bytes))) if bytes.is_empty() => continue,
-                Poll::Ready(Some(Ok(bytes))) => return Poll::Ready(Ok(PayloadRead::Chunk(bytes))),
-                Poll::Ready(Some(Err(error))) => {
-                    self.ended = true;
-                    return Poll::Ready(Err(StreamError::upstream(Box::new(ProducerSource(error)))));
-                }
-                Poll::Ready(None) => {
-                    self.ended = true;
-                    return Poll::Ready(Ok(PayloadRead::Eof {
-                        trailers: TrailingHeaders::empty(),
-                    }));
-                }
-            }
-        }
-        cx.waker().wake_by_ref();
-        Poll::Pending
-    }
-
-    fn caps(&self) -> PayloadCaps {
-        let mut caps = PayloadCaps::PUSH;
-        caps.set(PayloadCaps::KNOWN_LENGTH, self.len_hint().is_some());
-        caps
-    }
-
-    fn len_hint(&self) -> Option<u64> {
-        self.body.remaining_length().exact().map(|length| length as u64)
     }
 }
 
@@ -307,17 +253,15 @@ mod tests {
         assert_eq!(slot.available_permits(), 1);
     }
 
-    use crate::app::storage_api::request_body::RemainingLength;
     use std::collections::VecDeque;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    struct LegacyProbe {
-        frames: VecDeque<Option<Result<Bytes, StdError>>>,
-        length: Option<usize>,
+    struct IoProbe {
+        frames: VecDeque<Option<std::io::Result<Bytes>>>,
         polls: Arc<AtomicUsize>,
     }
-    impl Stream for LegacyProbe {
-        type Item = Result<Bytes, StdError>;
+    impl Stream for IoProbe {
+        type Item = std::io::Result<Bytes>;
         fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
             self.polls.fetch_add(1, Ordering::SeqCst);
             match self.frames.pop_front() {
@@ -330,21 +274,18 @@ mod tests {
             }
         }
     }
-    impl ByteStream for LegacyProbe {
-        fn remaining_length(&self) -> RemainingLength {
-            self.length.map_or_else(RemainingLength::unknown, RemainingLength::new_exact)
-        }
-    }
 
     #[tokio::test]
     async fn legacy_body_preserves_demand_pending_and_length_validation_location() {
         for (length, bytes) in [(Some(0), b"".as_slice()), (Some(4), b"a"), (Some(1), b"abcd"), (None, b"abc")] {
             let polls = Arc::new(AtomicUsize::new(0));
-            let body = from_legacy(StreamingBlob::new(LegacyProbe {
-                frames: VecDeque::from([None, Some(Ok(Bytes::copy_from_slice(bytes)))]),
+            let body = from_io_stream_with_length(
+                IoProbe {
+                    frames: VecDeque::from([None, Some(Ok(Bytes::copy_from_slice(bytes)))]),
+                    polls: Arc::clone(&polls),
+                },
                 length,
-                polls: Arc::clone(&polls),
-            }));
+            );
             assert_eq!(body.len_hint(), length.map(|value| value as u64));
             let (chunks, trailers) = BodyChunks::new(body);
             let (chunks, control) = super::super::request_body::guard_native_upload_progress(
@@ -373,13 +314,13 @@ mod tests {
 
     #[tokio::test]
     async fn legacy_producer_error_keeps_its_concrete_type_and_is_not_eof() {
-        let body = from_legacy(StreamingBlob::new(LegacyProbe {
-            frames: VecDeque::from([Some(Err(
-                Box::new(std::io::Error::from(std::io::ErrorKind::ConnectionReset)) as StdError
-            ))]),
-            length: None,
-            polls: Arc::new(AtomicUsize::new(0)),
-        }));
+        let body = from_io_stream_with_length(
+            IoProbe {
+                frames: VecDeque::from([Some(Err(std::io::Error::from(std::io::ErrorKind::ConnectionReset)))]),
+                polls: Arc::new(AtomicUsize::new(0)),
+            },
+            None,
+        );
         let (mut chunks, trailers) = BodyChunks::new(body);
         let error = chunks.next().await.unwrap().unwrap_err();
         assert_eq!(

@@ -540,42 +540,6 @@ fn restore_output() -> RestoreObjectOutput {
 }
 
 #[cfg(test)]
-impl DefaultObjectUsecase {
-    /// Projects a legacy RestoreObject request onto the shared restore path.
-    pub async fn execute_restore_object(
-        &self,
-        req: crate::app::storage_api::s3::S3Request<crate::app::storage_api::s3::dto::RestoreObjectInput>,
-    ) -> crate::app::storage_api::s3::S3Result<
-        crate::app::storage_api::s3::S3Response<crate::app::storage_api::s3::dto::RestoreObjectOutput>,
-    > {
-        use crate::app::storage_api::object_usecase::bucket::restore_request_from_wire;
-        use crate::app::storage_api::s3::{
-            S3Response,
-            dto::{RequestCharged, RestoreObjectOutput},
-        };
-        let envelope = RequestEnvelope::from_s3s(&req);
-        let input = req.input;
-        self.execute_restore_object_owned(
-            envelope,
-            input.bucket,
-            input.key,
-            input.version_id,
-            input.restore_request.map(restore_request_from_wire),
-        )
-        .await
-        .map(|output| {
-            S3Response::new(RestoreObjectOutput {
-                request_charged: output
-                    .request_charged
-                    .map(|value| RequestCharged::from(value.as_str().to_owned())),
-                restore_output_path: output.restore_output_path,
-            })
-        })
-        .map_err(crate::error::legacy_error_for_test)
-    }
-}
-
-#[cfg(test)]
 mod tests {
     use super::*;
     use crate::app::RequestHead;

@@ -47,6 +47,13 @@ pub(crate) enum IamBootstrapDisposition {
     Deferred,
 }
 
+#[cfg(test)]
+impl IamBootstrapDisposition {
+    pub(crate) fn test_ready_inline() -> Self {
+        Self::ReadyInline(HealTopologyReady(()))
+    }
+}
+
 pub(crate) async fn publish_ready_for_iam_bootstrap(
     disposition: IamBootstrapDisposition,
     readiness: &GlobalReadiness,
@@ -141,6 +148,7 @@ fn spawn_iam_recovery_task(
     readiness: Arc<GlobalReadiness>,
     state_manager: Option<Arc<ServiceStateManager>>,
     server_ctx: Arc<ServerContextSlot>,
+    post_prepare: Option<PostPrepareHook>,
 ) {
     let init_store = store.clone();
     let finalize_store = store;
@@ -165,6 +173,7 @@ fn spawn_iam_recovery_task(
                 let server_ctx = finalize_server_ctx.clone();
                 Box::pin(prepare_iam_startup(iam, store, kms_interface, readiness, server_ctx))
             },
+            post_prepare,
             move |topology_ready| {
                 let readiness = finalize_readiness.clone();
                 let state_manager = finalize_state_manager.clone();
@@ -181,6 +190,8 @@ fn spawn_iam_recovery_task(
 }
 
 type RecoveryFuture<T = ()> = Pin<Box<dyn Future<Output = Result<T>> + Send>>;
+type PostPrepareFuture = Pin<Box<dyn Future<Output = ()> + Send>>;
+type PostPrepareHook = Box<dyn FnOnce() -> PostPrepareFuture + Send>;
 
 async fn run_iam_recovery_loop<T, Prepared, InitFn, PrepareFn, FinalizeFn>(
     initial_interval: Duration,
@@ -188,6 +199,7 @@ async fn run_iam_recovery_loop<T, Prepared, InitFn, PrepareFn, FinalizeFn>(
     shutdown_token: Option<tokio_util::sync::CancellationToken>,
     mut init_fn: InitFn,
     mut prepare_fn: PrepareFn,
+    mut post_prepare_fn: Option<PostPrepareHook>,
     mut finalize_fn: FinalizeFn,
 ) where
     T: Clone,
@@ -256,12 +268,30 @@ async fn run_iam_recovery_loop<T, Prepared, InitFn, PrepareFn, FinalizeFn>(
         }
     };
 
-    // Preparation claims the context once. Only publication retries after it.
+    // Preparation claims the context once. Post-prepare services initialize once
+    // after preparation and before publication; only publication retries after it.
     let mut prepared: Option<Prepared> = None;
     let mut finalize_attempts: u64 = 0;
     loop {
+        if shutdown_token
+            .as_ref()
+            .is_some_and(tokio_util::sync::CancellationToken::is_cancelled)
+        {
+            return;
+        }
         let result = match prepared.as_ref() {
-            Some(prepared) => finalize_fn(prepared.clone()).await,
+            Some(prepared) => {
+                if let Some(post_prepare) = post_prepare_fn.take() {
+                    post_prepare().await;
+                    if shutdown_token
+                        .as_ref()
+                        .is_some_and(tokio_util::sync::CancellationToken::is_cancelled)
+                    {
+                        return;
+                    }
+                }
+                finalize_fn(prepared.clone()).await
+            }
             None => match prepare_fn(recovered.clone()).await {
                 Ok(value) => {
                     prepared = Some(value);
@@ -396,6 +426,7 @@ pub(crate) async fn bootstrap_or_defer_iam_init(
     state_manager: Option<Arc<ServiceStateManager>>,
     shutdown_token: Option<tokio_util::sync::CancellationToken>,
     server_ctx: Arc<ServerContextSlot>,
+    deferred_post_prepare: Option<PostPrepareHook>,
 ) -> Result<IamBootstrapDisposition> {
     match attempt_init_iam_sys(store.clone()).await {
         Ok(iam) => {
@@ -425,6 +456,7 @@ pub(crate) async fn bootstrap_or_defer_iam_init(
                 readiness,
                 state_manager,
                 server_ctx,
+                deferred_post_prepare,
             );
         }
     }
@@ -438,9 +470,19 @@ pub(crate) async fn bootstrap_or_defer_iam_init_with_startup_kms(
     state_manager: Option<Arc<ServiceStateManager>>,
     shutdown_token: Option<tokio_util::sync::CancellationToken>,
     server_ctx: Arc<ServerContextSlot>,
+    deferred_post_prepare: Option<PostPrepareHook>,
 ) -> Result<IamBootstrapDisposition> {
     let kms_interface = AppContext::ensure_startup_kms_interface();
-    bootstrap_or_defer_iam_init(store, kms_interface, readiness, state_manager, shutdown_token, server_ctx).await
+    bootstrap_or_defer_iam_init(
+        store,
+        kms_interface,
+        readiness,
+        state_manager,
+        shutdown_token,
+        server_ctx,
+        deferred_post_prepare,
+    )
+    .await
 }
 
 pub(crate) async fn init_embedded_iam_runtime(
@@ -449,7 +491,7 @@ pub(crate) async fn init_embedded_iam_runtime(
     readiness: Arc<GlobalReadiness>,
     server_ctx: Arc<ServerContextSlot>,
 ) -> Result<IamBootstrapDisposition> {
-    bootstrap_or_defer_iam_init_with_startup_kms(store, readiness, None, Some(ctx), server_ctx).await
+    bootstrap_or_defer_iam_init_with_startup_kms(store, readiness, None, Some(ctx), server_ctx, None).await
 }
 
 pub(crate) async fn init_iam_runtime(
@@ -459,7 +501,15 @@ pub(crate) async fn init_iam_runtime(
     state_manager: Arc<ServiceStateManager>,
     server_ctx: Arc<ServerContextSlot>,
 ) -> Result<IamBootstrapDisposition> {
-    bootstrap_or_defer_iam_init_with_startup_kms(store, readiness, Some(state_manager), Some(ctx), server_ctx).await
+    bootstrap_or_defer_iam_init_with_startup_kms(
+        store,
+        readiness,
+        Some(state_manager),
+        Some(ctx),
+        server_ctx,
+        Some(Box::new(|| Box::pin(crate::startup_audit::init_audit_runtime()))),
+    )
+    .await
 }
 
 #[cfg(test)]
@@ -641,6 +691,7 @@ mod tests {
                 })
             },
             |()| Box::pin(async { Ok(()) }),
+            None,
             move |_| {
                 let finalize_calls = finalize_calls.clone();
                 Box::pin(async move {
@@ -685,6 +736,7 @@ mod tests {
                 })
             },
             |()| Box::pin(async { Ok(()) }),
+            None,
             move |_| {
                 let readiness = readiness_for_finalize.clone();
                 let observed_iam_ready = observed_iam_ready_for_finalize.clone();
@@ -787,6 +839,7 @@ mod tests {
                             })
                         }
                     },
+                    None,
                     {
                         let readiness = Arc::clone(&readiness);
                         let calls = Arc::clone(&publish_calls);
@@ -877,6 +930,7 @@ mod tests {
                     })
                 }
             },
+            None,
             {
                 let calls = Arc::clone(&publish_calls);
                 move |owner| {
@@ -917,6 +971,7 @@ mod tests {
                         })
                     },
                     |()| Box::pin(async { Ok(()) }),
+                    None,
                     |()| Box::pin(async { Ok(()) }),
                 )
                 .await;
@@ -929,5 +984,171 @@ mod tests {
         task.await.expect("recovery task should exit after cancellation");
 
         assert_eq!(init_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn recovery_loop_runs_post_prepare_once_after_prepare_and_before_finalize_retries() {
+        let events = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let prepare_calls = Arc::new(AtomicUsize::new(0));
+        let post_prepare_calls = Arc::new(AtomicUsize::new(0));
+        let finalize_calls = Arc::new(AtomicUsize::new(0));
+
+        run_iam_recovery_loop(
+            Duration::from_secs(1),
+            Duration::from_secs(4),
+            None,
+            || Box::pin(async { Ok(()) }),
+            {
+                let events = Arc::clone(&events);
+                let calls = Arc::clone(&prepare_calls);
+                move |()| {
+                    let events = Arc::clone(&events);
+                    let calls = Arc::clone(&calls);
+                    Box::pin(async move {
+                        if calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                            events.lock().expect("events lock").push("prepare_failed");
+                            Err(Error::other("prepare failed"))
+                        } else {
+                            events.lock().expect("events lock").push("prepare_ok");
+                            Ok(())
+                        }
+                    })
+                }
+            },
+            Some(Box::new({
+                let events = Arc::clone(&events);
+                let calls = Arc::clone(&post_prepare_calls);
+                move || {
+                    Box::pin(async move {
+                        calls.fetch_add(1, Ordering::SeqCst);
+                        events.lock().expect("events lock").push("post_prepare");
+                    })
+                }
+            })),
+            {
+                let events = Arc::clone(&events);
+                let calls = Arc::clone(&finalize_calls);
+                move |()| {
+                    let events = Arc::clone(&events);
+                    let calls = Arc::clone(&calls);
+                    Box::pin(async move {
+                        let attempt = calls.fetch_add(1, Ordering::SeqCst) + 1;
+                        if attempt < 3 {
+                            events.lock().expect("events lock").push("finalize_failed");
+                            Err(Error::other("finalize failed"))
+                        } else {
+                            events.lock().expect("events lock").push("finalize_ok");
+                            Ok(())
+                        }
+                    })
+                }
+            },
+        )
+        .await;
+
+        assert_eq!(prepare_calls.load(Ordering::SeqCst), 2);
+        assert_eq!(post_prepare_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(finalize_calls.load(Ordering::SeqCst), 3);
+        assert_eq!(
+            *events.lock().expect("events lock"),
+            vec![
+                "prepare_failed",
+                "prepare_ok",
+                "post_prepare",
+                "finalize_failed",
+                "finalize_failed",
+                "finalize_ok",
+            ]
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn recovery_loop_skips_post_prepare_and_finalize_when_cancelled_after_prepare() {
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let prepare_calls = Arc::new(AtomicUsize::new(0));
+        let post_prepare_calls = Arc::new(AtomicUsize::new(0));
+        let finalize_calls = Arc::new(AtomicUsize::new(0));
+
+        run_iam_recovery_loop(
+            Duration::from_secs(1),
+            Duration::from_secs(4),
+            Some(cancel.clone()),
+            || Box::pin(async { Ok(()) }),
+            {
+                let cancel = cancel.clone();
+                let calls = Arc::clone(&prepare_calls);
+                move |()| {
+                    let cancel = cancel.clone();
+                    let calls = Arc::clone(&calls);
+                    Box::pin(async move {
+                        calls.fetch_add(1, Ordering::SeqCst);
+                        cancel.cancel();
+                        Ok(())
+                    })
+                }
+            },
+            Some(Box::new({
+                let calls = Arc::clone(&post_prepare_calls);
+                move || {
+                    Box::pin(async move {
+                        calls.fetch_add(1, Ordering::SeqCst);
+                    })
+                }
+            })),
+            {
+                let calls = Arc::clone(&finalize_calls);
+                move |()| {
+                    let calls = Arc::clone(&calls);
+                    Box::pin(async move {
+                        calls.fetch_add(1, Ordering::SeqCst);
+                        Ok(())
+                    })
+                }
+            },
+        )
+        .await;
+
+        assert_eq!(prepare_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(post_prepare_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(finalize_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn recovery_loop_skips_finalize_when_cancelled_during_post_prepare() {
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let post_prepare_calls = Arc::new(AtomicUsize::new(0));
+        let finalize_calls = Arc::new(AtomicUsize::new(0));
+
+        run_iam_recovery_loop(
+            Duration::from_secs(1),
+            Duration::from_secs(4),
+            Some(cancel.clone()),
+            || Box::pin(async { Ok(()) }),
+            |()| Box::pin(async { Ok(()) }),
+            Some(Box::new({
+                let cancel = cancel.clone();
+                let calls = Arc::clone(&post_prepare_calls);
+                move || {
+                    Box::pin(async move {
+                        calls.fetch_add(1, Ordering::SeqCst);
+                        cancel.cancel();
+                    })
+                }
+            })),
+            {
+                let calls = Arc::clone(&finalize_calls);
+                move |()| {
+                    let calls = Arc::clone(&calls);
+                    Box::pin(async move {
+                        calls.fetch_add(1, Ordering::SeqCst);
+                        Ok(())
+                    })
+                }
+            },
+        )
+        .await;
+
+        assert_eq!(post_prepare_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(finalize_calls.load(Ordering::SeqCst), 0);
     }
 }

@@ -123,10 +123,14 @@ jobs:
           echo "AWSCURL_PATH=$HOME/.local/bin/awscurl" >> "$GITHUB_ENV"
           test -x "$HOME/.local/bin/awscurl"
 
-      - name: Install network fault-injection tools
+      - name: Install network fault-injection tools and the persistence test clock
         if: matrix.profile == 'e2e-full'
         run: |
-          sudo apt-get install -y iptables
+          sudo apt-get update
+          sudo apt-get install -y iptables libfaketime
+          clock_library="$(dpkg-query -L libfaketime | grep -E '/libfaketime[.]so[.]1$')"
+          test -f "$clock_library"
+          echo "RUSTFS_PERSISTENCE_CLOCK_LIBRARY=$clock_library" >> "$GITHUB_ENV"
           sudo -n iptables --version
           # The endpoint-blackhole heal scenario needs CAP_NET_ADMIN. Containerised
           # runners can run iptables but not touch the rule set; the test then logs
@@ -171,11 +175,23 @@ jobs:
         run: |
           "$RUSTFS_TEST_VAULT_BIN" version
 
+      - name: Download pinned release for persistence byte parity
+        id: persistence-reference
+        if: matrix.profile == 'e2e-full'
+        uses: ./.github/actions/reference-binary
+
       - name: Run the profile
         env:
           PROFILE: ${{ matrix.profile }}
           RUSTFS_E2E_LOG_DIR: ${{ runner.temp }}/server-logs
+          PERSISTENCE_REFERENCE_BINARY: ${{ steps.persistence-reference.outputs.path }}
         run: |
+          set -euo pipefail
+          if [[ "$PROFILE" == "e2e-full" ]]; then
+            test -x "$PERSISTENCE_REFERENCE_BINARY"
+            test -f "$RUSTFS_PERSISTENCE_CLOCK_LIBRARY"
+            export RUSTFS_PERSISTENCE_REFERENCE_BINARY="$PERSISTENCE_REFERENCE_BINARY"
+          fi
           chmod +x target/debug/rustfs
           filter='not test(/^(dual_stack_differential|fake_s3_target|distributed_startup_regression_test)::/)'
           filter="$filter & not test(/^upgrade_compatibility_test::upgrade_write_readiness_tests::/)"

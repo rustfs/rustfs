@@ -69,6 +69,7 @@ body-cache-whitelist-check: ## Check the body-cache eligibility gate stays a fai
 s3s-footprint-check: ## Check the s3s dependency footprint ratchet stays frozen
 	@echo "📦 Checking s3s footprint ratchet..."
 	./scripts/check_s3s_footprint.sh
+	./scripts/check_s3s_footprint.sh --mode allowlist
 
 .PHONY: release-feature-boundary-check
 release-feature-boundary-check: ## Check no release-reachable feature enables a debug-only one

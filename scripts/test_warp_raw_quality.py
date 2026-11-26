@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 
 import importlib.util
+import json
+import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -47,6 +50,52 @@ class WarpRawQualityTest(unittest.TestCase):
         self.assertEqual(result["completed_requests"], 3)
         self.assertEqual(result["host_counts"], {"a": 4, "b": 4})
         self.assertAlmostEqual(result["reqps"], 1.0)
+
+    def run_cli(self, source: Path, *flags: str) -> tuple[int, dict]:
+        output = source.with_name("quality.json")
+        result = subprocess.run(
+            [sys.executable, str(MODULE_PATH), "--input", str(source), "--output", str(output), *flags],
+            check=False,
+        )
+        return result.returncode, json.loads(output.read_text())
+
+    def test_steady_rate_uses_exact_completions_and_accepts_the_minimum(self) -> None:
+        source = self.fixture()
+        status, result = self.run_cli(source, "--steady-after-seconds", "1", "--min-steady-rps", "1")
+        self.assertEqual(status, 0)
+        self.assertEqual(result["status"], "pass")
+        self.assertEqual(result["steady"]["completed_objects"], 2)
+        self.assertEqual(result["steady"]["start_ns"], result["measure_start_ns"] + 1_000_000_000)
+        self.assertEqual(result["steady"]["duration_secs"], 2)
+        self.assertEqual(result["steady"]["completed_objects_per_second"], 1)
+
+    def test_steady_shortfall_fails_even_when_whole_window_rate_meets_threshold(self) -> None:
+        source = self.fixture()
+        intervals = ((0, 1), (1, 2), (2, 3), (3, 4), (4, 9), (9, 10))
+        source.write_text(HEADER + "".join(row(0, "a", start, end) for start, end in intervals))
+        status, old_result = self.run_cli(source)
+        self.assertEqual(status, 0)
+        self.assertGreaterEqual(old_result["reqps"], 0.5)
+        self.assertNotIn("steady", old_result)
+        status, result = self.run_cli(source, "--steady-after-seconds", "4", "--min-steady-rps", "0.5")
+        self.assertEqual(status, 1)
+        self.assertEqual(result["reason"], "steady completion rate below minimum")
+        self.assertEqual(result["steady"]["completed_objects"], 0)
+        self.assertEqual(result["reqps"], old_result["reqps"])
+
+    def test_invalid_steady_gate_rejects_missing_empty_and_nonfinite_options(self) -> None:
+        source = self.fixture()
+        cases = (
+            ("--steady-after-seconds", "1"),
+            ("--steady-after-seconds", "3", "--min-steady-rps", "1"),
+            ("--steady-after-seconds", "-1", "--min-steady-rps", "1"),
+            ("--steady-after-seconds", "1", "--min-steady-rps", "nan"),
+        )
+        for args in cases:
+            with self.subTest(args=args):
+                status, result = self.run_cli(source, *args)
+                self.assertEqual(status, 1)
+                self.assertEqual(result["status"], "fail")
 
     def test_any_raw_error_fails_closed(self) -> None:
         with self.assertRaisesRegex(ValueError, "contains request errors"):
