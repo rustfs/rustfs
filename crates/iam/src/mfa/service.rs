@@ -24,7 +24,7 @@
 //! caller must not be able to tell a wrong code from a replayed one, or an
 //! identity with no enrollment from one that is locked out.
 
-use super::record::{MfaVerification, MfaVerifyError};
+use super::record::{MfaRecord, MfaVerification, MfaVerifyError};
 use super::totp::{TOTP_ALGORITHM, TOTP_DIGITS, TOTP_PERIOD_SECONDS, TotpSecret, provisioning_uri};
 use super::{challenge, qr, recovery, store};
 use crate::IamStore;
@@ -142,11 +142,34 @@ pub async fn is_enabled(api: Arc<IamStore>, access_key: &str, now: OffsetDateTim
     Ok(store::is_enabled(api, access_key, now).await?)
 }
 
+/// Require proof of the active factor before an enrollment may replace it.
+///
+/// An identity with nothing enrolled has nothing to prove. Runs inside the
+/// store update rather than ahead of it, so a factor activated by a concurrent
+/// request cannot bypass step-up verification.
+fn authorize_enrollment(record: &mut MfaRecord, current_code: Option<&str>, now: OffsetDateTime) -> Result<(), MfaServiceError> {
+    if !record.is_enabled() {
+        return Ok(());
+    }
+
+    let code = current_code.ok_or(MfaServiceError::AlreadyEnabled)?;
+    record.verify(code, now).map_err(map_verify_error)?;
+    Ok(())
+}
+
 /// Begin an enrollment and return everything needed to complete it.
 ///
 /// Calling this on an already-enrolled identity is a re-configuration, not an
-/// error: the active factor keeps working until the new one is confirmed.
-pub async fn enroll(api: Arc<IamStore>, access_key: &str, now: OffsetDateTime) -> Result<MfaEnrollResponse, MfaServiceError> {
+/// error: the active factor keeps working until the new one is confirmed. When
+/// a factor is already active, `current_code` must prove possession of that
+/// active factor (in addition to the handler verifying the account password);
+/// failed codes increment the persisted failure counter and honour lockout.
+pub async fn enroll(
+    api: Arc<IamStore>,
+    access_key: &str,
+    current_code: Option<&str>,
+    now: OffsetDateTime,
+) -> Result<MfaEnrollResponse, MfaServiceError> {
     if !store::at_rest_protection_available() {
         return Err(MfaServiceError::EnrollmentUnavailable(store::ENROLLMENT_UNAVAILABLE_REASON));
     }
@@ -156,7 +179,9 @@ pub async fn enroll(api: Arc<IamStore>, access_key: &str, now: OffsetDateTime) -
     let rendered = qr::render(&uri).map_err(|err| MfaServiceError::Internal(err.to_string()))?;
 
     let secret_for_store = secret.clone();
+    let current_code = current_code.map(str::to_string);
     let expires_at = store::update(api, access_key, now, move |record| {
+        authorize_enrollment(record, current_code.as_deref(), now)?;
         record.begin_enrollment(&secret_for_store, now);
         Ok::<_, MfaServiceError>(record.pending_expires_at)
     })
@@ -346,6 +371,43 @@ mod tests {
         ] {
             assert_eq!(map_verify_error(error).audit_class(), expected, "for {error:?}");
         }
+    }
+
+    #[test]
+    fn a_first_enrollment_needs_no_proof() {
+        let now = OffsetDateTime::from_unix_timestamp(1_700_000_000).expect("valid timestamp");
+        let mut record = MfaRecord::new("sinan", now);
+
+        assert!(authorize_enrollment(&mut record, None, now).is_ok());
+    }
+
+    #[test]
+    fn replacing_an_active_factor_requires_a_code_from_it() {
+        let now = OffsetDateTime::from_unix_timestamp(1_700_000_000).expect("valid timestamp");
+        let active = TotpSecret::generate();
+        let mut record = MfaRecord::new("sinan", now);
+        record.begin_enrollment(&active, now);
+        record
+            .activate_enrollment(&active.code_at(now.unix_timestamp() as u64), now)
+            .expect("activate");
+
+        let later = now + time::Duration::seconds(60);
+        let foreign = TotpSecret::generate().code_at(later.unix_timestamp() as u64);
+
+        assert!(matches!(
+            authorize_enrollment(&mut record, None, later),
+            Err(MfaServiceError::AlreadyEnabled)
+        ));
+        assert_eq!(record.failed_attempts, 0);
+
+        assert!(matches!(
+            authorize_enrollment(&mut record, Some(&foreign), later),
+            Err(MfaServiceError::InvalidCode)
+        ));
+        assert_eq!(record.failed_attempts, 1);
+
+        assert!(authorize_enrollment(&mut record, Some(&active.code_at(later.unix_timestamp() as u64)), later).is_ok());
+        assert_eq!(record.failed_attempts, 0);
     }
 
     #[test]

@@ -1689,20 +1689,26 @@ fn assemble_s3_stack(
     let router = admin::make_admin_router(config.console_enable, Arc::clone(&assembly.server_ctx))?;
     let control_plane =
         GatewayEdgeService(GatewayStack::assemble_control_plane(assembly.clone(), Arc::new(router)).map_err(Error::other)?);
+    let reserved_console = (!config.console_enable)
+        .then(|| GatewayStack::assemble_reserved_console(assembly.clone()).map(GatewayEdgeService))
+        .transpose()
+        .map_err(Error::other)?;
     #[cfg(feature = "corpus-record")]
     let recorder = corpus::recorder(config, &assembly.server_domains)?;
     let s3 = GatewayEdgeService(GatewayStack::assemble(assembly).map_err(Error::other)?);
     #[cfg(feature = "corpus-record")]
-    let (s3, native_admin, control_plane) = {
+    let (s3, native_admin, control_plane, reserved_console) = {
         use tower::{Layer, util::Either};
         (
             Either::Left(recorder.layer(s3)),
             Either::Right(native_admin),
             Either::Right(control_plane),
+            reserved_console.map(Either::Right),
         )
     };
     Ok(S3StackService::new(s3)
         .with_native_console(NativeConsoleEdgeService::for_config(config))
+        .with_reserved_console(reserved_console)
         .with_native_website(NativeWebsiteEdgeService::claiming(website))
         .with_native_admin(Some(native_admin))
         .with_control_plane(Some(control_plane)))
@@ -6327,6 +6333,56 @@ mod tests {
             let [control_plane, gateway, console] = counts(&calls);
             assert_eq!(console, 0);
             assert_eq!(control_plane + gateway, cases.len() * 2);
+        }
+
+        #[tokio::test]
+        async fn production_s3_stack_reserved_console_contract() {
+            use http_body_util::BodyExt;
+
+            let prefix = crate::server::console_prefix();
+            let make_assembly = || GatewayAssembly {
+                server_ctx: ServerContextSlot::new(),
+                root_access_key: "rustfsadmin".to_owned(),
+                root_secret_key: "rustfsadmin-secret".to_owned(),
+                region: Some("us-east-1".to_owned()),
+                server_domains: Vec::new(),
+                body_read_timeout: Duration::from_secs(30),
+                keystone_auth: None,
+            };
+
+            let mut s3_port_config = config::Config::new("127.0.0.1:9000", Vec::new());
+            s3_port_config.console_enable = false;
+            let s3_port = assemble_s3_stack(&s3_port_config, None, make_assembly()).expect("s3 port stack assembles");
+
+            for target in [
+                format!("{prefix}/"),
+                format!("{prefix}/index.html?v=1"),
+                "/favicon.ico".to_owned(),
+            ] {
+                let response = s3_port
+                    .clone()
+                    .oneshot(console_request(Method::GET, &target, false))
+                    .await
+                    .expect("s3 port response");
+                assert_eq!(response.status(), StatusCode::FORBIDDEN, "anonymous S3 port {target}");
+                let body = response.into_body().collect().await.unwrap().to_bytes();
+                let body = String::from_utf8_lossy(&body);
+                assert!(
+                    body.contains("<Code>AccessDenied</Code>"),
+                    "anonymous S3 port {target} expected AccessDenied XML, got: {body}"
+                );
+            }
+
+            let mut console_port_config = config::Config::new("127.0.0.1:9001", Vec::new());
+            console_port_config.console_enable = true;
+            let console_port =
+                assemble_s3_stack(&console_port_config, None, make_assembly()).expect("console port stack assembles");
+            let target = format!("{prefix}/index.html");
+            let response = console_port
+                .oneshot(console_request(Method::GET, &target, false))
+                .await
+                .expect("console port response");
+            static_response_body(response, &Method::GET, &target).await;
         }
     }
 

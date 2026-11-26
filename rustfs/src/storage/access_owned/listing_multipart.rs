@@ -144,6 +144,7 @@ pub(crate) async fn authorize_create_multipart_upload<R: AuthorizationRequest + 
     set_requested_object_lock_retain_until(req, facts.retain_until);
     authorize_request(req, Action::S3Action(S3Action::PutObjectAction)).await?;
     authorize_replication_only_put_headers(req).await?;
+    super::object_commit::authorize_write_request_tagging(req, false).await?;
     if facts.legal_hold_present {
         authorize_request(req, Action::S3Action(S3Action::PutObjectLegalHoldAction)).await?;
     }
