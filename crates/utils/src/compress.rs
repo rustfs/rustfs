@@ -141,37 +141,57 @@ pub fn decompress_block(compressed: &[u8], algorithm: CompressionAlgorithm) -> i
 /// Returns [`io::ErrorKind::InvalidData`] if the decompressed output exceeds `max_len`,
 /// or propagates any underlying codec initialization or decoding error.
 pub fn decompress_block_with_limit(compressed: &[u8], algorithm: CompressionAlgorithm, max_len: usize) -> io::Result<Vec<u8>> {
+    let mut out = Vec::new();
+    decompress_block_into(compressed, algorithm, max_len, &mut out)?;
+    Ok(out)
+}
+
+/// Decodes a block into a reusable buffer. Replaces its contents and caps the output at `max_len`.
+///
+/// # Errors
+///
+/// Returns [`io::ErrorKind::InvalidData`] if the output exceeds the limit, or propagates
+/// a codec error. The output is empty on error and retains its capacity for reuse.
+pub fn decompress_block_into(
+    compressed: &[u8],
+    algorithm: CompressionAlgorithm,
+    max_len: usize,
+    out: &mut Vec<u8>,
+) -> io::Result<()> {
+    out.clear();
     let input = std::io::Cursor::new(compressed);
-    match algorithm {
-        CompressionAlgorithm::Gzip => read_to_end_with_limit(flate2::read::GzDecoder::new(input), max_len),
-        CompressionAlgorithm::Deflate => read_to_end_with_limit(flate2::read::DeflateDecoder::new(input), max_len),
+    let result = match algorithm {
+        CompressionAlgorithm::Gzip => read_to_end_with_limit(flate2::read::GzDecoder::new(input), max_len, out),
+        CompressionAlgorithm::Deflate => read_to_end_with_limit(flate2::read::DeflateDecoder::new(input), max_len, out),
         CompressionAlgorithm::Zstd => {
             let mut decoder = zstd::Decoder::new(input)?;
             if max_len <= ZSTD_BOUNDED_BLOCK_LIMIT {
                 decoder.window_log_max(ZSTD_BLOCK_MAX_WINDOW_LOG)?;
             }
-            read_to_end_with_limit(decoder, max_len)
+            read_to_end_with_limit(decoder, max_len, out)
         }
-        CompressionAlgorithm::Lz4 => read_to_end_with_limit(lz4::Decoder::new(input)?, max_len),
-        CompressionAlgorithm::Brotli => read_to_end_with_limit(brotli::Decompressor::new(input, 4096), max_len),
-        CompressionAlgorithm::Snappy => read_to_end_with_limit(snap::read::FrameDecoder::new(input), max_len),
-        CompressionAlgorithm::None => Ok(Vec::new()),
+        CompressionAlgorithm::Lz4 => read_to_end_with_limit(lz4::Decoder::new(input)?, max_len, out),
+        CompressionAlgorithm::Brotli => read_to_end_with_limit(brotli::Decompressor::new(input, 4096), max_len, out),
+        CompressionAlgorithm::Snappy => read_to_end_with_limit(snap::read::FrameDecoder::new(input), max_len, out),
+        CompressionAlgorithm::None => Ok(()),
+    };
+    if result.is_err() {
+        out.clear();
     }
+    result
 }
 
-fn read_to_end_with_limit(decoder: impl Read, max_len: usize) -> io::Result<Vec<u8>> {
-    let mut out = Vec::new();
-    // Read at most one byte past `max_len`: enough to distinguish an exact-length
-    // frame (and verify its trailer) from an over-limit expansion without unbounded allocation.
+fn read_to_end_with_limit(decoder: impl Read, max_len: usize, out: &mut Vec<u8>) -> io::Result<()> {
+    // Probe past the limit to verify an exact-length frame's trailer and reject expansion.
     let probe_len = u64::try_from(max_len).unwrap_or(u64::MAX).saturating_add(1);
-    decoder.take(probe_len).read_to_end(&mut out)?;
+    decoder.take(probe_len).read_to_end(out)?;
     if out.len() > max_len {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "decompressed block exceeds its declared length",
         ));
     }
-    Ok(out)
+    Ok(())
 }
 
 #[cfg(test)]
@@ -254,10 +274,11 @@ mod tests {
             CompressionAlgorithm::Snappy,
         ] {
             let compressed = compress_block(&data, algo);
-            let exact = decompress_block_with_limit(&compressed, algo, data.len()).expect("exact limit should succeed");
+            let mut exact = decompress_block_with_limit(&compressed, algo, data.len()).expect("exact limit should succeed");
             assert_eq!(exact, data, "{algo}");
 
-            let err = decompress_block_with_limit(&compressed, algo, data.len() - 1).expect_err("limit must be enforced");
+            let err = decompress_block_into(&compressed, algo, data.len() - 1, &mut exact).expect_err("limit must be enforced");
+            assert!(exact.is_empty(), "an error must clear reused output");
             assert_eq!(err.kind(), io::ErrorKind::InvalidData, "{algo}");
             assert_eq!(err.to_string(), "decompressed block exceeds its declared length", "{algo}");
 

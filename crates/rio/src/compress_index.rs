@@ -115,7 +115,7 @@ impl Index {
             ));
         }
 
-        if latest.uncompressed_offset + MIN_INDEX_DIST > uncompressed_offset {
+        if uncompressed_offset.saturating_sub(latest.uncompressed_offset) < MIN_INDEX_DIST {
             return Ok(());
         }
 
@@ -150,34 +150,23 @@ impl Index {
             return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "empty index"));
         }
 
-        if self.info.len() > 200 {
-            let n = self
-                .info
-                .binary_search_by(|info| {
-                    if info.uncompressed_offset > offset {
-                        std::cmp::Ordering::Greater
-                    } else {
-                        std::cmp::Ordering::Less
-                    }
-                })
-                .unwrap_or_else(|i| i);
+        Ok(self.checkpoint_at_or_before(offset).unwrap_or((0, 0)))
+    }
 
-            if n == 0 {
-                return Ok((self.info[0].compressed_offset, self.info[0].uncompressed_offset));
-            }
-            return Ok((self.info[n - 1].compressed_offset, self.info[n - 1].uncompressed_offset));
-        }
+    /// Returns the last recorded (stored, plaintext) offset at or before `offset`.
+    /// Index totals can be stale, so the caller must check the actual part bounds.
+    pub fn checkpoint_at_or_before(&self, offset: i64) -> Option<(i64, i64)> {
+        let next = self.info.partition_point(|entry| entry.uncompressed_offset <= offset);
+        let entry = self.info.get(next.checked_sub(1)?)?;
+        Some((entry.compressed_offset, entry.uncompressed_offset))
+    }
 
-        let mut compressed_off = 0;
-        let mut uncompressed_off = 0;
-        for info in &self.info {
-            if info.uncompressed_offset > offset {
-                break;
-            }
-            compressed_off = info.compressed_offset;
-            uncompressed_off = info.uncompressed_offset;
-        }
-        Ok((compressed_off, uncompressed_off))
+    /// Returns the first recorded (stored, plaintext) offset at or after `offset`.
+    /// Index totals can be stale, so the caller must check the actual part bounds.
+    pub fn checkpoint_at_or_after(&self, offset: i64) -> Option<(i64, i64)> {
+        let next = self.info.partition_point(|entry| entry.uncompressed_offset < offset);
+        let entry = self.info.get(next)?;
+        Some((entry.compressed_offset, entry.uncompressed_offset))
     }
 
     fn reduce(&mut self) {
@@ -366,7 +355,10 @@ impl Index {
 
             if idx > 0 {
                 let prev = self.info[idx - 1].uncompressed_offset;
-                u_off += prev + self.est_block_uncomp;
+                u_off = prev
+                    .checked_add(self.est_block_uncomp)
+                    .and_then(|base| base.checked_add(u_off))
+                    .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "uncompressed index offset overflow"))?;
                 if u_off <= prev {
                     return Err(io::Error::other("invalid offset"));
                 }
@@ -385,9 +377,14 @@ impl Index {
             b = &b[n..];
 
             if idx > 0 {
-                let next_c_predict = c_predict + c_off / 2;
+                let next_c_predict = c_predict
+                    .checked_add(c_off / 2)
+                    .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "compressed index prediction overflow"))?;
                 let prev = self.info[idx - 1].compressed_offset;
-                c_off += prev + c_predict;
+                c_off = prev
+                    .checked_add(c_predict)
+                    .and_then(|base| base.checked_add(c_off))
+                    .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "compressed index offset overflow"))?;
                 if c_off <= prev {
                     return Err(io::Error::other("invalid offset"));
                 }

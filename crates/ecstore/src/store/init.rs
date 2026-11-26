@@ -6451,8 +6451,14 @@ mod tests {
         };
         if let Some(split) = multipart_split {
             assert!(split > 0 && split < body.len(), "multipart source split must create two non-empty parts");
+            // Upload initiation belongs to the current bucket generation. The
+            // historical object timestamp is assigned at completion.
+            let init_opts = ObjectOptions {
+                mod_time: None,
+                ..write_opts.clone()
+            };
             let upload = pool
-                .new_multipart_upload(bucket, object, &write_opts)
+                .new_multipart_upload(bucket, object, &init_opts)
                 .await
                 .expect("create physical data-movement source upload");
             let mut completed_parts = Vec::with_capacity(2);
@@ -7609,7 +7615,7 @@ mod tests {
                 ..versioned.clone()
             };
             let upload = store.pools[0]
-                .new_multipart_upload(&bucket, object, &native_opts)
+                .new_multipart_upload(&bucket, object, &versioned)
                 .await
                 .expect("real pool-zero Init");
             let part = store.pools[0]
@@ -8943,23 +8949,44 @@ mod tests {
                             store.clone(),
                             0,
                             bucket.clone(),
-                            source_reader(object, old_body.clone(), old_time, retained_metadata.clone()).await,
+                            source_reader(object, old_body.clone(), old_time, HashMap::new()).await,
                             None,
                             "test_retained_target_seed",
                         )
                         .await
-                        .expect("seed retained migrated target");
+                        .expect("seed migrated target");
+                        // Model retention already present on the target independently of the source.
+                        // Preserve the migration ownership markers so WORM is the rejecting check.
+                        for disk in store.pools[1].disk_set[0].disk_inventory().await {
+                            disk.expect("target disk should be online")
+                                .update_metadata(
+                                    &bucket,
+                                    object,
+                                    FileInfo {
+                                        version_id: Some(version_id),
+                                        metadata: retained_metadata.clone(),
+                                        ..Default::default()
+                                    },
+                                    &crate::disk::UpdateMetadataOpts::default(),
+                                )
+                                .await
+                                .expect("seed retention on the exact target version");
+                        }
                         let err = crate::data_movement::migrate_object(
                             store.clone(),
                             0,
                             bucket.clone(),
-                            source_reader(object, new_body.clone(), new_time, retained_metadata).await,
+                            source_reader(object, new_body.clone(), new_time, HashMap::new()).await,
                             None,
                             "test_retained_target_replace",
                         )
                         .await
                         .expect_err("active retention must block stale target replacement");
-                        assert!(err.to_string().contains("complete_multipart_upload"), "unexpected retention error: {err}");
+                        assert!(
+                            crate::data_movement::data_movement_error_is_stage(&err, "complete_multipart_upload")
+                                && err.to_string().contains("Prefix access is denied"),
+                            "unexpected retention error: {err}"
+                        );
 
                         let mut retained_reader = store.pools[1]
                             .get_object_reader(
@@ -22127,6 +22154,92 @@ mod tests {
             .await
             .expect("protected body should drain");
         assert_eq!(body, original_body);
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn single_put_records_object_lock_snapshot_stages() {
+        use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+        use rustfs_io_metrics::{
+            PUT_STAGE_PUT_OBJECT_COMMIT_READY_SNAPSHOT_AUTHORITY_READ, PUT_STAGE_PUT_OBJECT_COMMIT_READY_SNAPSHOT_LIFECYCLE_LOCK,
+            PUT_STAGE_PUT_OBJECT_COMMIT_READY_SNAPSHOT_METADATA_LOCK, put_stage_metrics_enabled, set_put_stage_metrics_enabled,
+        };
+
+        struct RestorePutStageFlag(bool);
+        impl Drop for RestorePutStageFlag {
+            fn drop(&mut self) {
+                set_put_stage_metrics_enabled(self.0);
+            }
+        }
+
+        let temp = tempfile::tempdir().expect("create snapshot test store dir");
+        let (ctx, store, _shutdown) =
+            without_storage_class_env(build_isolated_test_store(temp.path(), "put-snapshot-stages", &[4])).await;
+        crate::bucket::metadata_sys::init_bucket_metadata_sys(Arc::clone(&store), Vec::new()).await;
+        let bucket = format!("snapshot-stages-{}", uuid::Uuid::new_v4());
+        store
+            .make_bucket(&bucket, &MakeBucketOptions::default())
+            .await
+            .expect("create snapshot bucket");
+        let opts = ObjectOptions {
+            expected_bucket_incarnation_id: Some(store.bucket_incarnation_id(&bucket).await.expect("load bucket incarnation")),
+            write_completion: crate::object_api::WriteCompletion::TailDrained,
+            ..Default::default()
+        };
+
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let _recorder = metrics::set_default_local_recorder(&recorder);
+        let _flag = RestorePutStageFlag(put_stage_metrics_enabled());
+        let take_stage_counts = || {
+            let stages = [
+                PUT_STAGE_PUT_OBJECT_COMMIT_READY_SNAPSHOT_LIFECYCLE_LOCK,
+                PUT_STAGE_PUT_OBJECT_COMMIT_READY_SNAPSHOT_METADATA_LOCK,
+                PUT_STAGE_PUT_OBJECT_COMMIT_READY_SNAPSHOT_AUTHORITY_READ,
+            ];
+            let mut counts = [0; 3];
+            for (key, _, _, value) in snapshotter.snapshot().into_vec() {
+                let key = key.key();
+                if key.name() != "rustfs_s3_put_object_stage_duration_ms" {
+                    continue;
+                }
+                if let Some(index) = stages
+                    .iter()
+                    .position(|stage| key.labels().any(|label| label.key() == "stage" && label.value() == *stage))
+                {
+                    assert_eq!(key.labels().count(), 1, "snapshot timings must have only a static stage label");
+                    let DebugValue::Histogram(samples) = value else {
+                        panic!("snapshot timing must be recorded as a histogram");
+                    };
+                    counts[index] += samples.len();
+                }
+            }
+            counts
+        };
+
+        set_put_stage_metrics_enabled(false);
+        store
+            .put_object(&bucket, "metrics-off", &mut PutObjReader::from_vec(vec![1]), &opts)
+            .await
+            .expect("ordinary PUT with metrics disabled");
+        assert_eq!(take_stage_counts(), [0, 0, 0]);
+
+        set_put_stage_metrics_enabled(true);
+        store
+            .put_object(&bucket, "metrics-on", &mut PutObjReader::from_vec(vec![1]), &opts)
+            .await
+            .expect("ordinary PUT with metrics enabled");
+        assert_eq!(take_stage_counts(), [1, 1, 1]);
+
+        crate::bucket::metadata_sys::inject_object_lock_disk_read_error_in(&ctx, &bucket)
+            .await
+            .expect("inject authority read error");
+        let error = store
+            .put_object(&bucket, "read-failed", &mut PutObjReader::from_vec(vec![1]), &opts)
+            .await
+            .expect_err("authority failure must still reject the PUT");
+        assert!(error.to_string().contains("injected Object Lock metadata disk read failure"));
+        assert_eq!(take_stage_counts(), [1, 1, 1], "each stage records once even when the final read fails");
     }
 
     #[cfg(feature = "test-util")]

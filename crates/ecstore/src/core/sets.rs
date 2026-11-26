@@ -44,7 +44,7 @@ use crate::{
 };
 use futures::{
     future::join_all,
-    stream::{FuturesUnordered, StreamExt},
+    stream::{self, StreamExt},
 };
 use http::HeaderMap;
 use rustfs_filemeta::FileInfo;
@@ -540,39 +540,39 @@ impl Sets {
 //     pub default_parity_count: usize,
 // }
 
-struct DelObj {
-    // set_idx: usize,
-    orig_idx: usize,
-    obj: ObjectToDelete,
+#[derive(Default)]
+struct SetDeleteBatch {
+    indices: Vec<usize>,
+    objects: Vec<ObjectToDelete>,
 }
 
 fn apply_delete_objects_results(
     del_objects: &mut [DeletedObject],
     del_errs: &mut [Option<Error>],
-    set_objects: &[DelObj],
-    dobjects: &[DeletedObject],
+    indices: &[usize],
+    deleted: Vec<DeletedObject>,
     errs: Vec<Option<Error>>,
 ) {
+    let mut deleted = deleted.into_iter();
     for (i, err) in errs.into_iter().enumerate() {
-        let obj = set_objects
+        let index = *indices
             .get(i)
             .expect("delete_objects should return errors aligned with input objects");
 
-        del_errs[obj.orig_idx] = err;
-        del_objects[obj.orig_idx] = dobjects
-            .get(i)
-            .expect("delete_objects should return objects aligned with input objects")
-            .clone();
+        del_errs[index] = err;
+        del_objects[index] = deleted
+            .next()
+            .expect("delete_objects should return objects aligned with input objects");
     }
 }
 
 fn apply_delete_accounting_results(
     accounting: &mut [Option<DeleteAccounting>],
-    set_objects: &[DelObj],
-    set_accounting: &[Option<DeleteAccounting>],
+    indices: &[usize],
+    set_accounting: Vec<Option<DeleteAccounting>>,
 ) {
-    for (obj, value) in set_objects.iter().zip(set_accounting.iter()) {
-        accounting[obj.orig_idx] = value.clone();
+    for (&index, value) in indices.iter().zip(set_accounting) {
+        accounting[index] = value;
     }
 }
 
@@ -583,43 +583,60 @@ impl Sets {
         objects: Vec<ObjectToDelete>,
         opts: ObjectOptions,
     ) -> (Vec<DeletedObject>, Vec<Option<Error>>, Vec<Option<DeleteAccounting>>) {
+        let [first, rest @ ..] = objects.as_slice() else {
+            return (Vec::new(), Vec::new(), Vec::new());
+        };
+        if let [set] = self.disk_set.as_slice() {
+            return set.delete_objects_with_accounting(bucket, objects, opts).await;
+        }
+
+        let first_set = self.get_hashed_set_index(&first.object_name);
+        let Some(prefix_len) = rest
+            .iter()
+            .position(|object| self.get_hashed_set_index(&object.object_name) != first_set)
+            .map(|offset| offset + 1)
+        else {
+            return self.disk_set[first_set]
+                .delete_objects_with_accounting(bucket, objects, opts)
+                .await;
+        };
+
         let mut del_objects = vec![DeletedObject::default(); objects.len()];
         let mut del_errs = vec![None; objects.len()];
         let mut accounting = vec![None; objects.len()];
-        let mut set_obj_map = HashMap::new();
 
-        for (i, obj) in objects.iter().enumerate() {
-            let idx = self.get_hashed_set_index(obj.object_name.as_str());
-            set_obj_map.entry(idx).or_insert_with(Vec::new).push(DelObj {
-                orig_idx: i,
-                obj: obj.clone(),
-            });
+        let mut objects = objects.into_iter().enumerate();
+        let (indices, first_objects) = objects.by_ref().take(prefix_len).unzip();
+        let mut batches = HashMap::new();
+        batches.insert(
+            first_set,
+            SetDeleteBatch {
+                indices,
+                objects: first_objects,
+            },
+        );
+
+        for (index, object) in objects {
+            let set_index = self.get_hashed_set_index(&object.object_name);
+            let batch = batches.entry(set_index).or_default();
+            batch.indices.push(index);
+            batch.objects.push(object);
         }
 
-        let max_concurrent = set_obj_map.len().min(num_cpus::get()).max(1);
-        let semaphore = Arc::new(tokio::sync::Semaphore::new(max_concurrent));
-        let mut futures = FuturesUnordered::new();
-        let bucket = bucket.to_owned();
+        let mut pending = stream::iter(batches)
+            .map(|(set_index, batch)| {
+                let disks = self.get_disks(set_index);
+                let opts = opts.clone();
+                async move {
+                    let (deleted, errors, accounting) = disks.delete_objects_with_accounting(bucket, batch.objects, opts).await;
+                    (batch.indices, deleted, errors, accounting)
+                }
+            })
+            .buffer_unordered(self.ctx.worker_parallelism().get());
 
-        for (set_index, set_objects) in set_obj_map {
-            let disks = self.get_disks(set_index);
-            let objects = set_objects.iter().map(|entry| entry.obj.clone()).collect::<Vec<_>>();
-            let bucket = bucket.clone();
-            let opts = opts.clone();
-            let semaphore = semaphore.clone();
-            futures.push(async move {
-                let _permit = semaphore
-                    .acquire_owned()
-                    .await
-                    .expect("delete_objects semaphore should remain open");
-                let (deleted, errors, accounting) = disks.delete_objects_with_accounting(&bucket, objects, opts).await;
-                (set_objects, deleted, errors, accounting)
-            });
-        }
-
-        while let Some((set_objects, deleted, errors, set_accounting)) = futures.next().await {
-            apply_delete_objects_results(&mut del_objects, &mut del_errs, &set_objects, &deleted, errors);
-            apply_delete_accounting_results(&mut accounting, &set_objects, &set_accounting);
+        while let Some((indices, deleted, errors, set_accounting)) = pending.next().await {
+            apply_delete_objects_results(&mut del_objects, &mut del_errs, &indices, deleted, errors);
+            apply_delete_accounting_results(&mut accounting, &indices, set_accounting);
         }
 
         (del_objects, del_errs, accounting)
@@ -1569,35 +1586,14 @@ mod tests {
         let mut del_objects = vec![DeletedObject::default(); 3];
         let mut del_errs = vec![None, None, None];
 
-        let early_batch = vec![DelObj {
-            orig_idx: 1,
-            obj: ObjectToDelete {
-                object_name: "second".to_string(),
-                ..Default::default()
-            },
-        }];
+        let early_indices = [1];
         let early_objects = vec![DeletedObject {
             object_name: "second".to_string(),
             found: true,
             ..Default::default()
         }];
 
-        let late_batch = vec![
-            DelObj {
-                orig_idx: 2,
-                obj: ObjectToDelete {
-                    object_name: "third".to_string(),
-                    ..Default::default()
-                },
-            },
-            DelObj {
-                orig_idx: 0,
-                obj: ObjectToDelete {
-                    object_name: "first".to_string(),
-                    ..Default::default()
-                },
-            },
-        ];
+        let late_indices = [2, 0];
         let late_objects = vec![
             DeletedObject {
                 object_name: "third".to_string(),
@@ -1611,12 +1607,12 @@ mod tests {
             },
         ];
 
-        apply_delete_objects_results(&mut del_objects, &mut del_errs, &early_batch, &early_objects, vec![None]);
+        apply_delete_objects_results(&mut del_objects, &mut del_errs, &early_indices, early_objects, vec![None]);
         apply_delete_objects_results(
             &mut del_objects,
             &mut del_errs,
-            &late_batch,
-            &late_objects,
+            &late_indices,
+            late_objects,
             vec![Some(Error::other("third failed")), None],
         );
 

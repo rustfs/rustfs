@@ -73,18 +73,13 @@ impl SetDisks {
     pub(crate) async fn stat_bucket_with_quorum(&self, bucket: &str, quorum: BucketInfoQuorum) -> Result<BucketInfo> {
         let disks = self.disk_inventory().await;
         let disk_count = disks.len();
-        let mut futures = Vec::with_capacity(disk_count);
-        for disk in disks {
-            let bucket = bucket.to_string();
-            futures.push(async move {
-                match disk {
-                    Some(disk) => disk.stat_volume(&bucket).await,
-                    None => Err(DiskError::DiskNotFound),
-                }
-            });
-        }
-
-        let results = join_all(futures).await;
+        let results = join_all(disks.into_iter().map(|disk| async move {
+            match disk {
+                Some(disk) => disk.stat_volume(bucket).await,
+                None => Err(DiskError::DiskNotFound),
+            }
+        }))
+        .await;
         let mut infos = Vec::with_capacity(results.len());
         let mut errs = Vec::with_capacity(results.len());
         for result in results {
