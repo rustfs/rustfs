@@ -21,13 +21,17 @@ pub(super) fn rules() -> Vec<Rule> {
     vec![
         Rule {
             evidence_fields: strings(["host"]),
-            anchors: strings(["Create pool endpoints host"]),
+            anchors: strings(["startup_endpoint_dns_failed", "Startup endpoint DNS resolution failed"]),
             ..base(
                 "endpoint-resolve-failed",
                 P1Unavailable,
                 "startup",
                 "启动期端点主机名解析失败",
-                all([contains("Create pool endpoints host"), contains("not found")]),
+                any([
+                    field("event", "startup_endpoint_dns_failed"),
+                    contains("Startup endpoint DNS resolution failed"),
+                    all([contains("Create pool endpoints host"), contains("not found")]),
+                ]),
                 "启动期端点主机名解析失败(DNS 未就绪/拼写错误/hosts 缺失)。",
                 "容器/K8s 场景确认 DNS 就绪顺序;核对 volumes 参数拼写。",
             )

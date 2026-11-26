@@ -33,8 +33,12 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use tokio::time::{Instant as TokioInstant, sleep as async_sleep, sleep_until};
-use tracing::{info, instrument, warn};
+use tracing::{error, info, instrument, warn};
 use url::Host;
+
+const LOG_COMPONENT_ECSTORE: &str = "ecstore";
+const LOG_SUBSYSTEM_ENDPOINT_TOPOLOGY: &str = "endpoint_topology";
+const EVENT_STARTUP_ENDPOINT_DNS_FAILED: &str = "startup_endpoint_dns_failed";
 
 /// enum for setup type.
 #[derive(PartialEq, Eq, Debug, Clone)]
@@ -802,6 +806,18 @@ over {timeout:?} (stage=local_host_detection): {err}. {TOPOLOGY_TIMEOUT_HINT}"
         },
     )
     .await
+    .inspect_err(|err| {
+        error!(
+            target: "rustfs::ecstore::endpoints",
+            event = EVENT_STARTUP_ENDPOINT_DNS_FAILED,
+            component = LOG_COMPONENT_ECSTORE,
+            subsystem = LOG_SUBSYSTEM_ENDPOINT_TOPOLOGY,
+            state = "failed",
+            host = %host,
+            error_kind = ?err.kind(),
+            "Startup endpoint DNS resolution failed"
+        );
+    })
 }
 
 fn is_retryable_dns_error(err: &Error) -> bool {
