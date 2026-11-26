@@ -22915,6 +22915,22 @@ mod test {
             .expect("new tmp data should be written");
         let dst_meta_parent = dir.path().join(bucket).join(object);
         os::fsync_dir_recorder::set_grouped_failure(&dst_meta_parent, io::ErrorKind::PermissionDenied);
+        let disk_permits = Arc::clone(&disk.file_sync_permits);
+        let initial_permits = disk_permits.available_permits();
+        let (permit_probe_tx, mut permit_probe_rx) = tokio::sync::oneshot::channel();
+        let canonical_parent = dir
+            .path()
+            .canonicalize()
+            .expect("canonical fixture directory")
+            .join(bucket)
+            .join(object);
+        let _probe = os::prepared_publication_test_hooks::install_at(
+            os::prepared_publication_test_hooks::Stage::DirFsync,
+            &canonical_parent,
+            move || {
+                let _ = permit_probe_tx.send(disk_permits.available_permits());
+            },
+        );
 
         let new_fi = test_file_info(object, version_id, Some(new_data_dir), None);
         let err = disk
@@ -22923,6 +22939,8 @@ mod test {
             .expect_err("grouped dst dir fsync failure must fail the fresh PUT");
 
         assert_eq!(err, DiskError::FileAccessDenied);
+        assert_eq!(permit_probe_rx.try_recv().expect("observe the grouped syscall"), initial_permits - 1);
+        assert_eq!(disk.file_sync_permits.available_permits(), initial_permits);
         assert!(
             !dst_meta_parent.join(STORAGE_FORMAT_FILE).exists(),
             "fresh PUT rollback must remove the committed xl.meta after grouped dst dir fsync failure"
