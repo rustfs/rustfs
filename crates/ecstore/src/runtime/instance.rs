@@ -54,6 +54,7 @@ use crate::store::delete_recovery_runtime::DeleteRecoveryHints;
 use rustfs_lock::{GlobalLockManager, get_global_lock_manager};
 use rustfs_s3_types::Region;
 use std::collections::{HashMap, HashSet};
+use std::num::NonZeroUsize;
 use std::sync::{
     Arc, OnceLock,
     atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering},
@@ -234,6 +235,8 @@ pub struct InstanceContext {
     /// drift out of sync). Stored as one value so the three predicates can
     /// never observe a torn intermediate state.
     erasure_kind: RwLock<SetupType>,
+    /// Snapshot of the creating thread's affinity and CPU quota for instance workers.
+    worker_parallelism: NonZeroUsize,
     list_read_budget: OnceLock<ListReadBudget>,
     #[cfg(feature = "internode-transport")]
     internode_data_transport: OnceLock<Arc<dyn crate::api::rpc::InternodeDataTransport>>,
@@ -464,6 +467,7 @@ impl InstanceContext {
     fn with_lock_manager(lock_manager: Arc<GlobalLockManager>) -> Self {
         Self {
             erasure_kind: RwLock::new(SetupType::Unknown),
+            worker_parallelism: super::detect_worker_parallelism(),
             list_read_budget: OnceLock::new(),
             #[cfg(feature = "internode-transport")]
             internode_data_transport: OnceLock::new(),
@@ -513,6 +517,10 @@ impl InstanceContext {
     #[cfg(test)]
     pub(crate) fn with_lock_manager_for_test(lock_manager: Arc<GlobalLockManager>) -> Self {
         Self::with_lock_manager(lock_manager)
+    }
+
+    pub(crate) fn worker_parallelism(&self) -> NonZeroUsize {
+        self.worker_parallelism
     }
 
     /// This instance's namespace lock manager.
