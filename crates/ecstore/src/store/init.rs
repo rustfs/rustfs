@@ -8801,9 +8801,9 @@ mod tests {
                     let retain_until = (OffsetDateTime::now_utc() + time::Duration::days(1))
                         .format(&time::format_description::well_known::Rfc3339)
                         .expect("retain-until date should format");
-                    for (object, mode) in [
-                        ("compliance-target.bin", "COMPLIANCE"),
-                        ("governance-target.bin", "GOVERNANCE"),
+                    for (object, replacement_source, mode) in [
+                        ("compliance-target.bin", "compliance-target-replacement.bin", "COMPLIANCE"),
+                        ("governance-target.bin", "governance-target-replacement.bin", "GOVERNANCE"),
                     ] {
                         let retained_metadata = HashMap::from([
                             (rustfs_filemeta::metadata_keys::OBJECT_LOCK_MODE.to_string(), mode.to_string()),
@@ -8822,11 +8822,14 @@ mod tests {
                         )
                         .await
                         .expect("seed retained migrated target");
+                        let mut replacement_source_reader =
+                            source_reader(replacement_source, new_body.clone(), new_time, retained_metadata).await;
+                        replacement_source_reader.object_info.name = object.to_string();
                         let err = crate::data_movement::migrate_object(
                             store.clone(),
                             0,
                             bucket.clone(),
-                            source_reader(object, new_body.clone(), new_time, retained_metadata).await,
+                            replacement_source_reader,
                             None,
                             "test_retained_target_replace",
                         )
