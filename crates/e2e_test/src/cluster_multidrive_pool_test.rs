@@ -200,13 +200,17 @@ async fn cluster_volume_fault_proxy_pass_smoke() -> TestResult {
             .no_proxy()
             .timeout(Duration::from_secs(3))
             .build()?;
+        let node_url = &cluster.nodes[1].url;
+        let node_ready = format!("{node_url}/health/ready");
+        let cluster_write_ready = format!("{node_url}/minio/health/cluster");
         let deadline = Instant::now() + Duration::from_secs(30);
         loop {
-            let response = http.get(format!("{}/health/ready", cluster.nodes[1].url)).send().await?;
+            let response = http.get(&node_ready).send().await?;
             let status = response.status();
             let body: serde_json::Value = response.json().await?;
-            // Reachable peers can still have Returning disk handles that reject
-            // writes. Wait for this node's live writer inventory to be Online.
+            // The node probe reports shared-lock readiness. The recovery PUT also
+            // needs exclusive-lock quorum and online local-runtime disk handles.
+            let write_status = http.head(&cluster_write_ready).send().await?.status();
             if status.as_u16() == 200
                 && body["details"]["storage"]["source"] == "local_runtime"
                 && body["details"]["storage"]["writeQuorum"] == true
@@ -214,10 +218,14 @@ async fn cluster_volume_fault_proxy_pass_smoke() -> TestResult {
                     .as_array()
                     .is_some_and(Vec::is_empty)
                 && body["details"]["lock"]["ready"] == true
+                && write_status.as_u16() == 200
             {
                 break;
             }
-            assert!(Instant::now() < deadline, "peer write quorum did not recover: HTTP {status}, {body}");
+            assert!(
+                Instant::now() < deadline,
+                "peer write quorum did not recover: node {status}, cluster write {write_status}, {body}"
+            );
             tokio::time::sleep(Duration::from_millis(200)).await;
         }
         client
