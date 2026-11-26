@@ -928,7 +928,7 @@ jobs:
         run: sudo apt-get install -y build-essential cmake pkg-config
 
       - name: Install s3s-e2e test tool
-        uses: taiki-e/cache-cargo-install-action@7447f04c51f2ba27ca35e7f1e28fab848c5b3ba7 # v2
+        uses: taiki-e/cache-cargo-install-action@9ee83daaa7b96a6fab930949ecf1122bba04a389 # v3.0.8
         with:
           tool: s3s-e2e
           git: https://github.com/s3s-project/s3s.git
