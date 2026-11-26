@@ -8451,6 +8451,133 @@ mod tests {
             .expect("join data movement test thread");
     }
 
+    /// Fails the migration if it reads the source body.
+    struct SourceBodyMustNotBeRead;
+
+    impl tokio::io::AsyncRead for SourceBodyMustNotBeRead {
+        fn poll_read(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+            _buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Err(std::io::Error::other("the source body must not be read again")))
+        }
+    }
+
+    /// A rebalance that stops after the target commit and before the source
+    /// cleanup leaves the version in both pools. The next attempt must settle
+    /// on the committed copy instead of uploading every part again.
+    #[test]
+    #[serial_test::serial(storage_class_env)]
+    fn rebalance_multipart_retry_skips_the_copy_the_target_already_holds() {
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(|| {
+                let runtime = tokio::runtime::Builder::new_multi_thread()
+                    .enable_all()
+                    .worker_threads(2)
+                    .build()
+                    .expect("build data movement test runtime");
+                runtime.block_on(async move {
+                    let temp_dir = tempfile::tempdir().expect("create data movement store dir");
+                    let (_ctx, store, _shutdown) = without_storage_class_env(build_isolated_test_store(
+                        temp_dir.path(),
+                        "data-movement-equivalent-target",
+                        &[4, 4],
+                    ))
+                    .await;
+                    crate::bucket::metadata_sys::init_bucket_metadata_sys(store.clone(), Vec::new()).await;
+
+                    let bucket = format!("data-movement-equivalent-{}", uuid::Uuid::new_v4());
+                    store
+                        .make_bucket(&bucket, &MakeBucketOptions::default())
+                        .await
+                        .expect("create data movement bucket");
+                    *store.rebalance_meta.write().await = Some(active_rebalance_meta_for_pool(store.pools.len(), 0));
+                    assert!(store.is_pool_rebalancing(0).await);
+
+                    let object = "multipart-object";
+                    let version_id = Uuid::new_v4();
+                    let first_part_size = 5 * 1024 * 1024;
+                    let mut body = vec![b'a'; first_part_size];
+                    body.push(b'b');
+                    let source_reader = seed_data_movement_source_reader(
+                        &store,
+                        &bucket,
+                        object,
+                        DataMovementSourceSeed {
+                            pool_idx: 0,
+                            version_id: Some(version_id),
+                            body,
+                            multipart_split: Some(first_part_size),
+                            mod_time: OffsetDateTime::UNIX_EPOCH + time::Duration::SECOND,
+                            user_defined: HashMap::new(),
+                        },
+                    )
+                    .await;
+                    assert!(source_reader.object_info.is_multipart());
+                    let committed = crate::data_movement::migrate_object(
+                        store.clone(),
+                        0,
+                        bucket.clone(),
+                        source_reader,
+                        None,
+                        "test_data_movement",
+                    )
+                    .await
+                    .expect("the first attempt commits the target copy");
+                    assert_eq!(committed, crate::data_movement::DataMovementCopy::Committed);
+
+                    let read_opts = ObjectOptions {
+                        versioned: true,
+                        version_id: Some(version_id.to_string()),
+                        include_part_checksums: true,
+                        ..Default::default()
+                    };
+                    let target = store.pools[1]
+                        .get_object_info(&bucket, object, &read_opts)
+                        .await
+                        .expect("the target holds the committed copy");
+
+                    // The run stopped here: the source is still on its pool.
+                    let mut retry_reader = store.pools[0]
+                        .get_object_reader(
+                            &bucket,
+                            object,
+                            None,
+                            HeaderMap::new(),
+                            &ObjectOptions {
+                                raw_data_movement_read: true,
+                                ..read_opts.clone()
+                            },
+                        )
+                        .await
+                        .expect("the source version is still present");
+                    retry_reader.stream = Box::new(SourceBodyMustNotBeRead);
+                    let retried = crate::data_movement::migrate_object(
+                        store.clone(),
+                        0,
+                        bucket.clone(),
+                        retry_reader,
+                        None,
+                        "test_data_movement",
+                    )
+                    .await
+                    .expect("an equivalent target settles the retry without another copy");
+                    assert_eq!(retried, crate::data_movement::DataMovementCopy::Committed);
+
+                    let after = store.pools[1]
+                        .get_object_info(&bucket, object, &read_opts)
+                        .await
+                        .expect("the committed copy is still on the target");
+                    assert_eq!(after.data_dir, target.data_dir, "the retry must not rewrite the committed copy");
+                });
+            })
+            .expect("spawn data movement test thread")
+            .join()
+            .expect("join data movement test thread");
+    }
+
     #[test]
     #[serial_test::serial(storage_class_env)]
     fn data_movement_multipart_replaces_only_unlocked_owned_generation() {
