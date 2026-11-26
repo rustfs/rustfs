@@ -25,7 +25,9 @@ use crate::{
     startup_preflight::{StartupServerPreflightError, bootstrap_external_prefix_compat, init_startup_server_preflight},
     startup_server::{StartupHttpServers, StartupListenContext, init_startup_http_servers, init_startup_listen_context},
     startup_services::init_startup_runtime_services,
-    startup_storage::{StartupStorageRuntime, init_startup_storage_foundation, init_startup_storage_runtime},
+    startup_storage::{
+        StartupEndpointDiscoveryTimeout, StartupStorageRuntime, init_startup_storage_foundation, init_startup_storage_runtime,
+    },
     storage_api::server::http::ServerContextSlot,
     storage_api::startup::storage::bootstrap_instance_ctx,
 };
@@ -129,10 +131,25 @@ fn run_process_on_current_thread(#[cfg(feature = "internode-transport")] build: 
     } else {
         ExitCode::SUCCESS
     };
-    drop(result);
-    // block_on has left its entered scope; the startup thread owns teardown.
-    drop(runtime);
+    shutdown_process_runtime(runtime, result);
     exit_code
+}
+
+fn shutdown_process_runtime(runtime: tokio::runtime::Runtime, result: Result<()>) {
+    let endpoint_discovery_timed_out = result
+        .as_ref()
+        .err()
+        .and_then(Error::get_ref)
+        .is_some_and(|source| source.is::<StartupEndpointDiscoveryTimeout>());
+    drop(result);
+
+    // The topology timed out before publishing disks or opening listeners. A
+    // system DNS call may still be running on the blocking pool after cancellation.
+    if endpoint_discovery_timed_out {
+        runtime.shutdown_background();
+    } else {
+        drop(runtime);
+    }
 }
 
 fn format_fatal_stderr_message(context: &str, error: impl std::fmt::Display) -> String {
@@ -2184,6 +2201,38 @@ mod tests {
         for code in [ExitCode::SUCCESS, ExitCode::FAILURE] {
             assert_eq!(run_on_startup_thread(move || code), code);
         }
+    }
+
+    #[test]
+    fn endpoint_discovery_timeout_does_not_wait_for_a_blocking_resolver() {
+        std::thread::scope(|scope| {
+            let (started, wait_for_start) = std::sync::mpsc::channel();
+            let (release, wait_for_release) = std::sync::mpsc::channel::<()>();
+            let (stopped, wait_for_stop) = std::sync::mpsc::channel();
+            let (completed, wait_for_completion) = std::sync::mpsc::channel();
+            scope.spawn(move || {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("create owned startup runtime");
+                runtime.spawn_blocking(move || {
+                    started.send(()).expect("report resolver start");
+                    let _ = wait_for_release.recv();
+                    completed.send(()).expect("report resolver completion");
+                });
+                wait_for_start.recv_timeout(Duration::from_secs(5)).expect("resolver started");
+                let err = Error::new(std::io::ErrorKind::TimedOut, "startup DNS deadline elapsed");
+                shutdown_process_runtime(runtime, Err(Error::other(StartupEndpointDiscoveryTimeout(err))));
+                let _ = stopped.send(());
+            });
+
+            let before_release = wait_for_stop.recv_timeout(Duration::from_secs(5));
+            drop(release);
+            wait_for_completion
+                .recv_timeout(Duration::from_secs(5))
+                .expect("resolver completed");
+            before_release.expect("startup shutdown must return while the resolver is still blocked");
+        });
     }
 
     #[test]

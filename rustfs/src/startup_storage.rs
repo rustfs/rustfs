@@ -20,7 +20,7 @@ use crate::storage_api::startup::storage::{
 };
 use rustfs_common::{GlobalReadiness, SystemStage};
 use std::{
-    io::{Error, Result},
+    io::{Error, ErrorKind, Result},
     net::SocketAddr,
     sync::Arc,
 };
@@ -43,6 +43,10 @@ pub(crate) struct StartupStorageRuntime {
     pub(crate) store: Arc<ECStore>,
     pub(crate) shutdown_token: CancellationToken,
 }
+
+#[derive(Debug, thiserror::Error)]
+#[error(transparent)]
+pub(crate) struct StartupEndpointDiscoveryTimeout(pub(crate) Error);
 
 pub(crate) async fn init_startup_storage_foundation(
     server_address: &str,
@@ -72,7 +76,13 @@ pub(crate) async fn init_startup_storage_foundation(
                 "Endpoint parsing failed"
             );
         })
-        .map_err(Error::other)?;
+        .map_err(|err| {
+            if err.kind() == ErrorKind::TimedOut {
+                Error::new(ErrorKind::TimedOut, StartupEndpointDiscoveryTimeout(err))
+            } else {
+                Error::other(err)
+            }
+        })?;
     ECStore::validate_startup_storage_class(&endpoint_pools)
         .inspect_err(|err| {
             error!(

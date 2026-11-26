@@ -774,10 +774,18 @@ async fn resolve_startup_host_with_retry(
         dns_retry_deadline,
         |err| Error::other(format!("endpoint '{context}' local-host detection failed for host '{host}': {err}")),
         |attempts, timeout, err| {
-            Error::other(format!(
-                "endpoint '{context}' local-host detection did not converge for host '{host}' after {attempts} attempts \
+            let kind = if timeout.is_zero() {
+                ErrorKind::Other
+            } else {
+                ErrorKind::TimedOut
+            };
+            Error::new(
+                kind,
+                format!(
+                    "endpoint '{context}' local-host detection did not converge for host '{host}' after {attempts} attempts \
 over {timeout:?} (stage=local_host_detection): {err}. {TOPOLOGY_TIMEOUT_HINT}"
-            ))
+                ),
+            )
         },
         |attempts, delay, elapsed, err| {
             warn!(
@@ -2789,6 +2797,7 @@ mod test {
         .await
         .expect("a pending lookup must complete before the test deadline")
         .expect_err("a pending lookup must stop at the startup deadline");
+        assert_eq!(err.kind(), ErrorKind::TimedOut);
         assert!(err.to_string().contains("first endpoint"));
         assert!(err.to_string().contains("startup DNS deadline elapsed"));
         assert_eq!(deadline.elapsed(), timeout);
