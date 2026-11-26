@@ -1151,9 +1151,12 @@ impl RemoteDisk {
         if payload.len() > operation.max_wire_payload_bytes() {
             return Err(Error::other("delete recovery operation exceeds payload limit"));
         }
-        let settle_timeout = if matches!(
+        // Batch prepare returns one reply after staging every group on the drive.
+        let recovery_timeout = if matches!(
             &operation,
-            DeleteRecoveryRpcOperation::Settle { .. } | DeleteRecoveryRpcOperation::SettleBounded(_)
+            DeleteRecoveryRpcOperation::ApplyVersions { .. }
+                | DeleteRecoveryRpcOperation::Settle { .. }
+                | DeleteRecoveryRpcOperation::SettleBounded(_)
         ) {
             Some(crate::disk::get_delete_recovery_timeout()?)
         } else {
@@ -1161,7 +1164,7 @@ impl RemoteDisk {
         };
         self.execute_with_timeout(
             || async {
-                let mut client = if let Some(timeout) = settle_timeout {
+                let mut client = if let Some(timeout) = recovery_timeout {
                     if let Some(error) = self.offline_bypass_error() {
                         return Err(error);
                     }
@@ -1212,7 +1215,7 @@ impl RemoteDisk {
                 }
                 rustfs_protos::decode_delete_recovery_payload(&response.result).map_err(Into::into)
             },
-            settle_timeout.unwrap_or_else(get_max_timeout_duration),
+            recovery_timeout.unwrap_or_else(get_max_timeout_duration),
         )
         .await
     }
@@ -5718,6 +5721,72 @@ mod tests {
         peer.stop().await;
     }
 
+    #[tokio::test]
+    async fn recoverable_batch_delete_survives_the_control_rpc_deadline() {
+        runtime_sources::ensure_test_rpc_secret();
+        let peer = TestGrpcPeer::spawn(Bytes::new(), Bytes::new())
+            .await
+            .expect("delete recovery peer must bind");
+        let gate = Arc::new(TestFormatReadGate::default());
+        *peer.peer.batch_prepare_gate.lock().expect("batch prepare fixture") = Some(Arc::clone(&gate));
+        let control = TonicEndpoint::from_shared(peer.addr.clone())
+            .expect("control endpoint")
+            .timeout(Duration::from_millis(100))
+            .connect()
+            .await
+            .expect("connect control channel");
+        runtime_sources::cache_test_node_channel(peer.addr.clone(), control).await;
+        let remote = Arc::new(remote_disk_for_addr(&peer.addr).await);
+        let prepare_disk = Arc::clone(&remote);
+        let mut prepare = tokio::spawn(async move {
+            let versions = (0..1_000)
+                .map(|index| FileInfoVersions {
+                    name: format!("object-{index:04}"),
+                    versions: vec![FileInfo::default()],
+                    ..Default::default()
+                })
+                .collect();
+            prepare_disk
+                .delete_versions_recoverable(
+                    "bucket",
+                    versions,
+                    DeleteOptions {
+                        old_data_dir: Some(Uuid::new_v4()),
+                        requires_bounded_delete_recovery: true,
+                        ..Default::default()
+                    },
+                )
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(5), gate.entered.notified())
+            .await
+            .expect("peer receives batch preparation");
+        let control_error =
+            tokio::time::timeout(Duration::from_secs(5), remote.has_delete_transaction_evidence("bucket", "object-0000"))
+                .await
+                .expect("ordinary RPC deadline must still apply")
+                .expect_err("ordinary RPC expires while the peer holds the reply");
+        let DiskError::Io(error) = control_error else {
+            panic!("expected a tonic deadline, got {control_error:?}");
+        };
+        let status = crate::cluster::rpc::client::embedded_tonic_status(&error).expect("tonic deadline status");
+        assert!(matches!(status.code(), Code::Cancelled | Code::DeadlineExceeded));
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), &mut prepare).await.is_err(),
+            "the batch stays pending past the ordinary deadline"
+        );
+        gate.release.cancel();
+        let results = tokio::time::timeout(Duration::from_secs(5), prepare)
+            .await
+            .expect("batch reply must arrive after the ordinary deadline")
+            .expect("batch prepare task");
+        let mut expected = vec![None; 1_000];
+        expected[999] = Some(DiskError::FileNotFound);
+        assert_eq!(results, expected, "the batch retains each group's result");
+        peer.stop().await;
+    }
+
     #[test]
     fn recoverable_batch_delete_rejects_invalid_error_codes_and_length() {
         let errors = decode_delete_recovery_batch_errors(vec![None, Some(DiskError::FileNotFound.to_u32())], 2)
@@ -6109,6 +6178,7 @@ mod tests {
         read_all_data: Bytes,
         fail_format_reads: Arc<AtomicBool>,
         next_format_read_gate: Arc<StdMutex<Option<Arc<TestFormatReadGate>>>>,
+        batch_prepare_gate: Arc<StdMutex<Option<Arc<TestFormatReadGate>>>>,
         bounded_discovery: Arc<StdMutex<Option<Arc<TestBoundedDiscovery>>>>,
         unsupported_methods: Arc<StdMutex<Vec<String>>>,
     }
@@ -6136,6 +6206,7 @@ mod tests {
                 read_all_data,
                 fail_format_reads: Arc::default(),
                 next_format_read_gate: Arc::default(),
+                batch_prepare_gate: Arc::default(),
                 bounded_discovery: Arc::default(),
                 unsupported_methods: Arc::default(),
             }
@@ -6234,6 +6305,54 @@ mod tests {
                         let codec = tonic_prost::ProstCodec::default();
                         let mut grpc = tonic::server::Grpc::new(codec);
                         Ok(grpc.unary(method, request).await)
+                    })
+                }
+                "/node_service.NodeService/RecoverDeleteTransaction"
+                    if self.peer.batch_prepare_gate.lock().expect("batch prepare fixture").is_some() =>
+                {
+                    struct BatchPrepareSvc(Arc<TestFormatReadGate>);
+                    impl tonic::server::UnaryService<RecoverDeleteTransactionRequest> for BatchPrepareSvc {
+                        type Response = rustfs_protos::proto_gen::node_service::RecoverDeleteTransactionResponse;
+                        type Future = Pin<Box<dyn Future<Output = std::result::Result<Response<Self::Response>, Status>> + Send>>;
+                        fn call(&mut self, request: Request<RecoverDeleteTransactionRequest>) -> Self::Future {
+                            let gate = Arc::clone(&self.0);
+                            Box::pin(async move {
+                                let request = request.into_inner();
+                                let operation: DeleteRecoveryRpcOperation =
+                                    rustfs_protos::decode_delete_recovery_payload(&request.operation)
+                                        .map_err(|_| Status::invalid_argument("invalid recovery operation"))?;
+                                if let DeleteRecoveryRpcOperation::ApplyVersions { versions, .. } = operation {
+                                    assert_eq!(versions.len(), 1_000);
+                                    assert_eq!(request.protocol_version, BOUNDED_DELETE_PREPARE_PROTOCOL_VERSION);
+                                    gate.entered.notify_one();
+                                    gate.release.cancelled().await;
+                                    let mut errors = vec![None; versions.len()];
+                                    errors[999] = Some(DiskError::FileNotFound.to_u32());
+                                    let result = rmp_serde::to_vec_named(&DeleteRecoveryRpcReply::AppliedVersions(errors))
+                                        .expect("encode batch reply");
+                                    return Ok(Response::new(Self::Response {
+                                        success: true,
+                                        protocol_version: request.protocol_version,
+                                        result: result.into(),
+                                        error: None,
+                                    }));
+                                }
+                                gate.release.cancelled().await;
+                                Err(Status::invalid_argument("unexpected recovery operation"))
+                            })
+                        }
+                    }
+
+                    let gate = self
+                        .peer
+                        .batch_prepare_gate
+                        .lock()
+                        .expect("batch prepare fixture")
+                        .clone()
+                        .expect("gate");
+                    Box::pin(async move {
+                        let mut grpc = tonic::server::Grpc::new(tonic_prost::ProstCodec::default());
+                        Ok(grpc.unary(BatchPrepareSvc(gate), request).await)
                     })
                 }
                 "/node_service.NodeService/RecoverDeleteTransaction"
