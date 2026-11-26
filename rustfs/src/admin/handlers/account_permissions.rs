@@ -1293,7 +1293,7 @@ mod tests {
                 .await
                 .expect("create denial bucket");
             bucket_policy(&store, &bucket, serde_json::json!({"Version":"2012-10-17","Statement":[
-                {"Effect":"Allow","Principal":"*","Action":["s3:PutObject","s3:DeleteObject"],"Resource":format!("arn:aws:s3:::{bucket}/*")}
+                {"Effect":"Allow","Principal":"*","Action":["s3:GetObject","s3:PutObject","s3:DeleteObject"],"Resource":format!("arn:aws:s3:::{bucket}/*")}
             ]})).await;
             let denied = rustfs_policy::policy::Policy::parse_config(
                 serde_json::to_string(&serde_json::json!({"Version":"2012-10-17","Statement":[
@@ -1307,7 +1307,11 @@ mod tests {
             iam.policy_db_set(&cred.access_key, UserType::Reg, false, "permission-denial")
                 .await
                 .expect("attach denial");
-            for (action, expected) in [("s3:PutObject", Decision::Allowed), ("s3:DeleteObject", Decision::Denied)] {
+            for (action, expected) in [
+                ("s3:GetObject", Decision::Allowed),
+                ("s3:PutObject", Decision::Denied),
+                ("s3:DeleteObject", Decision::Denied),
+            ] {
                 let request = parse(serde_json::json!({"checks":[{"id":"x","action":action,"bucket":bucket,"object":"object"}]}));
                 let result = evaluate_check(
                     &envelope,

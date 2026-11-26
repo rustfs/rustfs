@@ -1741,7 +1741,18 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn concurrent_completions_share_durable_bucket_quota_reservations() {
-        let (store, bucket) = crate::app::gating_test_env::durable_quota_test_bucket("concurrent-complete-quota", 6000).await;
+        let (store, bucket) = crate::app::gating_test_env::durable_quota_test_bucket("concurrent-complete-quota", 8192).await;
+        // Both parts fit the staging cap, while committed usage leaves room for only one completion.
+        store
+            .clone()
+            .put_object(
+                &bucket,
+                "committed",
+                &mut PutObjReader::from_vec(vec![0x63; 4096]),
+                &ObjectOptions::default(),
+            )
+            .await
+            .expect("seed committed quota usage");
 
         let usecase = DefaultMultipartUsecase::from_global();
 

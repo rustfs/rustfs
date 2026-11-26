@@ -10552,6 +10552,9 @@ mod tests {
                 ObjectOptions {
                     delete_prefix: true,
                     delete_prefix_object: true,
+                    object_lock_config_snapshot: Some(Arc::new(ObjectLockConfigSnapshot::new(
+                        ObjectLockConfigState::ConfirmedAbsent,
+                    ))),
                     ..Default::default()
                 },
             ),

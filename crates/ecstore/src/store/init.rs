@@ -6451,8 +6451,14 @@ mod tests {
         };
         if let Some(split) = multipart_split {
             assert!(split > 0 && split < body.len(), "multipart source split must create two non-empty parts");
+            // Upload initiation belongs to the current bucket generation. The
+            // historical object timestamp is assigned at completion.
+            let init_opts = ObjectOptions {
+                mod_time: None,
+                ..write_opts.clone()
+            };
             let upload = pool
-                .new_multipart_upload(bucket, object, &write_opts)
+                .new_multipart_upload(bucket, object, &init_opts)
                 .await
                 .expect("create physical data-movement source upload");
             let mut completed_parts = Vec::with_capacity(2);
@@ -7609,7 +7615,7 @@ mod tests {
                 ..versioned.clone()
             };
             let upload = store.pools[0]
-                .new_multipart_upload(&bucket, object, &native_opts)
+                .new_multipart_upload(&bucket, object, &versioned)
                 .await
                 .expect("real pool-zero Init");
             let part = store.pools[0]
@@ -8816,23 +8822,44 @@ mod tests {
                             store.clone(),
                             0,
                             bucket.clone(),
-                            source_reader(object, old_body.clone(), old_time, retained_metadata.clone()).await,
+                            source_reader(object, old_body.clone(), old_time, HashMap::new()).await,
                             None,
                             "test_retained_target_seed",
                         )
                         .await
-                        .expect("seed retained migrated target");
+                        .expect("seed migrated target");
+                        // Model retention already present on the target independently of the source.
+                        // Preserve the migration ownership markers so WORM is the rejecting check.
+                        for disk in store.pools[1].disk_set[0].disk_inventory().await {
+                            disk.expect("target disk should be online")
+                                .update_metadata(
+                                    &bucket,
+                                    object,
+                                    FileInfo {
+                                        version_id: Some(version_id),
+                                        metadata: retained_metadata.clone(),
+                                        ..Default::default()
+                                    },
+                                    &crate::disk::UpdateMetadataOpts::default(),
+                                )
+                                .await
+                                .expect("seed retention on the exact target version");
+                        }
                         let err = crate::data_movement::migrate_object(
                             store.clone(),
                             0,
                             bucket.clone(),
-                            source_reader(object, new_body.clone(), new_time, retained_metadata).await,
+                            source_reader(object, new_body.clone(), new_time, HashMap::new()).await,
                             None,
                             "test_retained_target_replace",
                         )
                         .await
                         .expect_err("active retention must block stale target replacement");
-                        assert!(err.to_string().contains("complete_multipart_upload"), "unexpected retention error: {err}");
+                        assert!(
+                            crate::data_movement::data_movement_error_is_stage(&err, "complete_multipart_upload")
+                                && err.to_string().contains("Prefix access is denied"),
+                            "unexpected retention error: {err}"
+                        );
 
                         let mut retained_reader = store.pools[1]
                             .get_object_reader(
