@@ -806,7 +806,11 @@ pub(crate) async fn authorize_owned_internal_object_request(
 }
 
 fn prepare_owned_authorization(req: &mut RequestEnvelope, action: Action) -> rustfs_s3_types::S3Result<()> {
-    crate::auth::hoist_signed_query_params(&mut req.headers, req.uri.query())?;
+    // POST uploads authenticate multipart form fields only, never query
+    // parameters, so presign query markers must not hoist unsigned headers.
+    if req.post_object.is_none() && req.post_object_policy_headers.is_none() && !req.gateway_post {
+        crate::auth::hoist_signed_query_params(&mut req.headers, req.uri.query())?;
+    }
     require_body_policy_inputs(req, action)
 }
 
@@ -1458,5 +1462,72 @@ mod tests {
         let native_tls = envelope_with_transport_claim(Some(true), "http");
         assert_eq!(native_tls.native_tls_transport(), Some(true));
         assert!(native_tls.residual_extensions().get::<NativeTlsTransport>().is_none());
+    }
+
+    #[test]
+    fn prepare_owned_authorization_skips_query_hoist_for_post_uploads() {
+        let query_uri: Uri = "/bucket?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=AKID&X-Amz-Signature=deadbeef&x-amz-meta-snowball-auto-extract=true&x-amz-meta-owner=mallory"
+            .parse()
+            .expect("valid presign-marker URI");
+        let action = Action::S3Action(S3Action::PutObjectAction);
+
+        for (label, post_marker, gateway_post, policy_headers) in [
+            ("post-marker-and-policy", true, false, true),
+            ("gateway-post-and-policy", false, true, true),
+            ("policy-headers-only", false, false, true),
+        ] {
+            let mut extensions = Extensions::new();
+            if post_marker {
+                extensions.insert(PostObjectRequestMarker);
+            }
+            if policy_headers {
+                extensions.insert(PostObjectPolicyHeaders(HeaderMap::new()));
+            }
+            let mut envelope = RequestEnvelope::from_parts(
+                RequestHead {
+                    method: Method::POST,
+                    uri: query_uri.clone(),
+                    headers: HeaderMap::new(),
+                    credentials: None,
+                    region: None,
+                    service: None,
+                },
+                extensions,
+            );
+            if gateway_post {
+                envelope.mark_gateway_post();
+            }
+            prepare_owned_authorization(&mut envelope, action).expect("POST preparation should succeed");
+            assert!(
+                !envelope.headers().contains_key("x-amz-meta-snowball-auto-extract"),
+                "{label}: POST must not hoist archive switch from query"
+            );
+            assert!(
+                !envelope.headers().contains_key("x-amz-meta-owner"),
+                "{label}: POST must not hoist metadata from query"
+            );
+        }
+
+        // Positive control: a non-POST presigned PUT still hoists signed query metadata.
+        let mut put_envelope = RequestEnvelope::from_parts(
+            RequestHead {
+                method: Method::PUT,
+                uri: query_uri,
+                headers: HeaderMap::new(),
+                credentials: None,
+                region: None,
+                service: None,
+            },
+            Extensions::new(),
+        );
+        prepare_owned_authorization(&mut put_envelope, action).expect("PUT preparation should succeed");
+        assert_eq!(
+            put_envelope.headers().get("x-amz-meta-snowball-auto-extract"),
+            Some(&http::HeaderValue::from_static("true"))
+        );
+        assert_eq!(
+            put_envelope.headers().get("x-amz-meta-owner"),
+            Some(&http::HeaderValue::from_static("mallory"))
+        );
     }
 }

@@ -33,6 +33,7 @@ use crate::server::gateway_handlers::{OperationTable, metadata_listing, serves};
 use crate::server::gateway_stack::OwnedKeystoneIdentity;
 use crate::shared_types::{NativeTlsTransport, RemoteAddr};
 use crate::storage_api::server::http::access::access_owned::bucket_core::authorize_delete_bucket;
+use crate::storage_api::server::http::access::access_owned::object_commit::{has_non_empty_request_tags, write_tagging_action};
 use crate::storage_api::server::http::access::access_owned::object_misc::{
     authorize_select_object_content, decide_delete_object,
 };
@@ -413,6 +414,11 @@ async fn evaluate_put_object(route: &mut RouteRequest<'_>, bucket: &str, key: &s
     authorize_write_etag_condition(route, false).await?;
     route.evaluate_table = false;
     authorize_replication_only_put_headers(route).await?;
+    if has_non_empty_request_tags(route.headers()) {
+        let action = write_tagging_action(route, false);
+        arm(route, action);
+        authorize_request(route, action).await?;
+    }
     if header_present(route.headers(), AMZ_OBJECT_LOCK_LEGAL_HOLD_LOWER) {
         let action = Action::S3Action(S3Action::PutObjectLegalHoldAction);
         arm(route, action);
@@ -439,6 +445,11 @@ async fn evaluate_create_multipart(route: &mut RouteRequest<'_>, bucket: &str, k
     authorize_request(route, put).await?;
     route.evaluate_table = false;
     authorize_replication_only_put_headers(route).await?;
+    if has_non_empty_request_tags(route.headers()) {
+        let action = write_tagging_action(route, false);
+        arm(route, action);
+        authorize_request(route, action).await?;
+    }
     // Legal-hold and retention on this operation are decided with the decoded input, in the handler.
     Ok(())
 }
@@ -1069,5 +1080,136 @@ mod tests {
         assert_eq!(first_version_id("versionId=").as_deref(), Some(""));
         assert_eq!(version_id_count("versionId=a&versionId=b"), 2);
         assert_eq!(first_version_id("versionId=a&versionId=b").as_deref(), Some("a"));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn early_gate_enforces_tagging_permissions_on_put_and_create_multipart() {
+        use crate::storage_api::server::http::access::test_support::{
+            BucketOperations as _, MakeBucketOptions, get_bucket_metadata, set_bucket_metadata,
+        };
+        use http::HeaderValue;
+
+        crate::app::gating_test_env::run_large_stack_test("early-gate-tagging", || async {
+            let store = crate::app::gating_test_env::shared_gating_ecstore().await;
+            let server = ServerContextSlot::new();
+            assert!(server.install(crate::app::gating_test_env::shared_gating_ambient().await));
+            let bucket = format!("early-gate-tags-{}", uuid::Uuid::new_v4().simple());
+            store.make_bucket(&bucket, &MakeBucketOptions::default()).await.unwrap();
+
+            let set_statements = |statements: Vec<serde_json::Value>| {
+                let bucket = bucket.clone();
+                async move {
+                    let policy = serde_json::json!({"Version": "2012-10-17", "Statement": statements}).to_string();
+                    let mut metadata = (*get_bucket_metadata(&bucket).await.unwrap()).clone();
+                    metadata.policy_config = Some(serde_json::from_str(&policy).unwrap());
+                    metadata.policy_config_json = policy.into_bytes();
+                    set_bucket_metadata(bucket, metadata).await.unwrap();
+                }
+            };
+
+            let eval_route = |eval: Eval, method: Method, headers: HeaderMap| {
+                let server = Arc::clone(&server);
+                let bucket = bucket.clone();
+                async move {
+                    let mut extensions = Extensions::new();
+                    extensions.insert(server);
+                    extensions.insert(ReqInfo::default());
+                    let mut envelope = RequestEnvelope::from_parts(
+                        RequestHead {
+                            method,
+                            uri: Uri::from_static("/"),
+                            headers,
+                            credentials: None,
+                            region: None,
+                            service: None,
+                        },
+                        extensions,
+                    );
+                    let mut route = RouteRequest {
+                        inner: &mut envelope,
+                        evaluate_table: true,
+                    };
+                    decision_of(evaluate(&mut route, eval, &bucket, "obj", None).await)
+                }
+            };
+
+            // 1. PutObject only: untagged allowed, tagged denied, malformed defers to handler (Allow).
+            set_statements(vec![serde_json::json!({
+                "Effect": "Allow",
+                "Principal": {"AWS": "*"},
+                "Action": "s3:PutObject",
+                "Resource": format!("arn:aws:s3:::{bucket}/*"),
+            })])
+            .await;
+
+            for (eval, method) in [(Eval::PutObject, Method::PUT), (Eval::CreateMultipartUpload, Method::POST)] {
+                assert_eq!(eval_route(eval, method.clone(), HeaderMap::new()).await, Decision::Allow);
+
+                let mut tagged = HeaderMap::new();
+                tagged.insert("x-amz-tagging", HeaderValue::from_static("env=dev"));
+                assert_eq!(eval_route(eval, method.clone(), tagged).await, Decision::Deny);
+
+                let mut malformed = HeaderMap::new();
+                malformed.insert("x-amz-tagging", HeaderValue::from_static("env=%ZZ"));
+                assert_eq!(eval_route(eval, method, malformed).await, Decision::Allow);
+            }
+
+            // 2. PutObject + conditioned PutObjectTagging: matching tag allowed, mismatched denied.
+            set_statements(vec![
+                serde_json::json!({
+                    "Effect": "Allow",
+                    "Principal": {"AWS": "*"},
+                    "Action": "s3:PutObject",
+                    "Resource": format!("arn:aws:s3:::{bucket}/*"),
+                }),
+                serde_json::json!({
+                    "Effect": "Allow",
+                    "Principal": {"AWS": "*"},
+                    "Action": "s3:PutObjectTagging",
+                    "Resource": format!("arn:aws:s3:::{bucket}/*"),
+                    "Condition": {"StringEquals": {"s3:RequestObjectTag/env": "dev"}},
+                }),
+            ])
+            .await;
+
+            for (eval, method) in [(Eval::PutObject, Method::PUT), (Eval::CreateMultipartUpload, Method::POST)] {
+                let mut dev = HeaderMap::new();
+                dev.insert("x-amz-tagging", HeaderValue::from_static("env=dev"));
+                assert_eq!(eval_route(eval, method.clone(), dev).await, Decision::Allow);
+
+                let mut prod = HeaderMap::new();
+                prod.insert("x-amz-tagging", HeaderValue::from_static("env=prod"));
+                assert_eq!(eval_route(eval, method, prod).await, Decision::Deny);
+            }
+
+            // 3. Inbound replication with ReplicateObject + ReplicateTags (PutObjectTagging denied).
+            set_statements(vec![
+                serde_json::json!({
+                    "Effect": "Allow",
+                    "Principal": {"AWS": "*"},
+                    "Action": ["s3:PutObject", "s3:ReplicateObject", "s3:ReplicateTags"],
+                    "Resource": format!("arn:aws:s3:::{bucket}/*"),
+                }),
+                serde_json::json!({
+                    "Effect": "Deny",
+                    "Principal": {"AWS": "*"},
+                    "Action": "s3:PutObjectTagging",
+                    "Resource": format!("arn:aws:s3:::{bucket}/*"),
+                }),
+            ])
+            .await;
+
+            for (eval, method) in [(Eval::PutObject, Method::PUT), (Eval::CreateMultipartUpload, Method::POST)] {
+                let mut repl = HeaderMap::new();
+                repl.insert("x-rustfs-source-replication-request", HeaderValue::from_static("true"));
+                repl.insert("x-amz-tagging", HeaderValue::from_static("env=replica"));
+                assert_eq!(eval_route(eval, method.clone(), repl).await, Decision::Allow);
+
+                let mut non_repl = HeaderMap::new();
+                non_repl.insert("x-amz-tagging", HeaderValue::from_static("env=replica"));
+                assert_eq!(eval_route(eval, method, non_repl).await, Decision::Deny);
+            }
+        });
     }
 }

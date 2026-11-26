@@ -34,22 +34,23 @@
 //!      regardless of what IAM says. This gate runs BEFORE the IAM-allow
 //!      short-circuit, which is why a bucket Deny beats an IAM Allow.
 //!   2. IAM allow — if the identity policy allows, the request is permitted.
-//!   3. Bucket-policy allow fallback — if IAM did not allow, a bucket Allow can
-//!      still permit the request.
+//!   3. IAM explicit-Deny gate — if IAM did not allow, the identity policy is
+//!      evaluated again with `deny_only` so ONLY its Deny statements can reject;
+//!      a matching IAM Deny denies regardless of what the bucket policy says.
+//!   4. Bucket-policy allow fallback — if IAM did not allow and did not
+//!      explicitly deny, a bucket Allow can still permit the request.
 //!
-//! Anonymous requests skip 1-3 and are governed by the bucket policy alone.
+//! Anonymous requests skip 1-4 and are governed by the bucket policy alone.
 //!
 //! ## Invariant surfaced by the matrix (read before changing an assertion)
 //!
-//! A **bucket** explicit Deny is a hard gate and always wins (cases
-//! `iam_allow_x_bucket_deny`, `iam_deny_x_bucket_deny`, `anon_x_bucket_deny`).
-//! An **IAM** explicit Deny is NOT a hard gate: because step 3 falls back to the
-//! bucket policy, a bucket Allow overrides an IAM explicit Deny
-//! (`iam_deny_x_bucket_allow` => allowed). This is RustFS's (MinIO-lineage)
-//! resolution and it DIVERGES from AWS's "an explicit Deny in any policy always
-//! wins". The case below pins the actual behavior; if RustFS later hardens IAM
-//! Deny into a hard gate, that case flips to `false` and must be updated
-//! deliberately.
+//! An explicit Deny is a hard gate in either layer and always wins, matching
+//! AWS's "an explicit Deny in any policy always wins". For a **bucket** Deny see
+//! `iam_allow_x_bucket_deny`, `iam_deny_x_bucket_deny`, and `anon_x_bucket_deny`;
+//! for an **IAM** Deny see `iam_deny_x_bucket_allow` (=> denied). The bucket
+//! Allow fallback of step 4 only supplements an IMPLICIT IAM denial, that is an
+//! identity policy with no statement matching the request
+//! (`iam_empty_x_bucket_allow` and `no_iam_policy_x_bucket_allow` => allowed).
 
 use rustfs_policy::policy::action::{Action, S3Action};
 use rustfs_policy::policy::{Args, BucketPolicy, BucketPolicyArgs, Policy};
@@ -69,6 +70,15 @@ fn iam(effect: &str) -> Policy {
         r#"{{"Version":"2012-10-17","Statement":[{{"Effect":"{effect}","Action":["s3:GetObject"],"Resource":["arn:aws:s3:::mybucket/*"]}}]}}"#
     );
     serde_json::from_str(&json).expect("IAM policy JSON should parse")
+}
+
+/// An identity policy that neither allows nor denies `s3:GetObject` on the
+/// test object: an implicit IAM denial.
+fn iam_unrelated() -> Policy {
+    serde_json::from_str(
+        r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":["s3:PutObject"],"Resource":["arn:aws:s3:::mybucket/*"]}]}"#,
+    )
+    .expect("IAM policy JSON should parse")
 }
 
 fn bucket(effect: &str) -> BucketPolicy {
@@ -114,27 +124,32 @@ async fn authorize(iam_policy: Option<&Policy>, bucket_policy: Option<&BucketPol
         return false;
     }
 
-    // (2) IAM allow.
     if let Some(p) = iam_policy {
-        let allowed = p
-            .is_allowed(&Args {
-                account,
-                groups: &groups,
-                action,
-                bucket: BUCKET,
-                conditions: &conditions,
-                is_owner: false,
-                object: OBJECT,
-                claims: &claims,
-                deny_only: false,
-            })
-            .await;
-        if allowed {
+        let mut iam_args = Args {
+            account,
+            groups: &groups,
+            action,
+            bucket: BUCKET,
+            conditions: &conditions,
+            is_owner: false,
+            object: OBJECT,
+            claims: &claims,
+            deny_only: false,
+        };
+
+        // (2) IAM allow.
+        if p.is_allowed(&iam_args).await {
             return true;
+        }
+
+        // (3) IAM explicit-Deny gate: deny_only isolates Deny statements.
+        iam_args.deny_only = true;
+        if !p.is_allowed(&iam_args).await {
+            return false;
         }
     }
 
-    // (3) Bucket-policy allow fallback.
+    // (4) Bucket-policy allow fallback.
     if let Some(bp) = bucket_policy
         && bp.is_allowed(&bucket_args(false)).await
     {
@@ -172,13 +187,12 @@ fn bucket_iam_priority_matrix() {
             expected: false,
         },
         Case {
-            // IAM explicit Deny is SOFT: the bucket Allow fallback overrides it.
-            // Diverges from AWS "explicit Deny always wins"; pins current behavior.
+            // IAM explicit Deny wins over bucket Allow (deny gate before the bucket fallback).
             name: "iam_deny_x_bucket_allow",
             iam: Some(iam("Deny")),
             bucket: Some(bucket("Allow")),
             account: USER,
-            expected: true,
+            expected: false,
         },
         Case {
             name: "iam_deny_x_bucket_deny",
@@ -204,8 +218,16 @@ fn bucket_iam_priority_matrix() {
         },
         // --- No IAM grant: bucket Allow fallback can still permit ---
         Case {
+            // Implicit IAM denial (no matching statement); the fallback decides.
             name: "iam_empty_x_bucket_allow",
-            iam: Some(iam("Deny")), // Deny here == "IAM does not grant"; fallback decides
+            iam: Some(iam_unrelated()),
+            bucket: Some(bucket("Allow")),
+            account: USER,
+            expected: true,
+        },
+        Case {
+            name: "no_iam_policy_x_bucket_allow",
+            iam: None,
             bucket: Some(bucket("Allow")),
             account: USER,
             expected: true,

@@ -136,6 +136,7 @@ pub(crate) mod kms {
 
 pub(crate) mod protocols {
     pub(crate) mod client {
+        pub(crate) use crate::storage::storage_api::access_consumer::access_owned::listing_multipart::authorize_list_objects_v2;
         pub(crate) use crate::storage::storage_api::access_consumer::{MultipartStagingOperation, ReqInfo, authorize_request};
         #[cfg(test)]
         pub(crate) use crate::storage::storage_api::contract::bucket::{BucketOperations, MakeBucketOptions};

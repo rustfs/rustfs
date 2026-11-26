@@ -3521,7 +3521,25 @@ async fn test_anonymous_post_object_accepts_tagging_field_exact_policy_match()
 
     let admin_client = env.create_s3_client();
     admin_client.create_bucket().bucket(bucket).send().await?;
-    allow_anonymous_put_object(&admin_client, bucket).await?;
+    let tagging_policy = serde_json::json!({
+        "Version": "2012-10-17",
+        "Statement": [
+            {
+                "Sid": "AllowAnonymousTaggedPutObject",
+                "Effect": "Allow",
+                "Principal": "*",
+                "Action": ["s3:PutObject", "s3:PutObjectTagging"],
+                "Resource": [format!("arn:aws:s3:::{}/*", bucket)]
+            }
+        ]
+    })
+    .to_string();
+    admin_client
+        .put_bucket_policy()
+        .bucket(bucket)
+        .policy(tagging_policy)
+        .send()
+        .await?;
 
     let policy = encode_post_policy(vec![
         serde_json::json!({ "bucket": bucket }),

@@ -180,13 +180,26 @@ pub(crate) fn merge_request_object_tag_conditions(
     headers: &HeaderMap,
     conditions: &mut HashMap<String, Vec<String>>,
 ) -> S3Result<()> {
-    if action != Action::S3Action(S3Action::PutObjectAction) {
+    if !matches!(
+        action,
+        Action::S3Action(S3Action::PutObjectAction | S3Action::PutObjectTaggingAction | S3Action::ReplicateTagsAction)
+    ) {
         return Ok(());
     }
 
-    let Some(tagging) = headers.get("x-amz-tagging").and_then(|value| value.to_str().ok()) else {
+    let mut values = headers.get_all("x-amz-tagging").iter();
+    let Some(first) = values.next() else {
         return Ok(());
     };
+    if values.next().is_some() {
+        return Err(S3Error::with_message(
+            S3ErrorCode::InvalidTag,
+            "Multiple x-amz-tagging headers are not allowed".to_string(),
+        ));
+    }
+    let tagging = first
+        .to_str()
+        .map_err(|_| S3Error::with_message(S3ErrorCode::InvalidTag, "The Tagging header contains invalid UTF-8".to_string()))?;
 
     let mut tag_keys = Vec::new();
     for tag in crate::storage::s3_api::tagging::parse_object_tag_header(tagging)? {
@@ -209,8 +222,13 @@ pub(crate) fn request_authz_facts<R: AuthorizationRequest + ?Sized>(req: &R, mut
         target.location_constraint = None;
     }
     // A POST upload applies its form fields, not its headers, so the policy
-    // decision must read the values the handler stores.
-    AuthzFacts::from_request_parts(
+    // decision must read the values the handler stores. When no POST form
+    // projection is installed, a `multipart/form-data` or bare `Action` header
+    // on an S3 request must not relabel it as POST or STS.
+    let is_post_form = !std::ptr::eq(req.policy_headers(), req.headers());
+    let method = if is_post_form { http::Method::POST } else { http::Method::GET };
+    AuthzFacts::from_request_parts_with_method(
+        Some(&method),
         req.policy_headers(),
         req.uri().query(),
         req.remote_addr(),
@@ -218,6 +236,7 @@ pub(crate) fn request_authz_facts<R: AuthorizationRequest + ?Sized>(req: &R, mut
         target,
         OffsetDateTime::now_utc(),
     )
+    .without_s3_header_sts()
     .with_caller_authentication(if req.permission_probe() {
         req.permission_probe_caller_authentication()
     } else {
@@ -267,6 +286,15 @@ pub(crate) fn authorization_conditions_with_internal<R: AuthorizationRequest + ?
     } else {
         build_conditions(principal, facts)
     };
+    if !std::ptr::eq(req.policy_headers(), req.headers())
+        || req.req_info().is_some_and(|info| info.keystone_session_present.is_some())
+        || req.permission_probe()
+    {
+        // POST Object forms, header-token (Keystone) requests, and synthetic
+        // permission probes are not authenticated by URL query parameters, so
+        // any query signing timestamp is unverified.
+        conditions.remove("signatureAge");
+    }
     forward_secret_headers(req.headers(), &mut conditions);
     if internal_object_authorization {
         retain_internal_object_authorization_conditions(&mut conditions, principal.claims());
@@ -278,7 +306,9 @@ pub(crate) fn authorization_conditions_with_internal<R: AuthorizationRequest + ?
     if internal_object_authorization {
         return Ok(conditions);
     }
-    merge_request_object_tag_conditions(facts.action(), req.policy_headers(), &mut conditions)?;
+    if req.requested_object_tags().is_none() {
+        merge_request_object_tag_conditions(facts.action(), req.policy_headers(), &mut conditions)?;
+    }
     if let Some(RequestedCopySource(source)) = req.requested_copy_source() {
         conditions.insert("x-amz-copy-source".to_string(), vec![source.clone()]);
     }
@@ -542,4 +572,160 @@ pub(crate) async fn maybe_merge_object_tag_conditions<R: AuthorizationRequest + 
     let tags = get_or_fetch_object_tag_conditions(req, store.as_ref(), bucket, object, version_id, action).await?;
     merge_object_tag_conditions(conditions, &tags);
     Ok(())
+}
+
+#[cfg(test)]
+mod signature_age_post_tests {
+    use super::{AuthorizationRequest as _, AuthzPrincipal, AuthzTarget, authorization_conditions, request_authz_facts};
+    use crate::storage::authorization::tests::fixture::request;
+    use crate::storage::request_markers::PostObjectPolicyHeaders;
+    use http::{HeaderValue, Method};
+    use rustfs_policy::policy::action::{Action, S3Action};
+
+    #[test]
+    fn post_object_form_query_does_not_populate_signature_age() {
+        let cred = rustfs_credentials::Credentials {
+            access_key: "writer".to_owned(),
+            ..Default::default()
+        };
+        let principal = AuthzPrincipal::new(&cred, "");
+        let target = || AuthzTarget {
+            action: Action::S3Action(S3Action::PutObjectAction),
+            bucket: "vault",
+            object: "report.txt",
+            version_id: None,
+            location_constraint: None,
+        };
+        let presigned_uri = "/vault/report.txt?X-Amz-Date=20260801T000000Z&X-Amz-Signature=00";
+
+        // A presigned PUT carries the server-derived signature age and ignores a spoofed header.
+        let put = request(Method::PUT)
+            .uri(presigned_uri)
+            .header("x-amz-signature-age", "0")
+            .build();
+        let put_facts = request_authz_facts(&put, target());
+        let put_conditions = authorization_conditions(&put, &principal, &put_facts).expect("PUT conditions");
+        let age: i64 = put_conditions
+            .get("signatureAge")
+            .expect("presigned PUT must populate signatureAge")[0]
+            .parse()
+            .expect("numeric signatureAge");
+        assert!(age > 0, "presigned PUT age must reflect X-Amz-Date, got {age}");
+        assert!(!put_conditions.contains_key("x-amz-signature-age"));
+
+        // A POST form is authenticated by its fields, never its URL query string.
+        let mut post = request(Method::POST)
+            .uri(presigned_uri)
+            .header("x-amz-signature-age", "0")
+            .build();
+        let mut form_headers = post.headers().clone();
+        form_headers.insert("content-type", HeaderValue::from_static("multipart/form-data; boundary=test"));
+        post.install_post_object_policy_headers(PostObjectPolicyHeaders(form_headers));
+        let post_facts = request_authz_facts(&post, target());
+        let post_conditions = authorization_conditions(&post, &principal, &post_facts).expect("POST conditions");
+        assert!(
+            !post_conditions.contains_key("signatureAge"),
+            "POST Object form must not derive signatureAge from unverified query parameters"
+        );
+
+        // Header-token (Keystone) requests authenticate before query signature dispatch.
+        let keystone = request(Method::GET)
+            .uri(presigned_uri)
+            .extension(crate::storage::req_info::ReqInfo {
+                keystone_session_present: Some(false),
+                ..Default::default()
+            })
+            .build();
+        let keystone_facts = request_authz_facts(&keystone, target());
+        let keystone_conditions = authorization_conditions(&keystone, &principal, &keystone_facts).expect("Keystone conditions");
+        assert!(
+            !keystone_conditions.contains_key("signatureAge"),
+            "Keystone header-token request must not derive signatureAge from unverified query parameters"
+        );
+    }
+}
+
+#[cfg(test)]
+mod tagging_condition_tests {
+    use super::{
+        AuthorizationRequest as _, AuthzPrincipal, AuthzTarget, RequestedObjectTags, authorization_conditions,
+        merge_request_object_tag_conditions, request_authz_facts,
+    };
+    use crate::storage::authorization::tests::fixture::request;
+    use http::{HeaderMap, HeaderValue, Method};
+    use rustfs_policy::policy::action::{Action, S3Action};
+    use rustfs_s3_types::S3ErrorCode;
+    use std::collections::HashMap;
+
+    #[test]
+    fn merge_request_object_tag_conditions_applies_to_tagging_and_replication_write_actions() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-amz-tagging", HeaderValue::from_static("env=dev&owner=team%20a"));
+
+        for action in [
+            Action::S3Action(S3Action::PutObjectAction),
+            Action::S3Action(S3Action::PutObjectTaggingAction),
+            Action::S3Action(S3Action::ReplicateTagsAction),
+        ] {
+            let mut conditions = HashMap::new();
+            merge_request_object_tag_conditions(action, &headers, &mut conditions)
+                .expect("request tag conditions should populate");
+            assert_eq!(conditions.get("RequestObjectTag/env"), Some(&vec!["dev".to_string()]));
+            assert_eq!(conditions.get("RequestObjectTag/owner"), Some(&vec!["team a".to_string()]));
+            assert_eq!(
+                conditions.get("RequestObjectTagKeys"),
+                Some(&vec!["env".to_string(), "owner".to_string()])
+            );
+        }
+
+        let mut get_conditions = HashMap::new();
+        merge_request_object_tag_conditions(Action::S3Action(S3Action::GetObjectAction), &headers, &mut get_conditions)
+            .expect("GetObject ignores x-amz-tagging");
+        assert!(get_conditions.is_empty());
+
+        let mut duplicate = HeaderMap::new();
+        duplicate.append("x-amz-tagging", HeaderValue::from_static("env=dev"));
+        duplicate.append("x-amz-tagging", HeaderValue::from_static("env=prod"));
+        let err = merge_request_object_tag_conditions(
+            Action::S3Action(S3Action::PutObjectTaggingAction),
+            &duplicate,
+            &mut HashMap::new(),
+        )
+        .expect_err("duplicate x-amz-tagging headers must be rejected");
+        assert_eq!(err.code(), &S3ErrorCode::InvalidTag);
+
+        let mut non_utf8 = HeaderMap::new();
+        non_utf8.insert("x-amz-tagging", HeaderValue::from_bytes(&[0xff, b'=', b'a']).expect("header bytes"));
+        let err = merge_request_object_tag_conditions(
+            Action::S3Action(S3Action::PutObjectTaggingAction),
+            &non_utf8,
+            &mut HashMap::new(),
+        )
+        .expect_err("non-UTF-8 x-amz-tagging header must be rejected");
+        assert_eq!(err.code(), &S3ErrorCode::InvalidTag);
+    }
+
+    #[test]
+    fn authorization_conditions_skips_wire_tagging_header_when_requested_object_tags_installed() {
+        let mut req = request(Method::PUT).header("x-amz-tagging", "classification=%ZZ").build();
+        req.install_requested_object_tags(RequestedObjectTags(vec![("env".to_owned(), "dev".to_owned())]));
+
+        let credentials = rustfs_credentials::Credentials::default();
+        let principal = AuthzPrincipal::new(&credentials, "");
+        let facts = request_authz_facts(
+            &req,
+            AuthzTarget {
+                action: Action::S3Action(S3Action::PutObjectTaggingAction),
+                bucket: "bucket",
+                object: "key",
+                version_id: None,
+                location_constraint: None,
+            },
+        );
+        let conditions = authorization_conditions(&req, &principal, &facts)
+            .expect("installed RequestedObjectTags must take precedence over wire x-amz-tagging");
+        assert_eq!(conditions.get("RequestObjectTag/env"), Some(&vec!["dev".to_string()]));
+        assert_eq!(conditions.get("RequestObjectTagKeys"), Some(&vec!["env".to_string()]));
+        assert!(!conditions.contains_key("RequestObjectTag/classification"));
+    }
 }

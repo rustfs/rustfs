@@ -1934,10 +1934,16 @@ fn reserved_table_object_key_matches_exact_prefix_and_children_only() {
     assert!(is_reserved_table_object_key(".rustfs-table"));
     assert!(is_reserved_table_object_key(".rustfs-table/"));
     assert!(is_reserved_table_object_key(".rustfs-table/metadata/current.json"));
+    assert!(is_reserved_table_object_key("/.rustfs-table"));
+    assert!(is_reserved_table_object_key("//.rustfs-table/"));
+    assert!(is_reserved_table_object_key("/.rustfs-table/metadata/current.json"));
 
     assert!(!is_reserved_table_object_key(""));
+    assert!(!is_reserved_table_object_key("/"));
     assert!(!is_reserved_table_object_key(".rustfs-table-other"));
+    assert!(!is_reserved_table_object_key("/.rustfs-table-other"));
     assert!(!is_reserved_table_object_key("prefix/.rustfs-table/object"));
+    assert!(!is_reserved_table_object_key("/prefix/.rustfs-table/object"));
     assert!(!is_reserved_table_object_key("user/.rustfs-table"));
 }
 
@@ -1949,6 +1955,68 @@ fn object_mutation_guard_only_blocks_reserved_prefix_for_table_buckets() {
         TableObjectMutationError::ReservedCatalogObject
     );
     assert!(validate_object_mutation(true, ".rustfs-table-other/current.json").is_ok());
+}
+
+#[test]
+fn object_mutation_guard_blocks_bucket_publication_lock_key_in_every_bucket() {
+    let publication_lock = default_table_bucket_publication_lock_path();
+
+    for table_bucket_enabled in [false, true] {
+        assert_eq!(
+            validate_object_mutation(table_bucket_enabled, &publication_lock)
+                .expect_err("publication lock key must be rejected on every bucket"),
+            TableObjectMutationError::ReservedCatalogObject
+        );
+        assert_eq!(
+            validate_object_mutation(table_bucket_enabled, &format!("/{publication_lock}"))
+                .expect_err("leading-slash publication lock key alias must be rejected on every bucket"),
+            TableObjectMutationError::ReservedCatalogObject
+        );
+    }
+
+    assert_eq!(
+        validate_object_mutation(true, "/.rustfs-table/current.json")
+            .expect_err("leading-slash reserved table prefix alias must be rejected on table buckets"),
+        TableObjectMutationError::ReservedCatalogObject
+    );
+
+    // Neighboring keys and ordinary keys remain writable on non-table buckets.
+    assert!(validate_object_mutation(false, &format!("{publication_lock}.bak")).is_ok());
+    assert!(validate_object_mutation(false, &format!("prefix/{publication_lock}")).is_ok());
+    assert!(validate_object_mutation(false, "ordinary/object.txt").is_ok());
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn bucket_object_mutation_guard_rejects_publication_lock_key_on_non_table_bucket() {
+    let temp = tempfile::tempdir().expect("create non-table bucket test root");
+    let env = rustfs_test_utils::TestECStoreEnv::builder()
+        .base_dir(temp.path())
+        .disk_count(1)
+        .build()
+        .await;
+    env.make_bucket("ordinary-bucket", false).await;
+
+    // Confirm bucket metadata resolves with table_bucket_enabled == false (not fail-closed).
+    assert!(
+        validate_bucket_object_mutation("ordinary-bucket", ".rustfs-table/current.json")
+            .await
+            .is_ok(),
+        "ordinary non-table bucket must still allow unrelated .rustfs-table keys"
+    );
+
+    let publication_lock = default_table_bucket_publication_lock_path();
+    assert_eq!(
+        validate_bucket_object_mutation("ordinary-bucket", &publication_lock)
+            .await
+            .expect_err("publication lock key must be rejected for PUT/DELETE on ordinary buckets"),
+        TableObjectMutationError::ReservedCatalogObject
+    );
+    assert!(
+        validate_bucket_object_mutation("ordinary-bucket", "ordinary/object.txt")
+            .await
+            .is_ok()
+    );
 }
 
 #[tokio::test]
