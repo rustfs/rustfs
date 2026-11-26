@@ -130,11 +130,11 @@ pub(crate) struct RenameDataGuards {
     pub(crate) scanner_publication_lease_token: Option<Uuid>,
     pub(crate) external_guard: Option<Arc<dyn Send + Sync>>,
     pub(crate) namespace_owner: Option<Arc<dyn Send + Sync>>,
-    pub(crate) connect_deadline: Option<RenameConnectDeadline>,
+    pub(crate) dispatch_deadline: Option<RenameDispatchDeadline>,
 }
 
 /// The fanout publishes this deadline once enough disks have committed.
-pub(crate) type RenameConnectDeadline = tokio::sync::watch::Receiver<Option<tokio::time::Instant>>;
+pub(crate) type RenameDispatchDeadline = tokio::sync::watch::Receiver<Option<tokio::time::Instant>>;
 
 /// Pre-dispatch evidence stays outside DiskAPI and the RPC response format.
 pub(crate) struct RenameDataObservation {

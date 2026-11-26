@@ -5926,7 +5926,7 @@ impl SetDisks {
                 || commit_decommission_object_lock_guard.is_some()
                 || commit_publication_guard.is_some();
             let commit_write_completion = opts.write_completion;
-            let bound_rename_connect = commit_write_completion == crate::object_api::WriteCompletion::TailDrained
+            let bound_rename_dispatch = commit_write_completion == crate::object_api::WriteCompletion::TailDrained
                 && commit_object_lock_guard.is_some()
                 && !is_meta_bucketname(bucket)
                 && !opts.data_movement
@@ -6261,7 +6261,7 @@ impl SetDisks {
                         commit_scanner_publication_lease_tokens.as_ref(),
                     )
                     .with_publication_scope(commit_scanner_publication_scope.clone())
-                    .with_quorum_bounded_connect(bound_rename_connect)
+                    .with_quorum_bounded_dispatch(bound_rename_dispatch)
                     .with_rollback_receipt(commit_rollback_receipt.clone())
                     .with_namespace_commit_guard(
                         (!is_meta_bucketname(&commit_bucket))

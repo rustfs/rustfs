@@ -3279,7 +3279,7 @@ fn rename_tail_cleanup_queue() -> &'static RenameTailCleanupQueue {
 }
 
 const EVENT_SET_DISK_RENAME_ROLLBACK: &str = "set_disk_rename_rollback";
-const PUT_RENAME_POST_QUORUM_CONNECT_GRACE: Duration = Duration::from_secs(1);
+const PUT_RENAME_POST_QUORUM_DISPATCH_GRACE: Duration = Duration::from_secs(1);
 
 #[derive(Clone, Copy)]
 enum RenameDispatchState {
@@ -3334,7 +3334,7 @@ struct RenameSlotContext {
     paths: Arc<RenameSlotPaths>,
     successful_completion_rank: Option<Arc<AtomicUsize>>,
     write_quorum: usize,
-    connect_deadline: Option<disk::RenameConnectDeadline>,
+    dispatch_deadline: Option<disk::RenameDispatchDeadline>,
 }
 
 struct RenameOutcomeProducerArgs {
@@ -3346,7 +3346,7 @@ struct RenameOutcomeProducerArgs {
     publication_scope: Option<crate::object_api::ScannerPublicationCommitScope>,
     write_quorum: usize,
     allow_batch: bool,
-    connect_deadline: Option<disk::RenameConnectDeadline>,
+    dispatch_deadline: Option<disk::RenameDispatchDeadline>,
 }
 
 struct RenameOutcomeProducers {
@@ -3840,7 +3840,7 @@ pub(in crate::set_disk) struct RenameDataFenceOptions<'a> {
     rollback_receipt: Option<RenameRollbackReceipt>,
     multipart_proof_authority: Option<crate::disk::multipart_source::ProofVerificationContext>,
     multipart_commit_owner: Option<Arc<MultipartLogicalGuards>>,
-    bound_connect_after_quorum: bool,
+    bound_dispatch_after_quorum: bool,
 }
 
 impl<'a> RenameDataFenceOptions<'a> {
@@ -3856,12 +3856,12 @@ impl<'a> RenameDataFenceOptions<'a> {
             rollback_receipt: None,
             multipart_proof_authority: None,
             multipart_commit_owner: None,
-            bound_connect_after_quorum: false,
+            bound_dispatch_after_quorum: false,
         }
     }
 
-    pub(in crate::set_disk) fn with_quorum_bounded_connect(mut self, enabled: bool) -> Self {
-        self.bound_connect_after_quorum = enabled;
+    pub(in crate::set_disk) fn with_quorum_bounded_dispatch(mut self, enabled: bool) -> Self {
+        self.bound_dispatch_after_quorum = enabled;
         self
     }
 
@@ -4446,7 +4446,7 @@ impl SetDisks {
                 disk::RenameDataGuards {
                     scanner_publication_lease_token: context.scanner_token,
                     namespace_owner: context.namespace_owner.clone(),
-                    connect_deadline: context.connect_deadline.clone(),
+                    dispatch_deadline: context.dispatch_deadline.clone(),
                     ..Default::default()
                 },
             )
@@ -4623,7 +4623,7 @@ impl SetDisks {
             publication_scope,
             write_quorum,
             allow_batch,
-            connect_deadline,
+            dispatch_deadline,
         } = args;
         debug_assert!(!allow_batch || publication_scope.is_none());
         let disk_count = disks.len();
@@ -4648,7 +4648,7 @@ impl SetDisks {
                 continue;
             }
             let outcome_tx = outcome_tx.clone();
-            let connect_deadline = connect_deadline
+            let dispatch_deadline = dispatch_deadline
                 .as_ref()
                 .filter(|_| disk.as_ref().is_some_and(|disk| !disk.is_local()))
                 .cloned();
@@ -4662,7 +4662,7 @@ impl SetDisks {
                 paths: paths.clone(),
                 successful_completion_rank: successful_completion_rank.clone(),
                 write_quorum,
-                connect_deadline,
+                dispatch_deadline,
             };
             let resource_unit = resource_unit.clone();
             let producer = crate::disk::with_optional_resource_unit(resource_unit, async move {
@@ -4680,7 +4680,7 @@ impl SetDisks {
             let group_disks = disks.clone();
             let group_tokens = fence_tokens.clone();
             let resource_unit = resource_unit.clone();
-            let connect_deadline = connect_deadline.clone();
+            let dispatch_deadline = dispatch_deadline.clone();
             let producer = crate::disk::with_optional_resource_unit(resource_unit, async move {
                 let prepared = join_all(group.slots.into_iter().map(|slot| {
                     let context = RenameSlotContext {
@@ -4693,7 +4693,7 @@ impl SetDisks {
                         paths: paths.clone(),
                         successful_completion_rank: successful_completion_rank.clone(),
                         write_quorum,
-                        connect_deadline: connect_deadline.clone(),
+                        dispatch_deadline: dispatch_deadline.clone(),
                     };
                     async move { (slot, Self::prepare_and_admit_rename_slot(context).await) }
                 }))
@@ -4765,7 +4765,7 @@ impl SetDisks {
                                     &paths.dst_bucket,
                                     &paths.dst_object,
                                     items,
-                                    connect_deadline,
+                                    dispatch_deadline,
                                 )
                                 .await
                         }
@@ -4874,7 +4874,7 @@ impl SetDisks {
             rollback_receipt,
             multipart_proof_authority: _,
             multipart_commit_owner: _,
-            bound_connect_after_quorum: _,
+            bound_dispatch_after_quorum: _,
         } = fence_options;
         if let Some(file_info) = disks
             .iter()
@@ -4916,7 +4916,7 @@ impl SetDisks {
                     publication_scope: scanner_publication_commit_scope,
                     write_quorum,
                     allow_batch,
-                    connect_deadline: None,
+                    dispatch_deadline: None,
                 });
 
                 let mut commit_tx = Some(commit_tx);
@@ -5236,7 +5236,7 @@ impl SetDisks {
             rollback_receipt,
             multipart_proof_authority,
             multipart_commit_owner,
-            bound_connect_after_quorum,
+            bound_dispatch_after_quorum,
         } = fence_options;
         if let Some(file_info) = disks
             .iter()
@@ -5287,7 +5287,7 @@ impl SetDisks {
             let _fanout_publication_scope = fanout_publication_scope;
             let _namespace_commit_guard = fanout_namespace_commit_guard.clone();
             let allow_batch = !protected_multipart && scanner_publication_commit_scope.is_none();
-            let (connect_deadline_tx, connect_deadline) = if bound_connect_after_quorum
+            let (dispatch_deadline_tx, dispatch_deadline) = if bound_dispatch_after_quorum
                 && fanout_disks.iter().flatten().count() > write_quorum
                 && fanout_disks.iter().flatten().any(|disk| !disk.is_local())
             {
@@ -5308,17 +5308,17 @@ impl SetDisks {
                 publication_scope: scanner_publication_commit_scope,
                 write_quorum,
                 allow_batch,
-                connect_deadline,
+                dispatch_deadline,
             });
             let mut results = Vec::with_capacity(disk_count);
             let mut successful = 0;
             while let Some(outcome) = outcome_rx.recv().await {
-                if let Some(tx) = connect_deadline_tx.as_ref()
+                if let Some(tx) = dispatch_deadline_tx.as_ref()
                     && matches!(&outcome.completion, Ok(Ok(_)))
                 {
                     successful += 1;
                     if successful == write_quorum {
-                        tx.send_replace(Some(tokio::time::Instant::now() + PUT_RENAME_POST_QUORUM_CONNECT_GRACE));
+                        tx.send_replace(Some(tokio::time::Instant::now() + PUT_RENAME_POST_QUORUM_DISPATCH_GRACE));
                     }
                 }
                 results.push(outcome);
@@ -12877,7 +12877,7 @@ mod tests {
                     file_infos,
                     (bucket, object),
                     false,
-                    RenameDataFenceOptions::new(3, None).with_quorum_bounded_connect(true),
+                    RenameDataFenceOptions::new(3, None).with_quorum_bounded_dispatch(true),
                 ),
             )
             .await
