@@ -4322,6 +4322,24 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
         let mut decommission_target_lock_covered = false;
         let mut decommission_capacity_guard = None;
 
+        // Lock order: lifecycle -> metadata transaction -> object namespace -> upload.
+        // Capture the metadata-transaction snapshot before taking any object write
+        // lock so reservation::begin reuses it without acquiring new_ns_lock(bucket, bucket).
+        let commit_snapshot_opts;
+        let opts = if write_context.acquires_namespace() && metadata_sys::needs_commit_metadata_snapshot(&self.ctx, bucket, opts)
+        {
+            commit_snapshot_opts = metadata_sys::capture_commit_metadata_snapshot_for_options_in(
+                &self.ctx,
+                bucket,
+                opts.expected_bucket_incarnation_id,
+                opts,
+            )
+            .await?;
+            &commit_snapshot_opts
+        } else {
+            opts
+        };
+
         if opts.http_preconditions.is_some() {
             if write_context.acquires_namespace() {
                 object_lock_guard = Some(
@@ -5596,6 +5614,7 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
         let commit_is_versioned = opts.versioned || opts.version_suspended;
         let commit_capacity_scope_token = opts.capacity_scope_token;
         let commit_object_lock_guard = object_lock_guard.take().map(Arc::new);
+        let commit_object_lock_config_snapshot = opts.object_lock_config_snapshot.clone();
         let commit_decommission_object_lock_guard = decommission_object_lock_guard.take().map(Arc::new);
         let commit_decommission_capacity_guard = decommission_capacity_guard.take().map(Arc::new);
         // CompleteMultipartUpload is an S3 publication boundary: after a
@@ -5608,6 +5627,7 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
         let commit = async move {
             let write_context = Arc::new(write_context);
             let mut _object_lock_guard = commit_object_lock_guard;
+            let _object_lock_config_snapshot = commit_object_lock_config_snapshot;
             let mut _decommission_object_lock_guard = commit_decommission_object_lock_guard;
             let mut _upload_guard = upload_guard.map(Arc::new);
             let mut _decommission_capacity_guard = commit_decommission_capacity_guard;
@@ -19741,5 +19761,183 @@ mod multipart_staging_quota_tests {
             .expect("2048 + 2048 must fit exactly")
             .commit(2048);
         assert_eq!(budget.lock_state().staged_total, 4096);
+    }
+}
+
+#[cfg(test)]
+mod same_name_object_namespace_lock_tests {
+    use super::*;
+    use crate::bucket::quota::BucketQuota;
+    use crate::storage_api_contracts::bucket::{BucketOperations, MakeBucketOptions};
+    use crate::storage_api_contracts::namespace::NamespaceLocking;
+    use crate::storage_api_contracts::object::ObjectIO;
+    use serial_test::serial;
+
+    async fn setup_store_with_bucket(quota: Option<u64>) -> (Vec<tempfile::TempDir>, Arc<crate::store::ECStore>, String) {
+        let (dirs, store) = crate::bucket::metadata_sys::test_support::isolated_store_over_temp_disks().await;
+        crate::bucket::metadata_sys::init_bucket_metadata_sys(store.clone(), Vec::new()).await;
+        let bucket = format!("same-name-ns-{}", Uuid::new_v4().simple());
+        store
+            .make_bucket(&bucket, &MakeBucketOptions::default())
+            .await
+            .expect("create bucket");
+        if let Some(limit) = quota {
+            let cfg = BucketQuota::new(Some(limit));
+            store
+                .update_bucket_metadata_config(
+                    &bucket,
+                    rustfs_config::QUOTA_CONFIG_FILE,
+                    cfg.marshal_msg().expect("serialize hard quota"),
+                )
+                .await
+                .expect("persist hard quota");
+            crate::bucket::quota::reservation::initialize_quota_ledger_for_test(store.clone(), &bucket)
+                .await
+                .expect("initialize durable quota ledger");
+        }
+        (dirs, store, bucket)
+    }
+
+    async fn verify_same_name_put_copy_and_multipart(store: &Arc<crate::store::ECStore>, bucket: &str, versioned: bool) {
+        let budget = crate::set_disk::get_lock_acquire_timeout() / 2;
+        let write_opts = ObjectOptions {
+            versioned,
+            ..Default::default()
+        };
+
+        // 1. PutObject to key == bucket must not self-deadlock on new_ns_lock(bucket, bucket).
+        let mut reader = PutObjReader::from_vec(b"same-name-put".to_vec());
+        tokio::time::timeout(budget, store.put_object(bucket, bucket, &mut reader, &write_opts))
+            .await
+            .expect("PUT bucket/bucket must complete well before lock timeout")
+            .expect("PUT bucket/bucket should succeed");
+        store
+            .get_object_info(bucket, bucket, &ObjectOptions::default())
+            .await
+            .expect("stored bucket/bucket object must be readable");
+
+        // 2. CopyObject from another key into key == bucket must not self-deadlock.
+        let mut src_reader = PutObjReader::from_vec(b"copy-source-body".to_vec());
+        let mut src_info = store
+            .put_object(bucket, "source-key", &mut src_reader, &write_opts)
+            .await
+            .expect("seed copy source object");
+        src_info.put_object_reader = Some(PutObjReader::from_vec(b"copy-source-body".to_vec()));
+        tokio::time::timeout(
+            budget,
+            store.copy_object(
+                bucket,
+                "source-key",
+                bucket,
+                bucket,
+                &mut src_info,
+                &ObjectOptions::default(),
+                &write_opts,
+            ),
+        )
+        .await
+        .expect("CopyObject into bucket/bucket must complete well before lock timeout")
+        .expect("CopyObject into bucket/bucket should succeed");
+
+        // 3. CompleteMultipartUpload to key == bucket must not self-deadlock.
+        let upload = store
+            .new_multipart_upload(bucket, bucket, &write_opts)
+            .await
+            .expect("create same-name multipart upload");
+        let mut part_reader = PutObjReader::from_vec(b"same-name-mpu-part".to_vec());
+        let part = store
+            .put_object_part(bucket, bucket, &upload.upload_id, 1, &mut part_reader, &ObjectOptions::default())
+            .await
+            .expect("stage same-name multipart part");
+        tokio::time::timeout(
+            budget,
+            store.clone().complete_multipart_upload(
+                bucket,
+                bucket,
+                &upload.upload_id,
+                vec![CompletePart {
+                    part_num: part.part_num,
+                    etag: part.etag,
+                    ..Default::default()
+                }],
+                &write_opts,
+            ),
+        )
+        .await
+        .expect("CompleteMultipartUpload for bucket/bucket must complete well before lock timeout")
+        .expect("CompleteMultipartUpload for bucket/bucket should succeed");
+        store
+            .get_object_info(bucket, bucket, &ObjectOptions::default())
+            .await
+            .expect("completed bucket/bucket multipart object must be readable");
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn same_name_key_writes_succeed_on_unversioned_versioned_and_hard_quota_buckets() {
+        let (_dirs1, store1, unversioned_bucket) = setup_store_with_bucket(None).await;
+        verify_same_name_put_copy_and_multipart(&store1, &unversioned_bucket, false).await;
+
+        let (_dirs2, store2, versioned_bucket) = setup_store_with_bucket(None).await;
+        verify_same_name_put_copy_and_multipart(&store2, &versioned_bucket, true).await;
+
+        let (_dirs3, store3, quota_bucket) = setup_store_with_bucket(Some(64 * 1024)).await;
+        verify_same_name_put_copy_and_multipart(&store3, &quota_bucket, false).await;
+        verify_same_name_put_copy_and_multipart(&store3, &quota_bucket, true).await;
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn same_name_object_write_lock_does_not_block_other_keys_on_versioned_bucket() {
+        let (_dirs, store, bucket) = setup_store_with_bucket(Some(64 * 1024)).await;
+        let budget = crate::set_disk::get_lock_acquire_timeout() / 2;
+        let versioned_opts = ObjectOptions {
+            versioned: true,
+            ..Default::default()
+        };
+
+        // Hold the write lock on (bucket, bucket), simulating an active commit on key == bucket.
+        let same_name_lock = store
+            .new_ns_lock(&bucket, &bucket)
+            .await
+            .expect("create same-name namespace lock");
+        let _same_name_guard = same_name_lock
+            .get_write_lock(crate::set_disk::get_lock_acquire_timeout())
+            .await
+            .expect("acquire same-name write lock");
+
+        // Concurrent PutObject and CompleteMultipartUpload on OTHER keys must not contend on (bucket, bucket).
+        let mut other_reader = PutObjReader::from_vec(b"other-key-put".to_vec());
+        tokio::time::timeout(budget, store.put_object(&bucket, "other-key", &mut other_reader, &versioned_opts))
+            .await
+            .expect("PUT to another key must not wait on (bucket, bucket)")
+            .expect("PUT to another key should succeed");
+
+        let upload = store
+            .new_multipart_upload(&bucket, "other-mpu", &versioned_opts)
+            .await
+            .expect("create multipart upload on another key");
+        let mut part_reader = PutObjReader::from_vec(b"other-mpu-part".to_vec());
+        let part = store
+            .put_object_part(&bucket, "other-mpu", &upload.upload_id, 1, &mut part_reader, &ObjectOptions::default())
+            .await
+            .expect("stage multipart part on another key");
+        tokio::time::timeout(
+            budget,
+            store.clone().complete_multipart_upload(
+                &bucket,
+                "other-mpu",
+                &upload.upload_id,
+                vec![CompletePart {
+                    part_num: part.part_num,
+                    etag: part.etag,
+                    ..Default::default()
+                }],
+                &versioned_opts,
+            ),
+        )
+        .await
+        .expect("CompleteMultipartUpload to another key must not wait on (bucket, bucket)")
+        .expect("CompleteMultipartUpload to another key should succeed");
     }
 }

@@ -1362,10 +1362,10 @@ impl ECStore {
         let object = encoded_object.as_ref();
         let (mut opts, _bucket_lifecycle_guard) = self.guard_multipart_bucket_incarnation(bucket, opts).await?;
         if !is_meta_bucketname(bucket) {
-            // The set-level commit judges the version this completion
-            // replaces: the null version, or the version id the session staged
-            // at CreateMultipartUpload, which these options do not name. Give
-            // it the same authoritative snapshot a destructive PUT carries.
+            // Capture the metadata-transaction snapshot before SetDisks acquires
+            // the object namespace write lock so both the Object Lock check on
+            // the version being replaced (null or staged version id) and
+            // reservation::begin reuse it without taking new_ns_lock(bucket, bucket).
             let expected_incarnation_id = opts
                 .expected_bucket_incarnation_id
                 .ok_or_else(|| Error::other("multipart completion is missing its bucket incarnation"))?;
@@ -1503,7 +1503,7 @@ impl ECStore {
         }
         let (mut opts, _bucket_lifecycle_guard) = self.guard_multipart_bucket_incarnation(bucket, opts).await?;
         ensure_decommission_capacity_mutation_id(bucket, object, &mut opts);
-        if opts.overwrites_existing_version() && !is_meta_bucketname(bucket) {
+        if !is_meta_bucketname(bucket) {
             let expected_incarnation_id = opts
                 .expected_bucket_incarnation_id
                 .ok_or_else(|| Error::other("data movement completion is missing its bucket incarnation"))?;

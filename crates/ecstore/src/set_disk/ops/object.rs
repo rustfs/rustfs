@@ -5244,9 +5244,10 @@ impl SetDisks {
             // Lock order: lifecycle, metadata transaction, then object namespace.
             // No body reads occur below this point. The snapshot must describe the
             // configuration at commit, not the pre-body advisory object lookup.
-            let mut commit_opts;
-            let opts = if opts.defer_put_object_lock_snapshot {
-                commit_opts = opts.clone();
+            let mut deferred_commit_opts;
+            let pre_lock_commit_opts;
+            let mut opts = if opts.defer_put_object_lock_snapshot {
+                deferred_commit_opts = opts.clone();
                 let expected = source_bucket_incarnation_id
                     .ok_or_else(|| Error::other("destructive PUT is missing its bucket incarnation"))?;
                 let store = metadata_sys::object_store_in(&self.ctx).await?;
@@ -5254,10 +5255,24 @@ impl SetDisks {
                 if !snapshot.is_valid_for_destructive_put(store.id, bucket, expected) {
                     return Err(Error::other("PUT bucket generation or configuration changed while staging"));
                 }
-                snapshot.add_lock_fences(&mut commit_opts);
-                commit_opts.object_lock_config_snapshot = Some(snapshot);
-                commit_opts.defer_put_object_lock_snapshot = false;
-                &commit_opts
+                snapshot.add_lock_fences(&mut deferred_commit_opts);
+                deferred_commit_opts.object_lock_config_snapshot = Some(snapshot);
+                deferred_commit_opts.defer_put_object_lock_snapshot = false;
+                &deferred_commit_opts
+            } else if opts.decommission_capacity_admission.is_some()
+                && write_context.acquires_namespace()
+                && metadata_sys::needs_commit_metadata_snapshot(&self.ctx, bucket, opts)
+            {
+                // Multi-pool commit guards acquire the object write lock right below,
+                // so pre-capture the metadata snapshot before taking it.
+                deferred_commit_opts = metadata_sys::capture_commit_metadata_snapshot_for_options_in(
+                    &self.ctx,
+                    bucket,
+                    source_bucket_incarnation_id,
+                    opts,
+                )
+                .await?;
+                &deferred_commit_opts
             } else {
                 opts
             };
@@ -5295,6 +5310,24 @@ impl SetDisks {
                             .acquire_bucket_incarnation_fence(bucket, expected_incarnation_id)
                             .await?,
                     );
+                }
+                // Capture the metadata-transaction snapshot before taking the object
+                // write lock so reservation::begin reuses it without calling
+                // new_ns_lock(bucket, bucket) (preventing self-deadlock on key == bucket
+                // and avoiding bucket-namespace contention with concurrent writers).
+                if metadata_sys::needs_commit_metadata_snapshot(&self.ctx, bucket, opts) {
+                    let mut pre_snapshot_opts = opts.clone();
+                    if let Some(guard) = bucket_lifecycle_guard.as_ref() {
+                        guard.attach_to_object_options(&mut pre_snapshot_opts);
+                    }
+                    pre_lock_commit_opts = metadata_sys::capture_commit_metadata_snapshot_for_options_in(
+                        &self.ctx,
+                        bucket,
+                        source_bucket_incarnation_id,
+                        &pre_snapshot_opts,
+                    )
+                    .await?;
+                    opts = &pre_lock_commit_opts;
                 }
                 if let Some(fence) = publication_fence.take() {
                     publication_commit_guard = Some(fence.into_commit_guard(self.pool_index, bucket, object).await?);
@@ -10722,6 +10755,15 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
             })
             .collect::<Vec<_>>();
 
+        // Preload bucket Object Lock state before acquiring batch object write
+        // locks so a batch containing key == bucket cannot self-deadlock on
+        // new_ns_lock(bucket, bucket) when metadata_sys performs a cold load.
+        let preloaded_object_lock_config = if !is_meta_bucketname(bucket) && opts.object_lock_config_snapshot.is_none() {
+            Some(metadata_sys::get_object_lock_config_state_in(&self.ctx, bucket).await)
+        } else {
+            None
+        };
+
         // Acquire locks in batch mode (best effort, matching previous behavior)
         let mut batch = rustfs_lock::BatchLockRequest::new(self.locker_owner.as_str()).with_all_or_nothing(false);
         // Keyed by the same disk identity `new_ns_lock` uses, so aliases such
@@ -10845,9 +10887,9 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
         } else {
             match opts.object_lock_config_snapshot.clone() {
                 Some(snapshot) => snapshot,
-                None => match metadata_sys::get_object_lock_config_state_in(&self.ctx, bucket).await {
-                    Ok(state) => Arc::new(ObjectLockConfigSnapshot::new(state)),
-                    Err(err) => {
+                None => match preloaded_object_lock_config {
+                    Some(Ok(state)) => Arc::new(ObjectLockConfigSnapshot::new(state)),
+                    Some(Err(err)) => {
                         let message = err.to_string();
                         for (index, item) in del_errs.iter_mut().enumerate() {
                             if locked_objects.contains(lock_names[index].as_ref()) {
@@ -10856,6 +10898,7 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
                         }
                         return (del_objects, del_errs, accounting);
                     }
+                    None => Arc::new(ObjectLockConfigSnapshot::new(ObjectLockConfigState::ConfirmedAbsent)),
                 },
             }
         };
@@ -11903,6 +11946,19 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
 
         self.invalidate_get_object_metadata_cache(bucket, object).await;
 
+        // Preload Object Lock state before taking the object write lock so a
+        // prefix-object delete of key == bucket cannot self-deadlock on
+        // new_ns_lock(bucket, bucket) when metadata_sys loads from disk.
+        let preloaded_prefix_object_lock_config =
+            if opts.delete_prefix && opts.delete_prefix_object && !is_meta_bucketname(bucket) && !opts.data_movement {
+                Some(match opts.object_lock_config_snapshot.as_deref() {
+                    Some(snapshot) => snapshot.state().clone(),
+                    None => metadata_sys::get_object_lock_config_state_in(&self.ctx, bucket).await?,
+                })
+            } else {
+                None
+            };
+
         // Guard lock for single object delete
         let _lock_guard = if (!opts.delete_prefix || opts.delete_prefix_object) && !opts.no_lock {
             #[cfg(test)]
@@ -11951,14 +12007,7 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
                 }
             }
             if opts.delete_prefix_object && !is_meta_bucketname(bucket) {
-                let object_lock_config = if opts.data_movement {
-                    None
-                } else {
-                    Some(match opts.object_lock_config_snapshot.as_deref() {
-                        Some(snapshot) => snapshot.state().clone(),
-                        None => metadata_sys::get_object_lock_config_state_in(&self.ctx, bucket).await?,
-                    })
-                };
+                let object_lock_config = preloaded_prefix_object_lock_config;
                 if let Some(versions) = self.load_file_info_versions_exact(bucket, object).await? {
                     let bypass_governance = opts
                         .object_lock_delete

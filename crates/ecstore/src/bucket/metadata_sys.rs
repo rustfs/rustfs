@@ -1891,7 +1891,9 @@ pub(crate) async fn get_quota_config_and_incarnation_from_disk_for_options_in(
     {
         if snapshot_guard.is_lock_lost()
             || snapshot_guard.is_released()
-            || !snapshot.is_valid_for_destructive_put(store.id, bucket, opts.expected_bucket_incarnation_id.unwrap_or_default())
+            || snapshot
+                .validated_bucket_incarnation_for(store.id, bucket, opts.expected_bucket_incarnation_id)
+                .is_none()
         {
             return Err(Error::other("quota snapshot fence or bucket incarnation changed during the disk read"));
         }
@@ -1946,6 +1948,93 @@ pub(crate) async fn get_cached_quota_config_and_incarnation_in(
     let bucket_meta_sys_lock = bucket_metadata_sys_of(ctx)?;
     let bucket_meta_sys = bucket_meta_sys_lock.read().await.clone();
     bucket_meta_sys.cached_quota_config_and_incarnation(bucket).await
+}
+
+/// Returns whether a commit-time write path will consult bucket metadata in
+/// `reservation::begin` and therefore needs a pre-captured Object Lock / quota
+/// snapshot before acquiring the object namespace write lock.
+pub(crate) fn needs_commit_metadata_snapshot(
+    ctx: &crate::runtime::instance::InstanceContext,
+    bucket: &str,
+    opts: &ObjectOptions,
+) -> bool {
+    let base_required = opts.object_lock_config_snapshot.is_none()
+        && !is_meta_bucketname(bucket)
+        && !(opts.is_lockless_cache_write() && opts.quota_admission.is_none());
+    #[cfg(test)]
+    let base_required = base_required && opts.quota_admission.is_none();
+    #[cfg(any(test, feature = "test-util"))]
+    let base_required = base_required && ctx.bucket_metadata_sys().is_some();
+    #[cfg(not(any(test, feature = "test-util")))]
+    let _ = ctx;
+    base_required
+}
+
+/// Capture an authoritative Object Lock / quota metadata snapshot using an
+/// already-held bucket lifecycle read fence. Acquires only the bucket metadata
+/// transaction read lock (preserving `lifecycle -> transaction -> object` order
+/// without touching `new_ns_lock(bucket, bucket)`).
+pub(crate) async fn capture_object_lock_config_snapshot_under_lifecycle_fence_in(
+    ctx: &crate::runtime::instance::InstanceContext,
+    bucket: &str,
+    lifecycle_fence: &crate::object_api::NamespaceLockFence,
+) -> Result<Arc<crate::object_api::ObjectLockConfigSnapshot>> {
+    if lifecycle_fence.is_lock_lost() {
+        return Err(Error::other("bucket lifecycle lock was lost before loading the Object Lock snapshot"));
+    }
+    let store = object_store_in(ctx).await?;
+    let metadata_guard =
+        acquire_bucket_metadata_transaction_read_lock_in_for_purpose(ctx, bucket, "object_lock_completion_metadata_read").await?;
+    let (state, bucket_incarnation_id, config_revision) =
+        get_object_lock_config_and_incarnation_from_disk_with_guard_in(ctx, bucket, Some(&metadata_guard)).await?;
+    if lifecycle_fence.is_lock_lost() || metadata_guard.is_lock_lost() {
+        return Err(Error::other("bucket lock was lost while loading the Object Lock snapshot"));
+    }
+    Ok(Arc::new(
+        crate::object_api::ObjectLockConfigSnapshot::for_store_bucket_under_lifecycle_fence(
+            store.id,
+            bucket,
+            bucket_incarnation_id,
+            config_revision,
+            state,
+            lifecycle_fence.clone(),
+            Arc::new(metadata_guard),
+        ),
+    ))
+}
+
+/// Clone `opts` and attach a commit-time metadata snapshot captured strictly
+/// before acquiring the object namespace write lock. Reuses an already-held
+/// bucket lifecycle fence when present, otherwise acquires both lifecycle and
+/// metadata-transaction read locks without touching `new_ns_lock(bucket, bucket)`.
+pub(crate) async fn capture_commit_metadata_snapshot_for_options_in(
+    ctx: &crate::runtime::instance::InstanceContext,
+    bucket: &str,
+    expected_incarnation_id: Option<Uuid>,
+    opts: &ObjectOptions,
+) -> Result<ObjectOptions> {
+    let mut commit_opts = opts.clone();
+    let store = object_store_in(ctx).await?;
+    let snapshot = if let Some(lifecycle_fence) = commit_opts.bucket_lifecycle_lock_fence.as_ref() {
+        capture_object_lock_config_snapshot_under_lifecycle_fence_in(ctx, bucket, lifecycle_fence).await?
+    } else {
+        store.object_lock_config_snapshot_for_single_put(bucket).await?
+    };
+    if let Some(expected) = expected_incarnation_id {
+        if snapshot
+            .validated_bucket_incarnation_for(store.id, bucket, Some(expected))
+            .is_none()
+        {
+            return Err(Error::BucketNotFound(bucket.to_string()));
+        }
+    } else if let Some(incarnation) = snapshot.validated_bucket_incarnation_for(store.id, bucket, None) {
+        commit_opts.expected_bucket_incarnation_id = Some(incarnation);
+    } else {
+        return Err(Error::other("bucket generation or configuration changed before commit"));
+    }
+    snapshot.add_lock_fences(&mut commit_opts);
+    commit_opts.object_lock_config_snapshot = Some(snapshot);
+    Ok(commit_opts)
 }
 
 /// Resolve the bucket's hard quota limit (if configured) and bucket incarnation
