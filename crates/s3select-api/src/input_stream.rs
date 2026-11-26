@@ -20,8 +20,9 @@ use async_compression::tokio::bufread::BzDecoder;
 use bytes::{Buf as _, Bytes};
 use datafusion::object_store::{Error as ObjectStoreError, Result as ObjectStoreResult};
 use flate2::bufread::GzDecoder;
-use futures::{StreamExt, stream};
+use futures::{Stream, StreamExt, TryStreamExt as _, stream};
 use futures_core::stream::BoxStream;
+use memchr::{memchr, memchr2};
 use std::{
     error::Error as StdError,
     io::{self, BufRead as _, Read as _},
@@ -356,7 +357,8 @@ impl io::Read for BlockingChannelReader {
     }
 }
 
-pub(crate) fn compressed_input_stream(
+#[cfg(test)]
+fn compressed_input_stream(
     reader: SelectInputReader,
     compressed_size: u64,
     format: CompressionFormat,
@@ -366,22 +368,58 @@ pub(crate) fn compressed_input_stream(
     query_guard: Option<QueryExecutionGuard>,
 ) -> ObjectStoreResult<BoxStream<'static, ObjectStoreResult<Bytes>>> {
     let record_size = RecordSizeTracker::new(record_delimiter).map_err(select_object_store_error)?;
+    compressed_input_stream_with_tracker(
+        reader,
+        compressed_size,
+        format,
+        input_metrics,
+        record_size,
+        max_processed_bytes,
+        query_guard,
+    )
+}
+
+pub(crate) fn compressed_input_stream_with_tracker(
+    reader: SelectInputReader,
+    compressed_size: u64,
+    format: CompressionFormat,
+    input_metrics: Arc<SelectInputMetrics>,
+    record_size: RecordSizeTracker,
+    max_processed_bytes: u64,
+    query_guard: Option<QueryExecutionGuard>,
+) -> ObjectStoreResult<BoxStream<'static, ObjectStoreResult<Bytes>>> {
     let reader = compressed_input_reader(reader, compressed_size, format, input_metrics, max_processed_bytes, query_guard);
-    let stream = ReaderStream::with_capacity(reader, SELECT_DECODE_CHUNK_BYTES);
-    Ok(stream::try_unfold((stream, record_size), |(mut stream, mut record_size)| async move {
+    let stream = ReaderStream::with_capacity(reader, SELECT_DECODE_CHUNK_BYTES).map_err(input_io_error);
+    Ok(record_size_limited_stream(stream, record_size, select_object_store_error))
+}
+
+/// Fails the stream with `OverMaxRecordSize` once a record exceeds
+/// `MAX_SELECT_RECORD_BYTES`. The `ScanRange` splitter and the Arrow decoders
+/// buffer whole records, so every CSV and JSON Lines input path applies it,
+/// compressed or uncompressed.
+pub(crate) fn record_size_limited_stream<S, E>(
+    stream: S,
+    record_size: RecordSizeTracker,
+    map_error: fn(SelectError) -> E,
+) -> BoxStream<'static, Result<Bytes, E>>
+where
+    S: Stream<Item = Result<Bytes, E>> + Send + 'static,
+    E: Send + 'static,
+{
+    stream::try_unfold((stream.boxed(), record_size), move |(mut stream, mut record_size)| async move {
         match stream.next().await {
             Some(Ok(bytes)) => {
-                record_size.observe(&bytes).map_err(select_object_store_error)?;
+                record_size.observe(&bytes).map_err(map_error)?;
                 Ok(Some((bytes, (stream, record_size))))
             }
-            Some(Err(error)) => Err(input_io_error(error)),
+            Some(Err(error)) => Err(error),
             None => {
-                record_size.finish().map_err(select_object_store_error)?;
+                record_size.finish().map_err(map_error)?;
                 Ok(None)
             }
         }
     })
-    .boxed())
+    .boxed()
 }
 
 pub(crate) fn input_io_error(source: io::Error) -> ObjectStoreError {
@@ -395,7 +433,7 @@ pub(crate) fn input_io_error(source: io::Error) -> ObjectStoreError {
     }
 }
 
-fn select_object_store_error(source: SelectError) -> ObjectStoreError {
+pub(crate) fn select_object_store_error(source: SelectError) -> ObjectStoreError {
     ObjectStoreError::Generic {
         store: "EcObjectStore",
         source: Box::new(source),
@@ -657,84 +695,127 @@ pub(crate) fn find_error_source<'a, T: StdError + 'static>(error: &'a (dyn StdEr
     None
 }
 
-struct RecordSizeTracker {
-    delimiter: Vec<u8>,
-    prefix: Vec<usize>,
+enum RecordDelimiterMatcher {
+    /// Default CSV line endings (`\r`, `\n`, or `\r\n`) when no custom `RecordDelimiter` is configured.
+    DefaultCsvLineEnding,
+    SingleByte(u8),
+    MultiByte {
+        delimiter: Vec<u8>,
+        prefix: Vec<usize>,
+        matched: usize,
+    },
+}
+
+pub(crate) struct RecordSizeTracker {
+    matcher: RecordDelimiterMatcher,
     record_bytes: usize,
-    matched: usize,
 }
 
 impl RecordSizeTracker {
-    fn new(delimiter: Vec<u8>) -> Result<Self, SelectError> {
+    pub(crate) fn default_csv() -> Self {
+        Self {
+            matcher: RecordDelimiterMatcher::DefaultCsvLineEnding,
+            record_bytes: 0,
+        }
+    }
+
+    pub(crate) fn new(delimiter: Vec<u8>) -> Result<Self, SelectError> {
         if delimiter.is_empty() {
             return Err(SelectError::InvalidDataSource);
         }
-
-        let mut prefix = vec![0; delimiter.len()];
-        let mut matched = 0;
-        for index in 1..delimiter.len() {
-            while matched > 0 && delimiter[index] != delimiter[matched] {
-                matched = prefix[matched - 1];
+        let matcher = if delimiter.len() == 1 {
+            RecordDelimiterMatcher::SingleByte(delimiter[0])
+        } else {
+            let mut prefix = vec![0; delimiter.len()];
+            let mut matched = 0;
+            for index in 1..delimiter.len() {
+                while matched > 0 && delimiter[index] != delimiter[matched] {
+                    matched = prefix[matched - 1];
+                }
+                if delimiter[index] == delimiter[matched] {
+                    matched += 1;
+                }
+                prefix[index] = matched;
             }
-            if delimiter[index] == delimiter[matched] {
-                matched += 1;
+            RecordDelimiterMatcher::MultiByte {
+                delimiter,
+                prefix,
+                matched: 0,
             }
-            prefix[index] = matched;
-        }
+        };
 
         Ok(Self {
-            delimiter,
-            prefix,
+            matcher,
             record_bytes: 0,
-            matched: 0,
         })
     }
 
-    fn observe(&mut self, bytes: &[u8]) -> Result<(), SelectError> {
-        if self.delimiter.len() == 1 {
-            return self.observe_single_byte_delimiter(bytes);
-        }
-
-        for &byte in bytes {
-            self.record_bytes = self.record_bytes.checked_add(1).ok_or(SelectError::OverMaxRecordSize)?;
-            while self.matched > 0 && byte != self.delimiter[self.matched] {
-                self.matched = self.prefix[self.matched - 1];
-            }
-            if byte == self.delimiter[self.matched] {
-                self.matched += 1;
-            }
-            if self.matched == self.delimiter.len() {
-                let payload_bytes = self.record_bytes - self.delimiter.len();
-                if payload_bytes > MAX_SELECT_RECORD_BYTES {
+    fn observe(&mut self, mut bytes: &[u8]) -> Result<(), SelectError> {
+        match &mut self.matcher {
+            RecordDelimiterMatcher::DefaultCsvLineEnding => {
+                while let Some(index) = memchr2(b'\r', b'\n', bytes) {
+                    let payload_bytes = self.record_bytes.checked_add(index).ok_or(SelectError::OverMaxRecordSize)?;
+                    if payload_bytes > MAX_SELECT_RECORD_BYTES {
+                        return Err(SelectError::OverMaxRecordSize);
+                    }
+                    self.record_bytes = 0;
+                    bytes = &bytes[index + 1..];
+                }
+                self.record_bytes = self
+                    .record_bytes
+                    .checked_add(bytes.len())
+                    .ok_or(SelectError::OverMaxRecordSize)?;
+                if self.record_bytes > MAX_SELECT_RECORD_BYTES {
                     return Err(SelectError::OverMaxRecordSize);
                 }
-                self.record_bytes = 0;
-                self.matched = 0;
-            } else if self.record_bytes - self.matched > MAX_SELECT_RECORD_BYTES {
-                return Err(SelectError::OverMaxRecordSize);
+                Ok(())
+            }
+            RecordDelimiterMatcher::SingleByte(delimiter) => {
+                let delimiter = *delimiter;
+                while let Some(index) = memchr(delimiter, bytes) {
+                    let payload_bytes = self.record_bytes.checked_add(index).ok_or(SelectError::OverMaxRecordSize)?;
+                    if payload_bytes > MAX_SELECT_RECORD_BYTES {
+                        return Err(SelectError::OverMaxRecordSize);
+                    }
+                    self.record_bytes = 0;
+                    bytes = &bytes[index + 1..];
+                }
+                self.record_bytes = self
+                    .record_bytes
+                    .checked_add(bytes.len())
+                    .ok_or(SelectError::OverMaxRecordSize)?;
+                if self.record_bytes > MAX_SELECT_RECORD_BYTES {
+                    return Err(SelectError::OverMaxRecordSize);
+                }
+                Ok(())
+            }
+            RecordDelimiterMatcher::MultiByte {
+                delimiter,
+                prefix,
+                matched,
+            } => {
+                for &byte in bytes {
+                    self.record_bytes = self.record_bytes.checked_add(1).ok_or(SelectError::OverMaxRecordSize)?;
+                    while *matched > 0 && byte != delimiter[*matched] {
+                        *matched = prefix[*matched - 1];
+                    }
+                    if byte == delimiter[*matched] {
+                        *matched += 1;
+                    }
+                    if *matched == delimiter.len() {
+                        let payload_bytes = self.record_bytes - delimiter.len();
+                        if payload_bytes > MAX_SELECT_RECORD_BYTES {
+                            return Err(SelectError::OverMaxRecordSize);
+                        }
+                        self.record_bytes = 0;
+                        *matched = 0;
+                    } else if self.record_bytes - *matched > MAX_SELECT_RECORD_BYTES {
+                        return Err(SelectError::OverMaxRecordSize);
+                    }
+                }
+                Ok(())
             }
         }
-        Ok(())
-    }
-
-    fn observe_single_byte_delimiter(&mut self, mut bytes: &[u8]) -> Result<(), SelectError> {
-        let delimiter = self.delimiter[0];
-        while let Some(index) = bytes.iter().position(|byte| *byte == delimiter) {
-            let payload_bytes = self.record_bytes.checked_add(index).ok_or(SelectError::OverMaxRecordSize)?;
-            if payload_bytes > MAX_SELECT_RECORD_BYTES {
-                return Err(SelectError::OverMaxRecordSize);
-            }
-            self.record_bytes = 0;
-            bytes = &bytes[index + 1..];
-        }
-        self.record_bytes = self
-            .record_bytes
-            .checked_add(bytes.len())
-            .ok_or(SelectError::OverMaxRecordSize)?;
-        if self.record_bytes > MAX_SELECT_RECORD_BYTES {
-            return Err(SelectError::OverMaxRecordSize);
-        }
-        Ok(())
     }
 
     fn finish(&self) -> Result<(), SelectError> {

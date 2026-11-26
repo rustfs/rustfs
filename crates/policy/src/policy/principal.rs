@@ -133,6 +133,13 @@ impl Principal {
         }
         false
     }
+
+    /// Returns `true` when the principal admits callers it does not name, matching
+    /// either the wildcard account `"*"` or the empty account `""` used to evaluate
+    /// unauthenticated requests.
+    pub fn is_public(&self) -> bool {
+        self.is_match("*") || self.is_match("")
+    }
 }
 
 impl Validator for Principal {
@@ -235,5 +242,27 @@ mod test {
         assert!(principal.is_match("arn:aws:iam::123456789012:root"));
         assert!(!principal.is_match("logging.s3.amazonaws.com"));
         assert!(!principal.is_match("other-principal"));
+    }
+
+    #[test_case(r#""*""#, true ; "wildcard_string")]
+    #[test_case(r#"{"AWS": ["*"]}"#, true ; "aws_wildcard")]
+    #[test_case(r#"{"AWS": "**"}"#, true ; "aws_double_wildcard")]
+    #[test_case(r#"{"AWS": "?"}"#, true ; "aws_single_char_wildcard")]
+    #[test_case(r#"{"AWS": [""]}"#, true ; "aws_empty_array")]
+    #[test_case(r#"{"AWS": ""}"#, true ; "aws_empty_string")]
+    #[test_case(r#"{"AWS": ["alice", ""]}"#, true ; "aws_named_and_empty")]
+    #[test_case(r#"{"AWS": ["?nobody"]}"#, true ; "aws_leading_question_mark")]
+    #[test_case(r#"{"AWS": ["*?nobody"]}"#, true ; "aws_star_question_mark")]
+    #[test_case(r#"{"AWS": ["alice"]}"#, false ; "aws_named")]
+    #[test_case(r#"{"AWS": ["alice*"]}"#, false ; "aws_named_prefix")]
+    #[test_case(r#"{"AWS": ["arn:aws:iam::123456789012:root"]}"#, false ; "aws_arn")]
+    #[test_case(r#"{"Service": ""}"#, false ; "service_empty")]
+    #[test_case(r#"{"Service": "logging.s3.amazonaws.com"}"#, false ; "service_named")]
+    fn test_principal_is_public(json: &str, expected: bool) {
+        let principal: Principal = serde_json::from_str(json).expect("Should parse");
+        assert_eq!(principal.is_public(), expected, "input: {json}");
+        // Unauthenticated requests are evaluated under the empty account; any principal
+        // matching it must be classified as public.
+        assert!(!principal.is_match("") || principal.is_public(), "input: {json}");
     }
 }

@@ -212,13 +212,19 @@ impl KeystoneAuthProvider {
         claims.insert("keystone_roles".to_string(), json!(token.roles));
         claims.insert("auth_source".to_string(), json!("keystone"));
 
+        // Keep `parent_user` in the `keystone:` namespace (matching `access_key`) so an external
+        // Keystone username can never collide with a local IAM user or the root access key in
+        // service-account ownership or admin checks. The username remains available in `name`
+        // and `claims["keystone_username"]`.
+        let access_key = format!("keystone:{}", token.user_id);
+
         Credentials {
-            access_key: format!("keystone:{}", token.user_id),
+            access_key: access_key.clone(),
             secret_key: String::new(), // Not used for token auth
             session_token: token.token.clone(),
             expiration: Some(token.expires_at),
             status: "active".to_string(),
-            parent_user: token.username.clone(),
+            parent_user: access_key,
             groups,
             claims: Some(claims),
             name: Some(token.username.clone()),
@@ -303,13 +309,64 @@ mod tests {
         let cred = provider.keystone_token_to_credentials(&token);
 
         assert_eq!(cred.access_key, "keystone:user123");
-        assert_eq!(cred.parent_user, "testuser");
+        assert_eq!(cred.parent_user, "keystone:user123");
+        assert_eq!(cred.name.as_deref(), Some("testuser"));
         assert_eq!(cred.groups, Some(vec!["Member".to_string(), "admin".to_string()]));
         assert!(cred.claims.is_some());
 
-        let claims = cred.claims.unwrap();
-        assert_eq!(claims.get("keystone_user_id").unwrap().as_str().unwrap(), "user123");
-        assert_eq!(claims.get("keystone_project_id").unwrap().as_str().unwrap(), "proj456");
+        let claims = cred.claims.expect("keystone claims must be populated");
+        assert_eq!(claims.get("keystone_user_id").and_then(|v| v.as_str()), Some("user123"));
+        assert_eq!(claims.get("keystone_username").and_then(|v| v.as_str()), Some("testuser"));
+        assert_eq!(claims.get("keystone_project_id").and_then(|v| v.as_str()), Some("proj456"));
+    }
+
+    #[test]
+    fn test_keystone_parent_user_uses_namespaced_identity_not_username() {
+        let client = KeystoneClient::new(
+            "http://localhost:5000".to_string(),
+            crate::KeystoneVersion::V3,
+            None,
+            None,
+            None,
+            "Default".to_string(),
+            true,
+            Duration::from_secs(30),
+        );
+
+        let provider = KeystoneAuthProvider::new(client, 100, Duration::from_secs(60), true);
+
+        for (user_id, colliding_username) in [("uid-alice", "alice"), ("uid-root-lookalike", "rustfsadmin")] {
+            let token = KeystoneToken {
+                token: "test-token".to_string(),
+                user_id: user_id.to_string(),
+                username: colliding_username.to_string(),
+                project_id: None,
+                project_name: None,
+                domain_id: Some("default".to_string()),
+                domain_name: Some("Default".to_string()),
+                roles: vec!["member".to_string()],
+                expires_at: time::OffsetDateTime::now_utc() + time::Duration::hours(1),
+                issued_at: time::OffsetDateTime::now_utc(),
+            };
+
+            let cred = provider.keystone_token_to_credentials(&token);
+            let expected_identity = format!("keystone:{user_id}");
+
+            assert_eq!(cred.access_key, expected_identity);
+            assert_eq!(cred.parent_user, expected_identity);
+            assert_ne!(
+                cred.parent_user, colliding_username,
+                "parent_user must never carry the bare Keystone username"
+            );
+            assert_eq!(cred.name.as_deref(), Some(colliding_username));
+            assert_eq!(
+                cred.claims
+                    .as_ref()
+                    .and_then(|claims| claims.get("keystone_username"))
+                    .and_then(|value| value.as_str()),
+                Some(colliding_username)
+            );
+        }
     }
 
     #[test]
