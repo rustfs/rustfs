@@ -89,7 +89,9 @@ use crate::app::object::{
     ManagedObjectError,
 };
 use crate::app::storage_api::managed::{ManagedObjectAccess, ManagedObjectOperation};
-use crate::app::storage_api::object_usecase::sse::{KmsKeyAuthorizer, ManagedSseRuntime, SseKmsPrincipal, SseKmsPrincipalExt, sse_error};
+use crate::app::storage_api::object_usecase::sse::{
+    KmsKeyAuthorizer, ManagedSseRuntime, SseKmsPrincipal, SseKmsPrincipalExt, sse_error,
+};
 use crate::table_catalog::{VectorEffectiveEncryptionV1, VectorMaintenanceDispatchGuard};
 use rustfs_policy::policy::{
     Args,
@@ -350,8 +352,15 @@ struct MaintenanceKmsAuthorizer {
 
 #[async_trait::async_trait]
 impl KmsKeyAuthorizer for MaintenanceKmsAuthorizer {
-    async fn is_allowed(&self, principal: &SseKmsPrincipal, action: KmsAction, key_id: &str) -> Result<bool, rustfs_sse::SseError> {
-        let (identity, _) = resolve_identity(&self.app, self.identity.account()).await.map_err(sse_error)?;
+    async fn is_allowed(
+        &self,
+        principal: &SseKmsPrincipal,
+        action: KmsAction,
+        key_id: &str,
+    ) -> Result<bool, rustfs_sse::SseError> {
+        let (identity, _) = resolve_identity(&self.app, self.identity.account())
+            .await
+            .map_err(sse_error)?;
         if identity != self.identity {
             return Err(sse_error(ApiError::access_denied()));
         }

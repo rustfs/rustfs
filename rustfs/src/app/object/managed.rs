@@ -1146,6 +1146,20 @@ pub(super) mod tests {
         }
     }
 
+    fn managed_envelope(extensions: http::Extensions) -> RequestEnvelope {
+        RequestEnvelope::from_parts(
+            crate::app::RequestHead {
+                method: http::Method::POST,
+                uri: http::Uri::from_static("/"),
+                headers: http::HeaderMap::new(),
+                credentials: None,
+                region: None,
+                service: None,
+            },
+            extensions,
+        )
+    }
+
     async fn managed_fixture() -> (DefaultObjectUsecase, ManagedObjectContext, Arc<ECStore>, SseProviderReset) {
         managed_fixture_with_encryption(ManagedEncryption::Aes256).await
     }
@@ -1207,13 +1221,13 @@ pub(super) mod tests {
             .collect(),
         )
         .expect("scope");
-        let mut request = super::super::test_support::build_request((), http::Method::POST);
+        let mut extensions = http::Extensions::new();
         let request_context = request_context::RequestContext::fallback();
-        request.extensions.insert(request_context.clone());
+        extensions.insert(request_context.clone());
         let server = crate::app::runtime_sources::ServerContextSlot::new();
         assert!(server.install(Arc::clone(&app_context)));
-        request.extensions.insert(server);
-        request.extensions.insert(crate::app::storage_api::test::ReqInfo {
+        extensions.insert(server);
+        extensions.insert(crate::app::storage_api::test::ReqInfo {
             cred: Some(rustfs_credentials::Credentials {
                 access_key: "managed-test-user".into(),
                 ..Default::default()
@@ -1222,9 +1236,8 @@ pub(super) mod tests {
             request_context: Some(request_context),
             ..Default::default()
         });
-        let context =
-            ManagedObjectContext::from_authorized_request(scope, Arc::new(RequestEnvelope::from_s3s(&request)), encryption)
-                .expect("authorized context");
+        let context = ManagedObjectContext::from_authorized_request(scope, Arc::new(managed_envelope(extensions)), encryption)
+            .expect("authorized context");
         (DefaultObjectUsecase::with_context(Some(app_context)), context, store, reset)
     }
 
@@ -1634,13 +1647,11 @@ pub(super) mod tests {
             .await
             .expect("inject unrelated cached default");
         let authorizer = RecordingKmsKeyAuthorizer::new(false);
-        let mut request = super::super::test_support::build_request((), http::Method::POST);
+        let mut extensions = http::Extensions::new();
         let request_context = request_context::RequestContext::fallback();
-        request.extensions.insert(request_context.clone());
-        request
-            .extensions
-            .insert(original.request_for_test().server_context().expect("server context").clone());
-        request.extensions.insert(crate::app::storage_api::test::ReqInfo {
+        extensions.insert(request_context.clone());
+        extensions.insert(original.request_for_test().server_context().expect("server context").clone());
+        extensions.insert(crate::app::storage_api::test::ReqInfo {
             cred: Some(rustfs_credentials::Credentials {
                 access_key: "unencrypted-user".into(),
                 ..Default::default()
@@ -1649,13 +1660,13 @@ pub(super) mod tests {
             request_context: Some(request_context),
             ..Default::default()
         });
-        request.extensions.insert(TestAuthorizationHooks {
+        extensions.insert(TestAuthorizationHooks {
             enforced: true,
             authorizer: authorizer.clone(),
         });
         let context = ManagedObjectContext::from_authorized_request(
             original.access.clone(),
-            Arc::new(RequestEnvelope::from_s3s(&request)),
+            Arc::new(managed_envelope(extensions)),
             ManagedEncryption::Unencrypted,
         )
         .expect("unencrypted context");
@@ -1941,10 +1952,10 @@ pub(super) mod tests {
         let bucket = context.access.bucket().storage_bucket_id().as_str();
         let probe = crate::app::storage_api::object_usecase::helper::MutationCompletionProbe::install(bucket);
         let authorizer = RecordingKmsKeyAuthorizer::new(false);
-        let mut request = super::super::test_support::build_request((), http::Method::POST);
+        let mut extensions = http::Extensions::new();
         let request_context = request_context::RequestContext::fallback();
-        request.extensions.insert(request_context.clone());
-        request.extensions.insert(crate::app::storage_api::test::ReqInfo {
+        extensions.insert(request_context.clone());
+        extensions.insert(crate::app::storage_api::test::ReqInfo {
             cred: Some(rustfs_credentials::Credentials {
                 access_key: "denied-kms-user".into(),
                 ..Default::default()
@@ -1953,13 +1964,13 @@ pub(super) mod tests {
             request_context: Some(request_context),
             ..Default::default()
         });
-        request.extensions.insert(TestAuthorizationHooks {
+        extensions.insert(TestAuthorizationHooks {
             enforced: true,
             authorizer: authorizer.clone(),
         });
         let denied = ManagedObjectContext::from_authorized_request(
             context.access.clone(),
-            Arc::new(RequestEnvelope::from_s3s(&request)),
+            Arc::new(managed_envelope(extensions)),
             ManagedEncryption::AwsKms {
                 key_id: "managed-test-key".into(),
             },
@@ -2040,10 +2051,10 @@ pub(super) mod tests {
             .expect("managed KMS key");
         set_sse_dek_provider_for_test(kms_sse_dek_provider_for_test(manager).await.expect("real KMS provider"));
         let authorizer = RecordingKmsKeyAuthorizer::new(true);
-        let mut request = super::super::test_support::build_request((), http::Method::POST);
+        let mut extensions = http::Extensions::new();
         let request_context = request_context::RequestContext::fallback();
-        request.extensions.insert(request_context.clone());
-        request.extensions.insert(crate::app::storage_api::test::ReqInfo {
+        extensions.insert(request_context.clone());
+        extensions.insert(crate::app::storage_api::test::ReqInfo {
             cred: Some(rustfs_credentials::Credentials {
                 access_key: "managed-kms-user".into(),
                 ..Default::default()
@@ -2052,16 +2063,13 @@ pub(super) mod tests {
             request_context: Some(request_context),
             ..Default::default()
         });
-        request.extensions.insert(TestAuthorizationHooks {
+        extensions.insert(TestAuthorizationHooks {
             enforced: true,
             authorizer: authorizer.clone(),
         });
-        let context = ManagedObjectContext::from_authorized_request(
-            initial.access,
-            Arc::new(RequestEnvelope::from_s3s(&request)),
-            encryption,
-        )
-        .expect("KMS operation context");
+        let context =
+            ManagedObjectContext::from_authorized_request(initial.access, Arc::new(managed_envelope(extensions)), encryption)
+                .expect("KMS operation context");
         let key = format!("{}kms.bin", context.access.allowed_prefix());
         let payload = Bytes::from_static(b"encrypted managed manifest");
         let created = usecase
