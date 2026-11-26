@@ -27,7 +27,7 @@ use crate::{
     },
     query::{
         ast::{JsonPathSegment, JsonSource},
-        parser::RustFsDialect,
+        parser::{BoundedRustFsDialect, validate_set_operator_budget},
         session::QueryExecutionTracker,
     },
     resolve_select_object_store_handle, select_is_err_bucket_not_found, select_is_err_object_not_found,
@@ -47,6 +47,7 @@ use datafusion::{
         sqlparser::{
             ast::{Expr, Ident, JsonPathElem, ObjectNamePart, SetExpr, Statement, TableFactor},
             parser::Parser as SqlParser,
+            tokenizer::Tokenizer,
         },
     },
 };
@@ -515,10 +516,19 @@ pub(crate) fn is_json_document_input(input: &SelectObjectContentInput) -> bool {
 
 /// Preserves the pre-typed-path single-key behavior of public legacy constructors.
 pub(crate) fn legacy_json_source_from_input(input: &SelectObjectContentInput) -> JsonSource {
-    if !is_json_document_input(input) {
+    const MAX_LEGACY_EXPRESSION_BYTES: usize = 256 * 1024;
+
+    if !is_json_document_input(input) || input.request.expression.len() > MAX_LEGACY_EXPRESSION_BYTES {
         return JsonSource::default();
     }
-    let Ok(mut statements) = SqlParser::parse_sql(&RustFsDialect, &input.request.expression) else {
+    let dialect = BoundedRustFsDialect::default();
+    let Ok(tokens) = Tokenizer::new(&dialect, &input.request.expression).tokenize() else {
+        return JsonSource::default();
+    };
+    if validate_set_operator_budget(&tokens).is_err() {
+        return JsonSource::default();
+    }
+    let Ok(mut statements) = SqlParser::new(&dialect).with_tokens(tokens).parse_statements() else {
         return JsonSource::default();
     };
     if statements.len() != 1 {
@@ -1637,6 +1647,23 @@ mod test {
         );
         assert_eq!(legacy_json_source_from_input(&key).scalar_column(), Some("longkey"));
         assert_eq!(legacy_json_source_from_input(&quoted_key).scalar_column(), Some("LongKey"));
+    }
+
+    #[test]
+    fn legacy_source_adapter_bounds_operator_and_set_chains_on_small_stack() {
+        let plus_chain = format!("SELECT {} FROM S3Object.employees", vec!["1"; 64 * 1024].join("+"));
+        let trailing_err = format!("SELECT {}+) FROM S3Object.employees", vec!["1"; 64 * 1024].join("+"));
+        let union_chain = vec!["SELECT 1"; 16 * 1024].join(" UNION ");
+        for expression in [plus_chain, trailing_err, union_chain] {
+            let input = json_document_input("bucket", "input.json", &expression);
+            let source = std::thread::Builder::new()
+                .stack_size(1024 * 1024)
+                .spawn(move || legacy_json_source_from_input(&input))
+                .expect("spawn bounded-stack worker")
+                .join()
+                .expect("bounded parser must not overflow worker stack");
+            assert_eq!(source, JsonSource::default());
+        }
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
