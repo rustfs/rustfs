@@ -1429,7 +1429,9 @@ pub(crate) mod test {
     }
     pub(crate) use crate::storage::storage_api::bootstrap_instance_ctx;
     pub(crate) use crate::storage::storage_api::ecstore_bucket::install_all_v6_fleet_capability_proof;
-    pub(crate) use crate::storage::storage_api::test_consumer::{get_global_bucket_metadata_sys, set_bucket_metadata};
+    pub(crate) use crate::storage::storage_api::test_consumer::{
+        DeleteAfterObjectLockSnapshotBarrier, get_global_bucket_metadata_sys, set_bucket_metadata,
+    };
     pub(crate) use crate::storage::storage_api::{
         ECStore, Endpoint, Endpoints, PoolEndpoints, StorageObjectInfo, StorageObjectOptions, StoragePutObjReader,
     };
