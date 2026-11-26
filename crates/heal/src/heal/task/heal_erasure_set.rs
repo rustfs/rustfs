@@ -460,13 +460,14 @@ impl HealTask {
             progress.update_stage(2, 4);
         }
 
-        // Step 3: Heal bucket structure
-        // Check control flags before each iteration to ensure timely cancellation.
+        // Crash recovery queues a snapshot of names. Check the live generation under the
+        // lifecycle fence before repairing directories that DeleteBucket may have removed.
+        let crash_recovery = self.source == HealRequestSource::AutoHeal && self.heal_endpoints.is_empty();
         let bucket_heal_opts = HealOpts {
             recursive: false,
             dry_run: self.options.dry_run,
             remove: false,
-            recreate: self.options.recreate_missing,
+            recreate: self.options.recreate_missing && !crash_recovery,
             scan_mode: self.options.scan_mode,
             update_parity: self.options.update_parity,
             no_lock: self.options.no_lock,
@@ -485,6 +486,11 @@ impl HealTask {
             }
             let expected = if let Some((_, manager, _)) = replacement_resume.as_ref() {
                 Some(manager.replacement_bucket_incarnation(bucket).await?)
+            } else if crash_recovery {
+                let Some(incarnation) = self.await_with_control(self.storage.bucket_incarnation_id(bucket)).await? else {
+                    continue;
+                };
+                Some(incarnation)
             } else {
                 None
             };
@@ -500,6 +506,7 @@ impl HealTask {
                 Ok(result) => {
                     self.record_result_item(result).await;
                 }
+                Err(Error::StaleBucketIncarnation { .. }) if crash_recovery => continue,
                 Err(err) => {
                     // Cancellation and timeout keep their classification; only
                     // a storage failure may be reclassified as a namespace change.

@@ -1559,6 +1559,7 @@ impl HealStorageAPI for ECStoreHealStorage {
 
         match self.ecstore.get_bucket_info(bucket, &Default::default()).await {
             Ok(info) => Ok(Some(info)),
+            Err(StorageError::VolumeNotFound | StorageError::BucketNotFound(_)) => Ok(None),
             Err(e) => {
                 error!(
                     target: "rustfs::heal::storage",
@@ -1577,13 +1578,8 @@ impl HealStorageAPI for ECStoreHealStorage {
     }
 
     async fn mrf_bucket_incarnation_id(&self, bucket: &str) -> Result<Option<Uuid>> {
-        match self.ecstore.bucket_incarnation_id(bucket).await {
-            Ok(incarnation) => Ok(Some(incarnation)),
-            // A missing bucket leaves the current identity unresolved. It is
-            // not a retirement receipt for an unknown source generation.
-            Err(StorageError::BucketNotFound(_)) => Ok(None),
-            Err(error) => Err(Error::Storage(error)),
-        }
+        // A missing identity leaves the source generation unresolved for MRF replay.
+        self.bucket_incarnation_id(bucket).await
     }
 
     async fn replacement_bucket_incarnation(&self, bucket: &str) -> Result<Option<Uuid>> {
@@ -1828,11 +1824,11 @@ impl HealStorageAPI for ECStoreHealStorage {
     }
 
     async fn bucket_incarnation_id(&self, bucket: &str) -> Result<Option<Uuid>> {
-        self.ecstore
-            .bucket_incarnation_id(bucket)
-            .await
-            .map(Some)
-            .map_err(Error::Storage)
+        match self.ecstore.bucket_incarnation_id(bucket).await {
+            Ok(id) => Ok(Some(id)),
+            Err(StorageError::BucketNotFound(_)) => Ok(None),
+            Err(error) => Err(Error::Storage(error)),
+        }
     }
 
     async fn heal_object(
