@@ -68,7 +68,6 @@ async fn collect_bucket_presence(
         .into())
 }
 
-
 impl SetDisks {
     /// Require proof from every configured disk before retiring a bucket
     /// generation whose visible volume was removed outside the storage API.

@@ -12,7 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-pub(in crate::disk) use self::commit::LocalRenamePreflightRejection;
 #[cfg(test)]
 #[path = "local/read_path_tests.rs"]
 mod read_path_tests;

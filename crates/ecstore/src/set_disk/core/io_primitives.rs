@@ -149,7 +149,7 @@ use std::{
     time::{Duration, Instant},
 };
 use tokio::io::{AsyncRead, ReadBuf};
-use tokio::sync::{RwLock, mpsc, oneshot};
+use tokio::sync::{RwLock, mpsc, oneshot, watch};
 use tokio::task::JoinSet;
 
 pub(in crate::set_disk) const EVENT_SET_DISK_READ: &str = "set_disk_read";
@@ -3279,6 +3279,7 @@ fn rename_tail_cleanup_queue() -> &'static RenameTailCleanupQueue {
 }
 
 const EVENT_SET_DISK_RENAME_ROLLBACK: &str = "set_disk_rename_rollback";
+const PUT_RENAME_POST_QUORUM_CONNECT_GRACE: Duration = Duration::from_secs(1);
 
 #[derive(Clone, Copy)]
 enum RenameDispatchState {
@@ -3323,6 +3324,7 @@ struct RenameSlotContext {
     paths: RenameSlotPaths,
     successful_completion_rank: Option<Arc<AtomicUsize>>,
     write_quorum: usize,
+    connect_deadline: Option<disk::RenameConnectDeadline>,
 }
 
 struct RenameOutcomeProducerArgs {
@@ -3334,6 +3336,7 @@ struct RenameOutcomeProducerArgs {
     publication_scope: Option<crate::object_api::ScannerPublicationCommitScope>,
     write_quorum: usize,
     allow_batch: bool,
+    connect_deadline: Option<disk::RenameConnectDeadline>,
 }
 
 struct RenameOutcomeProducers {
@@ -3827,6 +3830,7 @@ pub(in crate::set_disk) struct RenameDataFenceOptions<'a> {
     rollback_receipt: Option<RenameRollbackReceipt>,
     multipart_proof_authority: Option<crate::disk::multipart_source::ProofVerificationContext>,
     multipart_commit_owner: Option<Arc<MultipartLogicalGuards>>,
+    bound_connect_after_quorum: bool,
 }
 
 impl<'a> RenameDataFenceOptions<'a> {
@@ -3842,7 +3846,13 @@ impl<'a> RenameDataFenceOptions<'a> {
             rollback_receipt: None,
             multipart_proof_authority: None,
             multipart_commit_owner: None,
+            bound_connect_after_quorum: false,
         }
+    }
+
+    pub(in crate::set_disk) fn with_quorum_bounded_connect(mut self, enabled: bool) -> Self {
+        self.bound_connect_after_quorum = enabled;
+        self
     }
 
     pub(in crate::set_disk) fn with_multipart_commit_owner(mut self, owner: Arc<MultipartLogicalGuards>) -> Self {
@@ -4426,6 +4436,7 @@ impl SetDisks {
                 disk::RenameDataGuards {
                     scanner_publication_lease_token: context.scanner_token,
                     namespace_owner: context.namespace_owner.clone(),
+                    connect_deadline: context.connect_deadline.clone(),
                     ..Default::default()
                 },
             )
@@ -4602,6 +4613,7 @@ impl SetDisks {
             publication_scope,
             write_quorum,
             allow_batch,
+            connect_deadline,
         } = args;
         debug_assert!(!allow_batch || publication_scope.is_none());
         let disk_count = disks.len();
@@ -4636,6 +4648,7 @@ impl SetDisks {
                 paths: paths.clone(),
                 successful_completion_rank: successful_completion_rank.clone(),
                 write_quorum,
+                connect_deadline: connect_deadline.clone(),
             };
             let resource_unit = resource_unit.clone();
             let producer = crate::disk::with_optional_resource_unit(resource_unit, async move {
@@ -4653,6 +4666,7 @@ impl SetDisks {
             let group_disks = disks.clone();
             let group_tokens = fence_tokens.clone();
             let resource_unit = resource_unit.clone();
+            let connect_deadline = connect_deadline.clone();
             let producer = crate::disk::with_optional_resource_unit(resource_unit, async move {
                 let prepared = join_all(group.slots.into_iter().map(|slot| {
                     let context = RenameSlotContext {
@@ -4665,6 +4679,7 @@ impl SetDisks {
                         paths: paths.clone(),
                         successful_completion_rank: successful_completion_rank.clone(),
                         write_quorum,
+                        connect_deadline: connect_deadline.clone(),
                     };
                     async move { (slot, Self::prepare_and_admit_rename_slot(context).await) }
                 }))
@@ -4736,6 +4751,7 @@ impl SetDisks {
                                     &paths.dst_bucket,
                                     &paths.dst_object,
                                     items,
+                                    connect_deadline,
                                 )
                                 .await
                         }
@@ -4844,6 +4860,7 @@ impl SetDisks {
             rollback_receipt,
             multipart_proof_authority: _,
             multipart_commit_owner: _,
+            bound_connect_after_quorum: _,
         } = fence_options;
         if let Some(file_info) = disks
             .iter()
@@ -4896,6 +4913,7 @@ impl SetDisks {
                     publication_scope: scanner_publication_commit_scope,
                     write_quorum,
                     allow_batch,
+                    connect_deadline: None,
                 });
 
                 let mut commit_tx = Some(commit_tx);
@@ -5216,6 +5234,7 @@ impl SetDisks {
             rollback_receipt,
             multipart_proof_authority,
             multipart_commit_owner,
+            bound_connect_after_quorum,
         } = fence_options;
         if let Some(file_info) = disks
             .iter()
@@ -5285,6 +5304,13 @@ impl SetDisks {
                 dst_object: fanout_dst_object.clone(),
             };
             let allow_batch = !protected_multipart && scanner_publication_commit_scope.is_none();
+            let (connect_deadline_tx, connect_deadline) =
+                if bound_connect_after_quorum && fanout_disks.iter().flatten().any(|disk| !disk.is_local()) {
+                    let (tx, rx) = watch::channel(None);
+                    (Some(tx), Some(rx))
+                } else {
+                    (None, None)
+                };
             let RenameOutcomeProducers {
                 outcomes: mut outcome_rx,
                 mut tasks,
@@ -5297,9 +5323,19 @@ impl SetDisks {
                 publication_scope: scanner_publication_commit_scope,
                 write_quorum,
                 allow_batch,
+                connect_deadline,
             });
             let mut results = Vec::with_capacity(disk_count);
+            let mut successful = 0;
             while let Some(outcome) = outcome_rx.recv().await {
+                if let Some(tx) = connect_deadline_tx.as_ref()
+                    && matches!(&outcome.completion, Ok(Ok(_)))
+                {
+                    successful += 1;
+                    if successful == write_quorum {
+                        tx.send_replace(Some(tokio::time::Instant::now() + PUT_RENAME_POST_QUORUM_CONNECT_GRACE));
+                    }
+                }
                 results.push(outcome);
             }
             while tasks.join_next().await.is_some() {}
@@ -12815,6 +12851,66 @@ mod tests {
                 dir.path().join(bucket).join(object).join(STORAGE_FORMAT_FILE).exists(),
                 "disk {idx} must finish the rename after caller cancellation"
             );
+        }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(capacity_dirty_scope)]
+    async fn rename_data_bounds_cold_connect_after_durable_quorum() {
+        const DISKS: usize = 4;
+        let bucket = "rename-connect-tail-bucket";
+        let object = "rename-connect-tail-object";
+        let (dirs, mut disks) = call_counter_local_disks(bucket, DISKS).await;
+        prepare_rename_source_dirs(&dirs, &disks, "source").await;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind cold peer");
+        // The TCP socket remains open, but there is no TLS server to finish the dial.
+        let endpoint = crate::disk::endpoint::Endpoint {
+            url: url::Url::parse(&format!("https://{}/data/rustfs0", listener.local_addr().expect("cold peer address")))
+                .expect("cold peer URL"),
+            is_local: false,
+            pool_idx: 0,
+            set_idx: 0,
+            disk_idx: 3,
+        };
+        disks[DISKS - 1] = Some(
+            crate::disk::new_disk(
+                &endpoint,
+                &crate::disk::DiskOption {
+                    cleanup: false,
+                    health_check: false,
+                },
+            )
+            .await
+            .expect("construct remote disk"),
+        );
+        let file_infos = rename_commit_fileinfos(object, DISKS, "bounded-connect-etag");
+        let commit = temp_env::async_with_vars([(rustfs_config::ENV_INTERNODE_CONNECT_TIMEOUT_SECS, Some("15"))], async {
+            tokio::time::timeout(
+                Duration::from_secs(5),
+                SetDisks::rename_data_owned_with_fence(
+                    &disks,
+                    (RUSTFS_META_TMP_BUCKET, "source"),
+                    file_infos,
+                    (bucket, object),
+                    false,
+                    RenameDataFenceOptions::new(3, None).with_quorum_bounded_connect(true),
+                ),
+            )
+            .await
+            .expect("durable quorum must finish before the silent peer's dial deadline")
+            .expect("three durable renames must satisfy write quorum")
+        })
+        .await;
+        assert_eq!(commit.convergence, RenameConvergence::PartialCommit);
+        assert!(commit.needs_immediate_heal());
+        assert!(commit.tail_drain.is_none());
+        for dir in dirs.iter().take(3) {
+            let reopened = reopen_local_disk(dir).await;
+            let stored = reopened
+                .read_version("", bucket, object, "", &ReadOptions::default())
+                .await
+                .expect("quorum metadata survives reopening");
+            assert_eq!(stored.metadata.get("etag").map(String::as_str), Some("bounded-connect-etag"));
         }
     }
 

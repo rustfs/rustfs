@@ -288,7 +288,7 @@ impl ECStore {
             RenameDataGuards {
                 scanner_publication_lease_token: scanner_token,
                 external_guard,
-                namespace_owner: None,
+                ..Default::default()
             },
         );
         if scanner_token.is_some() {
