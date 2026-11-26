@@ -540,7 +540,7 @@ async fn prepare_rename_commit_and_destination_metadata(
 /// Proof produced only when the local rename returns at an existing access
 /// preflight, before metadata, backups, or object data can be published.
 #[derive(Debug)]
-pub(in crate::disk) struct LocalRenamePreflightRejection(());
+struct LocalRenamePreflightRejection(());
 
 #[derive(Default)]
 pub(super) struct RenameDataState {
@@ -2947,7 +2947,7 @@ impl LocalDisk {
             .await;
         super::super::RenameDataObservation {
             result,
-            preflight_rejection: state.preflight_rejection,
+            rejected_before_publication: state.preflight_rejection.is_some(),
         }
     }
 }

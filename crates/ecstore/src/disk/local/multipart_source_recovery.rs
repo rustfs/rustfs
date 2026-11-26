@@ -2599,6 +2599,7 @@ mod tests {
         assert!(!disk.root.join(RUSTFS_META_TMP_BUCKET).join(raw_path).exists());
     }
 
+    #[cfg(unix)]
     async fn assert_cold_recovery_after_present_head_failure(
         fixture: &mut Fixture,
         publication: &PublicationIdentity,
