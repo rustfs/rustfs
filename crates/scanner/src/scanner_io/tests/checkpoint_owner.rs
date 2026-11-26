@@ -14,6 +14,7 @@ const LEADER_EPOCH: u64 = 11;
 const CHECKPOINT_OBJECTS: u64 = 1024;
 const CHECKPOINT_MIN_INTERVAL: Duration = Duration::from_secs(5);
 const PHASE_TIMEOUT: Duration = Duration::from_secs(60);
+const FIRST_OBJECT: &str = "object-0000";
 
 async fn checkpoint_plan(set: &Arc<SetDisks>, owner: &CancellationToken) -> ScannerBucketScanPlan {
     let buckets = vec![bucket_info(BUCKET)];
@@ -55,17 +56,15 @@ async fn run_checkpoint_owner_case(lose_owner: bool) -> serde_json::Value {
         .make_bucket(BUCKET, &MakeBucketOptions::default())
         .await
         .expect("create checkpoint owner bucket");
-    for object in 0..=CHECKPOINT_OBJECTS {
-        store
-            .put_object(
-                BUCKET,
-                &format!("object-{object:04}"),
-                &mut ScannerPutObjReader::from_vec(vec![1]),
-                &ScannerObjectOptions::default(),
-            )
-            .await
-            .expect("write real object for the periodic checkpoint threshold");
-    }
+    store
+        .put_object(
+            BUCKET,
+            FIRST_OBJECT,
+            &mut ScannerPutObjReader::from_vec(vec![1]),
+            &ScannerObjectOptions::default(),
+        )
+        .await
+        .expect("write a real object for the checkpoint fixture");
     save_config(
         store.clone(),
         DATA_USAGE_BLOOM_NAME_PATH.as_str(),
@@ -74,10 +73,27 @@ async fn run_checkpoint_owner_case(lose_owner: bool) -> serde_json::Value {
     .await
     .expect("persist the real global cycle fence");
     wait_for_namespace_commit_tails(store.as_ref()).await;
-    record_dirty_usage_bucket(BUCKET);
-    let dirty_before = dirty_usage_buckets_for_tests();
     let set = store.pools[0].disk_set[0].clone();
     let disk = scanner_set_disk_inventory(&set).await.pop().expect("checkpoint owner disk");
+    let first_object_dir = disk
+        .get_object_path_if_local(BUCKET, FIRST_OBJECT)
+        .expect("checkpoint owner disk is local")
+        .expect("first checkpoint fixture object path");
+    // This case exercises metadata traversal and checkpoint publication. Seed
+    // the other disk entries from real xl.meta without repeating the PUT path.
+    tokio::task::spawn_blocking(move || {
+        let metadata = std::fs::read(first_object_dir.join(STORAGE_FORMAT_FILE)).expect("read real fixture metadata");
+        let bucket_dir = first_object_dir.parent().expect("checkpoint fixture bucket directory");
+        for object in 1..=CHECKPOINT_OBJECTS {
+            let object_dir = bucket_dir.join(format!("object-{object:04}"));
+            std::fs::create_dir(&object_dir).expect("create checkpoint fixture object directory");
+            std::fs::write(object_dir.join(STORAGE_FORMAT_FILE), &metadata).expect("seed checkpoint fixture metadata");
+        }
+    })
+    .await
+    .expect("seed disk entries for the periodic checkpoint threshold");
+    record_dirty_usage_bucket(BUCKET);
+    let dirty_before = dirty_usage_buckets_for_tests();
     let cache_name = path_join_buf(&[BUCKET, DATA_USAGE_CACHE_NAME]);
     let revisions_before = DataUsageCache::read_revisions(set.clone(), &cache_name)
         .await
@@ -93,7 +109,7 @@ async fn run_checkpoint_owner_case(lose_owner: bool) -> serde_json::Value {
     let mut first_object = EcstoreLocalPublicationPause::install(
         &disk,
         BUCKET,
-        "object-0000/xl.meta",
+        &format!("{FIRST_OBJECT}/{STORAGE_FORMAT_FILE}"),
         EcstoreLocalPublicationStage::MetadataReadAfterOpen,
     )
     .expect("pause the first real object read");
