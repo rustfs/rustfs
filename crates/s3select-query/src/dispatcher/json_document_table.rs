@@ -637,7 +637,7 @@ impl Stream for JsonDocumentBatchStream {
     }
 }
 
-fn json_decoder_layout(schema: &SchemaRef, requested_batch_size: usize) -> DFResult<(usize, usize)> {
+pub(super) fn json_decoder_layout(schema: &SchemaRef, requested_batch_size: usize) -> DFResult<(usize, usize)> {
     let fields = schema.flattened_fields().len();
     let field_slots = fields.checked_mul(2).ok_or_else(decoder_resource_error)?;
     let offset_bytes_per_row = field_slots

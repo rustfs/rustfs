@@ -22,8 +22,9 @@ use crate::{
     SelectInputMetrics, SelectObjectOptions, SelectObjectSnapshot, SelectObjectSnapshotReadError, SelectStorageError,
     SelectStore, SnapshotConsistencyError,
     input_stream::{
-        CompressionFormat, SELECT_DECODE_CHUNK_BYTES, compressed_input_reader, compressed_input_stream, input_io_error,
-        processed_bytes_limit,
+        CompressionFormat, MAX_SELECT_RECORD_BYTES, RecordSizeTracker, SELECT_DECODE_CHUNK_BYTES, compressed_input_reader,
+        compressed_input_stream_with_tracker, input_io_error, processed_bytes_limit, record_size_limited_stream,
+        select_object_store_error,
     },
     query::{
         ast::{JsonPathSegment, JsonSource},
@@ -346,6 +347,37 @@ impl EcObjectStore {
             .unwrap_or_else(|| b"\n".to_vec())
     }
 
+    fn record_size_tracker(&self) -> Result<RecordSizeTracker> {
+        if let Some(csv) = self.input.request.input_serialization.csv.as_ref() {
+            if csv.record_delimiter.is_none() {
+                return Ok(RecordSizeTracker::default_csv());
+            }
+            return RecordSizeTracker::new(self.record_delimiter()).map_err(select_object_store_error);
+        }
+        RecordSizeTracker::new(b"\n".to_vec()).map_err(select_object_store_error)
+    }
+
+    /// Applies the 1 MiB record size limit to uncompressed CSV and JSON Lines input,
+    /// matching compressed input enforcement.
+    fn limit_record_size<S>(&self, stream: S) -> Result<BoxStream<'static, Result<Bytes>>>
+    where
+        S: Stream<Item = Result<Bytes>> + Send + 'static,
+    {
+        if self
+            .input
+            .request
+            .input_serialization
+            .csv
+            .as_ref()
+            .is_some_and(|csv| csv.allow_quoted_record_delimiter.unwrap_or(false))
+        {
+            // The CSV normalizer owns logical-record limits.
+            return Ok(stream.boxed());
+        }
+        let record_size = self.record_size_tracker()?;
+        Ok(record_size_limited_stream(stream, record_size, select_object_store_error))
+    }
+
     fn record_delimiter_for_conversion(&self) -> Option<Vec<u8>> {
         let delimiter = self.record_delimiter();
         (self.need_convert || (delimiter.len() == 2 && delimiter != NORMALIZED_RECORD_DELIMITER)).then_some(delimiter)
@@ -468,16 +500,22 @@ impl EcObjectStore {
             return Ok(Bytes::new());
         }
 
-        let mut end = select_default_read_buffer_size_u64().min(object_size);
+        let max_probe = u64::try_from(MAX_SELECT_RECORD_BYTES.saturating_add(delimiter.len())).unwrap_or(u64::MAX);
+        let mut end = select_default_read_buffer_size_u64().min(object_size).min(max_probe);
         loop {
             let bytes = self.read_raw_range(0..end).await?;
-            if let Some(pos) = find_delimiter(&bytes, delimiter) {
+            let header_end = find_delimiter(&bytes, delimiter);
+            // Stop widening the read once the header cannot fit the 1 MiB record limit.
+            if header_end.unwrap_or(bytes.len()) > MAX_SELECT_RECORD_BYTES {
+                return Err(select_object_store_error(SelectError::OverMaxRecordSize));
+            }
+            if let Some(pos) = header_end {
                 return Ok(bytes.slice(0..pos + delimiter.len()));
             }
             if end == object_size {
                 return Ok(bytes);
             }
-            end = end.saturating_mul(2).min(object_size);
+            end = end.saturating_mul(2).min(object_size).min(max_probe);
         }
     }
 
@@ -973,17 +1011,13 @@ impl ObjectStore for EcObjectStore {
                 let stream = ReaderStream::with_capacity(reader, SELECT_DECODE_CHUNK_BYTES).map_err(input_io_error);
                 GetResultPayload::Stream(self.convert_csv_stream(stream))
             } else {
-                let input_record_delimiter = if self.input.request.input_serialization.csv.is_some() {
-                    self.record_delimiter()
-                } else {
-                    b"\n".to_vec()
-                };
-                let stream = compressed_input_stream(
+                let record_size = self.record_size_tracker()?;
+                let stream = compressed_input_stream_with_tracker(
                     reader.stream,
                     original_size,
                     compression,
                     Arc::clone(&self.input_metrics),
-                    input_record_delimiter,
+                    record_size,
                     max_processed_bytes,
                     query_guard,
                 )?;
@@ -1023,10 +1057,17 @@ impl ObjectStore for EcObjectStore {
             } else {
                 None
             };
+            // The ScanRange splitter buffers each record up to its delimiter, so the
+            // record size limit has to come first.
+            let record_size = RecordSizeTracker::new(delimiter.clone()).map_err(select_object_store_error)?;
             let stream = scan_range_stream(
-                meter_uncompressed_input_stream(
-                    ReaderStream::with_capacity(reader.stream, SELECT_DEFAULT_READ_BUFFER_SIZE),
-                    Arc::clone(&self.input_metrics),
+                record_size_limited_stream(
+                    meter_uncompressed_input_stream(
+                        ReaderStream::with_capacity(reader.stream, SELECT_DEFAULT_READ_BUFFER_SIZE),
+                        Arc::clone(&self.input_metrics),
+                    ),
+                    record_size,
+                    |error| std::io::Error::new(std::io::ErrorKind::InvalidData, error),
                 ),
                 delimiter,
                 scan_range,
@@ -1050,6 +1091,7 @@ impl ObjectStore for EcObjectStore {
             let stream = bytes_stream(ReaderStream::with_capacity(reader.stream, SELECT_DEFAULT_READ_BUFFER_SIZE), stream_size);
             if meter_input {
                 let stream = meter_uncompressed_input_stream(stream, Arc::clone(&self.input_metrics));
+                let stream = self.limit_record_size(stream)?;
                 let stream = self.convert_csv_stream(stream);
                 GetResultPayload::Stream(stream)
             } else {
@@ -1273,13 +1315,7 @@ where
                 Some(Ok(bytes)) => state.push_chunk(&bytes),
                 Some(Err(err)) => {
                     state.done = true;
-                    return Some((
-                        Err(o_Error::Generic {
-                            store: "EcObjectStore",
-                            source: Box::new(err),
-                        }),
-                        state,
-                    ));
+                    return Some((Err(input_io_error(err)), state));
                 }
                 None => {
                     if state.offset < state.expected_end {
@@ -3259,6 +3295,145 @@ mod test {
             let measured = metrics.snapshot();
             assert_eq!(measured.bytes_scanned, u64::try_from(raw_size).expect("raw length"));
             assert_eq!(measured.bytes_processed, u64::try_from(data.len()).expect("decoded length"));
+        }
+    }
+
+    #[tokio::test]
+    async fn uncompressed_input_enforces_the_record_size_limit() {
+        const BUCKET: &str = "select-uncompressed-record-limit";
+        let env = crate::storage_api::select_test_ecstore_env().await;
+        env.make_bucket(BUCKET, false).await;
+        // (JSON Lines, ScanRange, ScanRange starting after CSV header)
+        let cases = [
+            (false, false, false),
+            (false, true, false),
+            (false, true, true),
+            (true, false, false),
+            (true, true, false),
+        ];
+        for (json, scan_range, after_header) in cases {
+            for size in [MAX_SELECT_RECORD_BYTES, MAX_SELECT_RECORD_BYTES + 1] {
+                let mut data = if json {
+                    let mut record = br#"{"v":""#.to_vec();
+                    record.resize(size - 2, b'a');
+                    record.extend_from_slice(b"\"}");
+                    record
+                } else {
+                    vec![b'a'; size]
+                };
+                data.push(b'\n');
+                if after_header {
+                    data.extend_from_slice(b"1\n");
+                }
+                let object = format!("{json}-{scan_range}-{after_header}-{size}");
+                let mut reader = SelectPutObjReader::from_vec(data.clone());
+                env.ecstore
+                    .put_object(BUCKET, &object, &mut reader, &Default::default())
+                    .await
+                    .expect("write record limit fixture");
+                let mut input = if json {
+                    (*json_input(BUCKET, &object, JsonType::LINES)).clone()
+                } else {
+                    (*csv_input(BUCKET, &object)).clone()
+                };
+                if after_header {
+                    let csv = input.request.input_serialization.csv.as_mut().expect("CSV input");
+                    csv.file_header_info = Some(FileHeaderInfo::USE);
+                }
+                if scan_range {
+                    let start = if after_header { size + 1 } else { 0 };
+                    input.request.scan_range = Some(ScanRange {
+                        start: Some(i64::try_from(start).expect("fixture offset")),
+                        end: Some(i64::try_from(start + 1).expect("fixture offset")),
+                    });
+                }
+                let store = EcObjectStore::build_with_snapshot(
+                    Arc::new(input),
+                    Arc::new(GreedyMemoryPool::new(4 * MAX_SELECT_RECORD_BYTES)),
+                    None,
+                    Arc::new(SelectInputMetrics::default()),
+                    prepare_test_snapshot(BUCKET, &object).await,
+                    JsonSource::default(),
+                )
+                .expect("record limit store");
+                let output = match store.get_opts(&Path::from(object.as_str()), GetOptions::default()).await {
+                    Ok(result) => {
+                        let GetResultPayload::Stream(stream) = result.payload else { panic!("uncompressed stream") };
+                        stream.try_collect::<Vec<_>>().await
+                    }
+                    Err(error) => Err(error),
+                };
+                if size > MAX_SELECT_RECORD_BYTES {
+                    let error = output.expect_err("uncompressed records over 1 MiB must fail like compressed ones");
+                    assert_eq!(
+                        QueryError::from(DataFusionError::from(error)).select_error(),
+                        SelectError::OverMaxRecordSize,
+                        "object={object}"
+                    );
+                } else {
+                    assert_eq!(output.expect("records within the limit must pass").concat(), data, "object={object}");
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn default_csv_record_limit_handles_cr_only_line_endings() {
+        const BUCKET: &str = "select-cr-only-csv-limit";
+        let env = crate::storage_api::select_test_ecstore_env().await;
+        env.make_bucket(BUCKET, false).await;
+
+        let valid_cr_csv = format!("a,b\r{}", format!("{},val\r", "x".repeat(95)).repeat(15_000)).into_bytes();
+        assert!(
+            valid_cr_csv.len() > MAX_SELECT_RECORD_BYTES,
+            "fixture must span more than 1 MiB across CR-only records"
+        );
+        let mut oversized_cr_csv = vec![b'a'; MAX_SELECT_RECORD_BYTES + 1];
+        oversized_cr_csv.push(b'\r');
+
+        for compression in [None, Some(CompressionFormat::Gzip)] {
+            for (name, raw, should_fail) in [("valid-cr", &valid_cr_csv, false), ("oversized-cr", &oversized_cr_csv, true)] {
+                let bytes = match compression {
+                    Some(format) => encode_compressed_fixture(format, raw).await,
+                    None => raw.clone(),
+                };
+                let object = format!("{name}-{compression:?}");
+                let mut reader = SelectPutObjReader::from_vec(bytes);
+                env.ecstore
+                    .put_object(BUCKET, &object, &mut reader, &Default::default())
+                    .await
+                    .expect("write CR CSV fixture");
+                let mut input = (*csv_input(BUCKET, &object)).clone();
+                input.request.input_serialization.compression_type = compression.map(|format| match format {
+                    CompressionFormat::Gzip => CompressionType::GZIP,
+                    CompressionFormat::Bzip2 => CompressionType::BZIP2,
+                });
+                let store = EcObjectStore::build_with_snapshot(
+                    Arc::new(input),
+                    Arc::new(GreedyMemoryPool::new(4 * MAX_SELECT_RECORD_BYTES)),
+                    None,
+                    Arc::new(SelectInputMetrics::default()),
+                    prepare_test_snapshot(BUCKET, &object).await,
+                    JsonSource::default(),
+                )
+                .expect("CR CSV store");
+                let result = store
+                    .get_opts(&Path::from(object.as_str()), GetOptions::default())
+                    .await
+                    .expect("open CR CSV stream");
+                let GetResultPayload::Stream(stream) = result.payload else { panic!("CSV stream") };
+                let output = stream.try_collect::<Vec<_>>().await;
+                if should_fail {
+                    let error = output.expect_err("oversized CR-only record must fail");
+                    assert_eq!(
+                        QueryError::from(DataFusionError::from(error)).select_error(),
+                        SelectError::OverMaxRecordSize,
+                        "object={object}"
+                    );
+                } else {
+                    assert_eq!(output.expect("valid CR-only CSV over 1 MiB must pass").concat(), *raw, "object={object}");
+                }
+            }
         }
     }
 

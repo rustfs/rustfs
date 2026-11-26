@@ -28,8 +28,8 @@ use datafusion::{
         record_batch::RecordBatch,
     },
     datasource::{
-        file_format::{DEFAULT_SCHEMA_INFER_MAX_RECORD, csv::CsvFormat, json::JsonFormat},
-        listing::{ListingOptions, ListingTable, ListingTableConfig, ListingTableUrl},
+        file_format::{DEFAULT_SCHEMA_INFER_MAX_RECORD, csv::CsvFormat},
+        listing::ListingTableUrl,
     },
     error::{DataFusionError, Result as DFResult},
     execution::{RecordBatchStream, SendableRecordBatchStream},
@@ -62,7 +62,12 @@ use tokio::{
 };
 
 use crate::{
-    dispatcher::{json_document_table::JsonDocumentTable, json_lines_schema, parquet_table::ParquetSelectTable},
+    dispatcher::{
+        delimited_table::{DelimitedFormat, DelimitedSelectTable},
+        json_document_table::JsonDocumentTable,
+        json_lines_schema,
+        parquet_table::ParquetSelectTable,
+    },
     execution::factory::QueryExecutionFactoryRef,
     instance::{DEFAULT_MAX_CONCURRENT_QUERIES, DEFAULT_QUERY_TIMEOUT_SECS},
     metadata::{MetadataProvider, TableHandleProviderRef, base_table::BaseTableProvider},
@@ -75,7 +80,6 @@ use super::schema_inference::{PrefixBoundary, infer_csv_schema, read_schema_pref
 static IGNORE: LazyLock<FileHeaderInfo> = LazyLock::new(|| FileHeaderInfo::IGNORE);
 static NONE: LazyLock<FileHeaderInfo> = LazyLock::new(|| FileHeaderInfo::NONE);
 static USE: LazyLock<FileHeaderInfo> = LazyLock::new(|| FileHeaderInfo::USE);
-const EXACT_OBJECT_FILE_EXTENSION: &str = "";
 
 #[derive(Clone)]
 pub struct SimpleQueryDispatcher {
@@ -447,7 +451,7 @@ impl SimpleQueryDispatcher {
         let path = format!("s3://{}/{}", self.input.bucket, self.input.key);
         let table_path = ListingTableUrl::parse(path)?;
         let mut csv_format = None;
-        let (listing_options, need_rename_volume_name, need_ignore_volume_name) =
+        let (format, need_rename_volume_name, need_ignore_volume_name) =
             if let Some(csv) = self.input.request.input_serialization.csv.as_ref() {
                 let mut need_rename_volume_name = false;
                 let mut need_ignore_volume_name = false;
@@ -509,19 +513,11 @@ impl SimpleQueryDispatcher {
                         .with_comment(None)
                         .with_newlines_in_values(true);
                 }
-                csv_format = Some(CsvFormat::default().with_options(file_format.options().clone()));
-                (
-                    ListingOptions::new(Arc::new(file_format)).with_file_extension(EXACT_OBJECT_FILE_EXTENSION),
-                    need_rename_volume_name,
-                    need_ignore_volume_name,
-                )
+                let options = file_format.options().clone();
+                csv_format = Some(CsvFormat::default().with_options(options.clone()));
+                (DelimitedFormat::Csv(Box::new(options)), need_rename_volume_name, need_ignore_volume_name)
             } else if self.input.request.input_serialization.json.is_some() {
-                let file_format = JsonFormat::default();
-                (
-                    ListingOptions::new(Arc::new(file_format)).with_file_extension(EXACT_OBJECT_FILE_EXTENSION),
-                    false,
-                    false,
-                )
+                (DelimitedFormat::JsonLines, false, false)
             } else {
                 return Err(SelectError::InvalidDataSource.into());
             };
@@ -559,7 +555,7 @@ impl SimpleQueryDispatcher {
             Ok(schema)
         })
         .await?;
-        let config = if need_rename_volume_name {
+        let schema = if need_rename_volume_name {
             let mut new_fields = Vec::new();
             for (i, field) in resolve_schema.fields().iter().enumerate() {
                 let f_name = field.name();
@@ -574,17 +570,12 @@ impl SimpleQueryDispatcher {
                     new_fields.push(mut_field);
                 }
             }
-            let new_schema = Arc::new(Schema::new(new_fields).with_metadata(resolve_schema.metadata().clone()));
-            ListingTableConfig::new(table_path)
-                .with_listing_options(listing_options)
-                .with_schema(new_schema)
+            Arc::new(Schema::new(new_fields).with_metadata(resolve_schema.metadata().clone()))
         } else {
-            ListingTableConfig::new(table_path)
-                .with_listing_options(listing_options)
-                .with_schema(resolve_schema)
+            resolve_schema
         };
-        // rename default
-        let provider = Arc::new(ListingTable::try_new(config)?);
+        let provider =
+            DelimitedSelectTable::try_new(session.inner(), table_path.object_store(), &self.input.key, schema, format).await?;
         let current_session_table_provider = self.build_table_handle_provider()?;
         let metadata_provider =
             MetadataProvider::new(provider, current_session_table_provider, self.func_manager.clone(), session.clone());
@@ -2047,6 +2038,89 @@ mod tests {
             .expect("one row");
         assert_eq!(batches.iter().map(RecordBatch::num_rows).sum::<usize>(), 1);
         assert_eq!(field_names(batches[0].schema().fields()), ["z", "a"]);
+    }
+
+    #[tokio::test]
+    async fn delimited_input_stays_within_tight_memory_budget_and_enforces_record_limit() {
+        const TIGHT_MEMORY_LIMIT_BYTES: usize = 8 * 1024 * 1024;
+        const RECORDS: usize = 64;
+        let line = "x".repeat(256 * 1024);
+        // 64 rows * 128 KiB = 8 MiB CSV payload processed with a WHERE filter under an 8 MiB pool.
+        let csv_records = format!("id,name\n{}", format!("1,{}\n", &line[..line.len() / 2]).repeat(RECORDS));
+        // 64 rows * 128 KiB = 8 MiB JSON Lines payload processed with a WHERE filter under an 8 MiB pool.
+        let json_records = format!("{{\"id\":\"1\",\"name\":\"{}\"}}\n", &line[..line.len() / 2]).repeat(RECORDS);
+        // Oversized single uncompressed records (> 1 MiB) must fail with OverMaxRecordSize.
+        let oversized_csv = format!("id,name\n1,{}\n", "x".repeat(1024 * 1024 + 1));
+        let oversized_json = format!("{{\"id\":\"1\",\"name\":\"{}\"}}\n", "x".repeat(1024 * 1024));
+        // Logical quoted CSV record spanning 64 * 256 KiB = 16 MiB must fail under the 8 MiB pool.
+        let oversized_quoted_csv = format!("id,name\n1,\"{}\"\n", [line.as_str(); RECORDS].join("\n"));
+
+        let cases = [
+            (csv_records, false, TIGHT_MEMORY_LIMIT_BYTES, Ok(RECORDS)),
+            (json_records, true, TIGHT_MEMORY_LIMIT_BYTES, Ok(RECORDS)),
+            (
+                oversized_csv,
+                false,
+                DEFAULT_S3SELECT_MEMORY_LIMIT_BYTES,
+                Err(SelectError::OverMaxRecordSize),
+            ),
+            (
+                oversized_json,
+                true,
+                DEFAULT_S3SELECT_MEMORY_LIMIT_BYTES,
+                Err(SelectError::OverMaxRecordSize),
+            ),
+            (oversized_quoted_csv, false, TIGHT_MEMORY_LIMIT_BYTES, Err(SelectError::ResourceExhausted)),
+            // Valid large JSON Lines object (120 * 70 KiB = ~8.4 MiB) must succeed under the default 64 MiB limit.
+            (
+                format!("{{\"id\":\"1\",\"name\":\"{}\"}}\n", "x".repeat(70_000)).repeat(120),
+                true,
+                DEFAULT_S3SELECT_MEMORY_LIMIT_BYTES,
+                Ok(120),
+            ),
+        ];
+
+        let env = snapshot_test_env().await;
+        for (index, (data, json, memory_limit, expected)) in cases.into_iter().enumerate() {
+            let mut input = test_input();
+            input.bucket = format!("select-delimited-budget-{index}");
+            input.key = "records".to_owned();
+            if json {
+                input.request.input_serialization.csv = None;
+                input.request.input_serialization.json = Some(JsonInput {
+                    r#type: Some(JsonType::LINES),
+                });
+            }
+            env.make_bucket(&input.bucket, false).await;
+            env.put_object_bytes(&input.bucket, &input.key, data.into_bytes()).await;
+            let snapshot = env.prepare_select_object_snapshot(&input.bucket, &input.key).await;
+            let input = Arc::new(input);
+            let optimizer = Arc::new(CascadeOptimizerBuilder::default().build());
+            let dispatcher = SimpleQueryDispatcherBuilder::default()
+                .with_input(Arc::clone(&input))
+                .with_default_table_provider(Arc::new(BaseTableProvider::default()))
+                .with_session_factory(Arc::new(SessionCtxFactory::new(false)))
+                .with_parser(Arc::new(DefaultParser::default()))
+                .with_query_execution_factory(Arc::new(SqlQueryExecutionFactory::new(optimizer, Arc::new(LocalScheduler {}))))
+                .with_func_manager(Arc::new(SimpleFunctionMetadataManager::default()))
+                .with_memory_limit_bytes(memory_limit)
+                .build()
+                .expect("query dispatcher should build");
+            // Keep every row through a FilterExec to confirm filtered batches stream without coalescing.
+            let sql = "SELECT s.id FROM S3Object s WHERE s.name <> ''".to_owned();
+            let query = Query::new_with_snapshot(QueryContext { input }, sql, snapshot);
+            let rows = match dispatcher.execute_query(&query).await {
+                Ok(output) => output
+                    .into_record_batch_stream()
+                    .expect("record stream")
+                    .try_collect::<Vec<_>>()
+                    .await
+                    .map(|batches| batches.iter().map(RecordBatch::num_rows).sum::<usize>())
+                    .map_err(|error| QueryError::from(error).select_error()),
+                Err(error) => Err(error.select_error()),
+            };
+            assert_eq!(rows, expected, "fixture={index}");
+        }
     }
 
     #[tokio::test(flavor = "current_thread")]

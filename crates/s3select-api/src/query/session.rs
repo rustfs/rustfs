@@ -441,12 +441,20 @@ impl SessionCtxFactory {
         };
         let rt = RuntimeEnvBuilder::new().with_memory_limit(memory_limit_bytes, 1.0).build()?;
         let config = SessionConfig::new().with_target_partitions(self.target_partitions);
-        // Arrow CSV reserves two usize offsets for every cell outside the
-        // DataFusion memory pool. Bound that reservation to at most 4 MiB and
-        // one sixteenth of the configured query budget, including narrow input.
-        let config = if context.input.request.input_serialization.csv.is_some() {
+        // Bound decoder batch rows for CSV and JSON Lines to match the configured
+        // query budget, and disable batch coalescing across S3 Select formats so
+        // downstream operators cannot re-buffer unbounded batches outside the pool.
+        let config = if context.input.request.input_serialization.csv.is_some()
+            || (context.input.request.input_serialization.json.is_some() && !is_json_document_input(&context.input))
+        {
             let batch_rows = (memory_limit_bytes / 16 / (MAX_SELECT_COLUMNS * 2 * size_of::<usize>())).clamp(1, 256);
-            config.with_batch_size(batch_rows)
+            let mut config = config.with_batch_size(batch_rows);
+            config.options_mut().execution.coalesce_batches = false;
+            config
+        } else if is_json_document_input(&context.input) {
+            let mut config = config;
+            config.options_mut().execution.coalesce_batches = false;
+            config
         } else {
             config
         };
@@ -1035,12 +1043,26 @@ mod tests {
     #[tokio::test]
     async fn decoder_batch_budgets_keep_parquet_downstream_execution_single_row() {
         let factory = SessionCtxFactory::new(true);
-        for (budget, expected) in [(64 * 1024 * 1024, 256), (8 * 1024 * 1024, 32), (1024, 1)] {
-            let session = factory
-                .create_session_ctx_inner(&test_context(), None, JsonSource::default(), None, None, budget)
-                .await
-                .expect("CSV session");
-            assert_eq!(session.inner().config().batch_size(), expected);
+        for json_lines in [false, true] {
+            let mut context = test_context();
+            if json_lines {
+                let input = Arc::make_mut(&mut context.input);
+                input.request.input_serialization.csv = None;
+                input.request.input_serialization.json = Some(JsonInput {
+                    r#type: Some(JsonType::LINES),
+                });
+            }
+            for (budget, expected) in [(64 * 1024 * 1024, 256), (8 * 1024 * 1024, 32), (1024, 1)] {
+                let session = factory
+                    .create_session_ctx_inner(&context, None, JsonSource::default(), None, None, budget)
+                    .await
+                    .expect("delimited session");
+                assert_eq!(session.inner().config().batch_size(), expected, "json_lines={json_lines}");
+                assert!(
+                    !session.inner().config().options().execution.coalesce_batches,
+                    "coalesce_batches must be disabled for json_lines={json_lines}"
+                );
+            }
         }
         for parquet in [false, true] {
             let mut context = test_context();
@@ -1050,16 +1072,16 @@ mod tests {
                 input.request.input_serialization.parquet = Some(ParquetInput::default());
             } else {
                 input.request.input_serialization.json = Some(JsonInput {
-                    r#type: Some(JsonType::LINES),
+                    r#type: Some(JsonType::DOCUMENT),
                 });
             }
-            let session = factory.create_session_ctx(&context).await.expect("non-CSV session");
+            let session = factory.create_session_ctx(&context).await.expect("non-delimited session");
             assert_eq!(
                 session.inner().config().batch_size(),
                 if parquet { 1 } else { SessionConfig::new().batch_size() }
             );
+            assert!(!session.inner().config().options().execution.coalesce_batches);
             if parquet {
-                assert!(!session.inner().config().options().execution.coalesce_batches);
                 assert_eq!(session.inner().config().target_partitions(), 1);
             }
         }
