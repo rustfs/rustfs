@@ -226,17 +226,11 @@ Mixed-version stages verify that modern DELETE fails safely while older
 participants are online. They do not promise continuous DELETE availability or
 arbitrary downgrade while new recovery records exist.
 
-## Settlement deadline and durability
+## Batch preparation and settlement deadlines
 
-`RUSTFS_DELETE_RECOVERY_TIMEOUT_SECS` controls the settlement RPC deadline,
-including full shard verification during rollback. Key and bucket lifecycle
-ownership stay attached to late local filesystem operations after cancellation
-or timeout. The default is 900 seconds;
-valid values are 30 through 86400 seconds. Invalid values fail explicitly.
-Increase it when intact large objects need more verification time. It does not
-change normal object read or delete-apply deadlines. A timeout can conceal a
-completed mutation, so rerun inspection and recovery rather than guessing the
-outcome from the RPC error.
+`RUSTFS_DELETE_RECOVERY_TIMEOUT_SECS` controls the remote recoverable batch preparation and settlement RPC deadlines, including full shard verification during rollback. Batch preparation returns the per-object results together after the drive finishes staging the groups in the request. Key and bucket lifecycle ownership stay attached to late local filesystem operations after cancellation or timeout.
+
+The default is 900 seconds. Valid values are 30 through 86400 seconds. Invalid values fail explicitly. A stalled peer can hold the batch and its object locks until the preparation deadline because the coordinator waits for each drive’s reply. Ordinary reads, single-object preparation, and guarded batch preparation retain their existing deadlines. A timeout can conceal a completed mutation, so use the recovery records to inspect and settle the outcome.
 
 The records and restores follow the configured durability policy. Strict mode
 syncs the required metadata and directory changes. Process SIGKILL testing
