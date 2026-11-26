@@ -173,7 +173,7 @@ impl<S: StorageBackend + Send + Sync + 'static> SftpDriver<S> {
                             .build();
                         self.authorize_list_objects(&input).await?;
                         let out = self
-                            .run_backend("list_objects_v2", self.storage.list_objects_v2(input, self.credentials()))
+                            .run_backend("list_objects_v2", self.storage.list_objects_v2(&self.session_context, input))
                             .await?;
 
                         let has_contents = !out.contents.is_empty();

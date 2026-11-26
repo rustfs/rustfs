@@ -12,8 +12,8 @@ RustFS requires a standards-compliant OpenID Connect provider: discovery at `<is
 Login flow:
 
 1. The browser opens `https://rustfs.example.com/rustfs/admin/v3/oidc/authorize/<provider_id>`.
-2. RustFS creates `state`, `nonce`, and a PKCE S256 challenge and redirects to the IdP.
-3. The IdP redirects back to `/rustfs/admin/v3/oidc/callback/<provider_id>?code=...&state=...`.
+2. RustFS creates `state`, `nonce`, and a PKCE S256 challenge, sets the `rustfs_oidc_state` cookie (`HttpOnly`, `SameSite=Lax`, five-minute `Max-Age`, `Secure` on HTTPS, scoped to the callback path), and redirects to the IdP.
+3. The IdP redirects back to `/rustfs/admin/v3/oidc/callback/<provider_id>?code=...&state=...`. RustFS rejects the callback unless the browser returns the matching `rustfs_oidc_state` cookie, and clears the cookie on completion.
 4. RustFS exchanges the code at the token endpoint, sending `client_id` and `client_secret` in the request body (`client_secret_post`) together with the PKCE verifier.
 5. RustFS validates the ID token signature (JWKS), issuer, audience, expiry, and nonce.
 6. RustFS maps claim values to policy names and issues STS credentials to the Console with the lifetime set by `RUSTFS_CONSOLE_OIDC_SESSION_DURATION` (default 3600 seconds, one hour).
@@ -164,6 +164,8 @@ curl -fsS "<ISSUER>/.well-known/openid-configuration" | jq '{issuer, authorizati
 | Login succeeds, access denied | no claim value matches a policy name | Emit `groups` or `roles` as a flat array equal to policy names; check for `/` prefixes. |
 | Console redirects to an internal host | `RUSTFS_BROWSER_REDIRECT_URL` unset or proxy headers wrong | Set `RUSTFS_BROWSER_REDIRECT_URL` to the public origin. |
 | Invalid or expired OIDC state | callback reached a different node | Configure load-balancer session affinity for authorize and callback. |
+| Server logs `state_provider_mismatch` (`OIDC state was issued for a different provider`) | callback arrived on another provider's `/oidc/callback/<provider_id>` path than the login started on | Configure each provider with its own `/rustfs/admin/v3/oidc/callback/<provider_id>` redirect URI; do not share a callback across providers. |
+| `OIDC login was not started by this browser` | the callback arrived without the `rustfs_oidc_state` cookie: the login was started on a different host than the callback URL, a proxy strips `Cookie`/`Set-Cookie`, or the callback link was opened in another browser | Open the Console on the public origin configured in `redirect_uri` / `RUSTFS_BROWSER_REDIRECT_URL` and pass `Cookie`/`Set-Cookie` headers through the proxy. |
 | Console session expires after about an hour | callback issues credentials with the default lifetime | Set `RUSTFS_CONSOLE_OIDC_SESSION_DURATION` to the desired lifetime in seconds (max `604800`, 7 days) and restart RustFS. `RUSTFS_CONSOLE_AUTH_TIMEOUT` is a request timeout and does not extend the session. |
 
 ## Production checklist

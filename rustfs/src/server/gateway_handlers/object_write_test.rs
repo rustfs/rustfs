@@ -175,7 +175,7 @@ async fn put_authorization_honors_request_object_tag_policy_on_both_edges() {
         serde_json::json!({
             "Effect": "Allow",
             "Principal": {"AWS": "*"},
-            "Action": "s3:PutObject",
+            "Action": ["s3:PutObject", "s3:PutObjectTagging"],
             "Resource": format!("arn:aws:s3:::{bucket}/allowed"),
             "Condition": {"StringEquals": {"s3:RequestObjectTag/visibility": "private"}},
         }),

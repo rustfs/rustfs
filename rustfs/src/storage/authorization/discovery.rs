@@ -23,7 +23,7 @@
 //! IAM and the bucket policy system.
 
 use super::conditions::{authorization_conditions, request_authz_facts, request_principal, root_access_key};
-use super::decision::{DenialContext, owner_can_bypass_policy_deny};
+use super::decision::{DenialContext, bucket_policy_deny_accounts, is_reserved_meta_bucket, owner_can_bypass_policy_deny};
 use super::{AuthorizationRequest, missing_req_info_error, request_iam_store, request_object_store};
 use crate::auth::facts::{AuthzTarget, build_args};
 use crate::error::ApiError;
@@ -213,6 +213,9 @@ pub(crate) async fn s3_action_potential<R: AuthorizationRequest + ?Sized>(req: &
         .as_ref()
         .ok_or_else(|| rustfs_s3_types::s3_error!(AccessDenied, "authentication required"))?;
     let bucket = info.bucket.as_deref().unwrap_or_default();
+    if is_reserved_meta_bucket(bucket) {
+        return Ok(false);
+    }
     let root = root_access_key();
     let principal = request_principal(req, cred, &root).with_owner(info.is_owner);
     let facts = request_authz_facts(
@@ -248,9 +251,20 @@ pub(crate) async fn s3_action_potential<R: AuthorizationRequest + ?Sized>(req: &
         conditions: &conditions,
         object: "",
     };
-    if !owner_can_bypass_policy_deny(info.is_owner, &action) && bucket_policy_blocks_action_potential(&policy, &bucket_args).await
-    {
-        return Ok(false);
+    if !owner_can_bypass_policy_deny(info.is_owner, &action) {
+        for account in bucket_policy_deny_accounts(cred) {
+            if bucket_policy_blocks_action_potential(
+                &policy,
+                &BucketPolicyArgs {
+                    account,
+                    ..bucket_args.clone()
+                },
+            )
+            .await
+            {
+                return Ok(false);
+            }
+        }
     }
     Ok(iam_potential
         || (prepared.permits_bucket_policy_probe_fallback() && bucket_policy_action_potential(&policy, &bucket_args).await))

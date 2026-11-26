@@ -11,15 +11,13 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
-//! `HeadRequestBodyFixLayer`: an s3s compatibility patch, installed by
-//! `server::http::external_service_stack!` and pinned there by `stack_census`.
+//! `HeadRequestBodyFixLayer`: outer-edge HTTP `HEAD` body-stripping layer installed by
+//! `server::http::external_service_stack!` and pinned by `stack_census` / `middleware_matrix_census`.
 //!
-//! Patches: a refused `HEAD` carries the s3s error document as a body, which
-//! h2 clients reject as a protocol error. Introduced in rustfs/rustfs#2648.
-//! Replaced by: the same response invariants as `BodylessStatusFixLayer`, on
-//! the refusal path too (gateway `docs/middleware.md`, "The nine RustFS tower
-//! patch layers", row 2).
-//! Removed by: T2.12 (rustfs/backlog#2771).
+//! Origin: patched refused `HEAD` responses carrying s3s XML error bodies (`rustfs/rustfs#2648`).
+//! T2.12 (`rustfs/backlog#2771`) ruling: gateway enforces this invariant on its own responses,
+//! while this layer stays on the outer stack because it also guards website, console, and outer
+//! middleware responses until all non-S3 edges guarantee the same invariant.
 
 use crate::server::hybrid::HybridBody;
 use bytes::Bytes;

@@ -78,6 +78,7 @@ struct GatewayServices<G, C, W> {
     s3: G,
     native_website: Option<(HostClaim, W)>,
     native_console: Option<C>,
+    reserved_console: Option<G>,
     native_admin: Option<G>,
     control_plane: Option<G>,
 }
@@ -90,6 +91,7 @@ impl<G> S3StackService<G> {
                 s3,
                 native_website: None,
                 native_console: None,
+                reserved_console: None,
                 native_admin: None,
                 control_plane: None,
             },
@@ -106,10 +108,18 @@ impl<G, C, W> S3StackService<G, C, W> {
                 s3: services.s3,
                 native_website: services.native_website,
                 native_console,
+                reserved_console: services.reserved_console,
                 native_admin: services.native_admin,
                 control_plane: services.control_plane,
             },
         }
+    }
+
+    /// Attaches the reserved-console SigV4 host used when the native console is disabled on this
+    /// listener (e.g. the S3 port while a dedicated console listener serves assets).
+    pub(crate) fn with_reserved_console(mut self, reserved_console: Option<G>) -> Self {
+        self.services.reserved_console = reserved_console;
+        self
     }
 
     /// Attaches the website service: every request `claim` selects goes to it before any other
@@ -121,6 +131,7 @@ impl<G, C, W> S3StackService<G, C, W> {
                 s3: services.s3,
                 native_website,
                 native_console: services.native_console,
+                reserved_console: services.reserved_console,
                 native_admin: services.native_admin,
                 control_plane: services.control_plane,
             },
@@ -171,10 +182,13 @@ impl<G, C, W> GatewayServices<G, C, W> {
         if claimed && (request.headers().contains_key("x-auth-token") || request.headers().contains_key("x-storage-token")) {
             return bare(http::StatusCode::FORBIDDEN);
         }
-        if let Some(console) = &mut self.native_console
-            && claims_native_console_route(request.method(), request.uri())
-        {
-            return Box::pin(console.call(request));
+        if claims_native_console_route(request.method(), request.uri()) {
+            if let Some(console) = &mut self.native_console {
+                return Box::pin(console.call(request));
+            }
+            if let Some(reserved_console) = &mut self.reserved_console {
+                return Box::pin(reserved_console.call(request));
+            }
         }
         if let Some(admin) = &mut self.native_admin
             && claims_native_admin_read(request.method(), request.uri())
@@ -213,9 +227,13 @@ where
     fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
         let services = &mut self.services;
         ready!(services.s3.poll_ready(cx))?;
-        for host in [&mut services.native_admin, &mut services.control_plane]
-            .into_iter()
-            .flatten()
+        for host in [
+            &mut services.reserved_console,
+            &mut services.native_admin,
+            &mut services.control_plane,
+        ]
+        .into_iter()
+        .flatten()
         {
             ready!(host.poll_ready(cx))?;
         }
@@ -705,5 +723,51 @@ mod tests {
             };
             assert_eq!(answered_by(&mut service, request(method, target)).await, expected, "{target}");
         }
+    }
+
+    #[tokio::test]
+    async fn reserved_console_handles_disabled_console_routes_while_preserving_extensions_and_native_console() {
+        let prefix = crate::server::console_prefix();
+        let console_root = prefix.to_owned();
+        let console_slash = format!("{prefix}/");
+        let console_index = format!("{prefix}/index.html?v=1");
+        let console_lambda = format!("{prefix}/index.html?lambdaArn=arn");
+        let neighbor = format!("{prefix}x/index.html");
+
+        let mut disabled_stack = S3StackService::new(Named("gateway"))
+            .with_reserved_console(Some(Named("reserved-console")))
+            .with_control_plane(Some(Named("control-plane")));
+        for (method, target, expected) in [
+            (Method::GET, console_root.as_str(), "reserved-console"),
+            (Method::GET, console_slash.as_str(), "reserved-console"),
+            (Method::GET, console_index.as_str(), "reserved-console"),
+            (Method::GET, "/favicon.ico", "reserved-console"),
+            (Method::GET, "/apple-touch-icon.png", "reserved-console"),
+            (Method::GET, "/apple-touch-icon-precomposed.png", "reserved-console"),
+            (Method::GET, console_lambda.as_str(), "control-plane"),
+            (Method::GET, "/favicon.ico?replication-metrics", "control-plane"),
+            (Method::GET, neighbor.as_str(), "gateway"),
+            (Method::GET, "/bucket/key", "gateway"),
+        ] {
+            assert_eq!(
+                answered_by(&mut disabled_stack, request(method, target)).await,
+                expected,
+                "console-disabled S3 port: {target}"
+            );
+        }
+
+        // Dedicated console listener with native_console mounted keeps precedence over reserved_console.
+        let mut enabled_stack = S3StackService::new(Named("gateway"))
+            .with_native_console(Some(Named("native-console")))
+            .with_reserved_console(Some(Named("reserved-console")))
+            .with_control_plane(Some(Named("control-plane")));
+        assert_eq!(
+            answered_by(&mut enabled_stack, request(Method::GET, console_index.as_str())).await,
+            "native-console"
+        );
+        assert_eq!(
+            answered_by(&mut enabled_stack, request(Method::GET, console_lambda.as_str())).await,
+            "control-plane"
+        );
     }
 }

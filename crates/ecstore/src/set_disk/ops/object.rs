@@ -57,9 +57,9 @@ use super::super::{
     record_compression_total_memory, record_get_codec_streaming_gate_decision, record_get_direct_memory_decision,
     record_get_object_pipeline_failure, record_get_object_pipeline_failure_for_path, record_get_object_reader_path_observation,
     record_get_stage_duration_if_enabled, record_lock_acquire, reduce_write_quorum_errs, release_materialized_read_lock,
-    replication_write_may_pass_worm_gate, republishes_data_movement_delete_marker, require_restore_operation_id,
-    resolve_delete_version_state, resolve_tiered_decommission_write_quorum_result, resolve_write_layout,
-    restore_commit_operation_id_from_metadata, restore_operation_id_from_metadata, send_event,
+    replication_write_may_pass_worm_gate_with_inbound_metadata, republishes_data_movement_delete_marker,
+    require_restore_operation_id, resolve_delete_version_state, resolve_tiered_decommission_write_quorum_result,
+    resolve_write_layout, restore_commit_operation_id_from_metadata, restore_operation_id_from_metadata, send_event,
     set_disk_delete_creates_delete_marker, should_force_delete_marker_for_missing_version, should_inline_put,
     should_persist_encryption_original_size, should_preserve_delete_replication_state, should_use_inline_fast_path_with_plan,
     take_prepared_get_object_metadata, to_object_err, try_decode_inline_data_shards, warn,
@@ -4160,6 +4160,95 @@ pub(in crate::set_disk) fn merge_replication_metadata_lww(
     changed
 }
 
+/// Applies only the LWW-judged replication metadata categories (tags, Object
+/// Lock retention, Object Lock legal hold) from `inbound` onto a WORM-locked
+/// existing version's `FileInfo::metadata`.
+///
+/// All non-category user/internal metadata (including `etag`, content headers,
+/// encryption/compression headers, and payload identity) stays untouched so a
+/// replication metadata update onto an actively locked version can never alter
+/// its data, ETag, or `mod_time`.
+pub(in crate::set_disk) fn apply_replication_lww_categories_to_locked_metadata(
+    target: &mut HashMap<String, String>,
+    inbound: &HashMap<String, String>,
+    opts: &ObjectOptions,
+) -> bool {
+    use rustfs_utils::http::headers::AMZ_OBJECT_TAGGING;
+    use rustfs_utils::http::metadata_compat::{
+        SUFFIX_OBJECTLOCK_LEGALHOLD_TIMESTAMP, SUFFIX_OBJECTLOCK_RETENTION_TIMESTAMP, SUFFIX_TAGGING_TIMESTAMP, get_str,
+        insert_str,
+    };
+    use time::format_description::well_known::Rfc3339;
+
+    let categories: [(Option<OffsetDateTime>, &str, &[&str]); 3] = [
+        (opts.replication_tagging_timestamp, SUFFIX_TAGGING_TIMESTAMP, &[AMZ_OBJECT_TAGGING]),
+        (
+            opts.replication_retention_timestamp,
+            SUFFIX_OBJECTLOCK_RETENTION_TIMESTAMP,
+            &[metadata_keys::OBJECT_LOCK_MODE, metadata_keys::OBJECT_LOCK_RETAIN_UNTIL_DATE],
+        ),
+        (
+            opts.replication_legalhold_timestamp,
+            SUFFIX_OBJECTLOCK_LEGALHOLD_TIMESTAMP,
+            &[metadata_keys::OBJECT_LOCK_LEGAL_HOLD],
+        ),
+    ];
+
+    let mut changed = false;
+    for (inbound_timestamp, timestamp_suffix, value_keys) in categories {
+        let Some(inbound_timestamp) = inbound_timestamp else { continue };
+        let is_category_value_key = |key: &str| value_keys.iter().any(|value_key| key.eq_ignore_ascii_case(value_key));
+        let stored_timestamp = get_str(target, timestamp_suffix).and_then(|value| OffsetDateTime::parse(&value, &Rfc3339).ok());
+        if stored_timestamp.is_some_and(|stored| stored > inbound_timestamp) {
+            if let Some(stored_value) = get_str(target, timestamp_suffix) {
+                let rustfs_key = format!("{}{timestamp_suffix}", rustfs_utils::http::RUSTFS_INTERNAL_PREFIX);
+                let minio_key = format!("{}{timestamp_suffix}", rustfs_utils::http::MINIO_INTERNAL_PREFIX);
+                if target.get(&rustfs_key).map(String::as_str) != Some(stored_value.as_str())
+                    || target.get(&minio_key).map(String::as_str) != Some(stored_value.as_str())
+                {
+                    insert_str(target, timestamp_suffix, stored_value);
+                    changed = true;
+                }
+            }
+            continue;
+        }
+
+        let mut next_values: Vec<(&str, String)> = Vec::new();
+        for &canonical_key in value_keys {
+            if let Some(value) = inbound.get(canonical_key) {
+                if canonical_key == AMZ_OBJECT_TAGGING && value.is_empty() {
+                    continue;
+                }
+                next_values.push((canonical_key, value.clone()));
+            }
+        }
+        let existing_matches = target.iter().filter(|(key, _)| is_category_value_key(key)).count() == next_values.len()
+            && next_values
+                .iter()
+                .all(|(key, value)| target.get(*key).is_some_and(|stored| stored == value));
+        if !existing_matches {
+            target.retain(|key, _| !is_category_value_key(key));
+            for (key, value) in next_values {
+                target.insert(key.to_string(), value);
+            }
+            changed = true;
+        }
+
+        if let Ok(source_authored) = inbound_timestamp.format(&Rfc3339) {
+            let rustfs_key = format!("{}{timestamp_suffix}", rustfs_utils::http::RUSTFS_INTERNAL_PREFIX);
+            let minio_key = format!("{}{timestamp_suffix}", rustfs_utils::http::MINIO_INTERNAL_PREFIX);
+            if target.get(&rustfs_key).map(String::as_str) != Some(source_authored.as_str())
+                || target.get(&minio_key).map(String::as_str) != Some(source_authored.as_str())
+            {
+                insert_str(target, timestamp_suffix, source_authored);
+                changed = true;
+            }
+        }
+    }
+
+    changed
+}
+
 struct CommittedPutOutcome {
     // Namespace publication succeeded even if its writer must retain repair
     // responsibility. Completion errors must not select rollback cleanup.
@@ -4974,10 +5063,11 @@ impl SetDisks {
                 }
             }
 
-            // SSE-C replication carries the source object's sealed checksum
-            // out of band; store it verbatim like the multipart path does.
-            if let Some(cssum) =
-                rustfs_utils::http::get_header_map(&user_defined, rustfs_utils::http::SUFFIX_REPLICATION_SSEC_CRC)
+            // SSE-C replication and internal data movement carry the source
+            // object's sealed checksum out of band; ignore it on ordinary writes.
+            if (opts.replication_request || opts.data_movement)
+                && let Some(cssum) =
+                    rustfs_utils::http::get_header_map(&user_defined, rustfs_utils::http::SUFFIX_REPLICATION_SSEC_CRC)
                 && !cssum.is_empty()
             {
                 fi.checksum = base64_simd::STANDARD.decode_to_vec(&cssum).ok().map(bytes::Bytes::from);
@@ -5154,9 +5244,10 @@ impl SetDisks {
             // Lock order: lifecycle, metadata transaction, then object namespace.
             // No body reads occur below this point. The snapshot must describe the
             // configuration at commit, not the pre-body advisory object lookup.
-            let mut commit_opts;
-            let opts = if opts.defer_put_object_lock_snapshot {
-                commit_opts = opts.clone();
+            let mut deferred_commit_opts;
+            let pre_lock_commit_opts;
+            let mut opts = if opts.defer_put_object_lock_snapshot {
+                deferred_commit_opts = opts.clone();
                 let expected = source_bucket_incarnation_id
                     .ok_or_else(|| Error::other("destructive PUT is missing its bucket incarnation"))?;
                 let store = metadata_sys::object_store_in(&self.ctx).await?;
@@ -5164,10 +5255,24 @@ impl SetDisks {
                 if !snapshot.is_valid_for_destructive_put(store.id, bucket, expected) {
                     return Err(Error::other("PUT bucket generation or configuration changed while staging"));
                 }
-                snapshot.add_lock_fences(&mut commit_opts);
-                commit_opts.object_lock_config_snapshot = Some(snapshot);
-                commit_opts.defer_put_object_lock_snapshot = false;
-                &commit_opts
+                snapshot.add_lock_fences(&mut deferred_commit_opts);
+                deferred_commit_opts.object_lock_config_snapshot = Some(snapshot);
+                deferred_commit_opts.defer_put_object_lock_snapshot = false;
+                &deferred_commit_opts
+            } else if opts.decommission_capacity_admission.is_some()
+                && write_context.acquires_namespace()
+                && metadata_sys::needs_commit_metadata_snapshot(&self.ctx, bucket, opts)
+            {
+                // Multi-pool commit guards acquire the object write lock right below,
+                // so pre-capture the metadata snapshot before taking it.
+                deferred_commit_opts = metadata_sys::capture_commit_metadata_snapshot_for_options_in(
+                    &self.ctx,
+                    bucket,
+                    source_bucket_incarnation_id,
+                    opts,
+                )
+                .await?;
+                &deferred_commit_opts
             } else {
                 opts
             };
@@ -5205,6 +5310,24 @@ impl SetDisks {
                             .acquire_bucket_incarnation_fence(bucket, expected_incarnation_id)
                             .await?,
                     );
+                }
+                // Capture the metadata-transaction snapshot before taking the object
+                // write lock so reservation::begin reuses it without calling
+                // new_ns_lock(bucket, bucket) (preventing self-deadlock on key == bucket
+                // and avoiding bucket-namespace contention with concurrent writers).
+                if metadata_sys::needs_commit_metadata_snapshot(&self.ctx, bucket, opts) {
+                    let mut pre_snapshot_opts = opts.clone();
+                    if let Some(guard) = bucket_lifecycle_guard.as_ref() {
+                        guard.attach_to_object_options(&mut pre_snapshot_opts);
+                    }
+                    pre_lock_commit_opts = metadata_sys::capture_commit_metadata_snapshot_for_options_in(
+                        &self.ctx,
+                        bucket,
+                        source_bucket_incarnation_id,
+                        &pre_snapshot_opts,
+                    )
+                    .await?;
+                    opts = &pre_lock_commit_opts;
                 }
                 if let Some(fence) = publication_fence.take() {
                     publication_commit_guard = Some(fence.into_commit_guard(self.pool_index, bucket, object).await?);
@@ -5378,19 +5501,145 @@ impl SetDisks {
                             .object_lock_config_snapshot
                             .as_deref()
                             .ok_or_else(|| Error::other("destructive PUT is missing its Object Lock configuration snapshot"))?;
-                        // The WORM gate protects the locked version from local
-                        // overwrites; an authorized replication write passes it
-                        // only when the LWW merge below will judge every
-                        // locking category (see
-                        // `replication_write_may_pass_worm_gate`, which judges
-                        // the same authoritative lock state as the gate,
-                        // bucket default retention included). Gate first so
-                        // malformed lock metadata still fails closed.
-                        if check_object_lock_for_deletion_with_state(object_lock_config.state(), &existing, false)?.is_some()
-                            && !replication_write_may_pass_worm_gate(object_lock_config.state(), &existing, opts)?
-                        {
-                            return Err(StorageError::PrefixAccessDenied(bucket.to_string(), object.to_string()));
+                        // The WORM gate protects an actively locked version
+                        // from local overwrites; an authorized replication
+                        // write passes it only when every locking category has
+                        // a valid LWW decision. Even when admitted, a locked
+                        // version's payload, `data_dir`, ETag, and `mod_time`
+                        // stay immutable: commit only the LWW-judged metadata
+                        // categories via `update_object_meta_with_opts`.
+                        let is_locked =
+                            check_object_lock_for_deletion_with_state(object_lock_config.state(), &existing, false)?.is_some();
+                        if is_locked {
+                            let inbound_metadata = &parts_metadatas[response_metadata_slot].metadata;
+                            if !replication_write_may_pass_worm_gate_with_inbound_metadata(
+                                object_lock_config.state(),
+                                &existing,
+                                opts,
+                                inbound_metadata,
+                            )? {
+                                return Err(StorageError::PrefixAccessDenied(bucket.to_string(), object.to_string()));
+                            }
+
+                            let metadata_lookup_opts = ObjectOptions {
+                                version_id: Some(version_id.to_string()),
+                                no_lock: true,
+                                metadata_cache_safe: false,
+                                versioned: opts.versioned,
+                                version_suspended: opts.version_suspended,
+                                include_part_checksums: true,
+                                ..Default::default()
+                            };
+                            let (mut existing_fi, _, existing_disks) = self
+                                .get_object_fileinfo_for_metadata_update(bucket, object, &metadata_lookup_opts)
+                                .await?
+                                .into_owned();
+                            let metadata_changed = apply_replication_lww_categories_to_locked_metadata(
+                                &mut existing_fi.metadata,
+                                inbound_metadata,
+                                opts,
+                            );
+
+                            self.require_current_restore_operation_id(
+                                bucket,
+                                object,
+                                opts,
+                                expected_restore_operation_id,
+                                "put_object_commit",
+                            )
+                            .await?;
+                            if object_lock_guard.as_ref().is_some_and(|guard| guard.is_lock_lost())
+                                || publication_commit_guard
+                                    .as_ref()
+                                    .is_some_and(RemoteTuplePublicationCommitGuard::is_lock_lost)
+                            {
+                                return Err(StorageError::NamespaceLockQuorumUnavailable {
+                                    mode: "put_object_commit",
+                                    bucket: bucket.to_string(),
+                                    object: object.to_string(),
+                                    required: 1,
+                                    achieved: 0,
+                                });
+                            }
+                            if opts
+                                .namespace_lock_fence
+                                .as_ref()
+                                .is_some_and(NamespaceLockFence::is_lock_lost)
+                            {
+                                return Err(StorageError::NamespaceLockQuorumUnavailable {
+                                    mode: "put_object_outer_lock",
+                                    bucket: bucket.to_string(),
+                                    object: object.to_string(),
+                                    required: 1,
+                                    achieved: 0,
+                                });
+                            }
+                            if opts
+                                .bucket_lifecycle_lock_fence
+                                .as_ref()
+                                .is_some_and(NamespaceLockFence::is_lock_lost)
+                                || bucket_lifecycle_guard.as_ref().is_some_and(|guard| guard.is_lock_lost())
+                            {
+                                return Err(StorageError::NamespaceLockQuorumUnavailable {
+                                    mode: "put_object_bucket_generation",
+                                    bucket: bucket.to_string(),
+                                    object: object.to_string(),
+                                    required: 1,
+                                    achieved: 0,
+                                });
+                            }
+                            if decommission_object_lock_guard
+                                .as_ref()
+                                .is_some_and(|guard| guard.is_lock_lost())
+                            {
+                                return Err(StorageError::NamespaceLockQuorumUnavailable {
+                                    mode: "put_object_external_namespace",
+                                    bucket: bucket.to_string(),
+                                    object: object.to_string(),
+                                    required: 1,
+                                    achieved: 0,
+                                });
+                            }
+
+                            if metadata_changed {
+                                self.update_object_meta_with_opts(
+                                    bucket,
+                                    object,
+                                    existing_fi.clone(),
+                                    &existing_disks,
+                                    &UpdateMetadataOpts {
+                                        replace_user_metadata: true,
+                                        ..Default::default()
+                                    },
+                                )
+                                .await
+                                .map_err(|e| to_object_err(e.into(), vec![bucket, object]))?;
+                                self.invalidate_get_object_metadata_cache(bucket, object).await;
+                            }
+
+                            if !direct_inline_commit {
+                                staging_cleanup.runtime = None;
+                                tmp_cleanup_owned = true;
+                                if let Err(cleanup_err) = self.delete_put_tmp_with_budget(&tmp_dir, &cleanup_reservation).await {
+                                    warn!(
+                                        tmp_dir = %tmp_dir,
+                                        error = ?cleanup_err,
+                                        "failed to cleanup put_object temporary data"
+                                    );
+                                }
+                            }
+
+                            let committed_info = ObjectInfo::from_file_info(
+                                &existing_fi,
+                                bucket,
+                                object,
+                                opts.versioned || opts.version_suspended,
+                            );
+                            return Ok(CommittedPutOutcome {
+                                completion: Ok((committed_info, None)),
+                            });
                         }
+
                         // Receiver-side LWW (rustfs/backlog#1953): reuse this
                         // commit-lock read of the destination version so a
                         // category (tags / retention / legal hold) modified
@@ -10506,6 +10755,15 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
             })
             .collect::<Vec<_>>();
 
+        // Preload bucket Object Lock state before acquiring batch object write
+        // locks so a batch containing key == bucket cannot self-deadlock on
+        // new_ns_lock(bucket, bucket) when metadata_sys performs a cold load.
+        let preloaded_object_lock_config = if !is_meta_bucketname(bucket) && opts.object_lock_config_snapshot.is_none() {
+            Some(metadata_sys::get_object_lock_config_state_in(&self.ctx, bucket).await)
+        } else {
+            None
+        };
+
         // Acquire locks in batch mode (best effort, matching previous behavior)
         let mut batch = rustfs_lock::BatchLockRequest::new(self.locker_owner.as_str()).with_all_or_nothing(false);
         // Keyed by the same disk identity `new_ns_lock` uses, so aliases such
@@ -10629,9 +10887,9 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
         } else {
             match opts.object_lock_config_snapshot.clone() {
                 Some(snapshot) => snapshot,
-                None => match metadata_sys::get_object_lock_config_state_in(&self.ctx, bucket).await {
-                    Ok(state) => Arc::new(ObjectLockConfigSnapshot::new(state)),
-                    Err(err) => {
+                None => match preloaded_object_lock_config {
+                    Some(Ok(state)) => Arc::new(ObjectLockConfigSnapshot::new(state)),
+                    Some(Err(err)) => {
                         let message = err.to_string();
                         for (index, item) in del_errs.iter_mut().enumerate() {
                             if locked_objects.contains(lock_names[index].as_ref()) {
@@ -10640,6 +10898,7 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
                         }
                         return (del_objects, del_errs, accounting);
                     }
+                    None => Arc::new(ObjectLockConfigSnapshot::new(ObjectLockConfigState::ConfirmedAbsent)),
                 },
             }
         };
@@ -11288,40 +11547,43 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
             return (del_objects, del_errs, accounting);
         }
 
-        let mut del_obj_errs: Vec<Vec<Option<DiskError>>> = vec![vec![None; objects.len()]; disks.len()];
-
-        // For each disk delete all objects
-        for (disk_idx, errors) in results.into_iter().enumerate() {
-            // Deletion results for all objects
-            for idx in 0..vers.len() {
-                if errors[idx].is_some() {
-                    for fi in vers[idx].versions.iter() {
-                        del_obj_errs[disk_idx][fi.idx] = errors[idx].clone();
-                    }
-                }
+        let write_quorum = self.set_drive_count / 2 + 1;
+        let missing_group_error = (results.len() < write_quorum).then_some(DiskError::ErasureWriteQuorum);
+        let mut group_by_object = vec![None; objects.len()];
+        let mut group_results = Vec::with_capacity(vers.len());
+        let mut disk_errors = Vec::with_capacity(disks.len());
+        for (group_index, group) in vers.iter().enumerate() {
+            for version in &group.versions {
+                group_by_object[version.idx] = Some(group_index);
             }
-        }
-
-        for obj_idx in 0..objects.len() {
-            let mut disk_err = vec![None; disks.len()];
-
-            for disk_idx in 0..disks.len() {
-                if del_obj_errs[disk_idx][obj_idx].is_some() {
-                    disk_err[disk_idx] = del_obj_errs[disk_idx][obj_idx].clone();
-                }
+            let has_disk_error = results.iter().any(|errors| errors[group_index].is_some());
+            if !has_disk_error {
+                group_results.push((false, missing_group_error.clone()));
+                continue;
             }
-
-            let mut has_err = reduce_write_quorum_errs(&disk_err, OBJECT_OP_IGNORED_ERRS, self.set_drive_count / 2 + 1);
-            if disk_err
+            disk_errors.clear();
+            disk_errors.extend(results.iter().map(|errors| errors[group_index].clone()));
+            let error = if !is_meta_bucketname(bucket)
+                && disk_errors.iter().flatten().any(super::delete_recovery::unsupported_recovery)
+            {
+                Some(DiskError::UnsupportedDisk)
+            } else if disk_errors
                 .iter()
                 .flatten()
                 .any(|error| matches!(error, DiskError::GuardedDeleteUnsupported))
             {
-                has_err = Some(DiskError::GuardedDeleteUnsupported);
-            }
-            if !is_meta_bucketname(bucket) && disk_err.iter().flatten().any(super::delete_recovery::unsupported_recovery) {
-                has_err = Some(DiskError::UnsupportedDisk);
-            }
+                Some(DiskError::GuardedDeleteUnsupported)
+            } else {
+                reduce_write_quorum_errs(&disk_errors, OBJECT_OP_IGNORED_ERRS, write_quorum)
+            };
+            group_results.push((true, error));
+        }
+
+        for obj_idx in 0..objects.len() {
+            let mut has_err = match group_by_object[obj_idx] {
+                Some(group_index) => group_results[group_index].1.clone(),
+                None => missing_group_error.clone(),
+            };
             if let Some(err) = has_err.clone() {
                 let er = err.into();
                 if (is_err_object_not_found(&er) || is_err_version_not_found(&er)) && !del_objects[obj_idx].delete_marker {
@@ -11448,7 +11710,7 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
         let mut rollback_futures = Vec::new();
         let committed_receipt_indices =
             committed_tier_free_version_receipt_indices(&vers, &del_errs, &tier_free_version_receipt_candidates);
-        for fi_vers in &vers {
+        for (group_index, fi_vers) in vers.iter().enumerate() {
             if published_groups.contains(&fi_vers.name) {
                 continue;
             }
@@ -11459,7 +11721,7 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
                 // staged + applied the delete and then errored is still restored (the
                 // disk-side undo is idempotent, no-op when nothing was staged). On
                 // success, skip the errored disks and only clean up successful ones.
-                if !should_rollback && fi_vers.versions.iter().any(|fi| del_obj_errs[disk_idx][fi.idx].is_some()) {
+                if !should_rollback && results[disk_idx][group_index].is_some() {
                     continue;
                 }
 
@@ -11637,7 +11899,8 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
             .enumerate()
             .filter_map(|(index, purge)| {
                 let purge = purge?;
-                if del_errs[index].is_some() || !del_obj_errs.iter().any(|errors| errors[index].is_some()) {
+                let had_disk_error = group_by_object[index].is_some_and(|group_index| group_results[group_index].0);
+                if del_errs[index].is_some() || !had_disk_error {
                     return None;
                 }
                 let version = objects[index].version_id.filter(|version| !version.is_nil())?;
@@ -11687,6 +11950,19 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
 
         self.invalidate_get_object_metadata_cache(bucket, object).await;
 
+        // Preload Object Lock state before taking the object write lock so a
+        // prefix-object delete of key == bucket cannot self-deadlock on
+        // new_ns_lock(bucket, bucket) when metadata_sys loads from disk.
+        let preloaded_prefix_object_lock_config =
+            if opts.delete_prefix && opts.delete_prefix_object && !is_meta_bucketname(bucket) && !opts.data_movement {
+                Some(match opts.object_lock_config_snapshot.as_deref() {
+                    Some(snapshot) => snapshot.state().clone(),
+                    None => metadata_sys::get_object_lock_config_state_in(&self.ctx, bucket).await?,
+                })
+            } else {
+                None
+            };
+
         // Guard lock for single object delete
         let _lock_guard = if (!opts.delete_prefix || opts.delete_prefix_object) && !opts.no_lock {
             #[cfg(test)]
@@ -11735,14 +12011,7 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
                 }
             }
             if opts.delete_prefix_object && !is_meta_bucketname(bucket) {
-                let object_lock_config = if opts.data_movement {
-                    None
-                } else {
-                    Some(match opts.object_lock_config_snapshot.as_deref() {
-                        Some(snapshot) => snapshot.state().clone(),
-                        None => metadata_sys::get_object_lock_config_state_in(&self.ctx, bucket).await?,
-                    })
-                };
+                let object_lock_config = preloaded_prefix_object_lock_config;
                 if let Some(versions) = self.load_file_info_versions_exact(bucket, object).await? {
                     let bypass_governance = opts
                         .object_lock_delete
@@ -12423,7 +12692,7 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
             return Err(Error::PreconditionFailed);
         }
 
-        check_object_lock_retention_update(bucket, object, &obj_info, opts)?;
+        check_object_lock_retention_update(&self.ctx, bucket, object, &obj_info, opts).await?;
 
         if let Some(expected_incarnation_id) = opts.expected_bucket_incarnation_id {
             self.validate_bucket_incarnation(bucket, expected_incarnation_id, opts)
@@ -14412,6 +14681,56 @@ mod replication_quota_safety_tests {
             .expect_err("ciphertext replication without a server-observed logical size must fail closed");
         assert!(matches!(err, StorageError::PartMissingOrCorrupt));
     }
+
+    #[tokio::test]
+    async fn put_object_only_honors_replication_ssec_crc_for_replication_or_data_movement() {
+        let (_temp_dirs, disks, set_disks) = hermetic_set_disks(4).await;
+        let bucket = "ssec-crc-guard-bucket";
+        for disk in &disks {
+            disk.make_volume(bucket).await.expect("bucket volume should be created");
+        }
+        let forged_checksum = vec![0xAA; 8];
+        let encoded_forged = base64_simd::STANDARD.encode_to_string(&forged_checksum);
+
+        // An ordinary write must ignore SUFFIX_REPLICATION_SSEC_CRC in user_defined.
+        let mut ordinary_opts = ObjectOptions::default();
+        rustfs_utils::http::insert_header_map(
+            &mut ordinary_opts.user_defined,
+            rustfs_utils::http::SUFFIX_REPLICATION_SSEC_CRC,
+            encoded_forged.clone(),
+        );
+        let mut ordinary_reader = PutObjReader::from_vec(b"ordinary payload".to_vec());
+        let ordinary = set_disks
+            .put_object(bucket, "ordinary", &mut ordinary_reader, &ordinary_opts)
+            .await
+            .expect("ordinary put should succeed");
+        assert_ne!(
+            ordinary.checksum.as_deref(),
+            Some(forged_checksum.as_slice()),
+            "ordinary write must not promote replication-ssec-crc into object checksum"
+        );
+
+        // Authorized replication writes must continue honoring SUFFIX_REPLICATION_SSEC_CRC.
+        let mut repl_opts = ObjectOptions {
+            replication_request: true,
+            ..Default::default()
+        };
+        rustfs_utils::http::insert_header_map(
+            &mut repl_opts.user_defined,
+            rustfs_utils::http::SUFFIX_REPLICATION_SSEC_CRC,
+            encoded_forged,
+        );
+        let mut repl_reader = PutObjReader::from_vec(b"replicated payload".to_vec());
+        let replicated = set_disks
+            .put_object(bucket, "replicated", &mut repl_reader, &repl_opts)
+            .await
+            .expect("replicated put should succeed");
+        assert_eq!(
+            replicated.checksum.as_deref(),
+            Some(forged_checksum.as_slice()),
+            "replication write must preserve sealed SSE-C checksum"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -15006,17 +15325,173 @@ mod replication_lww_tests {
                 "{mode}: the default-protected version must be untouched"
             );
 
+            let with_retention_timestamp_only = ObjectOptions {
+                replication_retention_timestamp: Some(parse_ts(T_NEW)),
+                ..tagging_only.clone()
+            };
+            let mut reader = PutObjReader::from_vec(b"forged-body".to_vec());
+            let err = set_disks
+                .put_object(bucket, object, &mut reader, &with_retention_timestamp_only)
+                .await
+                .expect_err("{mode}: a retention timestamp without compatible retention must not clear bucket default retention");
+            assert!(matches!(err, StorageError::PrefixAccessDenied(_, _)), "{mode}: unexpected error: {err}");
+
+            let mut preserving_meta = tagging_only.user_defined.clone();
+            preserving_meta.insert(metadata_keys::OBJECT_LOCK_MODE.to_string(), mode.to_string());
+            preserving_meta.insert(
+                metadata_keys::OBJECT_LOCK_RETAIN_UNTIL_DATE.to_string(),
+                "2099-01-01T00:00:00Z".to_string(),
+            );
             let with_retention_decision = ObjectOptions {
+                user_defined: preserving_meta,
                 replication_retention_timestamp: Some(parse_ts(T_NEW)),
                 ..tagging_only
             };
-            put_version(&set_disks, bucket, object, &version_id, &with_retention_decision).await;
+            let mut forged_reader = PutObjReader::from_vec(b"forged-body".to_vec());
+            set_disks
+                .put_object(bucket, object, &mut forged_reader, &with_retention_decision)
+                .await
+                .expect("preserving retention allows LWW tagging update");
             let info = version_info(&set_disks, bucket, object, &version_id).await;
             assert_eq!(
                 info.user_tags.as_str(),
                 "site=remote",
-                "{mode}: with the retention source timestamp the newer inbound tags win"
+                "{mode}: with compatible retention metadata the newer inbound tags win"
             );
+            assert_eq!(info.etag, seeded.etag, "{mode}: locked version ETag must stay immutable");
+            assert_eq!(info.mod_time, seeded.mod_time, "{mode}: locked version mod_time must stay immutable");
+            let mut body_reader = set_disks
+                .get_object_reader(bucket, object, None, http::HeaderMap::new(), &versioned_opts(&version_id, HashMap::new()))
+                .await
+                .expect("locked version body should remain readable");
+            let mut body = Vec::new();
+            tokio::io::AsyncReadExt::read_to_end(&mut body_reader.stream, &mut body)
+                .await
+                .expect("read locked version body");
+            assert_eq!(body, b"lww-body", "{mode}: locked version payload bytes must stay immutable");
+        }
+    }
+
+    #[tokio::test]
+    async fn forged_replication_put_cannot_unlock_or_overwrite_locked_version_payload() {
+        for (case, original_payload) in [
+            ("inline-object", b"original evidence".to_vec()),
+            ("non-inline-object", vec![0x41u8; 256 * 1024]),
+        ] {
+            let (_temp_dirs, disk_stores, set_disks) = hermetic_set_disks(4).await;
+            let bucket = format!("worm-immutable-{case}");
+            let object = "evidence.bin";
+            let version_id = Uuid::new_v4().to_string();
+            make_bucket(&disk_stores, &bucket).await;
+
+            let mut local = HashMap::new();
+            local.insert(metadata_keys::OBJECT_LOCK_LEGAL_HOLD.to_string(), "ON".to_string());
+            insert_str(&mut local, SUFFIX_OBJECTLOCK_LEGALHOLD_TIMESTAMP, T_LOCAL.to_string());
+            local.insert(metadata_keys::OBJECT_LOCK_MODE.to_string(), "COMPLIANCE".to_string());
+            local.insert(
+                metadata_keys::OBJECT_LOCK_RETAIN_UNTIL_DATE.to_string(),
+                "2099-01-01T00:00:00Z".to_string(),
+            );
+            insert_str(&mut local, SUFFIX_OBJECTLOCK_RETENTION_TIMESTAMP, T_LOCAL.to_string());
+            let mut seed_reader = PutObjReader::from_vec(original_payload.clone());
+            let seeded = set_disks
+                .put_object(&bucket, object, &mut seed_reader, &versioned_opts(&version_id, local))
+                .await
+                .expect("seed locked version");
+
+            // 1. Future timestamps trying to clear COMPLIANCE + LegalHold must be rejected.
+            let forged_unlock_opts = ObjectOptions {
+                replication_request: true,
+                replication_retention_timestamp: Some(parse_ts("2098-01-01T00:00:00Z")),
+                replication_legalhold_timestamp: Some(parse_ts("2098-01-01T00:00:00Z")),
+                mod_time: Some(parse_ts("2001-01-01T00:00:00Z")),
+                preserve_etag: Some("forged-etag".to_string()),
+                ..versioned_opts(&version_id, HashMap::new())
+            };
+            let mut forged_reader = PutObjReader::from_vec(b"forged".to_vec());
+            let err = set_disks
+                .put_object(&bucket, object, &mut forged_reader, &forged_unlock_opts)
+                .await
+                .expect_err("forged future-timestamp replication PUT must not unlock COMPLIANCE/LegalHold");
+            assert!(matches!(err, StorageError::PrefixAccessDenied(_, _)), "{case}: {err}");
+
+            // 2. Stale timestamps trying to overwrite bytes in place must leave payload, ETag,
+            //    data_dir, mod_time, and locks completely immutable.
+            let stale_overwrite_opts = ObjectOptions {
+                replication_request: true,
+                replication_retention_timestamp: Some(parse_ts(T_OLD)),
+                replication_legalhold_timestamp: Some(parse_ts(T_OLD)),
+                mod_time: Some(parse_ts("2001-01-01T00:00:00Z")),
+                preserve_etag: Some("forged-stale-etag".to_string()),
+                ..versioned_opts(&version_id, HashMap::new())
+            };
+            let mut stale_reader = PutObjReader::from_vec(b"forged-stale".to_vec());
+            set_disks
+                .put_object(&bucket, object, &mut stale_reader, &stale_overwrite_opts)
+                .await
+                .expect("stale replication PUT stays idempotent at object level without altering payload");
+
+            // 3. Matching/extending COMPLIANCE + LegalHold release (OFF) with forged body bytes
+            //    updates ONLY the LWW-winning lock metadata; bytes, ETag, data_dir, and mod_time stay immutable.
+            let mut extending_meta = HashMap::new();
+            extending_meta.insert(metadata_keys::OBJECT_LOCK_MODE.to_string(), "COMPLIANCE".to_string());
+            extending_meta.insert(
+                metadata_keys::OBJECT_LOCK_RETAIN_UNTIL_DATE.to_string(),
+                "2100-01-01T00:00:00Z".to_string(),
+            );
+            extending_meta.insert(metadata_keys::OBJECT_LOCK_LEGAL_HOLD.to_string(), "OFF".to_string());
+            let extending_opts = ObjectOptions {
+                replication_request: true,
+                replication_retention_timestamp: Some(parse_ts(T_NEW)),
+                replication_legalhold_timestamp: Some(parse_ts(T_NEW)),
+                mod_time: Some(parse_ts("2001-01-01T00:00:00Z")),
+                preserve_etag: Some("forged-ext-etag".to_string()),
+                ..versioned_opts(&version_id, extending_meta)
+            };
+            let mut ext_reader = PutObjReader::from_vec(b"forged-replacement".to_vec());
+            let updated = set_disks
+                .put_object(&bucket, object, &mut ext_reader, &extending_opts)
+                .await
+                .expect("authorized COMPLIANCE extension + legal-hold release should update metadata only");
+
+            let info = version_info(&set_disks, &bucket, object, &version_id).await;
+            assert_eq!(updated.etag, seeded.etag, "{case}: returned ETag must match original");
+            assert_eq!(info.etag, seeded.etag, "{case}: persisted ETag must remain immutable");
+            assert_eq!(info.data_dir, seeded.data_dir, "{case}: data_dir must remain immutable");
+            assert_eq!(info.mod_time, seeded.mod_time, "{case}: mod_time must remain immutable");
+            assert_eq!(info.size, seeded.size, "{case}: size must remain immutable");
+            assert_eq!(
+                info.user_defined.get(metadata_keys::OBJECT_LOCK_MODE).map(String::as_str),
+                Some("COMPLIANCE")
+            );
+            assert_eq!(
+                info.user_defined
+                    .get(metadata_keys::OBJECT_LOCK_RETAIN_UNTIL_DATE)
+                    .map(String::as_str),
+                Some("2100-01-01T00:00:00Z")
+            );
+            assert_eq!(
+                info.user_defined
+                    .get(metadata_keys::OBJECT_LOCK_LEGAL_HOLD)
+                    .map(String::as_str),
+                Some("OFF")
+            );
+
+            let mut reader = set_disks
+                .get_object_reader(
+                    &bucket,
+                    object,
+                    None,
+                    http::HeaderMap::new(),
+                    &versioned_opts(&version_id, HashMap::new()),
+                )
+                .await
+                .expect("original locked payload must remain readable");
+            let mut actual_body = Vec::new();
+            tokio::io::AsyncReadExt::read_to_end(&mut reader.stream, &mut actual_body)
+                .await
+                .expect("read original locked payload");
+            assert_eq!(actual_body, original_payload, "{case}: payload bytes must remain byte-for-byte immutable");
         }
     }
 
