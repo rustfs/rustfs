@@ -89,12 +89,19 @@ pub(crate) mod data_usage {
         crate::storage::storage_api::ecstore_data_usage::load_admin_data_usage_with_memory_overlay(store).await
     }
 
-    pub(crate) async fn load_bucket_usage_from_backend_cached(
+    pub(crate) use crate::storage::storage_api::ecstore_data_usage::{BucketUsagePendingReason, BucketUsageStatus};
+
+    pub(crate) async fn load_bucket_usage_certification_from_backend_cached(
         store: Arc<crate::storage::storage_api::ECStore>,
         bucket: &str,
         incarnation: uuid::Uuid,
-    ) -> Result<Option<u64>, crate::storage::storage_api::StorageError> {
-        crate::storage::storage_api::ecstore_data_usage::load_bucket_usage_from_backend_cached(store, bucket, incarnation).await
+    ) -> Result<BucketUsageStatus, crate::storage::storage_api::StorageError> {
+        crate::storage::storage_api::ecstore_data_usage::load_bucket_usage_certification_from_backend_cached(
+            store,
+            bucket,
+            incarnation,
+        )
+        .await
     }
 
     #[cfg(test)]
@@ -1728,7 +1735,8 @@ pub(crate) mod object_meta_usecase {
     pub(crate) use crate::storage::storage_api::check_retention_for_modification;
 
     pub(crate) use crate::storage::storage_api::ecfs_consumer::object_lock::{
-        load_bucket_object_lock_config_state, validate_bucket_object_lock_enabled, validate_bucket_object_lock_enabled_state,
+        load_bucket_object_lock_config_state, validate_bucket_object_lock_enabled, validate_bucket_object_lock_enabled_for_read,
+        validate_bucket_object_lock_enabled_state,
     };
     pub(crate) use crate::storage::storage_api::ecstore_bucket::metadata::validate_tag_set_entries;
     pub(crate) use crate::storage::storage_api::ecstore_bucket::tagging::{

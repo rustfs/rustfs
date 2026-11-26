@@ -755,7 +755,7 @@ impl SourceStore {
             .await?;
         Ok(state)
     }
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     pub async fn write_owned_backup(&self, owner: Uuid, target: bool, bytes: &[u8]) -> Result<()> {
         if owner.is_nil() {
             return Err(DiskError::FileCorrupt);

@@ -21,19 +21,24 @@ use rustfs_config::{
     ENV_KUBERNETES_SERVICE_HOST, ENV_LOCAL_ENDPOINT_HOST, ENV_MINIO_CI, ENV_STARTUP_TOPOLOGY_RETRY_MAX_DELAY,
     ENV_STARTUP_TOPOLOGY_WAIT_MODE, ENV_STARTUP_TOPOLOGY_WAIT_TIMEOUT, ENV_UNSAFE_BYPASS_DISK_CHECK,
 };
-use rustfs_utils::{XHost, check_local_server_addr, get_env_opt_str, get_host_ip, is_local_host};
+use rustfs_utils::{XHost, check_local_server_addr, get_env_opt_str, is_local_ip};
 #[cfg(test)]
 use std::sync::{LazyLock, Mutex};
 use std::{
+    borrow::Cow,
     collections::{BTreeMap, BTreeSet, HashMap, HashSet, hash_map::Entry},
     future::Future,
     io::{Error, ErrorKind, Result},
     net::IpAddr,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
-use tokio::time::sleep as async_sleep;
+use tokio::time::{Instant as TokioInstant, sleep as async_sleep, sleep_until};
 use tracing::{error, info, instrument, warn};
 use url::Host;
+
+const LOG_COMPONENT_ECSTORE: &str = "ecstore";
+const LOG_SUBSYSTEM_ENDPOINT_TOPOLOGY: &str = "endpoint_topology";
+const EVENT_STARTUP_ENDPOINT_DNS_FAILED: &str = "startup_endpoint_dns_failed";
 
 /// enum for setup type.
 #[derive(PartialEq, Eq, Debug, Clone)]
@@ -196,15 +201,14 @@ struct PoolEndpointList {
     setup_type: SetupType,
 }
 
+struct ResolvedStartupHost {
+    addresses: HashSet<IpAddr>,
+    is_local: bool,
+}
+
 impl AsRef<Vec<Endpoints>> for PoolEndpointList {
     fn as_ref(&self) -> &Vec<Endpoints> {
         &self.inner
-    }
-}
-
-impl AsMut<Vec<Endpoints>> for PoolEndpointList {
-    fn as_mut(&mut self) -> &mut Vec<Endpoints> {
-        &mut self.inner
     }
 }
 
@@ -322,76 +326,41 @@ impl PoolEndpointList {
 
         let convergence_started = Instant::now();
         let dns_retry_deadline = DnsRetryDeadline::new(policy.wait_timeout, policy.retry_max_delay);
-        if let Some(local_endpoint_host) = local_endpoint_host {
+        let resolved_hosts = if let Some(local_endpoint_host) = local_endpoint_host {
             pool_endpoint_list.update_is_local_from_explicit_host(disks_layout, server_addr.port(), local_endpoint_host)?;
+            HashMap::new()
         } else {
             pool_endpoint_list
-                .update_is_local(server_addr.port(), &dns_retry_deadline)
-                .await?;
+                .resolve_startup_hosts(server_addr.port(), &dns_retry_deadline, lookup_startup_host_ips)
+                .await?
+        };
 
-            // Collapse divergent local/remote verdicts for the same host:port that
-            // orchestrated DNS churn can produce during startup, before any check
-            // relies on the local flag.
-            normalize_same_host_local_state(pool_endpoint_list.as_mut());
-        }
-
+        let mut total_endpoints = 0;
+        let mut local_endpoints = 0;
         for endpoints in pool_endpoint_list.inner.iter_mut() {
             // Check whether same path is not used in endpoints of a host on different port.
             // This relies on resolving every host to its IP set, which can flap while a
             // Kubernetes headless service is still publishing records; defer it in
             // orchestrated mode and re-run the DNS-independent checks below.
             if !policy.is_orchestrated() {
-                let mut path_ip_map: HashMap<String, HashSet<IpAddr>> = HashMap::new();
-                let mut host_ip_cache: HashMap<Host<&str>, HashSet<IpAddr>> = HashMap::new();
+                let mut path_ip_map: HashMap<String, Cow<'_, HashSet<IpAddr>>> = HashMap::new();
                 for ep in endpoints.as_ref() {
-                    let Some(host) = ep.url.host() else {
+                    let Some(host) = ep.url.host_str().and_then(|host| resolved_hosts.get(host)) else {
                         continue;
                     };
-
-                    let host_ip_set = if let Some(set) = host_ip_cache.get(&host) {
-                        info!(
-                            target: "rustfs::ecstore::endpoints",
-                            host = %host,
-                            endpoint = %ep.to_string(),
-                            from = "cache",
-                            "Create pool endpoints host '{}' found in cache for endpoint '{}'", host, ep.to_string()
-                        );
-                        set.clone()
-                    } else {
-                        let ips = match resolve_host_ips_with_retry(host.clone(), &ep.to_string(), &dns_retry_deadline).await {
-                            Ok(ips) => ips,
-                            Err(e) => {
-                                error!("Create pool endpoints host {} not found, error:{}", host, e);
-                                return Err(e);
-                            }
-                        };
-                        info!(
-                            target: "rustfs::ecstore::endpoints",
-                            host = %host,
-                            endpoint = %ep.to_string(),
-                            from = "get_host_ip",
-                            "Create pool endpoints host '{}' resolved to ips {:?} for endpoint '{}'",
-                            host,
-                            ips,
-                            ep.to_string()
-                        );
-                        host_ip_cache.insert(host.clone(), ips.clone());
-                        ips
-                    };
-
                     let path = ep.get_file_path();
                     match path_ip_map.entry(path) {
                         Entry::Occupied(mut e) => {
-                            if e.get().intersection(&host_ip_set).count() > 0 {
-                                let path_key = e.key().clone();
+                            if !e.get().is_disjoint(&host.addresses) {
                                 return Err(Error::other(format!(
-                                    "same path '{path_key}' can not be served by different port on same address"
+                                    "same path '{}' can not be served by different port on same address",
+                                    e.key()
                                 )));
                             }
-                            e.get_mut().extend(host_ip_set.iter());
+                            e.get_mut().to_mut().extend(&host.addresses);
                         }
                         Entry::Vacant(e) => {
-                            e.insert(host_ip_set);
+                            e.insert(Cow::Borrowed(&host.addresses));
                         }
                     }
                 }
@@ -414,13 +383,11 @@ impl PoolEndpointList {
             }
 
             // Here all endpoints are URL style.
-            let mut ep_path_set = HashSet::new();
             let mut local_server_host_set = HashSet::new();
             let mut local_port_set = HashSet::new();
             let mut local_endpoint_count = 0;
 
             for ep in endpoints.as_ref() {
-                ep_path_set.insert(ep.get_file_path());
                 if ep.is_local && ep.url.has_host() {
                     local_server_host_set.insert(ep.url.host());
                     local_port_set.insert(ep.url.port());
@@ -438,29 +405,19 @@ impl PoolEndpointList {
             }
 
             // Add missing port in all endpoints.
+            total_endpoints += endpoints.as_ref().len();
             for ep in endpoints.as_mut() {
+                local_endpoints += usize::from(ep.is_local);
                 if !ep.url.has_host() {
                     unique_args.insert(format!("localhost:{}", server_addr.port()));
                     continue;
                 }
-                match ep.url.port() {
-                    None => {
-                        if local_endpoint_host.is_none() {
-                            let _ = ep.url.set_port(Some(server_addr.port()));
-                        }
-                    }
-                    Some(port) => {
-                        // If endpoint is local, but port is different than serverAddrPort, then make it as remote.
-                        if ep.is_local && server_addr.port() != port {
-                            ep.is_local = false;
-                        }
-                    }
+                if ep.url.port().is_none() && local_endpoint_host.is_none() {
+                    let _ = ep.url.set_port(Some(server_addr.port()));
                 }
                 unique_args.insert(ep.host_port());
             }
         }
-
-        validate_local_physical_disk_independence(pool_endpoint_list.as_ref())?;
 
         let setup_type = match pool_endpoint_list.as_ref()[0].as_ref()[0].get_type() {
             EndpointType::Path => SetupType::Erasure,
@@ -470,15 +427,25 @@ impl PoolEndpointList {
             },
         };
 
-        pool_endpoint_list.setup_type = setup_type;
+        // A storage member can belong to just one pool, but it must own a slot somewhere in the topology.
+        if local_endpoints == 0 {
+            let local_port = server_addr.port();
+            if local_endpoint_host.is_some() {
+                return Err(Error::other(format!(
+                    "{ENV_LOCAL_ENDPOINT_HOST} does not match any distributed endpoint on the local server port {local_port}"
+                )));
+            }
+            return Err(Error::new(
+                ErrorKind::InvalidInput,
+                format!(
+                    "no local storage endpoints on the local server port {local_port}; \
+                     check that a host in RUSTFS_VOLUMES resolves to a local interface and uses the RUSTFS_ADDRESS port"
+                ),
+            ));
+        }
 
-        let total_endpoints: usize = pool_endpoint_list.inner.iter().map(|eps| eps.as_ref().len()).sum();
-        let local_endpoints = pool_endpoint_list
-            .inner
-            .iter()
-            .flat_map(|eps| eps.as_ref())
-            .filter(|ep| ep.is_local)
-            .count();
+        validate_local_physical_disk_independence(pool_endpoint_list.as_ref())?;
+        pool_endpoint_list.setup_type = setup_type;
         info!(
             target: "rustfs::ecstore::endpoints",
             mode = ?policy.mode,
@@ -492,34 +459,33 @@ impl PoolEndpointList {
         Ok(pool_endpoint_list)
     }
 
-    /// resolves all hosts and discovers which are local
-    async fn update_is_local(&mut self, local_port: u16, dns_retry_deadline: &DnsRetryDeadline) -> Result<()> {
-        self._update_is_local(local_port, dns_retry_deadline).await
-    }
-
-    /// resolves all hosts and discovers which are local
-    async fn _update_is_local(&mut self, local_port: u16, dns_retry_deadline: &DnsRetryDeadline) -> Result<()> {
+    // Keep each successful answer for the whole startup so all drives and path checks agree.
+    async fn resolve_startup_hosts(
+        &mut self,
+        local_port: u16,
+        dns_retry_deadline: &DnsRetryDeadline,
+        resolve: impl for<'a> AsyncFn(Host<&'a str>) -> Result<HashSet<IpAddr>>,
+    ) -> Result<HashMap<String, ResolvedStartupHost>> {
+        let mut resolved_hosts: HashMap<String, ResolvedStartupHost> = HashMap::new();
         for endpoints in self.inner.iter_mut() {
             for ep in endpoints.as_mut() {
-                match ep.url.host() {
-                    None => {
-                        ep.is_local = true;
-                    }
-                    Some(host) => {
-                        ep.is_local = resolve_local_host_with_retry(
-                            host,
-                            ep.url.port().unwrap_or_default(),
-                            local_port,
-                            &ep.to_string(),
-                            dns_retry_deadline,
-                        )
-                        .await?;
-                    }
-                }
+                let (Some(host_name), Some(host)) = (ep.url.host_str(), ep.url.host()) else {
+                    ep.is_local = true;
+                    continue;
+                };
+                let is_local = if let Some(resolved) = resolved_hosts.get(host_name) {
+                    resolved.is_local
+                } else {
+                    let addresses = resolve_startup_host_with_retry(host, &ep.to_string(), dns_retry_deadline, &resolve).await?;
+                    let is_local = addresses.iter().any(is_local_ip);
+                    resolved_hosts.insert(host_name.to_owned(), ResolvedStartupHost { addresses, is_local });
+                    is_local
+                };
+                ep.is_local = is_local && ep.url.port().is_none_or(|port| port == local_port);
             }
         }
 
-        Ok(())
+        Ok(resolved_hosts)
     }
 
     fn update_is_local_from_explicit_host(
@@ -529,7 +495,6 @@ impl PoolEndpointList {
         raw_local_host: &str,
     ) -> Result<()> {
         let local_host = parse_explicit_local_endpoint_host(raw_local_host)?;
-        let mut local_endpoint_found = false;
         let mut host_path_ports = HashMap::new();
         debug_assert_eq!(self.inner.len(), disks_layout.pools.len());
 
@@ -575,15 +540,7 @@ impl PoolEndpointList {
                         entry.insert(endpoint_port);
                     }
                 }
-
-                local_endpoint_found |= endpoint.is_local;
             }
-        }
-
-        if !local_endpoint_found {
-            return Err(Error::other(format!(
-                "{ENV_LOCAL_ENDPOINT_HOST} does not match any distributed endpoint on the local server port {local_port}"
-            )));
         }
 
         Ok(())
@@ -686,17 +643,21 @@ fn kernel_hostname_for_endpoint_identity() -> Result<String> {
         .map_err(|_| Error::new(ErrorKind::InvalidData, "kernel hostname is not valid UTF-8"))
 }
 
-fn endpoint_is_local_host(host: Host<&str>, port: u16, local_port: u16) -> Result<bool> {
+async fn lookup_startup_host_ips(host: Host<&str>) -> Result<HashSet<IpAddr>> {
     #[cfg(test)]
     if local_host_resolution_timeout_forced(&host) {
         return Err(Error::new(ErrorKind::TimedOut, "resolver timeout"));
     }
 
-    is_local_host(host, port, local_port)
+    match host {
+        Host::Domain(domain) => Ok(tokio::net::lookup_host((domain, 0)).await?.map(|addr| addr.ip()).collect()),
+        Host::Ipv4(ip) => Ok(HashSet::from([IpAddr::V4(ip)])),
+        Host::Ipv6(ip) => Ok(HashSet::from([IpAddr::V6(ip)])),
+    }
 }
 
 struct DnsRetryDeadline {
-    started: Instant,
+    started: TokioInstant,
     timeout: Duration,
     max_delay: Duration,
 }
@@ -704,7 +665,7 @@ struct DnsRetryDeadline {
 impl DnsRetryDeadline {
     fn new(timeout: Duration, max_delay: Duration) -> Self {
         Self {
-            started: Instant::now(),
+            started: TokioInstant::now(),
             timeout,
             max_delay,
         }
@@ -716,6 +677,14 @@ impl DnsRetryDeadline {
 
     fn elapsed(&self) -> Duration {
         self.started.elapsed()
+    }
+
+    fn expires_at(&self) -> Option<TokioInstant> {
+        // Zero means one lookup with no retries. MAX is the unbounded orchestrated policy.
+        if matches!(self.timeout, Duration::ZERO | Duration::MAX) {
+            return None;
+        }
+        self.started.checked_add(self.timeout)
     }
 
     fn bounded_delay(&self, delay: Duration) -> Option<Duration> {
@@ -746,17 +715,16 @@ where
     RetryLog: FnMut(u32, Duration, Duration, &Error),
 {
     let mut attempts: u32 = 0;
-    let mut last_warn: Option<Instant> = None;
-
-    loop {
-        match resolve().await {
-            Ok(value) => return Ok(value),
-            Err(err) => {
-                if !is_retryable_dns_error(&err) {
-                    return Err(permanent_error(err));
-                }
-
+    let result = {
+        let retry = async {
+            let mut last_warn: Option<Instant> = None;
+            loop {
                 attempts += 1;
+                let err = match resolve().await {
+                    Ok(value) => return Ok(value),
+                    Err(err) if is_retryable_dns_error(&err) => err,
+                    Err(err) => return Err(permanent_error(err)),
+                };
                 let Some(delay) = dns_retry_deadline.bounded_delay(dns_retry_delay(attempts, dns_retry_deadline.max_delay))
                 else {
                     return Err(timeout_error(attempts, dns_retry_deadline.timeout(), err));
@@ -770,8 +738,25 @@ where
                 }
                 sleep(delay).await;
             }
+        };
+
+        match dns_retry_deadline.expires_at() {
+            Some(expires_at) if expires_at <= TokioInstant::now() => None,
+            Some(expires_at) => tokio::select! {
+                biased;
+                () = sleep_until(expires_at) => None,
+                result = retry => Some(result),
+            },
+            None => Some(retry.await),
         }
-    }
+    };
+    result.unwrap_or_else(|| {
+        Err(timeout_error(
+            attempts,
+            dns_retry_deadline.timeout(),
+            Error::new(ErrorKind::TimedOut, "startup DNS deadline elapsed"),
+        ))
+    })
 }
 
 /// Action-oriented tail shared by topology convergence timeout errors so a
@@ -781,26 +766,30 @@ const TOPOLOGY_TIMEOUT_HINT: &str = "check DNS and /etc/hosts resolution, the ht
 and that all peer nodes have started; on Kubernetes/orchestrated deployments set \
 RUSTFS_STARTUP_TOPOLOGY_WAIT_MODE=orchestrated to keep waiting instead of exiting";
 
-async fn resolve_local_host_with_retry(
+async fn resolve_startup_host_with_retry(
     host: Host<&str>,
-    port: u16,
-    local_port: u16,
     context: &str,
     dns_retry_deadline: &DnsRetryDeadline,
-) -> Result<bool> {
+    resolve: &impl for<'a> AsyncFn(Host<&'a str>) -> Result<HashSet<IpAddr>>,
+) -> Result<HashSet<IpAddr>> {
     retry_dns_operation(
-        || {
-            let host = host.clone();
-            async move { endpoint_is_local_host(host, port, local_port) }
-        },
+        || resolve(host.clone()),
         async_sleep,
         dns_retry_deadline,
         |err| Error::other(format!("endpoint '{context}' local-host detection failed for host '{host}': {err}")),
         |attempts, timeout, err| {
-            Error::other(format!(
-                "endpoint '{context}' local-host detection did not converge for host '{host}' after {attempts} attempts \
+            let kind = if timeout.is_zero() {
+                ErrorKind::Other
+            } else {
+                ErrorKind::TimedOut
+            };
+            Error::new(
+                kind,
+                format!(
+                    "endpoint '{context}' local-host detection did not converge for host '{host}' after {attempts} attempts \
 over {timeout:?} (stage=local_host_detection): {err}. {TOPOLOGY_TIMEOUT_HINT}"
-            ))
+                ),
+            )
         },
         |attempts, delay, elapsed, err| {
             warn!(
@@ -817,42 +806,18 @@ over {timeout:?} (stage=local_host_detection): {err}. {TOPOLOGY_TIMEOUT_HINT}"
         },
     )
     .await
-}
-
-async fn resolve_host_ips_with_retry(
-    host: Host<&str>,
-    context: &str,
-    dns_retry_deadline: &DnsRetryDeadline,
-) -> Result<HashSet<IpAddr>> {
-    retry_dns_operation(
-        || {
-            let host = host.clone();
-            async move { get_host_ip(host).await }
-        },
-        async_sleep,
-        dns_retry_deadline,
-        |err| Error::other(format!("endpoint '{context}' host '{host}' cannot resolve: {err}")),
-        |attempts, timeout, err| {
-            Error::other(format!(
-                "endpoint '{context}' host '{host}' DNS resolution did not converge after {attempts} attempts over \
-{timeout:?} (stage=host_ip_resolution): {err}. {TOPOLOGY_TIMEOUT_HINT}"
-            ))
-        },
-        |attempts, delay, elapsed, err| {
-            warn!(
-                target = "rustfs::ecstore::endpoints",
-                stage = "host_ip_resolution",
-                context = %context,
-                host = %host,
-                attempt = attempts,
-                delay_ms = delay.as_millis(),
-                elapsed_ms = elapsed.as_millis(),
-                error = %err,
-                "retrying endpoint DNS resolution after temporary error"
-            );
-        },
-    )
-    .await
+    .inspect_err(|err| {
+        error!(
+            target: "rustfs::ecstore::endpoints",
+            event = EVENT_STARTUP_ENDPOINT_DNS_FAILED,
+            component = LOG_COMPONENT_ECSTORE,
+            subsystem = LOG_SUBSYSTEM_ENDPOINT_TOPOLOGY,
+            state = "failed",
+            host = %host,
+            error_kind = ?err.kind(),
+            "Startup endpoint DNS resolution failed"
+        );
+    })
 }
 
 fn is_retryable_dns_error(err: &Error) -> bool {
@@ -934,6 +899,26 @@ fn explicit_url_port(raw: &str) -> Result<Option<u16>> {
     };
 
     port.parse().map(Some).map_err(|_| invalid())
+}
+
+fn is_url_topology_with_non_literal_hosts(disks_layout: &DisksLayout) -> Result<bool> {
+    let mut endpoints = disks_layout
+        .pools
+        .iter()
+        .flat_map(|pool| pool.iter().flatten())
+        .map(|endpoint| Endpoint::try_from(endpoint.as_str()));
+    let Some(first) = endpoints.next().transpose()? else {
+        return Ok(false);
+    };
+    if first.get_type() != EndpointType::Url {
+        return Ok(false);
+    }
+    for endpoint in std::iter::once(Ok(first)).chain(endpoints) {
+        if !matches!(endpoint?.url.host(), Some(Host::Ipv4(_) | Host::Ipv6(_))) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 fn infer_kubernetes_local_endpoint_host(
@@ -1189,34 +1174,6 @@ fn parse_wait_duration(raw: &str) -> Option<Duration> {
     }
 }
 
-/// Collapses divergent local/remote verdicts for endpoints that share the same
-/// `host:port`. A `host:port` is a single network identity, so if any endpoint
-/// of the group resolved as local, all of them are local. This absorbs the
-/// transient inconsistency that orchestrated DNS churn can produce across the
-/// several drives exported by one host.
-fn normalize_same_host_local_state(pools: &mut [Endpoints]) {
-    let mut local_hosts: HashSet<String> = HashSet::new();
-    for endpoints in pools.iter() {
-        for ep in endpoints.as_ref() {
-            if ep.is_local && ep.url.has_host() {
-                local_hosts.insert(ep.host_port());
-            }
-        }
-    }
-
-    if local_hosts.is_empty() {
-        return;
-    }
-
-    for endpoints in pools.iter_mut() {
-        for ep in endpoints.as_mut() {
-            if !ep.is_local && ep.url.has_host() && local_hosts.contains(&ep.host_port()) {
-                ep.is_local = true;
-            }
-        }
-    }
-}
-
 /// represent endpoints in a given pool
 /// along with its setCount and setDriveCount.
 #[derive(Debug, Clone)]
@@ -1280,32 +1237,11 @@ impl EndpointServerPools {
     ) -> Result<(EndpointServerPools, SetupType)> {
         let mut local_endpoint_host = get_env_opt_str(ENV_LOCAL_ENDPOINT_HOST);
         let mut policy_override = None;
-        let first_endpoint = disks_layout
-            .pools
-            .iter()
-            .flat_map(|pool| pool.iter().flatten())
-            .next()
-            .map(|endpoint| Endpoint::try_from(endpoint.as_str()))
-            .transpose()?;
-        let distributed = first_endpoint
-            .as_ref()
-            .is_some_and(|endpoint| endpoint.get_type() == EndpointType::Url);
-        let mut all_distributed_hosts_are_ip_literals = distributed;
-        if distributed {
-            for raw_endpoint in disks_layout.pools.iter().flat_map(|pool| pool.iter().flatten()) {
-                let endpoint = Endpoint::try_from(raw_endpoint.as_str())?;
-                if !matches!(endpoint.url.host(), Some(Host::Ipv4(_) | Host::Ipv6(_))) {
-                    all_distributed_hosts_are_ip_literals = false;
-                    break;
-                }
-            }
-        }
         let wait_mode = get_env_opt_str(ENV_STARTUP_TOPOLOGY_WAIT_MODE).map(|value| value.trim().to_ascii_lowercase());
         let infer_kubernetes_host = local_endpoint_host.is_none()
-            && distributed
-            && !all_distributed_hosts_are_ip_literals
             && std::env::var_os(ENV_KUBERNETES_SERVICE_HOST).is_some()
-            && matches!(wait_mode.as_deref(), None | Some("") | Some("auto") | Some("orchestrated"));
+            && matches!(wait_mode.as_deref(), None | Some("") | Some("auto") | Some("orchestrated"))
+            && is_url_topology_with_non_literal_hosts(disks_layout)?;
         if infer_kubernetes_host {
             let kernel_hostname = kernel_hostname_for_endpoint_identity()?;
             let local_port = check_local_server_addr(server_addr)?.port();
@@ -1317,7 +1253,7 @@ impl EndpointServerPools {
                         policy_override = Some(StartupTopologyPolicy::resolve_from(
                             Some("bounded"),
                             true,
-                            distributed,
+                            true,
                             get_env_opt_str(ENV_STARTUP_TOPOLOGY_WAIT_TIMEOUT).as_deref(),
                             get_env_opt_str(ENV_STARTUP_TOPOLOGY_RETRY_MAX_DELAY).as_deref(),
                             false,
@@ -1788,7 +1724,7 @@ mod test {
 
     #[tokio::test]
     async fn system_resolver_negative_result_reaches_the_dns_allowlist() {
-        let Err(err) = get_host_ip(Host::Domain("rustfs-startup-negative.invalid")).await else {
+        let Err(err) = lookup_startup_host_ips(Host::Domain("rustfs-startup-negative.invalid")).await else {
             // Some corporate and ISP resolvers synthesize an address for
             // unknown names, including the reserved .invalid suffix.
             return;
@@ -1959,22 +1895,48 @@ mod test {
         );
     }
 
-    #[test]
-    fn normalize_same_host_local_state_unifies_divergent_verdicts() {
-        let mut d1 = Endpoint::try_from("http://node1:9000/d1").unwrap();
-        let mut d2 = Endpoint::try_from("http://node1:9000/d2").unwrap();
-        d1.is_local = true;
-        d2.is_local = false; // divergent verdict for the same host:port
-        let mut remote = Endpoint::try_from("http://node2:9000/d1").unwrap();
-        remote.is_local = false;
+    #[tokio::test]
+    async fn startup_reuses_one_dns_answer_per_host_across_ports_and_pools() {
+        let mut pools = PoolEndpointList {
+            inner: vec![
+                Endpoints::try_from(["http://node1:9000/d1", "http://node1:9000/d2", "http://node2:9000/d1"].as_slice())
+                    .expect("first pool endpoints should parse"),
+                Endpoints::try_from(["http://node1:9000/d3", "http://node1:9001/d4"].as_slice())
+                    .expect("second pool endpoints should parse"),
+            ],
+            setup_type: SetupType::Unknown,
+        };
+        let deadline = DnsRetryDeadline::new(Duration::ZERO, DNS_RETRY_MAX_DELAY);
+        let node1_lookups = std::cell::Cell::new(0);
+        let local_ip = IpAddr::V4(std::net::Ipv4Addr::LOCALHOST);
+        let stale_ip = IpAddr::V4(std::net::Ipv4Addr::new(192, 0, 2, 10));
+        let resolve = async |host: Host<&str>| match host {
+            Host::Domain("node1") => {
+                let lookups = node1_lookups.get();
+                node1_lookups.set(lookups + 1);
+                Ok(HashSet::from([if lookups == 0 { stale_ip } else { local_ip }]))
+            }
+            Host::Domain("node2") => Ok(HashSet::from([stale_ip])),
+            _ => panic!("unexpected hostname in test: {host}"),
+        };
 
-        let mut pools = vec![Endpoints::from(vec![d1, d2, remote])];
-        normalize_same_host_local_state(&mut pools);
+        let first_start = pools
+            .resolve_startup_hosts(9000, &deadline, resolve)
+            .await
+            .expect("first lookup");
+        assert_eq!(node1_lookups.get(), 1);
+        assert_eq!(first_start["node1"].addresses, HashSet::from([stale_ip]));
+        assert_eq!(local_flags(&pools.inner[0]), [false, false, false]);
+        assert_eq!(local_flags(&pools.inner[1]), [false, false]);
 
-        let eps = pools[0].as_ref();
-        assert!(eps[0].is_local);
-        assert!(eps[1].is_local, "same host:port must inherit the local verdict");
-        assert!(!eps[2].is_local, "a genuinely remote host must stay remote");
+        let restart = pools
+            .resolve_startup_hosts(9000, &deadline, resolve)
+            .await
+            .expect("fresh lookup");
+        assert_eq!(node1_lookups.get(), 2);
+        assert_eq!(restart["node1"].addresses, HashSet::from([local_ip]));
+        assert_eq!(local_flags(&pools.inner[0]), [true, true, false]);
+        assert_eq!(local_flags(&pools.inner[1]), [true, false]);
     }
 
     #[test]
@@ -2020,11 +1982,11 @@ mod test {
         // trip the DNS-IP cross-port check in bounded mode but must be deferred
         // (allowed) in orchestrated mode, where headless-service records can
         // still be flapping.
-        let args = vec![
+        let args = [
             "http://192.0.2.10:9000/export",
             "http://192.0.2.10:9001/export",
             "http://192.0.2.11:9000/export",
-            "http://192.0.2.12:9000/export",
+            "http://127.0.0.1:9000/export",
         ];
         let layout = DisksLayout::from_volumes(args.as_slice()).unwrap();
 
@@ -2044,6 +2006,24 @@ mod test {
             .await
             .expect("orchestrated mode should defer the DNS-IP cross-port check");
         assert_eq!(resolved.setup_type, SetupType::DistErasure);
+    }
+
+    #[tokio::test]
+    async fn rejects_startup_when_no_endpoint_is_local() {
+        for volumes in [
+            ["http://192.0.2.10:9000/data", "http://192.0.2.11:9000/data"],
+            ["http://192.0.2.10:9000/data", "http://127.0.0.1:9001/data"],
+            ["http://192.0.2.10:9000/data1", "http://192.0.2.10:9000/data2"],
+        ] {
+            let layout = DisksLayout::from_volumes(&volumes).expect("URL topology should parse");
+            for policy in [bounded_test_policy(), orchestrated_test_policy()] {
+                let err = EndpointServerPools::create_server_endpoints_with("0.0.0.0:9000", &layout, Some(policy), None)
+                    .await
+                    .expect_err("startup must reject a topology with no local endpoints");
+                assert_eq!(err.kind(), ErrorKind::InvalidInput);
+                assert!(err.to_string().contains("no local storage endpoints"), "{err}");
+            }
+        }
     }
 
     #[test]
@@ -2274,7 +2254,7 @@ mod test {
 
     #[serial]
     #[tokio::test]
-    async fn create_server_endpoints_infers_kubernetes_pod_host_without_peer_dns() {
+    async fn create_server_endpoints_infers_kubernetes_host_after_literal_peer_without_dns() {
         let _kernel_hostname = force_kernel_hostname_for_test("rustfs-0");
         let local_host = "rustfs-0.rustfs-headless.ns.svc.cluster.local";
 
@@ -2288,14 +2268,16 @@ mod test {
                 let (pools, setup_type) = EndpointServerPools::from_volumes(
                     "0.0.0.0:9000",
                     vec![
+                        "http://192.0.2.10:9000/data2".to_string(),
                         format!("http://{local_host}:9000/data0"),
                         "http://permanently-missing.invalid:9000/data1".to_string(),
+                        "http://192.0.2.11:9000/data3".to_string(),
                     ],
                 )
                 .await
                 .expect("kernel hostname inference should avoid resolving the missing peer");
 
-                assert_eq!(local_flags(&pools.0[0].endpoints), vec![true, false]);
+                assert_eq!(local_flags(&pools.0[0].endpoints), vec![false, true, false, false]);
                 assert_eq!(setup_type, SetupType::DistErasure);
             },
         )
@@ -2813,6 +2795,40 @@ mod test {
         assert_eq!(sleeps, 0);
         assert!(err.to_string().contains("endpoint-a"));
         assert!(err.to_string().contains("timed out after 1 attempts"));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn startup_dns_deadline_stops_pending_and_later_lookups() {
+        let timeout = Duration::from_secs(3);
+        let deadline = DnsRetryDeadline::new(timeout, DNS_RETRY_MAX_DELAY);
+        let lookups = std::cell::Cell::new(0);
+        let resolve = async |_host: Host<&str>| {
+            lookups.set(lookups.get() + 1);
+            std::future::pending::<Result<HashSet<IpAddr>>>().await
+        };
+
+        let err = tokio::time::timeout(
+            timeout * 2,
+            resolve_startup_host_with_retry(Host::Domain("node1"), "first endpoint", &deadline, &resolve),
+        )
+        .await
+        .expect("a pending lookup must complete before the test deadline")
+        .expect_err("a pending lookup must stop at the startup deadline");
+        assert_eq!(err.kind(), ErrorKind::TimedOut);
+        assert!(err.to_string().contains("first endpoint"));
+        assert!(err.to_string().contains("startup DNS deadline elapsed"));
+        assert_eq!(deadline.elapsed(), timeout);
+        assert_eq!(lookups.get(), 1);
+
+        let err = tokio::time::timeout(
+            timeout * 2,
+            resolve_startup_host_with_retry(Host::Domain("node2"), "second endpoint", &deadline, &resolve),
+        )
+        .await
+        .expect("a later lookup must complete before the test deadline")
+        .expect_err("an exhausted startup budget must prevent a new lookup");
+        assert!(err.to_string().contains("second endpoint"));
+        assert_eq!(lookups.get(), 1);
     }
 
     #[test]

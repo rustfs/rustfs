@@ -496,10 +496,12 @@ class GateTests(unittest.TestCase):
 
     def test_plan_from_a_previous_contract_cannot_authorize_the_new_job_set(self):
         # A base planner predating the NIGHTLY_JOBS contract still emits
-        # connect-feature-boundaries as required success on a pull request. The
-        # current verifier must reject that plan instead of accepting the old
-        # responsibility, so the workflow's contract-marker fallback is the only
-        # path that can widen or narrow the required set.
+        # connect-feature-boundaries as required success on a pull request, and
+        # one that predates the rio-v2 lane removal still names
+        # test-and-lint-rio-v2. The current verifier must reject that plan
+        # instead of accepting the old responsibility, so the workflow's
+        # contract-marker fallback is the only path that can widen or narrow
+        # the required set.
         stale = self.plan()
         stale['jobs'] = dict(stale['jobs'], **{'connect-feature-boundaries': 'success',
                                               'uring-integration': 'success',
@@ -513,6 +515,29 @@ class GateTests(unittest.TestCase):
                                                 'connect': 'true', 'full_validation': 'true'}
         self.assertTrue(gate.verify_results(needs, 'pull_request', 'refs/heads/main'))
 
+    def test_retired_rio_v2_lanes_stay_out_of_the_aggregate(self):
+        retired = ("test-and-lint-rio-v2", "build-rustfs-debug-binary-rio-v2", "e2e-tests-rio-v2")
+        for event in gate.EVENTS:
+            jobs = gate.expected_results("full", event, "refs/heads/main")
+            self.assertTrue(set(retired).isdisjoint(jobs), event)
+            self.assertEqual(jobs["build-rustfs-debug-binary"], "success")
+            self.assertEqual(jobs["e2e-tests"], "success")
+            self.assertEqual(jobs["s3-implemented-tests"], "success")
+            self.assertEqual(jobs["s3-lifecycle-behavior-tests"], "success")
+            self.assertTrue(all(item["job"] not in retired and "rio-v2" not in item["features"] for item in gate.configurations(jobs)))
+        root = Path(gate.__file__).resolve().parent.parent
+        workflow = (root / ".github/workflows/ci.yml").read_text()
+        warm = (root / ".github/workflows/cache-warm.yml").read_text()
+        for name in (*retired, "warm-ci-feat-rio", "ci-feat-rio"):
+            self.assertNotIn(name, workflow)
+            self.assertNotIn(name, warm)
+        self.assertIn("\n  build-rustfs-debug-binary:\n", workflow)
+        self.assertIn("\n  e2e-tests:\n", workflow)
+        plan = self.plan("schedule")
+        needs = self.needs(plan)
+        needs["test-and-lint-rio-v2"] = {"result": "success"}
+        self.assertTrue(gate.verify_results(needs, "schedule", plan["ref"], plan["head"], plan["tree"]))
+
     def workflow(self):
         jobs = {}
         for job in gate.ALWAYS_JOBS + gate.CODE_JOBS + gate.OPTIONAL_JOBS:
@@ -523,8 +548,6 @@ class GateTests(unittest.TestCase):
                 expression = "needs.classify-changes.outputs.mode == 'full' && needs.classify-changes.outputs.connect == 'true' && contains(fromJSON('[\"schedule\",\"workflow_dispatch\"]'), github.event_name)"
             elif job in gate.NIGHTLY_JOBS:
                 expression = "needs.classify-changes.outputs.mode == 'full' && contains(fromJSON('[\"schedule\",\"workflow_dispatch\"]'), github.event_name)"
-            elif job in gate.OPTIONAL_JOBS[:2]:
-                expression = "contains(fromJSON('[\"schedule\",\"workflow_dispatch\"]'), github.event_name)"
             elif job == 'e2e-full':
                 expression = "needs.classify-changes.outputs.mode == 'full' && (github.event_name == 'merge_group' || github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && github.ref == 'refs/heads/main'))"
             elif job in gate.E2E_JOBS:
@@ -597,8 +620,8 @@ class GateTests(unittest.TestCase):
             (lambda d: step(d['cache-warm.yml'], 'warm-ci-dev', e2e).pop('if'), 'warm-ci-dev builds after an exact cache hit'),
             (lambda d: step(d['cache-warm.yml'], 'warm-ci-dev', gate.LINT_COMMANDS[1]).update({'if': 'always()'}), 'warm-ci-dev builds after an exact cache hit'),
             (lambda d: step(d['cache-warm.yml'], 'warm-ci-uring', 'cargo build').pop('if'), 'warm-ci-uring builds after an exact cache hit'),
-            (lambda d: step(d['cache-warm.yml'], 'warm-ci-feat-rio', './.github/actions/setup').pop('id'),
-             'warm-ci-feat-rio builds after an exact cache hit'),
+            (lambda d: step(d['cache-warm.yml'], 'warm-ci-feat-proto', './.github/actions/setup').pop('id'),
+             'warm-ci-feat-proto builds after an exact cache hit'),
         ]
         warm_key = key(json.loads(original)['cache-warm.yml'], 'warm-ci-dev')['cache-shared-key']
         readers = [(workflow, job) for workflow in ('ci.yml', 'reference-parity.yml') for job, block in json.loads(original)[workflow].items()

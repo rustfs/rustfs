@@ -5035,27 +5035,37 @@ mod metadata_cache_tests {
             disk.make_volume(bucket).await.expect("bucket volume should be created");
         }
         let mut reader = PutObjReader::from_vec(vec![7u8; 1024]);
-        set.put_object(bucket, object, &mut reader, &ObjectOptions::default())
-            .await
-            .expect("test object should be written");
+        // A quorum-acknowledged PUT can leave a rename running on a healthy
+        // disk. This test needs an error-free fanout to reach cache publication.
+        set.put_object(
+            bucket,
+            object,
+            &mut reader,
+            &ObjectOptions {
+                write_completion: crate::object_api::WriteCompletion::TailDrained,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("the fixture PUT should drain its commit fanout");
 
         let barrier = MetadataCachePublishBarrier::install(bucket, object);
         let stale_generation = set
             .get_object_metadata_cache_generation(bucket, object)
             .expect("metadata cache generation should be active");
-        let reader_set = Arc::clone(&set);
-        let read = tokio::spawn(async move {
-            reader_set
-                .get_object_fileinfo(bucket, object, &ObjectOptions::default(), true, false)
-                .await
-        });
-        barrier.wait_until_paused().await;
+        let opts = ObjectOptions::default();
+        let read = set.get_object_fileinfo(bucket, object, &opts, true, false);
+        tokio::pin!(read);
+        tokio::select! {
+            () = barrier.wait_until_paused() => {}
+            result = &mut read => match result {
+                Ok(_) => panic!("metadata read returned without reaching cache publication"),
+                Err(err) => panic!("metadata read failed before cache publication: {err}"),
+            },
+        }
         set.invalidate_get_object_metadata_cache(bucket, object).await;
         barrier.release();
-        let snapshot = read
-            .await
-            .expect("metadata read task should not panic")
-            .expect("metadata fanout should still return its selected FileInfo");
+        let snapshot = read.await.expect("metadata fanout should still return its selected FileInfo");
         assert!(snapshot.owned.is_some());
         assert!(snapshot.has_valid_representation());
 

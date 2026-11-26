@@ -58,6 +58,7 @@ type SharedDataMovementStream = Arc<Mutex<Box<dyn AsyncRead + Unpin + Send + Syn
 const LOG_COMPONENT_ECSTORE: &str = "ecstore";
 const LOG_SUBSYSTEM_DATA_MOVEMENT: &str = "data_movement";
 const EVENT_DATA_MOVEMENT_MULTIPART_ABORT_FAILED: &str = "data_movement_multipart_abort_failed";
+const EVENT_DATA_MOVEMENT_EQUIVALENT_TARGET: &str = "data_movement_equivalent_target";
 const DATA_MOVEMENT_MULTIPART_ABORT_RETRY_ATTEMPTS: usize = 3;
 const DATA_MOVEMENT_MULTIPART_ABORT_RETRY_DELAY_SECS: u64 = 60;
 
@@ -1636,6 +1637,57 @@ async fn find_data_movement_target_info(
     }
 }
 
+/// The pool that already holds this exact source version, for a caller that
+/// carries no decommission capacity owner: rebalance, and a decommission
+/// without a capacity reservation. A run that stops after the target commit
+/// and before the source cleanup leaves the version in both pools; without
+/// this lookup the next run uploads every part again and learns of the copy
+/// only when the create-only completion is refused. Only the strict identity
+/// match settles here; the looser matches stay with the completion path. A
+/// lookup that fails or finds no equivalent copy leaves the decision to the
+/// normal path, which repeats the lookup and reports its own stage.
+///
+/// The caller removes the source on this answer, so the copy must also be on
+/// a write quorum of the target set's drives. The object read behind the
+/// identity match answers from read quorum; a copy held only there leaves the
+/// decision to the normal path too, which needs a write quorum to start.
+async fn find_equivalent_multipart_target(
+    store: &ECStore,
+    src_pool_idx: usize,
+    bucket: &str,
+    object_info: &ObjectInfo,
+    new_multipart_opts: &ObjectOptions,
+    compare_part_checksums: bool,
+) -> Option<usize> {
+    let target_pool_idx = store
+        .select_data_movement_pool_idx(bucket, &object_info.name, -1, new_multipart_opts, false)
+        .await
+        .ok()?;
+    if !should_check_data_movement_resume_target(src_pool_idx, target_pool_idx) {
+        return None;
+    }
+    let target = find_data_movement_target_info(store, target_pool_idx, bucket, object_info)
+        .await
+        .ok()??;
+    if !is_equivalent_data_movement_object_identity(object_info, &target, true, compare_part_checksums) {
+        return None;
+    }
+    let object = encode_dir_object(object_info.name.as_str());
+    store
+        .pools
+        .get(target_pool_idx)?
+        .get_disks_by_key(object.as_str())
+        .holds_version_on_write_quorum(
+            bucket,
+            object.as_str(),
+            object_info.version_id.unwrap_or_else(uuid::Uuid::nil),
+            target.data_dir,
+        )
+        .await
+        .ok()?
+        .then_some(target_pool_idx)
+}
+
 /// How a data-movement copy settled on its target pool.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum DataMovementCopy {
@@ -2012,6 +2064,28 @@ async fn migrate_object_inner(
                         )
                     })?;
             }
+        } else if let Some(target_pool_idx) = find_equivalent_multipart_target(
+            store.as_ref(),
+            pool_idx,
+            &bucket,
+            &object_info,
+            &new_multipart_opts,
+            preserve_part_checksums,
+        )
+        .await
+        {
+            info!(
+                event = EVENT_DATA_MOVEMENT_EQUIVALENT_TARGET,
+                component = LOG_COMPONENT_ECSTORE,
+                subsystem = LOG_SUBSYSTEM_DATA_MOVEMENT,
+                result = "skipped",
+                operation = op_label,
+                bucket = bucket.as_str(),
+                object = object_info.name.as_str(),
+                target_pool = target_pool_idx,
+                "data movement multipart copy skipped for an equivalent target"
+            );
+            return Ok(DataMovementCopy::Committed);
         }
         let (res, target_pool_idx, expected_bucket_incarnation_id) = match store
             .handle_new_multipart_upload_with_pool_idx(

@@ -12,7 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-pub(in crate::disk) use self::commit::LocalRenamePreflightRejection;
 #[cfg(test)]
 #[path = "local/read_path_tests.rs"]
 mod read_path_tests;
@@ -978,7 +977,7 @@ fn restore_part_transaction_file(current: &Path, backup: &Path, absent: &Path, r
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(windows)))]
 async fn write_metadata_rollback_backup(object_dir: &Path, rollback_dir: Uuid, data: &[u8]) -> Result<()> {
     write_delete_rollback_file(
         object_dir.parent().unwrap_or(object_dir),
@@ -9324,10 +9323,29 @@ impl LocalDisk {
         }
         let path = trash.join(name);
         let result = async {
-            if entry.file_type().await?.is_dir() {
-                fs::remove_dir_all(&path).await
-            } else {
-                fs::remove_file(&path).await
+            let is_dir = entry.file_type().await?.is_dir();
+            #[cfg(windows)]
+            {
+                // Competing recursive deletions can deny each other's directory
+                // handles. Keep ownership until the blocking operation returns.
+                let lease = os::acquire_namespace_mutation_lease_with_owner(&path, None).await;
+                let path = path.clone();
+                os::run_blocking_namespace_operation(lease, move || {
+                    if is_dir {
+                        std::fs::remove_dir_all(path)
+                    } else {
+                        std::fs::remove_file(path)
+                    }
+                })
+                .await
+            }
+            #[cfg(not(windows))]
+            {
+                if is_dir {
+                    fs::remove_dir_all(&path).await
+                } else {
+                    fs::remove_file(&path).await
+                }
             }
         }
         .await;

@@ -130,24 +130,28 @@ pub(crate) struct RenameDataGuards {
     pub(crate) scanner_publication_lease_token: Option<Uuid>,
     pub(crate) external_guard: Option<Arc<dyn Send + Sync>>,
     pub(crate) namespace_owner: Option<Arc<dyn Send + Sync>>,
+    pub(crate) dispatch_deadline: Option<RenameDispatchDeadline>,
 }
 
-/// Local preflight evidence stays outside DiskAPI and the RPC response format.
+/// The fanout publishes this deadline once enough disks have committed.
+pub(crate) type RenameDispatchDeadline = tokio::sync::watch::Receiver<Option<tokio::time::Instant>>;
+
+/// Pre-dispatch evidence stays outside DiskAPI and the RPC response format.
 pub(crate) struct RenameDataObservation {
     pub(crate) result: Result<RenameDataResp>,
-    preflight_rejection: Option<local::LocalRenamePreflightRejection>,
+    pub(crate) rejected_before_publication: bool,
 }
 
 impl RenameDataObservation {
-    fn unknown(result: Result<RenameDataResp>) -> Self {
+    pub(crate) fn unknown(result: Result<RenameDataResp>) -> Self {
         Self {
             result,
-            preflight_rejection: None,
+            rejected_before_publication: false,
         }
     }
 
     pub(crate) fn rejected_before_publication(&self) -> bool {
-        self.result.is_err() && self.preflight_rejection.is_some()
+        self.result.is_err() && self.rejected_before_publication
     }
 }
 
@@ -1388,18 +1392,11 @@ impl Disk {
                     .rename_data_observed_with_guards(src_volume, src_path, fi, dst_volume, dst_path, guards)
                     .await
             }
-            Disk::Remote(remote_disk) => RenameDataObservation::unknown(
+            Disk::Remote(remote_disk) => {
                 remote_disk
-                    .rename_data_borrowed_with_fence(
-                        src_volume,
-                        src_path,
-                        fi,
-                        dst_volume,
-                        dst_path,
-                        guards.scanner_publication_lease_token,
-                    )
-                    .await,
-            ),
+                    .rename_data_observed(src_volume, src_path, fi, dst_volume, dst_path, guards)
+                    .await
+            }
         }
     }
 

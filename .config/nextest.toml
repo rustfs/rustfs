@@ -416,6 +416,18 @@ threads-required = "num-test-threads"
 filter = 'package(rustfs-ecstore) & test(/^store::object::tests::(canceled_create_retains_usage_cleanup_namespace_owner|batch_delete_excludes_recovery_on_nonzero_pool|delete_excludes_recovery_with_(disjoint|identical|overlapping)_pool_lock_clients)$/)'
 threads-required = "num-test-threads"
 
+# Isolate the physical Apply barrier and same-name multipart lock probes from
+# competing disk fixtures. Keep their deadlines and internal concurrency.
+[[profile.ci.overrides]]
+filter = """
+package(rustfs-ecstore) & (
+    test(=core::pools::native_recovery::integration_tests::pool_meta_native_physical_runtime_fork_after_apply_latches_original_gate)
+    | test(=set_disk::ops::multipart::same_name_object_namespace_lock_tests::same_name_key_writes_succeed_on_unversioned_versioned_and_hard_quota_buckets)
+    | test(=set_disk::ops::multipart::same_name_object_namespace_lock_tests::same_name_object_write_lock_does_not_block_other_keys_on_versioned_bucket)
+)
+"""
+threads-required = "num-test-threads"
+
 # These eight-disk decommission fixtures exercise concurrent retries,
 # free-version cleanup, and real capacity probes under production lock deadlines.
 # Reserve the run's capacity so unrelated IO cannot exhaust those budgets.

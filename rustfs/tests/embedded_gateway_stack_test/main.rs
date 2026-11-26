@@ -356,6 +356,7 @@ async fn every_served_operation_serves_root_and_refuses_the_callers_it_cannot_ad
     create_bucket_in_the_store(bucket_replication_lifecycle::REPLICATION_MATRIX_BUCKET).await;
     create_bucket_in_the_store(bucket_replication_lifecycle::LOCK_CONFIGURATION_MATRIX_BUCKET).await;
     create_bucket_in_the_store(object_meta::MATRIX_BUCKET).await;
+    object_meta::seed_object_lock_matrix().await;
     create_bucket_in_the_store(object_misc::MATRIX_BUCKET).await;
     object_misc::seed_restore_object(object_misc::MATRIX_BUCKET, false).await;
     object_misc::seed_select_matrix().await;

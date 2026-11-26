@@ -34,6 +34,7 @@ use std::collections::HashMap;
 /// The object every call names.
 const KEY: &str = "object-meta";
 pub(super) const MATRIX_BUCKET: &str = "object-meta-matrix";
+const LOCKED_KEY: &str = "object-meta-protected";
 
 pub(crate) const MATRIX: &[MatrixRow] = &[
     MatrixRow {
@@ -114,18 +115,16 @@ fn put_object_acl<'a>(client: &'a Client, _bucket: &'a str) -> BoxFuture<'a, Out
 }
 
 fn get_object_legal_hold<'a>(client: &'a Client, _bucket: &'a str) -> BoxFuture<'a, Outcome> {
-    let bucket = MATRIX_BUCKET;
     Box::pin(async move {
-        let bucket = locked_bucket(bucket).await;
-        outcome(client.get_object_legal_hold().bucket(&bucket).key(KEY).send().await)
+        let bucket = format!("{MATRIX_BUCKET}-locked");
+        outcome(client.get_object_legal_hold().bucket(bucket).key(LOCKED_KEY).send().await)
     })
 }
 
 fn get_object_retention<'a>(client: &'a Client, _bucket: &'a str) -> BoxFuture<'a, Outcome> {
-    let bucket = MATRIX_BUCKET;
     Box::pin(async move {
-        let bucket = locked_bucket(bucket).await;
-        outcome(client.get_object_retention().bucket(&bucket).key(KEY).send().await)
+        let bucket = format!("{MATRIX_BUCKET}-locked");
+        outcome(client.get_object_retention().bucket(bucket).key(LOCKED_KEY).send().await)
     })
 }
 
@@ -190,14 +189,28 @@ async fn locked_bucket(bucket: &str) -> String {
         versioning_enabled: true,
         ..Default::default()
     };
-    // A second call finds the bucket made by the first.
-    let _ = get_global_app_context()
+    get_global_app_context()
         .expect("embedded server context")
         .object_store()
         .make_bucket(&locked, &options)
-        .await;
+        .await
+        .expect("create Object Lock bucket");
     put_object_in_the_store(&locked, KEY, HashMap::new()).await;
     locked
+}
+
+pub(super) async fn seed_object_lock_matrix() {
+    let bucket = locked_bucket(MATRIX_BUCKET).await;
+    put_object_in_the_store(
+        &bucket,
+        LOCKED_KEY,
+        HashMap::from([
+            ("x-amz-object-lock-legal-hold".to_owned(), "OFF".to_owned()),
+            ("x-amz-object-lock-mode".to_owned(), "GOVERNANCE".to_owned()),
+            ("x-amz-object-lock-retain-until-date".to_owned(), "2035-01-02T00:00:00Z".to_owned()),
+        ]),
+    )
+    .await;
 }
 
 /// Writes `key` with `metadata` as stored user metadata.
@@ -252,44 +265,98 @@ async fn object_metadata_answers_as_stored(server: rustfs::embedded::RustFSServe
         .expect_err("XML grants are refused");
     assert_eq!(refusal(&refused), (Some("NotImplemented".to_owned()), Some(501)));
 
-    let unlocked = client
-        .get_object_legal_hold()
-        .bucket(BUCKET)
-        .key(KEY)
-        .send()
-        .await
-        .expect_err("no Object Lock");
-    assert_eq!(refusal(&unlocked), (Some("InvalidRequest".to_owned()), Some(400)));
-    let unlocked = client
-        .get_object_retention()
-        .bucket(BUCKET)
-        .key(KEY)
-        .send()
-        .await
-        .expect_err("no Object Lock");
-    assert_eq!(refusal(&unlocked), (Some("InvalidRequest".to_owned()), Some(400)));
+    for (bucket, code, status) in [(BUCKET, "InvalidRequest", 400), ("object-meta-absent", "NoSuchBucket", 404)] {
+        let retention = client.get_object_retention().bucket(bucket).key(KEY).send().await;
+        let hold = client.get_object_legal_hold().bucket(bucket).key(KEY).send().await;
+        let expected = (Some(code.to_owned()), Some(status));
+        assert_eq!(refusal(&retention.expect_err("lock query refused")), expected, "retention for {bucket}");
+        assert_eq!(refusal(&hold.expect_err("lock query refused")), expected, "legal hold for {bucket}");
+    }
 
     let locked = locked_bucket(BUCKET).await;
-    let missing = client
+    put_object_in_the_store(
+        &locked,
+        "cleared",
+        HashMap::from([
+            ("x-amz-object-lock-mode".to_owned(), String::new()),
+            ("x-amz-object-lock-retain-until-date".to_owned(), String::new()),
+        ]),
+    )
+    .await;
+    for (key, code, status) in [
+        ("missing", "NoSuchKey", 404),
+        (KEY, "NoSuchObjectLockConfiguration", 404),
+        ("cleared", "NoSuchObjectLockConfiguration", 404),
+    ] {
+        let retention = client.get_object_retention().bucket(&locked).key(key).send().await;
+        let hold = client.get_object_legal_hold().bucket(&locked).key(key).send().await;
+        let expected = (Some(code.to_owned()), Some(status));
+        assert_eq!(refusal(&retention.expect_err("no retention")), expected, "retention for {key}");
+        assert_eq!(refusal(&hold.expect_err("no legal hold")), expected, "legal hold for {key}");
+    }
+
+    put_object_in_the_store(
+        &locked,
+        "explicit-off",
+        HashMap::from([("x-amz-object-lock-legal-hold".to_owned(), "OFF".to_owned())]),
+    )
+    .await;
+    put_object_in_the_store(
+        &locked,
+        "unreadable-retention",
+        HashMap::from([("x-amz-object-lock-retain-until-date".to_owned(), "invalid date".to_owned())]),
+    )
+    .await;
+    let unreadable = client
         .get_object_retention()
         .bucket(&locked)
-        .key("missing")
+        .key("unreadable-retention")
         .send()
         .await
-        .expect_err("a missing key");
-    assert_eq!(refusal(&missing), (Some("InternalError".to_owned()), Some(500)));
+        .expect_err("an unreadable date alone cannot produce a retention response");
+    assert_eq!(refusal(&unreadable), (Some("InternalError".to_owned()), Some(500)));
 
     let hold = client
         .get_object_legal_hold()
         .bucket(&locked)
-        .key(KEY)
+        .key("explicit-off")
         .send()
         .await
-        .expect("the default hold");
+        .expect("an explicit OFF hold");
     assert_eq!(
         hold.legal_hold().and_then(|hold| hold.status()).map(|status| status.as_str()),
         Some("OFF")
     );
+
+    let deleted = client
+        .delete_object()
+        .bucket(&locked)
+        .key(KEY)
+        .send()
+        .await
+        .expect("create a delete marker");
+    let marker = deleted.version_id().expect("delete marker version");
+    for (version_id, code, status) in [(None, "NoSuchKey", 404), (Some(marker.to_owned()), "MethodNotAllowed", 405)] {
+        let retention = client
+            .get_object_retention()
+            .bucket(&locked)
+            .key(KEY)
+            .set_version_id(version_id.clone())
+            .send()
+            .await
+            .expect_err("a marker has no retention");
+        let hold = client
+            .get_object_legal_hold()
+            .bucket(&locked)
+            .key(KEY)
+            .set_version_id(version_id)
+            .send()
+            .await
+            .expect_err("a marker has no legal hold");
+        let expected = (Some(code.to_owned()), Some(status));
+        assert_eq!(refusal(&retention), expected);
+        assert_eq!(refusal(&hold), expected);
+    }
 
     // Values outside the model's sets, as a replicated or migrated object may hold them.
     let stored = HashMap::from([
@@ -328,6 +395,7 @@ async fn object_metadata_answers_as_stored(server: rustfs::embedded::RustFSServe
         .await
         .expect_err("retention for a missing version");
     assert_eq!(refusal(&missing_retention), (Some("NoSuchVersion".to_owned()), Some(404)));
+    assert_eq!(missing_retention.message(), Some("The specified version does not exist."));
 
     let missing_hold = client
         .get_object_legal_hold()
@@ -338,6 +406,7 @@ async fn object_metadata_answers_as_stored(server: rustfs::embedded::RustFSServe
         .await
         .expect_err("legal hold for a missing version");
     assert_eq!(refusal(&missing_hold), (Some("NoSuchVersion".to_owned()), Some(404)));
+    assert_eq!(missing_hold.message(), Some("The specified version does not exist."));
 
     let missing = client
         .get_object_tagging()

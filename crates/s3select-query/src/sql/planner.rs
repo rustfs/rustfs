@@ -171,6 +171,11 @@ pub(crate) fn prepare_s3_select_statement(statement: &mut Statement) -> QueryRes
         return Err(unsupported_structure("subqueries are not supported"));
     }
 
+    let mut field_depth = FieldAccessDepthValidator;
+    if Visit::visit(&*query, &mut field_depth).is_break() {
+        return Err(unsupported_structure("nested field access depth exceeds limit"));
+    }
+
     let source = {
         let SetExpr::Select(select) = query.body.as_mut() else {
             return Err(unsupported_structure("set operations and nested queries are not supported"));
@@ -598,6 +603,27 @@ impl Visitor for SubqueryDetector {
     }
 }
 
+struct FieldAccessDepthValidator;
+
+impl Visitor for FieldAccessDepthValidator {
+    type Break = ();
+
+    fn pre_visit_expr(&mut self, expr: &Expr) -> ControlFlow<Self::Break> {
+        let max_depth = rustfs_s3select_api::query::parser::MAX_SELECT_FIELD_ACCESS_DEPTH;
+        let exceeds = match expr {
+            Expr::CompoundIdentifier(parts) => parts.len() > max_depth,
+            Expr::CompoundFieldAccess { access_chain, .. } => access_chain.len() > max_depth,
+            Expr::JsonAccess { path, .. } => path.path.len() > max_depth,
+            _ => false,
+        };
+        if exceeds {
+            ControlFlow::Break(())
+        } else {
+            ControlFlow::Continue(())
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{path_projection_keys, prepare_s3_select_statement};
@@ -977,5 +1003,24 @@ mod tests {
                 "query should be rejected: {sql}"
             );
         }
+    }
+
+    #[test]
+    fn rejects_excessive_compound_field_access_depth() {
+        let max_depth = rustfs_s3select_api::query::parser::MAX_SELECT_FIELD_ACCESS_DEPTH;
+        let allowed_path = format!("s.items{}", "[0]".repeat(max_depth));
+        let allowed_statement = parse_statement(&format!("SELECT {allowed_path} FROM S3Object AS s"));
+        assert!(validate_s3_select_statement(&allowed_statement).is_ok());
+
+        let deep_path = format!("s.items{}", "[0]".repeat(max_depth + 1));
+        let deep_statement = parse_statement(&format!("SELECT {deep_path} FROM S3Object AS s"));
+        assert!(matches!(
+            validate_s3_select_statement(&deep_statement),
+            Err(ref err) if matches!(err.s3_select_policy_error(), Some(SelectError::UnsupportedSqlStructure { .. }))
+        ));
+
+        // Dot chains are also bounded at parse time by sqlparser's recursion limit.
+        let deep_dots = vec!["a"; max_depth + 1].join(".");
+        assert!(ExtParser::parse_sql(&format!("SELECT {deep_dots} FROM S3Object")).is_err());
     }
 }

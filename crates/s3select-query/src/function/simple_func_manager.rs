@@ -19,9 +19,109 @@ use datafusion::execution::SessionStateDefaults;
 use datafusion::logical_expr::{AggregateUDF, ScalarUDF, WindowUDF};
 use rustfs_s3select_api::query::function::FunctionMetadataManager;
 use rustfs_s3select_api::{QueryError, QueryResult};
-use tracing::debug;
+
+use crate::function::size_bound::bound_result_size;
 
 pub type SimpleFunctionMetadataManagerRef = Arc<SimpleFunctionMetadataManager>;
+
+/// Explicit allowlist of canonical DataFusion scalar function names exposed to S3 Select SQL.
+///
+/// S3 Select must not expose the entire DataFusion catalog (such as `arrow_cast`,
+/// `repeat`, `lpad`, `rpad`, `replace`, `levenshtein`, `version`, `uuid`, regex,
+/// encoding, crypto, or nested-array builders). Aliases declared by an allowlisted
+/// UDF (such as `length` / `char_length` for `character_length`, `substring` for
+/// `substr`, `trim` for `btrim`, and `pow` for `power`) are registered alongside it.
+const ALLOWED_SCALAR_FUNCTIONS: &[&str] = &[
+    // Conditional
+    "coalesce",
+    "greatest",
+    "least",
+    "nullif",
+    "nvl",
+    "nvl2",
+    // String
+    "ascii",
+    "bit_length",
+    "btrim",
+    "character_length",
+    "chr",
+    "concat",
+    "concat_ws",
+    "contains",
+    "ends_with",
+    "initcap",
+    "left",
+    "lower",
+    "ltrim",
+    "octet_length",
+    "reverse",
+    "right",
+    "rtrim",
+    "split_part",
+    "starts_with",
+    "strpos",
+    "substr",
+    "substr_index",
+    "upper",
+    // Math
+    "abs",
+    "acos",
+    "acosh",
+    "asin",
+    "asinh",
+    "atan",
+    "atan2",
+    "atanh",
+    "cbrt",
+    "ceil",
+    "cos",
+    "cosh",
+    "cot",
+    "degrees",
+    "exp",
+    "floor",
+    "isnan",
+    "iszero",
+    "ln",
+    "log",
+    "log10",
+    "log2",
+    "nanvl",
+    "pi",
+    "power",
+    "radians",
+    "round",
+    "signum",
+    "sin",
+    "sinh",
+    "sqrt",
+    "tan",
+    "tanh",
+    "trunc",
+    // Date / Time
+    "current_date",
+    "current_time",
+    "date_bin",
+    "date_part",
+    "date_trunc",
+    "from_unixtime",
+    "make_date",
+    "make_time",
+    "now",
+    "to_char",
+    "to_date",
+    "to_local_time",
+    "to_time",
+    "to_timestamp",
+    "to_timestamp_micros",
+    "to_timestamp_millis",
+    "to_timestamp_nanos",
+    "to_timestamp_seconds",
+    "to_unixtime",
+];
+
+/// Explicit allowlist of canonical DataFusion aggregate function names exposed to S3 Select SQL.
+const ALLOWED_AGGREGATE_FUNCTIONS: &[&str] = &["avg", "count", "max", "min", "sum"];
 
 #[derive(Debug)]
 pub struct SimpleFunctionMetadataManager {
@@ -40,28 +140,19 @@ impl Default for SimpleFunctionMetadataManager {
             aggregate_functions: Default::default(),
             window_functions: Default::default(),
         };
-        SessionStateDefaults::default_scalar_functions().into_iter().for_each(|udf| {
-            let existing_udf = func_meta_manager.register_udf(udf.clone());
-            if let Ok(()) = existing_udf {
-                debug!("Overwrote an existing UDF: {}", udf.name());
+        for udf in SessionStateDefaults::default_scalar_functions() {
+            if ALLOWED_SCALAR_FUNCTIONS.contains(&udf.name()) {
+                let _ = func_meta_manager.register_udf(udf);
             }
-        });
+        }
 
-        SessionStateDefaults::default_aggregate_functions()
-            .into_iter()
-            .for_each(|udaf| {
-                let existing_udaf = func_meta_manager.register_udaf(udaf.clone());
-                if let Ok(()) = existing_udaf {
-                    debug!("Overwrote an existing UDAF: {}", udaf.name());
-                }
-            });
-
-        SessionStateDefaults::default_window_functions().into_iter().for_each(|udwf| {
-            let existing_udwf = func_meta_manager.register_udwf(udwf.clone());
-            if let Ok(()) = existing_udwf {
-                debug!("Overwrote an existing UDWF: {}", udwf.name());
+        for udaf in SessionStateDefaults::default_aggregate_functions() {
+            if ALLOWED_AGGREGATE_FUNCTIONS.contains(&udaf.name()) {
+                let _ = func_meta_manager.register_udaf(udaf);
             }
-        });
+        }
+
+        // S3 Select does not support window functions, so no default window UDFs are registered.
 
         func_meta_manager
     }
@@ -69,7 +160,11 @@ impl Default for SimpleFunctionMetadataManager {
 
 impl FunctionMetadataManager for SimpleFunctionMetadataManager {
     fn register_udf(&mut self, f: Arc<ScalarUDF>) -> QueryResult<()> {
-        self.scalar_functions.insert(f.inner().name().to_uppercase(), f);
+        let f = bound_result_size(f);
+        self.scalar_functions.insert(f.inner().name().to_uppercase(), Arc::clone(&f));
+        for alias in f.aliases() {
+            self.scalar_functions.insert(alias.to_uppercase(), Arc::clone(&f));
+        }
         Ok(())
     }
 
@@ -115,5 +210,88 @@ impl FunctionMetadataManager for SimpleFunctionMetadataManager {
     }
     fn udwfs(&self) -> Vec<String> {
         self.window_functions.keys().cloned().collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn allowlist_entries_all_resolve_in_default_manager() {
+        let manager = SimpleFunctionMetadataManager::default();
+        for name in ALLOWED_SCALAR_FUNCTIONS {
+            assert!(manager.udf(name).is_ok(), "allowlisted scalar function '{name}' must be registered");
+        }
+        for alias in [
+            "length",
+            "char_length",
+            "substring",
+            "trim",
+            "pow",
+            "ifnull",
+            "position",
+            "instr",
+        ] {
+            assert!(manager.udf(alias).is_ok(), "allowlisted alias '{alias}' must be registered");
+        }
+        for name in ALLOWED_AGGREGATE_FUNCTIONS {
+            assert!(manager.udaf(name).is_ok(), "allowlisted aggregate function '{name}' must be registered");
+        }
+        assert!(manager.udwfs().is_empty(), "S3 Select must not register default window functions");
+    }
+
+    #[test]
+    fn disallowed_datafusion_functions_are_not_registered() {
+        let manager = SimpleFunctionMetadataManager::default();
+        for disallowed in [
+            "arrow_cast",
+            "arrow_try_cast",
+            "arrow_typeof",
+            "arrow_field",
+            "arrow_metadata",
+            "cast_to_type",
+            "try_cast_to_type",
+            "repeat",
+            "lpad",
+            "rpad",
+            "replace",
+            "levenshtein",
+            "version",
+            "uuid",
+            "input_file_name",
+            "file_row_index",
+            "encode",
+            "decode",
+            "regexp_like",
+            "regexp_match",
+            "regexp_replace",
+            "regexp_count",
+            "regexp_instr",
+            "random",
+            "rand",
+            "factorial",
+        ] {
+            assert!(
+                manager.udf(disallowed).is_err(),
+                "non-S3-Select scalar function '{disallowed}' must not be registered"
+            );
+        }
+        for disallowed in [
+            "array_agg",
+            "string_agg",
+            "median",
+            "percentile_cont",
+            "first_value",
+            "last_value",
+        ] {
+            assert!(
+                manager.udaf(disallowed).is_err(),
+                "non-S3-Select aggregate function '{disallowed}' must not be registered"
+            );
+        }
+        for disallowed in ["row_number", "rank", "dense_rank", "lag", "lead"] {
+            assert!(manager.udwf(disallowed).is_err(), "window function '{disallowed}' must not be registered");
+        }
     }
 }
