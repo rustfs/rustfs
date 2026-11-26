@@ -35,8 +35,8 @@ use uuid::Uuid;
 
 mod storage_api;
 use storage_api::integration::{
-    BucketInfo, BucketOperations, DeleteBucketOptions, DiskAPI, DiskError, DiskStore, ObjectIO, ObjectOperations, ObjectOptions,
-    ObjectToDelete, PutObjReader, ReadOptions, ShardIntegrityWriteMode,
+    BucketInfo, BucketOperations, DeleteBucketOptions, DiskAPI, DiskError, DiskStore, EcstoreStorageError, ObjectIO,
+    ObjectOperations, ObjectOptions, ObjectToDelete, PutObjReader, ReadOptions, ShardIntegrityWriteMode,
 };
 
 const BUCKET: &str = "concurrent-delete";
@@ -522,7 +522,7 @@ async fn delete_during_root(case: DeleteCase) {
     assert_version(&env, &control, false).await;
 }
 
-fn run_delete_case(case: DeleteCase) {
+fn run_heal_scenario(scenario: impl Future<Output = ()> + Send + 'static) {
     // Incarnation-bound repairs use a spawned owner; retain the server's stack
     // budget for the whole scenario, including its foreground DELETE. block_on
     // alone would poll that future on libtest's smaller calling-thread stack.
@@ -537,11 +537,15 @@ fn run_delete_case(case: DeleteCase) {
                 .enable_all()
                 .build()
                 .expect("concurrent delete runtime");
-            runtime.block_on(delete_during_root(case));
+            runtime.block_on(scenario);
         })
         .expect("concurrent delete scenario thread starts")
         .join()
         .expect("concurrent delete scenario must not panic");
+}
+
+fn run_delete_case(case: DeleteCase) {
+    run_heal_scenario(delete_during_root(case));
 }
 
 #[test]
@@ -577,25 +581,7 @@ fn admin_root_completes_after_unversioned_delete() {
 #[test]
 #[serial]
 fn admin_root_rejects_recreated_bucket_before_successor_repair() {
-    // Incarnation-bound repairs use a spawned owner; retain the server's stack
-    // budget for the whole scenario. block_on alone would poll that future on
-    // libtest's smaller calling-thread stack.
-    let stack_size = 8 * 1024 * 1024;
-    std::thread::Builder::new()
-        .name("heal-concurrent-delete".to_owned())
-        .stack_size(stack_size)
-        .spawn(move || {
-            let runtime = tokio::runtime::Builder::new_multi_thread()
-                .worker_threads(4)
-                .thread_stack_size(stack_size)
-                .enable_all()
-                .build()
-                .expect("concurrent delete runtime");
-            runtime.block_on(recreated_bucket_repair());
-        })
-        .expect("concurrent delete scenario thread starts")
-        .join()
-        .expect("concurrent delete scenario must not panic");
+    run_heal_scenario(recreated_bucket_repair());
 }
 
 async fn recreated_bucket_repair() {
@@ -643,4 +629,63 @@ async fn recreated_bucket_repair() {
     fresh.execute().await.expect("a fresh root may repair the successor");
     assert_eq!(fresh.get_status().await, HealTaskStatus::Completed);
     assert_version(&env, &successor, false).await;
+}
+
+#[test]
+#[serial]
+fn crash_recovery_skips_deleted_bucket_and_repairs_live_bucket() {
+    run_heal_scenario(async {
+        let directory = tempfile::tempdir().expect("crash recovery fixture");
+        let env = TestECStoreEnv::builder().base_dir(directory.path()).build().await;
+        let deleted = "a-deleted";
+        let live = "z-live";
+        env.make_bucket(deleted, false).await;
+        env.make_bucket(live, false).await;
+        let storage = Arc::new(ECStoreHealStorage::new(env.ecstore.clone()));
+        let mut buckets: Vec<_> = storage.list_buckets().await.unwrap().into_iter().map(|b| b.name).collect();
+        buckets.sort();
+        assert_eq!(buckets, [deleted, live]);
+        let mut request = HealRequest::new(
+            HealType::ErasureSet {
+                buckets,
+                set_disk_id: "pool_0_set_0".to_owned(),
+            },
+            HealOptions::default(),
+            HealPriority::Low,
+        );
+        request.source = HealRequestSource::AutoHeal;
+        let task = HealTask::from_request(request, storage.clone());
+
+        env.ecstore
+            .delete_bucket(deleted, &DeleteBucketOptions::default())
+            .await
+            .unwrap();
+        let missing_live_volume = env.disk_paths[3].join(live);
+        tokio::fs::remove_dir(&missing_live_volume).await.unwrap();
+        let result = task.execute().await;
+
+        for disk in &env.disk_paths {
+            assert!(!disk.join(deleted).exists(), "stale recovery recreated the deleted bucket on {disk:?}");
+        }
+        result.expect("recovery must still process the surviving bucket");
+        assert!(missing_live_volume.is_dir(), "recovery must restore the live bucket's missing directory");
+        let write = env
+            .ecstore
+            .put_object(deleted, "probe", &mut PutObjReader::from_vec(vec![1]), &ObjectOptions::default())
+            .await;
+        assert!(
+            matches!(write, Err(EcstoreStorageError::BucketNotFound(_) | EcstoreStorageError::VolumeNotFound)),
+            "{write:?}"
+        );
+        assert_eq!(
+            storage
+                .list_buckets()
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|b| b.name)
+                .collect::<Vec<_>>(),
+            [live]
+        );
+    });
 }
