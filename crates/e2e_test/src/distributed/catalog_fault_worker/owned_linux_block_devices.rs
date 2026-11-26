@@ -197,7 +197,8 @@ mod linux {
             check(
                 Self::path(path)? == *self && Self::of(&held.metadata()?) == *self,
                 format!("owned identity changed: {}", path.display()),
-            )
+            )?;
+            Ok(())
         }
     }
 
@@ -239,7 +240,8 @@ mod linux {
         check(
             path.parent() == Some(Path::new("/dev")) && !number.is_empty() && number.bytes().all(|v| v.is_ascii_digit()),
             "unowned device path",
-        )
+        )?;
+        Ok(())
     }
 
     fn verify_mapping(mapping: &Mapping, backing: &Identity, block: Option<&Identity>) -> TestResult {
@@ -303,12 +305,14 @@ mod linux {
     }
 
     fn verify_mount_record(expected: &Option<Mount>, observed: &Option<Mount>) -> TestResult {
-        check(expected.is_some() && observed == expected, "owned mount identity changed")
+        check(expected.is_some() && observed == expected, "owned mount identity changed")?;
+        Ok(())
     }
 
     fn validate_endpoint(root: &Path, path: &Path) -> TestResult {
         check(path.parent() == Some(root) && path.canonicalize()? == path, "endpoint is outside owner")?;
-        check(!fs::symlink_metadata(path)?.file_type().is_symlink(), "endpoint is a symlink")
+        check(!fs::symlink_metadata(path)?.file_type().is_symlink(), "endpoint is a symlink")?;
+        Ok(())
     }
 
     fn mount_at(path: &Path) -> TestResult<Option<Mount>> {
@@ -615,11 +619,13 @@ mod linux {
                 .ok_or("missing block identity")?
                 .verify(&expected.name, medium.block.as_ref().ok_or("missing block owner")?)?;
             let found = self.associations(index)?;
-            check(found.len() == 1 && found[0].name == expected.name, "owned loop association changed")
+            check(found.len() == 1 && found[0].name == expected.name, "owned loop association changed")?;
+            Ok(())
         }
 
         fn require_active(&self) -> TestResult {
-            check(!self.closing, "D07 storage owner has started cleanup")
+            check(!self.closing, "D07 storage owner has started cleanup")?;
+            Ok(())
         }
 
         pub(super) fn provision(&mut self) -> TestResult {
