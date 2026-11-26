@@ -4675,7 +4675,17 @@ mod tests {
         let (_temp, disk, _, original) = fixture().await;
         let root = disk.io_get_object_path("recovery", "object").expect("object path");
         let transaction = Uuid::new_v4();
-        os::fsync_dir_recorder::set_failure(&root, ErrorKind::Other);
+        // Arm the failure at the staged rename. A one-entry batch can otherwise take the fused delete path.
+        let failure_root = root.clone();
+        let (armed, mut observed) = tokio::sync::oneshot::channel();
+        let _rename = os::prepared_publication_test_hooks::install_at(
+            os::prepared_publication_test_hooks::Stage::Rename,
+            &root.join(transaction.to_string()),
+            move || {
+                os::fsync_dir_recorder::set_failure(&failure_root, ErrorKind::Other);
+                armed.send(()).expect("activation observer remains live");
+            },
+        );
         let result = disk
             .delete_versions_recoverable(
                 "recovery",
@@ -4690,6 +4700,7 @@ mod tests {
                 },
             )
             .await;
+        observed.try_recv().expect("the staged preparation must reach its rename");
         assert_eq!(result.len(), 1);
         assert!(result[0].is_some(), "activation sync failure must reach the caller");
         assert!(os::fsync_dir_recorder::take_failure(&root).is_none(), "the injected failure was consumed");
