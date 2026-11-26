@@ -1220,10 +1220,19 @@ fn ensure_multipart_bucket_lifecycle_lock_held(bucket: &str, object: &str, opts:
     Ok(())
 }
 
+fn empty_upload_fallback_possible(successful_responses: usize, errs: &[Option<DiskError>]) -> bool {
+    successful_responses == 0
+        && errs.iter().any(|err| matches!(err, Some(DiskError::FileNotFound)))
+        && errs.iter().all(|err| match err {
+            Some(DiskError::FileNotFound) => true,
+            Some(err) => OBJECT_OP_IGNORED_ERRS.contains(err),
+            None => false,
+        })
+}
+
 async fn collect_list_parts_results<F>(
     tasks: Vec<F>,
     read_quorum: usize,
-    absence_quorum: usize,
 ) -> disk::error::Result<(Vec<Option<DiskError>>, Vec<Vec<String>>)>
 where
     F: Future<Output = disk::error::Result<Vec<String>>> + Send + 'static,
@@ -1231,8 +1240,6 @@ where
     let mut errs = vec![Some(DiskError::DiskNotFound); tasks.len()];
     let mut object_parts = vec![Vec::new(); tasks.len()];
     let mut successful_responses = 0usize;
-    let mut missing_directories = 0usize;
-    let mut absence_disqualified = false;
     let mut pending = tasks.len();
     let mut join_set = JoinSet::new();
 
@@ -1248,28 +1255,35 @@ where
                 errs[index] = None;
                 object_parts[index] = parts;
                 successful_responses += 1;
-                absence_disqualified = true;
             }
             Ok((index, Err(err))) => {
-                match err {
-                    DiskError::FileNotFound => missing_directories += 1,
-                    DiskError::DiskNotFound | DiskError::FaultyDisk | DiskError::FaultyRemoteDisk => {}
-                    _ => absence_disqualified = true,
-                }
                 errs[index] = Some(err);
             }
             Err(_) => {}
         }
 
-        if successful_responses + pending < read_quorum
-            && (absence_disqualified || missing_directories + pending < absence_quorum)
-        {
+        if successful_responses + pending < read_quorum && !empty_upload_fallback_possible(successful_responses, &errs) {
             return Err(DiskError::ErasureReadQuorum);
         }
     }
 
     if successful_responses < read_quorum {
-        if !absence_disqualified && missing_directories >= absence_quorum {
+        // A single missing directory cannot speak for unavailable disks, but once
+        // at least `read_quorum` disks confirm the part directory is absent and
+        // strictly fewer than `read_quorum` disks are unavailable (with no
+        // non-ignored errors), no readable part quorum can exist on the offline
+        // disks.
+        let file_not_found = errs.iter().filter(|err| matches!(err, Some(DiskError::FileNotFound))).count();
+        let only_missing_or_ignored = errs.iter().all(|err| match err {
+            Some(DiskError::FileNotFound) => true,
+            Some(err) => OBJECT_OP_IGNORED_ERRS.contains(err),
+            None => false,
+        });
+        if !errs.is_empty()
+            && file_not_found >= read_quorum
+            && only_missing_or_ignored
+            && errs.len().saturating_sub(file_not_found) < read_quorum
+        {
             return Err(DiskError::FileNotFound);
         }
 
@@ -1602,8 +1616,7 @@ impl SetDisks {
             ]),
             SLASH_SEPARATOR
         );
-        let write_quorum = fi.write_quorum(self.default_write_quorum());
-        let part_numbers = match Self::list_parts(&online_disks, &part_path, read_quorum, write_quorum, true).await {
+        let part_numbers = match Self::list_parts(&online_disks, &part_path, read_quorum, true).await {
             Ok(parts) => parts,
             Err(DiskError::FileNotFound) => return Ok(0),
             Err(err) => return Err(to_object_err(err.into(), vec![bucket, object, upload_id])),
@@ -1615,10 +1628,15 @@ impl SetDisks {
             .iter()
             .map(|number| format!("{part_path}part.{number}.meta"))
             .collect::<Vec<_>>();
-        let existing_parts =
-            Self::read_parts(&online_disks, RUSTFS_META_MULTIPART_BUCKET, &part_meta_paths, &part_numbers, write_quorum)
-                .await
-                .map_err(|err| to_object_err(err.into(), vec![bucket, object, upload_id]))?;
+        let existing_parts = Self::read_parts(
+            &online_disks,
+            RUSTFS_META_MULTIPART_BUCKET,
+            &part_meta_paths,
+            &part_numbers,
+            fi.write_quorum(self.default_write_quorum()),
+        )
+        .await
+        .map_err(|err| to_object_err(err.into(), vec![bucket, object, upload_id]))?;
 
         if existing_parts.len() != part_numbers.len() {
             return Err(Error::PartMissingOrCorrupt);
@@ -1895,7 +1913,6 @@ impl SetDisks {
         disks: &[Option<DiskStore>],
         part_path: &str,
         read_quorum: usize,
-        write_quorum: usize,
         strict_size: bool,
     ) -> disk::error::Result<Vec<usize>> {
         let mut futures = Vec::with_capacity(disks.len());
@@ -1918,9 +1935,7 @@ impl SetDisks {
             });
         }
 
-        // Missing directories must satisfy read quorum and intersect every possible part write quorum.
-        let absence_quorum = read_quorum.max(disks.len().saturating_sub(write_quorum) + 1);
-        let (errs, object_parts) = collect_list_parts_results(futures, read_quorum, absence_quorum).await?;
+        let (errs, object_parts) = collect_list_parts_results(futures, read_quorum).await?;
 
         if strict_size {
             return validate_part_size_observations(&errs, &object_parts, read_quorum);
@@ -3887,20 +3902,17 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
             SLASH_SEPARATOR
         );
 
-        let write_quorum = fi.write_quorum(self.default_write_quorum());
-        let mut part_numbers = match Self::list_parts(
-            &online_disks,
-            &part_path,
-            read_quorum,
-            write_quorum,
-            opts.strict_multipart_part_sizes,
-        )
-        .await
-        {
-            Ok(parts) => parts,
-            Err(DiskError::FileNotFound) => return Ok(ret),
-            Err(err) => return Err(to_object_err(err.into(), vec![bucket, object])),
-        };
+        let mut part_numbers =
+            match Self::list_parts(&online_disks, &part_path, read_quorum, opts.strict_multipart_part_sizes).await {
+                Ok(parts) => parts,
+                Err(err) => {
+                    if err == DiskError::FileNotFound {
+                        return Ok(ret);
+                    }
+
+                    return Err(to_object_err(err.into(), vec![bucket, object]));
+                }
+            };
 
         if part_numbers.is_empty() {
             return Ok(ret);
@@ -3923,7 +3935,7 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
             &part_meta_paths,
             &part_numbers,
             if opts.strict_multipart_part_sizes {
-                write_quorum
+                fi.write_quorum(self.default_write_quorum())
             } else {
                 read_quorum
             },
@@ -9447,7 +9459,7 @@ mod tests {
         })
         .collect();
 
-        let err = collect_list_parts_results(tasks, 2, 2)
+        let err = collect_list_parts_results(tasks, 2)
             .await
             .expect_err("quorum should become impossible before slow tail completes");
 
@@ -9468,7 +9480,7 @@ mod tests {
             })
             .collect();
 
-        let (errs, object_parts) = collect_list_parts_results(tasks, 2, 2)
+        let (errs, object_parts) = collect_list_parts_results(tasks, 2)
             .await
             .expect("quorum should still succeed");
         assert_eq!(errs.iter().filter(|err| err.is_none()).count(), 2);
@@ -9489,7 +9501,7 @@ mod tests {
         })
         .collect();
 
-        let err = collect_list_parts_results(tasks, 2, 2)
+        let err = collect_list_parts_results(tasks, 2)
             .await
             .expect_err("an unavailable disk cannot prove an empty upload");
 
@@ -9565,33 +9577,45 @@ mod tests {
         let tasks = (0..4)
             .map(|_| async { Err::<Vec<String>, _>(DiskError::FileNotFound) })
             .collect();
-        let err = collect_list_parts_results(tasks, 2, 2)
+        let err = collect_list_parts_results(tasks, 2)
             .await
             .expect_err("all missing directories are empty");
         assert_eq!(err, DiskError::FileNotFound);
     }
 
     #[tokio::test]
-    async fn collect_list_parts_results_requires_absence_that_intersects_write_quorum() {
-        let results = || {
-            [
-                DiskError::FileNotFound,
-                DiskError::FileNotFound,
-                DiskError::FileNotFound,
-                DiskError::FaultyDisk,
-            ]
-            .into_iter()
-            .map(|err| async move { Err::<Vec<String>, _>(err) })
-            .collect()
-        };
-        let empty = collect_list_parts_results(results(), 2, 2)
-            .await
-            .expect_err("three missing directories prove absence with a write quorum of three");
-        assert_eq!(empty, DiskError::FileNotFound);
-        let uncertain = collect_list_parts_results(results(), 1, 4)
-            .await
-            .expect_err("the unavailable disk may hold a part with a write quorum of one");
-        assert_eq!(uncertain, DiskError::ErasureReadQuorum);
+    async fn collect_list_parts_results_proves_empty_upload_with_sub_quorum_offline_disks() {
+        let degraded = vec![
+            Err::<Vec<String>, _>(DiskError::DiskNotFound),
+            Err(DiskError::FileNotFound),
+            Err(DiskError::FileNotFound),
+            Err(DiskError::FileNotFound),
+        ]
+        .into_iter()
+        .map(|outcome| async move { outcome })
+        .collect();
+        assert_eq!(
+            collect_list_parts_results(degraded, 2)
+                .await
+                .expect_err("one offline disk cannot hold a read quorum of parts"),
+            DiskError::FileNotFound
+        );
+
+        let ambiguous = vec![
+            Err::<Vec<String>, _>(DiskError::DiskNotFound),
+            Err(DiskError::DiskNotFound),
+            Err(DiskError::FileNotFound),
+            Err(DiskError::FileNotFound),
+        ]
+        .into_iter()
+        .map(|outcome| async move { outcome })
+        .collect();
+        assert_eq!(
+            collect_list_parts_results(ambiguous, 2)
+                .await
+                .expect_err("two offline disks could still hold a read quorum of parts"),
+            DiskError::ErasureReadQuorum
+        );
     }
 
     #[test]
@@ -9895,7 +9919,7 @@ mod tests {
         })
         .collect();
 
-        let err = collect_list_parts_results(tasks, 2, 2)
+        let err = collect_list_parts_results(tasks, 2)
             .await
             .expect_err("non-ignored errors should preserve early quorum failure");
 

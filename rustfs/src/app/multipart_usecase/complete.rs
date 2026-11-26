@@ -1741,20 +1741,14 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn concurrent_completions_share_durable_bucket_quota_reservations() {
-        let (store, bucket) = crate::app::gating_test_env::durable_quota_test_bucket("concurrent-complete-quota", 8192).await;
-        // Both parts fit the staging cap, while committed usage leaves room for only one completion.
-        store
-            .clone()
-            .put_object(
-                &bucket,
-                "committed",
-                &mut PutObjReader::from_vec(vec![0x63; 4096]),
-                &ObjectOptions::default(),
-            )
-            .await
-            .expect("seed committed quota usage");
+        let (store, bucket) = crate::app::gating_test_env::durable_quota_test_bucket("concurrent-complete-quota", 6000).await;
 
         let usecase = DefaultMultipartUsecase::from_global();
+        let mut seed_reader = PutObjReader::from_vec(vec![0x70; 2000]);
+        store
+            .put_object(&bucket, "seed", &mut seed_reader, &ObjectOptions::default())
+            .await
+            .expect("seed committed quota usage");
 
         let mut inputs = Vec::new();
         for object in ["first", "second"] {
@@ -1762,7 +1756,7 @@ mod tests {
                 .new_multipart_upload(&bucket, object, &ObjectOptions::default())
                 .await
                 .expect("create concurrent multipart upload");
-            let mut reader = PutObjReader::from_vec(vec![0x71; 4096]);
+            let mut reader = PutObjReader::from_vec(vec![0x71; 3000]);
             let part = store
                 .put_object_part(&bucket, object, &upload.upload_id, 1, &mut reader, &ObjectOptions::default())
                 .await
