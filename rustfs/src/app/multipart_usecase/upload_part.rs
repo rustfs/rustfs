@@ -182,7 +182,7 @@ impl DefaultMultipartUsecase {
             let owner = self.clone();
             return run_owned_mutation(async move {
                 let helper = origin.take_completion();
-                let result = owner.execute_upload_part_with_origin_inner(req, input, origin).await;
+                let result = Box::pin(owner.execute_upload_part_with_origin_inner(req, input, origin)).await;
                 if let Some(helper) = helper {
                     let _ = helper.complete_owned(&result, http::StatusCode::OK, &HeaderMap::new());
                 }
@@ -190,7 +190,7 @@ impl DefaultMultipartUsecase {
             })
             .await;
         }
-        self.execute_upload_part_with_origin_inner(req, input, origin).await
+        Box::pin(self.execute_upload_part_with_origin_inner(req, input, origin)).await
     }
 
     async fn execute_upload_part_with_origin_inner(

@@ -17,6 +17,41 @@ use crate::table_catalog::store::registration_cache_tests::{cache_fixture, regis
 use crate::table_catalog::test_support::TestCatalogObjectBackend;
 use crate::table_catalog::tests::{test_bucket_entry, test_namespace_entry, test_table_entry};
 
+#[tokio::test]
+async fn catalog_registration_futures_remain_bounded_with_ecstore_backend() {
+    let directory = tempfile::TempDir::new().expect("Catalog future test directory");
+    let shutdown = tokio_util::sync::CancellationToken::new();
+    let env = rustfs_test_utils::TestECStoreEnv::builder()
+        .disk_count(1)
+        .base_dir(directory.path())
+        .init_bucket_metadata(false)
+        .shutdown_token(shutdown.clone())
+        .build()
+        .await;
+    let backend = EcStoreTableCatalogObjectBackend::new(env.ecstore.clone());
+    let store = ObjectTableCatalogStore::new(backend.clone());
+    let paths = TableCatalogObjectPaths::default();
+    let publication = TableCommitLockPublication::new(&backend, &paths);
+    let namespace = Namespace::parse("sales").expect("Catalog namespace");
+    let entry = registration_entry(&namespace, "orders");
+    for (operation, future) in [
+        ("create_table", store.create_table(entry.clone())),
+        ("register_table", store.register_table(entry.clone())),
+        (
+            "register_table_with_publication",
+            store.register_table_with_publication(entry, &publication),
+        ),
+    ] {
+        // Measure the async-trait state through its vtable.
+        let future_size = std::mem::size_of_val(future.as_ref().get_ref());
+        assert!(
+            future_size <= 16 * 1024,
+            "{operation} future must remain bounded; measured {future_size} bytes"
+        );
+    }
+    shutdown.cancel();
+}
+
 fn is_preparation_timeout<T>(result: &TableCatalogStoreResult<T>) -> bool {
     matches!(result, Err(TableCatalogStoreError::Unavailable(message)) if message.contains("preparation deadline"))
 }

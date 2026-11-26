@@ -6263,14 +6263,15 @@ impl ECStore {
             .await
     }
 
-    async fn handle_delete_objects_with_journal_and_accounting_with_guard(
-        &self,
-        bucket: &str,
+    fn handle_delete_objects_with_journal_and_accounting_with_guard<'a>(
+        &'a self,
+        bucket: &'a str,
         objects: Vec<ObjectToDelete>,
         opts: ObjectOptions,
         tier_journal_api: Option<Arc<ECStore>>,
         lifecycle_owner: Option<Arc<BucketIncarnationFenceGuard>>,
-    ) -> (Vec<DeletedObject>, Vec<Option<Error>>, Vec<Option<DeleteAccounting>>) {
+    ) -> impl std::future::Future<Output = (Vec<DeletedObject>, Vec<Option<Error>>, Vec<Option<DeleteAccounting>>)> + Send + 'a
+    {
         Box::pin(async move {
             let count = objects.len();
             let mut deleted = vec![DeletedObject::default(); count];
@@ -6320,7 +6321,6 @@ impl ECStore {
             }
             (deleted, errors, accounting)
         })
-        .await
     }
 
     /// Each phase owns separate disk transactions, receipts, and rollback.

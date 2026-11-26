@@ -3222,7 +3222,8 @@ where
         precondition: TableCatalogPutPrecondition,
         publication: &(dyn TableCommitPublication + Sync),
     ) -> TableCatalogStoreResult<()> {
-        publication_preparation(publication, async {
+        // Keep the registration state on the heap through preparation and task-local polling.
+        let operation = Box::pin(async {
             self.paths.validate_table_entry(&entry)?;
             let namespace = parse_namespace_for_store(&entry.namespace)?;
             let table = self.paths.parse_name(&entry.table)?;
@@ -3356,8 +3357,8 @@ where
             }
             result?;
             Ok(())
-        })
-        .await
+        });
+        publication_preparation(publication, operation).await
     }
 
     async fn write_view_entry(&self, entry: ViewEntry, precondition: TableCatalogPutPrecondition) -> TableCatalogStoreResult<()> {
