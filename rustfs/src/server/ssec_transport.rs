@@ -389,11 +389,8 @@ mod tests {
             "every plaintext POST Object SSE-C form upload must increment the counter"
         );
         let logs = String::from_utf8(buffer.0.lock().expect("log buffer").clone()).expect("UTF-8 logs");
-        let warning_lines: Vec<_> = logs
-            .lines()
-            .filter(|line| line.contains("ssec_request_without_tls"))
-            .collect();
-        assert_eq!(warning_lines.len(), 1, "the plaintext SSE-C warning must fire once per process");
+        let warning_count = logs.lines().filter(|line| line.contains("ssec_request_without_tls")).count();
+        assert_eq!(warning_count, 1, "the plaintext SSE-C warning must fire once per process");
     }
 
     #[test]
