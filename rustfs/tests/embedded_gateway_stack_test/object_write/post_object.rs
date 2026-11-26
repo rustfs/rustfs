@@ -471,8 +471,8 @@ async fn post_wire_authorizes_form_values_before_success_status(server: rustfs::
         .handle();
     let policy = format!(
         r#"{{"Version":"2012-10-17","Statement":[
-        {{"Effect":"Allow","Action":"s3:PutObject","Resource":"arn:aws:s3:::{BUCKET}/*"}},
-        {{"Effect":"Deny","Action":"s3:PutObject","Resource":"arn:aws:s3:::{BUCKET}/*",
+        {{"Effect":"Allow","Action":["s3:PutObject","s3:PutObjectTagging"],"Resource":"arn:aws:s3:::{BUCKET}/*"}},
+        {{"Effect":"Deny","Action":["s3:PutObject","s3:PutObjectTagging"],"Resource":"arn:aws:s3:::{BUCKET}/*",
         "Condition":{{"StringEquals":{{"s3:RequestObjectTag/classification":"private"}}}}}}
         ]}}"#
     );
@@ -579,8 +579,8 @@ async fn post_wire_authorizes_form_values_before_success_status(server: rustfs::
             "{key}"
         );
     }
-    // The initial PutObject gate sees the version header. The final POST gate
-    // sees the form resource, which has no version, and must refuse it.
+    // POST admission rejects replication-only wire headers (`x-rustfs-source-version-id`)
+    // before form validation or final authorization.
     let version_policy = format!(
         r#"{{"Version":"2012-10-17","Statement":[
         {{"Effect":"Allow","Action":"s3:PutObject","Resource":"arn:aws:s3:::{BUCKET}/version-condition",
@@ -593,7 +593,7 @@ async fn post_wire_authorizes_form_values_before_success_status(server: rustfs::
     )
     .await
     .expect("replace attached writer policy");
-    for (status, expected) in [("202", (400, "MalformedPOSTRequest")), ("204", (403, "AccessDenied"))] {
+    for (status, expected) in [("202", (403, "AccessDenied")), ("204", (403, "AccessDenied"))] {
         let answer = caller
             .post_form(
                 BUCKET,

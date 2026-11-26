@@ -255,6 +255,24 @@ pub const ENV_RUSTFS_KMS_ENFORCE_SSE_KEY_POLICY: &str = "RUSTFS_KMS_ENFORCE_SSE_
 /// working; the default flips to on in a later release.
 pub const DEFAULT_KMS_ENFORCE_SSE_KEY_POLICY: bool = false;
 
+/// Write-side switch for opening every encrypted multipart part segment with
+/// an authenticated random segment-nonce frame (`0x03`).
+///
+/// Off by default for rolling-upgrade safety: nodes without `0x03` read support
+/// reject segment-nonce frames, and encrypted ciphertext travels verbatim
+/// through transition, decommission, heal, and SSE-C replication passthrough.
+/// Enable only after every node (and every RustFS warm or replication target
+/// receiving raw ciphertext) runs a release with segment-nonce read support.
+/// Reading `0x03` segments needs no switch; the default flips in a later
+/// release.
+pub const ENV_RUSTFS_ENCRYPTION_MULTIPART_SEGMENT_NONCE: &str = "RUSTFS_ENCRYPTION_MULTIPART_SEGMENT_NONCE";
+
+/// Default write-side switch for multipart segment-nonce frames.
+///
+/// Default value: false
+/// Environment variable: RUSTFS_ENCRYPTION_MULTIPART_SEGMENT_NONCE
+pub const DEFAULT_RUSTFS_ENCRYPTION_MULTIPART_SEGMENT_NONCE: bool = false;
+
 /// Environment variable for server KMS backend.
 pub const ENV_RUSTFS_KMS_BACKEND: &str = "RUSTFS_KMS_BACKEND";
 
@@ -426,6 +444,7 @@ mod tests {
             DEFAULT_ADDRESS,
             DEFAULT_CONSOLE_ADDRESS,
             ENV_RUSTFS_BROWSER_REDIRECT_URL,
+            ENV_RUSTFS_ENCRYPTION_MULTIPART_SEGMENT_NONCE,
         ];
 
         for constant in &string_constants {
@@ -467,5 +486,13 @@ mod tests {
         // Address format consistency
         assert_eq!(DEFAULT_ADDRESS, format!(":{DEFAULT_PORT}"));
         assert_eq!(DEFAULT_CONSOLE_ADDRESS, format!(":{DEFAULT_CONSOLE_PORT}"));
+    }
+
+    #[test]
+    fn test_multipart_segment_nonce_constants() {
+        assert_eq!(ENV_RUSTFS_ENCRYPTION_MULTIPART_SEGMENT_NONCE, "RUSTFS_ENCRYPTION_MULTIPART_SEGMENT_NONCE");
+        const {
+            assert!(!DEFAULT_RUSTFS_ENCRYPTION_MULTIPART_SEGMENT_NONCE);
+        }
     }
 }

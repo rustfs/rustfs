@@ -352,6 +352,31 @@ async fn replica_delete_fanout_state(
     replica_delete_fanout_state_from_config(config, replication_source, version_id, &site_peer_deployment_ids)
 }
 
+/// Whether this delete may clear GOVERNANCE retention on the addressed version.
+///
+/// An explicit bypass header was already authorized for `s3:BypassGovernanceRetention`
+/// by the access layer. A replicated version purge carries no bypass header (#6850),
+/// so we quietly probe `s3:BypassGovernanceRetention` for the caller: `s3:ReplicateDelete`
+/// is part of `s3:*` and must not stand in for the bypass permission or override an
+/// explicit Deny on it. Without the permission, the delete proceeds as a plain version
+/// delete and the WORM gate decides.
+async fn delete_may_bypass_governance(envelope: &mut RequestEnvelope, opts: &ObjectOptions) -> S3Result<bool> {
+    if has_bypass_governance_header(envelope.headers()) {
+        return Ok(true);
+    }
+    if !(opts.replication_request && opts.version_id.is_some()) {
+        return Ok(false);
+    }
+    let suppress_denial_log = std::mem::replace(&mut req_info_mut(envelope)?.suppress_denial_log, true);
+    let auth_res = authorize_request(envelope, Action::S3Action(S3Action::BypassGovernanceRetentionAction)).await;
+    req_info_mut(envelope)?.suppress_denial_log = suppress_denial_log;
+    match auth_res {
+        Ok(()) => Ok(true),
+        Err(err) if err.code() == &S3ErrorCode::AccessDenied => Ok(false),
+        Err(err) => Err(err),
+    }
+}
+
 fn validate_undo_delete_version(expected: Option<&str>, requested: Option<&str>) -> S3Result<()> {
     if expected.is_some() && expected != requested {
         return Err(rustfs_s3_types::S3Error::with_default_message(S3ErrorCode::PreconditionFailed));
@@ -1305,9 +1330,8 @@ impl DefaultObjectUsecase {
             del_opts_with_versioning(&bucket, &key, version_id, envelope.headers(), metadata, version_cfg, replica)
                 .map_err(ApiError::from)?;
         opts.delete_replication_config_snapshot = Some(Arc::clone(&delete_config_snapshot));
-        opts.object_lock_delete = Some(StorageObjectLockDeleteOptions {
-            bypass_governance: has_bypass_governance_header(envelope.headers()),
-        });
+        let bypass_governance = delete_may_bypass_governance(&mut envelope, &opts).await?;
+        opts.object_lock_delete = Some(StorageObjectLockDeleteOptions { bypass_governance });
         apply_bucket_generation_guard(&envelope, &bucket, &mut opts)?;
         let force_delete = opts.delete_prefix;
 
@@ -1430,12 +1454,8 @@ impl DefaultObjectUsecase {
                             None => Box::pin(store.get_object_info_for_delete(&bucket, &key, &opts)).await.ok(),
                         };
                         if let Some(existing_object_info) = existing_object_info.as_ref()
-                            && let Some(reason) = check_object_lock_for_deletion(
-                                &bucket,
-                                existing_object_info,
-                                has_bypass_governance_header(envelope.headers()),
-                            )
-                            .await
+                            && let Some(reason) =
+                                check_object_lock_for_deletion(&bucket, existing_object_info, bypass_governance).await
                         {
                             return Err(rustfs_s3_types::S3Error::with_message(
                                 rustfs_s3_types::S3ErrorCode::AccessDenied,
@@ -3776,6 +3796,104 @@ mod tests {
             .await
             .expect_err("untrusted force-delete must be rejected before storage lookup");
         assert_eq!(err.code(), &rustfs_s3_types::S3ErrorCode::AccessDenied);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn replicated_version_purge_bypasses_governance_only_with_bypass_permission() {
+        crate::app::gating_test_env::run_large_stack_test("replicated-purge-governance-bypass", || async {
+            use crate::app::storage_api::test::contract::bucket::{
+                BucketOperations as _, DeleteBucketOptions, MakeBucketOptions,
+            };
+
+            async fn may_bypass(bucket: &str, statements: &str, opts: &ObjectOptions) -> bool {
+                let policy_json = format!(r#"{{"Version":"2012-10-17","Statement":[{statements}]}}"#).replace("BUCKET", bucket);
+                let mut metadata = (*crate::storage::get_bucket_metadata(bucket).await.expect("load test metadata")).clone();
+                metadata.policy_config = Some(serde_json::from_str(&policy_json).expect("parse test policy"));
+                metadata.policy_config_json = policy_json.into_bytes();
+                crate::storage::storage_api::set_bucket_metadata(bucket.to_owned(), metadata)
+                    .await
+                    .expect("publish test policy");
+
+                let mut envelope = method_only_delete_envelope(Method::DELETE);
+                envelope.install_req_info(crate::storage::req_info::ReqInfo {
+                    bucket: Some(bucket.to_owned()),
+                    object: Some("object".to_owned()),
+                    version_id: opts.version_id.clone(),
+                    ..Default::default()
+                });
+                let allowed = delete_may_bypass_governance(&mut envelope, opts)
+                    .await
+                    .expect("a denied bypass probe is not a request error");
+                assert!(
+                    !req_info_ref(&envelope).expect("request info").suppress_denial_log,
+                    "the quiet probe must restore suppress_denial_log"
+                );
+                allowed
+            }
+
+            const ALLOW_REPLICA_DELETE: &str = r#"{"Effect":"Allow","Principal":{"AWS":"*"},"Action":["s3:DeleteObjectVersion","s3:ReplicateDelete"],"Resource":["arn:aws:s3:::BUCKET/*"]}"#;
+            const ALLOW_BYPASS: &str = r#"{"Effect":"Allow","Principal":{"AWS":"*"},"Action":["s3:BypassGovernanceRetention"],"Resource":["arn:aws:s3:::BUCKET/*"]}"#;
+            const ALLOW_ALL: &str =
+                r#"{"Effect":"Allow","Principal":{"AWS":"*"},"Action":["s3:*"],"Resource":["arn:aws:s3:::BUCKET/*"]}"#;
+            const DENY_BYPASS: &str = r#"{"Effect":"Deny","Principal":{"AWS":"*"},"Action":["s3:BypassGovernanceRetention"],"Resource":["arn:aws:s3:::BUCKET/*"]}"#;
+
+            let store = crate::app::gating_test_env::shared_gating_ecstore().await;
+            if current_app_context().is_none() {
+                crate::app::runtime_sources::install_test_app_context(Arc::clone(&store)).await;
+            }
+            let bucket = format!("replicated-purge-bypass-{}", Uuid::new_v4().simple());
+            store
+                .make_bucket(&bucket, &MakeBucketOptions::default())
+                .await
+                .expect("create test bucket");
+
+            let replicated_purge = ObjectOptions {
+                replication_request: true,
+                version_id: Some(Uuid::new_v4().to_string()),
+                ..Default::default()
+            };
+            assert!(
+                !may_bypass(&bucket, ALLOW_REPLICA_DELETE, &replicated_purge).await,
+                "s3:ReplicateDelete alone must not clear GOVERNANCE retention"
+            );
+            assert!(
+                !may_bypass(&bucket, &format!("{ALLOW_ALL},{DENY_BYPASS}"), &replicated_purge).await,
+                "an explicit Deny on s3:BypassGovernanceRetention must hold against replica headers"
+            );
+            assert!(
+                may_bypass(&bucket, &format!("{ALLOW_REPLICA_DELETE},{ALLOW_BYPASS}"), &replicated_purge).await,
+                "a replication identity holding s3:BypassGovernanceRetention still purges without the header"
+            );
+
+            let local_version_delete = ObjectOptions {
+                replication_request: false,
+                ..replicated_purge.clone()
+            };
+            assert!(
+                !may_bypass(&bucket, ALLOW_ALL, &local_version_delete).await,
+                "a local version delete without the bypass header never gets bypass"
+            );
+            let replicated_marker_creation = ObjectOptions {
+                version_id: None,
+                ..replicated_purge
+            };
+            assert!(
+                !may_bypass(&bucket, ALLOW_ALL, &replicated_marker_creation).await,
+                "a replicated delete without a version id creates a delete marker and gets no bypass"
+            );
+
+            store
+                .delete_bucket(
+                    &bucket,
+                    &DeleteBucketOptions {
+                        force: true,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect("remove test bucket");
+        });
     }
 
     // backlog#929 (HP-8): the pre-delete stat may only be skipped when every

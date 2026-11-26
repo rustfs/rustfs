@@ -28,9 +28,8 @@ use rustfs_utils::http::{
     AMZ_OBJECT_TAGGING, AMZ_SERVER_SIDE_ENCRYPTION, AMZ_SERVER_SIDE_ENCRYPTION_KMS_CONTEXT, AMZ_SERVER_SIDE_ENCRYPTION_KMS_ID,
     AMZ_STORAGE_CLASS, AMZ_TAG_COUNT, CACHE_CONTROL, CONTENT_DISPOSITION, CONTENT_ENCODING, CONTENT_LANGUAGE, CONTENT_TYPE,
     HeaderExt as _, SUFFIX_OBJECTLOCK_LEGALHOLD_TIMESTAMP, SUFFIX_OBJECTLOCK_RETENTION_TIMESTAMP,
-    SUFFIX_REPLICATION_ACTUAL_OBJECT_SIZE, SUFFIX_REPLICATION_SSEC_CRC, SUFFIX_SOURCE_REPLICATION_LEGALHOLD_TIMESTAMP,
-    SUFFIX_SOURCE_REPLICATION_RETENTION_TIMESTAMP, SUFFIX_SOURCE_REPLICATION_TAGGING_TIMESTAMP, SUFFIX_TAGGING_TIMESTAMP,
-    get_str, insert_header_map, is_internal_key, is_object_encryption_marker, is_replication_stripped_encryption_key,
+    SUFFIX_REPLICATION_ACTUAL_OBJECT_SIZE, SUFFIX_REPLICATION_SSEC_CRC, SUFFIX_TAGGING_TIMESTAMP, get_str, insert_header_map,
+    is_internal_key, is_minio_header, is_object_encryption_marker, is_replication_stripped_encryption_key, is_rustfs_header,
     ssec_replication_transport_header,
 };
 use time::OffsetDateTime;
@@ -133,25 +132,13 @@ fn classify_replication_source_encryption(metadata: &HashMap<String, String>) ->
     }
 }
 
-fn is_legacy_source_replication_timestamp_key(key: &str) -> bool {
-    fn has_prefix_and_suffix(key: &str, prefix: &str, suffix: &str) -> bool {
-        let key = key.as_bytes();
-        key.len() == prefix.len() + suffix.len()
-            && key[..prefix.len()].eq_ignore_ascii_case(prefix.as_bytes())
-            && key[prefix.len()..].eq_ignore_ascii_case(suffix.as_bytes())
-    }
-
-    [
-        SUFFIX_SOURCE_REPLICATION_TAGGING_TIMESTAMP,
-        SUFFIX_SOURCE_REPLICATION_RETENTION_TIMESTAMP,
-        SUFFIX_SOURCE_REPLICATION_LEGALHOLD_TIMESTAMP,
-    ]
-    .iter()
-    .any(|suffix| {
-        ["x-rustfs-", "x-minio-"]
-            .iter()
-            .any(|prefix| has_prefix_and_suffix(key, prefix, suffix))
-    })
+/// A stored, non-internal key in a vendor header namespace is client-chosen
+/// user metadata written before the ingest side reserved the full vendor
+/// prefixes. `PutObjectOptions::header()` forwards bare `x-rustfs-*` and
+/// `x-minio-*` keys verbatim, so left unescaped it would reach the target as a
+/// trusted replication transport header on this server-authorized request.
+fn is_legacy_vendor_user_metadata_key(key: &str) -> bool {
+    is_rustfs_header(key) || is_minio_header(key)
 }
 
 pub(crate) fn replication_object_is_ssec_encrypted(user_defined: &HashMap<String, String>) -> bool {
@@ -272,12 +259,12 @@ pub(crate) fn replication_put_object_options(sc: &str, object_info: &ObjectInfo)
             continue;
         }
 
-        if is_legacy_source_replication_timestamp_key(key) {
-            meta.insert(format!("x-amz-meta-{key}"), value.to_string());
+        if is_internal_key(key) || is_standard_header(key) {
             continue;
         }
 
-        if is_internal_key(key) || is_standard_header(key) {
+        if is_legacy_vendor_user_metadata_key(key) {
+            meta.insert(format!("x-amz-meta-{key}"), value.to_string());
             continue;
         }
 
@@ -609,7 +596,7 @@ mod tests {
     use rustfs_replication::content_matches_by_etag;
     use rustfs_utils::http::{
         SSEC_ALGORITHM_HEADER, SSEC_KEY_MD5_HEADER, SUFFIX_REPLICATION_ACTUAL_OBJECT_SIZE, SUFFIX_REPLICATION_SSEC_CRC,
-        get_header_map,
+        SUFFIX_SOURCE_REPLICATION_RETENTION_TIMESTAMP, get_header_map,
     };
     use std::sync::Arc;
     use time::Duration;
@@ -1323,21 +1310,30 @@ mod tests {
             "x-minio-source-replication-tagging-timestamp",
             "x-minio-source-replication-retention-timestamp",
             "x-minio-source-replication-legalhold-timestamp",
+            "x-rustfs-replication-ssec-original-size",
+            "x-rustfs-replication-compression",
+            "x-minio-replication-compression-actual-size",
+            "x-rustfs-replication-ssec-crc",
+            "x-minio-replication-ssec-crc",
+            "X-Rustfs-Replication-Ssec-Algorithm",
         ];
+        let mut stored: HashMap<String, String> = legacy_keys
+            .iter()
+            .map(|key| ((*key).to_string(), "2099-01-02T03:04:05Z".to_string()))
+            .collect();
+        // Genuine internal metadata must still be stripped rather than escaped
+        // into client-visible `x-amz-meta-*` headers.
+        rustfs_utils::http::insert_str(&mut stored, rustfs_utils::http::SUFFIX_HEALING, "true".to_string());
         let object_info = ObjectInfo {
-            user_defined: Arc::new(
-                legacy_keys
-                    .iter()
-                    .map(|key| (key.to_string(), "2099-01-02T03:04:05Z".to_string()))
-                    .collect(),
-            ),
+            user_defined: Arc::new(stored),
             ..Default::default()
         };
 
         let (options, _) = replication_put_object_options("", &object_info).expect("build put options");
+        let wire_headers = options.header();
 
         for legacy_key in legacy_keys {
-            assert!(!options.user_metadata.contains_key(legacy_key));
+            assert!(!options.user_metadata.contains_key(legacy_key), "{legacy_key} must not stay bare");
             assert_eq!(
                 options
                     .user_metadata
@@ -1345,7 +1341,25 @@ mod tests {
                     .map(String::as_str),
                 Some("2099-01-02T03:04:05Z")
             );
+            assert!(
+                !wire_headers.contains_key(legacy_key.to_ascii_lowercase().as_str()),
+                "{legacy_key} must never be emitted as a bare wire header"
+            );
+            assert_eq!(
+                wire_headers
+                    .get(format!("x-amz-meta-{}", legacy_key.to_ascii_lowercase()).as_str())
+                    .and_then(|value| value.to_str().ok()),
+                Some("2099-01-02T03:04:05Z"),
+                "{legacy_key} must travel only under x-amz-meta-"
+            );
         }
+        assert!(
+            !options
+                .user_metadata
+                .keys()
+                .any(|key| key.to_ascii_lowercase().contains("internal-healing")),
+            "internal keys must stay stripped rather than being escaped as user metadata"
+        );
         assert_eq!(options.internal.tagging_timestamp, OffsetDateTime::UNIX_EPOCH);
         assert_eq!(options.internal.retention_timestamp, OffsetDateTime::UNIX_EPOCH);
         assert_eq!(options.internal.legalhold_timestamp, OffsetDateTime::UNIX_EPOCH);

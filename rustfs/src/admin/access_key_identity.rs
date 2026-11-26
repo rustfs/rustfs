@@ -276,9 +276,21 @@ pub(crate) fn build_info_regular_user_resp(
     }
 }
 
+/// Provider of a full credential (with `session_token` intact for STS entries).
+/// Do not call on `IamSys::list_sts_accounts` entries whose `session_token` is blanked;
+/// use [`guess_sts_user_provider`] for listed STS credentials.
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn guess_user_provider(credentials: &StoredCredentials) -> &'static str {
     AccessKeyIdentity::from_credentials(credentials).provider.as_str()
+}
+
+/// Provider of an entry returned by `IamSys::list_sts_accounts`.
+///
+/// The listing strips `session_token`, making `is_temp()` false so `guess_user_provider`
+/// would report every listed STS entry as a long-term `builtin` user; each entry is an STS
+/// credential by construction, so its decoded claims determine the provider.
+pub(crate) fn guess_sts_user_provider(credentials: &StoredCredentials) -> &'static str {
+    classify_provider_from_claims(credentials.claims.as_ref()).as_str()
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
@@ -943,5 +955,30 @@ mod tests {
         )
         .expect("STS response policy is JSON");
         assert_eq!(policy, expected_policy);
+    }
+
+    #[test]
+    fn guess_sts_user_provider_classifies_listed_sts_credentials_without_session_token() {
+        let listed = |claims| StoredCredentials {
+            access_key: "STSKEY123".to_string(),
+            parent_user: "parent-user".to_string(),
+            expiration: Some(OffsetDateTime::now_utc() + time::Duration::hours(1)),
+            claims,
+            ..Default::default()
+        };
+
+        let openid = listed(Some(HashMap::from([("sub".to_string(), json!("subject-123"))])));
+        assert_eq!(guess_sts_user_provider(&openid), "openid");
+        // Without a session token, `guess_user_provider` treats the entry as a regular builtin user.
+        assert_eq!(guess_user_provider(&openid), "builtin");
+
+        let ldap = listed(Some(HashMap::from([("ldap:username".to_string(), json!("alice"))])));
+        assert_eq!(guess_sts_user_provider(&ldap), "ldap");
+
+        let builtin = listed(Some(HashMap::from([("parent".to_string(), json!("parent-user"))])));
+        assert_eq!(guess_sts_user_provider(&builtin), "builtin");
+
+        let no_claims = listed(None);
+        assert_eq!(guess_sts_user_provider(&no_claims), "builtin");
     }
 }

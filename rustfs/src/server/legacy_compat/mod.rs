@@ -12,37 +12,32 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! The s3s compatibility patch layers of the external HTTP stack, one file per
-//! layer, grouped so that T2.12 (rustfs/backlog#2771) can delete them together
-//! once the gateway stack replaces the s3s edge.
+//! Compatibility layers retained on the external HTTP stack after the gateway
+//! cutover, one file per layer.
 //!
-//! Every module here patches a behaviour of the s3s edge rather than owning a
-//! RustFS behaviour of its own. None of them is installed from here:
-//! `server::http::external_service_stack!` installs them in the canonical
-//! order documented beside it, and `server::http::tests::stack_census` pins
-//! that order. Each file header names the s3s behaviour it patches, the
-//! gateway mechanism that replaces it, and the task that removes it.
+//! None of them is installed from here: `server::http::external_service_stack!`
+//! installs them in the canonical order documented beside it, and
+//! `server::http::tests::stack_census` / `middleware_matrix_census` pin that
+//! order.
 //!
-//! Replaced by: the per-layer gateway mechanisms below (gateway
-//! `docs/middleware.md`, "The nine RustFS tower patch layers"; the two layers
-//! outside that table name their replacement in their own header).
-//! Removed by: T2.12 (rustfs/backlog#2771).
+//! T2.12 (`rustfs/backlog#2771`, 2026-11-11 ruling and 2026-11-24 audit):
 //!
-//! | Layer | Replaced by |
+//! - Deleted outright (replaced by the gateway edge): `DoubleSlashListBucketsCompatLayer`,
+//!   `VirtualHostStyleHintLayer`, `S3ErrorMessageCompatLayer`, `ObjectAttributesEtagFixLayer`,
+//!   and `SigV4HeaderGuardLayer`. `server::gateway_stack::tests::legacy_layers` pins what each
+//!   of them made the legacy stack answer against the gateway stack alone.
+//! - Retained on the outer stack for active non-S3 or shared outer-edge responsibilities until
+//!   each remaining non-S3 route has an equivalent post-cutover replacement:
+//!
+//! | Layer | Active outer-edge responsibility |
 //! | --- | --- |
-//! | `BodylessStatusFixLayer` | the gateway response invariants (row 1) |
-//! | `HeadRequestBodyFixLayer` | the same invariants on the refusal path (row 2) |
-//! | `EmptyBodyContentLengthCompatLayer` | its S3 half by `StageFilter::on_wire` (row 5); its admin, console and internode halves stay |
-//! | `StsQueryApiCompatLayer` | STS extension operations behind a `QueryPresent` route predicate (row 8) |
-//! | `IcebergRestErrorCompatLayer` | the `rustfs` dialect's claimed table-catalog surface (gateway ADR-0031) |
+//! | `BodylessStatusFixLayer` | enforces bodyless `1xx`/`204`/`205`/`304` across gateway, website, console, and outer layers |
+//! | `HeadRequestBodyFixLayer` | strips `HEAD` response bodies across gateway, website, console, and outer layers |
+//! | `EmptyBodyContentLengthCompatLayer` | S3 half retired; keeps admin, console, and internode `Content-Length: 0` handling |
+//! | `StsQueryApiCompatLayer` | wraps outer short-circuit STS errors in XML and marks requests for compression |
+//! | `IcebergRestErrorCompatLayer` | converts table-catalog XML errors into Iceberg REST JSON envelopes |
 //!
-//! The layers the gateway stack replaces outright are gone: `DoubleSlashListBucketsCompatLayer`,
-//! `VirtualHostStyleHintLayer`, `S3ErrorMessageCompatLayer`, `ObjectAttributesEtagFixLayer` and
-//! `SigV4HeaderGuardLayer`. `server::gateway_stack::tests::legacy_layers` pins what each of them
-//! made the legacy stack answer against the gateway stack alone.
-//!
-//! `ConditionalCorsLayer` (row 9) is outside the list rustfs/backlog#2787
-//! moves and stays in `server/layer.rs`.
+//! `ConditionalCorsLayer` is outside this module and stays in `server/layer.rs`.
 //!
 //! This file also holds the three helpers shared by more than one patch layer
 //! (`SerializedS3Error`, `xml_escape`, `is_xml_response`) and, under test, the

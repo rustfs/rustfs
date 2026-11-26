@@ -1256,6 +1256,36 @@ impl FolderScanner {
         self.new_cache.info.failed_objects.retain(|path, _| seen.contains(path));
     }
 
+    /// Drop stale `size_reconciliation` entries whose objects no longer exist
+    /// after an uninterrupted, full bucket scan. Mirrors
+    /// [`Self::reconcile_failed_objects_after_full_scan`]: resumed, prefix-scoped,
+    /// mixed-plan, or errored scans retain unseen entries so unresolved debt
+    /// outside the walked namespace is not lost.
+    fn reconcile_size_reconciliation_after_full_scan(&mut self) {
+        let mixed_coverage = self
+            .new_cache
+            .info
+            .scan_progress
+            .is_some_and(|progress| progress.started_plan != progress.requested_plan);
+        let has_failed_objects =
+            !self.new_cache.info.failed_objects.is_empty() || self.new_cache.cache.values().any(|entry| entry.failed_objects > 0);
+        if self.prefix_scan_scope.is_some()
+            || self.resume_frontier.is_some()
+            || self.old_cache.has_scan_position()
+            || self.coverage_gap
+            || mixed_coverage
+            || has_failed_objects
+        {
+            return;
+        }
+
+        let previous = &self.old_cache.info.size_reconciliation;
+        self.new_cache
+            .info
+            .size_reconciliation
+            .retain(|key, entry| previous.get(key).is_none_or(|old_entry| entry.attempts > old_entry.attempts));
+    }
+
     fn prune_failed_objects_cache(&mut self) {
         let ttl = self.failed_object_ttl_secs;
         if ttl == 0 {
@@ -1306,6 +1336,9 @@ impl FolderScanner {
                 .map(|scope| size_reconciliation_scope_key(&scope.bucket, &scope.object)),
         );
         self.pending_size_reconciliation_truncated |= summary.size_reconciliation_truncated;
+        if summary.size_reconciliation_truncated {
+            self.coverage_gap = true;
+        }
 
         let info = &mut self.new_cache.info;
         for incoming in &summary.size_reconciliation {
@@ -3125,6 +3158,7 @@ impl FolderScanner {
                             config.has_active_rules(&prefix)
                         });
                         if !has_lifecycle_work
+                            && self.new_cache.info.size_reconciliation.is_empty()
                             && let Some(reuse) = self.sampled_namespace_reuse(&h, into.compacted, forward_sweep)
                         {
                             if reuse {
@@ -3948,6 +3982,7 @@ pub(crate) async fn scan_data_folder_scoped(
                 Arc::new(std::sync::Mutex::new(Some(checkpoint.clone()))),
             );
     }
+    let prefix_scan_scope = prefix_scan_scope.filter(|_| cache.info.size_reconciliation.is_empty());
     let mut scanner = FolderScanner {
         root: base_path,
         old_cache: cache,
@@ -4006,6 +4041,18 @@ pub(crate) async fn scan_data_folder_scoped(
 
     let now = FolderScanner::now_secs();
     prune_size_reconciliation(&mut scanner.new_cache.info, now);
+    // Keep pre-scan attempt counts strictly below u32::MAX so any re-observed
+    // entry strictly advances `attempts` relative to `old_cache`.
+    for entry in scanner.new_cache.info.size_reconciliation.values_mut() {
+        if entry.attempts == u32::MAX {
+            entry.attempts = u32::MAX - 1;
+        }
+    }
+    for entry in scanner.old_cache.info.size_reconciliation.values_mut() {
+        if entry.attempts == u32::MAX {
+            entry.attempts = u32::MAX - 1;
+        }
+    }
 
     // Check if context is cancelled
     if ctx.is_cancelled() && scanner.local_stop.as_ref().is_none_or(|stop| stop.reason().is_none()) {
@@ -4034,6 +4081,7 @@ pub(crate) async fn scan_data_folder_scoped(
             // Get the new cache and finalize it
             let coverage_gap = scanner.coverage_gap;
             scanner.reconcile_failed_objects_after_full_scan();
+            scanner.reconcile_size_reconciliation_after_full_scan();
             let new_cache = scanner.as_mut_new_cache();
             new_cache.force_compact(force_compact_limit_for_sweep(false));
             new_cache.info.last_update = Some(SystemTime::now());
@@ -4253,6 +4301,218 @@ pub(crate) use tests::checkpoint_fixture::run_checkpoint_fixture;
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod size_reconciliation_reconcile_tests {
+    use super::*;
+    use crate::data_usage_define::SizeReconciliationEntry;
+    use crate::{DiskOption, Endpoint, SCANNER_SLEEPER, new_disk};
+    use std::sync::atomic::AtomicBool;
+
+    fn sample_entry(key: &str, object: &str, attempts: u32) -> SizeReconciliationEntry {
+        SizeReconciliationEntry {
+            key: key.to_string(),
+            bucket: "bucket".to_string(),
+            object: object.to_string(),
+            reason: "invalid_declared_size".to_string(),
+            first_seen: FolderScanner::now_secs(),
+            attempts,
+            ..Default::default()
+        }
+    }
+
+    async fn create_test_disk_and_bucket(bucket: &str) -> (tempfile::TempDir, Arc<Disk>) {
+        let temp_dir = tempfile::tempdir().expect("create temp scanner dir");
+        let bucket_dir = temp_dir.path().join(bucket);
+        std::fs::create_dir_all(&bucket_dir).expect("create bucket directory");
+        let mut endpoint = Endpoint::try_from(temp_dir.path().to_string_lossy().as_ref()).expect("parse local disk endpoint");
+        endpoint.set_pool_index(0);
+        endpoint.set_set_index(0);
+        endpoint.set_disk_index(0);
+        let disk = new_disk(
+            &endpoint,
+            &DiskOption {
+                cleanup: false,
+                health_check: false,
+            },
+        )
+        .await
+        .expect("create local disk");
+        (temp_dir, disk)
+    }
+
+    #[tokio::test]
+    async fn full_scan_clears_vanished_size_reconciliation_and_completes_snapshot() {
+        let bucket = "vanished-size-reconciliation";
+        let (_temp_dir, disk) = create_test_disk_and_bucket(bucket).await;
+
+        let mut old_cache = DataUsageCache::default();
+        old_cache.info.name = bucket.to_string();
+        old_cache.info.next_cycle = 2;
+        old_cache.info.size_reconciliation.insert(
+            "vanished-key".to_string(),
+            SizeReconciliationEntry {
+                key: "vanished-key".to_string(),
+                bucket: bucket.to_string(),
+                object: "poison".to_string(),
+                reason: "invalid_declared_size".to_string(),
+                first_seen: FolderScanner::now_secs(),
+                attempts: 1,
+                ..Default::default()
+            },
+        );
+        old_cache.info.size_reconciliation.insert(
+            "saturated-key".to_string(),
+            SizeReconciliationEntry {
+                key: "saturated-key".to_string(),
+                bucket: bucket.to_string(),
+                object: "old-poison".to_string(),
+                reason: "invalid_declared_size".to_string(),
+                first_seen: FolderScanner::now_secs(),
+                attempts: u32::MAX,
+                ..Default::default()
+            },
+        );
+
+        let ctx = CancellationToken::new();
+        let budget = ScannerCycleBudget::new(&ctx, Default::default());
+        let scanned = scan_data_folder(
+            ctx,
+            budget,
+            vec![Arc::clone(&disk)],
+            disk,
+            old_cache,
+            None,
+            HealScanMode::Normal,
+            SCANNER_SLEEPER.clone(),
+        )
+        .await
+        .expect("full scan of bucket after deleting corrupt object should succeed");
+
+        assert!(
+            scanned.info.size_reconciliation.is_empty(),
+            "vanished objects must be pruned from size_reconciliation after a full bucket scan: {:?}",
+            scanned.info.size_reconciliation
+        );
+        assert!(
+            scanned.info.snapshot_complete,
+            "snapshot must become complete once vanished corrupt entries are reconciled"
+        );
+    }
+
+    #[tokio::test]
+    async fn reconcile_size_reconciliation_keeps_reobserved_and_new_entries_drops_vanished() {
+        let (_temp_dir, disk) = create_test_disk_and_bucket("bucket").await;
+        let update_current_path: UpdateCurrentPathFn = Arc::new(|_: &str| Box::pin(async {}));
+
+        let mut old_cache = DataUsageCache::default();
+        old_cache.info.name = "bucket".to_string();
+        let vanished = sample_entry("vanished", "deleted-obj", 1);
+        let still_bad = sample_entry("still-bad", "corrupt-obj", 1);
+        old_cache.info.size_reconciliation.insert(vanished.key.clone(), vanished);
+        old_cache
+            .info
+            .size_reconciliation
+            .insert(still_bad.key.clone(), still_bad.clone());
+
+        let new_cache = DataUsageCache {
+            info: old_cache.info.clone(),
+            ..Default::default()
+        };
+
+        let mut scanner = FolderScanner {
+            root: disk.path().to_string_lossy().to_string(),
+            old_cache,
+            new_cache,
+            data_usage_scanner_debug: false,
+            heal_object_select: 0,
+            scan_mode: HealScanMode::Normal,
+            is_erasure_mode: false,
+            prefix_scan_scope: None,
+            failed_object_ttl_secs: u64::MAX,
+            failed_objects_max: usize::MAX,
+            failed_object_paths_seen: HashSet::new(),
+            resolved_failed_object_paths: HashSet::new(),
+            sleeper: SCANNER_SLEEPER.clone(),
+            pacing_debt: PacingDebt::default(),
+            node_admission: None,
+            disks: Vec::new(),
+            disks_quorum: 0,
+            notification_bucket_incarnation: None,
+            usage_updates: None,
+            checkpoint_tx: None,
+            checkpoint_ancestors: Vec::new(),
+            checkpoint_depth: 0,
+            checkpoint_objects: 0,
+            object_metadata_visits: metrics::Counter::noop(),
+            #[cfg(feature = "diagnostic-prefix-attribution")]
+            prefix_attribution: None,
+            last_checkpoint_objects: 0,
+            last_checkpoint_at: Instant::now(),
+            last_checkpoint_build_time: Duration::ZERO,
+            update_current_path,
+            budget: ScannerCycleBudget::new(&CancellationToken::new(), Default::default()),
+            skip_heal: Arc::new(AtomicBool::new(false)),
+            local_disk: disk,
+            local_stop: None,
+            tier_registry: crate::TierRegistrySnapshot {
+                generation: 0,
+                names: Arc::new([]),
+                refresh_failed: false,
+            },
+            pending_heals_changed: false,
+            coverage_frontier: None,
+            resume_frontier: None,
+            resume_failed_paths: Vec::new(),
+            coverage_gap: false,
+            raw_enumeration_progress: Vec::new(),
+            directory_checkpoints: HashMap::new(),
+            pending_size_reconciliation_keys: HashSet::new(),
+            pending_size_reconciliation_scopes: HashSet::new(),
+            pending_size_reconciliation_truncated: false,
+            list_path_raw_options_observer: None,
+            defer_abandoned_entries_until_finished: false,
+            partial_heal_candidate_limit: None,
+            partial_heal_discovery_observer: None,
+        };
+
+        // Re-observe `still-bad` and discover a brand-new `new-bad`; do not visit `vanished`.
+        let mut summary = SizeSummary::default();
+        summary.record_size_reconciliation(still_bad);
+        summary.record_reconciliation_scope("bucket", "corrupt-obj");
+        let new_bad = sample_entry("new-bad", "fresh-corrupt", 1);
+        summary.record_size_reconciliation(new_bad);
+        summary.record_reconciliation_scope("bucket", "fresh-corrupt");
+        scanner.apply_size_reconciliation(&summary);
+        scanner.finish_size_reconciliation_batch();
+
+        // Resumed / partial / errored scans must keep unseen entries.
+        scanner.resume_frontier = Some("bucket/a".to_string());
+        scanner.reconcile_size_reconciliation_after_full_scan();
+        assert!(scanner.new_cache.info.size_reconciliation.contains_key("vanished"));
+        scanner.resume_frontier = None;
+
+        scanner.coverage_gap = true;
+        scanner.reconcile_size_reconciliation_after_full_scan();
+        assert!(scanner.new_cache.info.size_reconciliation.contains_key("vanished"));
+        scanner.coverage_gap = false;
+
+        scanner
+            .new_cache
+            .info
+            .failed_objects
+            .insert("bucket/other/xl.meta".to_string(), FolderScanner::now_secs());
+        scanner.reconcile_size_reconciliation_after_full_scan();
+        assert!(scanner.new_cache.info.size_reconciliation.contains_key("vanished"));
+        scanner.new_cache.info.failed_objects.clear();
+
+        // Uninterrupted full scan drops only `vanished` while retaining `still-bad` and `new-bad`.
+        scanner.reconcile_size_reconciliation_after_full_scan();
+        assert!(!scanner.new_cache.info.size_reconciliation.contains_key("vanished"));
+        assert_eq!(scanner.new_cache.info.size_reconciliation["still-bad"].attempts, 2);
+        assert_eq!(scanner.new_cache.info.size_reconciliation["new-bad"].attempts, 1);
+    }
+}
 
 #[cfg(test)]
 tokio::task_local! {
