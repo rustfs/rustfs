@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
 
+from __future__ import annotations
+
 import importlib.util
 import json
 import subprocess
@@ -19,11 +21,13 @@ SPEC.loader.exec_module(MODULE)
 HEADER = "thread\top\tn_objects\tbytes\tendpoint\terror\tstart\tend\tduration_ns\n"
 
 
-def row(thread: int, endpoint: str, start: int, end: int, error: str = "") -> str:
+def row(thread: int, endpoint: str, start: int, end: int, error: str = "", *, duration_ns: int | None = None) -> str:
     def stamp(second: int) -> str:
-        return f"2026-01-01T00:00:{second:02d}Z"
+        minute, second = divmod(second, 60)
+        return f"2026-01-01T00:{minute:02d}:{second:02d}Z"
 
-    return f"{thread}\tPUT\t1\t100\t{endpoint}\t{error}\t{stamp(start)}\t{stamp(end)}\t{(end-start)*1_000_000_000}\n"
+    duration = (end - start) * 1_000_000_000 if duration_ns is None else duration_ns
+    return f"{thread}\tPUT\t1\t100\t{endpoint}\t{error}\t{stamp(start)}\t{stamp(end)}\t{duration}\n"
 
 
 class WarpRawQualityTest(unittest.TestCase):
@@ -65,6 +69,8 @@ class WarpRawQualityTest(unittest.TestCase):
         self.assertEqual(status, 0)
         self.assertEqual(result["status"], "pass")
         self.assertEqual(result["steady"]["completed_objects"], 2)
+        self.assertEqual(result["steady"]["completed_requests"], 2)
+        self.assertEqual(result["steady"]["p99_ms"], 2000)
         self.assertEqual(result["steady"]["start_ns"], result["measure_start_ns"] + 1_000_000_000)
         self.assertEqual(result["steady"]["duration_secs"], 2)
         self.assertEqual(result["steady"]["completed_objects_per_second"], 1)
@@ -81,7 +87,38 @@ class WarpRawQualityTest(unittest.TestCase):
         self.assertEqual(status, 1)
         self.assertEqual(result["reason"], "steady completion rate below minimum")
         self.assertEqual(result["steady"]["completed_objects"], 0)
+        self.assertIsNone(result["steady"]["p99_ms"])
         self.assertEqual(result["reqps"], old_result["reqps"])
+
+    def test_steady_rate_upper_bound_rejects_overshoot_and_accepts_equality(self) -> None:
+        source = self.fixture()
+        flags = ("--steady-after-seconds", "1", "--min-steady-rps", "0.5", "--max-steady-rps")
+        status, result = self.run_cli(source, *flags, "0.9")
+        self.assertEqual(status, 1)
+        self.assertEqual(result["reason"], "steady completion rate above maximum")
+        self.assertEqual(result["steady"]["completed_objects_per_second"], 1)
+        self.assertEqual(result["steady"]["max_completed_objects_per_second"], 0.9)
+        status, result = self.run_cli(source, *flags, "1")
+        self.assertEqual(status, 0)
+        self.assertEqual(result["status"], "pass")
+
+    def test_steady_p99_excludes_completions_at_right_edge(self) -> None:
+        source = self.fixture()
+        intervals = ((0, 0, 8), (0, 8, 10), (0, 10, 15), (0, 15, 35), (1, 0, 1), (1, 1, 2), (1, 2, 15), (1, 20, 40))
+        source.write_text(HEADER + "".join(row(thread, "a", start, end) for thread, start, end in intervals))
+        result = MODULE.parse(source, {"a"}, steady_after_seconds=2)
+        self.assertEqual(result["steady"]["completed_requests"], 1)
+        self.assertEqual(result["steady"]["p99_ms"], 2000)
+
+    def test_steady_p99_ranks_recorded_request_durations(self) -> None:
+        source = self.fixture()
+        # Use different wall-clock spans and recorded durations to verify both the
+        # source of latency and the 99th (not the largest) of 100 observations.
+        samples = (row(0, "a", i, i + 1, duration_ns=i * 1_000_000) for i in range(1, 101))
+        source.write_text(HEADER + row(0, "a", 0, 1) + "".join(samples) + row(0, "a", 102, 103))
+        result = MODULE.parse(source, {"a"}, steady_after_seconds=1)
+        self.assertEqual(result["steady"]["completed_requests"], 100)
+        self.assertEqual(result["steady"]["p99_ms"], 99)
 
     def test_invalid_steady_gate_rejects_missing_empty_and_nonfinite_options(self) -> None:
         source = self.fixture()
@@ -90,6 +127,9 @@ class WarpRawQualityTest(unittest.TestCase):
             ("--steady-after-seconds", "3", "--min-steady-rps", "1"),
             ("--steady-after-seconds", "-1", "--min-steady-rps", "1"),
             ("--steady-after-seconds", "1", "--min-steady-rps", "nan"),
+            ("--max-steady-rps", "1"),
+            ("--steady-after-seconds", "1", "--min-steady-rps", "1", "--max-steady-rps", "0.9"),
+            ("--steady-after-seconds", "1", "--min-steady-rps", "1", "--max-steady-rps", "inf"),
         )
         for args in cases:
             with self.subTest(args=args):

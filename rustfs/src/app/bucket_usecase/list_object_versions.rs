@@ -338,4 +338,109 @@ mod tests {
             .expect_err("no store");
         assert_eq!(err.code(), &S3ErrorCode::InternalError);
     }
+
+    #[test]
+    #[serial_test::serial]
+    fn list_object_versions_rejects_invalid_version_id_marker_with_bad_request_and_handles_control_delimiter() {
+        use crate::app::gating_test_env::{run_large_stack_test, shared_gating_ambient, shared_gating_ecstore};
+        use crate::app::metadata_listing::{MetadataListQuery, VersionsQuery};
+        use rustfs_gateway::{Limits, MetaView, OperationCodec, ResponseBody, TargetKind, WireRequest};
+
+        run_large_stack_test("list-versions-invalid-marker", || async {
+            let usecase = DefaultBucketUsecase::with_context(Some(shared_gating_ambient().await));
+            let store = shared_gating_ecstore().await;
+            let bucket = BucketName::new(format!("list-versions-marker-{}", uuid::Uuid::new_v4().simple())).unwrap();
+            store
+                .make_bucket(bucket.as_str(), &MakeBucketOptions::default())
+                .await
+                .unwrap();
+
+            let err = usecase
+                .execute_list_object_versions(
+                    owned_envelope(http::Method::GET),
+                    gateway_dto::ListObjectVersionsInput {
+                        bucket: bucket.clone(),
+                        key_marker: Some("k".to_owned()),
+                        version_id_marker: Some(OpaqueString::from("v")),
+                        delimiter: Some("\x0f".to_owned()),
+                        max_keys: Some(8),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect_err("invalid version-id-marker must be rejected");
+            assert_eq!(err.code(), &S3ErrorCode::InvalidArgument);
+            assert_eq!(err.status_code(), Some(StatusCode::BAD_REQUEST));
+
+            let metadata_err = usecase
+                .list_object_versions_metadata(
+                    &owned_envelope(http::Method::GET),
+                    VersionsQuery {
+                        listing: MetadataListQuery {
+                            bucket: bucket.as_str().to_owned(),
+                            delimiter: Some("\x0f".to_owned()),
+                            max_keys: Some(8),
+                            ..Default::default()
+                        },
+                        key_marker: Some("k".to_owned()),
+                        version_id_marker: Some("v".to_owned()),
+                    },
+                )
+                .await
+                .expect_err("metadata listing must reject invalid version-id-marker");
+            assert_eq!(metadata_err.code(), &S3ErrorCode::InvalidArgument);
+            assert_eq!(metadata_err.status_code(), Some(StatusCode::BAD_REQUEST));
+
+            let output = usecase
+                .execute_list_object_versions(
+                    owned_envelope(http::Method::GET),
+                    gateway_dto::ListObjectVersionsInput {
+                        bucket: bucket.clone(),
+                        key_marker: Some("k".to_owned()),
+                        version_id_marker: Some(OpaqueString::from("null")),
+                        delimiter: Some("\x0f".to_owned()),
+                        max_keys: Some(8),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect("valid version-id-marker with control delimiter must succeed");
+            assert_eq!(output.delimiter.as_deref(), Some("\x0f"));
+
+            let request = http::Request::get(format!("http://localhost/{}?versions&delimiter=%0F", bucket.as_str()))
+                .header(http::header::HOST, "localhost")
+                .body(bytes::Bytes::new())
+                .unwrap();
+            let wire = WireRequest::accept(request, &Limits::default()).unwrap();
+            let view = MetaView::of(&wire, TargetKind::Bucket).unwrap().with_rustfs_response_layout();
+            let encoded =
+                gateway_dto::ListObjectVersions::encode(output, &view, 200).expect("control delimiter response must encode");
+            assert_eq!(encoded.status, StatusCode::OK);
+            let ResponseBody::Complete(bytes) = encoded.body else {
+                panic!("ListObjectVersions must return an XML document");
+            };
+            let xml = String::from_utf8(bytes).expect("ListObjectVersions XML must be UTF-8");
+            assert!(xml.contains("<Delimiter>%0F</Delimiter>"), "unexpected XML: {xml}");
+
+            let metadata_output = usecase
+                .list_object_versions_metadata(
+                    &owned_envelope(http::Method::GET),
+                    VersionsQuery {
+                        listing: MetadataListQuery {
+                            bucket: bucket.as_str().to_owned(),
+                            delimiter: Some("\x0f".to_owned()),
+                            max_keys: Some(8),
+                            ..Default::default()
+                        },
+                        key_marker: Some("k".to_owned()),
+                        version_id_marker: None,
+                    },
+                )
+                .await
+                .expect("metadata listing with control delimiter must succeed");
+            metadata_output
+                .to_xml()
+                .expect("metadata listing XML with control delimiter must serialize");
+        });
+    }
 }

@@ -14,8 +14,9 @@
 
 use super::*;
 
+#[cfg(test)]
 use crate::io_support::rio::Index;
-use std::mem::MaybeUninit;
+use std::{mem::MaybeUninit, task::ready};
 
 #[cfg(feature = "rio-v2")]
 const DARE_PAYLOAD_SIZE: i64 = 64 * 1024;
@@ -41,11 +42,8 @@ pub(crate) fn restore_request_active(opts: &ObjectOptions) -> bool {
     restore.type_.is_some() || restore.days.is_some() || restore.output_location.is_some() || restore.select_parameters.is_some()
 }
 
-fn decode_compression_index(index: Option<&Bytes>) -> Option<Index> {
-    crate::io_support::rio::decode_compression_index_bytes(index?)
-}
-
-fn get_compressed_offsets(oi: &ObjectInfo, offset: i64) -> (i64, i64, usize, i64, u64) {
+#[cfg(feature = "rio-v2")]
+fn get_encrypted_compressed_offsets(oi: &ObjectInfo, offset: i64) -> (i64, i64, usize, i64, u64) {
     let mut skip_length = 0_i64;
     let mut cumulative_actual_size = 0_i64;
     let mut first_part_idx = 0_usize;
@@ -63,35 +61,87 @@ fn get_compressed_offsets(oi: &ObjectInfo, offset: i64) -> (i64, i64, usize, i64
     }
 
     let mut part_skip = offset - skip_length;
-    #[cfg(feature = "rio-v2")]
     let (mut decrypt_skip, mut seq_num) = (0_i64, 0_u64);
-    #[cfg(not(feature = "rio-v2"))]
-    let (decrypt_skip, seq_num) = (0_i64, 0_u64);
 
     if part_skip > 0
         && let Some(part) = oi.parts.get(first_part_idx)
-        && let Some(index) = decode_compression_index(part.index.as_ref())
+        && let Some(index) = part
+            .index
+            .as_ref()
+            .and_then(crate::io_support::rio::decode_compression_index_bytes)
         && let Ok((comp_off, uncomp_off)) = index.find(part_skip)
         && comp_off > 0
     {
-        #[cfg(feature = "rio-v2")]
-        if oi.is_encrypted() {
-            seq_num = (comp_off / DARE_PAYLOAD_SIZE) as u64;
-            decrypt_skip = comp_off % DARE_PAYLOAD_SIZE;
-            compressed_offset += (comp_off / DARE_PAYLOAD_SIZE) * DARE_PACKAGE_SIZE;
-        } else {
-            compressed_offset += comp_off;
-        }
-
-        #[cfg(not(feature = "rio-v2"))]
-        {
-            compressed_offset += comp_off;
-        }
+        seq_num = (comp_off / DARE_PAYLOAD_SIZE) as u64;
+        decrypt_skip = comp_off % DARE_PAYLOAD_SIZE;
+        compressed_offset += (comp_off / DARE_PAYLOAD_SIZE) * DARE_PACKAGE_SIZE;
 
         part_skip -= uncomp_off;
     }
 
     (compressed_offset, part_skip, first_part_idx, decrypt_skip, seq_num)
+}
+
+// Plan a window of complete compression blocks in stored coordinates. The
+// index can omit the final block or record a stale total. Part metadata owns
+// the actual bounds, and missing checkpoints widen only the covering parts.
+fn compressed_storage_window(oi: &ObjectInfo, offset: usize, length: i64) -> Option<(usize, i64, usize)> {
+    let start = i64::try_from(offset).ok()?;
+    let end = start.checked_add(length)?;
+    if start >= end {
+        return None;
+    }
+    let (mut plaintext_offset, mut stored_offset) = (0_i64, 0_i64);
+    let mut window_start = None;
+    for part in oi.parts.iter() {
+        let stored_size = i64::try_from(part.size).ok()?;
+        let stored_end = stored_offset.checked_add(stored_size)?;
+        if stored_end > oi.size || part.actual_size < 0 || (part.actual_size == 0) != (stored_size == 0) {
+            return None;
+        }
+        let plaintext_end = plaintext_offset.checked_add(part.actual_size)?;
+        let starts_here = window_start.is_none() && start < plaintext_end;
+        let ends_here = end <= plaintext_end;
+        if starts_here || ends_here {
+            let index = part
+                .index
+                .as_ref()
+                .filter(|_| (starts_here && start > plaintext_offset) || (ends_here && end < plaintext_end))
+                .and_then(crate::io_support::rio::decode_compression_index_bytes);
+            if starts_here {
+                let relative_start = start - plaintext_offset;
+                let (stored, plaintext) = index
+                    .as_ref()
+                    .filter(|_| relative_start > 0)
+                    .and_then(|index| index.checkpoint_at_or_before(relative_start))
+                    .filter(|&(stored, plaintext)| {
+                        (1..stored_size).contains(&stored) && (0..=relative_start).contains(&plaintext)
+                    })
+                    .unwrap_or((0, 0));
+                window_start = Some((stored_offset + stored, relative_start - plaintext));
+            }
+            if ends_here {
+                let (window_start, skip) = window_start?;
+                let relative_end = end - plaintext_offset;
+                let window_end = index
+                    .filter(|_| relative_end < part.actual_size)
+                    .as_ref()
+                    .and_then(|index| index.checkpoint_at_or_after(relative_end))
+                    .filter(|&(stored, plaintext)| {
+                        (1..=stored_size).contains(&stored) && (relative_end..=part.actual_size).contains(&plaintext)
+                    })
+                    .map_or(stored_end, |(stored, _)| stored_offset + stored);
+                return (window_end > window_start).then_some((
+                    usize::try_from(window_start).ok()?,
+                    window_end - window_start,
+                    usize::try_from(skip).ok()?,
+                ));
+            }
+        }
+        plaintext_offset = plaintext_end;
+        stored_offset = stored_end;
+    }
+    None
 }
 
 #[cfg(feature = "rio-v2")]
@@ -713,10 +763,12 @@ impl ReadPlan {
             let actual_size = oi.get_actual_size()?;
             let (storage_offset, storage_length, decompressed_offset, decompressed_length) = if let Some(rs) = rs {
                 let (req_off, req_length) = rs.get_offset_length(actual_size)?;
-                let (physical_off, decompressed_skip, _, _, _) = get_compressed_offsets(oi, req_off as i64);
-                let storage_offset = usize::try_from(physical_off)
-                    .map_err(|_| Error::other(format!("invalid compressed offset {physical_off}")))?;
-                (storage_offset, oi.size - physical_off, decompressed_skip as usize, req_length)
+                let (storage_offset, storage_length, skip) = if req_length < actual_size {
+                    compressed_storage_window(oi, req_off, req_length).unwrap_or((0, oi.size, req_off))
+                } else {
+                    (0, oi.size, req_off)
+                };
+                (storage_offset, storage_length, skip, req_length)
             } else {
                 (0, oi.size, 0, actual_size)
             };
@@ -794,7 +846,7 @@ impl ReadPlan {
                         )?
                     } else if is_compressed {
                         let (physical_off, decompressed_skip, first_part_idx, decrypt_skip, seq_num) =
-                            get_compressed_offsets(oi, requested_offset as i64);
+                            get_encrypted_compressed_offsets(oi, requested_offset as i64);
                         (
                             usize::try_from(physical_off)
                                 .map_err(|_| Error::other(format!("invalid encrypted compressed offset {physical_off}")))?,
@@ -910,40 +962,14 @@ impl ReadPlan {
                 decompressed_length,
                 total_plaintext_size,
             } => {
-                let dec_reader = crate::io_support::rio::decompression_reader(reader, algorithm, backend);
-                #[cfg(feature = "rio-v2")]
-                let dec_reader = StreamConsumer::new(dec_reader);
-                let final_reader: Box<dyn AsyncRead + Unpin + Send + Sync> = if decompressed_offset > 0
-                    || decompressed_length != total_plaintext_size as i64
-                {
-                    #[cfg(feature = "rio-v2")]
-                    let ranged_result = RangedDecompressReader::new_draining(
-                        dec_reader,
-                        decompressed_offset,
-                        decompressed_length,
-                        total_plaintext_size,
-                    );
-                    #[cfg(not(feature = "rio-v2"))]
-                    let ranged_result =
-                        RangedDecompressReader::new(dec_reader, decompressed_offset, decompressed_length, total_plaintext_size);
-
-                    match ranged_result {
-                        Ok(ranged_reader) => {
-                            tracing::debug!(
-                                "Successfully created RangedDecompressReader for offset={}, length={}",
-                                decompressed_offset,
-                                decompressed_length
-                            );
-                            Box::new(ranged_reader)
-                        }
-                        Err(e) => {
-                            tracing::error!("RangedDecompressReader failed with invalid range parameters: {}", e);
-                            return Err(e);
-                        }
-                    }
-                } else {
-                    Box::new(HardLimitReader::new(dec_reader, decompressed_length))
-                };
+                let final_reader = compressed_object_reader(
+                    reader,
+                    algorithm,
+                    backend,
+                    decompressed_offset,
+                    decompressed_length,
+                    total_plaintext_size,
+                )?;
 
                 let mut object_info = oi.clone();
                 object_info.size = self.object_size;
@@ -1019,29 +1045,14 @@ impl ReadPlan {
 
                 let final_reader: Box<dyn AsyncRead + Unpin + Send + Sync> =
                     if let Some((algo, compression_backend)) = compression {
-                        let decompressed_reader =
-                            crate::io_support::rio::decompression_reader(decrypted_reader, algo, compression_backend);
-                        #[cfg(feature = "rio-v2")]
-                        let decompressed_reader = StreamConsumer::new(decompressed_reader);
-                        if plaintext_offset > 0 || plaintext_length != total_plaintext_size_i64 {
-                            #[cfg(feature = "rio-v2")]
-                            let ranged_reader = RangedDecompressReader::new_draining(
-                                decompressed_reader,
-                                plaintext_offset,
-                                plaintext_length,
-                                total_plaintext_size,
-                            )?;
-                            #[cfg(not(feature = "rio-v2"))]
-                            let ranged_reader = RangedDecompressReader::new(
-                                decompressed_reader,
-                                plaintext_offset,
-                                plaintext_length,
-                                total_plaintext_size,
-                            )?;
-                            Box::new(ranged_reader)
-                        } else {
-                            Box::new(HardLimitReader::new(decompressed_reader, total_plaintext_size_i64))
-                        }
+                        compressed_object_reader(
+                            decrypted_reader,
+                            algo,
+                            compression_backend,
+                            plaintext_offset,
+                            plaintext_length,
+                            total_plaintext_size,
+                        )?
                     } else if plaintext_offset > 0 || plaintext_length != total_plaintext_size_i64 {
                         Box::new(RangedDecompressReader::new(
                             decrypted_reader,
@@ -1118,294 +1129,201 @@ impl AsyncRead for GetObjectReader {
     }
 }
 
+fn compressed_object_reader(
+    source: Box<dyn AsyncRead + Unpin + Send + Sync>,
+    algorithm: CompressionAlgorithm,
+    backend: crate::io_support::rio::ReadCompressionBackend,
+    offset: usize,
+    length: i64,
+    total_size: usize,
+) -> Result<Box<dyn AsyncRead + Unpin + Send + Sync>> {
+    let decoded = crate::io_support::rio::decompression_reader(source, algorithm, backend);
+    if offset != 0 || usize::try_from(length).ok() != Some(total_size) {
+        // A partial response needs the blocks covering its bytes. Dropping the
+        // source closes the producer instead of draining unrelated blocks.
+        return Ok(Box::new(RangedDecompressReader::new(decoded, offset, length, total_size)?));
+    }
+
+    #[cfg(feature = "rio-v2")]
+    let decoded = StreamConsumer::new(decoded);
+    Ok(Box::new(HardLimitReader::new(decoded, length)))
+}
+
 #[derive(Debug)]
 struct SkipReader<R> {
     inner: R,
-    bytes_to_skip: usize,
-    bytes_skipped: usize,
-    scratch: Box<[MaybeUninit<u8>]>,
+    remaining_skip: usize,
+    scratch: Option<Box<[MaybeUninit<u8>]>>,
 }
 
-impl<R: AsyncRead + Unpin + Send + Sync> SkipReader<R> {
+impl<R: AsyncRead + Unpin> SkipReader<R> {
     fn new(inner: R, bytes_to_skip: usize) -> Self {
         Self {
             inner,
-            bytes_to_skip,
-            bytes_skipped: 0,
-            scratch: Box::<[u8]>::new_uninit_slice(8192),
+            remaining_skip: bytes_to_skip,
+            scratch: None,
         }
     }
 }
 
-impl<R: AsyncRead + Unpin + Send + Sync> AsyncRead for SkipReader<R> {
+impl<R: AsyncRead + Unpin> AsyncRead for SkipReader<R> {
     fn poll_read(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<std::io::Result<()>> {
         let this = self.as_mut().get_mut();
+        if buf.remaining() == 0 {
+            return Poll::Ready(Ok(()));
+        }
 
-        while this.bytes_skipped < this.bytes_to_skip {
-            let remaining = this.bytes_to_skip - this.bytes_skipped;
-            let scratch_len = remaining.min(this.scratch.len());
-            let mut scratch_buf = ReadBuf::uninit(&mut this.scratch[..scratch_len]);
-            match Pin::new(&mut this.inner).poll_read(cx, &mut scratch_buf) {
-                Poll::Pending => return Poll::Pending,
-                Poll::Ready(Err(err)) => return Poll::Ready(Err(err)),
-                Poll::Ready(Ok(())) => {
-                    let n = scratch_buf.filled().len();
-                    if n == 0 {
-                        return Poll::Ready(Err(std::io::Error::new(
-                            std::io::ErrorKind::UnexpectedEof,
-                            format!("unexpected EOF while skipping {} bytes from decrypted stream", this.bytes_to_skip),
-                        )));
-                    }
-                    this.bytes_skipped += n;
+        if this.remaining_skip != 0 {
+            let scratch_len = this.remaining_skip.min(8192);
+            let scratch = this.scratch.get_or_insert_with(|| Box::<[u8]>::new_uninit_slice(scratch_len));
+            while this.remaining_skip > 0 {
+                // An unindexed range can skip many decoded blocks without the source yielding.
+                let budget = ready!(tokio::task::coop::poll_proceed(cx));
+                let len = this.remaining_skip.min(scratch.len());
+                let mut discard = ReadBuf::uninit(&mut scratch[..len]);
+                ready!(Pin::new(&mut this.inner).poll_read(cx, &mut discard))?;
+                let n = discard.filled().len();
+                if n == 0 {
+                    return Poll::Ready(Err(std::io::Error::new(
+                        std::io::ErrorKind::UnexpectedEof,
+                        "object stream ended before reaching the range start",
+                    )));
                 }
+                this.remaining_skip -= n;
+                budget.made_progress();
             }
+            this.scratch = None;
         }
 
         Pin::new(&mut this.inner).poll_read(cx, buf)
     }
 }
 
-/// A streaming decompression reader that supports range requests by skipping data in the decompressed stream.
-/// This implementation acknowledges that compressed streams (like LZ4) must be decompressed sequentially
-/// from the beginning, so it streams and discards data until reaching the target offset.
+/// Reads a bounded plaintext range from a stream positioned at or before its start.
+/// The source is released when the range completes. An early source EOF is an error.
 #[derive(Debug)]
 pub struct RangedDecompressReader<R: AsyncRead + Unpin + Send + Sync + 'static> {
-    inner: Option<R>,
-    target_offset: usize,
-    target_length: usize,
-    current_offset: usize,
-    bytes_returned: usize,
-    scratch: Box<[MaybeUninit<u8>]>,
+    inner: Option<tokio::io::Take<SkipReader<R>>>,
     drain_on_done: bool,
-    drain_task: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl<R: AsyncRead + Unpin + Send + Sync + 'static> RangedDecompressReader<R> {
+    /// Skips `offset` bytes and yields up to `length` bytes, capped by `total_size`.
+    ///
+    /// # Errors
+    /// Returns an invalid range error if the offset is outside the stream or the length is negative.
     pub fn new(inner: R, offset: usize, length: i64, total_size: usize) -> Result<Self> {
         Self::new_with_drain(inner, offset, length, total_size, false)
     }
 
+    /// Reads like [Self::new] and drains any remainder in the background once the range completes.
+    ///
+    /// # Errors
+    /// Returns the same range validation errors as [Self::new].
     pub fn new_draining(inner: R, offset: usize, length: i64, total_size: usize) -> Result<Self> {
         Self::new_with_drain(inner, offset, length, total_size, true)
     }
 
     fn new_with_drain(inner: R, offset: usize, length: i64, total_size: usize, drain_on_done: bool) -> Result<Self> {
-        // Validate the range request
         if offset >= total_size {
-            tracing::debug!("Range offset {} exceeds total size {}", offset, total_size);
             return Err(Error::InvalidRangeSpec("Range offset exceeds file size".to_string()));
         }
-
-        // Adjust length if it extends beyond file end
-        let actual_length = std::cmp::min(length as usize, total_size - offset);
-
-        tracing::debug!(
-            "Creating RangedDecompressReader: offset={}, length={}, total_size={}, actual_length={}",
-            offset,
-            length,
-            total_size,
-            actual_length
-        );
+        let length =
+            u64::try_from(length).map_err(|_| Error::InvalidRangeSpec("Range length must be nonnegative".to_string()))?;
+        let length = length.min((total_size - offset) as u64);
 
         Ok(Self {
-            inner: Some(inner),
-            target_offset: offset,
-            target_length: actual_length,
-            current_offset: 0,
-            bytes_returned: 0,
-            scratch: Box::<[u8]>::new_uninit_slice(8192),
+            inner: Some(SkipReader::new(inner, offset).take(length)),
             drain_on_done,
-            drain_task: None,
         })
     }
 
-    fn start_drain(&mut self) {
-        if !self.drain_on_done || self.drain_task.is_some() {
-            return;
+    fn finish(&mut self) {
+        if let Some(inner) = self.inner.take()
+            && self.drain_on_done
+        {
+            drain_stream(inner.into_inner().inner);
         }
-
-        let Some(mut inner) = self.inner.take() else {
-            return;
-        };
-
-        self.drain_task = Some(tokio::spawn(async move {
-            let mut buf = [0u8; 8192];
-            loop {
-                match inner.read(&mut buf).await {
-                    Ok(0) => break,
-                    Ok(_) => continue,
-                    Err(_) => break,
-                }
-            }
-        }));
     }
 }
 
 impl<R: AsyncRead + Unpin + Send + Sync + 'static> AsyncRead for RangedDecompressReader<R> {
     fn poll_read(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<std::io::Result<()>> {
-        use std::pin::Pin;
-        use std::task::Poll;
-        use tokio::io::ReadBuf;
-
         let this = self.as_mut().get_mut();
-
-        loop {
-            // If we've returned all the bytes we need, return EOF
-            if this.bytes_returned >= this.target_length {
-                this.start_drain();
-                return Poll::Ready(Ok(()));
-            }
-
-            // Read from the inner stream
-            let buf_capacity = buf.remaining();
-            if buf_capacity == 0 {
-                return Poll::Ready(Ok(()));
-            }
-
-            let scratch_len = std::cmp::min(this.scratch.len(), std::cmp::max(buf_capacity, 1));
-            let mut temp_read_buf = ReadBuf::uninit(&mut this.scratch[..scratch_len]);
-
-            let Some(inner) = this.inner.as_mut() else {
-                return Poll::Ready(Ok(()));
-            };
-
-            match Pin::new(inner).poll_read(cx, &mut temp_read_buf) {
-                Poll::Pending => return Poll::Pending,
-                Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
-                Poll::Ready(Ok(())) => {
-                    let n = temp_read_buf.filled().len();
-                    if n == 0 {
-                        // EOF from inner stream
-                        if this.current_offset < this.target_offset {
-                            // We haven't reached the target offset yet - this is an error
-                            return Poll::Ready(Err(std::io::Error::new(
-                                std::io::ErrorKind::UnexpectedEof,
-                                format!(
-                                    "Unexpected EOF: only read {} bytes, target offset is {}",
-                                    this.current_offset, this.target_offset
-                                ),
-                            )));
-                        }
-                        // Normal EOF after reaching target
-                        return Poll::Ready(Ok(()));
-                    }
-
-                    // Update current position
-                    let old_offset = this.current_offset;
-                    this.current_offset += n;
-
-                    // Check if we're still in the skip phase
-                    if old_offset < this.target_offset {
-                        // We're still skipping data
-                        let skip_end = std::cmp::min(this.current_offset, this.target_offset);
-                        let bytes_to_skip_in_this_read = skip_end - old_offset;
-
-                        if this.current_offset <= this.target_offset {
-                            // All data in this read should be skipped
-                            tracing::trace!("Skipping {} bytes at offset {}", n, old_offset);
-                            // Continue reading in the loop instead of recursive call
-                            continue;
-                        } else {
-                            // Partial skip: some data should be returned
-                            let data_start_in_buffer = bytes_to_skip_in_this_read;
-                            let available_data = n - data_start_in_buffer;
-                            let bytes_to_return = std::cmp::min(
-                                available_data,
-                                std::cmp::min(buf.remaining(), this.target_length - this.bytes_returned),
-                            );
-
-                            if bytes_to_return > 0 {
-                                let data_slice =
-                                    &temp_read_buf.filled()[data_start_in_buffer..data_start_in_buffer + bytes_to_return];
-                                buf.put_slice(data_slice);
-                                this.bytes_returned += bytes_to_return;
-
-                                tracing::trace!(
-                                    "Skipped {} bytes, returned {} bytes at offset {}",
-                                    bytes_to_skip_in_this_read,
-                                    bytes_to_return,
-                                    old_offset
-                                );
-                            }
-                            return Poll::Ready(Ok(()));
-                        }
-                    } else {
-                        // We're in the data return phase
-                        let bytes_to_return =
-                            std::cmp::min(n, std::cmp::min(buf.remaining(), this.target_length - this.bytes_returned));
-
-                        if bytes_to_return > 0 {
-                            buf.put_slice(&temp_read_buf.filled()[..bytes_to_return]);
-                            this.bytes_returned += bytes_to_return;
-
-                            tracing::trace!("Returned {} bytes at offset {}", bytes_to_return, old_offset);
-                        }
-                        return Poll::Ready(Ok(()));
-                    }
-                }
-            }
+        let Some(inner) = this.inner.as_mut() else {
+            return Poll::Ready(Ok(()));
+        };
+        if inner.limit() == 0 {
+            this.finish();
+            return Poll::Ready(Ok(()));
         }
+        if buf.remaining() == 0 {
+            return Poll::Ready(Ok(()));
+        }
+
+        let before = buf.filled().len();
+        ready!(Pin::new(&mut *inner).poll_read(cx, buf))?;
+        if before == buf.filled().len() {
+            return Poll::Ready(Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "decompressed stream ended before the requested range was complete",
+            )));
+        }
+        if inner.limit() == 0 {
+            this.finish();
+        }
+        Poll::Ready(Ok(()))
     }
 }
 
 impl<R: AsyncRead + Unpin + Send + Sync + 'static> Drop for RangedDecompressReader<R> {
     fn drop(&mut self) {
-        if self.bytes_returned >= self.target_length {
-            self.start_drain();
+        if self.inner.as_ref().is_some_and(|inner| inner.limit() == 0) {
+            self.finish();
         }
     }
 }
 
-/// A wrapper that ensures the inner stream is fully consumed even if the outer reader stops early.
-/// This prevents broken pipe errors in erasure coding scenarios where the writer expects
-/// the full stream to be consumed.
+fn drain_stream<R: AsyncRead + Unpin + Send + 'static>(mut stream: R) {
+    drop(tokio::spawn(async move {
+        let mut buf = [0u8; 8192];
+        while matches!(stream.read(&mut buf).await, Ok(n) if n > 0) {}
+    }));
+}
+
+/// Drains the source in the background if dropped before observing its EOF.
 pub struct StreamConsumer<R: AsyncRead + Unpin + Send + 'static> {
     inner: Option<R>,
-    consumer_task: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl<R: AsyncRead + Unpin + Send + 'static> StreamConsumer<R> {
     pub fn new(inner: R) -> Self {
-        Self {
-            inner: Some(inner),
-            consumer_task: None,
-        }
-    }
-
-    fn ensure_consumer_started(&mut self) {
-        if self.consumer_task.is_none() && self.inner.is_some() {
-            let mut inner = self.inner.take().unwrap();
-            let task = tokio::spawn(async move {
-                let mut buf = [0u8; 8192];
-                loop {
-                    match inner.read(&mut buf).await {
-                        Ok(0) => break,    // EOF
-                        Ok(_) => continue, // Keep consuming
-                        Err(_) => break,   // Error, stop consuming
-                    }
-                }
-            });
-            self.consumer_task = Some(task);
-        }
+        Self { inner: Some(inner) }
     }
 }
 
 impl<R: AsyncRead + Unpin + Send + 'static> AsyncRead for StreamConsumer<R> {
     fn poll_read(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<std::io::Result<()>> {
-        use std::pin::Pin;
-        use std::task::Poll;
-
-        if let Some(ref mut inner) = self.inner {
-            Pin::new(inner).poll_read(cx, buf)
-        } else {
-            Poll::Ready(Ok(())) // EOF
+        let Some(inner) = self.inner.as_mut() else {
+            return Poll::Ready(Ok(()));
+        };
+        if buf.remaining() == 0 {
+            return Poll::Ready(Ok(()));
         }
+        let before = buf.filled().len();
+        ready!(Pin::new(inner).poll_read(cx, buf))?;
+        if before == buf.filled().len() {
+            self.inner = None;
+        }
+        Poll::Ready(Ok(()))
     }
 }
 
 impl<R: AsyncRead + Unpin + Send + 'static> Drop for StreamConsumer<R> {
     fn drop(&mut self) {
-        self.ensure_consumer_started();
+        if let Some(inner) = self.inner.take() {
+            drain_stream(inner);
+        }
     }
 }
 
@@ -1664,6 +1582,129 @@ mod tests {
             .await
             .expect_err("EOF before the skip boundary must remain visible");
         assert_eq!(error.kind(), std::io::ErrorKind::UnexpectedEof);
+    }
+
+    #[tokio::test]
+    async fn ranged_reader_fills_large_buffers_without_overreading() {
+        let data = vec![0x32; 128 * 1024];
+        let length = 64 * 1024;
+        let mut reader = RangedDecompressReader::new(Cursor::new(data.clone()), 0, length as i64, data.len()).unwrap();
+        let mut output = vec![0xa5; data.len()];
+
+        assert_eq!(reader.read(&mut output).await.unwrap(), length);
+        assert_eq!(&output[..length], &data[..length]);
+        assert!(output[length..].iter().all(|&byte| byte == 0xa5));
+        assert_eq!(reader.read(&mut output).await.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn ranged_reader_skips_in_bulk_with_a_small_response_buffer() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct CountReads {
+            cursor: Cursor<Vec<u8>>,
+            calls: Arc<AtomicUsize>,
+        }
+
+        impl AsyncRead for CountReads {
+            fn poll_read(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<std::io::Result<()>> {
+                self.calls.fetch_add(1, Ordering::Relaxed);
+                Pin::new(&mut self.cursor).poll_read(cx, buf)
+            }
+        }
+
+        let skip = 512 * 1024;
+        let mut data = vec![0xa5; skip];
+        data.extend_from_slice(b"wanted bytes here");
+        let total = data.len();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let inner = CountReads {
+            cursor: Cursor::new(data),
+            calls: Arc::clone(&calls),
+        };
+        let mut reader = RangedDecompressReader::new(inner, skip, 16, total).unwrap();
+        let mut output = [0; 16];
+
+        reader.read_exact(&mut output).await.unwrap();
+        assert_eq!(&output, b"wanted bytes her");
+        assert_eq!(calls.load(Ordering::Relaxed), 65, "64 discards and one response read");
+    }
+
+    #[tokio::test]
+    async fn ranged_reader_yields_while_skipping_an_unindexed_prefix() {
+        let skip = 2 * 1024 * 1024;
+        let data = vec![0x36; skip + 1];
+        let total = data.len();
+        let mut reader = RangedDecompressReader::new(Cursor::new(data), skip, 1, total).unwrap();
+        let mut output = [0; 1];
+        let mut buf = ReadBuf::new(&mut output);
+        let mut yielded = false;
+
+        std::future::poll_fn(|cx| {
+            let poll = Pin::new(&mut reader).poll_read(cx, &mut buf);
+            yielded |= poll.is_pending();
+            poll
+        })
+        .await
+        .unwrap();
+        assert!(yielded, "a long discard must yield even when the source stays ready");
+        assert_eq!(buf.filled(), &[0x36]);
+    }
+
+    #[tokio::test]
+    async fn ranged_reader_releases_the_source_when_the_range_completes() {
+        use tokio::io::AsyncWriteExt;
+
+        let (source, mut producer) = tokio::io::duplex(16);
+        producer.write_all(b"abcxyz").await.unwrap();
+        let mut reader = RangedDecompressReader::new(source, 0, 3, 6).unwrap();
+        let mut body = [0; 3];
+
+        reader.read_exact(&mut body).await.unwrap();
+        assert_eq!(&body, b"abc");
+        let error = producer
+            .write_all(b"!")
+            .await
+            .expect_err("completed range must release the pipe");
+        assert_eq!(error.kind(), std::io::ErrorKind::BrokenPipe);
+        assert_eq!(reader.read(&mut body).await.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn ranged_reader_drains_the_source_when_requested() {
+        use tokio::io::AsyncWriteExt;
+
+        let (source, mut producer) = tokio::io::duplex(8);
+        producer.write_all(b"abc").await.unwrap();
+        let mut reader = RangedDecompressReader::new_draining(source, 0, 3, 19).unwrap();
+        let mut body = [0; 3];
+
+        reader.read_exact(&mut body).await.unwrap();
+        assert_eq!(&body, b"abc");
+        tokio::time::timeout(std::time::Duration::from_secs(2), producer.write_all(b"0123456789abcdef"))
+            .await
+            .expect("completed range must start draining the source")
+            .expect("draining must keep the pipe open");
+    }
+
+    #[tokio::test]
+    async fn stream_consumer_observes_eof_only_with_a_nonempty_buffer() {
+        let mut reader = StreamConsumer::new(Cursor::new(b"body"));
+        assert_eq!(reader.read(&mut []).await.unwrap(), 0);
+
+        let mut output = Vec::new();
+        reader.read_to_end(&mut output).await.unwrap();
+        assert_eq!(output, b"body");
+        assert!(reader.inner.is_none(), "observed EOF needs no background drain");
+    }
+
+    #[tokio::test]
+    async fn ranged_decompress_reader_rejects_eof_inside_the_requested_range() {
+        let mut reader = RangedDecompressReader::new(Cursor::new(b"abc"), 1, 3, 4).unwrap();
+        let mut output = Vec::new();
+        let error = reader.read_to_end(&mut output).await.expect_err("short range must fail");
+        assert_eq!(error.kind(), std::io::ErrorKind::UnexpectedEof);
+        assert_eq!(output, b"bc");
     }
 
     #[tokio::test]
@@ -2688,10 +2729,6 @@ mod tests {
         let (compressed_offset, uncompressed_offset) = decoded.find(2_097_152).expect("seek into decoded index");
         assert!(compressed_offset > 0);
         assert_eq!(uncompressed_offset, 2_097_152);
-        let (physical_offset, decompressed_skip, _, _, _) = get_compressed_offsets(&object_info, 2_097_152);
-        assert!(physical_offset > 0);
-        assert_eq!(decompressed_skip, 0);
-
         let range = HTTPRangeSpec {
             is_suffix_length: false,
             start: 2_097_152,
@@ -2830,7 +2867,8 @@ mod tests {
         assert!(compressed_offset > 0);
         assert_eq!(uncompressed_offset, range.start);
 
-        let (physical_offset, decompressed_skip, _, _, _) = get_compressed_offsets(&object_info, range.start);
+        let (physical_offset, _, decompressed_skip) =
+            compressed_storage_window(&object_info, range.start as usize, 10).expect("indexed range");
         assert!(physical_offset > 0);
         assert_eq!(decompressed_skip, 0);
 
@@ -2838,14 +2876,14 @@ mod tests {
             .await
             .expect("MinIO headerless compression index should be decoded");
 
-        assert_eq!(plan.storage_offset as i64, physical_offset);
+        assert_eq!(plan.storage_offset, physical_offset);
         assert_eq!(plan.storage_length, object_info.size - plan.storage_offset as i64);
         assert_eq!(plan.object_size, 10);
     }
 
     #[cfg(feature = "rio-v2")]
     #[test]
-    fn test_get_compressed_offsets_aligns_encrypted_ranges_to_dare_packages() {
+    fn test_get_encrypted_compressed_offsets_aligns_encrypted_ranges_to_dare_packages() {
         let mut index = Index::new();
         index.add(0, 0).unwrap();
         index.add(200_000, 2_097_152).unwrap();
@@ -2879,7 +2917,7 @@ mod tests {
         };
 
         let (physical_offset, decompressed_skip, first_part_idx, decrypt_skip, seq_num) =
-            get_compressed_offsets(&object_info, 2_097_152);
+            get_encrypted_compressed_offsets(&object_info, 2_097_152);
 
         assert_eq!(first_part_idx, 0);
         assert_eq!(physical_offset, (expected_comp_off / DARE_PAYLOAD_SIZE) * DARE_PACKAGE_SIZE);

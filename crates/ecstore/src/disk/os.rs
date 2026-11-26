@@ -1007,14 +1007,15 @@ impl OpenedDstDirFsyncGroup {
 }
 
 struct DstDirFsyncWaiter {
-    namespace_owner: Option<Arc<dyn Send + Sync>>,
-    resource_unit: Option<super::io_admission::ResourceIoUnit>,
+    owner: DstDirFsyncOwner,
     result_tx: oneshot::Sender<SharedDstDirFsyncResult>,
 }
 
+#[derive(Default)]
 struct DstDirFsyncOwner {
     _namespace: Option<Arc<dyn Send + Sync>>,
     _resource: Option<super::io_admission::ResourceIoUnit>,
+    disk_permit: Option<Arc<OwnedSemaphorePermit>>,
 }
 
 #[derive(Clone)]
@@ -1073,6 +1074,7 @@ impl DstDirFsyncGroupCommit {
         &self,
         opened: OpenedDstDirFsyncGroup,
         namespace_owner: Option<Arc<dyn Send + Sync>>,
+        admission: Option<&FileSyncAdmission>,
     ) -> io::Result<(oneshot::Receiver<SharedDstDirFsyncResult>, Option<Arc<DstDirFsyncGroup>>)> {
         let (result_tx, result_rx) = oneshot::channel();
         let mut registry = self.inner.lock();
@@ -1105,8 +1107,11 @@ impl DstDirFsyncGroupCommit {
         let mut group_state = group.inner.lock();
         group_state.pending.push_back(DstDirFsyncWaiter {
             result_tx,
-            namespace_owner,
-            resource_unit: super::io_admission::current_resource_unit(),
+            owner: DstDirFsyncOwner {
+                _namespace: namespace_owner,
+                _resource: super::io_admission::current_resource_unit(),
+                disk_permit: admission.map(|admission| Arc::clone(&admission.disk_permit)),
+            },
         });
         let start_worker = !group_state.worker_running;
         if start_worker {
@@ -1158,7 +1163,7 @@ impl DstDirFsyncGroupCommit {
         &self,
         dir: &Path,
     ) -> io::Result<(oneshot::Receiver<SharedDstDirFsyncResult>, Option<Arc<DstDirFsyncGroup>>)> {
-        self.enqueue_opened(OpenedDstDirFsyncGroup::open(dir)?, None)
+        self.enqueue_opened(OpenedDstDirFsyncGroup::open(dir)?, None, None)
     }
 }
 
@@ -1224,7 +1229,10 @@ impl Drop for DstDirFsyncWorkerGuard {
     }
 }
 
-fn run_dst_dir_fsync_group_worker(group: Arc<DstDirFsyncGroup>) -> impl std::future::Future<Output = ()> {
+fn run_dst_dir_fsync_group_worker(
+    group: Arc<DstDirFsyncGroup>,
+    global_permits: &Semaphore,
+) -> impl std::future::Future<Output = ()> + '_ {
     // Capture before spawning: shutdown may drop the future without polling it.
     let worker_guard = DstDirFsyncWorkerGuard {
         group: group.clone(),
@@ -1253,20 +1261,25 @@ fn run_dst_dir_fsync_group_worker(group: Arc<DstDirFsyncGroup>) -> impl std::fut
 
             #[cfg(test)]
             fsync_dir_recorder::record_grouped(&group.dir, batch.len());
-            let namespace_owners = batch
+            let owners: Vec<_> = batch
                 .iter_mut()
                 .filter_map(|waiter| {
-                    let namespace = waiter.namespace_owner.take();
-                    let resource = waiter.resource_unit.take();
-                    (namespace.is_some() || resource.is_some()).then_some(DstDirFsyncOwner {
-                        _namespace: namespace,
-                        _resource: resource,
-                    })
+                    let owner = std::mem::take(&mut waiter.owner);
+                    (owner._namespace.is_some() || owner._resource.is_some() || owner.disk_permit.is_some()).then_some(owner)
                 })
                 .collect();
-            let result = fsync_open_dst_dir_group(&group, namespace_owners)
-                .await
-                .map_err(SharedDstDirFsyncError::from_error);
+            let result = async {
+                // The waiters already hold their disk admission. Reserve one global slot
+                // per physical sync, keeping it with the worker so shutdown can release it.
+                let _global_permit = if owners.iter().any(|owner| owner.disk_permit.is_some()) {
+                    Some(acquire_global_file_sync_permit(global_permits).await?)
+                } else {
+                    None
+                };
+                fsync_open_dst_dir_group(&group, owners).await
+            }
+            .await
+            .map_err(SharedDstDirFsyncError::from_error);
             let batch_len = batch.len();
             DST_DIR_FSYNC_GROUP_COMMIT.complete_batch(batch_len);
             worker_guard.in_flight = 0;
@@ -1300,7 +1313,7 @@ async fn fsync_dst_dir_group_commit_with_enabled(
     enabled: bool,
     namespace_owner: Option<Arc<dyn Send + Sync>>,
 ) -> io::Result<()> {
-    fsync_dst_dir_group_commit_opened(dir.as_ref(), enabled, namespace_owner, None).await
+    fsync_dst_dir_group_commit_opened(dir.as_ref(), enabled, namespace_owner, None, None).await
 }
 
 async fn fsync_dst_dir_group_commit_opened(
@@ -1308,6 +1321,7 @@ async fn fsync_dst_dir_group_commit_opened(
     enabled: bool,
     namespace_owner: Option<Arc<dyn Send + Sync>>,
     opened: Option<Arc<std::fs::File>>,
+    admission: Option<&FileSyncAdmission>,
 ) -> io::Result<()> {
     if !enabled {
         if let Some(file) = opened {
@@ -1333,9 +1347,9 @@ async fn fsync_dst_dir_group_commit_opened(
     })
     .await
     .map_err(|err| io::Error::other(format!("blocking dst dir group open failed: {err}")))??;
-    let (result_rx, worker) = DST_DIR_FSYNC_GROUP_COMMIT.enqueue_opened(opened, namespace_owner)?;
+    let (result_rx, worker) = DST_DIR_FSYNC_GROUP_COMMIT.enqueue_opened(opened, namespace_owner, admission)?;
     if let Some(group) = worker {
-        tokio::spawn(run_dst_dir_fsync_group_worker(group));
+        tokio::spawn(run_dst_dir_fsync_group_worker(group, &FILE_SYNC_PERMITS));
     }
 
     match result_rx.await {
@@ -1415,9 +1429,8 @@ pub(crate) async fn fsync_commit_directory(
             .ok_or_else(|| io::Error::other("commit directory was not published"))?
             .file
             .clone();
-        if !dst_dir_fsync_group_commit_enabled()
-            && let Some(admission) = admission
-        {
+        let grouped = dst_dir_fsync_group_commit_enabled();
+        if !grouped && let Some(admission) = admission {
             let dir = dir.to_path_buf();
             return run_blocking_namespace_file_sync_operation(lease, admission, move || {
                 #[cfg(test)]
@@ -1426,7 +1439,7 @@ pub(crate) async fn fsync_commit_directory(
             })
             .await;
         }
-        fsync_dst_dir_group_commit_opened(dir, dst_dir_fsync_group_commit_enabled(), Some(lease), Some(file)).await
+        fsync_dst_dir_group_commit_opened(dir, grouped, Some(lease), Some(file), admission).await
     }
     #[cfg(not(target_os = "linux"))]
     {
@@ -1453,7 +1466,7 @@ pub(crate) async fn fsync_dst_dir_group_commit_or_namespace_file_sync_limit(
     admission: &FileSyncAdmission,
 ) -> io::Result<()> {
     if dst_dir_fsync_group_commit_enabled() {
-        fsync_dst_dir_group_commit_with_enabled(dir, true, Some(lease)).await
+        fsync_dst_dir_group_commit_opened(dir.as_ref(), true, Some(lease), None, Some(admission)).await
     } else {
         fsync_dir_with_namespace_file_sync_limit(dir, lease, admission).await
     }
@@ -2328,9 +2341,10 @@ static FSYNC_RUNTIME: LazyLock<Option<tokio::runtime::Runtime>> = LazyLock::new(
     if threads <= 1 {
         return None;
     }
+    let workers = crate::runtime::detect_worker_parallelism().get().min(8);
     let mut builder = tokio::runtime::Builder::new_multi_thread();
     builder
-        .worker_threads(num_cpus::get().min(8))
+        .worker_threads(workers)
         .max_blocking_threads(threads)
         .thread_name("rustfs-fsync")
         .thread_stack_size(512 * 1024)
@@ -2666,7 +2680,7 @@ fn default_global_file_sync_limit(cpu_count: usize, max_blocking_threads: usize)
 fn global_file_sync_limit() -> usize {
     let max_blocking_threads =
         rustfs_utils::get_env_usize(rustfs_config::ENV_MAX_BLOCKING_THREADS, rustfs_config::DEFAULT_MAX_BLOCKING_THREADS);
-    default_global_file_sync_limit(num_cpus::get(), max_blocking_threads)
+    default_global_file_sync_limit(crate::runtime::detect_worker_parallelism().get(), max_blocking_threads)
 }
 
 #[cfg(test)]
@@ -5845,15 +5859,7 @@ async fn run_cancellable_blocking_namespace_file_sync_operation_with_global<T: S
     global_permits: &Semaphore,
     operation: impl FnOnce(&dyn Fn() -> bool) -> io::Result<T> + Send + 'static,
 ) -> io::Result<T> {
-    let wait_started = rustfs_io_metrics::put_stage_timer();
-    let global_permit = global_permits
-        .acquire()
-        .await
-        .map_err(|_| io::Error::other("global file sync concurrency limiter closed"))?;
-    rustfs_io_metrics::record_put_object_stage_duration_from(
-        rustfs_io_metrics::PUT_STAGE_SET_DISK_RENAME_GLOBAL_FILE_SYNC_PERMIT_WAIT,
-        wait_started,
-    );
+    let global_permit = acquire_global_file_sync_permit(global_permits).await?;
     let disk_permit = admission.disk_permit.clone();
     let queue = Arc::clone(&lease.blocking_queue);
     let result = queue
@@ -5865,6 +5871,19 @@ async fn run_cancellable_blocking_namespace_file_sync_operation_with_global<T: S
         .await;
     drop(global_permit);
     result
+}
+
+async fn acquire_global_file_sync_permit(global_permits: &Semaphore) -> io::Result<SemaphorePermit<'_>> {
+    let wait_started = rustfs_io_metrics::put_stage_timer();
+    let permit = global_permits
+        .acquire()
+        .await
+        .map_err(|_| io::Error::other("global file sync concurrency limiter closed"))?;
+    rustfs_io_metrics::record_put_object_stage_duration_from(
+        rustfs_io_metrics::PUT_STAGE_SET_DISK_RENAME_GLOBAL_FILE_SYNC_PERMIT_WAIT,
+        wait_started,
+    );
+    Ok(permit)
 }
 
 pub(crate) async fn fsync_dir_with_namespace_file_sync_limit(
@@ -12306,11 +12325,20 @@ mod tests {
         let second_owner = second_ctx.begin_namespace_commit();
         let first_probe = Arc::downgrade(&first_owner);
         let second_probe = Arc::downgrade(&second_owner);
+        let disk_permits = Arc::new(Semaphore::new(2));
+        let first_admission = acquire_file_sync_admission(disk_permits.clone())
+            .await
+            .expect("first disk slot");
+        let second_admission = acquire_file_sync_admission(disk_permits.clone())
+            .await
+            .expect("second disk slot");
+        let global_permits = Arc::new(Semaphore::new(1));
         let (first_rx, group) = with_background_resource_unit(resources[0].acquire().await, async {
             DST_DIR_FSYNC_GROUP_COMMIT
                 .enqueue_opened(
                     OpenedDstDirFsyncGroup::open(&dir).expect("open first waiter directory"),
                     Some(first_owner),
+                    Some(&first_admission),
                 )
                 .expect("queue first real waiter")
         })
@@ -12321,6 +12349,7 @@ mod tests {
                 .enqueue_opened(
                     OpenedDstDirFsyncGroup::open(&dir).expect("open second waiter directory"),
                     Some(second_owner),
+                    Some(&second_admission),
                 )
                 .expect("queue second real waiter")
         })
@@ -12334,12 +12363,18 @@ mod tests {
                 let _ = entered_tx.send(());
                 let _ = release_rx.recv();
             });
-        let worker = tokio::spawn(run_dst_dir_fsync_group_worker(group.clone()));
+        drop((first_admission, second_admission));
+        let worker = tokio::spawn({
+            let group = group.clone();
+            let global_permits = global_permits.clone();
+            async move { run_dst_dir_fsync_group_worker(group, &global_permits).await }
+        });
         tokio::time::timeout(Duration::from_secs(5), entered_rx)
             .await
             .expect("batch must reach its physical fsync")
             .expect("physical fsync entry");
         assert_eq!(fsync_dir_recorder::grouped_batch_sizes(&dir), vec![2]);
+        assert_eq!(global_permits.available_permits(), 0, "one physical sync must reserve the global slot");
         assert!(
             group.inner.lock().pending.is_empty(),
             "both waiters were transferred into the physical batch"
@@ -12353,6 +12388,7 @@ mod tests {
                 .enqueue_opened(
                     OpenedDstDirFsyncGroup::open(&dir).expect("open queued waiter directory"),
                     Some(queued_owner),
+                    None,
                 )
                 .expect("queue a waiter after the physical batch was frozen")
         })
@@ -12372,6 +12408,8 @@ mod tests {
         let first_pending = first_ctx.namespace_commits_pending() && first_probe.upgrade().is_some();
         let second_pending = second_ctx.namespace_commits_pending() && second_probe.upgrade().is_some();
         let retained_resources = resources.each_ref().map(|gate| gate.snapshot().active);
+        let retained_disk_permits = disk_permits.available_permits();
+        let released_global_permits = global_permits.available_permits();
         let generations = (first_ctx.namespace_commit_generation(), second_ctx.namespace_commit_generation());
         drop(release_tx);
         tokio::time::timeout(Duration::from_secs(5), async {
@@ -12401,6 +12439,38 @@ mod tests {
         assert!(!second_ctx.namespace_commits_pending());
         assert!(first_ctx.namespace_commit_generation() > generations.0);
         assert!(second_ctx.namespace_commit_generation() > generations.1);
+        assert_eq!(retained_disk_permits, 0, "both disk slots must survive abort while the syscall runs");
+        assert_eq!(released_global_permits, 1, "abort must restore capacity for other disks");
+        assert_eq!(disk_permits.available_permits(), 2, "both disk slots return after fsync");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial_test::serial(dst_dir_fsync_group_commit)]
+    async fn grouped_fsync_propagates_closed_global_limit_without_syncing() {
+        let directory = tempdir().expect("fixture directory");
+        let disk_permits = Arc::new(Semaphore::new(1));
+        let admission = acquire_file_sync_admission(disk_permits.clone()).await.expect("disk slot");
+        let (result, worker) = DST_DIR_FSYNC_GROUP_COMMIT
+            .enqueue_opened(
+                OpenedDstDirFsyncGroup::open(directory.path()).expect("open fixture"),
+                None,
+                Some(&admission),
+            )
+            .expect("enqueue waiter");
+        drop(admission);
+        let global_permits = Semaphore::new(0);
+        global_permits.close();
+        run_dst_dir_fsync_group_worker(worker.expect("first waiter starts worker"), &global_permits).await;
+
+        let error = result
+            .await
+            .expect("worker reports completion")
+            .expect_err("closed limiter must reject fsync");
+        assert_eq!(&*error.message, "global file sync concurrency limiter closed");
+        assert!(!fsync_dir_recorder::was_fsynced(directory.path()));
+        assert_eq!(disk_permits.available_permits(), 1);
+        assert_eq!(DST_DIR_FSYNC_GROUP_COMMIT.counts_for_test(), (0, 0));
     }
 
     #[cfg(unix)]
@@ -12416,10 +12486,11 @@ mod tests {
             .enqueue_opened(
                 OpenedDstDirFsyncGroup::open(temp_dir.path()).expect("open queued waiter directory"),
                 Some(owner),
+                None,
             )
             .expect("queue a real waiter");
         let group = group.expect("first waiter starts the group");
-        let worker = run_dst_dir_fsync_group_worker(group.clone());
+        let worker = run_dst_dir_fsync_group_worker(group.clone(), &FILE_SYNC_PERMITS);
         assert!(ctx.namespace_commits_pending());
         drop(worker);
         assert!(rx.await.is_err(), "shutdown before first poll must release the waiter");
@@ -12496,9 +12567,12 @@ mod tests {
             .enqueue_for_test(temp_dir.path())
             .expect("enqueue old group");
         let old_group = old_worker.expect("old group starts a worker");
-        tokio::time::timeout(Duration::from_secs(5), run_dst_dir_fsync_group_worker(old_group.clone()))
-            .await
-            .expect("old worker must finish its actual fsync");
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            run_dst_dir_fsync_group_worker(old_group.clone(), &FILE_SYNC_PERMITS),
+        )
+        .await
+        .expect("old worker must finish its actual fsync");
         assert!(old_rx.await.expect("old worker reports completion").is_ok());
         assert!(fsync_dir_recorder::was_fsynced(temp_dir.path()));
         assert_eq!(fsync_dir_recorder::grouped_batch_sizes(temp_dir.path()), vec![1]);
@@ -12512,11 +12586,12 @@ mod tests {
             .enqueue_opened(
                 OpenedDstDirFsyncGroup::open(temp_dir.path()).expect("open successor directory"),
                 Some(owner),
+                None,
             )
             .expect("enqueue successor owner");
         let successor = successor_worker.expect("successor starts a new group");
         assert!(!Arc::ptr_eq(&old_group, &successor));
-        let worker = run_dst_dir_fsync_group_worker(successor.clone());
+        let worker = run_dst_dir_fsync_group_worker(successor.clone(), &FILE_SYNC_PERMITS);
         // The stale Arc represents W1 resuming after another worker removed G.
         DST_DIR_FSYNC_GROUP_COMMIT.remove_idle_group(&old_group);
         assert!(ctx.namespace_commits_pending());
@@ -14665,8 +14740,17 @@ mod tests {
         q_fsync
             .run_fsync_cancellable(|is_cancelled| {
                 assert!(!is_cancelled());
-                if FSYNC_RUNTIME.is_some() {
+                let blocking_threads = rustfs_utils::get_env_usize(
+                    rustfs_config::ENV_FSYNC_BLOCKING_THREADS,
+                    rustfs_config::DEFAULT_FSYNC_BLOCKING_THREADS,
+                );
+                if blocking_threads > 1 {
+                    let runtime = FSYNC_RUNTIME.as_ref().expect("configured dedicated fsync runtime");
                     assert_eq!(std::thread::current().name(), Some("rustfs-fsync"));
+                    let expected = std::thread::available_parallelism().map_or(1, usize::from).min(8);
+                    assert_eq!(runtime.metrics().num_workers(), expected);
+                } else {
+                    assert!(FSYNC_RUNTIME.is_none());
                 }
                 Ok(())
             })

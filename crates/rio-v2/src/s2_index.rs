@@ -65,10 +65,17 @@ pub fn minio_index_storage_bytes(index: &Index) -> Bytes {
         .unwrap_or(encoded)
 }
 
+/// Decodes a complete framed S2 index or its headerless metadata payload.
 pub fn decode_minio_index_bytes(bytes: &Bytes) -> Option<Index> {
-    let decoded = S2Index::load(bytes.as_ref())
-        .or_else(|_| S2Index::load(&restore_index_headers(bytes.as_ref())))
-        .ok()?;
+    let bytes = bytes.as_ref();
+    // An unframed index starts with a nonnegative signed varint. Its
+    // low bit is clear, so it cannot start with the odd frame marker.
+    let body = if bytes.first() == Some(&CHUNK_TYPE_INDEX) {
+        remove_index_headers(bytes)?
+    } else {
+        bytes
+    };
+    let decoded = S2Index::load_body(body).ok()?;
 
     let mut index = Index::new();
     for info in decoded.info {
@@ -165,26 +172,7 @@ impl S2Index {
         false
     }
 
-    fn load(mut bytes: &[u8]) -> io::Result<Self> {
-        if bytes.len() <= SKIPPABLE_FRAME_HEADER + S2_INDEX_HEADER.len() + S2_INDEX_TRAILER.len() {
-            return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "buffer too small"));
-        }
-        if bytes[0] != CHUNK_TYPE_INDEX {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, "invalid index chunk type"));
-        }
-
-        let chunk_len = (bytes[1] as usize) | ((bytes[2] as usize) << 8) | ((bytes[3] as usize) << 16);
-        bytes = &bytes[SKIPPABLE_FRAME_HEADER..];
-        if bytes.len() < chunk_len {
-            return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "buffer too small"));
-        }
-        bytes = &bytes[..chunk_len];
-
-        if !bytes.starts_with(S2_INDEX_HEADER) {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, "invalid index header"));
-        }
-        bytes = &bytes[S2_INDEX_HEADER.len()..];
-
+    fn load_body(mut bytes: &[u8]) -> io::Result<Self> {
         let (total_uncompressed, used) = read_varint(bytes)?;
         if total_uncompressed < 0 {
             return Err(io::Error::new(io::ErrorKind::InvalidData, "invalid uncompressed size"));
@@ -234,7 +222,10 @@ impl S2Index {
 
             if idx > 0 {
                 let prev = info[idx - 1].uncompressed_offset;
-                uncompressed_offset += prev + est_block_uncompressed;
+                uncompressed_offset = prev
+                    .checked_add(est_block_uncompressed)
+                    .and_then(|base| base.checked_add(uncompressed_offset))
+                    .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "uncompressed index offset overflow"))?;
                 if uncompressed_offset <= prev {
                     return Err(io::Error::new(io::ErrorKind::InvalidData, "invalid uncompressed offset"));
                 }
@@ -251,9 +242,14 @@ impl S2Index {
             bytes = &bytes[used..];
 
             if idx > 0 {
-                let next_compressed_predict = compressed_predict + compressed_offset / 2;
+                let next_compressed_predict = compressed_predict
+                    .checked_add(compressed_offset / 2)
+                    .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "compressed index prediction overflow"))?;
                 let prev = info[idx - 1].compressed_offset;
-                compressed_offset += prev + compressed_predict;
+                compressed_offset = prev
+                    .checked_add(compressed_predict)
+                    .and_then(|base| base.checked_add(compressed_offset))
+                    .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "compressed index offset overflow"))?;
                 if compressed_offset <= prev {
                     return Err(io::Error::new(io::ErrorKind::InvalidData, "invalid compressed offset"));
                 }
@@ -265,12 +261,8 @@ impl S2Index {
             info[idx].compressed_offset = compressed_offset;
         }
 
-        if bytes.len() < 4 + S2_INDEX_TRAILER.len() {
-            return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "buffer too small"));
-        }
-        bytes = &bytes[4..];
-        if !bytes.starts_with(S2_INDEX_TRAILER) {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, "invalid index trailer"));
+        if !bytes.is_empty() {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "trailing bytes in index body"));
         }
 
         Ok(Self {
@@ -290,10 +282,9 @@ fn remove_index_headers(bytes: &[u8]) -> Option<&[u8]> {
 
     let chunk_len = (bytes[1] as usize) | ((bytes[2] as usize) << 8) | ((bytes[3] as usize) << 16);
     let bytes = &bytes[SKIPPABLE_FRAME_HEADER..];
-    if bytes.len() < chunk_len {
+    if bytes.len() != chunk_len {
         return None;
     }
-    let bytes = &bytes[..chunk_len];
 
     let bytes = bytes.strip_prefix(S2_INDEX_HEADER)?;
     let bytes = bytes.strip_suffix(S2_INDEX_TRAILER)?;
@@ -301,25 +292,6 @@ fn remove_index_headers(bytes: &[u8]) -> Option<&[u8]> {
         return None;
     }
     Some(&bytes[..bytes.len() - 4])
-}
-
-fn restore_index_headers(input: &[u8]) -> Vec<u8> {
-    if input.is_empty() {
-        return Vec::new();
-    }
-
-    let mut bytes = Vec::with_capacity(SKIPPABLE_FRAME_HEADER + S2_INDEX_HEADER.len() + input.len() + 4 + S2_INDEX_TRAILER.len());
-    bytes.extend_from_slice(&[CHUNK_TYPE_INDEX, 0, 0, 0]);
-    bytes.extend_from_slice(S2_INDEX_HEADER);
-    bytes.extend_from_slice(input);
-    bytes.extend_from_slice(&((bytes.len() + 4 + S2_INDEX_TRAILER.len()) as u32).to_le_bytes());
-    bytes.extend_from_slice(S2_INDEX_TRAILER);
-
-    let chunk_len = bytes.len() - SKIPPABLE_FRAME_HEADER;
-    bytes[1] = chunk_len as u8;
-    bytes[2] = (chunk_len >> 8) as u8;
-    bytes[3] = (chunk_len >> 16) as u8;
-    bytes
 }
 
 fn write_varint(out: &mut Vec<u8>, value: i64) {
@@ -342,10 +314,10 @@ fn read_uvarint(bytes: &[u8]) -> io::Result<(u64, usize)> {
     let mut shift = 0_u32;
 
     for (idx, byte) in bytes.iter().copied().enumerate() {
+        if idx == 9 && byte > 1 {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "varint overflow"));
+        }
         if byte < 0x80 {
-            if idx > 9 || (idx == 9 && byte > 1) {
-                return Err(io::Error::new(io::ErrorKind::InvalidData, "varint overflow"));
-            }
             return Ok((value | ((byte as u64) << shift), idx + 1));
         }
 
@@ -388,15 +360,7 @@ mod tests {
         source.total_compressed = 3_000_000;
 
         let stored = minio_index_storage_bytes(&source);
-        assert!(!stored.starts_with(&[CHUNK_TYPE_INDEX, 0x2a, 0x4d, 0x18]));
-        assert_eq!(
-            S2Index::load(&restore_index_headers(&stored))
-                .expect("restore full index")
-                .info
-                .len(),
-            2
-        );
-
+        assert_ne!(stored.first(), Some(&CHUNK_TYPE_INDEX));
         let decoded = decode_minio_index_bytes(&stored).expect("decode headerless MinIO index");
         assert_eq!(decoded.total_uncompressed, source.total_uncompressed);
         assert_eq!(decoded.total_compressed, source.total_compressed);
@@ -423,12 +387,17 @@ mod tests {
         let full = index.into_full_bytes();
         assert_eq!(full[0], CHUNK_TYPE_INDEX);
         let headerless = Bytes::copy_from_slice(remove_index_headers(full.as_ref()).expect("strip index headers"));
-        let restored = restore_index_headers(&headerless);
-        assert_eq!(restored[0], CHUNK_TYPE_INDEX);
+        for bytes in [&full, &headerless] {
+            let decoded = decode_minio_index_bytes(bytes).expect("decode index with unknown compressed total");
+            assert_eq!(decoded.total_uncompressed, 4_194_304);
+            assert_eq!(decoded.total_compressed, -1);
+            assert_eq!(decoded.find(2_097_152).unwrap(), (1_048_576, 2_097_152));
 
-        let decoded = decode_minio_index_bytes(&headerless).expect("decode index with unknown compressed total");
-        assert_eq!(decoded.total_uncompressed, 4_194_304);
-        assert_eq!(decoded.total_compressed, -1);
-        assert_eq!(decoded.find(2_097_152).unwrap(), (1_048_576, 2_097_152));
+            let truncated = bytes.slice(..bytes.len() - 1);
+            assert!(decode_minio_index_bytes(&truncated).is_none());
+            let mut trailing = bytes.to_vec();
+            trailing.push(0);
+            assert!(decode_minio_index_bytes(&Bytes::from(trailing)).is_none());
+        }
     }
 }
