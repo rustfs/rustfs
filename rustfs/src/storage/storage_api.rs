@@ -485,6 +485,7 @@ pub(crate) mod tonic_service_consumer {
 #[cfg(test)]
 pub(crate) mod test_consumer {
     pub(crate) use super::super::access_owned::object_read::authorize_head_object;
+    pub(crate) use rustfs_ecstore::api::object::test_util::DeleteAfterObjectLockSnapshotBarrier;
     pub(crate) mod sse {
         pub(crate) use super::super::super::sse::{RecordingKmsKeyAuthorizer, TestAuthorizationHooks, sse_kms_object_metadata};
     }
