@@ -32,7 +32,7 @@ use std::{
     net::IpAddr,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
-use tokio::time::sleep as async_sleep;
+use tokio::time::{Instant as TokioInstant, sleep as async_sleep, sleep_until};
 use tracing::{info, instrument, warn};
 use url::Host;
 
@@ -653,7 +653,7 @@ async fn lookup_startup_host_ips(host: Host<&str>) -> Result<HashSet<IpAddr>> {
 }
 
 struct DnsRetryDeadline {
-    started: Instant,
+    started: TokioInstant,
     timeout: Duration,
     max_delay: Duration,
 }
@@ -661,7 +661,7 @@ struct DnsRetryDeadline {
 impl DnsRetryDeadline {
     fn new(timeout: Duration, max_delay: Duration) -> Self {
         Self {
-            started: Instant::now(),
+            started: TokioInstant::now(),
             timeout,
             max_delay,
         }
@@ -673,6 +673,14 @@ impl DnsRetryDeadline {
 
     fn elapsed(&self) -> Duration {
         self.started.elapsed()
+    }
+
+    fn expires_at(&self) -> Option<TokioInstant> {
+        // Zero means one lookup with no retries. MAX is the unbounded orchestrated policy.
+        if matches!(self.timeout, Duration::ZERO | Duration::MAX) {
+            return None;
+        }
+        self.started.checked_add(self.timeout)
     }
 
     fn bounded_delay(&self, delay: Duration) -> Option<Duration> {
@@ -703,17 +711,16 @@ where
     RetryLog: FnMut(u32, Duration, Duration, &Error),
 {
     let mut attempts: u32 = 0;
-    let mut last_warn: Option<Instant> = None;
-
-    loop {
-        match resolve().await {
-            Ok(value) => return Ok(value),
-            Err(err) => {
-                if !is_retryable_dns_error(&err) {
-                    return Err(permanent_error(err));
-                }
-
+    let result = {
+        let retry = async {
+            let mut last_warn: Option<Instant> = None;
+            loop {
                 attempts += 1;
+                let err = match resolve().await {
+                    Ok(value) => return Ok(value),
+                    Err(err) if is_retryable_dns_error(&err) => err,
+                    Err(err) => return Err(permanent_error(err)),
+                };
                 let Some(delay) = dns_retry_deadline.bounded_delay(dns_retry_delay(attempts, dns_retry_deadline.max_delay))
                 else {
                     return Err(timeout_error(attempts, dns_retry_deadline.timeout(), err));
@@ -727,8 +734,25 @@ where
                 }
                 sleep(delay).await;
             }
+        };
+
+        match dns_retry_deadline.expires_at() {
+            Some(expires_at) if expires_at <= TokioInstant::now() => None,
+            Some(expires_at) => tokio::select! {
+                biased;
+                () = sleep_until(expires_at) => None,
+                result = retry => Some(result),
+            },
+            None => Some(retry.await),
         }
-    }
+    };
+    result.unwrap_or_else(|| {
+        Err(timeout_error(
+            attempts,
+            dns_retry_deadline.timeout(),
+            Error::new(ErrorKind::TimedOut, "startup DNS deadline elapsed"),
+        ))
+    })
 }
 
 /// Action-oriented tail shared by topology convergence timeout errors so a
@@ -2746,6 +2770,39 @@ mod test {
         assert_eq!(sleeps, 0);
         assert!(err.to_string().contains("endpoint-a"));
         assert!(err.to_string().contains("timed out after 1 attempts"));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn startup_dns_deadline_stops_pending_and_later_lookups() {
+        let timeout = Duration::from_secs(3);
+        let deadline = DnsRetryDeadline::new(timeout, DNS_RETRY_MAX_DELAY);
+        let lookups = std::cell::Cell::new(0);
+        let resolve = async |_host: Host<&str>| {
+            lookups.set(lookups.get() + 1);
+            std::future::pending::<Result<HashSet<IpAddr>>>().await
+        };
+
+        let err = tokio::time::timeout(
+            timeout * 2,
+            resolve_startup_host_with_retry(Host::Domain("node1"), "first endpoint", &deadline, &resolve),
+        )
+        .await
+        .expect("a pending lookup must complete before the test deadline")
+        .expect_err("a pending lookup must stop at the startup deadline");
+        assert!(err.to_string().contains("first endpoint"));
+        assert!(err.to_string().contains("startup DNS deadline elapsed"));
+        assert_eq!(deadline.elapsed(), timeout);
+        assert_eq!(lookups.get(), 1);
+
+        let err = tokio::time::timeout(
+            timeout * 2,
+            resolve_startup_host_with_retry(Host::Domain("node2"), "second endpoint", &deadline, &resolve),
+        )
+        .await
+        .expect("a later lookup must complete before the test deadline")
+        .expect_err("an exhausted startup budget must prevent a new lookup");
+        assert!(err.to_string().contains("second endpoint"));
+        assert_eq!(lookups.get(), 1);
     }
 
     #[test]
