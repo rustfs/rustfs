@@ -153,6 +153,13 @@ pub async fn is_enabled(api: Arc<IamStore>, access_key: &str, now: OffsetDateTim
 /// Generic over the closure's error so a caller can return its own typed
 /// failure — a rejected code, say — without encoding it into a string and
 /// decoding it on the way out. Storage failures arrive through `From<Error>`.
+///
+/// A rejection is not a rollback: a failed verification increments
+/// `failed_attempts` and may engage `locked_until`, and that rate-limiting
+/// state must persist even when the caller receives an `Err`. Any mutation
+/// that changes the record is therefore written through the compare-and-set
+/// loop before returning `outcome`; an `Err` that leaves the record untouched
+/// (such as not enrolled or already locked) returns immediately without writing.
 pub async fn update<T, E, F>(
     api: Arc<IamStore>,
     access_key: &str,
@@ -168,7 +175,11 @@ where
     for attempt in 1..=MAX_WRITE_ATTEMPTS {
         let loaded = load(api.clone(), access_key, now).await.map_err(E::from)?;
         let mut record = loaded.record;
-        let outcome = mutate(&mut record)?;
+        let before = record.clone();
+        let outcome = mutate(&mut record);
+        if outcome.is_err() && record == before {
+            return outcome;
+        }
 
         let plain = serde_json::to_vec(&record).map_err(|err| E::from(Error::other(err.to_string())))?;
         let encrypted = encrypt_iam_blob(&plain).map_err(E::from)?;
@@ -192,7 +203,7 @@ where
         });
 
         match save_iam_config_with_opts(api.clone(), &path, encrypted, &opts).await {
-            Ok(()) => return Ok(outcome),
+            Ok(()) => return outcome,
             Err(IamStorageError::PreconditionFailed) => {
                 warn!(
                     path = %path,
