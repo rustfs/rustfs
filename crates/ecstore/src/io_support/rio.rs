@@ -118,8 +118,10 @@ pub fn decode_compression_index_bytes(bytes: &Bytes) -> Option<Index> {
         }
     }
 
+    // Metadata holds a single index frame. A partial parse must not authorize
+    // a seek, including when old offsets are mistaken for a frame trailer.
     let mut decoded = Index::new();
-    if decoded.load(bytes.as_ref()).is_ok() {
+    if decoded.load(bytes.as_ref()).is_ok_and(|remaining| remaining.is_empty()) {
         return Some(decoded);
     }
 
@@ -127,7 +129,7 @@ pub fn decode_compression_index_bytes(bytes: &Bytes) -> Option<Index> {
     {
         let restored = restore_legacy_index_headers(bytes.as_ref());
         let mut decoded = Index::new();
-        if decoded.load(&restored).is_ok() {
+        if decoded.load(&restored).is_ok_and(|remaining| remaining.is_empty()) {
             return Some(decoded);
         }
     }

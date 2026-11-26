@@ -14,6 +14,7 @@
 
 use super::*;
 
+#[cfg(test)]
 use crate::io_support::rio::Index;
 use std::mem::MaybeUninit;
 
@@ -41,11 +42,8 @@ pub(crate) fn restore_request_active(opts: &ObjectOptions) -> bool {
     restore.type_.is_some() || restore.days.is_some() || restore.output_location.is_some() || restore.select_parameters.is_some()
 }
 
-fn decode_compression_index(index: Option<&Bytes>) -> Option<Index> {
-    crate::io_support::rio::decode_compression_index_bytes(index?)
-}
-
-fn get_compressed_offsets(oi: &ObjectInfo, offset: i64) -> (i64, i64, usize, i64, u64) {
+#[cfg(feature = "rio-v2")]
+fn get_encrypted_compressed_offsets(oi: &ObjectInfo, offset: i64) -> (i64, i64, usize, i64, u64) {
     let mut skip_length = 0_i64;
     let mut cumulative_actual_size = 0_i64;
     let mut first_part_idx = 0_usize;
@@ -63,35 +61,87 @@ fn get_compressed_offsets(oi: &ObjectInfo, offset: i64) -> (i64, i64, usize, i64
     }
 
     let mut part_skip = offset - skip_length;
-    #[cfg(feature = "rio-v2")]
     let (mut decrypt_skip, mut seq_num) = (0_i64, 0_u64);
-    #[cfg(not(feature = "rio-v2"))]
-    let (decrypt_skip, seq_num) = (0_i64, 0_u64);
 
     if part_skip > 0
         && let Some(part) = oi.parts.get(first_part_idx)
-        && let Some(index) = decode_compression_index(part.index.as_ref())
+        && let Some(index) = part
+            .index
+            .as_ref()
+            .and_then(crate::io_support::rio::decode_compression_index_bytes)
         && let Ok((comp_off, uncomp_off)) = index.find(part_skip)
         && comp_off > 0
     {
-        #[cfg(feature = "rio-v2")]
-        if oi.is_encrypted() {
-            seq_num = (comp_off / DARE_PAYLOAD_SIZE) as u64;
-            decrypt_skip = comp_off % DARE_PAYLOAD_SIZE;
-            compressed_offset += (comp_off / DARE_PAYLOAD_SIZE) * DARE_PACKAGE_SIZE;
-        } else {
-            compressed_offset += comp_off;
-        }
-
-        #[cfg(not(feature = "rio-v2"))]
-        {
-            compressed_offset += comp_off;
-        }
+        seq_num = (comp_off / DARE_PAYLOAD_SIZE) as u64;
+        decrypt_skip = comp_off % DARE_PAYLOAD_SIZE;
+        compressed_offset += (comp_off / DARE_PAYLOAD_SIZE) * DARE_PACKAGE_SIZE;
 
         part_skip -= uncomp_off;
     }
 
     (compressed_offset, part_skip, first_part_idx, decrypt_skip, seq_num)
+}
+
+// Plan a window of complete compression blocks in stored coordinates. The
+// index can omit the final block or record a stale total. Part metadata owns
+// the actual bounds, and missing checkpoints widen only the covering parts.
+fn compressed_storage_window(oi: &ObjectInfo, offset: usize, length: i64) -> Option<(usize, i64, usize)> {
+    let start = i64::try_from(offset).ok()?;
+    let end = start.checked_add(length)?;
+    if start >= end {
+        return None;
+    }
+    let (mut plaintext_offset, mut stored_offset) = (0_i64, 0_i64);
+    let mut window_start = None;
+    for part in oi.parts.iter() {
+        let stored_size = i64::try_from(part.size).ok()?;
+        let stored_end = stored_offset.checked_add(stored_size)?;
+        if stored_end > oi.size || part.actual_size < 0 || (part.actual_size == 0) != (stored_size == 0) {
+            return None;
+        }
+        let plaintext_end = plaintext_offset.checked_add(part.actual_size)?;
+        let starts_here = window_start.is_none() && start < plaintext_end;
+        let ends_here = end <= plaintext_end;
+        if starts_here || ends_here {
+            let index = part
+                .index
+                .as_ref()
+                .filter(|_| (starts_here && start > plaintext_offset) || (ends_here && end < plaintext_end))
+                .and_then(crate::io_support::rio::decode_compression_index_bytes);
+            if starts_here {
+                let relative_start = start - plaintext_offset;
+                let (stored, plaintext) = index
+                    .as_ref()
+                    .filter(|_| relative_start > 0)
+                    .and_then(|index| index.checkpoint_at_or_before(relative_start))
+                    .filter(|&(stored, plaintext)| {
+                        (1..stored_size).contains(&stored) && (0..=relative_start).contains(&plaintext)
+                    })
+                    .unwrap_or((0, 0));
+                window_start = Some((stored_offset + stored, relative_start - plaintext));
+            }
+            if ends_here {
+                let (window_start, skip) = window_start?;
+                let relative_end = end - plaintext_offset;
+                let window_end = index
+                    .filter(|_| relative_end < part.actual_size)
+                    .as_ref()
+                    .and_then(|index| index.checkpoint_at_or_after(relative_end))
+                    .filter(|&(stored, plaintext)| {
+                        (1..=stored_size).contains(&stored) && (relative_end..=part.actual_size).contains(&plaintext)
+                    })
+                    .map_or(stored_end, |(stored, _)| stored_offset + stored);
+                return (window_end > window_start).then_some((
+                    usize::try_from(window_start).ok()?,
+                    window_end - window_start,
+                    usize::try_from(skip).ok()?,
+                ));
+            }
+        }
+        plaintext_offset = plaintext_end;
+        stored_offset = stored_end;
+    }
+    None
 }
 
 #[cfg(feature = "rio-v2")]
@@ -713,10 +763,12 @@ impl ReadPlan {
             let actual_size = oi.get_actual_size()?;
             let (storage_offset, storage_length, decompressed_offset, decompressed_length) = if let Some(rs) = rs {
                 let (req_off, req_length) = rs.get_offset_length(actual_size)?;
-                let (physical_off, decompressed_skip, _, _, _) = get_compressed_offsets(oi, req_off as i64);
-                let storage_offset = usize::try_from(physical_off)
-                    .map_err(|_| Error::other(format!("invalid compressed offset {physical_off}")))?;
-                (storage_offset, oi.size - physical_off, decompressed_skip as usize, req_length)
+                let (storage_offset, storage_length, skip) = if req_length < actual_size {
+                    compressed_storage_window(oi, req_off, req_length).unwrap_or((0, oi.size, req_off))
+                } else {
+                    (0, oi.size, req_off)
+                };
+                (storage_offset, storage_length, skip, req_length)
             } else {
                 (0, oi.size, 0, actual_size)
             };
@@ -794,7 +846,7 @@ impl ReadPlan {
                         )?
                     } else if is_compressed {
                         let (physical_off, decompressed_skip, first_part_idx, decrypt_skip, seq_num) =
-                            get_compressed_offsets(oi, requested_offset as i64);
+                            get_encrypted_compressed_offsets(oi, requested_offset as i64);
                         (
                             usize::try_from(physical_off)
                                 .map_err(|_| Error::other(format!("invalid encrypted compressed offset {physical_off}")))?,
@@ -911,39 +963,19 @@ impl ReadPlan {
                 total_plaintext_size,
             } => {
                 let dec_reader = crate::io_support::rio::decompression_reader(reader, algorithm, backend);
-                #[cfg(feature = "rio-v2")]
-                let dec_reader = StreamConsumer::new(dec_reader);
-                let final_reader: Box<dyn AsyncRead + Unpin + Send + Sync> = if decompressed_offset > 0
-                    || decompressed_length != total_plaintext_size as i64
-                {
-                    #[cfg(feature = "rio-v2")]
-                    let ranged_result = RangedDecompressReader::new_draining(
-                        dec_reader,
-                        decompressed_offset,
-                        decompressed_length,
-                        total_plaintext_size,
-                    );
-                    #[cfg(not(feature = "rio-v2"))]
-                    let ranged_result =
-                        RangedDecompressReader::new(dec_reader, decompressed_offset, decompressed_length, total_plaintext_size);
-
-                    match ranged_result {
-                        Ok(ranged_reader) => {
-                            tracing::debug!(
-                                "Successfully created RangedDecompressReader for offset={}, length={}",
-                                decompressed_offset,
-                                decompressed_length
-                            );
-                            Box::new(ranged_reader)
-                        }
-                        Err(e) => {
-                            tracing::error!("RangedDecompressReader failed with invalid range parameters: {}", e);
-                            return Err(e);
-                        }
-                    }
-                } else {
-                    Box::new(HardLimitReader::new(dec_reader, decompressed_length))
-                };
+                let final_reader: Box<dyn AsyncRead + Unpin + Send + Sync> =
+                    if decompressed_offset > 0 || decompressed_length != total_plaintext_size as i64 {
+                        Box::new(RangedDecompressReader::new(
+                            dec_reader,
+                            decompressed_offset,
+                            decompressed_length,
+                            total_plaintext_size,
+                        )?)
+                    } else {
+                        #[cfg(feature = "rio-v2")]
+                        let dec_reader = StreamConsumer::new(dec_reader);
+                        Box::new(HardLimitReader::new(dec_reader, decompressed_length))
+                    };
 
                 let mut object_info = oi.clone();
                 object_info.size = self.object_size;
@@ -1275,19 +1307,10 @@ impl<R: AsyncRead + Unpin + Send + Sync + 'static> AsyncRead for RangedDecompres
                 Poll::Ready(Ok(())) => {
                     let n = temp_read_buf.filled().len();
                     if n == 0 {
-                        // EOF from inner stream
-                        if this.current_offset < this.target_offset {
-                            // We haven't reached the target offset yet - this is an error
-                            return Poll::Ready(Err(std::io::Error::new(
-                                std::io::ErrorKind::UnexpectedEof,
-                                format!(
-                                    "Unexpected EOF: only read {} bytes, target offset is {}",
-                                    this.current_offset, this.target_offset
-                                ),
-                            )));
-                        }
-                        // Normal EOF after reaching target
-                        return Poll::Ready(Ok(()));
+                        return Poll::Ready(Err(std::io::Error::new(
+                            std::io::ErrorKind::UnexpectedEof,
+                            "decompressed stream ended before the requested range was complete",
+                        )));
                     }
 
                     // Update current position
@@ -1664,6 +1687,15 @@ mod tests {
             .await
             .expect_err("EOF before the skip boundary must remain visible");
         assert_eq!(error.kind(), std::io::ErrorKind::UnexpectedEof);
+    }
+
+    #[tokio::test]
+    async fn ranged_decompress_reader_rejects_eof_inside_the_requested_range() {
+        let mut reader = RangedDecompressReader::new(Cursor::new(b"abc"), 1, 3, 4).unwrap();
+        let mut output = Vec::new();
+        let error = reader.read_to_end(&mut output).await.expect_err("short range must fail");
+        assert_eq!(error.kind(), std::io::ErrorKind::UnexpectedEof);
+        assert_eq!(output, b"bc");
     }
 
     #[tokio::test]
@@ -2688,10 +2720,6 @@ mod tests {
         let (compressed_offset, uncompressed_offset) = decoded.find(2_097_152).expect("seek into decoded index");
         assert!(compressed_offset > 0);
         assert_eq!(uncompressed_offset, 2_097_152);
-        let (physical_offset, decompressed_skip, _, _, _) = get_compressed_offsets(&object_info, 2_097_152);
-        assert!(physical_offset > 0);
-        assert_eq!(decompressed_skip, 0);
-
         let range = HTTPRangeSpec {
             is_suffix_length: false,
             start: 2_097_152,
@@ -2830,7 +2858,8 @@ mod tests {
         assert!(compressed_offset > 0);
         assert_eq!(uncompressed_offset, range.start);
 
-        let (physical_offset, decompressed_skip, _, _, _) = get_compressed_offsets(&object_info, range.start);
+        let (physical_offset, _, decompressed_skip) =
+            compressed_storage_window(&object_info, range.start as usize, 10).expect("indexed range");
         assert!(physical_offset > 0);
         assert_eq!(decompressed_skip, 0);
 
@@ -2838,14 +2867,14 @@ mod tests {
             .await
             .expect("MinIO headerless compression index should be decoded");
 
-        assert_eq!(plan.storage_offset as i64, physical_offset);
+        assert_eq!(plan.storage_offset, physical_offset);
         assert_eq!(plan.storage_length, object_info.size - plan.storage_offset as i64);
         assert_eq!(plan.object_size, 10);
     }
 
     #[cfg(feature = "rio-v2")]
     #[test]
-    fn test_get_compressed_offsets_aligns_encrypted_ranges_to_dare_packages() {
+    fn test_get_encrypted_compressed_offsets_aligns_encrypted_ranges_to_dare_packages() {
         let mut index = Index::new();
         index.add(0, 0).unwrap();
         index.add(200_000, 2_097_152).unwrap();
@@ -2879,7 +2908,7 @@ mod tests {
         };
 
         let (physical_offset, decompressed_skip, first_part_idx, decrypt_skip, seq_num) =
-            get_compressed_offsets(&object_info, 2_097_152);
+            get_encrypted_compressed_offsets(&object_info, 2_097_152);
 
         assert_eq!(first_part_idx, 0);
         assert_eq!(physical_offset, (expected_comp_off / DARE_PAYLOAD_SIZE) * DARE_PACKAGE_SIZE);

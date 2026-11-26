@@ -175,10 +175,9 @@ impl S2Index {
 
         let chunk_len = (bytes[1] as usize) | ((bytes[2] as usize) << 8) | ((bytes[3] as usize) << 16);
         bytes = &bytes[SKIPPABLE_FRAME_HEADER..];
-        if bytes.len() < chunk_len {
-            return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "buffer too small"));
+        if bytes.len() != chunk_len {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "invalid index chunk length"));
         }
-        bytes = &bytes[..chunk_len];
 
         if !bytes.starts_with(S2_INDEX_HEADER) {
             return Err(io::Error::new(io::ErrorKind::InvalidData, "invalid index header"));
@@ -234,7 +233,10 @@ impl S2Index {
 
             if idx > 0 {
                 let prev = info[idx - 1].uncompressed_offset;
-                uncompressed_offset += prev + est_block_uncompressed;
+                uncompressed_offset = prev
+                    .checked_add(est_block_uncompressed)
+                    .and_then(|base| base.checked_add(uncompressed_offset))
+                    .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "uncompressed index offset overflow"))?;
                 if uncompressed_offset <= prev {
                     return Err(io::Error::new(io::ErrorKind::InvalidData, "invalid uncompressed offset"));
                 }
@@ -251,9 +253,14 @@ impl S2Index {
             bytes = &bytes[used..];
 
             if idx > 0 {
-                let next_compressed_predict = compressed_predict + compressed_offset / 2;
+                let next_compressed_predict = compressed_predict
+                    .checked_add(compressed_offset / 2)
+                    .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "compressed index prediction overflow"))?;
                 let prev = info[idx - 1].compressed_offset;
-                compressed_offset += prev + compressed_predict;
+                compressed_offset = prev
+                    .checked_add(compressed_predict)
+                    .and_then(|base| base.checked_add(compressed_offset))
+                    .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "compressed index offset overflow"))?;
                 if compressed_offset <= prev {
                     return Err(io::Error::new(io::ErrorKind::InvalidData, "invalid compressed offset"));
                 }
@@ -269,7 +276,7 @@ impl S2Index {
             return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "buffer too small"));
         }
         bytes = &bytes[4..];
-        if !bytes.starts_with(S2_INDEX_TRAILER) {
+        if bytes != S2_INDEX_TRAILER {
             return Err(io::Error::new(io::ErrorKind::InvalidData, "invalid index trailer"));
         }
 
@@ -342,10 +349,10 @@ fn read_uvarint(bytes: &[u8]) -> io::Result<(u64, usize)> {
     let mut shift = 0_u32;
 
     for (idx, byte) in bytes.iter().copied().enumerate() {
+        if idx == 9 && byte > 1 {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "varint overflow"));
+        }
         if byte < 0x80 {
-            if idx > 9 || (idx == 9 && byte > 1) {
-                return Err(io::Error::new(io::ErrorKind::InvalidData, "varint overflow"));
-            }
             return Ok((value | ((byte as u64) << shift), idx + 1));
         }
 
