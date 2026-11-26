@@ -18,10 +18,6 @@ use super::put_input::{PutObjectWriteInput, PutObjectWriteOutput};
 use super::request_body::UploadChunks;
 use super::*;
 use crate::app::RequestEnvelope;
-#[cfg(test)]
-use crate::app::storage_api::s3::dto::{PutObjectInput, ServerSideEncryption, StorageClass, StreamingBlob};
-#[cfg(test)]
-use crate::app::storage_api::s3::stream::ByteStream;
 use futures::FutureExt;
 use rustfs_gateway_stream::Body as NativeBody;
 use rustfs_rio::SharedTrailerSource;
@@ -992,6 +988,16 @@ fn is_post_object_sse_kms_requested(input: &PutObjectWriteInput, headers: &Heade
     is_sse_kms_requested(input, headers)
 }
 
+/// Returns true when raw request headers carry any `x-amz-server-side-encryption*`
+/// header. POST uploads sign form fields rather than HTTP headers, so wire SSE
+/// headers must be rejected instead of merged or silently downgraded to plaintext.
+pub(super) fn has_wire_sse_headers(headers: &HeaderMap) -> bool {
+    headers.keys().any(|name| {
+        let name = name.as_str();
+        name == "x-amz-server-side-encryption" || name.starts_with("x-amz-server-side-encryption-")
+    })
+}
+
 /// Standard content headers and the tagging / storage-class values of a PUT
 /// that become object metadata through [`apply_put_request_metadata_native`].
 pub(super) struct PutObjectContentInput {
@@ -1042,6 +1048,7 @@ pub(super) enum PutObjectOrigin<'a> {
         req: &'a RequestEnvelope,
         event_name: EventName,
         registered_body: bool,
+        replication_bypass_governance: bool,
     },
     /// A trusted in-process caller writing on the server's behalf. There is no
     /// request and no credential: managed-SSE authorization treats the write
@@ -1281,9 +1288,20 @@ impl DefaultObjectUsecase {
         Box::pin(self.execute_put_object_inner(envelope, input)).await
     }
 
+    async fn replication_put_may_bypass_governance(envelope: &mut RequestEnvelope) -> S3Result<bool> {
+        let suppress_denial_log = std::mem::replace(&mut req_info_mut(envelope)?.suppress_denial_log, true);
+        let auth_res = authorize_request(envelope, Action::S3Action(S3Action::BypassGovernanceRetentionAction)).await;
+        req_info_mut(envelope)?.suppress_denial_log = suppress_denial_log;
+        match auth_res {
+            Ok(()) => Ok(true),
+            Err(err) if err.code() == &S3ErrorCode::AccessDenied => Ok(false),
+            Err(err) => Err(err),
+        }
+    }
+
     async fn execute_put_object_inner(
         &self,
-        envelope: RequestEnvelope,
+        mut envelope: RequestEnvelope,
         input: PutObjectWriteInput,
     ) -> rustfs_s3_types::S3Result<PutObjectWriteOutput> {
         let start_time = std::time::Instant::now();
@@ -1312,7 +1330,8 @@ impl DefaultObjectUsecase {
             envelope.uri().query(),
             envelope.verified_presigned().is_some(),
         )?;
-        if envelope.post_object().is_some() && is_post_object_sse_kms_requested(&input, envelope.headers()) {
+        let is_post_object = envelope.post_object().is_some() || envelope.is_gateway_post();
+        if is_post_object && is_post_object_sse_kms_requested(&input, envelope.headers()) {
             return Err(rustfs_s3_types::s3_error!(
                 NotImplemented,
                 "SSE-KMS is not supported for POST object uploads"
@@ -1330,6 +1349,22 @@ impl DefaultObjectUsecase {
         // historical user metadata as a request to untar the member again.
         let inbound_replication_put = replication_request_authorized(&envelope)
             && get_header(envelope.headers(), SUFFIX_SOURCE_REPLICATION_REQUEST).as_deref() == Some("true");
+        // A source lock timestamp header lets an inbound replication PUT update
+        // that lock category on an existing version (including when the
+        // matching `x-amz-object-lock-*` header is omitted). Require the same
+        // Object Lock permissions as the explicit lock headers, and quietly
+        // probe `s3:BypassGovernanceRetention` so weakening active GOVERNANCE
+        // retention requires explicit authorization rather than `s3:ReplicateObject`.
+        let mut replication_bypass_governance = false;
+        if inbound_replication_put {
+            if get_header(envelope.headers(), rustfs_utils::http::SUFFIX_SOURCE_REPLICATION_LEGALHOLD_TIMESTAMP).is_some() {
+                authorize_request(&mut envelope, Action::S3Action(S3Action::PutObjectLegalHoldAction)).await?;
+            }
+            if get_header(envelope.headers(), rustfs_utils::http::SUFFIX_SOURCE_REPLICATION_RETENTION_TIMESTAMP).is_some() {
+                authorize_request(&mut envelope, Action::S3Action(S3Action::PutObjectRetentionAction)).await?;
+                replication_bypass_governance = Self::replication_put_may_bypass_governance(&mut envelope).await?;
+            }
+        }
         if max_content_length.is_some() && is_put_object_extract_requested(envelope.headers()) {
             return Err(S3Error::with_message(
                 S3ErrorCode::InvalidRequest,
@@ -1347,7 +1382,14 @@ impl DefaultObjectUsecase {
             inbound_replication_put && rustfs_utils::http::ssec_transport_to_stored_metadata(envelope.headers()).is_some();
 
         let trailing_headers = input.trailing_headers.clone();
-        let metadata_headers = input.metadata_headers.as_ref().unwrap_or_else(|| envelope.headers());
+        let empty_metadata_headers = HeaderMap::new();
+        let metadata_headers = input.metadata_headers.as_ref().unwrap_or_else(|| {
+            if is_post_object {
+                &empty_metadata_headers
+            } else {
+                envelope.headers()
+            }
+        });
         let checksum_headers = input.checksum_headers.as_ref().unwrap_or_else(|| envelope.headers());
 
         let PutObjectWriteInput {
@@ -1381,20 +1423,32 @@ impl DefaultObjectUsecase {
         // POST form uploads share the storage path but are a distinct S3
         // operation.  The V1 hint is defined for direct PutObject only, so a
         // POST field remains ordinary user metadata and never selects layout.
-        let ec_block_size_hint = if envelope.post_object().is_some() {
+        let ec_block_size_hint = if is_post_object {
             None
         } else {
             extract_ec_block_size_hint(envelope.headers(), metadata.as_ref())?
         };
 
-        // Merge SSE-C params from headers (fallback when S3 layer does not populate input)
-        let (h_algo, h_key, h_md5) = extract_ssec_params_from_headers(envelope.headers())?;
-        let sse_customer_algorithm = sse_customer_algorithm.or(h_algo);
-        let sse_customer_key = sse_customer_key.or(h_key);
-        let sse_customer_key_md5 = sse_customer_key_md5.or(h_md5);
+        let (sse_customer_algorithm, sse_customer_key, sse_customer_key_md5, server_side_encryption) = if is_post_object {
+            if has_wire_sse_headers(envelope.headers()) {
+                return Err(rustfs_s3_types::s3_error!(
+                    AccessDenied,
+                    "POST encryption parameters must be supplied as form fields"
+                ));
+            }
+            (sse_customer_algorithm, sse_customer_key, sse_customer_key_md5, server_side_encryption)
+        } else {
+            // Merge SSE-C params from headers (fallback when S3 layer does not populate input)
+            let (h_algo, h_key, h_md5) = extract_ssec_params_from_headers(envelope.headers())?;
+            let sse_customer_algorithm = sse_customer_algorithm.or(h_algo);
+            let sse_customer_key = sse_customer_key.or(h_key);
+            let sse_customer_key_md5 = sse_customer_key_md5.or(h_md5);
 
-        // Merge server_side_encryption from headers (fallback when S3 layer does not populate input)
-        let server_side_encryption = server_side_encryption.or(extract_server_side_encryption_from_headers(envelope.headers())?);
+            // Merge server_side_encryption from headers (fallback when S3 layer does not populate input)
+            let server_side_encryption =
+                server_side_encryption.or(extract_server_side_encryption_from_headers(envelope.headers())?);
+            (sse_customer_algorithm, sse_customer_key, sse_customer_key_md5, server_side_encryption)
+        };
 
         // Validate object key
         validate_new_object_key(&key, request_method_name)?;
@@ -1487,6 +1541,7 @@ impl DefaultObjectUsecase {
                 req: &envelope,
                 event_name,
                 registered_body: rdma_put.is_some(),
+                replication_bypass_governance,
             },
         };
         #[cfg_attr(
@@ -1860,6 +1915,20 @@ impl DefaultObjectUsecase {
             object_lock.retain_until_date,
             &mut opts,
         )?;
+        if matches!(
+            origin,
+            PutObjectOrigin::S3 {
+                replication_bypass_governance: true,
+                ..
+            }
+        ) {
+            opts.object_lock_retention =
+                Some(crate::app::storage_api::object_meta_usecase::contract::ObjectLockRetentionOptions {
+                    mode: None,
+                    retain_until: None,
+                    bypass_governance: true,
+                });
+        }
         // A lockless cache bucket commits without distributed locks. Every feature
         // those locks protect sends the PUT down the locked path instead.
         if matches!(origin, PutObjectOrigin::S3 { .. })
@@ -1963,8 +2032,15 @@ impl DefaultObjectUsecase {
         // response (#1256); captured at want_checksum set points before opts is moved.
         let mut put_extra_checksum_headers: Vec<(&'static str, String)> = Vec::new();
         let cache_adapter = self.object_data_cache();
-        let fill_on_put_collector =
-            put_body_cache_collector(&cache_adapter, size, should_compress, ciphertext_passthrough, headers);
+        // Skip fill-on-put for inbound replication PUTs: a replication write
+        // targeting an actively locked version commits metadata-only and
+        // preserves the existing payload on disk, so caching the incoming wire
+        // body under the preserved ETag/version would poison cache reads.
+        let fill_on_put_collector = if inbound_replication_put {
+            None
+        } else {
+            put_body_cache_collector(&cache_adapter, size, should_compress, ciphertext_passthrough, headers)
+        };
         let reader_prepare_stage_start = put_stage_metrics_enabled.then(Instant::now);
         let registered_body = matches!(
             origin,
@@ -2600,8 +2676,6 @@ mod tests {
     }
 
     use super::*;
-    use crate::app::storage_api::s3::dto::ObjectLockRetentionMode;
-    use crate::app::storage_api::s3::{S3Error, S3ErrorCode, S3Result};
     use crate::app::test_seams::{
         get_envelope, get_object_gateway, get_object_input, head_envelope, head_object_input, read_get_body,
     };
@@ -2641,18 +2715,15 @@ mod tests {
         }
     }
 
-    async fn put_method_only(usecase: &DefaultObjectUsecase, input: PutObjectInput) -> S3Result<PutObjectWriteOutput> {
-        let input = PutObjectWriteInput::from_legacy(input, None);
-        Box::pin(usecase.execute_put_object_owned(method_only_put_envelope(), input))
-            .await
-            .map_err(crate::error::legacy_error_for_test)
+    async fn put_method_only(usecase: &DefaultObjectUsecase, input: PutObjectWriteInput) -> S3Result<PutObjectWriteOutput> {
+        Box::pin(usecase.execute_put_object_owned(method_only_put_envelope(), input)).await
     }
 
-    async fn put_extract_method_only(usecase: &DefaultObjectUsecase, input: PutObjectInput) -> S3Result<PutObjectWriteOutput> {
-        let input = PutObjectWriteInput::from_legacy(input, None);
-        Box::pin(usecase.execute_put_object_extract_owned(method_only_put_envelope(), input))
-            .await
-            .map_err(crate::error::legacy_error_for_test)
+    async fn put_extract_method_only(
+        usecase: &DefaultObjectUsecase,
+        input: PutObjectWriteInput,
+    ) -> S3Result<PutObjectWriteOutput> {
+        Box::pin(usecase.execute_put_object_extract_owned(method_only_put_envelope(), input)).await
     }
 
     #[tokio::test]
@@ -2668,13 +2739,7 @@ mod tests {
             .await
             .expect("create PUT completion bucket");
         let payload = Bytes::from_static(b"readable after PUT acknowledgement");
-        let input = PutObjectInput::builder()
-            .bucket(bucket.clone())
-            .key("object".to_owned())
-            .content_length(Some(i64::try_from(payload.len()).expect("small payload length")))
-            .body(Some(StreamingBlob::from_bytes(payload.clone())))
-            .build()
-            .expect("PUT completion request");
+        let input = put_bytes(bucket.clone(), "object", payload.clone());
         let usecase = DefaultObjectUsecase::with_context(Some(context));
         let (response, observed) = PUT_STORAGE_TEST_COMPLETION
             .scope(std::cell::Cell::new(None), async {
@@ -2743,13 +2808,9 @@ mod tests {
         let usecase = DefaultObjectUsecase::with_context(Some(context));
         let recorder = DebuggingRecorder::new();
         let snapshotter = recorder.snapshotter();
-        let input = |invalid_class: bool| PutObjectInput {
-            bucket: bucket.clone(),
-            key: "counted".to_owned(),
-            body: Some(StreamingBlob::from_bytes(Bytes::from_static(b"count"))),
-            content_length: Some(5),
-            storage_class: invalid_class.then(|| StorageClass::from_static("INVALID")),
-            ..Default::default()
+        let input = |invalid_class: bool| PutObjectWriteInput {
+            storage_class: invalid_class.then(|| "INVALID".to_owned()),
+            ..put_bytes(bucket.clone(), "counted", Bytes::from_static(b"count"))
         };
         let baseline = official_count();
         let mut observed = 0;
@@ -2768,7 +2829,7 @@ mod tests {
                 .expect("successful PUT");
             assert_eq!(put_count(&snapshotter, &mut observed), 0, "the use case does not count an accepted PUT");
             assert_eq!(official_count() - baseline, 0, "official operation total");
-            let input = PutObjectInput {
+            let input = PutObjectWriteInput {
                 bucket: bucket.clone(),
                 key: "archive.tar".to_owned(),
                 ..Default::default()
@@ -2803,13 +2864,7 @@ mod tests {
         runtime
             .block_on(Box::pin(store.make_bucket(&bucket, &MakeBucketOptions::default())))
             .expect("test bucket");
-        let input = PutObjectInput::builder()
-            .bucket(bucket)
-            .key("test-object".to_string())
-            .body(Some(StreamingBlob::from_bytes(Bytes::from_static(b"payload"))))
-            .content_length(Some(7))
-            .build()
-            .expect("PUT input");
+        let input = put_bytes(bucket, "test-object", Bytes::from_static(b"payload"));
         let usecase = DefaultObjectUsecase::with_context(Some(context));
         let recorder = DebuggingRecorder::new();
         let snapshotter = recorder.snapshotter();
@@ -2951,13 +3006,7 @@ mod tests {
         let usecase = DefaultObjectUsecase::with_context(Some(context));
         for (index, failure) in [StorageError::DiskFull, StorageError::StorageFull].into_iter().enumerate() {
             let key = format!("refused-{index}");
-            let input = PutObjectInput::builder()
-                .bucket(bucket.clone())
-                .key(key.clone())
-                .body(Some(StreamingBlob::from_bytes(Bytes::from_static(b"capacity probe"))))
-                .content_length(Some(14))
-                .build()
-                .expect("capacity PUT input must build");
+            let input = put_bytes(bucket.clone(), &key, Bytes::from_static(b"capacity probe"));
             let error = PUT_STORAGE_TEST_FAILURE
                 .scope((PutStorageTestStage::Commit, failure), put_method_only(&usecase, input))
                 .await
@@ -3113,8 +3162,7 @@ mod tests {
 
     #[test]
     fn put_request_user_metadata_cannot_suppress_bucket_default_retention() {
-        let mut metadata =
-            HashMap::from([(AMZ_OBJECT_LOCK_MODE_LOWER.to_string(), ObjectLockRetentionMode::GOVERNANCE.to_string())]);
+        let mut metadata = HashMap::from([(AMZ_OBJECT_LOCK_MODE_LOWER.to_string(), "GOVERNANCE".to_string())]);
         apply_put_request_metadata_native(
             &mut metadata,
             &HeaderMap::new(),
@@ -3581,25 +3629,38 @@ mod tests {
 
     #[tokio::test]
     async fn put_object_body_read_timeout_guard_preserves_length_and_passes_through() {
-        let body = StreamingBlob::from_bytes(Bytes::from_static(b"hello world"));
-        assert_eq!(body.remaining_length().exact(), Some(11));
+        let body = super::super::native_body::from_io_stream_with_length(
+            futures::stream::iter([Ok(Bytes::from_static(b"hello world"))]),
+            Some(11),
+        );
+        assert_eq!(body.len_hint(), Some(11));
 
-        let (mut guarded, _) = super::super::request_body::guard_upload_progress(
-            body,
+        let (chunks, _) = super::super::native_body::BodyChunks::new(body);
+        let (mut guarded, _) = super::super::request_body::guard_native_upload_progress(
+            Box::new(chunks),
             Duration::from_secs(60),
             "test-bucket",
             "ok-object",
             "req-2",
             11,
         );
-        // remaining_length must be forwarded, not reset to unknown.
-        assert_eq!(guarded.remaining_length().exact(), Some(11));
 
         let mut collected = Vec::new();
         while let Some(chunk) = guarded.next().await {
             collected.extend_from_slice(&chunk.expect("chunk should read"));
         }
         assert_eq!(collected, b"hello world");
+
+        // size_hint on UploadProgressStream must also forward the inner stream's bounds.
+        let (sized_guarded, _) = super::super::request_body::guard_native_upload_progress(
+            Box::new(futures::stream::iter([Ok(Bytes::from_static(b"hello world"))])),
+            Duration::from_secs(60),
+            "test-bucket",
+            "ok-object",
+            "req-3",
+            11,
+        );
+        assert_eq!(sized_guarded.size_hint(), (1, Some(1)));
     }
 
     #[tokio::test]
@@ -3673,10 +3734,7 @@ mod tests {
 
     #[test]
     fn select_put_path_treats_bucket_default_sse_as_encrypted() {
-        for (algorithm, kms_key_id) in [
-            (ServerSideEncryption::AES256, None),
-            (ServerSideEncryption::AWS_KMS, Some("bucket-key")),
-        ] {
+        for (algorithm, kms_key_id) in [("AES256", None), ("aws:kms", Some("bucket-key"))] {
             let config = ServerSideEncryptionConfiguration {
                 rules: vec![ServerSideEncryptionRule {
                     apply_server_side_encryption_by_default: Some(ServerSideEncryptionByDefault {
@@ -4449,13 +4507,13 @@ mod tests {
     #[tokio::test]
     async fn gateway_post_archive_is_refused_before_body_on_both_internal_paths() {
         for direct_extract in [false, true] {
-            let (body, polls) = PollCountingBody::streaming_blob();
-            let input = PutObjectInput::builder()
-                .bucket("test-bucket".to_owned())
-                .key("archive.tar".to_owned())
-                .body(Some(body))
-                .build()
-                .expect("archive input");
+            let (body, polls) = PollCountingBody::native_body();
+            let input = PutObjectWriteInput {
+                bucket: "test-bucket".to_owned(),
+                key: "archive.tar".to_owned(),
+                body: Some(body),
+                ..Default::default()
+            };
             let mut headers = HeaderMap::new();
             headers.insert(AMZ_SNOWBALL_EXTRACT, HeaderValue::from_static("true"));
             // POST `/`, the snowball header, and the post-object marker. Credentials, region, and service stay absent.
@@ -4463,7 +4521,6 @@ mod tests {
             assert!(!envelope.is_gateway_post(), "legacy provenance must remain distinct");
             envelope.mark_gateway_post();
             assert!(envelope.fork_for_authorization().is_gateway_post());
-            let input = PutObjectWriteInput::from_legacy(input, None);
             let usecase = DefaultObjectUsecase::without_context();
             let result = if direct_extract {
                 Box::pin(usecase.execute_put_object_extract_owned(envelope, input)).await
@@ -4485,7 +4542,7 @@ mod tests {
         let input = PutObjectWriteInput {
             bucket: "test-bucket".to_owned(),
             key: "test-key".to_owned(),
-            server_side_encryption: Some(ServerSideEncryption::AWS_KMS.to_owned()),
+            server_side_encryption: Some("aws:kms".to_owned()),
             ..Default::default()
         };
 
@@ -4501,7 +4558,7 @@ mod tests {
         let input = PutObjectWriteInput {
             bucket: "test-bucket".to_owned(),
             key: "archive.tar".to_owned(),
-            server_side_encryption: Some(ServerSideEncryption::AWS_KMS.to_owned()),
+            server_side_encryption: Some("aws:kms".to_owned()),
             ..Default::default()
         };
         let mut headers = HeaderMap::new();
@@ -4643,6 +4700,164 @@ mod tests {
 
         let err = Box::pin(usecase.execute_put_object_owned(envelope, input)).await.unwrap_err();
         assert_eq!(err.code(), &OwnedS3ErrorCode::NotImplemented);
+    }
+
+    #[tokio::test]
+    async fn execute_put_object_rejects_post_object_unsigned_wire_sse_headers() {
+        let key_b64 = base64_simd::STANDARD.encode_to_string([0x11_u8; 32]);
+        let key_md5 = base64_simd::STANDARD.encode_to_string(Md5::digest([0x11_u8; 32]));
+        let cases: &[(&str, Vec<(&str, &str)>)] = &[
+            ("sse-s3", vec![("x-amz-server-side-encryption", "AES256")]),
+            (
+                "sse-c",
+                vec![
+                    ("x-amz-server-side-encryption-customer-algorithm", "AES256"),
+                    ("x-amz-server-side-encryption-customer-key", key_b64.as_str()),
+                    ("x-amz-server-side-encryption-customer-key-md5", key_md5.as_str()),
+                ],
+            ),
+            ("sse-context", vec![("x-amz-server-side-encryption-context", "e30=")]),
+            ("sse-bucket-key", vec![("x-amz-server-side-encryption-bucket-key-enabled", "true")]),
+        ];
+        let usecase = DefaultObjectUsecase::without_context();
+
+        for (label, wire_headers) in cases {
+            let mut headers = HeaderMap::new();
+            for (name, value) in wire_headers {
+                headers.insert(
+                    HeaderName::from_bytes(name.as_bytes()).expect("header name"),
+                    HeaderValue::from_str(value).expect("header value"),
+                );
+            }
+            let input = PutObjectWriteInput {
+                bucket: "test-bucket".to_owned(),
+                key: "test-key".to_owned(),
+                ..Default::default()
+            };
+            let envelope = write_envelope(Method::POST, http::Uri::from_static("/"), headers.clone(), http::Extensions::new());
+            let err = Box::pin(usecase.execute_put_object_owned(envelope, input))
+                .await
+                .expect_err("unsigned wire SSE on POST must be rejected, not downgraded");
+            assert_eq!(err.code(), &OwnedS3ErrorCode::AccessDenied, "{label}");
+
+            // Even when the form specifies SSE-S3, additional unsigned wire SSE headers must be rejected.
+            let combined_input = PutObjectWriteInput {
+                bucket: "test-bucket".to_owned(),
+                key: "test-key".to_owned(),
+                server_side_encryption: Some("AES256".to_owned()),
+                ..Default::default()
+            };
+            let mut gateway_envelope = RequestEnvelope::from_parts(
+                crate::app::RequestHead {
+                    method: Method::POST,
+                    uri: http::Uri::from_static("/"),
+                    headers,
+                    credentials: None,
+                    region: None,
+                    service: None,
+                },
+                http::Extensions::new(),
+            );
+            gateway_envelope.mark_gateway_post();
+            let err = Box::pin(usecase.execute_put_object_owned(gateway_envelope, combined_input))
+                .await
+                .expect_err("wire SSE alongside form SSE must be rejected");
+            assert_eq!(err.code(), &OwnedS3ErrorCode::AccessDenied, "{label} (gateway)");
+        }
+
+        // Positive control: form-supplied SSE-S3 without wire SSE headers passes the POST wire-SSE guard.
+        let form_sse_input = PutObjectWriteInput {
+            bucket: "test-bucket".to_owned(),
+            key: "test-key".to_owned(),
+            server_side_encryption: Some("AES256".to_owned()),
+            ..Default::default()
+        };
+        let envelope = write_envelope(Method::POST, http::Uri::from_static("/"), HeaderMap::new(), http::Extensions::new());
+        let err = Box::pin(usecase.execute_put_object_owned(envelope, form_sse_input))
+            .await
+            .expect_err("without_context stops at missing body");
+        assert_eq!(err.code(), &OwnedS3ErrorCode::IncompleteBody);
+
+        // Positive control: PUT keeps honoring signed wire SSE headers.
+        let mut put_headers = HeaderMap::new();
+        put_headers.insert(AMZ_SERVER_SIDE_ENCRYPTION, HeaderValue::from_static("AES256"));
+        let put_input = PutObjectWriteInput {
+            bucket: "test-bucket".to_owned(),
+            key: "test-key".to_owned(),
+            ..Default::default()
+        };
+        let put_envelope = write_envelope(Method::PUT, http::Uri::from_static("/"), put_headers, http::Extensions::new());
+        let err = Box::pin(usecase.execute_put_object_owned(put_envelope, put_input))
+            .await
+            .expect_err("without_context stops at missing body");
+        assert_eq!(err.code(), &OwnedS3ErrorCode::IncompleteBody);
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn execute_put_object_post_ignores_wire_lock_and_content_headers_without_projection() {
+        use crate::app::storage_api::test::bucket::metadata::OBJECT_LOCK_CONFIG;
+        use crate::app::storage_api::test::contract::bucket::{BucketOperations as _, MakeBucketOptions};
+
+        let (store, context) = real_store_test_context().await;
+        let bucket = format!("post-wire-lock-{}", Uuid::new_v4());
+        store
+            .make_bucket(
+                &bucket,
+                &MakeBucketOptions {
+                    lock_enabled: true,
+                    versioning_enabled: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("create object-lock bucket");
+        metadata_sys::update(
+            &bucket,
+            OBJECT_LOCK_CONFIG,
+            b"<ObjectLockConfiguration><ObjectLockEnabled>Enabled</ObjectLockEnabled><Rule><DefaultRetention><Mode>COMPLIANCE</Mode><Days>1</Days></DefaultRetention></Rule></ObjectLockConfiguration>".to_vec(),
+        )
+        .await
+        .expect("install bucket default retention");
+
+        let mut headers = HeaderMap::new();
+        headers.insert(AMZ_OBJECT_LOCK_MODE_LOWER, HeaderValue::from_static("GOVERNANCE"));
+        headers.insert(AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE_LOWER, HeaderValue::from_static("2000-01-01T00:00:00Z"));
+        headers.insert(AMZ_OBJECT_LOCK_LEGAL_HOLD_LOWER, HeaderValue::from_static("ON"));
+        headers.insert("content-disposition", HeaderValue::from_static("inline"));
+        headers.insert("cache-control", HeaderValue::from_static("no-store"));
+        headers.insert("x-amz-tagging", HeaderValue::from_static("injected=wire"));
+
+        let envelope = write_envelope(Method::POST, http::Uri::from_static("/"), headers, http::Extensions::new());
+        let input = put_bytes(bucket.clone(), "post-object.txt", Bytes::from_static(b"hello"));
+        let usecase = DefaultObjectUsecase::with_context(Some(context));
+        Box::pin(usecase.execute_put_object_owned(envelope, input))
+            .await
+            .expect("POST upload should commit with bucket defaults");
+
+        let stored = store
+            .get_object_info(&bucket, "post-object.txt", &ObjectOptions::default())
+            .await
+            .expect("read stored POST object");
+        assert!(!stored.user_defined.contains_key("content-disposition"));
+        assert!(!stored.user_defined.contains_key("cache-control"));
+        assert!(!stored.user_defined.contains_key(AMZ_OBJECT_LOCK_LEGAL_HOLD_LOWER));
+        assert!(stored.user_tags.is_empty(), "wire tags must not persist: {}", stored.user_tags);
+        assert_eq!(
+            stored.user_defined.get(AMZ_OBJECT_LOCK_MODE_LOWER).map(String::as_str),
+            Some("COMPLIANCE"),
+            "bucket default retention mode must not be suppressed by wire headers"
+        );
+        let retain_until = stored
+            .user_defined
+            .get(AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE_LOWER)
+            .expect("bucket default retain-until date");
+        let parsed = time::OffsetDateTime::parse(retain_until, &time::format_description::well_known::Rfc3339)
+            .expect("valid RFC3339 default retain-until date");
+        assert!(
+            parsed > time::OffsetDateTime::now_utc(),
+            "wire past retain-until date must not suppress bucket default retention: {retain_until}"
+        );
     }
 
     #[tokio::test]
@@ -4858,8 +5073,8 @@ mod tests {
         );
 
         for (algorithm, kms_key_id, prefix) in [
-            (ServerSideEncryption::AES256, None, "ssec-over-aes256-default"),
-            (ServerSideEncryption::AWS_KMS, Some("bucket-key"), "ssec-over-kms-default"),
+            ("AES256", None, "ssec-over-aes256-default"),
+            ("aws:kms", Some("bucket-key"), "ssec-over-kms-default"),
         ] {
             let (store, bucket) = crate::app::gating_test_env::durable_quota_test_bucket(prefix, 1 << 20).await;
             install_bucket_default_sse_for_test(&bucket, algorithm, kms_key_id).await;
@@ -4955,10 +5170,7 @@ mod tests {
                 stored.user_defined
             );
             assert!(
-                !stored
-                    .user_defined
-                    .values()
-                    .any(|value| value == ServerSideEncryption::AWS_KMS),
+                !stored.user_defined.values().any(|value| value == "aws:kms"),
                 "the bucket default must not claim managed encryption on an SSE-C object: {:?}",
                 stored.user_defined
             );
@@ -5033,17 +5245,17 @@ mod tests {
 
         let body_polled = Arc::new(AtomicBool::new(false));
         let body_polled_in_stream = Arc::clone(&body_polled);
-        let body = StreamingBlob::wrap(futures::stream::once(async move {
+        let body = super::super::native_body::from_io_stream(futures::stream::once(async move {
             body_polled_in_stream.store(true, Ordering::Release);
             Ok::<Bytes, std::io::Error>(Bytes::new())
         }));
-        let input = PutObjectInput::builder()
-            .bucket(bucket)
-            .key("object".to_string())
-            .body(Some(body))
-            .content_length(Some(i64::try_from(2 * GI_B).expect("test size should fit i64")))
-            .build()
-            .expect("legacy quota PUT input should build");
+        let input = PutObjectWriteInput {
+            bucket,
+            key: "object".to_string(),
+            body: Some(body),
+            content_length: Some(i64::try_from(2 * GI_B).expect("test size should fit i64")),
+            ..Default::default()
+        };
 
         let err = put_method_only(&DefaultObjectUsecase::from_global(), input)
             .await
@@ -5666,6 +5878,322 @@ mod tests {
             .expect_err("a refused extract upload must not leave an object behind");
         assert!(is_err_object_not_found(&lookup_err), "{lookup_err}");
     }
+
+    #[test]
+    #[serial_test::serial]
+    fn forged_replication_put_cannot_unlock_or_overwrite_locked_version() {
+        crate::app::gating_test_env::run_large_stack_test("forged-replication-put-worm", || async {
+            use crate::app::storage_api::object_usecase::StoragePutObjReader;
+            use crate::app::storage_api::test::contract::bucket::{BucketOperations as _, MakeBucketOptions};
+            use crate::app::storage_api::test::contract::object::ObjectIO as _;
+            use rustfs_utils::http::metadata_compat::{
+                SUFFIX_OBJECTLOCK_LEGALHOLD_TIMESTAMP, SUFFIX_OBJECTLOCK_RETENTION_TIMESTAMP, insert_str,
+            };
+            use rustfs_utils::http::{
+                SUFFIX_SOURCE_ETAG, SUFFIX_SOURCE_MTIME, SUFFIX_SOURCE_REPLICATION_LEGALHOLD_TIMESTAMP,
+                SUFFIX_SOURCE_REPLICATION_RETENTION_TIMESTAMP,
+            };
+            use tokio::io::AsyncReadExt as _;
+
+            async fn set_policy(bucket: &str, statements: &str) {
+                let policy_json = format!(r#"{{"Version":"2012-10-17","Statement":[{statements}]}}"#).replace("BUCKET", bucket);
+                let mut metadata = (*crate::storage::get_bucket_metadata(bucket)
+                    .await
+                    .expect("load bucket metadata"))
+                .clone();
+                metadata.policy_config = Some(serde_json::from_str(&policy_json).expect("parse bucket policy"));
+                metadata.policy_config_json = policy_json.into_bytes();
+                crate::storage::storage_api::set_bucket_metadata(bucket.to_owned(), metadata)
+                    .await
+                    .expect("publish bucket policy");
+            }
+
+            async fn read_version_bytes(store: &Arc<ECStore>, bucket: &str, key: &str, version_id: &str) -> Vec<u8> {
+                let opts = ObjectOptions {
+                    versioned: true,
+                    version_id: Some(version_id.to_owned()),
+                    ..Default::default()
+                };
+                let mut reader = store
+                    .get_object_reader(bucket, key, None, HeaderMap::new(), &opts)
+                    .await
+                    .expect("read locked object version");
+                let mut bytes = Vec::new();
+                reader.stream.read_to_end(&mut bytes).await.expect("read object bytes");
+                bytes
+            }
+
+            fn replication_put_envelope(bucket: &str, key: &str, version_id: &str, headers: HeaderMap) -> RequestEnvelope {
+                let mut envelope = write_envelope(Method::PUT, http::Uri::from_static("/"), headers, http::Extensions::new());
+                envelope.install_req_info(crate::storage::req_info::ReqInfo {
+                    bucket: Some(bucket.to_owned()),
+                    object: Some(key.to_owned()),
+                    version_id: Some(version_id.to_owned()),
+                    replication_request_authorized: true,
+                    ..Default::default()
+                });
+                envelope
+            }
+
+            const T_OLD: &str = "2026-01-01T00:00:00Z";
+            const T_STALE: &str = "2025-01-01T00:00:00Z";
+            const T_NEW: &str = "2099-01-01T00:00:00Z";
+            const ALLOW_PUT_AND_REPLICATE: &str = r#"{"Effect":"Allow","Principal":{"AWS":"*"},"Action":["s3:PutObject","s3:ReplicateObject"],"Resource":["arn:aws:s3:::BUCKET/*"]}"#;
+            const ALLOW_ALL: &str =
+                r#"{"Effect":"Allow","Principal":{"AWS":"*"},"Action":["s3:*"],"Resource":["arn:aws:s3:::BUCKET/*"]}"#;
+            const DENY_BYPASS: &str = r#"{"Effect":"Deny","Principal":{"AWS":"*"},"Action":["s3:BypassGovernanceRetention"],"Resource":["arn:aws:s3:::BUCKET/*"]}"#;
+
+            let (store, context) = real_store_test_context().await;
+            let bucket = format!("forged-repl-worm-{}", Uuid::new_v4().simple());
+            store
+                .make_bucket(
+                    &bucket,
+                    &MakeBucketOptions {
+                        lock_enabled: true,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect("create Object Lock bucket");
+            let usecase = DefaultObjectUsecase::with_context(Some(Arc::clone(&context)));
+
+            // Seed a COMPLIANCE + LegalHold ON version.
+            let compliance_key = "compliance-evidence.bin";
+            let compliance_payload = b"original compliance evidence";
+            let mut compliance_meta = HashMap::new();
+            compliance_meta.insert(AMZ_OBJECT_LOCK_MODE_LOWER.to_owned(), "COMPLIANCE".to_owned());
+            compliance_meta.insert(AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE_LOWER.to_owned(), "2099-01-01T00:00:00Z".to_owned());
+            compliance_meta.insert(AMZ_OBJECT_LOCK_LEGAL_HOLD_LOWER.to_owned(), "ON".to_owned());
+            insert_str(&mut compliance_meta, SUFFIX_OBJECTLOCK_RETENTION_TIMESTAMP, T_OLD.to_owned());
+            insert_str(&mut compliance_meta, SUFFIX_OBJECTLOCK_LEGALHOLD_TIMESTAMP, T_OLD.to_owned());
+            let mut compliance_reader = StoragePutObjReader::from_vec(compliance_payload.to_vec());
+            let seeded_compliance = store
+                .put_object(
+                    &bucket,
+                    compliance_key,
+                    &mut compliance_reader,
+                    &ObjectOptions {
+                        versioned: true,
+                        user_defined: compliance_meta,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect("seed COMPLIANCE + LegalHold version");
+            let compliance_vid = seeded_compliance.version_id.expect("compliance version id").to_string();
+
+            // Seed a GOVERNANCE-retained version.
+            let governance_key = "governance-evidence.bin";
+            let governance_payload = b"original governance evidence";
+            let mut governance_meta = HashMap::new();
+            governance_meta.insert(AMZ_OBJECT_LOCK_MODE_LOWER.to_owned(), "GOVERNANCE".to_owned());
+            governance_meta.insert(AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE_LOWER.to_owned(), "2099-01-01T00:00:00Z".to_owned());
+            insert_str(&mut governance_meta, SUFFIX_OBJECTLOCK_RETENTION_TIMESTAMP, T_OLD.to_owned());
+            let mut governance_reader = StoragePutObjReader::from_vec(governance_payload.to_vec());
+            let seeded_governance = store
+                .put_object(
+                    &bucket,
+                    governance_key,
+                    &mut governance_reader,
+                    &ObjectOptions {
+                        versioned: true,
+                        user_defined: governance_meta,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect("seed GOVERNANCE version");
+            let governance_vid = seeded_governance.version_id.expect("governance version id").to_string();
+
+            // 1. Caller with only PutObject + ReplicateObject cannot send source lock timestamp headers
+            //    (via either x-rustfs-* or x-minio-* alias) without PutObjectRetention / PutObjectLegalHold.
+            set_policy(&bucket, ALLOW_PUT_AND_REPLICATE).await;
+            for (header_name, header_val) in [
+                ("x-rustfs-source-replication-retention-timestamp", T_NEW),
+                ("x-minio-source-replication-legalhold-timestamp", T_NEW),
+            ] {
+                let mut headers = HeaderMap::new();
+                insert_header(&mut headers, SUFFIX_SOURCE_REPLICATION_REQUEST, "true");
+                headers.insert(HeaderName::from_static(header_name), HeaderValue::from_static(header_val));
+                let mut input = put_bytes(bucket.clone(), compliance_key, Bytes::from_static(b"forged"));
+                input.version_id = Some(compliance_vid.clone());
+                let err = Box::pin(usecase.execute_put_object_owned(
+                    replication_put_envelope(&bucket, compliance_key, &compliance_vid, headers),
+                    input,
+                ))
+                .await
+                .expect_err("source lock timestamp headers must require PutObjectRetention/PutObjectLegalHold");
+                assert_eq!(err.code(), &OwnedS3ErrorCode::AccessDenied, "{header_name}");
+            }
+
+            // 2. Even with full s3:* permissions, forged future timestamps omitting lock headers or
+            //    attempting to downgrade/shorten COMPLIANCE retention must be rejected.
+            set_policy(&bucket, ALLOW_ALL).await;
+            {
+                let mut headers = HeaderMap::new();
+                insert_header(&mut headers, SUFFIX_SOURCE_REPLICATION_REQUEST, "true");
+                insert_header(&mut headers, SUFFIX_SOURCE_REPLICATION_RETENTION_TIMESTAMP, T_NEW);
+                insert_header(&mut headers, SUFFIX_SOURCE_REPLICATION_LEGALHOLD_TIMESTAMP, T_NEW);
+                let mut input = put_bytes(bucket.clone(), compliance_key, Bytes::from_static(b"forged"));
+                input.version_id = Some(compliance_vid.clone());
+                let err = Box::pin(usecase.execute_put_object_owned(
+                    replication_put_envelope(&bucket, compliance_key, &compliance_vid, headers),
+                    input,
+                ))
+                .await
+                .expect_err("forged future timestamps must not clear COMPLIANCE or LegalHold");
+                assert_eq!(err.code(), &OwnedS3ErrorCode::AccessDenied);
+            }
+            {
+                let mut headers = HeaderMap::new();
+                insert_header(&mut headers, SUFFIX_SOURCE_REPLICATION_REQUEST, "true");
+                insert_header(&mut headers, SUFFIX_SOURCE_REPLICATION_RETENTION_TIMESTAMP, T_NEW);
+                insert_header(&mut headers, SUFFIX_SOURCE_REPLICATION_LEGALHOLD_TIMESTAMP, T_NEW);
+                let mut input = put_bytes(bucket.clone(), compliance_key, Bytes::from_static(b"forged"));
+                input.version_id = Some(compliance_vid.clone());
+                input.object_lock_mode = Some("GOVERNANCE".to_owned());
+                input.object_lock_retain_until_date = Some(
+                    time::OffsetDateTime::parse("2099-01-01T00:00:00Z", &time::format_description::well_known::Rfc3339)
+                        .expect("valid RFC3339 date"),
+                );
+                input.object_lock_legal_hold_status = Some("ON".to_owned());
+                let err = Box::pin(usecase.execute_put_object_owned(
+                    replication_put_envelope(&bucket, compliance_key, &compliance_vid, headers),
+                    input,
+                ))
+                .await
+                .expect_err("replication PUT must not downgrade COMPLIANCE to GOVERNANCE");
+                assert_eq!(err.code(), &OwnedS3ErrorCode::AccessDenied);
+            }
+
+            // 3. Stale timestamps and legitimate COMPLIANCE extension + LegalHold OFF updates must
+            //    never overwrite payload bytes, ETag, or mod_time on the locked version.
+            {
+                let mut headers = HeaderMap::new();
+                insert_header(&mut headers, SUFFIX_SOURCE_REPLICATION_REQUEST, "true");
+                insert_header(&mut headers, SUFFIX_SOURCE_REPLICATION_RETENTION_TIMESTAMP, T_STALE);
+                insert_header(&mut headers, SUFFIX_SOURCE_REPLICATION_LEGALHOLD_TIMESTAMP, T_STALE);
+                insert_header(&mut headers, SUFFIX_SOURCE_MTIME, "2001-01-01T00:00:00Z");
+                insert_header(&mut headers, SUFFIX_SOURCE_ETAG, "deadbeefdeadbeefdeadbeefdeadbeef");
+                let mut input = put_bytes(bucket.clone(), compliance_key, Bytes::from_static(b"forged stale body 28 bytes!!"));
+                input.version_id = Some(compliance_vid.clone());
+                let out = Box::pin(usecase.execute_put_object_owned(
+                    replication_put_envelope(&bucket, compliance_key, &compliance_vid, headers),
+                    input,
+                ))
+                .await
+                .expect("stale replication PUT stays idempotent without mutating locked bytes");
+                assert_eq!(out.e_tag.as_deref().map(|s| s.trim_matches('"')), seeded_compliance.etag.as_deref());
+                assert_eq!(
+                    read_version_bytes(&store, &bucket, compliance_key, &compliance_vid).await,
+                    compliance_payload
+                );
+            }
+            {
+                let mut headers = HeaderMap::new();
+                insert_header(&mut headers, SUFFIX_SOURCE_REPLICATION_REQUEST, "true");
+                insert_header(&mut headers, SUFFIX_SOURCE_REPLICATION_RETENTION_TIMESTAMP, T_NEW);
+                insert_header(&mut headers, SUFFIX_SOURCE_REPLICATION_LEGALHOLD_TIMESTAMP, T_NEW);
+                insert_header(&mut headers, SUFFIX_SOURCE_MTIME, "2001-01-01T00:00:00Z");
+                insert_header(&mut headers, SUFFIX_SOURCE_ETAG, "0123456789abcdef0123456789abcdef");
+                let mut input = put_bytes(bucket.clone(), compliance_key, Bytes::from_static(b"forged same-len payload!!!!!"));
+                input.version_id = Some(compliance_vid.clone());
+                input.object_lock_mode = Some("COMPLIANCE".to_owned());
+                input.object_lock_retain_until_date = Some(
+                    time::OffsetDateTime::parse("2100-01-01T00:00:00Z", &time::format_description::well_known::Rfc3339)
+                        .expect("valid RFC3339 date"),
+                );
+                input.object_lock_legal_hold_status = Some("OFF".to_owned());
+                let out = Box::pin(usecase.execute_put_object_owned(
+                    replication_put_envelope(&bucket, compliance_key, &compliance_vid, headers),
+                    input,
+                ))
+                .await
+                .expect("authorized COMPLIANCE extension + LegalHold release updates metadata only");
+                assert_eq!(out.e_tag.as_deref().map(|s| s.trim_matches('"')), seeded_compliance.etag.as_deref());
+
+                let info = store
+                    .get_object_info(
+                        &bucket,
+                        compliance_key,
+                        &ObjectOptions {
+                            versioned: true,
+                            version_id: Some(compliance_vid.clone()),
+                            ..Default::default()
+                        },
+                    )
+                    .await
+                    .expect("load updated compliance object info");
+                assert_eq!(info.etag, seeded_compliance.etag);
+                assert_eq!(info.mod_time, seeded_compliance.mod_time);
+                assert_eq!(info.size, seeded_compliance.size);
+                assert_eq!(info.user_defined.get(AMZ_OBJECT_LOCK_MODE_LOWER).map(String::as_str), Some("COMPLIANCE"));
+                assert_eq!(
+                    info.user_defined
+                        .get(AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE_LOWER)
+                        .map(String::as_str),
+                    Some("2100-01-01T00:00:00Z")
+                );
+                assert_eq!(info.user_defined.get(AMZ_OBJECT_LOCK_LEGAL_HOLD_LOWER).map(String::as_str), Some("OFF"));
+                assert_eq!(
+                    read_version_bytes(&store, &bucket, compliance_key, &compliance_vid).await,
+                    compliance_payload,
+                    "locked version payload bytes must remain byte-for-byte immutable"
+                );
+            }
+
+            // 4. Clearing/weakening active GOVERNANCE via replication PUT requires s3:BypassGovernanceRetention.
+            set_policy(&bucket, &format!("{ALLOW_ALL},{DENY_BYPASS}")).await;
+            {
+                let mut headers = HeaderMap::new();
+                insert_header(&mut headers, SUFFIX_SOURCE_REPLICATION_REQUEST, "true");
+                insert_header(&mut headers, SUFFIX_SOURCE_REPLICATION_RETENTION_TIMESTAMP, T_NEW);
+                let mut input = put_bytes(bucket.clone(), governance_key, Bytes::from_static(b"forged"));
+                input.version_id = Some(governance_vid.clone());
+                let err = Box::pin(usecase.execute_put_object_owned(
+                    replication_put_envelope(&bucket, governance_key, &governance_vid, headers),
+                    input,
+                ))
+                .await
+                .expect_err("clearing GOVERNANCE via replication PUT without BypassGovernanceRetention must be denied");
+                assert_eq!(err.code(), &OwnedS3ErrorCode::AccessDenied);
+            }
+            set_policy(&bucket, ALLOW_ALL).await;
+            {
+                let mut headers = HeaderMap::new();
+                insert_header(&mut headers, SUFFIX_SOURCE_REPLICATION_REQUEST, "true");
+                insert_header(&mut headers, SUFFIX_SOURCE_REPLICATION_RETENTION_TIMESTAMP, T_NEW);
+                let mut input = put_bytes(bucket.clone(), governance_key, Bytes::from_static(b"forged"));
+                input.version_id = Some(governance_vid.clone());
+                Box::pin(usecase.execute_put_object_owned(
+                    replication_put_envelope(&bucket, governance_key, &governance_vid, headers),
+                    input,
+                ))
+                .await
+                .expect("clearing GOVERNANCE via replication PUT with BypassGovernanceRetention updates metadata only");
+                let info = store
+                    .get_object_info(
+                        &bucket,
+                        governance_key,
+                        &ObjectOptions {
+                            versioned: true,
+                            version_id: Some(governance_vid.clone()),
+                            ..Default::default()
+                        },
+                    )
+                    .await
+                    .expect("load updated governance object info");
+                assert_eq!(info.etag, seeded_governance.etag);
+                assert_eq!(info.mod_time, seeded_governance.mod_time);
+                assert_eq!(info.user_defined.get(AMZ_OBJECT_LOCK_MODE_LOWER).map(String::as_str), None);
+                assert_eq!(
+                    read_version_bytes(&store, &bucket, governance_key, &governance_vid).await,
+                    governance_payload,
+                    "governance-locked version payload bytes must remain immutable on metadata-only LWW clear"
+                );
+            }
+        });
+    }
 }
 
 /// Test-only request body that records how often it is polled, so admission
@@ -5677,11 +6205,13 @@ pub(crate) struct PollCountingBody {
 
 #[cfg(test)]
 impl PollCountingBody {
-    pub(crate) fn streaming_blob() -> (StreamingBlob, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+    pub(crate) fn native_body() -> (NativeBody, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
         let polls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let body = StreamingBlob::new(Self {
-            polls: std::sync::Arc::clone(&polls),
-        });
+        let body_polls = std::sync::Arc::clone(&polls);
+        let body = super::native_body::from_io_stream(futures::stream::repeat_with(move || {
+            body_polls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(Bytes::from_static(b"x"))
+        }));
         (body, polls)
     }
 }
@@ -5695,9 +6225,6 @@ impl Stream for PollCountingBody {
         Poll::Ready(Some(Ok(Bytes::from_static(b"x"))))
     }
 }
-
-#[cfg(test)]
-impl ByteStream for PollCountingBody {}
 
 #[cfg(test)]
 mod oversize_single_upload_tests {

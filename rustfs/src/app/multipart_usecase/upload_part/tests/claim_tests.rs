@@ -98,7 +98,7 @@ async fn native_claim_checks_order_ownership_and_one_active_lookup() {
             content_length: length,
             body: body.then(|| {
                 if length.is_none() {
-                    legacy_put_body(StreamingBlob::wrap(futures::stream::pending::<Result<Bytes, std::io::Error>>()))
+                    pending_body()
                 } else {
                     Body::from(Bytes::from_static(b"abc"))
                 }
@@ -247,9 +247,8 @@ fn native_copy_part_rejects_unproved_owner_without_changing_parts() {
                         }
                     } else if matches!(mode, LookupResult::Outage) {
                         let Err(actual) = result else { panic!("expected read quorum failure") };
-                        let expected: crate::app::storage_api::s3::S3Error =
-                            ApiError::from(StorageError::ErasureReadQuorum).into();
-                        assert_eq!(actual.code().as_str(), expected.code().as_str());
+                        let expected: S3Error = ApiError::from(StorageError::ErasureReadQuorum).into();
+                        assert_eq!(actual.code(), expected.code());
                         assert_eq!(actual.status_code(), expected.status_code());
                         assert_eq!(actual.message(), expected.message());
                         assert!(

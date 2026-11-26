@@ -26,7 +26,9 @@ use crate::app::RequestEnvelope;
 use crate::app::dto_values;
 use crate::app::object::shared::{reject_veeam_sosapi_mutation, validate_table_catalog_object_mutation};
 use crate::app::storage_api::object_meta_usecase::contract::{ObjectLockRetentionOptions, ObjectOperations as _};
-use crate::app::storage_api::object_meta_usecase::{check_retention_for_modification, validate_bucket_object_lock_enabled};
+use crate::app::storage_api::object_meta_usecase::{
+    check_retention_for_modification, load_bucket_object_lock_config_state, validate_bucket_object_lock_enabled_state,
+};
 use crate::app::storage_api::object_usecase::access::{
     RequestedObjectLockRetention, apply_bucket_generation_guard, has_bypass_governance_header,
 };
@@ -70,7 +72,8 @@ impl ObjectMetaUsecase {
         validate_table_catalog_object_mutation(bucket, key).await?;
         let store = self.object_store()?;
 
-        validate_bucket_object_lock_enabled(bucket).await?;
+        let object_lock_config_state = load_bucket_object_lock_config_state(bucket).await?;
+        validate_bucket_object_lock_enabled_state(bucket, &object_lock_config_state)?;
 
         let new_retain_until = retention.as_ref().and_then(|retention| retention.retain_until);
         let new_mode = retention.as_ref().and_then(|retention| retention.mode.clone());
@@ -86,11 +89,15 @@ impl ObjectMetaUsecase {
 
         if let Some(existing_obj_info) = existing_obj_info.as_ref()
             && let Some(block_reason) = check_retention_for_modification(
-                &existing_obj_info.user_defined,
+                &object_lock_config_state,
+                existing_obj_info,
                 new_mode.as_deref(),
                 new_retain_until,
                 bypass_governance,
             )
+            .map_err(|_| {
+                S3Error::with_message(S3ErrorCode::AccessDenied, "Object Lock state could not be verified.".to_string())
+            })?
         {
             return Err(S3Error::with_message(S3ErrorCode::AccessDenied, block_reason.error_message()));
         }
@@ -174,9 +181,11 @@ impl ObjectMetaUsecase {
     ///
     /// # Errors
     ///
-    /// `MethodNotAllowed` for a Veeam SOSAPI system object; `InternalError` before the store is up,
-    /// when the object cannot be read, or for a stored date outside the answerable range; the
-    /// Object Lock refusal of a bucket without Object Lock.
+    /// `MethodNotAllowed` for a Veeam SOSAPI system object or an explicitly selected delete marker.
+    /// `NoSuchBucket`, `NoSuchKey`, or `NoSuchVersion` for an absent resource.
+    /// `InvalidRequest` if Object Lock is disabled and `NoSuchObjectLockConfiguration` if no
+    /// retention is stored for the object version. Storage failures and out-of-range dates can
+    /// return `InternalError`.
     pub async fn execute_get_object_retention(
         &self,
         envelope: RequestEnvelope,
@@ -213,14 +222,22 @@ impl ObjectMetaUsecase {
     }
 }
 
-/// The retention `metadata` stores. An unparseable date is answered as absent, as before.
+/// Decode stored retention, preserving a legacy mode even if its date cannot be parsed.
 fn stored_retention(metadata: &HashMap<String, String>) -> S3Result<ObjectLockRetention> {
-    let mode = metadata
-        .get(AMZ_OBJECT_LOCK_MODE_LOWER)
-        .map(|mode| Mode::custom(mode.clone()));
-    let retain_until_date = metadata
+    let mode = metadata.get(AMZ_OBJECT_LOCK_MODE_LOWER).filter(|mode| !mode.is_empty());
+    let retain_until = metadata
         .get(AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE_LOWER)
-        .and_then(|value| OffsetDateTime::parse(value, &Rfc3339).ok())
+        .filter(|date| !date.is_empty());
+    // PutObjectRetention clears both fields by storing empty strings.
+    if mode.is_none() && retain_until.is_none() {
+        return Err(S3Error::new(S3ErrorCode::NoSuchObjectLockConfiguration));
+    }
+    let parsed_date = match retain_until.map(|value| OffsetDateTime::parse(value, &Rfc3339)).transpose() {
+        Ok(date) => date,
+        Err(_) if mode.is_some() => None,
+        Err(_) => return Err(S3Error::with_message(S3ErrorCode::InternalError, "Stored retention date is invalid")),
+    };
+    let retain_until_date = parsed_date
         .map(|date| {
             date.checked_to_offset(time::UtcOffset::UTC)
                 .filter(|date| (0..=9999).contains(&date.year()))
@@ -234,7 +251,7 @@ fn stored_retention(metadata: &HashMap<String, String>) -> S3Result<ObjectLockRe
         })
         .transpose()?;
     Ok(ObjectLockRetention {
-        mode,
+        mode: mode.map(|mode| Mode::custom(mode.clone())),
         retain_until_date,
         ..Default::default()
     })
@@ -243,8 +260,8 @@ fn stored_retention(metadata: &HashMap<String, String>) -> S3Result<ObjectLockRe
 #[cfg(test)]
 mod tests {
     use super::{
-        AMZ_OBJECT_LOCK_MODE_LOWER, AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE_LOWER, HashMap, Mode, OffsetDateTime, Rfc3339, S3ErrorCode,
-        stored_retention,
+        AMZ_OBJECT_LOCK_MODE_LOWER, AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE_LOWER, HashMap, Mode, OffsetDateTime, RequestEnvelope,
+        Rfc3339, S3ErrorCode, stored_retention,
     };
     use rustfs_gateway::{Limits, MetaView, OperationCodec, ResponseBody, TargetKind, WireRequest, dto::GetObjectRetention};
     use rustfs_gateway_types::dto::GetObjectRetentionOutput;
@@ -325,5 +342,139 @@ mod tests {
 
         assert_eq!(retention.mode.as_ref().map(Mode::as_str), Some("governance"));
         assert_eq!(retention.retain_until_date, None);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn put_object_retention_blocks_downgrade_or_shorten_of_bucket_default_compliance() {
+        crate::app::gating_test_env::run_large_stack_test("put-object-retention-default-compliance", || async {
+            use crate::app::RequestHead;
+            use crate::app::object_meta::ObjectMetaUsecase;
+            use crate::app::storage_api::object_meta_usecase::contract::BucketOperations as _;
+            use crate::app::storage_api::object_usecase::access::RequestedObjectLockRetention;
+            use crate::app::storage_api::object_usecase::{StorageObjectOptions as ObjectOptions, StoragePutObjReader};
+            use crate::app::storage_api::test::contract::bucket::MakeBucketOptions;
+            use crate::app::storage_api::test::contract::object::ObjectIO as _;
+            use http::{Extensions, HeaderMap, HeaderValue, Method, Uri};
+            use std::sync::Arc;
+            use time::Duration;
+            use uuid::Uuid;
+
+            let store = crate::app::gating_test_env::shared_gating_ecstore().await;
+            if crate::app::runtime_sources::current_app_context().is_none() {
+                crate::app::runtime_sources::install_test_app_context(Arc::clone(&store)).await;
+            }
+            let bucket = format!("default-compliance-retention-{}", Uuid::new_v4().simple());
+            store
+                .make_bucket(
+                    &bucket,
+                    &MakeBucketOptions {
+                        lock_enabled: true,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect("create Object Lock bucket");
+
+            // Upload a version BEFORE setting a default retention rule so it carries no explicit retention keys.
+            let mut reader = StoragePutObjReader::from_vec(b"pre-rule ledger".to_vec());
+            let put_info = store
+                .put_object(
+                    &bucket,
+                    "old-ledger.csv",
+                    &mut reader,
+                    &ObjectOptions {
+                        versioned: true,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect("upload keyless version");
+            let version_id = put_info.version_id.expect("versioned upload assigns version id").to_string();
+
+            // Install a bucket DefaultRetention = COMPLIANCE / 30 days.
+            let mut metadata = (*crate::storage::get_bucket_metadata(&bucket)
+                .await
+                .expect("load bucket metadata"))
+            .clone();
+            metadata.object_lock_config = Some(rustfs_gateway_types::persistence::PersistedObjectLockConfiguration {
+                object_lock_enabled: Some("Enabled".to_owned()),
+                rule: Some(rustfs_gateway_types::persistence::PersistedObjectLockRule {
+                    default_retention: Some(rustfs_gateway_types::persistence::PersistedDefaultRetention {
+                        mode: Some("COMPLIANCE".to_owned()),
+                        days: Some(30),
+                        years: None,
+                    }),
+                }),
+            });
+            crate::storage::storage_api::set_bucket_metadata(bucket.clone(), metadata)
+                .await
+                .expect("publish default COMPLIANCE retention rule");
+
+            let usecase = ObjectMetaUsecase::with_context(crate::app::runtime_sources::current_app_context());
+            let build_envelope = |bypass: bool| {
+                let mut headers = HeaderMap::new();
+                if bypass {
+                    headers.insert("x-amz-bypass-governance-retention", HeaderValue::from_static("true"));
+                }
+                let head = RequestHead {
+                    method: Method::PUT,
+                    uri: Uri::from_static("/bucket/old-ledger.csv?retention"),
+                    headers,
+                    credentials: None,
+                    region: None,
+                    service: None,
+                };
+                RequestEnvelope::from_parts(head, Extensions::new())
+            };
+
+            let now = OffsetDateTime::now_utc();
+            // Downgrading default COMPLIANCE to GOVERNANCE must be rejected even with bypass.
+            let err = usecase
+                .put_object_retention_fields(
+                    build_envelope(true),
+                    &bucket,
+                    "old-ledger.csv",
+                    Some(version_id.clone()),
+                    Some(RequestedObjectLockRetention {
+                        mode: Some("GOVERNANCE".to_owned()),
+                        retain_until: Some(now + Duration::days(60)),
+                    }),
+                )
+                .await
+                .expect_err("downgrading bucket default COMPLIANCE to GOVERNANCE must fail");
+            assert_eq!(err.code(), &S3ErrorCode::AccessDenied);
+
+            // Shortening default COMPLIANCE (30d -> 1d) must be rejected.
+            let err = usecase
+                .put_object_retention_fields(
+                    build_envelope(true),
+                    &bucket,
+                    "old-ledger.csv",
+                    Some(version_id.clone()),
+                    Some(RequestedObjectLockRetention {
+                        mode: Some("COMPLIANCE".to_owned()),
+                        retain_until: Some(now + Duration::days(1)),
+                    }),
+                )
+                .await
+                .expect_err("shortening bucket default COMPLIANCE must fail");
+            assert_eq!(err.code(), &S3ErrorCode::AccessDenied);
+
+            // Extending default COMPLIANCE (30d -> 60d) must succeed.
+            usecase
+                .put_object_retention_fields(
+                    build_envelope(false),
+                    &bucket,
+                    "old-ledger.csv",
+                    Some(version_id),
+                    Some(RequestedObjectLockRetention {
+                        mode: Some("COMPLIANCE".to_owned()),
+                        retain_until: Some(now + Duration::days(60)),
+                    }),
+                )
+                .await
+                .expect("extending bucket default COMPLIANCE must succeed");
+        });
     }
 }

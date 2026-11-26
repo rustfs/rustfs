@@ -88,26 +88,30 @@ fn head_etag_http_projection_preserves_spelling() {
 
 #[test]
 fn head_proxy_etag_mapping_matches_the_legacy_parser() {
-    let mut inputs = vec![
-        "abc".to_owned(),
-        String::new(),
-        "*".to_owned(),
-        " abc ".to_owned(),
-        "abc_def".to_owned(),
-        "W/\"\"".to_owned(),
-        "W/abc".to_owned(),
-        "w/\"abc\"".to_owned(),
-        "\"a\\b\"".to_owned(),
-        "\"a\tb\"".to_owned(),
-        "\"a\"b\"".to_owned(),
+    // Answers measured on s3s 5761ddfe (`ETag::from_str`).
+    let mut cases: Vec<(String, Option<(String, bool)>)> = vec![
+        ("abc".to_owned(), Some(("abc".to_owned(), false))),
+        (String::new(), None),
+        ("*".to_owned(), None),
+        (" abc ".to_owned(), None),
+        ("abc_def".to_owned(), None),
+        ("W/\"\"".to_owned(), Some((String::new(), true))),
+        ("W/abc".to_owned(), None),
+        ("w/\"abc\"".to_owned(), None),
+        ("\"a\\b\"".to_owned(), Some(("a\\b".to_owned(), false))),
+        ("\"a\tb\"".to_owned(), Some(("a\tb".to_owned(), false))),
+        ("\"a\"b\"".to_owned(), Some(("a\"b".to_owned(), false))),
     ];
     for byte in 0..=255u8 {
-        inputs.push(format!("\"a{}b\"", char::from(byte)));
-        inputs.push(format!("W/\"a{}b\"", char::from(byte)));
-        inputs.push(char::from(byte).to_string());
+        let ch = char::from(byte);
+        let quoted_valid = byte == 0x09 || (0x20..=0x7e).contains(&byte);
+        let unquoted_valid = matches!(byte, b'0'..=b'9' | b'A'..=b'Z' | b'a'..=b'z' | b'-');
+        let inner = format!("a{ch}b");
+        cases.push((format!("\"{inner}\""), quoted_valid.then(|| (inner.clone(), false))));
+        cases.push((format!("W/\"{inner}\""), quoted_valid.then_some((inner, true))));
+        cases.push((ch.to_string(), unquoted_valid.then(|| (ch.to_string(), false))));
     }
-    for raw in inputs {
-        let expected = crate::app::storage_api::s3::dto::ETag::from_str(&raw).ok();
+    for (raw, expected) in cases {
         let sdk = aws_sdk_s3::operation::head_object::HeadObjectOutput::builder()
             .e_tag(&raw)
             .build();
@@ -115,7 +119,7 @@ fn head_proxy_etag_mapping_matches_the_legacy_parser() {
         assert!(facts.dto.e_tag.is_none(), "ETag is carried as a response fact");
         assert_eq!(
             facts.etag.as_ref().map(|tag| (tag.opaque.as_str(), tag.weak)),
-            expected.as_ref().map(|tag| (tag.value(), tag.as_weak().is_some())),
+            expected.as_ref().map(|(opaque, weak)| (opaque.as_str(), *weak)),
             "{raw:?}"
         );
     }

@@ -73,6 +73,8 @@ impl TryFrom<&str> for Endpoint {
 
     /// Performs the conversion.
     fn try_from(value: &str) -> std::result::Result<Self, Self::Error> {
+        const INVALID_URL_PORT: &str = "invalid URL endpoint format: port number must be between 1 to 65535";
+
         // check whether given path is not empty.
         if ["", "/", "\\"].iter().any(|&v| v.eq(value)) {
             return Err(Error::other("empty or root endpoint is not supported"));
@@ -80,6 +82,7 @@ impl TryFrom<&str> for Endpoint {
 
         let mut is_local = false;
         let url = match Url::parse(value) {
+            Ok(url) if url.port() == Some(0) => return Err(Error::other(INVALID_URL_PORT)),
             #[allow(unused_mut)]
             Ok(mut url) if url.has_host() => {
                 // URL style of endpoint.
@@ -139,9 +142,7 @@ impl TryFrom<&str> for Endpoint {
                 url_parse_from_file_path(value)?
             }
             Err(e) => match e {
-                ParseError::InvalidPort => {
-                    return Err(Error::other("invalid URL endpoint format: port number must be between 1 to 65535"));
-                }
+                ParseError::InvalidPort => return Err(Error::other(INVALID_URL_PORT)),
                 ParseError::EmptyHost => return Err(Error::other("invalid URL endpoint format: empty host name")),
                 ParseError::RelativeUrlWithoutBase => {
                     // like /foo
@@ -449,6 +450,12 @@ mod test {
                 }),
                 expected_type: Some(EndpointType::Url),
                 expected_err: None,
+            },
+            TestCase {
+                arg: "http://127.0.0.1:0/path",
+                expected_endpoint: None,
+                expected_type: None,
+                expected_err: Some(Error::other("invalid URL endpoint format: port number must be between 1 to 65535")),
             },
             TestCase {
                 arg: "https://93.184.216.34:808080/path",

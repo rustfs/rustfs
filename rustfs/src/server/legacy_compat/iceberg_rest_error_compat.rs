@@ -11,18 +11,13 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
-//! `IcebergRestErrorCompatLayer`: an s3s compatibility patch, installed by
-//! `server::http::external_service_stack!` and pinned there by `stack_census`.
+//! `IcebergRestErrorCompatLayer`: outer-edge Iceberg REST error envelope layer installed by
+//! `server::http::external_service_stack!` and pinned by `stack_census` / `middleware_matrix_census`.
 //!
-//! Patches: s3s renders every refusal on the table-catalog prefixes as an S3
-//! XML error document, while Iceberg REST clients (Spark) require the JSON
-//! error envelope. Introduced in rustfs/rustfs#4788.
-//! Replaced by: the `rustfs` dialect's claimed table-catalog surface, whose
-//! operations render their own error document (gateway ADR-0031 and
-//! `docs/dialects.md`, "Path-prefix claims"), with `StageFilter::on_response`
-//! as the escape hatch (gateway `docs/middleware.md`, "Level 2:
-//! `StageFilter`"). This layer is not one of the nine rows of that table.
-//! Removed by: T2.12 (rustfs/backlog#2771).
+//! Origin: Iceberg REST clients (Spark) require JSON error envelopes rather than XML error
+//! documents on table-catalog prefixes (`rustfs/rustfs#4788`).
+//! T2.12 (`rustfs/backlog#2771`) ruling: stays on the outer stack to translate XML error
+//! documents on table-catalog paths until all table-catalog operations render JSON errors natively.
 
 use super::{SerializedS3Error, is_xml_compat_body, is_xml_response};
 use crate::server::hybrid::HybridBody;

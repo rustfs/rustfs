@@ -36,11 +36,11 @@
 25|crates/ecstore/src/erasure/coding/erasure.rs
 3|crates/ecstore/src/layout/disks_layout.rs
 2|crates/ecstore/src/layout/endpoint.rs
-17|crates/ecstore/src/layout/endpoints.rs
+14|crates/ecstore/src/layout/endpoints.rs
 1|crates/ecstore/src/layout/format.rs
 1|crates/ecstore/src/layout/pool_space.rs
 1|crates/ecstore/src/layout/set_layout.rs
-19|crates/ecstore/src/object_api/readers.rs
+18|crates/ecstore/src/object_api/readers.rs
 1|crates/ecstore/src/object_api/types.rs
 3|crates/ecstore/src/runtime/sources.rs
 4|crates/ecstore/src/services/batch_processor.rs

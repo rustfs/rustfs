@@ -99,7 +99,21 @@ where
     ///
     /// This method binds the listener first to ensure the port is available,
     /// then spawns the server loop in a background task.
-    pub async fn start(&self, mut shutdown_rx: broadcast::Receiver<()>) -> Result<(), FtpsInitError> {
+    pub async fn start(&self, shutdown_rx: broadcast::Receiver<()>) -> Result<(), FtpsInitError> {
+        let authenticator: Arc<dyn Authenticator + Send + Sync> = Arc::new(ConnectionAuthenticator {
+            require_data_tls: self.config.tls_enabled && (self.config.ftps_required || self.config.ca_file.is_some()),
+        });
+        let user_detail_provider: Arc<dyn UserDetailProvider<User = FtpsUser> + Send + Sync> =
+            Arc::new(ConnectionUserDetailProvider);
+        self.start_with_auth(shutdown_rx, authenticator, user_detail_provider).await
+    }
+
+    async fn start_with_auth(
+        &self,
+        mut shutdown_rx: broadcast::Receiver<()>,
+        authenticator: Arc<dyn Authenticator + Send + Sync>,
+        user_detail_provider: Arc<dyn UserDetailProvider<User = FtpsUser> + Send + Sync>,
+    ) -> Result<(), FtpsInitError> {
         info!(
             event = EVENT_FTPS_SERVER_STATE,
             component = LOG_COMPONENT_PROTOCOLS,
@@ -118,11 +132,9 @@ where
         let storage_clone = self.storage.clone();
         let mut server_builder = libunftp::ServerBuilder::with_user_detail_provider(
             Box::new(move || FtpsDriver::new(storage_clone.clone())),
-            Arc::new(ConnectionUserDetailProvider),
+            user_detail_provider,
         )
-        .authenticator(Arc::new(ConnectionAuthenticator {
-            require_data_tls: self.config.tls_enabled && (self.config.ftps_required || self.config.ca_file.is_some()),
-        }));
+        .authenticator(authenticator);
 
         // Configure passive ports for data connections
         if let Some(passive_ports) = &self.config.passive_ports {
@@ -160,15 +172,17 @@ where
             server_builder = server_builder.passive_host(external_ip.as_str());
         }
 
-        // Configure both active and passive mode support
+        // Data connections are passive only. Active mode (PORT) makes the server open
+        // an outbound TCP connection to a client-supplied IPv4 address before peer
+        // validation runs; keep libunftp's PassiveOnly default explicit here.
         use libunftp::options::ActivePassiveMode;
-        server_builder = server_builder.active_passive_mode(ActivePassiveMode::ActiveAndPassive);
+        server_builder = server_builder.active_passive_mode(ActivePassiveMode::PassiveOnly);
         debug!(
             event = EVENT_FTPS_CONFIG_STATE,
             component = LOG_COMPONENT_PROTOCOLS,
             subsystem = LOG_SUBSYSTEM_FTPS_SERVER,
-            state = "active_passive_mode_enabled",
-            mode = "active_and_passive",
+            state = "active_passive_mode_configured",
+            mode = "passive_only",
             "FTPS active/passive mode configured"
         );
 
@@ -550,5 +564,125 @@ impl Authenticator for FtpsAuthenticator {
         Ok(Principal {
             username: username.to_string(),
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::common::dummy_storage::DummyBackend;
+    use crate::common::session::test_session;
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+    use tokio::net::{TcpListener, TcpStream};
+
+    #[derive(Debug)]
+    struct AllowAllTestAuth;
+
+    #[async_trait::async_trait]
+    impl Authenticator for AllowAllTestAuth {
+        async fn authenticate(&self, username: &str, _creds: &Credentials) -> Result<Principal, AuthenticationError> {
+            Ok(Principal {
+                username: username.to_string(),
+            })
+        }
+    }
+
+    #[derive(Debug)]
+    struct TestUserProvider;
+
+    #[async_trait::async_trait]
+    impl UserDetailProvider for TestUserProvider {
+        type User = FtpsUser;
+
+        async fn provide_user_detail(&self, principal: &Principal) -> Result<Self::User, UserDetailError> {
+            Ok(FtpsUser {
+                username: principal.username.clone(),
+                name: None,
+                session_context: test_session(Protocol::Ftps),
+            })
+        }
+    }
+
+    async fn read_reply(read: &mut tokio::io::BufReader<tokio::net::tcp::OwnedReadHalf>) -> String {
+        let mut line = String::new();
+        tokio::time::timeout(Duration::from_secs(5), read.read_line(&mut line))
+            .await
+            .expect("FTP reply timeout")
+            .expect("read FTP reply");
+        line
+    }
+
+    #[tokio::test]
+    async fn ftps_server_rejects_port_with_502_without_connecting_and_allows_pasv() {
+        let reservation = TcpListener::bind("127.0.0.1:0").await.expect("reserve FTP port");
+        let bind_addr = reservation.local_addr().expect("FTP addr");
+        drop(reservation);
+
+        let probe_listener = TcpListener::bind("127.0.0.1:0").await.expect("bind probe listener");
+        let probe_port = probe_listener.local_addr().expect("probe addr").port();
+
+        let server = FtpsServer::new(
+            FtpsConfig {
+                bind_addr,
+                tls_enabled: false,
+                ftps_required: false,
+                ..Default::default()
+            },
+            DummyBackend::new(),
+        )
+        .await
+        .expect("create FTPS server");
+
+        let (shutdown_tx, shutdown_rx) = broadcast::channel(1);
+        let server_task = tokio::spawn(async move {
+            server
+                .start_with_auth(shutdown_rx, Arc::new(AllowAllTestAuth), Arc::new(TestUserProvider))
+                .await
+        });
+
+        let stream = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                match TcpStream::connect(bind_addr).await {
+                    Ok(stream) => break stream,
+                    Err(_) => tokio::time::sleep(Duration::from_millis(20)).await,
+                }
+            }
+        })
+        .await
+        .expect("FTP listener ready");
+
+        let (read, mut write) = stream.into_split();
+        let mut read = tokio::io::BufReader::new(read);
+
+        assert!(read_reply(&mut read).await.starts_with("220"));
+        for (cmd, expected) in [("USER test-user\r\n", "331"), ("PASS test-secret\r\n", "230")] {
+            write.write_all(cmd.as_bytes()).await.expect("send login command");
+            let reply = read_reply(&mut read).await;
+            assert!(reply.starts_with(expected), "unexpected login reply: {reply}");
+        }
+
+        let port_cmd = format!("PORT 127,0,0,1,{},{}\r\n", probe_port >> 8, probe_port & 0xff);
+        write.write_all(port_cmd.as_bytes()).await.expect("send PORT");
+        let port_reply = read_reply(&mut read).await;
+        assert!(
+            port_reply.starts_with("502"),
+            "PORT must be rejected with 502 in passive-only mode: {port_reply}"
+        );
+
+        let probe_attempt = tokio::time::timeout(Duration::from_millis(150), probe_listener.accept()).await;
+        assert!(
+            probe_attempt.is_err(),
+            "server must not open any outbound TCP connection on rejected PORT"
+        );
+
+        write.write_all(b"PASV\r\n").await.expect("send PASV");
+        let pasv_reply = read_reply(&mut read).await;
+        assert!(pasv_reply.starts_with("227"), "PASV must remain supported: {pasv_reply}");
+
+        write.write_all(b"QUIT\r\n").await.expect("send QUIT");
+        assert!(read_reply(&mut read).await.starts_with("221"));
+
+        shutdown_tx.send(()).expect("signal shutdown");
+        server_task.await.expect("server task").expect("clean server exit");
     }
 }

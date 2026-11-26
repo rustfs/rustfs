@@ -15,6 +15,7 @@
 #[cfg(test)]
 mod error_handling_tests {
     use crate::get_global_db;
+    use datafusion::object_store::ObjectStoreExt as _;
     use rustfs_s3select_api::request::{
         CsvInput, ExpressionType, FileHeaderInfo, InputSerialization, SelectObjectContentInput, SelectObjectContentRequest,
     };
@@ -172,6 +173,147 @@ mod error_handling_tests {
                 "unexpected planner error for {sql}: {error:?}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn test_non_allowlisted_datafusion_functions_are_rejected() {
+        for sql in [
+            "SELECT length(repeat(arrow_cast('a', 'LargeUtf8'), 4611686018427387904)) FROM S3Object",
+            "SELECT length(repeat(arrow_cast(name, 'LargeUtf8'), 1000000000000000)) FROM S3Object",
+            "SELECT length(repeat('a', 1000000000)) FROM S3Object",
+            "SELECT length(lpad('a', 500000000)) FROM S3Object",
+            "SELECT length(rpad('a', 500000000)) FROM S3Object",
+            "SELECT levenshtein('abc', 'def') FROM S3Object",
+            "SELECT arrow_cast(name, 'LargeUtf8') FROM S3Object",
+            "SELECT version() FROM S3Object",
+            "SELECT uuid() FROM S3Object",
+            "SELECT replace(name, 'a', 'bb') FROM S3Object",
+            "SELECT regexp_replace(name, 'a', 'b') FROM S3Object",
+            "SELECT encode(name, 'hex') FROM S3Object",
+            "SELECT array_agg(name) FROM S3Object",
+            "SELECT string_agg(name, ',') FROM S3Object",
+            "SELECT row_number() OVER () FROM S3Object",
+        ] {
+            let input = create_test_input_with_sql(sql);
+            let db = get_global_db(input.clone(), true)
+                .await
+                .expect("test database should initialize");
+            let query = Query::new(Context { input: Arc::new(input) }, sql.to_string());
+
+            let error = match db.execute(&query).await {
+                Err(error) => error,
+                Ok(_) => panic!("disallowed function must be rejected during planning: {sql}"),
+            };
+
+            assert_eq!(
+                error.select_error(),
+                SelectError::InvalidQuery,
+                "disallowed function must fail with InvalidQuery for {sql}: {error:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_standard_s3_select_functions_continue_working() {
+        for sql in [
+            "SELECT LOWER(name), UPPER(name), LENGTH(name) AS len1, CHAR_LENGTH(name) AS len2, CHARACTER_LENGTH(name) AS len3 FROM S3Object LIMIT 2",
+            "SELECT LEFT(name, 2), RIGHT(name, 2), TRIM(name) AS trimmed, BTRIM(name), LTRIM(name), RTRIM(name), STRPOS(name, 'a'), STARTS_WITH(name, 'A'), ENDS_WITH(name, 'e'), CONTAINS(name, 'l') FROM S3Object LIMIT 2",
+            "SELECT COALESCE(name, 'n/a'), NULLIF(name, 'Alice'), CONCAT(name, '-', department), CONCAT_WS(':', name, department) FROM S3Object LIMIT 2",
+            "SELECT ABS(-5), ROUND(3.14159, 2), SQRT(16), CEIL(1.2), FLOOR(1.8), POWER(2, 3) AS p1, POW(2, 4) AS p2 FROM S3Object LIMIT 1",
+            "SELECT DATE_PART('year', TO_TIMESTAMP('2025-01-02T03:04:05Z')), CURRENT_DATE(), NOW() FROM S3Object LIMIT 1",
+            "SELECT COUNT(*), SUM(CAST(age AS INT)), AVG(CAST(age AS INT)), MIN(CAST(age AS INT)), MAX(CAST(age AS INT)) FROM S3Object",
+        ] {
+            let input = create_test_input_with_sql(sql);
+            let db = get_global_db(input.clone(), true)
+                .await
+                .expect("test database should initialize");
+            let query = Query::new(Context { input: Arc::new(input) }, sql.to_string());
+
+            let handle = db
+                .execute(&query)
+                .await
+                .unwrap_or_else(|error| panic!("standard S3 Select query must plan ({sql}): {error:?}"));
+            let batches = handle
+                .result()
+                .chunk_result()
+                .await
+                .unwrap_or_else(|error| panic!("standard S3 Select query must execute ({sql}): {error:?}"));
+            assert!(
+                batches.iter().map(|batch| batch.num_rows()).sum::<usize>() > 0,
+                "standard S3 Select query must return rows: {sql}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_retained_expanding_functions_respect_result_size_bound() {
+        // Test with a large format literal in `to_char` over the 10-row fixture (column-dependent
+        // timestamp prevents scalar-only folding): 10 rows * (100_000 * 20 + 64) > 16 MiB.
+        let huge_format = "%B".repeat(50_000);
+        let sql = format!("SELECT TO_CHAR(TO_TIMESTAMP(CAST(age AS BIGINT)), '{huge_format}') FROM S3Object");
+        let input = create_test_input_with_sql(&sql);
+        let db = get_global_db(input.clone(), true)
+            .await
+            .expect("test database should initialize");
+        let query = Query::new(Context { input: Arc::new(input) }, sql);
+
+        let error = match db.execute(&query).await {
+            Err(error) => error,
+            Ok(handle) => match handle.result().chunk_result().await {
+                Err(error) => error,
+                Ok(_) => panic!("oversized to_char result must fail"),
+            },
+        };
+        assert_eq!(error.select_error(), SelectError::InternalError, "unexpected error: {error:?}");
+
+        // Verify `concat_ws('', ...)` simplification re-wraps `concat` and enforces the bound:
+        // a single 200 KiB CSV column repeated 100 times (~20 MiB > 16 MiB) fails cleanly
+        // even though `concat_ws('', ...)` simplifies to `concat(...)` and SQL is < 1 KiB.
+        let repeated_cols = std::iter::repeat_n("payload", 100).collect::<Vec<_>>().join(", ");
+        let concat_sql = format!("SELECT LENGTH(CONCAT_WS('', {repeated_cols})) FROM S3Object");
+        let mut concat_input = create_test_input_with_sql(&concat_sql);
+        concat_input.key = "concat_bound.csv".to_string();
+        let db = get_global_db(concat_input.clone(), true)
+            .await
+            .expect("test database should initialize");
+        let query = Query::new(
+            Context {
+                input: Arc::new(concat_input.clone()),
+            },
+            concat_sql,
+        );
+        let state_machine = db.build_query_state_machine(query).await.expect("build query state machine");
+        let store_url = datafusion::execution::object_store::ObjectStoreUrl::parse(format!("s3://{}", concat_input.bucket))
+            .expect("valid test store url");
+        let store = state_machine
+            .session
+            .inner()
+            .runtime_env()
+            .object_store(&store_url)
+            .expect("test object store");
+        let csv_payload = format!("payload\n{}\n", "x".repeat(200 * 1024));
+        store
+            .put(
+                &datafusion::object_store::path::Path::from(concat_input.key.as_str()),
+                csv_payload.into_bytes().into(),
+            )
+            .await
+            .expect("put oversized concat fixture");
+        let plan = db
+            .build_logical_plan(Arc::clone(&state_machine))
+            .await
+            .expect("plan concat_ws query")
+            .expect("logical plan");
+        let output = db
+            .execute_logical_plan(plan, state_machine)
+            .await
+            .expect("start concat_ws execution");
+        let error = output
+            .result()
+            .chunk_result()
+            .await
+            .expect_err("oversized concat_ws result must fail instead of allocating");
+        assert_eq!(error.select_error(), SelectError::InternalError, "unexpected error: {error:?}");
     }
 
     #[tokio::test]

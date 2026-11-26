@@ -25,6 +25,8 @@ use crate::admin::storage_api::access::ReqInfo;
 use crate::admin::utils::{parse_query_pairs, query_value_exact, query_values_exact};
 use crate::app::object_usecase::{GetObjectFields, GetObjectOutputFacts};
 use crate::app::{Answered, RequestEnvelope};
+#[cfg(test)]
+use crate::app::{RequestCredentials, RequestHead};
 use crate::auth::{check_key_valid, constant_time_eq, get_session_token, reject_unsigned_amz_headers_on_sigv4_request};
 use crate::license::license_check;
 #[cfg(test)]
@@ -482,10 +484,12 @@ fn build_object_lambda_event_payload(
     output_route: &str,
     output_token: &str,
 ) -> S3Result<Vec<u8>> {
-    let request_headers = req
-        .headers()
-        .iter()
-        .filter_map(|(name, value)| value.to_str().ok().map(|value| (name.to_string(), value.to_string())))
+    // Route outbound webhook headers through the shared redaction helper used
+    // by audit and notification sinks so credential-bearing headers (SSE-C
+    // keys, Authorization, session tokens, cookies) are redacted before
+    // leaving the process.
+    let request_headers = rustfs_targets::extract_params_header(req.headers())
+        .into_iter()
         .collect::<std::collections::BTreeMap<_, _>>();
 
     serde_json::to_vec(&serde_json::json!({
@@ -1076,7 +1080,7 @@ where
             }
         }
         if let Some((bucket, object)) = parse_object_lambda_request(&req.method, &req.uri) {
-            let response = Box::pin(handle_object_lambda_request(RequestEnvelope::from_s3s(&req), &bucket, &object))
+            let response = Box::pin(handle_object_lambda_request(envelope_from_s3s(&req), &bucket, &object))
                 .await
                 .map_err(crate::error::legacy_error_for_test)?;
             return Ok(legacy_admin_response(response));
@@ -1097,7 +1101,7 @@ where
             return Err(s3s::s3_error!(InternalError, "console is not enabled"));
         }
 
-        let envelope = crate::app::RequestEnvelope::from_s3s(&req);
+        let envelope = envelope_from_s3s(&req);
         dispatch(self, envelope, rustfs_s3_types::Body::from_http_body(req.input))
             .await
             .map(legacy_admin_response)
@@ -1106,6 +1110,14 @@ where
 }
 
 impl<T> S3Router<T> {
+    /// Validates notification target path parameters before the native route asks IAM.
+    pub(crate) fn validate_notification_target_params(&self, method: &Method, uri: &Uri) -> S3Result<()> {
+        let key = route_key_canonical(method, uri.path());
+        let matched = self.table.at(&key).map_err(|_| S3Error::new(S3ErrorCode::NotImplemented))?;
+        super::handlers::event::extract_target_params(&matched.params)?;
+        Ok(())
+    }
+
     /// The access rule of every route this router claims, whichever edge verified the request:
     /// `signed` is whether a signature was verified for it. The legacy `check_access` and the
     /// gateway stack's control-plane host both decide by this one function.
@@ -1166,6 +1178,29 @@ impl<T> S3Router<T> {
         // For non-RPC admin requests, check credentials
         reject_unbound_custom_route_auth(method, uri, headers, signed)?;
         signature_required()
+    }
+}
+
+/// Access rule for reserved console paths arriving on a listener where the native console is
+/// disabled (for example, the S3 port when a dedicated console port is enabled).
+pub(crate) fn admit_reserved_console(
+    server_ctx: Option<&crate::admin::runtime_sources::ServerContextSlot>,
+    method: &Method,
+    uri: &Uri,
+    headers: &HeaderMap,
+    signed: bool,
+) -> rustfs_s3_types::S3Result<()> {
+    reject_unsigned_amz_headers_on_sigv4_request(headers, uri.query())?;
+    if let Some(server_ctx) = server_ctx
+        && server_ctx.installed_app_context().is_none()
+    {
+        return Err(server_context_not_ready_error());
+    }
+    reject_unbound_custom_route_auth(method, uri, headers, signed)?;
+    if signed {
+        Ok(())
+    } else {
+        Err(access_denied("Signature is required"))
     }
 }
 
@@ -2142,6 +2177,75 @@ mod tests {
     }
 
     #[test]
+    fn build_object_lambda_event_payload_redacts_sensitive_headers() {
+        let req = RequestEnvelope::from_parts(
+            RequestHead {
+                method: Method::GET,
+                uri: "/demo-bucket/object.txt?lambdaArn=arn%3Aacme%3As3-object-lambda%3A%3Atransformer%3Awebhook"
+                    .parse()
+                    .expect("uri should parse"),
+                headers: HeaderMap::from_iter([
+                    (http::header::HOST, HeaderValue::from_static("localhost:9000")),
+                    (http::header::RANGE, HeaderValue::from_static("bytes=0-9")),
+                    (http::header::IF_MATCH, HeaderValue::from_static("\"etag-1\"")),
+                    (
+                        http::header::AUTHORIZATION,
+                        HeaderValue::from_static("AWS4-HMAC-SHA256 Credential=rustfsadmin/20260101/us-east-1/s3/aws4_request"),
+                    ),
+                    (
+                        HeaderName::from_static("x-amz-security-token"),
+                        HeaderValue::from_static("session-secret-token"),
+                    ),
+                    (
+                        HeaderName::from_static("x-amz-server-side-encryption-customer-key"),
+                        HeaderValue::from_static("MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY="),
+                    ),
+                    (
+                        HeaderName::from_static("x-amz-server-side-encryption-customer-key-md5"),
+                        HeaderValue::from_static("hRasmdxgYDKV3nvbahU1MA=="),
+                    ),
+                    (http::header::COOKIE, HeaderValue::from_static("sid=super-secret")),
+                ]),
+                credentials: None,
+                region: None,
+                service: None,
+            },
+            http::Extensions::new(),
+        );
+
+        let payload_bytes = build_object_lambda_event_payload(
+            &req,
+            "arn:acme:s3-object-lambda::transformer:webhook",
+            "https://example.com/source",
+            "route-123",
+            "token-456",
+        )
+        .expect("payload should serialize");
+        let payload: serde_json::Value = serde_json::from_slice(&payload_bytes).expect("payload should be json");
+        let headers = &payload["userRequest"]["headers"];
+
+        assert_eq!(headers["host"], "localhost:9000");
+        assert_eq!(headers["range"], "bytes=0-9");
+        assert_eq!(headers["if-match"], "\"etag-1\"");
+        for name in [
+            "authorization",
+            "x-amz-security-token",
+            "x-amz-server-side-encryption-customer-key",
+            "x-amz-server-side-encryption-customer-key-md5",
+            "cookie",
+        ] {
+            assert_eq!(headers[name], "***redacted***", "{name} should be redacted");
+        }
+
+        let rendered = String::from_utf8(payload_bytes).expect("payload must be valid utf-8");
+        assert!(!rendered.contains("MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY="));
+        assert!(!rendered.contains("hRasmdxgYDKV3nvbahU1MA=="));
+        assert!(!rendered.contains("session-secret-token"));
+        assert!(!rendered.contains("Credential=rustfsadmin"));
+        assert!(!rendered.contains("sid=super-secret"));
+    }
+
+    #[test]
     fn validate_object_lambda_response_auth_headers_rejects_missing_or_mismatched_values() {
         let mut matching = HeaderMap::new();
         matching.insert("x-amz-request-route", HeaderValue::from_static("route-123"));
@@ -2934,4 +3038,155 @@ fn convert_response(resp: http::Response<axum::body::Body>) -> S3Response<Body> 
     s3_resp.headers = parts.headers;
     s3_resp.extensions = parts.extensions;
     s3_resp
+}
+
+#[cfg(test)]
+fn envelope_from_s3s<T>(req: &S3Request<T>) -> RequestEnvelope {
+    let credentials = req.credentials.as_ref().map(|credentials| {
+        let session_token = get_session_token(&req.uri, &req.headers).map(str::to_owned);
+        // An empty secret is not a key: carry it as absent so every reader fails closed.
+        RequestCredentials::new(
+            credentials.access_key.clone(),
+            credentials.secret_key.expose().to_owned(),
+            session_token.clone(),
+        )
+        .unwrap_or_else(|_| RequestCredentials::without_secret_key(credentials.access_key.clone(), session_token))
+    });
+    let head = RequestHead {
+        method: req.method.clone(),
+        uri: req.uri.clone(),
+        headers: req.headers.clone(),
+        credentials,
+        region: req.region.as_ref().map(|region| region.as_str().to_owned()),
+        service: req.service.clone(),
+    };
+    RequestEnvelope::from_parts(head, req.extensions.clone())
+}
+
+#[cfg(test)]
+mod legacy_envelope_tests {
+    use super::{RequestCredentials, S3Request, ServerContextSlot, envelope_from_s3s};
+    use crate::shared_types::{NativeTlsTransport, RemoteAddr};
+    use http::{Extensions, HeaderMap, HeaderValue, Method};
+    use s3s::auth::Credentials as S3sCredentials;
+    use std::net::SocketAddr;
+    use std::sync::Arc;
+
+    const PEER: ([u8; 4], u16) = ([10, 0, 0, 7], 41000);
+
+    fn request(extensions: Extensions) -> S3Request<()> {
+        S3Request {
+            input: (),
+            method: Method::PUT,
+            uri: "/bucket/key".parse().expect("static uri"),
+            headers: HeaderMap::new(),
+            extensions,
+            credentials: None,
+            region: None,
+            service: None,
+            trailing_headers: None,
+        }
+    }
+
+    fn credentials() -> Option<S3sCredentials> {
+        Some(S3sCredentials {
+            access_key: "AKIAENVELOPE".to_owned(),
+            secret_key: "envelope-secret".into(),
+        })
+    }
+
+    #[test]
+    fn from_s3s_copies_request_head_credentials_and_extensions() {
+        let server_context = ServerContextSlot::new();
+        let mut extensions = Extensions::new();
+        extensions.insert(Some(RemoteAddr(SocketAddr::from(PEER))));
+        extensions.insert(NativeTlsTransport(true));
+        extensions.insert(Arc::clone(&server_context));
+        let mut req = request(extensions);
+        req.method = Method::POST;
+        req.uri = "/bucket/key?uploads".parse().expect("static uri");
+        req.headers.insert("x-envelope-probe", HeaderValue::from_static("probe"));
+        req.headers
+            .insert("x-amz-security-token", HeaderValue::from_static("header-token"));
+        req.credentials = credentials();
+        req.region = Some("eu-west-3".parse().expect("valid region"));
+        req.service = Some("s3".to_owned());
+
+        let envelope = envelope_from_s3s(&req);
+
+        assert_eq!(envelope.method(), Method::POST);
+        assert_eq!(envelope.uri(), &req.uri);
+        assert_eq!(envelope.headers(), &req.headers);
+        let credentials = envelope.credentials().expect("credentials");
+        assert_eq!(credentials.access_key(), "AKIAENVELOPE");
+        assert_eq!(credentials.secret_key(), Some("envelope-secret"));
+        assert_eq!(credentials.session_token(), Some("header-token"));
+        assert_eq!(envelope.region(), Some("eu-west-3"));
+        assert_eq!(envelope.service(), Some("s3"));
+        assert_eq!(envelope.remote_addr(), Some(SocketAddr::from(PEER)));
+        assert_eq!(envelope.native_tls_transport(), Some(true));
+        assert!(
+            envelope
+                .server_context()
+                .is_some_and(|slot| Arc::ptr_eq(slot, &server_context))
+        );
+        assert!(envelope.residual_extensions().is_empty(), "residual bag");
+    }
+
+    #[test]
+    fn from_s3s_leaves_absent_payloads_none() {
+        let mut req = request(Extensions::new());
+        // A token on an anonymous request must not conjure credentials.
+        req.headers
+            .insert("x-amz-security-token", HeaderValue::from_static("anonymous-token"));
+
+        let envelope = envelope_from_s3s(&req);
+
+        assert!(envelope.credentials().is_none(), "credentials");
+        assert_eq!(envelope.region(), None, "region");
+        assert_eq!(envelope.service(), None, "service");
+        assert_eq!(envelope.remote_addr(), None, "remote_addr");
+        assert_eq!(envelope.native_tls_transport(), None, "native_tls_transport");
+        assert!(envelope.server_context().is_none(), "server_context");
+        assert!(envelope.residual_extensions().is_empty(), "residual bag");
+    }
+
+    #[test]
+    fn from_s3s_takes_the_session_token_from_the_query_without_a_header() {
+        let mut req = request(Extensions::new());
+        req.uri = "/bucket/key?X-Amz-Security-Token=query-token".parse().expect("static uri");
+        req.credentials = credentials();
+
+        let envelope = envelope_from_s3s(&req);
+
+        assert_eq!(envelope.credentials().and_then(RequestCredentials::session_token), Some("query-token"));
+    }
+
+    #[test]
+    fn from_s3s_leaves_the_session_token_none_when_the_request_carries_none() {
+        let mut req = request(Extensions::new());
+        req.credentials = credentials();
+
+        let envelope = envelope_from_s3s(&req);
+
+        let credentials = envelope.credentials().expect("credentials");
+        assert_eq!(credentials.access_key(), "AKIAENVELOPE");
+        assert_eq!(credentials.session_token(), None);
+    }
+
+    #[test]
+    fn from_s3s_keeps_empty_secret_key_absent() {
+        let mut req = request(Extensions::new());
+        req.credentials = Some(S3sCredentials {
+            access_key: "AKIAENVELOPE".to_owned(),
+            secret_key: "".into(),
+        });
+
+        let envelope = envelope_from_s3s(&req);
+
+        let credentials = envelope.credentials().expect("credentials");
+        assert_eq!(credentials.access_key(), "AKIAENVELOPE");
+        assert_eq!(credentials.secret_key(), None);
+        assert!(credentials.require_secret_key().is_err());
+    }
 }

@@ -12,8 +12,13 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::io::{self, Write};
+use std::io::{self, Read, Write};
 use std::{fmt, str};
+
+/// Cap the Zstd history window when decoding a bounded block so a crafted frame
+/// cannot reserve a 128 MiB window before the output limit observes any bytes.
+const ZSTD_BLOCK_MAX_WINDOW_LOG: u32 = 24;
+const ZSTD_BOUNDED_BLOCK_LIMIT: usize = 1 << ZSTD_BLOCK_MAX_WINDOW_LOG;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum CompressionAlgorithm {
@@ -126,45 +131,67 @@ pub fn compress_block(input: &[u8], algorithm: CompressionAlgorithm) -> Vec<u8> 
 /// * A Result containing a Vec<u8> with the decompressed data, or an io::Error.
 ///
 pub fn decompress_block(compressed: &[u8], algorithm: CompressionAlgorithm) -> io::Result<Vec<u8>> {
-    match algorithm {
-        CompressionAlgorithm::Gzip => {
-            let mut decoder = flate2::read::GzDecoder::new(std::io::Cursor::new(compressed));
-            let mut out = Vec::new();
-            std::io::Read::read_to_end(&mut decoder, &mut out)?;
-            Ok(out)
-        }
-        CompressionAlgorithm::Deflate => {
-            let mut decoder = flate2::read::DeflateDecoder::new(std::io::Cursor::new(compressed));
-            let mut out = Vec::new();
-            std::io::Read::read_to_end(&mut decoder, &mut out)?;
-            Ok(out)
-        }
+    decompress_block_with_limit(compressed, algorithm, usize::MAX)
+}
+
+/// Decompress a block of data while capping the decoded output at `max_len` bytes.
+///
+/// # Errors
+///
+/// Returns [`io::ErrorKind::InvalidData`] if the decompressed output exceeds `max_len`,
+/// or propagates any underlying codec initialization or decoding error.
+pub fn decompress_block_with_limit(compressed: &[u8], algorithm: CompressionAlgorithm, max_len: usize) -> io::Result<Vec<u8>> {
+    let mut out = Vec::new();
+    decompress_block_into(compressed, algorithm, max_len, &mut out)?;
+    Ok(out)
+}
+
+/// Decodes a block into a reusable buffer. Replaces its contents and caps the output at `max_len`.
+///
+/// # Errors
+///
+/// Returns [`io::ErrorKind::InvalidData`] if the output exceeds the limit, or propagates
+/// a codec error. The output is empty on error and retains its capacity for reuse.
+pub fn decompress_block_into(
+    compressed: &[u8],
+    algorithm: CompressionAlgorithm,
+    max_len: usize,
+    out: &mut Vec<u8>,
+) -> io::Result<()> {
+    out.clear();
+    let input = std::io::Cursor::new(compressed);
+    let result = match algorithm {
+        CompressionAlgorithm::Gzip => read_to_end_with_limit(flate2::read::GzDecoder::new(input), max_len, out),
+        CompressionAlgorithm::Deflate => read_to_end_with_limit(flate2::read::DeflateDecoder::new(input), max_len, out),
         CompressionAlgorithm::Zstd => {
-            let mut decoder = zstd::Decoder::new(std::io::Cursor::new(compressed))?;
-            let mut out = Vec::new();
-            std::io::Read::read_to_end(&mut decoder, &mut out)?;
-            Ok(out)
+            let mut decoder = zstd::Decoder::new(input)?;
+            if max_len <= ZSTD_BOUNDED_BLOCK_LIMIT {
+                decoder.window_log_max(ZSTD_BLOCK_MAX_WINDOW_LOG)?;
+            }
+            read_to_end_with_limit(decoder, max_len, out)
         }
-        CompressionAlgorithm::Lz4 => {
-            let mut decoder = lz4::Decoder::new(std::io::Cursor::new(compressed)).expect("lz4 decoder");
-            let mut out = Vec::new();
-            std::io::Read::read_to_end(&mut decoder, &mut out)?;
-            Ok(out)
-        }
-        CompressionAlgorithm::Brotli => {
-            let mut out = Vec::new();
-            let mut decoder = brotli::Decompressor::new(std::io::Cursor::new(compressed), 4096);
-            std::io::Read::read_to_end(&mut decoder, &mut out)?;
-            Ok(out)
-        }
-        CompressionAlgorithm::Snappy => {
-            let mut decoder = snap::read::FrameDecoder::new(std::io::Cursor::new(compressed));
-            let mut out = Vec::new();
-            std::io::Read::read_to_end(&mut decoder, &mut out)?;
-            Ok(out)
-        }
-        CompressionAlgorithm::None => Ok(Vec::new()),
+        CompressionAlgorithm::Lz4 => read_to_end_with_limit(lz4::Decoder::new(input)?, max_len, out),
+        CompressionAlgorithm::Brotli => read_to_end_with_limit(brotli::Decompressor::new(input, 4096), max_len, out),
+        CompressionAlgorithm::Snappy => read_to_end_with_limit(snap::read::FrameDecoder::new(input), max_len, out),
+        CompressionAlgorithm::None => Ok(()),
+    };
+    if result.is_err() {
+        out.clear();
     }
+    result
+}
+
+fn read_to_end_with_limit(decoder: impl Read, max_len: usize, out: &mut Vec<u8>) -> io::Result<()> {
+    // Probe past the limit to verify an exact-length frame's trailer and reject expansion.
+    let probe_len = u64::try_from(max_len).unwrap_or(u64::MAX).saturating_add(1);
+    decoder.take(probe_len).read_to_end(out)?;
+    if out.len() > max_len {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "decompressed block exceeds its declared length",
+        ));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -219,6 +246,102 @@ mod tests {
         let compressed = compress_block(data, CompressionAlgorithm::Snappy);
         let decompressed = decompress_block(&compressed, CompressionAlgorithm::Snappy).expect("operation should succeed");
         assert_eq!(decompressed, data);
+    }
+
+    fn build_zstd_rle_frame(block_count: usize, block_len: u32) -> Vec<u8> {
+        let mut frame = Vec::with_capacity(6 + block_count * 4);
+        frame.extend_from_slice(&[0x28, 0xB5, 0x2F, 0xFD]); // Zstd magic
+        frame.push(0x00); // Frame_Header_Descriptor
+        frame.push(0x38); // Window_Descriptor: exponent=7 -> 128 KiB window
+        for idx in 0..block_count {
+            let last_block = u32::from(idx + 1 == block_count);
+            let block_header = last_block | (1 << 1) | (block_len << 3);
+            frame.extend_from_slice(&block_header.to_le_bytes()[..3]);
+            frame.push(0x00); // repeated byte
+        }
+        frame
+    }
+
+    #[test]
+    fn test_decompress_block_with_limit_stops_at_limit() {
+        let data = vec![0u8; 1024 * 1024];
+        for algo in [
+            CompressionAlgorithm::Gzip,
+            CompressionAlgorithm::Deflate,
+            CompressionAlgorithm::Zstd,
+            CompressionAlgorithm::Lz4,
+            CompressionAlgorithm::Brotli,
+            CompressionAlgorithm::Snappy,
+        ] {
+            let compressed = compress_block(&data, algo);
+            let mut exact = decompress_block_with_limit(&compressed, algo, data.len()).expect("exact limit should succeed");
+            assert_eq!(exact, data, "{algo}");
+
+            let err = decompress_block_into(&compressed, algo, data.len() - 1, &mut exact).expect_err("limit must be enforced");
+            assert!(exact.is_empty(), "an error must clear reused output");
+            assert_eq!(err.kind(), io::ErrorKind::InvalidData, "{algo}");
+            assert_eq!(err.to_string(), "decompressed block exceeds its declared length", "{algo}");
+
+            let zero_err = decompress_block_with_limit(&compressed, algo, 0).expect_err("zero limit must reject non-empty block");
+            assert_eq!(zero_err.kind(), io::ErrorKind::InvalidData, "{algo}");
+        }
+        assert!(
+            decompress_block_with_limit(b"ignored", CompressionAlgorithm::None, 0)
+                .expect("CompressionAlgorithm::None returns empty")
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn test_decompress_block_with_limit_rejects_high_ratio_zstd_rle_frame() {
+        // 512 x 128 KiB = 64 MiB of zeros in ~2 KiB of compressed data.
+        let frame = build_zstd_rle_frame(512, 128 * 1024);
+        assert!(frame.len() < 4096, "fixture must be compact");
+
+        let err = decompress_block_with_limit(&frame, CompressionAlgorithm::Zstd, 4096)
+            .expect_err("high-ratio expansion past limit must be rejected");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(err.to_string(), "decompressed block exceeds its declared length");
+    }
+
+    #[test]
+    fn test_decompress_block_with_limit_caps_zstd_window_log() {
+        // Window_Descriptor exponent=17 -> windowLog = 27 (128 MiB > 16 MiB cap).
+        let mut frame = vec![0x28, 0xB5, 0x2F, 0xFD, 0x00, 17 << 3];
+        let last_raw_1byte: u32 = 1 | (1 << 3);
+        frame.extend_from_slice(&last_raw_1byte.to_le_bytes()[..3]);
+        frame.push(b'a');
+
+        let err = decompress_block_with_limit(&frame, CompressionAlgorithm::Zstd, 16)
+            .expect_err("bounded decode must reject zstd frames requesting > 16 MiB window");
+        assert_eq!(err.kind(), io::ErrorKind::Other);
+
+        let unbounded = decompress_block(&frame, CompressionAlgorithm::Zstd).expect("unbounded decode keeps compatibility");
+        assert_eq!(unbounded, b"a");
+    }
+
+    #[test]
+    fn test_decompress_block_lz4_malformed_frame_returns_error_without_panic() {
+        for truncated in [b"".as_slice(), b"\x04\x22\x4D\x18".as_slice()] {
+            if let Ok(out) = decompress_block_with_limit(truncated, CompressionAlgorithm::Lz4, 1024) {
+                assert!(out.is_empty(), "truncated lz4 frame must not yield data");
+            }
+        }
+        let cases: &[&[u8]] = &[
+            b"\x00\x00\x00\x00\x00\x00\x00\x00",
+            b"\x04\x22\x4D\x18\xFF\xFF\xFF\xFF", // valid magic with invalid flag/reserved bits
+            b"not-an-lz4-frame-payload",
+        ];
+        for malformed in cases {
+            assert!(
+                decompress_block(malformed, CompressionAlgorithm::Lz4).is_err(),
+                "unbounded lz4 decode must return Err for malformed input {malformed:?}"
+            );
+            assert!(
+                decompress_block_with_limit(malformed, CompressionAlgorithm::Lz4, 1024).is_err(),
+                "bounded lz4 decode must return Err for malformed input {malformed:?}"
+            );
+        }
     }
 
     #[test]

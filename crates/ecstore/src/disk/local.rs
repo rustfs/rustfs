@@ -12,7 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-pub(in crate::disk) use self::commit::LocalRenamePreflightRejection;
 #[cfg(test)]
 #[path = "local/read_path_tests.rs"]
 mod read_path_tests;
@@ -978,7 +977,7 @@ fn restore_part_transaction_file(current: &Path, backup: &Path, absent: &Path, r
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(windows)))]
 async fn write_metadata_rollback_backup(object_dir: &Path, rollback_dir: Uuid, data: &[u8]) -> Result<()> {
     write_delete_rollback_file(
         object_dir.parent().unwrap_or(object_dir),
@@ -9324,10 +9323,29 @@ impl LocalDisk {
         }
         let path = trash.join(name);
         let result = async {
-            if entry.file_type().await?.is_dir() {
-                fs::remove_dir_all(&path).await
-            } else {
-                fs::remove_file(&path).await
+            let is_dir = entry.file_type().await?.is_dir();
+            #[cfg(windows)]
+            {
+                // Competing recursive deletions can deny each other's directory
+                // handles. Keep ownership until the blocking operation returns.
+                let lease = os::acquire_namespace_mutation_lease_with_owner(&path, None).await;
+                let path = path.clone();
+                os::run_blocking_namespace_operation(lease, move || {
+                    if is_dir {
+                        std::fs::remove_dir_all(path)
+                    } else {
+                        std::fs::remove_file(path)
+                    }
+                })
+                .await
+            }
+            #[cfg(not(windows))]
+            {
+                if is_dir {
+                    fs::remove_dir_all(&path).await
+                } else {
+                    fs::remove_file(&path).await
+                }
             }
         }
         .await;
@@ -22915,6 +22933,22 @@ mod test {
             .expect("new tmp data should be written");
         let dst_meta_parent = dir.path().join(bucket).join(object);
         os::fsync_dir_recorder::set_grouped_failure(&dst_meta_parent, io::ErrorKind::PermissionDenied);
+        let disk_permits = Arc::clone(&disk.file_sync_permits);
+        let initial_permits = disk_permits.available_permits();
+        let (permit_probe_tx, mut permit_probe_rx) = tokio::sync::oneshot::channel();
+        let canonical_parent = dir
+            .path()
+            .canonicalize()
+            .expect("canonical fixture directory")
+            .join(bucket)
+            .join(object);
+        let _probe = os::prepared_publication_test_hooks::install_at(
+            os::prepared_publication_test_hooks::Stage::DirFsync,
+            &canonical_parent,
+            move || {
+                let _ = permit_probe_tx.send(disk_permits.available_permits());
+            },
+        );
 
         let new_fi = test_file_info(object, version_id, Some(new_data_dir), None);
         let err = disk
@@ -22923,6 +22957,8 @@ mod test {
             .expect_err("grouped dst dir fsync failure must fail the fresh PUT");
 
         assert_eq!(err, DiskError::FileAccessDenied);
+        assert_eq!(permit_probe_rx.try_recv().expect("observe the grouped syscall"), initial_permits - 1);
+        assert_eq!(disk.file_sync_permits.available_permits(), initial_permits);
         assert!(
             !dst_meta_parent.join(STORAGE_FORMAT_FILE).exists(),
             "fresh PUT rollback must remove the committed xl.meta after grouped dst dir fsync failure"

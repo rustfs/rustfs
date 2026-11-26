@@ -48,7 +48,6 @@ use rustfs_io_metrics::s3_http_metrics::S3HttpRequestGuard;
 use rustfs_obs::HTTP_SERVER_LOG_TARGET;
 #[cfg(feature = "swift")]
 use rustfs_protocols::swift::SwiftRouter;
-use rustfs_trusted_proxies::ClientInfo;
 use rustfs_utils::get_env_opt_str;
 use rustfs_utils::http::headers::{AMZ_REQUEST_ID, REQUEST_ID_HEADER};
 use std::cell::Cell;
@@ -425,6 +424,8 @@ where
             }
         }
 
+        super::gateway_stack::indeterminate_audit::finish(&mut response);
+
         let status = response.status();
         let suppressed = *this.head_request
             || status.is_informational()
@@ -598,8 +599,12 @@ impl RequestLogContext {
             request_id,
             trace_id: request_context.as_ref().and_then(|ctx| ctx.trace_id.clone()),
             span_id: request_context.as_ref().and_then(|ctx| ctx.span_id.clone()),
-            client_ip: req.extensions().get::<ClientInfo>().map(|info| info.real_ip),
-            peer_addr: req.extensions().get::<RemoteAddr>().map(|addr| addr.0),
+            client_ip: super::rate_limit::client_ip(req),
+            peer_addr: req
+                .extensions()
+                .get::<RemoteAddr>()
+                .map(|addr| addr.0)
+                .or_else(|| req.extensions().get::<SocketAddr>().copied()),
             method: req.method().clone(),
             uri: req.uri().clone(),
             request_started_at: request_context,
@@ -761,6 +766,8 @@ where
 
     fn call(&mut self, req: HttpRequest<B>) -> Self::Future {
         let context = RequestLogContext::from_request(&req);
+        let host = req.headers().get(http::header::HOST).cloned();
+        let user_agent = req.headers().get(http::header::USER_AGENT).cloned();
         let mut inner = self.inner.clone();
         let watchdog = tracing::enabled!(target: HTTP_SERVER_LOG_TARGET, Level::WARN).then(CancellationToken::new);
         if let Some(watchdog) = watchdog.as_ref() {
@@ -782,8 +789,18 @@ where
         // An unpolled response future must also cancel its watchdog on drop.
         let watchdog_guard = watchdog.map(CancellationToken::drop_guard);
         Box::pin(async move {
-            let result = inner.call(req).await;
+            let (mut result, pending) = super::gateway_stack::indeterminate_audit::collect(inner.call(req)).await;
             drop(watchdog_guard);
+            if let (Ok(response), Some(pending)) = (&mut result, pending) {
+                pending.attach(
+                    response,
+                    context.request_started_at.as_ref(),
+                    context.uri.path(),
+                    context.client_ip.or_else(|| context.peer_addr.map(|addr| addr.ip())),
+                    host.as_ref(),
+                    user_agent.as_ref(),
+                );
+            }
             match &result {
                 Ok(response) => context.log_response(response),
                 Err(error) => context.log_failure(error),

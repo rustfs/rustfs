@@ -18,6 +18,11 @@ use super::*;
 use crate::app::storage_api::bucket_usecase::bucket::{ObjectLockConfigExt as _, VersioningConfigExt as _};
 use rustfs_s3_types::{S3Error, S3ErrorCode, S3Result};
 
+/// Maximum number of excluded prefixes accepted in a bucket versioning configuration.
+const MAX_EXCLUDED_PREFIXES: usize = 100;
+/// Maximum byte length of a single excluded prefix (matches the S3 object key limit).
+const MAX_EXCLUDED_PREFIX_BYTES: usize = 1024;
+
 fn versioning_configuration_has_object_lock_incompatible_settings(config: &PersistedVersioningConfiguration) -> bool {
     config.suspended()
         || config.exclude_folders.unwrap_or(false)
@@ -27,7 +32,7 @@ fn versioning_configuration_has_object_lock_incompatible_settings(config: &Persi
             .is_some_and(|excluded_prefixes| !excluded_prefixes.is_empty())
 }
 
-async fn validate_bucket_versioning_update(bucket: &str, config: &PersistedVersioningConfiguration) -> S3Result<()> {
+fn validate_versioning_configuration_shape(config: &PersistedVersioningConfiguration) -> S3Result<()> {
     if config
         .status
         .as_ref()
@@ -38,6 +43,29 @@ async fn validate_bucket_versioning_update(bucket: &str, config: &PersistedVersi
             "bucket versioning configuration has an invalid status",
         ));
     }
+    if let Some(excluded_prefixes) = config.excluded_prefixes.as_ref() {
+        if excluded_prefixes.len() > MAX_EXCLUDED_PREFIXES {
+            return Err(S3Error::with_message(
+                S3ErrorCode::InvalidArgument,
+                format!("bucket versioning configuration cannot exceed {MAX_EXCLUDED_PREFIXES} excluded prefixes"),
+            ));
+        }
+        if excluded_prefixes
+            .iter()
+            .flatten()
+            .any(|prefix| prefix.len() > MAX_EXCLUDED_PREFIX_BYTES)
+        {
+            return Err(S3Error::with_message(
+                S3ErrorCode::InvalidArgument,
+                format!("bucket versioning excluded prefix cannot exceed {MAX_EXCLUDED_PREFIX_BYTES} bytes"),
+            ));
+        }
+    }
+    Ok(())
+}
+
+async fn validate_bucket_versioning_update(bucket: &str, config: &PersistedVersioningConfiguration) -> S3Result<()> {
+    validate_versioning_configuration_shape(config)?;
     match metadata_sys::get_object_lock_config(bucket).await {
         Ok((object_lock_config, _)) => {
             if object_lock_config.enabled() && versioning_configuration_has_object_lock_incompatible_settings(config) {
@@ -152,6 +180,56 @@ mod tests {
             .expect_err("an invalid string-backed versioning status must be rejected before persistence");
 
         assert_eq!(err.code(), &S3ErrorCode::InvalidArgument);
+    }
+
+    #[tokio::test]
+    async fn validate_bucket_versioning_update_rejects_excessive_excluded_prefix_count() {
+        let prefixes = (0..=MAX_EXCLUDED_PREFIXES)
+            .map(|i| Some(format!("tmp-{i}/")))
+            .collect::<Vec<_>>();
+        let config = PersistedVersioningConfiguration {
+            status: Some("Enabled".to_owned()),
+            excluded_prefixes: Some(prefixes),
+            ..Default::default()
+        };
+
+        let err = validate_bucket_versioning_update("unregistered-test-bucket", &config)
+            .await
+            .expect_err("excessive excluded prefix count must be rejected before persistence");
+
+        assert_eq!(err.code(), &S3ErrorCode::InvalidArgument);
+    }
+
+    #[tokio::test]
+    async fn validate_bucket_versioning_update_rejects_oversized_excluded_prefix() {
+        let config = PersistedVersioningConfiguration {
+            status: Some("Enabled".to_owned()),
+            excluded_prefixes: Some(vec![Some("*".repeat(MAX_EXCLUDED_PREFIX_BYTES + 1))]),
+            ..Default::default()
+        };
+
+        let err = validate_bucket_versioning_update("unregistered-test-bucket", &config)
+            .await
+            .expect_err("oversized excluded prefix must be rejected before persistence");
+
+        assert_eq!(err.code(), &S3ErrorCode::InvalidArgument);
+    }
+
+    #[test]
+    fn validate_versioning_configuration_shape_accepts_bounded_excluded_prefixes() {
+        let at_limit_count = PersistedVersioningConfiguration {
+            status: Some("Enabled".to_owned()),
+            excluded_prefixes: Some((0..MAX_EXCLUDED_PREFIXES).map(|i| Some(format!("tmp-{i}/"))).collect()),
+            ..Default::default()
+        };
+        validate_versioning_configuration_shape(&at_limit_count).expect("max allowed excluded prefix count should pass");
+
+        let at_limit_len = PersistedVersioningConfiguration {
+            status: Some("Enabled".to_owned()),
+            excluded_prefixes: Some(vec![Some("a".repeat(MAX_EXCLUDED_PREFIX_BYTES))]),
+            ..Default::default()
+        };
+        validate_versioning_configuration_shape(&at_limit_len).expect("max allowed excluded prefix length should pass");
     }
 
     #[test]

@@ -244,7 +244,10 @@ pub(crate) mod ecfs_consumer {
     }
 
     pub(crate) mod object_lock {
-        pub(crate) use super::super::super::validate_bucket_object_lock_enabled;
+        pub(crate) use super::super::super::{
+            load_bucket_object_lock_config_state, validate_bucket_object_lock_enabled,
+            validate_bucket_object_lock_enabled_for_read, validate_bucket_object_lock_enabled_state,
+        };
     }
 
     pub(crate) type StorageObjectOptions = super::StorageObjectOptions;
@@ -483,7 +486,7 @@ pub(crate) mod tonic_service_consumer {
 #[cfg(test)]
 pub(crate) mod test_consumer {
     pub(crate) use super::super::access_owned::object_read::authorize_head_object;
-    pub(crate) use super::super::legacy_s3_test_types;
+    pub(crate) use rustfs_ecstore::api::object::test_util::DeleteAfterObjectLockSnapshotBarrier;
     pub(crate) mod sse {
         pub(crate) use super::super::super::sse::{RecordingKmsKeyAuthorizer, TestAuthorizationHooks, sse_kms_object_metadata};
     }
@@ -552,12 +555,12 @@ pub(crate) mod ecstore_config {
 
 pub(crate) mod ecstore_data_usage {
     pub(crate) use rustfs_ecstore::api::data_usage::{
-        get_bucket_usage_memory, init_compression_total_memory_from_backend, load_admin_data_usage_from_backend_cached,
-        load_admin_data_usage_with_memory_overlay, load_bucket_scan_progress_for_admin, load_bucket_usage_from_backend_cached,
-        load_data_usage_from_backend, lookup_degraded_bucket_usage_baseline, quota_object_size,
-        record_bucket_delete_marker_memory, record_bucket_object_delete_memory, record_bucket_object_version_write_memory,
-        record_bucket_object_write_memory, record_bucket_object_write_unknown_previous_memory,
-        store_compression_total_in_backend, verified_account_bucket_usage,
+        BucketUsagePendingReason, BucketUsageStatus, get_bucket_usage_memory, init_compression_total_memory_from_backend,
+        load_admin_data_usage_from_backend_cached, load_admin_data_usage_with_memory_overlay,
+        load_bucket_scan_progress_for_admin, load_bucket_usage_certification_from_backend_cached, load_data_usage_from_backend,
+        lookup_degraded_bucket_usage_baseline, quota_object_size, record_bucket_delete_marker_memory,
+        record_bucket_object_delete_memory, record_bucket_object_version_write_memory, record_bucket_object_write_memory,
+        record_bucket_object_write_unknown_previous_memory, store_compression_total_in_backend, verified_account_bucket_usage,
     };
     // Test-only observables for the rustfs/backlog#1306 revert detector.
     #[cfg(test)]
@@ -2346,17 +2349,19 @@ pub(crate) fn add_object_lock_years(dt: time::OffsetDateTime, years: i32) -> tim
 }
 
 pub(crate) fn check_retention_for_modification(
-    user_defined: &std::collections::HashMap<String, String>,
+    object_lock_config_state: &ecstore_bucket::metadata_sys::ObjectLockConfigState,
+    obj_info: &ObjectInfo,
     new_mode: Option<&str>,
     new_retain_until: Option<time::OffsetDateTime>,
     bypass_governance: bool,
-) -> Option<ObjectLockBlockReason> {
+) -> Result<Option<ObjectLockBlockReason>> {
     // The gate compares the requested mode literally against the canonical
     // persisted mode, so only the exact canonical spelling maps to a typed
     // mode; anything else stays `None` and is judged as a mode change.
     let new_mode = new_mode.and_then(ecstore_bucket::object_lock::types::RetentionMode::parse_exact);
     ecstore_bucket::object_lock::objectlock_sys::check_retention_for_modification(
-        user_defined,
+        object_lock_config_state,
+        obj_info,
         new_mode,
         new_retain_until,
         bypass_governance,

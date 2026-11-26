@@ -43,6 +43,23 @@ pub const MAX_IAM_IMPORT_EXPANDED_SIZE: u64 = 100 * 1024 * 1024; // 100 MB
 /// 100MB allows importing metadata for ~10,000 buckets with reasonable configs.
 pub const MAX_BUCKET_METADATA_IMPORT_SIZE: usize = 100 * 1024 * 1024; // 100 MB
 
+/// Maximum total size the members of a bucket metadata import ZIP may expand to (100 MB).
+/// Used for: bounding total decompression of `ImportBucketMetadata` archive members.
+/// Rationale: `MAX_BUCKET_METADATA_IMPORT_SIZE` caps the *compressed* upload only, and
+/// the archive may use any compression method the `zip` crate supports (deflate, bzip2, zstd, ...),
+/// so without a separate budget a few hundred bytes can expand to gigabytes. Bucket
+/// configs are small XML/JSON documents: 100 MB of them still covers the ~10,000
+/// buckets the compressed cap is sized for while keeping worst-case allocation bounded.
+pub const MAX_BUCKET_METADATA_IMPORT_EXPANDED_SIZE: u64 = 100 * 1024 * 1024; // 100 MB
+
+/// Maximum expanded size of a single member inside a bucket metadata import ZIP (1 MB).
+/// Used for: bounding individual configuration payloads in `ImportBucketMetadata`.
+/// Rationale: Individual bucket configuration files (policy, lifecycle, replication, etc.)
+/// are small XML/JSON documents well under 1 MB (matching `MAX_ADMIN_REQUEST_BODY_SIZE`).
+/// Capping each member prevents repeated oversized config payloads from bloating
+/// persisted bucket metadata and startup memory across restarts.
+pub const MAX_BUCKET_METADATA_IMPORT_MEMBER_SIZE: u64 = 1024 * 1024; // 1 MB
+
 /// Maximum size for healing operation requests (1 MB)
 /// Used for: Healing parameters and configuration
 /// Rationale: Healing requests contain bucket/object paths and options. Should be small.

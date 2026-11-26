@@ -546,6 +546,16 @@ pub(crate) async fn validate_bucket_object_lock_enabled(bucket: &str) -> S3Resul
     validate_bucket_object_lock_enabled_state(bucket, &state)
 }
 
+pub(crate) async fn validate_bucket_object_lock_enabled_for_read(bucket: &str) -> S3Result<()> {
+    // Metadata authority already distinguishes a missing bucket from a missing
+    // lock configuration. Warm reads need no separate namespace quorum probe.
+    let Some(result) = metadata_sys::find_object_lock_config_state(bucket).await.transpose() else {
+        return Err(ApiError::from(StorageError::BucketNotFound(bucket.to_owned())).into());
+    };
+    let state = map_bucket_object_lock_config_state(bucket, result)?;
+    validate_bucket_object_lock_enabled_state(bucket, &state)
+}
+
 pub(crate) fn validate_bucket_object_lock_enabled_state(bucket: &str, state: &ObjectLockConfigState) -> S3Result<()> {
     match state {
         ObjectLockConfigState::Configured { config, .. } if config.object_lock_enabled.as_deref() == Some("Enabled") => Ok(()),

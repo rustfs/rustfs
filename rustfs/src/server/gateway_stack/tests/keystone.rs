@@ -378,6 +378,7 @@ fn probe_stack<H: rustfs_gateway::Handler<rustfs_gateway::dto::ListBuckets>>(
             .unwrap(),
         keystone_auth: a.keystone_auth,
         control_plane: false,
+        object_lambda_fallback: None,
     }
 }
 

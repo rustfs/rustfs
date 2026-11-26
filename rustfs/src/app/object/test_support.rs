@@ -17,8 +17,6 @@
 use super::*;
 use std::sync::Arc;
 
-pub(super) use crate::app::storage_api::s3::UploadStreamError;
-
 pub(super) async fn real_cold_fill_test_context() -> (Arc<ECStore>, Arc<AppContext>) {
     let store = crate::app::gating_test_env::shared_gating_ecstore().await;
     if current_app_context().is_none() {

@@ -153,17 +153,17 @@ rustfs-utils = { path = "crates/utils", version = "1.0.5" }
 rustfs-zip = { path = "./crates/zip", version = "1.0.5" }
 
 # Pin the gateway and its protocol crates to the same revision.
-rustfs-gateway-types = { git = "https://github.com/rustfs/gateway.git", rev = "cc8cba78dd8e29bb706d3a020f5264de43c9d69d", version = "0.42.0", default-features = false }
-rustfs-gateway-stream = { git = "https://github.com/rustfs/gateway.git", rev = "cc8cba78dd8e29bb706d3a020f5264de43c9d69d", version = "0.2.0", default-features = false }
+rustfs-gateway-types = { git = "https://github.com/rustfs/gateway.git", rev = "b4ea5ca3638dfbb0e3f34a6db99db534433dfe1b", version = "0.42.0", default-features = false }
+rustfs-gateway-stream = { git = "https://github.com/rustfs/gateway.git", rev = "b4ea5ca3638dfbb0e3f34a6db99db534433dfe1b", version = "0.2.0", default-features = false }
 # The gateway framework itself, consumed for its extension traits by the ring-2
 # adapter. `default-features = false` keeps the `server` feature, and with it the
 # server crate, out of the build.
-rustfs-gateway = { git = "https://github.com/rustfs/gateway.git", rev = "cc8cba78dd8e29bb706d3a020f5264de43c9d69d", version = "0.66.0", default-features = false }
+rustfs-gateway = { git = "https://github.com/rustfs/gateway.git", rev = "b4ea5ca3638dfbb0e3f34a6db99db534433dfe1b", version = "0.67.0", default-features = false }
 # Test-only: builds the `EffectiveHost` a host-resolution test queries with.
-rustfs-gateway-http = { git = "https://github.com/rustfs/gateway.git", rev = "cc8cba78dd8e29bb706d3a020f5264de43c9d69d", default-features = false }
-rustfs-gateway-core = { git = "https://github.com/rustfs/gateway.git", rev = "cc8cba78dd8e29bb706d3a020f5264de43c9d69d", version = "0.63.0", default-features = false }
-rustfs-gateway-corpus-recorder = { git = "https://github.com/rustfs/gateway.git", rev = "cc8cba78dd8e29bb706d3a020f5264de43c9d69d", version = "0.1.0", default-features = false }
-rustfs-gateway-dialect-rustfs-admin = { git = "https://github.com/rustfs/gateway.git", rev = "cc8cba78dd8e29bb706d3a020f5264de43c9d69d", version = "0.13.0", default-features = false }
+rustfs-gateway-http = { git = "https://github.com/rustfs/gateway.git", rev = "b4ea5ca3638dfbb0e3f34a6db99db534433dfe1b", default-features = false }
+rustfs-gateway-core = { git = "https://github.com/rustfs/gateway.git", rev = "b4ea5ca3638dfbb0e3f34a6db99db534433dfe1b", version = "0.64.0", default-features = false }
+rustfs-gateway-corpus-recorder = { git = "https://github.com/rustfs/gateway.git", rev = "b4ea5ca3638dfbb0e3f34a6db99db534433dfe1b", version = "0.1.0", default-features = false }
+rustfs-gateway-dialect-rustfs-admin = { git = "https://github.com/rustfs/gateway.git", rev = "b4ea5ca3638dfbb0e3f34a6db99db534433dfe1b", version = "0.13.0", default-features = false }
 
 # Async Runtime and Networking
 async-channel = "2.5.0"

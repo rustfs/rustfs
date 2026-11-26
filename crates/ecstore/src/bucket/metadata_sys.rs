@@ -151,6 +151,15 @@ pub enum ObjectLockConfigState {
     Fabricated,
 }
 
+// Only namespace probes can name the requested bucket. Internal metadata
+// storage errors must not be mistaken for absence of that bucket.
+fn bucket_namespace_error(bucket: &str, error: Error) -> Error {
+    match error {
+        Error::VolumeNotFound => Error::BucketNotFound(bucket.to_owned()),
+        error => error,
+    }
+}
+
 enum BucketMetadataAuthority {
     Authoritative(Arc<BucketMetadata>),
     Fabricated,
@@ -1695,6 +1704,24 @@ pub async fn get_object_lock_config_state(bucket: &str) -> Result<ObjectLockConf
     bucket_meta_sys.get_object_lock_config_state(bucket).await
 }
 
+/// Read Object Lock state from authoritative bucket metadata.
+///
+/// `Ok(None)` means the bucket is confirmed missing. An existing bucket with
+/// no Object Lock configuration returns `Some(ConfirmedAbsent)`.
+///
+/// # Errors
+///
+/// Returns storage, migration, or validation errors when the state cannot be read.
+pub async fn find_object_lock_config_state(bucket: &str) -> Result<Option<ObjectLockConfigState>> {
+    let bucket_meta_sys_lock = get_bucket_metadata_sys()?;
+    let bucket_meta_sys = bucket_meta_sys_lock.read().await.clone();
+
+    match bucket_meta_sys.find_object_lock_config_state(bucket).await {
+        Err(Error::BucketNotFound(name)) if name == bucket => Ok(None),
+        result => result,
+    }
+}
+
 pub(crate) async fn get_object_lock_config_state_in(
     ctx: &crate::runtime::instance::InstanceContext,
     bucket: &str,
@@ -1891,7 +1918,9 @@ pub(crate) async fn get_quota_config_and_incarnation_from_disk_for_options_in(
     {
         if snapshot_guard.is_lock_lost()
             || snapshot_guard.is_released()
-            || !snapshot.is_valid_for_destructive_put(store.id, bucket, opts.expected_bucket_incarnation_id.unwrap_or_default())
+            || snapshot
+                .validated_bucket_incarnation_for(store.id, bucket, opts.expected_bucket_incarnation_id)
+                .is_none()
         {
             return Err(Error::other("quota snapshot fence or bucket incarnation changed during the disk read"));
         }
@@ -1946,6 +1975,133 @@ pub(crate) async fn get_cached_quota_config_and_incarnation_in(
     let bucket_meta_sys_lock = bucket_metadata_sys_of(ctx)?;
     let bucket_meta_sys = bucket_meta_sys_lock.read().await.clone();
     bucket_meta_sys.cached_quota_config_and_incarnation(bucket).await
+}
+
+/// Returns whether a commit-time write path will consult bucket metadata in
+/// `reservation::begin` and therefore needs a pre-captured Object Lock / quota
+/// snapshot before acquiring the object namespace write lock.
+pub(crate) fn needs_commit_metadata_snapshot(
+    ctx: &crate::runtime::instance::InstanceContext,
+    bucket: &str,
+    opts: &ObjectOptions,
+) -> bool {
+    let base_required = opts.object_lock_config_snapshot.is_none()
+        && !is_meta_bucketname(bucket)
+        && !(opts.is_lockless_cache_write() && opts.quota_admission.is_none());
+    #[cfg(test)]
+    let base_required = base_required && opts.quota_admission.is_none();
+    #[cfg(any(test, feature = "test-util"))]
+    let base_required = base_required && ctx.bucket_metadata_sys().is_some();
+    #[cfg(not(any(test, feature = "test-util")))]
+    let _ = ctx;
+    base_required
+}
+
+/// Capture an authoritative Object Lock / quota metadata snapshot using an
+/// already-held bucket lifecycle read fence. Acquires only the bucket metadata
+/// transaction read lock (preserving `lifecycle -> transaction -> object` order
+/// without touching `new_ns_lock(bucket, bucket)`).
+pub(crate) async fn capture_object_lock_config_snapshot_under_lifecycle_fence_in(
+    ctx: &crate::runtime::instance::InstanceContext,
+    bucket: &str,
+    lifecycle_fence: &crate::object_api::NamespaceLockFence,
+) -> Result<Arc<crate::object_api::ObjectLockConfigSnapshot>> {
+    if lifecycle_fence.is_lock_lost() {
+        return Err(Error::other("bucket lifecycle lock was lost before loading the Object Lock snapshot"));
+    }
+    let store = object_store_in(ctx).await?;
+    let metadata_guard =
+        acquire_bucket_metadata_transaction_read_lock_in_for_purpose(ctx, bucket, "object_lock_completion_metadata_read").await?;
+    let (state, bucket_incarnation_id, config_revision) =
+        get_object_lock_config_and_incarnation_from_disk_with_guard_in(ctx, bucket, Some(&metadata_guard)).await?;
+    if lifecycle_fence.is_lock_lost() || metadata_guard.is_lock_lost() {
+        return Err(Error::other("bucket lock was lost while loading the Object Lock snapshot"));
+    }
+    Ok(Arc::new(
+        crate::object_api::ObjectLockConfigSnapshot::for_store_bucket_under_lifecycle_fence(
+            store.id,
+            bucket,
+            bucket_incarnation_id,
+            config_revision,
+            state,
+            lifecycle_fence.clone(),
+            Arc::new(metadata_guard),
+        ),
+    ))
+}
+
+/// Clone `opts` and attach a commit-time metadata snapshot captured strictly
+/// before acquiring the object namespace write lock. Reuses an already-held
+/// bucket lifecycle fence when present, otherwise acquires both lifecycle and
+/// metadata-transaction read locks without touching `new_ns_lock(bucket, bucket)`.
+pub(crate) async fn capture_commit_metadata_snapshot_for_options_in(
+    ctx: &crate::runtime::instance::InstanceContext,
+    bucket: &str,
+    expected_incarnation_id: Option<Uuid>,
+    opts: &ObjectOptions,
+) -> Result<ObjectOptions> {
+    let mut commit_opts = opts.clone();
+    let store = object_store_in(ctx).await?;
+    let snapshot = if let Some(lifecycle_fence) = commit_opts.bucket_lifecycle_lock_fence.as_ref() {
+        capture_object_lock_config_snapshot_under_lifecycle_fence_in(ctx, bucket, lifecycle_fence).await?
+    } else {
+        store.object_lock_config_snapshot_for_single_put(bucket).await?
+    };
+    if let Some(expected) = expected_incarnation_id {
+        if snapshot
+            .validated_bucket_incarnation_for(store.id, bucket, Some(expected))
+            .is_none()
+        {
+            return Err(Error::BucketNotFound(bucket.to_string()));
+        }
+    } else if snapshot.validated_bucket_incarnation_for(store.id, bucket, None).is_none() {
+        return Err(Error::other("bucket generation or configuration changed before commit"));
+    }
+    snapshot.add_lock_fences(&mut commit_opts);
+    commit_opts.object_lock_config_snapshot = Some(snapshot);
+    Ok(commit_opts)
+}
+
+/// Resolve the bucket's hard quota limit (if configured) and bucket incarnation
+/// for multipart staging admission. Uses the warm metadata cache on the hot path
+/// and falls back to loading bucket metadata on a cold cache; unsupported quota
+/// reservation protocols fail closed.
+pub(crate) async fn get_bucket_quota_limit_and_incarnation_in(
+    ctx: &crate::runtime::instance::InstanceContext,
+    bucket: &str,
+) -> Result<Option<(u64, Option<Uuid>)>> {
+    #[cfg(any(test, feature = "test-util"))]
+    if ctx.bucket_metadata_sys().is_none() {
+        return Ok(None);
+    }
+
+    let bucket_meta_sys_lock = bucket_metadata_sys_of(ctx)?;
+    let bucket_meta_sys = bucket_meta_sys_lock.read().await.clone();
+    if let Some(snapshot) = bucket_meta_sys.cached_quota_config_and_incarnation(bucket).await? {
+        let Some(quota) = snapshot.quota else {
+            return Ok(None);
+        };
+        if quota.has_unsupported_reservation_protocol() {
+            return Err(Error::PartMissingOrCorrupt);
+        }
+        return Ok(quota
+            .get_quota_limit()
+            .map(|limit| (limit, (!snapshot.bucket_incarnation.is_nil()).then_some(snapshot.bucket_incarnation))));
+    }
+
+    let (bm, _) = bucket_meta_sys.get_config(bucket).await?;
+    if !bm.quota_config_json.is_empty() && bm.quota_config.is_none() {
+        return Err(Error::other("persisted bucket quota configuration is invalid"));
+    }
+    let Some(quota) = &bm.quota_config else {
+        return Ok(None);
+    };
+    if quota.has_unsupported_reservation_protocol() {
+        return Err(Error::PartMissingOrCorrupt);
+    }
+    Ok(quota
+        .get_quota_limit()
+        .map(|limit| (limit, (!bm.bucket_incarnation_id.is_nil()).then_some(bm.bucket_incarnation_id))))
 }
 
 pub async fn get_replication_config(bucket: &str) -> Result<(PersistedReplicationConfiguration, OffsetDateTime)> {
@@ -3072,15 +3228,15 @@ impl BucketMetadataSys {
                     Box::pin(async {
                         let store = self.object_store();
                         let options = crate::storage_api_contracts::bucket::BucketOptions::default();
-                        let info = if require_write_quorum {
-                            store.get_bucket_info_from_sets(bucket, &options).await
+                        if require_write_quorum {
+                            store.get_bucket_info_from_sets(bucket, &options).await.map(|_| ())
                         } else {
-                            store.get_bucket_info_from_sets_at_read_quorum(bucket, &options).await
-                        };
-                        info.map(|_| ())
+                            store.check_bucket_presence_at_read_quorum(bucket).await
+                        }
                     }),
                 )
-                .await?;
+                .await
+                .map_err(|err| bucket_namespace_error(bucket, err))?;
                 if guard.is_lock_lost() {
                     return Err(Error::other(format!(
                         "bucket namespace lock was lost before lazy bucket metadata publish: {bucket}"
@@ -3240,14 +3396,18 @@ impl BucketMetadataSys {
     }
 
     pub async fn get_object_lock_config_state(&self, bucket: &str) -> Result<ObjectLockConfigState> {
-        match self.get_metadata_authority(bucket).await? {
-            BucketMetadataAuthority::Authoritative(bm) => object_lock_config_state_from_authoritative_metadata(&bm),
-            BucketMetadataAuthority::Fabricated => match self.migrate_legacy_metadata(bucket).await? {
-                BucketMetadataAuthority::Authoritative(bm) => object_lock_config_state_from_authoritative_metadata(&bm),
-                BucketMetadataAuthority::MissingBucket => Err(Error::ConfigNotFound),
-                BucketMetadataAuthority::Fabricated => Ok(ObjectLockConfigState::Fabricated),
-            },
-            BucketMetadataAuthority::MissingBucket => Err(Error::ConfigNotFound),
+        self.find_object_lock_config_state(bucket).await?.ok_or(Error::ConfigNotFound)
+    }
+
+    async fn find_object_lock_config_state(&self, bucket: &str) -> Result<Option<ObjectLockConfigState>> {
+        let authority = match self.get_metadata_authority(bucket).await? {
+            BucketMetadataAuthority::Fabricated => self.migrate_legacy_metadata(bucket).await?,
+            authority => authority,
+        };
+        match authority {
+            BucketMetadataAuthority::Authoritative(bm) => object_lock_config_state_from_authoritative_metadata(&bm).map(Some),
+            BucketMetadataAuthority::Fabricated => Ok(Some(ObjectLockConfigState::Fabricated)),
+            BucketMetadataAuthority::MissingBucket => Ok(None),
         }
     }
 
@@ -3387,7 +3547,8 @@ impl BucketMetadataSys {
             self.object_store()
                 .get_bucket_info_from_sets(bucket, &crate::storage_api_contracts::bucket::BucketOptions::default()),
         )
-        .await?;
+        .await
+        .map_err(|err| bucket_namespace_error(bucket, err))?;
 
         let (mut metadata, persisted) = await_bucket_namespace_operation(
             Some(&namespace_guard),
@@ -3640,19 +3801,12 @@ impl BucketMetadataSys {
         #[cfg(test)]
         self.authority_disk_loads.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
-        let (bucket_info_res, metadata_res) = tokio::join!(
+        let (bucket_presence_res, metadata_res) = tokio::join!(
             Box::pin(await_bucket_namespace_operation(
                 Some(guard),
                 bucket,
                 "bucket metadata snapshot existence check",
-                async {
-                    store
-                        .get_bucket_info_from_sets_at_read_quorum(
-                            bucket,
-                            &crate::storage_api_contracts::bucket::BucketOptions::default(),
-                        )
-                        .await
-                },
+                store.check_bucket_presence_at_read_quorum(bucket),
             )),
             Box::pin(await_bucket_namespace_operation(
                 Some(guard),
@@ -3661,8 +3815,8 @@ impl BucketMetadataSys {
                 load_bucket_metadata_parse_with_presence(Arc::clone(&store), bucket, false),
             )),
         );
-        match bucket_info_res {
-            Ok(_) => {}
+        match bucket_presence_res {
+            Ok(()) => {}
             Err(Error::VolumeNotFound) => return Ok(BucketMetadataAuthority::MissingBucket),
             Err(err) => return Err(err),
         }
@@ -4435,14 +4589,17 @@ mod tests {
             sys.get_bucket_policy("migration-write-failure").await,
             Err(Error::ConfigNotFound)
         ));
-        assert!(sys.get_object_lock_config_state("migration-write-failure").await.is_err());
+        assert!(sys.find_object_lock_config_state("migration-write-failure").await.is_err());
         assert!(sys.get("migration-write-failure").await.is_err());
         sys.legacy_migration_write_error.store(false, Ordering::Relaxed);
 
+        let loads_before = sys.lazy_disk_loads.load(Ordering::Relaxed);
+        assert!(sys.find_object_lock_config_state("missing-bucket").await.unwrap().is_none());
         assert!(matches!(
             sys.get_object_lock_config_state("missing-bucket").await,
             Err(Error::ConfigNotFound)
         ));
+        assert_eq!(sys.lazy_disk_loads.load(Ordering::Relaxed), loads_before + 1);
         assert!(matches!(sys.get_bucket_policy("missing-bucket").await, Err(Error::ConfigNotFound)));
         assert!(matches!(sys.get_bucket_policy_raw("missing-bucket").await, Err(Error::ConfigNotFound)));
 
@@ -5161,14 +5318,14 @@ mod tests {
         // be lazily republished as a live bucket generation.
         let mut deleted_lazy = BucketMetadata::new("deleted-lazy-bucket");
         deleted_lazy.policy_config_json = b"stale-generation".to_vec();
-        sys.persist_and_set(deleted_lazy)
+        sys.persist_new_and_set(deleted_lazy)
             .await
-            .expect("stale metadata should persist");
+            .expect("stale committed metadata should persist");
         sys.metadata_map.write().await.remove("deleted-lazy-bucket");
-        assert!(
-            sys.get_config("deleted-lazy-bucket").await.is_err(),
-            "lazy load must fail when the physical bucket no longer exists"
-        );
+        assert!(matches!(
+            sys.get_config("deleted-lazy-bucket").await,
+            Err(Error::BucketNotFound(name)) if name == "deleted-lazy-bucket"
+        ));
         assert!(sys.get("deleted-lazy-bucket").await.is_err());
 
         // (d) The namespace generation fence must be acquired before lazy

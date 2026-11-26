@@ -740,7 +740,7 @@ mod tests {
     use super::*;
     use crate::app::object::DefaultObjectUsecase;
     use crate::app::storage_api::object_usecase::StorageObjectInfo as ObjectInfo;
-    use crate::app::storage_api::s3::dto::{ChecksumAlgorithm, CreateMultipartUploadInput, StreamingBlob, UploadPartInput};
+    use rustfs_gateway_stream::Body;
     use rustfs_gateway_types::dto::HeadObjectInput;
     use rustfs_gateway_types::{BucketName, ObjectKey, SseCustomerKey};
     fn completion_with_header(name: impl http::header::IntoHeaderName, value: HeaderValue) -> RequestEnvelope {
@@ -939,17 +939,21 @@ mod tests {
 
     #[tokio::test]
     async fn execute_complete_multipart_upload_rejects_missing_parts_list() {
-        use crate::app::storage_api::s3::xml::Deserialize as _;
+        use rustfs_gateway::{Limits, MetaView, OperationCodec, RequestBody, TargetKind, WireRequest, dto};
 
-        let mut deserializer = crate::app::storage_api::s3::xml::Deserializer::new(b"<CompleteMultipartUpload/>");
-        let multipart_upload =
-            CompletedMultipartUpload::deserialize(&mut deserializer).expect("empty multipart XML should decode");
-        deserializer
-            .expect_eof()
-            .expect("empty multipart XML should be fully consumed");
-        assert!(multipart_upload.parts.is_none());
+        let request = http::Request::builder()
+            .method("POST")
+            .uri("http://localhost/bucket/object?uploadId=upload-id")
+            .header("host", "localhost")
+            .body(Bytes::new())
+            .expect("wire request");
+        let wire = WireRequest::accept(request, &Limits::default()).expect("accepted wire request");
+        let view = MetaView::of(&wire, TargetKind::Object).expect("object view");
+        let input =
+            dto::CompleteMultipartUpload::decode(&view, RequestBody::Buffered(Bytes::from_static(b"<CompleteMultipartUpload/>")))
+                .expect("empty multipart XML should decode");
+        assert!(input.multipart_upload.parts.is_empty());
 
-        let input = completion_input("bucket", "object", "upload-id", vec![]);
         let err = Box::pin(make_usecase().execute_complete_multipart_upload(owned_envelope(Method::POST), input))
             .await
             .expect_err("empty part list");
@@ -1012,23 +1016,30 @@ mod tests {
         let object = "object";
         let usecase = DefaultMultipartUsecase::from_global();
 
-        let create_input = CreateMultipartUploadInput::builder()
-            .bucket(bucket.clone())
-            .key(object.to_string())
-            .build()
-            .expect("create multipart input should build");
-        // Same facts `RequestEnvelope::from_s3s` copies. Credentials, region, and service stay absent.
+        // Metadata, tagging, storage class, request SSE, and object lock stay absent.
+        let create = super::super::CreateMultipartUploadFields {
+            bucket: bucket.clone(),
+            key: object.to_owned(),
+            metadata: None,
+            tagging: None,
+            storage_class: None,
+            server_side_encryption: None,
+            sse_customer_algorithm: None,
+            sse_customer_key: None,
+            sse_customer_key_md5: None,
+            ssekms_key_id: None,
+            object_lock_legal_hold_status: None,
+            object_lock_mode: None,
+            object_lock_retain_until_date: None,
+        };
+        // Credentials, region, and service stay absent.
         let mut create_envelope = completion_with_header(AMZ_BUCKET_REPLICATION_STATUS, HeaderValue::from_static("REPLICA"));
         create_envelope.install_req_info(crate::storage::req_info::ReqInfo {
             replication_request_authorized: true,
             ..Default::default()
         });
         let upload_id = usecase
-            .execute_create_multipart_upload(
-                create_envelope,
-                super::super::CreateMultipartUploadFields::from_legacy(create_input),
-                None,
-            )
+            .execute_create_multipart_upload(create_envelope, create, None)
             .await
             .expect("authorized REPLICA-only create should succeed")
             .upload_id;
@@ -1087,46 +1098,55 @@ mod tests {
             let customer_key = "KioqKioqKioqKioqKioqKioqKioqKioqKioqKioqKio=";
             let customer_md5 = "SaaDheEjzuynJH8eW6AEpQ==";
             let plaintext_sha256 = "ungWv48Bz+pBQUDeXa4iI7ADYaOWF3qctBD/YfIAFa0=";
-            let mut create_input = CreateMultipartUploadInput::builder()
-                .bucket(bucket.clone())
-                .key(key.to_string())
-                .build()
-                .expect("create");
-            create_input.sse_customer_algorithm = Some("AES256".to_string());
-            create_input.sse_customer_key = Some(customer_key.to_string());
-            create_input.sse_customer_key_md5 = Some(customer_md5.to_string());
-            create_input.checksum_algorithm = Some(ChecksumAlgorithm::from_static("SHA256"));
+            // Metadata, tagging, storage class, managed SSE, and object lock stay absent.
+            let create = super::super::CreateMultipartUploadFields {
+                bucket: bucket.clone(),
+                key: key.to_owned(),
+                metadata: None,
+                tagging: None,
+                storage_class: None,
+                server_side_encryption: None,
+                sse_customer_algorithm: Some("AES256".to_owned()),
+                sse_customer_key: Some(customer_key.to_owned()),
+                sse_customer_key_md5: Some(customer_md5.to_owned()),
+                ssekms_key_id: None,
+                object_lock_legal_hold_status: None,
+                object_lock_mode: None,
+                object_lock_retain_until_date: None,
+            };
             let mut headers = HeaderMap::new();
             headers.insert("x-amz-checksum-algorithm", HeaderValue::from_static("SHA256"));
             headers.insert("x-amz-checksum-type", HeaderValue::from_static("COMPOSITE"));
             let upload_id = usecase
-                .execute_create_multipart_upload(
-                    completion_with_headers(headers),
-                    super::super::CreateMultipartUploadFields::from_legacy(create_input),
-                    None,
-                )
+                .execute_create_multipart_upload(completion_with_headers(headers), create, None)
                 .await
                 .expect("SSE-C create")
                 .upload_id;
-            let mut part_input = UploadPartInput::builder()
-                .bucket(bucket.clone())
-                .key(key.to_string())
-                .upload_id(upload_id.clone())
-                .part_number(1)
-                .build()
-                .expect("part");
-            part_input.body = Some(StreamingBlob::from(Bytes::from_static(b"abc")));
-            part_input.content_length = Some(3);
-            part_input.sse_customer_algorithm = Some("AES256".to_string());
-            part_input.sse_customer_key = Some(customer_key.to_string());
-            part_input.sse_customer_key_md5 = Some(customer_md5.to_string());
-            part_input.checksum_algorithm = Some(ChecksumAlgorithm::from_static("SHA256"));
-            part_input.checksum_sha256 = Some(plaintext_sha256.to_string());
+            // Content MD5, non-SHA256 checksums, and trailers stay absent.
+            let part_input = super::super::UploadPartWriteInput {
+                target: super::super::UploadPartTarget::Legacy {
+                    bucket: bucket.clone(),
+                    key: key.to_owned(),
+                    upload_id: upload_id.clone(),
+                },
+                part_number: 1,
+                content_length: Some(3),
+                body: Some(Body::from(Bytes::from_static(b"abc"))),
+                trailing_headers: None,
+                frame_trailers: None,
+                content_md5: None,
+                checksum_algorithm: Some("SHA256".to_owned()),
+                checksum_crc32: None,
+                checksum_crc32c: None,
+                checksum_crc64nvme: None,
+                checksum_sha1: None,
+                checksum_sha256: Some(plaintext_sha256.to_owned()),
+                sse_customer_algorithm: Some("AES256".to_owned()),
+                sse_customer_key: Some(customer_key.to_owned()),
+                sse_customer_key_md5: Some(customer_md5.to_owned()),
+            };
             let part = usecase
-                .execute_upload_part_with_audit(
-                    put_part_checksum_envelope(plaintext_sha256),
-                    super::super::UploadPartWriteInput::from_legacy(part_input, None),
-                )
+                .execute_upload_part_with_audit(put_part_checksum_envelope(plaintext_sha256), part_input)
                 .await
                 .expect("SSE-C part");
             // Reject keyless completion before checksum comparison, then enforce
@@ -1348,7 +1368,7 @@ mod tests {
                 .await
                 .expect("configure bucket-default SSE-KMS");
             let usecase = DefaultMultipartUsecase::from_global();
-            // Same facts `from_legacy` carried. Metadata, tagging, storage class, request SSE, and object lock stay absent.
+            // Metadata, tagging, storage class, request SSE, and object lock stay absent.
             let create = super::super::CreateMultipartUploadFields {
                 bucket: bucket.clone(),
                 key: key.to_owned(),
@@ -1370,7 +1390,7 @@ mod tests {
                 .expect("create KMS multipart upload");
             let upload_id = created.upload_id;
             assert!(!upload_id.is_empty(), "KMS upload id");
-            // Same facts `from_legacy` carried. Checksums, request SSE, content MD5, and trailers stay absent.
+            // Checksums, request SSE, content MD5, and trailers stay absent.
             let input = super::super::UploadPartWriteInput {
                 target: super::super::UploadPartTarget::Legacy {
                     bucket: bucket.clone(),
@@ -1379,7 +1399,7 @@ mod tests {
                 },
                 part_number: 1,
                 content_length: Some(3),
-                body: Some(crate::app::object::legacy_put_body(StreamingBlob::from(Bytes::from_static(b"abc")))),
+                body: Some(Body::from(Bytes::from_static(b"abc"))),
                 trailing_headers: None,
                 frame_trailers: None,
                 content_md5: None,
@@ -1724,6 +1744,11 @@ mod tests {
         let (store, bucket) = crate::app::gating_test_env::durable_quota_test_bucket("concurrent-complete-quota", 6000).await;
 
         let usecase = DefaultMultipartUsecase::from_global();
+        let mut seed_reader = PutObjReader::from_vec(vec![0x70; 2000]);
+        store
+            .put_object(&bucket, "seed", &mut seed_reader, &ObjectOptions::default())
+            .await
+            .expect("seed committed quota usage");
 
         let mut inputs = Vec::new();
         for object in ["first", "second"] {
@@ -1731,7 +1756,7 @@ mod tests {
                 .new_multipart_upload(&bucket, object, &ObjectOptions::default())
                 .await
                 .expect("create concurrent multipart upload");
-            let mut reader = PutObjReader::from_vec(vec![0x71; 4096]);
+            let mut reader = PutObjReader::from_vec(vec![0x71; 3000]);
             let part = store
                 .put_object_part(&bucket, object, &upload.upload_id, 1, &mut reader, &ObjectOptions::default())
                 .await
@@ -2238,16 +2263,26 @@ mod tests {
 
         let usecase = DefaultMultipartUsecase::from_global();
         let key = "object-9272";
-        let mut create_input = CreateMultipartUploadInput::builder()
-            .bucket(bucket.clone())
-            .key(key.to_owned())
-            .build()
-            .expect("create");
-        create_input.checksum_algorithm = Some(ChecksumAlgorithm::from_static("SHA256"));
+        // Metadata, tagging, storage class, request SSE, and object lock stay absent.
+        let create = super::super::CreateMultipartUploadFields {
+            bucket: bucket.clone(),
+            key: key.to_owned(),
+            metadata: None,
+            tagging: None,
+            storage_class: None,
+            server_side_encryption: None,
+            sse_customer_algorithm: None,
+            sse_customer_key: None,
+            sse_customer_key_md5: None,
+            ssekms_key_id: None,
+            object_lock_legal_hold_status: None,
+            object_lock_mode: None,
+            object_lock_retain_until_date: None,
+        };
         let upload_id = usecase
             .execute_create_multipart_upload(
                 completion_with_header("x-amz-checksum-algorithm", HeaderValue::from_static("SHA256")),
-                super::super::CreateMultipartUploadFields::from_legacy(create_input),
+                create,
                 None,
             )
             .await
@@ -2269,23 +2304,32 @@ mod tests {
             combined_part_digests.extend_from_slice(&part_checksum.raw);
 
             let len = i64::try_from(bytes.len()).expect("part length fits i64");
-            let mut part_input = UploadPartInput::builder()
-                .bucket(bucket.clone())
-                .key(key.to_owned())
-                .upload_id(upload_id.clone())
-                .part_number(part_number)
-                .build()
-                .expect("part");
-            part_input.body = Some(StreamingBlob::from(Bytes::from(bytes)));
-            part_input.content_length = Some(len);
-            part_input.checksum_algorithm = Some(ChecksumAlgorithm::from_static("SHA256"));
-            part_input.checksum_sha256 = Some(part_checksum.encoded.clone());
+            // Content MD5, non-SHA256 checksums, request SSE, and trailers stay absent.
+            let part_input = super::super::UploadPartWriteInput {
+                target: super::super::UploadPartTarget::Legacy {
+                    bucket: bucket.clone(),
+                    key: key.to_owned(),
+                    upload_id: upload_id.clone(),
+                },
+                part_number,
+                content_length: Some(len),
+                body: Some(Body::from(Bytes::from(bytes))),
+                trailing_headers: None,
+                frame_trailers: None,
+                content_md5: None,
+                checksum_algorithm: Some("SHA256".to_owned()),
+                checksum_crc32: None,
+                checksum_crc32c: None,
+                checksum_crc64nvme: None,
+                checksum_sha1: None,
+                checksum_sha256: Some(part_checksum.encoded.clone()),
+                sse_customer_algorithm: None,
+                sse_customer_key: None,
+                sse_customer_key_md5: None,
+            };
 
             let uploaded = usecase
-                .execute_upload_part_with_audit(
-                    put_part_checksum_envelope(&part_checksum.encoded),
-                    super::super::UploadPartWriteInput::from_legacy(part_input, None),
-                )
+                .execute_upload_part_with_audit(put_part_checksum_envelope(&part_checksum.encoded), part_input)
                 .await
                 .expect("upload part");
             let mut part = completion_part(part_number, uploaded.e_tag.as_deref());

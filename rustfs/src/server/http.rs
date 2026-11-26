@@ -302,6 +302,23 @@ struct RpcRequestTarget {
     method: Method,
 }
 
+/// Set by `check_auth` once the caller's internode request HMAC has been verified.
+///
+/// Boot-epoch and capability response proofs are HMACs keyed with the internode RPC secret over
+/// caller-known values, so `RpcRequestPathService` only emits them when this marker is raised.
+#[derive(Clone, Debug, Default)]
+struct RpcSignatureVerified(Arc<AtomicBool>);
+
+impl RpcSignatureVerified {
+    fn mark_verified(&self) {
+        self.0.store(true, Ordering::Release);
+    }
+
+    fn is_verified(&self) -> bool {
+        self.0.load(Ordering::Acquire)
+    }
+}
+
 #[derive(Clone)]
 struct RpcRequestPathService<S> {
     inner: S,
@@ -434,22 +451,10 @@ where
             method: req.method().clone(),
         };
         req.extensions_mut().insert(target);
+        let signature_verified = RpcSignatureVerified::default();
+        req.extensions_mut().insert(signature_verified.clone());
         let msgpack_manifest_capability_requested = storage::tonic_msgpack_manifest_capability_requested(req.headers());
-        let response_headers = tonic_boot_epoch_challenge(req.headers())
-            .ok()
-            .flatten()
-            .and_then(|challenge| {
-                storage::try_current_local_node_name()
-                    .and_then(|node| normalize_tonic_rpc_audience(&node).ok())
-                    .and_then(|audience| {
-                        storage::tonic_boot_epoch_response_headers_with_msgpack_capability(
-                            &audience,
-                            challenge,
-                            msgpack_manifest_capability_requested,
-                        )
-                        .ok()
-                    })
-            });
+        let challenge = tonic_boot_epoch_challenge(req.headers()).ok().flatten();
         let future = self.inner.call(req);
         Box::pin(async move {
             let mut response = storage::with_remote_background_io(resource_context, async move {
@@ -463,6 +468,20 @@ where
                 result
             })
             .await?;
+            // Answer the challenge only after `check_auth` verified the caller's request HMAC.
+            // Unauthenticated, forged, or unrouted requests must never receive secret-keyed proofs.
+            let response_headers = challenge.filter(|_| signature_verified.is_verified()).and_then(|challenge| {
+                storage::try_current_local_node_name()
+                    .and_then(|node| normalize_tonic_rpc_audience(&node).ok())
+                    .and_then(|audience| {
+                        storage::tonic_boot_epoch_response_headers_with_msgpack_capability(
+                            &audience,
+                            challenge,
+                            msgpack_manifest_capability_requested,
+                        )
+                        .ok()
+                    })
+            });
             if let Some(headers) = response_headers {
                 response.headers_mut().extend(headers);
             }
@@ -1689,20 +1708,26 @@ fn assemble_s3_stack(
     let router = admin::make_admin_router(config.console_enable, Arc::clone(&assembly.server_ctx))?;
     let control_plane =
         GatewayEdgeService(GatewayStack::assemble_control_plane(assembly.clone(), Arc::new(router)).map_err(Error::other)?);
+    let reserved_console = (!config.console_enable)
+        .then(|| GatewayStack::assemble_reserved_console(assembly.clone()).map(GatewayEdgeService))
+        .transpose()
+        .map_err(Error::other)?;
     #[cfg(feature = "corpus-record")]
     let recorder = corpus::recorder(config, &assembly.server_domains)?;
     let s3 = GatewayEdgeService(GatewayStack::assemble(assembly).map_err(Error::other)?);
     #[cfg(feature = "corpus-record")]
-    let (s3, native_admin, control_plane) = {
+    let (s3, native_admin, control_plane, reserved_console) = {
         use tower::{Layer, util::Either};
         (
             Either::Left(recorder.layer(s3)),
             Either::Right(native_admin),
             Either::Right(control_plane),
+            reserved_console.map(Either::Right),
         )
     };
     Ok(S3StackService::new(s3)
         .with_native_console(NativeConsoleEdgeService::for_config(config))
+        .with_reserved_console(reserved_console)
         .with_native_website(NativeWebsiteEdgeService::claiming(website))
         .with_native_admin(Some(native_admin))
         .with_control_plane(Some(control_plane)))
@@ -3318,32 +3343,38 @@ fn process_connection(
         };
         // ── Canonical External Middleware Stack Order (outermost → innermost) ──
         // This order MUST be preserved across refactorings.
-        // Only AddExtensionLayer (layers 1-2) are per-connection; most remaining layers are stateless.
+        // Only AddExtensionLayer (layers 1-2) are per-connection; layers 3-24 are stateless or conditional.
         //
         //  1. AddExtensionLayer<RemoteAddr>           — per-connection peer address
         //  2. AddExtensionLayer<SocketAddr>           — per-connection raw socket addr (TrustedProxy)
         //  3. TrustedProxyLayer                       — conditional, parses X-Forwarded-For
-        //  4. ExternalRequestContextLayer            — S3 canonical ID / control-plane propagated ID
-        //  5. StsQueryApiCompatLayer                 — route-scoped STS envelopes, including outer short-circuit errors
-        //  6. EmptyBodyContentLengthCompatLayer       — adds Content-Length: 0 for known empty-body API routes
-        //  7. CatchPanicLayer                        — panic → 500
-        //  8. RateLimitLayer                         — conditional (external stack only), per-client 429 throttling
-        //  9. ReadinessGateLayer                     — blocks until ready
-        // 10. KeystoneAuthLayer                      — X-Auth-Token validation
-        // 11. TraceLayer                             — request span creation + metrics
-        // 12. RequestLoggingLayer                    — single completion event per request
-        // 13. CompressionLayer                       — response compression predicate (whitelist, path-aware)
-        // 14. PathCategoryInjectionLayer             — injects path category when compression is enabled
-        // 15. IcebergRestErrorCompatLayer            — Iceberg REST JSON error compatibility
-        //     PostObjectLocationFixLayer             — absolute, encoded POST Object Location
-        // 16. ConditionalCorsLayer                   — S3 API CORS
-        // 17. RedirectLayer                          — console redirect (conditional)
-        // 18. BodylessStatusFixLayer                 — clears body for 1xx/204/205/304 responses
-        // 19. HeadRequestBodyFixLayer                — strips actual body bytes from HEAD responses
-        // 20. PublicHealthEndpointLayer              — handles public health before the stack
-        // `tests::stack_census` pins this order against the real `external_service_stack!`
-        // expansion. Layers 5, 6, 15, 18 and 19 live in `server::legacy_compat`;
-        // T2.12 (rustfs/backlog#2771) removes them.
+        //  4. MapRequest                              — HTTP/3 forwarded-proto normalization
+        //  5. ExternalRequestContextLayer             — S3 canonical ID / control-plane propagated ID
+        //  6. StsQueryApiCompatLayer                  — route-scoped STS envelopes, including outer short-circuit errors
+        //  7. EmptyBodyContentLengthCompatLayer       — adds Content-Length: 0 for admin, console and internode routes (S3 half retired)
+        //  8. CatchPanicLayer                         — panic → 500
+        //  9. RateLimitLayer                          — conditional (external stack only), per-client 429 throttling
+        // 10. SsecTransportLayer                      — SSE-C plaintext transport check / RUSTFS_SSE_C_REQUIRE_TLS
+        // 11. ReadinessGateLayer                      — blocks until ready
+        // 12. KeystoneAuthLayer                       — X-Auth-Token validation
+        // 13. InFlightLayer                           — RAII in-flight request gauge guard
+        // 14. TraceLayer                              — request span creation + metrics
+        // 15. RequestLoggingLayer                     — single completion event per request
+        // 16. CompressionLayer                        — response compression predicate (whitelist, path-aware)
+        // 17. PathCategoryInjectionLayer              — conditional, injects path category when compression is enabled
+        // 18. IcebergRestErrorCompatLayer             — Iceberg REST JSON error compatibility
+        // 19. PostObjectLocationFixLayer              — absolute, encoded POST Object Location
+        // 20. ConditionalCorsLayer                    — S3 API CORS
+        // 21. RedirectLayer                           — console redirect (conditional)
+        // 22. BodylessStatusFixLayer                  — clears body for 1xx/204/205/304 responses across gateway/website/console
+        // 23. HeadRequestBodyFixLayer                 — strips actual body bytes from HEAD responses across gateway/website/console
+        // 24. PublicHealthEndpointLayer               — handles public health before the stack
+        // `tests::stack_census` and `tests::middleware_matrix_census` pin this 24-layer order
+        // against the real `external_service_stack!` expansion. Per T2.12 (rustfs/backlog#2771),
+        // the five S3-only s3s patch layers were deleted (SigV4HeaderGuard, S3ErrorMessageCompat,
+        // DoubleSlashListBucketsCompat, VirtualHostStyleHint, ObjectAttributesEtagFix), while
+        // layers 6, 7, 18, 22 and 23 in `server::legacy_compat` remain retained on the outer stack
+        // for their active non-S3 / shared outer-edge responsibilities.
         // The internode lane below intentionally keeps only the shared
         // transport/auth/observability subset needed by `/rustfs/rpc/...`.
         // ─────────────────────────────────────────────────────────────
@@ -3624,6 +3655,34 @@ fn hyper_body_write_close_kind(debug: &str) -> Option<&'static str> {
     }
 }
 
+fn mark_rpc_signature_verified(req: &Request<()>) {
+    if let Some(verified) = req.extensions().get::<RpcSignatureVerified>() {
+        verified.mark_verified();
+    }
+}
+
+/// Whether an error from `verify_tonic_rpc_signature_with_bootstrap` was raised only after the
+/// caller's request HMAC verified.
+///
+/// Only post-HMAC rejections may receive secret-keyed boot-epoch and capability proofs so cluster
+/// restart recovery, strict replay-scope bootstrap, and replay-cache overload retries keep working
+/// without emitting secret-keyed proofs to unauthenticated callers.
+fn rpc_auth_failure_verified_signature(error: &std::io::Error, failure_reason: &str) -> bool {
+    storage::rpc_auth_is_resource_exhausted(error)
+        || matches!(
+            failure_reason,
+            "stale_boot_epoch"
+                | "replay_scope_required"
+                | "replay_detected"
+                | "replay_cache_capacity"
+                | "replay_cache_memory"
+                | "replay_cache_allocation"
+                | "replay_cache_unavailable"
+                | "replay_expiry_overflow"
+                | "timestamp_expired_after_clock_regression"
+        )
+}
+
 fn rpc_auth_failure_status(error: &std::io::Error) -> Status {
     if storage::rpc_auth_is_resource_exhausted(error) {
         crate::error::rpc_replay_admission_exhausted_status()
@@ -3685,6 +3744,9 @@ fn check_auth(req: Request<()>) -> std::result::Result<Request<()>, Status> {
             .map(|addr| addr.0.to_string())
             .unwrap_or_else(|| "unknown".to_string());
         let failure_reason = storage::tonic_rpc_auth_failure_reason(&e);
+        if rpc_auth_failure_verified_signature(&e, failure_reason) {
+            mark_rpc_signature_verified(&req);
+        }
         let operation = match rpc_method {
             "ReadAll" => INTERNODE_OPERATION_GRPC_READ_ALL,
             "ReadMultiple" => INTERNODE_OPERATION_GRPC_READ_MULTIPLE,
@@ -3741,6 +3803,7 @@ fn check_auth(req: Request<()>) -> std::result::Result<Request<()>, Status> {
             rejection
         }
     })?;
+    mark_rpc_signature_verified(&req);
 
     if storage::rpc_background_admission(req.metadata().as_ref())
         .map_err(|_| Status::unauthenticated("Invalid background admission request"))?
@@ -6322,6 +6385,56 @@ mod tests {
             assert_eq!(console, 0);
             assert_eq!(control_plane + gateway, cases.len() * 2);
         }
+
+        #[tokio::test]
+        async fn production_s3_stack_reserved_console_contract() {
+            use http_body_util::BodyExt;
+
+            let prefix = crate::server::console_prefix();
+            let make_assembly = || GatewayAssembly {
+                server_ctx: ServerContextSlot::new(),
+                root_access_key: "rustfsadmin".to_owned(),
+                root_secret_key: "rustfsadmin-secret".to_owned(),
+                region: Some("us-east-1".to_owned()),
+                server_domains: Vec::new(),
+                body_read_timeout: Duration::from_secs(30),
+                keystone_auth: None,
+            };
+
+            let mut s3_port_config = config::Config::new("127.0.0.1:9000", Vec::new());
+            s3_port_config.console_enable = false;
+            let s3_port = assemble_s3_stack(&s3_port_config, None, make_assembly()).expect("s3 port stack assembles");
+
+            for target in [
+                format!("{prefix}/"),
+                format!("{prefix}/index.html?v=1"),
+                "/favicon.ico".to_owned(),
+            ] {
+                let response = s3_port
+                    .clone()
+                    .oneshot(console_request(Method::GET, &target, false))
+                    .await
+                    .expect("s3 port response");
+                assert_eq!(response.status(), StatusCode::FORBIDDEN, "anonymous S3 port {target}");
+                let body = response.into_body().collect().await.unwrap().to_bytes();
+                let body = String::from_utf8_lossy(&body);
+                assert!(
+                    body.contains("<Code>AccessDenied</Code>"),
+                    "anonymous S3 port {target} expected AccessDenied XML, got: {body}"
+                );
+            }
+
+            let mut console_port_config = config::Config::new("127.0.0.1:9001", Vec::new());
+            console_port_config.console_enable = true;
+            let console_port =
+                assemble_s3_stack(&console_port_config, None, make_assembly()).expect("console port stack assembles");
+            let target = format!("{prefix}/index.html");
+            let response = console_port
+                .oneshot(console_request(Method::GET, &target, false))
+                .await
+                .expect("console port response");
+            static_response_body(response, &Method::GET, &target).await;
+        }
     }
 
     type RateLimitTestCore = tower::util::BoxCloneService<
@@ -7078,10 +7191,11 @@ mod tests {
             DEFAULT_H2_MAX_HEADER_LIST_SIZE, DEFAULT_HTTP1_HEADER_READ_TIMEOUT, DEFAULT_HTTP1_MAX_BUF_SIZE,
         };
 
-        /// Number of middleware layers in the canonical stack order (see http.rs).
-        /// Layers 1-2 are per-connection (AddExtension), 3-22 are stateless
-        /// (includes InFlightLayer, added for backlog#806-35).
-        pub const MIDDLEWARE_LAYER_COUNT: usize = 22;
+        /// Number of middleware layers in the canonical external stack order (see `EXTERNAL_STACK_CENSUS`).
+        /// Layers 1-2 are per-connection (`AddExtension`), 3-24 are stateless or conditional
+        /// middleware layers retained after T2.12 (`rustfs/backlog#2771`) deleted the five
+        /// S3-only s3s patch layers.
+        pub const MIDDLEWARE_LAYER_COUNT: usize = 24;
 
         /// Current HTTP/2 defaults (from rustfs_config).
         pub const H2_INITIAL_STREAM_WINDOW_SIZE: u32 = DEFAULT_H2_INITIAL_STREAM_WINDOW_SIZE;
@@ -7137,7 +7251,8 @@ mod tests {
 
     #[test]
     fn test_baseline_middleware_count() {
-        assert_eq!(baseline::MIDDLEWARE_LAYER_COUNT, 22);
+        assert_eq!(baseline::MIDDLEWARE_LAYER_COUNT, 24);
+        assert_eq!(baseline::MIDDLEWARE_LAYER_COUNT, EXTERNAL_STACK_CENSUS.len());
     }
 
     #[test]
@@ -8527,30 +8642,40 @@ mod tests {
         let audience = "127.0.0.1:9000";
         rustfs_common::set_global_local_node_name(audience).await;
         let challenge = uuid::Uuid::new_v4();
+        let node = InterceptedService::new(NodeServiceServer::new(make_server()), check_auth);
+        let service = RpcRequestPathService::new(Routes::new(node).prepare());
 
-        let response_for = |request_capability: bool| async move {
-            let mut request = HttpRequest::builder()
-                .method(Method::POST)
-                .uri("/node_service.NodeService/Ping")
-                .body(())
-                .expect("capability request");
-            request.headers_mut().insert(
-                "x-rustfs-rpc-boot-epoch-challenge",
-                challenge.to_string().parse().expect("challenge header"),
-            );
-            if request_capability {
+        let response_for = |signed: bool, request_capability: bool| {
+            let mut service = service.clone();
+            async move {
+                let mut request = HttpRequest::builder()
+                    .method(Method::POST)
+                    .uri(format!("http://{audience}/node_service.NodeService/Ping"))
+                    .header("content-type", "application/grpc")
+                    .body(Empty::<Bytes>::new())
+                    .expect("capability request");
+                if signed {
+                    let auth = storage::gen_tonic_signature_headers(audience, "node_service.NodeService", "Ping", None)
+                        .expect("signed capability request");
+                    request.headers_mut().extend(auth);
+                }
                 request.headers_mut().insert(
-                    "x-rustfs-rpc-msgpack-manifest-request",
-                    HeaderValue::from_static("msgpack-compat-manifest-v1"),
+                    "x-rustfs-rpc-boot-epoch-challenge",
+                    challenge.to_string().parse().expect("challenge header"),
                 );
+                if request_capability {
+                    request.headers_mut().insert(
+                        "x-rustfs-rpc-msgpack-manifest-request",
+                        HeaderValue::from_static("msgpack-compat-manifest-v1"),
+                    );
+                }
+                service.call(request).await.expect("capability response")
             }
-            RpcRequestPathService::new(RpcPathObserver)
-                .call(request)
-                .await
-                .expect("capability response")
         };
 
-        let legacy = response_for(false).await;
+        let legacy = response_for(true, false).await;
+        storage::verify_tonic_boot_epoch_response(audience, challenge, legacy.headers())
+            .expect("signed legacy request must still receive boot-epoch proof");
         assert!(!legacy.headers().contains_key("x-rustfs-rpc-msgpack-manifest-capability"));
         assert!(
             !legacy
@@ -8558,7 +8683,9 @@ mod tests {
                 .contains_key("x-rustfs-rpc-msgpack-manifest-capability-proof")
         );
 
-        let capable = response_for(true).await;
+        let capable = response_for(true, true).await;
+        storage::verify_tonic_boot_epoch_response(audience, challenge, capable.headers())
+            .expect("signed capable request must receive boot-epoch proof");
         assert_eq!(
             capable
                 .headers()
@@ -8571,6 +8698,18 @@ mod tests {
                 .headers()
                 .contains_key("x-rustfs-rpc-msgpack-manifest-capability-proof")
         );
+
+        let unsigned = response_for(false, true).await;
+        for name in [
+            "x-rustfs-rpc-boot-epoch",
+            "x-rustfs-rpc-boot-epoch-proof",
+            "x-rustfs-rpc-replay-cache-capability",
+            "x-rustfs-rpc-replay-cache-capability-proof",
+            "x-rustfs-rpc-msgpack-manifest-capability",
+            "x-rustfs-rpc-msgpack-manifest-capability-proof",
+        ] {
+            assert!(!unsigned.headers().contains_key(name), "unsigned request must not receive {name}");
+        }
 
         rustfs_common::set_global_local_node_name(&previous_node_name).await;
     }
@@ -9550,6 +9689,178 @@ mod tests {
         );
     }
 
+    #[test]
+    fn rpc_auth_failure_verified_signature_classifies_post_hmac_errors_only() {
+        for error in [
+            std::io::Error::new(std::io::ErrorKind::WouldBlock, storage::RpcReplayCacheAdmissionError::Capacity),
+            std::io::Error::new(std::io::ErrorKind::WouldBlock, storage::RpcReplayCacheAdmissionError::MemoryBudget),
+            std::io::Error::new(std::io::ErrorKind::OutOfMemory, "replay cache allocation failed"),
+            std::io::Error::other("RPC boot epoch is stale"),
+            std::io::Error::other("RPC replay-scoped authentication required"),
+            std::io::Error::other("RPC request replay detected"),
+            std::io::Error::other("RPC replay cache unavailable"),
+            std::io::Error::other("RPC request timestamp expired after clock regression"),
+        ] {
+            let reason = storage::tonic_rpc_auth_failure_reason(&error);
+            assert!(
+                rpc_auth_failure_verified_signature(&error, reason),
+                "post-HMAC error ({reason}) must allow boot-epoch/capability proofs"
+            );
+        }
+
+        for error in [
+            std::io::Error::other("Missing signature header"),
+            std::io::Error::other("Invalid signature"),
+            std::io::Error::other("RPC v2 authentication required"),
+            std::io::Error::other("Invalid RPC v2 signature"),
+            std::io::Error::other("Invalid RPC replay scope signature"),
+            std::io::Error::other("Request timestamp expired"),
+            std::io::Error::other("Missing RPC boot epoch"),
+            std::io::Error::other("RPC background admission requires v2 authentication"),
+            std::io::Error::other("opaque failure"),
+        ] {
+            let reason = storage::tonic_rpc_auth_failure_reason(&error);
+            assert!(
+                !rpc_auth_failure_verified_signature(&error, reason),
+                "pre-HMAC error ({reason}) must never receive boot-epoch/capability proofs"
+            );
+        }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn rpc_boot_epoch_proof_requires_verified_request_signature() {
+        let _ = rustfs_credentials::set_global_rpc_secret("rpc-http-test-secret".to_string());
+        let previous_node_name = rustfs_common::get_global_local_node_name().await;
+        let audience = "127.0.0.1:9000";
+        let ping = "/node_service.NodeService/Ping";
+        let read_all = "/node_service.NodeService/ReadAll";
+        rustfs_common::set_global_local_node_name(audience).await;
+
+        let node = InterceptedService::new(NodeServiceServer::new(make_server()), check_auth);
+        let mut service = RpcRequestPathService::new(Routes::new(node).prepare());
+
+        let epoch_probe_challenge = uuid::Uuid::new_v4();
+        let current_epoch = storage::verify_tonic_boot_epoch_response(
+            audience,
+            epoch_probe_challenge,
+            &storage::tonic_boot_epoch_response_headers(audience, epoch_probe_challenge).expect("current epoch proof"),
+        )
+        .expect("current boot epoch");
+        let stale_epoch = uuid::Uuid::from_u128(current_epoch.as_u128() ^ 1);
+
+        let signed_v2 = storage::gen_tonic_signature_headers(audience, "node_service.NodeService", "Ping", None)
+            .expect("method-bound signature");
+        let mut signed_v3_current = signed_v2.clone();
+        signed_v3_current.extend(
+            storage::gen_tonic_replay_scope_headers(
+                audience,
+                ping,
+                signed_v2["x-rustfs-timestamp"].to_str().expect("timestamp"),
+                signed_v2["x-rustfs-content-sha256"].to_str().expect("body digest"),
+                current_epoch,
+            )
+            .expect("current-epoch replay-scoped signature"),
+        );
+        let signed_v3_replay = signed_v3_current.clone();
+        let mut signed_v3_stale = signed_v2.clone();
+        signed_v3_stale.extend(
+            storage::gen_tonic_replay_scope_headers(
+                audience,
+                ping,
+                signed_v2["x-rustfs-timestamp"].to_str().expect("timestamp"),
+                signed_v2["x-rustfs-content-sha256"].to_str().expect("body digest"),
+                stale_epoch,
+            )
+            .expect("stale-epoch replay-scoped signature"),
+        );
+        let mut forged_v2 = signed_v2.clone();
+        forged_v2.insert("x-rustfs-rpc-signature-v2", HeaderValue::from_static("invalid"));
+        let mut forged_v3 = signed_v3_stale.clone();
+        forged_v3.insert("x-rustfs-rpc-signature-v3", HeaderValue::from_static("invalid"));
+        let cross_method = signed_v2.clone();
+        let unrouted_signed = signed_v2.clone();
+
+        for (label, path, headers, expect_proof) in [
+            ("signed v2 ping", ping, signed_v2, true),
+            ("signed v3 current epoch ping", ping, signed_v3_current, true),
+            ("replayed signed v3 ping", ping, signed_v3_replay, true),
+            ("signed v3 stale epoch ping", ping, signed_v3_stale, true),
+            ("forged v2 ping", ping, forged_v2, false),
+            ("forged v3 ping", ping, forged_v3, false),
+            ("cross-method v2 read_all", read_all, cross_method, false),
+            ("unsigned ping", ping, HeaderMap::new(), false),
+            ("unrouted unsigned", "/unrouted.Service/Method", HeaderMap::new(), false),
+            ("unrouted signed", "/unrouted.Service/Method", unrouted_signed, false),
+        ] {
+            let challenge = uuid::Uuid::new_v4();
+            let mut request = HttpRequest::builder()
+                .method(Method::POST)
+                .uri(format!("http://{audience}{path}"))
+                .header("content-type", "application/grpc")
+                .header("x-rustfs-rpc-boot-epoch-challenge", challenge.to_string())
+                .header("x-rustfs-rpc-msgpack-manifest-request", "msgpack-compat-manifest-v1")
+                .body(Empty::<Bytes>::new())
+                .expect("request");
+            request.headers_mut().extend(headers);
+            let response = service.call(request).await.expect("response");
+            if expect_proof {
+                let verified_epoch = storage::verify_tonic_boot_epoch_response(audience, challenge, response.headers())
+                    .unwrap_or_else(|err| panic!("{label} must receive verifiable boot-epoch proof: {err}"));
+                assert_eq!(verified_epoch, current_epoch, "{label} must return current boot epoch");
+                assert!(
+                    response.headers().contains_key("x-rustfs-rpc-replay-cache-capability-proof"),
+                    "{label} must receive replay-cache capability proof"
+                );
+                assert!(
+                    response
+                        .headers()
+                        .contains_key("x-rustfs-rpc-msgpack-manifest-capability-proof"),
+                    "{label} must receive requested msgpack capability proof"
+                );
+                continue;
+            }
+            for name in [
+                "x-rustfs-rpc-boot-epoch",
+                "x-rustfs-rpc-boot-epoch-proof",
+                "x-rustfs-rpc-replay-cache-capability",
+                "x-rustfs-rpc-replay-cache-capability-proof",
+                "x-rustfs-rpc-msgpack-manifest-capability",
+                "x-rustfs-rpc-msgpack-manifest-capability-proof",
+            ] {
+                assert!(
+                    !response.headers().contains_key(name),
+                    "{label} ({path}) must not return {name} to an unverified caller"
+                );
+            }
+        }
+
+        // Verify that a post-HMAC ResourceExhausted rejection from background admission still
+        // raises `RpcSignatureVerified` so the peer does not falsely revoke capabilities.
+        let bg_owner = rustfs_concurrency::adaptive::NodeAdmission::new(std::num::NonZeroU16::MIN);
+        let bg_headers = storage::with_remote_background_io(Some(storage::RemoteBackgroundIo::new(bg_owner)), async {
+            storage::gen_tonic_signature_headers(audience, "node_service.NodeService", "ReadAll", None)
+        })
+        .await
+        .expect("signed background RPC headers");
+        let verified_marker = RpcSignatureVerified::default();
+        let mut bg_request = Request::new(());
+        bg_request.metadata_mut().as_mut().extend(bg_headers);
+        bg_request.extensions_mut().insert(RpcRequestTarget {
+            uri: format!("http://{audience}{read_all}").parse().expect("RPC URI"),
+            method: Method::POST,
+        });
+        bg_request.extensions_mut().insert(verified_marker.clone());
+        let bg_error = check_auth(bg_request).expect_err("background request without admission token must reject");
+        assert_eq!(bg_error.code(), tonic::Code::ResourceExhausted);
+        assert!(
+            verified_marker.is_verified(),
+            "post-HMAC ResourceExhausted rejection must still mark RpcSignatureVerified"
+        );
+
+        rustfs_common::set_global_local_node_name(&previous_node_name).await;
+    }
+
     #[tokio::test]
     #[serial_test::serial]
     async fn rpc_auth_rejection_records_failure_reason_metric() {
@@ -10073,7 +10384,7 @@ mod tests {
                     assert_eq!(info.real_ip, peer.ip());
                     assert_eq!(info.forwarded_proto.as_deref(), Some("https"));
                     let identity = rustfs_keystone::KEYSTONE_CREDENTIALS.try_with(Clone::clone).ok().flatten().map(|credentials| credentials.parent_user).unwrap_or_else(|| "anonymous".to_owned());
-                    if request.headers().contains_key("x-auth-token") { assert_eq!(identity, "test-user"); }
+                    if request.headers().contains_key("x-auth-token") { assert_eq!(identity, "keystone:user-id"); }
                     Ok::<_, Box<dyn std::error::Error + Send + Sync>>(Response::new(HybridBody::<EdgeBody, http_body_util::Empty<Bytes>>::Rest { rest_body: EdgeBody::from(Bytes::from(identity)) }))
                 });
                 let inner = Http3CoreService::new(inner);
@@ -10089,7 +10400,7 @@ mod tests {
             assert_eq!(request(&mut client, HttpRequest::builder().uri("https://localhost/bucket/key").header("x-auth-token", "invalid-token").body(())?, Bytes::new()).await?.0, http::StatusCode::UNAUTHORIZED);
             let (status, headers, body) = request(&mut client, HttpRequest::builder().uri("https://localhost/bucket/key").header("x-auth-token", "valid-token").header("x-forwarded-for", "203.0.113.1").body(())?, Bytes::new()).await?;
             assert_eq!(status, http::StatusCode::OK);
-            assert_eq!(body, "test-user");
+            assert_eq!(body, "keystone:user-id");
             assert!(headers.contains_key("x-amz-request-id"), "request context must survive HTTP/3 dispatch");
             assert_eq!(request(&mut client, make_request()?, Bytes::new()).await?.2, "anonymous", "Keystone task-local credentials must not leak between streams");
             assert_eq!(request(&mut client, make_request()?, Bytes::new()).await?.0, http::StatusCode::TOO_MANY_REQUESTS);
@@ -10370,8 +10681,53 @@ mod tests {
         );
     }
 
-    #[test]
-    fn stack_census() {
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum MatrixVerdict {
+        /// RustFS-owned / non-s3s middleware kept on the external stack.
+        Keep,
+        /// Retained outer-edge compatibility layer in `server::legacy_compat` still serving
+        /// non-S3 or shared outer-edge responsibilities per T2.12 (`rustfs/backlog#2771`).
+        KeepRetainedCompat,
+    }
+
+    const EXTERNAL_MIDDLEWARE_MATRIX: [(&str, MatrixVerdict); 24] = [
+        ("AddExtension", MatrixVerdict::Keep),
+        ("AddExtension", MatrixVerdict::Keep),
+        ("TrustedProxyMiddleware", MatrixVerdict::Keep),
+        ("MapRequest", MatrixVerdict::Keep),
+        ("ExternalRequestContextService", MatrixVerdict::Keep),
+        ("StsQueryApiCompatService", MatrixVerdict::KeepRetainedCompat),
+        ("EmptyBodyContentLengthCompatService", MatrixVerdict::KeepRetainedCompat),
+        ("CatchPanic", MatrixVerdict::Keep),
+        ("RateLimitService", MatrixVerdict::Keep),
+        ("SsecTransportService", MatrixVerdict::Keep),
+        ("ReadinessGateService", MatrixVerdict::Keep),
+        ("KeystoneAuthMiddleware", MatrixVerdict::Keep),
+        ("InFlightService", MatrixVerdict::Keep),
+        ("Trace", MatrixVerdict::Keep),
+        ("RequestLoggingService", MatrixVerdict::Keep),
+        ("Compression", MatrixVerdict::Keep),
+        ("PathCategoryInjectionService", MatrixVerdict::Keep),
+        ("IcebergRestErrorCompatService", MatrixVerdict::KeepRetainedCompat),
+        ("PostObjectLocationFixService", MatrixVerdict::Keep),
+        ("ConditionalCorsService", MatrixVerdict::Keep),
+        ("RedirectService", MatrixVerdict::Keep),
+        ("BodylessStatusFixService", MatrixVerdict::KeepRetainedCompat),
+        ("HeadRequestBodyFixService", MatrixVerdict::KeepRetainedCompat),
+        ("PublicHealthEndpointService", MatrixVerdict::Keep),
+    ];
+
+    /// S3-only s3s patch layers deleted in T2.12 (`rustfs/backlog#2771`); none may reappear on the
+    /// external gateway stack.
+    const RETIRED_S3S_COMPAT_LAYERS: [&str; 5] = [
+        "SigV4HeaderGuard",
+        "S3ErrorMessageCompat",
+        "DoubleSlashListBucketsCompat",
+        "VirtualHostStyleHint",
+        "ObjectAttributesEtagFix",
+    ];
+
+    fn rendered_external_stack_census() -> Vec<String> {
         let inner = tower::service_fn(|_request: HttpRequest<Incoming>| async {
             Ok::<_, Box<dyn std::error::Error + Send + Sync>>(Response::new(crate::server::hybrid::HybridBody::<
                 s3s::Body,
@@ -10396,10 +10752,52 @@ mod tests {
         );
         fn pin_request_type<S: Service<HttpRequest<Incoming>>>(_: &S) {}
         pin_request_type(&stack);
-        let rendered = render_stack_census(std::any::type_name_of_val(&stack));
+        render_stack_census(std::any::type_name_of_val(&stack))
+    }
+
+    #[test]
+    fn stack_census() {
+        let rendered = rendered_external_stack_census();
         assert_eq!(
             rendered, EXTERNAL_STACK_CENSUS,
             "the external stack order drifted from the committed census"
         );
+    }
+
+    #[test]
+    fn middleware_matrix_census() {
+        let rendered = rendered_external_stack_census();
+        let matrix_names: Vec<&str> = EXTERNAL_MIDDLEWARE_MATRIX.iter().map(|(name, _)| *name).collect();
+        assert_eq!(
+            matrix_names, EXTERNAL_STACK_CENSUS,
+            "T2.12 middleware matrix drifted from EXTERNAL_STACK_CENSUS"
+        );
+        assert_eq!(
+            rendered, matrix_names,
+            "real external_service_stack! expansion drifted from T2.12 middleware matrix"
+        );
+        assert_eq!(
+            EXTERNAL_MIDDLEWARE_MATRIX.len(),
+            baseline::MIDDLEWARE_LAYER_COUNT,
+            "baseline::MIDDLEWARE_LAYER_COUNT must match the 24-layer T2.12 matrix"
+        );
+
+        let keep_count = EXTERNAL_MIDDLEWARE_MATRIX
+            .iter()
+            .filter(|(_, verdict)| *verdict == MatrixVerdict::Keep)
+            .count();
+        let retained_compat_count = EXTERNAL_MIDDLEWARE_MATRIX
+            .iter()
+            .filter(|(_, verdict)| *verdict == MatrixVerdict::KeepRetainedCompat)
+            .count();
+        assert_eq!(keep_count, 19);
+        assert_eq!(retained_compat_count, 5);
+
+        for retired in RETIRED_S3S_COMPAT_LAYERS {
+            assert!(
+                !rendered.iter().any(|layer| layer.contains(retired)),
+                "retired s3s compat layer `{retired}` must not be mounted on the gateway stack: {rendered:?}"
+            );
+        }
     }
 }

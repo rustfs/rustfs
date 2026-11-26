@@ -19,6 +19,7 @@ mod admin;
 mod control_plane;
 mod keystone;
 mod legacy_layers;
+mod reserved_console;
 mod ssec;
 
 use super::*;

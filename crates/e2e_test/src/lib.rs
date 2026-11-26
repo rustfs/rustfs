@@ -323,6 +323,10 @@ mod presigned_negative_test;
 #[cfg(test)]
 mod negative_sigv4_test;
 
+// Dual-stack signature admission matrix and historical GHSA regressions (backlog#2781 T3.10).
+#[cfg(test)]
+mod sec_signature_matrix_test;
+
 #[cfg(test)]
 mod stale_multipart_cleanup_cluster_test;
 

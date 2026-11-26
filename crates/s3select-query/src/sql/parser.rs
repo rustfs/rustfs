@@ -22,10 +22,13 @@ use datafusion::sql::sqlparser::{
 };
 use rustfs_s3select_api::{
     QueryError,
-    query::{ast::ExtStatement, parser::Parser as RustFsParser},
+    query::{
+        ast::ExtStatement,
+        parser::{Parser as RustFsParser, validate_set_operator_budget},
+    },
 };
 
-use super::dialect::RustFsDialect;
+use super::dialect::BoundedRustFsDialect;
 
 pub(crate) const MAX_SQL_EXPRESSION_BYTES: usize = 256 * 1024;
 
@@ -61,6 +64,7 @@ impl<'a> ExtParser<'a> {
             return parser_err!("S3 Select expression exceeds 256 KiB");
         }
         let mut tokens = tokenizer.tokenize()?;
+        validate_set_operator_budget(&tokens)?;
         validate_projection_width(&tokens)?;
         rewrite_source_object_wildcards(&mut tokens);
         Ok(ExtParser {
@@ -70,7 +74,7 @@ impl<'a> ExtParser<'a> {
 
     /// Parse a SQL statement and produce a set of statements
     pub fn parse_sql(sql: &str) -> Result<VecDeque<ExtStatement>> {
-        let dialect = &RustFsDialect {};
+        let dialect = &BoundedRustFsDialect::default();
         ExtParser::parse_sql_with_dialect(sql, dialect)
     }
 
@@ -186,7 +190,11 @@ fn ends_from_source(keyword: Keyword) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rustfs_s3select_api::query::ast::ExtStatement;
+    use crate::sql::dialect::RustFsDialect;
+    use rustfs_s3select_api::query::{
+        ast::ExtStatement,
+        parser::{MAX_SELECT_OPERATORS, MAX_SELECT_SET_OPERATORS},
+    };
 
     #[test]
     fn test_default_parser_creation() {
@@ -334,6 +342,60 @@ mod tests {
 
         let statements = result.unwrap();
         assert_eq!(statements.len(), 1, "Should have exactly one statement");
+    }
+
+    #[test]
+    fn test_ext_parser_parse_sql_bounds_operator_and_set_chains() {
+        let plus_chain = |terms: usize| format!("SELECT {} FROM S3Object", vec!["1"; terms].join("+"));
+
+        assert!(
+            ExtParser::parse_sql(&plus_chain(MAX_SELECT_OPERATORS + 1)).is_ok(),
+            "chain with exactly MAX_SELECT_OPERATORS operators must succeed"
+        );
+        assert_eq!(
+            ExtParser::parse_sql(&plus_chain(MAX_SELECT_OPERATORS + 2)),
+            Err(ParserError::RecursionLimitExceeded)
+        );
+
+        let or_chain = |terms: usize| format!("SELECT * FROM S3Object s WHERE {}", vec!["s.id='1'"; terms].join(" OR "));
+        assert_eq!(
+            ExtParser::parse_sql(&or_chain(MAX_SELECT_OPERATORS + 1)),
+            Err(ParserError::RecursionLimitExceeded)
+        );
+
+        let is_null_chain = |ops: usize| format!("SELECT 1{} FROM S3Object", " IS NULL".repeat(ops));
+        assert!(ExtParser::parse_sql(&is_null_chain(MAX_SELECT_OPERATORS)).is_ok());
+        assert_eq!(
+            ExtParser::parse_sql(&is_null_chain(MAX_SELECT_OPERATORS + 1)),
+            Err(ParserError::RecursionLimitExceeded)
+        );
+
+        let union_chain = |unions: usize| vec!["SELECT 1"; unions + 1].join(" UNION ");
+        assert!(ExtParser::parse_sql(&union_chain(MAX_SELECT_SET_OPERATORS)).is_ok());
+        assert_eq!(
+            ExtParser::parse_sql(&union_chain(MAX_SELECT_SET_OPERATORS + 1)),
+            Err(ParserError::RecursionLimitExceeded)
+        );
+
+        // Long chains close to the 256 KiB expression limit, including trailing syntax
+        // errors that trigger `Drop` on a partially built AST, must fail cleanly without
+        // overflowing a release-profile 1 MiB worker stack.
+        for sql in [
+            plus_chain(120 * 1024),
+            format!("SELECT {}+) FROM S3Object", vec!["1"; 120 * 1024].join("+")),
+            or_chain(4096),
+            is_null_chain(4096),
+            union_chain(10_000),
+        ] {
+            assert!(sql.len() <= MAX_SQL_EXPRESSION_BYTES, "test SQL must exercise parser, not byte cap");
+            let result = std::thread::Builder::new()
+                .stack_size(1024 * 1024)
+                .spawn(move || ExtParser::parse_sql(&sql).map(|_| ()))
+                .expect("spawn 1 MiB stack worker")
+                .join()
+                .expect("parser thread must not overflow stack");
+            assert_eq!(result, Err(ParserError::RecursionLimitExceeded));
+        }
     }
 
     #[test]

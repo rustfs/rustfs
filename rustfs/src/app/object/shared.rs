@@ -17,10 +17,6 @@
 use super::*;
 use crate::app::RequestEnvelope;
 use crate::app::storage_api::object_usecase::access::authorize_missing_object_disclosure;
-#[cfg(test)]
-use crate::app::storage_api::s3::dto::ObjectLockRetentionMode;
-#[cfg(test)]
-use crate::app::storage_api::s3::dto::{ObjectLockLegalHoldStatus, ObjectLockMode, Timestamp};
 use crate::on_demand_migration::{OdmStateError, PolicyConfig, SourceErrorPolicy, SourceHead};
 use rustfs_gateway_types::ChecksumAlgorithm;
 use rustfs_s3_client::constants::{X_AMZ_DELETE_MARKER, X_AMZ_VERSION_ID};
@@ -857,23 +853,6 @@ pub(super) fn response_storage_class_for_object_attributes(
 pub(crate) const ERR_OBJECT_LOCK_RETENTION_HEADERS_MUST_BE_PAIRED: &str =
     "x-amz-object-lock-retain-until-date and x-amz-object-lock-mode must both be supplied";
 
-#[cfg(test)]
-fn build_put_like_object_lock_metadata(
-    bucket: &str,
-    object_lock_config_state: &metadata_sys::ObjectLockConfigState,
-    object_lock_legal_hold_status: Option<ObjectLockLegalHoldStatus>,
-    object_lock_mode: Option<ObjectLockMode>,
-    object_lock_retain_until_date: Option<Timestamp>,
-) -> S3Result<Option<HashMap<String, String>>> {
-    build_put_like_object_lock_metadata_native(
-        bucket,
-        object_lock_config_state,
-        object_lock_legal_hold_status.map(|value| value.as_str().to_owned()),
-        object_lock_mode.map(|value| value.as_str().to_owned()),
-        object_lock_retain_until_date.map(time::OffsetDateTime::from),
-    )
-}
-
 pub(crate) fn build_put_like_object_lock_metadata_native(
     bucket: &str,
     object_lock_config_state: &metadata_sys::ObjectLockConfigState,
@@ -925,15 +904,17 @@ pub(crate) fn validate_existing_object_lock_for_write(
     existing_obj_info: &ObjectInfo,
     opts: &ObjectOptions,
 ) -> S3Result<()> {
-    if put_like_write_creates_new_version(opts) {
+    if put_like_write_creates_new_version(opts) || existing_obj_info.delete_marker {
         return Ok(());
     }
-    // An authorized replication write may replace the locked version only
-    // when the set layer's commit-lock LWW will judge every locking category,
-    // judged against the bucket's authoritative lock state (default retention
-    // included) exactly like the set-layer gate, which re-checks the same
-    // rule under the lock. A non-authoritative state or malformed lock
-    // metadata fails closed here.
+    // An authorized replication write may update metadata on a locked version
+    // only when every locking category has a valid LWW decision judged against
+    // the bucket's authoritative lock state (default retention included)
+    // without weakening active COMPLIANCE retention, stripping active legal
+    // hold without an explicit ON|OFF status, or weakening active GOVERNANCE
+    // retention without authorized bypass. The set layer re-checks the same
+    // rule under the object write lock and commits metadata-only so payload
+    // bytes, ETag, and `mod_time` stay immutable.
     if opts.replication_request {
         let may_pass = replication_write_may_pass_worm_gate(object_lock_config_state, existing_obj_info, opts).map_err(|_| {
             S3Error::with_message(S3ErrorCode::AccessDenied, "Object Lock state could not be verified.".to_string())
@@ -943,7 +924,7 @@ pub(crate) fn validate_existing_object_lock_for_write(
         } else {
             Err(S3Error::with_message(
                 S3ErrorCode::AccessDenied,
-                "Object is locked and the replication write carries no source lock decision for it.".to_string(),
+                "Object is locked and the replication write carries no valid source lock decision for it.".to_string(),
             ))
         };
     }
@@ -965,6 +946,18 @@ pub(crate) fn validate_existing_object_lock_for_write(
             S3ErrorCode::AccessDenied,
             "Object is under COMPLIANCE retention and cannot be overwritten.".to_string(),
         ));
+    }
+
+    if let Some(block_reason) = crate::app::storage_api::object_meta_usecase::check_retention_for_modification(
+        object_lock_config_state,
+        existing_obj_info,
+        None,
+        None,
+        false,
+    )
+    .map_err(|_| S3Error::with_message(S3ErrorCode::AccessDenied, "Object Lock state could not be verified.".to_string()))?
+    {
+        return Err(S3Error::with_message(S3ErrorCode::AccessDenied, block_reason.error_message()));
     }
 
     Ok(())
@@ -1190,11 +1183,11 @@ pub(crate) fn reject_non_wildcard_write_if_none_match(specific_if_none_match: bo
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::app::storage_api::s3::dto::ServerSideEncryption;
     use http::{HeaderMap, HeaderValue};
     use rustfs_gateway_types::persistence::{
         PersistedBucketEncryptionRule as ServerSideEncryptionRule, PersistedEncryptionByDefault as ServerSideEncryptionByDefault,
     };
+    use rustfs_utils::http::headers::AMZ_ENCRYPTION_AES;
     use std::sync::Arc;
 
     #[test]
@@ -1701,37 +1694,36 @@ mod tests {
 
     #[test]
     fn resolve_bucket_default_sse_prefers_the_request_over_the_bucket_default() {
-        let config = bucket_sse_config_with(ServerSideEncryption::AWS_KMS, Some("bucket-key"));
+        let config = bucket_sse_config_with(AMZ_ENCRYPTION_KMS, Some("bucket-key"));
 
         let (sse, kms_key_id) = resolve_bucket_default_sse(
             Some(&config),
-            Some(String::from(ServerSideEncryption::AES256)),
+            Some(String::from(AMZ_ENCRYPTION_AES)),
             Some("request-key".to_string()),
             false,
         );
 
-        assert_eq!(sse.as_deref(), Some(ServerSideEncryption::AES256));
+        assert_eq!(sse.as_deref(), Some(AMZ_ENCRYPTION_AES));
         assert_eq!(kms_key_id.as_deref(), Some("request-key"));
     }
 
     #[test]
     fn resolve_bucket_default_sse_does_not_inherit_a_kms_key_for_an_explicit_sse_s3_request() {
-        let config = bucket_sse_config_with(ServerSideEncryption::AWS_KMS, Some("bucket-key"));
+        let config = bucket_sse_config_with(AMZ_ENCRYPTION_KMS, Some("bucket-key"));
 
-        let (sse, kms_key_id) =
-            resolve_bucket_default_sse(Some(&config), Some(String::from(ServerSideEncryption::AES256)), None, false);
+        let (sse, kms_key_id) = resolve_bucket_default_sse(Some(&config), Some(String::from(AMZ_ENCRYPTION_AES)), None, false);
 
-        assert_eq!(sse.as_deref(), Some(ServerSideEncryption::AES256));
+        assert_eq!(sse.as_deref(), Some(AMZ_ENCRYPTION_AES));
         assert!(kms_key_id.is_none(), "an SSE-S3 request must not inherit the bucket KMS key");
     }
 
     #[test]
     fn resolve_bucket_default_sse_fills_gaps_from_the_bucket_default() {
-        let config = bucket_sse_config_with(ServerSideEncryption::AWS_KMS, Some("bucket-key"));
+        let config = bucket_sse_config_with(AMZ_ENCRYPTION_KMS, Some("bucket-key"));
 
         let (sse, kms_key_id) = resolve_bucket_default_sse(Some(&config), None, None, false);
 
-        assert_eq!(sse.as_deref(), Some(ServerSideEncryption::AWS_KMS));
+        assert_eq!(sse.as_deref(), Some(AMZ_ENCRYPTION_KMS));
         assert_eq!(kms_key_id.as_deref(), Some("bucket-key"));
     }
 
@@ -1745,13 +1737,13 @@ mod tests {
 
         let (sse, kms_key_id) = resolve_bucket_default_sse(Some(&config), None, None, false);
 
-        assert_eq!(sse.as_deref(), Some(ServerSideEncryption::AES256));
+        assert_eq!(sse.as_deref(), Some(AMZ_ENCRYPTION_AES));
         assert!(kms_key_id.is_none());
     }
 
     #[test]
     fn resolve_bucket_default_sse_suppresses_the_default_for_explicit_ssec() {
-        let config = bucket_sse_config_with(ServerSideEncryption::AES256, Some("bucket-key"));
+        let config = bucket_sse_config_with(AMZ_ENCRYPTION_AES, Some("bucket-key"));
 
         let (sse, kms_key_id) = resolve_bucket_default_sse(Some(&config), None, None, true);
 
@@ -1769,11 +1761,11 @@ mod tests {
 
     #[test]
     fn build_put_like_object_lock_metadata_rejects_mode_without_retain_until_date() {
-        let err = build_put_like_object_lock_metadata(
+        let err = build_put_like_object_lock_metadata_native(
             "test-bucket",
             &metadata_sys::ObjectLockConfigState::ConfirmedAbsent,
             None,
-            Some(ObjectLockMode::from_static(ObjectLockMode::GOVERNANCE)),
+            Some("GOVERNANCE".to_owned()),
             None,
         )
         .unwrap_err();
@@ -1801,8 +1793,8 @@ mod tests {
 
     #[test]
     fn build_put_like_object_lock_metadata_rejects_retain_until_date_without_mode() {
-        let retain_until = Timestamp::from(OffsetDateTime::now_utc() + time::Duration::days(1));
-        let err = build_put_like_object_lock_metadata(
+        let retain_until = OffsetDateTime::now_utc() + time::Duration::days(1);
+        let err = build_put_like_object_lock_metadata_native(
             "test-bucket",
             &metadata_sys::ObjectLockConfigState::ConfirmedAbsent,
             None,
@@ -1843,14 +1835,14 @@ mod tests {
 
     fn compliance_retained_object_info() -> ObjectInfo {
         let mut metadata = HashMap::new();
-        metadata.insert(AMZ_OBJECT_LOCK_MODE_LOWER.to_string(), ObjectLockRetentionMode::COMPLIANCE.to_string());
+        metadata.insert(AMZ_OBJECT_LOCK_MODE_LOWER.to_string(), "COMPLIANCE".to_string());
         metadata.insert(AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE_LOWER.to_string(), "2030-01-01T00:00:00Z".to_string());
         object_info_with_lock_metadata(metadata)
     }
 
     fn legal_hold_object_info() -> ObjectInfo {
         let mut metadata = HashMap::new();
-        metadata.insert(AMZ_OBJECT_LOCK_LEGAL_HOLD_LOWER.to_string(), ObjectLockLegalHoldStatus::ON.to_string());
+        metadata.insert(AMZ_OBJECT_LOCK_LEGAL_HOLD_LOWER.to_string(), "ON".to_string());
         object_info_with_lock_metadata(metadata)
     }
 
@@ -1919,23 +1911,45 @@ mod tests {
 
     /// The source's lock state governs the replica (rustfs/backlog#1953):
     /// an authorized replication write carrying the locking category's source
-    /// timestamp may overwrite a locked version; the set layer's LWW then
-    /// decides per category.
+    /// timestamp and compatible lock metadata passes to the set layer's
+    /// metadata-only LWW commit, while forged timestamps cannot clear or weaken
+    /// active COMPLIANCE retention or strip LegalHold without explicit ON|OFF.
     #[test]
     fn validate_existing_object_lock_allows_authorized_replication_overwrite() {
+        let mut preserved_lock = (*compliance_retained_object_info().user_defined).clone();
+        preserved_lock.insert(AMZ_OBJECT_LOCK_LEGAL_HOLD_LOWER.to_string(), "OFF".to_string());
         let opts = ObjectOptions {
             versioned: true,
             version_id: Some(Uuid::new_v4().to_string()),
             replication_request: true,
             replication_retention_timestamp: Some(OffsetDateTime::UNIX_EPOCH),
             replication_legalhold_timestamp: Some(OffsetDateTime::UNIX_EPOCH),
+            user_defined: preserved_lock,
             ..Default::default()
         };
 
         validate_existing_object_lock_for_write(&NO_BUCKET_LOCK, &compliance_retained_object_info(), &opts)
-            .expect("replication write must bypass the destination COMPLIANCE lock");
+            .expect("replication write preserving COMPLIANCE retention must pass pre-check");
         validate_existing_object_lock_for_write(&NO_BUCKET_LOCK, &legal_hold_object_info(), &opts)
-            .expect("replication write must bypass the destination legal hold");
+            .expect("replication write carrying explicit legal-hold OFF must pass pre-check");
+
+        // Forged future timestamps with absent lock headers must never clear COMPLIANCE or legal hold.
+        let forged = ObjectOptions {
+            replication_retention_timestamp: Some(
+                OffsetDateTime::parse("2099-01-01T00:00:00Z", &time::format_description::well_known::Rfc3339).expect("valid"),
+            ),
+            replication_legalhold_timestamp: Some(
+                OffsetDateTime::parse("2099-01-01T00:00:00Z", &time::format_description::well_known::Rfc3339).expect("valid"),
+            ),
+            user_defined: HashMap::new(),
+            ..opts
+        };
+        let err = validate_existing_object_lock_for_write(&NO_BUCKET_LOCK, &compliance_retained_object_info(), &forged)
+            .expect_err("forged replication timestamps must not clear COMPLIANCE retention");
+        assert_eq!(err.code(), &S3ErrorCode::AccessDenied);
+        let err = validate_existing_object_lock_for_write(&NO_BUCKET_LOCK, &legal_hold_object_info(), &forged)
+            .expect_err("forged replication timestamps without explicit legal-hold status must not strip hold");
+        assert_eq!(err.code(), &S3ErrorCode::AccessDenied);
     }
 
     /// Without the locking category's source timestamp the LWW merge cannot
@@ -1960,8 +1974,8 @@ mod tests {
 
     /// The bucket default retention locks a version without explicit
     /// retention keys; the pre-check judges the same authoritative state as
-    /// the set-layer gate, so a tagging-only replication write is rejected
-    /// and one carrying the retention source timestamp passes to LWW.
+    /// the set-layer gate, so a tagging-only or lock-clearing replication
+    /// write is rejected and only a compatible retention decision passes.
     #[test]
     fn validate_existing_object_lock_judges_bucket_default_retention_for_replication_overwrite() {
         let default_protected = object_info_with_lock_metadata(HashMap::new());
@@ -1972,18 +1986,31 @@ mod tests {
             replication_tagging_timestamp: Some(OffsetDateTime::UNIX_EPOCH),
             ..Default::default()
         };
-        let with_retention_decision = ObjectOptions {
-            replication_retention_timestamp: Some(OffsetDateTime::UNIX_EPOCH),
-            ..tagging_only.clone()
-        };
 
-        for mode in [ObjectLockRetentionMode::COMPLIANCE, ObjectLockRetentionMode::GOVERNANCE] {
+        for mode in ["COMPLIANCE", "GOVERNANCE"] {
             let state = bucket_default_retention_state(mode);
             let err = validate_existing_object_lock_for_write(&state, &default_protected, &tagging_only)
                 .expect_err("bucket default retention must hold without a retention source timestamp");
             assert_eq!(err.code(), &S3ErrorCode::AccessDenied, "{mode}");
-            validate_existing_object_lock_for_write(&state, &default_protected, &with_retention_decision)
-                .expect("the retention source timestamp hands the default retention to LWW");
+
+            let forged_clear = ObjectOptions {
+                replication_retention_timestamp: Some(OffsetDateTime::UNIX_EPOCH),
+                ..tagging_only.clone()
+            };
+            let err = validate_existing_object_lock_for_write(&state, &default_protected, &forged_clear)
+                .expect_err("bucket default retention must not be cleared without valid retention/bypass");
+            assert_eq!(err.code(), &S3ErrorCode::AccessDenied, "{mode}");
+
+            let with_preserving_retention = ObjectOptions {
+                replication_retention_timestamp: Some(OffsetDateTime::UNIX_EPOCH),
+                user_defined: HashMap::from([
+                    (AMZ_OBJECT_LOCK_MODE_LOWER.to_string(), mode.to_string()),
+                    (AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE_LOWER.to_string(), "2099-01-01T00:00:00Z".to_string()),
+                ]),
+                ..tagging_only.clone()
+            };
+            validate_existing_object_lock_for_write(&state, &default_protected, &with_preserving_retention)
+                .expect("compatible retention metadata with source timestamp hands the default retention to LWW");
         }
 
         // Without a bucket default the same version is simply unlocked.
@@ -2013,12 +2040,15 @@ mod tests {
 
     #[test]
     fn s3s_body_error_to_io_preserves_upload_stream_error_source() {
-        let error = s3s_body_error_to_io(Box::new(UploadStreamError::Sha256Mismatch));
+        let error = s3s_body_error_to_io(Box::new(rustfs_rio::IncompleteBody { remaining: 7 }));
 
-        assert!(matches!(
-            error.get_ref().and_then(|source| source.downcast_ref::<UploadStreamError>()),
-            Some(UploadStreamError::Sha256Mismatch)
-        ));
+        assert_eq!(
+            error
+                .get_ref()
+                .and_then(|source| source.downcast_ref::<rustfs_rio::IncompleteBody>())
+                .map(|err| err.remaining),
+            Some(7)
+        );
     }
 
     #[test]

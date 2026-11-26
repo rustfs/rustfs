@@ -172,33 +172,116 @@ pub fn has_string_suffix_in_slice(str: &str, list: &[impl AsRef<str>]) -> bool {
     false
 }
 
-fn deep_match_rune(str_: &[u8], pattern: &[u8], simple: bool) -> bool {
-    let (mut str_, mut pattern) = (str_, pattern);
-    while !pattern.is_empty() {
-        match pattern[0] as char {
-            '*' => {
-                return if pattern.len() == 1 {
-                    true
-                } else {
-                    deep_match_rune(str_, &pattern[1..], simple)
-                        || (!str_.is_empty() && deep_match_rune(&str_[1..], pattern, simple))
-                };
-            }
-            '?' => {
+fn deep_match_rune(mut str_: &[u8], mut pattern: &[u8], simple: bool) -> bool {
+    // Fast path: match literal and `?` prefix without heap allocation.
+    while let Some(&p) = pattern.first() {
+        match p {
+            b'*' => break,
+            b'?' => {
                 if str_.is_empty() {
                     return simple;
                 }
+                str_ = &str_[1..];
+                pattern = &pattern[1..];
             }
             _ => {
-                if str_.is_empty() || str_[0] != pattern[0] {
+                if str_.first() != Some(&p) {
+                    return false;
+                }
+                str_ = &str_[1..];
+                pattern = &pattern[1..];
+            }
+        }
+    }
+
+    if pattern.is_empty() {
+        return str_.is_empty();
+    }
+
+    // Collapse consecutive leading `*` tokens; a trailing run matches everything.
+    while pattern.first() == Some(&b'*') {
+        pattern = &pattern[1..];
+    }
+    if pattern.is_empty() {
+        return true;
+    }
+
+    // Allocation-free fast paths when no further `*` remains in the pattern.
+    if !pattern.contains(&b'*') {
+        if !pattern.contains(&b'?') {
+            return str_.ends_with(pattern);
+        }
+        if !simple {
+            return str_.len() >= pattern.len()
+                && pattern
+                    .iter()
+                    .zip(&str_[str_.len() - pattern.len()..])
+                    .all(|(&p, &c)| p == b'?' || p == c);
+        }
+    }
+
+    star_match_rune(str_, pattern, simple)
+}
+
+/// Iteratively matches the remainder of a pattern immediately following a `*`.
+///
+/// Maintains reachable positions in `str_` (`O(str_.len())` space independent of
+/// `pattern.len()`) and collapses consecutive `*` tokens in `O(1)` each, avoiding
+/// both exponential backtracking and recursion stack growth.
+fn star_match_rune(str_: &[u8], pattern: &[u8], simple: bool) -> bool {
+    let n = str_.len();
+    // dp[j]: the pattern prefix processed so far (starting from the leading `*`)
+    // matches `str_[..j]`.
+    let mut dp = vec![true; n + 1];
+    let mut prev_was_star = true;
+
+    for &p in pattern {
+        match p {
+            b'*' => {
+                if prev_was_star {
+                    continue;
+                }
+                prev_was_star = true;
+                let Some(first) = dp.iter().position(|&matched| matched) else {
+                    return false;
+                };
+                dp[first..].fill(true);
+            }
+            b'?' => {
+                prev_was_star = false;
+                // In simple mode, reaching `?` when `str_` is exhausted accepts
+                // whatever follows in `pattern`.
+                if simple && dp[n] {
+                    return true;
+                }
+                let mut any = false;
+                for j in (1..=n).rev() {
+                    let matched = dp[j - 1];
+                    dp[j] = matched;
+                    any |= matched;
+                }
+                dp[0] = false;
+                if !any {
+                    return false;
+                }
+            }
+            literal => {
+                prev_was_star = false;
+                let mut any = false;
+                for j in (1..=n).rev() {
+                    let matched = dp[j - 1] && str_[j - 1] == literal;
+                    dp[j] = matched;
+                    any |= matched;
+                }
+                dp[0] = false;
+                if !any {
                     return false;
                 }
             }
         }
-        str_ = &str_[1..];
-        pattern = &pattern[1..];
     }
-    str_.is_empty() && pattern.is_empty()
+
+    dp[n]
 }
 
 /// Matches a pattern as a prefix against the given text.
@@ -558,6 +641,111 @@ pub fn strings_has_prefix_fold(s: &str, prefix: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_match_many_wildcards_without_backtracking() {
+        let name = "a".repeat(1000);
+        let pattern = "*a".repeat(100);
+
+        assert!(match_pattern(&pattern, &name));
+        assert!(match_simple(&pattern, &name));
+        assert!(!match_pattern(&format!("{pattern}*b"), &name));
+        assert!(!match_simple(&format!("{pattern}*b"), &name));
+
+        let repeated = format!("{}*b", "a*".repeat(80));
+        assert!(!match_pattern(&repeated, &name));
+        assert!(!match_simple(&repeated, &name));
+    }
+
+    #[test]
+    fn test_match_deep_star_runs_do_not_overflow_stack() {
+        let stars = "*".repeat(200_000);
+        assert!(match_pattern(&stars, "tenant-bkt/report.txt"));
+        assert!(match_simple(&stars, "tenant-bkt/report.txt"));
+
+        let stars_suffix = format!("{stars}x");
+        let long_name = "a".repeat(1024);
+        assert!(!match_pattern(&stars_suffix, &long_name));
+        assert!(!match_simple(&stars_suffix, &long_name));
+        assert!(match_pattern(&stars_suffix, &format!("{long_name}x")));
+
+        let middle_stars = format!("a{}b{}c", "*".repeat(50_000), "*".repeat(50_000));
+        assert!(match_pattern(&middle_stars, &format!("a{}b{}c", "x".repeat(200), "y".repeat(200))));
+        assert!(!match_pattern(&middle_stars, &format!("a{}c", "x".repeat(200))));
+    }
+
+    #[test]
+    fn test_match_utf8_multibyte() {
+        assert!(match_pattern("桶/目录/*文档*", "桶/目录/2026年文档.txt"));
+        assert!(!match_pattern("桶/目录/*文档*", "桶/目录/2026年表格.txt"));
+        assert!(match_simple("café*naïve", "café-et-naïve"));
+        assert!(!match_simple("café*naïve", "café-et-naive"));
+        assert!(match_simple("*🎉*🚀", "prefix🎉mid🚀"));
+        assert!(!match_simple("*🎉*🚀", "prefix🎉mid"));
+    }
+
+    #[test]
+    fn test_match_wildcards() {
+        let test_cases = [
+            ("my-bucket/In*/Ka*/Ban", "my-bucket/India/Karnataka/Ban/Ban/Ban", true, true),
+            ("my-bucket/In*/Ka*/Ban", "my-bucket/India/Karnataka/Bangalore", false, false),
+            ("my-bucket/mnop*?and?", "my-bucket/mnopqanda", true, true),
+            ("*", "", true, true),
+            ("**", "", true, true),
+            ("*a", "", false, false),
+            // Simple matching accepts a `?` reached at the end of the name, whatever follows it.
+            ("a?", "a", false, true),
+            ("?nobody", "", false, true),
+            ("*?a*b", "xa", false, true),
+            ("my-bucket/mnop*?and", "my-bucket/mnopand", false, true),
+            ("*a?c", "aa", false, true),
+            ("*a?*c", "aa", false, true),
+        ];
+
+        for (pattern, name, expected, expected_simple) in test_cases {
+            assert_eq!(match_pattern(pattern, name), expected, "match_pattern({pattern:?}, {name:?})");
+            assert_eq!(match_simple(pattern, name), expected_simple, "match_simple({pattern:?}, {name:?})");
+        }
+    }
+
+    fn backtracking_match_rune(str_: &[u8], pattern: &[u8], simple: bool) -> bool {
+        match pattern.split_first() {
+            None => str_.is_empty(),
+            Some((b'*', rest)) => {
+                backtracking_match_rune(str_, rest, simple)
+                    || (!str_.is_empty() && backtracking_match_rune(&str_[1..], pattern, simple))
+            }
+            Some((b'?', _)) if str_.is_empty() => simple,
+            Some((&p, rest)) => {
+                !str_.is_empty() && (p == b'?' || p == str_[0]) && backtracking_match_rune(&str_[1..], rest, simple)
+            }
+        }
+    }
+
+    fn small_strings(alphabet: &str, max_len: usize) -> Vec<String> {
+        let mut all = vec![String::new()];
+        let mut longest = all.clone();
+        for _ in 0..max_len {
+            longest = longest
+                .iter()
+                .flat_map(|s| alphabet.chars().map(move |c| format!("{s}{c}")))
+                .collect();
+            all.extend_from_slice(&longest);
+        }
+        all
+    }
+
+    #[test]
+    fn test_match_agrees_with_backtracking_definition() {
+        let names = small_strings("ab", 5);
+        for pattern in small_strings("ab*?", 5) {
+            for name in &names {
+                let expected = |simple| backtracking_match_rune(name.as_bytes(), pattern.as_bytes(), simple);
+                assert_eq!(match_pattern(&pattern, name), expected(false), "match_pattern({pattern:?}, {name:?})");
+                assert_eq!(match_simple(&pattern, name), expected(true), "match_simple({pattern:?}, {name:?})");
+            }
+        }
+    }
 
     #[test]
     fn test_has_ellipses() {

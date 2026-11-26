@@ -85,6 +85,17 @@ fn format_copy_source_version_id(version_id: Option<Uuid>, src_versioned: bool, 
     }
 }
 
+fn validate_upload_part_copy_source_key(src_key: &str) -> S3Result<()> {
+    crate::app::storage_api::multipart_usecase::validate_object_key(src_key, "UPLOAD_PART_COPY (source)")?;
+    if src_key.starts_with('/') {
+        return Err(S3Error::with_message(
+            S3ErrorCode::InvalidArgument,
+            "Object name contains forward slash as prefix",
+        ));
+    }
+    Ok(())
+}
+
 /// Returns InvalidRange error if CopySourceRange end exceeds the source object size.
 /// Used by execute_upload_part_copy to reject out-of-bounds ranges per S3 spec.
 fn validate_copy_source_range_not_exceeds(range_spec: &HTTPRangeSpec, object_size: i64) -> S3Result<()> {
@@ -170,6 +181,7 @@ impl DefaultMultipartUsecase {
             } => (src_bucket, src_key, version_id),
         };
         let src_version_id = normalize_copy_source_version_id(raw_src_version_id.as_deref())?;
+        validate_upload_part_copy_source_key(&src_key)?;
 
         let rs = if let Some(range_str) = copy_source_range {
             Some(parse_copy_source_range(&range_str)?)
@@ -538,10 +550,10 @@ mod tests {
             },
         );
         let err = match Box::pin(make_usecase().execute_upload_part_copy_with_audit(owned_envelope(Method::PUT), input)).await {
-            Err(error) => crate::error::legacy_error_for_test(error),
+            Err(error) => error,
             Ok(_) => panic!("uninitialized store must be an internal error"),
         };
-        assert_eq!(err.code(), &crate::app::storage_api::s3::S3ErrorCode::InternalError);
+        assert_eq!(err.code(), &S3ErrorCode::InternalError);
     }
 
     #[tokio::test]
@@ -560,11 +572,47 @@ mod tests {
             );
             let err = match Box::pin(make_usecase().execute_upload_part_copy_with_audit(owned_envelope(Method::PUT), input)).await
             {
-                Err(error) => crate::error::legacy_error_for_test(error),
+                Err(error) => error,
                 Ok(_) => panic!("invalid part number must be rejected"),
             };
-            assert_eq!(err.code(), &crate::app::storage_api::s3::S3ErrorCode::InvalidArgument);
+            assert_eq!(err.code(), &S3ErrorCode::InvalidArgument);
             assert_eq!(err.message(), Some("partNumber must be between 1 and 10000"));
+        }
+    }
+
+    #[tokio::test]
+    async fn execute_upload_part_copy_rejects_leading_slash_and_invalid_source_keys_before_store_lookup() {
+        for invalid_src_key in [
+            "/tables/table-uuid/data/00000-0-rows.parquet",
+            "/.rustfs-table/warehouses/default/metadata.json",
+            "//tables/table-uuid/data/00000-0-rows.parquet",
+            "/",
+            "",
+            "a/../b",
+            "a//b",
+            "a\0b",
+        ] {
+            let input = copy_part_input(
+                "bucket",
+                "object",
+                "upload-id",
+                1,
+                CopySourceValue::Bucket {
+                    bucket: "src-bucket".into(),
+                    key: invalid_src_key.into(),
+                    version_id: None,
+                },
+            );
+            let err = match Box::pin(make_usecase().execute_upload_part_copy_with_audit(owned_envelope(Method::PUT), input)).await
+            {
+                Err(error) => error,
+                Ok(_) => panic!("invalid copy source key {invalid_src_key:?} must be rejected"),
+            };
+            assert_eq!(
+                err.code(),
+                &S3ErrorCode::InvalidArgument,
+                "invalid copy source key {invalid_src_key:?} must fail with InvalidArgument"
+            );
         }
     }
 

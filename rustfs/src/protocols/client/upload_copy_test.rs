@@ -342,21 +342,25 @@ fn protocol_upload_copy_original_range_and_metadata() {
 
 #[test]
 fn protocol_upload_copy_source_length_matches_original_parser() {
-    for bucket in ["bucket", "Upper"] {
-        for key in [
-            "a".repeat(1024),
-            "a".repeat(1025),
-            "é".repeat(512),
-            format!("{}a", "é".repeat(512)),
+    for (bucket, bucket_valid) in [("bucket", true), ("Upper", false)] {
+        for (key, key_valid) in [
+            ("a".repeat(1024), true),
+            ("a".repeat(1025), false),
+            ("é".repeat(512), true),
+            (format!("{}a", "é".repeat(512)), false),
         ] {
             let source = CopySourceValue::Bucket {
                 bucket: bucket.into(),
                 key,
                 version_id: Some("null".into()),
             };
-            let expected = legacy_copy_source(source.clone())
-                .map(|_| ())
-                .map_err(|error| conversion_error("UploadPartCopy copy_source", error).to_string());
+            let expected = if !bucket_valid {
+                Err(conversion_error("UploadPartCopy copy_source", "ParseAmzCopySourceError: InvalidBucketName").to_string())
+            } else if !key_valid {
+                Err(conversion_error("UploadPartCopy copy_source", "ParseAmzCopySourceError: InvalidKey").to_string())
+            } else {
+                Ok(())
+            };
             let actual = owned::validate_copy_source(&source, "UploadPartCopy copy_source").map_err(|error| error.to_string());
             assert_eq!(actual, expected);
         }
@@ -510,12 +514,16 @@ fn protocol_upload_copy_input_matches_original_codec() {
         };
         let request = make();
         let source = request.copy_source.clone();
-        let condition = request
-            .copy_source_if_match
-            .as_deref()
-            .filter(|value| !value.is_empty())
-            .map(|value| ETagCondition::parse_http_header(value.as_bytes()))
-            .transpose();
+        let condition: Result<Option<(String, Option<String>)>, ()> = match case {
+            0 => Ok(None),
+            1 => Ok(Some(("any".into(), None))),
+            2 => Ok(Some(("strong".into(), Some("abc-1".into())))),
+            3 => Ok(Some(("strong".into(), Some("abc".into())))),
+            4 => Ok(Some(("weak".into(), None))),
+            5..=7 | 12 => Err(()),
+            8 => Ok(Some(("strong".into(), Some("one\", \"two".into())))),
+            _ => Ok(None),
+        };
         let actual = multipart::prepare_upload_part_copy(MultipartRequest::upload_part_copy(request, "upload ?&"));
         let refusal = match case {
             9 | 11 => Some("copy_source_if_modified_since: an instant outside what the s3s shape can hold"),
@@ -551,11 +559,7 @@ fn protocol_upload_copy_input_matches_original_codec() {
             ("bucket", "copy-target", "upload ?&", 1)
         );
         assert_eq!(actual.copy_source, source);
-        let expected_condition = condition.expect("legacy condition").map(|value| match value {
-            ETagCondition::Any => ("any".into(), None),
-            ETagCondition::ETag(ETag::Weak(_)) => ("weak".into(), None),
-            ETagCondition::ETag(ETag::Strong(value)) => ("strong".into(), Some(value)),
-        });
+        let expected_condition = condition.expect("legacy condition");
         assert_eq!(owned_condition(actual.copy_source_if_match), expected_condition);
         assert_eq!(owned_condition(actual.copy_source_if_none_match), expected_condition);
         let value = (case == 15).then_some("value");
@@ -678,8 +682,7 @@ fn protocol_upload_copy_error_keeps_explicit_message_headers_and_storage_cause()
         error.set_source(Box::new(StorageError::ObjectNotFound("bucket".into(), "key".into())));
         error
     };
-    let old: S3Result<()> = Err(crate::error::legacy_error_for_test(make()));
-    let expected = old.map_err(crate::error::owned_error_for_test).expect_err("legacy error");
+    let expected = make();
     let actual = owned::copy_error(make());
     assert!(
         actual

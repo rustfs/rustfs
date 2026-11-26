@@ -42,8 +42,8 @@ use crate::bucket::lifecycle::lifecycle::TRANSITION_COMPLETE;
 use crate::bucket::metadata_sys;
 use crate::bucket::metadata_sys::ObjectLockConfigState;
 use crate::bucket::object_lock::objectlock_sys::{
-    check_object_lock_for_deletion_with_state, check_retention_for_modification, replication_delete_may_bypass_governance,
-    replication_write_may_pass_worm_gate,
+    check_object_lock_for_deletion_with_state, check_retention_for_modification,
+    replication_write_may_pass_worm_gate_with_inbound_metadata,
 };
 #[cfg(test)]
 use crate::bucket::replication::ReplicationState;
@@ -6916,19 +6916,37 @@ impl SetDisks {
     }
 }
 
-fn check_object_lock_retention_update(bucket: &str, object: &str, obj_info: &ObjectInfo, opts: &ObjectOptions) -> Result<()> {
-    if let Some(retention) = &opts.object_lock_retention
-        && check_retention_for_modification(
-            &obj_info.user_defined,
-            retention
-                .mode
-                .as_deref()
-                .and_then(crate::bucket::object_lock::types::RetentionMode::parse_exact),
+async fn check_object_lock_retention_update(
+    ctx: &InstanceContext,
+    bucket: &str,
+    object: &str,
+    obj_info: &ObjectInfo,
+    opts: &ObjectOptions,
+) -> Result<()> {
+    let Some(retention) = &opts.object_lock_retention else {
+        return Ok(());
+    };
+
+    let new_mode = retention
+        .mode
+        .as_deref()
+        .and_then(crate::bucket::object_lock::types::RetentionMode::parse_exact);
+    let blocked = match opts.object_lock_config_snapshot.as_deref() {
+        Some(snapshot) => check_retention_for_modification(
+            snapshot.state(),
+            obj_info,
+            new_mode,
             retention.retain_until,
             retention.bypass_governance,
-        )
-        .is_some()
-    {
+        )?
+        .is_some(),
+        None => {
+            let state = metadata_sys::get_object_lock_config_state_in(ctx, bucket).await?;
+            check_retention_for_modification(&state, obj_info, new_mode, retention.retain_until, retention.bypass_governance)?
+                .is_some()
+        }
+    };
+    if blocked {
         return Err(StorageError::PrefixAccessDenied(bucket.to_string(), object.to_string()));
     }
 
@@ -6998,15 +7016,14 @@ async fn check_object_lock_delete(
         return Ok(());
     }
 
-    // An authorized replicated version purge already passed this gate on the
-    // source with the bypass it carried there, so it clears GOVERNANCE
-    // retention here without the header; COMPLIANCE and legal hold still
-    // block below (see `replication_delete_may_bypass_governance`, #6850).
+    // The serving layer decides GOVERNANCE bypass for both explicit bypass
+    // headers and replicated version purges (#6850) after authorizing the
+    // caller for `s3:BypassGovernanceRetention`. `replication_request` alone
+    // does not confer bypass; COMPLIANCE and legal hold always block below.
     let bypass_governance = opts
         .object_lock_delete
         .as_ref()
-        .is_some_and(|delete_opts| delete_opts.bypass_governance)
-        || replication_delete_may_bypass_governance(opts);
+        .is_some_and(|delete_opts| delete_opts.bypass_governance);
     let blocked = match opts.object_lock_config_snapshot.as_deref() {
         Some(snapshot) => check_object_lock_for_deletion_with_state(snapshot.state(), obj_info, bypass_governance)?.is_some(),
         None => {
@@ -7188,6 +7205,41 @@ impl SetDisks {
             .iter()
             .flatten()
             .any(|copy| FileMeta::load(&copy.buf).is_ok_and(|meta| meta.find_version(Some(version_id)).is_ok()))
+    }
+
+    /// Whether a write quorum of this set's drives hold `version_id` of the
+    /// key as the committed copy in `data_dir`. An object read answers from
+    /// read quorum, which on a data = parity set is one drive loss away from
+    /// unreadable; a data-movement caller that removes the source on this
+    /// answer needs the drives a new copy would have been written to. Every
+    /// drive is asked in one fanout, and a drive counts only for the shard
+    /// its own slot is assigned.
+    pub(crate) async fn holds_version_on_write_quorum(
+        &self,
+        bucket: &str,
+        object: &str,
+        version_id: Uuid,
+        data_dir: Option<Uuid>,
+    ) -> Result<bool> {
+        let disks = self.disk_inventory().await;
+        let (copies, _) =
+            Self::read_all_fileinfo(&disks, "", bucket, object, &version_id.to_string(), false, false, false).await?;
+        let mut holders: HashMap<[u8; 32], (usize, usize)> = HashMap::new();
+        for (slot, copy) in copies.iter().enumerate() {
+            if !file_info_is_valid_for_metadata(copy)
+                || copy.deleted
+                || copy.version_id.unwrap_or_else(Uuid::nil) != version_id
+                || copy.data_dir != data_dir
+                || !copy.has_valid_erasure_geometry()
+                || copy.erasure.distribution.len() != copies.len()
+                || copy.erasure.distribution.get(slot) != Some(&copy.erasure.index)
+            {
+                continue;
+            }
+            let required = copy.write_quorum(self.default_write_quorum());
+            holders.entry(Self::file_info_quorum_hash(copy)).or_insert((0, required)).0 += 1;
+        }
+        Ok(holders.into_values().any(|(drives, required)| drives >= required))
     }
 
     /// Publish an internal tier free-version record without changing its
@@ -14370,8 +14422,8 @@ mod tests {
         assert!(rendered.contains("object"), "{rendered}");
     }
 
-    #[test]
-    fn test_check_object_lock_retention_update_blocks_compliance_shorten() {
+    #[tokio::test]
+    async fn test_check_object_lock_retention_update_blocks_compliance_shorten() {
         let now = OffsetDateTime::now_utc();
         let existing_until = now + Duration::from_secs(60 * 60 * 24 * 60);
         let requested_until = now + Duration::from_secs(60 * 60 * 24);
@@ -14393,17 +14445,19 @@ mod tests {
                 retain_until: Some(requested_until),
                 bypass_governance: true,
             }),
+            object_lock_config_snapshot: Some(Arc::new(ObjectLockConfigSnapshot::new(ObjectLockConfigState::ConfirmedAbsent))),
             ..Default::default()
         };
 
-        let err = check_object_lock_retention_update("bucket", "object", &obj_info, &opts)
+        let err = check_object_lock_retention_update(&bootstrap_ctx(), "bucket", "object", &obj_info, &opts)
+            .await
             .expect_err("COMPLIANCE shortening must be blocked");
 
         assert!(matches!(err, StorageError::PrefixAccessDenied(_, _)));
     }
 
-    #[test]
-    fn test_check_object_lock_retention_update_allows_governance_shorten_with_bypass() {
+    #[tokio::test]
+    async fn test_check_object_lock_retention_update_allows_governance_shorten_with_bypass() {
         let now = OffsetDateTime::now_utc();
         let existing_until = now + Duration::from_secs(60 * 60 * 24 * 60);
         let requested_until = now + Duration::from_secs(60 * 60 * 24);
@@ -14425,11 +14479,91 @@ mod tests {
                 retain_until: Some(requested_until),
                 bypass_governance: true,
             }),
+            object_lock_config_snapshot: Some(Arc::new(ObjectLockConfigSnapshot::new(ObjectLockConfigState::ConfirmedAbsent))),
             ..Default::default()
         };
 
-        check_object_lock_retention_update("bucket", "object", &obj_info, &opts)
+        check_object_lock_retention_update(&bootstrap_ctx(), "bucket", "object", &obj_info, &opts)
+            .await
             .expect("GOVERNANCE shortening with bypass should remain allowed");
+    }
+
+    #[tokio::test]
+    async fn test_check_object_lock_retention_update_blocks_bucket_default_compliance_downgrade() {
+        let now = OffsetDateTime::now_utc();
+        let obj_info = ObjectInfo {
+            mod_time: Some(now),
+            ..Default::default()
+        };
+        let default_compliance_snapshot =
+            Arc::new(ObjectLockConfigSnapshot::new(metadata_sys::configured_object_lock_state_for_tests(
+                crate::bucket::object_lock::types::RetentionMode::Compliance,
+                30,
+            )));
+
+        let downgrade_opts = ObjectOptions {
+            object_lock_retention: Some(crate::storage_api_contracts::object::ObjectLockRetentionOptions {
+                mode: Some("GOVERNANCE".to_string()),
+                retain_until: Some(now + Duration::from_secs(60 * 60 * 24 * 60)),
+                bypass_governance: true,
+            }),
+            object_lock_config_snapshot: Some(Arc::clone(&default_compliance_snapshot)),
+            ..Default::default()
+        };
+        let err = check_object_lock_retention_update(&bootstrap_ctx(), "bucket", "object", &obj_info, &downgrade_opts)
+            .await
+            .expect_err("a version locked by the bucket default COMPLIANCE retention must not be downgraded");
+        assert!(matches!(err, StorageError::PrefixAccessDenied(_, _)));
+
+        let shorten_opts = ObjectOptions {
+            object_lock_retention: Some(crate::storage_api_contracts::object::ObjectLockRetentionOptions {
+                mode: Some("COMPLIANCE".to_string()),
+                retain_until: Some(now + Duration::from_secs(60 * 60 * 24)),
+                bypass_governance: true,
+            }),
+            object_lock_config_snapshot: Some(Arc::clone(&default_compliance_snapshot)),
+            ..Default::default()
+        };
+        let err = check_object_lock_retention_update(&bootstrap_ctx(), "bucket", "object", &obj_info, &shorten_opts)
+            .await
+            .expect_err("a version locked by the bucket default COMPLIANCE retention must not be shortened");
+        assert!(matches!(err, StorageError::PrefixAccessDenied(_, _)));
+
+        let extend_opts = ObjectOptions {
+            object_lock_retention: Some(crate::storage_api_contracts::object::ObjectLockRetentionOptions {
+                mode: Some("COMPLIANCE".to_string()),
+                retain_until: Some(now + Duration::from_secs(60 * 60 * 24 * 60)),
+                bypass_governance: false,
+            }),
+            object_lock_config_snapshot: Some(default_compliance_snapshot),
+            ..Default::default()
+        };
+        check_object_lock_retention_update(&bootstrap_ctx(), "bucket", "object", &obj_info, &extend_opts)
+            .await
+            .expect("extending bucket default COMPLIANCE retention must remain allowed");
+    }
+
+    #[tokio::test]
+    async fn test_check_object_lock_retention_update_fails_closed_on_fabricated_state() {
+        let now = OffsetDateTime::now_utc();
+        let obj_info = ObjectInfo {
+            mod_time: Some(now),
+            ..Default::default()
+        };
+        let opts = ObjectOptions {
+            object_lock_retention: Some(crate::storage_api_contracts::object::ObjectLockRetentionOptions {
+                mode: Some("GOVERNANCE".to_string()),
+                retain_until: Some(now + Duration::from_secs(60 * 60 * 24)),
+                bypass_governance: true,
+            }),
+            object_lock_config_snapshot: Some(Arc::new(ObjectLockConfigSnapshot::new(ObjectLockConfigState::Fabricated))),
+            ..Default::default()
+        };
+
+        let err = check_object_lock_retention_update(&bootstrap_ctx(), "bucket", "object", &obj_info, &opts)
+            .await
+            .expect_err("non-authoritative bucket Object Lock state must fail closed");
+        assert!(err.to_string().contains("not authoritative"), "unexpected error: {err}");
     }
 
     #[tokio::test]
@@ -14595,17 +14729,36 @@ mod tests {
         }
     }
 
+    fn replicated_version_purge_opts_with_bypass() -> ObjectOptions {
+        ObjectOptions {
+            object_lock_delete: Some(crate::storage_api_contracts::object::ObjectLockDeleteOptions { bypass_governance: true }),
+            ..explicit_version_delete_opts(true)
+        }
+    }
+
     // Issue #6850: a replicated version purge carries no bypass header, so the
-    // GOVERNANCE gate must honor the source's already-judged bypass instead of
-    // keeping the sites permanently diverged.
+    // GOVERNANCE gate honors the bypass granted by the serving layer after
+    // authorizing `s3:BypassGovernanceRetention`.
     #[tokio::test]
     async fn test_check_object_lock_delete_allows_replicated_governance_version_purge() {
         let obj_info = governance_retained_obj_info();
-        let opts = explicit_version_delete_opts(true);
+        let opts = replicated_version_purge_opts_with_bypass();
 
         check_object_lock_delete(&bootstrap_ctx(), "bucket", "object", &obj_info, &opts)
             .await
             .expect("an authorized replicated version purge must pass GOVERNANCE retention (#6850)");
+    }
+
+    #[tokio::test]
+    async fn test_check_object_lock_delete_blocks_replicated_governance_version_purge_without_bypass() {
+        let obj_info = governance_retained_obj_info();
+        let opts = explicit_version_delete_opts(true);
+
+        let err = check_object_lock_delete(&bootstrap_ctx(), "bucket", "object", &obj_info, &opts)
+            .await
+            .expect_err("the replication flag alone must not clear GOVERNANCE retention");
+
+        assert!(matches!(err, StorageError::PrefixAccessDenied(_, _)));
     }
 
     #[tokio::test]
@@ -14633,7 +14786,7 @@ mod tests {
             user_defined: Arc::new(user_defined),
             ..Default::default()
         };
-        let opts = explicit_version_delete_opts(true);
+        let opts = replicated_version_purge_opts_with_bypass();
 
         let err = check_object_lock_delete(&bootstrap_ctx(), "bucket", "object", &obj_info, &opts)
             .await
@@ -14650,7 +14803,7 @@ mod tests {
             user_defined: Arc::new(user_defined),
             ..Default::default()
         };
-        let opts = explicit_version_delete_opts(true);
+        let opts = replicated_version_purge_opts_with_bypass();
 
         let err = check_object_lock_delete(&bootstrap_ctx(), "bucket", "object", &obj_info, &opts)
             .await

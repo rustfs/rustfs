@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+mod delimited_table;
 mod json_document_schema;
 mod json_document_table;
 mod json_lines_schema;

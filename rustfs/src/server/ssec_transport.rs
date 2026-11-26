@@ -82,7 +82,7 @@ const SSEC_HEADERS: [&str; 6] = [
 /// and it is rejected later for being incomplete — but the key may already
 /// have crossed the wire. The copy-source triple counts the same as the
 /// object's own: it is the source object's key, sent in the clear just the same.
-fn carries_ssec_headers(headers: &HeaderMap) -> bool {
+pub(crate) fn carries_ssec_headers(headers: &HeaderMap) -> bool {
     SSEC_HEADERS.iter().any(|name| headers.contains_key(*name))
 }
 
@@ -103,6 +103,30 @@ pub(crate) fn is_secure_transport(connection_is_tls: bool, client_info: Option<&
 
 pub(crate) fn require_tls() -> bool {
     rustfs_utils::get_env_bool(ENV_SSE_C_REQUIRE_TLS, DEFAULT_SSE_C_REQUIRE_TLS)
+}
+
+/// Reports one SSE-C request observed on a plaintext transport: increments
+/// `rustfs_ssec_plaintext_requests_total` and emits the once-per-process warning.
+pub(crate) fn report_plaintext_ssec() {
+    counter!(METRIC_SSEC_PLAINTEXT_REQUESTS_TOTAL).increment(1);
+    warn_once_about_plaintext_ssec();
+}
+
+/// Reports a `POST Object` request carrying SSE-C form fields on a plaintext
+/// transport without double-counting requests that already carried SSE-C headers
+/// (which [`SsecTransportLayer`] already reported).
+///
+/// Returns `true` when the request was counted and warned as plaintext SSE-C.
+pub(crate) fn report_plaintext_ssec_form_fields(
+    headers: &HeaderMap,
+    connection_is_tls: bool,
+    client_info: Option<&ClientInfo>,
+) -> bool {
+    if carries_ssec_headers(headers) || is_secure_transport(connection_is_tls, client_info) {
+        return false;
+    }
+    report_plaintext_ssec();
+    true
 }
 
 /// One warning per process: plaintext SSE-C traffic is driven by clients, so a
@@ -198,8 +222,7 @@ where
             return Either::Left(self.inner.call(req));
         }
 
-        counter!(METRIC_SSEC_PLAINTEXT_REQUESTS_TOTAL).increment(1);
-        warn_once_about_plaintext_ssec();
+        report_plaintext_ssec();
 
         if !require_tls() {
             return Either::Left(self.inner.call(req));
@@ -305,5 +328,100 @@ mod tests {
         // rather than escaped into the XML body.
         let injected = ssec_requires_tls_response(Some("<injected>"));
         assert_eq!(injected.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[derive(Clone, Default)]
+    struct LogBuffer(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for LogBuffer {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().expect("log buffer").extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for LogBuffer {
+        type Writer = Self;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    fn plaintext_ssec_counter_value(recorder: &metrics_util::debugging::DebuggingRecorder) -> u64 {
+        recorder
+            .snapshotter()
+            .snapshot()
+            .into_vec()
+            .into_iter()
+            .find(|(key, _, _, _)| key.key().name() == METRIC_SSEC_PLAINTEXT_REQUESTS_TOTAL)
+            .map_or(0, |(_, _, _, value)| match value {
+                metrics_util::debugging::DebugValue::Counter(count) => count,
+                other => panic!("unexpected metric value for {METRIC_SSEC_PLAINTEXT_REQUESTS_TOTAL}: {other:?}"),
+            })
+    }
+
+    #[test]
+    fn plaintext_ssec_form_fields_increment_counter_and_emit_warning_once() {
+        let recorder = metrics_util::debugging::DebuggingRecorder::new();
+        let buffer = LogBuffer::default();
+        let subscriber = tracing_subscriber::fmt()
+            .json()
+            .without_time()
+            .with_writer(buffer.clone())
+            .finish();
+
+        metrics::with_local_recorder(&recorder, || {
+            tracing::subscriber::with_default(subscriber, || {
+                assert!(report_plaintext_ssec_form_fields(&HeaderMap::new(), false, None));
+                assert!(report_plaintext_ssec_form_fields(&HeaderMap::new(), false, Some(&direct())));
+                assert!(report_plaintext_ssec_form_fields(&HeaderMap::new(), false, Some(&proxied("http"))));
+            });
+        });
+
+        assert_eq!(
+            plaintext_ssec_counter_value(&recorder),
+            3,
+            "every plaintext POST Object SSE-C form upload must increment the counter"
+        );
+        let logs = String::from_utf8(buffer.0.lock().expect("log buffer").clone()).expect("UTF-8 logs");
+        let warning_count = logs.lines().filter(|line| line.contains("ssec_request_without_tls")).count();
+        assert_eq!(warning_count, 1, "the plaintext SSE-C warning must fire once per process");
+    }
+
+    #[test]
+    fn tls_and_header_ssec_requests_do_not_report_through_form_fields_path() {
+        let recorder = metrics_util::debugging::DebuggingRecorder::new();
+        let buffer = LogBuffer::default();
+        let subscriber = tracing_subscriber::fmt()
+            .json()
+            .without_time()
+            .with_writer(buffer.clone())
+            .finish();
+
+        metrics::with_local_recorder(&recorder, || {
+            tracing::subscriber::with_default(subscriber, || {
+                assert!(
+                    !report_plaintext_ssec_form_fields(&HeaderMap::new(), true, None),
+                    "native TLS POST form must not be reported"
+                );
+                assert!(
+                    !report_plaintext_ssec_form_fields(&HeaderMap::new(), false, Some(&proxied("https"))),
+                    "trusted-proxy HTTPS POST form must not be reported"
+                );
+                assert!(
+                    !report_plaintext_ssec_form_fields(&ssec_headers(), false, None),
+                    "header-based SSE-C was already counted by SsecTransportLayer"
+                );
+            });
+        });
+
+        assert_eq!(plaintext_ssec_counter_value(&recorder), 0);
+        let logs = String::from_utf8(buffer.0.lock().expect("log buffer").clone()).expect("UTF-8 logs");
+        assert!(!logs.contains("ssec_request_without_tls"));
     }
 }

@@ -43,6 +43,7 @@ script-tests: ## Run shell script tests
 	$(RUSTFS_PYTHON_BIN) ./scripts/test_internode_msgpack_peer_canary.py
 	./scripts/test_internode_msgpack_peer_canary_runner.sh
 	./scripts/test_object_batch_bench_enhanced.sh
+	$(RUSTFS_PYTHON_BIN) ./scripts/test_warp_raw_quality.py
 	$(RUSTFS_PYTHON_BIN) ./scripts/test_inline_docker_lab.py
 	./scripts/test_package_service_scripts.sh
 	./scripts/test_hotpath_warp_ab_gate.sh
@@ -103,8 +104,10 @@ script-tests: ## Run shell script tests
 	$(RUSTFS_PYTHON_BIN) ./scripts/test_retain_validation_evidence.py
 	$(RUSTFS_PYTHON_BIN) ./scripts/test_ci_timing_report.py
 	$(RUSTFS_PYTHON_BIN) ./scripts/test_junit_diff.py
+	$(RUSTFS_PYTHON_BIN) ./scripts/test_mint_stack_diff.py
 	$(RUSTFS_PYTHON_BIN) ./scripts/check_conformance_rulings.py --self-test
 	$(RUSTFS_PYTHON_BIN) ./scripts/compat_matrix_report.py --self-test
+	$(RUSTFS_PYTHON_BIN) ./scripts/check_gateway_admin_census.py --self-test
 	$(RUSTFS_PYTHON_BIN) ./scripts/test_gateway_corpus_capture.py
 	$(RUSTFS_PYTHON_BIN) ./scripts/test_gateway_wire_replay.py
 	$(RUSTFS_PYTHON_BIN) ./scripts/s3-tests/test_report_compat.py

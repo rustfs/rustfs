@@ -144,6 +144,15 @@ impl DenialAuditor {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn collecting(
+        rate: u64,
+        clock: impl Fn() -> Instant + Send + Sync + 'static,
+        emit: impl Fn(Option<RequestContext>, AuditEntry) + Send + Sync + 'static,
+    ) -> Self {
+        Self::new(DenialRateLimiter::new(rate, rate, clock()), || true, emit).with_clock(clock)
+    }
+
     /// Replaces the clock the limiter is driven by; tests use a frozen one so no wall-clock
     /// refill can change an outcome.
     #[cfg(test)]
@@ -175,22 +184,31 @@ impl DenialAuditor {
 
     /// Audits a denial for a request an owned edge decoded into `view`.
     pub(crate) fn audit_owned(&self, view: &AuditRequestView<'_>, action: &Action, reason: &'static str, scope: DenialScope) {
-        let now = (self.clock)();
-        if !(self.enabled)() {
+        self.audit_if_admitted(view.req_info.is_none_or(|info| info.cred.is_none()), || {
+            (view.request_context(), authorization_denial_entry_for_view(view, action, reason, scope))
+        });
+    }
+
+    pub(crate) fn enabled(&self) -> bool {
+        (self.enabled)()
+    }
+
+    /// Build and publish one confirmed refusal under the shared suppression budget.
+    pub(crate) fn audit_if_admitted(&self, anonymous: bool, build: impl FnOnce() -> (Option<RequestContext>, AuditEntry)) {
+        if !self.enabled() {
             return;
         }
-        let anonymous = view.req_info.is_none_or(|info| info.cred.is_none());
-        let Admission::Emit { suppressed } = self.limiter.admit(anonymous, now) else {
+        let Admission::Emit { suppressed } = self.limiter.admit(anonymous, (self.clock)()) else {
             return;
         };
-        let mut entry = authorization_denial_entry_for_view(view, action, reason, scope);
+        let (context, mut entry) = build();
         if suppressed > 0 {
             entry
                 .tags
                 .get_or_insert_with(Default::default)
                 .insert(SUPPRESSED_DENIALS_TAG.to_string(), Value::from(suppressed));
         }
-        (self.emit)(view.request_context(), entry);
+        (self.emit)(context, entry);
     }
 }
 

@@ -453,6 +453,15 @@ fn smoke_samples_hit_exact_rule_sets() {
         &["unknown-access-key"],
     );
     exact(&msg("HTTP transport failed: BrokenPipe while streaming response body"), &[]);
+    exact(
+        &Sample {
+            fields: &[("event", "startup_endpoint_dns_failed"), ("host", "node5")],
+            ..msg("DNS deadline exhausted")
+        },
+        &["endpoint-resolve-failed"],
+    );
+    exact(&msg("Startup endpoint DNS resolution failed"), &["endpoint-resolve-failed"]);
+    exact(&msg("retrying endpoint local-host detection after temporary DNS error"), &[]);
     // Internode auth failures legitimately hit both the internode rule and
     // the generic client signature rule.
     exact(

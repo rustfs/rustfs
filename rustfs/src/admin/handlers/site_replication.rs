@@ -596,11 +596,70 @@ async fn validate_site_replication_admin_request(
     authorize_admin_envelope(req.envelope(), vec![Action::AdminAction(action)]).await
 }
 
-fn reject_site_replicator_on_public_admin(cred: &rustfs_credentials::Credentials) -> S3Result<()> {
+pub(crate) fn reject_site_replicator_on_public_admin(cred: &rustfs_credentials::Credentials) -> S3Result<()> {
     if cred.access_key == SITE_REPLICATOR_SERVICE_ACCOUNT {
         return Err(s3_error!(
             AccessDenied,
             "site replicator service account cannot modify site replication state"
+        ));
+    }
+    Ok(())
+}
+
+/// Counterpart of [`reject_site_replicator_on_public_admin`] for internal peer
+/// routes (`peer/iam-item`, `peer/bucket-meta`, `peer/edit`, and steady-state
+/// `peer/bucket-ops`). Holding `admin:SiteReplicationOperation` alone is not
+/// proof of a peer — diagnostics and repair routes share that action — so these
+/// routes require site replication to be enabled and the caller to match the
+/// configured site replicator service account (or an in-flight rotation's
+/// target service account).
+fn require_site_replicator_on_peer_route(cred: &rustfs_credentials::Credentials, state: &SiteReplicationState) -> S3Result<()> {
+    if !state.enabled() {
+        return Err(s3_error!(InvalidRequest, "site replication is not enabled"));
+    }
+    let current_key = state.service_account_access_key.as_str();
+    let pending_key = state
+        .pending_rotation
+        .as_ref()
+        .map(|pending| pending.access_key.as_str())
+        .filter(|key| !key.is_empty());
+    if current_key.is_empty() && pending_key.is_none() {
+        return Err(s3_error!(InvalidRequest, "site replication is not enabled"));
+    }
+    let matches_current = !current_key.is_empty() && cred.access_key == current_key;
+    let matches_pending = pending_key.is_some_and(|key| cred.access_key == key);
+    if !matches_current && !matches_pending {
+        return Err(s3_error!(
+            AccessDenied,
+            "site replication peer routes accept only the site replicator service account"
+        ));
+    }
+    Ok(())
+}
+
+/// Caller and state guard for `SRPeerBucketOpsHandler`, preserving the
+/// bootstrap-token add window during an initial site add while restricting
+/// callbacks to the site replicator service account.
+fn require_site_replicator_on_peer_bucket_ops(
+    cred: &rustfs_credentials::Credentials,
+    state: &SiteReplicationState,
+    bucket: &str,
+    operation: &str,
+    bootstrap_token: Option<&str>,
+) -> S3Result<()> {
+    if state.removal_pending() {
+        return Err(s3_error!(InvalidRequest, "site replication is not enabled"));
+    }
+    if state.enabled() {
+        return require_site_replicator_on_peer_route(cred, state);
+    }
+    if !bootstrap_peer_bucket_operation_allowed(bucket, operation, bootstrap_token) {
+        return Err(s3_error!(InvalidRequest, "site replication is not enabled"));
+    }
+    if cred.access_key != SITE_REPLICATOR_SERVICE_ACCOUNT {
+        return Err(s3_error!(
+            AccessDenied,
+            "site replication peer routes accept only the site replicator service account"
         ));
     }
     Ok(())
@@ -7801,7 +7860,7 @@ pub struct SRPeerBucketOpsHandler {}
 #[async_trait::async_trait]
 impl Operation for SRPeerBucketOpsHandler {
     async fn call(&self, req: AdminRequest, _params: Params<'_, '_>) -> S3Result<AdminResponse> {
-        validate_site_replication_admin_request(&req, AdminAction::SiteReplicationOperationAction).await?;
+        let cred = validate_site_replication_admin_request(&req, AdminAction::SiteReplicationOperationAction).await?;
         let _bucket_op_guard = SITE_REPLICATION_BUCKET_OP_LOCK.read().await;
         let state = load_site_replication_state().await?;
         let queries = query_pairs(req.uri());
@@ -7815,16 +7874,13 @@ impl Operation for SRPeerBucketOpsHandler {
             .filter(|value| !value.is_empty())
             .cloned()
             .ok_or_else(|| s3_error!(InvalidRequest, "operation is required"))?;
-        if state.removal_pending()
-            || (!state.enabled()
-                && !bootstrap_peer_bucket_operation_allowed(
-                    &bucket,
-                    &operation,
-                    queries.get("bootstrapToken").map(String::as_str),
-                ))
-        {
-            return Err(s3_error!(InvalidRequest, "site replication is not enabled"));
-        }
+        require_site_replicator_on_peer_bucket_ops(
+            &cred,
+            &state,
+            &bucket,
+            &operation,
+            queries.get("bootstrapToken").map(String::as_str),
+        )?;
 
         let Some(store) = object_store_from_envelope(req.envelope()) else {
             return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
@@ -7921,7 +7977,8 @@ pub struct SRPeerReplicateIAMItemHandler {}
 #[async_trait::async_trait]
 impl Operation for SRPeerReplicateIAMItemHandler {
     async fn call(&self, req: AdminRequest, _params: Params<'_, '_>) -> S3Result<AdminResponse> {
-        validate_site_replication_admin_request(&req, AdminAction::SiteReplicationOperationAction).await?;
+        let cred = validate_site_replication_admin_request(&req, AdminAction::SiteReplicationOperationAction).await?;
+        require_site_replicator_on_peer_route(&cred, &load_site_replication_state().await?)?;
         let item: SRIAMItem = read_site_replication_json(req, "", false).await?;
         apply_iam_item(item).await?;
         Ok(owned_empty_response(StatusCode::OK))
@@ -7933,7 +7990,8 @@ pub struct SRPeerReplicateBucketItemHandler {}
 #[async_trait::async_trait]
 impl Operation for SRPeerReplicateBucketItemHandler {
     async fn call(&self, req: AdminRequest, _params: Params<'_, '_>) -> S3Result<AdminResponse> {
-        validate_site_replication_admin_request(&req, AdminAction::SiteReplicationOperationAction).await?;
+        let cred = validate_site_replication_admin_request(&req, AdminAction::SiteReplicationOperationAction).await?;
+        require_site_replicator_on_peer_route(&cred, &load_site_replication_state().await?)?;
         let item: SRBucketMeta = read_site_replication_json(req, "", false).await?;
         apply_bucket_meta_item(item).await?;
         Ok(owned_empty_response(StatusCode::OK))
@@ -8284,7 +8342,8 @@ enum PeerEditOutcome {
 #[async_trait::async_trait]
 impl Operation for SRPeerEditHandler {
     async fn call(&self, req: AdminRequest, _params: Params<'_, '_>) -> S3Result<AdminResponse> {
-        validate_site_replication_admin_request(&req, AdminAction::SiteReplicationOperationAction).await?;
+        let cred = validate_site_replication_admin_request(&req, AdminAction::SiteReplicationOperationAction).await?;
+        require_site_replicator_on_peer_route(&cred, &load_site_replication_state().await?)?;
         let queries = query_pairs(req.uri());
         let ilm_expiry_override = sr_edit_ilm_expiry_override(req.uri());
         let endpoint_refresh_requested = queries.get("refresh-targets").is_some_and(|value| value == "true");
@@ -8304,6 +8363,7 @@ impl Operation for SRPeerEditHandler {
         let commit_endpoint = local_endpoint.clone();
         let commit_refresh_id = refresh_id.clone();
         let outcome = update_site_replication_state_when_changed(move |state| {
+            require_site_replicator_on_peer_route(&cred, state)?;
             let mut incoming = incoming;
             let local_peer = local_peer_at_endpoint(commit_endpoint, state);
             if state.pending_remove_v2.is_some() {
@@ -11074,6 +11134,381 @@ mod tests {
             sender_block.contains("Ok((next_peer_edit_generation(state), peers_to_send))"),
             "the edit handler must allocate the generation inside the committed state, not outside the lock"
         );
+    }
+
+    #[test]
+    fn test_peer_routes_accept_only_the_site_replicator_account() {
+        let operator = rustfs_credentials::Credentials {
+            access_key: "sr-operator".to_string(),
+            ..Default::default()
+        };
+        let replicator = rustfs_credentials::Credentials {
+            access_key: SITE_REPLICATOR_SERVICE_ACCOUNT.to_string(),
+            ..Default::default()
+        };
+
+        // Disabled site: nobody is accepted, including the replicator account.
+        let unconfigured = SiteReplicationState::default();
+        assert_eq!(
+            require_site_replicator_on_peer_route(&operator, &unconfigured)
+                .expect_err("operator must be refused on an unconfigured site")
+                .code(),
+            &S3ErrorCode::InvalidRequest
+        );
+        assert_eq!(
+            require_site_replicator_on_peer_route(&replicator, &unconfigured)
+                .expect_err("replicator must be refused on an unconfigured site")
+                .code(),
+            &S3ErrorCode::InvalidRequest
+        );
+
+        let enabled_peers = BTreeMap::from([
+            (
+                "local".to_string(),
+                PeerInfo {
+                    deployment_id: "local".to_string(),
+                    ..peer("local", "http://local:9000")
+                },
+            ),
+            (
+                "remote".to_string(),
+                PeerInfo {
+                    deployment_id: "remote".to_string(),
+                    ..peer("remote", "http://remote:9000")
+                },
+            ),
+        ]);
+
+        // Enabled peers without a configured service account fail closed.
+        let missing_service_account = SiteReplicationState {
+            peers: enabled_peers.clone(),
+            ..Default::default()
+        };
+        assert_eq!(
+            require_site_replicator_on_peer_route(&replicator, &missing_service_account)
+                .expect_err("empty service account must fail closed")
+                .code(),
+            &S3ErrorCode::InvalidRequest
+        );
+
+        let enabled = SiteReplicationState {
+            service_account_access_key: SITE_REPLICATOR_SERVICE_ACCOUNT.to_string(),
+            peers: enabled_peers.clone(),
+            ..Default::default()
+        };
+        assert!(enabled.enabled());
+        assert_eq!(
+            require_site_replicator_on_peer_route(&operator, &enabled)
+                .expect_err("non-replicator user must be refused on an enabled site")
+                .code(),
+            &S3ErrorCode::AccessDenied
+        );
+        require_site_replicator_on_peer_route(&replicator, &enabled).expect("replicator account must be accepted");
+
+        // During a rotation window from a legacy access key, both the current
+        // and pending target replicator keys are accepted, while other callers stay denied.
+        let rotating = SiteReplicationState {
+            service_account_access_key: "legacy-replicator".to_string(),
+            peers: enabled_peers,
+            pending_rotation: Some(PendingRotation {
+                access_key: SITE_REPLICATOR_SERVICE_ACCOUNT.to_string(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let legacy = rustfs_credentials::Credentials {
+            access_key: "legacy-replicator".to_string(),
+            ..Default::default()
+        };
+        require_site_replicator_on_peer_route(&legacy, &rotating).expect("current replicator key stays accepted");
+        require_site_replicator_on_peer_route(&replicator, &rotating).expect("pending rotation target key is accepted");
+        assert_eq!(
+            require_site_replicator_on_peer_route(&operator, &rotating)
+                .expect_err("unrelated operator stays denied during rotation")
+                .code(),
+            &S3ErrorCode::AccessDenied
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_peer_bucket_ops_guard_preserves_bootstrap_window_for_replicator_only() {
+        let operator = rustfs_credentials::Credentials {
+            access_key: "sr-operator".to_string(),
+            ..Default::default()
+        };
+        let replicator = rustfs_credentials::Credentials {
+            access_key: SITE_REPLICATOR_SERVICE_ACCOUNT.to_string(),
+            ..Default::default()
+        };
+        let disabled = SiteReplicationState::default();
+
+        // Outside an add window, disabled sites refuse everyone.
+        assert_eq!(
+            require_site_replicator_on_peer_bucket_ops(&replicator, &disabled, "photos", "make-with-versioning", None)
+                .expect_err("disabled site outside add window must fail")
+                .code(),
+            &S3ErrorCode::InvalidRequest
+        );
+
+        // During an initial add window, valid bootstrap callbacks are allowed
+        // ONLY for the site replicator account, never for other callers.
+        {
+            let lifecycle = SiteReplicationLifecycleGuard::acquire()
+                .await
+                .expect("acquire lifecycle guard");
+            let guard = SiteReplicationAddInProgressGuard::start(lifecycle, HashSet::from(["legacy-bucket".to_string()]))
+                .expect("start add bootstrap guard");
+            let token = guard.token.to_string();
+
+            assert_eq!(
+                require_site_replicator_on_peer_bucket_ops(&operator, &disabled, "photos", "make-with-versioning", Some(&token))
+                    .expect_err("non-replicator caller must be denied even with bootstrap token")
+                    .code(),
+                &S3ErrorCode::AccessDenied
+            );
+            assert_eq!(
+                require_site_replicator_on_peer_bucket_ops(&operator, &disabled, "legacy-bucket", "make-with-versioning", None)
+                    .expect_err("non-replicator caller must be denied on legacy bootstrap fallback")
+                    .code(),
+                &S3ErrorCode::AccessDenied
+            );
+            require_site_replicator_on_peer_bucket_ops(&replicator, &disabled, "photos", "make-with-versioning", Some(&token))
+                .expect("replicator bootstrap callback with valid token must be accepted");
+            require_site_replicator_on_peer_bucket_ops(&replicator, &disabled, "legacy-bucket", "configure-replication", None)
+                .expect("replicator legacy bootstrap callback must be accepted");
+            assert_eq!(
+                require_site_replicator_on_peer_bucket_ops(&replicator, &disabled, "photos", "force-delete-bucket", Some(&token))
+                    .expect_err("destructive op must never pass bootstrap window")
+                    .code(),
+                &S3ErrorCode::InvalidRequest
+            );
+        }
+
+        // Enabled site rejects non-replicator callers with AccessDenied and accepts replicator.
+        let enabled = SiteReplicationState {
+            service_account_access_key: SITE_REPLICATOR_SERVICE_ACCOUNT.to_string(),
+            peers: BTreeMap::from([
+                (
+                    "local".to_string(),
+                    PeerInfo {
+                        deployment_id: "local".to_string(),
+                        ..peer("local", "http://local:9000")
+                    },
+                ),
+                (
+                    "remote".to_string(),
+                    PeerInfo {
+                        deployment_id: "remote".to_string(),
+                        ..peer("remote", "http://remote:9000")
+                    },
+                ),
+            ]),
+            ..Default::default()
+        };
+        assert_eq!(
+            require_site_replicator_on_peer_bucket_ops(&operator, &enabled, "photos", "force-delete-bucket", None)
+                .expect_err("operator must be denied on enabled peer/bucket-ops")
+                .code(),
+            &S3ErrorCode::AccessDenied
+        );
+        require_site_replicator_on_peer_bucket_ops(&replicator, &enabled, "photos", "force-delete-bucket", None)
+            .expect("replicator must be accepted on enabled peer/bucket-ops");
+    }
+
+    #[test]
+    #[serial]
+    fn test_peer_handlers_reject_non_replicator_site_replication_operation_holder() {
+        crate::app::gating_test_env::run_large_stack_test("sr-peer-routes-authz", || async {
+            use crate::admin::operation::test_support::TestRequest;
+            use crate::admin::runtime_sources::{AppContext, IamInterface, KmsInterface, publish_test_app_context};
+            use rustfs_iam::store::{Store as _, UserType};
+            use rustfs_madmin::{AccountStatus, AddOrUpdateUserReq};
+            use rustfs_policy::policy::Policy;
+            use std::sync::Arc;
+
+            struct ReadyIam(Arc<rustfs_iam::sys::IamSys<rustfs_iam::store::object::ObjectStore>>);
+            impl IamInterface for ReadyIam {
+                fn handle(&self) -> Arc<rustfs_iam::sys::IamSys<rustfs_iam::store::object::ObjectStore>> {
+                    Arc::clone(&self.0)
+                }
+                fn is_ready(&self) -> bool {
+                    true
+                }
+            }
+            struct TestKms;
+            impl KmsInterface for TestKms {
+                fn handle(&self) -> Arc<rustfs_kms::KmsServiceManager> {
+                    Arc::new(rustfs_kms::KmsServiceManager::new())
+                }
+            }
+
+            let previous = crate::runtime_sources::current_app_context();
+            let (_dir, _paths, store) = crate::app::gating_test_env::isolated_multi_pool_ecstore().await;
+            rustfs_iam::store::object::ObjectStore::new(Arc::clone(&store))
+                .save_iam_config(
+                    serde_json::json!({"version": 1}),
+                    format!("{}/format.json", *rustfs_iam::store::object::IAM_CONFIG_PREFIX),
+                )
+                .await
+                .expect("seed IAM format");
+
+            let iam = rustfs_iam::build_iam_sys(Arc::clone(&store)).await.expect("init IAM");
+            let operator_key = "sr-operator";
+            let operator_secret = "sr-operator-secret";
+            iam.create_user(
+                operator_key,
+                &AddOrUpdateUserReq {
+                    secret_key: operator_secret.to_owned(),
+                    policy: None,
+                    status: AccountStatus::Enabled,
+                },
+            )
+            .await
+            .expect("create operator");
+            iam.set_policy(
+                "sr-op-only",
+                Policy::parse_config(
+                    br#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":["admin:SiteReplicationOperation"]}]}"#,
+                )
+                .expect("parse policy"),
+            )
+            .await
+            .expect("store policy");
+            iam.policy_db_set(operator_key, UserType::Reg, false, "sr-op-only")
+                .await
+                .expect("attach policy");
+
+            let context = Arc::new(AppContext::new(store, Arc::new(ReadyIam(iam)), Arc::new(TestKms)));
+            assert!(context.publish_action_credentials(rustfs_credentials::Credentials {
+                access_key: "sr-test-root".to_owned(),
+                secret_key: "sr-test-root-secret".to_owned(),
+                status: "on".to_owned(),
+                ..Default::default()
+            }));
+            publish_test_app_context(context);
+
+            let make_req = |uri: &str, body: &str| {
+                TestRequest::new(Method::PUT, uri)
+                    .credentials(operator_key, operator_secret, None)
+                    .body(body.to_owned())
+                    .build()
+            };
+
+            let iam_body = r#"{"type":"policy-mapping","policyMapping":{"userOrGroup":"sr-operator","userType":0,"isGroup":false,"policy":"consoleAdmin"}}"#;
+            let bucket_meta_body = r#"{"type":"policy","bucket":"private"}"#;
+            let peer_edit_body = r#"{"name":"remote","endpoint":"http://remote:9000","deploymentID":"remote"}"#;
+
+            // Phase 1: site replication disabled -> all four peer routes reject with InvalidRequest.
+            let err = SRPeerReplicateIAMItemHandler {}
+                .call(make_req("/rustfs/admin/v3/site-replication/peer/iam-item", iam_body), Params::new())
+                .await
+                .expect_err("peer/iam-item must refuse operator when disabled");
+            assert_eq!(err.code(), &S3ErrorCode::InvalidRequest);
+
+            let err = SRPeerReplicateBucketItemHandler {}
+                .call(
+                    make_req("/rustfs/admin/v3/site-replication/peer/bucket-meta", bucket_meta_body),
+                    Params::new(),
+                )
+                .await
+                .expect_err("peer/bucket-meta must refuse operator when disabled");
+            assert_eq!(err.code(), &S3ErrorCode::InvalidRequest);
+
+            let err = SRPeerEditHandler {}
+                .call(make_req("/rustfs/admin/v3/site-replication/peer/edit", peer_edit_body), Params::new())
+                .await
+                .expect_err("peer/edit must refuse operator when disabled");
+            assert_eq!(err.code(), &S3ErrorCode::InvalidRequest);
+
+            let err = SRPeerBucketOpsHandler {}
+                .call(
+                    make_req(
+                        "/rustfs/admin/v3/site-replication/peer/bucket-ops?bucket=private&operation=force-delete-bucket",
+                        "{}",
+                    ),
+                    Params::new(),
+                )
+                .await
+                .expect_err("peer/bucket-ops must refuse operator when disabled");
+            assert_eq!(err.code(), &S3ErrorCode::InvalidRequest);
+
+            // Phase 2: site replication enabled with site-replicator-0 -> non-replicator
+            // caller with admin:SiteReplicationOperation is rejected with AccessDenied on all 4 routes.
+            let enabled_state = SiteReplicationState {
+                service_account_access_key: SITE_REPLICATOR_SERVICE_ACCOUNT.to_string(),
+                peers: BTreeMap::from([
+                    (
+                        "local".to_string(),
+                        PeerInfo {
+                            deployment_id: "local".to_string(),
+                            ..peer("local", "http://local:9000")
+                        },
+                    ),
+                    (
+                        "remote".to_string(),
+                        PeerInfo {
+                            deployment_id: "remote".to_string(),
+                            ..peer("remote", "http://remote:9000")
+                        },
+                    ),
+                ]),
+                ..Default::default()
+            };
+            save_site_replication_state(&enabled_state)
+                .await
+                .expect("persist enabled site replication state");
+
+            let err = SRPeerReplicateIAMItemHandler {}
+                .call(make_req("/rustfs/admin/v3/site-replication/peer/iam-item", iam_body), Params::new())
+                .await
+                .expect_err("peer/iam-item must deny non-replicator when enabled");
+            assert_eq!(err.code(), &S3ErrorCode::AccessDenied);
+
+            let err = SRPeerReplicateBucketItemHandler {}
+                .call(
+                    make_req("/rustfs/admin/v3/site-replication/peer/bucket-meta", bucket_meta_body),
+                    Params::new(),
+                )
+                .await
+                .expect_err("peer/bucket-meta must deny non-replicator when enabled");
+            assert_eq!(err.code(), &S3ErrorCode::AccessDenied);
+
+            let err = SRPeerEditHandler {}
+                .call(make_req("/rustfs/admin/v3/site-replication/peer/edit", peer_edit_body), Params::new())
+                .await
+                .expect_err("peer/edit must deny non-replicator when enabled");
+            assert_eq!(err.code(), &S3ErrorCode::AccessDenied);
+
+            let err = SRPeerBucketOpsHandler {}
+                .call(
+                    make_req(
+                        "/rustfs/admin/v3/site-replication/peer/bucket-ops?bucket=private&operation=force-delete-bucket",
+                        "{}",
+                    ),
+                    Params::new(),
+                )
+                .await
+                .expect_err("peer/bucket-ops must deny non-replicator when enabled");
+            assert_eq!(err.code(), &S3ErrorCode::AccessDenied);
+
+            // Capabilities preflight remains callable by admin/operator identities.
+            let caps_resp = SRPeerEditCapabilitiesHandler {}
+                .call(
+                    make_req(
+                        "/rustfs/admin/v3/site-replication/peer/edit-capabilities?capability=endpoint-target-refresh",
+                        "",
+                    ),
+                    Params::new(),
+                )
+                .await
+                .expect("peer/edit-capabilities must remain accessible for add preflight");
+            assert_eq!(caps_resp.into_parts().0, StatusCode::OK);
+
+            if let Some(previous) = previous {
+                publish_test_app_context(previous);
+            }
+        });
     }
 
     #[test]

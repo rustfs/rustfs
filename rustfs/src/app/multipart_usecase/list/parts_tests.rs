@@ -18,7 +18,6 @@ use super::super::test_support::{Method, owned_envelope};
 use super::*;
 use crate::app::gating_test_env::{run_large_stack_test, shared_gating_ambient, shared_gating_ecstore_and_disk_paths};
 use crate::app::storage_api::multipart_usecase::access::{AuthorizationRequest, load_bucket_generation_from_store};
-use crate::app::storage_api::s3::S3Error as LegacyS3Error;
 use crate::app::storage_api::test::contract::bucket::{BucketOperations as _, DeleteBucketOptions, MakeBucketOptions};
 use crate::runtime_sources::ServerContextSlot;
 use sha2::{Digest, Sha256};
@@ -165,7 +164,7 @@ fn list_parts_resolves_real_owners_and_retains_storage_errors() {
             storage_error,
             StorageError::InvalidUploadID(..) | StorageError::MalformedUploadID(..)
         ));
-        let expected: LegacyS3Error = ApiError::from(storage_error).into();
+        let expected: S3Error = ApiError::from(storage_error).into();
         for target in [
             gateway_fields(&bucket, key, id, None, None),
             ListPartsFields {
@@ -181,12 +180,11 @@ fn list_parts_resolves_real_owners_and_retains_storage_errors() {
             let refusal = execute_counted(&usecase, envelope(), target, 1)
                 .await
                 .expect_err("surface the outage");
-            let legacy: LegacyS3Error = crate::error::legacy_error_for_test(refusal);
-            assert_eq!(legacy.code(), expected.code());
-            assert_eq!(legacy.status_code(), expected.status_code());
-            assert_eq!(legacy.message(), expected.message());
+            assert_eq!(refusal.code(), expected.code());
+            assert_eq!(refusal.status_code(), expected.status_code());
+            assert_eq!(refusal.message(), expected.message());
             assert!(
-                legacy
+                refusal
                     .source()
                     .and_then(|cause| cause.downcast_ref::<StorageError>())
                     .is_some()

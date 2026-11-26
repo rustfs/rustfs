@@ -158,10 +158,16 @@ impl VariableResolver {
         self.context.username.clone()
     }
 
+    /// `parent` is the issuer-scoped identity RustFS authorizes and exposes through the
+    /// `aws:userid` condition key. A raw federated `sub` is unique only within its issuer,
+    /// so it must never shadow `parent`.
+    fn resolve_userid_values(&self) -> Option<Vec<String>> {
+        self.get_claim_as_strings("parent")
+            .or_else(|| self.get_claim_as_strings("sub"))
+    }
+
     fn resolve_userid(&self) -> Option<String> {
-        self.get_claim_as_strings("sub")
-            .or_else(|| self.get_claim_as_strings("parent"))
-            .and_then(|mut vec| vec.pop())
+        self.resolve_userid_values().and_then(|mut vec| vec.pop())
     }
 
     fn resolve_principal_type(&self) -> String {
@@ -238,9 +244,7 @@ impl PolicyVariableResolver for VariableResolver {
         match variable_name {
             "aws:username" => self.resolve_username().map(|s| vec![s]),
 
-            "aws:userid" => self
-                .get_claim_as_strings("sub")
-                .or_else(|| self.get_claim_as_strings("parent")),
+            "aws:userid" => self.resolve_userid_values(),
 
             _ => self.resolve(variable_name).await.map(|s| vec![s]),
         }
@@ -479,6 +483,32 @@ mod tests {
         let resolver = VariableResolver::new(context);
         let result = resolve_aws_variables("${aws:userid}-bucket", &resolver).await;
         assert_eq!(result, vec!["AIDACKCEVSQ6C2EXAMPLE-bucket".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn test_resolve_aws_variables_userid_prefers_parent_over_sub() {
+        let mut claims = HashMap::new();
+        claims.insert("sub".to_string(), Value::String("1001".to_string()));
+        claims.insert("parent".to_string(), Value::String("issuer-scoped-parent".to_string()));
+
+        let mut context = VariableContext::new();
+        context.claims = Some(claims);
+
+        let resolver = VariableResolver::new(context.clone());
+        assert_eq!(resolver.resolve("aws:userid").await, Some("issuer-scoped-parent".to_string()));
+        assert_eq!(
+            resolver.resolve_multiple("aws:userid").await,
+            Some(vec!["issuer-scoped-parent".to_string()])
+        );
+        let result = resolve_aws_variables("homes/${aws:userid}/*", &resolver).await;
+        assert_eq!(result, vec!["homes/issuer-scoped-parent/*".to_string()]);
+
+        let cached = CachedAwsVariableResolver::new(context);
+        assert_eq!(cached.resolve("aws:userid").await, Some("issuer-scoped-parent".to_string()));
+        assert_eq!(
+            resolve_aws_variables("homes/${aws:userid}/*", &cached).await,
+            vec!["homes/issuer-scoped-parent/*".to_string()]
+        );
     }
 
     #[tokio::test]

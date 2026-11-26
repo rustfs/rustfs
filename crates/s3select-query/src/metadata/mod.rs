@@ -90,10 +90,7 @@ impl ContextProvider for MetadataProvider {
     }
 
     fn get_function_meta(&self, name: &str) -> Option<Arc<ScalarUDF>> {
-        self.func_manager
-            .udf(name)
-            .ok()
-            .or_else(|| self.session.inner().scalar_functions().get(name).cloned())
+        self.func_manager.udf(name).ok()
     }
 
     fn get_aggregate_meta(&self, name: &str) -> Option<Arc<AggregateUDF>> {

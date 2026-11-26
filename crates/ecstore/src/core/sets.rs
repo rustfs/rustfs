@@ -44,7 +44,7 @@ use crate::{
 };
 use futures::{
     future::join_all,
-    stream::{FuturesUnordered, StreamExt},
+    stream::{self, StreamExt},
 };
 use http::HeaderMap;
 use rustfs_filemeta::FileInfo;
@@ -540,39 +540,39 @@ impl Sets {
 //     pub default_parity_count: usize,
 // }
 
-struct DelObj {
-    // set_idx: usize,
-    orig_idx: usize,
-    obj: ObjectToDelete,
+#[derive(Default)]
+struct SetDeleteBatch {
+    indices: Vec<usize>,
+    objects: Vec<ObjectToDelete>,
 }
 
 fn apply_delete_objects_results(
     del_objects: &mut [DeletedObject],
     del_errs: &mut [Option<Error>],
-    set_objects: &[DelObj],
-    dobjects: &[DeletedObject],
+    indices: &[usize],
+    deleted: Vec<DeletedObject>,
     errs: Vec<Option<Error>>,
 ) {
+    let mut deleted = deleted.into_iter();
     for (i, err) in errs.into_iter().enumerate() {
-        let obj = set_objects
+        let index = *indices
             .get(i)
             .expect("delete_objects should return errors aligned with input objects");
 
-        del_errs[obj.orig_idx] = err;
-        del_objects[obj.orig_idx] = dobjects
-            .get(i)
-            .expect("delete_objects should return objects aligned with input objects")
-            .clone();
+        del_errs[index] = err;
+        del_objects[index] = deleted
+            .next()
+            .expect("delete_objects should return objects aligned with input objects");
     }
 }
 
 fn apply_delete_accounting_results(
     accounting: &mut [Option<DeleteAccounting>],
-    set_objects: &[DelObj],
-    set_accounting: &[Option<DeleteAccounting>],
+    indices: &[usize],
+    set_accounting: Vec<Option<DeleteAccounting>>,
 ) {
-    for (obj, value) in set_objects.iter().zip(set_accounting.iter()) {
-        accounting[obj.orig_idx] = value.clone();
+    for (&index, value) in indices.iter().zip(set_accounting) {
+        accounting[index] = value;
     }
 }
 
@@ -583,43 +583,60 @@ impl Sets {
         objects: Vec<ObjectToDelete>,
         opts: ObjectOptions,
     ) -> (Vec<DeletedObject>, Vec<Option<Error>>, Vec<Option<DeleteAccounting>>) {
+        let [first, rest @ ..] = objects.as_slice() else {
+            return (Vec::new(), Vec::new(), Vec::new());
+        };
+        if let [set] = self.disk_set.as_slice() {
+            return set.delete_objects_with_accounting(bucket, objects, opts).await;
+        }
+
+        let first_set = self.get_hashed_set_index(&first.object_name);
+        let Some(prefix_len) = rest
+            .iter()
+            .position(|object| self.get_hashed_set_index(&object.object_name) != first_set)
+            .map(|offset| offset + 1)
+        else {
+            return self.disk_set[first_set]
+                .delete_objects_with_accounting(bucket, objects, opts)
+                .await;
+        };
+
         let mut del_objects = vec![DeletedObject::default(); objects.len()];
         let mut del_errs = vec![None; objects.len()];
         let mut accounting = vec![None; objects.len()];
-        let mut set_obj_map = HashMap::new();
 
-        for (i, obj) in objects.iter().enumerate() {
-            let idx = self.get_hashed_set_index(obj.object_name.as_str());
-            set_obj_map.entry(idx).or_insert_with(Vec::new).push(DelObj {
-                orig_idx: i,
-                obj: obj.clone(),
-            });
+        let mut objects = objects.into_iter().enumerate();
+        let (indices, first_objects) = objects.by_ref().take(prefix_len).unzip();
+        let mut batches = HashMap::new();
+        batches.insert(
+            first_set,
+            SetDeleteBatch {
+                indices,
+                objects: first_objects,
+            },
+        );
+
+        for (index, object) in objects {
+            let set_index = self.get_hashed_set_index(&object.object_name);
+            let batch = batches.entry(set_index).or_default();
+            batch.indices.push(index);
+            batch.objects.push(object);
         }
 
-        let max_concurrent = set_obj_map.len().min(num_cpus::get()).max(1);
-        let semaphore = Arc::new(tokio::sync::Semaphore::new(max_concurrent));
-        let mut futures = FuturesUnordered::new();
-        let bucket = bucket.to_owned();
+        let mut pending = stream::iter(batches)
+            .map(|(set_index, batch)| {
+                let disks = self.get_disks(set_index);
+                let opts = opts.clone();
+                async move {
+                    let (deleted, errors, accounting) = disks.delete_objects_with_accounting(bucket, batch.objects, opts).await;
+                    (batch.indices, deleted, errors, accounting)
+                }
+            })
+            .buffer_unordered(self.ctx.worker_parallelism().get());
 
-        for (set_index, set_objects) in set_obj_map {
-            let disks = self.get_disks(set_index);
-            let objects = set_objects.iter().map(|entry| entry.obj.clone()).collect::<Vec<_>>();
-            let bucket = bucket.clone();
-            let opts = opts.clone();
-            let semaphore = semaphore.clone();
-            futures.push(async move {
-                let _permit = semaphore
-                    .acquire_owned()
-                    .await
-                    .expect("delete_objects semaphore should remain open");
-                let (deleted, errors, accounting) = disks.delete_objects_with_accounting(&bucket, objects, opts).await;
-                (set_objects, deleted, errors, accounting)
-            });
-        }
-
-        while let Some((set_objects, deleted, errors, set_accounting)) = futures.next().await {
-            apply_delete_objects_results(&mut del_objects, &mut del_errs, &set_objects, &deleted, errors);
-            apply_delete_accounting_results(&mut accounting, &set_objects, &set_accounting);
+        while let Some((indices, deleted, errors, set_accounting)) = pending.next().await {
+            apply_delete_objects_results(&mut del_objects, &mut del_errs, &indices, deleted, errors);
+            apply_delete_accounting_results(&mut accounting, &indices, set_accounting);
         }
 
         (del_objects, del_errs, accounting)
@@ -773,6 +790,26 @@ impl BucketOperations for Sets {
     }
 }
 
+fn materialized_set_copy_user_defined(source: &HashMap<String, String>) -> HashMap<String, String> {
+    let mut metadata = source.clone();
+    for suffix in [
+        rustfs_utils::http::SUFFIX_INLINE_DATA,
+        rustfs_utils::http::SUFFIX_TRANSITION_STATUS,
+        rustfs_utils::http::SUFFIX_TRANSITIONED_OBJECTNAME,
+        rustfs_utils::http::SUFFIX_TRANSITIONED_VERSION_ID,
+        rustfs_utils::http::SUFFIX_TRANSITIONED_VERSION_STATE,
+        rustfs_utils::http::SUFFIX_TRANSITION_TIER,
+        rustfs_utils::http::SUFFIX_TRANSITION_TIER_DESTINATION_ID,
+        rustfs_utils::http::SUFFIX_TRANSITION_TRANSACTION_ID,
+        rustfs_utils::http::SUFFIX_FREE_VERSION,
+        rustfs_utils::http::SUFFIX_TIER_FV_ID,
+        rustfs_utils::http::SUFFIX_TIER_FV_MARKER,
+    ] {
+        rustfs_utils::http::metadata_compat::remove_str(&mut metadata, suffix);
+    }
+    metadata
+}
+
 #[async_trait::async_trait]
 impl crate::storage_api_contracts::object::ObjectOperations for Sets {
     type Error = Error;
@@ -822,7 +859,11 @@ impl crate::storage_api_contracts::object::ObjectOperations for Sets {
                     .await;
             }
 
-            if !dst_opts.versioned && src_opts.version_id.is_none() {
+            if !dst_opts.versioned
+                && src_opts.version_id.is_none()
+                && src_info.metadata_only
+                && src_info.version_id.is_none_or(|v| v.is_nil())
+            {
                 return src_set
                     .copy_object(src_bucket, src_object, dst_bucket, dst_object, src_info, src_opts, dst_opts)
                     .await;
@@ -837,13 +878,25 @@ impl crate::storage_api_contracts::object::ObjectOperations for Sets {
         }
 
         let put_opts = ObjectOptions {
-            user_defined: dst_opts.user_defined.clone(),
+            user_defined: materialized_set_copy_user_defined(if dst_opts.user_defined.is_empty() {
+                src_info.user_defined.as_ref()
+            } else {
+                &dst_opts.user_defined
+            }),
             shard_integrity_write_mode: Some(src_info.shard_integrity_write_mode()),
             versioned: dst_opts.versioned,
             version_suspended: dst_opts.version_suspended,
             version_id: dst_opts.version_id.clone(),
+            no_lock: dst_opts.no_lock,
+            write_completion: dst_opts.write_completion,
             mod_time: dst_opts.mod_time,
             http_preconditions: dst_opts.http_preconditions.clone(),
+            expected_current_version_id: dst_opts.expected_current_version_id.clone(),
+            expected_bucket_incarnation_id: dst_opts.expected_bucket_incarnation_id,
+            namespace_lock_fence: dst_opts.namespace_lock_fence.clone(),
+            write_lock_context: dst_opts.write_lock_context.clone(),
+            bucket_lifecycle_lock_fence: dst_opts.bucket_lifecycle_lock_fence.clone(),
+            object_lock_config_snapshot: dst_opts.object_lock_config_snapshot.clone(),
             quota_admission: dst_opts.quota_admission,
             ..Default::default()
         };
@@ -1533,35 +1586,14 @@ mod tests {
         let mut del_objects = vec![DeletedObject::default(); 3];
         let mut del_errs = vec![None, None, None];
 
-        let early_batch = vec![DelObj {
-            orig_idx: 1,
-            obj: ObjectToDelete {
-                object_name: "second".to_string(),
-                ..Default::default()
-            },
-        }];
+        let early_indices = [1];
         let early_objects = vec![DeletedObject {
             object_name: "second".to_string(),
             found: true,
             ..Default::default()
         }];
 
-        let late_batch = vec![
-            DelObj {
-                orig_idx: 2,
-                obj: ObjectToDelete {
-                    object_name: "third".to_string(),
-                    ..Default::default()
-                },
-            },
-            DelObj {
-                orig_idx: 0,
-                obj: ObjectToDelete {
-                    object_name: "first".to_string(),
-                    ..Default::default()
-                },
-            },
-        ];
+        let late_indices = [2, 0];
         let late_objects = vec![
             DeletedObject {
                 object_name: "third".to_string(),
@@ -1575,12 +1607,12 @@ mod tests {
             },
         ];
 
-        apply_delete_objects_results(&mut del_objects, &mut del_errs, &early_batch, &early_objects, vec![None]);
+        apply_delete_objects_results(&mut del_objects, &mut del_errs, &early_indices, early_objects, vec![None]);
         apply_delete_objects_results(
             &mut del_objects,
             &mut del_errs,
-            &late_batch,
-            &late_objects,
+            &late_indices,
+            late_objects,
             vec![Some(Error::other("third failed")), None],
         );
 
@@ -2453,6 +2485,142 @@ mod tests {
         assert!(
             Arc::ptr_eq(sets.instance_ctx(), &bootstrap_ctx()),
             "legacy Sets::new must keep adopting the process bootstrap context"
+        );
+    }
+
+    #[tokio::test]
+    async fn copy_object_preserves_uuid_version_and_keeps_null_and_explicit_version_in_place() {
+        let (_dirs, format, fixture) = setup_heal_format_sets(3, false).await;
+        let pool = &fixture.endpoints;
+        let ctx = Arc::new(InstanceContext::new());
+        let options = DiskOption {
+            cleanup: false,
+            health_check: false,
+        };
+        let (disks, errors) = crate::store::init_format::init_disks(&ctx, &pool.endpoints, &options).await;
+        assert!(errors.iter().all(Option::is_none), "disk init errors: {errors:?}");
+
+        let sets = Sets::new_with_instance_ctx(disks, pool, &format, 0, 1, ctx)
+            .await
+            .expect("assemble local Sets fixture");
+        sets.stop_endpoint_monitor_for_test().await;
+
+        let bucket = "sets-copy-suspended";
+        let key = "victim.txt";
+        let payload = b"sets copy preserved payload".to_vec();
+        let original_mod_time = time::OffsetDateTime::now_utc() - time::Duration::seconds(300);
+
+        sets.make_bucket(bucket, &MakeBucketOptions::default())
+            .await
+            .expect("create Sets fixture bucket");
+
+        let seeded = sets
+            .put_object(
+                bucket,
+                key,
+                &mut PutObjReader::from_vec(payload.clone()),
+                &ObjectOptions {
+                    versioned: true,
+                    mod_time: Some(original_mod_time),
+                    user_defined: HashMap::from([("x-amz-meta-author".to_owned(), "alice".to_owned())]),
+                    write_completion: crate::object_api::WriteCompletion::TailDrained,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("seed versioned object on Sets");
+        let preserved_vid = seeded.version_id.expect("seeded object must carry a UUID version");
+        assert!(!preserved_vid.is_nil());
+
+        // 1. Non-versioned self-copy over a preserved UUID version must create a new `null`
+        //    version via put_object rather than rewriting the UUID version in place.
+        let mut src_info = seeded.clone();
+        src_info.metadata_only = true;
+        src_info.user_defined = Arc::new(HashMap::from([("x-amz-meta-author".to_owned(), "mallory".to_owned())]));
+        src_info.put_object_reader = Some(PutObjReader::from_vec(payload.clone()));
+
+        let no_object_lock = Some(Arc::new(crate::object_api::ObjectLockConfigSnapshot::new(
+            crate::bucket::metadata_sys::ObjectLockConfigState::ConfirmedAbsent,
+        )));
+        let src_opts = ObjectOptions {
+            version_suspended: true,
+            ..Default::default()
+        };
+        let dst_opts = ObjectOptions {
+            versioned: false,
+            version_suspended: true,
+            object_lock_config_snapshot: no_object_lock.clone(),
+            write_completion: crate::object_api::WriteCompletion::TailDrained,
+            ..Default::default()
+        };
+
+        let copied = sets
+            .copy_object(bucket, key, bucket, key, &mut src_info, &src_opts, &dst_opts)
+            .await
+            .expect("Sets::copy_object on suspended bucket should create null version");
+        assert!(copied.version_id.is_none_or(|v| v.is_nil()));
+        assert_ne!(copied.data_dir, seeded.data_dir);
+        assert_eq!(copied.user_defined.get("x-amz-meta-author").map(String::as_str), Some("mallory"));
+        assert!(copied.mod_time > Some(original_mod_time));
+
+        let preserved = sets
+            .get_object_info(
+                bucket,
+                key,
+                &ObjectOptions {
+                    version_id: Some(preserved_vid.to_string()),
+                    version_suspended: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("preserved UUID version must stay intact on Sets");
+        assert_eq!(preserved.user_defined.get("x-amz-meta-author").map(String::as_str), Some("alice"));
+        assert_eq!(preserved.mod_time, Some(original_mod_time));
+        assert_eq!(preserved.data_dir, seeded.data_dir);
+
+        // 2. Subsequent metadata-only self-copy on the `null` version stays zero-copy in place.
+        let null_data_dir = copied.data_dir;
+        let mut null_src_info = copied;
+        null_src_info.metadata_only = true;
+        null_src_info.user_defined = Arc::new(HashMap::from([("x-amz-meta-author".to_owned(), "null-v2".to_owned())]));
+        null_src_info.put_object_reader = None;
+
+        let updated_null = sets
+            .copy_object(bucket, key, bucket, key, &mut null_src_info, &src_opts, &dst_opts)
+            .await
+            .expect("Sets::copy_object on null version should update in place");
+        assert!(updated_null.version_id.is_none_or(|v| v.is_nil()));
+        assert_eq!(updated_null.data_dir, null_data_dir);
+        assert_eq!(updated_null.user_defined.get("x-amz-meta-author").map(String::as_str), Some("null-v2"));
+
+        // 3. Explicit same-version copy (RestoreObject path) stays in place on that UUID version.
+        let mut explicit_src = seeded.clone();
+        explicit_src.metadata_only = true;
+        explicit_src.user_defined = Arc::new(HashMap::from([
+            ("x-amz-meta-author".to_owned(), "alice".to_owned()),
+            (rustfs_utils::http::headers::AMZ_RESTORE.to_owned(), "ongoing-request=\"true\"".to_owned()),
+        ]));
+        explicit_src.put_object_reader = None;
+        let explicit_opts = ObjectOptions {
+            version_id: Some(preserved_vid.to_string()),
+            mod_time: Some(original_mod_time),
+            object_lock_config_snapshot: no_object_lock,
+            ..Default::default()
+        };
+
+        let explicit_copied = sets
+            .copy_object(bucket, key, bucket, key, &mut explicit_src, &explicit_opts, &explicit_opts)
+            .await
+            .expect("explicit same-version Sets::copy_object must stay unaffected");
+        assert_eq!(explicit_copied.version_id, Some(preserved_vid));
+        assert_eq!(explicit_copied.data_dir, seeded.data_dir);
+        assert_eq!(
+            explicit_copied
+                .user_defined
+                .get(rustfs_utils::http::headers::AMZ_RESTORE)
+                .map(String::as_str),
+            Some("ongoing-request=\"true\"")
         );
     }
 }

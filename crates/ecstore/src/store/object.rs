@@ -2110,8 +2110,22 @@ fn batch_delete_action_key(object: &ObjectToDelete) -> (&str, Option<Uuid>) {
     (object.object_name.as_str(), object.version_id)
 }
 
-fn batch_delete_targets_pool(creates_latest_marker: bool, marker_target_pool_idx: Option<usize>, pool_idx: usize) -> bool {
-    !creates_latest_marker || marker_target_pool_idx == Some(pool_idx)
+#[derive(Clone, Copy)]
+enum BatchDeleteRoute {
+    Inactive,
+    AllPools,
+    PendingMarker,
+    Marker(usize),
+}
+
+impl BatchDeleteRoute {
+    fn targets(self, pool_idx: usize) -> bool {
+        match self {
+            Self::Inactive | Self::PendingMarker => false,
+            Self::AllPools => true,
+            Self::Marker(target) => target == pool_idx,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -2197,52 +2211,33 @@ fn inject_batch_delete_pool_errors(
     }
 }
 
-fn resolve_batch_delete_pool_results<'a>(
-    initial_error: Option<Error>,
-    pool_results: impl IntoIterator<Item = (&'a DeletedObject, &'a Option<Error>)>,
-) -> (Option<DeletedObject>, Option<Error>, bool) {
-    let mut failure = initial_error.map(|err| (None, err));
-    let mut deleted = None;
-    let mut fallback: Option<(DeletedObject, Option<Error>)> = None;
-    let mut attempted = false;
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum BatchDeleteOutcome {
+    SilentMiss,
+    Missing,
+    Deleted,
+    Failed,
+}
 
-    for (pool_delete, pool_error) in pool_results {
-        attempted = true;
-        match pool_error {
-            Some(err) if is_err_object_not_found(err) || is_err_version_not_found(err) => {
-                if fallback.as_ref().is_none_or(|(_, error)| error.is_none()) {
-                    fallback = Some(((*pool_delete).clone(), Some(err.clone())));
-                }
-            }
-            Some(err) => {
-                if failure.is_none() {
-                    failure = Some((Some((*pool_delete).clone()), err.clone()));
-                }
-            }
-            None if pool_delete.found => {
-                if deleted.is_none() {
-                    deleted = Some((*pool_delete).clone());
-                }
-            }
-            None => {
-                if fallback.is_none() {
-                    fallback = Some(((*pool_delete).clone(), None));
-                }
-            }
-        }
+fn apply_batch_delete_pool_result(
+    selected: &mut Option<BatchDeleteOutcome>,
+    deleted: &mut DeletedObject,
+    error: &mut Option<Error>,
+    pool_delete: DeletedObject,
+    pool_error: Option<Error>,
+) {
+    let outcome = match &pool_error {
+        Some(err) if is_err_object_not_found(err) || is_err_version_not_found(err) => BatchDeleteOutcome::Missing,
+        Some(_) => BatchDeleteOutcome::Failed,
+        None if pool_delete.found => BatchDeleteOutcome::Deleted,
+        None => BatchDeleteOutcome::SilentMiss,
+    };
+    // Results arrive in pool order. Equal priorities keep the first result.
+    if selected.is_none_or(|current| outcome > current) {
+        *selected = Some(outcome);
+        *deleted = pool_delete;
+        *error = pool_error;
     }
-
-    if let Some((failed_delete, err)) = failure {
-        return (failed_delete, Some(err), attempted);
-    }
-    if let Some(deleted) = deleted {
-        return (Some(deleted), None, attempted);
-    }
-    if let Some((deleted, err)) = fallback {
-        return (Some(deleted), err, attempted);
-    }
-
-    (None, None, attempted)
 }
 
 fn transition_restore_pool_opts(opts: &ObjectOptions) -> ObjectOptions {
@@ -2774,6 +2769,7 @@ async fn await_conditional_capability_set_probe_gate(bucket: &str) -> Result<()>
 }
 
 struct BatchDeletePhasePlan<'a> {
+    /// Unique input positions in request order.
     indices: &'a [usize],
     pool_generations: HashMap<usize, HashMap<String, CurrentDeleteGeneration>>,
     marker_targets: &'a HashMap<String, usize>,
@@ -3308,15 +3304,34 @@ impl ECStore {
 
     pub(crate) async fn object_lock_config_snapshot_for_single_put(&self, bucket: &str) -> Result<Arc<ObjectLockConfigSnapshot>> {
         check_valid_bucket_name(bucket)?;
-        let lifecycle_guard = self.acquire_bucket_lifecycle_read_lock(bucket).await?;
+        let lifecycle_lock_started = rustfs_io_metrics::put_stage_timer();
+        let lifecycle_guard = self.acquire_bucket_lifecycle_read_lock(bucket).await;
+        rustfs_io_metrics::record_put_object_stage_duration_from(
+            rustfs_io_metrics::PUT_STAGE_PUT_OBJECT_COMMIT_READY_SNAPSHOT_LIFECYCLE_LOCK,
+            lifecycle_lock_started,
+        );
+        let lifecycle_guard = lifecycle_guard?;
+
+        let metadata_lock_started = rustfs_io_metrics::put_stage_timer();
         let metadata_guard = crate::bucket::metadata_sys::acquire_bucket_metadata_transaction_read_lock_in_for_purpose(
             &self.ctx,
             bucket,
             "object_lock_snapshot_metadata_read",
         )
-        .await?;
-        let (state, bucket_incarnation_id, config_revision, quota_res) =
-            get_object_lock_and_quota_config_from_disk_with_guard_in(&self.ctx, bucket, Some(&lifecycle_guard)).await?;
+        .await;
+        rustfs_io_metrics::record_put_object_stage_duration_from(
+            rustfs_io_metrics::PUT_STAGE_PUT_OBJECT_COMMIT_READY_SNAPSHOT_METADATA_LOCK,
+            metadata_lock_started,
+        );
+        let metadata_guard = metadata_guard?;
+
+        let authority_read_started = rustfs_io_metrics::put_stage_timer();
+        let authority = get_object_lock_and_quota_config_from_disk_with_guard_in(&self.ctx, bucket, Some(&lifecycle_guard)).await;
+        rustfs_io_metrics::record_put_object_stage_duration_from(
+            rustfs_io_metrics::PUT_STAGE_PUT_OBJECT_COMMIT_READY_SNAPSHOT_AUTHORITY_READ,
+            authority_read_started,
+        );
+        let (state, bucket_incarnation_id, config_revision, quota_res) = authority?;
         if lifecycle_guard.is_lock_lost() || metadata_guard.is_lock_lost() {
             return Err(Error::other("bucket lifecycle lock was lost while loading the Object Lock snapshot"));
         }
@@ -5331,14 +5346,16 @@ impl ECStore {
             }
 
             if source_pool_writable && !dst_opts.versioned && src_opts.version_id.is_none() {
-                if src_info.metadata_only {
+                if src_info.metadata_only && src_info.version_id.is_none_or(|v| v.is_nil()) {
                     // Zero-copy update: only xl.meta is rewritten, the data blocks stay as they
                     // are. The caller must therefore guarantee that the destination metadata
-                    // still describes the stored bytes. In particular a copy that re-derives
+                    // still describes the stored bytes, and the resolved source version must be
+                    // the null/unversioned entry — never a preserved non-nil UUID version on a
+                    // suspended bucket or excluded prefix. In particular a copy that re-derives
                     // encryption material may NOT set metadata_only — that would leave a fresh
                     // DEK beside ciphertext sealed under the old one, permanently destroying the
                     // object. The S3 handler enforces this before calling in (see the
-                    // metadata_only decision in rustfs/src/app/object_usecase.rs); the sibling
+                    // metadata_only decision in rustfs/src/app/object/copy.rs); the sibling
                     // versioned branch below resolves the same risk by rewriting through
                     // put_object (issue #4238).
                     let capacity_object = dst_object.clone();
@@ -5358,7 +5375,9 @@ impl ECStore {
                         .await
                         .map(|oi| (oi, None));
                 }
-                // Transitioned object self-copy: restore from tier into the same pool.
+                // Materialized self-copy (e.g. transitioned object, encryption change, or
+                // non-versioned self-copy over a preserved non-nil UUID version): write a fresh
+                // null/unversioned entry into the same pool via put_object.
                 let mut put_opts = materialized_copy_options(src_info.user_defined.as_ref(), &dst_opts);
                 if !self.single_pool() {
                     put_opts.decommission_capacity_admission =
@@ -6200,10 +6219,7 @@ impl ECStore {
             mut pool_generations,
             marker_targets: conditional_marker_targets,
         } = plan;
-        let mut active = vec![false; objects.len()];
-        for idx in indices {
-            active[*idx] = true;
-        }
+        debug_assert!(indices.windows(2).all(|pair| pair[0] < pair[1]));
         let mut del_objects = vec![DeletedObject::default(); objects.len()];
         let mut del_errs = vec![None; objects.len()];
         let mut accounting = vec![None; objects.len()];
@@ -6211,46 +6227,55 @@ impl ECStore {
             .delete_replication_config_snapshot
             .as_deref()
             .expect("batch delete replication config snapshot should be loaded");
-        let latest_marker_objects = objects
-            .iter()
-            .enumerate()
-            .map(|(idx, object)| {
-                active[idx] && del_errs[idx].is_none() && batch_delete_creates_latest_marker(object, delete_config_snapshot)
-            })
-            .collect::<Vec<_>>();
-        let marker_target_results = join_all(objects.iter().zip(&latest_marker_objects).map(|(object, creates_marker)| {
-            let admitted_target = conditional_marker_targets.get(&object.object_name).copied();
-            async move {
-                if *creates_marker {
-                    // Routing is part of condition admission. A rebalance
-                    // start cannot replace the validated current owner.
-                    Some(match admitted_target {
-                        Some(pool_idx) => Ok(pool_idx),
-                        None => self.get_pool_idx_no_lock(bucket, &object.object_name, 0).await,
-                    })
-                } else {
-                    None
-                }
+        let mut routes = vec![BatchDeleteRoute::Inactive; objects.len()];
+        let mut has_markers = false;
+        let mut pending_markers = 0;
+        for &idx in indices {
+            let object = &objects[idx];
+            if !batch_delete_creates_latest_marker(object, delete_config_snapshot) {
+                routes[idx] = BatchDeleteRoute::AllPools;
+                continue;
             }
-        }))
-        .await;
-        let mut marker_target_pool_indices = Vec::with_capacity(objects.len());
-        for (idx, target_result) in marker_target_results.into_iter().enumerate() {
-            match target_result {
-                Some(Ok(pool_idx)) => marker_target_pool_indices.push(Some(pool_idx)),
-                Some(Err(err)) => {
-                    del_errs[idx] = Some(err);
-                    marker_target_pool_indices.push(None);
-                }
-                None => marker_target_pool_indices.push(None),
+            has_markers = true;
+            // Rebalancing cannot replace the owner used to admit a conditional delete.
+            if let Some(&pool_idx) = conditional_marker_targets.get(&object.object_name) {
+                routes[idx] = BatchDeleteRoute::Marker(pool_idx);
+            } else {
+                routes[idx] = BatchDeleteRoute::PendingMarker;
+                pending_markers += 1;
+            }
+        }
+        if pending_markers != 0 {
+            let lookups = indices
+                .iter()
+                .copied()
+                .filter(|&idx| matches!(routes[idx], BatchDeleteRoute::PendingMarker))
+                // Bound join_all's size hint by the unresolved markers.
+                .take(pending_markers)
+                .map(|idx| async move { (idx, self.get_pool_idx_no_lock(bucket, &objects[idx].object_name, 0).await) });
+            let lookup_results = join_all(lookups).await;
+            for (idx, result) in lookup_results {
+                routes[idx] = match result {
+                    Ok(pool_idx) => BatchDeleteRoute::Marker(pool_idx),
+                    Err(err) => {
+                        del_errs[idx] = Some(err);
+                        BatchDeleteRoute::Inactive
+                    }
+                };
             }
         }
 
-        let _capacity_fence = if !self.single_pool() && latest_marker_objects.iter().any(|creates_marker| *creates_marker) {
+        let _capacity_fence = if !self.single_pool() && has_markers {
             // Only marker destinations can grow. Other pools participate in
             // exact deletion under the same metadata read fence and must not
             // be treated as publication targets merely because they retire.
-            let mut target_pool_indices = marker_target_pool_indices.iter().flatten().copied().collect::<Vec<_>>();
+            let mut target_pool_indices = indices
+                .iter()
+                .filter_map(|&idx| match routes[idx] {
+                    BatchDeleteRoute::Marker(pool_idx) => Some(pool_idx),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
             target_pool_indices.sort_unstable();
             target_pool_indices.dedup();
             match self
@@ -6278,16 +6303,15 @@ impl ECStore {
                 continue;
             }
 
-            let (object_indices, pool_objects): (Vec<_>, Vec<_>) = objects
+            let (object_indices, pool_objects): (Vec<_>, Vec<_>) = indices
                 .iter()
-                .enumerate()
+                .map(|&idx| (idx, &objects[idx]))
                 .filter(|(idx, object)| {
-                    active[*idx] && del_errs[*idx].is_none()
+                    routes[*idx].targets(pool.pool_idx)
                         // A newly rebalancing pool still owes every admitted
                         // conditional key its guarded mutation. Ordinary keys
                         // retain the existing rebalance skip behavior.
                         && (!rebalancing || guarded_generations.is_some_and(|generations| generations.contains_key(&object.object_name)))
-                        && batch_delete_targets_pool(latest_marker_objects[*idx], marker_target_pool_indices[*idx], pool.pool_idx)
                 })
                 .map(|(idx, object)| (idx, object.clone()))
                 .unzip();
@@ -6315,32 +6339,29 @@ impl ECStore {
             });
         }
 
-        let results = join_all(futures).await;
-
-        for idx in 0..del_objects.len() {
-            let pool_results = results.iter().filter_map(|(object_indices, (dels, errs, _))| {
-                let pool_object_idx = object_indices.binary_search(&idx).ok()?;
-                Some((&dels[pool_object_idx], &errs[pool_object_idx]))
-            });
-            let (deleted, error, attempted) = resolve_batch_delete_pool_results(del_errs[idx].take(), pool_results);
-            if let Some(deleted) = deleted {
-                del_objects[idx] = deleted;
+        let mut selected: Vec<_> = del_errs
+            .iter()
+            .map(|error| error.as_ref().map(|_| BatchDeleteOutcome::Failed))
+            .collect();
+        for (object_indices, (pool_deleted, pool_errors, pool_accounting)) in join_all(futures).await {
+            debug_assert_eq!(object_indices.len(), pool_deleted.len());
+            debug_assert_eq!(object_indices.len(), pool_errors.len());
+            let mut pool_accounting = pool_accounting.into_iter();
+            for (idx, (deleted, error)) in object_indices.into_iter().zip(pool_deleted.into_iter().zip(pool_errors)) {
+                apply_batch_delete_pool_result(&mut selected[idx], &mut del_objects[idx], &mut del_errs[idx], deleted, error);
+                // Accounting follows the last pool that attempted this index.
+                accounting[idx] = pool_accounting.next().flatten();
             }
-            del_errs[idx] = error;
+        }
 
-            if !attempted && del_errs[idx].is_none() && latest_marker_objects[idx] {
+        for &idx in indices {
+            if matches!(routes[idx], BatchDeleteRoute::Marker(_)) && selected[idx].is_none() {
                 del_objects[idx] = DeletedObject {
                     object_name: objects[idx].object_name.clone(),
                     version_id: objects[idx].version_id,
                     ..Default::default()
                 };
                 del_errs[idx] = Some(StorageError::ObjectNotFound(bucket.to_owned(), objects[idx].object_name.clone()));
-            }
-        }
-
-        for (object_indices, (_, _, pool_accounting)) in &results {
-            for (pool_object_idx, object_idx) in object_indices.iter().enumerate() {
-                accounting[*object_idx] = pool_accounting.get(pool_object_idx).cloned().flatten();
             }
         }
 
@@ -6356,9 +6377,8 @@ impl ECStore {
     ) -> (Vec<DeletedObject>, Vec<Option<Error>>, Vec<Option<DeleteAccounting>>) {
         // encode object name
         let objects: Vec<ObjectToDelete> = objects
-            .iter()
-            .map(|v| {
-                let mut v = v.clone();
+            .into_iter()
+            .map(|mut v| {
                 v.object_name = encode_dir_object(v.object_name.as_str());
                 v
             })
@@ -6591,7 +6611,7 @@ impl ECStore {
             // the phase only runs for the keys this batch actually holds, and
             // only its outcomes replace the outer per-key state.
             let indices = (0..objects.len()).filter(|idx| del_errs[*idx].is_none()).collect::<Vec<_>>();
-            let (phase_deleted, mut phase_errors, mut phase_accounting) = self
+            let (mut phase_deleted, mut phase_errors, mut phase_accounting) = self
                 .run_batch_delete_phase(
                     bucket,
                     &objects,
@@ -6604,7 +6624,7 @@ impl ECStore {
                 )
                 .await;
             for idx in indices {
-                del_objects[idx] = phase_deleted[idx].clone();
+                del_objects[idx] = std::mem::take(&mut phase_deleted[idx]);
                 del_errs[idx] = phase_errors[idx].take();
                 accounting[idx] = phase_accounting[idx].take();
             }
@@ -6621,7 +6641,7 @@ impl ECStore {
                 }
             }
             if !conditional_indices.is_empty() {
-                let (deleted, mut errors, mut receipts) = self
+                let (mut deleted, mut errors, mut receipts) = self
                     .run_batch_delete_phase(
                         bucket,
                         &objects,
@@ -6634,7 +6654,7 @@ impl ECStore {
                     )
                     .await;
                 for idx in &conditional_indices {
-                    del_objects[*idx] = deleted[*idx].clone();
+                    del_objects[*idx] = std::mem::take(&mut deleted[*idx]);
                     del_errs[*idx] = errors[*idx].take();
                     accounting[*idx] = receipts[*idx].take();
                 }
@@ -6667,7 +6687,7 @@ impl ECStore {
             if !ordinary_indices.is_empty() {
                 // The guarded phase has finished all rollback/receipt work.
                 // These actions receive neither its CAS nor its transaction.
-                let (deleted, mut errors, mut receipts) = self
+                let (mut deleted, mut errors, mut receipts) = self
                     .run_batch_delete_phase(
                         bucket,
                         &objects,
@@ -6680,7 +6700,7 @@ impl ECStore {
                     )
                     .await;
                 for idx in ordinary_indices {
-                    del_objects[idx] = deleted[idx].clone();
+                    del_objects[idx] = std::mem::take(&mut deleted[idx]);
                     del_errs[idx] = errors[idx].take();
                     accounting[idx] = receipts[idx].take();
                 }
@@ -9758,9 +9778,11 @@ mod tests {
             ..Default::default()
         };
         assert!(batch_delete_creates_latest_marker(&latest, &versioned));
-        assert!(!batch_delete_targets_pool(true, Some(1), 0));
-        assert!(batch_delete_targets_pool(true, Some(1), 1));
-        assert!(!batch_delete_targets_pool(true, Some(1), 2));
+        assert!(!BatchDeleteRoute::Marker(1).targets(0));
+        assert!(BatchDeleteRoute::Marker(1).targets(1));
+        assert!(!BatchDeleteRoute::Marker(1).targets(2));
+        assert!(!BatchDeleteRoute::Inactive.targets(0));
+        assert!(!BatchDeleteRoute::PendingMarker.targets(0));
 
         let explicit = ObjectToDelete {
             object_name: "explicit".to_string(),
@@ -9768,11 +9790,23 @@ mod tests {
             ..Default::default()
         };
         assert!(!batch_delete_creates_latest_marker(&explicit, &versioned));
-        assert!(batch_delete_targets_pool(false, Some(1), 0));
+        assert!(BatchDeleteRoute::AllPools.targets(0));
 
         let unversioned = DeleteReplicationConfigSnapshot::default();
         assert!(!batch_delete_creates_latest_marker(&latest, &unversioned));
-        assert!(batch_delete_targets_pool(false, None, 0));
+        assert!(BatchDeleteRoute::AllPools.targets(1));
+    }
+
+    fn reduce_test_pool_results(
+        mut error: Option<Error>,
+        pool_results: impl IntoIterator<Item = (DeletedObject, Option<Error>)>,
+    ) -> (DeletedObject, Option<Error>, Option<BatchDeleteOutcome>) {
+        let mut selected = error.as_ref().map(|_| BatchDeleteOutcome::Failed);
+        let mut deleted = DeletedObject::default();
+        for (pool_delete, pool_error) in pool_results {
+            apply_batch_delete_pool_result(&mut selected, &mut deleted, &mut error, pool_delete, pool_error);
+        }
+        (deleted, error, selected)
     }
 
     #[test]
@@ -9798,15 +9832,14 @@ mod tests {
                 let failed = (DeletedObject::default(), Some(source_error.clone()));
                 let succeeded = (success.clone(), None);
                 let pool_results = if source_first {
-                    vec![failed, succeeded]
+                    [failed, succeeded]
                 } else {
-                    vec![succeeded, failed]
+                    [succeeded, failed]
                 };
 
-                let (_, error, attempted) =
-                    resolve_batch_delete_pool_results(None, pool_results.iter().map(|(deleted, error)| (deleted, error)));
+                let (_, error, selected) = reduce_test_pool_results(None, pool_results);
 
-                assert!(attempted);
+                assert!(matches!(selected, Some(BatchDeleteOutcome::Failed)));
                 assert_eq!(error, Some(source_error.clone()));
             }
         }
@@ -9829,32 +9862,52 @@ mod tests {
             for missing_first in [true, false] {
                 let succeeded = (success.clone(), None);
                 let pool_results = if missing_first {
-                    vec![missing.clone(), succeeded]
+                    [missing.clone(), succeeded]
                 } else {
-                    vec![succeeded, missing.clone()]
+                    [succeeded, missing.clone()]
                 };
-                let (deleted, error, attempted) =
-                    resolve_batch_delete_pool_results(None, pool_results.iter().map(|(deleted, error)| (deleted, error)));
+                let (deleted, error, selected) = reduce_test_pool_results(None, pool_results);
 
-                assert!(attempted);
-                let deleted = deleted.expect("successful pool result should be retained");
+                assert!(matches!(selected, Some(BatchDeleteOutcome::Deleted)));
                 assert!(deleted.found);
                 assert_eq!(deleted.object_name, success.object_name.as_str());
                 assert!(error.is_none());
             }
 
-            let missing_only = [missing];
-            let (_, error, attempted) =
-                resolve_batch_delete_pool_results(None, missing_only.iter().map(|(deleted, error)| (deleted, error)));
-            assert!(attempted);
+            let (_, error, selected) = reduce_test_pool_results(None, [missing]);
+            assert!(matches!(selected, Some(BatchDeleteOutcome::Missing)));
             assert_eq!(error, Some(missing_error));
         }
 
-        let silent_missing = [(DeletedObject::default(), None)];
-        let (_, error, attempted) =
-            resolve_batch_delete_pool_results(None, silent_missing.iter().map(|(deleted, error)| (deleted, error)));
-        assert!(attempted);
+        let (_, error, selected) = reduce_test_pool_results(None, [(DeletedObject::default(), None)]);
+        assert!(matches!(selected, Some(BatchDeleteOutcome::SilentMiss)));
         assert!(error.is_none());
+    }
+
+    #[test]
+    fn batch_delete_pool_reduction_keeps_the_first_equal_outcome_and_preflight_error() {
+        let miss = |name: &str| {
+            (
+                DeletedObject {
+                    object_name: name.to_owned(),
+                    ..Default::default()
+                },
+                Some(StorageError::ObjectNotFound("bucket".to_owned(), name.to_owned())),
+            )
+        };
+        let silent = (DeletedObject::default(), None);
+        let (deleted, error, selected) = reduce_test_pool_results(None, [silent, miss("first"), miss("second")]);
+        assert!(matches!(selected, Some(BatchDeleteOutcome::Missing)));
+        assert_eq!(deleted.object_name, "first");
+        assert_eq!(error, miss("first").1);
+
+        let (deleted, error, _) = reduce_test_pool_results(
+            Some(StorageError::PreconditionFailed),
+            [(miss("pool").0, Some(StorageError::ErasureWriteQuorum))],
+        );
+        assert!(deleted.object_name.is_empty());
+        assert_eq!(error, Some(StorageError::PreconditionFailed));
+        assert!(reduce_test_pool_results(None, []).2.is_none());
     }
 
     #[tokio::test]
@@ -13114,6 +13167,67 @@ mod tests {
 
     #[tokio::test]
     #[serial_test::serial(storage_class_env)]
+    async fn batch_delete_preserves_results_and_accounting_across_sets() {
+        let ctx = Arc::new(crate::runtime::instance::InstanceContext::new());
+        ctx.update_erasure_type(SetupType::Erasure).await;
+        let (_temp_dirs, sets) = make_local_two_set_sets_with_ctx(Arc::clone(&ctx)).await;
+        let store = Arc::new(new_prepared_reader_test_store_from_pools(
+            vec![Arc::clone(&sets)],
+            vec![sets.endpoints.clone()],
+            ctx,
+        ));
+        crate::bucket::metadata_sys::init_bucket_metadata_sys(Arc::clone(&store), Vec::new()).await;
+        let bucket = format!("batch-delete-{}", Uuid::new_v4().simple());
+        store
+            .make_bucket(&bucket, &MakeBucketOptions::default())
+            .await
+            .expect("create bucket on both sets");
+        let keys: Vec<_> = [1, 0, 1]
+            .into_iter()
+            .enumerate()
+            .map(|(index, set)| {
+                (0..100)
+                    .map(|suffix| format!("{index}-{suffix}"))
+                    .find(|key| Arc::ptr_eq(&sets.get_disks_by_key(key), &sets.disk_set[set]))
+                    .expect("fixture key routed to the selected set")
+            })
+            .collect();
+        for indices in [&[0, 1, 2][..], &[0, 2, 1], &[0, 2], &[1]] {
+            for &index in indices {
+                let mut data = PutObjReader::from_vec(vec![0; index + 1]);
+                sets.put_object(&bucket, &keys[index], &mut data, &ObjectOptions::default())
+                    .await
+                    .expect("seed an object with a distinct size");
+            }
+            let batch = indices
+                .iter()
+                .map(|&index| ObjectToDelete {
+                    object_name: keys[index].clone(),
+                    ..Default::default()
+                })
+                .collect();
+            let (deleted, errors, accounting) = sets
+                .delete_objects_with_accounting(&bucket, batch, ObjectOptions::default())
+                .await;
+
+            assert_eq!(errors.len(), indices.len());
+            assert!(errors.iter().all(Option::is_none), "{errors:?}");
+            assert_eq!(
+                deleted.iter().map(|object| object.object_name.as_str()).collect::<Vec<_>>(),
+                indices.iter().map(|&index| keys[index].as_str()).collect::<Vec<_>>()
+            );
+            assert_eq!(
+                accounting
+                    .into_iter()
+                    .map(|receipt| receipt.and_then(|receipt| receipt.size))
+                    .collect::<Vec<_>>(),
+                indices.iter().map(|&index| u64::try_from(index + 1).ok()).collect::<Vec<_>>()
+            );
+        }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(storage_class_env)]
     async fn select_snapshot_allows_store_delete_for_object_in_nonzero_set() {
         let ctx = Arc::new(crate::runtime::instance::InstanceContext::new());
         let (_dirs, sets) = make_local_two_set_sets_with_ctx(Arc::clone(&ctx)).await;
@@ -14550,5 +14664,416 @@ mod batch_delete_lock_tests {
                 );
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod copy_object_suspended_version_tests {
+    use super::*;
+    use crate::bucket::metadata_sys::{init_bucket_metadata_sys, test_support::isolated_store_over_temp_disks};
+    use crate::storage_api_contracts::bucket::{BucketOperations, MakeBucketOptions};
+    use crate::storage_api_contracts::object::{ObjectIO, ObjectOperations};
+    use rustfs_utils::http::headers::AMZ_OBJECT_TAGGING;
+    use tokio::io::AsyncReadExt;
+
+    async fn read_object_bytes(store: &ECStore, bucket: &str, key: &str, opts: &ObjectOptions) -> Vec<u8> {
+        let mut reader = store
+            .get_object_reader(bucket, key, None, HeaderMap::new(), opts)
+            .await
+            .expect("object reader should open");
+        let mut bytes = Vec::new();
+        reader
+            .stream
+            .read_to_end(&mut bytes)
+            .await
+            .expect("object payload should be readable");
+        bytes
+    }
+
+    #[tokio::test]
+    async fn copy_object_suspended_metadata_only_preserves_uuid_version_and_creates_null() {
+        let (_dirs, store) = isolated_store_over_temp_disks().await;
+        init_bucket_metadata_sys(store.clone(), Vec::new()).await;
+        let bucket = "copy-suspended-guard";
+        let key = "victim.txt";
+        let payload = b"preserved version payload".to_vec();
+        let original_mod_time = OffsetDateTime::now_utc() - time::Duration::seconds(300);
+
+        store
+            .make_bucket(
+                bucket,
+                &MakeBucketOptions {
+                    versioning_enabled: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("create versioned fixture bucket");
+
+        let seeded = store
+            .put_object(
+                bucket,
+                key,
+                &mut PutObjReader::from_vec(payload.clone()),
+                &ObjectOptions {
+                    versioned: true,
+                    mod_time: Some(original_mod_time),
+                    user_defined: HashMap::from([
+                        ("content-type".to_owned(), "text/plain".to_owned()),
+                        ("x-amz-meta-author".to_owned(), "alice".to_owned()),
+                        (AMZ_OBJECT_TAGGING.to_owned(), "class=secret".to_owned()),
+                    ]),
+                    write_completion: crate::object_api::WriteCompletion::TailDrained,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("seed enabled-era UUID version");
+        let preserved_vid = seeded.version_id.expect("seeded object must carry a UUID version");
+        assert!(!preserved_vid.is_nil(), "seeded version must be non-nil");
+
+        // Defense-in-depth: even if a caller erroneously sets `metadata_only = true` on a
+        // non-versioned self-copy whose resolved source version is a preserved UUID, the store
+        // layer must fall through to put_object and create a `null` version instead.
+        let mut src_info = seeded.clone();
+        src_info.metadata_only = true;
+        src_info.user_defined = Arc::new(HashMap::from([
+            ("content-type".to_owned(), "text/html".to_owned()),
+            ("x-amz-meta-author".to_owned(), "mallory".to_owned()),
+            (AMZ_OBJECT_TAGGING.to_owned(), "class=public".to_owned()),
+        ]));
+        src_info.user_tags = Arc::new("class=public".to_owned());
+        src_info.put_object_reader = Some(PutObjReader::from_vec(payload.clone()));
+
+        let src_opts = ObjectOptions {
+            version_suspended: true,
+            ..Default::default()
+        };
+        let dst_opts = ObjectOptions {
+            versioned: false,
+            version_suspended: true,
+            write_completion: crate::object_api::WriteCompletion::TailDrained,
+            ..Default::default()
+        };
+
+        let copied = store
+            .copy_object(bucket, key, bucket, key, &mut src_info, &src_opts, &dst_opts)
+            .await
+            .expect("store-layer self-copy on suspended bucket should create null version");
+
+        assert!(
+            copied.version_id.is_none_or(|v| v.is_nil()),
+            "self-copy over a preserved UUID in a non-versioned destination must create the null version, got {:?}",
+            copied.version_id
+        );
+        assert_ne!(copied.data_dir, seeded.data_dir, "new null version must allocate a fresh data_dir");
+        assert_eq!(copied.content_type.as_deref(), Some("text/html"));
+        assert_eq!(copied.user_defined.get("x-amz-meta-author").map(String::as_str), Some("mallory"));
+        assert_eq!(copied.user_tags.as_str(), "class=public");
+        assert!(
+            copied.mod_time > Some(original_mod_time),
+            "new null version must have a newer LastModified"
+        );
+
+        let versions = Arc::clone(&store)
+            .inner_list_object_versions(bucket, key, None, None, None, 10)
+            .await
+            .expect("list versions after suspended self-copy");
+        assert_eq!(versions.objects.len(), 2, "must list both null and preserved UUID versions");
+        assert!(
+            versions
+                .objects
+                .iter()
+                .any(|o| o.is_latest && o.version_id.is_none_or(|v| v.is_nil())),
+            "latest version must be null: {:?}",
+            versions
+                .objects
+                .iter()
+                .map(|o| (o.version_id, o.is_latest))
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            versions
+                .objects
+                .iter()
+                .any(|o| !o.is_latest && o.version_id == Some(preserved_vid)),
+            "preserved UUID version must remain non-latest: {:?}",
+            versions
+                .objects
+                .iter()
+                .map(|o| (o.version_id, o.is_latest))
+                .collect::<Vec<_>>()
+        );
+
+        let preserved = store
+            .get_object_info(
+                bucket,
+                key,
+                &ObjectOptions {
+                    version_id: Some(preserved_vid.to_string()),
+                    version_suspended: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("preserved UUID version must stay readable");
+        assert_eq!(preserved.content_type.as_deref(), Some("text/plain"));
+        assert_eq!(preserved.user_defined.get("x-amz-meta-author").map(String::as_str), Some("alice"));
+        assert_eq!(preserved.user_tags.as_str(), "class=secret");
+        assert_eq!(preserved.mod_time, Some(original_mod_time));
+        assert_eq!(preserved.data_dir, seeded.data_dir);
+        assert_eq!(preserved.etag, seeded.etag);
+        assert_eq!(
+            read_object_bytes(
+                &store,
+                bucket,
+                key,
+                &ObjectOptions {
+                    version_id: Some(preserved_vid.to_string()),
+                    version_suspended: true,
+                    ..Default::default()
+                },
+            )
+            .await,
+            payload
+        );
+        assert_eq!(read_object_bytes(&store, bucket, key, &ObjectOptions::default()).await, payload);
+
+        // Once the current version is already `null`, an in-place metadata-only self-copy
+        // updates that `null` version in place (keeping its data_dir) while still leaving
+        // the preserved UUID version untouched.
+        let null_data_dir = copied.data_dir;
+        let mut null_src_info = copied;
+        null_src_info.metadata_only = true;
+        null_src_info.user_defined = Arc::new(HashMap::from([
+            ("content-type".to_owned(), "application/json".to_owned()),
+            ("x-amz-meta-author".to_owned(), "updated-null".to_owned()),
+        ]));
+        null_src_info.user_tags = Arc::new(String::new());
+        null_src_info.put_object_reader = None;
+
+        let updated_null = store
+            .copy_object(bucket, key, bucket, key, &mut null_src_info, &src_opts, &dst_opts)
+            .await
+            .expect("metadata-only self-copy on an existing null version should update in place");
+        assert!(updated_null.version_id.is_none_or(|v| v.is_nil()));
+        assert_eq!(updated_null.data_dir, null_data_dir, "null-version self-copy stays zero-copy");
+        assert_eq!(updated_null.content_type.as_deref(), Some("application/json"));
+        assert_eq!(
+            updated_null.user_defined.get("x-amz-meta-author").map(String::as_str),
+            Some("updated-null")
+        );
+
+        let preserved_after = store
+            .get_object_info(
+                bucket,
+                key,
+                &ObjectOptions {
+                    version_id: Some(preserved_vid.to_string()),
+                    version_suspended: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("preserved UUID version must stay intact after null-version update");
+        assert_eq!(preserved_after.content_type.as_deref(), Some("text/plain"));
+        assert_eq!(preserved_after.user_defined.get("x-amz-meta-author").map(String::as_str), Some("alice"));
+        assert_eq!(preserved_after.mod_time, Some(original_mod_time));
+    }
+
+    #[tokio::test]
+    async fn copy_object_suspended_metadata_only_without_reader_fails_closed_for_uuid_version() {
+        let (_dirs, store) = isolated_store_over_temp_disks().await;
+        init_bucket_metadata_sys(store.clone(), Vec::new()).await;
+        let bucket = "copy-suspended-fail-closed";
+        let key = "victim.txt";
+        let original_mod_time = OffsetDateTime::now_utc() - time::Duration::seconds(300);
+
+        store
+            .make_bucket(
+                bucket,
+                &MakeBucketOptions {
+                    versioning_enabled: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("create versioned fixture bucket");
+
+        let seeded = store
+            .put_object(
+                bucket,
+                key,
+                &mut PutObjReader::from_vec(b"immutable version".to_vec()),
+                &ObjectOptions {
+                    versioned: true,
+                    mod_time: Some(original_mod_time),
+                    user_defined: HashMap::from([("x-amz-meta-author".to_owned(), "alice".to_owned())]),
+                    write_completion: crate::object_api::WriteCompletion::TailDrained,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("seed enabled-era UUID version");
+        let preserved_vid = seeded.version_id.expect("seeded object must carry a UUID version");
+
+        let mut src_info = seeded.clone();
+        src_info.metadata_only = true;
+        src_info.user_defined = Arc::new(HashMap::from([("x-amz-meta-author".to_owned(), "mallory".to_owned())]));
+        src_info.put_object_reader = None;
+
+        let err = store
+            .copy_object(
+                bucket,
+                key,
+                bucket,
+                key,
+                &mut src_info,
+                &ObjectOptions {
+                    version_suspended: true,
+                    ..Default::default()
+                },
+                &ObjectOptions {
+                    versioned: false,
+                    version_suspended: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect_err("metadata-only self-copy without a reader must refuse to mutate a preserved UUID version");
+        assert!(
+            matches!(err, StorageError::InvalidArgument(_, _, ref msg) if msg.contains("put_object_reader")),
+            "expected missing reader error, got {err:?}"
+        );
+
+        let preserved = store
+            .get_object_info(
+                bucket,
+                key,
+                &ObjectOptions {
+                    version_id: Some(preserved_vid.to_string()),
+                    version_suspended: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("preserved UUID version must remain untouched");
+        assert_eq!(preserved.user_defined.get("x-amz-meta-author").map(String::as_str), Some("alice"));
+        assert_eq!(preserved.mod_time, Some(original_mod_time));
+    }
+
+    #[tokio::test]
+    async fn copy_object_unversioned_and_explicit_same_version_keep_in_place_metadata_only() {
+        let (_dirs, store) = isolated_store_over_temp_disks().await;
+        init_bucket_metadata_sys(store.clone(), Vec::new()).await;
+
+        // 1. Never-versioned bucket: metadata_only self-copy stays zero-copy in place.
+        let unversioned_bucket = "copy-unversioned-in-place";
+        let key = "object.txt";
+        store
+            .make_bucket(unversioned_bucket, &MakeBucketOptions::default())
+            .await
+            .expect("create unversioned bucket");
+        let unversioned_seeded = store
+            .put_object(
+                unversioned_bucket,
+                key,
+                &mut PutObjReader::from_vec(b"unversioned payload".to_vec()),
+                &ObjectOptions {
+                    user_defined: HashMap::from([("x-amz-meta-stage".to_owned(), "initial".to_owned())]),
+                    write_completion: crate::object_api::WriteCompletion::TailDrained,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("seed unversioned object");
+
+        let mut unversioned_src = unversioned_seeded.clone();
+        unversioned_src.metadata_only = true;
+        unversioned_src.user_defined = Arc::new(HashMap::from([("x-amz-meta-stage".to_owned(), "updated".to_owned())]));
+        unversioned_src.put_object_reader = None;
+
+        let unversioned_copied = store
+            .copy_object(
+                unversioned_bucket,
+                key,
+                unversioned_bucket,
+                key,
+                &mut unversioned_src,
+                &ObjectOptions::default(),
+                &ObjectOptions::default(),
+            )
+            .await
+            .expect("unversioned metadata-only self-copy should succeed in place");
+        assert_eq!(unversioned_copied.data_dir, unversioned_seeded.data_dir);
+        assert_eq!(
+            unversioned_copied.user_defined.get("x-amz-meta-stage").map(String::as_str),
+            Some("updated")
+        );
+
+        // 2. Explicit same-version update (as used by RestoreObject): unaffected by the guard.
+        let versioned_bucket = "copy-explicit-version-in-place";
+        store
+            .make_bucket(
+                versioned_bucket,
+                &MakeBucketOptions {
+                    versioning_enabled: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("create versioned bucket");
+        let versioned_seeded = store
+            .put_object(
+                versioned_bucket,
+                key,
+                &mut PutObjReader::from_vec(b"explicit version payload".to_vec()),
+                &ObjectOptions {
+                    versioned: true,
+                    user_defined: HashMap::from([("x-amz-meta-stage".to_owned(), "initial".to_owned())]),
+                    write_completion: crate::object_api::WriteCompletion::TailDrained,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("seed versioned object");
+        let vid = versioned_seeded.version_id.expect("versioned object must have UUID");
+
+        let mut explicit_src = versioned_seeded.clone();
+        explicit_src.metadata_only = true;
+        explicit_src.user_defined = Arc::new(HashMap::from([
+            ("x-amz-meta-stage".to_owned(), "restored".to_owned()),
+            (rustfs_utils::http::headers::AMZ_RESTORE.to_owned(), "ongoing-request=\"true\"".to_owned()),
+        ]));
+        explicit_src.put_object_reader = None;
+        let same_version_opts = ObjectOptions {
+            version_id: Some(vid.to_string()),
+            mod_time: versioned_seeded.mod_time,
+            ..Default::default()
+        };
+
+        let explicit_copied = store
+            .copy_object(
+                versioned_bucket,
+                key,
+                versioned_bucket,
+                key,
+                &mut explicit_src,
+                &ObjectOptions {
+                    version_id: Some(vid.to_string()),
+                    ..Default::default()
+                },
+                &same_version_opts,
+            )
+            .await
+            .expect("explicit same-version metadata-only copy must stay unaffected");
+        assert_eq!(explicit_copied.version_id, Some(vid));
+        assert_eq!(explicit_copied.data_dir, versioned_seeded.data_dir);
+        assert_eq!(explicit_copied.user_defined.get("x-amz-meta-stage").map(String::as_str), Some("restored"));
+        let versions = Arc::clone(&store)
+            .inner_list_object_versions(versioned_bucket, key, None, None, None, 10)
+            .await
+            .expect("list versions after explicit same-version update");
+        assert_eq!(versions.objects.len(), 1, "explicit same-version update must not create a second version");
     }
 }

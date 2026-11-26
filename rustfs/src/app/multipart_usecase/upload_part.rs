@@ -512,79 +512,117 @@ impl DefaultMultipartUsecase {
 }
 
 #[cfg(test)]
-impl UploadPartWriteInput {
-    pub(crate) fn from_legacy(
-        input: crate::app::storage_api::s3::dto::UploadPartInput,
-        trailers: Option<crate::app::storage_api::s3::TrailingHeaders>,
-    ) -> Self {
-        Self {
-            target: UploadPartTarget::Legacy {
-                bucket: input.bucket,
-                key: input.key,
-                upload_id: input.upload_id,
-            },
-            part_number: input.part_number,
-            content_length: input.content_length,
-            body: input.body.map(crate::app::object::legacy_put_body),
-            trailing_headers: crate::app::trailer_adapter::trailer_source(trailers),
-            frame_trailers: None,
-            content_md5: input.content_md5,
-            checksum_algorithm: input.checksum_algorithm.map(|value| value.as_str().to_owned()),
-            checksum_crc32: input.checksum_crc32,
-            checksum_crc32c: input.checksum_crc32c,
-            checksum_crc64nvme: input.checksum_crc64nvme,
-            checksum_sha1: input.checksum_sha1,
-            checksum_sha256: input.checksum_sha256,
-            sse_customer_algorithm: input.sse_customer_algorithm,
-            sse_customer_key: input.sse_customer_key,
-            sse_customer_key_md5: input.sse_customer_key_md5,
-        }
-    }
-}
-
-#[cfg(test)]
-impl DefaultMultipartUsecase {
-    pub(crate) async fn execute_upload_part(
-        &self,
-        req: crate::app::storage_api::s3::S3Request<crate::app::storage_api::s3::dto::UploadPartInput>,
-    ) -> crate::app::storage_api::s3::S3Result<UploadPartWriteOutput> {
-        let envelope = RequestEnvelope::from_s3s(&req);
-        let input = UploadPartWriteInput::from_legacy(req.input, req.trailing_headers);
-        self.execute_upload_part_with_audit(envelope, input)
-            .await
-            .map_err(crate::error::legacy_error_for_test)
-    }
-}
-
-#[cfg(test)]
 mod tests {
     use super::super::test_support::*;
     use super::*;
-    use crate::app::object::legacy_put_body;
-    use crate::app::storage_api::s3::S3ErrorCode as LegacyErrorCode;
-    use crate::app::storage_api::s3::dto::{StreamingBlob, UploadPartInput};
     use http::HeaderValue;
 
-    /// Method, URI, headers, extensions, region, and service. These fixtures leave credentials absent.
-    fn envelope_from_presigned_fixture<T>(req: &crate::app::storage_api::s3::S3Request<T>) -> RequestEnvelope {
+    struct HttpBodyPayload<B> {
+        body: B,
+        ended: bool,
+    }
+
+    impl<B> rustfs_gateway_stream::PayloadStream for HttpBodyPayload<B>
+    where
+        B: http_body::Body<Data = Bytes> + Unpin,
+        B::Error: Into<rustfs_s3_types::StdError>,
+    {
+        fn poll_read(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Result<rustfs_gateway_stream::PayloadRead, rustfs_gateway_stream::StreamError>> {
+            use rustfs_gateway_stream::{PayloadRead, StreamError, TrailingHeaders};
+            use std::pin::Pin;
+            use std::task::Poll;
+
+            if self.ended {
+                return Poll::Ready(Err(StreamError::polled_after_eof()));
+            }
+            for _ in 0..32 {
+                match Pin::new(&mut self.body).poll_frame(cx) {
+                    Poll::Pending => return Poll::Pending,
+                    Poll::Ready(Some(Ok(frame))) => match frame.into_data() {
+                        Ok(bytes) if bytes.is_empty() => continue,
+                        Ok(bytes) => return Poll::Ready(Ok(PayloadRead::Chunk(bytes))),
+                        Err(frame) => {
+                            self.ended = true;
+                            let trailers = frame
+                                .into_trailers()
+                                .map(TrailingHeaders::from_header_map)
+                                .unwrap_or_else(|_| TrailingHeaders::empty());
+                            return Poll::Ready(Ok(PayloadRead::Eof { trailers }));
+                        }
+                    },
+                    Poll::Ready(Some(Err(error))) => {
+                        self.ended = true;
+                        return Poll::Ready(Err(StreamError::upstream(error.into())));
+                    }
+                    Poll::Ready(None) => {
+                        self.ended = true;
+                        return Poll::Ready(Ok(PayloadRead::Eof {
+                            trailers: TrailingHeaders::empty(),
+                        }));
+                    }
+                }
+            }
+            cx.waker().wake_by_ref();
+            Poll::Pending
+        }
+
+        fn caps(&self) -> rustfs_gateway_stream::PayloadCaps {
+            let mut caps = rustfs_gateway_stream::PayloadCaps::PUSH;
+            caps.set(rustfs_gateway_stream::PayloadCaps::KNOWN_LENGTH, self.len_hint().is_some());
+            caps
+        }
+
+        fn len_hint(&self) -> Option<u64> {
+            self.body.size_hint().exact()
+        }
+    }
+
+    pub(super) fn http_body_stream<B>(body: B) -> Body
+    where
+        B: http_body::Body<Data = Bytes> + Send + Unpin + 'static,
+        B::Error: Into<rustfs_s3_types::StdError>,
+    {
+        Body::from_stream(HttpBodyPayload { body, ended: false }).expect("http_body caps match size_hint")
+    }
+
+    pub(super) fn pending_body() -> Body {
+        http_body_stream(rustfs_s3_types::Body::from_stream(futures::stream::pending::<
+            Result<Bytes, std::io::Error>,
+        >()))
+    }
+
+    fn poll_counting_body() -> (Body, Arc<std::sync::atomic::AtomicUsize>) {
+        let polls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let stream = crate::app::object::PollCountingBody {
+            polls: Arc::clone(&polls),
+        };
+        (http_body_stream(rustfs_s3_types::Body::from_stream(stream)), polls)
+    }
+
+    fn presigned_part_envelope(uri: http::Uri, verified: bool) -> RequestEnvelope {
+        let mut extensions = Extensions::new();
+        if verified {
+            extensions.insert(VerifiedPresignedRequest);
+        }
         RequestEnvelope::from_parts(
             crate::app::RequestHead {
-                method: req.method.clone(),
-                uri: req.uri.clone(),
-                headers: req.headers.clone(),
+                method: Method::PUT,
+                uri,
+                headers: HeaderMap::new(),
                 credentials: None,
-                region: req.region.as_ref().map(|region| region.as_str().to_owned()),
-                service: req.service.clone(),
+                region: None,
+                service: None,
             },
-            req.extensions.clone(),
+            extensions,
         )
     }
 
     fn presigned_checksum_request(query: &str) -> (RequestEnvelope, UploadPartWriteInput) {
-        let mut req = build_request(UploadPartInput::default(), Method::PUT);
-        req.uri = format!("/bucket/object?{query}").parse().unwrap();
-        req.extensions.insert(VerifiedPresignedRequest);
-        (envelope_from_presigned_fixture(&req), UploadPartWriteInput::from_legacy(req.input, None))
+        let uri = format!("/bucket/object?{query}").parse().unwrap();
+        (presigned_part_envelope(uri, true), admission_part_input(0, None, None))
     }
 
     #[tokio::test]
@@ -668,10 +706,8 @@ mod tests {
 
     #[test]
     fn normalize_presigned_part_checksums_requires_verified_presign() {
-        let mut legacy = build_request(UploadPartInput::default(), Method::PUT);
-        legacy.uri = "/bucket/object?x-amz-checksum-sha256=one".parse().unwrap();
-        let mut req = envelope_from_presigned_fixture(&legacy);
-        let mut input = UploadPartWriteInput::from_legacy(legacy.input, None);
+        let mut req = presigned_part_envelope("/bucket/object?x-amz-checksum-sha256=one".parse().unwrap(), false);
+        let mut input = admission_part_input(0, None, None);
         normalize_presigned_part_checksums(&mut req, &mut input).unwrap();
         assert!(input.checksum_sha256.is_none());
         assert!(req.headers().is_empty());
@@ -685,12 +721,10 @@ mod tests {
         let body = Body::from(Bytes::from_static(b"abc"));
         assert_eq!(resolve_upload_part_size(None, Some(&body)).expect("exact bytes"), Some(3));
         assert_eq!(resolve_upload_part_size(Some(0), Some(&body)).expect("explicit length wins"), Some(0));
-        let body = StreamingBlob::wrap(futures::stream::iter([Ok::<_, std::io::Error>(Bytes::from_static(b"abc"))]));
-        assert_eq!(futures::Stream::size_hint(&body), (1, Some(1)), "the stream knows its item count");
-        assert_eq!(
-            resolve_upload_part_size(None, Some(&legacy_put_body(body))).expect("unknown byte length"),
-            None
-        );
+        let stream = futures::stream::iter([Ok::<_, std::io::Error>(Bytes::from_static(b"abc"))]);
+        assert_eq!(futures::Stream::size_hint(&stream), (1, Some(1)), "the stream knows its item count");
+        let body = http_body_stream(rustfs_s3_types::Body::from_stream(stream));
+        assert_eq!(resolve_upload_part_size(None, Some(&body)).expect("unknown byte length"), None);
     }
 
     #[test]
@@ -770,12 +804,9 @@ mod tests {
         let ceiling = i64::try_from(rustfs_config::MAX_SINGLE_PUT_OBJECT_SIZE).expect("ceiling fits i64");
 
         for (declared, expect_too_large) in [(ceiling + 1, true), (ceiling, false), (0, false)] {
-            let (body, polls) = crate::app::object::PollCountingBody::streaming_blob();
+            let (body, polls) = poll_counting_body();
             let err = match make_usecase()
-                .execute_upload_part_with_audit(
-                    owned_envelope(Method::PUT),
-                    admission_part_input(1, Some(declared), Some(legacy_put_body(body))),
-                )
+                .execute_upload_part_with_audit(owned_envelope(Method::PUT), admission_part_input(1, Some(declared), Some(body)))
                 .await
             {
                 Err(error) => error,
@@ -845,19 +876,29 @@ mod tests {
                 .expect("upload session");
             for content_length in [None, Some(-1)] {
                 for declared_chunk_encoding in [false, true] {
-                    let (body, polls) = crate::app::object::PollCountingBody::streaming_blob();
-                    let input = UploadPartInput::builder()
-                        .bucket(bucket.clone())
-                        .key("object".to_owned())
-                        .upload_id(upload.upload_id.clone())
-                        .part_number(1)
-                        .content_length(content_length)
-                        .body(Some(body))
-                        .build()
-                        .expect("part request");
-                    // Same facts `build_request` carried, plus the decoded-length and
-                    // optional aws-chunked headers this case asserts cannot bypass rejection.
-                    // Credentials, region, service, and extensions stay absent.
+                    let (body, polls) = poll_counting_body();
+                    let input = UploadPartWriteInput {
+                        target: UploadPartTarget::Legacy {
+                            bucket: bucket.clone(),
+                            key: "object".to_owned(),
+                            upload_id: upload.upload_id.clone(),
+                        },
+                        part_number: 1,
+                        content_length,
+                        body: Some(body),
+                        trailing_headers: None,
+                        frame_trailers: None,
+                        content_md5: None,
+                        checksum_algorithm: None,
+                        checksum_crc32: None,
+                        checksum_crc32c: None,
+                        checksum_crc64nvme: None,
+                        checksum_sha1: None,
+                        checksum_sha256: None,
+                        sse_customer_algorithm: None,
+                        sse_customer_key: None,
+                        sse_customer_key_md5: None,
+                    };
                     let mut headers = http::HeaderMap::new();
                     headers.insert("x-amz-decoded-content-length", HeaderValue::from_static("1024"));
                     if declared_chunk_encoding {
@@ -875,17 +916,16 @@ mod tests {
                         http::Extensions::new(),
                     );
                     let error = usecase
-                        .execute_upload_part_with_audit(envelope, UploadPartWriteInput::from_legacy(input, None))
+                        .execute_upload_part_with_audit(envelope, input)
                         .await
-                        .map_err(crate::error::legacy_error_for_test)
                         .err()
                         .expect("unknown or negative logical size");
                     assert_eq!(
                         error.code(),
                         &if capped || content_length.is_some() {
-                            LegacyErrorCode::UnexpectedContent
+                            S3ErrorCode::UnexpectedContent
                         } else {
-                            LegacyErrorCode::MissingContentLength
+                            S3ErrorCode::MissingContentLength
                         }
                     );
                     assert_eq!(polls.load(std::sync::atomic::Ordering::Relaxed), 0);
@@ -922,23 +962,34 @@ mod tests {
             .unwrap();
         let (sender, receiver) = tokio::sync::mpsc::unbounded_channel::<Result<Frame<Bytes>, std::io::Error>>();
         let control = BodyReadControl::default();
-        let body = StreamingBlob::from(crate::app::storage_api::s3::Body::http_body_unsync(ObservedBody::new(
+        let body = http_body_stream(ObservedBody::new(
             StreamBody::new(UnboundedReceiverStream::new(receiver)),
             control.clone(),
-        )));
-        let input = UploadPartInput::builder()
-            .bucket(bucket.clone())
-            .key("object".to_owned())
-            .upload_id(upload.upload_id.clone())
-            .part_number(1)
-            .content_length(Some(65536))
-            .body(Some(body))
-            .build()
-            .unwrap();
+        ));
+        let input = UploadPartWriteInput {
+            target: UploadPartTarget::Legacy {
+                bucket: bucket.clone(),
+                key: "object".to_owned(),
+                upload_id: upload.upload_id.clone(),
+            },
+            part_number: 1,
+            content_length: Some(65536),
+            body: Some(body),
+            trailing_headers: None,
+            frame_trailers: None,
+            content_md5: None,
+            checksum_algorithm: None,
+            checksum_crc32: None,
+            checksum_crc32c: None,
+            checksum_crc64nvme: None,
+            checksum_sha1: None,
+            checksum_sha256: None,
+            sse_customer_algorithm: None,
+            sse_customer_key: None,
+            sse_customer_key_md5: None,
+        };
         let mut extensions = http::Extensions::new();
         extensions.insert(control.clone());
-        // Same facts `build_request` carried, plus the body-read budget this
-        // case advances after admission. Credentials, region, and service stay absent.
         let envelope = RequestEnvelope::from_parts(
             crate::app::RequestHead {
                 method: Method::PUT,
@@ -950,12 +1001,7 @@ mod tests {
             },
             extensions,
         );
-        let owner = tokio::spawn(async move {
-            usecase
-                .execute_upload_part_with_audit(envelope, UploadPartWriteInput::from_legacy(input, None))
-                .await
-                .map_err(crate::error::legacy_error_for_test)
-        });
+        let owner = tokio::spawn(async move { usecase.execute_upload_part_with_audit(envelope, input).await });
         control.wait_until_pending_for_test().await;
         assert!(matches!(
             manager.admit_put_object(65536).await.unwrap(),
@@ -964,7 +1010,7 @@ mod tests {
         control.advance_wait_for_test(Duration::from_secs(60));
         sender.send(Ok(Frame::data(Bytes::from_static(b"x")))).unwrap();
         let error = owner.await.unwrap().err().expect("stalled part must fail");
-        assert_eq!(error.code(), &LegacyErrorCode::RequestTimeout);
+        assert_eq!(error.code(), &S3ErrorCode::RequestTimeout);
         assert!(matches!(
             manager.admit_put_object(65536).await.unwrap(),
             ForegroundWriteAdmission::Admitted(_)
@@ -1005,8 +1051,6 @@ mod tests {
             .expect("first multipart part should acquire the only permit");
         let usecase =
             DefaultMultipartUsecase::with_context_and_concurrency_manager(Some(context), Arc::clone(&concurrency_manager));
-        let body = StreamingBlob::wrap(futures::stream::pending::<Result<Bytes, std::io::Error>>());
-        // Same facts `from_legacy` carried. Checksums, SSE, and trailers stay absent.
         let input = UploadPartWriteInput {
             target: UploadPartTarget::Legacy {
                 bucket,
@@ -1015,7 +1059,7 @@ mod tests {
             },
             part_number: 1,
             content_length: Some(1024),
-            body: Some(legacy_put_body(body)),
+            body: Some(pending_body()),
             trailing_headers: None,
             frame_trailers: None,
             content_md5: None,

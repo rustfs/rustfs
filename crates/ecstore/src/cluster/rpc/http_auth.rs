@@ -2175,6 +2175,10 @@ fn verify_tonic_rpc_signature_with_policy(
         && has_v2_auth_headers(headers)
         && tonic_boot_epoch_challenge(headers).is_ok_and(|challenge| challenge.is_some());
     if replay_scope_strict && !bootstrap {
+        // The server answers this rejection with its boot-epoch proof so a signed peer can retry
+        // with a replay scope. Verify the method-bound v2 HMAC first so unsigned, legacy-only, or
+        // forged callers are rejected for the signature itself without consuming replay-cache slots.
+        verified_tonic_rpc_nonce(audience, path, headers, true)?;
         return Err(std::io::Error::other("RPC replay-scoped authentication required"));
     }
 
@@ -3289,6 +3293,64 @@ mod tests {
                 .is_ok(),
             "only the signed Ping bootstrap may obtain a new server epoch in strict mode"
         );
+    }
+
+    #[test]
+    fn replay_scope_strictness_reports_missing_scope_only_to_signed_callers() {
+        ensure_test_rpc_secret();
+        let path = "/node_service.NodeService/ReadVersion";
+        let mut headers = gen_tonic_signature_headers("node-a:9000", "node_service.NodeService", "ReadVersion", None)
+            .expect("v2 compatibility headers should build");
+        let signed = verify_tonic_rpc_signature_with_policy("node-a:9000", path, &headers, false, true, false)
+            .expect_err("strict replay scope must reject a signed v2-only request");
+        assert_eq!(signed.to_string(), "RPC replay-scoped authentication required");
+        assert_eq!(tonic_rpc_auth_failure_reason(&signed), "replay_scope_required");
+
+        // A body-digested v2-only mutation must also verify its v2 HMAC before reporting
+        // `replay_scope_required`, without inserting its nonce into the replay cache for a
+        // request that is rejected prior to execution.
+        let digest = hex_simd::encode_to_string(Sha256::digest(b"strict-body"), hex_simd::AsciiCase::Lower);
+        let mutation_path = "/node_service.NodeService/WriteAll";
+        let mutation_headers = gen_tonic_signature_headers("node-a:9000", "node_service.NodeService", "WriteAll", Some(&digest))
+            .expect("body-digested v2 headers should build");
+        let mutation_nonce = Uuid::parse_str(
+            mutation_headers[RPC_NONCE_HEADER]
+                .to_str()
+                .expect("v2 nonce header must be ASCII"),
+        )
+        .expect("body-digested v2 nonce must be a UUID");
+        let mutation_rejected =
+            verify_tonic_rpc_signature_with_policy("node-a:9000", mutation_path, &mutation_headers, false, true, false)
+                .expect_err("strict replay scope must reject a signed body-digested v2-only request");
+        assert_eq!(mutation_rejected.to_string(), "RPC replay-scoped authentication required");
+        assert!(
+            !LOCAL_RPC_NONCE_CACHE
+                .lock()
+                .expect("nonce cache lock")
+                .contains_nonce(&mutation_nonce),
+            "rejected replay_scope_required requests must not consume replay-cache slots"
+        );
+
+        let cross_method =
+            verify_tonic_rpc_signature_with_policy("node-a:9000", "/node_service.NodeService/Ping", &headers, false, true, false)
+                .expect_err("a v2 signature bound to another method must not report replay_scope_required");
+        assert_eq!(cross_method.to_string(), "Invalid RPC v2 signature");
+
+        let wrong_audience = verify_tonic_rpc_signature_with_policy("node-b:9000", path, &headers, false, true, false)
+            .expect_err("a v2 signature bound to another audience must not report replay_scope_required");
+        assert_eq!(wrong_audience.to_string(), "Invalid RPC v2 signature");
+
+        headers.insert(RPC_SIGNATURE_V2_HEADER, HeaderValue::from_static("invalid"));
+        let forged = verify_tonic_rpc_signature_with_policy("node-a:9000", path, &headers, false, true, false)
+            .expect_err("a forged v2 signature must be rejected as invalid_v2_signature");
+        assert_eq!(forged.to_string(), "Invalid RPC v2 signature");
+
+        let legacy = gen_signature_headers(TONIC_RPC_PREFIX, &Method::GET).expect("legacy auth headers should build");
+        for unsigned_or_legacy in [legacy, HeaderMap::new()] {
+            let error = verify_tonic_rpc_signature_with_policy("node-a:9000", path, &unsigned_or_legacy, false, true, false)
+                .expect_err("a request without v2 metadata must be rejected as v2_required");
+            assert_eq!(error.to_string(), "RPC v2 authentication required");
+        }
     }
 
     #[test]

@@ -352,6 +352,31 @@ async fn replica_delete_fanout_state(
     replica_delete_fanout_state_from_config(config, replication_source, version_id, &site_peer_deployment_ids)
 }
 
+/// Whether this delete may clear GOVERNANCE retention on the addressed version.
+///
+/// An explicit bypass header was already authorized for `s3:BypassGovernanceRetention`
+/// by the access layer. A replicated version purge carries no bypass header (#6850),
+/// so we quietly probe `s3:BypassGovernanceRetention` for the caller: `s3:ReplicateDelete`
+/// is part of `s3:*` and must not stand in for the bypass permission or override an
+/// explicit Deny on it. Without the permission, the delete proceeds as a plain version
+/// delete and the WORM gate decides.
+async fn delete_may_bypass_governance(envelope: &mut RequestEnvelope, opts: &ObjectOptions) -> S3Result<bool> {
+    if has_bypass_governance_header(envelope.headers()) {
+        return Ok(true);
+    }
+    if !(opts.replication_request && opts.version_id.is_some()) {
+        return Ok(false);
+    }
+    let suppress_denial_log = std::mem::replace(&mut req_info_mut(envelope)?.suppress_denial_log, true);
+    let auth_res = authorize_request(envelope, Action::S3Action(S3Action::BypassGovernanceRetentionAction)).await;
+    req_info_mut(envelope)?.suppress_denial_log = suppress_denial_log;
+    match auth_res {
+        Ok(()) => Ok(true),
+        Err(err) if err.code() == &S3ErrorCode::AccessDenied => Ok(false),
+        Err(err) => Err(err),
+    }
+}
+
 fn validate_undo_delete_version(expected: Option<&str>, requested: Option<&str>) -> S3Result<()> {
     if expected.is_some() && expected != requested {
         return Err(rustfs_s3_types::S3Error::with_default_message(S3ErrorCode::PreconditionFailed));
@@ -425,31 +450,18 @@ fn is_delete_objects_not_found(error: &EcstoreError) -> bool {
 /// a 1000-key batch from serializing while capping the disk fanout pressure.
 const DELETE_OBJECTS_PRE_STAT_CONCURRENCY: usize = 16;
 
-/// backlog#929 (HP-8): whether the pre-delete `get_object_info` for one entry
-/// of a DeleteObjects batch can be skipped without changing behavior.
-///
-/// The stat result feeds four consumers, and each must be provably idle:
-/// - the app-layer object-lock admission check never runs for deletes that
-///   create a delete marker, and non-lock buckets cannot hold retention or
-///   legal-hold metadata (`bucket_lock_enabled == false`);
-/// - replication reads its authoritative source metadata later while the
-///   SetDisks write lock is held, so it does not consume this advisory stat;
-/// - usage accounting for delete-marker creation goes through
-///   `record_bucket_delete_marker_memory` and never reads the object size
-///   (`accounting_creates_delete_marker` is computed from the same versioning
-///   snapshot the accounting branch uses);
-/// - transitioned-object (ILM tier) cleanup journaling is a no-op for
-///   delete-marker creation because no version is removed, so `ObjSweeper`
-///   produces no journal entry regardless of the stat result.
-///
-/// Object-lock enabled buckets always keep the stat, so their delete path is
-/// byte-for-byte the pre-#929 one (see PR #4297).
+/// Plain deletes get authoritative metadata for accounting, retention and tier
+/// cleanup under the storage write lock. An advisory read would take a second
+/// namespace lock per request entry, including duplicates of a busy key.
 fn can_skip_delete_objects_pre_stat(
     bucket_lock_enabled: bool,
     opts: &ObjectOptions,
     accounting_creates_delete_marker: bool,
+    has_entry_condition: bool,
 ) -> bool {
-    !bucket_lock_enabled && delete_creates_delete_marker(opts) && accounting_creates_delete_marker
+    !bucket_lock_enabled
+        && ((delete_creates_delete_marker(opts) && accounting_creates_delete_marker)
+            || (!opts.versioned && opts.version_id.is_none() && opts.http_preconditions.is_none() && !has_entry_condition))
 }
 
 fn complete_delete_noop(
@@ -844,7 +856,12 @@ impl DefaultObjectUsecase {
             // so evaluate it here with the same inputs to keep the stat-skip
             // decision and the accounting path provably consistent.
             let accounting_creates_delete_marker = object.version_id.is_none() && opts.versioned && !opts.version_suspended;
-            let skip_stat = can_skip_delete_objects_pre_stat(bucket_lock_enabled, &opts, accounting_creates_delete_marker);
+            let skip_stat = can_skip_delete_objects_pre_stat(
+                bucket_lock_enabled,
+                &opts,
+                accounting_creates_delete_marker,
+                object.delete_condition.is_some(),
+            );
 
             prepared_deletes.push(PreparedDelete {
                 idx,
@@ -1305,9 +1322,8 @@ impl DefaultObjectUsecase {
             del_opts_with_versioning(&bucket, &key, version_id, envelope.headers(), metadata, version_cfg, replica)
                 .map_err(ApiError::from)?;
         opts.delete_replication_config_snapshot = Some(Arc::clone(&delete_config_snapshot));
-        opts.object_lock_delete = Some(StorageObjectLockDeleteOptions {
-            bypass_governance: has_bypass_governance_header(envelope.headers()),
-        });
+        let bypass_governance = delete_may_bypass_governance(&mut envelope, &opts).await?;
+        opts.object_lock_delete = Some(StorageObjectLockDeleteOptions { bypass_governance });
         apply_bucket_generation_guard(&envelope, &bucket, &mut opts)?;
         let force_delete = opts.delete_prefix;
 
@@ -1430,12 +1446,8 @@ impl DefaultObjectUsecase {
                             None => Box::pin(store.get_object_info_for_delete(&bucket, &key, &opts)).await.ok(),
                         };
                         if let Some(existing_object_info) = existing_object_info.as_ref()
-                            && let Some(reason) = check_object_lock_for_deletion(
-                                &bucket,
-                                existing_object_info,
-                                has_bypass_governance_header(envelope.headers()),
-                            )
-                            .await
+                            && let Some(reason) =
+                                check_object_lock_for_deletion(&bucket, existing_object_info, bypass_governance).await
                         {
                             return Err(rustfs_s3_types::S3Error::with_message(
                                 rustfs_s3_types::S3ErrorCode::AccessDenied,
@@ -2914,6 +2926,109 @@ mod tests {
 
     #[tokio::test]
     #[serial_test::serial]
+    async fn execute_plain_unversioned_bulk_delete_reaches_storage_for_disabled_and_suspended_buckets() {
+        use crate::app::storage_api::test::DeleteAfterObjectLockSnapshotBarrier;
+        use crate::app::storage_api::test::contract::bucket::{BucketOperations as _, DeleteBucketOptions, MakeBucketOptions};
+
+        let store = crate::app::gating_test_env::shared_gating_ecstore().await;
+        let ambient = crate::app::gating_test_env::shared_gating_ambient().await;
+        let context = Arc::new(AppContext::new(Arc::clone(&store), ambient.iam(), ambient.kms()));
+        for suspended in [false, true] {
+            let bucket = format!("delete-objects-contended-{}", Uuid::new_v4());
+            store
+                .make_bucket(&bucket, &MakeBucketOptions::default())
+                .await
+                .expect("create authorized bucket");
+            let mut reader = PutObjReader::from_vec(b"contended object".to_vec());
+            store
+                .put_object(&bucket, "object", &mut reader, &ObjectOptions::default())
+                .await
+                .expect("put contended object");
+            if suspended {
+                store
+                    .update_bucket_metadata_config(
+                        &bucket,
+                        crate::app::storage_api::test::bucket::metadata::BUCKET_VERSIONING_CONFIG,
+                        b"<VersioningConfiguration><Status>Suspended</Status></VersioningConfiguration>".to_vec(),
+                    )
+                    .await
+                    .expect("suspend fixture versioning");
+            }
+
+            let policy_json = format!(
+                r#"{{"Version":"2012-10-17","Statement":[{{"Effect":"Allow","Principal":{{"AWS":"*"}},"Action":["s3:DeleteObject"],"Resource":["arn:aws:s3:::{bucket}/*"]}}]}}"#
+            );
+            let mut metadata = (*store
+                .get_bucket_metadata(&bucket)
+                .await
+                .expect("authorized bucket metadata should be cached"))
+            .clone();
+            metadata.policy_config = Some(serde_json::from_str(&policy_json).expect("test policy should parse"));
+            metadata.policy_config_json = policy_json.clone().into_bytes();
+            crate::storage::storage_api::set_bucket_metadata(bucket.clone(), metadata)
+                .await
+                .expect("publish test bucket policy");
+
+            let writer = store
+                .new_ns_lock(&bucket, "object")
+                .await
+                .expect("open object namespace lock")
+                .get_write_lock(tokio::time::Duration::from_secs(5))
+                .await
+                .expect("hold a concurrent writer's lock");
+            let admission = DeleteAfterObjectLockSnapshotBarrier::install(&bucket);
+            let usecase = DefaultObjectUsecase::with_context(Some(Arc::clone(&context)));
+            let input = DeleteBatchInput {
+                bucket: bucket.clone(),
+                objects: (0..16)
+                    .map(|_| DeleteBatchEntry {
+                        key: "object".to_owned(),
+                        ..Default::default()
+                    })
+                    .collect(),
+                quiet: None,
+            };
+            let mut req = method_only_delete_envelope(Method::POST);
+            req.install_req_info(crate::storage::req_info::ReqInfo::default());
+            let delete = tokio::spawn(async move { usecase.execute_delete_objects(req, input).await });
+
+            tokio::time::timeout(tokio::time::Duration::from_secs(5), admission.wait_until_paused())
+                .await
+                .expect("a plain batch must reach storage admission without acquiring an advisory read lock");
+            drop(writer);
+            admission.release();
+            let response = tokio::time::timeout(tokio::time::Duration::from_secs(10), delete)
+                .await
+                .expect("delete finishes once the writer releases the key")
+                .expect("delete task joins")
+                .expect("delete returns per-entry results");
+            let deleted = response.deleted.expect("non-quiet delete");
+            assert_eq!(deleted.len(), 16);
+            assert!(
+                deleted
+                    .iter()
+                    .all(|entry| entry.delete_marker.unwrap_or_default() == suspended)
+            );
+            assert!(response.errors.is_none_or(|errors| errors.is_empty()));
+            let read = store
+                .get_object_reader(&bucket, "object", None, HeaderMap::new(), &ObjectOptions::default())
+                .await;
+            assert!(matches!(read, Err(ref error) if is_err_object_not_found(error) || is_err_version_not_found(error)));
+            store
+                .delete_bucket(
+                    &bucket,
+                    &DeleteBucketOptions {
+                        force: suspended,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect("remove verification bucket");
+        }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
     async fn execute_delete_objects_rejects_bucket_recreated_before_publication_admission() {
         use crate::app::storage_api::test::contract::bucket::{BucketOperations as _, DeleteBucketOptions, MakeBucketOptions};
 
@@ -3778,9 +3893,104 @@ mod tests {
         assert_eq!(err.code(), &rustfs_s3_types::S3ErrorCode::AccessDenied);
     }
 
-    // backlog#929 (HP-8): the pre-delete stat may only be skipped when every
-    // consumer of its result is provably idle. Each guard flips one condition
-    // to prove the skip is fenced on all four data dependencies.
+    #[test]
+    #[serial_test::serial]
+    fn replicated_version_purge_bypasses_governance_only_with_bypass_permission() {
+        crate::app::gating_test_env::run_large_stack_test("replicated-purge-governance-bypass", || async {
+            use crate::app::storage_api::test::contract::bucket::{
+                BucketOperations as _, DeleteBucketOptions, MakeBucketOptions,
+            };
+
+            async fn may_bypass(bucket: &str, statements: &str, opts: &ObjectOptions) -> bool {
+                let policy_json = format!(r#"{{"Version":"2012-10-17","Statement":[{statements}]}}"#).replace("BUCKET", bucket);
+                let mut metadata = (*crate::storage::get_bucket_metadata(bucket).await.expect("load test metadata")).clone();
+                metadata.policy_config = Some(serde_json::from_str(&policy_json).expect("parse test policy"));
+                metadata.policy_config_json = policy_json.into_bytes();
+                crate::storage::storage_api::set_bucket_metadata(bucket.to_owned(), metadata)
+                    .await
+                    .expect("publish test policy");
+
+                let mut envelope = method_only_delete_envelope(Method::DELETE);
+                envelope.install_req_info(crate::storage::req_info::ReqInfo {
+                    bucket: Some(bucket.to_owned()),
+                    object: Some("object".to_owned()),
+                    version_id: opts.version_id.clone(),
+                    ..Default::default()
+                });
+                let allowed = delete_may_bypass_governance(&mut envelope, opts)
+                    .await
+                    .expect("a denied bypass probe is not a request error");
+                assert!(
+                    !req_info_ref(&envelope).expect("request info").suppress_denial_log,
+                    "the quiet probe must restore suppress_denial_log"
+                );
+                allowed
+            }
+
+            const ALLOW_REPLICA_DELETE: &str = r#"{"Effect":"Allow","Principal":{"AWS":"*"},"Action":["s3:DeleteObjectVersion","s3:ReplicateDelete"],"Resource":["arn:aws:s3:::BUCKET/*"]}"#;
+            const ALLOW_BYPASS: &str = r#"{"Effect":"Allow","Principal":{"AWS":"*"},"Action":["s3:BypassGovernanceRetention"],"Resource":["arn:aws:s3:::BUCKET/*"]}"#;
+            const ALLOW_ALL: &str =
+                r#"{"Effect":"Allow","Principal":{"AWS":"*"},"Action":["s3:*"],"Resource":["arn:aws:s3:::BUCKET/*"]}"#;
+            const DENY_BYPASS: &str = r#"{"Effect":"Deny","Principal":{"AWS":"*"},"Action":["s3:BypassGovernanceRetention"],"Resource":["arn:aws:s3:::BUCKET/*"]}"#;
+
+            let store = crate::app::gating_test_env::shared_gating_ecstore().await;
+            if current_app_context().is_none() {
+                crate::app::runtime_sources::install_test_app_context(Arc::clone(&store)).await;
+            }
+            let bucket = format!("replicated-purge-bypass-{}", Uuid::new_v4().simple());
+            store
+                .make_bucket(&bucket, &MakeBucketOptions::default())
+                .await
+                .expect("create test bucket");
+
+            let replicated_purge = ObjectOptions {
+                replication_request: true,
+                version_id: Some(Uuid::new_v4().to_string()),
+                ..Default::default()
+            };
+            assert!(
+                !may_bypass(&bucket, ALLOW_REPLICA_DELETE, &replicated_purge).await,
+                "s3:ReplicateDelete alone must not clear GOVERNANCE retention"
+            );
+            assert!(
+                !may_bypass(&bucket, &format!("{ALLOW_ALL},{DENY_BYPASS}"), &replicated_purge).await,
+                "an explicit Deny on s3:BypassGovernanceRetention must hold against replica headers"
+            );
+            assert!(
+                may_bypass(&bucket, &format!("{ALLOW_REPLICA_DELETE},{ALLOW_BYPASS}"), &replicated_purge).await,
+                "a replication identity holding s3:BypassGovernanceRetention still purges without the header"
+            );
+
+            let local_version_delete = ObjectOptions {
+                replication_request: false,
+                ..replicated_purge.clone()
+            };
+            assert!(
+                !may_bypass(&bucket, ALLOW_ALL, &local_version_delete).await,
+                "a local version delete without the bypass header never gets bypass"
+            );
+            let replicated_marker_creation = ObjectOptions {
+                version_id: None,
+                ..replicated_purge
+            };
+            assert!(
+                !may_bypass(&bucket, ALLOW_ALL, &replicated_marker_creation).await,
+                "a replicated delete without a version id creates a delete marker and gets no bypass"
+            );
+
+            store
+                .delete_bucket(
+                    &bucket,
+                    &DeleteBucketOptions {
+                        force: true,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect("remove test bucket");
+        });
+    }
+
     fn delete_marker_creating_opts() -> ObjectOptions {
         ObjectOptions {
             version_id: None,
@@ -3792,12 +4002,12 @@ mod tests {
 
     #[test]
     fn delete_objects_pre_stat_skippable_for_delete_marker_on_plain_bucket() {
-        assert!(can_skip_delete_objects_pre_stat(false, &delete_marker_creating_opts(), true));
+        assert!(can_skip_delete_objects_pre_stat(false, &delete_marker_creating_opts(), true, false));
     }
 
     #[test]
     fn delete_objects_pre_stat_kept_for_object_lock_buckets() {
-        assert!(!can_skip_delete_objects_pre_stat(true, &delete_marker_creating_opts(), true));
+        assert!(!can_skip_delete_objects_pre_stat(true, &delete_marker_creating_opts(), true, false));
     }
 
     #[test]
@@ -3808,39 +4018,50 @@ mod tests {
             version_suspended: false,
             ..Default::default()
         };
-        assert!(!can_skip_delete_objects_pre_stat(false, &opts, true));
+        assert!(!can_skip_delete_objects_pre_stat(false, &opts, true, false));
     }
 
     #[test]
-    fn delete_objects_pre_stat_kept_for_unversioned_buckets() {
-        // Unversioned deletes remove the current object: usage accounting needs
-        // the object size and ILM tier cleanup needs the transition metadata.
-        let opts = ObjectOptions {
-            version_id: None,
-            versioned: false,
-            version_suspended: false,
+    fn delete_objects_pre_stat_skips_plain_unversioned_entries() {
+        let opts = ObjectOptions::default();
+        assert!(can_skip_delete_objects_pre_stat(false, &opts, false, false));
+        assert!(!can_skip_delete_objects_pre_stat(true, &opts, false, false));
+        assert!(!can_skip_delete_objects_pre_stat(false, &opts, false, true));
+    }
+
+    #[test]
+    fn delete_objects_pre_stat_keeps_unversioned_http_conditions_and_version_ids() {
+        let header_condition = ObjectOptions {
+            http_preconditions: Some(Default::default()),
             ..Default::default()
         };
-        assert!(!can_skip_delete_objects_pre_stat(false, &opts, false));
+        assert!(!can_skip_delete_objects_pre_stat(false, &header_condition, false, false));
+
+        for synthetic_version_id in [false, true] {
+            let version_address = ObjectOptions {
+                version_id: Some(Uuid::nil().to_string()),
+                synthetic_version_id,
+                ..Default::default()
+            };
+            assert!(!can_skip_delete_objects_pre_stat(false, &version_address, false, false));
+        }
     }
 
     #[test]
-    fn delete_objects_pre_stat_kept_for_suspended_versioning() {
+    fn delete_objects_pre_stat_skips_plain_suspended_entries() {
         let opts = ObjectOptions {
-            version_id: None,
-            versioned: true,
             version_suspended: true,
             ..Default::default()
         };
-        assert!(!can_skip_delete_objects_pre_stat(false, &opts, false));
+        assert!(can_skip_delete_objects_pre_stat(false, &opts, false, false));
+        assert!(!can_skip_delete_objects_pre_stat(true, &opts, false, false));
+        assert!(!can_skip_delete_objects_pre_stat(false, &opts, false, true));
     }
 
     #[test]
     fn delete_objects_pre_stat_kept_when_accounting_snapshot_disagrees() {
-        // If the accounting-side versioning snapshot does not also classify the
-        // delete as a delete-marker creation, the stat must stay so usage
-        // accounting keeps its size input.
-        assert!(!can_skip_delete_objects_pre_stat(false, &delete_marker_creating_opts(), false));
+        // Keep the existing marker-specific skip tied to the accounting decision.
+        assert!(!can_skip_delete_objects_pre_stat(false, &delete_marker_creating_opts(), false, false));
     }
 
     #[test]

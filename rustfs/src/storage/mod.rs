@@ -27,8 +27,6 @@ pub mod request_context;
 pub(crate) mod request_markers;
 pub mod rpc;
 pub(crate) mod s3_api;
-#[cfg(test)]
-pub(crate) mod s3_compat;
 pub(crate) mod sse;
 pub mod timeout_wrapper;
 pub mod tonic_service;
@@ -40,8 +38,6 @@ mod concurrent_get_object_test;
 pub(crate) mod head_prefix;
 #[cfg(test)]
 mod helpers_test;
-#[cfg(test)]
-pub(crate) mod legacy_s3_test_types;
 #[cfg(test)]
 mod minio_generated_read_test;
 #[cfg(test)]

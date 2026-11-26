@@ -26,7 +26,7 @@ use tracing::{error, info};
 use transform_stream::AsyncTryStream;
 use url::{Host, Url};
 
-static LOCAL_IPS: LazyLock<Vec<IpAddr>> = LazyLock::new(get_local_ips_with_fallback);
+static LOCAL_IPS: LazyLock<HashSet<IpAddr>> = LazyLock::new(|| get_local_ips_with_fallback().into_iter().collect());
 
 #[derive(Debug, Clone)]
 struct DnsCacheEntry {
@@ -203,15 +203,10 @@ pub fn check_local_server_addr(server_addr: &str) -> std::io::Result<SocketAddr>
 /// checks if the given parameter correspond to one of
 /// the local IP of the current machine
 pub fn is_local_host(host: Host<&str>, port: u16, local_port: u16) -> std::io::Result<bool> {
-    let local_set: HashSet<IpAddr> = LOCAL_IPS.iter().copied().collect();
     let is_local_host = match host {
-        Host::Domain(domain) => {
-            let ips = resolve_domain(domain)?.into_iter().collect::<Vec<_>>();
-
-            ips.iter().any(|ip| is_local_ip(&local_set, ip))
-        }
-        Host::Ipv4(ip) => is_local_ip(&local_set, &IpAddr::V4(ip)),
-        Host::Ipv6(ip) => is_local_ip(&local_set, &IpAddr::V6(ip)),
+        Host::Domain(domain) => resolve_domain(domain)?.iter().any(is_local_ip),
+        Host::Ipv4(ip) => is_local_ip(&IpAddr::V4(ip)),
+        Host::Ipv6(ip) => is_local_ip(&IpAddr::V6(ip)),
     };
 
     if port > 0 {
@@ -224,11 +219,8 @@ pub fn is_local_host(host: Host<&str>, port: u16, local_port: u16) -> std::io::R
 /// Whether `ip` belongs to this host: it is either configured on a local
 /// interface or, where the platform routes the full loopback space, a loopback
 /// address.
-fn is_local_ip(local_set: &HashSet<IpAddr>, ip: &IpAddr) -> bool {
-    if local_set.contains(ip) {
-        return true;
-    }
-    is_loopback_local(ip)
+pub fn is_local_ip(ip: &IpAddr) -> bool {
+    LOCAL_IPS.contains(ip) || is_loopback_local(ip)
 }
 
 #[cfg(not(windows))]

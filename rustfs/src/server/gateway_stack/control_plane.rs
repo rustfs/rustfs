@@ -24,6 +24,9 @@
 //! (the admin router), or the ten system reads `admin.rs` serves natively.
 //! Upstream: `server/stack.rs`. Downstream: the gateway signature verifier and the admin router.
 
+mod native_authority;
+mod native_routes;
+
 use super::{GatewayAssembly, GatewayAssemblyError, GatewayStack};
 use crate::admin::operation::AdminResponse;
 use crate::admin::router::{AdminOperation, S3Router, dispatch, object_lambda_target, serve_object_lambda};
@@ -48,6 +51,7 @@ use rustfs_gateway_core::op::{AuthRequirement, ResourceShape};
 use rustfs_gateway_core::registry::{HandlerDeadlineClass, OperationSpec};
 use rustfs_gateway_core::route::{FormClaim, ShadowingDecl};
 use rustfs_gateway_core::{DerivedResourceError, NoDerived};
+use rustfs_gateway_dialect_rustfs_admin::native::extensions::control_plane;
 use rustfs_gateway_dialect_rustfs_admin::ops::{
     check_replication::CheckReplication, get_replication_metrics::GetReplicationMetrics,
     get_replication_metrics_v2::GetReplicationMetricsV2, get_replication_reset_status::GetReplicationResetStatus,
@@ -56,8 +60,7 @@ use rustfs_gateway_dialect_rustfs_admin::ops::{
     reset_bucket_replication::ResetBucketReplication,
 };
 use rustfs_gateway_dialect_rustfs_admin::{
-    AdminOperation as DialectAdminOperation, AdminResponse as WireResponse, CLAIMS, ExtensionOperation, OVERLAY,
-    TABLE_CATALOG_PREFIXES, admin,
+    AdminOperation as DialectAdminOperation, AdminResponse as WireResponse, CLAIMS, OVERLAY, TABLE_CATALOG_PREFIXES, admin,
 };
 use rustfs_gateway_stream::{ByteStream, PayloadCaps, PayloadRead, PayloadStream, StreamError, TrailingHeaders};
 use rustfs_s3_types::{Body, s3_error};
@@ -208,8 +211,7 @@ impl OperationCodec for StsForm {
     }
 }
 
-/// The gateway's query-discriminated extension rows and streamed speedtest row this host serves,
-/// recorded in the gateway's own overlay.
+/// Operations with explicit handlers that this host admits after its router's access check.
 const BORROWED: [&str; 9] = [
     PostV3SpeedtestClientDevnull::NAME,
     ResetBucketReplication::NAME,
@@ -256,16 +258,21 @@ fn dialect() -> Result<Dialect, GatewayAssemblyError> {
         anonymous: true,
         evidence: &[ROUTER],
     });
-    for name in BORROWED {
-        rows.push(OVERLAY.row(name).copied().ok_or(GatewayAssemblyError::AdminOverlayMissing)?);
-    }
+    rows.push(
+        OVERLAY
+            .row(PostV3SpeedtestClientDevnull::NAME)
+            .copied()
+            .ok_or(GatewayAssemblyError::AdminOverlayMissing)?,
+    );
+    rows.extend_from_slice(control_plane::ROWS);
+    native_routes::append_rows(&mut rows);
     let record = RECORD.get_or_init(|| DialectOverlay {
         name: "rustfs-control-plane",
         vendor: OVERLAY.vendor,
         claims: CLAIMS,
         operations: ROWS.get_or_init(|| rows),
     });
-    Dialect::assemble(record)
+    let builder = Dialect::assemble(record)
         .declare_claimed::<ControlPlane>(ROUTE)
         .declare_claimed::<PostV3SpeedtestClientDevnull>(ClaimedRoute {
             precedence: PostV3SpeedtestClientDevnull::PRECEDENCE,
@@ -273,17 +280,98 @@ fn dialect() -> Result<Dialect, GatewayAssemblyError> {
             shadows: SPEEDTEST_SHADOWS,
             bucket_param: PostV3SpeedtestClientDevnull::BUCKET,
         })
-        .declare_form::<StsForm>(STS_ROUTE)
-        .declare::<ResetBucketReplication>(ResetBucketReplication::ROUTE)
-        .declare::<GetReplicationResetStatus>(GetReplicationResetStatus::ROUTE)
-        .declare::<GetReplicationMetricsV2>(GetReplicationMetricsV2::ROUTE)
-        .declare::<GetReplicationMetrics>(GetReplicationMetrics::ROUTE)
-        .declare::<CheckReplication>(CheckReplication::ROUTE)
-        .declare::<InvokeObjectLambda>(InvokeObjectLambda::ROUTE)
-        .declare::<ListenNotification>(ListenNotification::ROUTE)
-        .declare::<ListenBucketNotification>(ListenBucketNotification::ROUTE)
+        .declare_form::<StsForm>(STS_ROUTE);
+    let builder = control_plane::declare(builder);
+    native_routes::declare(builder)
         .build()
         .map_err(GatewayAssemblyError::AdminDialect)
+}
+
+fn object_lambda_dialect() -> Result<Dialect, GatewayAssemblyError> {
+    static ROWS: OnceLock<Vec<OverlayRow>> = OnceLock::new();
+    static SELECTOR: OnceLock<String> = OnceLock::new();
+    static ACTION: OnceLock<String> = OnceLock::new();
+    static STS_SELECTOR: OnceLock<String> = OnceLock::new();
+    static STS_ACTION: OnceLock<String> = OnceLock::new();
+    static RECORD: OnceLock<DialectOverlay> = OnceLock::new();
+    let mut rows = vec![OverlayRow {
+        name: NAME,
+        precedence: ROUTE.precedence,
+        selector: SELECTOR.get_or_init(|| render_claimed_route(&ROUTE)),
+        action: ACTION.get_or_init(|| SPEC.auth.map(|auth| auth.render()).unwrap_or_default()),
+        resource: ResourceShape::Service,
+        success_status: 200,
+        anonymous: true,
+        evidence: &[ROUTER],
+    }];
+    rows.push(OverlayRow {
+        name: STS_NAME,
+        precedence: STS_ROUTE.precedence,
+        selector: STS_SELECTOR.get_or_init(|| STS_CLAIM.render()),
+        action: STS_ACTION.get_or_init(|| STS_SPEC.auth.map(|auth| auth.render()).unwrap_or_default()),
+        resource: ResourceShape::Service,
+        success_status: 200,
+        anonymous: true,
+        evidence: &[ROUTER],
+    });
+    rows.push(
+        OVERLAY
+            .row(PostV3SpeedtestClientDevnull::NAME)
+            .copied()
+            .ok_or(GatewayAssemblyError::AdminOverlayMissing)?,
+    );
+    rows.extend_from_slice(control_plane::ROWS);
+    let record = RECORD.get_or_init(|| DialectOverlay {
+        name: "rustfs-control-plane-object-lambda",
+        vendor: OVERLAY.vendor,
+        claims: CLAIMS,
+        operations: ROWS.get_or_init(|| rows),
+    });
+    let builder = Dialect::assemble(record)
+        .declare_claimed::<ControlPlane>(ROUTE)
+        .declare_claimed::<PostV3SpeedtestClientDevnull>(ClaimedRoute {
+            precedence: PostV3SpeedtestClientDevnull::PRECEDENCE,
+            rows: PostV3SpeedtestClientDevnull::rows(),
+            shadows: SPEEDTEST_SHADOWS,
+            bucket_param: PostV3SpeedtestClientDevnull::BUCKET,
+        })
+        .declare_form::<StsForm>(STS_ROUTE);
+    control_plane::declare(builder)
+        .build()
+        .map_err(GatewayAssemblyError::AdminDialect)
+}
+
+fn assemble_object_lambda_fallback(
+    assembly: &GatewayAssembly,
+    iam: Arc<dyn IamKeyLookup>,
+    root: Arc<dyn RootSource>,
+    router: Arc<S3Router<AdminOperation>>,
+    host: Arc<Host>,
+) -> Result<rustfs_gateway::S3Service, GatewayAssemblyError> {
+    let gate = Admission { router };
+    let authenticator = |authenticator: SigV4Authenticator| {
+        authenticator
+            .hand_caller_secret_to_handlers()
+            .verify_paths_double_encoded_under(TABLE_CATALOG_PREFIXES)
+    };
+    let (builder, _settings) = GatewayStack::configured_builder(assembly, iam, root, gate, authenticator)?
+        .config(super::service_config(assembly.body_read_timeout, CLAIMED_ROUTE_BODY_BYTES));
+    builder
+        .hand_caller_secret_to_every_operation_after_listing_in_the_posture_report()
+        .dialect(&object_lambda_dialect()?)
+        .register::<ControlPlane, _>(Arc::clone(&host))
+        .register::<PostV3SpeedtestClientDevnull, _>(Arc::clone(&host))
+        .register::<StsForm, _>(Arc::clone(&host))
+        .register::<ResetBucketReplication, _>(Arc::clone(&host))
+        .register::<GetReplicationResetStatus, _>(Arc::clone(&host))
+        .register::<GetReplicationMetricsV2, _>(Arc::clone(&host))
+        .register::<GetReplicationMetrics, _>(Arc::clone(&host))
+        .register::<CheckReplication, _>(Arc::clone(&host))
+        .register::<InvokeObjectLambda, _>(Arc::clone(&host))
+        .register::<ListenNotification, _>(Arc::clone(&host))
+        .register::<ListenBucketNotification, _>(host)
+        .build()
+        .map_err(GatewayAssemblyError::Service)
 }
 
 /// Assembles the host over `router`, the admin router the legacy stack mounts.
@@ -304,11 +392,13 @@ pub(super) fn assemble(
             .verify_paths_double_encoded_under(TABLE_CATALOG_PREFIXES)
     };
     let host = Arc::new(Host {
-        router,
+        router: Arc::clone(&router),
         server_ctx: Arc::clone(&assembly.server_ctx),
     });
-    let (builder, _settings) = GatewayStack::configured_builder(&assembly, iam, root, gate, authenticator)?
-        .config(super::service_config(assembly.body_read_timeout, CLAIMED_ROUTE_BODY_BYTES));
+    let (builder, _settings) =
+        GatewayStack::configured_builder(&assembly, Arc::clone(&iam), Arc::clone(&root), gate, authenticator)?
+            .config(super::service_config(assembly.body_read_timeout, CLAIMED_ROUTE_BODY_BYTES));
+    let builder = native_routes::register(builder, &host);
     let service = builder
         .hand_caller_secret_to_every_operation_after_listing_in_the_posture_report()
         .dialect(&dialect()?)
@@ -322,25 +412,27 @@ pub(super) fn assemble(
         .register::<CheckReplication, _>(Arc::clone(&host))
         .register::<InvokeObjectLambda, _>(Arc::clone(&host))
         .register::<ListenNotification, _>(Arc::clone(&host))
-        .register::<ListenBucketNotification, _>(host)
+        .register::<ListenBucketNotification, _>(Arc::clone(&host))
         .build()
         .map_err(GatewayAssemblyError::Service)?;
+    let object_lambda_fallback = assemble_object_lambda_fallback(&assembly, iam, root, router, host)?;
     Ok(GatewayStack {
         service,
         keystone_auth: assembly.keystone_auth,
         control_plane: true,
+        object_lambda_fallback: Some(object_lambda_fallback),
     })
 }
 
 /// The head of a claimed request as the transport handed it over, which the access rule reads.
 #[derive(Clone)]
-struct ClaimedHead {
-    method: Method,
-    uri: Uri,
-    headers: HeaderMap,
+pub(super) struct ClaimedHead {
+    pub(super) method: Method,
+    pub(super) uri: Uri,
+    pub(super) headers: HeaderMap,
     /// Whether the request carried more than one `Authorization` line, which [`attach_head`]
     /// removed before the gateway read the request.
-    repeated_authorization: bool,
+    pub(super) repeated_authorization: bool,
 }
 
 /// Attaches the head of `request` for the access rule, before the gateway reads anything.
@@ -375,7 +467,7 @@ struct Admission {
 
 /// Whether this host has a handler for `operation`.
 fn served(operation: &str) -> bool {
-    [NAME, STS_NAME].contains(&operation) || BORROWED.contains(&operation)
+    [NAME, STS_NAME].contains(&operation) || BORROWED.contains(&operation) || native_routes::contains(operation)
 }
 
 /// The decision once the rule has admitted a request: a served operation, or any signed request,
@@ -389,7 +481,7 @@ fn routed(request: &AuthzRequest<'_>) -> Decision {
 }
 
 impl Admission {
-    fn route(&self, context: &AuthzContext<'_>, request: &AuthzRequest<'_>) -> Result<Decision, HandlerError> {
+    async fn route(&self, context: &AuthzContext<'_>, request: &AuthzRequest<'_>) -> Result<Decision, HandlerError> {
         if !served(request.operation) {
             return Ok(routed(request));
         }
@@ -401,18 +493,31 @@ impl Admission {
         self.router
             .admit(&head.method, &head.uri, &head.headers, signed)
             .map_err(handler_error)?;
-        Ok(if head.repeated_authorization {
-            Decision::Deny
-        } else {
-            Decision::Allow
-        })
+        if head.repeated_authorization {
+            return Ok(Decision::Deny);
+        }
+        if native_routes::contains(request.operation) {
+            if request.operation
+                == rustfs_gateway_dialect_rustfs_admin::native::ops::delete_v3_target_by_target_type_by_target_name::NAME
+            {
+                self.router
+                    .validate_notification_target_params(&head.method, &head.uri)
+                    .map_err(handler_error)?;
+            }
+            if let Err(error) = native_authority::authorize(context, request, head).await {
+                if error.code() == &rustfs_s3_types::S3ErrorCode::AccessDenied {
+                    return Ok(Decision::Deny);
+                }
+                return Err(handler_error(error));
+            }
+        }
+        Ok(Decision::Allow)
     }
 }
 
 impl Authorizer for Admission {
     fn authorize_route<'a>(&'a self, context: &'a AuthzContext<'a>, request: &'a AuthzRequest<'a>) -> BoxFuture<'a, Decision> {
-        let decision = self.route(context, request).unwrap_or(Decision::Deny);
-        Box::pin(async move { decision })
+        Box::pin(async move { self.route(context, request).await.unwrap_or(Decision::Deny) })
     }
 
     fn authorize_route_result<'a>(
@@ -420,8 +525,7 @@ impl Authorizer for Admission {
         context: &'a AuthzContext<'a>,
         request: &'a AuthzRequest<'a>,
     ) -> BoxFuture<'a, Result<Decision, HandlerError>> {
-        let decision = self.route(context, request);
-        Box::pin(async move { decision })
+        Box::pin(self.route(context, request))
     }
 
     fn authorize_input<'a>(

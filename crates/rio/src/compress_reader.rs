@@ -14,7 +14,7 @@
 
 use crate::compress_index::{Index, TryGetIndex};
 use pin_project_lite::pin_project;
-use rustfs_utils::compress::{CompressionAlgorithm, compress_block, decompress_block};
+use rustfs_utils::compress::{CompressionAlgorithm, compress_block, decompress_block_into};
 use rustfs_utils::{put_uvarint, uvarint};
 use std::cmp::min;
 use std::io::{self};
@@ -29,6 +29,11 @@ const COMPRESS_TYPE_END: u8 = 0xFF;
 
 const DEFAULT_BLOCK_SIZE: usize = 1 << 20; // 1MB
 const HEADER_LEN: usize = 8;
+/// Upper bound on the plaintext length a single framed block may declare.
+/// `CompressReader` emits `DEFAULT_BLOCK_SIZE` (1 MiB) blocks and the 24-bit
+/// payload header caps framed blocks below 16 MiB, so this safely accepts all
+/// valid blocks while bounding memory allocated per block decode.
+const MAX_BLOCK_PLAINTEXT_LEN: u64 = 1 << 24;
 
 pin_project! {
     #[derive(Debug)]
@@ -172,7 +177,7 @@ where
 delegate_reader_capabilities_generic_no_index!(CompressReader<R>, inner);
 
 pin_project! {
-    /// A reader wrapper that decompresses data on the fly using DEFLATE algorithm.
+    /// Streams legacy compressed blocks after verifying their decoded length and checksum.
     /// Header format:
     /// - First byte: compression type (00 = compressed, 01 = uncompressed, FF = end)
     /// - Bytes 1-3: length of compressed data (little-endian)
@@ -342,76 +347,19 @@ where
             }
         }
 
-        let typ = this.header_buf[0];
-        let crc = (this.header_buf[4] as u32)
-            | ((this.header_buf[5] as u32) << 8)
-            | ((this.header_buf[6] as u32) << 16)
-            | ((this.header_buf[7] as u32) << 24);
-        let compressed_buf = &this.compressed_buf[..*this.compressed_len];
-        // `compressed_buf`'s length comes from the untrusted 24-bit header length field, so it
-        // can be shorter than 16 bytes. `uvarint` is safe on any slice length (reads at most 10
-        // bytes and stops at the terminator), so pass the whole slice instead of a fixed
-        // `[0..16]` index that panics on corrupted/truncated blocks shorter than 16 bytes.
-        let (uncompress_len, uvarint) = uvarint(compressed_buf);
-        // Reject a length prefix that could not be decoded: `uvarint <= 0` means the varint was
-        // empty/unterminated (0) or overflowed (negative — as usize it would index far past the
-        // buffer and panic the slice below). The `> len` bound is belt-and-suspenders (uvarint's
-        // positive return is always <= buf.len()) but keeps the slice panic-free regardless.
-        if uvarint <= 0 || uvarint as usize > compressed_buf.len() {
-            *this.compressed_read = 0;
-            *this.compressed_len = 0;
-            *this.poisoned = true;
-            return Poll::Ready(Err(io::Error::new(io::ErrorKind::InvalidData, "Invalid compressed block length prefix")));
-        }
-        let compressed_data = &compressed_buf[uvarint as usize..];
-        let decompressed = if typ == COMPRESS_TYPE_COMPRESSED {
-            match decompress_block(compressed_data, *this.compression_algorithm) {
-                Ok(out) => out,
-                Err(e) => {
-                    // error!("DecompressReader decompress_block error: {e}");
-                    *this.compressed_read = 0;
-                    *this.compressed_len = 0;
-                    *this.poisoned = true;
-                    return Poll::Ready(Err(e));
-                }
-            }
-        } else {
-            // The header phase already rejected every type other than
-            // COMPRESS_TYPE_COMPRESSED / COMPRESS_TYPE_UNCOMPRESSED.
-            compressed_data.to_vec()
-        };
-        if decompressed.is_empty() {
-            // The writer never emits zero-length plaintext blocks; an empty
-            // decode surfacing as Ready(Ok) with no bytes would read as EOF and
-            // silently truncate the stream.
-            *this.poisoned = true;
-            *this.compressed_read = 0;
-            *this.compressed_len = 0;
-            return Poll::Ready(Err(io::Error::new(io::ErrorKind::InvalidData, "Empty compressed block")));
-        }
-        if decompressed.len() != uncompress_len as usize {
-            // error!("DecompressReader decompressed length mismatch: {} != {}", decompressed.len(), uncompress_len);
-            *this.compressed_read = 0;
-            *this.compressed_len = 0;
-            *this.poisoned = true;
-            return Poll::Ready(Err(io::Error::new(io::ErrorKind::InvalidData, "Decompressed length mismatch")));
-        }
-        let actual_crc = {
-            let mut hasher = crc_fast::Digest::new(crc_fast::CrcAlgorithm::Crc32IsoHdlc);
-            hasher.update(&decompressed);
-            hasher.finalize() as u32
-        };
-        if actual_crc != crc {
-            // error!("DecompressReader CRC32 mismatch: actual {actual_crc} != expected {crc}");
-            *this.compressed_read = 0;
-            *this.compressed_len = 0;
-            *this.poisoned = true;
-            return Poll::Ready(Err(io::Error::new(io::ErrorKind::InvalidData, "CRC32 mismatch")));
-        }
-        *this.buffer = decompressed;
-        *this.buffer_pos = 0;
+        let result = decode_block(
+            this.header_buf,
+            &this.compressed_buf[..*this.compressed_len],
+            *this.compression_algorithm,
+            this.buffer,
+        );
         *this.compressed_read = 0;
         *this.compressed_len = 0;
+        if let Err(error) = result {
+            this.buffer.clear();
+            *this.poisoned = true;
+            return Poll::Ready(Err(error));
+        }
         let to_copy = min(buf.remaining(), this.buffer.len());
         buf.put_slice(&this.buffer[..to_copy]);
         *this.buffer_pos += to_copy;
@@ -424,6 +372,50 @@ where
 }
 
 delegate_reader_capabilities_generic_no_index!(DecompressReader<R>, inner);
+
+fn decode_block(
+    header: &[u8; HEADER_LEN],
+    payload: &[u8],
+    algorithm: CompressionAlgorithm,
+    output: &mut Vec<u8>,
+) -> io::Result<()> {
+    let (declared_len, prefix_len) = uvarint(payload);
+    let data = usize::try_from(prefix_len)
+        .ok()
+        .filter(|len| *len != 0)
+        .and_then(|len| payload.get(len..))
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "Invalid compressed block length prefix"))?;
+    let declared_len = usize::try_from(declared_len)
+        .ok()
+        .filter(|_| declared_len <= MAX_BLOCK_PLAINTEXT_LEN)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "Compressed block declares an oversized length"))?;
+
+    let compressed = header[0] == COMPRESS_TYPE_COMPRESSED;
+    let plaintext = if compressed {
+        decompress_block_into(data, algorithm, declared_len, output)?;
+        output.as_slice()
+    } else {
+        data
+    };
+    if plaintext.is_empty() {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "Empty compressed block"));
+    }
+    if plaintext.len() != declared_len {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "Decompressed length mismatch"));
+    }
+    let expected_crc = u32::from_le_bytes([header[4], header[5], header[6], header[7]]);
+    let mut hasher = crc_fast::Digest::new(crc_fast::CrcAlgorithm::Crc32IsoHdlc);
+    hasher.update(plaintext);
+    if hasher.finalize() as u32 != expected_crc {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "CRC32 mismatch"));
+    }
+
+    if !compressed {
+        output.clear();
+        output.extend_from_slice(data);
+    }
+    Ok(())
+}
 
 /// Build compressed block with header + uvarint + compressed data
 fn build_compressed_block(uncompressed_data: &[u8], compression_algorithm: CompressionAlgorithm) -> Vec<u8> {
@@ -475,6 +467,43 @@ mod tests {
         decompress_reader.read_to_end(&mut decompressed).await.unwrap();
 
         assert_eq!(&decompressed, data);
+    }
+
+    #[tokio::test]
+    async fn decompress_reader_reuses_the_verified_plaintext_buffer() {
+        let algorithm = CompressionAlgorithm::Lz4;
+        let len = 128 * 1024;
+        let first = vec![0x23; len];
+        let second = vec![0x45; len];
+        let mut stored = build_compressed_block(&first, algorithm);
+        stored.extend_from_slice(&build_compressed_block(&second, algorithm));
+        let mut bad_crc = build_compressed_block(&first, algorithm);
+        bad_crc[4] ^= 1;
+        stored.extend_from_slice(&bad_crc);
+
+        let mut reader = DecompressReader::new(Cursor::new(stored), algorithm);
+        let mut output = vec![0; len];
+        reader.read_exact(&mut output).await.unwrap();
+        assert_eq!(output, first);
+        let allocation = reader.buffer.as_ptr();
+
+        reader.read_exact(&mut output).await.unwrap();
+        assert_eq!(output, second);
+        assert_eq!(
+            reader.buffer.as_ptr(),
+            allocation,
+            "equal-sized blocks should reuse the output allocation"
+        );
+
+        let mut probe = [0xa5; 16];
+        for _ in 0..2 {
+            let error = reader
+                .read(&mut probe)
+                .await
+                .expect_err("a rejected block must never be readable");
+            assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+            assert_eq!(probe, [0xa5; 16]);
+        }
     }
 
     #[tokio::test]
@@ -850,5 +879,105 @@ mod tests {
             .expect_err("unterminated length prefix must error");
         assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
         assert!(err.to_string().contains("length prefix"), "got: {err}");
+    }
+
+    fn build_framed_compressed_block(declared_len: u64, compressed_data: &[u8]) -> Vec<u8> {
+        let mut uvarint_buf = [0u8; 10];
+        let int_len = put_uvarint(&mut uvarint_buf[..], declared_len);
+        let len = compressed_data.len() + int_len;
+        assert!(len < 1 << 24, "fixture must fit the 24-bit length field");
+
+        let mut out = Vec::with_capacity(HEADER_LEN + len);
+        out.push(COMPRESS_TYPE_COMPRESSED);
+        out.push((len & 0xFF) as u8);
+        out.push(((len >> 8) & 0xFF) as u8);
+        out.push(((len >> 16) & 0xFF) as u8);
+        out.extend_from_slice(&[0u8; 4]); // bogus CRC — decoder must reject before CRC
+        out.extend_from_slice(&uvarint_buf[..int_len]);
+        out.extend_from_slice(compressed_data);
+        out
+    }
+
+    fn build_block_declaring(declared_len: u64, plaintext: &[u8], algorithm: CompressionAlgorithm) -> Vec<u8> {
+        let compressed_data = compress_block(plaintext, algorithm);
+        build_framed_compressed_block(declared_len, &compressed_data)
+    }
+
+    #[tokio::test]
+    async fn test_decompress_reader_rejects_block_inflating_past_declared_length() {
+        let plaintext = vec![0u8; 4 << 20];
+        for algorithm in [
+            CompressionAlgorithm::Gzip,
+            CompressionAlgorithm::Deflate,
+            CompressionAlgorithm::Zstd,
+            CompressionAlgorithm::Lz4,
+            CompressionAlgorithm::Brotli,
+            CompressionAlgorithm::Snappy,
+        ] {
+            let input = build_block_declaring(1024, &plaintext, algorithm);
+            let mut decompress_reader = DecompressReader::new(Cursor::new(input), algorithm);
+            let mut out = Vec::new();
+            let err = decompress_reader
+                .read_to_end(&mut out)
+                .await
+                .expect_err("block inflating past its declared length must error");
+            assert_eq!(err.kind(), std::io::ErrorKind::InvalidData, "{algorithm}");
+            assert!(err.to_string().contains("exceeds its declared length"), "{algorithm}: {err}");
+            assert!(out.is_empty(), "no bytes may be produced from a rejected block");
+
+            let mut retry = Vec::new();
+            let second = decompress_reader
+                .read_to_end(&mut retry)
+                .await
+                .expect_err("rejected block must poison the reader");
+            assert_eq!(second.kind(), std::io::ErrorKind::InvalidData, "{algorithm}");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_decompress_reader_rejects_high_ratio_zstd_rle_block() {
+        // 512 x 128 KiB = 64 MiB of zeros encoded in ~2 KiB, declaring only 1 KiB plaintext.
+        let mut zstd_frame = Vec::with_capacity(6 + 512 * 4);
+        zstd_frame.extend_from_slice(&[0x28, 0xB5, 0x2F, 0xFD, 0x00, 0x38]);
+        for idx in 0..512usize {
+            let last_block = u32::from(idx + 1 == 512);
+            let block_header = last_block | (1 << 1) | ((128 * 1024) << 3);
+            zstd_frame.extend_from_slice(&block_header.to_le_bytes()[..3]);
+            zstd_frame.push(0x00);
+        }
+
+        let input = build_framed_compressed_block(1024, &zstd_frame);
+        let mut decompress_reader = DecompressReader::new(Cursor::new(input), CompressionAlgorithm::Zstd);
+        let mut out = Vec::new();
+        let err = decompress_reader
+            .read_to_end(&mut out)
+            .await
+            .expect_err("high-ratio expansion past declared length must error");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("exceeds its declared length"), "got: {err}");
+        assert!(out.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_decompress_reader_rejects_oversized_declared_length() {
+        for declared_len in [MAX_BLOCK_PLAINTEXT_LEN + 1, u64::MAX] {
+            let input = build_block_declaring(declared_len, b"x", CompressionAlgorithm::default());
+            let mut decompress_reader = DecompressReader::new(Cursor::new(input), CompressionAlgorithm::default());
+            let mut out = Vec::new();
+            let err = decompress_reader
+                .read_to_end(&mut out)
+                .await
+                .expect_err("oversized declared length must error");
+            assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+            assert!(err.to_string().contains("oversized length"), "got: {err}");
+            assert!(out.is_empty());
+
+            let mut retry = Vec::new();
+            let second = decompress_reader
+                .read_to_end(&mut retry)
+                .await
+                .expect_err("oversized declaration must poison the reader");
+            assert_eq!(second.kind(), std::io::ErrorKind::InvalidData);
+        }
     }
 }

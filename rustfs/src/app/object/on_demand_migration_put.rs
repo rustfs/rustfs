@@ -299,18 +299,17 @@ impl OdmWriteBack for OnDemandMigrationWriteBack {
 mod tests {
     use super::*;
     use crate::app::storage_api::multipart_usecase::contract::multipart::MultipartOperations as _;
-    use crate::app::storage_api::s3::{
-        PersistedOptionalReplicationStatus, PersistedReplicationConfiguration, PersistedReplicationDestination,
-        PersistedReplicationFilter, PersistedReplicationRule, PersistedReplicationTag, Status,
-    };
     use crate::app::storage_api::test::bucket::utils::serialize;
     use crate::app::storage_api::test::contract::bucket::{BucketOperations as _, DeleteBucketOptions, MakeBucketOptions};
     use crate::app::storage_api::test::{get_global_bucket_metadata_sys, set_bucket_metadata};
     use crate::app::test_seams::{get_envelope, get_object_gateway, get_object_input, read_get_body};
     use crate::on_demand_migration::{PullFailureReason, SourceSse};
+    use rustfs_gateway_types::dto::Status;
     use rustfs_gateway_types::persistence::{
         PersistedBucketEncryptionConfiguration as ServerSideEncryptionConfiguration,
         PersistedBucketEncryptionRule as ServerSideEncryptionRule, PersistedEncryptionByDefault as ServerSideEncryptionByDefault,
+        PersistedOptionalReplicationStatus, PersistedReplicationConfiguration, PersistedReplicationDestination,
+        PersistedReplicationFilter, PersistedReplicationRule, PersistedReplicationTag,
     };
     use rustfs_utils::http::{MINIO_INTERNAL_PREFIX, RUSTFS_INTERNAL_PREFIX, contains_key_str, get_str};
     use sha2::{Digest as Sha256Digest, Sha256};

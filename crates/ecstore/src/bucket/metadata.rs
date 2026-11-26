@@ -741,7 +741,7 @@ impl BucketMetadata {
     }
 
     pub fn save_file_path(&self) -> String {
-        format!("{}/{}/{}", BUCKET_META_PREFIX, self.name.as_str(), BUCKET_METADATA_FILE)
+        bucket_metadata_path(&self.name)
     }
 
     pub fn versioning(&self) -> bool {
@@ -1745,14 +1745,17 @@ pub(crate) async fn load_bucket_metadata_parse_with_presence(
     Ok((bm, persisted))
 }
 
+fn bucket_metadata_path(bucket: &str) -> String {
+    format!("{BUCKET_META_PREFIX}/{bucket}/{BUCKET_METADATA_FILE}")
+}
+
 async fn read_bucket_metadata(api: Arc<ECStore>, bucket: &str) -> Result<BucketMetadata> {
     if bucket.is_empty() {
         error!("bucket name empty");
         return Err(Error::other("invalid argument"));
     }
 
-    let bm = BucketMetadata::new(bucket);
-    let file_path = bm.save_file_path();
+    let file_path = bucket_metadata_path(bucket);
 
     let data = read_config(api, &file_path).await?;
 

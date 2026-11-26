@@ -132,69 +132,6 @@ pub(crate) struct CopyObjectWriteOutput {
 }
 
 #[cfg(test)]
-impl CopyObjectWriteInput {
-    pub(crate) fn from_legacy(input: crate::app::storage_api::s3::dto::CopyObjectInput) -> Self {
-        use crate::app::object_usecase::CopySourceCondition;
-        use crate::app::storage_api::s3::dto::{CopySource, ETag, ETagCondition};
-
-        let condition = |value: ETagCondition| match value {
-            ETagCondition::Any => CopySourceCondition::Any,
-            ETagCondition::ETag(ETag::Strong(value)) => CopySourceCondition::Strong(value),
-            ETagCondition::ETag(ETag::Weak(_)) => CopySourceCondition::Weak,
-        };
-        let copy_source = match &input.copy_source {
-            CopySource::AccessPoint { .. } | CopySource::Outpost { .. } => None,
-            CopySource::Bucket { bucket, key, version_id } => Some(rustfs_gateway_types::CopySourceValue::Bucket {
-                bucket: bucket.to_string(),
-                key: key.to_string(),
-                version_id: version_id.as_ref().map(|v| v.to_string()),
-            }),
-        };
-        CopyObjectWriteInput {
-            copy_source,
-            bucket: input.bucket,
-            key: input.key,
-            version_id: input.version_id,
-            specific_if_none_match: matches!(input.if_none_match, Some(ETagCondition::ETag(_))),
-            server_side_encryption: input.server_side_encryption.map(|value| value.as_str().to_owned()),
-            ssekms_key_id: input.ssekms_key_id,
-            sse_customer_algorithm: input.sse_customer_algorithm,
-            sse_customer_key: input.sse_customer_key,
-            sse_customer_key_md5: input.sse_customer_key_md5,
-            copy_source_sse_customer_algorithm: input.copy_source_sse_customer_algorithm,
-            copy_source_sse_customer_key: input.copy_source_sse_customer_key,
-            copy_source_sse_customer_key_md5: input.copy_source_sse_customer_key_md5,
-            metadata_directive: input.metadata_directive.map(|value| value.as_str().to_owned()),
-            metadata: input.metadata,
-            tagging: input.tagging,
-            tagging_directive: input.tagging_directive.map(|value| value.as_str().to_owned()),
-            copy_source_if_match: input.copy_source_if_match.map(condition),
-            copy_source_if_none_match: input.copy_source_if_none_match.map(condition),
-            copy_source_dates: CopySourceDates {
-                modified_since: input
-                    .copy_source_if_modified_since
-                    .map(|at| OffsetDateTime::from(at).unix_timestamp()),
-                unmodified_since: input
-                    .copy_source_if_unmodified_since
-                    .map(|at| OffsetDateTime::from(at).unix_timestamp()),
-            },
-            cache_control: input.cache_control,
-            content_disposition: input.content_disposition,
-            content_encoding: input.content_encoding,
-            content_language: input.content_language,
-            content_type: input.content_type,
-            expires: input.expires,
-            website_redirect_location: input.website_redirect_location,
-            object_lock_legal_hold_status: input.object_lock_legal_hold_status.map(|value| value.as_str().to_owned()),
-            object_lock_mode: input.object_lock_mode.map(|value| value.as_str().to_owned()),
-            object_lock_retain_until_date: input.object_lock_retain_until_date.map(time::OffsetDateTime::from),
-            storage_class: input.storage_class.map(|value| value.as_str().to_owned()),
-            checksum_algorithm: input.checksum_algorithm.map(|value| value.as_str().to_owned()),
-        }
-    }
-}
-
-#[cfg(test)]
 mod source_condition_tests {
     use super::{CopySourceCondition, CopySourceDates};
     use rustfs_gateway_types::Timestamp;

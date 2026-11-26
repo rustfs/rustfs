@@ -123,10 +123,10 @@ impl<T> IamCache<T>
 where
     T: Store,
 {
-    async fn verify_temp_user_persistence(&self, access_key: &str) -> Result<()> {
+    async fn verify_temp_user_persistence(&self, access_key: &str) -> Result<UserIdentity> {
         for attempt in 0..=TEMP_USER_PERSISTENCE_VERIFY_MAX_RETRIES {
             match self.api.load_user_identity(access_key, UserType::Sts).await {
-                Ok(_) => return Ok(()),
+                Ok(u) => return Ok(u),
                 Err(err)
                     if attempt < TEMP_USER_PERSISTENCE_VERIFY_MAX_RETRIES
                         && (is_err_no_such_user(&err) || is_err_config_not_found(&err)) =>
@@ -1416,12 +1416,14 @@ where
             None
         };
 
-        let mut u = UserIdentity::new(cred.clone());
+        let mut to_save = UserIdentity::new(cred.clone());
+        to_save.sts_generation = generation;
+        self.api.save_user_identity(access_key, UserType::Sts, to_save, None).await?;
+        // Cache the identity as the store loads it so the issuing node holds the decoded token
+        // claims just like a node that loads the session from disk or a peer notification, while
+        // strictly preserving the saved `sts_generation`.
+        let mut u = self.verify_temp_user_persistence(access_key).await?;
         u.sts_generation = generation;
-        self.api
-            .save_user_identity(access_key, UserType::Sts, u.clone(), None)
-            .await?;
-        self.verify_temp_user_persistence(access_key).await?;
 
         let now = self.cache.with_write_lock(|cache| {
             let now = OffsetDateTime::now_utc();
@@ -3012,11 +3014,17 @@ mod tests {
                 return Err(Error::NoSuchUser(name.to_string()));
             }
 
-            self.saved_user
+            let mut loaded = self
+                .saved_user
                 .lock()
                 .expect("saved_user mutex poisoned")
                 .clone()
-                .ok_or_else(|| Error::NoSuchUser(name.to_string()))
+                .ok_or_else(|| Error::NoSuchUser(name.to_string()))?;
+            // Mirror `ObjectStore::load_user_identity`, which decodes JWT claims from the session token.
+            if let Ok(claims) = extract_jwt_claims(&loaded) {
+                loaded.credentials.claims = Some(claims);
+            }
+            Ok(loaded)
         }
 
         async fn load_user(&self, name: &str, user_type: UserType, m: &mut HashMap<String, UserIdentity>) -> Result<()> {
@@ -3316,6 +3324,90 @@ mod tests {
             .get(&cred.access_key)
             .expect("verified temp user should be cached");
         assert_eq!(sts_identity.credentials.parent_user, cred.parent_user);
+    }
+
+    #[tokio::test]
+    async fn set_temp_user_caches_claims_decoded_by_the_store() {
+        let _ = rustfs_credentials::init_global_action_credentials(
+            Some("TESTROOTACCESSKEY".to_string()),
+            Some("TESTROOTSECRET123".to_string()),
+        );
+        let cache = build_test_iam_cache(DelayedTempUserVisibilityStore::new(0));
+        let mut cred = build_test_temp_credentials();
+        let claims = HashMap::from([
+            ("sub".to_string(), json!("subject-123")),
+            (
+                "exp".to_string(),
+                json!((OffsetDateTime::now_utc() + time::Duration::hours(1)).unix_timestamp()),
+            ),
+        ]);
+        cred.session_token = jwt_sign(&claims, &cred.secret_key).expect("sign session token");
+
+        cache
+            .set_temp_user(&cred.access_key, &cred, None)
+            .await
+            .expect("temp user should be stored");
+
+        let listed = cache
+            .list_sts_accounts(&cred.parent_user)
+            .await
+            .expect("temp user should be listable");
+        assert_eq!(listed.len(), 1);
+        assert!(listed[0].session_token.is_empty());
+        assert_eq!(
+            listed[0].claims.as_ref().and_then(|claims| claims.get("sub")),
+            Some(&json!("subject-123")),
+            "the issuing node must cache decoded JWT claims so listed STS sessions retain provider identity"
+        );
+    }
+
+    #[tokio::test]
+    async fn set_temp_user_with_generation_preserves_sts_generation_and_decoded_claims() {
+        let _ = rustfs_credentials::init_global_action_credentials(
+            Some("TESTROOTACCESSKEY".to_string()),
+            Some("TESTROOTSECRET123".to_string()),
+        );
+        let store = DelayedTempUserVisibilityStore::new(0);
+        let cache = build_test_iam_cache(store.clone());
+        let mut cred = build_test_temp_credentials();
+        let claims = HashMap::from([
+            ("sub".to_string(), json!("oidc-subject-456")),
+            (
+                "exp".to_string(),
+                json!((OffsetDateTime::now_utc() + time::Duration::hours(1)).unix_timestamp()),
+            ),
+        ]);
+        cred.session_token = jwt_sign(&claims, &cred.secret_key).expect("sign session token");
+        let generation = [0x5Au8; 16];
+
+        cache
+            .set_temp_user_with_generation(&cred.access_key, &cred, None, Some(generation))
+            .await
+            .expect("temp user with generation should be stored");
+
+        let persisted = store
+            .saved_user
+            .lock()
+            .expect("saved_user mutex poisoned")
+            .clone()
+            .expect("persisted STS identity");
+        assert_eq!(persisted.sts_generation, Some(generation));
+
+        let snapshot = cache.cache.snapshot();
+        let cached = snapshot.sts_accounts.get(&cred.access_key).expect("cached STS identity");
+        assert_eq!(cached.sts_generation, Some(generation));
+        assert_eq!(
+            cached.credentials.claims.as_ref().and_then(|c| c.get("sub")),
+            Some(&json!("oidc-subject-456"))
+        );
+
+        let listed = cache
+            .list_sts_accounts(&cred.parent_user)
+            .await
+            .expect("temp user should be listable");
+        assert_eq!(listed.len(), 1);
+        assert!(listed[0].session_token.is_empty());
+        assert_eq!(listed[0].claims.as_ref().and_then(|c| c.get("sub")), Some(&json!("oidc-subject-456")));
     }
 
     #[tokio::test]

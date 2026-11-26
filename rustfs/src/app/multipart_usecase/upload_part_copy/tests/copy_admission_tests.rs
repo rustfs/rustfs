@@ -13,9 +13,9 @@
 // limitations under the License.
 
 use super::*;
-use crate::app::storage_api::s3::S3ErrorCode;
 use crate::app::storage_api::test::contract::bucket::{BucketOperations, MakeBucketOptions};
 use crate::app::storage_api::test::contract::object::{ObjectIO, ObjectOperations};
+use rustfs_s3_types::S3ErrorCode;
 
 #[test]
 #[serial_test::serial]
@@ -77,7 +77,7 @@ fn upload_part_copy_shares_foreground_admission_with_upload_part() {
             })
         };
         let error = match Box::pin(usecase.execute_upload_part_copy_with_audit(owned_envelope(Method::PUT), input())).await {
-            Err(error) => crate::error::legacy_error_for_test(error),
+            Err(error) => error,
             Ok(_) => panic!("copy must not bypass the occupied UploadPart pool"),
         };
         assert_eq!(error.code(), &S3ErrorCode::SlowDown);
@@ -161,7 +161,7 @@ fn upload_part_copy_shares_foreground_admission_with_upload_part() {
                 )
             };
             let error = match Box::pin(usecase.execute_upload_part_copy_with_audit(owned_envelope(Method::PUT), input)).await {
-                Err(error) => crate::error::legacy_error_for_test(error),
+                Err(error) => error,
                 Ok(_) => panic!("deleted source must fail before conditions or admission"),
             };
             assert_eq!(error.code(), &expected);
@@ -268,7 +268,7 @@ fn upload_part_copy_range_error_and_cancellation_release_foreground_permit() {
             );
             if capped {
                 let error = match response {
-                    Err(error) => crate::error::legacy_error_for_test(error),
+                    Err(error) => error,
                     Ok(_) => panic!("range exceeds destination size limit"),
                 };
                 assert_eq!(error.code(), &S3ErrorCode::EntityTooLarge);

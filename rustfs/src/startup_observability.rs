@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::fmt::Write as _;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -59,6 +60,25 @@ fn configure_metric_gates(metrics_enabled: bool) {
     startup_runtime_sources::set_metrics_enabled(metrics_enabled);
 }
 
+fn format_stage_local_summary(rows: &[rustfs_io_metrics::GetStageLocalSummaryWithMax]) -> (String, String) {
+    let mut summary = String::new();
+    let mut max_ns = String::new();
+    for (index, row) in rows.iter().enumerate() {
+        if index != 0 {
+            summary.push(';');
+            max_ns.push(';');
+        }
+        let stage = &row.summary;
+        let _ = write!(
+            summary,
+            "{}|{}|{}|{}|{}|{}",
+            stage.path, stage.stage, stage.object_class, stage.size_bucket, stage.sampled_count, stage.duration_nanoseconds,
+        );
+        let _ = write!(max_ns, "{}", row.max_duration_nanoseconds);
+    }
+    (summary, max_ns)
+}
+
 fn init_get_stage_local_summary_runtime(ctx: CancellationToken) {
     let interval_secs =
         rustfs_utils::get_env_u64(rustfs_config::observability::ENV_OBS_GET_STAGE_LOCAL_SUMMARY_INTERVAL_SECS, 15).max(1);
@@ -71,20 +91,19 @@ fn init_get_stage_local_summary_runtime(ctx: CancellationToken) {
             tokio::select! {
                 _ = ctx.cancelled() => break,
                 _ = interval.tick() => {
-                    let rows = rustfs_io_metrics::take_get_stage_local_summary();
+                    let rows = rustfs_io_metrics::take_get_stage_local_summary_with_max();
                     let rename = rustfs_io_metrics::snapshot_ecstore_rename_diagnostics();
                     if rows.is_empty() && rename.is_empty() {
                         continue;
                     }
-                    let summary = rows.iter().map(|row| {
-                        format!("{}|{}|{}|{}|{}|{}", row.path, row.stage, row.object_class, row.size_bucket, row.sampled_count, row.duration_nanoseconds)
-                    }).collect::<Vec<_>>().join(";");
+                    // Each maximum uses the same row index as the existing stages field.
+                    let (summary, max_ns) = format_stage_local_summary(&rows);
                     let timestamp_ms = std::time::SystemTime::now()
                         .duration_since(std::time::UNIX_EPOCH)
                         .unwrap_or_default()
                         .as_millis();
                     let line = format!(
-                        "timestamp_ms={timestamp_ms}\tsample_rate={}\tstage_count={}\tstages={summary}\trename_diag_version=4\trename_rpc={}\trename_remote_width={}\trename_batchable_width={}\trename_coverage={}\trename_batch_execution={}\trename_admission={}\trename_quarantine={}\trename_batch_timing_count={}\trename_batch_timing_total_ns={}\trename_batch_timing_max_ns={}\n",
+                        "timestamp_ms={timestamp_ms}\tsample_rate={}\tstage_count={}\tstages={summary}\trename_diag_version=4\trename_rpc={}\trename_remote_width={}\trename_batchable_width={}\trename_coverage={}\trename_batch_execution={}\trename_admission={}\trename_quarantine={}\trename_batch_timing_count={}\trename_batch_timing_total_ns={}\trename_batch_timing_max_ns={}\tstage_max_ns={max_ns}\n",
                         rustfs_io_metrics::get_stage_local_summary_sample_rate(),
                         rows.len(),
                         rustfs_io_metrics::ECSTORE_RENAME_RPC_KINDS.iter().zip(rename.rpc_counts).map(|(label, count)| format!("{label}:{count}")).collect::<Vec<_>>().join(","),
@@ -141,6 +160,7 @@ mod tests {
 
                 rustfs_io_metrics::record_get_object_stage_duration("legacy_duplex", "metadata", 0.001);
                 rustfs_io_metrics::record_get_object_stage_duration("legacy_duplex", "metadata", 0.003);
+                rustfs_io_metrics::record_get_object_stage_duration("legacy_duplex", "metadata", 0.002);
                 rustfs_io_metrics::record_get_object_stage_duration_by_size(
                     "legacy_duplex",
                     "inline_direct.decode",
@@ -149,14 +169,29 @@ mod tests {
                     0.002,
                 );
 
-                let rows = rustfs_io_metrics::take_get_stage_local_summary();
+                let rows = rustfs_io_metrics::take_get_stage_local_summary_with_max();
                 let metadata = rows
                     .iter()
-                    .find(|row| row.path == "legacy_duplex" && row.stage == "metadata")
+                    .find(|row| row.summary.path == "legacy_duplex" && row.summary.stage == "metadata")
                     .expect("local summary should retain sampled metadata observations");
-                assert_eq!(metadata.sampled_count, 2);
-                assert_eq!(metadata.duration_nanoseconds, 4_000_000);
-                assert!(rows.iter().any(|row| row.size_bucket == "le_4kib"));
+                assert_eq!(metadata.summary.sampled_count, 3);
+                assert_eq!(metadata.summary.duration_nanoseconds, 6_000_000);
+                assert_eq!(metadata.max_duration_nanoseconds, 3_000_000);
+                assert_eq!(
+                    format_stage_local_summary(&rows),
+                    (
+                        "legacy_duplex|inline_direct.decode|plain_single_part|le_4kib|1|2000000;legacy_duplex|metadata|||3|6000000"
+                            .into(),
+                        "2000000;3000000".into(),
+                    )
+                );
+
+                rustfs_io_metrics::record_get_object_stage_duration("legacy_duplex", "metadata", 0.001);
+                let rows = rustfs_io_metrics::take_get_stage_local_summary_with_max();
+                assert_eq!(
+                    format_stage_local_summary(&rows),
+                    ("legacy_duplex|metadata|||1|1000000".into(), "1000000".into())
+                );
             });
         });
 
