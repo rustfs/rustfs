@@ -10668,40 +10668,43 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
             return (del_objects, del_errs, accounting);
         }
 
-        let mut del_obj_errs: Vec<Vec<Option<DiskError>>> = vec![vec![None; objects.len()]; disks.len()];
-
-        // For each disk delete all objects
-        for (disk_idx, errors) in results.into_iter().enumerate() {
-            // Deletion results for all objects
-            for idx in 0..vers.len() {
-                if errors[idx].is_some() {
-                    for fi in vers[idx].versions.iter() {
-                        del_obj_errs[disk_idx][fi.idx] = errors[idx].clone();
-                    }
-                }
+        let write_quorum = self.set_drive_count / 2 + 1;
+        let missing_group_error = (results.len() < write_quorum).then_some(DiskError::ErasureWriteQuorum);
+        let mut group_by_object = vec![None; objects.len()];
+        let mut group_results = Vec::with_capacity(vers.len());
+        let mut disk_errors = Vec::with_capacity(disks.len());
+        for (group_index, group) in vers.iter().enumerate() {
+            for version in &group.versions {
+                group_by_object[version.idx] = Some(group_index);
             }
-        }
-
-        for obj_idx in 0..objects.len() {
-            let mut disk_err = vec![None; disks.len()];
-
-            for disk_idx in 0..disks.len() {
-                if del_obj_errs[disk_idx][obj_idx].is_some() {
-                    disk_err[disk_idx] = del_obj_errs[disk_idx][obj_idx].clone();
-                }
+            let has_disk_error = results.iter().any(|errors| errors[group_index].is_some());
+            if !has_disk_error {
+                group_results.push((false, missing_group_error.clone()));
+                continue;
             }
-
-            let mut has_err = reduce_write_quorum_errs(&disk_err, OBJECT_OP_IGNORED_ERRS, self.set_drive_count / 2 + 1);
-            if disk_err
+            disk_errors.clear();
+            disk_errors.extend(results.iter().map(|errors| errors[group_index].clone()));
+            let error = if !is_meta_bucketname(bucket)
+                && disk_errors.iter().flatten().any(super::delete_recovery::unsupported_recovery)
+            {
+                Some(DiskError::UnsupportedDisk)
+            } else if disk_errors
                 .iter()
                 .flatten()
                 .any(|error| matches!(error, DiskError::GuardedDeleteUnsupported))
             {
-                has_err = Some(DiskError::GuardedDeleteUnsupported);
-            }
-            if !is_meta_bucketname(bucket) && disk_err.iter().flatten().any(super::delete_recovery::unsupported_recovery) {
-                has_err = Some(DiskError::UnsupportedDisk);
-            }
+                Some(DiskError::GuardedDeleteUnsupported)
+            } else {
+                reduce_write_quorum_errs(&disk_errors, OBJECT_OP_IGNORED_ERRS, write_quorum)
+            };
+            group_results.push((true, error));
+        }
+
+        for obj_idx in 0..objects.len() {
+            let mut has_err = match group_by_object[obj_idx] {
+                Some(group_index) => group_results[group_index].1.clone(),
+                None => missing_group_error.clone(),
+            };
             if let Some(err) = has_err.clone() {
                 let er = err.into();
                 if (is_err_object_not_found(&er) || is_err_version_not_found(&er)) && !del_objects[obj_idx].delete_marker {
@@ -10813,7 +10816,7 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
         let mut rollback_futures = Vec::new();
         let committed_receipt_indices =
             committed_tier_free_version_receipt_indices(&vers, &del_errs, &tier_free_version_receipt_candidates);
-        for fi_vers in &vers {
+        for (group_index, fi_vers) in vers.iter().enumerate() {
             if published_groups.contains(&fi_vers.name) {
                 continue;
             }
@@ -10824,7 +10827,7 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
                 // staged + applied the delete and then errored is still restored (the
                 // disk-side undo is idempotent, no-op when nothing was staged). On
                 // success, skip the errored disks and only clean up successful ones.
-                if !should_rollback && fi_vers.versions.iter().any(|fi| del_obj_errs[disk_idx][fi.idx].is_some()) {
+                if !should_rollback && results[disk_idx][group_index].is_some() {
                     continue;
                 }
 
@@ -11002,7 +11005,8 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
             .enumerate()
             .filter_map(|(index, purge)| {
                 let purge = purge?;
-                if del_errs[index].is_some() || !del_obj_errs.iter().any(|errors| errors[index].is_some()) {
+                let had_disk_error = group_by_object[index].is_some_and(|group_index| group_results[group_index].0);
+                if del_errs[index].is_some() || !had_disk_error {
                     return None;
                 }
                 let version = objects[index].version_id.filter(|version| !version.is_nil())?;
