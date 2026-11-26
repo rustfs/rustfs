@@ -460,8 +460,6 @@ impl PoolEndpointList {
             }
         }
 
-        validate_local_physical_disk_independence(pool_endpoint_list.as_ref())?;
-
         let setup_type = match pool_endpoint_list.as_ref()[0].as_ref()[0].get_type() {
             EndpointType::Path => SetupType::Erasure,
             EndpointType::Url => match unique_args.len() {
@@ -470,8 +468,6 @@ impl PoolEndpointList {
             },
         };
 
-        pool_endpoint_list.setup_type = setup_type;
-
         let total_endpoints: usize = pool_endpoint_list.inner.iter().map(|eps| eps.as_ref().len()).sum();
         let local_endpoints = pool_endpoint_list
             .inner
@@ -479,6 +475,25 @@ impl PoolEndpointList {
             .flat_map(|eps| eps.as_ref())
             .filter(|ep| ep.is_local)
             .count();
+        // A storage member can belong to just one pool, but it must own a slot somewhere in the topology.
+        if local_endpoints == 0 {
+            let local_port = server_addr.port();
+            if local_endpoint_host.is_some() {
+                return Err(Error::other(format!(
+                    "{ENV_LOCAL_ENDPOINT_HOST} does not match any distributed endpoint on the local server port {local_port}"
+                )));
+            }
+            return Err(Error::new(
+                ErrorKind::InvalidInput,
+                format!(
+                    "no local storage endpoints on the local server port {local_port}; \
+                     check that a host in RUSTFS_VOLUMES resolves to a local interface and uses the RUSTFS_ADDRESS port"
+                ),
+            ));
+        }
+
+        validate_local_physical_disk_independence(pool_endpoint_list.as_ref())?;
+        pool_endpoint_list.setup_type = setup_type;
         info!(
             target: "rustfs::ecstore::endpoints",
             mode = ?policy.mode,
@@ -529,7 +544,6 @@ impl PoolEndpointList {
         raw_local_host: &str,
     ) -> Result<()> {
         let local_host = parse_explicit_local_endpoint_host(raw_local_host)?;
-        let mut local_endpoint_found = false;
         let mut host_path_ports = HashMap::new();
         debug_assert_eq!(self.inner.len(), disks_layout.pools.len());
 
@@ -575,15 +589,7 @@ impl PoolEndpointList {
                         entry.insert(endpoint_port);
                     }
                 }
-
-                local_endpoint_found |= endpoint.is_local;
             }
-        }
-
-        if !local_endpoint_found {
-            return Err(Error::other(format!(
-                "{ENV_LOCAL_ENDPOINT_HOST} does not match any distributed endpoint on the local server port {local_port}"
-            )));
         }
 
         Ok(())
@@ -2020,11 +2026,11 @@ mod test {
         // trip the DNS-IP cross-port check in bounded mode but must be deferred
         // (allowed) in orchestrated mode, where headless-service records can
         // still be flapping.
-        let args = vec![
+        let args = [
             "http://192.0.2.10:9000/export",
             "http://192.0.2.10:9001/export",
             "http://192.0.2.11:9000/export",
-            "http://192.0.2.12:9000/export",
+            "http://127.0.0.1:9000/export",
         ];
         let layout = DisksLayout::from_volumes(args.as_slice()).unwrap();
 
@@ -2044,6 +2050,24 @@ mod test {
             .await
             .expect("orchestrated mode should defer the DNS-IP cross-port check");
         assert_eq!(resolved.setup_type, SetupType::DistErasure);
+    }
+
+    #[tokio::test]
+    async fn rejects_startup_when_no_endpoint_is_local() {
+        for volumes in [
+            ["http://192.0.2.10:9000/data", "http://192.0.2.11:9000/data"],
+            ["http://192.0.2.10:9000/data", "http://127.0.0.1:9001/data"],
+            ["http://192.0.2.10:9000/data1", "http://192.0.2.10:9000/data2"],
+        ] {
+            let layout = DisksLayout::from_volumes(&volumes).expect("URL topology should parse");
+            for policy in [bounded_test_policy(), orchestrated_test_policy()] {
+                let err = EndpointServerPools::create_server_endpoints_with("0.0.0.0:9000", &layout, Some(policy), None)
+                    .await
+                    .expect_err("startup must reject a topology with no local endpoints");
+                assert_eq!(err.kind(), ErrorKind::InvalidInput);
+                assert!(err.to_string().contains("no local storage endpoints"), "{err}");
+            }
+        }
     }
 
     #[test]

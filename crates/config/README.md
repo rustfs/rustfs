@@ -106,6 +106,7 @@ when restoring `/rustfs/console` for a custom OEM build.
 ## Distributed endpoint locality
 
 - `RUSTFS_LOCAL_ENDPOINT_HOST` identifies this server's host in a distributed `RUSTFS_VOLUMES` topology without resolving every peer during startup. Set it to exactly one host, without a scheme, port, or path. It is accepted only for orchestrated URL topologies and must match at least one endpoint on the RustFS server port; invalid or unmatched values fail startup. Leave it unset to retain DNS-based locality discovery.
+- If DNS-based locality discovery finds no local endpoint across the configured pools, startup exits before opening the service listener. Check that this member's advertised hostname resolves to an address on a local interface and that its endpoint port matches `RUSTFS_ADDRESS`. Once DNS is correct, the next start can discover the local endpoint.
 
 ## Scanner environment aliases
 
