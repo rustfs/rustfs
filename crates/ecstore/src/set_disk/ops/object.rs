@@ -5899,7 +5899,8 @@ impl SetDisks {
                 );
                 prepared
             } else {
-                (shuffle_disks.clone(), vec![None; shuffle_disks.len()])
+                let tokens = vec![None; shuffle_disks.len()];
+                (shuffle_disks, tokens)
             };
             let commit_context_prepare_started = rustfs_io_metrics::put_stage_timer();
             let transaction_epoch =
