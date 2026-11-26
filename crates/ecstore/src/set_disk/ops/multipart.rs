@@ -1268,8 +1268,22 @@ where
     }
 
     if successful_responses < read_quorum {
-        // A single missing directory cannot speak for unavailable disks.
-        if !errs.is_empty() && errs.iter().all(|err| matches!(err, Some(DiskError::FileNotFound))) {
+        // A single missing directory cannot speak for unavailable disks, but once
+        // at least `read_quorum` disks confirm the part directory is absent and
+        // strictly fewer than `read_quorum` disks are unavailable (with no
+        // non-ignored errors), no readable part quorum can exist on the offline
+        // disks.
+        let file_not_found = errs.iter().filter(|err| matches!(err, Some(DiskError::FileNotFound))).count();
+        let only_missing_or_ignored = errs.iter().all(|err| match err {
+            Some(DiskError::FileNotFound) => true,
+            Some(err) => OBJECT_OP_IGNORED_ERRS.contains(err),
+            None => false,
+        });
+        if !errs.is_empty()
+            && file_not_found >= read_quorum
+            && only_missing_or_ignored
+            && errs.len().saturating_sub(file_not_found) < read_quorum
+        {
             return Err(DiskError::FileNotFound);
         }
 
@@ -9567,6 +9581,41 @@ mod tests {
             .await
             .expect_err("all missing directories are empty");
         assert_eq!(err, DiskError::FileNotFound);
+    }
+
+    #[tokio::test]
+    async fn collect_list_parts_results_proves_empty_upload_with_sub_quorum_offline_disks() {
+        let degraded = vec![
+            Err::<Vec<String>, _>(DiskError::DiskNotFound),
+            Err(DiskError::FileNotFound),
+            Err(DiskError::FileNotFound),
+            Err(DiskError::FileNotFound),
+        ]
+        .into_iter()
+        .map(|outcome| async move { outcome })
+        .collect();
+        assert_eq!(
+            collect_list_parts_results(degraded, 2)
+                .await
+                .expect_err("one offline disk cannot hold a read quorum of parts"),
+            DiskError::FileNotFound
+        );
+
+        let ambiguous = vec![
+            Err::<Vec<String>, _>(DiskError::DiskNotFound),
+            Err(DiskError::DiskNotFound),
+            Err(DiskError::FileNotFound),
+            Err(DiskError::FileNotFound),
+        ]
+        .into_iter()
+        .map(|outcome| async move { outcome })
+        .collect();
+        assert_eq!(
+            collect_list_parts_results(ambiguous, 2)
+                .await
+                .expect_err("two offline disks could still hold a read quorum of parts"),
+            DiskError::ErasureReadQuorum
+        );
     }
 
     #[test]
