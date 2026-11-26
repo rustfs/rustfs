@@ -3318,32 +3318,38 @@ fn process_connection(
         };
         // ── Canonical External Middleware Stack Order (outermost → innermost) ──
         // This order MUST be preserved across refactorings.
-        // Only AddExtensionLayer (layers 1-2) are per-connection; most remaining layers are stateless.
+        // Only AddExtensionLayer (layers 1-2) are per-connection; layers 3-24 are stateless or conditional.
         //
         //  1. AddExtensionLayer<RemoteAddr>           — per-connection peer address
         //  2. AddExtensionLayer<SocketAddr>           — per-connection raw socket addr (TrustedProxy)
         //  3. TrustedProxyLayer                       — conditional, parses X-Forwarded-For
-        //  4. ExternalRequestContextLayer            — S3 canonical ID / control-plane propagated ID
-        //  5. StsQueryApiCompatLayer                 — route-scoped STS envelopes, including outer short-circuit errors
-        //  6. EmptyBodyContentLengthCompatLayer       — adds Content-Length: 0 for known empty-body API routes
-        //  7. CatchPanicLayer                        — panic → 500
-        //  8. RateLimitLayer                         — conditional (external stack only), per-client 429 throttling
-        //  9. ReadinessGateLayer                     — blocks until ready
-        // 10. KeystoneAuthLayer                      — X-Auth-Token validation
-        // 11. TraceLayer                             — request span creation + metrics
-        // 12. RequestLoggingLayer                    — single completion event per request
-        // 13. CompressionLayer                       — response compression predicate (whitelist, path-aware)
-        // 14. PathCategoryInjectionLayer             — injects path category when compression is enabled
-        // 15. IcebergRestErrorCompatLayer            — Iceberg REST JSON error compatibility
-        //     PostObjectLocationFixLayer             — absolute, encoded POST Object Location
-        // 16. ConditionalCorsLayer                   — S3 API CORS
-        // 17. RedirectLayer                          — console redirect (conditional)
-        // 18. BodylessStatusFixLayer                 — clears body for 1xx/204/205/304 responses
-        // 19. HeadRequestBodyFixLayer                — strips actual body bytes from HEAD responses
-        // 20. PublicHealthEndpointLayer              — handles public health before the stack
-        // `tests::stack_census` pins this order against the real `external_service_stack!`
-        // expansion. Layers 5, 6, 15, 18 and 19 live in `server::legacy_compat`;
-        // T2.12 (rustfs/backlog#2771) removes them.
+        //  4. MapRequest                              — HTTP/3 forwarded-proto normalization
+        //  5. ExternalRequestContextLayer             — S3 canonical ID / control-plane propagated ID
+        //  6. StsQueryApiCompatLayer                  — route-scoped STS envelopes, including outer short-circuit errors
+        //  7. EmptyBodyContentLengthCompatLayer       — adds Content-Length: 0 for admin, console and internode routes (S3 half retired)
+        //  8. CatchPanicLayer                         — panic → 500
+        //  9. RateLimitLayer                          — conditional (external stack only), per-client 429 throttling
+        // 10. SsecTransportLayer                      — SSE-C plaintext transport check / RUSTFS_SSE_C_REQUIRE_TLS
+        // 11. ReadinessGateLayer                      — blocks until ready
+        // 12. KeystoneAuthLayer                       — X-Auth-Token validation
+        // 13. InFlightLayer                           — RAII in-flight request gauge guard
+        // 14. TraceLayer                              — request span creation + metrics
+        // 15. RequestLoggingLayer                     — single completion event per request
+        // 16. CompressionLayer                        — response compression predicate (whitelist, path-aware)
+        // 17. PathCategoryInjectionLayer              — conditional, injects path category when compression is enabled
+        // 18. IcebergRestErrorCompatLayer             — Iceberg REST JSON error compatibility
+        // 19. PostObjectLocationFixLayer              — absolute, encoded POST Object Location
+        // 20. ConditionalCorsLayer                    — S3 API CORS
+        // 21. RedirectLayer                           — console redirect (conditional)
+        // 22. BodylessStatusFixLayer                  — clears body for 1xx/204/205/304 responses across gateway/website/console
+        // 23. HeadRequestBodyFixLayer                 — strips actual body bytes from HEAD responses across gateway/website/console
+        // 24. PublicHealthEndpointLayer               — handles public health before the stack
+        // `tests::stack_census` and `tests::middleware_matrix_census` pin this 24-layer order
+        // against the real `external_service_stack!` expansion. Per T2.12 (rustfs/backlog#2771),
+        // the five S3-only s3s patch layers were deleted (SigV4HeaderGuard, S3ErrorMessageCompat,
+        // DoubleSlashListBucketsCompat, VirtualHostStyleHint, ObjectAttributesEtagFix), while
+        // layers 6, 7, 18, 22 and 23 in `server::legacy_compat` remain retained on the outer stack
+        // for their active non-S3 / shared outer-edge responsibilities.
         // The internode lane below intentionally keeps only the shared
         // transport/auth/observability subset needed by `/rustfs/rpc/...`.
         // ─────────────────────────────────────────────────────────────
@@ -7078,10 +7084,11 @@ mod tests {
             DEFAULT_H2_MAX_HEADER_LIST_SIZE, DEFAULT_HTTP1_HEADER_READ_TIMEOUT, DEFAULT_HTTP1_MAX_BUF_SIZE,
         };
 
-        /// Number of middleware layers in the canonical stack order (see http.rs).
-        /// Layers 1-2 are per-connection (AddExtension), 3-22 are stateless
-        /// (includes InFlightLayer, added for backlog#806-35).
-        pub const MIDDLEWARE_LAYER_COUNT: usize = 22;
+        /// Number of middleware layers in the canonical external stack order (see `EXTERNAL_STACK_CENSUS`).
+        /// Layers 1-2 are per-connection (`AddExtension`), 3-24 are stateless or conditional
+        /// middleware layers retained after T2.12 (`rustfs/backlog#2771`) deleted the five
+        /// S3-only s3s patch layers.
+        pub const MIDDLEWARE_LAYER_COUNT: usize = 24;
 
         /// Current HTTP/2 defaults (from rustfs_config).
         pub const H2_INITIAL_STREAM_WINDOW_SIZE: u32 = DEFAULT_H2_INITIAL_STREAM_WINDOW_SIZE;
@@ -7137,7 +7144,8 @@ mod tests {
 
     #[test]
     fn test_baseline_middleware_count() {
-        assert_eq!(baseline::MIDDLEWARE_LAYER_COUNT, 22);
+        assert_eq!(baseline::MIDDLEWARE_LAYER_COUNT, 24);
+        assert_eq!(baseline::MIDDLEWARE_LAYER_COUNT, EXTERNAL_STACK_CENSUS.len());
     }
 
     #[test]
@@ -10370,8 +10378,53 @@ mod tests {
         );
     }
 
-    #[test]
-    fn stack_census() {
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum MatrixVerdict {
+        /// RustFS-owned / non-s3s middleware kept on the external stack.
+        Keep,
+        /// Retained outer-edge compatibility layer in `server::legacy_compat` still serving
+        /// non-S3 or shared outer-edge responsibilities per T2.12 (`rustfs/backlog#2771`).
+        KeepRetainedCompat,
+    }
+
+    const EXTERNAL_MIDDLEWARE_MATRIX: [(&str, MatrixVerdict); 24] = [
+        ("AddExtension", MatrixVerdict::Keep),
+        ("AddExtension", MatrixVerdict::Keep),
+        ("TrustedProxyMiddleware", MatrixVerdict::Keep),
+        ("MapRequest", MatrixVerdict::Keep),
+        ("ExternalRequestContextService", MatrixVerdict::Keep),
+        ("StsQueryApiCompatService", MatrixVerdict::KeepRetainedCompat),
+        ("EmptyBodyContentLengthCompatService", MatrixVerdict::KeepRetainedCompat),
+        ("CatchPanic", MatrixVerdict::Keep),
+        ("RateLimitService", MatrixVerdict::Keep),
+        ("SsecTransportService", MatrixVerdict::Keep),
+        ("ReadinessGateService", MatrixVerdict::Keep),
+        ("KeystoneAuthMiddleware", MatrixVerdict::Keep),
+        ("InFlightService", MatrixVerdict::Keep),
+        ("Trace", MatrixVerdict::Keep),
+        ("RequestLoggingService", MatrixVerdict::Keep),
+        ("Compression", MatrixVerdict::Keep),
+        ("PathCategoryInjectionService", MatrixVerdict::Keep),
+        ("IcebergRestErrorCompatService", MatrixVerdict::KeepRetainedCompat),
+        ("PostObjectLocationFixService", MatrixVerdict::Keep),
+        ("ConditionalCorsService", MatrixVerdict::Keep),
+        ("RedirectService", MatrixVerdict::Keep),
+        ("BodylessStatusFixService", MatrixVerdict::KeepRetainedCompat),
+        ("HeadRequestBodyFixService", MatrixVerdict::KeepRetainedCompat),
+        ("PublicHealthEndpointService", MatrixVerdict::Keep),
+    ];
+
+    /// S3-only s3s patch layers deleted in T2.12 (`rustfs/backlog#2771`); none may reappear on the
+    /// external gateway stack.
+    const RETIRED_S3S_COMPAT_LAYERS: [&str; 5] = [
+        "SigV4HeaderGuard",
+        "S3ErrorMessageCompat",
+        "DoubleSlashListBucketsCompat",
+        "VirtualHostStyleHint",
+        "ObjectAttributesEtagFix",
+    ];
+
+    fn rendered_external_stack_census() -> Vec<String> {
         let inner = tower::service_fn(|_request: HttpRequest<Incoming>| async {
             Ok::<_, Box<dyn std::error::Error + Send + Sync>>(Response::new(crate::server::hybrid::HybridBody::<
                 s3s::Body,
@@ -10396,10 +10449,52 @@ mod tests {
         );
         fn pin_request_type<S: Service<HttpRequest<Incoming>>>(_: &S) {}
         pin_request_type(&stack);
-        let rendered = render_stack_census(std::any::type_name_of_val(&stack));
+        render_stack_census(std::any::type_name_of_val(&stack))
+    }
+
+    #[test]
+    fn stack_census() {
+        let rendered = rendered_external_stack_census();
         assert_eq!(
             rendered, EXTERNAL_STACK_CENSUS,
             "the external stack order drifted from the committed census"
         );
+    }
+
+    #[test]
+    fn middleware_matrix_census() {
+        let rendered = rendered_external_stack_census();
+        let matrix_names: Vec<&str> = EXTERNAL_MIDDLEWARE_MATRIX.iter().map(|(name, _)| *name).collect();
+        assert_eq!(
+            matrix_names, EXTERNAL_STACK_CENSUS,
+            "T2.12 middleware matrix drifted from EXTERNAL_STACK_CENSUS"
+        );
+        assert_eq!(
+            rendered, matrix_names,
+            "real external_service_stack! expansion drifted from T2.12 middleware matrix"
+        );
+        assert_eq!(
+            EXTERNAL_MIDDLEWARE_MATRIX.len(),
+            baseline::MIDDLEWARE_LAYER_COUNT,
+            "baseline::MIDDLEWARE_LAYER_COUNT must match the 24-layer T2.12 matrix"
+        );
+
+        let keep_count = EXTERNAL_MIDDLEWARE_MATRIX
+            .iter()
+            .filter(|(_, verdict)| *verdict == MatrixVerdict::Keep)
+            .count();
+        let retained_compat_count = EXTERNAL_MIDDLEWARE_MATRIX
+            .iter()
+            .filter(|(_, verdict)| *verdict == MatrixVerdict::KeepRetainedCompat)
+            .count();
+        assert_eq!(keep_count, 19);
+        assert_eq!(retained_compat_count, 5);
+
+        for retired in RETIRED_S3S_COMPAT_LAYERS {
+            assert!(
+                !rendered.iter().any(|layer| layer.contains(retired)),
+                "retired s3s compat layer `{retired}` must not be mounted on the gateway stack: {rendered:?}"
+            );
+        }
     }
 }
