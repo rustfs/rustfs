@@ -198,13 +198,11 @@ impl PostObjectFormPolicy {
     }
 
     pub(crate) fn install_gateway<R: AuthorizationRequest + ?Sized>(mut self, req: &mut R) {
+        // Execution (`app/object/put.rs`) rejects any wire `x-amz-server-side-encryption*` header
+        // on POST Object, so preflight authorization must project only form SSE fields.
         for (name, value) in &mut self.0 {
-            match name.as_str() {
-                "if-match" | "if-none-match" => *value = req.headers().get(&*name).cloned(),
-                "x-amz-server-side-encryption" | "x-amz-server-side-encryption-customer-algorithm" if value.is_none() => {
-                    *value = req.headers().get(&*name).cloned();
-                }
-                _ => {}
+            if matches!(name.as_str(), "if-match" | "if-none-match") {
+                *value = req.headers().get(&*name).cloned();
             }
         }
         self.install(req);

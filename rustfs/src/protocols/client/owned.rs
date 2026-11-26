@@ -37,7 +37,7 @@ impl ProtocolStorageClient {
         range: Option<rustfs_gateway_types::ByteRange>,
     ) -> S3Result<dto::GetObjectOutput> {
         let uri = super::build_object_uri(bucket, key, &[])?;
-        let envelope = Self::create_envelope(
+        let envelope = self.create_envelope(
             Method::GET,
             uri,
             RequestParams {
@@ -72,21 +72,54 @@ impl ProtocolStorageClient {
         DefaultObjectUsecase::with_context(self.server_ctx.app_context())
     }
 
-    pub(super) fn create_envelope(method: Method, uri: Uri, params: RequestParams<'_>) -> RequestEnvelope {
-        Self::create_envelope_with_headers(method, uri, params, HeaderMap::new())
+    pub(super) fn create_envelope(&self, method: Method, uri: Uri, params: RequestParams<'_>) -> RequestEnvelope {
+        self.create_envelope_with_headers(method, uri, params, HeaderMap::new())
     }
 
     pub(super) fn create_envelope_with_headers(
+        &self,
         method: Method,
         uri: Uri,
         params: RequestParams<'_>,
         headers: HeaderMap,
     ) -> RequestEnvelope {
-        let is_owner = current_action_credentials().is_some_and(|root| params.credentials.access_key == root.access_key);
+        self.create_envelope_inner(method, uri, params, headers, false)
+    }
+
+    pub(super) fn create_list_buckets_envelope(&self, credentials: &rustfs_credentials::Credentials) -> RequestEnvelope {
+        self.create_envelope_inner(
+            Method::GET,
+            Uri::from_static("/"),
+            RequestParams {
+                bucket: None,
+                object: None,
+                credentials,
+            },
+            HeaderMap::new(),
+            self.server_ctx.installed_app_context().is_some(),
+        )
+    }
+
+    fn create_envelope_inner(
+        &self,
+        method: Method,
+        uri: Uri,
+        params: RequestParams<'_>,
+        headers: HeaderMap,
+        attach_server_ctx: bool,
+    ) -> RequestEnvelope {
+        let root = match self.server_ctx.installed_app_context() {
+            Some(context) => context.action_credentials().get(),
+            None => current_action_credentials(),
+        };
+        let is_owner = root.is_some_and(|root| params.credentials.access_key == root.access_key);
         let credentials =
             RequestCredentials::new(params.credentials.access_key.clone(), params.credentials.secret_key.clone(), None)
                 .unwrap_or_else(|_| RequestCredentials::without_secret_key(params.credentials.access_key.clone(), None));
         let mut extensions = http::Extensions::new();
+        if attach_server_ctx {
+            extensions.insert(self.server_ctx.clone());
+        }
         extensions.insert(ReqInfo {
             cred: Some(params.credentials.clone()),
             keystone_session_present: None,

@@ -29,6 +29,7 @@ use crate::auth::facts::{AuthzTarget, build_args};
 use crate::error::ApiError;
 use crate::storage::denial_audit::DenialAuditor;
 use crate::storage::storage_api::contract::bucket::{BucketOperations, BucketOptions};
+use crate::storage::storage_api::runtime_sources_consumer::ServerContextSlot;
 use crate::storage::{StorageError, is_err_bucket_not_found};
 use rustfs_iam::{
     store::object::ObjectStore,
@@ -129,6 +130,17 @@ pub(crate) async fn query_list_buckets_permission<R: AuthorizationRequest + ?Siz
     }
 }
 
+pub(crate) fn request_root_access_key(server_context: Option<&Arc<ServerContextSlot>>) -> String {
+    match server_context {
+        Some(slot) => slot
+            .installed_app_context()
+            .and_then(|context| context.action_credentials().get())
+            .map(|root| root.access_key)
+            .unwrap_or_default(),
+        None => root_access_key(),
+    }
+}
+
 /// Prepare the IAM-only authorization used to decide which buckets are visible in ListBuckets.
 /// Bucket policies are intentionally excluded from this discovery decision, matching MinIO.
 pub(crate) async fn prepare_list_buckets_iam_authorization<R: AuthorizationRequest + ?Sized>(
@@ -143,7 +155,7 @@ pub(crate) async fn prepare_list_buckets_iam_authorization<R: AuthorizationReque
     let groups = cred.groups.clone();
     let claims = cred.claims.clone().unwrap_or_default();
     let action = Action::S3Action(S3Action::ListAllMyBucketsAction);
-    let root_access_key = root_access_key();
+    let root_access_key = request_root_access_key(req.server_context());
     let principal = request_principal(req, cred, &root_access_key);
     let facts = request_authz_facts(
         req,
@@ -216,7 +228,7 @@ pub(crate) async fn s3_action_potential<R: AuthorizationRequest + ?Sized>(req: &
     if is_reserved_meta_bucket(bucket) {
         return Ok(false);
     }
-    let root = root_access_key();
+    let root = request_root_access_key(req.server_context());
     let principal = request_principal(req, cred, &root).with_owner(info.is_owner);
     let facts = request_authz_facts(
         req,

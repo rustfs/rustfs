@@ -62,6 +62,8 @@ pub(crate) use decision::{
     authorize_request_core, authorize_request_with_location_constraint, authorize_staged_multipart_part,
     authorize_write_etag_condition, iam_authorization_error,
 };
+#[cfg(test)]
+pub(crate) use discovery::request_root_access_key;
 pub(crate) use discovery::{
     log_list_buckets_iam_implicit_deny, prepare_list_buckets_iam_authorization, query_list_buckets_permission,
     s3_action_potential,

@@ -399,7 +399,7 @@ fn protocol_upload_copy_keeps_destination_generation_fence() {
             &[("partNumber", Some("1")), ("uploadId", Some(&upload.upload_id))],
         )
         .expect("URI");
-        let mut envelope = ProtocolStorageClient::create_envelope(
+        let mut envelope = ProtocolStorageClient::new(crate::runtime_sources::ServerContextSlot::new()).create_envelope(
             Method::PUT,
             uri,
             RequestParams {
@@ -729,7 +729,7 @@ async fn protocol_upload_copy_capabilities_precede_part_validation() {
         ),
     ] {
         let uri: http::Uri = format!("/bucket/copy-target?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Date=20260827T000000Z&X-Amz-Expires=900&X-Amz-SignedHeaders=host&X-Amz-Credential=fixture/20260827/us-east-1/s3/aws4_request&X-Amz-Signature=fixture{query}").parse().expect("URI");
-        let request = ProtocolStorageClient::create_envelope(
+        let request = ProtocolStorageClient::new(crate::runtime_sources::ServerContextSlot::new()).create_envelope(
             Method::PUT,
             uri.clone(),
             RequestParams {
