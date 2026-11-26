@@ -217,6 +217,7 @@ struct Inner {
     complete_multipart_calls: Vec<CompleteCall>,
     head_object_calls: Vec<HeadObjectCall>,
     delete_object_calls: Vec<DeleteObjectCall>,
+    create_bucket_calls: Vec<String>,
     delete_bucket_calls: Vec<String>,
 
     // Cancellation-test support. When stall_upload_part is true every
@@ -276,6 +277,7 @@ impl Inner {
             complete_multipart_calls: Vec::new(),
             head_object_calls: Vec::new(),
             delete_object_calls: Vec::new(),
+            create_bucket_calls: Vec::new(),
             delete_bucket_calls: Vec::new(),
             stall_upload_part: false,
             upload_part_entered: None,
@@ -563,6 +565,11 @@ impl DummyBackend {
             .push_back(Ok(ListObjectsV2Output::default()));
     }
 
+    /// Queue a custom list_objects_v2 Ok response.
+    pub fn queue_list_objects_v2_ok(&self, out: ListObjectsV2Output) {
+        self.inner.lock().expect("lock").list_objects_v2.push_back(Ok(out));
+    }
+
     /// Queue a list_objects_v2 Ok response listing the given keys as a
     /// single, non-truncated page. Recursive-delete tests use this to give
     /// the delete loop something to iterate over.
@@ -622,6 +629,32 @@ impl DummyBackend {
             ..Default::default()
         };
         self.inner.lock().expect("lock").get_object.push_back(Ok(output));
+    }
+
+    /// Queue a get_object Ok response whose body emits one initial chunk and
+    /// then stalls indefinitely on the next poll.
+    pub fn queue_get_object_stalling_after_chunk(&self, initial_chunk: Vec<u8>, reported_content_length: i64) {
+        let head = Bytes::from(initial_chunk);
+        let body_stream = stream::once(async move { Ok::<Bytes, std::io::Error>(head) })
+            .chain(stream::pending::<Result<Bytes, std::io::Error>>());
+        let out = GetObjectOutput {
+            body: Some(stream_body(body_stream)),
+            content_length: Some(reported_content_length),
+            ..Default::default()
+        };
+        self.inner.lock().expect("lock").get_object.push_back(Ok(out));
+    }
+
+    /// Queue a get_object Ok response backed by a scripted sequence of chunk
+    /// results (chunks and/or mid-stream I/O errors).
+    pub fn queue_get_object_chunks(&self, chunks: Vec<Result<Vec<u8>, std::io::Error>>, reported_content_length: i64) {
+        let items = chunks.into_iter().map(|chunk| chunk.map(Bytes::from));
+        let out = GetObjectOutput {
+            body: Some(stream_body(stream::iter(items))),
+            content_length: Some(reported_content_length),
+            ..Default::default()
+        };
+        self.inner.lock().expect("lock").get_object.push_back(Ok(out));
     }
 
     /// Queue a get_object_range Ok response carrying the given bytes as
@@ -732,6 +765,11 @@ impl DummyBackend {
     /// Snapshot the recorded delete_object invocations.
     pub fn delete_object_calls(&self) -> Vec<DeleteObjectCall> {
         self.inner.lock().expect("lock").delete_object_calls.clone()
+    }
+
+    /// Snapshot the buckets passed to create_bucket.
+    pub fn create_bucket_calls(&self) -> Vec<String> {
+        self.inner.lock().expect("lock").create_bucket_calls.clone()
     }
 
     /// Snapshot the buckets passed to delete_bucket.
@@ -880,8 +918,8 @@ impl StorageBackend for DummyBackend {
 
     async fn list_objects_v2(
         &self,
+        _session: &SessionContext,
         input: ListObjectsV2Input,
-        _credentials: &Credentials,
     ) -> Result<ListObjectsV2Output, Self::Error> {
         // Decide control flow while holding the lock. Release before
         // awaiting so the stall path does not hold the Mutex across
@@ -954,8 +992,10 @@ impl StorageBackend for DummyBackend {
             .unwrap_or(Ok(None))
     }
 
-    async fn create_bucket(&self, _bucket: &str, _credentials: &Credentials) -> Result<CreateBucketOutput, Self::Error> {
-        match self.inner.lock().expect("lock").create_bucket.pop_front() {
+    async fn create_bucket(&self, bucket: &str, _credentials: &Credentials) -> Result<CreateBucketOutput, Self::Error> {
+        let mut inner = self.inner.lock().expect("lock");
+        inner.create_bucket_calls.push(bucket.to_string());
+        match inner.create_bucket.pop_front() {
             Some(r) => r,
             None => Err(DummyError::Unconfigured("create_bucket")),
         }

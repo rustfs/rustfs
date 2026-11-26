@@ -244,7 +244,9 @@ pub(crate) mod ecfs_consumer {
     }
 
     pub(crate) mod object_lock {
-        pub(crate) use super::super::super::validate_bucket_object_lock_enabled;
+        pub(crate) use super::super::super::{
+            load_bucket_object_lock_config_state, validate_bucket_object_lock_enabled, validate_bucket_object_lock_enabled_state,
+        };
     }
 
     pub(crate) type StorageObjectOptions = super::StorageObjectOptions;
@@ -2345,17 +2347,19 @@ pub(crate) fn add_object_lock_years(dt: time::OffsetDateTime, years: i32) -> tim
 }
 
 pub(crate) fn check_retention_for_modification(
-    user_defined: &std::collections::HashMap<String, String>,
+    object_lock_config_state: &ecstore_bucket::metadata_sys::ObjectLockConfigState,
+    obj_info: &ObjectInfo,
     new_mode: Option<&str>,
     new_retain_until: Option<time::OffsetDateTime>,
     bypass_governance: bool,
-) -> Option<ObjectLockBlockReason> {
+) -> Result<Option<ObjectLockBlockReason>> {
     // The gate compares the requested mode literally against the canonical
     // persisted mode, so only the exact canonical spelling maps to a typed
     // mode; anything else stays `None` and is judged as a mode change.
     let new_mode = new_mode.and_then(ecstore_bucket::object_lock::types::RetentionMode::parse_exact);
     ecstore_bucket::object_lock::objectlock_sys::check_retention_for_modification(
-        user_defined,
+        object_lock_config_state,
+        obj_info,
         new_mode,
         new_retain_until,
         bypass_governance,
