@@ -3308,15 +3308,34 @@ impl ECStore {
 
     pub(crate) async fn object_lock_config_snapshot_for_single_put(&self, bucket: &str) -> Result<Arc<ObjectLockConfigSnapshot>> {
         check_valid_bucket_name(bucket)?;
-        let lifecycle_guard = self.acquire_bucket_lifecycle_read_lock(bucket).await?;
+        let lifecycle_lock_started = rustfs_io_metrics::put_stage_timer();
+        let lifecycle_guard = self.acquire_bucket_lifecycle_read_lock(bucket).await;
+        rustfs_io_metrics::record_put_object_stage_duration_from(
+            rustfs_io_metrics::PUT_STAGE_PUT_OBJECT_COMMIT_READY_SNAPSHOT_LIFECYCLE_LOCK,
+            lifecycle_lock_started,
+        );
+        let lifecycle_guard = lifecycle_guard?;
+
+        let metadata_lock_started = rustfs_io_metrics::put_stage_timer();
         let metadata_guard = crate::bucket::metadata_sys::acquire_bucket_metadata_transaction_read_lock_in_for_purpose(
             &self.ctx,
             bucket,
             "object_lock_snapshot_metadata_read",
         )
-        .await?;
-        let (state, bucket_incarnation_id, config_revision, quota_res) =
-            get_object_lock_and_quota_config_from_disk_with_guard_in(&self.ctx, bucket, Some(&lifecycle_guard)).await?;
+        .await;
+        rustfs_io_metrics::record_put_object_stage_duration_from(
+            rustfs_io_metrics::PUT_STAGE_PUT_OBJECT_COMMIT_READY_SNAPSHOT_METADATA_LOCK,
+            metadata_lock_started,
+        );
+        let metadata_guard = metadata_guard?;
+
+        let authority_read_started = rustfs_io_metrics::put_stage_timer();
+        let authority = get_object_lock_and_quota_config_from_disk_with_guard_in(&self.ctx, bucket, Some(&lifecycle_guard)).await;
+        rustfs_io_metrics::record_put_object_stage_duration_from(
+            rustfs_io_metrics::PUT_STAGE_PUT_OBJECT_COMMIT_READY_SNAPSHOT_AUTHORITY_READ,
+            authority_read_started,
+        );
+        let (state, bucket_incarnation_id, config_revision, quota_res) = authority?;
         if lifecycle_guard.is_lock_lost() || metadata_guard.is_lock_lost() {
             return Err(Error::other("bucket lifecycle lock was lost while loading the Object Lock snapshot"));
         }

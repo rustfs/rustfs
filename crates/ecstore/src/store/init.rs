@@ -22002,6 +22002,92 @@ mod tests {
         assert_eq!(body, original_body);
     }
 
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn single_put_records_object_lock_snapshot_stages() {
+        use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+        use rustfs_io_metrics::{
+            PUT_STAGE_PUT_OBJECT_COMMIT_READY_SNAPSHOT_AUTHORITY_READ, PUT_STAGE_PUT_OBJECT_COMMIT_READY_SNAPSHOT_LIFECYCLE_LOCK,
+            PUT_STAGE_PUT_OBJECT_COMMIT_READY_SNAPSHOT_METADATA_LOCK, put_stage_metrics_enabled, set_put_stage_metrics_enabled,
+        };
+
+        struct RestorePutStageFlag(bool);
+        impl Drop for RestorePutStageFlag {
+            fn drop(&mut self) {
+                set_put_stage_metrics_enabled(self.0);
+            }
+        }
+
+        let temp = tempfile::tempdir().expect("create snapshot test store dir");
+        let (ctx, store, _shutdown) =
+            without_storage_class_env(build_isolated_test_store(temp.path(), "put-snapshot-stages", &[4])).await;
+        crate::bucket::metadata_sys::init_bucket_metadata_sys(Arc::clone(&store), Vec::new()).await;
+        let bucket = format!("snapshot-stages-{}", uuid::Uuid::new_v4());
+        store
+            .make_bucket(&bucket, &MakeBucketOptions::default())
+            .await
+            .expect("create snapshot bucket");
+        let opts = ObjectOptions {
+            expected_bucket_incarnation_id: Some(store.bucket_incarnation_id(&bucket).await.expect("load bucket incarnation")),
+            write_completion: crate::object_api::WriteCompletion::TailDrained,
+            ..Default::default()
+        };
+
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let _recorder = metrics::set_default_local_recorder(&recorder);
+        let _flag = RestorePutStageFlag(put_stage_metrics_enabled());
+        let take_stage_counts = || {
+            let stages = [
+                PUT_STAGE_PUT_OBJECT_COMMIT_READY_SNAPSHOT_LIFECYCLE_LOCK,
+                PUT_STAGE_PUT_OBJECT_COMMIT_READY_SNAPSHOT_METADATA_LOCK,
+                PUT_STAGE_PUT_OBJECT_COMMIT_READY_SNAPSHOT_AUTHORITY_READ,
+            ];
+            let mut counts = [0; 3];
+            for (key, _, _, value) in snapshotter.snapshot().into_vec() {
+                let key = key.key();
+                if key.name() != "rustfs_s3_put_object_stage_duration_ms" {
+                    continue;
+                }
+                if let Some(index) = stages
+                    .iter()
+                    .position(|stage| key.labels().any(|label| label.key() == "stage" && label.value() == *stage))
+                {
+                    assert_eq!(key.labels().count(), 1, "snapshot timings must have only a static stage label");
+                    let DebugValue::Histogram(samples) = value else {
+                        panic!("snapshot timing must be recorded as a histogram");
+                    };
+                    counts[index] += samples.len();
+                }
+            }
+            counts
+        };
+
+        set_put_stage_metrics_enabled(false);
+        store
+            .put_object(&bucket, "metrics-off", &mut PutObjReader::from_vec(vec![1]), &opts)
+            .await
+            .expect("ordinary PUT with metrics disabled");
+        assert_eq!(take_stage_counts(), [0, 0, 0]);
+
+        set_put_stage_metrics_enabled(true);
+        store
+            .put_object(&bucket, "metrics-on", &mut PutObjReader::from_vec(vec![1]), &opts)
+            .await
+            .expect("ordinary PUT with metrics enabled");
+        assert_eq!(take_stage_counts(), [1, 1, 1]);
+
+        crate::bucket::metadata_sys::inject_object_lock_disk_read_error_in(&ctx, &bucket)
+            .await
+            .expect("inject authority read error");
+        let error = store
+            .put_object(&bucket, "read-failed", &mut PutObjReader::from_vec(vec![1]), &opts)
+            .await
+            .expect_err("authority failure must still reject the PUT");
+        assert!(error.to_string().contains("injected Object Lock metadata disk read failure"));
+        assert_eq!(take_stage_counts(), [1, 1, 1], "each stage records once even when the final read fails");
+    }
+
     #[cfg(feature = "test-util")]
     #[tokio::test]
     #[serial_test::serial(storage_class_env)]
