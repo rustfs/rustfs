@@ -366,13 +366,13 @@ mod tests {
                 {
                     "Effect": "Allow",
                     "Principal": "*",
-                    "Action": ["s3:PutObject"],
+                    "Action": ["s3:PutObject", "s3:PutObjectTagging"],
                     "Resource": [format!("arn:aws:s3:::{destination_bucket}/*")]
                 },
                 {
                     "Effect": "Deny",
                     "Principal": "*",
-                    "Action": ["s3:PutObject"],
+                    "Action": ["s3:PutObject", "s3:PutObjectTagging"],
                     "Resource": [format!("arn:aws:s3:::{destination_bucket}/*")],
                     "Condition": {
                         "StringEquals": {

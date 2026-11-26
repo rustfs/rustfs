@@ -13,6 +13,7 @@
 // limitations under the License.
 
 use moka::future::Cache;
+use moka::policy::EvictionPolicy;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -53,12 +54,19 @@ pub(super) struct OidcStateStore {
 
 impl OidcStateStore {
     pub(super) fn new() -> Self {
+        // Both stores hold random, single-use keys that are never read before `take`, so all keys
+        // have identical access frequency. Moka's default TinyLFU admission filter rejects new
+        // insertions once the cache reaches capacity because candidate frequency is never greater
+        // than victim frequency, starving new logins until abandoned entries expire. LRU always
+        // admits the newest entry and evicts the oldest pending one instead.
         let cache = Cache::builder()
             .max_capacity(OIDC_STATE_CAPACITY)
+            .eviction_policy(EvictionPolicy::lru())
             .time_to_live(Duration::from_secs(300)) // 5 minute TTL
             .build();
         let logout_cache = Cache::builder()
             .max_capacity(OIDC_STATE_CAPACITY)
+            .eviction_policy(EvictionPolicy::lru())
             // Keep the logout token alive for as long as the credentials it belongs to: if it
             // expired sooner, a session longer than the old hard-coded hour could no longer
             // trigger RP-initiated logout.
@@ -206,6 +214,68 @@ mod tests {
         for i in 0..5 {
             assert!(store.take(&format!("state_{i}")).await.is_none());
         }
+    }
+
+    #[tokio::test]
+    async fn full_state_store_evicts_oldest_pending_login_and_keeps_new_one() {
+        let store = OidcStateStore::new();
+        let session = OidcAuthSession {
+            provider_id: "corp".to_string(),
+            pkce_verifier: "verifier".to_string(),
+            nonce: "nonce".to_string(),
+            redirect_after: None,
+        };
+
+        for i in 0..OIDC_STATE_CAPACITY {
+            store.insert(format!("abandoned_{i}"), session.clone()).await;
+        }
+        store.cache.run_pending_tasks().await;
+        assert_eq!(store.cache.entry_count(), OIDC_STATE_CAPACITY);
+
+        store.insert("new_login".to_string(), session).await;
+        store.cache.run_pending_tasks().await;
+
+        assert_eq!(store.cache.entry_count(), OIDC_STATE_CAPACITY, "the store must stay bounded");
+        assert!(store.take("new_login").await.is_some(), "a full store must admit the newest login state");
+        assert!(
+            store.take("abandoned_0").await.is_none(),
+            "the oldest pending login state must be evicted to make room"
+        );
+    }
+
+    // Serial because the logout TTL is read from the environment, which
+    // `logout_retention_follows_the_bounded_session_duration` lowers to one second.
+    #[tokio::test]
+    #[serial]
+    async fn full_logout_store_evicts_oldest_session_and_keeps_new_one() {
+        let store = OidcStateStore::new();
+        let session = OidcLogoutSession {
+            provider_id: "corp".to_string(),
+            id_token: "jwt-token".to_string(),
+        };
+
+        for i in 0..OIDC_STATE_CAPACITY {
+            store.insert_logout(format!("older_{i}"), session.clone()).await;
+        }
+        store.logout_cache.run_pending_tasks().await;
+        assert_eq!(store.logout_cache.entry_count(), OIDC_STATE_CAPACITY);
+
+        store.insert_logout("new_session".to_string(), session).await;
+        store.logout_cache.run_pending_tasks().await;
+
+        assert_eq!(
+            store.logout_cache.entry_count(),
+            OIDC_STATE_CAPACITY,
+            "the logout store must stay bounded"
+        );
+        assert!(
+            store.take_logout("new_session").await.is_some(),
+            "a full logout store must admit the newest logout handle"
+        );
+        assert!(
+            store.take_logout("older_0").await.is_none(),
+            "the oldest logout handle must be evicted to make room"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

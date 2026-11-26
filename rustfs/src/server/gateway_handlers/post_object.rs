@@ -25,6 +25,7 @@ use crate::app::object::post_headers::{
     post_metadata_headers,
 };
 use crate::app::object_usecase::{DefaultObjectUsecase, PutObjectWriteInput};
+use crate::server::ssec_transport::report_plaintext_ssec_form_fields;
 use crate::storage_api::server::http::access::access_owned::object_write::{
     PostObjectFormPolicy, PostObjectPolicyFields, PutObjectAuthorization, authorize_post_object, authorize_put_object,
     invalid_post_form_field,
@@ -68,8 +69,12 @@ impl PostObjectHandler for GatewayBackend {
         let form_if_match = is_specific_etag(input.fields.if_match.as_deref());
         let legal_hold = input.fields.object_lock_legal_hold_status.is_some();
         let retention = input.fields.object_lock_mode.is_some() || input.fields.object_lock_retain_until_date.is_some();
+        let ssec_form_fields = has_ssec_form_fields(&input.fields);
         Box::pin(async move {
             let mut envelope = admission.await.map_err(handler_error)?;
+            if ssec_form_fields {
+                report_post_object_plaintext_ssec(&envelope);
+            }
             let (retain_until, policy) = form.map_err(handler_error)?;
             // The write evaluates a wire If-Match even when IAM sees the form's projection.
             let wire_if_match = envelope
@@ -213,6 +218,18 @@ fn is_specific_etag(value: Option<&str>) -> bool {
     value.is_some_and(|value| value != "*")
 }
 
+fn has_ssec_form_fields(fields: &dto::PostObjectFields) -> bool {
+    fields.sse_customer_algorithm.is_some() || fields.sse_customer_key.is_some() || fields.sse_customer_key_md5.is_some()
+}
+
+fn report_post_object_plaintext_ssec(envelope: &RequestEnvelope) -> bool {
+    report_plaintext_ssec_form_fields(
+        envelope.headers(),
+        envelope.native_tls_transport().unwrap_or(false),
+        envelope.client_info(),
+    )
+}
+
 fn post_retain_until(request: &Req<dto::PostObject>) -> S3Result<Option<time::OffsetDateTime>> {
     let Some(date) = request.input().fields.object_lock_retain_until_date.as_ref() else {
         return Ok(None);
@@ -328,4 +345,106 @@ async fn write_input(
         checksum_sha256: fields.checksum_sha256,
         ..Default::default()
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::app::RequestHead;
+    use crate::server::ssec_transport::METRIC_SSEC_PLAINTEXT_REQUESTS_TOTAL;
+    use crate::shared_types::NativeTlsTransport;
+    use http::{Extensions, HeaderMap, Method};
+    use rustfs_trusted_proxies::{ClientInfo, ValidationMode};
+    use std::net::IpAddr;
+
+    fn envelope(headers: HeaderMap, native_tls: Option<bool>, client_info: Option<ClientInfo>) -> RequestEnvelope {
+        let mut extensions = Extensions::new();
+        if let Some(tls) = native_tls {
+            extensions.insert(NativeTlsTransport(tls));
+        }
+        if let Some(info) = client_info {
+            extensions.insert(info);
+        }
+        RequestEnvelope::from_parts(
+            RequestHead {
+                method: Method::POST,
+                uri: "/bucket".parse().expect("POST URI"),
+                headers,
+                credentials: None,
+                region: None,
+                service: None,
+            },
+            extensions,
+        )
+    }
+
+    fn proxied(proto: &str) -> ClientInfo {
+        ClientInfo::from_trusted_proxy(
+            IpAddr::from([203, 0, 113, 10]),
+            None,
+            Some(proto.to_owned()),
+            IpAddr::from([10, 0, 0, 1]),
+            1,
+            ValidationMode::Lenient,
+            Vec::new(),
+        )
+    }
+
+    #[test]
+    fn has_ssec_form_fields_detects_any_customer_key_field() {
+        assert!(!has_ssec_form_fields(&dto::PostObjectFields::default()));
+
+        let with_algo = dto::PostObjectFields {
+            sse_customer_algorithm: Some("AES256".to_owned()),
+            ..Default::default()
+        };
+        assert!(has_ssec_form_fields(&with_algo));
+
+        let with_key = dto::PostObjectFields {
+            sse_customer_key: Some(rustfs_gateway_types::SseCustomerKey::from_wire("a2V5")),
+            ..Default::default()
+        };
+        assert!(has_ssec_form_fields(&with_key));
+
+        let with_md5 = dto::PostObjectFields {
+            sse_customer_key_md5: Some("bWQ1".to_owned()),
+            ..Default::default()
+        };
+        assert!(has_ssec_form_fields(&with_md5));
+    }
+
+    #[test]
+    fn post_object_plaintext_ssec_reports_only_plaintext_form_uploads() {
+        let recorder = metrics_util::debugging::DebuggingRecorder::new();
+        metrics::with_local_recorder(&recorder, || {
+            let plain = envelope(HeaderMap::new(), Some(false), None);
+            assert!(report_post_object_plaintext_ssec(&plain));
+
+            let tls = envelope(HeaderMap::new(), Some(true), None);
+            assert!(!report_post_object_plaintext_ssec(&tls));
+
+            let proxy_https = envelope(HeaderMap::new(), Some(false), Some(proxied("https")));
+            assert!(!report_post_object_plaintext_ssec(&proxy_https));
+
+            let mut with_header = HeaderMap::new();
+            with_header.insert(
+                rustfs_utils::http::headers::AMZ_SERVER_SIDE_ENCRYPTION_CUSTOMER_ALGORITHM,
+                HeaderValue::from_static("AES256"),
+            );
+            let header_and_form = envelope(with_header, Some(false), None);
+            assert!(!report_post_object_plaintext_ssec(&header_and_form));
+        });
+
+        let count = recorder
+            .snapshotter()
+            .snapshot()
+            .into_vec()
+            .into_iter()
+            .find(|(key, _, _, _)| key.key().name() == METRIC_SSEC_PLAINTEXT_REQUESTS_TOTAL)
+            .map_or(0, |(_, _, _, value)| match value {
+                metrics_util::debugging::DebugValue::Counter(count) => count,
+                other => panic!("unexpected metric value: {other:?}"),
+            });
+        assert_eq!(count, 1, "only the single plaintext form upload without SSE-C headers must be counted");
+    }
 }

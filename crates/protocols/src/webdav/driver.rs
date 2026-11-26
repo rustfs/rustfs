@@ -532,7 +532,6 @@ where
     }
 
     async fn prefix_has_entries(&self, bucket: &str, prefix: &str) -> FsResult<bool> {
-        let credentials = self.credentials();
         let list_input = ListObjectsV2Input::builder()
             .bucket(BucketName::new(bucket.to_string()).map_err(|_| FsError::GeneralFailure)?)
             .prefix(prefix.to_string())
@@ -544,18 +543,22 @@ where
             .await
             .map_err(|_| FsError::Forbidden)?;
 
-        let output = self.storage.list_objects_v2(list_input, credentials).await.map_err(|e| {
-            error!(
-                event = EVENT_WEBDAV_LIST_FAILED,
-                component = LOG_COMPONENT_PROTOCOLS,
-                subsystem = LOG_SUBSYSTEM_WEBDAV_DRIVER,
-                bucket = %bucket,
-                prefix = %prefix,
-                error = %e,
-                "webdav list failed"
-            );
-            FsError::GeneralFailure
-        })?;
+        let output = self
+            .storage
+            .list_objects_v2(&self.session_context, list_input)
+            .await
+            .map_err(|e| {
+                error!(
+                    event = EVENT_WEBDAV_LIST_FAILED,
+                    component = LOG_COMPONENT_PROTOCOLS,
+                    subsystem = LOG_SUBSYSTEM_WEBDAV_DRIVER,
+                    bucket = %bucket,
+                    prefix = %prefix,
+                    error = %e,
+                    "webdav list failed"
+                );
+                FsError::GeneralFailure
+            })?;
 
         Ok(!output.contents.is_empty() || !output.common_prefixes.is_empty())
     }
@@ -898,7 +901,7 @@ where
             .await
             .map_err(|_| FsError::Forbidden)?;
 
-        match self.storage.list_objects_v2(list_input, self.credentials()).await {
+        match self.storage.list_objects_v2(&self.session_context, list_input).await {
             Ok(output) => {
                 let mut entries = Vec::new();
 
@@ -1019,7 +1022,7 @@ where
                 .await
                 .map_err(|_| FsError::Forbidden)?;
 
-            if let Ok(output) = self.storage.list_objects_v2(list_input, self.credentials()).await {
+            if let Ok(output) = self.storage.list_objects_v2(&self.session_context, list_input).await {
                 // Delete all objects in this page
                 for obj in output.contents {
                     let obj_key = obj.key.as_str();
@@ -1381,7 +1384,7 @@ where
                         .await
                         .map_err(|_| FsError::Forbidden)?;
 
-                    if let Ok(output) = self.storage.list_objects_v2(list_input, self.credentials()).await {
+                    if let Ok(output) = self.storage.list_objects_v2(&self.session_context, list_input).await {
                         for obj in output.contents {
                             let obj_key = obj.key.as_str();
                             self.storage
@@ -1576,7 +1579,7 @@ where
 
                 let output = self
                     .storage
-                    .list_objects_v2(list_input.clone(), credentials)
+                    .list_objects_v2(&self.session_context, list_input.clone())
                     .await
                     .map_err(|e| {
                         error!(
@@ -1852,8 +1855,8 @@ mod tests {
 
         async fn list_objects_v2(
             &self,
+            _session: &SessionContext,
             _input: ListObjectsV2Input,
-            _credentials: &Credentials,
         ) -> Result<ListObjectsV2Output, Self::Error> {
             unreachable!("parse_path tests should not hit storage")
         }
@@ -2181,8 +2184,8 @@ mod tests {
 
         async fn list_objects_v2(
             &self,
+            _session: &SessionContext,
             input: ListObjectsV2Input,
-            _credentials: &Credentials,
         ) -> Result<ListObjectsV2Output, Self::Error> {
             let prefix = input.prefix.unwrap_or_default();
             let mut keys: Vec<String> = self

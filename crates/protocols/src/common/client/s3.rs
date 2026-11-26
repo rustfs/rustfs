@@ -147,11 +147,16 @@ pub trait StorageBackend: Send + Sync {
     async fn head_object(&self, bucket: &str, key: &str, credentials: &Credentials) -> Result<HeadObjectOutput, Self::Error>;
     /// Check if bucket exists and get metadata
     async fn head_bucket(&self, bucket: &str, credentials: &Credentials) -> Result<HeadBucketOutput, Self::Error>;
-    /// List objects in a bucket with pagination
+    /// List objects in a bucket with pagination.
+    ///
+    /// Evaluated against `session` rather than bare credentials so backends
+    /// that filter listings per principal (such as table-bucket list isolation)
+    /// apply the filter with the same request context authorized by
+    /// `authorize_list_objects`.
     async fn list_objects_v2(
         &self,
+        session: &SessionContext,
         input: ListObjectsV2Input,
-        credentials: &Credentials,
     ) -> Result<ListObjectsV2Output, Self::Error>;
     /// List all buckets (requires authentication).
     async fn list_buckets(&self, credentials: &Credentials) -> Result<ListBucketsOutput, Self::Error>;
