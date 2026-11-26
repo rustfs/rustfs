@@ -212,17 +212,18 @@ pub fn get_global_transition_state() -> Arc<TransitionState> {
     crate::runtime::global::current_ctx().transition_state()
 }
 
-fn resolve_transition_worker_count() -> (i64, i64, i64) {
-    let fallback = std::cmp::min(num_cpus::get() as i64, DEFAULT_TRANSITION_WORKERS_CAP);
+fn resolve_transition_worker_count(parallelism: std::num::NonZeroUsize) -> (i64, i64, i64) {
     let configured = env::var(ENV_TRANSITION_WORKERS)
         .ok()
         .and_then(|value| value.parse::<i64>().ok())
         .filter(|value| *value > 0)
-        .unwrap_or(fallback);
-    let mut effective = configured;
+        .unwrap_or_else(|| {
+            i64::try_from(parallelism.get())
+                .unwrap_or(i64::MAX)
+                .min(DEFAULT_TRANSITION_WORKERS_CAP)
+        });
     let absolute_max = resolve_transition_workers_absolute_max();
-    effective = std::cmp::min(effective, absolute_max);
-    (configured, absolute_max, effective)
+    (configured, absolute_max, configured.min(absolute_max))
 }
 
 fn resolve_transition_workers_absolute_max() -> i64 {
@@ -2085,7 +2086,7 @@ impl TransitionState {
     }
 
     pub async fn init(api: Arc<ECStore>) {
-        let (configured, absolute_max, n) = resolve_transition_worker_count();
+        let (configured, absolute_max, n) = resolve_transition_worker_count(api.ctx.worker_parallelism());
         let transition_state = runtime_sources::transition_state_handle();
         debug!(
             event = EVENT_LIFECYCLE_WORKER_STATE,
@@ -2100,8 +2101,7 @@ impl TransitionState {
             "Lifecycle worker configuration resolved"
         );
 
-        //self.objAPI = objAPI
-        Self::update_workers(api, n).await;
+        Self::resize_workers_to(api, n, n, absolute_max);
     }
 
     pub fn pending_tasks(&self) -> usize {
@@ -2270,18 +2270,15 @@ impl TransitionState {
         Self::update_workers_inner(api, n).await;
     }
 
-    pub async fn update_workers_inner(api: Arc<ECStore>, n: i64) {
-        let mut n = n;
-        let requested = n;
-        if n == 0 {
-            let (_, _, effective) = resolve_transition_worker_count();
-            n = effective;
-        }
-        // Allow environment override of maximum workers
-        let absolute_max = resolve_transition_workers_absolute_max();
-        n = n.clamp(0, absolute_max);
-
-        Self::resize_workers_to(api, n, requested, absolute_max);
+    pub async fn update_workers_inner(api: Arc<ECStore>, requested: i64) {
+        let (effective, absolute_max) = if requested == 0 {
+            let (_, absolute_max, effective) = resolve_transition_worker_count(api.ctx.worker_parallelism());
+            (effective, absolute_max)
+        } else {
+            let absolute_max = resolve_transition_workers_absolute_max();
+            (requested.clamp(0, absolute_max), absolute_max)
+        };
+        Self::resize_workers_to(api, effective, requested, absolute_max);
     }
 
     fn resize_workers_to(api: Arc<ECStore>, n: i64, requested: i64, absolute_max: i64) {
@@ -2477,19 +2474,16 @@ fn is_lifecycle_expiry_already_gone(err: &Error) -> bool {
 /// `_RUSTFS_ILM_EXPIRATION_WORKERS` silent override and the
 /// `RUSTFS_DEFAULT_EXPIRY_WORKERS` zero-fallback were undocumented, unset in
 /// every known deployment, and are removed (backlog#1832).
-fn expiry_worker_count() -> usize {
-    let default = std::cmp::min(num_cpus::get(), 16);
-    match env::var(ENV_MAX_EXPIRY_WORKERS) {
-        Ok(value) => match value.parse::<usize>() {
-            Ok(workers) if workers > 0 => workers,
-            _ => default,
-        },
-        Err(_) => default,
-    }
+fn expiry_worker_count(parallelism: std::num::NonZeroUsize) -> usize {
+    env::var(ENV_MAX_EXPIRY_WORKERS)
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|workers| *workers > 0)
+        .unwrap_or(parallelism.get().min(16))
 }
 
 pub async fn init_background_expiry(api: Arc<ECStore>) {
-    let workers = expiry_worker_count();
+    let workers = expiry_worker_count(api.ctx.worker_parallelism());
 
     ExpiryState::resize_workers(workers, api.clone()).await;
     let _ = spawn_tier_free_version_recovery_once(api.clone(), &TIER_FREE_VERSION_RECOVERY_STARTED);
@@ -9740,19 +9734,24 @@ mod tests {
     #[test]
     #[serial]
     fn expiry_worker_count_resolves_all_env_states() {
-        let default = std::cmp::min(num_cpus::get(), 16);
+        let default = std::thread::available_parallelism().map_or(1, usize::from).min(16);
+        let parallelism = crate::runtime::instance::InstanceContext::new().worker_parallelism();
 
         with_expiry_worker_env(None, || {
-            assert_eq!(expiry_worker_count(), default, "unset env must fall back to min(cpus, 16)");
+            assert_eq!(expiry_worker_count(parallelism), default, "unset env must fall back to min(cpus, 16)");
         });
         with_expiry_worker_env(Some("0"), || {
-            assert_eq!(expiry_worker_count(), default, "zero must fall back instead of spawning zero workers");
+            assert_eq!(
+                expiry_worker_count(parallelism),
+                default,
+                "zero must fall back instead of spawning zero workers"
+            );
         });
-        with_expiry_worker_env(Some("4"), || {
-            assert_eq!(expiry_worker_count(), 4, "a valid positive value must win");
+        with_expiry_worker_env(Some("32"), || {
+            assert_eq!(expiry_worker_count(parallelism), 32, "an explicit count may exceed the default cap");
         });
         with_expiry_worker_env(Some("not-a-number"), || {
-            assert_eq!(expiry_worker_count(), default, "garbage must fall back to the default");
+            assert_eq!(expiry_worker_count(parallelism), default, "garbage must fall back to the default");
         });
     }
 
@@ -9948,9 +9947,13 @@ mod tests {
     #[serial]
     fn resolve_transition_worker_count_uses_fallback_when_env_missing() {
         with_transition_worker_env(None, None, || {
-            let (configured, absolute_max, effective) = resolve_transition_worker_count();
+            let parallelism = crate::runtime::instance::InstanceContext::new().worker_parallelism();
+            let (configured, absolute_max, effective) = resolve_transition_worker_count(parallelism);
 
-            let fallback = std::cmp::min(num_cpus::get() as i64, DEFAULT_TRANSITION_WORKERS_CAP);
+            let cpus = std::thread::available_parallelism().map_or(1, usize::from);
+            let fallback = i64::try_from(cpus)
+                .expect("available parallelism fits in i64")
+                .min(DEFAULT_TRANSITION_WORKERS_CAP);
             assert_eq!(configured, fallback);
             assert_eq!(absolute_max, DEFAULT_TRANSITION_WORKERS_ABSOLUTE_MAX);
             assert_eq!(effective, fallback);
@@ -9961,7 +9964,7 @@ mod tests {
     #[serial]
     fn resolve_transition_worker_count_honors_positive_env_value() {
         with_transition_worker_env(Some("4"), Some("32"), || {
-            let (configured, absolute_max, effective) = resolve_transition_worker_count();
+            let (configured, absolute_max, effective) = resolve_transition_worker_count(std::num::NonZeroUsize::MIN);
 
             assert_eq!(configured, 4);
             assert_eq!(absolute_max, 32);
@@ -9973,7 +9976,7 @@ mod tests {
     #[serial]
     fn resolve_transition_worker_count_clamps_to_absolute_max() {
         with_transition_worker_env(Some("64"), Some("16"), || {
-            let (configured, absolute_max, effective) = resolve_transition_worker_count();
+            let (configured, absolute_max, effective) = resolve_transition_worker_count(std::num::NonZeroUsize::MIN);
 
             assert_eq!(configured, 64);
             assert_eq!(absolute_max, 16);
@@ -9985,7 +9988,7 @@ mod tests {
     #[serial]
     fn resolve_transition_worker_count_ignores_non_positive_absolute_max() {
         with_transition_worker_env(Some("4"), Some("0"), || {
-            let (configured, absolute_max, effective) = resolve_transition_worker_count();
+            let (configured, absolute_max, effective) = resolve_transition_worker_count(std::num::NonZeroUsize::MIN);
 
             assert_eq!(configured, 4);
             assert_eq!(absolute_max, DEFAULT_TRANSITION_WORKERS_ABSOLUTE_MAX);
@@ -9993,7 +9996,7 @@ mod tests {
         });
 
         with_transition_worker_env(Some("4"), Some("-1"), || {
-            let (configured, absolute_max, effective) = resolve_transition_worker_count();
+            let (configured, absolute_max, effective) = resolve_transition_worker_count(std::num::NonZeroUsize::MIN);
 
             assert_eq!(configured, 4);
             assert_eq!(absolute_max, DEFAULT_TRANSITION_WORKERS_ABSOLUTE_MAX);
@@ -10005,9 +10008,13 @@ mod tests {
     #[serial]
     fn resolve_transition_worker_count_falls_back_for_zero_value() {
         with_transition_worker_env(Some("0"), Some("32"), || {
-            let (configured, absolute_max, effective) = resolve_transition_worker_count();
+            let parallelism = crate::runtime::instance::InstanceContext::new().worker_parallelism();
+            let (configured, absolute_max, effective) = resolve_transition_worker_count(parallelism);
 
-            let fallback = std::cmp::min(num_cpus::get() as i64, DEFAULT_TRANSITION_WORKERS_CAP);
+            let cpus = std::thread::available_parallelism().map_or(1, usize::from);
+            let fallback = i64::try_from(cpus)
+                .expect("available parallelism fits in i64")
+                .min(DEFAULT_TRANSITION_WORKERS_CAP);
             assert_eq!(configured, fallback);
             assert_eq!(absolute_max, 32);
             assert_eq!(effective, fallback);

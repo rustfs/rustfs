@@ -111,8 +111,12 @@ mod multipart_copy_heal_tests {
                 ..Default::default()
             };
             bucket_guard.attach_to_object_options(&mut options);
+            let init_opts = ObjectOptions {
+                mod_time: None,
+                ..options.clone()
+            };
             let upload = store.pools[0]
-                .new_multipart_upload(&bucket, &object, &options)
+                .new_multipart_upload(&bucket, &object, &init_opts)
                 .await
                 .expect("actual native C Init");
             let part = store.pools[0]

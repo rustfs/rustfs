@@ -2152,9 +2152,17 @@ impl LocalDisk {
                 && let Some(parent) = dst_file_path.parent()
             {
                 let fsync_started = rustfs_io_metrics::put_stage_timer();
-                if let Err(err) =
-                    os::fsync_commit_directory(parent, &commit.directory_guard, commit.mutation_lease.clone(), None).await
-                {
+                let fsync_result = async {
+                    let admission = if dst_dir_group_commit {
+                        Some(os::acquire_file_sync_admission(self.file_sync_permits.clone()).await?)
+                    } else {
+                        None
+                    };
+                    os::fsync_commit_directory(parent, &commit.directory_guard, commit.mutation_lease.clone(), admission.as_ref())
+                        .await
+                }
+                .await;
+                if let Err(err) = fsync_result {
                     rustfs_io_metrics::record_put_object_stage_duration_from(
                         rustfs_io_metrics::PUT_STAGE_SET_DISK_RENAME_DST_DIR_FSYNC,
                         fsync_started,
