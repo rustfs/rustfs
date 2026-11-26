@@ -8,6 +8,7 @@ import csv
 import hashlib
 import io
 import json
+import math
 import re
 import subprocess
 import sys
@@ -45,7 +46,9 @@ def open_text(path: Path):
     return io.TextIOWrapper(process.stdout, newline=""), process
 
 
-def parse(path: Path, expected_hosts: set[str] | None) -> dict:
+def parse(path: Path, expected_hosts: set[str] | None, *, steady_after_seconds: int | None = None) -> dict:
+    if steady_after_seconds is not None and steady_after_seconds < 0:
+        raise ValueError("steady cutoff must be nonnegative")
     opened = open_text(path)
     process = None
     if isinstance(opened, tuple):
@@ -102,7 +105,7 @@ def parse(path: Path, expected_hosts: set[str] | None) -> dict:
             overlap = max(0, min(end, window_end) - max(start, window_start))
             fractional_objects += objects * overlap / (end - start)
         duration_secs = (window_end - window_start) / 1_000_000_000
-        return {
+        result = {
             "schema_version": 1,
             "source": str(path),
             "source_sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
@@ -121,6 +124,20 @@ def parse(path: Path, expected_hosts: set[str] | None) -> dict:
             "reqps": fractional_objects / duration_secs,
             "window_status": "warp_v1.8.2_common_active_window",
         }
+        if steady_after_seconds is not None:
+            steady_start = window_start + steady_after_seconds * 1_000_000_000
+            if steady_start >= window_end:
+                raise ValueError("steady cutoff leaves no common active window")
+            steady_duration = (window_end - steady_start) / 1_000_000_000
+            steady_objects = sum(objects for _, end, objects, error in rows if not error and steady_start <= end < window_end)
+            result["steady"] = {
+                "start_ns": steady_start,
+                "end_exclusive_ns": window_end,
+                "duration_secs": steady_duration,
+                "completed_objects": steady_objects,
+                "completed_objects_per_second": steady_objects / steady_duration,
+            }
+        return result
     finally:
         stream.close()
         if process is not None:
@@ -134,15 +151,30 @@ def main() -> int:
     parser.add_argument("--input", required=True)
     parser.add_argument("--output", required=True)
     parser.add_argument("--expected-host", action="append")
+    parser.add_argument("--steady-after-seconds", type=int, help="Seconds to exclude from the start of the common active window")
+    parser.add_argument("--min-steady-rps", type=float, help="Minimum successful object completions per second in the steady window")
     args = parser.parse_args()
     try:
-        result = parse(Path(args.input), set(args.expected_host) if args.expected_host else None)
+        if (args.steady_after_seconds is None) != (args.min_steady_rps is None):
+            raise ValueError("--steady-after-seconds and --min-steady-rps must be used together")
+        if args.min_steady_rps is not None and (not math.isfinite(args.min_steady_rps) or args.min_steady_rps <= 0):
+            raise ValueError("minimum steady rate must be finite and positive")
+        result = parse(
+            Path(args.input),
+            set(args.expected_host) if args.expected_host else None,
+            steady_after_seconds=args.steady_after_seconds,
+        )
     except (OSError, RuntimeError, ValueError, csv.Error) as error:
         Path(args.output).write_text(json.dumps({"schema_version": 1, "status": "fail", "reason": str(error)}, indent=2) + "\n")
         return 1
     result["status"] = "pass"
+    if args.min_steady_rps is not None:
+        steady = result["steady"]
+        steady["min_completed_objects_per_second"] = args.min_steady_rps
+        if steady["completed_objects_per_second"] < args.min_steady_rps:
+            result.update(status="fail", reason="steady completion rate below minimum")
     Path(args.output).write_text(json.dumps(result, indent=2, sort_keys=True) + "\n")
-    return 0
+    return int(result["status"] == "fail")
 
 
 if __name__ == "__main__":
