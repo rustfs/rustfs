@@ -111,7 +111,11 @@ mod compress_reader;
 pub use compress_reader::{CompressReader, DecompressReader};
 
 mod encrypt_reader;
-pub use encrypt_reader::{DecryptReader, EncryptReader, multipart_part_nonce};
+pub use encrypt_reader::{
+    DEFAULT_RUSTFS_ENCRYPTION_MULTIPART_SEGMENT_NONCE, DecryptReader, ENV_RUSTFS_ENCRYPTION_MULTIPART_SEGMENT_NONCE,
+    EncryptReader, SEGMENT_NONCE_FRAME_TOTAL_LEN, V2_FRAME_PLAINTEXT_LEN, V2_FULL_FRAME_LEN, authenticate_segment_nonce_frame,
+    multipart_part_nonce, v2_frame_ciphertext_offset,
+};
 
 mod hardlimit_reader;
 pub use hardlimit_reader::HardLimitReader;

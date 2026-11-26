@@ -120,6 +120,16 @@ impl DefaultBucketUsecase {
         let store = get_validated_store(bucket).await?;
         let incl_deleted = get_header(envelope.headers(), rustfs_utils::http::SUFFIX_INCLUDE_DELETED).as_deref() == Some("true");
         let table_list_access = envelope.table_list_access().cloned();
+        if table_list_access.is_none() {
+            // Fail closed if a listing entry point reached the use case for a
+            // table-enabled bucket without attaching its table list filter.
+            match store.table_bucket_enabled(bucket).await {
+                Ok(true) => return Err(S3Error::from(ApiError::access_denied())),
+                Ok(false) => {}
+                Err(err) if crate::app::storage_api::bucket_usecase::error::is_err_bucket_not_found(&err) => {}
+                Err(err) => return Err(ApiError::from(err).into()),
+            }
+        }
 
         // The on-demand migration envelope is decoded whether or not this bucket still merges: a
         // token handed out under `list_through` must keep paginating after the policy is turned
@@ -759,5 +769,54 @@ mod tests {
             .await
             .expect_err("no store");
         assert_eq!(err.code(), &S3ErrorCode::InternalError);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn list_objects_fail_closed_on_table_bucket_without_table_list_access() {
+        use crate::app::gating_test_env::{run_large_stack_test, shared_gating_ambient, shared_gating_ecstore};
+        use crate::table_catalog::{TABLE_BUCKET_MARKER_CONFIG, table_bucket_marker_json};
+
+        run_large_stack_test("list-table-bucket-fail-closed", || async {
+            let usecase = DefaultBucketUsecase::with_context(Some(shared_gating_ambient().await));
+            let store = shared_gating_ecstore().await;
+            let bucket = BucketName::new(format!("list-table-guard-{}", uuid::Uuid::new_v4().simple())).expect("bucket");
+            store
+                .make_bucket(bucket.as_str(), &MakeBucketOptions::default())
+                .await
+                .expect("create bucket");
+            store
+                .update_bucket_metadata_config(
+                    bucket.as_str(),
+                    TABLE_BUCKET_MARKER_CONFIG,
+                    table_bucket_marker_json().expect("table marker"),
+                )
+                .await
+                .expect("enable table bucket");
+
+            let v2_err = usecase
+                .execute_list_objects_v2(
+                    envelope(),
+                    gateway_dto::ListObjectsV2Input {
+                        bucket: bucket.clone(),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect_err("unfiltered ListObjectsV2 on table bucket must fail closed");
+            assert_eq!(v2_err.code(), &S3ErrorCode::AccessDenied);
+
+            let v1_err = usecase
+                .execute_list_objects(
+                    envelope(),
+                    gateway_dto::ListObjectsInput {
+                        bucket,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect_err("unfiltered ListObjects on table bucket must fail closed");
+            assert_eq!(v1_err.code(), &S3ErrorCode::AccessDenied);
+        });
     }
 }

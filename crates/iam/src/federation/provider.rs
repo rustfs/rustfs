@@ -56,7 +56,13 @@ impl VerifiedFederatedCodeExchange {
 #[async_trait::async_trait]
 pub(crate) trait StandardOidcAuthentication: Send + Sync {
     async fn authorize_url(&self, provider_id: &str, redirect_uri: &str, redirect_after: Option<String>) -> Result<String>;
-    async fn exchange_identity(&self, state: &str, code: &str, redirect_uri: &str) -> Result<VerifiedFederatedCodeExchange>;
+    async fn exchange_identity(
+        &self,
+        provider_id: &str,
+        state: &str,
+        code: &str,
+        redirect_uri: &str,
+    ) -> Result<VerifiedFederatedCodeExchange>;
     async fn verify_identity(&self, jwt: &str) -> Result<VerifiedFederatedIdentity>;
     async fn create_logout_token(&self, continuation: OpaqueLogoutContinuation) -> Result<String>;
     async fn build_logout_url(&self, logout_token: &str, post_logout_redirect_uri: &str) -> Result<Option<String>>;
