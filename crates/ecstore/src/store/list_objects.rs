@@ -1079,8 +1079,9 @@ fn clamp_ask_disks_to_available(ask_disks: i32, available_disks: usize) -> i32 {
     ask_disks.min(bounded_usize_to_i32(available_disks))
 }
 
-fn parse_version_marker(marker: String) -> Result<VersionMarker> {
-    Ok(VersionMarker::parse(marker)?)
+fn parse_version_marker(bucket: &str, key_marker: Option<&str>, marker: String) -> Result<VersionMarker> {
+    VersionMarker::parse(&marker)
+        .map_err(|_| StorageError::InvalidVersionID(bucket.to_owned(), key_marker.unwrap_or_default().to_owned(), marker))
 }
 
 fn version_marker_for_entries(
@@ -1498,11 +1499,9 @@ impl ECStore {
         }
 
         let has_version_marker = version_marker.is_some();
-        let version_marker = if let Some(marker) = version_marker {
-            Some(parse_version_marker(marker)?)
-        } else {
-            None
-        };
+        let version_marker = version_marker
+            .map(|raw| parse_version_marker(bucket, marker.as_deref(), raw))
+            .transpose()?;
 
         let effective_max_keys = list_versions_scan_limit(max_keys, has_version_marker);
         let opts = ListPathOptions {
@@ -2987,7 +2986,9 @@ impl SetDisks {
         }
 
         let has_version_marker = version_marker.is_some();
-        let version_marker = version_marker.map(parse_version_marker).transpose()?;
+        let version_marker = version_marker
+            .map(|raw| parse_version_marker(bucket, marker.as_deref(), raw))
+            .transpose()?;
         let effective_max_keys = list_versions_scan_limit(max_keys, has_version_marker);
         let opts = ListPathOptions {
             bucket: bucket.to_owned(),
@@ -5354,6 +5355,87 @@ mod test {
         assert_eq!(resumed.objects.iter().map(|o| o.name.as_str()).collect::<Vec<_>>(), vec!["obj-c"]);
         assert!(!resumed.is_truncated);
         assert!(resumed.next_continuation_token.is_none());
+    }
+
+    #[tokio::test]
+    async fn list_object_versions_rejects_invalid_version_id_marker_and_accepts_control_delimiter() {
+        use crate::storage_api_contracts::bucket::BucketOperations as _;
+        use crate::storage_api_contracts::object::ObjectIO as _;
+
+        let bucket = "invalid-version-marker";
+        let (_dirs, store) = crate::bucket::metadata_sys::test_support::isolated_store_over_temp_disks().await;
+        crate::bucket::metadata_sys::init_bucket_metadata_sys(store.clone(), Vec::new()).await;
+        store
+            .make_bucket(bucket, &crate::storage_api_contracts::bucket::MakeBucketOptions::default())
+            .await
+            .expect("create bucket");
+        store
+            .put_object(
+                bucket,
+                "obj-a",
+                &mut crate::object_api::PutObjReader::from_vec(vec![1]),
+                &crate::object_api::ObjectOptions::default(),
+            )
+            .await
+            .expect("seed object");
+
+        let err = store
+            .clone()
+            .inner_list_object_versions(bucket, "", Some("k".to_string()), Some("v".to_string()), Some("\x0f".to_string()), 8)
+            .await
+            .expect_err("non-UUID version-id-marker must be rejected");
+        assert!(
+            matches!(
+                &err,
+                StorageError::InvalidVersionID(err_bucket, err_key, err_version)
+                    if err_bucket == bucket && err_key == "k" && err_version == "v"
+            ),
+            "expected InvalidVersionID, got: {err:?}"
+        );
+
+        let delete_err = store.pools[0].disk_set[0]
+            .clone()
+            .inner_list_object_versions_for_recursive_delete(bucket, "", Some("k".to_string()), Some("v".to_string()), 8)
+            .await
+            .expect_err("recursive-delete listing must reject non-UUID version-id-marker");
+        assert!(
+            matches!(
+                &delete_err,
+                StorageError::InvalidVersionID(err_bucket, err_key, err_version)
+                    if err_bucket == bucket && err_key == "k" && err_version == "v"
+            ),
+            "expected InvalidVersionID, got: {delete_err:?}"
+        );
+
+        let control_delim_page = store
+            .clone()
+            .inner_list_object_versions(bucket, "", None, None, Some("\x0f".to_string()), 8)
+            .await
+            .expect("control-character delimiter without version-id-marker must succeed");
+        assert_eq!(
+            control_delim_page
+                .objects
+                .iter()
+                .map(|object| object.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["obj-a"]
+        );
+        assert!(control_delim_page.prefixes.is_empty());
+
+        let valid_null_marker_page = store
+            .clone()
+            .inner_list_object_versions(bucket, "", Some("k".to_string()), Some("null".to_string()), Some("\x0f".to_string()), 8)
+            .await
+            .expect("valid null version-id-marker with control-character delimiter must succeed");
+        assert_eq!(
+            valid_null_marker_page
+                .objects
+                .iter()
+                .map(|object| object.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["obj-a"]
+        );
+        assert!(valid_null_marker_page.prefixes.is_empty());
     }
 
     // ECA-03 / #944: a page whose raw keys fully collapse into fewer than max_keys
@@ -8445,12 +8527,33 @@ mod test {
 
     #[test]
     fn test_null_version_marker_handling() {
-        let parsed = parse_version_marker("null".to_string()).expect("null marker should parse");
+        let parsed = parse_version_marker("bucket", Some("key"), "null".to_string()).expect("null marker should parse");
         assert_eq!(parsed, VersionMarker::Null);
 
         let valid_uuid = "550e8400-e29b-41d4-a716-446655440000";
-        let parsed = parse_version_marker(valid_uuid.to_string()).expect("uuid marker should parse");
+        let parsed = parse_version_marker("bucket", Some("key"), valid_uuid.to_string()).expect("uuid marker should parse");
         assert_eq!(parsed, VersionMarker::Version(Uuid::parse_str(valid_uuid).unwrap()));
+
+        let invalid = parse_version_marker("bkt", Some("k"), "v".to_string()).expect_err("invalid marker should fail");
+        assert!(
+            matches!(
+                &invalid,
+                StorageError::InvalidVersionID(bucket, key, version)
+                    if bucket == "bkt" && key == "k" && version == "v"
+            ),
+            "expected InvalidVersionID, got: {invalid:?}"
+        );
+
+        let invalid_without_key =
+            parse_version_marker("bkt", None, "v".to_string()).expect_err("invalid marker without key should fail");
+        assert!(
+            matches!(
+                &invalid_without_key,
+                StorageError::InvalidVersionID(bucket, key, version)
+                    if bucket == "bkt" && key.is_empty() && version == "v"
+            ),
+            "expected InvalidVersionID with empty key, got: {invalid_without_key:?}"
+        );
     }
 
     /// Test that next_version_idmarker returns "null" for non-versioned objects
@@ -8476,7 +8579,7 @@ mod test {
         // Server parses "null" as an explicit null-version marker
         let server_response = "null";
         let client_request = server_response;
-        let parsed = parse_version_marker(client_request.to_string()).expect("null marker should parse");
+        let parsed = parse_version_marker("bucket", Some("key"), client_request.to_string()).expect("null marker should parse");
         assert_eq!(parsed, VersionMarker::Null);
 
         // Scenario 2: Versioned object
@@ -8486,7 +8589,7 @@ mod test {
         let uuid_str = "550e8400-e29b-41d4-a716-446655440000";
         let server_response = uuid_str;
         let client_request = server_response;
-        let parsed = parse_version_marker(client_request.to_string()).expect("uuid marker should parse");
+        let parsed = parse_version_marker("bucket", Some("key"), client_request.to_string()).expect("uuid marker should parse");
         assert_eq!(parsed, VersionMarker::Version(Uuid::parse_str(uuid_str).unwrap()));
     }
 

@@ -5899,7 +5899,8 @@ impl SetDisks {
                 );
                 prepared
             } else {
-                (shuffle_disks.clone(), vec![None; shuffle_disks.len()])
+                let tokens = vec![None; shuffle_disks.len()];
+                (shuffle_disks, tokens)
             };
             let commit_context_prepare_started = rustfs_io_metrics::put_stage_timer();
             let transaction_epoch =
@@ -11965,8 +11966,8 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
         let preloaded_prefix_object_lock_config =
             if opts.delete_prefix && opts.delete_prefix_object && !is_meta_bucketname(bucket) && !opts.data_movement {
                 Some(match opts.object_lock_config_snapshot.as_deref() {
-                    Some(snapshot) => snapshot.state().clone(),
-                    None => metadata_sys::get_object_lock_config_state_in(&self.ctx, bucket).await?,
+                    Some(snapshot) => Ok(snapshot.state().clone()),
+                    None => metadata_sys::get_object_lock_config_state_in(&self.ctx, bucket).await,
                 })
             } else {
                 None
@@ -12020,8 +12021,8 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
                 }
             }
             if opts.delete_prefix_object && !is_meta_bucketname(bucket) {
-                let object_lock_config = preloaded_prefix_object_lock_config;
                 if let Some(versions) = self.load_file_info_versions_exact(bucket, object).await? {
+                    let object_lock_config = preloaded_prefix_object_lock_config.transpose()?;
                     let bypass_governance = opts
                         .object_lock_delete
                         .as_ref()

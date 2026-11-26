@@ -2027,9 +2027,7 @@ pub(crate) async fn capture_commit_metadata_snapshot_for_options_in(
         {
             return Err(Error::BucketNotFound(bucket.to_string()));
         }
-    } else if let Some(incarnation) = snapshot.validated_bucket_incarnation_for(store.id, bucket, None) {
-        commit_opts.expected_bucket_incarnation_id = Some(incarnation);
-    } else {
+    } else if snapshot.validated_bucket_incarnation_for(store.id, bucket, None).is_none() {
         return Err(Error::other("bucket generation or configuration changed before commit"));
     }
     snapshot.add_lock_fences(&mut commit_opts);
