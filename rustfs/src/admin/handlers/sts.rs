@@ -120,10 +120,47 @@ fn sts_session_publication_error(error: IamError) -> S3Error {
     }
 }
 
+/// Map internal JWT verification diagnostics to safe, static client-facing reasons.
+///
+/// Full operator diagnostics (including internal discovery/JWKS URLs when metadata refresh
+/// fails) are logged by the handler and must never be echoed to unauthenticated callers.
+fn sanitize_web_identity_verification_error(message: &str) -> &'static str {
+    // Strip backend metadata-refresh diagnostics before classifying so internal discovery
+    // errors (e.g., `config_url` transport or TLS cert errors) never leak or distort the
+    // client-visible category.
+    let client_reason = message
+        .split("; failed to refresh provider metadata")
+        .next()
+        .unwrap_or(message);
+    let lower = client_reason.to_ascii_lowercase();
+    if lower.contains("missing 'iss' claim") {
+        return "token verification failed: missing issuer claim";
+    }
+    if lower.contains("no oidc provider configured for issuer") {
+        return "token verification failed: untrusted issuer";
+    }
+    if lower.contains("failed to parse jwt") {
+        return "token verification failed: malformed token";
+    }
+    if lower.contains("expired") {
+        return "token verification failed: token expired";
+    }
+    if lower.contains("audience") {
+        return "token verification failed: invalid audience";
+    }
+    if lower.contains("issuer") {
+        return "token verification failed: invalid issuer";
+    }
+    if lower.contains("signature") || lower.contains("signing") || lower.contains("jwk") {
+        return "token verification failed: invalid signature";
+    }
+    "token verification failed"
+}
+
 fn web_identity_federation_error(error: FederationError) -> S3Error {
     match error {
         FederationError::TokenVerification(message) => {
-            S3Error::with_message(S3ErrorCode::AccessDenied, format!("token verification failed: {message}"))
+            S3Error::with_message(S3ErrorCode::AccessDenied, sanitize_web_identity_verification_error(&message))
         }
         FederationError::NoAuthorizationContext => {
             s3_error!(InvalidArgument, "no policies are available for this OIDC token")
@@ -745,7 +782,65 @@ mod tests {
             (
                 FederationError::TokenVerification("invalid token".to_string()),
                 S3ErrorCode::AccessDenied,
-                "token verification failed: invalid token",
+                "token verification failed",
+            ),
+            (
+                FederationError::TokenVerification("JWT missing 'iss' claim".to_string()),
+                S3ErrorCode::AccessDenied,
+                "token verification failed: missing issuer claim",
+            ),
+            (
+                FederationError::TokenVerification(
+                    "no OIDC provider configured for issuer: https://untrusted.example".to_string(),
+                ),
+                S3ErrorCode::AccessDenied,
+                "token verification failed: untrusted issuer",
+            ),
+            (
+                FederationError::TokenVerification("failed to parse JWT as ID token: invalid base64".to_string()),
+                S3ErrorCode::AccessDenied,
+                "token verification failed: malformed token",
+            ),
+            (
+                FederationError::TokenVerification("ID token verification failed: Token expired".to_string()),
+                S3ErrorCode::AccessDenied,
+                "token verification failed: token expired",
+            ),
+            (
+                FederationError::TokenVerification("ID token verification failed: Invalid audience".to_string()),
+                S3ErrorCode::AccessDenied,
+                "token verification failed: invalid audience",
+            ),
+            (
+                FederationError::TokenVerification("ID token verification failed: Invalid issuer".to_string()),
+                S3ErrorCode::AccessDenied,
+                "token verification failed: invalid issuer",
+            ),
+            (
+                FederationError::TokenVerification(
+                    "ID token verification failed: InvalidSignature; failed to refresh provider metadata: \
+                     discovery failed: HTTP status code 503 at http://keycloak.keycloak.svc.cluster.local:8080/realms/rustfs"
+                        .to_string(),
+                ),
+                S3ErrorCode::AccessDenied,
+                "token verification failed: invalid signature",
+            ),
+            (
+                FederationError::TokenVerification(
+                    "ID token verification failed: InvalidSignature; failed to refresh provider metadata: \
+                     TLS certificate expired at http://keycloak.keycloak.svc.cluster.local:8080/realms/rustfs"
+                        .to_string(),
+                ),
+                S3ErrorCode::AccessDenied,
+                "token verification failed: invalid signature",
+            ),
+            (
+                FederationError::TokenVerification(
+                    "discovery failed: HTTP status code 503 at http://keycloak.keycloak.svc.cluster.local:8080/realms/rustfs"
+                        .to_string(),
+                ),
+                S3ErrorCode::AccessDenied,
+                "token verification failed",
             ),
             (
                 FederationError::NoAuthorizationContext,
@@ -767,7 +862,12 @@ mod tests {
         for (error, expected_code, expected_message) in cases {
             let error = web_identity_federation_error(error);
             assert_eq!(error.code(), &expected_code);
-            assert_eq!(error.message(), Some(expected_message));
+            let message = error.message().expect("error should carry a message");
+            assert_eq!(message, expected_message);
+            assert!(
+                !message.contains("keycloak.keycloak.svc.cluster.local"),
+                "internal discovery URL must never leak in client error: {message}"
+            );
         }
     }
 }

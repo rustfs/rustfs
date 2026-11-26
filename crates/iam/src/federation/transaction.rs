@@ -44,8 +44,11 @@ struct RuntimeCodeExchange {
 }
 
 impl FederatedIdentityService {
-    async fn exchange_code(&self, state: &str, code: &str, redirect_uri: &str) -> Result<RuntimeCodeExchange> {
-        let exchange = self.authentication.exchange_identity(state, code, redirect_uri).await?;
+    async fn exchange_code(&self, provider_id: &str, state: &str, code: &str, redirect_uri: &str) -> Result<RuntimeCodeExchange> {
+        let exchange = self
+            .authentication
+            .exchange_identity(provider_id, state, code, redirect_uri)
+            .await?;
         let (identity, redirect_after, logout_continuation) = exchange.into_parts();
         Ok(RuntimeCodeExchange {
             authorization: self.mapper.map(identity),
@@ -100,13 +103,14 @@ impl FederatedIdentityService {
 
     pub async fn complete_authorization_code(
         &self,
+        provider_id: &str,
         state: &str,
         code: &str,
         redirect_uri: &str,
         duration_seconds: usize,
         binding: &dyn FederatedSessionBinding,
     ) -> Result<FederatedLoginSession> {
-        let exchange = self.exchange_code(state, code, redirect_uri).await?;
+        let exchange = self.exchange_code(provider_id, state, code, redirect_uri).await?;
         let transaction = FederatedSessionTransaction {
             authorization: exchange.authorization,
             duration_seconds,
@@ -205,6 +209,7 @@ mod tests {
         failure: ProviderFailure,
         events: Arc<Mutex<Vec<&'static str>>>,
         authorize_calls: Mutex<Vec<(String, String, Option<String>)>>,
+        exchange_calls: Mutex<Vec<(String, String, String, String)>>,
         logout_url_calls: Mutex<Vec<(String, String)>>,
         expected_logout: (&'static str, &'static str),
         listed_provider_ids: Vec<&'static str>,
@@ -221,6 +226,7 @@ mod tests {
                 failure: ProviderFailure::None,
                 events,
                 authorize_calls: Mutex::new(Vec::new()),
+                exchange_calls: Mutex::new(Vec::new()),
                 logout_url_calls: Mutex::new(Vec::new()),
                 expected_logout: (DEFAULT_OIDC_PROVIDER_ID, "id-token"),
                 listed_provider_ids: Vec::new(),
@@ -294,11 +300,16 @@ mod tests {
 
         async fn exchange_identity(
             &self,
-            _state: &str,
-            _code: &str,
-            _redirect_uri: &str,
+            provider_id: &str,
+            state: &str,
+            code: &str,
+            redirect_uri: &str,
         ) -> Result<VerifiedFederatedCodeExchange> {
             self.record("exchange");
+            self.exchange_calls
+                .lock()
+                .expect("exchange call log should not be poisoned")
+                .push((provider_id.to_string(), state.to_string(), code.to_string(), redirect_uri.to_string()));
             if self.failure == ProviderFailure::Exchange {
                 return Err(FederationError::CodeExchange("exchange failed".to_string()));
             }
@@ -488,12 +499,26 @@ mod tests {
         provider.web_provider_id = "partner";
         provider.expected_logout = ("corp", "id-token");
         let binding = Arc::new(RecordingBinding::new(events.clone()));
-        let service = standard_service(Arc::new(provider));
+        let provider = Arc::new(provider);
+        let service = standard_service(provider.clone());
 
         let login = service
-            .complete_authorization_code("state", "code", "https://console.example/callback", 3600, binding.as_ref())
+            .complete_authorization_code("corp", "state", "code", "https://console.example/callback", 3600, binding.as_ref())
             .await
             .expect("callback flow should complete");
+        assert_eq!(
+            provider
+                .exchange_calls
+                .lock()
+                .expect("exchange call log should not be poisoned")
+                .as_slice(),
+            [(
+                "corp".to_string(),
+                "state".to_string(),
+                "code".to_string(),
+                "https://console.example/callback".to_string(),
+            )]
+        );
         assert_eq!(login.session.credentials.access_key, "user");
         assert_eq!(login.session.authorization.provider_id(), "corp");
         assert_eq!(login.redirect_after.as_deref(), Some("/browser"));
@@ -535,7 +560,7 @@ mod tests {
         let service = standard_service(Arc::new(provider));
 
         let login = service
-            .complete_authorization_code("state", "code", "https://console.example/callback", 3600, binding.as_ref())
+            .complete_authorization_code("corp", "state", "code", "https://console.example/callback", 3600, binding.as_ref())
             .await
             .expect("standard callback flow should complete");
         assert_eq!(login.session.authorization.provider_id(), "corp");
@@ -615,7 +640,14 @@ mod tests {
             let service = standard_service(Arc::new(provider));
 
             let error = service
-                .complete_authorization_code("state", "code", "https://console.example/callback", 3600, binding.as_ref())
+                .complete_authorization_code(
+                    DEFAULT_OIDC_PROVIDER_ID,
+                    "state",
+                    "code",
+                    "https://console.example/callback",
+                    3600,
+                    binding.as_ref(),
+                )
                 .await
                 .expect_err("the configured failure should be returned");
 

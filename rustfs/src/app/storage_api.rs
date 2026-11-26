@@ -294,6 +294,7 @@ pub(crate) mod access {
         log_list_buckets_iam_implicit_deny, odm_read_generation, prepare_list_buckets_iam_authorization,
         prepare_odm_read_generation, recursive_force_delete_has_authenticated_caller, replication_request_authorized,
         req_info_mut, req_info_ref, retained_table_data_plane_publication_guards, set_requested_object_lock_retain_until,
+        versioned_read_action, versioned_tagging_action,
     };
 }
 
@@ -1726,7 +1727,9 @@ pub(crate) mod object_meta_usecase {
 
     pub(crate) use crate::storage::storage_api::check_retention_for_modification;
 
-    pub(crate) use crate::storage::storage_api::ecfs_consumer::object_lock::validate_bucket_object_lock_enabled;
+    pub(crate) use crate::storage::storage_api::ecfs_consumer::object_lock::{
+        load_bucket_object_lock_config_state, validate_bucket_object_lock_enabled, validate_bucket_object_lock_enabled_state,
+    };
     pub(crate) use crate::storage::storage_api::ecstore_bucket::metadata::validate_tag_set_entries;
     pub(crate) use crate::storage::storage_api::ecstore_bucket::tagging::{
         decode_tags as decode_stored_tags, encode_tags as encode_stored_tags,
@@ -1769,6 +1772,7 @@ pub(crate) mod multipart_usecase {
         DEFAULT_EC_BLOCK_SIZE, EC_BLOCK_SIZE_HINT_INTERNAL_SUFFIX, EC_BLOCK_SIZE_HINT_METADATA_KEY,
         EC_BLOCK_SIZE_HINT_REASON_HEADER, EC_BLOCK_SIZE_HINT_STATUS_HEADER, EC_BLOCK_SIZE_RESPONSE_HEADER, ECStore,
         EcBlockSizeHintOutcome, StorageObjectOptions, StoragePutObjReader, resolve_ec_block_size_hint, validate_new_object_key,
+        validate_object_key,
     };
 }
 

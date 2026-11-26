@@ -333,6 +333,35 @@ pub async fn authorize_admin_envelope(req: &RequestEnvelope, actions: Vec<Action
     Ok(cred)
 }
 
+/// Resolve an [`SseKmsPrincipal`](crate::admin::storage_api::sse::SseKmsPrincipal)
+/// for an authenticated admin request envelope that serves object bytes.
+///
+/// Records the authenticated caller as a [`ReqInfo`](crate::admin::storage_api::access::ReqInfo)
+/// on `req` — matching the S3 read boundary — and extracts the KMS principal from
+/// it, failing closed with `AccessDenied` if the principal cannot be resolved so
+/// `None` (the SSE layer's internal-caller sentinel) is never passed through.
+pub(crate) async fn resolve_admin_object_read_sse_kms_principal(
+    req: &mut RequestEnvelope,
+) -> S3Result<crate::admin::storage_api::sse::SseKmsPrincipal> {
+    use crate::admin::runtime_sources::current_region;
+    use crate::admin::storage_api::access::ReqInfo;
+    use crate::admin::storage_api::sse::{SseKmsPrincipal, SseKmsPrincipalExt as _};
+
+    let Some(input_cred) = req.credentials() else {
+        return Err(s3_error!(AccessDenied, "Access Denied"));
+    };
+    let (cred, is_owner) = authenticate_envelope_credentials(input_cred).await?;
+    let request_context = req.request_context().cloned();
+    req.install_req_info(ReqInfo {
+        cred: Some(cred),
+        is_owner,
+        region: current_region(),
+        request_context,
+        ..Default::default()
+    });
+    SseKmsPrincipal::from_request(req).ok_or_else(|| s3_error!(AccessDenied, "Access Denied"))
+}
+
 #[cfg(test)]
 mod tests {
     //! Unit coverage for the central admin authorization gate (rustfs/backlog#1151 sec-4).
@@ -1045,5 +1074,25 @@ mod tests {
         let iam = iam_sys_with_empty_store();
         let res = evaluate_admin_actions(iam, &user_ctx, &actions, "", "").await;
         assert_access_denied(res);
+    }
+
+    #[tokio::test]
+    async fn resolve_admin_object_read_sse_kms_principal_fails_closed_without_credentials() {
+        let mut envelope = crate::app::RequestEnvelope::from_parts(
+            crate::app::RequestHead {
+                method: http::Method::GET,
+                uri: Uri::from_static("/rustfs/admin/v3/inspect-data?volume=data&file=a.txt"),
+                headers: HeaderMap::new(),
+                credentials: None,
+                region: None,
+                service: None,
+            },
+            http::Extensions::new(),
+        );
+
+        let err = resolve_admin_object_read_sse_kms_principal(&mut envelope)
+            .await
+            .expect_err("unauthenticated envelope must fail closed");
+        assert_eq!(err.code(), &rustfs_s3_types::S3ErrorCode::AccessDenied);
     }
 }

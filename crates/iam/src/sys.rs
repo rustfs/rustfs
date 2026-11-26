@@ -1062,13 +1062,25 @@ impl<T: Store> IamSys<T> {
                 Value::String(base64_simd::URL_SAFE_NO_PAD.encode_to_string(&policy_buf)),
             );
             m.insert(iam_policy_claim_name_sa(), Value::String(EMBEDDED_POLICY_TYPE.to_owned()));
+        } else if let Some(encoded) = opts
+            .claims
+            .as_ref()
+            .map(creator_session_policy_from_claims)
+            .transpose()?
+            .flatten()
+        {
+            // Promote a creator's session policy (copied from a bounded caller
+            // or replayed by site replication) into an embedded service-account
+            // policy so the new account cannot escape into inherited mode.
+            m.insert(SESSION_POLICY_NAME.to_owned(), Value::String(encoded));
+            m.insert(iam_policy_claim_name_sa(), Value::String(EMBEDDED_POLICY_TYPE.to_owned()));
         } else {
             m.insert(iam_policy_claim_name_sa(), Value::String(INHERITED_POLICY_TYPE.to_owned()));
         }
 
         if let Some(claims) = opts.claims {
             for (k, v) in claims.iter() {
-                if !m.contains_key(k) {
+                if k != SESSION_POLICY_NAME_EXTRACTED && !m.contains_key(k) {
                     m.insert(k.to_owned(), v.to_owned());
                 }
             }
@@ -1817,14 +1829,7 @@ impl<T: Store> IamSys<T> {
             return Ok(None);
         };
 
-        let boundary = match claims.get(SESSION_POLICY_NAME) {
-            Some(Value::String(encoded)) => {
-                decode_session_policy(encoded)?;
-                Some(encoded.clone())
-            }
-            Some(_) => return Err(IamError::InvalidArgument),
-            None => None,
-        };
+        let boundary = creator_session_policy_from_claims(claims)?;
 
         let mut verified_claims = HashMap::from([
             (VERIFIED_FEDERATED_POLICY_CLAIM.to_string(), Value::Bool(true)),
@@ -1991,6 +1996,16 @@ impl<T: Store> IamSys<T> {
                 .await
                 .map_err(|_| IamError::IAMActionNotAllowed)?
         };
+        // A non-federated caller bounded by a session policy passes that policy
+        // down as the new account's embedded policy; it cannot replace it with
+        // an arbitrary request policy, and a caller carrying a federated
+        // boundary without a live federated policy resolution cannot drop it.
+        if verified_federated_policy.is_none()
+            && claims_have_policy_boundary(caller.claims_or_empty())
+            && (opts.session_policy.is_some() || caller.claims_or_empty().contains_key(FEDERATED_POLICY_BOUNDARY_CLAIM))
+        {
+            return Err(IamError::IAMActionNotAllowed);
+        }
         if let Some(source_claims) = caller.claims.as_ref() {
             merge_derived_service_account_claims(opts.claims.get_or_insert_default(), source_claims, verified_federated_policy)?;
         }
@@ -2763,17 +2778,54 @@ fn prepare_session_policy(args: &Args<'_>, empty_is_none: bool) -> PreparedSessi
     PreparedSessionPolicy::Policy(sub_policy)
 }
 
-fn decode_session_policy(encoded: &str) -> Result<Policy> {
-    let bytes = base64_simd::URL_SAFE_NO_PAD.decode_to_vec(encoded.as_bytes())?;
+/// Whether `claims` carry a session policy (`sessionPolicy` or
+/// `sessionPolicy-extracted`) that restricts the credential relative to its
+/// parent identity.
+pub fn claims_have_session_policy(claims: &HashMap<String, Value>) -> bool {
+    claims.contains_key(SESSION_POLICY_NAME) || claims.contains_key(SESSION_POLICY_NAME_EXTRACTED)
+}
+
+/// Whether `claims` carry any per-credential policy restriction: either a
+/// session policy or a persisted federated policy boundary.
+pub fn claims_have_policy_boundary(claims: &HashMap<String, Value>) -> bool {
+    claims_have_session_policy(claims) || claims.contains_key(FEDERATED_POLICY_BOUNDARY_CLAIM)
+}
+
+fn validate_session_policy_bytes(bytes: &[u8]) -> Result<Policy> {
     if bytes.len() > MAX_SVCSESSION_POLICY_SIZE {
         return Err(IamError::PolicyTooLarge);
     }
-    let policy = Policy::parse_config(&bytes)?;
+    let policy = Policy::parse_config(bytes)?;
     policy.validate()?;
     if policy.version.is_empty() {
         return Err(IamError::InvalidArgument);
     }
     Ok(policy)
+}
+
+fn decode_session_policy(encoded: &str) -> Result<Policy> {
+    let bytes = base64_simd::URL_SAFE_NO_PAD.decode_to_vec(encoded.as_bytes())?;
+    validate_session_policy_bytes(&bytes)
+}
+
+fn creator_session_policy_from_claims(claims: &HashMap<String, Value>) -> Result<Option<String>> {
+    match claims.get(SESSION_POLICY_NAME) {
+        Some(Value::String(encoded)) => {
+            decode_session_policy(encoded)?;
+            return Ok(Some(encoded.clone()));
+        }
+        Some(_) => return Err(IamError::InvalidArgument),
+        None => {}
+    }
+
+    match claims.get(SESSION_POLICY_NAME_EXTRACTED) {
+        Some(Value::String(raw)) => {
+            validate_session_policy_bytes(raw.as_bytes())?;
+            Ok(Some(base64_simd::URL_SAFE_NO_PAD.encode_to_string(raw.as_bytes())))
+        }
+        Some(_) => Err(IamError::InvalidArgument),
+        None => Ok(None),
+    }
 }
 
 pub fn is_safe_claim_policy_name(policy: &str) -> bool {
@@ -6790,6 +6842,241 @@ mod tests {
             !iam_sys.is_allowed(&args).await,
             "OIDC service accounts must resolve current policy documents instead of retaining a policy snapshot"
         );
+    }
+
+    /// Build a live, session-policy-bounded STS caller parented to root and
+    /// register it in `iam_sys` so `new_service_account_from_caller` executes
+    /// the full live-caller validation path.
+    async fn register_session_policy_bounded_root_caller(
+        iam_sys: &IamSys<StsTestMockStore>,
+        access_key: &str,
+        claims: HashMap<String, Value>,
+    ) -> Credentials {
+        let root = crate::root_credentials::credentials().expect("global action (root) credentials should be initialized");
+        let expiration = OffsetDateTime::now_utc() + time::Duration::hours(1);
+        let caller = Credentials {
+            access_key: access_key.to_string(),
+            secret_key: "boundedSessionCallerSecret123".to_string(),
+            session_token: "signed-session-token".to_string(),
+            status: ACCOUNT_ON.to_string(),
+            expiration: Some(expiration),
+            parent_user: root.access_key,
+            claims: Some(claims),
+            ..Default::default()
+        };
+        iam_sys
+            .set_temp_user(&caller.access_key, &caller, None)
+            .await
+            .expect("register bounded STS caller");
+        caller
+    }
+
+    #[tokio::test]
+    async fn session_policy_bounded_caller_passes_its_policy_to_service_account() {
+        ensure_test_global_credentials();
+        let iam_sys = IamSys::new(IamCache::new(StsTestMockStore::new(true)).await.expect("initialize IAM"));
+        let root = crate::root_credentials::credentials().expect("root credentials");
+        let encoded_policy = base64_simd::URL_SAFE_NO_PAD.encode_to_string(CUSTOM_STS_CLAIM_POLICY_JSON.as_bytes());
+        let exp = (OffsetDateTime::now_utc() + time::Duration::hours(1)).unix_timestamp();
+
+        let cases = [
+            (
+                "BOUNDEDSESSIONCALLER1",
+                "BOUNDEDSERVICEACCOUNT1",
+                HashMap::from([
+                    ("parent".to_string(), Value::String(root.access_key.clone())),
+                    (SESSION_POLICY_NAME.to_string(), Value::String(encoded_policy)),
+                    (
+                        SESSION_POLICY_NAME_EXTRACTED.to_string(),
+                        Value::String(CUSTOM_STS_CLAIM_POLICY_JSON.to_string()),
+                    ),
+                    ("exp".to_string(), Value::Number(exp.into())),
+                ]),
+            ),
+            (
+                "BOUNDEDEXTRACTEDCALLER1",
+                "BOUNDEDSERVICEACCOUNT1B",
+                HashMap::from([
+                    ("parent".to_string(), Value::String(root.access_key.clone())),
+                    (
+                        SESSION_POLICY_NAME_EXTRACTED.to_string(),
+                        Value::String(CUSTOM_STS_CLAIM_POLICY_JSON.to_string()),
+                    ),
+                    ("exp".to_string(), Value::Number(exp.into())),
+                ]),
+            ),
+        ];
+
+        for (caller_ak, svc_ak, caller_claims) in cases {
+            let caller = register_session_policy_bounded_root_caller(&iam_sys, caller_ak, caller_claims).await;
+            let parent_user = caller.parent_user.clone();
+
+            let (credential, _, replication_claims) = iam_sys
+                .new_service_account_from_caller(
+                    &parent_user,
+                    None,
+                    NewServiceAccountOpts {
+                        access_key: svc_ak.to_string(),
+                        secret_key: "boundedServiceAccountSecret123".to_string(),
+                        ..Default::default()
+                    },
+                    &caller,
+                )
+                .await
+                .expect("service account without a request policy should be created");
+            assert!(
+                claims_have_session_policy(&replication_claims),
+                "replication claims must retain the creator's session policy for {svc_ak}"
+            );
+            let claims = iam_sys
+                .get_claims_for_svc_acc(&credential.access_key)
+                .await
+                .expect("stored service-account claims should decode");
+            assert_eq!(
+                claims.get(&iam_policy_claim_name_sa()),
+                Some(&Value::String(EMBEDDED_POLICY_TYPE.to_string())),
+                "creator's session policy must be embedded rather than inherited for {svc_ak}"
+            );
+            assert!(
+                claims.contains_key(SESSION_POLICY_NAME),
+                "stored service account must carry encoded sessionPolicy for {svc_ak}"
+            );
+            let groups = None;
+            let conditions = HashMap::new();
+
+            for (action, allowed) in [(S3Action::GetObjectAction, true), (S3Action::PutObjectAction, false)] {
+                let args = Args {
+                    account: &credential.access_key,
+                    groups: &groups,
+                    action: Action::S3Action(action),
+                    bucket: CUSTOM_STS_CLAIM_BUCKET,
+                    conditions: &conditions,
+                    is_owner: false,
+                    object: "allowed/object.txt",
+                    claims: &claims,
+                    deny_only: false,
+                };
+                assert_eq!(
+                    iam_sys.is_allowed(&args).await,
+                    allowed,
+                    "service account created by bounded caller {caller_ak} must stay within its session policy"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn session_policy_bounded_caller_cannot_choose_service_account_policy() {
+        ensure_test_global_credentials();
+        let iam_sys = IamSys::new(IamCache::new(StsTestMockStore::new(true)).await.expect("initialize IAM"));
+        let root = crate::root_credentials::credentials().expect("root credentials");
+        let encoded_policy = base64_simd::URL_SAFE_NO_PAD.encode_to_string(CUSTOM_STS_CLAIM_POLICY_JSON.as_bytes());
+        let exp = (OffsetDateTime::now_utc() + time::Duration::hours(1)).unix_timestamp();
+        let wider_policy = Policy::parse_config(
+            br#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":["s3:*"],"Resource":["arn:aws:s3:::*"]}]}"#,
+        )
+        .expect("wider policy should parse");
+
+        let cases = [
+            (
+                "BOUNDEDSESSIONCALLER2",
+                "BOUNDEDSERVICEACCOUNT2A",
+                HashMap::from([
+                    ("parent".to_string(), Value::String(root.access_key.clone())),
+                    (SESSION_POLICY_NAME.to_string(), Value::String(encoded_policy.clone())),
+                    ("exp".to_string(), Value::Number(exp.into())),
+                ]),
+                Some(wider_policy.clone()),
+            ),
+            (
+                "BOUNDEDEXTRACTEDCALLER2",
+                "BOUNDEDSERVICEACCOUNT2B",
+                HashMap::from([
+                    ("parent".to_string(), Value::String(root.access_key.clone())),
+                    (
+                        SESSION_POLICY_NAME_EXTRACTED.to_string(),
+                        Value::String(CUSTOM_STS_CLAIM_POLICY_JSON.to_string()),
+                    ),
+                    ("exp".to_string(), Value::Number(exp.into())),
+                ]),
+                Some(wider_policy.clone()),
+            ),
+            (
+                "BOUNDEDFEDERATEDCALLER2",
+                "BOUNDEDSERVICEACCOUNT2C",
+                HashMap::from([
+                    ("parent".to_string(), Value::String(root.access_key.clone())),
+                    (FEDERATED_POLICY_BOUNDARY_CLAIM.to_string(), Value::String(encoded_policy)),
+                    ("exp".to_string(), Value::Number(exp.into())),
+                ]),
+                None,
+            ),
+        ];
+
+        for (caller_ak, svc_ak, caller_claims, request_policy) in cases {
+            let caller = register_session_policy_bounded_root_caller(&iam_sys, caller_ak, caller_claims).await;
+            let parent_user = caller.parent_user.clone();
+
+            let err = iam_sys
+                .new_service_account_from_caller(
+                    &parent_user,
+                    None,
+                    NewServiceAccountOpts {
+                        access_key: svc_ak.to_string(),
+                        secret_key: "boundedServiceAccountSecret123".to_string(),
+                        session_policy: request_policy,
+                        ..Default::default()
+                    },
+                    &caller,
+                )
+                .await
+                .expect_err("a bounded caller must not bypass or replace its policy boundary");
+            assert!(matches!(err, IamError::IAMActionNotAllowed), "for {caller_ak}: {err}");
+            assert!(iam_sys.get_claims_for_svc_acc(svc_ak).await.is_err());
+        }
+    }
+
+    #[test]
+    fn service_account_credentials_rejects_malformed_creator_session_policy_claims() {
+        ensure_test_global_credentials();
+        for bad_claims in [
+            HashMap::from([(SESSION_POLICY_NAME.to_string(), Value::Bool(true))]),
+            HashMap::from([(SESSION_POLICY_NAME.to_string(), Value::String("not-valid-base64!!!".to_string()))]),
+            HashMap::from([(SESSION_POLICY_NAME_EXTRACTED.to_string(), Value::Number(42.into()))]),
+            HashMap::from([(SESSION_POLICY_NAME_EXTRACTED.to_string(), Value::String("{}".to_string()))]),
+        ] {
+            let result = IamSys::<StsTestMockStore>::service_account_credentials(
+                "alice",
+                None,
+                NewServiceAccountOpts {
+                    access_key: "MALFORMEDCREATORSA1".to_string(),
+                    secret_key: "malformedCreatorSecret123".to_string(),
+                    claims: Some(bad_claims),
+                    ..Default::default()
+                },
+            );
+            assert!(result.is_err(), "malformed creator sessionPolicy claims must fail closed");
+        }
+    }
+
+    #[test]
+    fn claims_have_policy_boundary_recognizes_session_and_federated_boundary_claims() {
+        let empty = HashMap::new();
+        assert!(!claims_have_session_policy(&empty));
+        assert!(!claims_have_policy_boundary(&empty));
+
+        let with_encoded = HashMap::from([(SESSION_POLICY_NAME.to_string(), Value::String("e30".to_string()))]);
+        assert!(claims_have_session_policy(&with_encoded));
+        assert!(claims_have_policy_boundary(&with_encoded));
+
+        let with_extracted = HashMap::from([(SESSION_POLICY_NAME_EXTRACTED.to_string(), Value::String("{}".to_string()))]);
+        assert!(claims_have_session_policy(&with_extracted));
+        assert!(claims_have_policy_boundary(&with_extracted));
+
+        let with_federated_boundary =
+            HashMap::from([(FEDERATED_POLICY_BOUNDARY_CLAIM.to_string(), Value::String("e30".to_string()))]);
+        assert!(!claims_have_session_policy(&with_federated_boundary));
+        assert!(claims_have_policy_boundary(&with_federated_boundary));
     }
 
     #[tokio::test]
