@@ -385,6 +385,63 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn presigned_and_anonymous_gateway_envelopes_ignore_unsigned_auth_type_headers() {
+        use crate::app::storage_api::owned_parity::parity_test_support::request_authz_facts;
+        use crate::auth::facts::{AuthzPrincipal, AuthzTarget, build_conditions};
+        use rustfs_policy::policy::action::{Action, S3Action};
+
+        let mut presigned = signed_list_buckets(Signed::Query);
+        presigned
+            .headers_mut()
+            .insert("awsaccesskeyid", HeaderValue::from_static("x"));
+        let envelope = envelope_of::<dto::ListBuckets>(presigned, &ServerContextSlot::new()).await;
+        assert!(envelope.verified_sigv4().is_some(), "verified_sigv4");
+        assert!(envelope.verified_presigned().is_some(), "verified_presigned");
+        let cred = rustfs_credentials::Credentials {
+            access_key: SIGNER_ACCESS_KEY.to_owned(),
+            ..Default::default()
+        };
+        let facts = request_authz_facts(
+            &envelope,
+            AuthzTarget {
+                action: Action::S3Action(S3Action::ListAllMyBucketsAction),
+                bucket: "",
+                object: "",
+                version_id: None,
+                location_constraint: None,
+            },
+        );
+        let conditions = build_conditions(&AuthzPrincipal::new(&cred, ""), &facts);
+        assert_eq!(conditions.get("authType"), Some(&vec!["REST-QUERY-STRING".to_owned()]));
+        assert_eq!(conditions.get("signatureversion"), Some(&vec!["AWS4-HMAC-SHA256".to_owned()]));
+
+        let anon_request = list_buckets_request("/")
+            .header("awsaccesskeyid", "x")
+            .header("x-amz-content-sha256", "STREAMING-AWS4-HMAC-SHA256-PAYLOAD")
+            .header("content-type", "multipart/form-data; boundary=x")
+            .header("action", "AssumeRole")
+            .body(Empty::new())
+            .expect("static request");
+        let anon_envelope = envelope_of::<dto::ListBuckets>(anon_request, &ServerContextSlot::new()).await;
+        assert!(anon_envelope.verified_sigv4().is_none(), "verified_sigv4");
+        assert!(anon_envelope.verified_presigned().is_none(), "verified_presigned");
+        let anon_cred = rustfs_credentials::Credentials::default();
+        let anon_facts = request_authz_facts(
+            &anon_envelope,
+            AuthzTarget {
+                action: Action::S3Action(S3Action::ListAllMyBucketsAction),
+                bucket: "",
+                object: "",
+                version_id: None,
+                location_constraint: None,
+            },
+        );
+        let anon_conditions = build_conditions(&AuthzPrincipal::new(&anon_cred, ""), &anon_facts);
+        assert_eq!(anon_conditions.get("authType"), Some(&vec!["Anonymous".to_owned()]));
+        assert!(!anon_conditions.contains_key("signatureversion"));
+    }
+
+    #[tokio::test]
     async fn an_operation_that_stages_an_upload_is_marked_as_staging() {
         let request = Request::builder()
             .method(Method::POST)

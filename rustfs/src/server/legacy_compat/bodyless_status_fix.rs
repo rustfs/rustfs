@@ -11,17 +11,14 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
-//! `BodylessStatusFixLayer`: an s3s compatibility patch, installed by
-//! `server::http::external_service_stack!` and pinned there by `stack_census`.
+//! `BodylessStatusFixLayer`: outer-edge HTTP response invariant layer installed by
+//! `server::http::external_service_stack!` and pinned by `stack_census` / `middleware_matrix_census`.
 //!
-//! Patches: s3s serialises every `S3Error` as an XML body, including the
-//! `1xx`/`204`/`205`/`304` responses that RFC 9110 §15 forbids a body on; h2
-//! clients read the extra DATA frames as a connection failure (`GOAWAY`).
-//! Introduced in rustfs/rustfs#2627.
-//! Replaced by: the gateway's response invariants, applied once to every
-//! response (gateway `docs/middleware.md`, "The nine RustFS tower patch
-//! layers", row 1).
-//! Removed by: T2.12 (rustfs/backlog#2771).
+//! Origin: patched s3s serialising XML bodies on `1xx`/`204`/`205`/`304` responses that RFC 9110
+//! §15 forbids a body on (`rustfs/rustfs#2627`).
+//! T2.12 (`rustfs/backlog#2771`) ruling: gateway enforces this invariant on its own responses,
+//! while this layer stays on the outer stack because it also wraps website, console, and outer
+//! middleware responses until all non-S3 edges guarantee the same invariant.
 
 use crate::server::hybrid::HybridBody;
 use bytes::Bytes;

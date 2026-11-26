@@ -484,10 +484,12 @@ fn build_object_lambda_event_payload(
     output_route: &str,
     output_token: &str,
 ) -> S3Result<Vec<u8>> {
-    let request_headers = req
-        .headers()
-        .iter()
-        .filter_map(|(name, value)| value.to_str().ok().map(|value| (name.to_string(), value.to_string())))
+    // Route outbound webhook headers through the shared redaction helper used
+    // by audit and notification sinks so credential-bearing headers (SSE-C
+    // keys, Authorization, session tokens, cookies) are redacted before
+    // leaving the process.
+    let request_headers = rustfs_targets::extract_params_header(req.headers())
+        .into_iter()
         .collect::<std::collections::BTreeMap<_, _>>();
 
     serde_json::to_vec(&serde_json::json!({
@@ -1176,6 +1178,29 @@ impl<T> S3Router<T> {
         // For non-RPC admin requests, check credentials
         reject_unbound_custom_route_auth(method, uri, headers, signed)?;
         signature_required()
+    }
+}
+
+/// Access rule for reserved console paths arriving on a listener where the native console is
+/// disabled (for example, the S3 port when a dedicated console port is enabled).
+pub(crate) fn admit_reserved_console(
+    server_ctx: Option<&crate::admin::runtime_sources::ServerContextSlot>,
+    method: &Method,
+    uri: &Uri,
+    headers: &HeaderMap,
+    signed: bool,
+) -> rustfs_s3_types::S3Result<()> {
+    reject_unsigned_amz_headers_on_sigv4_request(headers, uri.query())?;
+    if let Some(server_ctx) = server_ctx
+        && server_ctx.installed_app_context().is_none()
+    {
+        return Err(server_context_not_ready_error());
+    }
+    reject_unbound_custom_route_auth(method, uri, headers, signed)?;
+    if signed {
+        Ok(())
+    } else {
+        Err(access_denied("Signature is required"))
     }
 }
 
@@ -2149,6 +2174,75 @@ mod tests {
             payload["userRequest"]["url"],
             "/demo-bucket/object.txt?lambdaArn=arn%3Aacme%3As3-object-lambda%3A%3Atransformer%3Awebhook"
         );
+    }
+
+    #[test]
+    fn build_object_lambda_event_payload_redacts_sensitive_headers() {
+        let req = RequestEnvelope::from_parts(
+            RequestHead {
+                method: Method::GET,
+                uri: "/demo-bucket/object.txt?lambdaArn=arn%3Aacme%3As3-object-lambda%3A%3Atransformer%3Awebhook"
+                    .parse()
+                    .expect("uri should parse"),
+                headers: HeaderMap::from_iter([
+                    (http::header::HOST, HeaderValue::from_static("localhost:9000")),
+                    (http::header::RANGE, HeaderValue::from_static("bytes=0-9")),
+                    (http::header::IF_MATCH, HeaderValue::from_static("\"etag-1\"")),
+                    (
+                        http::header::AUTHORIZATION,
+                        HeaderValue::from_static("AWS4-HMAC-SHA256 Credential=rustfsadmin/20260101/us-east-1/s3/aws4_request"),
+                    ),
+                    (
+                        HeaderName::from_static("x-amz-security-token"),
+                        HeaderValue::from_static("session-secret-token"),
+                    ),
+                    (
+                        HeaderName::from_static("x-amz-server-side-encryption-customer-key"),
+                        HeaderValue::from_static("MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY="),
+                    ),
+                    (
+                        HeaderName::from_static("x-amz-server-side-encryption-customer-key-md5"),
+                        HeaderValue::from_static("hRasmdxgYDKV3nvbahU1MA=="),
+                    ),
+                    (http::header::COOKIE, HeaderValue::from_static("sid=super-secret")),
+                ]),
+                credentials: None,
+                region: None,
+                service: None,
+            },
+            http::Extensions::new(),
+        );
+
+        let payload_bytes = build_object_lambda_event_payload(
+            &req,
+            "arn:acme:s3-object-lambda::transformer:webhook",
+            "https://example.com/source",
+            "route-123",
+            "token-456",
+        )
+        .expect("payload should serialize");
+        let payload: serde_json::Value = serde_json::from_slice(&payload_bytes).expect("payload should be json");
+        let headers = &payload["userRequest"]["headers"];
+
+        assert_eq!(headers["host"], "localhost:9000");
+        assert_eq!(headers["range"], "bytes=0-9");
+        assert_eq!(headers["if-match"], "\"etag-1\"");
+        for name in [
+            "authorization",
+            "x-amz-security-token",
+            "x-amz-server-side-encryption-customer-key",
+            "x-amz-server-side-encryption-customer-key-md5",
+            "cookie",
+        ] {
+            assert_eq!(headers[name], "***redacted***", "{name} should be redacted");
+        }
+
+        let rendered = String::from_utf8(payload_bytes).expect("payload must be valid utf-8");
+        assert!(!rendered.contains("MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY="));
+        assert!(!rendered.contains("hRasmdxgYDKV3nvbahU1MA=="));
+        assert!(!rendered.contains("session-secret-token"));
+        assert!(!rendered.contains("Credential=rustfsadmin"));
+        assert!(!rendered.contains("sid=super-secret"));
     }
 
     #[test]

@@ -426,13 +426,13 @@ pub(super) fn assemble(
 
 /// The head of a claimed request as the transport handed it over, which the access rule reads.
 #[derive(Clone)]
-struct ClaimedHead {
-    method: Method,
-    uri: Uri,
-    headers: HeaderMap,
+pub(super) struct ClaimedHead {
+    pub(super) method: Method,
+    pub(super) uri: Uri,
+    pub(super) headers: HeaderMap,
     /// Whether the request carried more than one `Authorization` line, which [`attach_head`]
     /// removed before the gateway read the request.
-    repeated_authorization: bool,
+    pub(super) repeated_authorization: bool,
 }
 
 /// Attaches the head of `request` for the access rule, before the gateway reads anything.

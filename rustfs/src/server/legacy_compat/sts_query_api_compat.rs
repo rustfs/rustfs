@@ -11,18 +11,14 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
-//! `StsQueryApiCompatLayer`: an s3s compatibility patch, installed by
-//! `server::http::external_service_stack!` and pinned there by `stack_census`.
+//! `StsQueryApiCompatLayer`: outer-edge STS Query API envelope layer installed by
+//! `server::http::external_service_stack!` and pinned by `stack_census` / `middleware_matrix_census`.
 //!
-//! Patches: s3s has no STS Query API, so the STS envelope
-//! (`ResponseMetadata`, `ErrorResponse`, the request id) has to be written
-//! around s3s's response, including the short-circuit errors of outer layers.
-//! Introduced in rustfs/rustfs#5282.
-//! Replaced by: STS calls registered as gateway extension operations behind a
-//! `QueryPresent` route predicate (gateway `docs/middleware.md`, "The nine
-//! RustFS tower patch layers", row 8); RustFS's own STS endpoint is served by
-//! the `rustfs` dialect's form claim (rustfs/gateway#1375).
-//! Removed by: T2.12 (rustfs/backlog#2771).
+//! Origin: wraps outer short-circuit errors in STS XML envelopes (`ErrorResponse`) and marks STS
+//! requests (`StsQueryRequest`) for downstream compression handling (`rustfs/rustfs#5282`).
+//! T2.12 (`rustfs/backlog#2771`) ruling: stays on the outer stack because outer layers (rate
+//! limiting, readiness, panic recovery) can still short-circuit STS requests before the gateway
+//! form claim runs, and compression reads `StsQueryRequest`.
 
 use super::{SerializedS3Error, xml_escape};
 use crate::error::ApiError;

@@ -573,7 +573,20 @@ impl DefaultObjectUsecase {
         // has no such rewrap primitive today; adding one is backlog#1637, and it would enter here
         // as an explicit exception rather than by relaxing this guard.
         let copy_changes_encryption = src_info.is_encrypted() || effective_sse.is_some() || has_explicit_ssec;
-        if cp_src_dst_same && src_info.transitioned_object.tier.is_empty() && !copy_changes_encryption {
+        // The in-place metadata-only shortcut rewrites the version the source read resolved.
+        // When the destination is not versioned (versioning suspended, or a key under
+        // ExcludedPrefixes / ExcludeFolders), writes must create or replace the `null` version
+        // rather than mutating a preserved non-nil UUID version in place; leave
+        // `metadata_only = false` so the store layer writes a new `null` version through
+        // `put_object`, matching PutObject.
+        let same_explicit_version = src_opts.version_id.is_some() && src_opts.version_id == dst_opts.version_id;
+        let rewrites_preserved_version =
+            !dst_opts.versioned && !same_explicit_version && src_info.version_id.is_some_and(|version_id| !version_id.is_nil());
+        if cp_src_dst_same
+            && src_info.transitioned_object.tier.is_empty()
+            && !copy_changes_encryption
+            && !rewrites_preserved_version
+        {
             src_info.metadata_only = true;
         }
 
@@ -1659,5 +1672,534 @@ mod tests {
             .await
             .expect_err("a refused copy must not leave a destination object behind");
         assert!(is_err_object_not_found(&lookup_err), "{lookup_err}");
+    }
+
+    async fn read_store_object_bytes(store: &ECStore, bucket: &str, key: &str, opts: &ObjectOptions) -> Vec<u8> {
+        let mut reader = store
+            .get_object_reader(bucket, key, None, HeaderMap::new(), opts)
+            .await
+            .expect("object reader should open");
+        let mut bytes = Vec::new();
+        reader
+            .stream
+            .read_to_end(&mut bytes)
+            .await
+            .expect("object body should be readable");
+        bytes
+    }
+
+    async fn publish_bucket_versioning_xml(store: &ECStore, bucket: &str, xml: &[u8]) {
+        store
+            .update_bucket_metadata_config(
+                bucket,
+                crate::app::storage_api::test::bucket::metadata::BUCKET_VERSIONING_CONFIG,
+                xml.to_vec(),
+            )
+            .await
+            .expect("update bucket versioning config");
+        let metadata = store.get_bucket_metadata(bucket).await.expect("reload bucket metadata");
+        crate::app::storage_api::test::set_bucket_metadata(bucket.to_owned(), (*metadata).clone())
+            .await
+            .expect("publish updated bucket versioning metadata");
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn execute_copy_object_suspended_self_copy_preserves_pre_suspension_uuid_version() {
+        use crate::app::storage_api::test::contract::bucket::{BucketOperations as _, DeleteBucketOptions, MakeBucketOptions};
+
+        let (store, context) = real_store_test_context().await;
+        let slot = crate::app::runtime_sources::ServerContextSlot::new();
+        assert!(slot.install(Arc::clone(&context)));
+        let gateway = crate::server::TestGateway::over(&context, slot);
+
+        let bucket = format!("copy-suspended-self-{}", Uuid::new_v4());
+        let original_mod_time = OffsetDateTime::now_utc() - time::Duration::seconds(300);
+
+        store
+            .make_bucket(
+                &bucket,
+                &MakeBucketOptions {
+                    versioning_enabled: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("create versioned copy test bucket");
+
+        let seed_key = |key: &'static str, payload: Vec<u8>| {
+            let store = Arc::clone(&store);
+            let bucket = bucket.clone();
+            async move {
+                store
+                    .put_object(
+                        &bucket,
+                        key,
+                        &mut PutObjReader::from_vec(payload),
+                        &ObjectOptions {
+                            versioned: true,
+                            mod_time: Some(original_mod_time),
+                            user_defined: HashMap::from([
+                                ("content-type".to_owned(), "text/plain".to_owned()),
+                                ("author".to_owned(), "alice".to_owned()),
+                                (AMZ_OBJECT_TAGGING.to_owned(), "class=secret".to_owned()),
+                            ]),
+                            write_completion: crate::app::storage_api::object_usecase::WriteCompletion::TailDrained,
+                            ..Default::default()
+                        },
+                    )
+                    .await
+                    .expect("seed enabled-era UUID version")
+            }
+        };
+
+        let meta_payload = b"metadata replace body".to_vec();
+        let tag_payload = b"tag replace body".to_vec();
+        let sc_payload = b"storage class body".to_vec();
+
+        let meta_seeded = seed_key("meta-replace.txt", meta_payload.clone()).await;
+        let tag_seeded = seed_key("tag-replace.txt", tag_payload.clone()).await;
+        let sc_seeded = seed_key("storage-class.txt", sc_payload.clone()).await;
+
+        let meta_vid = meta_seeded.version_id.expect("meta-replace seed must have UUID");
+        let tag_vid = tag_seeded.version_id.expect("tag-replace seed must have UUID");
+        let sc_vid = sc_seeded.version_id.expect("storage-class seed must have UUID");
+        assert!(!meta_vid.is_nil() && !tag_vid.is_nil() && !sc_vid.is_nil());
+
+        // Suspend versioning: every existing UUID version must now stay immutable on writes.
+        publish_bucket_versioning_xml(
+            &store,
+            &bucket,
+            b"<VersioningConfiguration><Status>Suspended</Status></VersioningConfiguration>",
+        )
+        .await;
+        assert!(!BucketVersioningSys::prefix_enabled(&bucket, "meta-replace.txt").await);
+        assert!(BucketVersioningSys::prefix_suspended(&bucket, "meta-replace.txt").await);
+
+        // 1. Metadata-replace self-copy must create a new `null` version and leave the UUID intact.
+        let meta_resp = gateway
+            .signed(
+                Method::PUT,
+                &format!("/{bucket}/meta-replace.txt"),
+                vec![
+                    ("x-amz-copy-source", format!("/{bucket}/meta-replace.txt")),
+                    ("x-amz-metadata-directive", "REPLACE".to_owned()),
+                    ("content-type", "text/html".to_owned()),
+                    ("x-amz-meta-author", "mallory".to_owned()),
+                ],
+                Bytes::new(),
+            )
+            .await
+            .expect("metadata-replace self-copy HTTP response");
+        assert_eq!(meta_resp.status(), http::StatusCode::OK);
+        assert!(
+            meta_resp.headers().get("x-amz-version-id").is_none(),
+            "suspended destination returns no x-amz-version-id"
+        );
+        assert_eq!(
+            meta_resp
+                .headers()
+                .get("x-amz-copy-source-version-id")
+                .and_then(|v| v.to_str().ok()),
+            Some(meta_vid.to_string().as_str())
+        );
+
+        let meta_versions = Arc::clone(&store)
+            .list_object_versions(&bucket, "meta-replace.txt", None, None, None, 10)
+            .await
+            .expect("list meta-replace versions");
+        assert_eq!(meta_versions.objects.len(), 2, "must contain both null and preserved UUID");
+        assert!(
+            meta_versions
+                .objects
+                .iter()
+                .any(|o| o.is_latest && o.version_id.is_none_or(|v| v.is_nil()))
+        );
+        assert!(
+            meta_versions
+                .objects
+                .iter()
+                .any(|o| !o.is_latest && o.version_id == Some(meta_vid))
+        );
+
+        let meta_preserved = store
+            .get_object_info(
+                &bucket,
+                "meta-replace.txt",
+                &ObjectOptions {
+                    version_id: Some(meta_vid.to_string()),
+                    version_suspended: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("preserved meta-replace UUID version must remain readable");
+        assert_eq!(meta_preserved.content_type.as_deref(), Some("text/plain"));
+        assert_eq!(meta_preserved.user_defined.get("author").map(String::as_str), Some("alice"));
+        assert_eq!(meta_preserved.user_tags.as_str(), "class=secret");
+        assert_eq!(meta_preserved.mod_time, Some(original_mod_time));
+        assert_eq!(meta_preserved.data_dir, meta_seeded.data_dir);
+
+        let meta_current = store
+            .get_object_info(&bucket, "meta-replace.txt", &ObjectOptions::default())
+            .await
+            .expect("current null version should be readable");
+        assert!(meta_current.version_id.is_none_or(|v| v.is_nil()));
+        assert_ne!(meta_current.data_dir, meta_seeded.data_dir);
+        assert_eq!(meta_current.content_type.as_deref(), Some("text/html"));
+        assert_eq!(meta_current.user_defined.get("author").map(String::as_str), Some("mallory"));
+        assert_eq!(meta_current.user_tags.as_str(), "class=secret");
+        assert!(meta_current.mod_time > Some(original_mod_time));
+        assert_eq!(
+            read_store_object_bytes(&store, &bucket, "meta-replace.txt", &ObjectOptions::default()).await,
+            meta_payload
+        );
+
+        // Once the current version is already `null`, a subsequent self-copy updates `null`
+        // in place (keeping `null`'s data_dir) while the preserved UUID stays unchanged.
+        let null_data_dir = meta_current.data_dir;
+        let meta_resp_2 = gateway
+            .signed(
+                Method::PUT,
+                &format!("/{bucket}/meta-replace.txt"),
+                vec![
+                    ("x-amz-copy-source", format!("/{bucket}/meta-replace.txt")),
+                    ("x-amz-metadata-directive", "REPLACE".to_owned()),
+                    ("content-type", "application/json".to_owned()),
+                    ("x-amz-meta-author", "null-v2".to_owned()),
+                ],
+                Bytes::new(),
+            )
+            .await
+            .expect("second self-copy on existing null version");
+        assert_eq!(meta_resp_2.status(), http::StatusCode::OK);
+        assert_eq!(
+            meta_resp_2
+                .headers()
+                .get("x-amz-copy-source-version-id")
+                .and_then(|v| v.to_str().ok()),
+            Some(NULL_VERSION_ID)
+        );
+        let meta_current_2 = store
+            .get_object_info(&bucket, "meta-replace.txt", &ObjectOptions::default())
+            .await
+            .expect("updated null version should be readable");
+        assert_eq!(meta_current_2.data_dir, null_data_dir, "null-to-null self-copy remains zero-copy");
+        assert_eq!(meta_current_2.content_type.as_deref(), Some("application/json"));
+        assert_eq!(meta_current_2.user_defined.get("author").map(String::as_str), Some("null-v2"));
+
+        // 2. Tag-replace-only self-copy (no MetadataDirective) must preserve UUID tags & metadata.
+        let tag_resp = gateway
+            .signed(
+                Method::PUT,
+                &format!("/{bucket}/tag-replace.txt"),
+                vec![
+                    ("x-amz-copy-source", format!("/{bucket}/tag-replace.txt")),
+                    ("x-amz-tagging-directive", "REPLACE".to_owned()),
+                    ("x-amz-tagging", "class=public".to_owned()),
+                ],
+                Bytes::new(),
+            )
+            .await
+            .expect("tag-replace-only self-copy on suspended bucket");
+        assert_eq!(tag_resp.status(), http::StatusCode::OK);
+        assert!(tag_resp.headers().get("x-amz-version-id").is_none());
+        assert_eq!(
+            tag_resp
+                .headers()
+                .get("x-amz-copy-source-version-id")
+                .and_then(|v| v.to_str().ok()),
+            Some(tag_vid.to_string().as_str())
+        );
+
+        let tag_versions = Arc::clone(&store)
+            .list_object_versions(&bucket, "tag-replace.txt", None, None, None, 10)
+            .await
+            .expect("list tag-replace versions");
+        assert_eq!(tag_versions.objects.len(), 2);
+
+        let tag_preserved = store
+            .get_object_info(
+                &bucket,
+                "tag-replace.txt",
+                &ObjectOptions {
+                    version_id: Some(tag_vid.to_string()),
+                    version_suspended: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("preserved tag-replace UUID version must remain readable");
+        assert_eq!(tag_preserved.user_tags.as_str(), "class=secret");
+        assert_eq!(tag_preserved.content_type.as_deref(), Some("text/plain"));
+        assert_eq!(tag_preserved.user_defined.get("author").map(String::as_str), Some("alice"));
+        assert_eq!(tag_preserved.mod_time, Some(original_mod_time));
+        assert_eq!(tag_preserved.data_dir, tag_seeded.data_dir);
+
+        let tag_current = store
+            .get_object_info(&bucket, "tag-replace.txt", &ObjectOptions::default())
+            .await
+            .expect("current null version for tag-replace should be readable");
+        assert!(tag_current.version_id.is_none_or(|v| v.is_nil()));
+        assert_eq!(tag_current.user_tags.as_str(), "class=public");
+        assert_eq!(tag_current.content_type.as_deref(), Some("text/plain"));
+        assert_eq!(tag_current.user_defined.get("author").map(String::as_str), Some("alice"));
+        assert!(tag_current.mod_time > Some(original_mod_time));
+        assert_eq!(
+            read_store_object_bytes(&store, &bucket, "tag-replace.txt", &ObjectOptions::default()).await,
+            tag_payload
+        );
+
+        // 3. Storage-class-only self-copy must preserve UUID LastModified & storage class.
+        let sc_resp = gateway
+            .signed(
+                Method::PUT,
+                &format!("/{bucket}/storage-class.txt"),
+                vec![
+                    ("x-amz-copy-source", format!("/{bucket}/storage-class.txt")),
+                    ("x-amz-storage-class", storageclass::RRS.to_owned()),
+                ],
+                Bytes::new(),
+            )
+            .await
+            .expect("storage-class-only self-copy on suspended bucket");
+        assert_eq!(sc_resp.status(), http::StatusCode::OK);
+        assert!(sc_resp.headers().get("x-amz-version-id").is_none());
+        assert_eq!(
+            sc_resp
+                .headers()
+                .get("x-amz-copy-source-version-id")
+                .and_then(|v| v.to_str().ok()),
+            Some(sc_vid.to_string().as_str())
+        );
+
+        let sc_versions = Arc::clone(&store)
+            .list_object_versions(&bucket, "storage-class.txt", None, None, None, 10)
+            .await
+            .expect("list storage-class versions");
+        assert_eq!(sc_versions.objects.len(), 2);
+
+        let sc_preserved = store
+            .get_object_info(
+                &bucket,
+                "storage-class.txt",
+                &ObjectOptions {
+                    version_id: Some(sc_vid.to_string()),
+                    version_suspended: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("preserved storage-class UUID version must remain readable");
+        assert_eq!(sc_preserved.storage_class.as_deref(), Some(storageclass::STANDARD));
+        assert_eq!(sc_preserved.mod_time, Some(original_mod_time));
+        assert_eq!(sc_preserved.data_dir, sc_seeded.data_dir);
+        assert_eq!(sc_preserved.user_tags.as_str(), "class=secret");
+
+        let sc_current = store
+            .get_object_info(&bucket, "storage-class.txt", &ObjectOptions::default())
+            .await
+            .expect("current null version for storage-class should be readable");
+        assert!(sc_current.version_id.is_none_or(|v| v.is_nil()));
+        assert_eq!(sc_current.storage_class.as_deref(), Some(storageclass::RRS));
+        assert_eq!(sc_current.content_type.as_deref(), Some("text/plain"));
+        assert_eq!(sc_current.user_defined.get("author").map(String::as_str), Some("alice"));
+        assert_eq!(sc_current.user_tags.as_str(), "class=secret");
+        assert!(sc_current.mod_time > Some(original_mod_time));
+        assert_eq!(
+            read_store_object_bytes(&store, &bucket, "storage-class.txt", &ObjectOptions::default()).await,
+            sc_payload
+        );
+
+        // 4. Control: normal never-versioned bucket self-copy keeps zero-copy in-place behavior.
+        let unversioned_bucket = format!("copy-unversioned-self-{}", Uuid::new_v4());
+        store
+            .make_bucket(&unversioned_bucket, &MakeBucketOptions::default())
+            .await
+            .expect("create unversioned copy test bucket");
+        let unversioned_payload = b"plain unversioned object".to_vec();
+        let unversioned_seeded = store
+            .put_object(
+                &unversioned_bucket,
+                "plain.txt",
+                &mut PutObjReader::from_vec(unversioned_payload.clone()),
+                &ObjectOptions {
+                    user_defined: HashMap::from([
+                        ("content-type".to_owned(), "text/plain".to_owned()),
+                        ("author".to_owned(), "alice".to_owned()),
+                    ]),
+                    write_completion: crate::app::storage_api::object_usecase::WriteCompletion::TailDrained,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("seed unversioned object");
+
+        let unversioned_resp = gateway
+            .signed(
+                Method::PUT,
+                &format!("/{unversioned_bucket}/plain.txt"),
+                vec![
+                    ("x-amz-copy-source", format!("/{unversioned_bucket}/plain.txt")),
+                    ("x-amz-metadata-directive", "REPLACE".to_owned()),
+                    ("content-type", "text/markdown".to_owned()),
+                    ("x-amz-meta-author", "bob".to_owned()),
+                ],
+                Bytes::new(),
+            )
+            .await
+            .expect("unversioned metadata-replace self-copy");
+        assert_eq!(unversioned_resp.status(), http::StatusCode::OK);
+        assert!(unversioned_resp.headers().get("x-amz-version-id").is_none());
+        assert!(unversioned_resp.headers().get("x-amz-copy-source-version-id").is_none());
+
+        let unversioned_after = store
+            .get_object_info(&unversioned_bucket, "plain.txt", &ObjectOptions::default())
+            .await
+            .expect("read updated unversioned object");
+        assert_eq!(unversioned_after.data_dir, unversioned_seeded.data_dir);
+        assert_eq!(unversioned_after.content_type.as_deref(), Some("text/markdown"));
+        assert_eq!(unversioned_after.user_defined.get("author").map(String::as_str), Some("bob"));
+        assert_eq!(
+            read_store_object_bytes(&store, &unversioned_bucket, "plain.txt", &ObjectOptions::default()).await,
+            unversioned_payload
+        );
+
+        for b in [&bucket, &unversioned_bucket] {
+            store
+                .delete_bucket(
+                    b,
+                    &DeleteBucketOptions {
+                        force: true,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect("clean up copy test bucket");
+        }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn execute_copy_object_excluded_prefix_self_copy_preserves_pre_exclusion_uuid_version() {
+        use crate::app::storage_api::test::contract::bucket::{BucketOperations as _, DeleteBucketOptions, MakeBucketOptions};
+
+        let (store, context) = real_store_test_context().await;
+        let slot = crate::app::runtime_sources::ServerContextSlot::new();
+        assert!(slot.install(Arc::clone(&context)));
+        let gateway = crate::server::TestGateway::over(&context, slot);
+
+        let bucket = format!("copy-excluded-prefix-{}", Uuid::new_v4());
+        let key = "archive/victim.txt";
+        let payload = b"excluded prefix payload".to_vec();
+        let original_mod_time = OffsetDateTime::now_utc() - time::Duration::seconds(300);
+
+        store
+            .make_bucket(
+                &bucket,
+                &MakeBucketOptions {
+                    versioning_enabled: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("create versioned bucket for excluded-prefix test");
+
+        let seeded = store
+            .put_object(
+                &bucket,
+                key,
+                &mut PutObjReader::from_vec(payload.clone()),
+                &ObjectOptions {
+                    versioned: true,
+                    mod_time: Some(original_mod_time),
+                    user_defined: HashMap::from([
+                        ("content-type".to_owned(), "text/plain".to_owned()),
+                        ("author".to_owned(), "alice".to_owned()),
+                    ]),
+                    write_completion: crate::app::storage_api::object_usecase::WriteCompletion::TailDrained,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("seed pre-exclusion UUID version");
+        let preserved_vid = seeded.version_id.expect("seeded object must carry a UUID version");
+        assert!(!preserved_vid.is_nil());
+
+        publish_bucket_versioning_xml(
+            &store,
+            &bucket,
+            b"<VersioningConfiguration><ExcludedPrefixes><Prefix>archive/</Prefix></ExcludedPrefixes><Status>Enabled</Status></VersioningConfiguration>",
+        )
+        .await;
+        assert!(!BucketVersioningSys::prefix_enabled(&bucket, key).await);
+        assert!(BucketVersioningSys::prefix_suspended(&bucket, key).await);
+
+        let resp = gateway
+            .signed(
+                Method::PUT,
+                &format!("/{bucket}/{key}"),
+                vec![
+                    ("x-amz-copy-source", format!("/{bucket}/{key}")),
+                    ("x-amz-metadata-directive", "REPLACE".to_owned()),
+                    ("content-type", "text/html".to_owned()),
+                    ("x-amz-meta-author", "mallory".to_owned()),
+                ],
+                Bytes::new(),
+            )
+            .await
+            .expect("metadata-replace self-copy under ExcludedPrefixes");
+        assert_eq!(resp.status(), http::StatusCode::OK);
+        assert!(resp.headers().get("x-amz-version-id").is_none());
+        assert_eq!(
+            resp.headers()
+                .get("x-amz-copy-source-version-id")
+                .and_then(|v| v.to_str().ok()),
+            Some(preserved_vid.to_string().as_str())
+        );
+
+        let versions = Arc::clone(&store)
+            .list_object_versions(&bucket, key, None, None, None, 10)
+            .await
+            .expect("list versions under excluded prefix");
+        assert_eq!(versions.objects.len(), 2, "must list both null and pre-exclusion UUID versions");
+
+        let preserved = store
+            .get_object_info(
+                &bucket,
+                key,
+                &ObjectOptions {
+                    version_id: Some(preserved_vid.to_string()),
+                    version_suspended: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("pre-exclusion UUID version must remain readable");
+        assert_eq!(preserved.content_type.as_deref(), Some("text/plain"));
+        assert_eq!(preserved.user_defined.get("author").map(String::as_str), Some("alice"));
+        assert_eq!(preserved.mod_time, Some(original_mod_time));
+        assert_eq!(preserved.data_dir, seeded.data_dir);
+
+        let current = store
+            .get_object_info(&bucket, key, &ObjectOptions::default())
+            .await
+            .expect("new null version under excluded prefix should be readable");
+        assert!(current.version_id.is_none_or(|v| v.is_nil()));
+        assert_eq!(current.content_type.as_deref(), Some("text/html"));
+        assert_eq!(current.user_defined.get("author").map(String::as_str), Some("mallory"));
+        assert!(current.mod_time > Some(original_mod_time));
+        assert_eq!(read_store_object_bytes(&store, &bucket, key, &ObjectOptions::default()).await, payload);
+
+        store
+            .delete_bucket(
+                &bucket,
+                &DeleteBucketOptions {
+                    force: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("clean up excluded-prefix test bucket");
     }
 }
