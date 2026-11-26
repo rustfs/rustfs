@@ -124,13 +124,13 @@ async fn pause_prepared_pool_read_before_refetch(object: &str) {
 }
 /// Capacity that every online drive of one pool reports to free-space target
 /// selection, per store, until the guard drops.
-#[cfg(test)]
+#[cfg(all(test, feature = "test-util"))]
 static POOL_SPACE_FOR_TEST: std::sync::Mutex<Vec<(Uuid, usize, crate::disk::DiskInfo)>> = std::sync::Mutex::new(Vec::new());
 
-#[cfg(test)]
+#[cfg(all(test, feature = "test-util"))]
 pub(crate) struct PoolSpaceForTest(Uuid);
 
-#[cfg(test)]
+#[cfg(all(test, feature = "test-util"))]
 impl PoolSpaceForTest {
     pub(crate) fn install(store: Uuid, pools: &[(usize, crate::disk::DiskInfo)]) -> Self {
         POOL_SPACE_FOR_TEST
@@ -141,7 +141,7 @@ impl PoolSpaceForTest {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "test-util"))]
 impl Drop for PoolSpaceForTest {
     fn drop(&mut self) {
         POOL_SPACE_FOR_TEST
@@ -151,7 +151,7 @@ impl Drop for PoolSpaceForTest {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "test-util"))]
 fn pool_space_for_test(
     store: Uuid,
     pool: usize,
@@ -586,7 +586,7 @@ impl ECStore {
 
             let disks = pool.get_disks_by_key(object).disk_inventory().await;
             let disk_infos = get_disk_infos(&disks).await;
-            #[cfg(test)]
+            #[cfg(all(test, feature = "test-util"))]
             let disk_infos = pool_space_for_test(self.id, idx, disk_infos);
 
             (idx, pool.set_count, disk_infos)
