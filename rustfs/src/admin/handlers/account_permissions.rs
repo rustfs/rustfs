@@ -1295,9 +1295,10 @@ mod tests {
             bucket_policy(&store, &bucket, serde_json::json!({"Version":"2012-10-17","Statement":[
                 {"Effect":"Allow","Principal":"*","Action":["s3:PutObject","s3:DeleteObject"],"Resource":format!("arn:aws:s3:::{bucket}/*")}
             ]})).await;
+            let denied_object = "explicitly-denied";
             let denied = rustfs_policy::policy::Policy::parse_config(
                 serde_json::to_string(&serde_json::json!({"Version":"2012-10-17","Statement":[
-                    {"Effect":"Deny","Action":["s3:PutObject","s3:DeleteObject"],"Resource":format!("arn:aws:s3:::{bucket}/*")}
+                    {"Effect":"Deny","Action":["s3:PutObject","s3:DeleteObject"],"Resource":format!("arn:aws:s3:::{bucket}/{denied_object}")}
                 ]}))
                 .expect("identity denial JSON")
                 .as_bytes(),
@@ -1307,18 +1308,23 @@ mod tests {
             iam.policy_db_set(&cred.access_key, UserType::Reg, false, "permission-denial")
                 .await
                 .expect("attach denial");
-            for (action, expected) in [("s3:PutObject", Decision::Allowed), ("s3:DeleteObject", Decision::Denied)] {
-                let request = parse(serde_json::json!({"checks":[{"id":"x","action":action,"bucket":bucket,"object":"object"}]}));
+            for (action, object, expected) in [
+                ("s3:PutObject", "bucket-grant", Decision::Allowed),
+                ("s3:DeleteObject", "bucket-grant", Decision::Allowed),
+                ("s3:PutObject", denied_object, Decision::Denied),
+                ("s3:DeleteObject", denied_object, Decision::Denied),
+            ] {
+                let request = parse(serde_json::json!({"checks":[{"id":"x","action":action,"bucket":bucket,"object":object}]}));
                 let result = evaluate_check(
                     &envelope,
                     &cred,
                     false,
                     &request.checks[0],
-                    request.validate().expect("valid denial query")[0],
+                    request.validate().expect("valid permission query")[0],
                 )
                 .await
                 .expect("non-owner query");
-                assert_eq!(result.decision, expected, "real gate semantics for {action}");
+                assert_eq!(result.decision, expected, "real gate semantics for {action} on {object}");
             }
         });
     }
