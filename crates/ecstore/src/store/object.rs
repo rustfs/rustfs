@@ -2110,8 +2110,22 @@ fn batch_delete_action_key(object: &ObjectToDelete) -> (&str, Option<Uuid>) {
     (object.object_name.as_str(), object.version_id)
 }
 
-fn batch_delete_targets_pool(creates_latest_marker: bool, marker_target_pool_idx: Option<usize>, pool_idx: usize) -> bool {
-    !creates_latest_marker || marker_target_pool_idx == Some(pool_idx)
+#[derive(Clone, Copy)]
+enum BatchDeleteRoute {
+    Inactive,
+    AllPools,
+    PendingMarker,
+    Marker(usize),
+}
+
+impl BatchDeleteRoute {
+    fn targets(self, pool_idx: usize) -> bool {
+        match self {
+            Self::Inactive | Self::PendingMarker => false,
+            Self::AllPools => true,
+            Self::Marker(target) => target == pool_idx,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -2755,6 +2769,7 @@ async fn await_conditional_capability_set_probe_gate(bucket: &str) -> Result<()>
 }
 
 struct BatchDeletePhasePlan<'a> {
+    /// Unique input positions in request order.
     indices: &'a [usize],
     pool_generations: HashMap<usize, HashMap<String, CurrentDeleteGeneration>>,
     marker_targets: &'a HashMap<String, usize>,
@@ -6185,10 +6200,7 @@ impl ECStore {
             mut pool_generations,
             marker_targets: conditional_marker_targets,
         } = plan;
-        let mut active = vec![false; objects.len()];
-        for idx in indices {
-            active[*idx] = true;
-        }
+        debug_assert!(indices.windows(2).all(|pair| pair[0] < pair[1]));
         let mut del_objects = vec![DeletedObject::default(); objects.len()];
         let mut del_errs = vec![None; objects.len()];
         let mut accounting = vec![None; objects.len()];
@@ -6196,46 +6208,55 @@ impl ECStore {
             .delete_replication_config_snapshot
             .as_deref()
             .expect("batch delete replication config snapshot should be loaded");
-        let latest_marker_objects = objects
-            .iter()
-            .enumerate()
-            .map(|(idx, object)| {
-                active[idx] && del_errs[idx].is_none() && batch_delete_creates_latest_marker(object, delete_config_snapshot)
-            })
-            .collect::<Vec<_>>();
-        let marker_target_results = join_all(objects.iter().zip(&latest_marker_objects).map(|(object, creates_marker)| {
-            let admitted_target = conditional_marker_targets.get(&object.object_name).copied();
-            async move {
-                if *creates_marker {
-                    // Routing is part of condition admission. A rebalance
-                    // start cannot replace the validated current owner.
-                    Some(match admitted_target {
-                        Some(pool_idx) => Ok(pool_idx),
-                        None => self.get_pool_idx_no_lock(bucket, &object.object_name, 0).await,
-                    })
-                } else {
-                    None
-                }
+        let mut routes = vec![BatchDeleteRoute::Inactive; objects.len()];
+        let mut has_markers = false;
+        let mut pending_markers = 0;
+        for &idx in indices {
+            let object = &objects[idx];
+            if !batch_delete_creates_latest_marker(object, delete_config_snapshot) {
+                routes[idx] = BatchDeleteRoute::AllPools;
+                continue;
             }
-        }))
-        .await;
-        let mut marker_target_pool_indices = Vec::with_capacity(objects.len());
-        for (idx, target_result) in marker_target_results.into_iter().enumerate() {
-            match target_result {
-                Some(Ok(pool_idx)) => marker_target_pool_indices.push(Some(pool_idx)),
-                Some(Err(err)) => {
-                    del_errs[idx] = Some(err);
-                    marker_target_pool_indices.push(None);
-                }
-                None => marker_target_pool_indices.push(None),
+            has_markers = true;
+            // Rebalancing cannot replace the owner used to admit a conditional delete.
+            if let Some(&pool_idx) = conditional_marker_targets.get(&object.object_name) {
+                routes[idx] = BatchDeleteRoute::Marker(pool_idx);
+            } else {
+                routes[idx] = BatchDeleteRoute::PendingMarker;
+                pending_markers += 1;
+            }
+        }
+        if pending_markers != 0 {
+            let lookups = indices
+                .iter()
+                .copied()
+                .filter(|&idx| matches!(routes[idx], BatchDeleteRoute::PendingMarker))
+                // Bound join_all's size hint by the unresolved markers.
+                .take(pending_markers)
+                .map(|idx| async move { (idx, self.get_pool_idx_no_lock(bucket, &objects[idx].object_name, 0).await) });
+            let lookup_results = join_all(lookups).await;
+            for (idx, result) in lookup_results {
+                routes[idx] = match result {
+                    Ok(pool_idx) => BatchDeleteRoute::Marker(pool_idx),
+                    Err(err) => {
+                        del_errs[idx] = Some(err);
+                        BatchDeleteRoute::Inactive
+                    }
+                };
             }
         }
 
-        let _capacity_fence = if !self.single_pool() && latest_marker_objects.iter().any(|creates_marker| *creates_marker) {
+        let _capacity_fence = if !self.single_pool() && has_markers {
             // Only marker destinations can grow. Other pools participate in
             // exact deletion under the same metadata read fence and must not
             // be treated as publication targets merely because they retire.
-            let mut target_pool_indices = marker_target_pool_indices.iter().flatten().copied().collect::<Vec<_>>();
+            let mut target_pool_indices = indices
+                .iter()
+                .filter_map(|&idx| match routes[idx] {
+                    BatchDeleteRoute::Marker(pool_idx) => Some(pool_idx),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
             target_pool_indices.sort_unstable();
             target_pool_indices.dedup();
             match self
@@ -6263,16 +6284,15 @@ impl ECStore {
                 continue;
             }
 
-            let (object_indices, pool_objects): (Vec<_>, Vec<_>) = objects
+            let (object_indices, pool_objects): (Vec<_>, Vec<_>) = indices
                 .iter()
-                .enumerate()
+                .map(|&idx| (idx, &objects[idx]))
                 .filter(|(idx, object)| {
-                    active[*idx] && del_errs[*idx].is_none()
+                    routes[*idx].targets(pool.pool_idx)
                         // A newly rebalancing pool still owes every admitted
                         // conditional key its guarded mutation. Ordinary keys
                         // retain the existing rebalance skip behavior.
                         && (!rebalancing || guarded_generations.is_some_and(|generations| generations.contains_key(&object.object_name)))
-                        && batch_delete_targets_pool(latest_marker_objects[*idx], marker_target_pool_indices[*idx], pool.pool_idx)
                 })
                 .map(|(idx, object)| (idx, object.clone()))
                 .unzip();
@@ -6315,8 +6335,8 @@ impl ECStore {
             }
         }
 
-        for (idx, creates_marker) in latest_marker_objects.into_iter().enumerate() {
-            if creates_marker && selected[idx].is_none() {
+        for &idx in indices {
+            if matches!(routes[idx], BatchDeleteRoute::Marker(_)) && selected[idx].is_none() {
                 del_objects[idx] = DeletedObject {
                     object_name: objects[idx].object_name.clone(),
                     version_id: objects[idx].version_id,
@@ -6338,9 +6358,8 @@ impl ECStore {
     ) -> (Vec<DeletedObject>, Vec<Option<Error>>, Vec<Option<DeleteAccounting>>) {
         // encode object name
         let objects: Vec<ObjectToDelete> = objects
-            .iter()
-            .map(|v| {
-                let mut v = v.clone();
+            .into_iter()
+            .map(|mut v| {
                 v.object_name = encode_dir_object(v.object_name.as_str());
                 v
             })
@@ -6573,7 +6592,7 @@ impl ECStore {
             // the phase only runs for the keys this batch actually holds, and
             // only its outcomes replace the outer per-key state.
             let indices = (0..objects.len()).filter(|idx| del_errs[*idx].is_none()).collect::<Vec<_>>();
-            let (phase_deleted, mut phase_errors, mut phase_accounting) = self
+            let (mut phase_deleted, mut phase_errors, mut phase_accounting) = self
                 .run_batch_delete_phase(
                     bucket,
                     &objects,
@@ -6586,7 +6605,7 @@ impl ECStore {
                 )
                 .await;
             for idx in indices {
-                del_objects[idx] = phase_deleted[idx].clone();
+                del_objects[idx] = std::mem::take(&mut phase_deleted[idx]);
                 del_errs[idx] = phase_errors[idx].take();
                 accounting[idx] = phase_accounting[idx].take();
             }
@@ -6603,7 +6622,7 @@ impl ECStore {
                 }
             }
             if !conditional_indices.is_empty() {
-                let (deleted, mut errors, mut receipts) = self
+                let (mut deleted, mut errors, mut receipts) = self
                     .run_batch_delete_phase(
                         bucket,
                         &objects,
@@ -6616,7 +6635,7 @@ impl ECStore {
                     )
                     .await;
                 for idx in &conditional_indices {
-                    del_objects[*idx] = deleted[*idx].clone();
+                    del_objects[*idx] = std::mem::take(&mut deleted[*idx]);
                     del_errs[*idx] = errors[*idx].take();
                     accounting[*idx] = receipts[*idx].take();
                 }
@@ -6649,7 +6668,7 @@ impl ECStore {
             if !ordinary_indices.is_empty() {
                 // The guarded phase has finished all rollback/receipt work.
                 // These actions receive neither its CAS nor its transaction.
-                let (deleted, mut errors, mut receipts) = self
+                let (mut deleted, mut errors, mut receipts) = self
                     .run_batch_delete_phase(
                         bucket,
                         &objects,
@@ -6662,7 +6681,7 @@ impl ECStore {
                     )
                     .await;
                 for idx in ordinary_indices {
-                    del_objects[idx] = deleted[idx].clone();
+                    del_objects[idx] = std::mem::take(&mut deleted[idx]);
                     del_errs[idx] = errors[idx].take();
                     accounting[idx] = receipts[idx].take();
                 }
@@ -9740,9 +9759,11 @@ mod tests {
             ..Default::default()
         };
         assert!(batch_delete_creates_latest_marker(&latest, &versioned));
-        assert!(!batch_delete_targets_pool(true, Some(1), 0));
-        assert!(batch_delete_targets_pool(true, Some(1), 1));
-        assert!(!batch_delete_targets_pool(true, Some(1), 2));
+        assert!(!BatchDeleteRoute::Marker(1).targets(0));
+        assert!(BatchDeleteRoute::Marker(1).targets(1));
+        assert!(!BatchDeleteRoute::Marker(1).targets(2));
+        assert!(!BatchDeleteRoute::Inactive.targets(0));
+        assert!(!BatchDeleteRoute::PendingMarker.targets(0));
 
         let explicit = ObjectToDelete {
             object_name: "explicit".to_string(),
@@ -9750,11 +9771,11 @@ mod tests {
             ..Default::default()
         };
         assert!(!batch_delete_creates_latest_marker(&explicit, &versioned));
-        assert!(batch_delete_targets_pool(false, Some(1), 0));
+        assert!(BatchDeleteRoute::AllPools.targets(0));
 
         let unversioned = DeleteReplicationConfigSnapshot::default();
         assert!(!batch_delete_creates_latest_marker(&latest, &unversioned));
-        assert!(batch_delete_targets_pool(false, None, 0));
+        assert!(BatchDeleteRoute::AllPools.targets(1));
     }
 
     fn reduce_test_pool_results(
