@@ -8835,7 +8835,7 @@ mod tests {
                                 .update_metadata(
                                     &bucket,
                                     object,
-                                    FileInfo {
+                                    rustfs_filemeta::FileInfo {
                                         version_id: Some(version_id),
                                         metadata: retained_metadata.clone(),
                                         ..Default::default()
