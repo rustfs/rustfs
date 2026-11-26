@@ -5063,10 +5063,11 @@ impl SetDisks {
                 }
             }
 
-            // SSE-C replication carries the source object's sealed checksum
-            // out of band; store it verbatim like the multipart path does.
-            if let Some(cssum) =
-                rustfs_utils::http::get_header_map(&user_defined, rustfs_utils::http::SUFFIX_REPLICATION_SSEC_CRC)
+            // SSE-C replication and internal data movement carry the source
+            // object's sealed checksum out of band; ignore it on ordinary writes.
+            if (opts.replication_request || opts.data_movement)
+                && let Some(cssum) =
+                    rustfs_utils::http::get_header_map(&user_defined, rustfs_utils::http::SUFFIX_REPLICATION_SSEC_CRC)
                 && !cssum.is_empty()
             {
                 fi.checksum = base64_simd::STANDARD.decode_to_vec(&cssum).ok().map(bytes::Bytes::from);
@@ -14626,6 +14627,56 @@ mod replication_quota_safety_tests {
             .await
             .expect_err("ciphertext replication without a server-observed logical size must fail closed");
         assert!(matches!(err, StorageError::PartMissingOrCorrupt));
+    }
+
+    #[tokio::test]
+    async fn put_object_only_honors_replication_ssec_crc_for_replication_or_data_movement() {
+        let (_temp_dirs, disks, set_disks) = hermetic_set_disks(4).await;
+        let bucket = "ssec-crc-guard-bucket";
+        for disk in &disks {
+            disk.make_volume(bucket).await.expect("bucket volume should be created");
+        }
+        let forged_checksum = vec![0xAA; 8];
+        let encoded_forged = base64_simd::STANDARD.encode_to_string(&forged_checksum);
+
+        // An ordinary write must ignore SUFFIX_REPLICATION_SSEC_CRC in user_defined.
+        let mut ordinary_opts = ObjectOptions::default();
+        rustfs_utils::http::insert_header_map(
+            &mut ordinary_opts.user_defined,
+            rustfs_utils::http::SUFFIX_REPLICATION_SSEC_CRC,
+            encoded_forged.clone(),
+        );
+        let mut ordinary_reader = PutObjReader::from_vec(b"ordinary payload".to_vec());
+        let ordinary = set_disks
+            .put_object(bucket, "ordinary", &mut ordinary_reader, &ordinary_opts)
+            .await
+            .expect("ordinary put should succeed");
+        assert_ne!(
+            ordinary.checksum.as_deref(),
+            Some(forged_checksum.as_slice()),
+            "ordinary write must not promote replication-ssec-crc into object checksum"
+        );
+
+        // Authorized replication writes must continue honoring SUFFIX_REPLICATION_SSEC_CRC.
+        let mut repl_opts = ObjectOptions {
+            replication_request: true,
+            ..Default::default()
+        };
+        rustfs_utils::http::insert_header_map(
+            &mut repl_opts.user_defined,
+            rustfs_utils::http::SUFFIX_REPLICATION_SSEC_CRC,
+            encoded_forged,
+        );
+        let mut repl_reader = PutObjReader::from_vec(b"replicated payload".to_vec());
+        let replicated = set_disks
+            .put_object(bucket, "replicated", &mut repl_reader, &repl_opts)
+            .await
+            .expect("replicated put should succeed");
+        assert_eq!(
+            replicated.checksum.as_deref(),
+            Some(forged_checksum.as_slice()),
+            "replication write must preserve sealed SSE-C checksum"
+        );
     }
 }
 

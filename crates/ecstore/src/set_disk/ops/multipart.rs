@@ -3564,7 +3564,8 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
             );
         }
 
-        if let Some(cssum) = get_header_map(&user_defined, SUFFIX_REPLICATION_SSEC_CRC)
+        if (opts.replication_request || opts.data_movement)
+            && let Some(cssum) = get_header_map(&user_defined, SUFFIX_REPLICATION_SSEC_CRC)
             && !cssum.is_empty()
         {
             fi.checksum = base64_simd::STANDARD.decode_to_vec(&cssum).ok().map(Bytes::from);
@@ -4396,17 +4397,25 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
             }
         }
 
+        // Validate caller-declared replication actual size unconditionally as a
+        // non-negative i64 before persisting it to object metadata, since readers
+        // and the usage scanner require a valid non-negative i64 regardless of
+        // whether a bucket quota is enforced.
         let declared_replication_actual_size = opts
             .replication_request
             .then(|| get_str(&opts.user_defined, SUFFIX_ACTUAL_OBJECT_SIZE_CAP))
-            .flatten();
+            .flatten()
+            .map(|value| {
+                value
+                    .parse::<i64>()
+                    .ok()
+                    .and_then(|value| u64::try_from(value).ok())
+                    .ok_or(Error::PartMissingOrCorrupt)
+            })
+            .transpose()?;
         let replication_actual_size = if opts.replication_request && quota_context.is_enforced() {
             let observed_size = u64::try_from(object_actual_size).map_err(|_| Error::PartMissingOrCorrupt)?;
-            let declared_cap = declared_replication_actual_size
-                .as_deref()
-                .map(|value| value.parse::<u64>().map_err(|_| Error::PartMissingOrCorrupt))
-                .transpose()?
-                .unwrap_or(0);
+            let declared_cap = declared_replication_actual_size.unwrap_or(0);
             let declared_encryption_size = rustfs_utils::http::get_object_encryption_original_size(&fi.metadata)
                 .map_err(Error::other)?
                 .map(u64::try_from)
@@ -4415,17 +4424,22 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
                 .unwrap_or(0);
             Some(observed_size.max(declared_cap).max(declared_encryption_size))
         } else {
-            None
+            declared_replication_actual_size
         };
         let data_movement_quota_size = data_movement_actual_size_u64.filter(|_| quota_context.is_enforced());
-        let quota_new_size = match data_movement_quota_size.or(replication_actual_size) {
-            Some(size) => size.max(u64::try_from(object_size).map_err(|_| Error::PartMissingOrCorrupt)?),
-            None if quota_context.is_enforced() => u64::try_from(object_actual_size)
-                .map_err(|_| Error::PartMissingOrCorrupt)?
-                .max(u64::try_from(object_size).map_err(|_| Error::PartMissingOrCorrupt)?),
-            None => 0,
+        let quota_new_size = if quota_context.is_enforced() {
+            match data_movement_quota_size.or(replication_actual_size) {
+                Some(size) => size.max(u64::try_from(object_size).map_err(|_| Error::PartMissingOrCorrupt)?),
+                None => u64::try_from(object_actual_size)
+                    .map_err(|_| Error::PartMissingOrCorrupt)?
+                    .max(u64::try_from(object_size).map_err(|_| Error::PartMissingOrCorrupt)?),
+            }
+        } else {
+            0
         };
-        if let Some(rc_crc) = get_header_map(&opts.user_defined, SUFFIX_REPLICATION_SSEC_CRC) {
+        if (opts.replication_request || opts.data_movement)
+            && let Some(rc_crc) = get_header_map(&opts.user_defined, SUFFIX_REPLICATION_SSEC_CRC)
+        {
             if let Ok(rc_crc_bytes) = base64_simd::STANDARD.decode_to_vec(&rc_crc) {
                 fi.checksum = Some(Bytes::from(rc_crc_bytes));
             } else {
@@ -4507,12 +4521,6 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
                 if persist_encryption_original_size {
                     fi.metadata
                         .insert("x-rustfs-encryption-original-size".to_string(), actual_size.to_string());
-                }
-            } else if let Some(actual_size) = declared_replication_actual_size {
-                insert_str(&mut fi.metadata, SUFFIX_ACTUAL_SIZE, actual_size.clone());
-                if persist_encryption_original_size {
-                    fi.metadata
-                        .insert("x-rustfs-encryption-original-size".to_string(), actual_size);
                 }
             }
         } else {
@@ -7456,6 +7464,150 @@ mod tests {
             .await
             .expect_err("overflowing logical size must fail closed");
         assert!(matches!(overflow_err, StorageError::PartMissingOrCorrupt));
+    }
+
+    #[tokio::test]
+    async fn complete_multipart_validates_declared_replication_size_without_quota() {
+        let (_temp_dirs, disk_stores, set_disks) = hermetic_set_disks(4).await;
+        let bucket = "multipart-replication-declared-size-bucket";
+        make_bucket_on_all(&disk_stores, bucket).await;
+
+        for (object, declared) in [
+            ("text", "abc"),
+            ("negative", "-1"),
+            ("empty", ""),
+            ("overflow", "18446744073709551615"),
+        ] {
+            let upload = set_disks
+                .new_multipart_upload(bucket, object, &ObjectOptions::default())
+                .await
+                .expect("replication multipart upload should be created");
+            let part = put_test_part(&set_disks, bucket, object, &upload.upload_id, 1, &[0x76; 5], 5).await;
+            let mut complete_opts = ObjectOptions {
+                replication_request: true,
+                ..Default::default()
+            };
+            insert_str(&mut complete_opts.user_defined, SUFFIX_ACTUAL_OBJECT_SIZE_CAP, declared.to_string());
+
+            let err = set_disks
+                .clone()
+                .complete_multipart_upload(bucket, object, &upload.upload_id, vec![part], &complete_opts)
+                .await
+                .expect_err("invalid declared replica size must not be persisted");
+            assert!(matches!(err, StorageError::PartMissingOrCorrupt), "{object}: {err:?}");
+        }
+
+        // u64 values above i64::MAX must also fail on quota-enforced buckets.
+        let quota_upload = set_disks
+            .new_multipart_upload(bucket, "quota-overflow", &ObjectOptions::default())
+            .await
+            .expect("quota replication upload should be created");
+        let quota_part = put_test_part(&set_disks, bucket, "quota-overflow", &quota_upload.upload_id, 1, &[0x78; 5], 5).await;
+        let mut quota_complete_opts = ObjectOptions {
+            replication_request: true,
+            ..Default::default()
+        };
+        assert!(quota_complete_opts.set_quota_admission(0, u64::MAX));
+        insert_str(&mut quota_complete_opts.user_defined, SUFFIX_ACTUAL_OBJECT_SIZE_CAP, u64::MAX.to_string());
+        let quota_err = set_disks
+            .clone()
+            .complete_multipart_upload(bucket, "quota-overflow", &quota_upload.upload_id, vec![quota_part], &quota_complete_opts)
+            .await
+            .expect_err("i64-overflowing declared replica size must fail under quota too");
+        assert!(matches!(quota_err, StorageError::PartMissingOrCorrupt));
+
+        let upload = set_disks
+            .new_multipart_upload(bucket, "valid", &ObjectOptions::default())
+            .await
+            .expect("replication multipart upload should be created");
+        let part = put_test_part(&set_disks, bucket, "valid", &upload.upload_id, 1, &[0x77; 5], 5).await;
+        let mut complete_opts = ObjectOptions {
+            replication_request: true,
+            ..Default::default()
+        };
+        insert_str(&mut complete_opts.user_defined, SUFFIX_ACTUAL_OBJECT_SIZE_CAP, "5".to_string());
+        let completed = set_disks
+            .clone()
+            .complete_multipart_upload(bucket, "valid", &upload.upload_id, vec![part], &complete_opts)
+            .await
+            .expect("well-formed declared replica size should be accepted");
+        assert_eq!(completed.get_actual_size().expect("replica logical size should parse"), 5);
+    }
+
+    #[tokio::test]
+    async fn multipart_only_honors_replication_ssec_crc_for_replication_or_data_movement() {
+        let (_temp_dirs, disk_stores, set_disks) = hermetic_set_disks(4).await;
+        let bucket = "multipart-ssec-crc-guard-bucket";
+        make_bucket_on_all(&disk_stores, bucket).await;
+
+        let forged_checksum = vec![0xBB; 8];
+        let encoded_forged = base64_simd::STANDARD.encode_to_string(&forged_checksum);
+
+        // Ordinary multipart create + complete must ignore SUFFIX_REPLICATION_SSEC_CRC.
+        let mut ordinary_create_opts = ObjectOptions::default();
+        rustfs_utils::http::insert_header_map(
+            &mut ordinary_create_opts.user_defined,
+            SUFFIX_REPLICATION_SSEC_CRC,
+            encoded_forged.clone(),
+        );
+        let ordinary_upload = set_disks
+            .new_multipart_upload(bucket, "ordinary", &ordinary_create_opts)
+            .await
+            .expect("ordinary upload should be created");
+        let ordinary_part = put_test_part(&set_disks, bucket, "ordinary", &ordinary_upload.upload_id, 1, &[0x55; 5], 5).await;
+        let mut ordinary_complete_opts = ObjectOptions::default();
+        rustfs_utils::http::insert_header_map(
+            &mut ordinary_complete_opts.user_defined,
+            SUFFIX_REPLICATION_SSEC_CRC,
+            encoded_forged.clone(),
+        );
+        let ordinary_completed = set_disks
+            .clone()
+            .complete_multipart_upload(
+                bucket,
+                "ordinary",
+                &ordinary_upload.upload_id,
+                vec![ordinary_part],
+                &ordinary_complete_opts,
+            )
+            .await
+            .expect("ordinary multipart completion should succeed");
+        assert_ne!(
+            ordinary_completed.checksum.as_deref(),
+            Some(forged_checksum.as_slice()),
+            "ordinary multipart upload must not promote replication-ssec-crc into object checksum"
+        );
+
+        // Authorized replication multipart completion must still honor SUFFIX_REPLICATION_SSEC_CRC.
+        let mut repl_create_opts = ObjectOptions {
+            replication_request: true,
+            ..Default::default()
+        };
+        rustfs_utils::http::insert_header_map(
+            &mut repl_create_opts.user_defined,
+            SUFFIX_REPLICATION_SSEC_CRC,
+            encoded_forged.clone(),
+        );
+        let repl_upload = set_disks
+            .new_multipart_upload(bucket, "replicated", &repl_create_opts)
+            .await
+            .expect("replication upload should be created");
+        let repl_part = put_test_part(&set_disks, bucket, "replicated", &repl_upload.upload_id, 1, &[0x66; 5], 5).await;
+        let mut repl_complete_opts = ObjectOptions {
+            replication_request: true,
+            ..Default::default()
+        };
+        rustfs_utils::http::insert_header_map(&mut repl_complete_opts.user_defined, SUFFIX_REPLICATION_SSEC_CRC, encoded_forged);
+        let repl_completed = set_disks
+            .clone()
+            .complete_multipart_upload(bucket, "replicated", &repl_upload.upload_id, vec![repl_part], &repl_complete_opts)
+            .await
+            .expect("replication multipart completion should succeed");
+        assert_eq!(
+            repl_completed.checksum.as_deref(),
+            Some(forged_checksum.as_slice()),
+            "replication multipart completion must preserve sealed SSE-C checksum"
+        );
     }
 
     #[tokio::test]
