@@ -28,7 +28,7 @@ async fn catalog_registration_futures_remain_bounded_with_ecstore_backend() {
         .shutdown_token(shutdown.clone())
         .build()
         .await;
-    let backend = EcStoreTableCatalogObjectBackend::new(env.ecstore.clone());
+    let backend = EcStoreTableCatalogObjectBackend::new(env.ecstore);
     let store = ObjectTableCatalogStore::new(backend.clone());
     let paths = TableCatalogObjectPaths::default();
     let publication = TableCommitLockPublication::new(&backend, &paths);
