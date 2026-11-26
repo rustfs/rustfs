@@ -245,7 +245,8 @@ pub(crate) mod ecfs_consumer {
 
     pub(crate) mod object_lock {
         pub(crate) use super::super::super::{
-            load_bucket_object_lock_config_state, validate_bucket_object_lock_enabled, validate_bucket_object_lock_enabled_state,
+            load_bucket_object_lock_config_state, validate_bucket_object_lock_enabled,
+            validate_bucket_object_lock_enabled_for_read, validate_bucket_object_lock_enabled_state,
         };
     }
 
