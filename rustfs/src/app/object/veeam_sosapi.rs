@@ -32,7 +32,9 @@ use rustfs_s3_types::{S3Error, S3ErrorCode, S3Result};
 use time::OffsetDateTime;
 use tracing::debug;
 
-use super::super::storage_api::object_usecase::data_usage::load_bucket_usage_from_backend_cached;
+use super::super::storage_api::object_usecase::data_usage::{
+    BucketUsagePendingReason, BucketUsageStatus, load_bucket_usage_certification_from_backend_cached,
+};
 use super::super::storage_api::object_usecase::{ECStore, StorageObjectInfo as ObjectInfo, check_preconditions};
 use super::HTTPRangeSpec;
 use super::shared::{LOG_COMPONENT_APP, LOG_SUBSYSTEM_OBJECT};
@@ -388,12 +390,17 @@ fn capacity_unavailable() -> S3Error {
 }
 
 async fn load_capacity_inputs(store: &Arc<ECStore>, bucket: &str, incarnation: Uuid) -> S3Result<CapacityInputs> {
-    let used_bucket = load_bucket_usage_from_backend_cached(Arc::clone(store), bucket, incarnation)
+    let used_bucket = match load_bucket_usage_certification_from_backend_cached(Arc::clone(store), bucket, incarnation)
         .await
-        .map_err(|_| capacity_unavailable())?;
-    if used_bucket.is_none() {
-        log_usage_missing_once(bucket);
-    }
+        .map_err(|_| capacity_unavailable())?
+    {
+        BucketUsageStatus::Certified(bytes) => Some(bytes),
+        BucketUsageStatus::Pending(reason) => {
+            log_usage_missing_once(bucket, reason);
+            None
+        }
+        BucketUsageStatus::Unavailable(_) => return Err(capacity_unavailable()),
+    };
     let (capacity_cluster, free_cluster) = cached_cluster_capacity(store).await?;
     // The authoritative quota read also fences publication of the sampled capacity to this incarnation.
     let (quota, quota_incarnation, _) = store.bucket_quota_and_incarnation_from_disk(bucket).await.map_err(|_| {
@@ -533,7 +540,7 @@ fn conservative_cluster_capacity(info: &rustfs_madmin::StorageInfo) -> Option<(u
     Some((total, free))
 }
 
-fn log_usage_missing_once(bucket: &str) {
+fn log_usage_missing_once(bucket: &str, reason: BucketUsagePendingReason) {
     if LOGGED_USAGE_MISSING
         .compare_exchange(false, true, Ordering::Relaxed, Ordering::Relaxed)
         .is_ok()
@@ -543,6 +550,7 @@ fn log_usage_missing_once(bucket: &str) {
             component = LOG_COMPONENT_APP,
             subsystem = LOG_SUBSYSTEM_OBJECT,
             state = "snapshot_missing",
+            reason = ?reason,
             bucket = %bucket,
             "Veeam SOSAPI is reporting undefined bucket usage"
         );

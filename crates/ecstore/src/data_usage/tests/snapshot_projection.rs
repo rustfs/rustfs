@@ -20,7 +20,7 @@ fn scalar_projection_borrows_snapshot_and_preserves_unknown_and_zero() {
     let mut info = data_usage_info_for_test("known", 1, 42, SystemTime::UNIX_EPOCH);
     info.buckets_usage.insert("empty".to_string(), BucketUsageInfo::default());
     let cache = Some(CachedDataUsageSnapshot {
-        snapshot: Some(UsageSnapshot::new(info)),
+        snapshot: Some(UsageSnapshot::new(info, false)),
         last_load_failed: false,
         loaded_at,
         degraded_baseline: HashMap::new(),
@@ -66,7 +66,10 @@ fn projection_is_skipped_for_missing_failed_expired_or_invalidated_snapshots() {
     );
 
     cache = Some(CachedDataUsageSnapshot {
-        snapshot: Some(UsageSnapshot::new(data_usage_info_for_test("known", 1, 42, SystemTime::UNIX_EPOCH))),
+        snapshot: Some(UsageSnapshot::new(
+            data_usage_info_for_test("known", 1, 42, SystemTime::UNIX_EPOCH),
+            false,
+        )),
         last_load_failed: false,
         loaded_at,
         degraded_baseline: HashMap::new(),
@@ -78,6 +81,7 @@ fn projection_is_skipped_for_missing_failed_expired_or_invalidated_snapshots() {
         Ok(LoadedUsageBaseline {
             info: data_usage_info_for_test("known", 1, 42, SystemTime::UNIX_EPOCH),
             degraded_baseline: HashMap::new(),
+            invalid_certification_claim: false,
             observed_unavailable: false,
         }),
         loaded_at,
@@ -99,6 +103,7 @@ fn projected_publication_moves_bucket_maps_into_cache() {
         Ok(LoadedUsageBaseline {
             info,
             degraded_baseline: HashMap::new(),
+            invalid_certification_claim: false,
             observed_unavailable: false,
         }),
         tokio::time::Instant::now(),
@@ -167,41 +172,106 @@ fn projected_publication_moves_bucket_maps_into_cache() {
 }
 
 #[test]
-fn certified_bucket_usage_rejects_unproven_and_pending_data() {
+fn bucket_usage_certification_distinguishes_pending_and_unavailable_proof() {
+    use BucketUsagePendingReason::{BucketPending, MissingBucketProof, PreviousIncarnation, SnapshotNotReady};
+    use BucketUsageStatus::{Certified, Pending, Unavailable};
+    use BucketUsageUnavailableReason::{InvalidBucketIncarnation, InvalidSnapshotProof};
+
     let id = uuid::Uuid::from_u128(7);
     let mut info = data_usage_info_for_test("known", 1, 42, SystemTime::UNIX_EPOCH);
     info.usage_snapshot_converged = Some(true);
     info.scanner_cycle = Some(1);
     info.scanner_epoch = Some(1);
-    info.buckets_usage.get_mut("known").unwrap().bucket_incarnation = Some(id.to_string());
-    let certified = UsageSnapshot::new(info.clone());
-    assert_eq!(certified.certified_bucket_usage("known", id), Some(42));
-    assert_eq!(certified.certified_bucket_usage("known", uuid::Uuid::from_u128(8)), None);
-    assert_eq!(certified.certified_bucket_usage("known", uuid::Uuid::nil()), None);
-    let mut legacy = info.clone();
-    legacy.buckets_usage.get_mut("known").unwrap().bucket_incarnation = None;
-    assert_eq!(UsageSnapshot::new(legacy.clone()).certified_bucket_usage("known", id), None);
-    legacy.buckets_usage.get_mut("known").unwrap().bucket_incarnation = Some("corrupt".into());
-    assert_eq!(UsageSnapshot::new(legacy).certified_bucket_usage("known", id), None);
-    let mut pending = info.clone();
-    pending.usage_snapshot_converged = Some(false);
-    pending.usage_snapshot_pending_buckets = vec!["other".into()];
-    pending.usage_snapshot_pending_bucket_count = 1;
-    assert_eq!(UsageSnapshot::new(pending.clone()).certified_bucket_usage("known", id), Some(42));
-    pending.usage_snapshot_pending_buckets = vec!["known".into()];
-    assert_eq!(UsageSnapshot::new(pending.clone()).certified_bucket_usage("known", id), None);
-    pending.usage_snapshot_pending_bucket_count = 0;
-    assert_eq!(UsageSnapshot::new(pending.clone()).certified_bucket_usage("known", id), None);
-    pending.usage_snapshot_pending_buckets = vec!["z".into(), "a".into()];
-    pending.usage_snapshot_pending_bucket_count = 2;
-    assert_eq!(UsageSnapshot::new(pending.clone()).certified_bucket_usage("known", id), None);
-    pending.usage_snapshot_pending_buckets = vec!["other".into(), "other".into()];
-    assert_eq!(UsageSnapshot::new(pending).certified_bucket_usage("known", id), None);
-    let mut observational = info.clone();
-    observational.usage_snapshot_observational = true;
-    assert_eq!(UsageSnapshot::new(observational).certified_bucket_usage("known", id), None);
-    info.usage_snapshot_converged = None;
-    assert_eq!(UsageSnapshot::new(info).certified_bucket_usage("known", id), None);
+    info.buckets_usage
+        .get_mut("known")
+        .expect("fixture bucket")
+        .bucket_incarnation = Some(id.to_string());
+    let certified = UsageSnapshot::new(info.clone(), false);
+    assert_eq!(certified.bucket_usage_certification("known", id), Certified(42));
+    assert_eq!(certified.bucket_usage_certification("missing", id), Pending(MissingBucketProof));
+    assert_eq!(
+        certified.bucket_usage_certification("known", uuid::Uuid::from_u128(8)),
+        Pending(PreviousIncarnation)
+    );
+    assert_eq!(
+        certified.bucket_usage_certification("known", uuid::Uuid::nil()),
+        Unavailable(InvalidBucketIncarnation)
+    );
+    for (proof, expected) in [
+        (None, Pending(MissingBucketProof)),
+        (Some("corrupt".into()), Unavailable(InvalidBucketIncarnation)),
+        (Some(uuid::Uuid::nil().to_string()), Unavailable(InvalidBucketIncarnation)),
+    ] {
+        let mut sample = info.clone();
+        sample
+            .buckets_usage
+            .get_mut("known")
+            .expect("fixture bucket")
+            .bucket_incarnation = proof;
+        assert_eq!(UsageSnapshot::new(sample, false).bucket_usage_certification("known", id), expected);
+    }
+
+    for (names, count, expected) in [
+        (vec!["other"], 1, Certified(42)),
+        (vec!["known"], 1, Pending(BucketPending)),
+        (vec!["known"], 0, Unavailable(InvalidSnapshotProof)),
+        (vec!["z", "a"], 2, Unavailable(InvalidSnapshotProof)),
+        (vec!["other", "other"], 2, Unavailable(InvalidSnapshotProof)),
+        (vec![], 0, Unavailable(InvalidSnapshotProof)),
+    ] {
+        let mut sample = info.clone();
+        sample.usage_snapshot_converged = Some(false);
+        sample.usage_snapshot_pending_buckets = names.into_iter().map(str::to_owned).collect();
+        sample.usage_snapshot_pending_bucket_count = count;
+        assert_eq!(UsageSnapshot::new(sample, false).bucket_usage_certification("known", id), expected);
+    }
+
+    for sample in [
+        DataUsageInfo {
+            usage_snapshot_partial: true,
+            ..info.clone()
+        },
+        DataUsageInfo {
+            scanner_epoch: None,
+            usage_snapshot_converged: Some(false),
+            usage_snapshot_pending_buckets: vec!["known".into()],
+            ..info.clone()
+        },
+    ] {
+        assert_eq!(
+            UsageSnapshot::new(sample, false).bucket_usage_certification("known", id),
+            Unavailable(InvalidSnapshotProof)
+        );
+    }
+
+    let bootstrap = DataUsageInfo {
+        last_update: Some(SystemTime::UNIX_EPOCH),
+        scanner_epoch: Some(1),
+        usage_snapshot_converged: Some(false),
+        usage_snapshot_bootstrap_pending: true,
+        ..Default::default()
+    };
+    for sample in [
+        DataUsageInfo::default(),
+        bootstrap,
+        DataUsageInfo {
+            usage_snapshot_observational: true,
+            ..info.clone()
+        },
+        DataUsageInfo {
+            scanner_epoch: None,
+            ..info.clone()
+        },
+        DataUsageInfo {
+            usage_snapshot_converged: None,
+            ..info
+        },
+    ] {
+        assert_eq!(
+            UsageSnapshot::new(sample, false).bucket_usage_certification("known", id),
+            Pending(SnapshotNotReady)
+        );
+    }
 }
 
 #[tokio::test]
@@ -296,12 +366,55 @@ async fn persisted_scalar_projection_shares_cache_refresh_and_invalidation() {
     .expect("persist malformed certification evidence");
     invalidate_data_usage_snapshot_cache().await;
     assert_eq!(
-        load_bucket_usage_from_backend_cached(store.clone(), "known", incarnation)
+        load_bucket_usage_certification_from_backend_cached(store.clone(), "known", incarnation)
             .await
             .expect("read snapshot without accepting malformed certification"),
-        None
+        BucketUsageStatus::Unavailable(BucketUsageUnavailableReason::InvalidSnapshotProof)
     );
     assert_eq!(persisted_bucket_usage(store.clone(), "known").await, Some(84));
+
+    info.scanner_cycle = Some(3);
+    info.usage_snapshot_converged = Some(true);
+    info.usage_snapshot_pending_bucket_count = 0;
+    info.usage_snapshot_pending_buckets.clear();
+    info.buckets_count += 1;
+    save_config(
+        store.clone(),
+        DATA_USAGE_OBJ_NAME_PATH.as_str(),
+        serde_json::to_vec(&info).expect("encode invalid bucket count"),
+    )
+    .await
+    .expect("persist malformed completeness claim");
+    invalidate_data_usage_snapshot_cache().await;
+    assert_eq!(
+        load_bucket_usage_certification_from_backend_cached(store.clone(), "known", incarnation)
+            .await
+            .expect("classify demoted completeness claim"),
+        BucketUsageStatus::Unavailable(BucketUsageUnavailableReason::InvalidSnapshotProof)
+    );
+    let raw = load_data_usage_from_backend_cached(store.clone())
+        .await
+        .expect("read normalized usage");
+    assert!(!raw.usage_snapshot_complete);
+    assert!(raw.buckets_usage.is_empty());
+
+    info.scanner_cycle = Some(4);
+    info.buckets_count -= 1;
+    info.usage_snapshot_observational = true;
+    save_config(
+        store.clone(),
+        DATA_USAGE_OBJ_NAME_PATH.as_str(),
+        serde_json::to_vec(&info).expect("encode observational sample in primary slot"),
+    )
+    .await
+    .expect("persist wrong snapshot kind");
+    invalidate_data_usage_snapshot_cache().await;
+    assert_eq!(
+        load_bucket_usage_certification_from_backend_cached(store.clone(), "known", incarnation)
+            .await
+            .expect("classify wrong snapshot kind"),
+        BucketUsageStatus::Unavailable(BucketUsageUnavailableReason::InvalidSnapshotProof)
+    );
     invalidate_data_usage_snapshot_cache().await;
     if let Some(cancel) = store.ctx.background_cancel_token() {
         cancel.cancel();

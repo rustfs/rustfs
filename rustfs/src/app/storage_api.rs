@@ -89,12 +89,19 @@ pub(crate) mod data_usage {
         crate::storage::storage_api::ecstore_data_usage::load_admin_data_usage_with_memory_overlay(store).await
     }
 
-    pub(crate) async fn load_bucket_usage_from_backend_cached(
+    pub(crate) use crate::storage::storage_api::ecstore_data_usage::{BucketUsagePendingReason, BucketUsageStatus};
+
+    pub(crate) async fn load_bucket_usage_certification_from_backend_cached(
         store: Arc<crate::storage::storage_api::ECStore>,
         bucket: &str,
         incarnation: uuid::Uuid,
-    ) -> Result<Option<u64>, crate::storage::storage_api::StorageError> {
-        crate::storage::storage_api::ecstore_data_usage::load_bucket_usage_from_backend_cached(store, bucket, incarnation).await
+    ) -> Result<BucketUsageStatus, crate::storage::storage_api::StorageError> {
+        crate::storage::storage_api::ecstore_data_usage::load_bucket_usage_certification_from_backend_cached(
+            store,
+            bucket,
+            incarnation,
+        )
+        .await
     }
 
     #[cfg(test)]

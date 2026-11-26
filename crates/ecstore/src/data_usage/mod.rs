@@ -230,50 +230,126 @@ pub async fn lookup_degraded_bucket_usage_baseline(store: Arc<ECStore>, bucket: 
         .and_then(|cached| cached.degraded_baseline.get(bucket).copied())
 }
 
+/// Whether a cached usage snapshot can certify the current bucket's byte count.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BucketUsageStatus {
+    Certified(u64),
+    Pending(BucketUsagePendingReason),
+    Unavailable(BucketUsageUnavailableReason),
+}
+
+/// Why otherwise readable usage cannot yet certify this bucket.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BucketUsagePendingReason {
+    SnapshotNotReady,
+    BucketPending,
+    MissingBucketProof,
+    PreviousIncarnation,
+}
+
+/// Which part of a purported certification was invalid.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BucketUsageUnavailableReason {
+    InvalidSnapshotProof,
+    InvalidBucketIncarnation,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum SnapshotCertification {
+    Ready,
+    Pending,
+    Invalid,
+}
+
 /// An immutable sample with its bucket certification metadata checked once.
 #[derive(Debug, Clone)]
 struct UsageSnapshot {
     info: DataUsageInfo,
-    can_certify_buckets: bool,
+    certification: SnapshotCertification,
 }
 
 impl UsageSnapshot {
-    fn new(info: DataUsageInfo) -> Self {
-        let pending = &info.usage_snapshot_pending_buckets;
-        let can_certify_buckets = info.is_complete_bucket_usage_snapshot()
-            && !info.usage_snapshot_observational
-            && info.scanner_cycle.is_some()
-            && info.scanner_epoch.is_some()
-            && u64::try_from(pending.len()).ok() == Some(info.usage_snapshot_pending_bucket_count)
-            && match info.usage_snapshot_converged {
-                Some(true) => pending.is_empty(),
-                Some(false) => !pending.is_empty() && pending.windows(2).all(|pair| pair[0] < pair[1]),
-                None => false,
-            };
-        Self {
-            info,
-            can_certify_buckets,
-        }
+    fn new(info: DataUsageInfo, invalid_certification_claim: bool) -> Self {
+        let certification = if invalid_certification_claim
+            || info.usage_snapshot_admin_projection
+            || (info.usage_snapshot_complete && (info.usage_snapshot_partial || info.usage_snapshot_bootstrap_pending))
+        {
+            SnapshotCertification::Invalid
+        } else if info.usage_snapshot_bootstrap_pending || info.usage_snapshot_observational || !info.usage_snapshot_complete {
+            SnapshotCertification::Pending
+        } else if !info.is_complete_bucket_usage_snapshot() {
+            SnapshotCertification::Invalid
+        } else {
+            let pending = &info.usage_snapshot_pending_buckets;
+            if u64::try_from(pending.len()).ok() != Some(info.usage_snapshot_pending_bucket_count) {
+                SnapshotCertification::Invalid
+            } else {
+                match info.usage_snapshot_converged {
+                    Some(true) if pending.is_empty() => SnapshotCertification::Ready,
+                    Some(false) if !pending.is_empty() && pending.windows(2).all(|pair| pair[0] < pair[1]) => {
+                        SnapshotCertification::Ready
+                    }
+                    None if pending.is_empty() => SnapshotCertification::Pending,
+                    _ => SnapshotCertification::Invalid,
+                }
+            }
+        };
+        let certification = match certification {
+            SnapshotCertification::Ready if info.scanner_cycle.is_none() || info.scanner_epoch.is_none() => {
+                SnapshotCertification::Pending
+            }
+            other => other,
+        };
+        Self { info, certification }
     }
 
     fn clone_info(&self) -> DataUsageInfo {
         self.info.clone()
     }
 
-    fn certified_bucket_usage(&self, bucket: &str, incarnation: uuid::Uuid) -> Option<u64> {
-        if !self.can_certify_buckets
-            || incarnation.is_nil()
-            || self
-                .info
-                .usage_snapshot_pending_buckets
-                .binary_search_by(|pending| pending.as_str().cmp(bucket))
-                .is_ok()
-        {
-            return None;
+    fn bucket_usage_certification(&self, bucket: &str, incarnation: uuid::Uuid) -> BucketUsageStatus {
+        use BucketUsagePendingReason::{BucketPending, MissingBucketProof, PreviousIncarnation, SnapshotNotReady};
+        use BucketUsageStatus::{Certified, Pending, Unavailable};
+        use BucketUsageUnavailableReason::{InvalidBucketIncarnation, InvalidSnapshotProof};
+
+        if incarnation.is_nil() {
+            return Unavailable(InvalidBucketIncarnation);
         }
-        let usage = self.info.buckets_usage.get(bucket)?;
-        let certified = uuid::Uuid::parse_str(usage.bucket_incarnation.as_deref()?).ok()?;
-        (certified == incarnation).then_some(usage.size)
+        match self.certification {
+            SnapshotCertification::Invalid => return Unavailable(InvalidSnapshotProof),
+            SnapshotCertification::Pending => return Pending(SnapshotNotReady),
+            SnapshotCertification::Ready => {}
+        }
+        if self
+            .info
+            .usage_snapshot_pending_buckets
+            .binary_search_by(|pending| pending.as_str().cmp(bucket))
+            .is_ok()
+        {
+            return Pending(BucketPending);
+        }
+        let Some((usage, proof)) = self
+            .info
+            .buckets_usage
+            .get(bucket)
+            .and_then(|usage| usage.bucket_incarnation.as_deref().map(|proof| (usage, proof)))
+        else {
+            return Pending(MissingBucketProof);
+        };
+        match uuid::Uuid::parse_str(proof) {
+            Ok(id) if id == incarnation => Certified(usage.size),
+            Ok(id) if !id.is_nil() => Pending(PreviousIncarnation),
+            _ => Unavailable(InvalidBucketIncarnation),
+        }
+    }
+}
+
+impl BucketUsageStatus {
+    fn certified_bytes(self) -> Option<u64> {
+        match self {
+            Self::Certified(bytes) => Some(bytes),
+            Self::Pending(_) | Self::Unavailable(_) => None,
+        }
     }
 }
 
@@ -330,6 +406,7 @@ fn cache_data_usage_snapshot_result<T>(
     Some(match result {
         Ok(LoadedUsageBaseline {
             info,
+            invalid_certification_claim,
             mut degraded_baseline,
             observed_unavailable,
         }) => {
@@ -352,7 +429,7 @@ fn cache_data_usage_snapshot_result<T>(
                     degraded_baseline.entry(bucket.clone()).or_insert(*size);
                 }
             }
-            let snapshot = UsageSnapshot::new(info);
+            let snapshot = UsageSnapshot::new(info, invalid_certification_claim);
             let projected = project(&snapshot);
             *cache = Some(CachedDataUsageSnapshot {
                 snapshot: Some(snapshot),
@@ -1349,6 +1426,8 @@ pub async fn load_data_usage_from_backend(store: Arc<ECStore>) -> Result<DataUsa
 /// baseline derived from it.
 struct LoadedUsageBaseline {
     info: DataUsageInfo,
+    /// Certification failures detected before normalization can demote the sample.
+    invalid_certification_claim: bool,
     degraded_baseline: HashMap<String, u64>,
     /// True when the observed snapshot could not be read (a transport error,
     /// not absence): the cached loader then carries the previous refresh's
@@ -1365,7 +1444,8 @@ async fn load_data_usage_from_backend_with_baseline(store: Arc<ECStore>) -> Resu
     // The observed-newness gate below compares against the snapshot as
     // persisted, before normalization demotes or discards anything.
     let authoritative_as_persisted = loaded_snapshot.snapshot_identity();
-    let (info, mut degraded_baseline) = normalize_loaded_data_usage(loaded_snapshot, source.is_authoritative()).await;
+    let (info, mut degraded_baseline, invalid_certification_claim) =
+        normalize_loaded_data_usage(loaded_snapshot, source.is_authoritative()).await;
 
     // A bucket without a converged scanner cycle behind it — a freshly joined
     // replica whose every cycle is superseded by the sustained replication
@@ -1391,6 +1471,7 @@ async fn load_data_usage_from_backend_with_baseline(store: Arc<ECStore>) -> Resu
 
     Ok(LoadedUsageBaseline {
         info,
+        invalid_certification_claim,
         degraded_baseline,
         observed_unavailable,
     })
@@ -1570,10 +1651,12 @@ fn discard_incomplete_bucket_usage(data_usage_info: &mut DataUsageInfo) {
     }
 }
 
-fn validate_complete_usage_snapshot(data_usage_info: &mut DataUsageInfo) {
-    if data_usage_info.usage_snapshot_complete && !data_usage_info.is_complete_bucket_usage_snapshot() {
+fn validate_complete_usage_snapshot(data_usage_info: &mut DataUsageInfo) -> bool {
+    let invalid_complete_claim = data_usage_info.usage_snapshot_complete && !data_usage_info.is_complete_bucket_usage_snapshot();
+    if invalid_complete_claim {
         data_usage_info.usage_snapshot_complete = false;
     }
+    invalid_complete_claim
 }
 
 fn populate_backward_compatible_usage_maps(data_usage_info: &mut DataUsageInfo) {
@@ -1608,14 +1691,16 @@ fn populate_backward_compatible_usage_maps(data_usage_info: &mut DataUsageInfo) 
 async fn normalize_loaded_data_usage(
     mut data_usage_info: DataUsageInfo,
     authoritative_format: bool,
-) -> (DataUsageInfo, HashMap<String, u64>) {
+) -> (DataUsageInfo, HashMap<String, u64>, bool) {
     info!("Loaded data usage info from backend with {} buckets", data_usage_info.buckets_count);
 
     if !authoritative_format {
         data_usage_info.usage_snapshot_complete = false;
     }
     populate_backward_compatible_usage_maps(&mut data_usage_info);
-    validate_complete_usage_snapshot(&mut data_usage_info);
+    let invalid_complete_claim = validate_complete_usage_snapshot(&mut data_usage_info);
+    let invalid_certification_claim =
+        invalid_complete_claim || (authoritative_format && data_usage_info.usage_snapshot_observational);
     let degraded_baseline = data_usage_info.bucket_sizes.clone();
     discard_incomplete_bucket_usage(&mut data_usage_info);
 
@@ -1642,7 +1727,7 @@ async fn normalize_loaded_data_usage(
         }
     }
 
-    (data_usage_info, degraded_baseline)
+    (data_usage_info, degraded_baseline, invalid_certification_claim)
 }
 
 /// Load the persisted data usage snapshot through a small in-process cache.
@@ -1663,7 +1748,21 @@ pub async fn load_bucket_usage_from_backend_cached(
     bucket: &str,
     incarnation: uuid::Uuid,
 ) -> Result<Option<u64>, Error> {
-    project_data_usage_from_backend_cached(store, |snapshot| snapshot.certified_bucket_usage(bucket, incarnation)).await
+    Ok(load_bucket_usage_certification_from_backend_cached(store, bucket, incarnation)
+        .await?
+        .certified_bytes())
+}
+
+/// Inspect the certification for one bucket in the cached authoritative usage snapshot.
+///
+/// # Errors
+/// Returns an error when the snapshot cannot be read or decoded.
+pub async fn load_bucket_usage_certification_from_backend_cached(
+    store: Arc<ECStore>,
+    bucket: &str,
+    incarnation: uuid::Uuid,
+) -> Result<BucketUsageStatus, Error> {
+    project_data_usage_from_backend_cached(store, |snapshot| snapshot.bucket_usage_certification(bucket, incarnation)).await
 }
 
 // Project under the cache guard so scalar readers never copy the snapshot's
@@ -1745,6 +1844,7 @@ async fn load_admin_data_usage_snapshot_cached(store: Arc<ECStore>) -> Result<Da
             .map(|info| LoadedUsageBaseline {
                 info,
                 degraded_baseline: HashMap::new(),
+                invalid_certification_claim: false,
                 observed_unavailable: false,
             });
         let loaded_at = tokio::time::Instant::now();
@@ -3970,7 +4070,7 @@ mod tests {
         legacy.bucket_sizes.insert("large".to_string(), 0);
         legacy.buckets_count = 2;
 
-        let (normalized, degraded_baseline) = normalize_loaded_data_usage(legacy, false).await;
+        let (normalized, degraded_baseline, _) = normalize_loaded_data_usage(legacy, false).await;
 
         assert_eq!(normalized.buckets_count, 0);
         assert!(normalized.buckets_usage.is_empty());
@@ -4017,7 +4117,7 @@ mod tests {
         info.buckets_usage.insert("empty".to_string(), BucketUsageInfo::default());
         info.buckets_count = 2;
 
-        let (normalized, _) = normalize_loaded_data_usage(info, true).await;
+        let (normalized, _, _) = normalize_loaded_data_usage(info, true).await;
 
         assert_eq!(normalized.buckets_count, 2);
         assert!(normalized.usage_snapshot_complete);
@@ -4052,7 +4152,7 @@ mod tests {
         info.bucket_sizes.insert("partial".to_string(), 196_870_144);
         info.buckets_count = 1;
 
-        let (normalized, _) = normalize_loaded_data_usage(info, true).await;
+        let (normalized, _, _) = normalize_loaded_data_usage(info, true).await;
 
         assert_eq!(normalized.buckets_count, 0);
         assert!(!normalized.buckets_usage.contains_key("control"));
@@ -4067,7 +4167,7 @@ mod tests {
         info.buckets_count = 2;
 
         assert!(!data_usage_contains_bucket(&info, "missing"));
-        let (normalized, _) = normalize_loaded_data_usage(info, true).await;
+        let (normalized, _, _) = normalize_loaded_data_usage(info, true).await;
 
         assert!(!normalized.usage_snapshot_complete);
         assert!(normalized.buckets_usage.is_empty());
@@ -4076,7 +4176,7 @@ mod tests {
 
     #[tokio::test]
     async fn complete_empty_snapshot_remains_authoritative() {
-        let (normalized, _) = normalize_loaded_data_usage(
+        let (normalized, _, _) = normalize_loaded_data_usage(
             DataUsageInfo {
                 last_update: Some(SystemTime::UNIX_EPOCH),
                 usage_snapshot_complete: true,
@@ -4341,7 +4441,7 @@ mod tests {
     async fn partial_admin_observation_does_not_promote_a_legacy_baseline() {
         let (legacy, observed) = usage_snapshots_with_missing_observed_set();
         let (selected, current_format) = select_admin_data_usage_snapshot(legacy, false, Some(observed));
-        let (normalized, _) = normalize_loaded_data_usage(selected, current_format).await;
+        let (normalized, _, _) = normalize_loaded_data_usage(selected, current_format).await;
 
         assert!(normalized.is_valid_partial_snapshot());
         assert!(!normalized.is_complete_bucket_usage_snapshot());
@@ -4463,7 +4563,7 @@ mod tests {
     async fn install_data_usage_snapshot_cache_for_test(info: DataUsageInfo, age: Duration) {
         let degraded_baseline = info.bucket_sizes.clone();
         *data_usage_snapshot_cache().write().await = Some(CachedDataUsageSnapshot {
-            snapshot: Some(UsageSnapshot::new(info)),
+            snapshot: Some(UsageSnapshot::new(info, false)),
             last_load_failed: false,
             loaded_at: tokio::time::Instant::now()
                 .checked_sub(age)
@@ -4499,6 +4599,7 @@ mod tests {
         LoadedUsageBaseline {
             degraded_baseline: info.bucket_sizes.clone(),
             info,
+            invalid_certification_claim: false,
             observed_unavailable: false,
         }
     }
@@ -4919,6 +5020,7 @@ mod tests {
             Ok(LoadedUsageBaseline {
                 info: expected,
                 degraded_baseline: HashMap::new(),
+                invalid_certification_claim: false,
                 observed_unavailable: false,
             }),
             loaded_at,
@@ -5118,7 +5220,7 @@ mod tests {
         observed.usage_snapshot_converged = Some(false);
         observed.usage_snapshot_authoritative_baseline = Some(baseline.snapshot_identity());
         let mut cache = Some(CachedDataUsageSnapshot {
-            snapshot: Some(UsageSnapshot::new(observed)),
+            snapshot: Some(UsageSnapshot::new(observed, false)),
             last_load_failed: false,
             loaded_at,
             degraded_baseline: HashMap::new(),
@@ -5157,7 +5259,7 @@ mod tests {
             (loaded.scanner_epoch, loaded.scanner_cycle) = loaded_position;
             let expected = if accept { &loaded } else { &previous };
             let mut cache = Some(CachedDataUsageSnapshot {
-                snapshot: Some(UsageSnapshot::new(previous.clone())),
+                snapshot: Some(UsageSnapshot::new(previous.clone(), false)),
                 last_load_failed: false,
                 loaded_at,
                 degraded_baseline: HashMap::new(),
@@ -5184,7 +5286,7 @@ mod tests {
         let loaded_at = tokio::time::Instant::now();
         let expected = data_usage_info_for_test("bucket", 3, 42, SystemTime::UNIX_EPOCH + Duration::from_secs(2));
         let mut cache = Some(CachedDataUsageSnapshot {
-            snapshot: Some(UsageSnapshot::new(expected.clone())),
+            snapshot: Some(UsageSnapshot::new(expected.clone(), false)),
             last_load_failed: false,
             loaded_at,
             degraded_baseline: HashMap::from([("bucket".to_string(), 42)]),
@@ -5230,7 +5332,7 @@ mod tests {
         let now = SystemTime::now();
         let future = now + rustfs_data_usage::USAGE_LAST_UPDATE_FUTURE_TOLERANCE + Duration::from_secs(60);
         let mut cache = Some(CachedDataUsageSnapshot {
-            snapshot: Some(UsageSnapshot::new(data_usage_info_for_test("bucket", 3, 42, future))),
+            snapshot: Some(UsageSnapshot::new(data_usage_info_for_test("bucket", 3, 42, future), false)),
             last_load_failed: false,
             loaded_at,
             degraded_baseline: HashMap::new(),
@@ -5329,7 +5431,10 @@ mod tests {
         let loaded_at = tokio::time::Instant::now();
         let refresh_generation = data_usage_snapshot_generation();
         let mut cache = Some(CachedDataUsageSnapshot {
-            snapshot: Some(UsageSnapshot::new(data_usage_info_for_test("bucket", 1, 42, SystemTime::UNIX_EPOCH))),
+            snapshot: Some(UsageSnapshot::new(
+                data_usage_info_for_test("bucket", 1, 42, SystemTime::UNIX_EPOCH),
+                false,
+            )),
             last_load_failed: false,
             loaded_at,
             degraded_baseline: HashMap::from([("observed-only".to_string(), 7_u64), ("covered".to_string(), 1)]),
@@ -5340,6 +5445,7 @@ mod tests {
             Ok(LoadedUsageBaseline {
                 info: data_usage_info_for_test("bucket", 1, 42, SystemTime::UNIX_EPOCH),
                 degraded_baseline: HashMap::from([("covered".to_string(), 2_u64)]),
+                invalid_certification_claim: false,
                 observed_unavailable: true,
             }),
             loaded_at,
@@ -5363,7 +5469,10 @@ mod tests {
         let loaded_at = tokio::time::Instant::now();
         let refresh_generation = data_usage_snapshot_generation();
         let mut cache = Some(CachedDataUsageSnapshot {
-            snapshot: Some(UsageSnapshot::new(data_usage_info_for_test("stale", 1, 42, SystemTime::UNIX_EPOCH))),
+            snapshot: Some(UsageSnapshot::new(
+                data_usage_info_for_test("stale", 1, 42, SystemTime::UNIX_EPOCH),
+                false,
+            )),
             last_load_failed: false,
             loaded_at,
             degraded_baseline: HashMap::new(),
@@ -5375,6 +5484,7 @@ mod tests {
             Ok(LoadedUsageBaseline {
                 info: data_usage_info_for_test("stale", 1, 42, SystemTime::UNIX_EPOCH),
                 degraded_baseline: HashMap::new(),
+                invalid_certification_claim: false,
                 observed_unavailable: false,
             }),
             loaded_at,
@@ -6552,7 +6662,7 @@ mod tests {
         let successor = data_usage_info_for_test(BUCKET, 7, 294, SystemTime::now());
         let mut snapshot_cache = data_usage_snapshot_cache().write().await;
         *snapshot_cache = Some(CachedDataUsageSnapshot {
-            snapshot: Some(UsageSnapshot::new(successor)),
+            snapshot: Some(UsageSnapshot::new(successor, false)),
             last_load_failed: false,
             loaded_at: tokio::time::Instant::now(),
             degraded_baseline: HashMap::new(),
@@ -6624,7 +6734,7 @@ mod tests {
         let successor = data_usage_info_for_test(BUCKET, 7, 294, SystemTime::now());
         let mut snapshot_cache = data_usage_snapshot_cache().write().await;
         *snapshot_cache = Some(CachedDataUsageSnapshot {
-            snapshot: Some(UsageSnapshot::new(successor)),
+            snapshot: Some(UsageSnapshot::new(successor, false)),
             last_load_failed: false,
             loaded_at: tokio::time::Instant::now(),
             degraded_baseline: HashMap::new(),
@@ -6677,7 +6787,7 @@ mod tests {
         };
         let stale = data_usage_info_for_test(BUCKET, 7, 294, SystemTime::now());
         *data_usage_snapshot_cache().write().await = Some(CachedDataUsageSnapshot {
-            snapshot: Some(UsageSnapshot::new(stale)),
+            snapshot: Some(UsageSnapshot::new(stale, false)),
             last_load_failed: false,
             loaded_at: tokio::time::Instant::now(),
             degraded_baseline: HashMap::new(),
@@ -8127,7 +8237,7 @@ mod tests {
                     // memory. Selecting that newer view must not erase local mutations.
                     let (selected, current_format) = select_admin_data_usage_snapshot(baseline, true, Some(observed));
                     assert_eq!(selected.scanner_cycle, Some(11));
-                    let (selected, _) = normalize_loaded_data_usage(selected, current_format).await;
+                    let (selected, _, _) = normalize_loaded_data_usage(selected, current_format).await;
                     let mut distributed = selected.clone();
                     apply_bucket_usage_memory_overlay_if_authoritative(&mut distributed, false).await;
                     assert_eq!((distributed.objects_total_count, distributed.objects_total_size), (2, 20));

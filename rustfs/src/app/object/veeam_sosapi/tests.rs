@@ -1018,15 +1018,23 @@ fn veeam_sosapi_http_contract() {
             assert_eq!(stale.status(), http::StatusCode::OK);
             let stale_body = BodyExt::collect(stale.into_body()).await.expect("stale capacity body").to_bytes();
             assert_eq!(element_text(std::str::from_utf8(&stale_body).unwrap(), "Used"), "-1");
+            let recycled_key = CapacityCacheKey { store_id: store.id, bucket: recycled.clone(), incarnation: new_id };
             snapshot.last_update = Some(std::time::SystemTime::now() + Duration::from_secs(5));
+            snapshot.buckets_usage.get_mut(&recycled).expect("recycled bucket").bucket_incarnation = Some("invalid UUID".into());
+            crate::app::storage_api::test::data_usage::store_data_usage_in_backend(snapshot.clone(), Arc::clone(&store))
+                .await.expect("seed malformed incarnation proof");
+            caches.current.invalidate(&recycled_key).await;
+            for method in [Method::GET, Method::HEAD] {
+                let malformed = owner.call(owner_call(method, recycled_uri.clone(), Vec::new(), Bytes::new()))
+                    .await.expect("malformed capacity");
+                assert_eq!(malformed.status(), http::StatusCode::SERVICE_UNAVAILABLE);
+            }
+            snapshot.last_update = Some(std::time::SystemTime::now() + Duration::from_secs(6));
             snapshot.buckets_usage.get_mut(&recycled).unwrap().bucket_incarnation = Some(new_id.to_string());
             snapshot.buckets_usage.get_mut(&recycled).unwrap().size = 17;
             snapshot.bucket_sizes.insert(recycled.clone(), 17);
             crate::app::storage_api::test::data_usage::store_data_usage_in_backend(snapshot, Arc::clone(&store))
                 .await.expect("seed new incarnation snapshot");
-            capacity_caches().current.invalidate(&CapacityCacheKey {
-                store_id: store.id, bucket: recycled.clone(), incarnation: new_id,
-            }).await;
             let fresh = owner.call(owner_call(Method::GET, recycled_uri, Vec::new(), Bytes::new())).await.expect("new capacity");
             assert_eq!(fresh.status(), http::StatusCode::OK);
             let fresh_body = BodyExt::collect(fresh.into_body()).await.expect("new capacity body").to_bytes();
