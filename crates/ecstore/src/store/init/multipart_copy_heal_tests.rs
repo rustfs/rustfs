@@ -98,12 +98,19 @@ mod multipart_copy_heal_tests {
                     seed as u8
                 })
                 .collect::<Vec<_>>();
-            let options = ObjectOptions {
+            // C's historical timestamp predates this bucket, so bind the upload to its generation.
+            let (bucket_guard, incarnation) = store
+                .acquire_bucket_incarnation_fence_for_options(&bucket, None, None)
+                .await
+                .expect("hold the source bucket generation through native completion");
+            let mut options = ObjectOptions {
                 versioned: true,
                 mod_time: Some(OffsetDateTime::from_unix_timestamp(1_700_000_000).expect("fixed native C timestamp")),
+                expected_bucket_incarnation_id: Some(incarnation),
                 write_completion: WriteCompletion::TailDrained,
                 ..Default::default()
             };
+            bucket_guard.attach_to_object_options(&mut options);
             let upload = store.pools[0]
                 .new_multipart_upload(&bucket, &object, &options)
                 .await
@@ -141,6 +148,7 @@ mod multipart_copy_heal_tests {
             })
             .await
             .expect("native completion physical tails drain");
+            drop(bucket_guard);
             let version = completed.version_id.expect("actual native C version");
             let original_options = ObjectOptions {
                 versioned: true,
