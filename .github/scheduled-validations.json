@@ -1302,6 +1302,27 @@
       "alert_contract": "independent"
     },
     {
+      "workflow": ".github/workflows/package-deb-rpm.yml",
+      "name": "Package DEB/RPM",
+      "roles": [
+        "release"
+      ],
+      "events": [
+        "workflow_run",
+        "workflow_dispatch"
+      ],
+      "cadence": "event",
+      "timezone": "UTC",
+      "schedule": [],
+      "owner": "@overtrue",
+      "policy": "active",
+      "monitor": "none",
+      "result_owner": "package-deb-rpm.yml",
+      "disposition": "After a successful tag push of Build and Release, wrap the published Linux zips as deb and rpm assets and refresh SHA256SUMS and SHA512SUMS. Dispatch with a tag backfills an existing release. manual-main-packages.yml still only uploads workflow artifacts.",
+      "monitor_reason": "Event-driven release packaging has no periodic freshness obligation.",
+      "origin": "package-deb-rpm"
+    },
+    {
       "workflow": ".github/workflows/package.yml",
       "name": "Build candidate packages",
       "roles": [

@@ -127,7 +127,7 @@ The versioned plan is `.config/release-validation-plan.json` (`schema_version=1`
 | Nightly Linux schedule, weekly desktop schedule, or dispatch | `build.yml` `build-rustfs` (development build of that schedule's platform subset, or the dispatch platform list) | build artifacts and the uncertified dev download channel; no release publication |
 | Valid release or preview tag | `build.yml` `build-rustfs`, `release-certification`, `create-release`, `upload-release-assets`, `publish-release`, `promote-release-artifacts` | staged binaries, draft release, checksummed assets, then certified publish and promotion of the same bytes |
 | Successful non-preview release-tag build (`workflow_run`) | `docker.yml` `release-certification`, `build-docker`, `scan-docker-image` | multi-architecture images staged, verified against the certification and promoted, plus vulnerability report |
-| Successful release-tag build (`workflow_run`) | `package.yml` `release-certification`, `package`, `promote-packages` | DEB/RPM packages with wrapped-binary verification, staged then promoted with checksums |
+| Successful release-tag build (`workflow_run`) | `package-deb-rpm.yml` `resolve`, `package`, `checksums` | eight Linux deb/rpm assets wrapped from the published zips, then SHA256SUMS and SHA512SUMS rewritten to include them |
 | Successful non-preview release-tag build (`workflow_run`) | `helm-package.yml` `release-certification`, `build-helm-package`, `publish-helm-package` | versioned chart and repository index, only over a certified image promotion record |
 | Final tag's release published | `build.yml` `cleanup-preview-releases` | deletes every `<target>-preview.<N>` Release for that target; the tags are kept |
 
@@ -140,7 +140,7 @@ Publication exits and their gate:
 | `latest.json` version pointer | `build.yml` `update-latest-version` | transitively through `publish-release` |
 | Image channels (Docker Hub, GHCR, Quay tags) | `docker.yml` `build-docker` promotion step | certified input digests, staged image binary identity and `verify-promotion`, then promotion of the same digest with `imagetools create` |
 | Official R2 package paths `packages/release` and `packages/latest` | `package.yml` `promote-packages` | `release-certification` and wrapped-binary `verify-promotion`; the package job only stages |
-| GitHub release package assets | `package.yml` `package` | `release-certification` and wrapped-binary `verify-promotion` before upload |
+| GitHub release package assets | `package-deb-rpm.yml` `package` and `checksums` | zip digest checked against the published SHA256SUMS, then deb/rpm upload without replacing a different digest; checksum files are rewritten to include the packages |
 | Helm chart repository (`rustfs/helm` push) | `helm-package.yml` `publish-helm-package` | `release-certification` plus the Docker workflow's image-promotion record bound to the same candidate |
 
 Downstream workflows fail closed when the trusted certification is absent: a manual dispatch without certification fails and pushes no official tag. Only results from the trusted verification sources listed in the plan (currently the `rustfs/s3chaos` `release-gate.yml` envelope runs) carry release authority; a PR-uploaded JSON set cannot certify a release. Retries reuse the same candidate, only the staged bytes are promoted (no rebuild-after-verify), and no downstream step re-resolves a mutable `latest`.

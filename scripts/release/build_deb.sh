@@ -77,6 +77,12 @@ fakeroot dpkg-deb --build "${PKG_DIR}" "$DEB_FILE"
 [[ $(dpkg-deb -f "$DEB_FILE" Version) == "$DEB_VERSION" ]]
 [[ $(dpkg-deb -f "$DEB_FILE" Architecture) == "$DEB_ARCH" ]]
 dpkg-deb --fsys-tarfile "$DEB_FILE" | tar -tf - | grep -Fx './usr/bin/rustfs' >/dev/null
+# dpkg keeps a locally modified conffile on upgrade. The path stays
+# /etc/default/rustfs; this only records that file as a conffile.
+control_dir=$(mktemp -d)
+dpkg-deb --control "$DEB_FILE" "$control_dir"
+grep -Fx '/etc/default/rustfs' "$control_dir/conffiles" >/dev/null
+rm -rf "$control_dir"
 stat --printf='%n %s bytes\n' "$DEB_FILE"
 echo "deb_file=$DEB_FILE" >> "$GITHUB_OUTPUT"
 echo "✅ DEB built: $DEB_FILE"

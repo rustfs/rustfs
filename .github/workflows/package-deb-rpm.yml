@@ -1,0 +1,380 @@
+# Copyright 2026 RustFS Team
+# SPDX-License-Identifier: Apache-2.0
+
+# Attach the eight Linux deb/rpm packages to a tag release built by
+# Build and Release. GitHub reads workflow_run only from the default
+# branch, so this file has to live on main even when the tag workflow
+# itself runs from a release branch. It wraps that build's Linux zip
+# artifact with build_deb.sh and build_rpm.sh after the zip matches
+# the release SHA256SUMS. It does not compile RustFS and it does not
+# replace an existing package asset.
+#
+# Dispatch with the tag to backfill a release while the build artifacts
+# still exist. That upload is a live release write; run it from main
+# only after this workflow is merged.
+
+name: Package DEB/RPM
+
+on:
+  workflow_run:
+    workflows: ["Build and Release"]
+    types: [completed]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to package, such as 1.0.7. No leading v."
+        required: true
+        type: string
+      build_run_id:
+        description: "Successful Build and Release run ID for that tag. Leave empty to select the newest successful run."
+        required: false
+        type: string
+        default: ""
+
+permissions:
+  contents: write
+  actions: read
+
+concurrency:
+  group: package-deb-rpm-${{ github.event.workflow_run.head_branch || github.event.inputs.tag || github.run_id }}
+  cancel-in-progress: false
+
+jobs:
+  resolve:
+    name: Resolve release build
+    if: >-
+      github.repository == 'rustfs/rustfs' &&
+      (github.event_name == 'workflow_dispatch' ||
+       (github.event.workflow_run.conclusion == 'success' &&
+        github.event.workflow_run.event == 'push' &&
+        github.event.workflow_run.head_branch != 'main'))
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      version: ${{ steps.resolve.outputs.version }}
+      build_type: ${{ steps.resolve.outputs.build_type }}
+      build_run_id: ${{ steps.resolve.outputs.build_run_id }}
+      tag: ${{ steps.resolve.outputs.tag }}
+    steps:
+      - name: Resolve build run
+        id: resolve
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EVENT_NAME: ${{ github.event_name }}
+          REPOSITORY: ${{ github.repository }}
+          HEAD_BRANCH: ${{ github.event.workflow_run.head_branch }}
+          WORKFLOW_RUN_ID: ${{ github.event.workflow_run.id }}
+          INPUT_TAG: ${{ github.event.inputs.tag }}
+          INPUT_RUN_ID: ${{ github.event.inputs.build_run_id }}
+        run: |
+          set -euo pipefail
+
+          fail() {
+            printf '%s\n' "$1" >&2
+            exit 1
+          }
+
+          tag=""
+          build_run_id=""
+          case "$EVENT_NAME" in
+            workflow_run)
+              tag="${HEAD_BRANCH}"
+              build_run_id="${WORKFLOW_RUN_ID}"
+              ;;
+            workflow_dispatch)
+              tag="${INPUT_TAG}"
+              build_run_id="${INPUT_RUN_ID}"
+              ;;
+            *) fail "unsupported event: ${EVENT_NAME}" ;;
+          esac
+
+          semver_core='(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)'
+          prerelease_id='(alpha|beta|rc)\.(0|[1-9][0-9]*)'
+          if [[ "$tag" =~ ^${semver_core}(-${prerelease_id})?-preview\.(0|[1-9][0-9]*)$ ]]; then
+            build_type=preview
+          elif [[ "$tag" =~ ^${semver_core}-${prerelease_id}$ ]]; then
+            build_type=prerelease
+          elif [[ "$tag" =~ ^${semver_core}$ ]]; then
+            build_type=release
+          else
+            fail "tag is not a supported strict package version"
+          fi
+
+          if [[ -n "$build_run_id" ]]; then
+            [[ "$build_run_id" =~ ^[1-9][0-9]*$ ]] || fail "build run ID must be a positive decimal integer"
+          else
+            build_run_id=$(gh api --method GET \
+              "repos/${REPOSITORY}/actions/workflows/build.yml/runs" \
+              -f branch="$tag" -f status=success -F per_page=1 \
+              --jq '.workflow_runs[0].id // empty')
+            [[ "$build_run_id" =~ ^[1-9][0-9]*$ ]] || fail "no successful build run found for tag"
+          fi
+
+          run_json=$(gh api "repos/${REPOSITORY}/actions/runs/${build_run_id}")
+          run_id=$(jq -r '.id // empty' <<<"$run_json")
+          run_status=$(jq -r '.status // empty' <<<"$run_json")
+          run_conclusion=$(jq -r '.conclusion // empty' <<<"$run_json")
+          run_event=$(jq -r '.event // empty' <<<"$run_json")
+          run_path=$(jq -r '.path // empty' <<<"$run_json")
+          head_sha=$(jq -r '.head_sha // empty' <<<"$run_json")
+          run_head_branch=$(jq -r '.head_branch // empty' <<<"$run_json")
+
+          [[ "$run_id" == "$build_run_id" ]] || fail "run metadata ID mismatch"
+          [[ "$run_status" == completed && "$run_conclusion" == success ]] || fail "selected build run is not successful"
+          [[ "$run_event" == push ]] || fail "selected build run is not a tag push"
+          [[ "$run_path" == .github/workflows/build.yml ]] || fail "selected run is not Build and Release"
+          [[ "$head_sha" =~ ^[0-9a-f]{40}$ ]] || fail "selected build run has an invalid head SHA"
+          [[ "$run_head_branch" == "$tag" ]] || fail "tag and build run head branch do not match"
+
+          tag_json=$(gh api "repos/${REPOSITORY}/git/ref/tags/${tag}")
+          tag_type=$(jq -r '.object.type // empty' <<<"$tag_json")
+          tag_sha=$(jq -r '.object.sha // empty' <<<"$tag_json")
+          depth=0
+          while [[ "$tag_type" == tag && "$depth" -lt 5 ]]; do
+            tag_json=$(gh api "repos/${REPOSITORY}/git/tags/${tag_sha}")
+            tag_type=$(jq -r '.object.type // empty' <<<"$tag_json")
+            tag_sha=$(jq -r '.object.sha // empty' <<<"$tag_json")
+            depth=$((depth + 1))
+          done
+          [[ "$tag_type" == commit && "$tag_sha" == "$head_sha" ]] || fail "release tag commit and build run head SHA do not match"
+
+          {
+            printf 'version=%s\n' "$tag"
+            printf 'build_type=%s\n' "$build_type"
+            printf 'build_run_id=%s\n' "$build_run_id"
+            printf 'tag=%s\n' "$tag"
+          } >> "$GITHUB_OUTPUT"
+
+  package:
+    name: Package (${{ matrix.arch }}-${{ matrix.libc }})
+    needs: resolve
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            libc: gnu
+            deb_arch: amd64
+            deb_depends: "libc6 (>= 2.31)"
+            rpm_depends: "glibc >= 2.31"
+          - arch: aarch64
+            libc: gnu
+            deb_arch: arm64
+            deb_depends: "libc6 (>= 2.31)"
+            rpm_depends: "glibc >= 2.31"
+          - arch: x86_64
+            libc: musl
+            deb_arch: amd64
+            deb_depends: ""
+            rpm_depends: ""
+          - arch: aarch64
+            libc: musl
+            deb_arch: arm64
+            deb_depends: ""
+            rpm_depends: ""
+    steps:
+      - name: Checkout packaging recipe
+        uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7
+        with:
+          persist-credentials: false
+
+      - name: Install DEB and RPM tools
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y ruby ruby-dev build-essential rpm fakeroot cpio
+          sudo gem install fpm --version 1.17.0 --no-document
+
+      - name: Download the build artifact
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: rustfs-linux-${{ matrix.arch }}-${{ matrix.libc }}-v${{ needs.resolve.outputs.version }}
+          path: binary-artifact
+          run-id: ${{ needs.resolve.outputs.build_run_id }}
+          github-token: ${{ github.token }}
+
+      - name: Check the artifact against the published checksum
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+          TAG: ${{ needs.resolve.outputs.tag }}
+          ARCH: ${{ matrix.arch }}
+          LIBC: ${{ matrix.libc }}
+          VERSION: ${{ needs.resolve.outputs.version }}
+        run: |
+          set -euo pipefail
+          zip_name="rustfs-linux-${ARCH}-${LIBC}-v${VERSION}.zip"
+          [[ "$zip_name" =~ ^rustfs-linux-(x86_64|aarch64)-(gnu|musl)-v[0-9A-Za-z.-]+[.]zip$ ]]
+          [[ -f "binary-artifact/${zip_name}" ]]
+          mkdir -p "$RUNNER_TEMP/source"
+          gh release download "$TAG" --repo "$REPOSITORY" \
+            --pattern SHA256SUMS --dir "$RUNNER_TEMP/source"
+          digest=$(sha256sum "binary-artifact/${zip_name}" | awk '{print $1}')
+          python3 scripts/release/refresh_release_checksums.py verify \
+            --checksum "$RUNNER_TEMP/source/SHA256SUMS" \
+            --name "$zip_name" \
+            --digest "$digest" \
+            --digest-length 64
+          mkdir -p ./bin
+          unzip -q "binary-artifact/${zip_name}" -d ./bin
+          [[ -f ./bin/rustfs ]]
+          chmod 755 ./bin/rustfs
+
+      - name: Build deb and rpm
+        shell: bash
+        env:
+          BUILD_TYPE: ${{ needs.resolve.outputs.build_type }}
+          VERSION: ${{ needs.resolve.outputs.version }}
+          ARCH: ${{ matrix.arch }}
+          LIBC: ${{ matrix.libc }}
+          DEB_ARCH: ${{ matrix.deb_arch }}
+          DEB_DEPENDS: ${{ matrix.deb_depends }}
+          RPM_DEPENDS: ${{ matrix.rpm_depends }}
+        run: |
+          set -euo pipefail
+          normalized=$(./scripts/release/package_versions.sh "$BUILD_TYPE" "$VERSION" "" "$ARCH" "$LIBC")
+          declare -A meta=()
+          while IFS= read -r line; do
+            key=${line%%=*}
+            value=${line#*=}
+            case "$key" in
+              deb_version|rpm_version|rpm_release|deb_file|rpm_file) meta[$key]="$value" ;;
+              *) printf 'unexpected package metadata %s\n' "$key" >&2; exit 1 ;;
+            esac
+          done <<<"$normalized"
+          [[ "${#meta[@]}" -eq 5 ]]
+          export DEB_VERSION="${meta[deb_version]}"
+          export RPM_VERSION="${meta[rpm_version]}"
+          export RPM_RELEASE="${meta[rpm_release]}"
+          export DEB_FILE="${meta[deb_file]}"
+          export RPM_FILE="${meta[rpm_file]}"
+          export RPM_ARCH="$ARCH"
+          bash scripts/release/build_deb.sh
+          bash scripts/release/build_rpm.sh
+          expected=$(sha256sum ./bin/rustfs | awk '{print $1}')
+          unpack=$(mktemp -d)
+          dpkg-deb --extract "$DEB_FILE" "$unpack"
+          [[ "$(sha256sum "$unpack/usr/bin/rustfs" | awk '{print $1}')" == "$expected" ]]
+          rm -rf "$unpack"
+          unpack=$(mktemp -d)
+          rpm2cpio "$RPM_FILE" | (cd "$unpack" && cpio --extract --make-directories --quiet ./usr/bin/rustfs)
+          [[ "$(sha256sum "$unpack/usr/bin/rustfs" | awk '{print $1}')" == "$expected" ]]
+          rm -rf "$unpack"
+          printf '%s\n%s\n' "$DEB_FILE" "$RPM_FILE" > "$RUNNER_TEMP/package-names"
+
+      - name: Upload packages to the GitHub release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+          TAG: ${{ needs.resolve.outputs.tag }}
+        run: |
+          set -euo pipefail
+          mapfile -t names < "$RUNNER_TEMP/package-names"
+          [[ "${#names[@]}" -eq 2 ]]
+          for file in "${names[@]}"; do
+            [[ -f "$file" && "$file" =~ ^[A-Za-z0-9._-]+$ ]]
+            digest=$(sha256sum "$file" | awk '{print $1}')
+            existing=$(gh api "repos/${REPOSITORY}/releases/tags/${TAG}" \
+              --jq ".assets[] | select(.name == \"${file}\") | .digest")
+            if [[ -z "$existing" ]]; then
+              gh release upload "$TAG" "$file" --repo "$REPOSITORY"
+            elif [[ "$existing" == "sha256:${digest}" ]]; then
+              printf 'release already has %s\n' "$file"
+            else
+              printf 'existing release asset %s has a different digest\n' "$file" >&2
+              exit 1
+            fi
+          done
+
+      - name: Upload package artifacts
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: packages-${{ matrix.arch }}-${{ matrix.libc }}
+          path: |
+            *.deb
+            *.rpm
+          if-no-files-found: error
+          retention-days: 30
+
+  checksums:
+    name: Refresh release checksums
+    needs: [resolve, package]
+    if: github.repository == 'rustfs/rustfs' && needs.resolve.result == 'success' && needs.package.result == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout checksum helper
+        uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7
+        with:
+          persist-credentials: false
+
+      - name: Download built packages
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: packages-*
+          merge-multiple: true
+          path: packages
+
+      - name: Rewrite SHA256SUMS and SHA512SUMS
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+          TAG: ${{ needs.resolve.outputs.tag }}
+          BUILD_TYPE: ${{ needs.resolve.outputs.build_type }}
+          VERSION: ${{ needs.resolve.outputs.version }}
+        run: |
+          set -euo pipefail
+          mapfile -t files < <(find packages -type f \( -name '*.deb' -o -name '*.rpm' \) | sort)
+          [[ "${#files[@]}" -eq 8 ]]
+          declare -A present=()
+          for file in "${files[@]}"; do
+            present["$(basename "$file")"]=1
+          done
+          for arch in x86_64 aarch64; do
+            for libc in gnu musl; do
+              normalized=$(./scripts/release/package_versions.sh "$BUILD_TYPE" "$VERSION" "" "$arch" "$libc")
+              while IFS= read -r line; do
+                key=${line%%=*}
+                value=${line#*=}
+                case "$key" in
+                  deb_file|rpm_file)
+                    [[ -n "${present[$value]:-}" ]] || { printf 'missing package %s\n' "$value" >&2; exit 1; }
+                    ;;
+                esac
+              done <<<"$normalized"
+            done
+          done
+          mkdir -p "$RUNNER_TEMP/checksums"
+          gh release download "$TAG" --repo "$REPOSITORY" \
+            --pattern SHA256SUMS --pattern SHA512SUMS \
+            --dir "$RUNNER_TEMP/checksums"
+          python3 scripts/release/refresh_release_checksums.py refresh \
+            --checksum "$RUNNER_TEMP/checksums/SHA256SUMS" \
+            --output "$RUNNER_TEMP/checksums/SHA256SUMS.next" \
+            --algorithm sha256 --digest-length 64 \
+            "${files[@]}"
+          python3 scripts/release/refresh_release_checksums.py refresh \
+            --checksum "$RUNNER_TEMP/checksums/SHA512SUMS" \
+            --output "$RUNNER_TEMP/checksums/SHA512SUMS.next" \
+            --algorithm sha512 --digest-length 128 \
+            "${files[@]}"
+          # Checksums are the only assets this workflow replaces. Package
+          # bytes uploaded above are left in place.
+          mv "$RUNNER_TEMP/checksums/SHA256SUMS.next" "$RUNNER_TEMP/checksums/SHA256SUMS"
+          mv "$RUNNER_TEMP/checksums/SHA512SUMS.next" "$RUNNER_TEMP/checksums/SHA512SUMS"
+          gh release upload "$TAG" \
+            "$RUNNER_TEMP/checksums/SHA256SUMS" \
+            "$RUNNER_TEMP/checksums/SHA512SUMS" \
+            --repo "$REPOSITORY" --clobber
+          verify=$(mktemp -d)
+          gh release download "$TAG" --repo "$REPOSITORY" \
+            --pattern SHA256SUMS --pattern SHA512SUMS --dir "$verify" --clobber
+          cmp "$RUNNER_TEMP/checksums/SHA256SUMS" "$verify/SHA256SUMS"
+          cmp "$RUNNER_TEMP/checksums/SHA512SUMS" "$verify/SHA512SUMS"

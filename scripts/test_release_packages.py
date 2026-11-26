@@ -41,6 +41,22 @@ class PackageIntegrationTests(unittest.TestCase):
                 self.assertEqual(record["binary_sha256"], expected)
                 self.assertEqual(record["inputs_sha256"], c.digest(value))
                 self.assertEqual({Path(item["name"]).suffix for item in record["files"]}, {".deb", ".rpm"})
+                output = root / "output"
+                deb = next(output.glob("*.deb"))
+                rpm_package = next(output.glob("*.rpm"))
+                control = root / "control"
+                control.mkdir()
+                subprocess.run(["dpkg-deb", "--control", str(deb), str(control)], check=True)
+                self.assertIn("/etc/default/rustfs", (control / "conffiles").read_text(encoding="utf-8").splitlines())
+                listing = subprocess.check_output(
+                    ["rpm", "-qp", "--qf", "[%{filenames} %{fileflags}\\n]", str(rpm_package)], text=True)
+                flags = {}
+                for line in listing.splitlines():
+                    path, bits = line.rsplit(" ", 1)
+                    flags[path] = int(bits)
+                # RPMFILE_CONFIG (1) and RPMFILE_NOREPLACE (16). A modified
+                # /etc/default/rustfs must stay in place across an upgrade.
+                self.assertEqual(flags["/etc/default/rustfs"] & 17, 17)
 
     def test_real_package_with_substituted_payload_is_rejected(self):
         with tempfile.TemporaryDirectory() as temp:

@@ -64,6 +64,11 @@ RPM_METADATA=$(rpm -qp --qf '%{NAME}\n%{VERSION}\n%{RELEASE}\n%{ARCH}\n' "$RPM_F
 EXPECTED_METADATA=$(printf 'rustfs\n%s\n%s\n%s' "$RPM_VERSION" "$RPM_RELEASE" "$RPM_ARCH")
 [[ "$RPM_METADATA" == "$EXPECTED_METADATA" ]]
 rpm -qpl "$RPM_FILE" | grep -Fx '/usr/bin/rustfs' >/dev/null
+# fpm 1.17 writes %config(noreplace). RPMFILE_CONFIG is 1 and
+# RPMFILE_NOREPLACE is 16. Without noreplace, rpm replaces a modified
+# /etc/default/rustfs and keeps the operator file only as .rpmsave.
+config_flags=$(rpm -qp --qf '[%{filenames} %{fileflags}\n]' "$RPM_FILE" | awk '$1 == "/etc/default/rustfs" { print $2; found = 1 } END { if (!found) exit 1 }')
+[[ $((config_flags & 17)) -eq 17 ]]
 stat --printf='%n %s bytes\n' "$RPM_FILE"
 echo "rpm_file=$RPM_FILE" >> "$GITHUB_OUTPUT"
 echo "✅ RPM built: $RPM_FILE"
