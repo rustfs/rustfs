@@ -113,7 +113,7 @@ jobs:
             printf '%s\n' 'mode=full' >> "$GITHUB_OUTPUT"
             echo "Base CI policy unavailable; running the full matrix."
           fi
-          if ! grep -q '^plan=' "$GITHUB_OUTPUT" || ! grep -q '^plan_contract=8$' "$GITHUB_OUTPUT"; then
+          if ! grep -q '^plan=' "$GITHUB_OUTPUT" || ! grep -q '^plan_contract=9$' "$GITHUB_OUTPUT"; then
             printf '%s\n' 'mode=full' 'connect=true' 'full_validation=true' 'packages=' 'plan=' >> "$GITHUB_OUTPUT"
             echo "Base policy does not cover this workflow contract; retaining the full matrix."
           fi
@@ -531,73 +531,9 @@ jobs:
           done
           cargo clippy --locked -p rustfs --lib "${args[@]}" -- -D warnings
 
-  test-and-lint-rio-v2:
-    name: Test and Lint (rio-v2)
-    # Specialized boundary, hardware and alternate-feature lanes run only on
-    # the nightly schedule and manual dispatch. They do not gate a merge: the
-    # nightly run reports a regression within a day, and repeating these builds
-    # on every PR revision and merge group bought no earlier signal worth the
-    # runner occupancy. Workspace lint and tests, the core contract, the debug
-    # build, E2E smoke and the S3 lanes remain the pull-request gate.
-    if: needs.classify-changes.outputs.mode == 'full' && contains(fromJSON('["schedule", "workflow_dispatch"]'), github.event_name)
-    needs: [ quick-checks, classify-changes ]
-    runs-on: sm-standard-4
-    timeout-minutes: 90
-    env:
-      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7
-        with:
-          persist-credentials: false
-
-      - name: Setup Rust environment
-        uses: ./.github/actions/setup
-        with:
-          rust-version: stable
-          cache-shared-key: ci-feat-rio
-          cache-save-if: 'false'
-          install-build-packaging-tools: 'false'
-
-      - name: Protect Connect test home
-        run: chmod go-w "$(realpath "$HOME")"
-
-      - name: Run rio-v2 clippy lints
-        run: cargo clippy -p rustfs -p rustfs-ecstore -p rustfs-sse --all-targets --features rio-v2 -- -D warnings
-
-      - name: Run rio-v2 feature tests
-        shell: bash
-        env:
-          # Match the main nextest lane's #5394 link-I/O guard. A cold feature
-          # cache otherwise fans out enough rust-lld processes to exhaust this
-          # job's 90-minute budget before any test starts.
-          CARGO_BUILD_JOBS: "2"
-        run: |
-          # --profile ci so the quarantine list (and its junit flaky markers)
-          # covers this leg too; the default profile is the local no-retry
-          # profile and silently ignored quarantined flakes here (rustfs#6703).
-          mkdir -p artifacts/workspace
-          rm -f target/nextest/ci/junit.xml
-          ./scripts/ci/resource_sampler.sh start nextest-rio-v2
-          trap './scripts/ci/resource_sampler.sh stop' EXIT
-          cargo nextest run --profile ci -p rustfs -p rustfs-ecstore -p rustfs-sse --features rio-v2 \
-            2>&1 | tee artifacts/workspace/nextest.log
-          cargo test -p rustfs --doc --features rio-v2
-
-      - name: Upload rio-v2 test reports and diagnostics
-        if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        with:
-          name: junit-test-and-lint-rio-v2-${{ github.run_number }}-${{ github.run_attempt }}
-          path: |
-            target/nextest/ci/junit.xml
-            artifacts/workspace
-          retention-days: 3
-          if-no-files-found: error
-
   test-and-lint-protocols:
     name: "Test and Lint (${{ matrix.features.name }})"
-    # Same cadence as test-and-lint-rio-v2 above.
+    # Nightly schedule and manual dispatch only. This lane does not gate a merge.
     if: needs.classify-changes.outputs.mode == 'full' && contains(fromJSON('["schedule", "workflow_dispatch"]'), github.event_name)
     needs: [ quick-checks, classify-changes ]
     runs-on: sm-standard-4
@@ -771,47 +707,6 @@ jobs:
           overwrite: true
           path: ${{ runner.temp }}/e2e-tests.tar.zst*
           compression-level: 0
-          if-no-files-found: error
-          retention-days: 1
-
-  build-rustfs-debug-binary-rio-v2:
-    name: Build RustFS Debug Binary (rio-v2)
-    # Dormant rio-v2 variant (rustfs/backlog#1835): the feature ships in no
-    # default build, so this full-suite lane runs only on the nightly schedule
-    # and manual dispatch. Per-PR cfg-seam coverage stays with
-    # test-and-lint-rio-v2. Lifecycle and the promote-or-delete condition:
-    # docs/architecture/minio-file-format-compat.md ("rio-v2 variant lifecycle").
-    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
-    needs: [ quick-checks ]
-    runs-on: sm-standard-4
-    timeout-minutes: 30
-    env:
-      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7
-        with:
-          persist-credentials: false
-
-      - name: Setup Rust environment
-        uses: ./.github/actions/setup
-        with:
-          rust-version: stable
-          cache-shared-key: ci-feat-rio
-          cache-save-if: 'false'
-          install-build-packaging-tools: 'false'
-
-      - name: Build debug binary with rio-v2
-        run: python3 scripts/e2e_binary.py build --bins --features rio-v2,e2e-test-hooks
-
-      - name: Upload debug binary
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        with:
-          name: rustfs-debug-binary-rio-v2
-          overwrite: true
-          path: |
-            target/debug/rustfs
-            target/debug/rustfs.e2e.json
           if-no-files-found: error
           retention-days: 1
 
@@ -1252,65 +1147,6 @@ jobs:
           if-no-files-found: warn
           retention-days: 7
 
-  e2e-tests-rio-v2:
-    name: End-to-End Tests (rio-v2)
-    # Inherits the schedule/dispatch-only gate through needs: on every other
-    # event build-rustfs-debug-binary-rio-v2 is skipped, so this job skips
-    # with it (see the dormant-variant comment on that job).
-    needs: [ build-rustfs-debug-binary-rio-v2 ]
-    runs-on: sm-standard-2
-    timeout-minutes: 30
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7
-        with:
-          persist-credentials: false
-
-      - name: Clean up previous test run
-        run: |
-          rm -rf /tmp/rustfs
-          rm -f /tmp/rustfs.log
-
-      - name: Download debug binary
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
-        with:
-          name: rustfs-debug-binary-rio-v2
-          path: target/debug
-
-      - name: Make binary executable
-        run: chmod +x ./target/debug/rustfs
-
-      - name: Setup Rust toolchain for s3s-e2e installation
-        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
-
-      # The sm-standard-* custom runner images (introduced in #4884) ship no C
-      # toolchain, unlike GitHub-hosted ubuntu-latest. Installing s3s-e2e below
-      # compiles it from source on a cache miss, and build scripts need cc.
-      - name: Install build tools for s3s-e2e compilation
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y build-essential cmake pkg-config libssl-dev
-
-      - name: Install s3s-e2e test tool
-        uses: taiki-e/cache-cargo-install-action@7447f04c51f2ba27ca35e7f1e28fab848c5b3ba7 # v2
-        with:
-          tool: s3s-e2e
-          git: https://github.com/s3s-project/s3s.git
-          rev: 62cb4a71dd759a6ec56b64c4c42fcc183a2c6a52
-
-      - name: Run end-to-end tests
-        run: |
-          s3s-e2e --version
-          python3 scripts/e2e_binary.py run --features rio-v2,e2e-test-hooks -- ./scripts/e2e-run.sh ./target/debug/rustfs /tmp/rustfs
-
-      - name: Upload test logs
-        if: failure()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        with:
-          name: e2e-test-logs-rio-v2-${{ github.run_number }}-${{ github.run_attempt }}
-          path: /tmp/rustfs.log
-          retention-days: 3
-
   s3-implemented-tests:
     name: S3 Implemented Tests
     needs: [ build-rustfs-debug-binary ]
@@ -1440,15 +1276,12 @@ jobs:
       - core-contract
       - connect-feature-boundaries
       - fips-provider
-      - test-and-lint-rio-v2
       - test-and-lint-protocols
       - build-rustfs-debug-binary
       - uring-integration
       - e2e-tests
       - s3-implemented-tests
       - s3-lifecycle-behavior-tests
-      - build-rustfs-debug-binary-rio-v2
-      - e2e-tests-rio-v2
       - e2e-full
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -1475,14 +1308,11 @@ jobs:
       - workspace-lint-and-build
       - workspace-tests
       - core-contract
-      - test-and-lint-rio-v2
       - test-and-lint-protocols
       - build-rustfs-debug-binary
-      - build-rustfs-debug-binary-rio-v2
       - uring-integration
       - e2e-tests
       - e2e-full
-      - e2e-tests-rio-v2
       - s3-implemented-tests
       - s3-lifecycle-behavior-tests
     if: >-
