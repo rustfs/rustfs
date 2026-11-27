@@ -13,8 +13,9 @@
 // limitations under the License.
 
 use crate::admin::operation::AdminRequest;
+use crate::admin::runtime_sources::AppContext;
 use crate::app::{RequestCredentials, RequestEnvelope};
-use crate::auth::get_condition_values;
+use crate::auth::get_condition_values_with_client_info;
 use http::HeaderMap;
 use rustfs_credentials::Credentials;
 use rustfs_iam::store::Store;
@@ -24,6 +25,7 @@ use rustfs_policy::policy::{
     action::{Action, AdminAction},
 };
 use rustfs_s3_types::{S3Result, s3_error};
+use rustfs_trusted_proxies::ClientInfo;
 use std::sync::Arc;
 use tracing::debug;
 
@@ -34,6 +36,90 @@ struct AuthContext<'a> {
     is_owner: bool,
     deny_only: bool,
     remote_addr: Option<std::net::SocketAddr>,
+    client_info: Option<&'a ClientInfo>,
+}
+
+/// Network and optional per-server context facts for an admin authorization check.
+///
+/// Converting `&RequestEnvelope` via `From` threads only the verified proxy
+/// [`ClientInfo`] and policy source address (`aws:SourceIp` and
+/// `aws:SecureTransport`) while keeping IAM resolution ambient so ambient-store
+/// admin handlers never split-brain auth/authz against a different server
+/// domain. Handlers whose authentication, authorization, and execution all
+/// resolve from the request's `ServerContextSlot` opt in explicitly via
+/// [`Self::with_server_context`]. Callers outside `admin` that hold only a
+/// resolved `Option<SocketAddr>` can keep passing it directly.
+#[derive(Clone, Copy)]
+pub struct AdminRequestOrigin<'a> {
+    remote_addr: Option<std::net::SocketAddr>,
+    client_info: Option<&'a ClientInfo>,
+    server_context_envelope: Option<&'a RequestEnvelope>,
+}
+
+impl<'a> AdminRequestOrigin<'a> {
+    /// Thread both verified proxy [`ClientInfo`] and the request's
+    /// `ServerContextSlot` for handlers that authenticate and execute against
+    /// the same request-scoped server context.
+    pub(crate) fn with_server_context(envelope: &'a RequestEnvelope) -> Self {
+        Self {
+            remote_addr: envelope.policy_source_addr(),
+            client_info: envelope.client_info(),
+            server_context_envelope: Some(envelope),
+        }
+    }
+}
+
+impl From<Option<std::net::SocketAddr>> for AdminRequestOrigin<'_> {
+    fn from(remote_addr: Option<std::net::SocketAddr>) -> Self {
+        Self {
+            remote_addr,
+            client_info: None,
+            server_context_envelope: None,
+        }
+    }
+}
+
+impl<'a> From<&'a RequestEnvelope> for AdminRequestOrigin<'a> {
+    fn from(envelope: &'a RequestEnvelope) -> Self {
+        Self {
+            remote_addr: envelope.policy_source_addr(),
+            client_info: envelope.client_info(),
+            server_context_envelope: None,
+        }
+    }
+}
+
+pub(crate) fn ready_iam_handle_from_envelope(
+    envelope: Option<&RequestEnvelope>,
+) -> S3Result<Arc<IamSys<rustfs_iam::store::object::ObjectStore>>> {
+    if let Some(slot) = envelope.and_then(RequestEnvelope::server_context) {
+        let Some(context) = slot.installed_app_context() else {
+            return Err(s3_error!(ServiceUnavailable, "server context is not ready"));
+        };
+        if !context.iam().is_ready() {
+            return Err(s3_error!(InternalError, "iam not init"));
+        }
+        return Ok(context.iam().handle());
+    }
+
+    crate::admin::runtime_sources::current_ready_iam_handle().map_err(|_| s3_error!(InternalError, "iam not init"))
+}
+
+pub(crate) fn action_credentials_from_envelope(envelope: &RequestEnvelope) -> Option<Credentials> {
+    match envelope.server_context() {
+        Some(slot) => slot.installed_app_context().and_then(|ctx| ctx.action_credentials().get()),
+        None => crate::admin::runtime_sources::current_action_credentials(),
+    }
+}
+
+fn scoped_app_context_for_auth(envelope: &RequestEnvelope) -> S3Result<Option<Arc<AppContext>>> {
+    match envelope.server_context() {
+        Some(slot) => slot
+            .installed_app_context()
+            .map(Some)
+            .ok_or_else(|| s3_error!(ServiceUnavailable, "server context is not ready")),
+        None => Ok(None),
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -66,23 +152,23 @@ impl<'a> AdminResourceScope<'a> {
     }
 }
 
-pub async fn validate_admin_request(
+pub async fn validate_admin_request<'a>(
     headers: &HeaderMap,
     cred: &Credentials,
     is_owner: bool,
     deny_only: bool,
     actions: Vec<Action>,
-    remote_addr: Option<std::net::SocketAddr>,
+    origin: impl Into<AdminRequestOrigin<'a>>,
 ) -> S3Result<()> {
-    let Ok(iam_store) = crate::admin::runtime_sources::current_ready_iam_handle() else {
-        return Err(s3_error!(InternalError, "iam not init"));
-    };
+    let origin = origin.into();
+    let iam_store = ready_iam_handle_from_envelope(origin.server_context_envelope)?;
     let ctx = AuthContext {
         headers,
         cred,
         is_owner,
         deny_only,
-        remote_addr,
+        remote_addr: origin.remote_addr,
+        client_info: origin.client_info,
     };
 
     evaluate_admin_actions(iam_store, &ctx, &actions, "", "").await
@@ -95,10 +181,22 @@ pub(crate) enum SelfServiceMutation {
 
 impl SelfServiceMutation {
     pub(crate) async fn check(&self, req: &AdminRequest, cred: &Credentials, is_owner: bool) -> S3Result<()> {
-        let context = crate::admin::runtime_sources::app_context_from_envelope(req.envelope())
-            .filter(|ctx| ctx.iam().is_ready())
-            .ok_or_else(|| s3_error!(ServiceUnavailable, "iam unavailable"))?;
-        self.check_for_iam(context.iam().handle(), req, cred, is_owner).await
+        let iam = match self {
+            // Password self-service handlers (`account.rs`, `user.rs::AddUser`)
+            // authenticate and mutate against the process-ambient IAM domain.
+            Self::Password => crate::admin::runtime_sources::current_ready_iam_handle()
+                .map_err(|_| s3_error!(ServiceUnavailable, "iam unavailable"))?,
+            // MFA self-service handlers (`mfa.rs`) resolve auth, IAM, and store
+            // strictly from the request envelope's `ServerContextSlot`.
+            Self::Mfa => ready_iam_handle_from_envelope(Some(req.envelope())).map_err(|err| {
+                if err.code() == &rustfs_s3_types::S3ErrorCode::ServiceUnavailable {
+                    err
+                } else {
+                    s3_error!(ServiceUnavailable, "iam unavailable")
+                }
+            })?,
+        };
+        self.check_for_iam(iam, req, cred, is_owner).await
     }
 
     async fn check_for_iam<S: Store>(
@@ -115,6 +213,7 @@ impl SelfServiceMutation {
             is_owner: is_owner && cred.session_token.is_empty() && !cred.is_service_account(),
             deny_only: true,
             remote_addr: req.policy_source_addr(),
+            client_info: req.client_info(),
         };
         // Password rotation also honors the existing add-user self-rotation deny.
         // The ordinary multi-action admin gate is any-of; here every check must pass.
@@ -158,7 +257,7 @@ async fn check_admin_request_auth<S: Store>(
     bucket: &str,
     object: &str,
 ) -> S3Result<()> {
-    let conditions = get_condition_values(ctx.headers, ctx.cred, None, None, ctx.remote_addr);
+    let conditions = get_condition_values_with_client_info(ctx.headers, ctx.cred, None, None, ctx.remote_addr, ctx.client_info);
 
     let allowed = iam_store
         .is_allowed(&Args {
@@ -189,13 +288,13 @@ async fn check_admin_request_auth<S: Store>(
     Ok(())
 }
 
-pub async fn validate_admin_request_with_bucket(
+pub async fn validate_admin_request_with_bucket<'a>(
     headers: &HeaderMap,
     cred: &Credentials,
     is_owner: bool,
     deny_only: bool,
     actions: Vec<Action>,
-    remote_addr: Option<std::net::SocketAddr>,
+    origin: impl Into<AdminRequestOrigin<'a>>,
     bucket: &str,
 ) -> S3Result<()> {
     validate_admin_request_with_bucket_object(
@@ -204,50 +303,52 @@ pub async fn validate_admin_request_with_bucket(
         is_owner,
         deny_only,
         actions,
-        remote_addr,
+        origin,
         AdminResourceScope::bucket(bucket),
     )
     .await
 }
 
-pub async fn validate_admin_request_with_bucket_object(
+pub async fn validate_admin_request_with_bucket_object<'a>(
     headers: &HeaderMap,
     cred: &Credentials,
     is_owner: bool,
     deny_only: bool,
     actions: Vec<Action>,
-    remote_addr: Option<std::net::SocketAddr>,
+    origin: impl Into<AdminRequestOrigin<'a>>,
     resource: AdminResourceScope<'_>,
 ) -> S3Result<()> {
-    let Ok(iam_store) = crate::admin::runtime_sources::current_ready_iam_handle() else {
-        return Err(s3_error!(InternalError, "iam not init"));
-    };
+    let origin = origin.into();
+    let iam_store = ready_iam_handle_from_envelope(origin.server_context_envelope)?;
     let ctx = AuthContext {
         headers,
         cred,
         is_owner,
         deny_only,
-        remote_addr,
+        remote_addr: origin.remote_addr,
+        client_info: origin.client_info,
     };
 
     evaluate_admin_actions(iam_store, &ctx, &actions, resource.bucket, resource.object).await
 }
 
-pub(crate) async fn validate_admin_action_with_bucket_object_for_iam<S: Store>(
+pub(crate) async fn validate_admin_action_with_bucket_object_for_iam<'a, S: Store>(
     iam_store: Arc<IamSys<S>>,
     headers: &HeaderMap,
     cred: &Credentials,
     is_owner: bool,
     action: Action,
-    remote_addr: Option<std::net::SocketAddr>,
+    origin: impl Into<AdminRequestOrigin<'a>>,
     resource: AdminResourceScope<'_>,
 ) -> S3Result<()> {
+    let origin = origin.into();
     let ctx = AuthContext {
         headers,
         cred,
         is_owner,
         deny_only: false,
-        remote_addr,
+        remote_addr: origin.remote_addr,
+        client_info: origin.client_info,
     };
     evaluate_admin_actions(iam_store, &ctx, &[action], resource.bucket, resource.object).await
 }
@@ -259,13 +360,13 @@ pub(crate) async fn validate_admin_action_with_bucket_object_for_iam<S: Store>(
 /// without a target key pass `""` and stay unscoped, which is also what a
 /// malformed request resolves to: the request is rejected on its own parse error
 /// right after the gate, so no key is ever touched under an unscoped decision.
-pub async fn validate_admin_request_with_kms_key(
+pub async fn validate_admin_request_with_kms_key<'a>(
     headers: &HeaderMap,
     cred: &Credentials,
     is_owner: bool,
     deny_only: bool,
     actions: Vec<Action>,
-    remote_addr: Option<std::net::SocketAddr>,
+    origin: impl Into<AdminRequestOrigin<'a>>,
     key_id: &str,
 ) -> S3Result<()> {
     validate_admin_request_with_bucket_object(
@@ -274,7 +375,7 @@ pub async fn validate_admin_request_with_kms_key(
         is_owner,
         deny_only,
         actions,
-        remote_addr,
+        origin,
         AdminResourceScope::kms_key(key_id),
     )
     .await
@@ -284,12 +385,53 @@ pub async fn validate_admin_request_with_kms_key(
 /// envelope carries: the presented access key and the session token the edge
 /// decoded.
 pub(crate) async fn authenticate_envelope_credentials(credentials: &RequestCredentials) -> S3Result<(Credentials, bool)> {
-    authenticate_request_facts(credentials.access_key(), credentials.session_token().unwrap_or_default()).await
+    authenticate_request_facts_with_context(credentials.access_key(), credentials.session_token().unwrap_or_default(), None).await
 }
 
-async fn authenticate_request_facts(access_key: &str, session_token: &str) -> S3Result<(Credentials, bool)> {
+/// Authenticate the caller of an owned admin request against the request's
+/// server context slot when present, falling back to the ambient process
+/// context only when no slot was attached.
+pub(crate) async fn authenticate_envelope_credentials_with_context(
+    credentials: &RequestCredentials,
+    envelope: &RequestEnvelope,
+) -> S3Result<(Credentials, bool)> {
+    let context = scoped_app_context_for_auth(envelope)?;
+    authenticate_request_facts_with_context(
+        credentials.access_key(),
+        credentials.session_token().unwrap_or_default(),
+        context.as_deref(),
+    )
+    .await
+}
+
+/// Validate an access key against an explicit application context while also
+/// scoping IAM root-credential lookup to that context's own root credentials
+/// so another embedded server's process-ambient root key cannot leak through
+/// `IamSys::check_key` (rustfs/backlog#1469).
+pub(crate) async fn check_admin_key_valid_with_context(
+    session_token: &str,
+    access_key: &str,
+    ctx: Option<&AppContext>,
+) -> S3Result<(Credentials, bool)> {
     use crate::auth::check_key_valid_with_context;
 
+    match ctx {
+        Some(context) => {
+            rustfs_iam::sys::with_scoped_root_credentials(
+                context.action_credentials().get(),
+                check_key_valid_with_context(session_token, access_key, Some(context)),
+            )
+            .await
+        }
+        None => check_key_valid_with_context(session_token, access_key, None).await,
+    }
+}
+
+async fn authenticate_request_facts_with_context(
+    access_key: &str,
+    session_token: &str,
+    ctx: Option<&AppContext>,
+) -> S3Result<(Credentials, bool)> {
     // Log authentication attempt for debugging
     debug!(
         "authenticate_request: processing authentication - access_key={}, has_session_token={}",
@@ -297,8 +439,7 @@ async fn authenticate_request_facts(access_key: &str, session_token: &str) -> S3
         !session_token.is_empty()
     );
 
-    // Validate credentials using the core authentication function
-    let result = check_key_valid_with_context(session_token, access_key, None).await;
+    let result = check_admin_key_valid_with_context(session_token, access_key, ctx).await;
 
     match &result {
         Ok((cred, is_owner)) => {
@@ -317,18 +458,59 @@ async fn authenticate_request_facts(access_key: &str, session_token: &str) -> S3
 
 /// Full admin gate over RustFS-owned request facts: authenticate the
 /// presented credentials, then authorize the caller for `actions`
-/// ([`validate_admin_request`], allowing on the first permitted action).
-/// Returns the authenticated credentials for handlers that need the caller
-/// identity. `deny_only` stays `false`: every caller performs a full allow
-/// check.
+/// ([`validate_admin_request`], allowing on the first permitted action) against
+/// the process-ambient IAM domain while propagating verified proxy
+/// `ClientInfo`. Returns the authenticated credentials for handlers that need
+/// the caller identity. `deny_only` stays `false`: every caller performs a full
+/// allow check.
 pub async fn authorize_admin_envelope(req: &RequestEnvelope, actions: Vec<Action>) -> S3Result<Credentials> {
+    authorize_admin_envelope_with_scope(req, actions, AdminResourceScope::bucket_object("", "")).await
+}
+
+/// Full admin gate over RustFS-owned request facts scoped to a bucket/object
+/// resource against the process-ambient IAM domain (matching ambient-store
+/// admin handlers).
+pub(crate) async fn authorize_admin_envelope_with_scope(
+    req: &RequestEnvelope,
+    actions: Vec<Action>,
+    resource: AdminResourceScope<'_>,
+) -> S3Result<Credentials> {
     let Some(input_cred) = req.credentials() else {
         return Err(s3_error!(InvalidRequest, "get cred failed"));
     };
 
     let (cred, owner) = authenticate_envelope_credentials(input_cred).await?;
     // Policy conditions see the verified proxy client, never the raw peer.
-    validate_admin_request(req.headers(), &cred, owner, false, actions, req.policy_source_addr()).await?;
+    validate_admin_request_with_bucket_object(req.headers(), &cred, owner, false, actions, req, resource).await?;
+
+    Ok(cred)
+}
+
+/// Full admin gate over RustFS-owned request facts scoped to both the request's
+/// `ServerContextSlot` (when present) and a bucket/object resource. Use this
+/// ONLY for handlers whose downstream execution also resolves from
+/// `req.envelope()`.
+pub(crate) async fn authorize_admin_envelope_with_context_and_scope(
+    req: &RequestEnvelope,
+    actions: Vec<Action>,
+    resource: AdminResourceScope<'_>,
+) -> S3Result<Credentials> {
+    let Some(input_cred) = req.credentials() else {
+        return Err(s3_error!(InvalidRequest, "get cred failed"));
+    };
+
+    let (cred, owner) = authenticate_envelope_credentials_with_context(input_cred, req).await?;
+    // Policy conditions see the verified proxy client, never the raw peer.
+    validate_admin_request_with_bucket_object(
+        req.headers(),
+        &cred,
+        owner,
+        false,
+        actions,
+        AdminRequestOrigin::with_server_context(req),
+        resource,
+    )
+    .await?;
 
     Ok(cred)
 }
@@ -350,7 +532,7 @@ pub(crate) async fn resolve_admin_object_read_sse_kms_principal(
     let Some(input_cred) = req.credentials() else {
         return Err(s3_error!(AccessDenied, "Access Denied"));
     };
-    let (cred, is_owner) = authenticate_envelope_credentials(input_cred).await?;
+    let (cred, is_owner) = authenticate_envelope_credentials_with_context(input_cred, req).await?;
     let request_context = req.request_context().cloned();
     req.install_req_info(ReqInfo {
         cred: Some(cred),
@@ -586,6 +768,7 @@ mod tests {
             is_owner,
             deny_only: false,
             remote_addr: None,
+            client_info: None,
         }
     }
 
@@ -679,13 +862,13 @@ mod tests {
                 ..Default::default()
             }));
             publish_test_app_context(context);
-            let (root, is_owner) = authenticate_request_facts("proxy-test-root", "")
+            let (root, is_owner) = authenticate_request_facts_with_context("proxy-test-root", "", None)
                 .await
                 .expect("root credentials");
             assert_eq!(root.access_key, "proxy-test-root");
             assert!(is_owner);
 
-            let error = authenticate_request_facts("proxy-test-root", "unexpected-token")
+            let error = authenticate_request_facts_with_context("proxy-test-root", "unexpected-token", None)
                 .await
                 .expect_err("the root has no session token");
             assert_eq!(error.code(), &rustfs_s3_types::S3ErrorCode::InvalidRequest);
@@ -1094,5 +1277,483 @@ mod tests {
             .await
             .expect_err("unauthenticated envelope must fail closed");
         assert_eq!(err.code(), &rustfs_s3_types::S3ErrorCode::AccessDenied);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn admin_auth_evaluates_aws_secure_transport_from_verified_client_info() {
+        crate::app::gating_test_env::run_large_stack_test("admin-secure-transport", || async {
+            use crate::admin::operation::Operation;
+            use crate::admin::operation::test_support::TestRequest;
+            use crate::admin::runtime_sources::{AppContext, IamInterface, KmsInterface, publish_test_app_context};
+            use crate::shared_types::RemoteAddr;
+            use rustfs_iam::store::object::ObjectStore;
+            use rustfs_madmin::{AccountStatus, AddOrUpdateUserReq};
+            use rustfs_trusted_proxies::{ClientInfo, ValidationMode};
+            use std::sync::Arc;
+
+            struct ReadyIam(Arc<rustfs_iam::sys::IamSys<ObjectStore>>);
+            impl IamInterface for ReadyIam {
+                fn handle(&self) -> Arc<rustfs_iam::sys::IamSys<ObjectStore>> {
+                    Arc::clone(&self.0)
+                }
+                fn is_ready(&self) -> bool {
+                    true
+                }
+            }
+            struct TestKms;
+            impl KmsInterface for TestKms {
+                fn handle(&self) -> Arc<rustfs_kms::KmsServiceManager> {
+                    Arc::new(rustfs_kms::KmsServiceManager::new())
+                }
+            }
+
+            let previous = crate::runtime_sources::current_app_context();
+            let (_dir, _paths, store) = crate::app::gating_test_env::isolated_multi_pool_ecstore().await;
+            ObjectStore::new(Arc::clone(&store))
+                .save_iam_config(
+                    serde_json::json!({"version": 1}),
+                    format!("{}/format.json", *rustfs_iam::store::object::IAM_CONFIG_PREFIX),
+                )
+                .await
+                .expect("seed IAM format");
+            let iam = rustfs_iam::build_iam_sys(Arc::clone(&store)).await.expect("init IAM");
+            let user = "tls-only-admin";
+            let secret = "tls-admin-secret-1234";
+            iam.create_user(
+                user,
+                &AddOrUpdateUserReq {
+                    secret_key: secret.to_owned(),
+                    policy: None,
+                    status: AccountStatus::Enabled,
+                },
+            )
+            .await
+            .expect("create user");
+            let doc = serde_json::json!({
+                "Version": "2012-10-17",
+                "Statement": [
+                    {
+                        "Effect": "Allow",
+                        "Action": ["admin:*"],
+                        "Condition": {"Bool": {"aws:SecureTransport": "true"}}
+                    },
+                    {
+                        "Effect": "Allow",
+                        "Action": ["sts:AssumeRole"]
+                    },
+                    {
+                        "Effect": "Deny",
+                        "Action": ["sts:AssumeRole"],
+                        "Condition": {"Bool": {"aws:SecureTransport": "false"}}
+                    }
+                ]
+            });
+            iam.set_policy(
+                "tls-only",
+                Policy::parse_config(&serde_json::to_vec(&doc).expect("encode policy")).expect("parse policy"),
+            )
+            .await
+            .expect("store policy");
+            iam.policy_db_set(user, UserType::Reg, false, "tls-only")
+                .await
+                .expect("attach policy");
+
+            let context = Arc::new(AppContext::new(store, Arc::new(ReadyIam(iam)), Arc::new(TestKms)));
+            assert!(context.publish_action_credentials(Credentials {
+                access_key: "tls-test-root".to_owned(),
+                secret_key: "tls-root-secret".to_owned(),
+                status: "on".to_owned(),
+                ..Default::default()
+            }));
+            publish_test_app_context(context);
+
+            let proxy_peer: std::net::SocketAddr = "10.0.0.2:4430".parse().expect("proxy socket");
+            let client_ip: std::net::IpAddr = "198.51.100.42".parse().expect("client ip");
+            let build_req = |proto: Option<&str>, trusted: bool, method: http::Method, body: &str| {
+                let mut builder = TestRequest::new(method, "/")
+                    .extension(Some(RemoteAddr(proxy_peer)))
+                    // Spoofed header must never satisfy aws:SecureTransport without verified ClientInfo.
+                    .header("x-forwarded-proto", "https")
+                    .credentials(user, secret, None)
+                    .body(body.to_owned());
+                if trusted {
+                    builder = builder.extension(ClientInfo::from_trusted_proxy(
+                        client_ip,
+                        None,
+                        proto.map(str::to_owned),
+                        proxy_peer.ip(),
+                        1,
+                        ValidationMode::Strict,
+                        Vec::new(),
+                    ));
+                } else if proto.is_some() {
+                    builder = builder.extension(ClientInfo::direct(proxy_peer));
+                }
+                builder.build()
+            };
+
+            for (label, proto, trusted, allowed) in [
+                ("trusted-https", Some("https"), true, true),
+                ("trusted-http", Some("http"), true, false),
+                ("trusted-missing-proto", None, true, false),
+                ("spoofed-direct-header", Some("https"), false, false),
+                ("spoofed-no-client-info", None, false, false),
+            ] {
+                let req = build_req(proto, trusted, http::Method::GET, "");
+                let gate = authorize_admin_envelope(req.envelope(), vec![admin_action()]).await;
+                if allowed {
+                    gate.unwrap_or_else(|err| panic!("{label}: trusted https must satisfy aws:SecureTransport=true: {err}"));
+                } else {
+                    assert_access_denied(gate.map(|_| ()));
+                }
+
+                let is_admin_resp = crate::admin::handlers::is_admin::IsAdminHandler {}
+                    .call(build_req(proto, trusted, http::Method::GET, ""), matchit::Params::new())
+                    .await
+                    .expect("is_admin responds 200");
+                let (_status, _headers, mut body) = is_admin_resp.into_parts();
+                let json: serde_json::Value =
+                    serde_json::from_slice(&body.store_all_limited(4096).await.expect("read body")).expect("parse json");
+                assert_eq!(json["is_admin"], allowed, "{label}");
+
+                let sts_err = crate::admin::handlers::sts::AssumeRoleHandle {}
+                    .call(
+                        build_req(proto, trusted, http::Method::POST, "Action=AssumeRole&Version=invalid"),
+                        matchit::Params::new(),
+                    )
+                    .await
+                    .expect_err("invalid STS version or denied");
+                if allowed {
+                    assert_eq!(sts_err.code(), &rustfs_s3_types::S3ErrorCode::InvalidArgument, "{label}");
+                } else {
+                    assert_eq!(sts_err.code(), &rustfs_s3_types::S3ErrorCode::AccessDenied, "{label}");
+                }
+            }
+
+            if let Some(previous) = previous {
+                publish_test_app_context(previous);
+            }
+        });
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn admin_auth_uses_request_server_context_slot_for_accountinfo_and_heal() {
+        crate::app::gating_test_env::run_large_stack_test("admin-multi-instance-context", || async {
+            use crate::admin::operation::Operation;
+            use crate::admin::operation::test_support::TestRequest;
+            use crate::admin::runtime_sources::{
+                AppContext, IamInterface, KmsInterface, ServerContextSlot, publish_test_app_context,
+            };
+            use rustfs_iam::store::object::ObjectStore;
+            use rustfs_madmin::{AccountStatus, AddOrUpdateUserReq};
+            use std::sync::Arc;
+
+            struct ReadyIam(Arc<rustfs_iam::sys::IamSys<ObjectStore>>);
+            impl IamInterface for ReadyIam {
+                fn handle(&self) -> Arc<rustfs_iam::sys::IamSys<ObjectStore>> {
+                    Arc::clone(&self.0)
+                }
+                fn is_ready(&self) -> bool {
+                    true
+                }
+            }
+            struct TestKms;
+            impl KmsInterface for TestKms {
+                fn handle(&self) -> Arc<rustfs_kms::KmsServiceManager> {
+                    Arc::new(rustfs_kms::KmsServiceManager::new())
+                }
+            }
+
+            let previous = crate::runtime_sources::current_app_context();
+            let (_dir_a, _paths_a, store_a) = crate::app::gating_test_env::isolated_multi_pool_ecstore().await;
+            let (_dir_b, _paths_b, store_b) = crate::app::gating_test_env::isolated_multi_pool_ecstore().await;
+            for store in [&store_a, &store_b] {
+                ObjectStore::new(Arc::clone(store))
+                    .save_iam_config(
+                        serde_json::json!({"version": 1}),
+                        format!("{}/format.json", *rustfs_iam::store::object::IAM_CONFIG_PREFIX),
+                    )
+                    .await
+                    .expect("seed IAM format");
+            }
+            let iam_a = rustfs_iam::build_iam_sys(Arc::clone(&store_a)).await.expect("init IAM A");
+            let iam_b = rustfs_iam::build_iam_sys(Arc::clone(&store_b)).await.expect("init IAM B");
+
+            iam_a
+                .create_user(
+                    "alice-server-a",
+                    &AddOrUpdateUserReq {
+                        secret_key: "alice-secret-1234".to_owned(),
+                        policy: None,
+                        status: AccountStatus::Enabled,
+                    },
+                )
+                .await
+                .expect("create alice on server A");
+            iam_a
+                .set_policy(
+                    "a-all",
+                    Policy::parse_config(br#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":["admin:*"]}]}"#)
+                        .expect("parse policy A"),
+                )
+                .await
+                .expect("save policy A");
+            iam_a
+                .policy_db_set("alice-server-a", UserType::Reg, false, "a-all")
+                .await
+                .expect("attach policy A");
+
+            iam_a
+                .create_user(
+                    "split-brain-user",
+                    &AddOrUpdateUserReq {
+                        secret_key: "split-secret-a-1234".to_owned(),
+                        policy: None,
+                        status: AccountStatus::Enabled,
+                    },
+                )
+                .await
+                .expect("create unprivileged split-brain-user on server A");
+
+            iam_b
+                .create_user(
+                    "bob-server-b",
+                    &AddOrUpdateUserReq {
+                        secret_key: "bob-secret-1234".to_owned(),
+                        policy: None,
+                        status: AccountStatus::Enabled,
+                    },
+                )
+                .await
+                .expect("create bob on server B");
+            iam_b
+                .create_user(
+                    "split-brain-user",
+                    &AddOrUpdateUserReq {
+                        secret_key: "split-secret-b-1234".to_owned(),
+                        policy: None,
+                        status: AccountStatus::Enabled,
+                    },
+                )
+                .await
+                .expect("create privileged split-brain-user on server B");
+            iam_b
+                .set_policy(
+                    "b-heal",
+                    Policy::parse_config(br#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":["admin:Heal"]}]}"#)
+                        .expect("parse policy B"),
+                )
+                .await
+                .expect("save policy B");
+            iam_b
+                .policy_db_set("bob-server-b", UserType::Reg, false, "b-heal")
+                .await
+                .expect("attach policy B");
+            iam_b
+                .set_policy(
+                    "b-create-user",
+                    Policy::parse_config(
+                        br#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":["admin:CreateUser"]}]}"#,
+                    )
+                    .expect("parse create-user policy B"),
+                )
+                .await
+                .expect("save create-user policy B");
+            iam_b
+                .policy_db_set("split-brain-user", UserType::Reg, false, "b-create-user")
+                .await
+                .expect("attach create-user policy B");
+
+            // Server A is the process-ambient global context.
+            let context_a = Arc::new(AppContext::new(store_a, Arc::new(ReadyIam(iam_a)), Arc::new(TestKms)));
+            assert!(context_a.publish_action_credentials(Credentials {
+                access_key: "root-server-a".to_owned(),
+                secret_key: "root-a-secret-1234".to_owned(),
+                status: "on".to_owned(),
+                ..Default::default()
+            }));
+            publish_test_app_context(context_a);
+
+            // Server B runs in the same process with its own ServerContextSlot and root credentials.
+            let context_b = Arc::new(AppContext::new(store_b, Arc::new(ReadyIam(iam_b)), Arc::new(TestKms)));
+            assert!(context_b.publish_action_credentials(Credentials {
+                access_key: "root-server-b".to_owned(),
+                secret_key: "root-b-secret-1234".to_owned(),
+                status: "on".to_owned(),
+                ..Default::default()
+            }));
+            let slot_b = ServerContextSlot::new();
+            assert!(slot_b.install(Arc::clone(&context_b)));
+
+            // 1. Server A's root and IAM user must NEVER authenticate against Server B's slot
+            //    or direct `check_admin_key_valid_with_context` (used by table_catalog/plugin/listen).
+            for (access_key, secret_key) in [
+                ("root-server-a", "root-a-secret-1234"),
+                ("alice-server-a", "alice-secret-1234"),
+            ] {
+                let direct_err = check_admin_key_valid_with_context("", access_key, Some(context_b.as_ref()))
+                    .await
+                    .expect_err("direct context-scoped key check must reject server A identity on server B");
+                assert_eq!(direct_err.code(), &rustfs_s3_types::S3ErrorCode::InvalidAccessKeyId, "{access_key}");
+
+                let req = TestRequest::new(http::Method::GET, "/rustfs/admin/v3/accountinfo")
+                    .extension(slot_b.clone())
+                    .credentials(access_key, secret_key, None)
+                    .build();
+                let auth_err =
+                    authenticate_envelope_credentials_with_context(req.credentials().expect("test cred"), req.envelope())
+                        .await
+                        .expect_err("server A identity must not authenticate on server B");
+                assert_eq!(auth_err.code(), &rustfs_s3_types::S3ErrorCode::InvalidAccessKeyId, "{access_key}");
+
+                let acct_err = crate::admin::handlers::account_info::AccountInfoHandler {}
+                    .call(req, matchit::Params::new())
+                    .await
+                    .expect_err("AccountInfoHandler must reject server A identity on server B");
+                assert_eq!(acct_err.code(), &rustfs_s3_types::S3ErrorCode::InvalidAccessKeyId, "{access_key}");
+
+                let heal_req = TestRequest::new(http::Method::POST, "/rustfs/admin/v3/heal")
+                    .extension(slot_b.clone())
+                    .credentials(access_key, secret_key, None)
+                    .build();
+                let heal_err = crate::admin::handlers::heal::HealHandler {}
+                    .call(heal_req, matchit::Params::new())
+                    .await
+                    .expect_err("HealHandler must reject server A identity on server B");
+                assert_eq!(heal_err.code(), &rustfs_s3_types::S3ErrorCode::InvalidAccessKeyId, "{access_key}");
+            }
+
+            // 2. An empty ServerContextSlot fails closed on slot-scoped paths rather than falling back to Server A.
+            let empty_slot = ServerContextSlot::new();
+            let empty_req = TestRequest::new(http::Method::GET, "/rustfs/admin/v3/accountinfo")
+                .extension(empty_slot)
+                .credentials("root-server-a", "root-a-secret-1234", None)
+                .build();
+            let empty_err = authorize_admin_envelope_with_context_and_scope(
+                empty_req.envelope(),
+                vec![admin_action()],
+                AdminResourceScope::bucket_object("", ""),
+            )
+            .await
+            .expect_err("uninstalled server slot must fail closed");
+            assert_eq!(empty_err.code(), &rustfs_s3_types::S3ErrorCode::ServiceUnavailable);
+
+            // 3. Server B's own root and IAM user authenticate and authorize against Server B's slot.
+            let (direct_root_b, direct_root_b_owner) =
+                check_admin_key_valid_with_context("", "root-server-b", Some(context_b.as_ref()))
+                    .await
+                    .expect("direct context-scoped key check must authenticate server B root");
+            assert_eq!(direct_root_b.access_key, "root-server-b");
+            assert!(direct_root_b_owner);
+
+            let root_b_req = TestRequest::new(http::Method::GET, "/rustfs/admin/v3/accountinfo")
+                .extension(slot_b.clone())
+                .credentials("root-server-b", "root-b-secret-1234", None)
+                .build();
+            let (cred_b, is_owner_b) = authenticate_envelope_credentials_with_context(
+                root_b_req.credentials().expect("test cred"),
+                root_b_req.envelope(),
+            )
+            .await
+            .expect("server B root must authenticate on server B");
+            assert_eq!(cred_b.access_key, "root-server-b");
+            assert!(is_owner_b);
+
+            let acct_resp = crate::admin::handlers::account_info::AccountInfoHandler {}
+                .call(root_b_req, matchit::Params::new())
+                .await
+                .expect("server B root must succeed on AccountInfoHandler");
+            let (status, _headers, mut body) = acct_resp.into_parts();
+            assert_eq!(status, http::StatusCode::OK);
+            let payload: serde_json::Value =
+                serde_json::from_slice(&body.store_all_limited(65_536).await.expect("read body")).expect("parse json");
+            assert_eq!(payload["account_name"], "root-server-b");
+
+            // Server B's user with admin:Heal clears HealHandler authentication & authorization.
+            let bob_heal_req = TestRequest::new(http::Method::POST, "/rustfs/admin/v3/heal")
+                .extension(slot_b.clone())
+                .credentials("bob-server-b", "bob-secret-1234", None)
+                .body("{invalid-json")
+                .build();
+            let bob_heal_err = crate::admin::handlers::heal::HealHandler {}
+                .call(bob_heal_req, matchit::Params::new())
+                .await
+                .expect_err("malformed heal body should fail after authz");
+            assert_ne!(bob_heal_err.code(), &rustfs_s3_types::S3ErrorCode::InvalidAccessKeyId);
+            assert_ne!(bob_heal_err.code(), &rustfs_s3_types::S3ErrorCode::AccessDenied);
+
+            // Server B's user without admin:ServerInfo is denied by Server B's IAM on slot-scoped gate.
+            let bob_info_req = TestRequest::new(http::Method::GET, "/rustfs/admin/v3/info")
+                .extension(slot_b.clone())
+                .credentials("bob-server-b", "bob-secret-1234", None)
+                .build();
+            assert_access_denied(
+                authorize_admin_envelope_with_context_and_scope(
+                    bob_info_req.envelope(),
+                    vec![admin_action()],
+                    AdminResourceScope::bucket_object("", ""),
+                )
+                .await
+                .map(|_| ()),
+            );
+
+            // 4. Zero split-brain on ambient-store admin gates:
+            //    (a) `validate_admin_request(..., req.envelope())` keeps IAM ambient (Server A), so
+            //        an unprivileged Server A user whose name holds `admin:CreateUser` on Server B
+            //        must NOT pass authz against Server A's ambient IAM.
+            let split_req = TestRequest::new(http::Method::PUT, "/rustfs/admin/v3/add-user?accessKey=victim")
+                .extension(slot_b.clone())
+                .credentials("split-brain-user", "split-secret-a-1234", None)
+                .build();
+            let split_cred = Credentials {
+                access_key: "split-brain-user".to_owned(),
+                secret_key: "split-secret-a-1234".to_owned(),
+                status: "on".to_owned(),
+                ..Default::default()
+            };
+            assert_access_denied(
+                validate_admin_request(
+                    split_req.headers(),
+                    &split_cred,
+                    false,
+                    false,
+                    vec![Action::AdminAction(AdminAction::CreateUserAdminAction)],
+                    split_req.envelope(),
+                )
+                .await,
+            );
+
+            //    (b) `authorize_admin_envelope(req.envelope(), ...)` stays ambient across both auth
+            //        and authz, so a Server B-only admin cannot authenticate on Server B and mutate
+            //        Server A's ambient IAM/stores.
+            let bob_ambient_req = TestRequest::new(http::Method::GET, "/rustfs/admin/v3/list-groups")
+                .extension(slot_b.clone())
+                .credentials("bob-server-b", "bob-secret-1234", None)
+                .build();
+            let bob_ambient_err =
+                authorize_admin_envelope(bob_ambient_req.envelope(), vec![Action::AdminAction(AdminAction::HealAdminAction)])
+                    .await
+                    .expect_err("Server B identity must not pass ambient authorize_admin_envelope");
+            assert_eq!(bob_ambient_err.code(), &rustfs_s3_types::S3ErrorCode::InvalidAccessKeyId);
+
+            //    (c) Ambient `CallerIdentity::resolve_envelope` rejects Server B identities while
+            //        slot-scoped `CallerIdentity::resolve_envelope_with_context` resolves them.
+            let caller_ambient_err =
+                crate::admin::service::caller_identity::CallerIdentity::resolve_envelope(bob_ambient_req.envelope())
+                    .await
+                    .expect_err("ambient CallerIdentity must stay in Server A");
+            assert_eq!(caller_ambient_err.code(), &rustfs_s3_types::S3ErrorCode::InvalidAccessKeyId);
+            let caller_scoped =
+                crate::admin::service::caller_identity::CallerIdentity::resolve_envelope_with_context(bob_ambient_req.envelope())
+                    .await
+                    .expect("slot-scoped CallerIdentity must resolve Server B identity");
+            assert_eq!(caller_scoped.access_key, "bob-server-b");
+
+            if let Some(previous) = previous {
+                publish_test_app_context(previous);
+            }
+        });
     }
 }

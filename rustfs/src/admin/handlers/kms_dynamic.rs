@@ -854,7 +854,7 @@ impl Operation for ConfigureKmsHandler {
         let audit = KmsAdminAudit::from_envelope(req.envelope(), &cred);
 
         audit.gate_admin(
-            validate_admin_request(req.headers(), &cred, owner, false, kms_configure_actions(), req.policy_source_addr()).await,
+            validate_admin_request(req.headers(), &cred, owner, false, kms_configure_actions(), req.envelope()).await,
             KmsAdminOperation::Configure,
             None,
         )?;
@@ -999,15 +999,7 @@ impl Operation for StartKmsHandler {
         let audit = KmsAdminAudit::from_envelope(req.envelope(), &cred);
 
         audit.gate_admin(
-            validate_admin_request(
-                req.headers(),
-                &cred,
-                owner,
-                false,
-                kms_service_control_actions(),
-                req.policy_source_addr(),
-            )
-            .await,
+            validate_admin_request(req.headers(), &cred, owner, false, kms_service_control_actions(), req.envelope()).await,
             KmsAdminOperation::Start,
             None,
         )?;
@@ -1156,15 +1148,7 @@ impl Operation for StopKmsHandler {
         let audit = KmsAdminAudit::from_envelope(req.envelope(), &cred);
 
         audit.gate_admin(
-            validate_admin_request(
-                req.headers(),
-                &cred,
-                owner,
-                false,
-                kms_service_control_actions(),
-                req.policy_source_addr(),
-            )
-            .await,
+            validate_admin_request(req.headers(), &cred, owner, false, kms_service_control_actions(), req.envelope()).await,
             KmsAdminOperation::Stop,
             None,
         )?;
@@ -1258,15 +1242,7 @@ impl Operation for ReloadKmsHandler {
         let audit = KmsAdminAudit::from_envelope(req.envelope(), &cred);
 
         audit.gate_admin(
-            validate_admin_request(
-                req.headers(),
-                &cred,
-                owner,
-                false,
-                kms_service_control_actions(),
-                req.policy_source_addr(),
-            )
-            .await,
+            validate_admin_request(req.headers(), &cred, owner, false, kms_service_control_actions(), req.envelope()).await,
             KmsAdminOperation::Reload,
             None,
         )?;
@@ -1352,15 +1328,17 @@ impl Operation for GetKmsStatusHandler {
         let (cred, owner) =
             check_key_valid(get_session_token(req.uri(), req.headers()).unwrap_or_default(), cred.access_key()).await?;
 
-        validate_admin_request(
-            req.headers(),
-            &cred,
-            owner,
-            false,
-            kms_service_control_actions(),
-            req.policy_source_addr(),
-        )
-        .await?;
+        let audit = KmsAdminAudit::from_envelope(req.envelope(), &cred);
+
+        // Audit authorization denials through `gate_admin` to match the rest of
+        // the KMS dynamic handler family (rustfs/backlog#1886). Successful
+        // status reads intentionally skip `audit.finish` so polling does not
+        // flood the audit trail.
+        audit.gate_admin(
+            validate_admin_request(req.headers(), &cred, owner, false, kms_service_control_actions(), req.envelope()).await,
+            KmsAdminOperation::Status,
+            None,
+        )?;
 
         info!(
             component = LOG_COMPONENT_ADMIN,
@@ -1446,7 +1424,7 @@ impl Operation for ReconfigureKmsHandler {
         let audit = KmsAdminAudit::from_envelope(req.envelope(), &cred);
 
         audit.gate_admin(
-            validate_admin_request(req.headers(), &cred, owner, false, kms_configure_actions(), req.policy_source_addr()).await,
+            validate_admin_request(req.headers(), &cred, owner, false, kms_configure_actions(), req.envelope()).await,
             KmsAdminOperation::Reconfigure,
             None,
         )?;
@@ -2251,5 +2229,31 @@ mod tests {
         assert!(message.contains("2 peer(s)"));
         assert!(message.contains("10.0.0.2:9000"));
         assert!(message.contains("10.0.0.3:9000"));
+    }
+
+    #[test]
+    fn get_kms_status_handler_audits_denials_via_gate_admin_without_polling_finish_noise() {
+        let production = include_str!("kms_dynamic.rs")
+            .split("\n#[cfg(test)]\n")
+            .next()
+            .expect("production source must precede tests");
+        let status_block = production
+            .split_once("impl Operation for GetKmsStatusHandler")
+            .and_then(|(_, rest)| rest.split_once("/// Reconfigure KMS service handler"))
+            .map(|(block, _)| block)
+            .expect("GetKmsStatusHandler block should exist");
+
+        assert!(
+            status_block.contains("KmsAdminAudit::from_envelope(req.envelope(), &cred)"),
+            "GetKmsStatusHandler must construct KmsAdminAudit from the request envelope"
+        );
+        assert!(
+            status_block.contains("audit.gate_admin(") && status_block.contains("KmsAdminOperation::Status"),
+            "GetKmsStatusHandler must wrap validate_admin_request in audit.gate_admin for KmsAdminOperation::Status"
+        );
+        assert!(
+            !status_block.contains("audit.finish("),
+            "GetKmsStatusHandler should only audit authorization denials via gate_admin to avoid polling noise"
+        );
     }
 }

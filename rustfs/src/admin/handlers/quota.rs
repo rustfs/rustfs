@@ -179,6 +179,14 @@ fn bucket_from_params_or_query(params: &Params<'_, '_>, uri: &hyper::Uri) -> Str
     String::new()
 }
 
+fn validate_quota_bucket_name(bucket: &str) -> S3Result<()> {
+    if bucket.is_empty() {
+        return Err(s3_error!(InvalidRequest, "bucket name is required"));
+    }
+    crate::admin::storage_api::bucket::utils::check_valid_bucket_name_strict(bucket)
+        .map_err(|_| s3_error!(InvalidArgument, "invalid bucket name"))
+}
+
 fn parse_set_bucket_quota_request(body: &[u8]) -> Result<SetBucketQuotaRequest, rustfs_s3_types::S3Error> {
     if body.is_empty() {
         return Ok(SetBucketQuotaRequest {
@@ -486,21 +494,20 @@ impl Operation for SetBucketQuotaHandler {
         let (cred, owner) =
             check_key_valid(get_session_token(req.uri(), req.headers()).unwrap_or_default(), cred.access_key()).await?;
 
-        let remote_addr = req.policy_source_addr();
-        validate_admin_request(
+        let bucket = bucket_from_params_or_query(&params, req.uri());
+        validate_quota_bucket_name(&bucket)?;
+
+        validate_admin_request_with_bucket(
             req.headers(),
             &cred,
             owner,
             false,
             vec![Action::AdminAction(AdminAction::SetBucketQuotaAdminAction)],
-            remote_addr,
+            req.envelope(),
+            &bucket,
         )
         .await?;
 
-        let bucket = bucket_from_params_or_query(&params, req.uri());
-        if bucket.is_empty() {
-            return Err(s3_error!(InvalidRequest, "bucket name is required"));
-        }
         let expected_incarnation_id = metadata_sys::capture_bucket_metadata_incarnation(&bucket)
             .await
             .map_err(|e| s3_error!(InternalError, "failed to capture bucket incarnation: {}", e))?;
@@ -630,17 +637,14 @@ impl Operation for GetBucketQuotaHandler {
             check_key_valid(get_session_token(req.uri(), req.headers()).unwrap_or_default(), cred.access_key()).await?;
 
         let bucket = bucket_from_params_or_query(&params, req.uri());
-        if bucket.is_empty() {
-            return Err(s3_error!(InvalidRequest, "bucket name is required"));
-        }
-        let remote_addr = req.policy_source_addr();
+        validate_quota_bucket_name(&bucket)?;
         validate_admin_request_with_bucket(
             req.headers(),
             &cred,
             owner,
             false,
             vec![Action::S3Action(S3Action::GetBucketQuotaAction)],
-            remote_addr,
+            req.envelope(),
             &bucket,
         )
         .await?;
@@ -702,21 +706,20 @@ impl Operation for ClearBucketQuotaHandler {
         let (cred, owner) =
             check_key_valid(get_session_token(req.uri(), req.headers()).unwrap_or_default(), cred.access_key()).await?;
 
-        let remote_addr = req.policy_source_addr();
-        validate_admin_request(
+        let bucket = params.get("bucket").unwrap_or("").to_string();
+        validate_quota_bucket_name(&bucket)?;
+
+        validate_admin_request_with_bucket(
             req.headers(),
             &cred,
             owner,
             false,
             vec![Action::AdminAction(AdminAction::SetBucketQuotaAdminAction)],
-            remote_addr,
+            req.envelope(),
+            &bucket,
         )
         .await?;
 
-        let bucket = params.get("bucket").unwrap_or("").to_string();
-        if bucket.is_empty() {
-            return Err(s3_error!(InvalidRequest, "bucket name is required"));
-        }
         let expected_incarnation_id = metadata_sys::capture_bucket_metadata_incarnation(&bucket)
             .await
             .map_err(|e| s3_error!(InternalError, "failed to capture bucket incarnation: {}", e))?;
@@ -821,18 +824,15 @@ impl Operation for GetBucketQuotaStatsHandler {
             check_key_valid(get_session_token(req.uri(), req.headers()).unwrap_or_default(), cred.access_key()).await?;
 
         let bucket = params.get("bucket").unwrap_or("").to_string();
-        if bucket.is_empty() {
-            return Err(s3_error!(InvalidRequest, "bucket name is required"));
-        }
+        validate_quota_bucket_name(&bucket)?;
 
-        let remote_addr = req.policy_source_addr();
         validate_admin_request_with_bucket(
             req.headers(),
             &cred,
             owner,
             false,
             vec![Action::S3Action(S3Action::GetBucketQuotaAction)],
-            remote_addr,
+            req.envelope(),
             &bucket,
         )
         .await?;
@@ -890,18 +890,15 @@ impl Operation for CheckBucketQuotaHandler {
             check_key_valid(get_session_token(req.uri(), req.headers()).unwrap_or_default(), cred.access_key()).await?;
 
         let bucket = params.get("bucket").unwrap_or("").to_string();
-        if bucket.is_empty() {
-            return Err(s3_error!(InvalidRequest, "bucket name is required"));
-        }
+        validate_quota_bucket_name(&bucket)?;
 
-        let remote_addr = req.policy_source_addr();
         validate_admin_request_with_bucket(
             req.headers(),
             &cred,
             owner,
             false,
             vec![Action::S3Action(S3Action::GetBucketQuotaAction)],
-            remote_addr,
+            req.envelope(),
             &bucket,
         )
         .await?;
@@ -989,14 +986,15 @@ impl Operation for MigrateBucketQuotaProtocolHandler {
         let (cred, owner) =
             check_key_valid(get_session_token(req.uri(), req.headers()).unwrap_or_default(), cred.access_key()).await?;
 
-        let remote_addr = req.policy_source_addr();
+        // Protocol migration iterates every bucket in the cluster, so it requires
+        // unscoped `admin:SetBucketQuota` authority rather than a single bucket.
         validate_admin_request(
             req.headers(),
             &cred,
             owner,
             false,
             vec![Action::AdminAction(AdminAction::SetBucketQuotaAdminAction)],
-            remote_addr,
+            req.envelope(),
         )
         .await?;
 
@@ -1359,5 +1357,240 @@ mod tests {
         assert_eq!(stats["current_usage"], 0);
         assert_eq!(stats["remaining_quota"], 2048);
         assert_eq!(stats["usage_percentage"], 0.0);
+    }
+
+    #[test]
+    fn quota_bucket_validation_enforces_strict_s3_bucket_naming() {
+        let empty_err = validate_quota_bucket_name("").expect_err("empty bucket must fail");
+        assert_eq!(empty_err.code(), &rustfs_s3_types::S3ErrorCode::InvalidRequest);
+
+        for invalid in [
+            ".rustfs.sys",
+            ".minio.sys",
+            "../escape",
+            "UPPERCASE",
+            "bad_bucket",
+            "ab",
+            "192.168.1.1",
+        ] {
+            let err = validate_quota_bucket_name(invalid).expect_err("invalid bucket name must fail");
+            assert_eq!(err.code(), &rustfs_s3_types::S3ErrorCode::InvalidArgument, "invalid bucket `{invalid}`");
+        }
+
+        for valid in ["allowed-bucket", "data.2026", "abc"] {
+            validate_quota_bucket_name(valid).unwrap_or_else(|err| panic!("valid bucket `{valid}` failed: {err}"));
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn quota_write_and_read_handlers_enforce_bucket_scope_and_strict_names() {
+        crate::app::gating_test_env::run_large_stack_test("quota-bucket-scope", || async {
+            use crate::admin::operation::test_support::TestRequest;
+            use crate::admin::runtime_sources::{AppContext, IamInterface, KmsInterface, publish_test_app_context};
+            use rustfs_iam::store::{Store as _, UserType};
+            use rustfs_madmin::{AccountStatus, AddOrUpdateUserReq};
+            use rustfs_policy::policy::Policy;
+            use std::sync::Arc;
+
+            struct ReadyIam(Arc<rustfs_iam::sys::IamSys<rustfs_iam::store::object::ObjectStore>>);
+            impl IamInterface for ReadyIam {
+                fn handle(&self) -> Arc<rustfs_iam::sys::IamSys<rustfs_iam::store::object::ObjectStore>> {
+                    Arc::clone(&self.0)
+                }
+                fn is_ready(&self) -> bool {
+                    true
+                }
+            }
+            struct TestKms;
+            impl KmsInterface for TestKms {
+                fn handle(&self) -> Arc<rustfs_kms::KmsServiceManager> {
+                    Arc::new(rustfs_kms::KmsServiceManager::new())
+                }
+            }
+
+            let previous = crate::runtime_sources::current_app_context();
+            let (_dir, _paths, store) = crate::app::gating_test_env::isolated_multi_pool_ecstore().await;
+            rustfs_iam::store::object::ObjectStore::new(Arc::clone(&store))
+                .save_iam_config(
+                    serde_json::json!({"version": 1}),
+                    format!("{}/format.json", *rustfs_iam::store::object::IAM_CONFIG_PREFIX),
+                )
+                .await
+                .expect("seed IAM format");
+            let iam = rustfs_iam::build_iam_sys(Arc::clone(&store)).await.expect("init IAM");
+            let scoped_user = "quota-scoped-user";
+            let secret = "quota-secret-1234";
+            iam.create_user(
+                scoped_user,
+                &AddOrUpdateUserReq {
+                    secret_key: secret.to_owned(),
+                    policy: None,
+                    status: AccountStatus::Enabled,
+                },
+            )
+            .await
+            .expect("create quota user");
+            iam.set_policy(
+                "quota-allowed-only",
+                Policy::parse_config(
+                    br#"{
+                        "Version": "2012-10-17",
+                        "Statement": [
+                            {"Effect": "Allow", "Action": ["admin:SetBucketQuota"], "Resource": ["arn:aws:s3:::allowed-bucket"]},
+                            {"Effect": "Allow", "Action": ["s3:GetBucketQuota"], "Resource": ["arn:aws:s3:::allowed-bucket"]}
+                        ]
+                    }"#,
+                )
+                .expect("parse quota policy"),
+            )
+            .await
+            .expect("save quota policy");
+            iam.policy_db_set(scoped_user, UserType::Reg, false, "quota-allowed-only")
+                .await
+                .expect("attach quota policy");
+
+            let context = Arc::new(AppContext::new(store, Arc::new(ReadyIam(iam)), Arc::new(TestKms)));
+            assert!(context.publish_action_credentials(rustfs_credentials::Credentials {
+                access_key: "quota-test-root".to_owned(),
+                secret_key: "quota-root-secret".to_owned(),
+                status: "on".to_owned(),
+                ..Default::default()
+            }));
+            publish_test_app_context(context);
+
+            let mut routes = matchit::Router::new();
+            routes.insert("/quota/{bucket}", ()).expect("quota route");
+
+            // Write & read handlers must deny buckets outside the granted resource scope.
+            let forbidden = routes.at("/quota/forbidden-bucket").expect("match forbidden");
+            let set_err = SetBucketQuotaHandler
+                .call(
+                    TestRequest::new(Method::PUT, "/rustfs/admin/v3/quota/forbidden-bucket")
+                        .credentials(scoped_user, secret, None)
+                        .body(r#"{"quota":1024}"#)
+                        .build(),
+                    forbidden.params.clone(),
+                )
+                .await
+                .expect_err("SetBucketQuotaHandler must deny forbidden-bucket");
+            assert_eq!(set_err.code(), &rustfs_s3_types::S3ErrorCode::AccessDenied);
+
+            let compat_set_err = SetBucketQuotaHandler
+                .call(
+                    TestRequest::new(Method::PUT, "/rustfs/admin/v3/set-bucket-quota?bucket=forbidden-bucket")
+                        .credentials(scoped_user, secret, None)
+                        .body(r#"{"quota":1024}"#)
+                        .build(),
+                    Params::new(),
+                )
+                .await
+                .expect_err("compat set-bucket-quota must deny forbidden-bucket");
+            assert_eq!(compat_set_err.code(), &rustfs_s3_types::S3ErrorCode::AccessDenied);
+
+            let clear_err = ClearBucketQuotaHandler
+                .call(
+                    TestRequest::new(Method::DELETE, "/rustfs/admin/v3/quota/forbidden-bucket")
+                        .credentials(scoped_user, secret, None)
+                        .build(),
+                    forbidden.params.clone(),
+                )
+                .await
+                .expect_err("ClearBucketQuotaHandler must deny forbidden-bucket");
+            assert_eq!(clear_err.code(), &rustfs_s3_types::S3ErrorCode::AccessDenied);
+
+            let get_err = GetBucketQuotaHandler
+                .call(
+                    TestRequest::new(Method::GET, "/rustfs/admin/v3/quota/forbidden-bucket")
+                        .credentials(scoped_user, secret, None)
+                        .build(),
+                    forbidden.params.clone(),
+                )
+                .await
+                .expect_err("GetBucketQuotaHandler must deny forbidden-bucket");
+            assert_eq!(get_err.code(), &rustfs_s3_types::S3ErrorCode::AccessDenied);
+
+            // Bucket-scoped SetBucketQuota must not authorize cluster-wide quota migration.
+            let migrate_err = MigrateBucketQuotaProtocolHandler
+                .call(
+                    TestRequest::new(Method::POST, "/rustfs/admin/v3/quota-migration")
+                        .credentials(scoped_user, secret, None)
+                        .build(),
+                    Params::new(),
+                )
+                .await
+                .expect_err("single-bucket SetBucketQuota must not authorize cluster-wide migration");
+            assert_eq!(migrate_err.code(), &rustfs_s3_types::S3ErrorCode::AccessDenied);
+
+            // The granted bucket clears the authorization gate (fails later on malformed JSON, not AccessDenied).
+            let allowed = routes.at("/quota/allowed-bucket").expect("match allowed");
+            let allowed_res = SetBucketQuotaHandler
+                .call(
+                    TestRequest::new(Method::PUT, "/rustfs/admin/v3/quota/allowed-bucket")
+                        .credentials(scoped_user, secret, None)
+                        .body("{invalid-json")
+                        .build(),
+                    allowed.params.clone(),
+                )
+                .await
+                .expect_err("malformed body should fail after authorization");
+            assert_ne!(allowed_res.code(), &rustfs_s3_types::S3ErrorCode::AccessDenied);
+
+            // Reserved/invalid bucket names are rejected with InvalidArgument across all 5 bucket handlers.
+            let invalid = routes.at("/quota/.rustfs.sys").expect("match invalid");
+            for err in [
+                SetBucketQuotaHandler
+                    .call(
+                        TestRequest::new(Method::PUT, "/rustfs/admin/v3/quota/.rustfs.sys")
+                            .credentials("quota-test-root", "quota-root-secret", None)
+                            .build(),
+                        invalid.params.clone(),
+                    )
+                    .await
+                    .expect_err("Set must reject .rustfs.sys"),
+                GetBucketQuotaHandler
+                    .call(
+                        TestRequest::new(Method::GET, "/rustfs/admin/v3/quota/.rustfs.sys")
+                            .credentials("quota-test-root", "quota-root-secret", None)
+                            .build(),
+                        invalid.params.clone(),
+                    )
+                    .await
+                    .expect_err("Get must reject .rustfs.sys"),
+                ClearBucketQuotaHandler
+                    .call(
+                        TestRequest::new(Method::DELETE, "/rustfs/admin/v3/quota/.rustfs.sys")
+                            .credentials("quota-test-root", "quota-root-secret", None)
+                            .build(),
+                        invalid.params.clone(),
+                    )
+                    .await
+                    .expect_err("Clear must reject .rustfs.sys"),
+                GetBucketQuotaStatsHandler
+                    .call(
+                        TestRequest::new(Method::GET, "/rustfs/admin/v3/quota-stats/.rustfs.sys")
+                            .credentials("quota-test-root", "quota-root-secret", None)
+                            .build(),
+                        invalid.params.clone(),
+                    )
+                    .await
+                    .expect_err("Stats must reject .rustfs.sys"),
+                CheckBucketQuotaHandler
+                    .call(
+                        TestRequest::new(Method::POST, "/rustfs/admin/v3/quota-check/.rustfs.sys")
+                            .credentials("quota-test-root", "quota-root-secret", None)
+                            .build(),
+                        invalid.params.clone(),
+                    )
+                    .await
+                    .expect_err("Check must reject .rustfs.sys"),
+            ] {
+                assert_eq!(err.code(), &rustfs_s3_types::S3ErrorCode::InvalidArgument);
+            }
+
+            if let Some(previous) = previous {
+                publish_test_app_context(previous);
+            }
+        });
     }
 }
