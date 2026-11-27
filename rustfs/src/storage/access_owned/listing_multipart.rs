@@ -141,14 +141,21 @@ pub(crate) async fn authorize_create_multipart_upload<R: AuthorizationRequest + 
     req_info.object = Some(facts.key.to_owned());
     req_info.version_id = version;
 
-    set_requested_object_lock_retain_until(req, facts.retain_until);
+    let (retain_until, legal_hold_present, retention_present) = super::object_write::resolve_hoisted_object_lock_authorization(
+        req,
+        false,
+        facts.retain_until,
+        facts.legal_hold_present,
+        facts.retention_present,
+    )?;
+    set_requested_object_lock_retain_until(req, retain_until);
     authorize_request(req, Action::S3Action(S3Action::PutObjectAction)).await?;
     authorize_replication_only_put_headers(req).await?;
     super::object_commit::authorize_write_request_tagging(req, false).await?;
-    if facts.legal_hold_present {
+    if legal_hold_present {
         authorize_request(req, Action::S3Action(S3Action::PutObjectLegalHoldAction)).await?;
     }
-    if facts.retention_present {
+    if retention_present {
         authorize_request(req, Action::S3Action(S3Action::PutObjectRetentionAction)).await?;
     }
     req.install_bucket_generation(bucket_generation?);

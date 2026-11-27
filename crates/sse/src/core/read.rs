@@ -115,11 +115,12 @@ pub async fn sse_decryption(host: &dyn SseHost, request: DecryptionRequest<'_>) 
 /// Contract, mirrored from [`sse_decryption`] item by item:
 /// - SSE-C: missing request key/MD5 and stored/request MD5 mismatch fail with
 ///   the same errors and precedence, and the provided key is fully validated.
-/// - Managed SSE: per-key `kms:Decrypt` authorization runs ahead of every other
-///   failure mode, and the request's KMS audit summary records the same
-///   scheme/key/version/outcome fields the unwrap-based path recorded. The
-///   success outcome is honest because a failed unwrap aborts the read in the
-///   object layer before response classification is ever reached.
+/// - Managed SSE: client-initiated reads authorize `kms:Decrypt` ahead of
+///   unwrapping via [`authorize_sse_kms_object_read`]; this check retains the
+///   same authorization as defense in depth and records the request's KMS audit
+///   summary (scheme/key/version/outcome). The success outcome is honest
+///   because a failed unwrap aborts the read in the object layer before
+///   response classification is ever reached.
 /// - Objects without SSE metadata — and managed metadata whose scheme cannot
 ///   be established in this build — classify as `None`, exactly where
 ///   [`sse_decryption`] returned `None`.
@@ -151,20 +152,17 @@ pub async fn classify_sse_read_response(
         return Ok(None);
     };
 
-    // Ahead of every other failure mode, so a denied caller learns nothing
-    // about the key beyond "not yours".
+    // Defense in depth after the pre-unwrap authorization in the S3 read layer.
     if let Err(error) =
         authorize_sse_kms_key(host, request.principal, stored.sse_type, KmsAction::DecryptAction, &kms_key_id).await
     {
-        if let Some((sse_type, key_id)) = stored_managed_encryption_key(request.metadata) {
-            record_managed_kms_outcome(
-                request.principal,
-                sse_type,
-                Some(&key_id),
-                || stored_envelope_master_key_version(request.metadata),
-                Err(&error),
-            );
-        }
+        record_managed_kms_outcome(
+            request.principal,
+            stored.sse_type,
+            Some(&kms_key_id),
+            || stored_envelope_master_key_version(request.metadata),
+            Err(&error),
+        );
         return Err(error);
     }
 
@@ -184,6 +182,39 @@ pub async fn classify_sse_read_response(
         // object's wrapping key is internal: only aws:kms objects advertise it.
         ssekms_key_id: matches!(stored.sse_type, SSEType::SseKms).then_some(kms_key_id),
     }))
+}
+
+/// Authorize `kms:Decrypt` for a client read before the object layer unwraps
+/// the stored data key.
+///
+/// Uses the same managed-key recognition and default-key resolution as
+/// [`sse_decryption`] and [`classify_sse_read_response`], so a denied caller
+/// receives `AccessDenied` before KMS is called and cannot distinguish a
+/// missing, disabled, pending-deletion, or corrupted key from an unauthorized
+/// one.
+pub async fn authorize_sse_kms_object_read(
+    host: &dyn SseHost,
+    principal: Option<&SseKmsPrincipal>,
+    metadata: &HashMap<String, String>,
+) -> Result<(), SseError> {
+    let Some((stored, kms_key_id)) = resolve_stored_managed_key(host, metadata).await else {
+        return Ok(());
+    };
+
+    let result = authorize_sse_kms_key(host, principal, stored.sse_type, KmsAction::DecryptAction, &kms_key_id).await;
+    // Only a denial is recorded here: an allowed read goes on to unwrap the key,
+    // and that operation reports its own outcome.
+    if let Err(error) = &result {
+        record_managed_kms_outcome(
+            principal,
+            stored.sse_type,
+            Some(&kms_key_id),
+            || stored_envelope_master_key_version(metadata),
+            Err(error),
+        );
+    }
+
+    result
 }
 
 /// Recognize a stored managed-SSE object and name the key it is read under.

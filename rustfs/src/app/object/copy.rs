@@ -129,6 +129,189 @@ where
         .map_err(|err| ApiError::from(copy_namespace_lock_error(bucket, &object, "write", err)).into())
 }
 
+fn parse_hoisted_copy_condition(headers: &HeaderMap, name: &str) -> S3Result<Option<super::copy_input::CopySourceCondition>> {
+    let Some(raw) = super::shared::optional_header_string(headers, name)? else {
+        return Ok(None);
+    };
+    let tag = rustfs_gateway_types::ETag::parse_http_header(&raw)
+        .map_err(|_| s3_error!(InvalidArgument, "Invalid copy source ETag condition"))?;
+    Ok(Some(if tag.is_any() {
+        super::copy_input::CopySourceCondition::Any
+    } else if tag.is_weak() {
+        super::copy_input::CopySourceCondition::Weak
+    } else {
+        super::copy_input::CopySourceCondition::Strong(tag.opaque_tag().to_owned())
+    }))
+}
+
+#[inline(never)]
+fn apply_hoisted_copy_headers(input: &mut CopyObjectWriteInput, headers: &HeaderMap) -> S3Result<()> {
+    if input.server_side_encryption.is_none() {
+        input.server_side_encryption = extract_server_side_encryption_from_headers(headers)?;
+    }
+    if input.ssekms_key_id.is_none() {
+        input.ssekms_key_id = super::shared::optional_header_string(headers, "x-amz-server-side-encryption-aws-kms-key-id")?;
+    }
+    if input.metadata_directive.is_none() {
+        input.metadata_directive = super::shared::optional_header_string(headers, "x-amz-metadata-directive")?;
+    }
+    if input.tagging.is_none() {
+        input.tagging = super::shared::optional_header_string(headers, "x-amz-tagging")?;
+    }
+    if input.tagging_directive.is_none() {
+        input.tagging_directive = super::shared::optional_header_string(headers, "x-amz-tagging-directive")?;
+    }
+    if input.copy_source_if_match.is_none() {
+        input.copy_source_if_match = parse_hoisted_copy_condition(headers, "x-amz-copy-source-if-match")?;
+    }
+    if input.copy_source_if_none_match.is_none() {
+        input.copy_source_if_none_match = parse_hoisted_copy_condition(headers, "x-amz-copy-source-if-none-match")?;
+    }
+    input.copy_source_dates.merge_headers(headers)?;
+    if input.website_redirect_location.is_none() {
+        input.website_redirect_location = super::shared::optional_header_string(headers, "x-amz-website-redirect-location")?;
+    }
+    if input.storage_class.is_none() {
+        input.storage_class = super::shared::optional_header_string(headers, "x-amz-storage-class")?;
+    }
+    if input.object_lock_legal_hold_status.is_none() {
+        input.object_lock_legal_hold_status = super::shared::optional_header_string(headers, AMZ_OBJECT_LOCK_LEGAL_HOLD_LOWER)?;
+    }
+    if input.object_lock_mode.is_none() {
+        input.object_lock_mode = super::shared::optional_header_string(headers, AMZ_OBJECT_LOCK_MODE_LOWER)?;
+    }
+    if input.object_lock_retain_until_date.is_none() {
+        input.object_lock_retain_until_date = super::shared::optional_object_lock_retain_until_from_headers(headers)?;
+    }
+    if input.checksum_algorithm.is_none() {
+        input.checksum_algorithm = match super::shared::optional_header_string(headers, "x-amz-checksum-algorithm")? {
+            Some(value) => Some(value),
+            None => super::shared::optional_header_string(headers, "x-amz-sdk-checksum-algorithm")?,
+        };
+    }
+    Ok(())
+}
+
+struct CopySourceOpenParams<'a> {
+    store: &'a Arc<ECStore>,
+    src_bucket: &'a str,
+    src_key: &'a str,
+    requested_src_version_id: Option<&'a str>,
+    src_get_opts: &'a ObjectOptions,
+    src_headers: HeaderMap,
+    replacement_tags: Option<String>,
+    copy_source_if_match: Option<&'a super::copy_input::CopySourceCondition>,
+    copy_source_if_none_match: Option<&'a super::copy_input::CopySourceCondition>,
+    copy_source_dates: &'a super::copy_input::CopySourceDates,
+    copy_principal: Option<&'a SseKmsPrincipal>,
+}
+
+type BoxedFuture<'a, T> = Pin<Box<dyn std::future::Future<Output = T> + Send + 'a>>;
+type OpenedCopySource = (GetObjectReader, tokio_util::sync::DropGuard, String);
+
+#[inline(never)]
+fn make_boxed_future<'a, Fut, T>(make: impl FnOnce() -> Fut) -> BoxedFuture<'a, T>
+where
+    Fut: std::future::Future<Output = T> + Send + 'a,
+{
+    Box::pin(make())
+}
+
+#[inline(never)]
+fn open_copy_source_boxed<'a>(
+    envelope: &'a mut RequestEnvelope,
+    params: CopySourceOpenParams<'a>,
+) -> BoxedFuture<'a, S3Result<OpenedCopySource>> {
+    Box::pin(open_copy_source(envelope, params))
+}
+
+async fn open_copy_source(envelope: &mut RequestEnvelope, params: CopySourceOpenParams<'_>) -> S3Result<OpenedCopySource> {
+    let CopySourceOpenParams {
+        store,
+        src_bucket,
+        src_key,
+        requested_src_version_id,
+        src_get_opts,
+        src_headers,
+        replacement_tags,
+        copy_source_if_match,
+        copy_source_if_none_match,
+        copy_source_dates,
+        copy_principal,
+    } = params;
+
+    let prepared_source =
+        make_boxed_future(|| store.prepare_get_object_reader(src_bucket, src_key, None, src_headers, src_get_opts))
+            .await
+            .map_err(map_get_object_reader_error)?;
+
+    let effective_tags = {
+        let prepared_info = prepared_source.object_info();
+        if prepared_info.delete_marker {
+            let error = if src_get_opts.version_id.is_none() {
+                StorageError::ObjectNotFound(src_bucket.to_owned(), src_key.to_owned())
+            } else {
+                StorageError::MethodNotAllowed
+            };
+            return Err(map_get_object_reader_error(error).into());
+        }
+
+        let copies_tags = replacement_tags.is_none();
+        let effective_tags = replacement_tags.unwrap_or_else(|| (*prepared_info.user_tags).clone());
+        make_boxed_future(|| {
+            crate::app::storage_api::object_usecase::access::authorize_copy_object_tags(
+                envelope,
+                CopySourceObject {
+                    bucket: src_bucket,
+                    key: src_key,
+                    version_id: requested_src_version_id,
+                },
+                copies_tags,
+                &prepared_info.user_tags,
+                &effective_tags,
+            )
+        })
+        .await?;
+
+        // A copy reads the source plaintext, so it needs the source key's decrypt permission
+        // before opening the source reader (which resolves/unwraps the DEK inside ecstore
+        // without a request principal). Matching UploadPartCopy and SelectObjectContent, run
+        // this against the prepared metadata snapshot before `into_reader_for_copy`.
+        make_boxed_future(|| authorize_sse_kms_object_read(copy_principal, &prepared_info.user_defined)).await?;
+
+        if !copy_source_dates.permits_copy(
+            copy_source_if_match,
+            copy_source_if_none_match,
+            prepared_info.etag.as_deref(),
+            prepared_info.mod_time,
+        ) {
+            return Err(s3_error!(PreconditionFailed));
+        }
+        effective_tags
+    };
+
+    // The commit owner is intentionally detached so SetDisk can finish
+    // its rename/cleanup and post-commit publication if the HTTP caller
+    // goes away.  Keep a request-owned guard for the source producer:
+    // cancellation drops the source read promptly, while the detached
+    // commit task retains the guards it needs to complete safely.
+    // Run `into_reader_for_copy` on a fresh task so its deep ECStore read
+    // future does not compound the HTTP gateway + CopyObject stack in debug
+    // builds, while aborting it immediately if the caller is cancelled.
+    struct AbortOnDrop<T>(tokio::task::JoinHandle<T>);
+    impl<T> Drop for AbortOnDrop<T> {
+        fn drop(&mut self) {
+            self.0.abort();
+        }
+    }
+    let mut open_task = AbortOnDrop(spawn_traced_join(make_boxed_future(move || prepared_source.into_reader_for_copy())));
+    let (gr, source_cancellation_guard) = (&mut open_task.0)
+        .await
+        .map_err(|err| S3Error::with_message(S3ErrorCode::InternalError, format!("copy source reader task failed: {err}")))?
+        .map_err(map_get_object_reader_error)?;
+    Ok((gr, source_cancellation_guard, effective_tags))
+}
+
 impl DefaultObjectUsecase {
     pub(crate) fn execute_copy_object_owned(
         &self,
@@ -152,7 +335,7 @@ impl DefaultObjectUsecase {
     async fn execute_copy_object_body(
         &self,
         mut envelope: RequestEnvelope,
-        input: CopyObjectWriteInput,
+        mut input: CopyObjectWriteInput,
     ) -> S3Result<CopyObjectWriteOutput> {
         reject_presigned_put_max_content_length_for_other_operation(
             envelope.headers(),
@@ -160,6 +343,7 @@ impl DefaultObjectUsecase {
             envelope.verified_presigned().is_some(),
         )?;
         reject_non_wildcard_write_if_none_match(input.specific_if_none_match, envelope.headers())?;
+        apply_hoisted_copy_headers(&mut input, envelope.headers())?;
         if let Some(context) = &self.context {
             let _ = context.object_store();
         }
@@ -436,7 +620,7 @@ impl DefaultObjectUsecase {
             if _self_copy_lock_guard.is_some() {
                 current_opts.no_lock = true;
             }
-            Some(match store.get_object_info(&bucket, &key, &current_opts).await {
+            Some(match make_boxed_future(|| store.get_object_info(&bucket, &key, &current_opts)).await {
                 Ok(existing_obj_info) => {
                     validate_existing_object_lock_for_write(&object_lock_config_state, &existing_obj_info, &dst_opts)?;
                     if let Some(expected) = expected_current_version_id.as_deref()
@@ -486,39 +670,25 @@ impl DefaultObjectUsecase {
             .into());
         }
 
-        let (gr, source_cancellation) = store
-            .get_object_reader_for_copy(&src_bucket, &src_key, None, h, &src_get_opts)
-            .await
-            .map_err(map_get_object_reader_error)?;
-
-        // The commit owner is intentionally detached so SetDisk can finish
-        // its rename/cleanup and post-commit publication if the HTTP caller
-        // goes away.  Keep a request-owned guard for the source producer:
-        // cancellation drops the source read promptly, while the detached
-        // commit task retains the guards it needs to complete safely.
-        let _source_cancellation_guard = source_cancellation.clone().drop_guard();
-
-        let mut src_info = gr.object_info.clone();
-        let copies_tags = replacement_tags.is_none();
-        let effective_tags = replacement_tags.unwrap_or_else(|| (*src_info.user_tags).clone());
-        crate::app::storage_api::object_usecase::access::authorize_copy_object_tags(
+        let (gr, _source_cancellation_guard, effective_tags) = open_copy_source_boxed(
             &mut envelope,
-            CopySourceObject {
-                bucket: &src_bucket,
-                key: &src_key,
-                version_id: requested_src_version_id.as_deref(),
+            CopySourceOpenParams {
+                store: &store,
+                src_bucket: &src_bucket,
+                src_key: &src_key,
+                requested_src_version_id: requested_src_version_id.as_deref(),
+                src_get_opts: &src_get_opts,
+                src_headers: h,
+                replacement_tags,
+                copy_source_if_match: copy_source_if_match.as_ref(),
+                copy_source_if_none_match: copy_source_if_none_match.as_ref(),
+                copy_source_dates: &copy_source_dates,
+                copy_principal: copy_principal.as_ref(),
             },
-            copies_tags,
-            &src_info.user_tags,
-            &effective_tags,
         )
         .await?;
 
-        // A copy reads the source plaintext, so it needs the source key's decrypt permission
-        // as well as the destination key's generate permission below. The source read resolves
-        // its material inside the object layer, which has no request identity, so the check
-        // happens here.
-        authorize_sse_kms_object_read(copy_principal.as_ref(), &src_info.user_defined).await?;
+        let mut src_info = gr.object_info;
 
         // Capture the version actually read from the source before src_info is mutated/consumed
         // below. This is the exact source version copied (issue #4976): the response must echo it
@@ -535,15 +705,6 @@ impl DefaultObjectUsecase {
                 .into_iter()
                 .find_map(|(k, v)| rustfs_rio::Checksum::new_from_string(&k, &v))
         });
-
-        if !copy_source_dates.permits_copy(
-            copy_source_if_match.as_ref(),
-            copy_source_if_none_match.as_ref(),
-            src_info.etag.as_deref(),
-            src_info.mod_time,
-        ) {
-            return Err(s3_error!(PreconditionFailed));
-        }
 
         // A same-name copy is normally serviced as a metadata-only update: the store layer
         // rewrites xl.meta in place and leaves the data blocks alone. That shortcut is only sound
@@ -717,7 +878,7 @@ impl DefaultObjectUsecase {
             principal: copy_principal.as_ref(),
         };
 
-        if let Some(material) = sse_encryption(encryption_request).await? {
+        if let Some(material) = make_boxed_future(|| sse_encryption(encryption_request)).await? {
             effective_sse = Some(material.server_side_encryption.clone());
             effective_kms_key_id = material.response_kms_key_id();
 
@@ -758,14 +919,16 @@ impl DefaultObjectUsecase {
         // `must_replicate_object` itself declines inbound replica writes
         // (replication_request / REPLICA status), so replicas are never
         // re-scheduled outbound.
-        let dsc = must_replicate_object(
-            &bucket,
-            &key,
-            &user_defined,
-            "".to_string(),
-            dst_opts.delete_marker_replication_status(),
-            dst_opts.clone(),
-        )
+        let dsc = make_boxed_future(|| {
+            must_replicate_object(
+                &bucket,
+                &key,
+                &user_defined,
+                "".to_string(),
+                dst_opts.delete_marker_replication_status(),
+                dst_opts.clone(),
+            )
+        })
         .await;
         if dsc.replicate_any() {
             insert_str(&mut user_defined, SUFFIX_REPLICATION_GENERATION, Uuid::new_v4().to_string());
@@ -819,17 +982,28 @@ impl DefaultObjectUsecase {
                 let _self_copy_lock_guard = _self_copy_lock_guard;
                 let _table_data_plane_publication_guards = table_data_plane_publication_guards;
 
-                let (oi, backfilled_old_current_size) = store
-                    .copy_object_with_old_current_size(&src_bucket, &src_key, &bucket, &key, &mut src_info, &src_opts, &dst_opts)
-                    .await
-                    .map_err(ApiError::from)?;
+                let (oi, backfilled_old_current_size) = make_boxed_future(|| {
+                    store.copy_object_with_old_current_size(
+                        &src_bucket,
+                        &src_key,
+                        &bucket,
+                        &key,
+                        &mut src_info,
+                        &src_opts,
+                        &dst_opts,
+                    )
+                })
+                .await
+                .map_err(ApiError::from)?;
 
                 // Reuse the single pre-commit replication decision (see `dsc` above) so
                 // the persisted pending marker and the schedule always agree, mirroring
                 // the PUT path.
                 if dsc.replicate_any() {
-                    schedule_object_replication(oi.clone(), Arc::clone(&store), dsc, dst_opts.expected_bucket_incarnation_id)
-                        .await;
+                    make_boxed_future(|| {
+                        schedule_object_replication(oi.clone(), Arc::clone(&store), dsc, dst_opts.expected_bucket_incarnation_id)
+                    })
+                    .await;
                 }
 
                 maybe_enqueue_transition_immediate(&oi, LcEventSrc::S3CopyObject, dst_opts.expected_bucket_incarnation_id).await;
@@ -2201,5 +2375,360 @@ mod tests {
             )
             .await
             .expect("clean up excluded-prefix test bucket");
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn copy_object_denies_unauthorized_sse_kms_before_dek_unwrap() {
+        use crate::app::storage_api::test::ReqInfo;
+        use crate::app::storage_api::test::contract::bucket::{BucketOperations as _, DeleteBucketOptions, MakeBucketOptions};
+        use crate::app::storage_api::test::sse::{
+            RecordingKmsKeyAuthorizer, SseDekProvider, SseError, TestAuthorizationHooks, reset_sse_dek_provider,
+            set_sse_dek_provider_for_test,
+        };
+        use rustfs_kms::DataKey;
+        use rustfs_kms::types::ObjectEncryptionContext;
+        use rustfs_policy::policy::action::KmsAction;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct ProviderResetGuard;
+        impl Drop for ProviderResetGuard {
+            fn drop(&mut self) {
+                reset_sse_dek_provider();
+            }
+        }
+
+        #[derive(Clone, Copy)]
+        enum DecryptOutcome {
+            Ok,
+            KeyNotFound,
+            ServiceUnavailable,
+        }
+
+        struct CountingKmsProvider {
+            decrypt_calls: Arc<AtomicUsize>,
+            outcome: Arc<std::sync::Mutex<DecryptOutcome>>,
+            plaintext_dek: [u8; 32],
+        }
+
+        #[async_trait::async_trait]
+        impl SseDekProvider for CountingKmsProvider {
+            async fn generate_sse_dek(
+                &self,
+                context: &ObjectEncryptionContext,
+                kms_key_id: &str,
+            ) -> Result<(DataKey, Vec<u8>), SseError> {
+                let nonce = [0x11u8; 12];
+                let wrapped = serde_json::to_vec(&serde_json::json!({
+                    "key_id": "dek-test-copy",
+                    "master_key_id": kms_key_id,
+                    "key_spec": "AES_256",
+                    "encrypted_key": self.plaintext_dek.to_vec(),
+                    "nonce": nonce.to_vec(),
+                    "encryption_context": context.encryption_context,
+                    "created_at": "2026-01-01T00:00:00Z[UTC]",
+                    "master_key_version": 1,
+                }))
+                .expect("serialize envelope");
+                Ok((
+                    DataKey {
+                        plaintext_key: self.plaintext_dek,
+                        nonce,
+                    },
+                    wrapped,
+                ))
+            }
+
+            async fn decrypt_sse_dek(
+                &self,
+                _encrypted_dek: &[u8],
+                kms_key_id: &str,
+                _context: &ObjectEncryptionContext,
+            ) -> Result<[u8; 32], SseError> {
+                self.decrypt_calls.fetch_add(1, Ordering::SeqCst);
+                let outcome = *self.outcome.lock().expect("outcome lock");
+                match outcome {
+                    DecryptOutcome::Ok => Ok(self.plaintext_dek),
+                    DecryptOutcome::KeyNotFound => Err(SseError::internal(rustfs_kms::KmsError::key_not_found(kms_key_id))),
+                    DecryptOutcome::ServiceUnavailable => Err(SseError::internal(rustfs_kms::KmsUnavailableError)),
+                }
+            }
+        }
+
+        let _reset = ProviderResetGuard;
+        let decrypt_calls = Arc::new(AtomicUsize::new(0));
+        let outcome = Arc::new(std::sync::Mutex::new(DecryptOutcome::Ok));
+        let plaintext_dek = [0x5A; 32];
+        set_sse_dek_provider_for_test(Arc::new(CountingKmsProvider {
+            decrypt_calls: Arc::clone(&decrypt_calls),
+            outcome: Arc::clone(&outcome),
+            plaintext_dek,
+        }));
+
+        let store = crate::app::gating_test_env::shared_gating_ecstore().await;
+        if current_app_context().is_none() {
+            crate::app::runtime_sources::install_test_app_context(Arc::clone(&store)).await;
+        }
+        let ambient = current_app_context().expect("CopyObject KMS test requires an AppContext");
+        let context = Arc::new(AppContext::new(Arc::clone(&store), ambient.iam(), ambient.kms()));
+        let usecase = DefaultObjectUsecase::with_context(Some(context));
+        let bucket = format!("copy-kms-preauth-{}", Uuid::new_v4());
+        store
+            .make_bucket(&bucket, &MakeBucketOptions::default())
+            .await
+            .expect("create KMS copy test bucket");
+
+        let source_key = "secret.bin";
+        let payload = b"top-secret-copy-payload";
+        let allowed_write_authorizer = RecordingKmsKeyAuthorizer::new(true);
+        let write_principal = SseKmsPrincipal::new("writer".to_string(), None, false, HashMap::new(), HashMap::new())
+            .with_test_hooks(Some(TestAuthorizationHooks {
+                enforced: true,
+                authorizer: allowed_write_authorizer,
+            }));
+        let material = sse_encryption(EncryptionRequest {
+            bucket: &bucket,
+            key: source_key,
+            server_side_encryption: Some("aws:kms".to_string()),
+            ssekms_key_id: Some("finance-key".to_string()),
+            ssekms_context: None,
+            sse_customer_algorithm: None,
+            sse_customer_key: None,
+            sse_customer_key_md5: None,
+            content_size: payload.len() as i64,
+            principal: Some(&write_principal),
+        })
+        .await
+        .expect("encrypt test object")
+        .expect("SSE-KMS material");
+        let mut encrypted_meta = encryption_material_to_metadata(&material).expect("encryption metadata");
+        let write_plan = WritePlan::new().with_encryption(material.write_encryption(None));
+        let reader = HashReader::from_stream(
+            std::io::Cursor::new(payload.to_vec()),
+            payload.len() as i64,
+            payload.len() as i64,
+            None,
+            None,
+            false,
+        )
+        .expect("hash reader");
+        let reader = write_plan.apply(reader, payload.len() as i64).expect("apply write plan");
+        let mut src_reader = PutObjReader::new(reader);
+        let src_opts = ObjectOptions {
+            user_defined: encrypted_meta.clone(),
+            ..Default::default()
+        };
+        make_boxed_future(|| store.put_object(&bucket, source_key, &mut src_reader, &src_opts))
+            .await
+            .expect("store encrypted source");
+
+        // Also seed a corrupt-envelope SSE-KMS object to prove denied callers still get 403 with 0 KMS calls.
+        let corrupt_key = "corrupt.bin";
+        encrypted_meta.insert(
+            rustfs_utils::http::object_encryption_keys::INTERNAL_ENCRYPTION_KEY_HEADER.to_string(),
+            "not-valid-base64-envelope".to_string(),
+        );
+        let mut corrupt_reader = PutObjReader::from_vec(b"ciphertext-stub".to_vec());
+        let corrupt_opts = ObjectOptions {
+            user_defined: encrypted_meta,
+            ..Default::default()
+        };
+        make_boxed_future(|| store.put_object(&bucket, corrupt_key, &mut corrupt_reader, &corrupt_opts))
+            .await
+            .expect("store corrupt SSE-KMS object");
+
+        let envelope_for = |allowed: bool| -> (RequestEnvelope, Arc<RecordingKmsKeyAuthorizer>) {
+            let authorizer = RecordingKmsKeyAuthorizer::new(allowed);
+            let mut extensions = http::Extensions::new();
+            extensions.insert(ReqInfo::default());
+            extensions.insert(TestAuthorizationHooks {
+                enforced: true,
+                authorizer: Arc::clone(&authorizer) as _,
+            });
+            let head = crate::app::RequestHead {
+                method: http::Method::PUT,
+                uri: http::Uri::from_static("/bucket/dst"),
+                headers: HeaderMap::new(),
+                credentials: None,
+                region: None,
+                service: None,
+            };
+            (RequestEnvelope::from_parts(head, extensions), authorizer)
+        };
+
+        // 1. Unauthorized caller gets 403 AccessDenied with 0 KMS decrypt calls across healthy, deleted, unavailable, and corrupt states.
+        for (label, src_key, mode) in [
+            ("healthy", source_key, DecryptOutcome::Ok),
+            ("key-deleted", source_key, DecryptOutcome::KeyNotFound),
+            ("kms-unavailable", source_key, DecryptOutcome::ServiceUnavailable),
+            ("corrupt-envelope", corrupt_key, DecryptOutcome::Ok),
+        ] {
+            *outcome.lock().expect("outcome lock") = mode;
+            decrypt_calls.store(0, Ordering::SeqCst);
+            let (envelope, authorizer) = envelope_for(false);
+            let err = usecase
+                .execute_copy_object_owned(envelope, copy_input(&bucket, src_key, "denied-dst.bin", None))
+                .await
+                .expect_err("unauthorized CopyObject must be denied before DEK unwrap");
+            assert_eq!(err.code(), &S3ErrorCode::AccessDenied, "{label}: unexpected error {err:?}");
+            assert_eq!(
+                decrypt_calls.load(Ordering::SeqCst),
+                0,
+                "{label}: unauthorized CopyObject must never invoke KMS decrypt"
+            );
+            assert_eq!(
+                authorizer.calls(),
+                vec![(KmsAction::DecryptAction, "finance-key".to_string())],
+                "{label}: must authorize kms:Decrypt on source key"
+            );
+        }
+
+        // 2. Authorized caller reaches KMS decrypt and copies decrypted plaintext to destination.
+        *outcome.lock().expect("outcome lock") = DecryptOutcome::Ok;
+        decrypt_calls.store(0, Ordering::SeqCst);
+        let (envelope, authorizer) = envelope_for(true);
+        usecase
+            .execute_copy_object_owned(envelope, copy_input(&bucket, source_key, "allowed-dst.bin", None))
+            .await
+            .expect("authorized CopyObject should succeed");
+        assert_eq!(decrypt_calls.load(Ordering::SeqCst), 1, "authorized copy must unwrap DEK once");
+        assert_eq!(authorizer.calls(), vec![(KmsAction::DecryptAction, "finance-key".to_string())]);
+        assert_eq!(
+            read_store_object_bytes(&store, &bucket, "allowed-dst.bin", &ObjectOptions::default()).await,
+            payload
+        );
+
+        // 3. Authorized caller on deleted KMS key still observes KMS.NotFoundException (proving KMS was reached).
+        *outcome.lock().expect("outcome lock") = DecryptOutcome::KeyNotFound;
+        decrypt_calls.store(0, Ordering::SeqCst);
+        let (envelope, _) = envelope_for(true);
+        let err = usecase
+            .execute_copy_object_owned(envelope, copy_input(&bucket, source_key, "missing-key-dst.bin", None))
+            .await
+            .expect_err("authorized CopyObject against deleted key must fail in KMS");
+        assert_eq!(err.code(), &S3ErrorCode::Custom("KMS.NotFoundException".into()));
+        assert_eq!(decrypt_calls.load(Ordering::SeqCst), 1);
+
+        store
+            .delete_bucket(
+                &bucket,
+                &DeleteBucketOptions {
+                    force: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("clean up KMS copy test bucket");
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn copy_object_enforces_hoisted_preconditions_and_checksum_algorithm() {
+        use crate::app::storage_api::test::contract::bucket::{BucketOperations as _, DeleteBucketOptions, MakeBucketOptions};
+
+        let (store, context) = real_store_test_context().await;
+        let usecase = DefaultObjectUsecase::with_context(Some(context));
+        let bucket = format!("copy-hoisted-cond-{}", Uuid::new_v4());
+        store
+            .make_bucket(&bucket, &MakeBucketOptions::default())
+            .await
+            .expect("create bucket");
+
+        let source_key = "src.txt";
+        let payload = b"hoisted-copy-precondition-body";
+        let mut reader = PutObjReader::from_vec(payload.to_vec());
+        let seed_opts = ObjectOptions::default();
+        let seeded = make_boxed_future(|| store.put_object(&bucket, source_key, &mut reader, &seed_opts))
+            .await
+            .expect("seed source object");
+        let source_etag = seeded.etag.clone().expect("source etag");
+
+        // 1. Hoisted x-amz-copy-source-if-match mismatch fails with 412 PreconditionFailed without creating dst.
+        let mut mismatch_headers = HeaderMap::new();
+        mismatch_headers.insert(
+            "x-amz-copy-source-if-match",
+            HeaderValue::from_static("\"00000000000000000000000000000000\""),
+        );
+        let err = usecase
+            .execute_copy_object_owned(
+                copy_envelope(mismatch_headers),
+                copy_input(&bucket, source_key, "blocked-if-match.txt", None),
+            )
+            .await
+            .expect_err("hoisted if-match mismatch must return 412");
+        assert_eq!(err.code(), &S3ErrorCode::PreconditionFailed);
+
+        // 2. Hoisted x-amz-copy-source-if-none-match matching ETag fails with 412.
+        let mut none_match_headers = HeaderMap::new();
+        none_match_headers.insert(
+            "x-amz-copy-source-if-none-match",
+            HeaderValue::from_str(&format!("\"{source_etag}\"")).expect("etag header"),
+        );
+        let err = usecase
+            .execute_copy_object_owned(
+                copy_envelope(none_match_headers),
+                copy_input(&bucket, source_key, "blocked-if-none-match.txt", None),
+            )
+            .await
+            .expect_err("hoisted if-none-match matching ETag must return 412");
+        assert_eq!(err.code(), &S3ErrorCode::PreconditionFailed);
+
+        // 3. Hoisted x-amz-copy-source-if-modified-since in the future fails with 412.
+        let mut future_mod_headers = HeaderMap::new();
+        future_mod_headers.insert(
+            "x-amz-copy-source-if-modified-since",
+            HeaderValue::from_static("Wed, 01 Jan 2098 00:00:00 GMT"),
+        );
+        let err = usecase
+            .execute_copy_object_owned(
+                copy_envelope(future_mod_headers),
+                copy_input(&bucket, source_key, "blocked-if-modified.txt", None),
+            )
+            .await
+            .expect_err("hoisted future if-modified-since must return 412");
+        assert_eq!(err.code(), &S3ErrorCode::PreconditionFailed);
+
+        // 4. Hoisted x-amz-copy-source-if-unmodified-since in the past fails with 412.
+        let mut past_unmod_headers = HeaderMap::new();
+        past_unmod_headers.insert(
+            "x-amz-copy-source-if-unmodified-since",
+            HeaderValue::from_static("Mon, 01 Jan 2001 00:00:00 GMT"),
+        );
+        let err = usecase
+            .execute_copy_object_owned(
+                copy_envelope(past_unmod_headers),
+                copy_input(&bucket, source_key, "blocked-if-unmodified.txt", None),
+            )
+            .await
+            .expect_err("hoisted past if-unmodified-since must return 412");
+        assert_eq!(err.code(), &S3ErrorCode::PreconditionFailed);
+
+        // 5. Hoisted matching x-amz-copy-source-if-match + x-amz-checksum-algorithm succeeds and echoes checksum.
+        let mut matching_headers = HeaderMap::new();
+        matching_headers.insert(
+            "x-amz-copy-source-if-match",
+            HeaderValue::from_str(&format!("\"{source_etag}\"")).expect("etag header"),
+        );
+        matching_headers.insert("x-amz-checksum-algorithm", HeaderValue::from_static("SHA256"));
+        let output = usecase
+            .execute_copy_object_owned(copy_envelope(matching_headers), copy_input(&bucket, source_key, "allowed-dst.txt", None))
+            .await
+            .expect("hoisted matching precondition + checksum algorithm should succeed");
+        let expected_sha256 = {
+            use sha2::{Digest, Sha256};
+            base64_simd::STANDARD.encode_to_string(Sha256::digest(payload))
+        };
+        assert_eq!(output.checksum_sha256.as_deref(), Some(expected_sha256.as_str()));
+
+        store
+            .delete_bucket(
+                &bucket,
+                &DeleteBucketOptions {
+                    force: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("clean up hoisted copy precondition bucket");
     }
 }

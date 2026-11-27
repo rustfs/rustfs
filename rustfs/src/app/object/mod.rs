@@ -71,7 +71,9 @@ pub(crate) use super::storage_api::object_usecase::concurrency::{
 #[cfg(test)]
 use super::storage_api::object_usecase::contract::http::HTTPPreconditions;
 use super::storage_api::object_usecase::contract::namespace::NamespaceLocking;
-use super::storage_api::object_usecase::contract::object::{ListOperations as _, ObjectIO as _, ObjectOperations as _};
+#[cfg(test)]
+use super::storage_api::object_usecase::contract::object::ObjectIO as _;
+use super::storage_api::object_usecase::contract::object::{ListOperations as _, ObjectOperations as _};
 use super::storage_api::object_usecase::contract::range::HTTPRangeSpec;
 use super::storage_api::object_usecase::data_usage::{
     quota_object_size, record_bucket_delete_marker_memory, record_bucket_object_delete_memory,

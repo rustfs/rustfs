@@ -635,37 +635,102 @@ fn is_request_signature_v2(header: &HeaderMap) -> bool {
         .is_some_and(|credential| credential.contains(':'))
 }
 
-/// True when `query` can name a user-metadata parameter at all. A single ASCII
-/// scan, so a request whose query only carries things like `versionId` or a
-/// typed property never pays for a parse.
-fn query_may_carry_user_metadata(query: &str) -> bool {
-    const NEEDLE: &[u8] = b"-meta-";
+/// True when `query` can name any `x-amz-*` query parameter at all. A single
+/// ASCII scan, so a request whose query only carries things like `versionId`
+/// or `uploads` never pays for a parse.
+fn query_may_carry_hoistable_amz_param(query: &str) -> bool {
+    const NEEDLE: &[u8] = b"x-amz-";
     query
         .as_bytes()
         .windows(NEEDLE.len())
         .any(|window| window.eq_ignore_ascii_case(NEEDLE))
 }
 
-/// Restores signature-covered `x-amz-meta-*` user metadata as request headers.
+/// Exact `x-amz-*` request properties that SigV4 presigners hoist into the
+/// query string (`@smithy/signature-v4` `moveHeadersToQuery`) and that RustFS
+/// safely restores as headers after signature verification (rustfs/backlog#3143).
 ///
-/// AWS SDK presigners hoist metadata into the query string, while RustFS's
-/// metadata consumers read headers (rustfs/rustfs#9142). Only user metadata is
-/// restored here. s3s has already parsed typed request properties before this
-/// hook runs; restoring Object Lock, encryption or routing headers here would
-/// bypass the corresponding DTO validation and per-property authorization.
-/// Those properties keep their existing handling (rustfs/backlog#3143).
+/// Explicitly excluded (fail-closed):
+/// - SigV4 authentication parameters (`x-amz-algorithm`, `x-amz-credential`,
+///   `x-amz-date`, `x-amz-expires`, `x-amz-signedheaders`, `x-amz-signature`,
+///   `x-amz-security-token`);
+/// - payload digest / streaming framing headers (`x-amz-content-sha256`,
+///   `x-amz-decoded-content-length`, `x-amz-trailer`) — hoisting
+///   `x-amz-content-sha256` after body construction would disable the storage
+///   layer's query-digest verification (`get_content_sha256_with_query`);
+/// - SSE-C customer key headers (`x-amz-server-side-encryption-customer-*`,
+///   `x-amz-copy-source-server-side-encryption-customer-*`) — customer keys
+///   must arrive as signed headers over TLS, never hoisted from query strings;
+/// - replication-only, governance-bypass, and vendor extension headers
+///   (`x-amz-replication-status`, `x-amz-bypass-governance-retention`,
+///   `x-rustfs-*`, `x-minio-*`).
+const HOISTABLE_SIGNED_QUERY_PARAMS: &[&str] = &[
+    "x-amz-object-lock-mode",
+    "x-amz-object-lock-retain-until-date",
+    "x-amz-object-lock-legal-hold",
+    "x-amz-acl",
+    "x-amz-grant-full-control",
+    "x-amz-grant-read",
+    "x-amz-grant-write",
+    "x-amz-grant-read-acp",
+    "x-amz-grant-write-acp",
+    "x-amz-tagging",
+    "x-amz-tagging-directive",
+    "x-amz-storage-class",
+    "x-amz-website-redirect-location",
+    "x-amz-snowball-auto-extract",
+    "x-amz-copy-source",
+    "x-amz-copy-source-range",
+    "x-amz-copy-source-if-match",
+    "x-amz-copy-source-if-none-match",
+    "x-amz-copy-source-if-modified-since",
+    "x-amz-copy-source-if-unmodified-since",
+    "x-amz-metadata-directive",
+    "x-amz-checksum-crc32",
+    "x-amz-checksum-crc32c",
+    "x-amz-checksum-crc64nvme",
+    "x-amz-checksum-sha1",
+    "x-amz-checksum-sha256",
+    "x-amz-checksum-algorithm",
+    "x-amz-sdk-checksum-algorithm",
+    "x-amz-server-side-encryption",
+    "x-amz-server-side-encryption-aws-kms-key-id",
+    "x-amz-server-side-encryption-context",
+    "x-amz-server-side-encryption-bucket-key-enabled",
+];
+
+pub(crate) fn is_hoistable_signed_query_param(name: &str) -> bool {
+    starts_with_ignore_ascii_case(name, "x-amz-meta-")
+        || HOISTABLE_SIGNED_QUERY_PARAMS
+            .iter()
+            .any(|candidate| name.eq_ignore_ascii_case(candidate))
+}
+
+/// Restores signature-covered hoistable `x-amz-*` request properties from the
+/// query string as request headers (rustfs/rustfs#9142, rustfs/backlog#3143).
 ///
-/// This runs after s3s has verified the signature and before policy evaluation
-/// and the handler read request properties. It must not run earlier: s3s's own
-/// verifier rejects an `x-amz-*` header outside `X-Amz-SignedHeaders`, which is
-/// exactly what a restored parameter becomes.
+/// AWS SDK presigners hoist signable `x-amz-*` headers into the query string
+/// (`moveHeadersToQuery`), while RustFS's policy evaluation and object write
+/// handlers read headers. This covers user metadata (`x-amz-meta-*`) plus the
+/// explicit allowlist of S3 request properties (`x-amz-object-lock-*`,
+/// `x-amz-acl`, `x-amz-grant-*`, `x-amz-tagging`, `x-amz-storage-class`,
+/// `x-amz-website-redirect-location`, `x-amz-copy-source*`,
+/// `x-amz-checksum-*`, `x-amz-snowball-auto-extract`, managed SSE headers).
+///
+/// This runs after signature verification and before policy evaluation and
+/// operation handlers read request properties. It must not run earlier: the
+/// SigV4 verifier rejects an `x-amz-*` header outside `X-Amz-SignedHeaders`,
+/// which is exactly what a restored parameter becomes. Downstream authorization
+/// hooks (`authorize_put_object`, `authorize_copy_object`,
+/// `authorize_create_multipart_upload`) inspect the restored headers so Object
+/// Lock, tagging, ACL/grant, and copy-source permissions and validations apply
+/// identically to wire headers.
 ///
 /// Only a query the SigV4 signature covers is honored. SigV4 signs the
-/// canonical query string (AWS General Reference, "Create a signed AWS API
-/// request"; s3s-sigv4 verifies every parameter except the signature itself),
-/// so its query parameters are as trustworthy as its headers. SigV2's
-/// string-to-sign covers headers plus a fixed subresource list rather than
-/// arbitrary query parameters, so a SigV2 presigned URL keeps validating after
+/// canonical query string (every parameter except `X-Amz-Signature`), so its
+/// query parameters are as trustworthy as its headers. SigV2's string-to-sign
+/// covers headers plus a fixed subresource list rather than arbitrary query
+/// parameters, so a SigV2 presigned URL keeps validating after
 /// `X-Amz-Algorithm`/`X-Amz-Signature` markers are appended to it — those
 /// markers must not be allowed to widen it into accepting query properties the
 /// presigner never authorized. An existing header always wins, so this is purely
@@ -677,13 +742,13 @@ pub fn hoist_signed_query_params(headers: &mut HeaderMap, query: Option<&str>) -
     let Some(query) = query else {
         return Ok(());
     };
-    if !query_may_carry_user_metadata(query) || is_request_signature_v2(headers) {
+    if !query_may_carry_hoistable_amz_param(query) || is_request_signature_v2(headers) {
         return Ok(());
     }
 
     // One pass over the query: recognize the presigned-SigV4 marker set and
-    // stage user metadata parameters. Nothing is validated
-    // or applied until the gate below passes, so a request whose query is not
+    // stage allowlisted `x-amz-*` request properties. Nothing is validated or
+    // applied until the gate below passes, so a request whose query is not
     // signature-covered is never rejected here.
     let mut algorithm = false;
     let mut credential = false;
@@ -692,10 +757,11 @@ pub fn hoist_signed_query_params(headers: &mut HeaderMap, query: Option<&str>) -
     let mut seen = std::collections::HashSet::new();
     let mut duplicate = false;
     for (name, value) in form_urlencoded::parse(query.as_bytes()) {
-        if name.eq_ignore_ascii_case("awsaccesskeyid") {
-            // A SigV2 presigned URL is recognized by its own credential
-            // parameter; the SigV4 markers below can be appended to it without
-            // invalidating the SigV2 signature, so it must not be widened.
+        if name.eq_ignore_ascii_case("awsaccesskeyid") || name.eq_ignore_ascii_case("signature") {
+            // A SigV2 presigned URL is recognized by its own credential or
+            // signature parameter; the SigV4 markers below can be appended to
+            // it without invalidating the SigV2 signature, so it must never be
+            // widened.
             if !value.is_empty() {
                 return Ok(());
             }
@@ -714,8 +780,9 @@ pub fn hoist_signed_query_params(headers: &mut HeaderMap, query: Option<&str>) -
             continue;
         }
         // Parameter names keep whatever case the signer used (`X-Amz-Meta-User-Id`
-        // is what a hoist produces), so match the prefix the way `HeaderName` would.
-        if !starts_with_ignore_ascii_case(&name, "x-amz-meta-") {
+        // or `X-Amz-Object-Lock-Mode` is what a hoist produces), so match
+        // case-insensitively the way `HeaderName` would.
+        if !is_hoistable_signed_query_param(&name) {
             continue;
         }
         let stored_name = name.to_ascii_lowercase();
@@ -735,8 +802,8 @@ pub fn hoist_signed_query_params(headers: &mut HeaderMap, query: Option<&str>) -
 
     for (name, value) in staged {
         // The read path rebuilds `x-amz-meta-<key>` as a header name and the
-        // value as a header value (s3s `add_opt_metadata`); anything that could
-        // not have arrived as a header would 500 every Head/Get of the object.
+        // value as a header value; anything that could not have arrived as a
+        // header would fail downstream header validation or Head/Get responses.
         let header_name = HeaderName::from_bytes(name.as_bytes())
             .map_err(|_| owned_error!(InvalidArgument, "Invalid x-amz request parameter name"))?;
         let header_value = HeaderValue::from_bytes(value.as_bytes())
@@ -1065,11 +1132,14 @@ fn reject_unsigned_presigned_headers_matching(
         if signed.iter().any(|signed_name| signed_name == name) {
             continue;
         }
-        // The query-hoist layer restores a signed `x-amz-meta-*` query parameter
-        // as a header before this rule runs a second time at the access boundary.
-        // Extension headers (`x-rustfs-*`, `x-minio-*`) are never hoisted from
-        // the query string, so they must always appear in `X-Amz-SignedHeaders`.
-        if !is_extension_header(name) && header_as_signed_query_value(header, query, name) {
+        // The query-hoist layer restores signed, allowlisted `x-amz-*` query
+        // parameters as headers before this rule runs a second time at the
+        // access boundary. Extension headers (`x-rustfs-*`, `x-minio-*`) and
+        // non-hoistable `x-amz-*` headers (e.g. `x-amz-content-sha256`,
+        // `x-amz-replication-status`, SSE-C customer keys) are never hoisted
+        // from the query string, so they must always appear in
+        // `X-Amz-SignedHeaders`.
+        if is_hoistable_signed_query_param(name) && header_as_signed_query_value(header, query, name) {
             continue;
         }
         warn!(
@@ -1087,19 +1157,28 @@ fn reject_unsigned_presigned_headers_matching(
 }
 
 /// True when `name` is a single-valued header whose value is exactly the value
-/// of a same-named query parameter.
+/// of a unique same-named query parameter.
 ///
 /// The SigV4 canonical query string covers every parameter except the signature
-/// itself, so a match proves the value the header carries is authorized. Only
-/// a single-valued header can match: the query-hoist layer never produces a
-/// multi-valued one, and a second value would be unsigned.
+/// itself, so a unique match proves the value the header carries is authorized.
+/// Only a single-valued header matching a single query occurrence can pass: the
+/// query-hoist layer rejects duplicate query keys and never produces a
+/// multi-valued header, so any extra value would be unsigned or conflicting.
 fn header_as_signed_query_value(header: &HeaderMap, query: &str, name: &str) -> bool {
     let mut values = header.get_all(name).iter();
     let (Some(value), None) = (values.next(), values.next()) else {
         return false;
     };
-    form_urlencoded::parse(query.as_bytes())
-        .any(|(param, param_value)| param.eq_ignore_ascii_case(name) && param_value.as_bytes() == value.as_bytes())
+    let mut matched = false;
+    for (param, param_value) in form_urlencoded::parse(query.as_bytes()) {
+        if param.eq_ignore_ascii_case(name) {
+            if matched || param_value.as_bytes() != value.as_bytes() {
+                return false;
+            }
+            matched = true;
+        }
+    }
+    matched
 }
 
 /// Parse the RustFS presigned PutObject size capability after authentication.
@@ -1329,6 +1408,197 @@ mod tests {
             assert_eq!(error.status_code(), Some(http::StatusCode::BAD_REQUEST));
             assert_eq!(error.message(), Some(message));
             assert!(error.source().is_none());
+        }
+    }
+
+    #[test]
+    fn hoist_signed_query_params_widens_sigv4_presigned_properties() {
+        let presigned_base = "X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=AKID%2F20261126%2Fus-east-1%2Fs3%2Faws4_request&X-Amz-Date=20261126T000000Z&X-Amz-Expires=300&X-Amz-SignedHeaders=host&X-Amz-Signature=deadbeef&X-Amz-Security-Token=session-tok";
+        let hoisted_pairs = [
+            ("X-Amz-Meta-Owner", "x-amz-meta-owner", "alice"),
+            ("X-Amz-Object-Lock-Mode", AMZ_OBJECT_LOCK_MODE_LOWER, "GOVERNANCE"),
+            (
+                "X-Amz-Object-Lock-Retain-Until-Date",
+                AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE_LOWER,
+                "2030-01-01T00:00:00Z",
+            ),
+            ("X-Amz-Object-Lock-Legal-Hold", AMZ_OBJECT_LOCK_LEGAL_HOLD_LOWER, "ON"),
+            ("X-Amz-Acl", "x-amz-acl", "private"),
+            ("X-Amz-Grant-Full-Control", "x-amz-grant-full-control", "id=owner-1"),
+            ("X-Amz-Grant-Read", "x-amz-grant-read", "id=reader-1"),
+            ("X-Amz-Grant-Write", "x-amz-grant-write", "id=writer-1"),
+            ("X-Amz-Grant-Read-Acp", "x-amz-grant-read-acp", "id=acp-reader"),
+            ("X-Amz-Grant-Write-Acp", "x-amz-grant-write-acp", "id=acp-writer"),
+            ("X-Amz-Tagging", "x-amz-tagging", "env=prod&team=core"),
+            ("X-Amz-Tagging-Directive", "x-amz-tagging-directive", "REPLACE"),
+            ("X-Amz-Storage-Class", "x-amz-storage-class", "STANDARD_IA"),
+            ("X-Amz-Website-Redirect-Location", "x-amz-website-redirect-location", "/redirect"),
+            ("X-Amz-Snowball-Auto-Extract", "x-amz-snowball-auto-extract", "true"),
+            ("X-Amz-Copy-Source", "x-amz-copy-source", "/src-bucket/src-key"),
+            ("X-Amz-Copy-Source-Range", "x-amz-copy-source-range", "bytes=0-10"),
+            ("X-Amz-Metadata-Directive", "x-amz-metadata-directive", "REPLACE"),
+            (
+                "X-Amz-Checksum-Sha256",
+                "x-amz-checksum-sha256",
+                "ungWv48Bz+pBQUDeXa4iI7ADYaOWF3qctBD/YfIAFa0=",
+            ),
+            ("X-Amz-Sdk-Checksum-Algorithm", "x-amz-sdk-checksum-algorithm", "SHA256"),
+            ("X-Amz-Server-Side-Encryption", "x-amz-server-side-encryption", "aws:kms"),
+            (
+                "X-Amz-Server-Side-Encryption-Aws-Kms-Key-Id",
+                "x-amz-server-side-encryption-aws-kms-key-id",
+                "kms-key-1",
+            ),
+            (
+                "X-Amz-Server-Side-Encryption-Context",
+                "x-amz-server-side-encryption-context",
+                "eyJhIjoiYiJ9",
+            ),
+        ];
+        let excluded_pairs = [
+            ("x-amz-content-sha256", "UNSIGNED-PAYLOAD"),
+            ("x-amz-replication-status", "REPLICA"),
+            ("x-amz-bypass-governance-retention", "true"),
+            ("x-amz-server-side-encryption-customer-algorithm", "AES256"),
+            ("x-amz-server-side-encryption-customer-key", "secret-key"),
+            ("x-rustfs-meta-owner", "mallory"),
+            ("x-rustfs-force-delete", "true"),
+            ("x-minio-force-delete", "true"),
+            ("x-amz-unknown-custom", "dropped"),
+        ];
+
+        let mut query = presigned_base.to_owned();
+        for (raw_name, _, val) in hoisted_pairs {
+            query.push('&');
+            query.push_str(raw_name);
+            query.push('=');
+            query.push_str(&urlencoding::encode(val));
+        }
+        for (raw_name, val) in excluded_pairs {
+            query.push('&');
+            query.push_str(raw_name);
+            query.push('=');
+            query.push_str(&urlencoding::encode(val));
+        }
+
+        let mut headers = HeaderMap::new();
+        // Pre-existing header must always win over a query parameter of the same name.
+        headers.insert("x-amz-storage-class", HeaderValue::from_static("STANDARD"));
+        hoist_signed_query_params(&mut headers, Some(&query)).expect("valid SigV4 presigned query must hoist");
+
+        for (_, lower_name, expected_val) in hoisted_pairs {
+            let expected = if lower_name == "x-amz-storage-class" {
+                "STANDARD"
+            } else {
+                expected_val
+            };
+            assert_eq!(
+                headers.get(lower_name).and_then(|v| v.to_str().ok()),
+                Some(expected),
+                "expected hoisted header {lower_name}"
+            );
+        }
+        for auth_param in [
+            "x-amz-algorithm",
+            "x-amz-credential",
+            "x-amz-date",
+            "x-amz-expires",
+            "x-amz-signedheaders",
+            "x-amz-signature",
+            "x-amz-security-token",
+        ] {
+            assert!(!headers.contains_key(auth_param), "SigV4 auth param {auth_param} must not be hoisted");
+        }
+        for (excluded_name, _) in excluded_pairs {
+            assert!(!headers.contains_key(excluded_name), "excluded param {excluded_name} must not be hoisted");
+        }
+
+        // Duplicate hoisted property (case-insensitive) fails closed without mutating headers.
+        let dup_query = format!("{presigned_base}&x-amz-tagging=a%3D1&X-Amz-Tagging=b%3D2&x-amz-acl=private");
+        let mut dup_headers = HeaderMap::new();
+        let err =
+            hoist_signed_query_params(&mut dup_headers, Some(&dup_query)).expect_err("duplicate x-amz-tagging must be rejected");
+        assert_eq!(err.code(), &S3ErrorCode::InvalidArgument);
+        assert!(dup_headers.is_empty(), "failed duplicate check must not mutate headers");
+    }
+
+    #[test]
+    fn hoist_signed_query_params_does_not_widen_sigv2_or_unsigned_requests() {
+        let payload_params = "x-amz-object-lock-legal-hold=ON&x-amz-object-lock-mode=GOVERNANCE&x-amz-acl=public-read&x-amz-grant-read=id%3D1&x-amz-tagging=k%3Dv&x-amz-storage-class=GLACIER&x-amz-copy-source=%2Fsrc%2Fkey&x-amz-meta-owner=mallory&x-amz-snowball-auto-extract=true";
+        let sigv4_markers = "X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=AKID%2F20261126%2Fus-east-1%2Fs3%2Faws4_request&X-Amz-Signature=deadbeef";
+
+        // 1. Anonymous / unsigned query.
+        let mut headers = HeaderMap::new();
+        hoist_signed_query_params(&mut headers, Some(payload_params)).expect("unsigned query is ignored");
+        assert!(headers.is_empty());
+
+        // 2. SigV2 Authorization header (even with SigV4 query markers appended).
+        let mut headers = HeaderMap::new();
+        headers.insert(http::header::AUTHORIZATION, HeaderValue::from_static("AWS AKID:sigv2"));
+        let query = format!("{sigv4_markers}&{payload_params}");
+        hoist_signed_query_params(&mut headers, Some(&query)).expect("SigV2 Authorization header must not hoist");
+        assert_eq!(headers.len(), 1);
+
+        // 3. SigV2 presigned URL (AWSAccessKeyId + Signature) with appended SigV4 markers.
+        let mut headers = HeaderMap::new();
+        let sigv2_widened = format!("AWSAccessKeyId=AKID&Expires=1893456000&Signature=sigv2&{sigv4_markers}&{payload_params}");
+        hoist_signed_query_params(&mut headers, Some(&sigv2_widened)).expect("SigV2 presigned URL must not hoist");
+        assert!(headers.is_empty());
+
+        // 4. SigV2 Signature marker alone with appended SigV4 markers.
+        let mut headers = HeaderMap::new();
+        let sigv2_sig_only = format!("Signature=sigv2&{sigv4_markers}&{payload_params}");
+        hoist_signed_query_params(&mut headers, Some(&sigv2_sig_only)).expect("SigV2 Signature marker must not hoist");
+        assert!(headers.is_empty());
+    }
+
+    #[test]
+    fn presigned_unsigned_header_guard_accepts_hoisted_properties_and_rejects_smuggling() {
+        let base = "X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Date=20261126T000000Z&X-Amz-Expires=900&X-Amz-SignedHeaders=host&X-Amz-Credential=test%2F20261126%2Fus-east-1%2Fs3%2Faws4_request&X-Amz-Signature=signature";
+        let query = format!(
+            "{base}&x-amz-object-lock-mode=GOVERNANCE&x-amz-object-lock-legal-hold=ON&x-amz-acl=private&x-amz-grant-read=id%3Dreader&x-amz-tagging=a%3Db&x-amz-storage-class=STANDARD_IA&x-amz-copy-source=%2Fsrc%2Fkey"
+        );
+
+        let mut headers = HeaderMap::new();
+        hoist_signed_query_params(&mut headers, Some(&query)).expect("hoist signed properties");
+        reject_unsigned_amz_headers_on_presigned_request(&headers, Some(&query))
+            .expect("hoisted signed query properties must pass presigned unsigned-header guard");
+
+        // Tampered header value (does not match signed query) must be denied.
+        let mut tampered = headers.clone();
+        tampered.insert("x-amz-tagging", HeaderValue::from_static("a=evil"));
+        assert_unsigned_headers_denied(reject_unsigned_amz_headers_on_presigned_request(&tampered, Some(&query)));
+
+        // Extra unsigned header not in query or SignedHeaders must be denied.
+        let mut extra = headers.clone();
+        extra.insert("x-amz-website-redirect-location", HeaderValue::from_static("https://evil.example"));
+        assert_unsigned_headers_denied(reject_unsigned_amz_headers_on_presigned_request(&extra, Some(&query)));
+
+        // Multi-valued header (matching query + unsigned second value) must be denied.
+        let mut multi = headers.clone();
+        multi.append("x-amz-acl", HeaderValue::from_static("public-read"));
+        assert_unsigned_headers_denied(reject_unsigned_amz_headers_on_presigned_request(&multi, Some(&query)));
+
+        // Duplicate query parameter must never satisfy the signed-query exemption.
+        let dup_query = format!("{base}&x-amz-tagging=a%3Db&X-Amz-Tagging=c%3Dd");
+        let mut dup_headers = HeaderMap::new();
+        dup_headers.insert("x-amz-tagging", HeaderValue::from_static("a=b"));
+        assert_unsigned_headers_denied(reject_unsigned_amz_headers_on_presigned_request(&dup_headers, Some(&dup_query)));
+
+        // Non-hoistable `x-amz-*` headers cannot bypass X-Amz-SignedHeaders via a matching query parameter.
+        for (name, value) in [
+            ("x-amz-content-sha256", "UNSIGNED-PAYLOAD"),
+            ("x-amz-replication-status", "REPLICA"),
+            ("x-amz-bypass-governance-retention", "true"),
+            ("x-amz-server-side-encryption-customer-key", "secret-key"),
+        ] {
+            let matching_query = format!("{base}&{name}={}", urlencoding::encode(value));
+            let mut smuggled = HeaderMap::new();
+            smuggled.insert(
+                HeaderName::from_bytes(name.as_bytes()).expect("header name"),
+                HeaderValue::from_str(value).expect("header value"),
+            );
+            assert_unsigned_headers_denied(reject_unsigned_amz_headers_on_presigned_request(&smuggled, Some(&matching_query)));
         }
     }
 

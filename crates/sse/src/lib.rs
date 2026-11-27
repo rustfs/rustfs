@@ -79,12 +79,12 @@ pub use crate::core::keying::metadata::{
     ConflictingEncryptionMetadata, encryption_material_to_metadata, mark_encrypted_multipart_metadata,
     normalize_encryption_metadata_case, stored_ssec_metadata, strip_managed_encryption_metadata,
 };
-pub use crate::core::read::{DecryptionRequest, classify_sse_read_response, sse_decryption};
+pub use crate::core::read::{DecryptionRequest, authorize_sse_kms_object_read, classify_sse_read_response, sse_decryption};
 pub use crate::core::request::SseKmsPrincipal;
 #[cfg(any(test, feature = "test-util"))]
 pub use crate::core::request::TestAuthorizationHooks;
 pub use crate::core::rewrap::{ObjectDekRewrapOutcome, rewrap_object_encryption_metadata};
-pub use crate::core::s3::authorization::{authorize_sse_kms_multipart_write, authorize_sse_kms_object_read};
+pub use crate::core::s3::authorization::authorize_sse_kms_multipart_write;
 pub use crate::core::s3::headers::{
     SseReadResponseHeaders, SsecParamsFromHeaders, build_ssec_read_headers, extract_server_side_encryption_from_headers,
     extract_ssec_params_from_headers, extract_ssekms_context_from_headers, project_sse_read_response_headers,

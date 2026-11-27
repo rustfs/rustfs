@@ -246,8 +246,44 @@ pub(crate) async fn authorize_copy_object<R: AuthorizationRequest + ?Sized>(
     info.bucket = Some(facts.bucket.to_owned());
     info.object = Some(facts.key.to_owned());
     info.version_id = destination_version.clone();
-    set_requested_object_lock_retain_until(req, facts.retain_until);
-    let replacement = crate::storage::s3_api::tagging::resolve_copy_object_tags(facts.tagging, facts.tagging_directive)?;
+    let (retain_until, legal_hold, retention) = super::object_write::resolve_hoisted_object_lock_authorization(
+        req,
+        false,
+        facts.retain_until,
+        facts.legal_hold,
+        facts.retention,
+    )?;
+    set_requested_object_lock_retain_until(req, retain_until);
+    let hoisted_tagging = match facts.tagging {
+        Some(tagging) => Some(tagging.to_owned()),
+        None => req
+            .headers()
+            .get("x-amz-tagging")
+            .map(|value| {
+                value
+                    .to_str()
+                    .map(str::to_owned)
+                    .map_err(|_| s3_error!(InvalidTag, "The Tagging header contains invalid UTF-8"))
+            })
+            .transpose()?,
+    };
+    let hoisted_tagging_directive = match facts.tagging_directive {
+        Some(directive) => Some(directive.to_owned()),
+        None => req
+            .headers()
+            .get("x-amz-tagging-directive")
+            .map(|value| {
+                value
+                    .to_str()
+                    .map(str::to_owned)
+                    .map_err(|_| s3_error!(InvalidArgument, "The TaggingDirective header is invalid"))
+            })
+            .transpose()?,
+    };
+    let replacement = crate::storage::s3_api::tagging::resolve_copy_object_tags(
+        hoisted_tagging.as_deref(),
+        hoisted_tagging_directive.as_deref(),
+    )?;
     let store = request_object_store(req)?;
     let copies_tags = replacement.is_none();
     let source_tags = if copies_tags {
@@ -296,10 +332,10 @@ pub(crate) async fn authorize_copy_object<R: AuthorizationRequest + ?Sized>(
     if !replication_request_authorized(req) {
         authorize_replication_only_put_headers(req).await?;
     }
-    if facts.legal_hold {
+    if legal_hold {
         authorize_request(req, Action::S3Action(S3Action::PutObjectLegalHoldAction)).await?;
     }
-    if facts.retention {
+    if retention {
         authorize_request(req, Action::S3Action(S3Action::PutObjectRetentionAction)).await?;
     }
     req.install_bucket_generation(bucket_generation?);

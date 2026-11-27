@@ -147,6 +147,11 @@ pub(crate) trait AuthorizationRequest {
     /// The headers that describe what the request stores: a POST upload's form
     /// fields when present, otherwise the request headers.
     fn policy_headers(&self) -> &HeaderMap;
+    /// True when the request is a browser POST Object upload whose properties
+    /// come from authenticated multipart form fields, never URL query params.
+    fn is_post_object(&self) -> bool {
+        false
+    }
     fn install_post_object_policy_headers(&mut self, headers: PostObjectPolicyHeaders);
     fn install_post_object_marker(&mut self);
     fn object_tag_conditions(&self) -> Option<&ObjectTagConditions>;

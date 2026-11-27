@@ -1262,6 +1262,53 @@ impl Drop for PutObjectCommitted {
     }
 }
 
+#[inline(never)]
+fn apply_hoisted_put_headers(input: &mut PutObjectWriteInput, headers: &HeaderMap) -> S3Result<()> {
+    if input.storage_class.is_none() {
+        input.storage_class = super::shared::optional_header_string(headers, "x-amz-storage-class")?;
+    }
+    if input.tagging.is_none() {
+        input.tagging = super::shared::optional_header_string(headers, "x-amz-tagging")?;
+    }
+    if input.website_redirect_location.is_none() {
+        input.website_redirect_location = super::shared::optional_header_string(headers, "x-amz-website-redirect-location")?;
+    }
+    if input.object_lock_legal_hold_status.is_none() {
+        input.object_lock_legal_hold_status = super::shared::optional_header_string(headers, AMZ_OBJECT_LOCK_LEGAL_HOLD_LOWER)?;
+    }
+    if input.object_lock_mode.is_none() {
+        input.object_lock_mode = super::shared::optional_header_string(headers, AMZ_OBJECT_LOCK_MODE_LOWER)?;
+    }
+    if input.object_lock_retain_until_date.is_none() {
+        input.object_lock_retain_until_date = super::shared::optional_object_lock_retain_until_from_headers(headers)?;
+    }
+    if input.ssekms_key_id.is_none() {
+        input.ssekms_key_id = super::shared::optional_header_string(headers, "x-amz-server-side-encryption-aws-kms-key-id")?;
+    }
+    if input.checksum_crc32.is_none() {
+        input.checksum_crc32 = super::shared::optional_header_string(headers, "x-amz-checksum-crc32")?;
+    }
+    if input.checksum_crc32c.is_none() {
+        input.checksum_crc32c = super::shared::optional_header_string(headers, "x-amz-checksum-crc32c")?;
+    }
+    if input.checksum_sha1.is_none() {
+        input.checksum_sha1 = super::shared::optional_header_string(headers, "x-amz-checksum-sha1")?;
+    }
+    if input.checksum_sha256.is_none() {
+        input.checksum_sha256 = super::shared::optional_header_string(headers, "x-amz-checksum-sha256")?;
+    }
+    if input.checksum_crc64nvme.is_none() {
+        input.checksum_crc64nvme = super::shared::optional_header_string(headers, "x-amz-checksum-crc64nvme")?;
+    }
+    if input.checksum_algorithm.is_none() {
+        input.checksum_algorithm = match super::shared::optional_header_string(headers, "x-amz-sdk-checksum-algorithm")? {
+            Some(value) => Some(value),
+            None => super::shared::optional_header_string(headers, "x-amz-checksum-algorithm")?,
+        };
+    }
+    Ok(())
+}
+
 impl DefaultObjectUsecase {
     fn should_use_large_put_concurrency_tuning(size: i64) -> bool {
         size >= DEFAULT_PUT_LARGE_CONCURRENCY_TUNING_MIN_SIZE_BYTES
@@ -1331,6 +1378,10 @@ impl DefaultObjectUsecase {
             envelope.verified_presigned().is_some(),
         )?;
         let is_post_object = envelope.post_object().is_some() || envelope.is_gateway_post();
+        let mut input = input;
+        if !is_post_object {
+            apply_hoisted_put_headers(&mut input, envelope.headers())?;
+        }
         if is_post_object && is_post_object_sse_kms_requested(&input, envelope.headers()) {
             return Err(rustfs_s3_types::s3_error!(
                 NotImplemented,
@@ -6241,5 +6292,96 @@ mod oversize_single_upload_tests {
         let err = reject_oversize_single_upload(ceiling + 1).expect_err("one byte over must be rejected");
         assert_eq!(err.code(), &rustfs_s3_types::S3ErrorCode::EntityTooLarge);
         assert_eq!(err.message(), Some("Your proposed upload exceeds the maximum allowed object size."));
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn put_object_echoes_and_verifies_hoisted_checksum_headers() {
+        use crate::app::storage_api::test::contract::bucket::{BucketOperations as _, DeleteBucketOptions, MakeBucketOptions};
+
+        let (store, context) = crate::app::object::test_support::real_store_test_context().await;
+        let usecase = DefaultObjectUsecase::with_context(Some(context));
+        let bucket = format!("put-hoisted-checksum-{}", Uuid::new_v4());
+        store
+            .make_bucket(&bucket, &MakeBucketOptions::default())
+            .await
+            .expect("create bucket");
+
+        let payload = b"hoisted-put-checksum-payload";
+        let expected_sha256 = {
+            use sha2::{Digest, Sha256};
+            base64_simd::STANDARD.encode_to_string(Sha256::digest(payload))
+        };
+
+        // 1. Hoisted checksum + algorithm in headers (with DTO checksum fields None) succeeds and echoes checksum.
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-amz-checksum-sha256",
+            http::HeaderValue::from_str(&expected_sha256).expect("sha256 header"),
+        );
+        headers.insert("x-amz-sdk-checksum-algorithm", http::HeaderValue::from_static("SHA256"));
+        let envelope = crate::app::RequestEnvelope::from_parts(
+            crate::app::RequestHead {
+                method: http::Method::PUT,
+                uri: http::Uri::from_static("/bucket/checked.txt"),
+                headers,
+                credentials: None,
+                region: None,
+                service: None,
+            },
+            http::Extensions::new(),
+        );
+        let input = PutObjectWriteInput {
+            bucket: bucket.clone(),
+            key: "checked.txt".to_owned(),
+            body: Some(NativeBody::from_bytes(Bytes::from_static(payload))),
+            content_length: Some(payload.len() as i64),
+            ..Default::default()
+        };
+        let output = Box::pin(usecase.execute_put_object_owned(envelope, input))
+            .await
+            .expect("PUT with hoisted checksum should succeed");
+        assert_eq!(output.checksum_sha256.as_deref(), Some(expected_sha256.as_str()));
+
+        // 2. Mismatched hoisted checksum fails validation.
+        let mut bad_headers = HeaderMap::new();
+        bad_headers.insert(
+            "x-amz-checksum-sha256",
+            http::HeaderValue::from_static("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="),
+        );
+        bad_headers.insert("x-amz-sdk-checksum-algorithm", http::HeaderValue::from_static("SHA256"));
+        let bad_envelope = crate::app::RequestEnvelope::from_parts(
+            crate::app::RequestHead {
+                method: http::Method::PUT,
+                uri: http::Uri::from_static("/bucket/bad.txt"),
+                headers: bad_headers,
+                credentials: None,
+                region: None,
+                service: None,
+            },
+            http::Extensions::new(),
+        );
+        let bad_input = PutObjectWriteInput {
+            bucket: bucket.clone(),
+            key: "bad.txt".to_owned(),
+            body: Some(NativeBody::from_bytes(Bytes::from_static(payload))),
+            content_length: Some(payload.len() as i64),
+            ..Default::default()
+        };
+        let err = Box::pin(usecase.execute_put_object_owned(bad_envelope, bad_input))
+            .await
+            .expect_err("PUT with mismatched hoisted checksum must fail");
+        assert_eq!(err.code(), &rustfs_s3_types::S3ErrorCode::BadDigest);
+
+        store
+            .delete_bucket(
+                &bucket,
+                &DeleteBucketOptions {
+                    force: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("clean up hoisted checksum bucket");
     }
 }

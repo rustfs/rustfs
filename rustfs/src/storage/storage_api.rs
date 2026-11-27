@@ -488,7 +488,11 @@ pub(crate) mod test_consumer {
     pub(crate) use super::super::access_owned::object_read::authorize_head_object;
     pub(crate) use rustfs_ecstore::api::object::test_util::DeleteAfterObjectLockSnapshotBarrier;
     pub(crate) mod sse {
-        pub(crate) use super::super::super::sse::{RecordingKmsKeyAuthorizer, TestAuthorizationHooks, sse_kms_object_metadata};
+        pub(crate) use super::super::super::sse::{
+            RecordingKmsKeyAuthorizer, SseDekProvider, TestAuthorizationHooks, reset_sse_dek_provider,
+            set_sse_dek_provider_for_test, sse_kms_object_metadata,
+        };
+        pub(crate) use rustfs_sse::SseError;
     }
     pub(crate) use super::super::{
         apply_cors_headers, apply_default_lock_retention_metadata, check_preconditions, decode_tags_to_map,

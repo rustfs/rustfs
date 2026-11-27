@@ -51,6 +51,36 @@ impl CopySourceDates {
         }
     }
 
+    pub(crate) fn merge_headers(&mut self, headers: &http::HeaderMap) -> rustfs_s3_types::S3Result<()> {
+        fn parse_copy_date(headers: &http::HeaderMap, name: &str) -> rustfs_s3_types::S3Result<Option<i64>> {
+            let Some(value) = headers.get(name) else {
+                return Ok(None);
+            };
+            let raw = value
+                .to_str()
+                .map_err(|_| rustfs_s3_types::s3_error!(InvalidArgument, "Invalid copy source date condition"))?
+                .trim();
+            if raw.is_empty() {
+                return Ok(None);
+            }
+            let secs = rustfs_gateway_types::Timestamp::parse(raw, rustfs_gateway_types::TimestampFormat::HttpDate)
+                .map(|at| at.secs())
+                .or_else(|_| {
+                    OffsetDateTime::parse(raw, &time::format_description::well_known::Rfc3339).map(OffsetDateTime::unix_timestamp)
+                })
+                .map_err(|_| rustfs_s3_types::s3_error!(InvalidArgument, "Invalid copy source date condition"))?;
+            Ok(Some(secs))
+        }
+
+        if self.modified_since.is_none() {
+            self.modified_since = parse_copy_date(headers, "x-amz-copy-source-if-modified-since")?;
+        }
+        if self.unmodified_since.is_none() {
+            self.unmodified_since = parse_copy_date(headers, "x-amz-copy-source-if-unmodified-since")?;
+        }
+        Ok(())
+    }
+
     pub(crate) fn permits_copy(
         &self,
         if_match: Option<&CopySourceCondition>,

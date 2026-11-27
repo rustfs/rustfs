@@ -1413,6 +1413,25 @@ fn retain_cold_fill_producer_for_matching_plan(
     }
 }
 
+async fn authorize_cold_fill_producer_or_bypass(
+    producer: ColdFillProducer,
+    principal: Option<&SseKmsPrincipal>,
+    metadata: &HashMap<String, String>,
+) -> Option<ColdFillProducer> {
+    if authorize_sse_kms_object_read(principal, metadata).await.is_ok() {
+        Some(producer)
+    } else {
+        // Bypass the shared cold-fill session rather than relinquishing or
+        // finishing with a shared error: relinquishing would promote a follower
+        // while keeping the denied producer waiting for the follower's plaintext,
+        // and publishing a shared error would wrongly deny an authorized
+        // follower. Bypass forces every participant onto its own independent
+        // pre-unwrap authorization path.
+        producer.bypass();
+        None
+    }
+}
+
 impl<R> futures::Stream for GetObjectReaderStream<R>
 where
     R: AsyncRead,
@@ -2083,16 +2102,17 @@ struct GetObjectResumeIdentity {
 }
 
 impl GetObjectResumeIdentity {
+    fn matches_metadata(&self, info: &ObjectInfo) -> bool {
+        self.version_id == info.version_id && self.mod_time == info.mod_time && self.etag == info.etag
+    }
+
     fn matches(&self, info: &ObjectInfo, emitted: usize) -> bool {
         let expected_size = if self.range_dependent_size {
             self.size - emitted as i64
         } else {
             self.size
         };
-        self.version_id == info.version_id
-            && self.mod_time == info.mod_time
-            && expected_size == info.size
-            && self.etag == info.etag
+        self.matches_metadata(info) && expected_size == info.size
     }
 }
 
@@ -2106,6 +2126,7 @@ struct GetObjectResumeContext {
     key: String,
     opts: ObjectOptions,
     ssec_headers: HeaderMap,
+    principal: Option<SseKmsPrincipal>,
     // Resolved plaintext offsets of the committed response body, captured
     // after `HTTPRangeSpec::get_offset_length`: suffix ranges and partNumber
     // GETs are already resolved to absolute offsets at that point, so the
@@ -2141,6 +2162,7 @@ impl GetObjectResumeContext {
             key: key.to_string(),
             opts,
             ssec_headers,
+            principal: None,
             range_start,
             range_end,
             identity: GetObjectResumeIdentity {
@@ -2151,6 +2173,11 @@ impl GetObjectResumeContext {
                 range_dependent_size: info.is_encrypted() || info.is_compressed(),
             },
         }
+    }
+
+    fn with_principal(mut self, principal: Option<SseKmsPrincipal>) -> Self {
+        self.principal = principal;
+        self
     }
 
     fn resume_range(range_start: i64, range_end: i64, emitted: usize) -> Option<HTTPRangeSpec> {
@@ -2185,9 +2212,9 @@ impl GetObjectResumeContext {
                 }
             })?;
         let range = Self::resume_range(self.range_start, self.range_end, emitted);
-        let reader = self
+        let prepared = self
             .store
-            .get_object_reader(&self.bucket, &self.key, range, self.ssec_headers.clone(), &self.opts)
+            .prepare_get_object_reader(&self.bucket, &self.key, range, self.ssec_headers.clone(), &self.opts)
             .await
             .map_err(|err| {
                 debug!(
@@ -2198,6 +2225,29 @@ impl GetObjectResumeContext {
                 );
                 GetObjectResumeFailure::Retryable
             })?;
+        if !self.identity.matches_metadata(prepared.object_info()) {
+            warn!(
+                bucket = %self.bucket,
+                object = %self.key,
+                "GetObject mid-stream resume resolved a different object version; refusing to splice content"
+            );
+            return Err(GetObjectResumeFailure::Fatal);
+        }
+        if authorize_sse_kms_object_read(self.principal.as_ref(), &prepared.object_info().user_defined)
+            .await
+            .is_err()
+        {
+            return Err(GetObjectResumeFailure::Fatal);
+        }
+        let reader = prepared.into_reader().await.map_err(|err| {
+            debug!(
+                bucket = %self.bucket,
+                object = %self.key,
+                error = %err,
+                "GetObject mid-stream resume reopen failed"
+            );
+            GetObjectResumeFailure::Retryable
+        })?;
         if !self.identity.matches(&reader.object_info, emitted) {
             warn!(
                 bucket = %self.bucket,
@@ -2878,9 +2928,10 @@ impl DefaultObjectUsecase {
         let read_start = std::time::Instant::now();
         let read_stage_start = rustfs_io_metrics::get_stage_metrics_enabled().then_some(read_start);
         let store_headers = project_ssec_transport_headers(envelope.headers());
+        let read_principal = SseKmsPrincipal::from_request(envelope);
         let cache_adapter = self.object_data_cache();
         let conditional = has_read_preconditions(envelope.headers());
-        if cache_adapter.is_disabled() || !cache_adapter.materialize_fill_enabled() {
+        if cache_adapter.is_disabled() {
             let io_planning = Self::acquire_get_object_io_planning(
                 manager,
                 Some(GetObjectRequestTimeout {
@@ -2891,13 +2942,23 @@ impl DefaultObjectUsecase {
                 key,
             )
             .await?;
+            let prepared = track_object_read_setup(
+                object_traffic_health.as_deref(),
+                store.prepare_get_object_reader(bucket, key, rs.clone(), HeaderMap::new(), opts),
+            )
+            .await
+            .map_err(map_get_object_reader_error)?;
+            // Authorize `kms:Decrypt` on the prepared metadata snapshot before
+            // entering `into_reader()`, which unwraps the stored DEK inside
+            // ecstore without a request principal (rustfs/backlog#2702).
+            authorize_sse_kms_object_read(read_principal.as_ref(), &prepared.object_info().user_defined).await?;
             let reader = track_object_read_setup(
                 object_traffic_health.as_deref(),
                 Self::with_get_object_conditions(
                     envelope,
                     input,
                     part_number,
-                    store.get_object_reader(bucket, key, rs.clone(), store_headers, opts),
+                    prepared.with_headers(store_headers).into_reader(),
                 ),
             )
             .await
@@ -2928,6 +2989,9 @@ impl DefaultObjectUsecase {
         )
         .await
         .map_err(map_get_object_reader_error)?;
+        // Authorize `kms:Decrypt` before conditional checks, cache hits, cold
+        // fills, or `into_reader()` DEK unwrapping (rustfs/backlog#2702).
+        authorize_sse_kms_object_read(read_principal.as_ref(), &initial_metadata.object_info().user_defined).await?;
         let mut cache_fill_allowed = true;
         let mut legacy_hook_missed = false;
         if conditional {
@@ -3030,6 +3094,9 @@ impl DefaultObjectUsecase {
                 });
             }
 
+            if !cache_adapter.materialize_fill_enabled() {
+                break 'snapshot;
+            }
             let GetObjectBodyCachePlan::Cacheable(engine_plan) = &cache_plan else {
                 break 'snapshot;
             };
@@ -3054,6 +3121,7 @@ impl DefaultObjectUsecase {
                 let store = &store;
                 let range = &rs;
                 let object_traffic_health = &object_traffic_health;
+                let producer_principal = read_principal.clone();
                 move |producer| {
                     let adapter = Arc::clone(adapter);
                     let engine_plan = engine_plan.clone();
@@ -3070,6 +3138,7 @@ impl DefaultObjectUsecase {
                     // the materialized body like any cache hit.
                     opts.get_object_sink = None;
                     let object_traffic_health = object_traffic_health.as_ref().map(Arc::clone);
+                    let producer_principal = producer_principal.clone();
                     async move {
                         let producer_deadline = producer.deadline();
                         let cancellation = producer.cancellation_token();
@@ -3158,6 +3227,15 @@ impl DefaultObjectUsecase {
                             },
                         );
                         let Some(producer) = retain_cold_fill_producer_for_matching_plan(producer, &current_plan, &engine_plan)
+                        else {
+                            return;
+                        };
+                        let Some(producer) = authorize_cold_fill_producer_or_bypass(
+                            producer,
+                            producer_principal.as_ref(),
+                            &prepared.object_info().user_defined,
+                        )
+                        .await
                         else {
                             return;
                         };
@@ -3253,37 +3331,24 @@ impl DefaultObjectUsecase {
                 key,
             )
             .await?;
-            let reader = if legacy_hook_missed {
-                let prepared = track_object_read_setup(
-                    object_traffic_health.as_deref(),
-                    store.prepare_get_object_reader(bucket, key, rs.clone(), HeaderMap::new(), opts),
-                )
-                .await
-                .map_err(map_get_object_reader_error)?;
-                track_object_read_setup(
-                    object_traffic_health.as_deref(),
-                    Self::with_get_object_conditions(
-                        envelope,
-                        input,
-                        part_number,
-                        prepared.with_headers(store_headers).into_reader(),
-                    ),
-                )
-                .await
-                .map_err(map_get_object_reader_error)?
-            } else {
-                track_object_read_setup(
-                    object_traffic_health.as_deref(),
-                    Self::with_get_object_conditions(
-                        envelope,
-                        input,
-                        part_number,
-                        store.get_object_reader(bucket, key, rs.clone(), store_headers, opts),
-                    ),
-                )
-                .await
-                .map_err(map_get_object_reader_error)?
-            };
+            let prepared = track_object_read_setup(
+                object_traffic_health.as_deref(),
+                store.prepare_get_object_reader(bucket, key, rs.clone(), HeaderMap::new(), opts),
+            )
+            .await
+            .map_err(map_get_object_reader_error)?;
+            authorize_sse_kms_object_read(read_principal.as_ref(), &prepared.object_info().user_defined).await?;
+            let reader = track_object_read_setup(
+                object_traffic_health.as_deref(),
+                Self::with_get_object_conditions(
+                    envelope,
+                    input,
+                    part_number,
+                    prepared.with_headers(store_headers).into_reader(),
+                ),
+            )
+            .await
+            .map_err(map_get_object_reader_error)?;
             (io_planning, reader)
         };
         let read_setup = Self::finish_get_object_read(
@@ -4885,16 +4950,19 @@ impl DefaultObjectUsecase {
                 lifecycle,
                 |info| {
                     should_attach_get_object_resume(info).then(|| {
-                        get_object_resume_control(GetObjectResumeContext::new(
-                            store,
-                            &bucket,
-                            &key,
-                            opts,
-                            envelope.headers(),
-                            info,
-                            resume_range_start,
-                            resume_range_end,
-                        ))
+                        get_object_resume_control(
+                            GetObjectResumeContext::new(
+                                store,
+                                &bucket,
+                                &key,
+                                opts,
+                                envelope.headers(),
+                                info,
+                                resume_range_start,
+                                resume_range_end,
+                            )
+                            .with_principal(SseKmsPrincipal::from_request(&envelope)),
+                        )
                     })
                 },
             )
@@ -12383,6 +12451,542 @@ mod tests {
         assert_eq!(err.code(), &rustfs_s3_types::S3ErrorCode::InvalidArgument);
         assert_eq!(err.message(), Some("range and part_number invalid"));
         assert_eq!(err.status_code(), Some(http::StatusCode::BAD_REQUEST));
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn get_object_denies_unauthorized_sse_kms_before_dek_unwrap() {
+        use crate::app::storage_api::test::ReqInfo;
+        use crate::app::storage_api::test::contract::bucket::{BucketOperations as _, DeleteBucketOptions, MakeBucketOptions};
+        use crate::app::storage_api::test::sse::{
+            RecordingKmsKeyAuthorizer, SseDekProvider, SseError, TestAuthorizationHooks, reset_sse_dek_provider,
+            set_sse_dek_provider_for_test,
+        };
+        use rustfs_kms::DataKey;
+        use rustfs_kms::types::ObjectEncryptionContext;
+        use rustfs_policy::policy::action::KmsAction;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct ProviderResetGuard;
+        impl Drop for ProviderResetGuard {
+            fn drop(&mut self) {
+                reset_sse_dek_provider();
+            }
+        }
+
+        #[derive(Clone, Copy)]
+        enum DecryptOutcome {
+            Ok,
+            KeyNotFound,
+            ServiceUnavailable,
+        }
+
+        struct CountingKmsProvider {
+            decrypt_calls: Arc<AtomicUsize>,
+            outcome: Arc<std::sync::Mutex<DecryptOutcome>>,
+            plaintext_dek: [u8; 32],
+        }
+
+        #[async_trait::async_trait]
+        impl SseDekProvider for CountingKmsProvider {
+            async fn generate_sse_dek(
+                &self,
+                context: &ObjectEncryptionContext,
+                kms_key_id: &str,
+            ) -> Result<(DataKey, Vec<u8>), SseError> {
+                let nonce = [0x22u8; 12];
+                let wrapped = serde_json::to_vec(&serde_json::json!({
+                    "key_id": "dek-test-get",
+                    "master_key_id": kms_key_id,
+                    "key_spec": "AES_256",
+                    "encrypted_key": self.plaintext_dek.to_vec(),
+                    "nonce": nonce.to_vec(),
+                    "encryption_context": context.encryption_context,
+                    "created_at": "2026-01-01T00:00:00Z[UTC]",
+                    "master_key_version": 1,
+                }))
+                .expect("serialize envelope");
+                Ok((
+                    DataKey {
+                        plaintext_key: self.plaintext_dek,
+                        nonce,
+                    },
+                    wrapped,
+                ))
+            }
+
+            async fn decrypt_sse_dek(
+                &self,
+                _encrypted_dek: &[u8],
+                kms_key_id: &str,
+                _context: &ObjectEncryptionContext,
+            ) -> Result<[u8; 32], SseError> {
+                self.decrypt_calls.fetch_add(1, Ordering::SeqCst);
+                let outcome = *self.outcome.lock().expect("outcome lock");
+                match outcome {
+                    DecryptOutcome::Ok => Ok(self.plaintext_dek),
+                    DecryptOutcome::KeyNotFound => Err(SseError::internal(rustfs_kms::KmsError::key_not_found(kms_key_id))),
+                    DecryptOutcome::ServiceUnavailable => Err(SseError::internal(rustfs_kms::KmsUnavailableError)),
+                }
+            }
+        }
+
+        let _reset = ProviderResetGuard;
+        let decrypt_calls = Arc::new(AtomicUsize::new(0));
+        let outcome = Arc::new(std::sync::Mutex::new(DecryptOutcome::Ok));
+        let plaintext_dek = [0x6B; 32];
+        set_sse_dek_provider_for_test(Arc::new(CountingKmsProvider {
+            decrypt_calls: Arc::clone(&decrypt_calls),
+            outcome: Arc::clone(&outcome),
+            plaintext_dek,
+        }));
+
+        let store = crate::app::gating_test_env::shared_gating_ecstore().await;
+        if current_app_context().is_none() {
+            crate::app::runtime_sources::install_test_app_context(Arc::clone(&store)).await;
+        }
+        let ambient = current_app_context().expect("GetObject KMS test requires an AppContext");
+        let bucket = format!("get-kms-preauth-{}", Uuid::new_v4());
+        store
+            .make_bucket(&bucket, &MakeBucketOptions::default())
+            .await
+            .expect("create KMS get test bucket");
+
+        let kms_key = "kms-secret.bin";
+        let payload = b"confidential-kms-plaintext";
+        let write_principal = SseKmsPrincipal::new("writer".to_string(), None, false, HashMap::new(), HashMap::new())
+            .with_test_hooks(Some(TestAuthorizationHooks {
+                enforced: true,
+                authorizer: RecordingKmsKeyAuthorizer::new(true),
+            }));
+        let kms_material = sse_encryption(EncryptionRequest {
+            bucket: &bucket,
+            key: kms_key,
+            server_side_encryption: Some("aws:kms".to_string()),
+            ssekms_key_id: Some("finance-key".to_string()),
+            ssekms_context: None,
+            sse_customer_algorithm: None,
+            sse_customer_key: None,
+            sse_customer_key_md5: None,
+            content_size: payload.len() as i64,
+            principal: Some(&write_principal),
+        })
+        .await
+        .expect("encrypt SSE-KMS test object")
+        .expect("SSE-KMS material");
+        let mut kms_meta = encryption_material_to_metadata(&kms_material).expect("kms metadata");
+        let kms_reader = WritePlan::new()
+            .with_encryption(kms_material.write_encryption(None))
+            .apply(
+                HashReader::from_stream(
+                    std::io::Cursor::new(payload.to_vec()),
+                    payload.len() as i64,
+                    payload.len() as i64,
+                    None,
+                    None,
+                    false,
+                )
+                .expect("hash reader"),
+                payload.len() as i64,
+            )
+            .expect("apply SSE-KMS write plan");
+        store
+            .put_object(
+                &bucket,
+                kms_key,
+                &mut PutObjReader::new(kms_reader),
+                &ObjectOptions {
+                    user_defined: kms_meta.clone(),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("store SSE-KMS object");
+
+        let corrupt_key = "kms-corrupt.bin";
+        kms_meta.insert(
+            rustfs_utils::http::object_encryption_keys::INTERNAL_ENCRYPTION_KEY_HEADER.to_string(),
+            "not-a-valid-envelope".to_string(),
+        );
+        store
+            .put_object(
+                &bucket,
+                corrupt_key,
+                &mut PutObjReader::from_vec(b"ciphertext-stub".to_vec()),
+                &ObjectOptions {
+                    user_defined: kms_meta,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("store corrupt SSE-KMS object");
+
+        // Also seed an SSE-S3 object to confirm SSE-S3 stays exempt from per-key kms:Decrypt.
+        let s3_key = "sse-s3.bin";
+        let s3_payload = b"sse-s3-plaintext";
+        let s3_material = sse_encryption(EncryptionRequest {
+            bucket: &bucket,
+            key: s3_key,
+            server_side_encryption: Some("AES256".to_string()),
+            ssekms_key_id: None,
+            ssekms_context: None,
+            sse_customer_algorithm: None,
+            sse_customer_key: None,
+            sse_customer_key_md5: None,
+            content_size: s3_payload.len() as i64,
+            principal: None,
+        })
+        .await
+        .expect("encrypt SSE-S3 test object")
+        .expect("SSE-S3 material");
+        let s3_meta = encryption_material_to_metadata(&s3_material).expect("sse-s3 metadata");
+        let s3_reader = WritePlan::new()
+            .with_encryption(s3_material.write_encryption(None))
+            .apply(
+                HashReader::from_stream(
+                    std::io::Cursor::new(s3_payload.to_vec()),
+                    s3_payload.len() as i64,
+                    s3_payload.len() as i64,
+                    None,
+                    None,
+                    false,
+                )
+                .expect("hash reader"),
+                s3_payload.len() as i64,
+            )
+            .expect("apply SSE-S3 write plan");
+        store
+            .put_object(
+                &bucket,
+                s3_key,
+                &mut PutObjReader::new(s3_reader),
+                &ObjectOptions {
+                    user_defined: s3_meta,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("store SSE-S3 object");
+
+        let envelope_for = |headers: HeaderMap, allowed: bool| -> (RequestEnvelope, Arc<RecordingKmsKeyAuthorizer>) {
+            let authorizer = RecordingKmsKeyAuthorizer::new(allowed);
+            let mut extensions = http::Extensions::new();
+            extensions.insert(ReqInfo::default());
+            extensions.insert(TestAuthorizationHooks {
+                enforced: true,
+                authorizer: Arc::clone(&authorizer) as _,
+            });
+            (get_envelope(headers, extensions), authorizer)
+        };
+
+        let cache_disabled_context = temp_env::with_vars([(rustfs_config::ENV_OBJECT_DATA_CACHE_ENABLE, Some("false"))], || {
+            Arc::new(AppContext::new(Arc::clone(&store), ambient.iam(), ambient.kms()))
+        });
+        assert!(cache_disabled_context.object_data_cache().is_disabled());
+        let cache_enabled_context = temp_env::with_vars(
+            [
+                (rustfs_config::ENV_OBJECT_DATA_CACHE_ENABLE, Some("true")),
+                (rustfs_config::ENV_OBJECT_DATA_CACHE_MODE, Some("fill_materialize_enabled")),
+                (rustfs_config::ENV_OBJECT_DATA_CACHE_MAX_BYTES, Some("8388608")),
+                (rustfs_config::ENV_OBJECT_DATA_CACHE_MAX_ENTRY_BYTES, Some("2097152")),
+                (rustfs_config::ENV_OBJECT_DATA_CACHE_MIN_FREE_MEMORY_PERCENT, Some("0")),
+            ],
+            || Arc::new(AppContext::new(Arc::clone(&store), ambient.iam(), ambient.kms())),
+        );
+        assert!(cache_enabled_context.object_data_cache().materialize_fill_enabled());
+
+        for (cache_label, context) in [
+            ("cache-disabled", cache_disabled_context),
+            ("cache-enabled", cache_enabled_context),
+        ] {
+            let usecase = DefaultObjectUsecase::with_context(Some(context));
+
+            // 1. Unauthorized caller denied BEFORE DEK unwrap across healthy, range, conditional, deleted-key, unavailable-KMS, and corrupt-envelope states.
+            for (case_label, key, range, headers, mode) in [
+                ("full-healthy", kms_key, None, HeaderMap::new(), DecryptOutcome::Ok),
+                ("range-healthy", kms_key, Some("bytes=0-11"), HeaderMap::new(), DecryptOutcome::Ok),
+                (
+                    "conditional-if-none-match",
+                    kms_key,
+                    None,
+                    {
+                        let mut h = HeaderMap::new();
+                        h.insert(http::header::IF_NONE_MATCH, HeaderValue::from_static("*"));
+                        h
+                    },
+                    DecryptOutcome::Ok,
+                ),
+                ("key-deleted", kms_key, None, HeaderMap::new(), DecryptOutcome::KeyNotFound),
+                ("kms-unavailable", kms_key, None, HeaderMap::new(), DecryptOutcome::ServiceUnavailable),
+                ("corrupt-envelope", corrupt_key, None, HeaderMap::new(), DecryptOutcome::Ok),
+            ] {
+                *outcome.lock().expect("outcome lock") = mode;
+                decrypt_calls.store(0, Ordering::SeqCst);
+                let mut input = get_object_input(&bucket, key, None);
+                if let Some(range) = range {
+                    input.range = Some(rustfs_gateway_types::RangeSpec::new(range));
+                }
+                let (envelope, authorizer) = envelope_for(headers, false);
+                let err = Box::pin(get_object_gateway(&usecase, envelope, input))
+                    .await
+                    .expect_err("unauthorized GetObject must be denied before DEK unwrap");
+                assert_eq!(
+                    err.code(),
+                    &S3ErrorCode::AccessDenied,
+                    "{cache_label}/{case_label}: unexpected error {err:?}"
+                );
+                assert_eq!(
+                    decrypt_calls.load(Ordering::SeqCst),
+                    0,
+                    "{cache_label}/{case_label}: unauthorized GetObject must never invoke KMS decrypt"
+                );
+                assert_eq!(
+                    authorizer.calls(),
+                    vec![(KmsAction::DecryptAction, "finance-key".to_string())],
+                    "{cache_label}/{case_label}: must authorize kms:Decrypt on finance-key"
+                );
+            }
+
+            // 2. Authorized caller decrypts full object and range reads cleanly.
+            *outcome.lock().expect("outcome lock") = DecryptOutcome::Ok;
+            decrypt_calls.store(0, Ordering::SeqCst);
+            let (envelope, _) = envelope_for(HeaderMap::new(), true);
+            let output = Box::pin(get_object_gateway(&usecase, envelope, get_object_input(&bucket, kms_key, None)))
+                .await
+                .expect("authorized GetObject should succeed");
+            let body = crate::app::test_seams::read_get_body(output.output.body.expect("GET body")).await;
+            assert_eq!(body.as_ref(), payload, "{cache_label}: full plaintext mismatch");
+            assert_eq!(decrypt_calls.load(Ordering::SeqCst), 1, "{cache_label}: expected 1 KMS decrypt");
+
+            decrypt_calls.store(0, Ordering::SeqCst);
+            let mut range_input = get_object_input(&bucket, kms_key, None);
+            range_input.range = Some(rustfs_gateway_types::RangeSpec::new("bytes=0-11"));
+            let (envelope, _) = envelope_for(HeaderMap::new(), true);
+            let range_output = Box::pin(get_object_gateway(&usecase, envelope, range_input))
+                .await
+                .expect("authorized range GetObject should succeed");
+            let range_body = crate::app::test_seams::read_get_body(range_output.output.body.expect("range GET body")).await;
+            assert_eq!(range_body.as_ref(), &payload[..12], "{cache_label}: range plaintext mismatch");
+
+            // 3. Authorized caller on deleted KMS key observes KMS.NotFoundException (proving KMS was reached).
+            *outcome.lock().expect("outcome lock") = DecryptOutcome::KeyNotFound;
+            decrypt_calls.store(0, Ordering::SeqCst);
+            let (envelope, _) = envelope_for(HeaderMap::new(), true);
+            let err = Box::pin(get_object_gateway(&usecase, envelope, get_object_input(&bucket, kms_key, None)))
+                .await
+                .expect_err("authorized GetObject against deleted key must fail in KMS");
+            assert_eq!(
+                err.code(),
+                &S3ErrorCode::Custom("KMS.NotFoundException".into()),
+                "{cache_label}: unexpected error {err:?}"
+            );
+            assert_eq!(
+                decrypt_calls.load(Ordering::SeqCst),
+                1,
+                "{cache_label}: authorized deleted-key call hits KMS"
+            );
+
+            // 4. SSE-S3 remains readable even when KMS per-key authorizer denies kms:Decrypt.
+            *outcome.lock().expect("outcome lock") = DecryptOutcome::Ok;
+            let (envelope, authorizer) = envelope_for(HeaderMap::new(), false);
+            let s3_output = Box::pin(get_object_gateway(&usecase, envelope, get_object_input(&bucket, s3_key, None)))
+                .await
+                .expect("SSE-S3 GetObject must not be gated by kms:Decrypt");
+            let s3_body = crate::app::test_seams::read_get_body(s3_output.output.body.expect("SSE-S3 GET body")).await;
+            assert_eq!(s3_body.as_ref(), s3_payload, "{cache_label}: SSE-S3 plaintext mismatch");
+            assert!(authorizer.calls().is_empty(), "{cache_label}: SSE-S3 must not invoke KMS authorizer");
+        }
+
+        // 5. Mid-stream resume denies an unauthorized principal before DEK unwrap.
+        *outcome.lock().expect("outcome lock") = DecryptOutcome::Ok;
+        decrypt_calls.store(0, Ordering::SeqCst);
+        let stored_info = store
+            .get_object_info(&bucket, kms_key, &ObjectOptions::default())
+            .await
+            .expect("get stored object info");
+        let denied_resume_principal = SseKmsPrincipal::new("revoked".to_string(), None, false, HashMap::new(), HashMap::new())
+            .with_test_hooks(Some(TestAuthorizationHooks {
+                enforced: true,
+                authorizer: RecordingKmsKeyAuthorizer::new(false),
+            }));
+        let resume_ctx = GetObjectResumeContext::new(
+            Arc::clone(&store),
+            &bucket,
+            kms_key,
+            ObjectOptions::default(),
+            &HeaderMap::new(),
+            &stored_info,
+            0,
+            -1,
+        )
+        .with_principal(Some(denied_resume_principal));
+        let resume_result = resume_ctx.reopen(0).await;
+        assert!(
+            matches!(resume_result, Err(GetObjectResumeFailure::Fatal)),
+            "unauthorized resume reopen must fail fatally before DEK unwrap"
+        );
+        assert_eq!(
+            decrypt_calls.load(Ordering::SeqCst),
+            0,
+            "unauthorized resume reopen must never invoke KMS decrypt"
+        );
+
+        store
+            .delete_bucket(
+                &bucket,
+                &DeleteBucketOptions {
+                    force: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("clean up KMS get test bucket");
+    }
+
+    #[tokio::test]
+    async fn cold_fill_producer_kms_denial_bypasses_without_leaking_to_or_blocking_follower() {
+        use crate::app::storage_api::test::sse::{RecordingKmsKeyAuthorizer, TestAuthorizationHooks, sse_kms_object_metadata};
+        use rustfs_policy::policy::action::KmsAction;
+
+        let adapter = Arc::new(
+            ObjectDataCacheAdapter::new(rustfs_object_data_cache::ObjectDataCacheConfig {
+                mode: rustfs_object_data_cache::ObjectDataCacheMode::FillMaterializeEnabled,
+                max_bytes: 1024 * 1024,
+                max_memory_percent: 0,
+                max_entry_bytes: 1024,
+                min_free_memory_percent: 0,
+                fill_concurrency_max: 1,
+                ..rustfs_object_data_cache::ObjectDataCacheConfig::default()
+            })
+            .expect("cold-fill cache config must be valid"),
+        );
+        let plan = adapter.plan_get(rustfs_object_data_cache::ObjectDataCacheGetRequest {
+            bucket: "kms-bypass-bucket",
+            object: "kms-bypass-object",
+            version_id: None,
+            etag: "kms-bypass-etag",
+            size: 16,
+            data_dir_u128: Some(1),
+            mod_time_unix_nanos: 1,
+            body_variant: rustfs_object_data_cache::ObjectDataCacheBodyVariant::FullObjectPlainV1,
+        });
+        let cache_key = plan.key().cloned().expect("cache key");
+        let coordinator = adapter.cold_fill_coordinator();
+        let metadata = sse_kms_object_metadata();
+
+        let denied_authorizer = RecordingKmsKeyAuthorizer::new(false);
+        let denied_principal = SseKmsPrincipal::new("denied-user".to_string(), None, false, HashMap::new(), HashMap::new())
+            .with_test_hooks(Some(TestAuthorizationHooks {
+                enforced: true,
+                authorizer: Arc::clone(&denied_authorizer) as _,
+            }));
+        let allowed_authorizer = RecordingKmsKeyAuthorizer::new(true);
+        let allowed_principal = SseKmsPrincipal::new("allowed-user".to_string(), None, false, HashMap::new(), HashMap::new())
+            .with_test_hooks(Some(TestAuthorizationHooks {
+                enforced: true,
+                authorizer: Arc::clone(&allowed_authorizer) as _,
+            }));
+
+        let producer_started = Arc::new(tokio::sync::Notify::new());
+        let follower_joined = Arc::new(tokio::sync::Notify::new());
+        let producer_attempts = Arc::new(AtomicUsize::new(0));
+        let reader_opens = Arc::new(AtomicUsize::new(0));
+
+        let denied_task = {
+            let coordinator = Arc::clone(&coordinator);
+            let cache_key = cache_key.clone();
+            let metadata = metadata.clone();
+            let denied_principal = denied_principal.clone();
+            let producer_started = Arc::clone(&producer_started);
+            let follower_joined = Arc::clone(&follower_joined);
+            let producer_attempts = Arc::clone(&producer_attempts);
+            let reader_opens = Arc::clone(&reader_opens);
+            tokio::spawn(async move {
+                coordinate_cold_fill(&coordinator, cache_key, None, None, move |producer| {
+                    let metadata = metadata.clone();
+                    let denied_principal = denied_principal.clone();
+                    let producer_started = Arc::clone(&producer_started);
+                    let follower_joined = Arc::clone(&follower_joined);
+                    let producer_attempts = Arc::clone(&producer_attempts);
+                    let reader_opens = Arc::clone(&reader_opens);
+                    async move {
+                        producer_attempts.fetch_add(1, AtomicOrdering::SeqCst);
+                        producer_started.notify_one();
+                        follower_joined.notified().await;
+                        let Some(_producer) =
+                            authorize_cold_fill_producer_or_bypass(producer, Some(&denied_principal), &metadata).await
+                        else {
+                            return;
+                        };
+                        reader_opens.fetch_add(1, AtomicOrdering::SeqCst);
+                    }
+                })
+                .await
+            })
+        };
+
+        producer_started.notified().await;
+
+        let allowed_task = {
+            let coordinator = Arc::clone(&coordinator);
+            let cache_key = cache_key.clone();
+            let reader_opens = Arc::clone(&reader_opens);
+            tokio::spawn(async move {
+                coordinate_cold_fill(&coordinator, cache_key, None, None, move |producer| {
+                    let reader_opens = Arc::clone(&reader_opens);
+                    async move {
+                        // A follower must never be promoted into a shared fill whose
+                        // result could be handed back to the denied producer.
+                        reader_opens.fetch_add(1, AtomicOrdering::SeqCst);
+                        producer.finish_shared(Ok(Bytes::from_static(b"leaked-plaintext")));
+                    }
+                })
+                .await
+            })
+        };
+
+        // Wait until the follower has joined the active session as a waiter.
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while coordinator.global_waiter_count_for_test() == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("follower must join the active cold-fill session");
+        follower_joined.notify_one();
+
+        let (denied_outcome, allowed_outcome) = tokio::join!(denied_task, allowed_task);
+        assert!(
+            matches!(denied_outcome.expect("denied task join"), ColdFillCoordinateOutcome::Bypass),
+            "denied producer must bypass rather than wait for a successor's plaintext"
+        );
+        assert!(
+            matches!(allowed_outcome.expect("allowed task join"), ColdFillCoordinateOutcome::Bypass),
+            "authorized follower must bypass rather than inherit producer denial"
+        );
+        assert_eq!(producer_attempts.load(AtomicOrdering::SeqCst), 1, "denied producer must not be retried");
+        assert_eq!(
+            reader_opens.load(AtomicOrdering::SeqCst),
+            0,
+            "bypass must neither unwrap DEK for denied producer nor promote follower inside shared session"
+        );
+        assert_eq!(
+            denied_authorizer.calls(),
+            vec![(KmsAction::DecryptAction, "finance-key".to_string())],
+            "denied producer must record exactly one KMS denial check in the session"
+        );
+        assert_eq!(coordinator.active_session_count_for_test(), 0);
+        assert_eq!(coordinator.global_waiter_count_for_test(), 0);
+
+        // After bypass, each caller authorizes independently before opening its own reader.
+        let denied_err = authorize_sse_kms_object_read(Some(&denied_principal), &metadata)
+            .await
+            .expect_err("denied caller still fails with AccessDenied on bypass path");
+        assert_eq!(denied_err.code, S3ErrorCode::AccessDenied);
+        authorize_sse_kms_object_read(Some(&allowed_principal), &metadata)
+            .await
+            .expect("authorized follower succeeds independently on bypass path");
+        assert_eq!(allowed_authorizer.calls(), vec![(KmsAction::DecryptAction, "finance-key".to_string())]);
     }
 }
 
