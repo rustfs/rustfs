@@ -1098,6 +1098,27 @@
       "origin": "baseline"
     },
     {
+      "workflow": ".github/workflows/jepsen-unit.yml",
+      "name": "Jepsen unit",
+      "roles": [
+        "pr"
+      ],
+      "events": [
+        "pull_request",
+        "push"
+      ],
+      "cadence": "event",
+      "timezone": "UTC",
+      "schedule": [],
+      "owner": "@overtrue",
+      "policy": "active",
+      "monitor": "none",
+      "result_owner": "jepsen-unit.yml",
+      "disposition": "Runs the Jepsen checker unit tests. It does not start a RustFS cluster.",
+      "monitor_reason": "Runs when the Jepsen project changes and has no periodic freshness obligation.",
+      "origin": "added"
+    },
+    {
       "workflow": ".github/workflows/manual-main-packages.yml",
       "name": "Manual Linux packages",
       "roles": [

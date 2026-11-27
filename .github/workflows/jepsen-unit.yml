@@ -31,6 +31,8 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7
+        with:
+          persist-credentials: false
       - uses: actions/setup-java@cf277c60eb25467037889841efdb72551f06f6c3 # v4.9.1
         with:
           distribution: temurin
@@ -42,7 +44,7 @@ jobs:
           curl -fsSL -o "$HOME/bin/lein" https://raw.githubusercontent.com/technomancy/leiningen/2.11.2/bin/lein
           chmod +x "$HOME/bin/lein"
           echo "$HOME/bin" >> "$GITHUB_PATH"
-          lein version
+          "$HOME/bin/lein" version
       - name: Run Jepsen checker tests
         working-directory: jepsen
         run: lein test

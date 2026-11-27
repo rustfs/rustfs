@@ -53,6 +53,8 @@ RTO = "RTO"
 rto = "rto"
 # rustix OFlags variant (POSIX O_WRONLY equivalent).
 WRONLY = "WRONLY"
+# Jepsen writes Extensible Data Notation result files named results.edn.
+edn = "edn"
 
 [files]
 extend-exclude = []
