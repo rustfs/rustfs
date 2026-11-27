@@ -21,7 +21,6 @@
 
 use crate::core::pools::DecommissionCapacityAdmission;
 use crate::disk::cleanup_runtime::{self, OLD_DATA_CLEANUP_RECEIPT_FILE};
-use crate::disk::health_state::RuntimeDriveHealthState;
 use rustfs_common::mrf_channel::MrfDeleteMarkerPurge;
 use rustfs_filemeta::metadata_keys;
 
@@ -4743,10 +4742,7 @@ impl SetDisks {
         {
             let offline_drives = disks
                 .iter()
-                .filter(|slot| {
-                    slot.as_ref()
-                        .is_none_or(|disk| disk.runtime_state() == RuntimeDriveHealthState::Offline)
-                })
+                .filter(|slot| slot.as_ref().is_none_or(|disk| disk.is_faulty()))
                 .count();
             layout.with_degraded_put_parity(disks.len(), offline_drives)?
         } else {
@@ -23200,6 +23196,7 @@ mod heterogeneous_pool_put_tests {
     use super::*;
     use crate::config::storageclass::{OPTIMIZE_ENV, lookup_config_for_pools, lookup_config_for_pools_without_env};
     use crate::disk::ReadOptions;
+    use crate::disk::health_state::RuntimeDriveHealthState;
     use crate::services::notification_sys::install_remote_version_state_fleet_proof_for_test;
     use rustfs_config::server_config::KVS;
     use serial_test::serial;
@@ -23323,9 +23320,22 @@ mod heterogeneous_pool_put_tests {
 
         set_disks.set_test_storage_class_config(upgraded);
         set_disks.disks.write().await[11] = Some(disk_stores[11].clone());
-        disk_stores[11].force_runtime_state_for_test(RuntimeDriveHealthState::Offline);
-        put("upgraded").await.expect("a known offline handle should raise parity");
+        let disk = &disk_stores[11];
+        disk.force_runtime_state_for_test(RuntimeDriveHealthState::Offline);
+        put("upgraded-while-offline")
+            .await
+            .expect("a known offline handle should raise parity");
+        let crate::disk::Disk::Local(local) = disk.as_ref() else {
+            panic!("the hermetic disk must be local");
+        };
+        assert!(!local.mark_recovery_success_for_test());
+        assert_eq!(disk.runtime_state(), RuntimeDriveHealthState::Returning);
+        assert!(!disk.is_online().await);
+        put("upgraded")
+            .await
+            .expect("a recovering handle still blocked for I/O should raise parity");
         disk_stores[11].force_runtime_state_for_test(RuntimeDriveHealthState::Online);
+        check_layout("upgraded-while-offline", 7, 5, 11).await;
         check_layout("upgraded", 7, 5, 11).await;
 
         set_disks.disks.write().await[8..].fill(None);

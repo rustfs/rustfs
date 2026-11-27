@@ -391,7 +391,7 @@ Version-aware heal ([set_disk/ops/heal.rs](../../crates/ecstore/src/set_disk/ops
 |-----------|--------|--------|
 | Read (payload) | `data_blocks = N − parity` | [set_disk/metadata.rs](../../crates/ecstore/src/set_disk/metadata.rs) |
 | Decode (shards needed) | `≥ data_blocks` | [set_disk/read.rs](../../crates/ecstore/src/set_disk/read.rs) |
-| Write (payload) | `data_blocks`, `+1` iff `data == parity` | [set_disk/core/io_primitives.rs](../../crates/ecstore/src/set_disk/core/io_primitives.rs) |
+| Write (payload) | `data_blocks`, `+1` iff `data == parity`. Degraded PUT parity retains the baseline PUT commit floor. | [Parity selection](#22-parity-selection) |
 | Delete marker (write + metadata vote) | `N/2 + 1` (majority) | [set_disk/ops/object.rs](../../crates/ecstore/src/set_disk/ops/object.rs), [set_disk/metadata.rs](../../crates/ecstore/src/set_disk/metadata.rs) |
 | `opts.max_parity` internal writes | parity `= N/2` | [set_disk/ops/object.rs](../../crates/ecstore/src/set_disk/ops/object.rs) |
 
