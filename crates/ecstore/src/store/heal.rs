@@ -421,6 +421,7 @@ impl ECStore {
             let recovery_context = crate::set_disk::DeleteRecoveryContext {
                 dry_run: opts.dry_run,
                 explicit_delete,
+                classify_generation_conflicts: true,
                 namespace_owner: (!opts.dry_run)
                     .then(|| Arc::new((scope.clone(), store.ctx.begin_namespace_commit_for_bucket(&bucket))) as Arc<dyn Send + Sync>),
                 ..crate::set_disk::DeleteRecoveryContext::new(Some(scope.incarnation), &can_commit)
@@ -457,6 +458,7 @@ impl ECStore {
                     state = "insufficient_evidence",
                     bucket = ?bucket,
                     object = ?decode_dir_object(object),
+                    transaction = ?summary.conflicting_transaction,
                     pool = opts.pool,
                     set = opts.set,
                     legacy_ambiguous = summary.legacy_ambiguous,
@@ -467,8 +469,8 @@ impl ECStore {
             if object.is_some() && summary.pending > 0 {
                 return Err(StorageError::ErasureReadQuorum);
             }
-            if object.is_some() && !opts.dry_run && summary.blocked > 0 {
-                return Err(StorageError::SlowDown);
+            if let Some(object) = &object && !opts.dry_run && summary.blocked > 0 {
+                return Err(summary.generation_conflict_error(&bucket, object).unwrap_or(StorageError::SlowDown));
             }
             let delete_recovery = rustfs_madmin::heal_commands::DeleteRecoveryStatus {
                 pending: summary.pending,
