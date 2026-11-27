@@ -634,20 +634,44 @@ impl DefaultBucketUsecase {
             return Err(BucketResolveError::IdentityMismatch);
         }
         let store = self.object_store().ok_or(BucketResolveError::CapabilityUnavailable)?;
+        #[cfg(test)]
+        let mut diagnostic = crate::table_catalog::CatalogRetirementDeleteProbe::begin(identity, store.id);
         let catalog = crate::table_catalog::ObjectTableCatalogStore::for_vector_scope(
             crate::table_catalog::EcStoreTableCatalogObjectBackend::new(store.clone()),
             identity.clone(),
         )
         .await
-        .map_err(StorageError::other)?;
+        .map_err(StorageError::other);
+        #[cfg(test)]
+        diagnostic.catalog_scope_returned(&catalog);
+        let catalog = catalog?;
         let prepared_identity = identity.clone();
-        managed::delete_managed_bucket_with_preparation(&store, identity, move |guard| async move {
-            catalog
-                .prepare_empty_vector_bucket_delete(&prepared_identity, guard)
+        let cleanup_instance_id = store.id;
+        #[cfg(test)]
+        diagnostic.managed_started();
+        #[cfg(test)]
+        let mut callback_diagnostic = diagnostic.callback();
+        let result = managed::delete_managed_bucket_with_preparation(&store, identity, move |guard| async move {
+            #[cfg(test)]
+            callback_diagnostic.entered();
+            let execution = crate::table_catalog::CatalogCleanupExecution::new(cleanup_instance_id).map_err(StorageError::other);
+            #[cfg(test)]
+            if execution.is_err() {
+                callback_diagnostic.returned(&execution);
+            }
+            let execution = execution?;
+            let result = catalog
+                .prepare_vector_bucket_delete(&prepared_identity, guard, execution)
                 .await
-                .map_err(StorageError::other)
+                .map_err(StorageError::other);
+            #[cfg(test)]
+            callback_diagnostic.returned(&result);
+            result
         })
-        .await?;
+        .await;
+        #[cfg(test)]
+        diagnostic.managed_returned(&result);
+        result?;
         Ok(())
     }
 

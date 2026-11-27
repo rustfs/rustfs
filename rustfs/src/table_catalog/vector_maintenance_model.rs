@@ -151,7 +151,19 @@ fn validate_json(value: &Value, depth: usize) -> TableCatalogStoreResult<()> {
         }
         Value::Object(values) => {
             let expected: Option<&[&str]> = if values.contains_key("content_sha256") {
-                Some(&["object_key", "content_length", "content_sha256", "body_revision", "etag"])
+                if values.contains_key("kind") || values.contains_key("resource") {
+                    Some(&[
+                        "kind",
+                        "resource",
+                        "object_key",
+                        "etag",
+                        "body_revision",
+                        "content_sha256",
+                        "content_length",
+                    ])
+                } else {
+                    Some(&["object_key", "content_length", "content_sha256", "body_revision", "etag"])
+                }
             } else if values.contains_key("storage_bucket_id") {
                 Some(&[
                     "version",

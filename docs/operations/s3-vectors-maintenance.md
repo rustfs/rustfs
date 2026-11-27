@@ -22,6 +22,14 @@ Cleanup requires an authoritative retirement record containing the exact object 
 
 Quota reconciliation follows actual native deletion or recovery evidence. Candidate upload consumes storage even if publication fails. A scheduled cleanup or an expired job lease does not establish physical deletion or release quota.
 
+## Deleting a used Vector bucket
+
+Delete its Index resources and let eligible data, manifests, index files and pagination sessions complete the existing retirement process. Bucket deletion requires the matching full bucket identity and incarnation, complete resource retirement evidence, and no active resources or unresolved work. Current permissions and the existing bucket lifecycle and Catalog publication guards remain required.
+
+Catalog cleanup publishes an immutable authority only after its exact target plan, resource proofs and initial progress pages have been persisted and verified. These records live in the system bucket under `s3vectors/catalog-retirements/v1/`, outside the deleted Vector bucket and its reusable Catalog namespace. They retain the old identity across physical bucket deletion and same-name recreation. Ordinary Catalog and maintenance admissions reject an identity with a published cleanup authority; authorized deletion can resume its recorded progress.
+
+An acknowledged target deletion can be resumed from its durable acknowledgement. A dispatched deletion without its original completion evidence remains `InFlight` or `Unknown` and returns an error. A missing object alone cannot establish successful deletion. Missing or inconsistent progress for a published authority also returns an error. Preserve the authority, plan, proofs and progress when investigating a failure; these records, including unpublished pages, have no automatic expiry.
+
 ## Failure and shutdown handling
 
 New work stops when the worker loses authorization, reaches its admission limit or receives cancellation. An operation already holding its owners retains them until its actual storage work completes. Its recorded result describes that completion even if permissions changed while it was running. A lease expiry cannot prove that an earlier operation has stopped.

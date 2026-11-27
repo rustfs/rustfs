@@ -492,6 +492,23 @@ where
         })
     }
 
+    /// Builds a Vector entry position; list operations still acquire their usual protection.
+    pub(crate) fn vector_index_list_cursor_after(
+        &self,
+        bucket: &BucketHandle,
+        namespace: &Namespace,
+        after: &CatalogName,
+    ) -> TableCatalogStoreResult<String> {
+        if self.vector_bucket_for(bucket.storage_bucket_id().as_str())? != bucket {
+            return Err(TableCatalogStoreError::Conflict("bucket does not match this Vector catalog".to_string()));
+        }
+        Ok(format!(
+            "{OBJECT_CATALOG_LIST_CURSOR_PREFIX}{}",
+            self.paths
+                .table_entry_path(bucket.storage_bucket_id().as_str(), namespace, after)
+        ))
+    }
+
     fn vector_bucket_for(&self, bucket: &str) -> TableCatalogStoreResult<&BucketHandle> {
         self.vector_bucket
             .as_ref()
@@ -536,10 +553,10 @@ where
         table_bucket: &str,
     ) -> TableCatalogStoreResult<TableCatalogLockGuard> {
         if self.paths.scope == CatalogScope::Vector {
-            return self
-                .backend
-                .acquire_bucket_lifecycle_read(self.vector_bucket_for(table_bucket)?)
-                .await;
+            let bucket = self.vector_bucket_for(table_bucket)?;
+            let guard = self.backend.acquire_bucket_lifecycle_read(bucket).await?;
+            self.require_vector_bucket_catalog_admission(bucket, &guard).await?;
+            return Ok(guard);
         }
         let guard = self
             .backend
@@ -570,6 +587,7 @@ where
         if self.paths.scope == CatalogScope::Vector {
             let bucket = self.vector_bucket_for(table_bucket)?;
             let guard = self.backend.acquire_bucket_lifecycle_read(bucket).await?;
+            self.require_vector_bucket_catalog_admission(bucket, &guard).await?;
             let result = read.await?;
             self.backend.revalidate_bucket_handle(bucket).await?;
             if guard.is_lock_lost() {
@@ -3180,6 +3198,8 @@ where
             let guard = self
                 .backend
                 .acquire_bucket_lifecycle_read(self.vector_bucket_for(table_bucket)?)
+                .await?;
+            self.require_vector_bucket_catalog_admission(self.vector_bucket_for(table_bucket)?, &guard)
                 .await?;
             publication.begin_table_bucket(table_bucket).await?;
             if guard.is_lock_lost() {
@@ -6626,11 +6646,10 @@ impl<B: TableCatalogObjectBackend> ObjectTableCatalogStore<B> {
                 if operation_guard.is_some() {
                     None
                 } else {
-                    Some(
-                        self.backend
-                            .acquire_bucket_lifecycle_read(self.vector_bucket_for(&request.table_bucket)?)
-                            .await?,
-                    )
+                    let bucket = self.vector_bucket_for(&request.table_bucket)?;
+                    let lifecycle = self.backend.acquire_bucket_lifecycle_read(bucket).await?;
+                    self.require_vector_bucket_catalog_admission(bucket, &lifecycle).await?;
+                    Some(lifecycle)
                 }
             } else {
                 self.begin_table_bucket_with_migration_permit(&request.table_bucket, publication)
@@ -7252,6 +7271,10 @@ impl<B: TableCatalogObjectBackend> ObjectTableCatalogStore<B> {
                 "Vector operation identity differs from the store".into(),
             ));
         }
+        let bucket = resource
+            .vector_bucket()
+            .ok_or_else(|| TableCatalogStoreError::Conflict("Vector operation has no bucket identity".into()))?;
+        self.require_vector_bucket_catalog_admission(bucket, &lifecycle).await?;
         let gc = self
             .backend
             .acquire_read_lock(
@@ -8614,13 +8637,13 @@ impl<B: TableCatalogObjectBackend> ObjectTableCatalogStore<B> {
 }
 
 impl<B: TableCatalogObjectBackend> ObjectTableCatalogStore<B> {
-    /// Remove only canonical empty Vector registration under ECStore's deletion writer.
-    /// The owned application callback must supply the writer acquired by
-    /// `delete_managed_bucket_with_preparation` and retain it through physical cleanup.
-    pub(crate) async fn prepare_empty_vector_bucket_delete(
+    /// Prepare exact Catalog cleanup under ECStore's existing deletion writer.
+    /// The owned application callback retains this writer through physical cleanup.
+    pub(crate) async fn prepare_vector_bucket_delete(
         &self,
         bucket: &BucketHandle,
         lifecycle: Arc<BucketIncarnationFenceGuard>,
+        execution: CatalogCleanupExecution,
     ) -> TableCatalogStoreResult<()> {
         // BucketHandle caps names at 63 bytes and region at 255 bytes. Canonical
         // empty records fit below 4 KiB even with six-byte JSON escaping.
@@ -8634,7 +8657,7 @@ impl<B: TableCatalogObjectBackend> ObjectTableCatalogStore<B> {
         let registry = self.acquire_table_bucket_registry_write_permit().await?;
         let publication = TableCommitLockPublication::new(&self.backend, &self.paths);
         let owner_signals = [lifecycle.lock_lost_signal(), registry.lock_lost_signal()];
-        publication_preparation(&publication, async {
+        let prepare = async {
             let storage_name = bucket.storage_bucket_id().as_str();
             publication.begin_table_bucket(storage_name).await?;
             let _completion = TableCommitPublicationCompletion::new(&publication);
@@ -8644,6 +8667,13 @@ impl<B: TableCatalogObjectBackend> ObjectTableCatalogStore<B> {
                 .ok_or_else(|| TableCatalogStoreError::Unavailable("Vector deletion publication fence is unavailable".into()))?;
             fence.extend_signals(owner_signals);
             fence.ensure_held()?;
+            if self
+                .resume_vector_bucket_catalog_retirement_under_writer(bucket, &execution, &fence)
+                .await?
+                .is_some()
+            {
+                return Ok(());
+            }
             let prefix = self.paths.table_bucket_root_prefix(storage_name);
             let parent_path = self.paths.table_bucket_entry_path(storage_name);
             let namespace = Namespace::parse("indexes").map_err(|error| TableCatalogStoreError::Invalid(error.to_string()))?;
@@ -8754,9 +8784,9 @@ impl<B: TableCatalogObjectBackend> ObjectTableCatalogStore<B> {
                         }
                         namespace_etag = Some(etag);
                     } else {
-                        return Err(TableCatalogStoreError::Conflict(
-                            "Vector bucket retains Catalog resources or history".into(),
-                        ));
+                        return self
+                            .prepare_vector_bucket_catalog_retirement_under_writer(bucket, &execution, &fence)
+                            .await;
                     }
                     cursor = Some(object.key);
                 }
@@ -8787,8 +8817,8 @@ impl<B: TableCatalogObjectBackend> ObjectTableCatalogStore<B> {
             }
             self.backend.revalidate_bucket_handle(bucket).await?;
             fence.ensure_held()
-        })
-        .await
+        };
+        publication_preparation(&publication, Box::pin(prepare)).await
     }
 
     #[cfg(test)]
@@ -8814,6 +8844,7 @@ impl<B: TableCatalogObjectBackend> ObjectTableCatalogStore<B> {
                 "Vector parent registration differs from its store".into(),
             ));
         }
+        self.require_vector_bucket_catalog_admission(bucket, &lifecycle).await?;
         let _registry = self.acquire_table_bucket_registry_write_permit().await?;
         let publication = TableCommitLockPublication::new(&self.backend, &self.paths);
         // Keep both owners in this scope through publication completion.

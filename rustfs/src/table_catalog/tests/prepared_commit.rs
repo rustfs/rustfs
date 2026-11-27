@@ -3153,6 +3153,28 @@ async fn catalog_vector_v3_native_parent_rejects_another_instance_guard() {
             .unwrap()
             .is_none()
     );
+    let owners = Arc::strong_count(&source.guard);
+    let direct_error = match backend
+        .reuse_bucket_lifecycle_read(&source.bucket, source.guard.clone())
+        .await
+    {
+        Err(error) => error,
+        Ok(_) => panic!("native backend must reject the foreign instance guard"),
+    };
+    assert!(matches!(&direct_error, TableCatalogStoreError::Conflict(message)
+        if message.contains("validate shared managed bucket lifecycle")));
+    let wrapped = crate::table_catalog::test_support::real_catalog_backend::RealCatalogBackend::new(backend.clone());
+    let wrapped_error = match wrapped
+        .reuse_bucket_lifecycle_read(&source.bucket, source.guard.clone())
+        .await
+    {
+        Err(error) => error,
+        Ok(_) => panic!("fault backend must retain the native instance rejection"),
+    };
+    assert_eq!(std::mem::discriminant(&wrapped_error), std::mem::discriminant(&direct_error));
+    assert_eq!(wrapped_error.to_string(), direct_error.to_string());
+    assert!(wrapped.events().is_empty());
+    assert_eq!(Arc::strong_count(&source.guard), owners);
     assert_matches!(
         isolated.validate_managed_bucket_fence(&source.guard, source.bucket.storage_bucket_id().as_str()),
         Err(crate::storage_api::table::StorageError::PreconditionFailed)
@@ -3608,11 +3630,13 @@ impl NativeVectorDeleteFixture {
     ) -> TableCatalogStoreResult<()> {
         let observed = Arc::new(std::sync::Mutex::new(None));
         let output = observed.clone();
+        let storage_instance_id = self.storage.id;
         let result = tokio::time::timeout(
             StdDuration::from_secs(15),
             self.storage
                 .delete_managed_bucket_with_preparation(&self.bucket, move |writer| async move {
-                    let result = catalog.prepare_empty_vector_bucket_delete(&bucket, writer).await;
+                    let execution = CatalogCleanupExecution::new(storage_instance_id).unwrap();
+                    let result = catalog.prepare_vector_bucket_delete(&bucket, writer, execution).await;
                     *output.lock().unwrap() = Some(result);
                     // Preserve the physical bucket for Catalog recovery assertions.
                     Err(crate::storage_api::table::StorageError::other(std::io::Error::other(
@@ -4348,4 +4372,65 @@ pub(in crate::table_catalog) async fn native_vector_index_fixture_at(
     let (fixture, reset) = native_vector_delete_fixture().await;
     let (store, entry) = native_vector_delete_child_at(&fixture, Some(mod_time)).await;
     (store, entry, (fixture, reset))
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn catalog_vector_native_list_cursor_preserves_full_scope_and_existing_protection() {
+    use crate::storage_api::table::managed::ManagedBucketStorage as _;
+    let (fixture, _reset) = native_vector_parent_fixture().await;
+    let namespace = Namespace::parse("indexes").unwrap();
+    let name = CatalogName::parse("aaa.bbb").unwrap();
+    fixture
+        .catalog
+        .ensure_vector_catalog_parent(&fixture.bucket, fixture.guard.clone())
+        .await
+        .unwrap();
+    let cursor = fixture
+        .catalog
+        .vector_index_list_cursor_after(&fixture.bucket, &namespace, &name)
+        .unwrap();
+    assert_eq!(
+        cursor,
+        format!(
+            "{OBJECT_CATALOG_LIST_CURSOR_PREFIX}{}",
+            fixture
+                .catalog
+                .paths
+                .table_entry_path(fixture.bucket.storage_bucket_id().as_str(), &namespace, &name)
+        )
+    );
+    let page = fixture
+        .catalog
+        .list_tables_page(
+            fixture.bucket.storage_bucket_id().as_str(),
+            &namespace.public_name(),
+            Some(&cursor),
+            NonZeroUsize::MIN,
+        )
+        .await
+        .unwrap();
+    assert!(page.entries.is_empty());
+    assert!(page.next_cursor.is_none());
+    fixture
+        .storage
+        .validate_managed_bucket_fence(&fixture.guard, fixture.bucket.storage_bucket_id().as_str())
+        .unwrap();
+    let mut replacement = VectorBucketBindingV1::from_handle(&fixture.bucket).unwrap();
+    replacement.bucket_incarnation = Uuid::new_v4();
+    assert!(matches!(
+        fixture
+            .catalog
+            .vector_index_list_cursor_after(&replacement.to_handle().unwrap(), &namespace, &name),
+        Err(TableCatalogStoreError::Conflict(_))
+    ));
+    let table_scope = ObjectTableCatalogStore::new(fixture.backend.clone());
+    assert!(matches!(
+        table_scope.vector_index_list_cursor_after(&fixture.bucket, &namespace, &name),
+        Err(TableCatalogStoreError::Conflict(_))
+    ));
+    fixture
+        .storage
+        .validate_managed_bucket_fence(&fixture.guard, fixture.bucket.storage_bucket_id().as_str())
+        .unwrap();
 }

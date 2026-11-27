@@ -75,9 +75,25 @@ impl MaintenanceExecutor {
                         &CatalogName::parse(resource.name()).map_err(maintenance_execution_error)?,
                     )
                     .await?;
-                let source = catalog
-                    .copy_vector_maintenance_source(&identity, &CatalogMetadataRef::try_from(expected_source.reference())?)
-                    .await?;
+                let expected = CatalogMetadataRef::try_from(expected_source.reference())?;
+                let source = if kind == VectorMaintenanceKind::DeleteRecovery
+                    && *expected_source.kind() == VectorMaintenanceSourceKind::DeleteIntent
+                    && snapshot.state() == VectorMaintenanceResourceState::Deleted
+                {
+                    let guard = catalog.begin_vector_maintenance_resource_operation(&snapshot).await?;
+                    if snapshot.source_intent() != Some(&expected) {
+                        return Err(
+                            TableCatalogStoreError::Conflict("delete recovery source changed before preparation".into()).into(),
+                        );
+                    }
+                    let source = catalog
+                        .copy_vector_maintenance_source_with_operation_guard(&guard, &expected)
+                        .await?;
+                    guard.check_held()?;
+                    source
+                } else {
+                    catalog.copy_vector_maintenance_source(&identity, &expected).await?
+                };
                 let input = VectorMaintenanceInputV1::try_new(
                     snapshot.head().cloned(),
                     Some(VectorMaintenanceSourceV1::try_new(*expected_source.kind(), (&source).into())?),

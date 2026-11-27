@@ -1,6 +1,7 @@
 // Copyright 2026 RustFS Team
 // SPDX-License-Identifier: Apache-2.0
 
+mod catalog_worker_replay;
 mod delete_bucket;
 mod http_socket;
 mod index_metadata;
@@ -526,7 +527,7 @@ fn vector_kms_requires_real_key_permissions_before_provider_access() {
 
 #[test]
 #[serial_test::serial]
-fn vector_list_indexes_returns_complete_pages_and_rejects_unsupported_continuation() {
+fn vector_list_indexes_returns_complete_pages_and_validates_continuation() {
     run_large_stack_test("vector-app-list-indexes", || async {
         let fixture = Fixture::new().await;
         let bucket = format!("vectors-{}", Uuid::new_v4().simple());
@@ -555,26 +556,39 @@ fn vector_list_indexes_returns_complete_pages_and_rejects_unsupported_continuati
         let output: Value = serde_json::from_slice(&filtered.body_bytes().unwrap()).unwrap();
         assert_eq!(output["indexes"].as_array().unwrap().len(), 1);
         assert_eq!(output["indexes"][0]["indexName"], "index.one");
-        assert_eq!(
-            fixture
-                .execute(Request::ListIndexes(
-                    serde_json::from_value(json!({"vectorBucketName":bucket,"maxResults":1})).unwrap()
-                ))
-                .await
-                .unwrap_err()
-                .code(),
-            ErrorCode::ServiceUnavailable
-        );
-        assert_eq!(
-            fixture
-                .execute(Request::ListIndexes(
-                    serde_json::from_value(json!({"vectorBucketName":bucket,"nextToken":"unsupported"})).unwrap()
-                ))
-                .await
-                .unwrap_err()
-                .code(),
-            ErrorCode::ServiceUnavailable
-        );
+        let first = fixture
+            .execute(Request::ListIndexes(
+                serde_json::from_value(json!({"vectorBucketName":bucket,"maxResults":1})).unwrap(),
+            ))
+            .await
+            .unwrap();
+        let Response::ListIndexes(first) = first else { panic!("expected Index page") };
+        assert_eq!(first.indexes.len(), 1);
+        let token = first.next_token.unwrap();
+        assert!(token.len() <= 512);
+        let second = fixture
+            .execute(Request::ListIndexes(
+                serde_json::from_value(json!({"vectorBucketArn":format!("arn:aws:s3vectors:{}::bucket/{bucket}", fixture.service.region),"maxResults":500,"nextToken":token})).unwrap(),
+            ))
+            .await
+            .unwrap();
+        let Response::ListIndexes(second) = second else { panic!("expected Index page") };
+        assert_eq!(second.indexes.len(), 1);
+        assert_ne!(first.indexes[0].index_name, second.indexes[0].index_name);
+        assert!(second.next_token.is_none());
+        for input in [
+            json!({"vectorBucketName":bucket,"nextToken":"unsupported"}),
+            json!({"vectorBucketName":bucket,"prefix":"index.","nextToken":token}),
+        ] {
+            assert_eq!(
+                fixture
+                    .execute(Request::ListIndexes(serde_json::from_value(input).unwrap()))
+                    .await
+                    .unwrap_err()
+                    .code(),
+                ErrorCode::Validation,
+            );
+        }
     });
 }
 
@@ -615,5 +629,183 @@ fn vector_maintenance_identity_reloads_rotation_disable_and_deletion() {
         assert!(super::maintenance::resolve_identity(&fixture.app, account).await.is_err());
         iam.delete_user(account, true).await.expect("delete maintenance account");
         assert!(super::maintenance::resolve_identity(&fixture.app, account).await.is_err());
+    });
+}
+
+#[test]
+#[serial_test::serial]
+fn vector_resource_bucket_pages_preserve_scope_identity_and_current_authorization() {
+    run_large_stack_test("vector-resource-bucket-pages", || async {
+        let fixture = Fixture::new().await;
+        let prefix = format!("bucket-pages-{}", Uuid::new_v4().simple());
+        let names: Vec<_> = ["aaa", "bbb", "ccc"].map(|suffix| format!("{prefix}-{suffix}")).into();
+        for name in &names {
+            fixture
+                .execute(Request::CreateVectorBucket(
+                    serde_json::from_value(json!({"vectorBucketName":name})).unwrap(),
+                ))
+                .await
+                .unwrap();
+        }
+        let list = |token: Option<&str>, max| {
+            Request::ListVectorBuckets(
+                serde_json::from_value(json!({"prefix":prefix,"maxResults":max,"nextToken":token})).unwrap(),
+            )
+        };
+        let Response::ListVectorBuckets(first) = fixture.execute(list(None, 1)).await.unwrap() else {
+            panic!("expected bucket page")
+        };
+        assert_eq!(first.vector_buckets.len(), 1);
+        assert_eq!(first.vector_buckets[0].vector_bucket_name, names[0]);
+        let token = first.next_token.unwrap();
+        assert!(token.len() <= 512);
+        let Response::ListVectorBuckets(rest) = fixture.execute(list(Some(&token), 2)).await.unwrap() else {
+            panic!("expected bucket page")
+        };
+        assert_eq!(
+            rest.vector_buckets
+                .iter()
+                .map(|item| item.vector_bucket_name.as_str())
+                .collect::<Vec<_>>(),
+            vec![names[1].as_str(), names[2].as_str()]
+        );
+        assert!(rest.next_token.is_none());
+        let replay = fixture.execute(list(Some(&token), 2)).await.unwrap();
+        assert_eq!(
+            serde_json::from_slice::<Value>(&replay.body_bytes().unwrap()).unwrap(),
+            serde_json::to_value(&rest).unwrap()
+        );
+        let other = Fixture::new().await;
+        assert_eq!(other.execute(list(Some(&token), 1)).await.unwrap_err().code(), ErrorCode::Validation);
+        assert_eq!(
+            fixture
+                .execute(Request::ListVectorBuckets(
+                    serde_json::from_value(json!({"prefix":"different-prefix","nextToken":token})).unwrap()
+                ))
+                .await
+                .unwrap_err()
+                .code(),
+            ErrorCode::Validation
+        );
+        assert_eq!(
+            fixture
+                .execute(Request::ListIndexes(
+                    serde_json::from_value(json!({"vectorBucketName":names[1],"nextToken":token})).unwrap()
+                ))
+                .await
+                .unwrap_err()
+                .code(),
+            ErrorCode::Validation
+        );
+        fixture
+            .execute(Request::DeleteVectorBucket(
+                serde_json::from_value(json!({"vectorBucketName":names[0]})).unwrap(),
+            ))
+            .await
+            .unwrap();
+        let Response::ListVectorBuckets(after_delete) = fixture.execute(list(Some(&token), 2)).await.unwrap() else {
+            panic!("expected bucket page")
+        };
+        assert_eq!(
+            after_delete
+                .vector_buckets
+                .iter()
+                .map(|item| item.vector_bucket_name.as_str())
+                .collect::<Vec<_>>(),
+            vec![names[1].as_str(), names[2].as_str()]
+        );
+        fixture
+            .execute(Request::CreateVectorBucket(
+                serde_json::from_value(json!({"vectorBucketName":names[0]})).unwrap(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(fixture.execute(list(Some(&token), 2)).await.unwrap_err().code(), ErrorCode::Validation);
+        let Response::ListVectorBuckets(current) = fixture.execute(list(None, 1)).await.unwrap() else {
+            panic!("expected bucket page")
+        };
+        let current = current.next_token.unwrap();
+        fixture
+            .set_statements(json!([{"Effect":"Allow","Action":"s3vectors:ListVectorBuckets","Resource":"*"}]))
+            .await;
+        assert!(fixture.execute(list(Some(&current), 2)).await.is_ok());
+        fixture
+            .set_statements(json!([{"Effect":"Deny","Action":"s3vectors:ListVectorBuckets","Resource":"*"}]))
+            .await;
+        assert_eq!(
+            fixture.execute(list(Some(&current), 2)).await.unwrap_err().code(),
+            ErrorCode::AccessDenied
+        );
+    });
+}
+
+#[test]
+#[serial_test::serial]
+fn vector_resource_index_pages_follow_catalog_order_and_reject_recreated_anchor() {
+    run_large_stack_test("vector-resource-index-pages", || async {
+        let fixture = Fixture::new().await;
+        let bucket = format!("index-pages-{}", Uuid::new_v4().simple());
+        fixture
+            .execute(Request::CreateVectorBucket(
+                serde_json::from_value(json!({"vectorBucketName":bucket})).unwrap(),
+            ))
+            .await
+            .unwrap();
+        let create = |name: &str| {
+            Request::CreateIndex(serde_json::from_value(json!({"vectorBucketName":bucket,"indexName":name,"dataType":"float32","dimension":2,"distanceMetric":"euclidean"})).unwrap())
+        };
+        for name in ["aaa", "aaa-bbb", "aaa.bbb", "zzz"] {
+            fixture.execute(create(name)).await.unwrap();
+        }
+        let list = |token: Option<&str>, max| {
+            Request::ListIndexes(
+                serde_json::from_value(json!({"vectorBucketName":bucket,"maxResults":max,"nextToken":token})).unwrap(),
+            )
+        };
+        let Response::ListIndexes(first) = fixture.execute(list(None, 1)).await.unwrap() else {
+            panic!("expected Index page")
+        };
+        assert_eq!(first.indexes[0].index_name, "aaa-bbb");
+        let token = first.next_token.unwrap();
+        let Response::ListIndexes(rest) = fixture.execute(list(Some(&token), 500)).await.unwrap() else {
+            panic!("expected Index page")
+        };
+        assert_eq!(
+            rest.indexes.iter().map(|item| item.index_name.as_str()).collect::<Vec<_>>(),
+            vec!["aaa.bbb", "aaa", "zzz"]
+        );
+        assert!(rest.next_token.is_none());
+        fixture
+            .execute(Request::DeleteIndex(
+                serde_json::from_value(json!({"vectorBucketName":bucket,"indexName":"aaa-bbb"})).unwrap(),
+            ))
+            .await
+            .unwrap();
+        let Response::ListIndexes(after_delete) = fixture.execute(list(Some(&token), 500)).await.unwrap() else {
+            panic!("expected Index page")
+        };
+        assert_eq!(
+            after_delete
+                .indexes
+                .iter()
+                .map(|item| item.index_name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["aaa.bbb", "aaa", "zzz"]
+        );
+        fixture.execute(create("aaa-bbb")).await.unwrap();
+        assert_eq!(fixture.execute(list(Some(&token), 500)).await.unwrap_err().code(), ErrorCode::Validation);
+        let Response::ListIndexes(current) = fixture.execute(list(None, 1)).await.unwrap() else {
+            panic!("expected Index page")
+        };
+        let current = current.next_token.unwrap();
+        fixture.set_statements(json!([{"Effect":"Allow","Action":"s3vectors:ListIndexes","Resource":format!("arn:aws:s3vectors:{}::bucket/{bucket}",fixture.service.region)}])).await;
+        assert!(fixture.execute(list(Some(&current), 500)).await.is_ok());
+        fixture
+            .set_statements(json!([{"Effect":"Deny","Action":"s3vectors:ListIndexes","Resource":"*"}]))
+            .await;
+        assert_eq!(
+            fixture.execute(list(Some(&current), 500)).await.unwrap_err().code(),
+            ErrorCode::AccessDenied
+        );
     });
 }

@@ -304,6 +304,20 @@ impl<B: TableCatalogObjectBackend> ObjectTableCatalogStore<B> {
     ) -> TableCatalogStoreResult<Option<VectorRetirementEvidenceV1>> {
         self.validate_vector_operation_guard(guard)?;
         let current = self.read_vector_maintenance_resource_with_guard(guard).await?;
+        let evidence = self
+            .read_vector_deleted_retirement_evidence_under_protection(&current, &guard.inner.fence)
+            .await?;
+        guard.check_held()?;
+        Ok(evidence)
+    }
+
+    /// The caller retains the existing operation or bucket deletion writer protection for this snapshot.
+    pub(super) async fn read_vector_deleted_retirement_evidence_under_protection(
+        &self,
+        current: &VectorMaintenanceResourceSnapshot,
+        fence: &TableCatalogObjectMutationFence,
+    ) -> TableCatalogStoreResult<Option<VectorRetirementEvidenceV1>> {
+        fence.ensure_held()?;
         if current.state != VectorMaintenanceResourceState::Deleted {
             return Err(TableCatalogStoreError::Conflict(
                 "retirement evidence reuse requires a deleted resource".into(),
@@ -325,6 +339,7 @@ impl<B: TableCatalogObjectBackend> ObjectTableCatalogStore<B> {
         })
         .await?;
         let Some(authorization) = selected else {
+            fence.ensure_held()?;
             return Ok(None);
         };
         let plan_object = self
@@ -370,8 +385,8 @@ impl<B: TableCatalogObjectBackend> ObjectTableCatalogStore<B> {
                 "retirement evidence belongs to another deletion transaction".into(),
             ));
         }
-        self.verify_retirement_history_evidence(&current, &evidence).await?;
-        guard.check_held()?;
+        self.verify_retirement_history_evidence(current, &evidence).await?;
+        fence.ensure_held()?;
         Ok(Some(evidence))
     }
 

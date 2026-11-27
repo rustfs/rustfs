@@ -1,6 +1,7 @@
 // Copyright 2026 RustFS Team
 // SPDX-License-Identifier: Apache-2.0
 
+use super::resource_list_pagination::ResourceListPagination;
 use super::*;
 use rustfs_gateway_types::cors_tagging::{PersistedTag, PersistedTagging};
 use std::collections::BTreeMap;
@@ -198,27 +199,42 @@ impl DefaultVectorUsecase {
         }
         if let Request::ListVectorBuckets(input) = request {
             authorization.verified.authorize(request, &VectorTarget::Service).await?;
-            if input.next_token.is_some() {
-                return Err(pagination_unavailable());
-            }
+            let pagination = ResourceListPagination::for_request(self, &authorization, request, None)?;
+            let cursor = pagination.decode(input.next_token.as_deref())?;
             let snapshots = self
                 .buckets()
                 .list_managed_buckets(&AccountNamespaceId::try_new(String::new()).map_err(|_| unavailable())?, &self.region)
                 .await
                 .map_err(bucket_error)?;
             let max = usize::try_from(input.max_results.unwrap_or(500)).map_err(|_| denied())?;
-            let buckets: Vec<_> = snapshots
+            if let Some(cursor) = &cursor
+                && let Some((handle, _)) = snapshots
+                    .iter()
+                    .find(|(handle, _)| handle.public_name().as_str() == cursor.after)
+            {
+                pagination.check_identity(cursor, handle, None)?;
+            }
+            let mut buckets: Vec<_> = snapshots
                 .into_iter()
                 .filter(|(handle, _)| {
-                    input
-                        .prefix
+                    cursor
                         .as_ref()
-                        .is_none_or(|prefix| handle.public_name().as_str().starts_with(prefix))
+                        .is_none_or(|cursor| handle.public_name().as_str() > cursor.after.as_str())
+                        && input
+                            .prefix
+                            .as_ref()
+                            .is_none_or(|prefix| handle.public_name().as_str().starts_with(prefix))
                 })
+                .take(max.checked_add(1).ok_or_else(unavailable)?)
                 .collect();
-            if buckets.len() > max {
-                return Err(pagination_unavailable());
-            }
+            let next_token = if buckets.len() > max {
+                buckets.pop();
+                let (last, _) = buckets.last().ok_or_else(unavailable)?;
+                Some(pagination.encode(last.public_name().as_str(), last, None)?)
+            } else {
+                None
+            };
+            authorization.verified.authorize(request, &VectorTarget::Service).await?;
             return Ok(Response::ListVectorBuckets(dto::ListVectorBucketsOutput {
                 vector_buckets: buckets
                     .into_iter()
@@ -228,7 +244,7 @@ impl DefaultVectorUsecase {
                         creation_time: snapshot.created.unix_timestamp_nanos() as f64 / 1_000_000_000.0,
                     })
                     .collect(),
-                next_token: None,
+                next_token,
             }));
         }
         let bucket = authorization.bucket.as_ref().ok_or_else(unavailable)?;
@@ -252,7 +268,15 @@ impl DefaultVectorUsecase {
                 return Err(unavailable());
             }
             drop(guard);
-            self.buckets().delete_managed_bucket(bucket).await.map_err(bucket_error)?;
+            let buckets = self.buckets();
+            let deletion = buckets.delete_managed_bucket(bucket);
+            #[cfg(test)]
+            let deletion = crate::table_catalog::with_catalog_retirement_request(
+                authorization.request_id.as_uuid(),
+                authorization.verified.fault_http_request_id(),
+                deletion,
+            );
+            deletion.await.map_err(bucket_error)?;
             return Ok(Response::DeleteVectorBucket(dto::DeleteVectorBucketOutput {}));
         }
         if let Request::ListIndexes(input) = request {
@@ -346,16 +370,50 @@ impl DefaultVectorUsecase {
         input: &dto::ListIndexesInput,
     ) -> Result<Response, ProtocolError> {
         use crate::table_catalog::TableCatalogStore;
-        if input.next_token.is_some() {
-            return Err(pagination_unavailable());
-        }
+        let pagination =
+            ResourceListPagination::for_request(self, authorization, authorization.verified.request(), Some(bucket))?;
+        let position = pagination.decode(input.next_token.as_deref())?;
         let max = usize::try_from(input.max_results.unwrap_or(500)).map_err(|_| denied())?;
         let page_size = NonZeroUsize::new(max.checked_add(1).ok_or_else(unavailable)?).ok_or_else(unavailable)?;
         let catalog = self.catalog(bucket, authorization.reader.clone()).await?;
         let namespace = index_namespace()?;
-        let mut cursor = None;
+        let mut cursor = if let Some(position) = &position {
+            if let Some(listed) = catalog
+                .load_table(bucket.storage_bucket_id().as_str(), &namespace.public_name(), &position.after)
+                .await
+                .map_err(catalog_error)?
+            {
+                let name = CatalogName::parse(&position.after).map_err(|_| unavailable())?;
+                let (operation, _) = catalog
+                    .begin_vector_operation(bucket, &namespace, &name)
+                    .await
+                    .map_err(catalog_error)?;
+                let resource = operation.resource_identity();
+                if resource.vector_bucket() != Some(bucket)
+                    || resource.table_id().as_str() != listed.table_id
+                    || listed.table_uuid != listed.table_id
+                {
+                    return Err(ProtocolError::new(ErrorCode::Conflict, "Vector Index changed during listing"));
+                }
+                pagination.check_identity(position, bucket, Some(resource.table_id().as_str()))?;
+                operation.check_held().map_err(catalog_error)?;
+            }
+            Some(
+                catalog
+                    .vector_index_list_cursor_after(
+                        bucket,
+                        &namespace,
+                        &CatalogName::parse(&position.after).map_err(|_| unavailable())?,
+                    )
+                    .map_err(catalog_error)?,
+            )
+        } else {
+            None
+        };
         let mut indexes = Vec::new();
-        loop {
+        let mut last_returned: Option<(String, String)> = None;
+        let mut next_token = None;
+        'pages: loop {
             let page = catalog
                 .list_tables_page(
                     bucket.storage_bucket_id().as_str(),
@@ -393,15 +451,18 @@ impl DefaultVectorUsecase {
                     .authorize(authorization.verified.request(), &VectorTarget::Bucket(&facts))
                     .await?;
                 operation.check_held().map_err(catalog_error)?;
+                if indexes.len() == max {
+                    let (name, table_id) = last_returned.as_ref().ok_or_else(unavailable)?;
+                    next_token = Some(pagination.encode(name, bucket, Some(table_id))?);
+                    break 'pages;
+                }
+                last_returned = Some((listed.table.clone(), resource.table_id().as_str().to_owned()));
                 indexes.push(dto::IndexSummary {
                     vector_bucket_name: bucket.public_name().as_str().into(),
                     index_name: listed.table.clone(),
                     index_arn: format!("{}/index/{}", arn(bucket), listed.table),
                     creation_time: current.created_at().map_err(catalog_error)?.unix_timestamp_nanos() as f64 / 1_000_000_000.0,
                 });
-                if indexes.len() > max {
-                    return Err(pagination_unavailable());
-                }
             }
             match page.next_cursor {
                 Some(next) if cursor.as_ref() != Some(&next) => cursor = Some(next),
@@ -426,9 +487,6 @@ impl DefaultVectorUsecase {
                 &VectorTarget::Bucket(&authorization_facts(bucket, &metadata)?),
             )
             .await?;
-        Ok(Response::ListIndexes(dto::ListIndexesOutput {
-            next_token: None,
-            indexes,
-        }))
+        Ok(Response::ListIndexes(dto::ListIndexesOutput { next_token, indexes }))
     }
 }

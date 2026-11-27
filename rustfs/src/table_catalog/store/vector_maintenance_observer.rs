@@ -295,7 +295,8 @@ impl<B: TableCatalogObjectBackend> ObjectTableCatalogStore<B> {
                         resource.table_id().as_str(),
                         &stage.commit_id,
                     );
-                    if reference.object_key != expected_path {
+                    let expected_source_path = format!("{prefix}sources/{}.json", reference.content_sha256);
+                    if reference.object_key != expected_path && reference.object_key != expected_source_path {
                         return Err(maintenance_error("result stage reference is outside its deterministic path"));
                     }
                     budget.add(exact.content_length())?;

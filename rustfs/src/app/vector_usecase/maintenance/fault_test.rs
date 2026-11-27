@@ -27,6 +27,8 @@ const MAX_OPERATIONS: usize = 256;
 const MAX_INSPECTION_CURSORS: usize = 32;
 const JOIN_OBSERVATION_WINDOW: Duration = Duration::from_millis(100);
 
+#[path = "deleted_observation.rs"]
+mod deleted_observation;
 #[path = "quota_observation.rs"]
 mod quota_observation;
 #[path = "sdk_observer.rs"]
@@ -192,6 +194,7 @@ pub(crate) struct MaintenanceDriver {
     cancellation: CancellationToken,
     state: parking_lot::Mutex<DriverState>,
     inspection_cursors: Mutex<BTreeMap<String, InspectionCursor>>,
+    deleted_inspection_cursors: Mutex<BTreeMap<String, deleted_observation::InspectionCursor>>,
     inspection_budgets: Arc<VectorMaintenanceBudgets>,
     sdk_candidates: Mutex<BTreeMap<Uuid, Arc<sdk_observer::SdkCandidateBinding>>>,
 }
@@ -262,6 +265,7 @@ impl MaintenanceDriver {
             cancellation: CancellationToken::new(),
             state: parking_lot::Mutex::new(DriverState::default()),
             inspection_cursors: Mutex::new(BTreeMap::new()),
+            deleted_inspection_cursors: Mutex::new(BTreeMap::new()),
             inspection_budgets,
             sdk_candidates: Mutex::new(BTreeMap::new()),
         })

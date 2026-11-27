@@ -58,8 +58,13 @@ const MAX_VECTOR_FAULTS: usize = 32;
 const IO_TIMEOUT: Duration = Duration::from_secs(15);
 type Backend = RealCatalogBackend<EcStoreTableCatalogObjectBackend<ECStore>>;
 
+mod catalog_retirement;
+mod table_sentinel;
+
 #[derive(Debug, thiserror::Error)]
 enum WorkerError {
+    #[error(transparent)]
+    VectorProtocol(#[from] crate::vector::protocol::ProtocolError),
     #[error(transparent)]
     VectorFault(#[from] crate::vector::fault_test::FaultError),
     #[error(transparent)]
@@ -248,6 +253,39 @@ impl TryFrom<MaintenanceWriteTarget> for VectorMaintenanceTestWriteTarget {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
 enum Action {
+    D09Capture {
+        runtime_token: String,
+        resource: VectorMaintenanceResourceV1,
+    },
+    D09Reopen {
+        bucket: VectorBucketBindingV1,
+        resource: Option<VectorMaintenanceResourceV1>,
+        authority_ref: CatalogMetadataRefRecordV1,
+    },
+    D09Snapshot {
+        captured_token: String,
+        cursor: Option<String>,
+    },
+    D09PublicationState {
+        captured_token: String,
+    },
+    D09GateArm {
+        captured_token: String,
+        phase: catalog_retirement::Phase,
+        occurrence: NonZeroU32,
+        pause_timeout_ms: u64,
+    },
+    D09GatePoll {
+        fault_token: String,
+    },
+    D09GateRelease {
+        fault_token: String,
+    },
+    D09DeleteReplay {
+        captured_token: String,
+        runtime_token: String,
+    },
+
     Ping,
     VectorHttpStart,
     MaintenanceOpen {
@@ -287,6 +325,18 @@ enum Action {
         runtime_token: String,
         resource: VectorMaintenanceResourceV1,
         cursor: Option<String>,
+    },
+    VectorDeletedInspect {
+        runtime_token: String,
+        resource: VectorMaintenanceResourceV1,
+        cursor: Option<String>,
+    },
+    TableSentinelCreate,
+    TableSentinelOpen {
+        identity: table_sentinel::Identity,
+    },
+    TableSentinelRead {
+        sentinel_token: String,
     },
     M4WriteFaultArm {
         runtime_token: String,
@@ -741,10 +791,12 @@ fn sdk_candidate_token(
 
 #[derive(Default)]
 struct State {
+    catalog_retirement: catalog_retirement::Registry,
     maintenance_write_faults: BTreeMap<String, Arc<CatalogWriteFaultHandle>>,
     vector_faults: BTreeMap<String, Arc<VectorFaultRecord>>,
     maintenance: BTreeMap<String, Arc<MaintenanceDriver>>,
     sessions: BTreeMap<String, Arc<Session>>,
+    table_sentinels: BTreeMap<String, Option<table_sentinel::Identity>>,
     prepared: BTreeMap<String, Prepared>,
     pauses: BTreeMap<String, PauseHandle>,
     candidate_before: BTreeMap<String, CandidateBefore>,
@@ -1327,6 +1379,39 @@ impl Worker {
     }
     async fn dispatch(&self, action: Action, request_id: &str) -> WorkerResult<Value> {
         match action {
+            Action::D09Capture { runtime_token, resource } => self.d09_capture(runtime_token, resource).await,
+            Action::D09Reopen {
+                bucket,
+                resource,
+                authority_ref,
+            } => self.d09_reopen(bucket, resource, authority_ref).await,
+            Action::D09Snapshot { captured_token, cursor } => self.d09_snapshot(captured_token, cursor).await,
+            Action::D09PublicationState { captured_token } => self.d09_publication_state(&captured_token).await,
+            Action::D09GateArm {
+                captured_token,
+                phase,
+                occurrence,
+                pause_timeout_ms,
+            } => self.d09_gate_arm(captured_token, phase, occurrence, pause_timeout_ms),
+            Action::D09GatePoll { fault_token } => self.d09_gate_poll(&fault_token),
+            Action::D09GateRelease { fault_token } => self.d09_gate_release(&fault_token),
+            Action::D09DeleteReplay {
+                captured_token,
+                runtime_token,
+            } => self.d09_delete_replay(&captured_token, &runtime_token).await,
+
+            Action::VectorDeletedInspect {
+                runtime_token,
+                resource,
+                cursor,
+            } => Ok(serde_json::to_value(
+                self.maintenance(&runtime_token)?
+                    .inspect_deleted_resource(&resource, cursor.as_deref())
+                    .await?,
+            )?),
+            Action::TableSentinelCreate => self.create_table_sentinel().await,
+            Action::TableSentinelOpen { identity } => self.open_table_sentinel(identity).await,
+            Action::TableSentinelRead { sentinel_token } => self.read_table_sentinel(&sentinel_token).await,
             Action::M4WriteFaultArm {
                 runtime_token,
                 resource,
@@ -2057,6 +2142,7 @@ fn error_value(error: &WorkerError) -> Value {
     }
     let class = match error {
         WorkerError::VectorFault(_) => "VectorFault".into(),
+        WorkerError::VectorProtocol(_) => "VectorProtocol".into(),
         WorkerError::Maintenance(_) => "Maintenance".into(),
         WorkerError::Catalog(error) | WorkerError::Lance(LanceManifestError::Catalog(error)) => catalog_class(error),
         WorkerError::Lance(_) => "Lance".into(),
@@ -2080,6 +2166,10 @@ fn error_value(error: &WorkerError) -> Value {
         _ => None,
     };
     let mut output = json!({"class":class,"category":category,"message":error.to_string(),"sources":sources});
+    if let WorkerError::VectorProtocol(error) = error {
+        output["code"] = json!(error.code().name());
+        output["status"] = json!(error.status_code().as_u16());
+    }
     let mut source = error.source();
     let mut typed_sources = Vec::new();
     for _ in 0..64 {
@@ -2104,6 +2194,8 @@ fn error_value(error: &WorkerError) -> Value {
 
 #[cfg(test)]
 mod tests {
+    mod d09_observation_tests;
+
     use super::*;
     use crate::app::gating_test_env::run_large_stack_test;
     use aws_sdk_s3vectors::{

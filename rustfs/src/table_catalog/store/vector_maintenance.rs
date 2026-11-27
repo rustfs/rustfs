@@ -740,6 +740,7 @@ impl<B: TableCatalogObjectBackend> ObjectTableCatalogStore<B> {
         let resource = spec.resource.identity()?;
         let bucket = self.maintenance_bucket(&resource)?;
         let lifecycle = self.backend.acquire_bucket_lifecycle_read(bucket).await?;
+        self.require_vector_bucket_catalog_admission(bucket, &lifecycle).await?;
         let gc = self
             .backend
             .acquire_read_lock(
@@ -897,6 +898,7 @@ impl<B: TableCatalogObjectBackend> ObjectTableCatalogStore<B> {
         worker.execution_identity.validate()?;
         let bucket = self.maintenance_bucket(resource)?;
         let lifecycle = self.backend.acquire_bucket_lifecycle_read(bucket).await?;
+        self.require_vector_bucket_catalog_admission(bucket, &lifecycle).await?;
         let dispatch = self
             .backend
             .acquire_write_lock(self.catalog_bucket(), &self.paths.vector_maintenance_dispatch_path(resource, job_id)?)
@@ -1040,6 +1042,7 @@ impl<B: TableCatalogObjectBackend> ObjectTableCatalogStore<B> {
     ) -> TableCatalogStoreResult<VectorMaintenanceDispatchGuard> {
         let bucket = self.maintenance_bucket(&lease.resource)?;
         let lifecycle = self.backend.acquire_bucket_lifecycle_read(bucket).await?;
+        self.require_vector_bucket_catalog_admission(bucket, &lifecycle).await?;
         let lifecycle_owner = lifecycle.lifecycle_guard.clone().ok_or_else(|| {
             TableCatalogStoreError::Unsupported("maintenance dispatch requires a native lifecycle owner".into())
         })?;
@@ -1368,6 +1371,7 @@ impl<B: TableCatalogObjectBackend> ObjectTableCatalogStore<B> {
         let resource = expected.head().resource_identity().clone();
         let bucket = self.maintenance_bucket(&resource)?;
         let lifecycle = self.backend.acquire_bucket_lifecycle_read(bucket).await?;
+        self.require_vector_bucket_catalog_admission(bucket, &lifecycle).await?;
         let gc = self
             .backend
             .acquire_write_lock(
@@ -1974,6 +1978,8 @@ impl<B: TableCatalogObjectBackend> ObjectTableCatalogStore<B> {
         let lifecycle = self
             .backend
             .acquire_bucket_lifecycle_read(self.maintenance_bucket(resource)?)
+            .await?;
+        self.require_vector_bucket_catalog_admission(self.maintenance_bucket(resource)?, &lifecycle)
             .await?;
         let fence = TableCatalogObjectMutationFence::from_signals([lifecycle.lock_lost_signal()]);
         self.maintenance_copy_source(resource, exact_source, &fence).await
@@ -2585,6 +2591,7 @@ impl<B: TableCatalogObjectBackend> ObjectTableCatalogStore<B> {
             return Err(maintenance_error("deleted enrollment input differs from exact intent"));
         }
         let lifecycle = self.backend.acquire_bucket_lifecycle_read(bucket).await?;
+        self.require_vector_bucket_catalog_admission(bucket, &lifecycle).await?;
         let gc = self
             .backend
             .acquire_write_lock(
@@ -2676,6 +2683,15 @@ impl<B: TableCatalogObjectBackend> ObjectTableCatalogStore<B> {
     }
 }
 
+#[path = "vector_bucket_retirement.rs"]
+mod bucket_retirement;
+pub(crate) use bucket_retirement::CatalogCleanupExecution;
+#[cfg(test)]
+pub(crate) use bucket_retirement::{
+    CatalogRetirementDeleteProbe, CatalogRetirementEvidenceCursor, CatalogRetirementEvidenceReader, CatalogRetirementObservation,
+    CatalogRetirementObservationHandle, CatalogRetirementObservedOutcome, CatalogRetirementObservedPhase,
+    observe_catalog_retirement, with_catalog_retirement_request,
+};
 #[path = "vector_retirement.rs"]
 mod retirement;
 pub(crate) use retirement::*;

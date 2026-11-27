@@ -65,6 +65,7 @@ mod maintenance;
 mod model;
 mod rename_recovery;
 mod store;
+mod vector_bucket_retirement_model;
 mod vector_maintenance_model;
 
 pub(crate) use background::{CatalogBackgroundTask, CatalogBackgroundTaskError};
@@ -91,6 +92,7 @@ pub(crate) use maintenance::*;
 pub(crate) use model::*;
 pub(crate) use rename_recovery::spawn_table_rename_recovery;
 pub(crate) use store::*;
+pub(crate) use vector_bucket_retirement_model::*;
 pub(crate) use vector_maintenance_model::*;
 
 pub(crate) const TABLE_BUCKET_MARKER_CONFIG: &str = BUCKET_TABLE_CONFIG;

@@ -1,7 +1,7 @@
 //! Fault injection at real object-backend return boundaries.
 
 use crate::storage_api::table::WriteCommitGuard;
-use crate::storage_api::table::managed::BucketHandle;
+use crate::storage_api::table::managed::{BucketHandle, BucketIncarnationFenceGuard};
 use crate::table_catalog::*;
 use sha2::{Digest, Sha256};
 #[cfg(unix)]
@@ -392,6 +392,14 @@ impl<B: TableCatalogObjectBackend> TableCatalogObjectBackend for RealCatalogBack
         Ok(guard)
     }
 
+    async fn reuse_bucket_lifecycle_read(
+        &self,
+        expected: &BucketHandle,
+        guard: Arc<BucketIncarnationFenceGuard>,
+    ) -> TableCatalogStoreResult<TableCatalogLockGuard> {
+        self.inner.reuse_bucket_lifecycle_read(expected, guard).await
+    }
+
     async fn read_managed_candidate(
         &self,
         bucket: &BucketHandle,
@@ -767,3 +775,6 @@ impl<B: TableCatalogObjectBackend> TableCatalogObjectBackend for RealCatalogBack
         self.inner.complete_table_commit_publication()
     }
 }
+
+#[cfg(test)]
+mod tests;

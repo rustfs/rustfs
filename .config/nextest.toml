@@ -899,6 +899,20 @@ slow-timeout = { period = "120s", terminate-after = 15 }
 filter = 'package(e2e_test) & test(=distributed::catalog_fault_acceptance_test::catalog_m4_acceptance_test::catalog_m4_d10_test::catalog_m4_d10_failed_sdk_candidate_retains_v2_charge_until_physical_gc)'
 slow-timeout = { period = "120s", terminate-after = 20 }
 
+
+# These bucket-retirement cases retain the production 900-second GC age.
+[[profile.e2e-distributed.overrides]]
+filter = 'package(e2e_test) & test(=distributed::catalog_fault_acceptance_test::catalog_m4_acceptance_test::catalog_m4_d09_bucket_delete_test::catalog_m4_d09_used_bucket_delete_recreate_and_isolation)'
+slow-timeout = { period = "120s", terminate-after = 18 }
+
+[[profile.e2e-distributed.overrides]]
+filter = 'package(e2e_test) & test(=distributed::catalog_fault_acceptance_test::catalog_m4_acceptance_test::catalog_m4_d09_bucket_delete_test::catalog_m4_d09_catalog_cleanup_restarts_from_published_progress)'
+slow-timeout = { period = "120s", terminate-after = 20 }
+
+[[profile.e2e-distributed.overrides]]
+filter = 'package(e2e_test) & test(=distributed::catalog_fault_acceptance_test::catalog_m4_acceptance_test::catalog_m4_d09_bucket_delete_test::catalog_m4_d09_unconfirmed_catalog_delete_remains_protected)'
+slow-timeout = { period = "120s", terminate-after = 18 }
+
 [[profile.e2e-distributed.overrides]]
 filter = 'package(e2e_test)'
 test-group = 'e2e-cluster-nightly'

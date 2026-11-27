@@ -252,6 +252,7 @@ fn fresh_control() -> VectorMaintenanceControl {
 fn vector_maintenance_deleted_gc_reuses_complete_proof_after_first_batch() {
     use crate::app::storage_api::object_usecase::StorageObjectOptions;
     use crate::app::storage_api::object_usecase::contract::object::ObjectOperations;
+    use crate::app::storage_api::test::RUSTFS_META_BUCKET;
     use crate::app::storage_api::vector_usecase::StorageError;
     use std::num::{NonZeroU16, NonZeroUsize};
     use time::{Duration, OffsetDateTime};
@@ -357,6 +358,73 @@ fn vector_maintenance_deleted_gc_reuses_complete_proof_after_first_batch() {
             "native Compaction must publish through the authorized Catalog path"
         );
         let guard = catalog.begin_vector_maintenance_resource_operation(&compacted).await.unwrap();
+        let observed = catalog
+            .read_vector_maintenance_test_job_with_guard(&guard, *compact.job().job_id())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(*observed.job().state(), VectorMaintenanceJobState::Succeeded);
+        let observed = catalog
+            .inspect_vector_maintenance_evidence_with_guard(&guard, &observed)
+            .await
+            .expect("the real Compaction result must be observable through its immutable source copies");
+        let result = serde_json::to_value(&observed.result.as_ref().unwrap().result).unwrap();
+        assert_eq!(result["effect"], "PUBLISHED");
+        assert_eq!(result["job_id"], compact.job().job_id().to_string());
+        let stages = result["stages"].as_array().unwrap();
+        assert_eq!(stages.len(), 2);
+        let job = catalog
+            .read_vector_maintenance_test_job_with_guard(&guard, *compact.job().job_id())
+            .await
+            .unwrap()
+            .unwrap();
+        let prefix = job.observed_object().object_key().as_str().rsplit_once("jobs/").unwrap().0;
+        for (stage, name) in stages.iter().zip(["reserve-fragments", "rewrite"]) {
+            assert_eq!(stage["stage"], name);
+            assert_eq!(stage["outcome"], "COMMITTED");
+            assert!(result["commit_refs"].as_array().unwrap().contains(&stage["commit_ref"]));
+            let reference: CatalogMetadataRefRecordV1 = serde_json::from_value(stage["commit_ref"].clone()).unwrap();
+            let exact = CatalogMetadataRef::try_from(&reference).unwrap();
+            assert_eq!(
+                exact.object_key().as_str(),
+                format!("{prefix}sources/{}.json", exact.content_sha256().to_hex())
+            );
+            let (log, original) = catalog
+                .read_vector_maintenance_test_stage_commit_with_guard(&guard, &job, name)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(serde_json::to_value(&log).unwrap()["commit_id"], stage["commit_id"]);
+            assert_eq!(serde_json::to_value(&log).unwrap()["status"], "COMMITTED");
+            let copied = executor
+                .source
+                .backend
+                .read_object_limited(
+                    RUSTFS_META_BUCKET,
+                    exact.object_key().as_str(),
+                    usize::try_from(exact.content_length()).unwrap(),
+                )
+                .await
+                .unwrap()
+                .unwrap();
+            let original_bytes = executor
+                .source
+                .backend
+                .read_object_limited(
+                    RUSTFS_META_BUCKET,
+                    original.object_key().as_str(),
+                    usize::try_from(original.content_length()).unwrap(),
+                )
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(CatalogMetadataRef::from_read(exact.object_key().clone(), &copied).unwrap(), exact);
+            assert_eq!(
+                CatalogMetadataRef::from_read(original.object_key().clone(), &original_bytes).unwrap(),
+                original
+            );
+            assert_eq!(copied.data, original_bytes.data);
+        }
         let (bound, adapter) = executor
             .preparation_adapter(
                 catalog.clone(),
@@ -596,3 +664,204 @@ fn vector_maintenance_gc_planning_rechecks_changed_resource_tags() {
 
 #[path = "pagination_session_tests.rs"]
 mod pagination_session_tests;
+
+#[test]
+#[serial_test::serial]
+fn vector_maintenance_deleted_discovery_refreshes_enrolled_intent_before_recovery() {
+    use crate::app::storage_api::test::RUSTFS_META_BUCKET;
+    use std::num::{NonZeroU16, NonZeroUsize};
+
+    run_large_stack_test("vector-maintenance-deleted-discovery", || async {
+        let (fixture, executor, catalog, initial, _) = fixture().await;
+        let executor = Arc::new(executor);
+        let identity = initial.head().resource_identity().clone();
+        fixture
+            .execute(Request::DeleteIndex(
+                serde_json::from_value(json!({
+                    "vectorBucketName": identity.vector_bucket().unwrap().public_name().as_str(),
+                    "indexName": initial.head().name().as_str()
+                }))
+                .expect("valid deletion request"),
+            ))
+            .await
+            .expect("actual logical deletion");
+        let budget = |calls| {
+            VectorMaintenanceDiscoveryBudget::new(
+                CancellationToken::new(),
+                tokio::time::Instant::now() + std::time::Duration::from_secs(30),
+                NonZeroUsize::new(calls).expect("nonzero discovery calls"),
+            )
+        };
+        let mut page = executor
+            .source
+            .next_targets(None, NonZeroUsize::new(1).unwrap(), &budget(64))
+            .await
+            .expect("discover the actual Deleted resource");
+        assert!(page.failures.is_empty());
+        assert_eq!(page.targets.len(), 1);
+        let VectorMaintenanceTarget::Preparation {
+            resource,
+            kind,
+            expected,
+        } = page.targets.pop().unwrap()
+        else {
+            panic!("unenrolled Deleted resource must require preparation");
+        };
+        assert_eq!(resource.identity().unwrap(), identity);
+        assert_eq!(kind, VectorMaintenancePreparationKind::Deleted);
+        let previous = CatalogMetadataRef::try_from(&expected).expect("exact pre-enrollment reference");
+        let cursor = page.next_cursor.expect("resource discovery remains active");
+        assert_eq!(cursor.active_buckets.len(), 1);
+        assert_eq!(cursor.active_buckets[0].resource_stage, VectorMaintenanceResourceStage::Recovery);
+        let observed = cursor.active_buckets[0].current_resource.as_ref().unwrap();
+        assert_eq!(observed.source_intent(), Some(&previous));
+        assert!(observed.maintenance().is_none());
+        let result = execute_vector_maintenance_preparation(
+            catalog.as_ref().clone(),
+            resource.clone(),
+            kind,
+            expected,
+            VectorMaintenanceExecutionContext {
+                identity: executor.source.identity.clone(),
+                source: executor.source.clone(),
+                executor: executor.clone(),
+            },
+            fresh_control(),
+        )
+        .await
+        .expect("real enrollment preparation succeeds");
+        assert!(matches!(result, VectorMaintenanceWorkerResult::Prepared));
+        let current = catalog
+            .read_vector_maintenance_resource(&identity, initial.head().namespace(), initial.head().name())
+            .await
+            .expect("reread enrolled deletion");
+        let current_ref = current.source_intent().expect("current deletion reference").clone();
+        assert!(current.maintenance().is_some());
+        assert_eq!(current_ref.object_key(), previous.object_key());
+        assert!(current_ref.content_length() > previous.content_length());
+        assert_ne!(current_ref.content_sha256(), previous.content_sha256());
+        assert_ne!(current_ref.body_revision(), previous.body_revision());
+        let read = executor
+            .source
+            .backend
+            .read_object_limited(
+                RUSTFS_META_BUCKET,
+                current_ref.object_key().as_str(),
+                usize::try_from(current_ref.content_length()).unwrap(),
+            )
+            .await
+            .expect("read actual enrolled bytes")
+            .expect("enrolled intent exists");
+        assert_eq!(
+            CatalogMetadataRef::from_read(current_ref.object_key().clone(), &read).unwrap(),
+            current_ref
+        );
+
+        let stale = executor
+            .prepare(
+                catalog.clone(),
+                VectorMaintenancePreparationAction::PrepareRecovery {
+                    resource: resource.clone(),
+                    kind: VectorMaintenanceKind::DeleteRecovery,
+                    expected_source: VectorMaintenanceSourceV1::try_new(
+                        VectorMaintenanceSourceKind::DeleteIntent,
+                        (&previous).into(),
+                    )
+                    .unwrap(),
+                },
+                fresh_control(),
+            )
+            .await;
+        assert!(
+            matches!(stale, Err(VectorMaintenanceExecutionError::Catalog(TableCatalogStoreError::Conflict(message)))
+            if message == "delete recovery source changed before preparation")
+        );
+        let (jobs, continuation) = catalog
+            .list_vector_maintenance_jobs(&identity, None, NonZeroU16::new(8).unwrap(), &budget(64))
+            .await
+            .expect("inspect jobs after stale rejection")
+            .into_parts();
+        assert!(jobs.is_empty() && continuation.is_none());
+        assert_eq!(
+            catalog
+                .read_vector_maintenance_resource(&identity, initial.head().namespace(), initial.head().name())
+                .await
+                .unwrap(),
+            current
+        );
+
+        let limited = budget(1);
+        let page = executor
+            .source
+            .next_targets(Some(&cursor), NonZeroUsize::new(1).unwrap(), &limited)
+            .await
+            .expect("exhausted refresh budget preserves continuation");
+        assert!(page.targets.is_empty() && page.failures.is_empty());
+        assert_eq!(limited.remaining_calls(), 0);
+        let cursor = page.next_cursor.expect("budget exhaustion retains the cursor");
+        assert_eq!(cursor.active_buckets[0].resource_stage, VectorMaintenanceResourceStage::Recovery);
+        assert_eq!(
+            cursor.active_buckets[0].current_resource.as_ref().unwrap().source_intent(),
+            Some(&previous)
+        );
+        let mut page = executor
+            .source
+            .next_targets(Some(&cursor), NonZeroUsize::new(1).unwrap(), &budget(64))
+            .await
+            .expect("refresh before deriving the recovery input");
+        assert!(page.failures.is_empty());
+        assert_eq!(page.targets.len(), 1);
+        let VectorMaintenanceTarget::PrepareRecovery {
+            resource: selected,
+            kind,
+            expected_source,
+        } = page.targets.pop().unwrap()
+        else {
+            panic!("enrolled deletion must expose its recovery input");
+        };
+        assert_eq!(selected, resource);
+        assert_eq!(kind, VectorMaintenanceKind::DeleteRecovery);
+        assert_eq!(*expected_source.kind(), VectorMaintenanceSourceKind::DeleteIntent);
+        assert_eq!(CatalogMetadataRef::try_from(expected_source.reference()).unwrap(), current_ref);
+        executor
+            .prepare(
+                catalog.clone(),
+                VectorMaintenancePreparationAction::PrepareRecovery {
+                    resource: selected,
+                    kind,
+                    expected_source,
+                },
+                fresh_control(),
+            )
+            .await
+            .expect("current exact deletion input prepares recovery");
+        let (jobs, continuation) = catalog
+            .list_vector_maintenance_jobs(&identity, None, NonZeroU16::new(8).unwrap(), &budget(64))
+            .await
+            .expect("read the actual recovery job")
+            .into_parts();
+        assert!(continuation.is_none());
+        assert_eq!(jobs.len(), 1);
+        let job = jobs[0].job();
+        assert_eq!(job.resource(), &resource);
+        assert_eq!(*job.kind(), VectorMaintenanceKind::DeleteRecovery);
+        assert_eq!(*job.state(), VectorMaintenanceJobState::Queued);
+        let copied = CatalogMetadataRef::try_from(job.input().source().as_ref().unwrap().reference()).unwrap();
+        assert_ne!(copied.object_key(), current_ref.object_key());
+        assert_eq!(copied.content_sha256(), current_ref.content_sha256());
+        assert_eq!(copied.content_length(), current_ref.content_length());
+        let bytes = executor
+            .source
+            .backend
+            .read_object_limited(
+                RUSTFS_META_BUCKET,
+                copied.object_key().as_str(),
+                usize::try_from(copied.content_length()).unwrap(),
+            )
+            .await
+            .expect("read exact persisted recovery source")
+            .expect("immutable recovery source exists");
+        assert_eq!(CatalogMetadataRef::from_read(copied.object_key().clone(), &bytes).unwrap(), copied);
+        assert_eq!(bytes.data, read.data);
+    });
+}

@@ -331,6 +331,22 @@ impl MaintenanceSource {
             active.current_resource = Some(resource);
             active.resource_stage = VectorMaintenanceResourceStage::ExistingJobs;
         }
+        if active.resource_stage == VectorMaintenanceResourceStage::Recovery
+            && let Some(previous) = active.current_resource.as_ref()
+            && previous.state() == VectorMaintenanceResourceState::Deleted
+            && previous.maintenance().is_none()
+        {
+            // Enrollment replaces the delete intent while this cursor retains its earlier snapshot.
+            // Reserve two lock acquisitions, one identity check, and at most three bounded reads.
+            if !(0..6).all(|_| budget.try_start_call()) {
+                return Ok(Advance::Continue);
+            }
+            active.current_resource = Some(
+                catalog
+                    .read_vector_maintenance_resource(previous.resource(), previous.namespace(), previous.name())
+                    .await?,
+            );
+        }
         let observed = active
             .current_resource
             .as_ref()

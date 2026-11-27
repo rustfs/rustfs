@@ -6,8 +6,10 @@
 mod catalog_m4_d05_test;
 mod catalog_m4_d06_test;
 mod catalog_m4_d08_test;
+mod catalog_m4_d09_bucket_delete_test;
 mod catalog_m4_d10_test;
 mod catalog_m4_pagination_test;
+mod catalog_m4_resource_list_pagination_test;
 
 use super::{CatalogCluster, TestResult, field, require, sha256};
 use crate::common::{AdminTransport, admin_add_canned_policy_via, admin_attach_user_policy_via, admin_create_user_via};
@@ -130,6 +132,14 @@ async fn sdk_client(cluster: &CatalogCluster, node: usize, account: &Account) ->
 
 impl Fixture {
     async fn create(cluster: &CatalogCluster, dimension: usize) -> TestResult<Self> {
+        Self::create_with_bucket_delete(cluster, dimension, false).await
+    }
+
+    async fn create_with_bucket_delete(
+        cluster: &CatalogCluster,
+        dimension: usize,
+        allow_bucket_delete: bool,
+    ) -> TestResult<Self> {
         let bucket_name = format!("m4-{}", Uuid::new_v4().simple());
         let index_name = "index.v1".to_owned();
         let foreground = Account::random();
@@ -137,18 +147,22 @@ impl Fixture {
         let listener = cluster.clients[0].call(json!({"op":"vector_http_start"})).await?;
         let bucket_arn = format!("arn:aws:s3vectors:{}::bucket/{bucket_name}", field(&listener, "region")?);
         let expected_index_arn = format!("{bucket_arn}/index/{index_name}");
-        install_account(
-            cluster,
-            &foreground,
-            json!([{
-                "Effect":"Allow",
-                "Action":["s3vectors:CreateVectorBucket","s3vectors:GetVectorBucket","s3vectors:CreateIndex","s3vectors:GetIndex",
-                    "s3vectors:DeleteIndex","s3vectors:PutVectors","s3vectors:DeleteVectors","s3vectors:GetVectors",
-                    "s3vectors:ListVectors","s3vectors:QueryVectors"],
-                "Resource":[bucket_arn,expected_index_arn]
-            }]),
-        )
-        .await?;
+        let mut foreground_statements = json!([{
+            "Effect":"Allow",
+            "Action":["s3vectors:CreateVectorBucket","s3vectors:GetVectorBucket","s3vectors:CreateIndex","s3vectors:GetIndex",
+                "s3vectors:DeleteIndex","s3vectors:PutVectors","s3vectors:DeleteVectors","s3vectors:GetVectors",
+                "s3vectors:ListVectors","s3vectors:QueryVectors"],
+            "Resource":[bucket_arn,expected_index_arn]
+        }]);
+        if allow_bucket_delete {
+            foreground_statements
+                .as_array_mut()
+                .expect("fixture policy array")
+                .push(json!({
+                    "Effect":"Allow","Action":"s3vectors:DeleteVectorBucket","Resource":bucket_arn
+                }));
+        }
+        install_account(cluster, &foreground, foreground_statements).await?;
         let mut clients = Vec::new();
         for node in 0..4 {
             clients.push(sdk_client(cluster, node, &foreground).await?);
@@ -173,15 +187,20 @@ impl Fixture {
             .await?;
         let index_arn = created.index_arn().ok_or("CreateIndex omitted ARN")?.to_owned();
         require(index_arn == expected_index_arn, "SDK Index ARN differs from the scoped IAM policy")?;
-        install_account(
-            cluster,
-            &maintenance,
-            json!([{
-                "Effect":"Allow","Action":["s3vectors:GetVectors","s3vectors:PutVectors","s3vectors:DeleteVectors"],
-                "Resource":index_arn
-            }]),
-        )
-        .await?;
+        let mut maintenance_statements = json!([{
+            "Effect":"Allow","Action":["s3vectors:GetVectors","s3vectors:PutVectors","s3vectors:DeleteVectors"],
+            "Resource":index_arn
+        }]);
+        if allow_bucket_delete {
+            maintenance_statements
+                .as_array_mut()
+                .expect("fixture policy array")
+                .push(json!({
+                    "Effect":"Allow","Action":["s3vectors:GetVectorBucket","s3vectors:DeleteVectorBucket"],
+                    "Resource":bucket_arn
+                }));
+        }
+        install_account(cluster, &maintenance, maintenance_statements).await?;
         let mut runtimes = Vec::new();
         let mut execution_identity = None;
         for (node, client) in clients.iter().enumerate() {

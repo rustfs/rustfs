@@ -205,6 +205,29 @@ fn object_maintenance_deleted_enrollment_preserves_v1_receipt_and_replays() {
         assert_eq!(intent.deleted_entry, original.deleted_entry);
         assert_eq!(intent.request_sha256, original.request_sha256);
         assert_eq!(intent.phase, VectorIndexDeletePhase::LogicallyDeleted);
+        assert!(upgraded.observed_object().content_length() > previous.observed_object().content_length());
+        assert_ne!(upgraded.observed_object().content_sha256(), previous.observed_object().content_sha256());
+        assert_ne!(upgraded.observed_object().body_revision(), previous.observed_object().body_revision());
+        let sources = format!("{}sources/", store.paths.vector_maintenance_prefix(&resource).unwrap());
+        let stale = store
+            .copy_vector_maintenance_source(&resource, previous.observed_object())
+            .await;
+        assert!(matches!(stale, Err(TableCatalogStoreError::Invalid(message)) if message.contains("exceeds the maximum size")));
+        let retained = store
+            .backend
+            .list_catalog_objects_page(store.catalog_bucket(), &sources, None, std::num::NonZeroUsize::new(1).unwrap())
+            .await
+            .unwrap();
+        assert!(retained.objects.is_empty() && !retained.is_truncated);
+        assert_eq!(store.maintenance_read_ref(upgraded.observed_object()).await.unwrap().data, after.data);
+        let copied = store
+            .copy_vector_maintenance_source(&resource, upgraded.observed_object())
+            .await
+            .unwrap();
+        assert_eq!(copied.content_length(), upgraded.observed_object().content_length());
+        assert_eq!(copied.content_sha256(), upgraded.observed_object().content_sha256());
+        assert_ne!(copied.object_key(), upgraded.observed_object().object_key());
+        assert_eq!(store.maintenance_read_ref(&copied).await.unwrap().data, after.data);
     });
 }
 
@@ -814,6 +837,164 @@ fn object_maintenance_retirement_publishes_exact_chain_and_rejects_reintroductio
     });
 }
 
+async fn persist_observer_test_result<B: TableCatalogObjectBackend>(
+    store: &ObjectTableCatalogStore<B>,
+    observed: &VectorMaintenanceJobSnapshot,
+    result: &VectorMaintenanceResultV1,
+) -> VectorMaintenanceJobSnapshot {
+    let resource = observed.job.resource.identity().unwrap();
+    let bytes = encode_vector_maintenance_record(result).unwrap();
+    let digest = hex_simd::encode_to_string(Sha256::digest(&bytes), hex_simd::AsciiCase::Lower);
+    let path = format!(
+        "{}results/{}/attempt-{}/{digest}.json",
+        store.paths.vector_maintenance_prefix(&resource).unwrap(),
+        table_catalog_path_hash(&observed.job.job_id.to_string()),
+        observed.job.attempt
+    );
+    if let Some(existing) = store.backend.read_object(store.catalog_bucket(), &path).await.unwrap() {
+        assert_eq!(existing.data, bytes);
+    } else {
+        store
+            .backend
+            .put_object(store.catalog_bucket(), &path, bytes, TableCatalogPutPrecondition::IfAbsent)
+            .await
+            .unwrap();
+    }
+    let object = store
+        .backend
+        .read_object(store.catalog_bucket(), &path)
+        .await
+        .unwrap()
+        .unwrap();
+    let reference = CatalogMetadataRef::from_read(CatalogObjectKey::try_new(path).unwrap(), &object).unwrap();
+    let mut changed = observed.job.clone();
+    changed.result_ref = Some((&reference).into());
+    store
+        .backend
+        .put_object(
+            store.catalog_bucket(),
+            observed.observed_object.object_key().as_str(),
+            encode_vector_maintenance_record(&changed).unwrap(),
+            TableCatalogPutPrecondition::IfMatch(observed.etag.clone()),
+        )
+        .await
+        .unwrap();
+    let actual = store
+        .read_vector_maintenance_job(&resource, changed.job_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(actual.job, changed);
+    actual
+}
+
+async fn assert_partial_compaction_observer_references<B: TableCatalogObjectBackend>(
+    store: &ObjectTableCatalogStore<B>,
+    recovered: &VectorMaintenanceJobSnapshot,
+    result: &VectorMaintenanceResultV1,
+    original_log: &CatalogMetadataRef,
+) {
+    let resource = recovered.job.resource.identity().unwrap();
+    let snapshot = store
+        .read_vector_maintenance_resource(
+            &resource,
+            &Namespace::parse(&recovered.job.resource.namespace).unwrap(),
+            &CatalogName::parse(&recovered.job.resource.name).unwrap(),
+        )
+        .await
+        .unwrap();
+    let guard = store.begin_vector_maintenance_resource_operation(&snapshot).await.unwrap();
+    let mut observed = store
+        .read_vector_maintenance_test_job_with_guard(&guard, recovered.job.job_id)
+        .await
+        .unwrap()
+        .unwrap();
+    let evidence = store
+        .inspect_vector_maintenance_evidence_with_guard(&guard, &observed)
+        .await
+        .expect("PartialRecovered must preserve the observed original Compaction result");
+    assert_eq!(evidence.job, recovered.job);
+    assert_eq!(evidence.result.unwrap().result, *result);
+    let reference = CatalogMetadataRef::try_from(result.stages[0].commit_ref.as_ref().unwrap()).unwrap();
+    let prefix = store.paths.vector_maintenance_prefix(&resource).unwrap();
+    assert_eq!(
+        reference.object_key().as_str(),
+        format!("{prefix}sources/{}.json", reference.content_sha256().to_hex())
+    );
+    let copied = store.maintenance_read_ref(&reference).await.unwrap();
+    let original = store.maintenance_read_ref(original_log).await.unwrap();
+    assert_eq!(copied.data, original.data);
+    assert_eq!(result.stages[0].outcome, VectorMaintenanceStageOutcome::Committed);
+    assert_eq!(result.stages[1].outcome, VectorMaintenanceStageOutcome::NotPrepared);
+
+    // Persist valid native bytes and exact references so rejection exercises the stage path check.
+    let wrong_digest_path = format!("{prefix}sources/{}.json", "0".repeat(64));
+    assert_ne!(wrong_digest_path, reference.object_key().as_str());
+    let foreign_path = format!(
+        "{}resources/{}/maintenance/v1/sources/{}.json",
+        store.paths.table_bucket_root_prefix(resource.storage_bucket_id()),
+        table_catalog_path_hash(&Uuid::new_v4().to_string()),
+        reference.content_sha256().to_hex()
+    );
+    for path in [wrong_digest_path, foreign_path] {
+        store
+            .backend
+            .put_object(store.catalog_bucket(), &path, copied.data.clone(), TableCatalogPutPrecondition::IfAbsent)
+            .await
+            .unwrap();
+        let bytes = store
+            .backend
+            .read_object(store.catalog_bucket(), &path)
+            .await
+            .unwrap()
+            .unwrap();
+        let exact = CatalogMetadataRef::from_read(CatalogObjectKey::try_new(path).unwrap(), &bytes).unwrap();
+        let mut altered = result.clone();
+        altered.stages[0].commit_ref = Some((&exact).into());
+        observed = persist_observer_test_result(store, &observed, &altered).await;
+        assert!(matches!(
+            store.inspect_vector_maintenance_evidence_with_guard(&guard, &observed).await,
+            Err(TableCatalogStoreError::Invalid(message)) if message == "result stage reference is outside its deterministic path"
+        ));
+    }
+    let mut altered = result.clone();
+    let different_candidate = altered.stages[0].expected_head.as_ref().unwrap().binding.metadata.clone();
+    assert_ne!(altered.stages[0].candidate.as_ref(), Some(&different_candidate));
+    altered.stages[0].candidate = Some(different_candidate);
+    observed = persist_observer_test_result(store, &observed, &altered).await;
+    assert!(matches!(
+        store.inspect_vector_maintenance_evidence_with_guard(&guard, &observed).await,
+        Err(TableCatalogStoreError::Invalid(message)) if message == "result stage log and candidate differ"
+    ));
+
+    let mut direct = result.clone();
+    direct.stages[0].commit_ref = Some(original_log.into());
+    observed = persist_observer_test_result(store, &observed, &direct).await;
+    assert_eq!(
+        store
+            .inspect_vector_maintenance_evidence_with_guard(&guard, &observed)
+            .await
+            .unwrap()
+            .result
+            .unwrap()
+            .result,
+        direct
+    );
+    observed = persist_observer_test_result(store, &observed, result).await;
+    assert_eq!(observed.job, recovered.job);
+    assert_eq!(
+        store
+            .inspect_vector_maintenance_evidence_with_guard(&guard, &observed)
+            .await
+            .unwrap()
+            .result
+            .unwrap()
+            .result,
+        *result
+    );
+    assert_eq!(store.read_vector_maintenance_resource_with_guard(&guard).await.unwrap(), snapshot);
+}
+
 #[test]
 #[serial_test::serial]
 fn object_maintenance_recovers_partial_compaction_without_repeating_reservation() {
@@ -1051,6 +1232,7 @@ fn object_maintenance_recovers_partial_compaction_without_repeating_reservation(
             recovered.job
         );
         drop(recovery_guard);
+        assert_partial_compaction_observer_references(&store, &recovered, &result, &log_ref).await;
 
         let ordinary_spec = VectorMaintenanceJobSpec::from_semantic(
             VectorMaintenanceSemanticSpec::try_new(
@@ -1519,4 +1701,253 @@ async fn object_maintenance_query_sessions_have_exact_scope_and_expiry_window() 
     assert!(!vector_retirement_target_is_old_enough(&target, VectorHistoryRetentionV1::All, now).unwrap());
     target.mod_time = Some(VectorObjectTimeV1::from_time(now - Duration::seconds(3600)));
     assert!(vector_retirement_target_is_old_enough(&target, VectorHistoryRetentionV1::All, now).unwrap());
+}
+
+async fn seed_catalog_retirement_admission_header<B: TableCatalogObjectBackend>(
+    store: &ObjectTableCatalogStore<B>,
+    bucket: &BucketHandle,
+) -> String {
+    use crate::table_catalog::vector_bucket_retirement_model::VectorBucketCatalogRetirementV1;
+    let authority_path = store.paths.vector_bucket_retirement_authority_path(bucket).unwrap();
+    let prefix = authority_path.strip_suffix("/authority.json").unwrap();
+    let retirement_id = Uuid::new_v4();
+    let plan_path = format!("{prefix}/{retirement_id}/plan/{}.json", Uuid::new_v4());
+    // This header-only fixture exercises admission and supplies no executable cleanup proof.
+    store
+        .backend
+        .put_object(
+            RUSTFS_META_BUCKET,
+            &plan_path,
+            br#"{"fixture":"maintenance-admission"}"#.to_vec(),
+            TableCatalogPutPrecondition::IfAbsent,
+        )
+        .await
+        .unwrap();
+    let plan = store
+        .backend
+        .read_object(RUSTFS_META_BUCKET, &plan_path)
+        .await
+        .unwrap()
+        .unwrap();
+    let plan_ref = CatalogMetadataRef::from_read(CatalogObjectKey::try_new(plan_path).unwrap(), &plan).unwrap();
+    let body = serde_json::to_vec(&serde_json::json!({
+        "version":1,"bucket":VectorBucketBindingV1::from_handle(bucket).unwrap(),
+        "retirement_id":retirement_id,"created_at":maintenance_now(),
+        "plan_root":CatalogMetadataRefRecordV1::from(&plan_ref),
+        "plan_page_count":1,"target_count":1,"resource_count":0,
+        "inventory_sha256":"1".repeat(64),"closure_sha256":"2".repeat(64)
+    }))
+    .unwrap();
+    decode_vector_maintenance_record::<VectorBucketCatalogRetirementV1>(&body).unwrap();
+    store
+        .backend
+        .put_object(RUSTFS_META_BUCKET, &authority_path, body, TableCatalogPutPrecondition::IfAbsent)
+        .await
+        .unwrap();
+    authority_path
+}
+
+#[tokio::test]
+async fn object_maintenance_retirement_admission_rejects_create_claim_and_source_copy() {
+    for corrupt in [false, true] {
+        let (fixture, spec) = maintenance_fixture().await;
+        let snapshot = fixture.store.create_vector_maintenance_job(spec.clone()).await.unwrap();
+        let resource = spec.resource.identity().unwrap();
+        let observed = fixture
+            .store
+            .read_vector_maintenance_resource(
+                &resource,
+                &Namespace::parse(&spec.resource.namespace).unwrap(),
+                &CatalogName::parse(&spec.resource.name).unwrap(),
+            )
+            .await
+            .unwrap();
+        let condition = VectorMaintenanceClaimCondition::from_snapshot(&snapshot, observed);
+        let worker =
+            VectorMaintenanceWorker::try_new("retirement-admission".into(), Uuid::new_v4(), spec.execution_identity.clone())
+                .unwrap();
+        fixture
+            .store
+            .copy_vector_maintenance_source(&resource, snapshot.observed_object())
+            .await
+            .unwrap();
+        let mut next_spec = snapshot.job().semantic_spec();
+        next_spec.execution_identity = VectorMaintenanceExecutionIdentityV1::try_new("next-account".into(), [9; 16]).unwrap();
+        let next_spec = VectorMaintenanceJobSpec::from_semantic(next_spec).unwrap();
+        assert_ne!(next_spec.job_id, spec.job_id);
+        let authority = seed_catalog_retirement_admission_header(&fixture.store, &fixture.bucket).await;
+        if corrupt {
+            fixture
+                .backend
+                .seed_object(RUSTFS_META_BUCKET, &authority, b"{".to_vec())
+                .await;
+        }
+        let before = {
+            let state = fixture.backend.state.lock().await;
+            (state.objects.clone(), state.put_attempts.clone(), state.delete_attempts.clone())
+        };
+        let created = fixture.store.create_vector_maintenance_job(next_spec).await;
+        let claimed = fixture
+            .store
+            .claim_vector_maintenance_job(&resource, spec.job_id, condition, worker, Uuid::new_v4())
+            .await;
+        let copied = fixture
+            .store
+            .copy_vector_maintenance_source(&resource, snapshot.observed_object())
+            .await;
+        if corrupt {
+            assert!(created.is_err() && claimed.is_err() && copied.is_err());
+        } else {
+            assert!(matches!(created, Err(TableCatalogStoreError::Conflict(_))));
+            assert!(matches!(claimed, Err(TableCatalogStoreError::Conflict(_))));
+            assert!(matches!(copied, Err(TableCatalogStoreError::Conflict(_))));
+        }
+        let state = fixture.backend.state.lock().await;
+        assert_eq!(state.objects, before.0);
+        assert_eq!(state.put_attempts, before.1);
+        assert_eq!(state.delete_attempts, before.2);
+    }
+}
+
+#[tokio::test]
+async fn object_maintenance_retirement_admission_uses_exact_incarnation() {
+    let (fixture, spec) = maintenance_fixture().await;
+    let mut old = VectorBucketBindingV1::from_handle(&fixture.bucket).unwrap();
+    old.bucket_incarnation = Uuid::new_v4();
+    let old = old.to_handle().unwrap();
+    let old_path = seed_catalog_retirement_admission_header(&fixture.store, &old).await;
+    assert_ne!(
+        old_path,
+        fixture
+            .store
+            .paths
+            .vector_bucket_retirement_authority_path(&fixture.bucket)
+            .unwrap()
+    );
+    let old_before = fixture
+        .backend
+        .read_object(RUSTFS_META_BUCKET, &old_path)
+        .await
+        .unwrap()
+        .unwrap();
+    let created = fixture.store.create_vector_maintenance_job(spec.clone()).await.unwrap();
+    assert_eq!(created.job().resource().bucket().to_handle().unwrap(), fixture.bucket);
+    let old_after = fixture
+        .backend
+        .read_object(RUSTFS_META_BUCKET, &old_path)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(old_before.data, old_after.data);
+    assert_eq!(old_before.etag, old_after.etag);
+    assert_eq!(old_before.body_revision, old_after.body_revision);
+}
+
+#[test]
+#[serial_test::serial]
+fn object_maintenance_retirement_admission_rejects_dispatch_and_enrollment() {
+    use crate::table_catalog::tests::prepared_commit::{native_vector_index_fixture, run_native_vector_delete_test};
+    run_native_vector_delete_test("maintenance-retirement-admission", || async {
+        let (store, original, _fixture) = native_vector_index_fixture().await;
+        let entry = VectorCatalogEntry::from_entry(original).unwrap();
+        let resource = entry.head().resource_identity().clone();
+        let bucket = resource.vector_bucket().unwrap();
+        drop(store.begin_vector_maintenance_enrollment(&entry).await.unwrap());
+        let enrollment_entry = entry.clone();
+        let entry = store
+            .enroll_vector_maintenance(
+                &entry,
+                vector_maintenance_enroll_commit_id(&resource, &VectorMaintenanceHeadV1::from_entry(&entry).unwrap()).unwrap(),
+            )
+            .await
+            .unwrap();
+        let spec = VectorMaintenanceJobSpec::from_semantic(
+            VectorMaintenanceSemanticSpec::try_new(
+                VectorMaintenanceResourceV1::try_new(&resource, entry.head().namespace(), entry.head().name()).unwrap(),
+                VectorMaintenanceKind::AnnBuild,
+                VectorMaintenanceOrigin::Periodic,
+                VectorMaintenanceInputV1::try_new(Some(VectorMaintenanceHeadV1::from_entry(&entry).unwrap()), None, None)
+                    .unwrap(),
+                VectorMaintenanceExecutionIdentityV1::try_new("retirement-admission".into(), [7; 16]).unwrap(),
+                None,
+                VectorMaintenancePolicyV1::default(),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let work = claim_native_job(&store, spec).await;
+        drop(store.begin_vector_maintenance_dispatch(work.lease()).await.unwrap());
+        let current = store
+            .read_vector_maintenance_resource(&resource, entry.head().namespace(), entry.head().name())
+            .await
+            .unwrap();
+        drop(store.begin_vector_maintenance_resource_operation(&current).await.unwrap());
+        let head_before = store.maintenance_read_ref(current.observed_object()).await.unwrap();
+        let job_before = store.maintenance_read_ref(work.snapshot().observed_object()).await.unwrap();
+        let authority = seed_catalog_retirement_admission_header(&store, bucket).await;
+        assert!(matches!(
+            store.begin_vector_maintenance_dispatch(work.lease()).await,
+            Err(TableCatalogStoreError::Conflict(_))
+        ));
+        let enrollment = store.begin_vector_maintenance_enrollment(&enrollment_entry).await;
+        assert!(matches!(&enrollment, Err(TableCatalogStoreError::Conflict(_))));
+        assert!(matches!(enrollment,
+            Err(TableCatalogStoreError::Conflict(message))
+                if message == "Vector bucket Catalog retirement prevents ordinary admission"));
+        assert!(matches!(
+            store.begin_vector_maintenance_resource_operation(&current).await,
+            Err(TableCatalogStoreError::Conflict(_))
+        ));
+        let head_after = store.maintenance_read_ref(current.observed_object()).await.unwrap();
+        let job_after = store.maintenance_read_ref(work.snapshot().observed_object()).await.unwrap();
+        assert_eq!(head_after.data, head_before.data);
+        assert_eq!(job_after.data, job_before.data);
+        assert!(
+            store
+                .backend
+                .read_object(RUSTFS_META_BUCKET, &authority)
+                .await
+                .unwrap()
+                .is_some()
+        );
+    });
+}
+
+#[test]
+#[serial_test::serial]
+fn object_maintenance_retirement_admission_rejects_deleted_enrollment() {
+    use crate::table_catalog::tests::prepared_commit::{native_vector_index_fixture, run_native_vector_delete_test};
+    run_native_vector_delete_test("maintenance-retirement-deleted", || async {
+        let (store, original, _fixture) = native_vector_index_fixture().await;
+        let entry = VectorCatalogEntry::from_entry(original).unwrap();
+        let resource = entry.head().resource_identity().clone();
+        let bucket = resource.vector_bucket().unwrap();
+        let (guard, _) = store
+            .begin_vector_operation(bucket, entry.head().namespace(), entry.head().name())
+            .await
+            .unwrap();
+        store
+            .delete_vector_index_with_guard(&guard, &entry, CatalogCommitId::try_new(Uuid::new_v4().to_string()).unwrap())
+            .await
+            .unwrap();
+        drop(guard);
+        let current = store
+            .read_vector_maintenance_resource(&resource, entry.head().namespace(), entry.head().name())
+            .await
+            .unwrap();
+        assert_eq!(current.state(), VectorMaintenanceResourceState::Deleted);
+        let before = store.maintenance_read_ref(current.observed_object()).await.unwrap();
+        let intent: VectorIndexDeleteIntent = serde_json::from_slice(&before.data).unwrap();
+        assert!(matches!(intent, VectorIndexDeleteIntent::V1(_)));
+        let update_id = vector_maintenance_enroll_deleted_update_id(&resource, current.observed_object()).unwrap();
+        seed_catalog_retirement_admission_header(&store, bucket).await;
+        assert!(matches!(
+            store
+                .enroll_deleted_vector_maintenance(&resource, current.observed_object(), update_id)
+                .await,
+            Err(TableCatalogStoreError::Conflict(_))
+        ));
+        let after = store.maintenance_read_ref(current.observed_object()).await.unwrap();
+        assert_eq!(after.data, before.data);
+    });
 }

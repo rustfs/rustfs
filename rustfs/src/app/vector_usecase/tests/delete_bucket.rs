@@ -3,7 +3,112 @@
 
 use super::*;
 use crate::app::storage_api::vector_usecase::{NamespaceLocking as _, StorageError};
+use crate::table_catalog::{CatalogRetirementObservationHandle, VectorBucketBindingV1, observe_catalog_retirement};
 use std::time::Duration;
+
+fn observe_delete(identity: &BucketHandle) -> CatalogRetirementObservationHandle {
+    observe_catalog_retirement(
+        VectorBucketBindingV1::from_handle(identity).unwrap(),
+        Arc::new(|_| Box::pin(async { Ok(()) })),
+    )
+    .unwrap()
+}
+
+fn assert_successful_delete_diagnostics(
+    observer: &CatalogRetirementObservationHandle,
+    identity: &BucketHandle,
+    instance_id: Uuid,
+    expected_invocations: usize,
+) {
+    let snapshot = observer.managed_delete_diagnostics();
+    assert_eq!(snapshot["overflow"], false);
+    let events = snapshot["events"].as_array().unwrap();
+    assert_eq!(events.len(), expected_invocations * 6);
+    let binding = json!(VectorBucketBindingV1::from_handle(identity).unwrap());
+    for invocation in events.as_chunks::<6>().0 {
+        let phases = invocation
+            .iter()
+            .map(|event| event["phase"].as_str().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            phases,
+            [
+                "CatalogScopeStarted",
+                "CatalogScopeReturned",
+                "ManagedStarted",
+                "CallbackStarted",
+                "CallbackReturned",
+                "ManagedReturned"
+            ]
+        );
+        for event in invocation {
+            assert_eq!(event["bucket"], binding);
+            assert_eq!(event["instance_id"], json!(instance_id));
+            assert_eq!(event["invocation_id"], invocation[0]["invocation_id"]);
+            assert_eq!(event["request"], invocation[0]["request"]);
+            assert!(
+                !Uuid::parse_str(event["request"]["request_id"].as_str().unwrap())
+                    .unwrap()
+                    .is_nil()
+            );
+        }
+        for index in [1, 4, 5] {
+            assert_eq!(invocation[index]["outcome"], json!({"result":"Succeeded"}));
+        }
+    }
+}
+
+fn assert_native_nonempty_diagnostics(
+    observer: &CatalogRetirementObservationHandle,
+    identity: &BucketHandle,
+    instance_id: Uuid,
+    expected_invocations: usize,
+) {
+    let snapshot = observer.managed_delete_diagnostics();
+    assert_eq!(snapshot["overflow"], false);
+    let events = snapshot["events"].as_array().unwrap();
+    assert_eq!(events.len(), expected_invocations * 4, "{snapshot}");
+    let binding = json!(VectorBucketBindingV1::from_handle(identity).unwrap());
+    let mut invocation_ids = std::collections::BTreeSet::new();
+    for invocation in events.as_chunks::<4>().0 {
+        let phases = invocation
+            .iter()
+            .map(|event| event["phase"].as_str().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            phases,
+            [
+                "CatalogScopeStarted",
+                "CatalogScopeReturned",
+                "ManagedStarted",
+                "ManagedReturned"
+            ]
+        );
+        let invocation_id = Uuid::parse_str(invocation[0]["invocation_id"].as_str().unwrap()).unwrap();
+        assert!(!invocation_id.is_nil());
+        assert!(invocation_ids.insert(invocation_id));
+        for event in invocation {
+            assert_eq!(event["bucket"], binding);
+            assert_eq!(event["instance_id"], json!(instance_id));
+            assert_eq!(event["invocation_id"], invocation[0]["invocation_id"]);
+            assert_eq!(event["request"], invocation[0]["request"]);
+            assert!(
+                !Uuid::parse_str(event["request"]["request_id"].as_str().unwrap())
+                    .unwrap()
+                    .is_nil()
+            );
+        }
+        assert_eq!(invocation[0]["outcome"], Value::Null);
+        assert_eq!(invocation[1]["outcome"], json!({"result":"Succeeded"}));
+        assert_eq!(invocation[2]["outcome"], Value::Null);
+        // Native object residue rejects deletion before the Catalog callback is polled.
+        assert_eq!(
+            invocation[3]["outcome"],
+            json!({"result":"Failed","error":{"domain":"Storage","category":"BucketNotEmpty"}}),
+            "{snapshot}"
+        );
+    }
+}
 
 fn delete_request(bucket: &str) -> Request {
     Request::DeleteVectorBucket(serde_json::from_value(json!({"vectorBucketName": bucket})).unwrap())
@@ -35,6 +140,8 @@ fn vector_bucket_delete_recreates_name_and_rejects_old_admission() {
         let admitted = fixture.service.admit(fixture.verified(request.clone())).await.unwrap();
         let stale = fixture.service.admit(fixture.verified(request.clone())).await.unwrap();
         let previous = admitted.bucket.as_ref().unwrap().clone();
+        let observer = observe_delete(&previous);
+        let request_id = admitted.request_id.as_uuid();
         let catalog = fixture.service.catalog(&previous, admitted.reader.clone()).await.unwrap();
         let lifecycle = fixture
             .service
@@ -51,6 +158,11 @@ fn vector_bucket_delete_recreates_name_and_rejects_old_admission() {
             fixture.service.execute_authorized(admitted, request.clone()).await.unwrap(),
             Response::DeleteVectorBucket(_)
         ));
+        assert_successful_delete_diagnostics(&observer, &previous, fixture.app.object_store().id, 1);
+        assert_eq!(
+            observer.managed_delete_diagnostics()["events"][0]["request"]["request_id"],
+            json!(request_id)
+        );
         assert_eq!(
             fixture
                 .execute(Request::GetVectorBucket(
@@ -175,7 +287,20 @@ fn vector_bucket_delete_rejects_active_and_retained_indexes() {
             ))
             .await
             .unwrap();
+        let identity = fixture
+            .service
+            .buckets()
+            .resolve_bucket_handle(
+                BucketKind::Vector,
+                &AccountNamespaceId::try_new(String::new()).unwrap(),
+                &fixture.service.region,
+                &BucketPublicName::try_new(bucket.clone()).unwrap(),
+            )
+            .await
+            .unwrap();
+        let observer = observe_delete(&identity);
         assert_eq!(fixture.execute(delete_request(&bucket)).await.unwrap_err().code(), ErrorCode::Conflict);
+        assert_native_nonempty_diagnostics(&observer, &identity, fixture.app.object_store().id, 1);
         fixture
             .execute(Request::GetIndex(
                 serde_json::from_value(json!({"vectorBucketName":bucket,"indexName":"index.one"})).unwrap(),
@@ -189,6 +314,7 @@ fn vector_bucket_delete_rejects_active_and_retained_indexes() {
             .await
             .unwrap();
         assert_eq!(fixture.execute(delete_request(&bucket)).await.unwrap_err().code(), ErrorCode::Conflict);
+        assert_native_nonempty_diagnostics(&observer, &identity, fixture.app.object_store().id, 2);
         fixture
             .execute(Request::GetVectorBucket(
                 serde_json::from_value(json!({"vectorBucketName":bucket})).unwrap(),
@@ -291,4 +417,93 @@ fn vector_bucket_delete_preserves_typed_catalog_errors() {
     }
     let native = BucketResolveError::Storage(StorageError::BucketNotEmpty("retained-data".into()));
     assert_eq!(bucket_error(native).code(), ErrorCode::Conflict);
+}
+
+#[test]
+#[serial_test::serial]
+fn vector_bucket_delete_diagnostics_record_direct_callback_drop() {
+    run_large_stack_test("vector-delete-diagnostic-drop", || async {
+        let fixture = Fixture::new().await;
+        let bucket = format!("vectors-{}", Uuid::new_v4().simple());
+        create_bucket(&fixture, &bucket).await;
+        let identity = fixture
+            .service
+            .buckets()
+            .resolve_bucket_handle(
+                BucketKind::Vector,
+                &AccountNamespaceId::try_new(String::new()).unwrap(),
+                &fixture.service.region,
+                &BucketPublicName::try_new(bucket.clone()).unwrap(),
+            )
+            .await
+            .unwrap();
+        let before = current_metadata(&fixture, &identity).await.marshal_msg().unwrap();
+        let observer = observe_delete(&identity);
+        let store = fixture.app.object_store();
+        let namespace = store
+            .new_ns_lock(".rustfs.sys", "s3vectors/catalog/registry.lock")
+            .await
+            .unwrap();
+        let blocker = namespace.get_write_lock(Duration::from_secs(5)).await.unwrap();
+        let owner = fixture.service.clone();
+        let expected = identity.clone();
+        // This directly tests dropping the lower-level future; owned HTTP execution is tested separately.
+        let waiter = tokio::spawn(async move {
+            let buckets = owner.buckets();
+            buckets.delete_managed_bucket(&expected).await
+        });
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let snapshot = observer.managed_delete_diagnostics();
+                if snapshot["events"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|event| event["phase"] == "CallbackStarted")
+                {
+                    break;
+                }
+                assert!(!waiter.is_finished(), "the direct delete must remain blocked by the registry writer");
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the original callback is actually polled");
+        assert!(!waiter.is_finished());
+        waiter.abort();
+        assert!(waiter.await.unwrap_err().is_cancelled());
+        let snapshot = observer.managed_delete_diagnostics();
+        assert_eq!(snapshot["overflow"], false);
+        let events = snapshot["events"].as_array().unwrap();
+        assert_eq!(events.len(), 6);
+        for (index, phase) in [
+            "CatalogScopeStarted",
+            "CatalogScopeReturned",
+            "ManagedStarted",
+            "CallbackStarted",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            assert_eq!(events[index]["phase"], phase);
+        }
+        for phase in ["CallbackDroppedWithoutResult", "ManagedDroppedWithoutResult"] {
+            assert_eq!(events.iter().filter(|event| event["phase"] == phase).count(), 1);
+        }
+        for event in events {
+            assert_eq!(event["bucket"], json!(VectorBucketBindingV1::from_handle(&identity).unwrap()));
+            assert_eq!(event["instance_id"], json!(store.id));
+            assert_eq!(event["invocation_id"], events[0]["invocation_id"]);
+            assert_eq!(event["request"], Value::Null);
+        }
+        drop(blocker);
+        let after = current_metadata(&fixture, &identity).await.marshal_msg().unwrap();
+        assert_eq!(before, after);
+        fixture
+            .execute(Request::GetVectorBucket(
+                serde_json::from_value(json!({"vectorBucketName":bucket})).unwrap(),
+            ))
+            .await
+            .unwrap();
+    });
 }

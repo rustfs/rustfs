@@ -8,6 +8,7 @@ mod bucket;
 mod dataset;
 mod encryption;
 pub(crate) mod maintenance;
+mod resource_list_pagination;
 mod target;
 #[cfg(test)]
 mod tests;
@@ -290,6 +291,110 @@ pub(crate) async fn catalog_worker_test_identity() -> (Arc<crate::runtime_source
     (fixture.app, fixture.credentials)
 }
 
+#[cfg(test)]
+pub(crate) struct CatalogWorkerBucketDeleteReplay {
+    service: DefaultVectorUsecase,
+    authorization: AuthorizedVectorRequest,
+    request: Request,
+    execution_identity: crate::table_catalog::VectorMaintenanceExecutionIdentityV1,
+}
+
+#[cfg(test)]
+impl CatalogWorkerBucketDeleteReplay {
+    pub(crate) async fn execute(
+        self,
+        identity: &crate::table_catalog::VectorMaintenanceExecutionIdentityV1,
+    ) -> Result<Response, ProtocolError> {
+        let identity = identity.clone();
+        crate::app::storage_api::vector_usecase::run_owned_mutation(async move {
+            let Self {
+                service,
+                mut authorization,
+                request,
+                execution_identity,
+            } = self;
+            let helper = authorization.audit.take().ok_or_else(|| OwnedExecutionError(unavailable()))?;
+            let result = async move {
+                if identity != execution_identity {
+                    return Err(denied());
+                }
+                let app = service.server.installed_app_context().ok_or_else(unavailable)?;
+                let (current, _) = maintenance::resolve_identity(&app, identity.account())
+                    .await
+                    .map_err(|error| s3_error(error.into()))?;
+                if current.user_generation() != identity.user_generation() {
+                    return Err(denied());
+                }
+                service.execute_owned(authorization, request).await
+            }
+            .await;
+            complete_audit(helper, result.as_ref().err());
+            result.map_err(OwnedExecutionError)
+        })
+        .await
+        .map_err(|error| error.0)
+    }
+}
+
+/// Captures the same one-shot authorization owner used by the existing stale-admission tests.
+#[cfg(test)]
+pub(crate) async fn catalog_worker_capture_bucket_delete(
+    server: Arc<ServerContextSlot>,
+    expected: &BucketHandle,
+    execution_identity: &crate::table_catalog::VectorMaintenanceExecutionIdentityV1,
+) -> Result<CatalogWorkerBucketDeleteReplay, ProtocolError> {
+    let app = server.installed_app_context().ok_or_else(unavailable)?;
+    let (current, credentials) = maintenance::resolve_identity(&app, execution_identity.account())
+        .await
+        .map_err(|error| s3_error(error.into()))?;
+    if current.user_generation() != execution_identity.user_generation() {
+        return Err(denied());
+    }
+    let service = DefaultVectorUsecase::new(
+        server.clone(),
+        ManifestIoLimits {
+            max_manifest_bytes: std::num::NonZeroU64::new(64 * 1024 * 1024).expect("positive worker manifest limit"),
+            max_concurrent_reads: NonZeroUsize::new(4).expect("positive worker read concurrency"),
+        },
+        NonZeroUsize::new(3).expect("positive worker write attempts"),
+    )?;
+    let request = Request::DeleteVectorBucket(dto::DeleteVectorBucketInput {
+        vector_bucket_name: Some(expected.public_name().as_str().into()),
+        vector_bucket_arn: None,
+    });
+    let mut extensions = http::Extensions::new();
+    extensions.insert(server.clone());
+    extensions.insert(crate::app::storage_api::vector_usecase::RequestContext::fallback());
+    let envelope = RequestEnvelope::from_parts(
+        crate::app::RequestHead {
+            method: http::Method::POST,
+            uri: http::Uri::from_static("/DeleteVectorBucket"),
+            headers: http::HeaderMap::new(),
+            credentials: Some(
+                crate::app::RequestCredentials::new(credentials.access_key, credentials.secret_key, None)
+                    .map_err(|_| denied())?,
+            ),
+            region: Some(service.region.clone()),
+            service: Some("s3vectors".into()),
+        },
+        extensions,
+    );
+    let verified = VerifiedVectorRequest::for_test(server, envelope, request.clone(), service.region.clone());
+    let mut authorization = service.admit(verified).await?;
+    if authorization.bucket.as_ref() != Some(expected) || authorization.catalog.is_some() || authorization.resource.is_some() {
+        let error = denied();
+        let helper = authorization.audit.take().ok_or_else(unavailable)?;
+        complete_audit(helper, Some(&error));
+        return Err(error);
+    }
+    Ok(CatalogWorkerBucketDeleteReplay {
+        service,
+        authorization,
+        request,
+        execution_identity: execution_identity.clone(),
+    })
+}
+
 struct OwnedExecutionError(ProtocolError);
 
 fn complete_audit(helper: crate::app::storage_api::vector_usecase::OperationHelper, error: Option<&ProtocolError>) {
@@ -342,9 +447,6 @@ fn denied() -> ProtocolError {
 }
 fn unavailable() -> ProtocolError {
     ProtocolError::new(ErrorCode::ServiceUnavailable, "Vector service is unavailable")
-}
-fn pagination_unavailable() -> ProtocolError {
-    ProtocolError::new(ErrorCode::ServiceUnavailable, "Vector pagination is unavailable")
 }
 fn access_error(error: VectorAccessError) -> ProtocolError {
     match error {

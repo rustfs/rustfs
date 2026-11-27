@@ -235,6 +235,7 @@ fn same_action_family(left: &Action, right: &Action) -> bool {
     matches!(
         (left, right),
         (Action::S3Action(_), Action::S3Action(_))
+            | (Action::S3VectorsAction(_), Action::S3VectorsAction(_))
             | (Action::AdminAction(_), Action::AdminAction(_))
             | (Action::StsAction(_), Action::StsAction(_))
             | (Action::KmsAction(_), Action::KmsAction(_))
