@@ -205,7 +205,7 @@ behavior.
 | config.rustfs.kms.vault.default_key | string | `"transit"`| The master key id for RustFS. |
 | extraEnv | list | `[]` | Extra environment variables for the RustFS container. An explicit `RUSTFS_LOCAL_ENDPOINT_HOST` or `RUSTFS_VOLUMES`, or a bounded, dynamic, or unrecognized startup mode, disables generated anchor injection. `POD_NAME` and `RUSTFS_ADDRESS` remain independent overrides. |
 | extraVolumes | list | `[]` | Extra volumes to add to the pod spec. Supported in both standalone (Deployment) and distributed (StatefulSet) modes. |
-| extraVolumeMounts | list | `[]` | Extra volume mounts to add to the RustFS container. Supported in both standalone (Deployment) and distributed (StatefulSet) modes. |
+| extraVolumeMounts | list | `[]` | Extra mounts for the RustFS container in both modes. Each pod mounts a disk-backed `emptyDir` at `/tmp` for large scanner checkpoints. Supply a writable mount at `/tmp` to use your own volume or set `emptyDir.sizeLimit`. |
 | containerSecurityContext.capabilities.drop[0] | string | `"ALL"` |  |
 | containerSecurityContext.readOnlyRootFilesystem | bool | `true` |  |
 | containerSecurityContext.runAsNonRoot | bool | `true` |  |

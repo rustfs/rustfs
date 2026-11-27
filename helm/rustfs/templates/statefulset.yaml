@@ -37,6 +37,7 @@
 {{- end -}}
 
 {{- if .Values.mode.distributed.enabled }}
+{{- $tmpVolumeName := include "rustfs.tmpVolumeName" . }}
 {{- $pools := include "rustfs.pools" . | fromJsonArray }}
 {{- range $pool := $pools }}
 {{- $drivesPerNode := int $pool.drives }}
@@ -241,6 +242,10 @@ spec:
             {{- toYaml $.Values.resources | nindent 12 }}
           {{- include "rustfs.probes" $ | nindent 10 }}
           volumeMounts:
+            {{- with $tmpVolumeName }}
+            - name: {{ . }}
+              mountPath: /tmp
+            {{- end }}
             {{- if or $.Values.mtls.enabled $tlsEnabled }}
             - name: tls-material
               mountPath: /opt/tls
@@ -265,8 +270,12 @@ spec:
               mountPath: /data
             {{- end }}
             {{- end }}
-      {{- if or $.Values.mtls.enabled $tlsEnabled $.Values.extraVolumes }}
+      {{- if or $tmpVolumeName $.Values.mtls.enabled $tlsEnabled $.Values.extraVolumes }}
       volumes:
+        {{- with $tmpVolumeName }}
+        - name: {{ . }}
+          emptyDir: {}
+        {{- end }}
         {{- if or $.Values.mtls.enabled $tlsEnabled }}
         - name: tls-material
           projected:
