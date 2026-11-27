@@ -31,7 +31,9 @@ use crate::runtime_sources::ServerContextSlot;
 use crate::server::gateway_handlers::{handler_error, verified_signature};
 use crate::storage_api::server::http::access::ReqInfo;
 use http_body_util::BodyExt as _;
-use rustfs_gateway::{Decision, Handler, HandlerResult, Operation, Req, RequestContextView, Resp, decide_with};
+use rustfs_gateway::{
+    Decision, Handler, HandlerResult, Operation, Req, RequestContextView, Resp, SigV4Authenticator, decide_with,
+};
 use rustfs_gateway_adapter::{IamKeyLookup, RootSource};
 use rustfs_gateway_core::dialect::{ClaimedRoute, Dialect, DialectBuilder, DialectOverlay, OverlayRow};
 use rustfs_gateway_dialect_rustfs_admin::ops::{
@@ -41,7 +43,9 @@ use rustfs_gateway_dialect_rustfs_admin::ops::{
     get_v4_extensions_catalog::GetV4ExtensionsCatalog, get_v4_plugins_catalog::GetV4PluginsCatalog,
     get_v4_runtime_capabilities::GetV4RuntimeCapabilities,
 };
-use rustfs_gateway_dialect_rustfs_admin::{AdminOperation, AdminResponse as WireResponse, CLAIMS, OVERLAY};
+use rustfs_gateway_dialect_rustfs_admin::{
+    AdminOperation, AdminResponse as WireResponse, CLAIMS, OVERLAY, TABLE_CATALOG_PREFIXES,
+};
 use rustfs_s3_types::{Body, S3Result, s3_error};
 use std::sync::{Arc, OnceLock};
 
@@ -86,6 +90,10 @@ pub(super) fn dialect() -> Result<Dialect, GatewayAssemblyError> {
         .map_err(GatewayAssemblyError::AdminDialect)
 }
 
+pub(super) fn configure_authenticator(authenticator: SigV4Authenticator) -> SigV4Authenticator {
+    authenticator.verify_paths_double_encoded_under(TABLE_CATALOG_PREFIXES)
+}
+
 pub(super) fn assemble(
     assembly: GatewayAssembly,
     iam: Arc<dyn IamKeyLookup>,
@@ -98,7 +106,7 @@ pub(super) fn assemble(
             Decision::Deny
         }
     });
-    let builder = GatewayStack::configured_builder(&assembly, iam, root, gate, std::convert::identity)?;
+    let builder = GatewayStack::configured_builder(&assembly, iam, root, gate, configure_authenticator)?;
     let service = builder
         .dialect(&dialect()?)
         .register::<GetIcebergConfig, _>(Arc::new(AdminBridge {

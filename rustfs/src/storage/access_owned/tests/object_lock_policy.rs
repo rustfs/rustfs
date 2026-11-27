@@ -363,12 +363,16 @@ fn post_object_policy_checks_form_fields_instead_of_headers() {
     assert_eq!(conditions.get("object-lock-legal-hold"), Some(&vec!["ON".to_string()]));
 }
 
-#[test]
-fn gateway_post_policy_projects_effective_write_conditions() {
+#[tokio::test]
+async fn gateway_post_policy_projects_effective_write_conditions() {
     let mut req = request(Method::POST)
         .header("if-none-match", "*")
         .header("if-none-match", "\"second\"")
-        .header("x-amz-server-side-encryption", "wire")
+        .header("x-amz-server-side-encryption", "AES256")
+        .header(
+            "x-amz-server-side-encryption-aws-kms-key-id",
+            "arn:aws:kms:us-east-1:111122223333:key/wire",
+        )
         .header("x-amz-server-side-encryption-customer-algorithm", "AES256")
         .build();
     PostObjectFormPolicy::new(PostObjectPolicyFields {
@@ -383,12 +387,58 @@ fn gateway_post_policy_projects_effective_write_conditions() {
     assert!(!projected.contains_key("if-match"));
     assert_eq!(projected.get("if-none-match"), Some(&HeaderValue::from_static("*")));
     assert_eq!(projected.get("x-amz-server-side-encryption"), Some(&HeaderValue::from_static("form")));
-    assert_eq!(
-        projected.get("x-amz-server-side-encryption-customer-algorithm"),
-        Some(&HeaderValue::from_static("AES256"))
+    assert!(
+        !projected.contains_key("x-amz-server-side-encryption-aws-kms-key-id"),
+        "unsigned wire KMS key header must not bleed into PostObject policy headers"
+    );
+    assert!(
+        !projected.contains_key("x-amz-server-side-encryption-customer-algorithm"),
+        "unsigned wire SSE-C algorithm header must not bleed into PostObject policy headers"
     );
     assert_eq!(req.headers().get_all("if-none-match").iter().count(), 2);
-    assert_eq!(req.headers().get("x-amz-server-side-encryption"), Some(&HeaderValue::from_static("wire")));
+    assert_eq!(
+        req.headers().get("x-amz-server-side-encryption"),
+        Some(&HeaderValue::from_static("AES256"))
+    );
+
+    // Unsigned HTTP wire SSE headers must not satisfy a preflight policy requiring SSE when the
+    // POST form itself omits encryption fields.
+    let mut wire_only_sse = request(Method::POST)
+        .header("x-amz-server-side-encryption", "AES256")
+        .header("x-amz-server-side-encryption-customer-algorithm", "AES256")
+        .build();
+    PostObjectFormPolicy::new(PostObjectPolicyFields::default())
+        .expect("empty form policy")
+        .install_gateway(&mut wire_only_sse);
+    let projected = &wire_only_sse.post_object_policy_headers().expect("projected headers").0;
+    assert!(!projected.contains_key("x-amz-server-side-encryption"));
+    assert!(!projected.contains_key("x-amz-server-side-encryption-customer-algorithm"));
+
+    let action = Action::S3Action(S3Action::PutObjectAction);
+    let conditions = remaining_retention_days_conditions(&wire_only_sse, action);
+    assert!(!conditions.contains_key("x-amz-server-side-encryption"));
+    let require_sse_policy = Policy::parse_config(
+        br#"{
+        "Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":"s3:PutObject","Resource":"arn:aws:s3:::bucket/*",
+        "Condition":{"StringEquals":{"s3:x-amz-server-side-encryption":"AES256"}}}]
+    }"#,
+    )
+    .expect("SSE condition policy should parse");
+    let args = Args {
+        account: "writer",
+        groups: &None,
+        action,
+        bucket: "bucket",
+        conditions: &conditions,
+        is_owner: false,
+        object: "object",
+        claims: &HashMap::new(),
+        deny_only: false,
+    };
+    assert!(
+        !require_sse_policy.is_allowed(&args).await,
+        "unsigned wire SSE headers must not satisfy a PostObject preflight encryption policy"
+    );
 }
 
 #[tokio::test]
@@ -736,4 +786,56 @@ fn replication_proxy_requires_authorization_independent_of_local_tags() {
         HashMap::from([("ExistingObjectTag/protected".to_string(), vec!["yes".to_string()])]),
     ));
     assert!(!proxy_allowed(&req));
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn discovery_root_access_key_stays_isolated_to_bound_server_context() {
+    use crate::runtime_sources::{
+        AppContext, ServerContextSlot, current_action_credentials, current_app_context, install_test_app_context,
+    };
+    use crate::storage::authorization::request_root_access_key;
+    use std::sync::Arc;
+
+    let store = crate::app::gating_test_env::shared_gating_ecstore().await;
+    if current_app_context().is_none() {
+        install_test_app_context(Arc::clone(&store)).await;
+    }
+    let _ = rustfs_credentials::init_global_action_credentials(
+        Some("global-server-a-root".to_owned()),
+        Some("global-server-a-secret".to_owned()),
+    );
+    let ambient = current_app_context().expect("ambient context");
+    let _ = ambient.publish_action_credentials(rustfs_credentials::Credentials {
+        access_key: "global-server-a-root".to_owned(),
+        secret_key: "global-server-a-secret".to_owned(),
+        status: "on".to_owned(),
+        ..Default::default()
+    });
+    let global_root = current_action_credentials().map(|cred| cred.access_key).unwrap_or_default();
+    assert!(!global_root.is_empty());
+    assert_eq!(request_root_access_key(None), global_root);
+
+    let uninstalled = ServerContextSlot::new();
+    assert_eq!(request_root_access_key(Some(&uninstalled)), "");
+
+    let no_root_ctx = Arc::new(AppContext::new(Arc::clone(&store), ambient.iam(), ambient.kms()).with_empty_action_credentials());
+    let slot_without_root = ServerContextSlot::new();
+    assert!(slot_without_root.install(no_root_ctx));
+    assert_eq!(
+        request_root_access_key(Some(&slot_without_root)),
+        "",
+        "installed server context without published root credentials must never fall back to global root"
+    );
+
+    let isolated_ctx = Arc::new(AppContext::new(Arc::clone(&store), ambient.iam(), ambient.kms()));
+    assert!(isolated_ctx.publish_action_credentials(rustfs_credentials::Credentials {
+        access_key: "server-b-root".to_owned(),
+        secret_key: "server-b-secret".to_owned(),
+        status: "on".to_owned(),
+        ..Default::default()
+    }));
+    let slot_with_root = ServerContextSlot::new();
+    assert!(slot_with_root.install(isolated_ctx));
+    assert_eq!(request_root_access_key(Some(&slot_with_root)), "server-b-root");
 }
