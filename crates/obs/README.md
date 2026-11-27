@@ -157,8 +157,12 @@ With OTLP → Collector → Prometheus, the time from a failure to an alert also
 
 | Variable                                        | Default      | Description                                                 |
 |-------------------------------------------------|--------------|-------------------------------------------------------------|
-| `RUSTFS_OBS_LOG_MAX_TOTAL_SIZE_BYTES`           | `2147483648` | Byte budget (2 GiB), applied to rolled logs and to compressed archives separately; `0` = no budget. See [Disk usage bound](#disk-usage-bound) |
+| `RUSTFS_OBS_LOG_MAX_TOTAL_SIZE_BYTES`           | `2147483648` | Byte budget (2 GiB) shared across rolled logs and compressed archives when `RUSTFS_OBS_LOG_MAX_ARCHIVE_SIZE_BYTES` is unset; `0` = no budget. See [Disk usage bound](#disk-usage-bound) |
+| `RUSTFS_OBS_LOG_MAX_ARCHIVE_SIZE_BYTES`         | unset        | Optional dedicated byte budget for compressed archives (`.gz`/`.zst`). Unset = share remaining `RUSTFS_OBS_LOG_MAX_TOTAL_SIZE_BYTES` after rolled logs; `0` = unlimited archive bytes (retention days still apply) |
 | `RUSTFS_OBS_LOG_MAX_SINGLE_FILE_SIZE_BYTES`     | unset        | Unset or unparsable: the active file rolls at 256 MiB, or at a quarter of the byte budget when that is smaller (at least 1 MiB). A value: the active file rolls at that size and the cleaner also processes rolled files above it. `0` = no size roll |
+| `RUSTFS_OBS_LOG_MAX_COMPRESS_FILES_PER_PASS`    | `32`         | Maximum rolled files compressed per cleanup pass (`0` = unlimited); over-budget files beyond this cap are deleted directly without compression |
+| `RUSTFS_OBS_LOG_SINK_MAX_EVENTS_PER_SEC`        | `10000`      | Global file-sink event rate limit (events/sec); `0` disables sink-side rate limiting |
+| `RUSTFS_OBS_LOG_SINK_PER_CALLSITE_MAX_EVENTS_PER_SEC` | unset  | Per-callsite file-sink event rate limit (events/sec) so one noisy site cannot starve others; unset = `(sink_max / 4).max(1)`, `0` = disabled |
 | `RUSTFS_OBS_LOG_COMPRESS_OLD_FILES`             | `true`       | Compress files before deleting                              |
 | `RUSTFS_OBS_LOG_GZIP_COMPRESSION_LEVEL`         | `6`          | Gzip level `1` (fastest) – `9` (best)                       |
 | `RUSTFS_OBS_LOG_COMPRESSION_ALGORITHM`          | `zstd`       | Compression codec: `zstd` or `gzip`                         |
@@ -176,9 +180,9 @@ With OTLP → Collector → Prometheus, the time from a failure to an alert also
 
 ### Disk usage bound
 
-With the defaults the log directory holds at most the byte budget of rolled logs, the same budget of compressed archives, and one active file of up to 256 MiB. The active file is rolled by size as well as by time, and the cleaner runs a pass after every roll in addition to its interval, so the budget is enforced when a file is rolled. While the rolled logs exceed the budget the cleaner processes the oldest ones, as many as the budget requires, even if they are younger than `RUSTFS_OBS_LOG_MIN_FILE_AGE_SECONDS`; `RUSTFS_OBS_LOG_KEEP_FILES` still applies only to files past that age.
+With the defaults the log directory holds at most the shared `RUSTFS_OBS_LOG_MAX_TOTAL_SIZE_BYTES` budget across rolled logs and compressed archives combined (or independent rolled and archive budgets when `RUSTFS_OBS_LOG_MAX_ARCHIVE_SIZE_BYTES` is set), plus one active file of up to 256 MiB. The active file is rolled by size as well as by time, and the cleaner runs a pass after every roll in addition to its interval, so the budget is enforced when a file is rolled and newly created archives are accounted for in the same pass. While the rolled logs exceed the budget the cleaner processes the oldest ones, as many as the budget requires, even if they are younger than `RUSTFS_OBS_LOG_MIN_FILE_AGE_SECONDS`; `RUSTFS_OBS_LOG_KEEP_FILES` still applies only to files past that age.
 
-The bound is not instantaneous: the directory can exceed it by what is written while one cleanup pass runs, archives created by a pass are trimmed by the next one, and a cleaner that compresses more slowly than logs are produced falls behind. Setting `RUSTFS_OBS_LOG_MAX_TOTAL_SIZE_BYTES=0` removes the budget and `RUSTFS_OBS_LOG_MAX_SINGLE_FILE_SIZE_BYTES=0` turns size rolling off, which leaves the active file bounded only by the rotation period. Neither setting limits how fast logs are produced.
+To stay bounded under sustained failures or log storms: the file layer attaches a sink-side rate-limiting filter (`RUSTFS_OBS_LOG_SINK_MAX_EVENTS_PER_SEC` with per-callsite fairness isolation); each cleanup pass compresses at most `RUSTFS_OBS_LOG_MAX_COMPRESS_FILES_PER_PASS` files and directly deletes older mandatory over-budget excess without compression; and if rotation continuously fails, `RollingAppender` sheds active-file writes past a bounded ceiling (2x roll size on transient failures, tightened to 1x after 3 consecutive failures) until rotation recovers. The bound is still not instantaneous (bytes written while a cleanup pass runs can transiently exceed it). Setting `RUSTFS_OBS_LOG_MAX_TOTAL_SIZE_BYTES=0` removes the budget, `RUSTFS_OBS_LOG_MAX_SINGLE_FILE_SIZE_BYTES=0` turns size rolling off, and `RUSTFS_OBS_LOG_SINK_MAX_EVENTS_PER_SEC=0` disables sink-side rate limiting.
 
 The cleaner recognizes only its own process's active file. Do not let two processes write log files that match the same pattern in one directory: a file another process is still writing looks like a rolled log, and the minimum file age no longer shields it once the budget is exceeded.
 
@@ -200,6 +204,8 @@ The log rotation and cleanup pipeline emits these metrics (via the `metrics` fac
 | `rustfs_log_cleaner_rotation_failures_total` | counter | Failed file rotations |
 | `rustfs_log_cleaner_rotation_duration_seconds` | histogram | Rotation latency |
 | `rustfs_log_cleaner_active_file_size_bytes` | gauge | Current active log file size |
+| `rustfs_log_cleaner_rotation_dropped_bytes_total` | counter | Bytes shed by the rolling appender when continuous rotation failure hits the active-file cap |
+| `rustfs_log_cleaner_sink_dropped_events_total` | counter | File-sink log events shed by the sink-side rate limiter |
 
 These metrics cover compression, cleanup, and file rotation end-to-end.
 

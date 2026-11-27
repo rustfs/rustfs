@@ -743,4 +743,190 @@ mod tests {
         assert_eq!(std::fs::metadata(&gz)?.len(), archive_len, "existing valid archive unchanged");
         Ok(())
     }
+
+    /// P2-6: under the byte budget, a single cleanup pass compresses at most
+    /// `max_compress_files_per_pass` rolled files and defers the remaining
+    /// backlog to subsequent passes instead of spiking CPU.
+    #[test]
+    fn single_pass_compression_cap_defers_under_budget_backlog() -> std::io::Result<()> {
+        let tmp = TempDir::new()?;
+        let dir = tmp.path().to_path_buf();
+        for i in 0..5u64 {
+            let name = format!("app.log.2024-01-0{i}");
+            create_log_file(&dir, &name, 1024)?;
+            set_mtime_ago(&dir.join(&name), Duration::from_secs((10 - i) * 60));
+        }
+
+        let cleaner = LogCleaner::builder(dir.clone(), "app.log.".to_string(), "app.log".to_string())
+            .match_mode(FileMatchMode::Prefix)
+            .keep_files(0)
+            .max_total_size_bytes(0)
+            .compress_old_files(true)
+            .compression_algorithm(CompressionAlgorithm::Gzip)
+            .parallel_compress(false)
+            .max_compress_files_per_pass(2)
+            .min_file_age_seconds(0)
+            .build();
+
+        let (deleted_pass_1, _) = cleaner.cleanup()?;
+        assert_eq!(deleted_pass_1, 2, "first pass must compress at most 2 files");
+        assert!(dir.join("app.log.2024-01-00.gz").exists());
+        assert!(dir.join("app.log.2024-01-01.gz").exists());
+        for i in 2..5 {
+            assert!(
+                dir.join(format!("app.log.2024-01-0{i}")).exists(),
+                "deferred file {i} must wait for a later pass"
+            );
+            assert!(!dir.join(format!("app.log.2024-01-0{i}.gz")).exists());
+        }
+
+        let (deleted_pass_2, _) = cleaner.cleanup()?;
+        assert_eq!(deleted_pass_2, 2, "second pass compresses the next 2 files");
+        let (deleted_pass_3, _) = cleaner.cleanup()?;
+        assert_eq!(deleted_pass_3, 1, "third pass finishes the backlog");
+        Ok(())
+    }
+
+    /// P2-6 under storm pressure: when rolled files exceed `max_total_size_bytes`,
+    /// at most `max_compress_files_per_pass` files are compressed and older
+    /// mandatory over-budget files are deleted directly so the disk cap holds in
+    /// one pass without unbounded CPU work.
+    #[test]
+    fn single_pass_compression_cap_evicts_over_budget_excess_without_compressing() -> std::io::Result<()> {
+        let tmp = TempDir::new()?;
+        let dir = tmp.path().to_path_buf();
+        for i in 0..6u64 {
+            let name = format!("app.log.2024-01-0{i}");
+            create_log_file(&dir, &name, 1024)?;
+            set_mtime_ago(&dir.join(&name), Duration::from_secs((60 - i * 5) * 60));
+        }
+
+        // 6 KiB rolled, 2 KiB rolled budget -> 4 files must be evicted immediately.
+        // Separate archive budget keeps the 2 created archives visible for assertion.
+        let cleaner = LogCleaner::builder(dir.clone(), "app.log.".to_string(), "app.log".to_string())
+            .match_mode(FileMatchMode::Prefix)
+            .keep_files(30)
+            .max_total_size_bytes(2 * 1024)
+            .max_archive_size_bytes(Some(10 * 1024))
+            .compress_old_files(true)
+            .compression_algorithm(CompressionAlgorithm::Gzip)
+            .parallel_compress(false)
+            .max_compress_files_per_pass(2)
+            .min_file_age_seconds(0)
+            .build();
+
+        let (deleted, _) = cleaner.cleanup()?;
+        assert_eq!(deleted, 4, "all 4 over-budget files must be removed in one pass");
+        // Oldest 2 deleted directly without compression.
+        for i in 0..2 {
+            assert!(!dir.join(format!("app.log.2024-01-0{i}")).exists());
+            assert!(
+                !dir.join(format!("app.log.2024-01-0{i}.gz")).exists(),
+                "excess over-budget file {i} must bypass compression"
+            );
+        }
+        // Newest 2 of the evicted 4 are compressed (respecting cap=2).
+        for i in 2..4 {
+            assert!(!dir.join(format!("app.log.2024-01-0{i}")).exists());
+            assert!(dir.join(format!("app.log.2024-01-0{i}.gz")).exists());
+        }
+        // Newest 2 remain as plain rolled logs within the 2 KiB budget.
+        for i in 4..6 {
+            assert!(dir.join(format!("app.log.2024-01-0{i}")).exists());
+        }
+        Ok(())
+    }
+
+    /// When `max_archive_size_bytes` is unset, rolled logs and compressed
+    /// archives share the single `max_total_size_bytes` ceiling instead of each
+    /// consuming up to `max_total_size_bytes` independently.
+    #[test]
+    fn shared_total_budget_bounds_rolled_logs_and_archives_together() -> std::io::Result<()> {
+        let tmp = TempDir::new()?;
+        let dir = tmp.path().to_path_buf();
+        create_log_file(&dir, "app.log.2024-01-01.gz", 1024)?;
+        create_log_file(&dir, "app.log.2024-01-02.gz", 1024)?;
+        set_mtime_ago(&dir.join("app.log.2024-01-01.gz"), Duration::from_secs(300));
+        set_mtime_ago(&dir.join("app.log.2024-01-02.gz"), Duration::from_secs(200));
+        create_log_file(&dir, "app.log.2024-01-03", 1024)?;
+        create_log_file(&dir, "app.log.2024-01-04", 1024)?;
+        set_mtime_ago(&dir.join("app.log.2024-01-03"), Duration::from_secs(100));
+        set_mtime_ago(&dir.join("app.log.2024-01-04"), Duration::from_secs(50));
+
+        // 2 KiB rolled + 2 KiB archives = 4 KiB total; shared budget is 3 KiB.
+        // Rolled logs (2 KiB) fit, leaving 1 KiB for archives -> oldest archive goes.
+        let cleaner = LogCleaner::builder(dir.clone(), "app.log.".to_string(), "app.log".to_string())
+            .match_mode(FileMatchMode::Prefix)
+            .keep_files(30)
+            .max_total_size_bytes(3 * 1024)
+            .compressed_file_retention_days(0)
+            .min_file_age_seconds(0)
+            .build();
+
+        let (deleted, _) = cleaner.cleanup()?;
+        assert_eq!(deleted, 1, "oldest archive must be trimmed to keep rolled+archives <= total budget");
+        assert!(!dir.join("app.log.2024-01-01.gz").exists());
+        assert!(dir.join("app.log.2024-01-02.gz").exists());
+        assert!(dir.join("app.log.2024-01-03").exists());
+        assert!(dir.join("app.log.2024-01-04").exists());
+        Ok(())
+    }
+
+    /// Setting `max_archive_size_bytes(Some(cap))` enforces separate rolled-log
+    /// and archive budgets independently, including archives created in the same
+    /// cleanup pass.
+    #[test]
+    fn explicit_separate_archive_budget_applies_independently_and_same_pass() -> std::io::Result<()> {
+        let tmp = TempDir::new()?;
+        let dir = tmp.path().to_path_buf();
+        create_log_file(&dir, "app.log.2024-01-01.gz", 1024)?;
+        create_log_file(&dir, "app.log.2024-01-02.gz", 1024)?;
+        set_mtime_ago(&dir.join("app.log.2024-01-01.gz"), Duration::from_secs(300));
+        set_mtime_ago(&dir.join("app.log.2024-01-02.gz"), Duration::from_secs(200));
+        // Rolled logs fit inside 2 KiB rolled budget while separate archive budget is 3 KiB.
+        create_log_file(&dir, "app.log.2024-01-03", 1024)?;
+        create_log_file(&dir, "app.log.2024-01-04", 1024)?;
+
+        let cleaner = LogCleaner::builder(dir.clone(), "app.log.".to_string(), "app.log".to_string())
+            .match_mode(FileMatchMode::Prefix)
+            .keep_files(30)
+            .max_total_size_bytes(2 * 1024)
+            .max_archive_size_bytes(Some(3 * 1024))
+            .compressed_file_retention_days(0)
+            .min_file_age_seconds(0)
+            .build();
+
+        assert_eq!(
+            cleaner.cleanup()?,
+            (0, 0),
+            "both rolled (2 KiB <= 2 KiB) and archives (2 KiB <= 3 KiB) fit their separate budgets"
+        );
+
+        // Now tighten the separate archive budget to 1024 bytes while compressing a new log in the same pass.
+        create_log_file(&dir, "app.log.2024-01-00", 2048)?;
+        set_mtime_ago(&dir.join("app.log.2024-01-00"), Duration::from_secs(400));
+        let tight = LogCleaner::builder(dir.clone(), "app.log.".to_string(), "app.log".to_string())
+            .match_mode(FileMatchMode::Prefix)
+            .keep_files(2)
+            .max_total_size_bytes(2 * 1024)
+            .max_archive_size_bytes(Some(1024))
+            .compress_old_files(true)
+            .compression_algorithm(CompressionAlgorithm::Gzip)
+            .parallel_compress(false)
+            .compressed_file_retention_days(0)
+            .min_file_age_seconds(0)
+            .build();
+
+        let _ = tight.cleanup()?;
+        let archive_bytes: u64 = std::fs::read_dir(&dir)?
+            .filter_map(Result::ok)
+            .filter(|e| e.file_name().to_string_lossy().ends_with(".gz"))
+            .map(|e| e.metadata().map(|m| m.len()).unwrap_or(0))
+            .sum();
+        assert!(
+            archive_bytes <= 1024,
+            "same-pass newly created archives must obey the archive budget (got {archive_bytes} bytes)"
+        );
+        Ok(())
+    }
 }

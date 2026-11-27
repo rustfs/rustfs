@@ -38,6 +38,8 @@ pub(crate) const METRIC_LOG_CLEANER_ROTATION_TOTAL: &str = "rustfs_log_cleaner_r
 pub(crate) const METRIC_LOG_CLEANER_ROTATION_FAILURES_TOTAL: &str = "rustfs_log_cleaner_rotation_failures_total";
 pub(crate) const METRIC_LOG_CLEANER_ROTATION_DURATION_SECONDS: &str = "rustfs_log_cleaner_rotation_duration_seconds";
 pub(crate) const METRIC_LOG_CLEANER_ACTIVE_FILE_SIZE_BYTES: &str = "rustfs_log_cleaner_active_file_size_bytes";
+pub(crate) const METRIC_LOG_CLEANER_ROTATION_DROPPED_BYTES_TOTAL: &str = "rustfs_log_cleaner_rotation_dropped_bytes_total";
+pub(crate) const METRIC_LOG_CLEANER_SINK_DROPPED_EVENTS_TOTAL: &str = "rustfs_log_cleaner_sink_dropped_events_total";
 
 /// Check whether Observability metric is enabled
 pub fn observability_metric_enabled() -> bool {
@@ -224,6 +226,8 @@ mod tests {
             METRIC_LOG_CLEANER_ROTATION_FAILURES_TOTAL,
             METRIC_LOG_CLEANER_ROTATION_DURATION_SECONDS,
             METRIC_LOG_CLEANER_ACTIVE_FILE_SIZE_BYTES,
+            METRIC_LOG_CLEANER_ROTATION_DROPPED_BYTES_TOTAL,
+            METRIC_LOG_CLEANER_SINK_DROPPED_EVENTS_TOTAL,
         ];
 
         for metric in metrics {

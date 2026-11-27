@@ -31,6 +31,7 @@ use crossbeam_deque::{Injector, Steal, Stealer, Worker};
 use crossbeam_utils::{Backoff, thread};
 use metrics::{counter, gauge, histogram};
 use rustfs_config::DEFAULT_LOG_KEEP_FILES;
+use rustfs_config::observability::DEFAULT_OBS_LOG_MAX_COMPRESS_FILES_PER_PASS;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -56,8 +57,18 @@ fn compressed_file_retention_window(days: u64) -> Duration {
 struct CompressionTaskResult {
     /// Original file metadata so successful workers can be deleted later.
     file: FileInfo,
+    /// Archive created on disk (absent in dry-run mode or on compression error).
+    archive: Option<FileInfo>,
     /// Whether compression completed successfully for this file.
     compressed: bool,
+}
+
+#[derive(Debug, Default)]
+struct BatchProcessOutcome {
+    deleted_files: usize,
+    freed_bytes: u64,
+    deleted_source_bytes: u64,
+    created_archives: Vec<FileInfo>,
 }
 
 /// Log-file lifecycle manager.
@@ -76,10 +87,19 @@ pub struct LogCleaner {
     pub(super) match_mode: FileMatchMode,
     /// Maximum number of newest regular log files to keep.
     pub(super) keep_files: usize,
-    /// Optional cap for the cumulative size of regular logs.
+    /// Optional cap for the cumulative size of regular logs (and shared with
+    /// compressed archives when `max_archive_size_bytes` is `None`).
     pub(super) max_total_size_bytes: u64,
+    /// Optional dedicated byte budget for compressed archives.
+    /// - `None`: archives share the remaining `max_total_size_bytes` budget
+    ///   after surviving rolled logs are accounted for.
+    /// - `Some(0)`: unlimited archive bytes (retention days still apply).
+    /// - `Some(cap)`: independent archive byte budget `cap`.
+    pub(super) max_archive_size_bytes: Option<u64>,
     /// Optional cap for an individual regular log file.
     pub(super) max_single_file_size_bytes: u64,
+    /// Maximum regular logs compressed in a single cleanup pass (`0` = unlimited).
+    pub(super) max_compress_files_per_pass: usize,
     /// Whether selected regular logs should be compressed before deletion.
     pub(super) compress_old_files: bool,
     /// Gzip compression level used when gzip is selected or used as fallback.
@@ -163,24 +183,26 @@ impl LogCleaner {
         )?;
 
         logs.sort_by_key(|f| f.modified);
+        let aged_rolled_bytes: u64 = logs.iter().fold(0u64, |acc, f| acc.saturating_add(f.size));
+        let recent_rolled_bytes: u64 = recent_logs.iter().fold(0u64, |acc, f| acc.saturating_add(f.size));
+        let all_rolled_bytes = aged_rolled_bytes.saturating_add(recent_rolled_bytes);
+
         let mut to_delete = Vec::new();
         if !logs.is_empty() {
-            let total_size: u64 = logs.iter().map(|f| f.size).sum();
-
             info!(
                 event = EVENT_LOG_CLEANER_STATE,
                 component = LOG_COMPONENT_OBS,
                 subsystem = LOG_SUBSYSTEM_LOG_CLEANER,
                 state = "scan_completed",
                 regular_log_files = logs.len(),
-                total_bytes = total_size,
-                total_megabytes = total_size as f64 / 1024.0 / 1024.0,
+                total_bytes = aged_rolled_bytes,
+                total_megabytes = aged_rolled_bytes as f64 / 1024.0 / 1024.0,
                 "log cleaner state changed"
             );
 
             // Select the oldest files first, then additionally trim any files
             // that still violate configured size constraints.
-            to_delete = self.select_files_to_process(&logs, total_size);
+            to_delete = self.select_files_to_process(&logs, aged_rolled_bytes);
         }
 
         // `min_file_age_seconds` keeps freshly rolled files readable for a
@@ -201,20 +223,57 @@ impl LogCleaner {
             to_delete.extend(over_budget);
         }
 
+        let mut deleted_source_bytes = 0u64;
         if !to_delete.is_empty() {
-            let (deleted, freed) = if self.parallel_compress && self.compress_old_files {
-                self.parallel_stealing_compress(&to_delete)?
-            } else {
-                self.serial_compress_and_delete(&to_delete)?
-            };
-            total_deleted += deleted;
-            total_freed += freed;
+            // Sort oldest-first so per-pass compression capping and direct
+            // over-budget eviction stay deterministic.
+            to_delete.sort_by_key(|f| f.modified);
+            let (to_compress, to_direct_delete) = self.partition_files_for_pass(&to_delete, all_rolled_bytes);
+
+            if !to_direct_delete.is_empty() {
+                warn!(
+                    event = EVENT_LOG_CLEANER_STATE,
+                    component = LOG_COMPONENT_OBS,
+                    subsystem = LOG_SUBSYSTEM_LOG_CLEANER,
+                    result = "compression_cap_bypassed_over_budget",
+                    compressed_files = to_compress.len(),
+                    direct_deleted_files = to_direct_delete.len(),
+                    max_compress_files_per_pass = self.max_compress_files_per_pass,
+                    max_total_size_bytes = self.max_total_size_bytes,
+                    "log cleaner state changed"
+                );
+                let (deleted, freed, source_bytes) = self.delete_files_with_source_bytes(&to_direct_delete)?;
+                total_deleted += deleted;
+                total_freed += freed;
+                deleted_source_bytes = deleted_source_bytes.saturating_add(source_bytes);
+            }
+
+            if !to_compress.is_empty() {
+                let outcome = if self.parallel_compress && self.compress_old_files {
+                    self.parallel_stealing_compress(&to_compress)?
+                } else {
+                    self.serial_compress_and_delete(&to_compress)?
+                };
+                total_deleted += outcome.deleted_files;
+                total_freed += outcome.freed_bytes;
+                deleted_source_bytes = deleted_source_bytes.saturating_add(outcome.deleted_source_bytes);
+                for archive in outcome.created_archives {
+                    if let Some(existing) = compressed_archives.iter_mut().find(|entry| entry.path == archive.path) {
+                        *existing = archive;
+                    } else {
+                        compressed_archives.push(archive);
+                    }
+                }
+            }
         }
 
+        let surviving_rolled_bytes = all_rolled_bytes.saturating_sub(deleted_source_bytes);
+        let effective_archive_budget = self.effective_archive_budget(surviving_rolled_bytes);
+
         if !compressed_archives.is_empty() {
-            let to_delete = self.select_archives_to_delete(&mut compressed_archives);
+            let to_delete = self.select_archives_to_delete(&mut compressed_archives, effective_archive_budget);
             if !to_delete.is_empty() {
-                let (d, f) = self.delete_files(&to_delete)?;
+                let (d, f, _) = self.delete_files_with_source_bytes(&to_delete)?;
                 total_deleted += d;
                 total_freed += f;
             }
@@ -309,16 +368,73 @@ impl LogCleaner {
         to_delete
     }
 
+    /// Partition selected regular logs into `(compress_and_delete, direct_delete)`
+    /// while enforcing `max_compress_files_per_pass` when compression is active.
+    ///
+    /// - Under the byte budget: compresses at most `max_compress_files_per_pass`
+    ///   files and defers the rest to subsequent cleanup passes so CPU spikes
+    ///   are amortized across ticks.
+    /// - Over the byte budget: compresses the newest `max_compress_files_per_pass`
+    ///   mandatory files and directly deletes older mandatory excess files
+    ///   without compression so the disk budget is enforced in a single pass.
+    fn partition_files_for_pass(&self, sorted_candidates: &[FileInfo], all_rolled_bytes: u64) -> (Vec<FileInfo>, Vec<FileInfo>) {
+        if !self.compress_old_files
+            || self.max_compress_files_per_pass == 0
+            || sorted_candidates.len() <= self.max_compress_files_per_pass
+        {
+            return (sorted_candidates.to_vec(), Vec::new());
+        }
+
+        let cap = self.max_compress_files_per_pass;
+        if self.max_total_size_bytes == 0 {
+            return (sorted_candidates[..cap].to_vec(), Vec::new());
+        }
+
+        // Compute how many oldest candidates must be evicted right now to bring
+        // rolled logs back under `max_total_size_bytes`.
+        let mut remaining = all_rolled_bytes;
+        let mut mandatory_count = 0usize;
+        for file in sorted_candidates {
+            if remaining <= self.max_total_size_bytes {
+                break;
+            }
+            remaining = remaining.saturating_sub(file.size);
+            mandatory_count += 1;
+        }
+
+        if mandatory_count <= cap {
+            // Compressing `cap` files already satisfies the byte budget; defer
+            // any additional keep_files/single-file candidates to later passes.
+            (sorted_candidates[..cap].to_vec(), Vec::new())
+        } else {
+            let direct_count = mandatory_count - cap;
+            let direct = sorted_candidates[..direct_count].to_vec();
+            let compress = sorted_candidates[direct_count..mandatory_count].to_vec();
+            (compress, direct)
+        }
+    }
+
+    /// Compute the effective byte budget applied to compressed archives.
+    ///
+    /// - Explicit `Some(0)`: unlimited archive bytes (retention days still apply).
+    /// - Explicit `Some(cap)`: dedicated archive byte cap independent of rolled logs.
+    /// - Unset (`None`) with `max_total_size_bytes > 0`: shares the remaining
+    ///   `max_total_size_bytes` budget after `surviving_rolled_bytes` so rolled
+    ///   logs + archives stay within the single configured total budget.
+    /// - Unset (`None`) with `max_total_size_bytes == 0`: unlimited.
+    fn effective_archive_budget(&self, surviving_rolled_bytes: u64) -> Option<u64> {
+        match self.max_archive_size_bytes {
+            Some(0) => None,
+            Some(cap) => Some(cap),
+            None if self.max_total_size_bytes > 0 => Some(self.max_total_size_bytes.saturating_sub(surviving_rolled_bytes)),
+            None => None,
+        }
+    }
+
     /// Select compressed archives to delete: those older than the retention
     /// window, plus — regardless of retention — the oldest archives needed to
-    /// bring the archive set back under `max_total_size_bytes`.
-    ///
-    /// The byte cap is the crucial part: with `compressed_file_retention_days`
-    /// set to 0 (retention disabled) and compression enabled, age-based expiry
-    /// never fires, so without this cap archives would grow without bound (the
-    /// cap on regular logs does not cover them). Bounding the archive set by the
-    /// same byte budget keeps disk usage finite even when retention is off.
-    fn select_archives_to_delete(&self, files: &mut [FileInfo]) -> Vec<FileInfo> {
+    /// bring the archive set back under `effective_archive_budget`.
+    fn select_archives_to_delete(&self, files: &mut [FileInfo], effective_archive_budget: Option<u64>) -> Vec<FileInfo> {
         if self.compressed_file_retention_days > MAX_RETENTION_DAYS_BEFORE_SATURATION {
             warn!(
                 event = EVENT_LOG_CLEANER_STATE,
@@ -352,8 +468,8 @@ impl LogCleaner {
         }
 
         // 2. Byte-cap trim: drop the oldest surviving archives until the set
-        //    fits under the configured total. 0 means "no cap".
-        if self.max_total_size_bytes > 0 {
+        //    fits under `effective_archive_budget`. `None` means "no byte cap".
+        if let Some(archive_budget) = effective_archive_budget {
             let mut remaining: u64 = files
                 .iter()
                 .enumerate()
@@ -361,7 +477,7 @@ impl LogCleaner {
                 .map(|(_, file)| file.size)
                 .sum();
             for (idx, file) in files.iter().enumerate() {
-                if remaining <= self.max_total_size_bytes {
+                if remaining <= archive_budget {
                     break;
                 }
                 if selected[idx] {
@@ -387,7 +503,7 @@ impl LogCleaner {
     /// Compression workers only decide whether an archive was created; the main
     /// thread remains responsible for actual source removal so deletion policy
     /// and error reporting stay deterministic.
-    fn parallel_stealing_compress(&self, files: &[FileInfo]) -> Result<(usize, u64), std::io::Error> {
+    fn parallel_stealing_compress(&self, files: &[FileInfo]) -> Result<BatchProcessOutcome, std::io::Error> {
         if files.len() <= 1 {
             return self.serial_compress_and_delete(files);
         }
@@ -484,7 +600,7 @@ impl LogCleaner {
                         // starts from a cheap spin again.
                         backoff.reset();
                         let mut file = file;
-                        let compressed = match compress_file(&file.path, &options) {
+                        let (compressed, archive) = match compress_file(&file.path, &options) {
                             Ok(output) => {
                                 debug!(
                                     event = EVENT_LOG_CLEANER_STATE,
@@ -499,15 +615,21 @@ impl LogCleaner {
                                     "log cleaner state changed"
                                 );
                                 file.projected_freed_bytes = output.input_bytes.saturating_sub(output.output_bytes);
-                                true
+                                let archive = (!options.dry_run).then(|| FileInfo {
+                                    path: output.archive_path,
+                                    size: output.output_bytes,
+                                    projected_freed_bytes: output.output_bytes,
+                                    modified: SystemTime::now(),
+                                });
+                                (true, archive)
                             }
                             Err(err) => {
                                 warn!(event = EVENT_LOG_CLEANER_STATE, component = LOG_COMPONENT_OBS, subsystem = LOG_SUBSYSTEM_LOG_CLEANER, file = ?file.path, error = %err, result = "parallel_compression_failed", "log cleaner state changed");
-                                false
+                                (false, None)
                             }
                         };
 
-                        if tx.send(CompressionTaskResult { file, compressed }).is_err() {
+                        if tx.send(CompressionTaskResult { file, archive, compressed }).is_err() {
                             break;
                         }
                     }
@@ -516,18 +638,22 @@ impl LogCleaner {
             drop(tx);
 
             let mut deletable = Vec::with_capacity(files.len());
+            let mut created_archives = Vec::new();
             for result in rx {
                 if result.compressed {
                     deletable.push(result.file);
+                    if let Some(archive) = result.archive {
+                        created_archives.push(archive);
+                    }
                 }
             }
 
-            deletable
+            (deletable, created_archives)
         });
 
         // Any worker panic triggers deterministic fallback behavior.
-        let deletable = match scope_result {
-            Ok(deletable) => deletable,
+        let (deletable, created_archives) = match scope_result {
+            Ok(outcome) => outcome,
             Err(_) => {
                 warn!(
                     event = EVENT_LOG_CLEANER_STATE,
@@ -541,7 +667,7 @@ impl LogCleaner {
             }
         };
 
-        let (deleted, freed) = self.delete_files(&deletable)?;
+        let (deleted, freed, deleted_source_bytes) = self.delete_files_with_source_bytes(&deletable)?;
         let elapsed = started_at.elapsed().as_secs_f64();
         // NOTE on metric scope: attempts/successes count only *victim* steals
         // (not the injector `steal_batch_and_pop`), and a multi-task stolen
@@ -576,7 +702,12 @@ impl LogCleaner {
             "log cleaner state changed"
         );
 
-        Ok((deleted, freed))
+        Ok(BatchProcessOutcome {
+            deleted_files: deleted,
+            freed_bytes: freed,
+            deleted_source_bytes,
+            created_archives,
+        })
     }
 
     /// Attempt to steal a task from peer workers using randomized victim order.
@@ -620,9 +751,10 @@ impl LogCleaner {
     ///
     /// This path is also used whenever the task set is too small to benefit
     /// from worker orchestration.
-    fn serial_compress_and_delete(&self, files: &[FileInfo]) -> Result<(usize, u64), std::io::Error> {
+    fn serial_compress_and_delete(&self, files: &[FileInfo]) -> Result<BatchProcessOutcome, std::io::Error> {
         let started_at = Instant::now();
         let mut deletable = Vec::with_capacity(files.len());
+        let mut created_archives = Vec::new();
 
         if self.compress_old_files {
             let options = self.compression_options();
@@ -644,6 +776,14 @@ impl LogCleaner {
                         let mut file = file.clone();
                         file.projected_freed_bytes = output.input_bytes.saturating_sub(output.output_bytes);
                         deletable.push(file);
+                        if !options.dry_run {
+                            created_archives.push(FileInfo {
+                                path: output.archive_path,
+                                size: output.output_bytes,
+                                projected_freed_bytes: output.output_bytes,
+                                modified: SystemTime::now(),
+                            });
+                        }
                     }
                     Err(err) => {
                         warn!(event = EVENT_LOG_CLEANER_STATE, component = LOG_COMPONENT_OBS, subsystem = LOG_SUBSYSTEM_LOG_CLEANER, file = ?file.path, error = %err, result = "serial_compression_failed", "log cleaner state changed");
@@ -654,10 +794,15 @@ impl LogCleaner {
             deletable.extend(files.iter().cloned());
         }
 
-        let (deleted, freed) = self.delete_files(&deletable)?;
+        let (deleted, freed, deleted_source_bytes) = self.delete_files_with_source_bytes(&deletable)?;
         histogram!(METRIC_LOG_CLEANER_COMPRESS_DURATION_SECONDS).record(started_at.elapsed().as_secs_f64());
 
-        Ok((deleted, freed))
+        Ok(BatchProcessOutcome {
+            deleted_files: deleted,
+            freed_bytes: freed,
+            deleted_source_bytes,
+            created_archives,
+        })
     }
 
     /// Snapshot compression-related configuration for a single cleanup pass.
@@ -708,26 +853,30 @@ impl LogCleaner {
         }
     }
 
-    /// Delete the supplied files and return `(deleted_count, freed_bytes)`.
+    /// Delete the supplied files and return
+    /// `(deleted_count, freed_bytes, deleted_source_bytes)`.
     ///
     /// In dry-run mode the returned counters still reflect the projected work
     /// so callers and metrics can report what would have happened.
-    pub(super) fn delete_files(&self, files: &[FileInfo]) -> Result<(usize, u64), std::io::Error> {
+    fn delete_files_with_source_bytes(&self, files: &[FileInfo]) -> Result<(usize, u64, u64), std::io::Error> {
         let mut deleted = 0usize;
         let mut freed = 0u64;
+        let mut source_bytes = 0u64;
 
         for f in files {
             if self.dry_run {
                 info!(event = EVENT_LOG_CLEANER_STATE, component = LOG_COMPONENT_OBS, subsystem = LOG_SUBSYSTEM_LOG_CLEANER, state = "dry_run_delete", file = ?f.path, bytes = f.size, "log cleaner state changed");
                 deleted += 1;
-                freed += f.projected_freed_bytes;
+                freed = freed.saturating_add(f.projected_freed_bytes);
+                source_bytes = source_bytes.saturating_add(f.size);
                 continue;
             }
 
             match self.secure_delete(&f.path) {
                 Ok(()) => {
                     deleted += 1;
-                    freed += f.projected_freed_bytes;
+                    freed = freed.saturating_add(f.projected_freed_bytes);
+                    source_bytes = source_bytes.saturating_add(f.size);
                     debug!(event = EVENT_LOG_CLEANER_STATE, component = LOG_COMPONENT_OBS, subsystem = LOG_SUBSYSTEM_LOG_CLEANER, state = "deleted", file = ?f.path, bytes = f.size, projected_freed_bytes = f.projected_freed_bytes, "log cleaner state changed");
                 }
                 Err(e) => {
@@ -746,7 +895,7 @@ impl LogCleaner {
             let _ = dir.sync_all();
         }
 
-        Ok((deleted, freed))
+        Ok((deleted, freed, source_bytes))
     }
 }
 
@@ -761,7 +910,9 @@ pub struct LogCleanerBuilder {
     match_mode: FileMatchMode,
     keep_files: usize,
     max_total_size_bytes: u64,
+    max_archive_size_bytes: Option<u64>,
     max_single_file_size_bytes: u64,
+    max_compress_files_per_pass: usize,
     compress_old_files: bool,
     gzip_compression_level: u32,
     compressed_file_retention_days: u64,
@@ -787,7 +938,9 @@ impl LogCleanerBuilder {
             match_mode: FileMatchMode::Prefix,
             keep_files: DEFAULT_LOG_KEEP_FILES,
             max_total_size_bytes: 0,
+            max_archive_size_bytes: None,
             max_single_file_size_bytes: 0,
+            max_compress_files_per_pass: DEFAULT_OBS_LOG_MAX_COMPRESS_FILES_PER_PASS,
             compress_old_files: false,
             gzip_compression_level: 6,
             compressed_file_retention_days: 0,
@@ -816,15 +969,31 @@ impl LogCleanerBuilder {
         self
     }
 
-    /// Cap the aggregate size of retained regular log files.
+    /// Cap the aggregate size of retained regular log files (and compressed
+    /// archives when `max_archive_size_bytes` is unset).
     pub fn max_total_size_bytes(mut self, max_total_size_bytes: u64) -> Self {
         self.max_total_size_bytes = max_total_size_bytes;
+        self
+    }
+
+    /// Set a dedicated byte budget for compressed archives independent of
+    /// `max_total_size_bytes`. Pass `None` to share `max_total_size_bytes`,
+    /// `Some(0)` for unlimited archive bytes, or `Some(cap)` for a separate cap.
+    pub fn max_archive_size_bytes(mut self, max_archive_size_bytes: Option<u64>) -> Self {
+        self.max_archive_size_bytes = max_archive_size_bytes;
         self
     }
 
     /// Cap the size of any individual regular log file.
     pub fn max_single_file_size_bytes(mut self, max_single_file_size_bytes: u64) -> Self {
         self.max_single_file_size_bytes = max_single_file_size_bytes;
+        self
+    }
+
+    /// Cap how many rolled log files may be compressed in a single cleanup pass
+    /// (`0` = unlimited).
+    pub fn max_compress_files_per_pass(mut self, max_compress_files_per_pass: usize) -> Self {
+        self.max_compress_files_per_pass = max_compress_files_per_pass;
         self
     }
 
@@ -959,7 +1128,9 @@ impl LogCleanerBuilder {
             match_mode: self.match_mode,
             keep_files: self.keep_files,
             max_total_size_bytes: self.max_total_size_bytes,
+            max_archive_size_bytes: self.max_archive_size_bytes,
             max_single_file_size_bytes: self.max_single_file_size_bytes,
+            max_compress_files_per_pass: self.max_compress_files_per_pass,
             compress_old_files: self.compress_old_files,
             // gzip level 0 is a valid "store" (no compression) mode, so keep the
             // lower bound at 0 rather than silently bumping it to 1.
