@@ -320,8 +320,8 @@ impl Drop for MultipartCommitStaging {
 #[derive(Clone)]
 pub(super) struct UploadLockHandle(Arc<UploadEntry>);
 
+#[cfg(all(test, target_os = "linux"))]
 impl UploadLockHandle {
-    #[cfg(test)]
     pub(super) fn ptr_eq(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.0, &other.0)
     }
