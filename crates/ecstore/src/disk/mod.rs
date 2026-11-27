@@ -2700,6 +2700,11 @@ pub struct DeleteRecoveryInspection {
     pub current_versions: Vec<DeleteRecoveryVersionIdentity>,
     pub backup_digest: Option<DeleteRecoveryDigest>,
     pub rollback_data_complete: bool,
+    /// For a journaled transaction, the commit can be applied to this drive's
+    /// live metadata. For a journal-less `LegacyAmbiguous` residue, the backup
+    /// belongs to an overwritten generation that this drive's live metadata
+    /// supersedes. The wire shape is closed, so the second meaning shares this
+    /// field; peers that predate it always report `false` there.
     pub commit_data_safe: bool,
     pub explicit_delete_safe: bool,
     pub fingerprint: DeleteRecoveryDigest,

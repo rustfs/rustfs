@@ -507,6 +507,69 @@ fn live_write_backup_matches(current: &FileMeta, backup: &FileMeta, transaction:
     Ok(true)
 }
 
+fn has_object_lock_metadata(info: &FileInfo) -> bool {
+    info.metadata.keys().any(|key| {
+        let key = key.to_ascii_lowercase();
+        key.starts_with("x-amz-object-lock-")
+            || rustfs_utils::http::metadata_compat::internal_key_strip_suffix_prefix(&key, "objectlock-").is_some()
+    })
+}
+
+/// An overwrite interrupted after publishing its metadata leaves the previous
+/// generation's backup behind a live successor. Every backed-up version is
+/// still live here, and each one that differs was replaced in place by a
+/// strictly newer unversioned object, so the residue records no removal.
+///
+/// This is only the drive-local half of the proof. The successor may itself be
+/// an uncommitted write, so the set must establish it on every drive before
+/// the backup may be discarded.
+fn superseded_write_backup_matches(current: &FileMeta, backup: &FileMeta, transaction: Uuid) -> Result<bool> {
+    if backup.versions.is_empty() || current.get_data_dirs()?.into_iter().flatten().any(|id| id == transaction) {
+        return Ok(false);
+    }
+    let mut live = HashMap::with_capacity(current.versions.len());
+    for version in &current.versions {
+        let mut info = version.into_fileinfo("", "", true)?;
+        let id = info.version_id.unwrap_or_default();
+        let successor_mod_time = (version.header.version_type == rustfs_filemeta::VersionType::Object && !info.deleted)
+            .then_some(info.mod_time)
+            .flatten();
+        rustfs_utils::http::metadata_compat::remove_str(&mut info.metadata, rustfs_utils::http::metadata_compat::SUFFIX_HEALING);
+        if live.insert(id, (generation(info)?, successor_mod_time)).is_some() {
+            return Err(DiskError::FileCorrupt);
+        }
+    }
+    let mut seen = HashSet::with_capacity(backup.versions.len());
+    let mut replaced = false;
+    for version in &backup.versions {
+        let mut info = version.into_fileinfo("", "", true)?;
+        let id = info.version_id.unwrap_or_default();
+        if !seen.insert(id) {
+            return Err(DiskError::FileCorrupt);
+        }
+        let Some((live_generation, successor_mod_time)) = live.get(&id) else {
+            return Ok(false);
+        };
+        // Tiered and locked versions keep owners that an overwrite does not
+        // obviously transfer; leave those to operator inspection.
+        let replaceable = id.is_nil()
+            && version.header.version_type == rustfs_filemeta::VersionType::Object
+            && !info.deleted
+            && !info.is_remote()
+            && !has_object_lock_metadata(&info);
+        let mod_time = info.mod_time;
+        rustfs_utils::http::metadata_compat::remove_str(&mut info.metadata, rustfs_utils::http::metadata_compat::SUFFIX_HEALING);
+        if *live_generation == generation(info)? {
+            continue;
+        }
+        if !replaceable || !matches!((mod_time, successor_mod_time), (Some(old), Some(new)) if *new > old) {
+            return Ok(false);
+        }
+        replaced = true;
+    }
+    Ok(replaced)
+}
+
 fn journal_bytes(journal: &DeleteRecoveryJournal) -> Result<Vec<u8>> {
     let bytes = serde_json::to_vec(journal)?;
     // The same journal is carried by adoption requests and decision receipts.
@@ -702,15 +765,7 @@ fn explicit_delete_referenced_data_dirs(
             return Ok(None);
         }
         let info = metadata.versions[0].into_fileinfo("", "", false)?;
-        if info.version_id.is_some_and(|id| !id.is_nil())
-            || info.deleted
-            || info.is_remote()
-            || info.metadata.keys().any(|key| {
-                let key = key.to_ascii_lowercase();
-                key.starts_with("x-amz-object-lock-")
-                    || rustfs_utils::http::metadata_compat::internal_key_strip_suffix_prefix(&key, "objectlock-").is_some()
-            })
-        {
+        if info.version_id.is_some_and(|id| !id.is_nil()) || info.deleted || info.is_remote() || has_object_lock_metadata(&info) {
             return Ok(None);
         }
         referenced.extend(metadata.get_data_dirs()?.into_iter().flatten().filter(|id| !id.is_nil()));
@@ -1155,17 +1210,27 @@ pub(super) fn inspection_with_markers_bounded(
     }
     // In-place shard repair leaves a backup in the live data directory.
     // Preserve it without interpreting it as an unfinished delete.
-    let live_write_backup = journal.is_none()
+    let no_delete_evidence = journal.is_none()
         && !any_marker
         && !regular_marker(&rollback.join(DELETE_MARKER_ROLLBACK_FILE))?
         && prepared.is_none()
         && target.is_none()
         && receipt_bytes.is_none()
-        && !finished
+        && !finished;
+    let live_write_backup = no_delete_evidence
         && match (current_meta.as_ref(), before_meta.as_ref()) {
             (Some(current), Some(backup)) => live_write_backup_matches(current, backup, transaction)?,
             _ => false,
         };
+    // The backup of an overwritten generation stays ambiguous on this drive
+    // alone; report that it is superseded so the set can decide.
+    let commit_data_safe = commit_data_safe
+        || (no_delete_evidence
+            && !live_write_backup
+            && match (current_meta.as_ref(), before_meta.as_ref()) {
+                (Some(current), Some(backup)) => superseded_write_backup_matches(current, backup, transaction)?,
+                _ => false,
+            });
     let state = if live_write_backup {
         DeleteRecoveryState::Absent
     } else if journal.is_some() {
@@ -2582,11 +2647,55 @@ impl LocalDisk {
             }
         }
         if action == DeleteRecoveryAction::DiscardLegacy {
-            if observed.state != DeleteRecoveryState::LegacyAmbiguous || !observed.explicit_delete_safe {
+            let superseded_write_backup = observed.journal.is_none() && observed.commit_data_safe;
+            if observed.state != DeleteRecoveryState::LegacyAmbiguous
+                || !(observed.explicit_delete_safe || superseded_write_backup)
+            {
                 return Err(DiskError::FileCorrupt);
             }
             let root = self.io_get_object_path(volume, object)?;
             let rollback = root.join(transaction.to_string());
+            if superseded_write_backup {
+                let lease = os::acquire_namespace_mutation_lease_with_owner(&root, owner.clone()).await;
+                let sync = effective_durability(volume).syncs_recovery_protocol_state();
+                let current_path = root.join(STORAGE_FORMAT_FILE);
+                // Only the backup is removed. The replaced generation's parts
+                // become a plain orphan data directory, which the set reclaims
+                // once no drive's metadata references it.
+                os::run_blocking_namespace_operation_with_sync(lease, true, move || {
+                    Ok((|| {
+                        let backup_path = rollback.join(STORAGE_FORMAT_FILE_BACKUP);
+                        let load = |path: &Path| -> Result<Option<FileMeta>> {
+                            Ok(regular_metadata_bytes(path)?.as_deref().map(FileMeta::load).transpose()?)
+                        };
+                        let (Some(current), Some(backup)) = (load(&current_path)?, load(&backup_path)?) else {
+                            return Err(DiskError::FileCorrupt);
+                        };
+                        if !superseded_write_backup_matches(&current, &backup, transaction)? {
+                            return Err(DiskError::FileCorrupt);
+                        }
+                        std::fs::remove_file(&backup_path).map_err(to_file_error)?;
+                        match std::fs::remove_dir(&rollback) {
+                            Ok(()) => {}
+                            Err(err) if is_benign_object_rmdir_error(&err) => {}
+                            Err(err) => return Err(to_file_error(err).into()),
+                        }
+                        if sync {
+                            for dir in [rollback.as_path(), rollback.parent().unwrap_or(&rollback)] {
+                                match os::fsync_dir_std(dir) {
+                                    Ok(()) => {}
+                                    Err(err) if err.kind() == ErrorKind::NotFound => {}
+                                    Err(err) => return Err(to_file_error(err).into()),
+                                }
+                            }
+                        }
+                        Ok(())
+                    })())
+                })
+                .await
+                .map_err(to_file_error)??;
+                return self.delete_recovery_inspect_owned(volume, object, transaction, owner).await;
+            }
             let plan_root = root.clone();
             let missing = observed.current_digest.is_none();
             let lease = os::acquire_namespace_mutation_lease_with_owner(&root, owner.clone()).await;
@@ -4959,6 +5068,132 @@ mod tests {
                 backup.find_version(Some(free_id)).expect("retained free-version owner").1,
                 free,
                 "{change}: ordinary-object readability cannot release remote ownership"
+            );
+        }
+    }
+
+    /// rustfs/rustfs#9671: an interrupted overwrite leaves the replaced
+    /// generation's backup behind live metadata that no longer names its
+    /// directory. The drive reports that shape without resolving it alone.
+    #[tokio::test]
+    async fn delete_recovery_superseded_write_backup_is_reported_and_discarded_on_request() {
+        for shape in [
+            "superseded",
+            "same-mod-time",
+            "marker-successor",
+            "versioned",
+            "locked",
+            "missing-version",
+            "delete-evidence",
+        ] {
+            let (_temp, disk, _, _) = fixture().await;
+            let root = disk.io_get_object_path("recovery", "object").expect("object path");
+            let transaction = Uuid::new_v4();
+            let id = if shape == "versioned" { Uuid::new_v4() } else { Uuid::nil() };
+            let mut old = test_file_info("object", id, Some(transaction), None);
+            old.mod_time = Some(OffsetDateTime::UNIX_EPOCH + std::time::Duration::from_secs(1_000));
+            if shape == "locked" {
+                old.metadata.insert("x-amz-object-lock-legal-hold".into(), "ON".into());
+            }
+            let mut backup = FileMeta::new();
+            backup.add_version(old.clone()).expect("replaced generation");
+            if shape == "missing-version" {
+                let mut sibling = test_file_info("object", Uuid::new_v4(), Some(Uuid::new_v4()), None);
+                sibling.mod_time = old.mod_time;
+                backup.add_version(sibling).expect("backed-up sibling the live metadata lost");
+            }
+            let backup_bytes = backup.marshal_msg().expect("encode backup");
+            let rollback = root.join(transaction.to_string());
+            fs::create_dir_all(&rollback).await.expect("replaced data directory");
+            fs::write(rollback.join("part.1"), b"replaced shard")
+                .await
+                .expect("replaced shard");
+            fs::write(rollback.join(STORAGE_FORMAT_FILE_BACKUP), &backup_bytes)
+                .await
+                .expect("retained backup");
+            if shape == "delete-evidence" {
+                fs::write(rollback.join(DELETE_QUORUM_COMMITTED_FILE), [])
+                    .await
+                    .expect("legacy receipt");
+            }
+
+            let mut successor = test_file_info("object", id, Some(Uuid::new_v4()), None);
+            successor.mod_time = old.mod_time.map(|time| time + std::time::Duration::from_secs(1));
+            match shape {
+                "same-mod-time" => successor.mod_time = old.mod_time,
+                "marker-successor" => {
+                    successor = FileInfo {
+                        name: "object".to_owned(),
+                        version_id: Some(id),
+                        deleted: true,
+                        mod_time: successor.mod_time,
+                        ..Default::default()
+                    };
+                }
+                _ => {}
+            }
+            let current_bytes = test_meta(successor);
+            fs::write(root.join(STORAGE_FORMAT_FILE), &current_bytes)
+                .await
+                .expect("live successor");
+
+            let state = disk
+                .inspect_delete_transaction("recovery", "object", transaction)
+                .await
+                .expect("inspect overwrite residue");
+            assert_eq!(
+                state.state,
+                DeleteRecoveryState::LegacyAmbiguous,
+                "{shape}: one drive cannot prove its successor is committed"
+            );
+            assert!(state.journal.is_none(), "{shape}");
+            assert!(!state.explicit_delete_safe, "{shape}: live metadata forbids explicit legacy discard");
+            assert_eq!(state.commit_data_safe, shape == "superseded", "{shape}");
+            assert!(
+                disk.discover_delete_transactions("recovery", Some("object"), None, 128)
+                    .await
+                    .expect("discover residue")
+                    .transactions
+                    .iter()
+                    .any(|found| found.transaction == transaction),
+                "{shape}: the residue stays discoverable until the set decides"
+            );
+
+            let discarded = disk
+                .settle_delete_transaction(
+                    "recovery",
+                    "object",
+                    transaction,
+                    state.fingerprint,
+                    DeleteRecoveryAction::DiscardLegacy,
+                )
+                .await;
+            if shape != "superseded" {
+                assert!(discarded.is_err(), "{shape}: unproven residue must not be discarded");
+                assert_eq!(
+                    fs::read(rollback.join(STORAGE_FORMAT_FILE_BACKUP))
+                        .await
+                        .expect("retained backup bytes"),
+                    backup_bytes,
+                    "{shape}"
+                );
+                continue;
+            }
+            let discarded = discarded.expect("discard superseded backup");
+            assert_eq!(discarded.state, DeleteRecoveryState::Absent);
+            assert!(!rollback.join(STORAGE_FORMAT_FILE_BACKUP).exists());
+            assert_eq!(
+                fs::read(rollback.join("part.1")).await.expect("replaced shard survives"),
+                b"replaced shard",
+                "only the set may reclaim the replaced generation's parts"
+            );
+            assert_eq!(fs::read(root.join(STORAGE_FORMAT_FILE)).await.expect("live metadata"), current_bytes);
+            assert!(
+                disk.discover_delete_transactions("recovery", Some("object"), None, 128)
+                    .await
+                    .expect("discover after discard")
+                    .transactions
+                    .is_empty()
             );
         }
     }
