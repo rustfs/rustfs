@@ -31,7 +31,8 @@ pub enum BucketKind {
 }
 
 /// Restricted configuration changes for a resolved Vector bucket.
-/// The caller authorizes the corresponding Vector operation before storage mutation.
+/// Callers supply an under-lock authorization precheck so policy, tags, and
+/// IAM permissions are verified against the latest persisted metadata before saving.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ManagedBucketConfigMutation {
     PutPolicy {
@@ -44,6 +45,41 @@ pub enum ManagedBucketConfigMutation {
     Untag {
         keys: std::collections::BTreeSet<String>,
     },
+}
+
+/// Outcome of an under-lock managed-bucket precheck combined with storage execution.
+///
+/// Keeping the caller's precheck failure distinct from storage errors lets upper
+/// layers enforce exact authorization and protocol errors under storage locks
+/// without coupling storage crates to application error types.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ManagedBucketPrecheckError<P, S> {
+    /// The caller's under-lock precheck/authorization callback rejected the operation.
+    Precheck(P),
+    /// Storage lock acquisition, identity validation, or persistence failed.
+    Storage(S),
+}
+
+impl<P: std::fmt::Display, S: std::fmt::Display> std::fmt::Display for ManagedBucketPrecheckError<P, S> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Precheck(error) => error.fmt(f),
+            Self::Storage(error) => error.fmt(f),
+        }
+    }
+}
+
+impl<P, S> std::error::Error for ManagedBucketPrecheckError<P, S>
+where
+    P: std::error::Error + 'static,
+    S: std::error::Error + 'static,
+{
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Precheck(error) => Some(error),
+            Self::Storage(error) => Some(error),
+        }
+    }
 }
 
 /// Invalid identity syntax or an operation outside a managed object scope.
@@ -514,5 +550,20 @@ mod tests {
         assert!(!opts.no_lock);
         assert!(!opts.no_recreate);
         assert!(!opts.force);
+    }
+
+    #[test]
+    fn managed_bucket_precheck_error_preserves_display_and_source() {
+        use std::error::Error as _;
+
+        let precheck: ManagedBucketPrecheckError<BucketIdentityError, std::io::Error> =
+            ManagedBucketPrecheckError::Precheck(BucketIdentityError::OperationNotAllowed);
+        assert_eq!(precheck.to_string(), "operation is outside the managed scope");
+        assert!(precheck.source().is_some());
+
+        let storage: ManagedBucketPrecheckError<BucketIdentityError, std::io::Error> =
+            ManagedBucketPrecheckError::Storage(std::io::Error::other("disk quorum failed"));
+        assert_eq!(storage.to_string(), "disk quorum failed");
+        assert!(storage.source().is_some());
     }
 }

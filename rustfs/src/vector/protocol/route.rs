@@ -157,20 +157,11 @@ fn query_tag_keys(query: &str) -> Result<Vec<String>, ProtocolError> {
     let mut keys = Vec::new();
     for part in query.split('&').filter(|part| !part.is_empty()) {
         let (key, value) = part.split_once('=').unwrap_or((part, ""));
-        if decode_query_component(key, "query")? == "tagKeys" {
-            keys.push(decode_query_component(value, "tagKeys")?);
+        if decode_component(key, "query")? == "tagKeys" {
+            keys.push(decode_component(value, "tagKeys")?);
         }
     }
     Ok(keys)
-}
-
-fn decode_query_component(value: &str, path: &str) -> Result<String, ProtocolError> {
-    // s3s OrderedQs uses form decoding for the signed query, including literal '+'.
-    if value.contains('+') {
-        decode_component(&value.replace('+', " "), path)
-    } else {
-        decode_component(value, path)
-    }
 }
 
 fn decode_component(value: &str, path: &str) -> Result<String, ProtocolError> {

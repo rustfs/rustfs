@@ -923,6 +923,40 @@ impl BucketMetadata {
         Ok(())
     }
 
+    /// Returns `true` when this metadata is a `BucketKind::Vector` creation intent
+    /// whose commit record has not yet been finalized (`!bucket_creation_committed`).
+    ///
+    /// # Errors
+    /// Fails closed when the persisted bucket kind / identity JSON is corrupt.
+    pub fn is_uncommitted_vector_creation_intent(&self) -> Result<bool> {
+        Ok(self.bucket_kind()? == BucketKind::Vector
+            && !self.bucket_incarnation_id.is_nil()
+            && (!self.bucket_creation_commit_record_present || !self.bucket_creation_committed))
+    }
+
+    /// Simulates an in-flight uncommitted creation intent for concurrency regression tests.
+    #[doc(hidden)]
+    pub fn mark_creation_uncommitted_for_test(&mut self) {
+        self.bucket_creation_committed = false;
+        self.bucket_creation_commit_record_present = true;
+    }
+
+    /// Ensure authorization-relevant sub-configurations (`policy_config`,
+    /// `sse_config`, and `tagging_config`) decoded cleanly from disk bytes
+    /// rather than degrading unreadable bytes to `None`.
+    pub(crate) fn validate_managed_authoritative_configs(&self) -> Result<()> {
+        use rustfs_policy::policy::Validator as _;
+
+        if let Some(policy) =
+            ConfigState::of(&self.policy_config_json, &self.policy_config).require(&self.name, BUCKET_POLICY_CONFIG)?
+        {
+            policy.is_valid().map_err(Error::other)?;
+        }
+        ConfigState::of(&self.encryption_config_xml, &self.sse_config).require(&self.name, BUCKET_SSECONFIG)?;
+        ConfigState::of(&self.tagging_config_xml, &self.tagging_config).require(&self.name, BUCKET_TAGGING_CONFIG)?;
+        Ok(())
+    }
+
     pub(crate) fn set_vector_identity(&mut self, identity: &BucketHandle) -> Result<()> {
         if identity.kind() != BucketKind::Vector
             || identity.storage_bucket_id().as_str() != self.name

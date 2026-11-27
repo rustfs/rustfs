@@ -659,3 +659,131 @@ fn vector_aws_sdk_group_conditions_and_membership_refresh_preserve_resources() {
         }
     });
 }
+
+#[test]
+#[serial_test::serial]
+fn vector_aws_sdk_bucket_control_plane_enforces_abac_tags_and_deny_policies() {
+    run_large_stack_test("vector-sdk-bucket-control-plane-auth", || async {
+        let fixture = Fixture::new().await;
+        let server = SdkServer::new(&fixture).await;
+        let client = &server.client;
+        let bucket = format!("sdk-bkt-auth-{}", Uuid::new_v4().simple());
+        let result = AssertUnwindSafe(async {
+            let created = client
+                .create_vector_bucket()
+                .vector_bucket_name(&bucket)
+                .tags("env", "staging")
+                .send()
+                .await
+                .unwrap();
+            let bucket_arn = created.vector_bucket_arn().unwrap().to_owned();
+
+            fixture
+                .set_statements(json!([
+                    {
+                        "Effect": "Allow",
+                        "Action": ["s3vectors:TagResource", "s3vectors:UntagResource", "s3vectors:GetVectorBucket"],
+                        "Resource": "*"
+                    },
+                    {
+                        "Effect": "Allow",
+                        "Action": [
+                            "s3vectors:PutVectorBucketPolicy",
+                            "s3vectors:DeleteVectorBucketPolicy",
+                            "s3vectors:DeleteVectorBucket"
+                        ],
+                        "Resource": bucket_arn,
+                        "Condition": {"StringEquals": {"s3vectors:VectorBucketTag/env": "staging"}}
+                    },
+                    {"Effect": "Deny", "Action": "s3:*", "Resource": "*"}
+                ]))
+                .await;
+
+            let allow_policy = json!({
+                "Version": "2012-10-17",
+                "Statement": [{
+                    "Effect": "Allow",
+                    "Principal": {"AWS": fixture.credentials.access_key},
+                    "Action": "s3vectors:GetVectorBucket",
+                    "Resource": bucket_arn
+                }]
+            })
+            .to_string();
+            client
+                .put_vector_bucket_policy()
+                .vector_bucket_name(&bucket)
+                .policy(&allow_policy)
+                .send()
+                .await
+                .unwrap();
+
+            // Mutating the ABAC tag immediately revokes bucket policy & deletion authority.
+            client
+                .tag_resource()
+                .resource_arn(&bucket_arn)
+                .tags("env", "production")
+                .send()
+                .await
+                .unwrap();
+            service_error!(
+                client.delete_vector_bucket_policy().vector_bucket_name(&bucket).send().await,
+                "AccessDeniedException",
+                403
+            );
+            service_error!(
+                client.delete_vector_bucket().vector_bucket_name(&bucket).send().await,
+                "AccessDeniedException",
+                403
+            );
+
+            // Restore staging tag, install an explicit Deny bucket policy, and verify
+            // control-plane mutations are refused with AccessDeniedException before invalid body checks.
+            client
+                .tag_resource()
+                .resource_arn(&bucket_arn)
+                .tags("env", "staging")
+                .send()
+                .await
+                .unwrap();
+            let deny_policy = json!({
+                "Version": "2012-10-17",
+                "Statement": [{
+                    "Effect": "Deny",
+                    "Principal": "*",
+                    "Action": ["s3vectors:PutVectorBucketPolicy", "s3vectors:DeleteVectorBucket"],
+                    "Resource": bucket_arn
+                }]
+            })
+            .to_string();
+            client
+                .put_vector_bucket_policy()
+                .vector_bucket_name(&bucket)
+                .policy(&deny_policy)
+                .send()
+                .await
+                .unwrap();
+            service_error!(
+                client
+                    .put_vector_bucket_policy()
+                    .vector_bucket_name(&bucket)
+                    .policy("not-json")
+                    .send()
+                    .await,
+                "AccessDeniedException",
+                403
+            );
+            service_error!(
+                client.delete_vector_bucket().vector_bucket_name(&bucket).send().await,
+                "AccessDeniedException",
+                403
+            );
+        })
+        .catch_unwind()
+        .await;
+        server.finish().await;
+        cleanup_iam(&fixture).await;
+        if let Err(panic) = result {
+            std::panic::resume_unwind(panic);
+        }
+    });
+}

@@ -8,6 +8,7 @@ mod bucket;
 mod dataset;
 mod encryption;
 pub(crate) mod maintenance;
+pub(crate) mod managed_objects;
 mod resource_list_pagination;
 mod target;
 #[cfg(test)]
@@ -89,16 +90,20 @@ impl DefaultVectorUsecase {
     }
 
     async fn admit(&self, verified: VerifiedVectorRequest) -> Result<AuthorizedVectorRequest, ProtocolError> {
+        let operation = verified.request().operation();
         let current = verified.current_envelope().await;
         let envelope = match &current {
             Ok(envelope) => envelope.fork_for_authorization(),
-            Err(_) => verified.revoked_identity_audit_envelope()?,
+            Err(_) => verified
+                .revoked_identity_audit_envelope()
+                .map_err(|error| protocol_error_for_operation(operation, error))?,
         };
         let helper = crate::app::storage_api::vector_usecase::OperationHelper::audit_only_named_from_view(
             &envelope.audit_view(),
-            verified.request().operation().name(),
+            operation.name(),
         );
         if let Err(error) = current {
+            let error = protocol_error_for_operation(operation, error);
             complete_audit(helper, Some(&error));
             return Err(error);
         }
@@ -108,6 +113,7 @@ impl DefaultVectorUsecase {
                 Ok(authorization)
             }
             Err(error) => {
+                let error = protocol_error_for_operation(operation, error);
                 complete_audit(helper, Some(&error));
                 Err(error)
             }
@@ -238,50 +244,57 @@ impl DefaultVectorUsecase {
     }
 
     async fn execute_owned(&self, authorization: AuthorizedVectorRequest, request: Request) -> Result<Response, ProtocolError> {
-        authorization
-            .bound
-            .require_same(&request, authorization.resource.as_ref())
-            .map_err(access_error)?;
-        match &authorization.target {
-            RequestTarget::Index { index, .. } | RequestTarget::NewIndex { index, .. } => {
-                let catalog = authorization.catalog.as_ref().ok_or_else(unavailable)?.clone();
-                if matches!(request, Request::CreateIndex(_)) {
-                    self.initialize_index_catalog(&authorization, index).await?;
-                }
-                let context = dataset::IndexRequest {
-                    owner: self,
-                    authorization: &authorization,
-                    index,
-                };
-                let execution = VectorService::new(catalog, self.limits, self.max_write_attempts)
-                    .with_numeric_proof_cache(self.numeric_proof_cache.clone())
-                    .execute(&context)
-                    .await;
-                #[cfg(test)]
-                if let Err(error) = &execution {
-                    crate::vector::fault_test::observe_sdk_request_failure(
-                        crate::vector::fault_test::SdkRequestFailureContext {
-                            instance_id: self.server.installed_app_context().map(|app| app.object_store().id),
-                            resource: authorization.resource.as_ref(),
-                            request_id: authorization.request_id.as_uuid(),
-                            http_request_id: authorization.verified.fault_http_request_id(),
-                            account: authorization.verified.fault_account(),
-                        },
-                        error,
-                    );
-                }
-                match execution.map_err(|error| service_error_for_operation(request.operation(), error))? {
-                    VectorExecution::Complete(response) => Ok(response),
-                    VectorExecution::GetVectors(prepared) => Ok(Response::GetVectors(dto::GetVectorsOutput {
-                        vectors: prepared.vectors,
-                    })),
-                    VectorExecution::QueryVectors(prepared) => {
-                        Ok(Response::QueryVectors(prepared.into_output().map_err(service_error)?))
+        let operation = request.operation();
+        let result = async {
+            authorization
+                .bound
+                .require_same(&request, authorization.resource.as_ref())
+                .map_err(access_error)?;
+            match &authorization.target {
+                RequestTarget::Index { index, .. } | RequestTarget::NewIndex { index, .. } => {
+                    let catalog = authorization.catalog.as_ref().ok_or_else(unavailable)?.clone();
+                    if matches!(request, Request::CreateIndex(_)) {
+                        self.initialize_index_catalog(&authorization, index).await?;
+                    }
+                    let context = dataset::IndexRequest {
+                        owner: self,
+                        authorization: &authorization,
+                        index,
+                    };
+                    let execution = VectorService::new(catalog, self.limits, self.max_write_attempts)
+                        .with_numeric_proof_cache(self.numeric_proof_cache.clone())
+                        .execute(&context)
+                        .await;
+                    #[cfg(test)]
+                    if let Err(error) = &execution {
+                        crate::vector::fault_test::observe_sdk_request_failure(
+                            crate::vector::fault_test::SdkRequestFailureContext {
+                                instance_id: self.server.installed_app_context().map(|app| app.object_store().id),
+                                resource: authorization.resource.as_ref(),
+                                request_id: authorization.request_id.as_uuid(),
+                                http_request_id: authorization.verified.fault_http_request_id(),
+                                account: authorization.verified.fault_account(),
+                            },
+                            error,
+                        );
+                    }
+                    match execution.map_err(|error| service_error_for_operation(operation, error))? {
+                        VectorExecution::Complete(response) => Ok(response),
+                        VectorExecution::GetVectors(prepared) => Ok(Response::GetVectors(dto::GetVectorsOutput {
+                            vectors: prepared.vectors,
+                        })),
+                        VectorExecution::QueryVectors(prepared) => Ok(Response::QueryVectors(
+                            prepared
+                                .into_output()
+                                .map_err(|error| service_error_for_operation(operation, error))?,
+                        )),
                     }
                 }
+                _ => self.execute_bucket(authorization, &request).await,
             }
-            _ => self.execute_bucket(authorization, &request).await,
         }
+        .await;
+        result.map_err(|error| protocol_error_for_operation(operation, error))
     }
 }
 
@@ -461,9 +474,13 @@ fn s3_error(error: rustfs_s3_types::S3Error) -> ProtocolError {
 fn api_code(code: &str) -> ProtocolError {
     ProtocolError::new(
         match code {
-            "AccessDenied" | "InvalidAccessKeyId" | "ExpiredToken" | "InvalidToken" | "SignatureDoesNotMatch" => {
-                ErrorCode::AccessDenied
-            }
+            "AccessDenied"
+            | "InvalidAccessKeyId"
+            | "ExpiredToken"
+            | "InvalidToken"
+            | "SignatureDoesNotMatch"
+            | "KMS.AccessDeniedException" => ErrorCode::AccessDenied,
+            "KMS.NotFoundException" => ErrorCode::KmsNotFound,
             "NoSuchBucket" | "NoSuchKey" | "NoSuchVersion" => ErrorCode::NotFound,
             "BucketAlreadyExists" | "BucketAlreadyOwnedByYou" | "BucketNotEmpty" | "PreconditionFailed" => ErrorCode::Conflict,
             "InvalidRequest" | "InvalidArgument" => ErrorCode::Validation,
@@ -508,6 +525,25 @@ fn catalog_error_ref(error: &TableCatalogStoreError) -> ProtocolError {
     };
     ProtocolError::new(code, "Vector Catalog operation failed")
 }
+fn operation_declares_kms_exceptions(operation: Operation) -> bool {
+    matches!(
+        operation,
+        Operation::PutVectors | Operation::GetVectors | Operation::DeleteVectors | Operation::QueryVectors
+    )
+}
+fn protocol_error_for_operation(operation: Operation, error: ProtocolError) -> ProtocolError {
+    if operation_declares_kms_exceptions(operation) {
+        return error;
+    }
+    let message = match error.code() {
+        ErrorCode::KmsDisabled => "KMS key is disabled",
+        ErrorCode::KmsInvalidKeyUsage => "KMS key cannot encrypt Vector data",
+        ErrorCode::KmsInvalidState => "KMS key is in an invalid state",
+        ErrorCode::KmsNotFound => "KMS key was not found",
+        _ => return error,
+    };
+    ProtocolError::new(ErrorCode::Validation, message)
+}
 fn service_error_for_operation(operation: Operation, error: VectorServiceError) -> ProtocolError {
     if matches!(operation, Operation::CreateIndex | Operation::PutVectors) {
         let mut source: &(dyn std::error::Error + 'static) = &error;
@@ -529,7 +565,7 @@ fn service_error_for_operation(operation: Operation, error: VectorServiceError) 
             source = next;
         }
     }
-    service_error(error)
+    protocol_error_for_operation(operation, service_error(error))
 }
 fn service_error(error: VectorServiceError) -> ProtocolError {
     let mut source: &(dyn std::error::Error + 'static) = &error;

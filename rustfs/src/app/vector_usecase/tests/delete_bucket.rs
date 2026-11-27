@@ -448,10 +448,7 @@ fn vector_bucket_delete_diagnostics_record_direct_callback_drop() {
         let owner = fixture.service.clone();
         let expected = identity.clone();
         // This directly tests dropping the lower-level future; owned HTTP execution is tested separately.
-        let waiter = tokio::spawn(async move {
-            let buckets = owner.buckets();
-            buckets.delete_managed_bucket(&expected).await
-        });
+        let waiter = tokio::spawn(async move { owner.delete_vector_bucket_for_test(&expected).await });
         tokio::time::timeout(Duration::from_secs(5), async {
             loop {
                 let snapshot = observer.managed_delete_diagnostics();
@@ -507,3 +504,5 @@ fn vector_bucket_delete_diagnostics_record_direct_callback_drop() {
             .unwrap();
     });
 }
+
+mod concurrency;

@@ -16,10 +16,23 @@
 #   cycle|left_layer<->right_layer
 cycle|app<->infra
 cycle|app<->interface
+cycle|composition<->infra
+cycle|composition<->interface
 cycle|infra<->interface
+dep|rustfs/src/admin/service/oidc_config.rs|interface->composition|crate::startup_auth::current_oidc_extra_root_ca_material
+dep|rustfs/src/allocator_reclaim.rs|infra->interface|crate::server::active_http_requests
 dep|rustfs/src/app/admin_usecase.rs|app->interface|crate::server::collect_dependency_readiness_report
+dep|rustfs/src/app/storage_api.rs|app->interface|crate::server::cors::CorsRequest::from_headers
 dep|rustfs/src/cluster_snapshot.rs|infra->interface|crate::server::snapshot_dependency_readiness_report
 dep|rustfs/src/runtime_sources.rs|infra->app|crate::app::context
+dep|rustfs/src/site_replication/hooks.rs|infra->interface|crate::admin::runtime_sources::current_notification_system
+dep|rustfs/src/storage/access_owned/bucket_replication_lifecycle.rs|infra->interface|crate::admin::handlers::site_replication::site_replication_edit_context
+dep|rustfs/src/storage/access_owned/bucket_replication_lifecycle.rs|infra->interface|crate::admin::handlers::site_replication::site_replication_enabled
+dep|rustfs/src/storage/access_owned/object_commit.rs|infra->interface|crate::storage::s3_api::common::RUSTFS_OWNER_ID
+dep|rustfs/src/storage/access_owned/object_commit.rs|infra->interface|crate::storage::s3_api::tagging::parse_object_tag_header
+dep|rustfs/src/storage/access_owned/object_commit.rs|infra->interface|crate::storage::s3_api::tagging::resolve_copy_object_tags
+dep|rustfs/src/storage/authorization/conditions.rs|infra->interface|crate::storage::s3_api::tagging::parse_object_tag_header
+dep|rustfs/src/storage/rpc/http_service.rs|infra->composition|crate::startup_background::background_node_admission
 dep|rustfs/src/storage/rpc/http_service.rs|infra->interface|crate::server::RPC_PREFIX
 dep|rustfs/src/storage/rpc/node_service.rs|infra->interface|crate::admin::handlers::kms_dynamic::current_kms_config_fingerprint
 dep|rustfs/src/storage/rpc/node_service.rs|infra->interface|crate::admin::handlers::kms_dynamic::reload_persisted_kms_config
@@ -27,4 +40,5 @@ dep|rustfs/src/storage/rpc/node_service.rs|infra->interface|crate::admin::servic
 dep|rustfs/src/storage/rpc/node_service.rs|infra->interface|crate::admin::service::config::reload_runtime_config_snapshot
 dep|rustfs/src/storage/rpc/node_service.rs|infra->interface|crate::admin::service::site_replication::reload_site_replication_runtime_state
 dep|rustfs/src/storage/rpc/node_service.rs|infra->interface|crate::server::MODULE_SWITCHES_SIGNAL_SUBSYSTEM
+dep|rustfs/src/storage/rpc/node_service.rs|infra->interface|crate::server::observe_peer_drive_admission
 dep|rustfs/src/storage/s3_support.rs|infra->interface|crate::server::cors

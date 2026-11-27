@@ -163,11 +163,13 @@ pub(super) async fn preflight(
             .key_metadata;
         let invalid = match metadata.key_state {
             KeyState::Enabled => None,
-            KeyState::Disabled => Some(ErrorCode::KmsDisabled),
-            KeyState::PendingDeletion | KeyState::PendingImport | KeyState::Unavailable => Some(ErrorCode::KmsInvalidState),
+            KeyState::Disabled => Some((ErrorCode::KmsDisabled, "KMS key is disabled")),
+            KeyState::PendingDeletion | KeyState::PendingImport | KeyState::Unavailable => {
+                Some((ErrorCode::KmsInvalidState, "KMS key is in an invalid state"))
+            }
         };
-        if let Some(code) = invalid {
-            return Err(ProtocolError::new(code, "KMS key is unavailable"));
+        if let Some((code, message)) = invalid {
+            return Err(ProtocolError::new(code, message));
         }
         if metadata.key_usage != KeyUsage::EncryptDecrypt {
             return Err(ProtocolError::new(ErrorCode::KmsInvalidKeyUsage, "KMS key cannot encrypt Vector data"));
@@ -180,12 +182,59 @@ pub(super) async fn preflight(
 }
 
 fn kms_error(error: KmsError) -> ProtocolError {
-    let code = match error {
-        KmsError::AccessDenied { .. } => ErrorCode::AccessDenied,
-        KmsError::KeyNotFound { .. } => ErrorCode::KmsNotFound,
-        KmsError::InvalidKey { .. } | KmsError::InvalidOperation { .. } => ErrorCode::KmsInvalidState,
-        KmsError::UnsupportedAlgorithm { .. } | KmsError::InvalidKeySize { .. } => ErrorCode::KmsInvalidKeyUsage,
-        _ => ErrorCode::ServiceUnavailable,
+    let (code, message) = match error {
+        KmsError::AccessDenied { .. } => (ErrorCode::AccessDenied, "KMS operation failed"),
+        KmsError::KeyNotFound { .. } => (ErrorCode::KmsNotFound, "KMS key was not found"),
+        KmsError::InvalidKey { .. } | KmsError::InvalidOperation { .. } => {
+            (ErrorCode::KmsInvalidState, "KMS key is in an invalid state")
+        }
+        KmsError::UnsupportedAlgorithm { .. } | KmsError::InvalidKeySize { .. } => {
+            (ErrorCode::KmsInvalidKeyUsage, "KMS key cannot encrypt Vector data")
+        }
+        _ => (ErrorCode::ServiceUnavailable, "KMS operation failed"),
     };
-    ProtocolError::new(code, "KMS operation failed")
+    ProtocolError::new(code, message)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn kms_exceptions_normalize_strictly_by_operation_error_model() {
+        let kms_cases = [
+            (ErrorCode::KmsDisabled, "KMS key is disabled"),
+            (ErrorCode::KmsInvalidKeyUsage, "KMS key cannot encrypt Vector data"),
+            (ErrorCode::KmsInvalidState, "KMS key is in an invalid state"),
+            (ErrorCode::KmsNotFound, "KMS key was not found"),
+        ];
+        for operation in Operation::ALL {
+            let declares_kms = matches!(
+                operation,
+                Operation::PutVectors | Operation::GetVectors | Operation::DeleteVectors | Operation::QueryVectors
+            );
+            assert_eq!(operation_declares_kms_exceptions(operation), declares_kms);
+            for (kms_code, expected_message) in kms_cases {
+                let original = ProtocolError::new(kms_code, "raw KMS preflight error");
+                let normalized = service_error_for_operation(operation, VectorServiceError::Protocol(original.clone()));
+                let via_protocol = protocol_error_for_operation(operation, original.clone());
+                assert_eq!(normalized, via_protocol);
+                if declares_kms {
+                    assert_eq!(normalized.code(), kms_code);
+                    assert_eq!(normalized, original);
+                } else {
+                    assert_eq!(normalized.code(), ErrorCode::Validation, "operation {operation:?}");
+                    assert_eq!(normalized.status_code(), http::StatusCode::BAD_REQUEST);
+                    assert_eq!(normalized.to_string(), format!("ValidationException: {expected_message}"));
+                }
+            }
+            for passthrough in [ErrorCode::AccessDenied, ErrorCode::ServiceUnavailable, ErrorCode::NotFound] {
+                let original = ProtocolError::new(passthrough, "passthrough error");
+                assert_eq!(
+                    service_error_for_operation(operation, VectorServiceError::Protocol(original.clone())),
+                    original
+                );
+            }
+        }
+    }
 }

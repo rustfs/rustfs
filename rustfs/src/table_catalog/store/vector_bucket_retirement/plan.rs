@@ -6,6 +6,7 @@ use super::*;
 pub(super) struct ValidatedBucketCatalogRetirement {
     pub(super) authority: VectorBucketCatalogRetirementV1,
     pub(super) reference: CatalogMetadataRef,
+    pub(super) plan: LoadedBucketRetirementPlan,
 }
 
 impl<B: TableCatalogObjectBackend> ObjectTableCatalogStore<B> {
@@ -52,12 +53,17 @@ impl<B: TableCatalogObjectBackend> ObjectTableCatalogStore<B> {
         Ok(reference)
     }
 
-    pub(super) async fn prepare_bucket_retirement_plan(
+    pub(super) async fn prepare_bucket_retirement_plan_validated(
         &self,
         bucket: &BucketHandle,
         fence: &TableCatalogObjectMutationFence,
-    ) -> TableCatalogStoreResult<CatalogBucketRetirementAuthority> {
+    ) -> TableCatalogStoreResult<ValidatedBucketCatalogRetirement> {
         self.require_bucket_retirement_identity(bucket)?;
+        let index = self.index_bucket_catalog_sources(bucket, fence).await?;
+        if index.targets_in_order.is_empty() {
+            return Err(maintenance_error("Catalog retirement has no source inventory"));
+        }
+        publication_recovery(self.cleanup_uncommitted_bucket_retirement_pages(bucket, fence)).await?;
         let binding = VectorBucketBindingV1::from_handle(bucket)?;
         let retirement_id = Uuid::new_v4();
         let mut page = VectorBucketCatalogRetirementPlanPageV1 {
@@ -72,9 +78,7 @@ impl<B: TableCatalogObjectBackend> ObjectTableCatalogStore<B> {
         let mut page_count = 0_u32;
         let mut target_count = 0_u64;
         let mut resource_count = 0_u64;
-        let mut cursor = None;
-        while let Some((key, object)) = self.next_bucket_catalog_source(bucket, cursor.as_deref(), fence).await? {
-            let target = self.classify_bucket_retirement_source(bucket, &key, &object, fence).await?;
+        for target in index.targets_in_order.iter().cloned() {
             self.validate_bucket_retirement_target_path(&binding, &target)?;
             let proof = if target.kind == VectorCatalogRetirementTargetKind::DeleteIntent {
                 let resource = target
@@ -82,7 +86,7 @@ impl<B: TableCatalogObjectBackend> ObjectTableCatalogStore<B> {
                     .as_ref()
                     .ok_or_else(|| maintenance_error("Catalog deletion anchor has no resource"))?;
                 Some(
-                    self.prepare_bucket_retirement_resource_proof(bucket, resource, retirement_id, fence)
+                    self.prepare_bucket_retirement_resource_proof_indexed(bucket, resource, retirement_id, &index, fence)
                         .await?,
                 )
             } else {
@@ -144,10 +148,6 @@ impl<B: TableCatalogObjectBackend> ObjectTableCatalogStore<B> {
                     .checked_add(1)
                     .ok_or_else(|| maintenance_error("Catalog resource count overflow"))?;
             }
-            cursor = Some(key);
-        }
-        if page.targets.is_empty() {
-            return Err(maintenance_error("Catalog retirement has no source inventory"));
         }
         let root = self.flush_bucket_retirement_plan_page(bucket, &page, fence).await?;
         page_count = page_count
@@ -165,54 +165,73 @@ impl<B: TableCatalogObjectBackend> ObjectTableCatalogStore<B> {
             inventory_sha256: "0".repeat(64),
             closure_sha256: "0".repeat(64),
         };
-        let (inventory, closure) = self.bucket_retirement_complete_digests(&record, fence).await?;
+        let (inventory, closure, loaded_plan) = self.load_and_complete_bucket_retirement_digests(&record, fence).await?;
         record.inventory_sha256 = inventory;
         record.closure_sha256 = closure;
         // Every initial progress record is durable before the authority exists.
         // No missing-progress recovery is allowed after this publication.
-        self.verify_bucket_retirement_sources_and_progress(&record, CatalogRetirementProgressRequirement::Prepared, fence)
-            .await?;
+        self.verify_bucket_retirement_sources_and_progress_with_plan(
+            &record,
+            &loaded_plan,
+            CatalogRetirementProgressRequirement::Prepared,
+            fence,
+        )
+        .await?;
         self.backend.revalidate_bucket_handle(bucket).await?;
         fence.ensure_held()?;
         let path = self.paths.vector_bucket_retirement_authority_path(bucket)?;
         let reference = self.write_bucket_retirement_record(&path, None, &record, fence).await?;
         #[cfg(test)]
         checkpoint(CatalogRetirementObservedPhase::AuthorityPublished, &record, &reference, None).await?;
-        Ok(CatalogBucketRetirementAuthority { record, reference })
+        Ok(ValidatedBucketCatalogRetirement {
+            authority: record,
+            reference,
+            plan: loaded_plan,
+        })
     }
 
-    pub(super) async fn bucket_retirement_complete_digests(
+    #[cfg(test)]
+    pub(super) async fn prepare_bucket_retirement_plan(
+        &self,
+        bucket: &BucketHandle,
+        fence: &TableCatalogObjectMutationFence,
+    ) -> TableCatalogStoreResult<CatalogBucketRetirementAuthority> {
+        let validated = self.prepare_bucket_retirement_plan_validated(bucket, fence).await?;
+        Ok(CatalogBucketRetirementAuthority {
+            record: validated.authority,
+            reference: validated.reference,
+        })
+    }
+
+    pub(super) async fn load_and_complete_bucket_retirement_digests(
         &self,
         authority: &VectorBucketCatalogRetirementV1,
         fence: &TableCatalogObjectMutationFence,
-    ) -> TableCatalogStoreResult<(String, String)> {
+    ) -> TableCatalogStoreResult<(String, String, LoadedBucketRetirementPlan)> {
+        let loaded = self.load_bucket_retirement_plan(authority, fence).await?;
+        let mut verified_sources_by_resource = BTreeMap::new();
+        for (rkey, descriptor) in &loaded.resources_by_key {
+            let facts = self
+                .collect_bucket_retirement_proof_facts(authority, descriptor, fence)
+                .await?;
+            let verified_sources = self.validate_resource_facts_closure_in_memory(descriptor, &facts, &loaded.targets_by_key)?;
+            verified_sources_by_resource.insert(rkey.clone(), verified_sources);
+        }
         let mut inventory =
             CatalogRetirementInventoryDigest::new(&authority.bucket, authority.retirement_id, authority.target_count)?;
-        let mut after = None;
-        for _ in 0..authority.target_count {
-            let planned = self
-                .next_bucket_retirement_target(authority, after.as_deref(), fence)
-                .await?
-                .ok_or_else(|| maintenance_error("Catalog retirement inventory is incomplete"))?;
+        for (_, planned) in loaded.targets_by_key.values() {
             if let Some(owner) = &planned.target.resource {
-                let descriptor = self.bucket_retirement_resource_by_identity(authority, owner, fence).await?;
-                self.require_bucket_retirement_source_fact(
-                    authority,
-                    &descriptor,
-                    &catalog_retirement_target_reference(&planned.target),
-                    fence,
-                )
-                .await?;
+                let verified_sources = verified_sources_by_resource
+                    .get(&resource_key(owner))
+                    .ok_or_else(|| maintenance_error("Catalog target has no resource proof"))?;
+                let observed_source = verified_sources
+                    .get(&planned.target.object_key)
+                    .ok_or_else(|| maintenance_error("Catalog proof edge has no exact source record"))?;
+                if *observed_source != catalog_retirement_target_reference(&planned.target) {
+                    return Err(maintenance_error("Catalog proof source identity disagrees with its edge"));
+                }
             }
             inventory.push(&planned.target)?;
-            after = Some(planned.target.object_key);
-        }
-        if self
-            .next_bucket_retirement_target(authority, after.as_deref(), fence)
-            .await?
-            .is_some()
-        {
-            return Err(maintenance_error("Catalog inventory has excess targets"));
         }
         let inventory = inventory.finish()?;
         let mut closure = CatalogRetirementClosureDigest::new(
@@ -221,27 +240,20 @@ impl<B: TableCatalogObjectBackend> ObjectTableCatalogStore<B> {
             &inventory,
             authority.resource_count,
         )?;
-        let mut after = None;
-        for _ in 0..authority.resource_count {
-            let descriptor = self
-                .next_bucket_retirement_resource(authority, after.as_ref(), fence)
-                .await?
-                .ok_or_else(|| maintenance_error("Catalog resource proof inventory is incomplete"))?;
-            self.visit_bucket_retirement_proof(authority, &descriptor, fence, |_| Ok(()))
-                .await?;
-            self.validate_bucket_retirement_resource_closure(authority, &descriptor, fence)
-                .await?;
+        for descriptor in loaded.resources_by_key.values() {
             closure.push(&descriptor.resource, descriptor.proof_id, descriptor.fact_count, &descriptor.proof_sha256)?;
-            after = Some(resource_key(&descriptor.resource));
         }
-        if self
-            .next_bucket_retirement_resource(authority, after.as_ref(), fence)
-            .await?
-            .is_some()
-        {
-            return Err(maintenance_error("Catalog closure has excess resources"));
-        }
-        Ok((inventory, closure.finish()?))
+        Ok((inventory, closure.finish()?, loaded))
+    }
+
+    #[cfg(test)]
+    pub(super) async fn bucket_retirement_complete_digests(
+        &self,
+        authority: &VectorBucketCatalogRetirementV1,
+        fence: &TableCatalogObjectMutationFence,
+    ) -> TableCatalogStoreResult<(String, String)> {
+        let (inventory, closure, _) = self.load_and_complete_bucket_retirement_digests(authority, fence).await?;
+        Ok((inventory, closure))
     }
 
     pub(super) async fn validate_bucket_retirement_authority(
@@ -249,12 +261,15 @@ impl<B: TableCatalogObjectBackend> ObjectTableCatalogStore<B> {
         authority: CatalogBucketRetirementAuthority,
         fence: &TableCatalogObjectMutationFence,
     ) -> TableCatalogStoreResult<ValidatedBucketCatalogRetirement> {
-        let (inventory, closure) = self.bucket_retirement_complete_digests(&authority.record, fence).await?;
+        let (inventory, closure, loaded_plan) = self
+            .load_and_complete_bucket_retirement_digests(&authority.record, fence)
+            .await?;
         if inventory != authority.record.inventory_sha256 || closure != authority.record.closure_sha256 {
             return Err(maintenance_error("Catalog retirement authority digest mismatch"));
         }
-        self.verify_bucket_retirement_sources_and_progress(
+        self.verify_bucket_retirement_sources_and_progress_with_plan(
             &authority.record,
+            &loaded_plan,
             CatalogRetirementProgressRequirement::Recoverable,
             fence,
         )
@@ -268,6 +283,7 @@ impl<B: TableCatalogObjectBackend> ObjectTableCatalogStore<B> {
         Ok(ValidatedBucketCatalogRetirement {
             authority: authority.record,
             reference: authority.reference,
+            plan: loaded_plan,
         })
     }
 }

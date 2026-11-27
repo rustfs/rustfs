@@ -2387,11 +2387,31 @@ where
     }
 
     async fn acquire_bucket_lifecycle_read(&self, expected: &BucketHandle) -> TableCatalogStoreResult<TableCatalogLockGuard> {
-        let guard = self
+        let bucket_id = expected.storage_bucket_id().as_str();
+        let guard = match self
             .store
-            .acquire_managed_bucket_fence(expected.storage_bucket_id().as_str(), expected.incarnation().as_uuid())
+            .acquire_managed_bucket_fence(bucket_id, expected.incarnation().as_uuid())
             .await
-            .map_err(|err| storage_error_to_catalog("acquire managed bucket lifecycle guard", err))?;
+        {
+            Ok(guard) => guard,
+            Err(err) => {
+                if matches!(
+                    &err,
+                    StorageError::Io(io_err)
+                        if io_err
+                            .to_string()
+                            .contains("bucket incarnation metadata is not authoritative")
+                ) && matches!(
+                    self.store.get_managed_bucket_metadata(bucket_id).await,
+                    Err(StorageError::BucketNotFound(_) | StorageError::ConfigNotFound | StorageError::VolumeNotFound)
+                ) {
+                    return Err(TableCatalogStoreError::NotFound(format!(
+                        "acquire managed bucket lifecycle guard: bucket {bucket_id}"
+                    )));
+                }
+                return Err(storage_error_to_catalog("acquire managed bucket lifecycle guard", err));
+            }
+        };
         self.revalidate_bucket_handle(expected).await?;
         if guard.is_lock_lost() {
             return Err(TableCatalogStoreError::Unavailable("managed bucket lifecycle guard was lost".to_string()));

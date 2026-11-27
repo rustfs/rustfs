@@ -507,7 +507,7 @@ impl MaintenanceExecutor {
         )
         .map_err(maintenance_execution_error)?;
         let objects =
-            crate::startup_services::maintenance_managed_lance_objects(self.app.clone(), context, operation.clone(), self.limits)
+            super::managed_objects::maintenance_managed_lance_objects(self.app.clone(), context, operation.clone(), self.limits)
                 .map_err(maintenance_execution_error)?;
         reader.bind(&objects);
         let publication = Arc::new(MaintenancePublicationAuthorization {
@@ -668,7 +668,7 @@ impl MaintenanceExecutor {
         )
         .map_err(maintenance_execution_error)?;
         let objects =
-            crate::startup_services::maintenance_managed_lance_objects(self.app.clone(), context, guard.clone(), self.limits)
+            super::managed_objects::maintenance_managed_lance_objects(self.app.clone(), context, guard.clone(), self.limits)
                 .map_err(maintenance_execution_error)?;
         reader.bind(&objects);
         let name = guard.name().clone();

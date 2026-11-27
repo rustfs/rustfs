@@ -7798,7 +7798,7 @@ impl<B: TableCatalogObjectBackend> ObjectTableCatalogStore<B> {
     }
 
     async fn verify_vector_replaced_entry(&self, entry: &TableEntry) -> TableCatalogStoreResult<()> {
-        if entry.version != 3 || entry.state != TableCatalogEntryState::Deleted {
+        if !matches!(entry.version, 3 | 4) || entry.state != TableCatalogEntryState::Deleted {
             return Err(TableCatalogStoreError::Conflict(
                 "Vector name is occupied by an active or incompatible entry".into(),
             ));
@@ -8821,7 +8821,13 @@ impl<B: TableCatalogObjectBackend> ObjectTableCatalogStore<B> {
         publication_preparation(&publication, Box::pin(prepare)).await
     }
 
-    #[cfg(test)]
+    /// Idempotently ensure the canonical Vector bucket parent and `indexes` namespace
+    /// exist in the Catalog while reusing an already-held `BucketIncarnationFenceGuard`
+    /// without re-acquiring `"__bucket_lifecycle__"` on `FastLock`.
+    ///
+    /// # Errors
+    /// Rejects foreign/lost lifecycle guards, mismatched `BucketHandle` incarnations,
+    /// active bucket Catalog retirement authorities, or incompatible existing entries.
     pub(crate) async fn ensure_vector_catalog_parent(
         &self,
         bucket: &BucketHandle,
@@ -8833,7 +8839,6 @@ impl<B: TableCatalogObjectBackend> ObjectTableCatalogStore<B> {
         run_vector_catalog_mutation(async move { store.ensure_vector_catalog_parent_guarded(&bucket, guard).await }).await
     }
 
-    #[cfg(test)]
     pub(in crate::table_catalog) async fn ensure_vector_catalog_parent_guarded(
         &self,
         bucket: &BucketHandle,

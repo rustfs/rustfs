@@ -965,6 +965,28 @@ impl ECStore {
         metadata_sys::mutate_managed_bucket_config_in(&self.ctx, self.id, identity, mutation).await
     }
 
+    /// Update a resolved Vector bucket configuration after verifying an application
+    /// precheck/authorization callback against the latest persisted [`BucketMetadata`]
+    /// under the bucket lifecycle read lock and metadata transaction write lock.
+    ///
+    /// # Errors
+    /// Returns [`crate::storage_api_contracts::bucket::ManagedBucketPrecheckError::Precheck`]
+    /// when `precheck` rejects the operation under held locks, or
+    /// [`crate::storage_api_contracts::bucket::ManagedBucketPrecheckError::Storage`] when
+    /// lock acquisition, identity/config validation, or persistence fails.
+    pub async fn mutate_managed_bucket_config_with_precheck<P, PFut, E>(
+        &self,
+        identity: &BucketHandle,
+        mutation: crate::storage_api_contracts::bucket::ManagedBucketConfigMutation,
+        precheck: P,
+    ) -> std::result::Result<time::OffsetDateTime, crate::storage_api_contracts::bucket::ManagedBucketPrecheckError<E, Error>>
+    where
+        P: FnOnce(&BucketMetadata) -> PFut + Send,
+        PFut: Future<Output = std::result::Result<(), E>> + Send,
+    {
+        metadata_sys::mutate_managed_bucket_config_in_with_precheck(&self.ctx, self.id, identity, mutation, precheck).await
+    }
+
     /// Delete an empty Vector bucket using its complete persisted identity.
     ///
     /// The required preparation runs under the bucket lifecycle writer and must
@@ -983,23 +1005,73 @@ impl ECStore {
         F: FnOnce(Arc<super::BucketIncarnationFenceGuard>) -> Fut + Send,
         Fut: Future<Output = Result<()>> + Send,
     {
-        if identity.kind() != BucketKind::Vector || self.ctx.lock_manager().is_disabled() {
-            return Err(Error::PreconditionFailed);
+        match self
+            .delete_managed_bucket_with_precheck_and_preparation(
+                identity,
+                |_| async { Ok::<(), std::convert::Infallible>(()) },
+                prepare,
+            )
+            .await
+        {
+            Ok(()) => Ok(()),
+            Err(crate::storage_api_contracts::bucket::ManagedBucketPrecheckError::Precheck(never)) => match never {},
+            Err(crate::storage_api_contracts::bucket::ManagedBucketPrecheckError::Storage(error)) => Err(error),
         }
-        let sys = metadata_sys::require_bucket_metadata_sys_in(&self.ctx)?;
+    }
+
+    /// Delete an empty Vector bucket after verifying `precheck` under the bucket
+    /// publication, lifecycle, metadata-transaction, and exact-namespace write locks
+    /// against the latest authoritative [`BucketMetadata`], before inspecting data
+    /// emptiness or running Catalog retirement preparation.
+    ///
+    /// # Errors
+    /// Returns [`crate::storage_api_contracts::bucket::ManagedBucketPrecheckError::Precheck`]
+    /// when `precheck` rejects the operation under held locks, or
+    /// [`crate::storage_api_contracts::bucket::ManagedBucketPrecheckError::Storage`] on
+    /// lock, identity, emptiness, preparation, or persistence failures.
+    pub async fn delete_managed_bucket_with_precheck_and_preparation<P, PFut, F, Fut, E>(
+        &self,
+        identity: &BucketHandle,
+        precheck: P,
+        prepare: F,
+    ) -> std::result::Result<(), crate::storage_api_contracts::bucket::ManagedBucketPrecheckError<E, Error>>
+    where
+        P: FnOnce(&BucketMetadata) -> PFut + Send,
+        PFut: Future<Output = std::result::Result<(), E>> + Send,
+        F: FnOnce(Arc<super::BucketIncarnationFenceGuard>) -> Fut + Send,
+        Fut: Future<Output = Result<()>> + Send,
+    {
+        use crate::storage_api_contracts::bucket::ManagedBucketPrecheckError;
+
+        if identity.kind() != BucketKind::Vector || self.ctx.lock_manager().is_disabled() {
+            return Err(ManagedBucketPrecheckError::Storage(Error::PreconditionFailed));
+        }
+        let sys = metadata_sys::require_bucket_metadata_sys_in(&self.ctx).map_err(ManagedBucketPrecheckError::Storage)?;
         let metadata = sys.read().await.clone();
-        let store = metadata.object_store_if_live().ok_or(Error::PreconditionFailed)?;
+        let store = metadata
+            .object_store_if_live()
+            .ok_or(ManagedBucketPrecheckError::Storage(Error::PreconditionFailed))?;
         if store.id != self.id {
-            return Err(Error::PreconditionFailed);
+            return Err(ManagedBucketPrecheckError::Storage(Error::PreconditionFailed));
         }
         let bucket = identity.storage_bucket_id().as_str();
         // Lock order: physical publication -> lifecycle -> metadata transaction
         // -> exact bucket namespace. Every acquisition uses the captured instance.
-        let publication = store.acquire_bucket_publication_write_lock(bucket).await?;
-        let lifecycle = store.acquire_bucket_lifecycle_write_lock(bucket).await?;
-        let transaction =
-            metadata_sys::acquire_transaction_lock_for_store(store.clone(), bucket, "managed_bucket_delete").await?;
-        let lock = store.new_ns_lock(bucket, bucket).await?;
+        let publication = store
+            .acquire_bucket_publication_write_lock(bucket)
+            .await
+            .map_err(ManagedBucketPrecheckError::Storage)?;
+        let lifecycle = store
+            .acquire_bucket_lifecycle_write_lock(bucket)
+            .await
+            .map_err(ManagedBucketPrecheckError::Storage)?;
+        let transaction = metadata_sys::acquire_transaction_lock_for_store(store.clone(), bucket, "managed_bucket_delete")
+            .await
+            .map_err(ManagedBucketPrecheckError::Storage)?;
+        let lock = store
+            .new_ns_lock(bucket, bucket)
+            .await
+            .map_err(ManagedBucketPrecheckError::Storage)?;
         let namespace = Arc::new(
             lock.get_write_lock(get_lock_acquire_timeout())
                 .await
@@ -1014,7 +1086,8 @@ impl ECStore {
                         }
                     }
                     other => StorageError::Lock(other),
-                })?,
+                })
+                .map_err(ManagedBucketPrecheckError::Storage)?,
         );
         let lifecycle = Arc::new(super::BucketIncarnationFenceGuard::new(
             Arc::clone(&self.bucket_fence_registry),
@@ -1030,24 +1103,39 @@ impl ECStore {
             transaction,
             namespace,
         };
-        Box::pin(self.delete_managed_bucket_under_guards(identity, &state, prepare)).await
+        Box::pin(self.delete_managed_bucket_under_guards(identity, &state, precheck, prepare)).await
     }
 
-    async fn delete_managed_bucket_under_guards<F, Fut>(
+    async fn delete_managed_bucket_under_guards<P, PFut, F, Fut, E>(
         &self,
         identity: &BucketHandle,
         state: &ManagedBucketDeleteState,
+        precheck: P,
         prepare: F,
-    ) -> Result<()>
+    ) -> std::result::Result<(), crate::storage_api_contracts::bucket::ManagedBucketPrecheckError<E, Error>>
     where
+        P: FnOnce(&BucketMetadata) -> PFut + Send,
+        PFut: Future<Output = std::result::Result<(), E>> + Send,
         F: FnOnce(Arc<super::BucketIncarnationFenceGuard>) -> Fut + Send,
         Fut: Future<Output = Result<()>> + Send,
     {
+        use crate::storage_api_contracts::bucket::ManagedBucketPrecheckError;
+
         let bucket = identity.storage_bucket_id().as_str();
-        let lifecycle = state.lifecycle.namespace_lock_guard().ok_or(Error::PreconditionFailed)?;
+        let lifecycle = state
+            .lifecycle
+            .namespace_lock_guard()
+            .ok_or(ManagedBucketPrecheckError::Storage(Error::PreconditionFailed))?;
         let deletion = Box::pin(async {
             self.validate_bucket_incarnation_fence(&state.lifecycle, bucket)?;
-            self.validate_managed_bucket_delete_identity(identity, &state.store).await?;
+            let metadata = self.validate_managed_bucket_delete_identity(identity, &state.store).await?;
+            metadata.validate_managed_authoritative_configs()?;
+            if let Err(error) = precheck(&metadata).await {
+                self.validate_bucket_incarnation_fence(&state.lifecycle, bucket)?;
+                return Ok(Err(error));
+            }
+            self.validate_bucket_incarnation_fence(&state.lifecycle, bucket)?;
+
             let mut diagnostic_budget = BucketDeleteDiagnosticBudget::new();
             if let Some(blocker) = bucket_delete_local_blocker(&self.ctx, bucket, &mut diagnostic_budget).await? {
                 return Err(blocker);
@@ -1095,12 +1183,20 @@ impl ECStore {
             state.metadata.remove(bucket).await;
             runtime_sources::delete_bucket_monitor_entry(bucket);
             crate::store::list_objects::observe_scanner_namespace_mutations(bucket, 1);
-            Ok(())
+            Ok(Ok(()))
         });
-        await_orphan_bucket_recovery(bucket, &state.publication, lifecycle, &state.transaction, &state.namespace, deletion).await
+        let outcome =
+            await_orphan_bucket_recovery(bucket, &state.publication, lifecycle, &state.transaction, &state.namespace, deletion)
+                .await
+                .map_err(ManagedBucketPrecheckError::Storage)?;
+        outcome.map_err(ManagedBucketPrecheckError::Precheck)
     }
 
-    async fn validate_managed_bucket_delete_identity(&self, identity: &BucketHandle, store: &Arc<ECStore>) -> Result<()> {
+    async fn validate_managed_bucket_delete_identity(
+        &self,
+        identity: &BucketHandle,
+        store: &Arc<ECStore>,
+    ) -> Result<BucketMetadata> {
         let current = metadata_sys::object_store_if_initialized_in(&self.ctx)
             .await
             .ok_or(Error::PreconditionFailed)?;
@@ -1124,7 +1220,8 @@ impl ECStore {
         if !persisted {
             return Err(Error::ConfigNotFound);
         }
-        metadata.validate_managed_bucket_delete_identity(identity)
+        metadata.validate_managed_bucket_delete_identity(identity)?;
+        Ok(metadata)
     }
 
     pub async fn bucket_incarnation_id(&self, bucket: &str) -> Result<Uuid> {
@@ -3048,10 +3145,20 @@ mod tests {
                 namespace,
             };
             let result = store
-                .delete_managed_bucket_under_guards(&identity, &state, |_| async { panic!("expired guard callback") })
+                .delete_managed_bucket_under_guards(
+                    &identity,
+                    &state,
+                    |_| async { Ok::<(), std::convert::Infallible>(()) },
+                    |_| async { panic!("expired guard callback") },
+                )
                 .await;
             assert!(
-                matches!(result, Err(StorageError::NamespaceLockQuorumUnavailable { .. })),
+                matches!(
+                    result,
+                    Err(crate::storage_api_contracts::bucket::ManagedBucketPrecheckError::Storage(
+                        StorageError::NamespaceLockQuorumUnavailable { .. }
+                    ))
+                ),
                 "expired guard: {result:?}"
             );
             tokio::time::resume();
@@ -3545,6 +3652,75 @@ mod tests {
         assert_eq!(preserved.tagging_config_xml, damaged.tagging_config_xml);
         assert_eq!(preserved.tagging_config_updated_at, damaged.tagging_config_updated_at);
         assert_eq!(preserved.bucket_identity_config_json, damaged.bucket_identity_config_json);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn managed_bucket_precheck_evaluates_latest_metadata_under_locks_and_aborts_before_prepare_or_save() {
+        use crate::storage_api_contracts::bucket::{ManagedBucketConfigMutation, ManagedBucketPrecheckError};
+
+        let (_dirs, store) = setup_bucket_quorum_test_env(&[4], Some(2)).await;
+        metadata_sys::init_bucket_metadata_sys(store.clone(), Vec::new()).await;
+        let identity = managed_bucket_identity();
+        let bucket = identity.storage_bucket_id().as_str();
+        store
+            .make_managed_bucket(&identity, &[], &[], &MakeBucketOptions::default())
+            .await
+            .expect("managed bucket");
+        let deny_policy =
+            br#"{"Version":"2012-10-17","Statement":[{"Effect":"Deny","Principal":"*","Action":"s3:*","Resource":"*"}]}"#
+                .to_vec();
+        store
+            .mutate_managed_bucket_config(
+                &identity,
+                ManagedBucketConfigMutation::PutPolicy {
+                    policy_json: deny_policy.clone(),
+                },
+            )
+            .await
+            .expect("install policy before prechecked operations");
+
+        let err = store
+            .mutate_managed_bucket_config_with_precheck(&identity, ManagedBucketConfigMutation::DeletePolicy, |metadata| {
+                let observed = metadata.policy_config_json.clone();
+                async move {
+                    if !observed.is_empty() {
+                        return Err("denied-by-current-policy");
+                    }
+                    Ok(())
+                }
+            })
+            .await
+            .expect_err("precheck rejection must abort config mutation");
+        assert!(matches!(err, ManagedBucketPrecheckError::Precheck("denied-by-current-policy")));
+        let after_mutation = store
+            .get_bucket_metadata_from_disk(bucket)
+            .await
+            .expect("metadata after rejected mutation");
+        assert_eq!(after_mutation.policy_config_json, deny_policy);
+
+        let err = store
+            .delete_managed_bucket_with_precheck_and_preparation(
+                &identity,
+                |metadata| {
+                    let observed = metadata.policy_config_json.clone();
+                    async move {
+                        if !observed.is_empty() {
+                            return Err("denied-delete");
+                        }
+                        Ok(())
+                    }
+                },
+                |_| async { panic!("prepare callback must not run when precheck denies deletion") },
+            )
+            .await
+            .expect_err("precheck rejection must abort bucket deletion before preparation");
+        assert!(matches!(err, ManagedBucketPrecheckError::Precheck("denied-delete")));
+        let after_delete = store
+            .get_bucket_metadata_from_disk(bucket)
+            .await
+            .expect("bucket must still exist after rejected deletion");
+        assert_eq!(after_delete.policy_config_json, deny_policy);
     }
 
     fn managed_bucket_identity() -> crate::storage_api_contracts::bucket::BucketHandle {

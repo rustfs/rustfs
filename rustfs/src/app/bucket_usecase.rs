@@ -286,6 +286,38 @@ tokio::task_local! {
 }
 
 #[cfg(test)]
+type ListManagedBucketsPauseHook = Arc<dyn Fn() -> std::pin::Pin<Box<dyn Future<Output = ()> + Send>> + Send + Sync>;
+
+#[cfg(test)]
+static LIST_MANAGED_BUCKETS_PAUSE_HOOK: std::sync::Mutex<Option<ListManagedBucketsPauseHook>> = std::sync::Mutex::new(None);
+
+#[cfg(test)]
+pub(crate) struct ListManagedBucketsPauseGuard;
+
+#[cfg(test)]
+impl ListManagedBucketsPauseGuard {
+    pub(crate) fn install<F, Fut>(hook: F) -> Self
+    where
+        F: Fn() -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = ()> + Send + 'static,
+    {
+        let mut slot = LIST_MANAGED_BUCKETS_PAUSE_HOOK.lock().expect("list managed buckets hook");
+        assert!(slot.is_none(), "list_managed_buckets pause hook already installed");
+        *slot = Some(Arc::new(move || Box::pin(hook())));
+        Self
+    }
+}
+
+#[cfg(test)]
+impl Drop for ListManagedBucketsPauseGuard {
+    fn drop(&mut self) {
+        if let Ok(mut slot) = LIST_MANAGED_BUCKETS_PAUSE_HOOK.lock() {
+            *slot = None;
+        }
+    }
+}
+
+#[cfg(test)]
 fn record_bucket_metadata_reload(bucket: &str, completed: bool, operation: &'static str, scanner_maintenance_change: bool) {
     let _ = BUCKET_METADATA_RELOAD_PROBE.try_with(|(observed_bucket, record)| {
         if observed_bucket == bucket {
@@ -443,6 +475,44 @@ where
         .map_err(|err| S3Error::with_message(S3ErrorCode::InternalError, format!("{operation} task failed: {err}")))?
 }
 
+fn is_managed_bucket_absent_error(error: &StorageError) -> bool {
+    matches!(
+        error,
+        StorageError::ConfigNotFound
+            | StorageError::BucketNotFound(_)
+            | StorageError::VolumeNotFound
+            | StorageError::ObjectNotFound(_, _)
+    )
+}
+
+async fn acquire_managed_bucket_incarnation_fence_checked(
+    store: &Arc<ECStore>,
+    bucket_id: &str,
+    expected: uuid::Uuid,
+) -> Result<BucketIncarnationFenceGuard, StorageError> {
+    match managed::acquire_bucket_incarnation_fence(store, bucket_id, expected).await {
+        Ok(guard) => Ok(guard),
+        Err(error) if is_managed_bucket_absent_error(&error) => Err(StorageError::BucketNotFound(bucket_id.to_owned())),
+        Err(error)
+            if matches!(
+                &error,
+                StorageError::Io(io_err)
+                    if io_err
+                        .to_string()
+                        .contains("bucket incarnation metadata is not authoritative")
+            ) =>
+        {
+            match managed::get_bucket_metadata(store, bucket_id).await {
+                Err(meta_err) if is_managed_bucket_absent_error(&meta_err) => {
+                    Err(StorageError::BucketNotFound(bucket_id.to_owned()))
+                }
+                Ok(_) | Err(_) => Err(error),
+            }
+        }
+        Err(error) => Err(error),
+    }
+}
+
 impl DefaultBucketUsecase {
     fn validate_managed_bucket_deployment(&self, account: &AccountNamespaceId, region: &str) -> Result<(), BucketResolveError> {
         if self.context.is_none() {
@@ -576,13 +646,16 @@ impl DefaultBucketUsecase {
             }
         }
         let store = self.object_store().ok_or(BucketResolveError::CapabilityUnavailable)?;
-        let guard = managed::acquire_bucket_incarnation_fence(
-            &store,
-            expected.storage_bucket_id().as_str(),
-            expected.incarnation().as_uuid(),
-        )
-        .await?;
-        let metadata = managed::get_bucket_metadata(&store, expected.storage_bucket_id().as_str()).await?;
+        let storage_id = expected.storage_bucket_id().as_str();
+        let guard =
+            acquire_managed_bucket_incarnation_fence_checked(&store, storage_id, expected.incarnation().as_uuid()).await?;
+        let metadata = match managed::get_bucket_metadata(&store, storage_id).await {
+            Ok(metadata) => metadata,
+            Err(error) if is_managed_bucket_absent_error(&error) => {
+                return Err(StorageError::BucketNotFound(storage_id.to_owned()).into());
+            }
+            Err(error) => return Err(error.into()),
+        };
         metadata.validate_bucket_handle(expected)?;
         if guard.is_lock_lost() {
             return Err(StorageError::PreconditionFailed.into());
@@ -590,89 +663,62 @@ impl DefaultBucketUsecase {
         Ok(guard)
     }
 
-    /// Update one authorized Vector bucket configuration through its exact store.
+    pub(crate) fn checked_vector_store(&self, identity: &BucketHandle) -> Result<Arc<ECStore>, BucketResolveError> {
+        if identity.kind() != BucketKind::Vector {
+            return Err(BucketResolveError::KindMismatch);
+        }
+        let expected_storage = self.checked_storage_bucket_id(
+            identity.kind(),
+            identity.account_namespace_id(),
+            identity.region(),
+            identity.public_name(),
+        )?;
+        if &expected_storage != identity.storage_bucket_id() {
+            return Err(BucketResolveError::IdentityMismatch);
+        }
+        self.object_store().ok_or(BucketResolveError::CapabilityUnavailable)
+    }
+
+    /// Update one Vector bucket configuration through its exact store after verifying
+    /// `precheck` under the storage engine's lifecycle and metadata-transaction locks.
     ///
-    /// The caller owns the accepted operation through storage and Vector audit completion.
-    /// It must not retain a lifecycle guard for this bucket.
-    ///
-    /// # Errors
-    /// Rejects a different kind, region, storage identity, or unavailable instance.
-    /// The storage boundary validates the full persisted identity under its write guards.
+    /// The caller owns the accepted operation through storage and Vector audit completion,
+    /// and must not hold a separate lifecycle guard across this call.
+    pub(crate) async fn mutate_managed_bucket_config_with_precheck<P, PFut, E>(
+        &self,
+        identity: &BucketHandle,
+        mutation: managed::ManagedBucketConfigMutation,
+        precheck: P,
+    ) -> Result<time::OffsetDateTime, managed::ManagedBucketPrecheckError<E, BucketResolveError>>
+    where
+        P: FnOnce(&managed::BucketMetadata) -> PFut + Send,
+        PFut: Future<Output = Result<(), E>> + Send,
+    {
+        let store = self
+            .checked_vector_store(identity)
+            .map_err(managed::ManagedBucketPrecheckError::Storage)?;
+        managed::mutate_managed_bucket_config_with_precheck(&store, identity, mutation, precheck)
+            .await
+            .map_err(|error| match error {
+                managed::ManagedBucketPrecheckError::Precheck(error) => managed::ManagedBucketPrecheckError::Precheck(error),
+                managed::ManagedBucketPrecheckError::Storage(error) => managed::ManagedBucketPrecheckError::Storage(error.into()),
+            })
+    }
+
+    #[cfg(test)]
     pub(crate) async fn mutate_managed_bucket_config(
         &self,
         identity: &BucketHandle,
         mutation: managed::ManagedBucketConfigMutation,
     ) -> Result<time::OffsetDateTime, BucketResolveError> {
-        if identity.kind() != BucketKind::Vector {
-            return Err(BucketResolveError::KindMismatch);
+        match self
+            .mutate_managed_bucket_config_with_precheck(identity, mutation, |_| async { Ok::<(), std::convert::Infallible>(()) })
+            .await
+        {
+            Ok(updated) => Ok(updated),
+            Err(managed::ManagedBucketPrecheckError::Precheck(never)) => match never {},
+            Err(managed::ManagedBucketPrecheckError::Storage(error)) => Err(error),
         }
-        let expected_storage = self.checked_storage_bucket_id(
-            identity.kind(),
-            identity.account_namespace_id(),
-            identity.region(),
-            identity.public_name(),
-        )?;
-        if &expected_storage != identity.storage_bucket_id() {
-            return Err(BucketResolveError::IdentityMismatch);
-        }
-        let store = self.object_store().ok_or(BucketResolveError::CapabilityUnavailable)?;
-        Ok(managed::mutate_managed_bucket_config(&store, identity, mutation).await?)
-    }
-
-    /// The owned Vector execution authorizes deletion before releasing its read guard.
-    pub(crate) async fn delete_managed_bucket(&self, identity: &BucketHandle) -> Result<(), BucketResolveError> {
-        if identity.kind() != BucketKind::Vector {
-            return Err(BucketResolveError::KindMismatch);
-        }
-        let expected_storage = self.checked_storage_bucket_id(
-            identity.kind(),
-            identity.account_namespace_id(),
-            identity.region(),
-            identity.public_name(),
-        )?;
-        if &expected_storage != identity.storage_bucket_id() {
-            return Err(BucketResolveError::IdentityMismatch);
-        }
-        let store = self.object_store().ok_or(BucketResolveError::CapabilityUnavailable)?;
-        #[cfg(test)]
-        let mut diagnostic = crate::table_catalog::CatalogRetirementDeleteProbe::begin(identity, store.id);
-        let catalog = crate::table_catalog::ObjectTableCatalogStore::for_vector_scope(
-            crate::table_catalog::EcStoreTableCatalogObjectBackend::new(store.clone()),
-            identity.clone(),
-        )
-        .await
-        .map_err(StorageError::other);
-        #[cfg(test)]
-        diagnostic.catalog_scope_returned(&catalog);
-        let catalog = catalog?;
-        let prepared_identity = identity.clone();
-        let cleanup_instance_id = store.id;
-        #[cfg(test)]
-        diagnostic.managed_started();
-        #[cfg(test)]
-        let mut callback_diagnostic = diagnostic.callback();
-        let result = managed::delete_managed_bucket_with_preparation(&store, identity, move |guard| async move {
-            #[cfg(test)]
-            callback_diagnostic.entered();
-            let execution = crate::table_catalog::CatalogCleanupExecution::new(cleanup_instance_id).map_err(StorageError::other);
-            #[cfg(test)]
-            if execution.is_err() {
-                callback_diagnostic.returned(&execution);
-            }
-            let execution = execution?;
-            let result = catalog
-                .prepare_vector_bucket_delete(&prepared_identity, guard, execution)
-                .await
-                .map_err(StorageError::other);
-            #[cfg(test)]
-            callback_diagnostic.returned(&result);
-            result
-        })
-        .await;
-        #[cfg(test)]
-        diagnostic.managed_returned(&result);
-        result?;
-        Ok(())
     }
 
     /// The service retains its admitted lifecycle guard and owns Vector authorization and audit.
@@ -682,21 +728,16 @@ impl DefaultBucketUsecase {
         guard: &BucketIncarnationFenceGuard,
     ) -> Result<Arc<managed::BucketMetadata>, BucketResolveError> {
         use rustfs_policy::policy::Validator;
-        if expected.kind() != BucketKind::Vector {
-            return Err(BucketResolveError::KindMismatch);
-        }
-        let storage_id = self.checked_storage_bucket_id(
-            expected.kind(),
-            expected.account_namespace_id(),
-            expected.region(),
-            expected.public_name(),
-        )?;
-        if &storage_id != expected.storage_bucket_id() {
-            return Err(BucketResolveError::IdentityMismatch);
-        }
-        let store = self.object_store().ok_or(BucketResolveError::CapabilityUnavailable)?;
+        let store = self.checked_vector_store(expected)?;
+        let storage_id = expected.storage_bucket_id();
         managed::validate_bucket_incarnation_fence(&store, guard, storage_id.as_str())?;
-        let metadata = managed::get_bucket_metadata(&store, storage_id.as_str()).await?;
+        let metadata = match managed::get_bucket_metadata(&store, storage_id.as_str()).await {
+            Ok(metadata) => metadata,
+            Err(error) if is_managed_bucket_absent_error(&error) => {
+                return Err(StorageError::BucketNotFound(storage_id.as_str().to_owned()).into());
+            }
+            Err(error) => return Err(error.into()),
+        };
         if let Some(policy) = managed::ConfigState::of(&metadata.policy_config_json, &metadata.policy_config)
             .require(storage_id.as_str(), BUCKET_POLICY_CONFIG)?
         {
@@ -728,16 +769,55 @@ impl DefaultBucketUsecase {
                 ..Default::default()
             })
             .await?;
+        #[cfg(test)]
+        {
+            let hook = LIST_MANAGED_BUCKETS_PAUSE_HOOK
+                .lock()
+                .expect("list managed buckets hook")
+                .clone();
+            if let Some(hook) = hook {
+                hook().await;
+            }
+        }
         let mut snapshots = Vec::new();
         for bucket in buckets {
             if !bucket.name.starts_with(managed::BUCKET_VECTOR_STORAGE_PREFIX) {
                 continue;
             }
-            let metadata = managed::get_bucket_metadata(&store, &bucket.name).await?;
-            let identity = metadata.bucket_handle(account, region)?;
-            let guard = managed::acquire_bucket_incarnation_fence(&store, &bucket.name, identity.incarnation().as_uuid()).await?;
-            let snapshot = self.read_managed_bucket_metadata(&identity, &guard).await?;
-            snapshots.push((identity, snapshot));
+            let mut observed = None;
+            for _attempt in 0..2 {
+                let metadata = match managed::get_bucket_metadata(&store, &bucket.name).await {
+                    Ok(metadata) => metadata,
+                    Err(error) if is_managed_bucket_absent_error(&error) => break,
+                    Err(error) => return Err(error.into()),
+                };
+                if metadata.is_uncommitted_vector_creation_intent()? {
+                    break;
+                }
+                let identity = metadata.bucket_handle(account, region)?;
+                let guard = match acquire_managed_bucket_incarnation_fence_checked(
+                    &store,
+                    &bucket.name,
+                    identity.incarnation().as_uuid(),
+                )
+                .await
+                {
+                    Ok(guard) => guard,
+                    Err(error) if is_managed_bucket_absent_error(&error) => continue,
+                    Err(error) => return Err(error.into()),
+                };
+                match self.read_managed_bucket_metadata(&identity, &guard).await {
+                    Ok(snapshot) => {
+                        observed = Some((identity, snapshot));
+                        break;
+                    }
+                    Err(BucketResolveError::Storage(error)) if is_managed_bucket_absent_error(&error) => continue,
+                    Err(error) => return Err(error),
+                }
+            }
+            if let Some(entry) = observed {
+                snapshots.push(entry);
+            }
         }
         snapshots.sort_by(|left, right| left.0.public_name().as_str().cmp(right.0.public_name().as_str()));
         Ok(snapshots)

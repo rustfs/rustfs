@@ -10,7 +10,7 @@ pub(crate) mod admin {
 pub(crate) mod bucket {
     pub(crate) use rustfs_storage_api::bucket::{
         AccountNamespaceId, BucketHandle, BucketIncarnation, BucketKind, BucketPublicName, ManagedBucketConfigMutation,
-        StorageBucketId,
+        ManagedBucketPrecheckError, StorageBucketId,
     };
     pub(crate) use rustfs_storage_api::{
         BUCKET_LIFECYCLE_LOCK_OBJECT, BucketInfo, BucketOperations, BucketOptions, DeleteBucketOptions, MakeBucketOptions,

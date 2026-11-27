@@ -173,3 +173,114 @@ fn vector_aws_sdk_pagination_shares_sessions_between_gateway_instances() {
         }
     });
 }
+
+#[test]
+#[serial_test::serial]
+fn vector_aws_sdk_resource_lists_handle_interleaved_mutations_and_sparse_prefixes() {
+    run_large_stack_test("vector-sdk-resource-list-interleaved", || async {
+        let fixture = Fixture::new().await;
+        let server = SdkServer::new(&fixture).await;
+        let client = &server.client;
+        let prefix = format!("sdk-rlist-{}", Uuid::new_v4().simple());
+        let bucket = format!("{prefix}-parent");
+        let extra = format!("{prefix}-sibling");
+        let result = AssertUnwindSafe(async {
+            for name in [&bucket, &extra] {
+                client.create_vector_bucket().vector_bucket_name(name).send().await.unwrap();
+            }
+            for name in ["alpha.1", "alpha.2", "beta.1", "beta.2", "omega.target"] {
+                client
+                    .create_index()
+                    .vector_bucket_name(&bucket)
+                    .index_name(name)
+                    .data_type(DataType::Float32)
+                    .dimension(2)
+                    .distance_metric(DistanceMetric::Euclidean)
+                    .send()
+                    .await
+                    .unwrap();
+            }
+
+            let first = client
+                .list_indexes()
+                .vector_bucket_name(&bucket)
+                .max_results(2)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(first.indexes().len(), 2);
+            let anchor = first.indexes()[1].index_name().to_owned();
+            let token = first.next_token().expect("continuation token").to_owned();
+
+            // Delete the anchor index and a sibling before continuing pagination.
+            client
+                .delete_index()
+                .vector_bucket_name(&bucket)
+                .index_name(&anchor)
+                .send()
+                .await
+                .unwrap();
+            client
+                .delete_index()
+                .vector_bucket_name(&bucket)
+                .index_name("beta.1")
+                .send()
+                .await
+                .unwrap();
+
+            let rest = client
+                .list_indexes()
+                .vector_bucket_name(&bucket)
+                .max_results(10)
+                .next_token(&token)
+                .send()
+                .await
+                .unwrap();
+            let rest_names: Vec<_> = rest.indexes().iter().map(|i| i.index_name()).collect();
+            assert_eq!(rest_names, vec!["beta.2", "omega.target"]);
+            assert!(rest.next_token().is_none());
+
+            // Sparse prefix filtering returns exact matching summary with maxResults=1.
+            let sparse = client
+                .list_indexes()
+                .vector_bucket_name(&bucket)
+                .prefix("omega.")
+                .max_results(1)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(sparse.indexes().len(), 1);
+            assert_eq!(sparse.indexes()[0].index_name(), "omega.target");
+            assert!(sparse.next_token().is_none());
+
+            // Bucket listing continues cleanly when a bucket anchor is deleted between pages.
+            let bpage1 = client
+                .list_vector_buckets()
+                .prefix(&prefix)
+                .max_results(1)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(bpage1.vector_buckets().len(), 1);
+            let btoken = bpage1.next_token().expect("bucket continuation token").to_owned();
+            client.delete_vector_bucket().vector_bucket_name(&extra).send().await.unwrap();
+            let bpage2 = client
+                .list_vector_buckets()
+                .prefix(&prefix)
+                .max_results(10)
+                .next_token(&btoken)
+                .send()
+                .await
+                .unwrap();
+            assert!(bpage2.vector_buckets().is_empty());
+            assert!(bpage2.next_token().is_none());
+        })
+        .catch_unwind()
+        .await;
+        server.finish().await;
+        cleanup_iam(&fixture).await;
+        if let Err(panic) = result {
+            std::panic::resume_unwind(panic);
+        }
+    });
+}

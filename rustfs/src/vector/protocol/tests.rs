@@ -688,12 +688,16 @@ fn documents_distinguish_omitted_fields_from_explicit_null() {
 fn query_plus_and_percent_plus_match_the_signature_query_interpretation() {
     let route = Route::recognize(&Method::DELETE, "/tags/arn%3Aaws%3As3vectors%3Aus-east-1%3A%3Abucket%2Ftest-bucket").unwrap();
     let Request::UntagResource(input) = route
-        .parse(Some("tagKeys=a+b&tagKeys=a%2Bb&tag%4Beys=encoded"), b"", REGION)
+        .parse(
+            Some("tag+Keys=ignored&tagKeys=a+b&tagKeys=a%2Bb&tagKeys=a%20b&tag%4Beys=encoded"),
+            b"",
+            REGION,
+        )
         .unwrap()
     else {
         panic!("UntagResource DTO");
     };
-    assert_eq!(input.tag_keys, ["a b", "a+b", "encoded"]);
+    assert_eq!(input.tag_keys, ["a+b", "a+b", "a b", "encoded"]);
 }
 
 #[test]

@@ -604,6 +604,254 @@ async fn sdk_tags_keep_signed_resource_and_repeated_query_until_authorization() 
     assert_eq!(calls.executed.load(Ordering::SeqCst), 0);
 }
 
+#[derive(Default)]
+struct TagKeysExecution {
+    condition_tag_keys: Mutex<Vec<Vec<String>>>,
+    executed_tag_keys: Mutex<Vec<Vec<String>>>,
+}
+
+struct TagKeysConditionApplication {
+    fixture: crate::vector::access_core::test_support::ResourceFixture,
+    policy: rustfs_policy::policy::Policy,
+    recorded: Arc<TagKeysExecution>,
+}
+
+impl VectorGatewayService for TagKeysConditionApplication {
+    type Authorization = Request;
+
+    fn authorize<'a>(
+        &'a self,
+        context: &'a RequestContextView,
+        request: &'a Request,
+    ) -> BoxFuture<'a, Result<Self::Authorization, ProtocolError>> {
+        let principal = context.principal().expect("verified principal");
+        let target = self.fixture.target(request.operation());
+        let conditions =
+            crate::vector::access_core::vector_conditions(std::collections::HashMap::new(), request, &target, "us-east-1")
+                .expect("valid resource target");
+        let tag_keys = conditions.get("TagKeys").cloned().unwrap_or_default();
+        self.recorded.condition_tag_keys.lock().expect("condition log").push(tag_keys);
+        let (bucket, object) = crate::vector::access_core::test_support::target_names(&target);
+        let bucket = bucket.to_owned();
+        let object = object.to_owned();
+        let account = principal.identity().access_key_id().to_owned();
+        let action = rustfs_policy::policy::action::Action::S3VectorsAction(crate::vector::access_core::primary_action(
+            request.operation(),
+        ));
+        Box::pin(async move {
+            let empty_claims = std::collections::HashMap::new();
+            let args = rustfs_policy::policy::Args {
+                account: &account,
+                groups: &None,
+                action,
+                bucket: &bucket,
+                object: &object,
+                conditions: &conditions,
+                is_owner: false,
+                claims: &empty_claims,
+                deny_only: false,
+            };
+            if self.policy.is_allowed(&args).await {
+                Ok(request.clone())
+            } else {
+                Err(ProtocolError::new(ErrorCode::AccessDenied, "Access denied"))
+            }
+        })
+    }
+
+    fn execute<'a>(
+        &'a self,
+        authorization: Self::Authorization,
+        request: Request,
+    ) -> BoxFuture<'a, Result<Response, ProtocolError>> {
+        assert_eq!(authorization, request, "execute receives exact authorized UntagResource DTO");
+        let Request::UntagResource(input) = request else {
+            panic!("expected UntagResource request");
+        };
+        self.recorded
+            .executed_tag_keys
+            .lock()
+            .expect("execution log")
+            .push(input.tag_keys);
+        Box::pin(async { Ok(Response::UntagResource(super::super::dto::UntagResourceOutput {})) })
+    }
+}
+
+fn tag_keys_policy_service(allowed_tag_keys: &[&str]) -> (S3Service, Arc<TagKeysExecution>) {
+    let policy_bytes = serde_json::to_vec(&serde_json::json!({
+        "Version": "2012-10-17",
+        "Statement": [{
+            "Effect": "Allow",
+            "Action": ["s3vectors:UntagResource"],
+            "Resource": ["arn:aws:s3vectors:us-east-1::bucket/s6-vector-bucket/index/s6-index"],
+            "Condition": {
+                "ForAllValues:StringEquals": { "aws:TagKeys": allowed_tag_keys },
+                "Null": { "aws:TagKeys": "false" }
+            }
+        }]
+    }))
+    .expect("policy JSON");
+    let policy: rustfs_policy::policy::Policy = serde_json::from_slice(&policy_bytes).expect("valid aws:TagKeys policy");
+    let credentials =
+        Arc::new(StaticCredentials::new().with(Credentials::new(TEST_ACCESS_KEY, TEST_SECRET).expect("test identity")));
+    let authenticator = SigV4Authenticator::new(credentials, RegionSet::new(["us-east-1"]).expect("test region"))
+        .verify_paths_double_encoded_under(&["/tags"]);
+    let builder = ServiceBuilder::for_service(SigService::S3Vectors)
+        .authenticator(authenticator)
+        .authorizer(allow_when(|request| serves(request.operation)))
+        .clock_with_skew_ack(
+            FixedClock::at_unix_seconds(TEST_EPOCH),
+            ClockSkewAck::i_understand_a_skewed_clock_can_disable_signature_expiry(),
+        );
+    let recorded = Arc::new(TagKeysExecution::default());
+    let backend = Arc::new(Backend::new(
+        TagKeysConditionApplication {
+            fixture: crate::vector::access_core::test_support::ResourceFixture::new(),
+            policy,
+            recorded: Arc::clone(&recorded),
+        },
+        "us-east-1".to_owned(),
+    ));
+    let service = register(builder, backend)
+        .expect("Vector dialect")
+        .build()
+        .expect("Vector service");
+    (service, recorded)
+}
+
+fn signed_double_encoded_tags_delete(
+    location: SigLocation,
+    wire_path: &str,
+    query: &str,
+) -> (HttpRequest<http_body_util::Full<Bytes>>, String) {
+    let mut headers = http::HeaderMap::new();
+    headers.insert(http::header::HOST, http::HeaderValue::from_static("gateway-sdk-probe.invalid"));
+    let probe = HttpRequest::builder()
+        .uri(wire_path)
+        .header(http::header::HOST, "gateway-sdk-probe.invalid")
+        .body(Bytes::new())
+        .expect("probe");
+    let accepted = WireRequest::accept(probe, &Limits::default()).expect("accepted host");
+    let stamp = AmzDate::parse("20260102T030405Z").expect("fixed date");
+    let scope = SigningScope::new(stamp.day(), "us-east-1", SigService::S3Vectors).expect("scope");
+    let mut signer = SigV4Signer::new(SigningCredentials::new(TEST_ACCESS_KEY, TEST_SECRET).expect("credentials"), scope);
+    let double_encoded_path = wire_path.replace('%', "%25");
+    let signing = SigningRequest::new(
+        &Method::DELETE,
+        &double_encoded_path,
+        query,
+        &headers,
+        accepted.host().raw_for_signing(),
+        match location {
+            SigLocation::Query => PayloadMode::Unsigned,
+            _ => PayloadMode::Empty,
+        },
+        stamp,
+    );
+    let signed = match location {
+        SigLocation::Header => signer.sign_headers(&signing),
+        SigLocation::Query => signer.presign(&signing, 300),
+        _ => panic!("test supports header and query signatures"),
+    }
+    .expect("signed request");
+    let canonical = signed.canonical_request().to_owned();
+    let target = if signed.query().is_empty() {
+        wire_path.to_owned()
+    } else {
+        format!("{wire_path}?{}", signed.query())
+    };
+    let mut request = HttpRequest::builder().method(Method::DELETE).uri(target);
+    for (name, value) in signed.headers() {
+        request = request.header(name, value);
+    }
+    (
+        request
+            .body(http_body_util::Full::new(Bytes::new()))
+            .expect("signed DELETE request"),
+        canonical,
+    )
+}
+
+#[tokio::test]
+async fn untag_resource_sigv4_query_plus_aligns_signature_route_conditions_and_handler() {
+    const WIRE_PATH: &str = "/tags/arn%3Aaws%3As3vectors%3Aus-east-1%3A%3Abucket%2Fs6-vector-bucket%2Findex%2Fs6-index";
+    const QUERY: &str = "tagKeys=a+b&tagKeys=a%2Bb&tagKeys=a%20b";
+
+    for location in [SigLocation::Header, SigLocation::Query] {
+        let (service, recorded) = tag_keys_policy_service(&["a+b", "a b"]);
+        let (request, canonical) = signed_double_encoded_tags_delete(location, WIRE_PATH, QUERY);
+        assert!(
+            canonical.contains("tagKeys=a%20b&tagKeys=a%2Bb&tagKeys=a%2Bb"),
+            "SigV4 canonical query must treat '+' and '%2B' identically and keep '%20' distinct: {canonical}"
+        );
+        let response = service.call(request).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()["content-type"], "application/json");
+        assert!(
+            response
+                .into_body()
+                .collect()
+                .await
+                .expect("empty body")
+                .to_bytes()
+                .is_empty()
+        );
+        assert_eq!(
+            *recorded.condition_tag_keys.lock().expect("condition log"),
+            vec![vec!["a+b".to_owned(), "a+b".to_owned(), "a b".to_owned()]]
+        );
+        assert_eq!(
+            *recorded.executed_tag_keys.lock().expect("execution log"),
+            vec![vec!["a+b".to_owned(), "a+b".to_owned(), "a b".to_owned()]]
+        );
+    }
+
+    // Regression guard: a policy permitting only "a b" must deny `tagKeys=a+b`.
+    let (space_only_service, space_only_recorded) = tag_keys_policy_service(&["a b"]);
+    let (plus_request, _) = signed_double_encoded_tags_delete(SigLocation::Header, WIRE_PATH, "tagKeys=a+b");
+    assert_protocol_error(space_only_service.call(plus_request).await, ErrorCode::AccessDenied).await;
+    assert_eq!(
+        *space_only_recorded.condition_tag_keys.lock().expect("condition log"),
+        vec![vec!["a+b".to_owned()]]
+    );
+    assert!(
+        space_only_recorded
+            .executed_tag_keys
+            .lock()
+            .expect("execution log")
+            .is_empty()
+    );
+
+    // Wire-spelling parity: a signature over `tagKeys=a+b` is rejected if rewritten to `a%20b`,
+    // and accepted with identical condition/handler semantics if rewritten to `a%2Bb`.
+    let (plus_only_service, plus_only_recorded) = tag_keys_policy_service(&["a+b"]);
+    let (mut tampered_to_space, _) = signed_double_encoded_tags_delete(SigLocation::Header, WIRE_PATH, "tagKeys=a+b");
+    *tampered_to_space.uri_mut() = format!("{WIRE_PATH}?tagKeys=a%20b").parse().expect("URI");
+    let refused = plus_only_service.call(tampered_to_space).await;
+    assert!(!refused.status().is_success());
+    assert!(refused.extensions().get::<rustfs_gateway::S3Error>().is_some());
+    assert!(
+        plus_only_recorded
+            .condition_tag_keys
+            .lock()
+            .expect("condition log")
+            .is_empty()
+    );
+
+    let (mut respelled_percent_plus, _) = signed_double_encoded_tags_delete(SigLocation::Header, WIRE_PATH, "tagKeys=a+b");
+    *respelled_percent_plus.uri_mut() = format!("{WIRE_PATH}?tagKeys=a%2Bb").parse().expect("URI");
+    let accepted = plus_only_service.call(respelled_percent_plus).await;
+    assert_eq!(accepted.status(), StatusCode::OK);
+    assert_eq!(
+        *plus_only_recorded.condition_tag_keys.lock().expect("condition log"),
+        vec![vec!["a+b".to_owned()]]
+    );
+    assert_eq!(
+        *plus_only_recorded.executed_tag_keys.lock().expect("execution log"),
+        vec![vec!["a+b".to_owned()]]
+    );
+}
+
 #[tokio::test]
 async fn signed_unknown_route_and_wrong_method_do_not_enter_application() {
     let (service, calls) = admission_service(true);

@@ -386,6 +386,9 @@ fn storage_error_to_catalog(action: &str, err: StorageError) -> TableCatalogStor
         StorageError::Lock(lock_err) => store::catalog_lock_acquisition_error(action, lock_err),
         StorageError::ObjectNotFound(bucket, object) => TableCatalogStoreError::NotFound(format!("{action}: {bucket}/{object}")),
         StorageError::BucketNotFound(bucket) => TableCatalogStoreError::NotFound(format!("{action}: bucket {bucket}")),
+        StorageError::ConfigNotFound | StorageError::VolumeNotFound => {
+            TableCatalogStoreError::NotFound(format!("{action}: {err}"))
+        }
         StorageError::PreconditionFailed => TableCatalogStoreError::Conflict(format!("{action}: precondition failed")),
         other => TableCatalogStoreError::Internal(format!("{action}: {other}")),
     }

@@ -13,14 +13,14 @@ use crate::{
 
 #[derive(Default)]
 pub(super) struct CandidateReader {
-    objects: parking_lot::RwLock<Option<std::sync::Weak<crate::startup_services::ManagedLanceObjects>>>,
+    objects: parking_lot::RwLock<Option<std::sync::Weak<super::managed_objects::ManagedLanceObjects>>>,
     owned_maintenance: Option<Arc<dyn CatalogManagedCandidateReader>>,
     maintenance: Option<crate::table_catalog::VectorMaintenanceControl>,
     retained_allocations: parking_lot::Mutex<Vec<Arc<crate::table_catalog::VectorMaintenanceMemoryReservation>>>,
 }
 
 impl CandidateReader {
-    pub(super) fn bind(&self, objects: &Arc<crate::startup_services::ManagedLanceObjects>) {
+    pub(super) fn bind(&self, objects: &Arc<super::managed_objects::ManagedLanceObjects>) {
         *self.objects.write() = Some(Arc::downgrade(objects));
     }
 
@@ -258,7 +258,7 @@ impl VectorRequestAccess for IndexRequest<'_> {
             operations,
         )
         .map_err(|_| denied())?;
-        let objects = crate::startup_services::guarded_managed_lance_objects(
+        let objects = super::managed_objects::guarded_managed_lance_objects(
             access.clone(),
             Arc::new(envelope),
             definition,
@@ -306,13 +306,8 @@ impl VectorRequestAccess for IndexRequest<'_> {
                 .ok_or(VectorServiceError::InvalidContext("invalid pagination read limit"))?,
             ..self.owner.limits
         };
-        let objects = crate::startup_services::guarded_managed_query_results(
-            access.clone(),
-            Arc::new(envelope),
-            definition,
-            guard,
-            limits,
-        )?;
+        let objects =
+            super::managed_objects::guarded_managed_query_results(access.clone(), Arc::new(envelope), definition, guard, limits)?;
         Ok(ManagedDatasetAccess { access, objects })
     }
 }

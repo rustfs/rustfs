@@ -1327,25 +1327,53 @@ pub(crate) async fn mutate_managed_bucket_config_in(
     identity: &crate::storage_api_contracts::bucket::BucketHandle,
     mutation: crate::storage_api_contracts::bucket::ManagedBucketConfigMutation,
 ) -> Result<OffsetDateTime> {
-    use crate::storage_api_contracts::bucket::BucketKind;
+    match mutate_managed_bucket_config_in_with_precheck(ctx, expected_store_id, identity, mutation, |_| async {
+        Ok::<(), std::convert::Infallible>(())
+    })
+    .await
+    {
+        Ok(updated) => Ok(updated),
+        Err(crate::storage_api_contracts::bucket::ManagedBucketPrecheckError::Precheck(never)) => match never {},
+        Err(crate::storage_api_contracts::bucket::ManagedBucketPrecheckError::Storage(error)) => Err(error),
+    }
+}
 
-    let sys = require_bucket_metadata_sys_in(ctx)?;
+pub(crate) async fn mutate_managed_bucket_config_in_with_precheck<P, PFut, E>(
+    ctx: &crate::runtime::instance::InstanceContext,
+    expected_store_id: Uuid,
+    identity: &crate::storage_api_contracts::bucket::BucketHandle,
+    mutation: crate::storage_api_contracts::bucket::ManagedBucketConfigMutation,
+    precheck: P,
+) -> std::result::Result<OffsetDateTime, crate::storage_api_contracts::bucket::ManagedBucketPrecheckError<E, Error>>
+where
+    P: FnOnce(&BucketMetadata) -> PFut + Send,
+    PFut: Future<Output = std::result::Result<(), E>> + Send,
+{
+    use crate::storage_api_contracts::bucket::{BucketKind, ManagedBucketPrecheckError};
+
+    let sys = require_bucket_metadata_sys_in(ctx).map_err(ManagedBucketPrecheckError::Storage)?;
     let metadata_sys = sys.read().await.clone();
-    let store = metadata_sys.object_store_if_live().ok_or(Error::PreconditionFailed)?;
+    let store = metadata_sys
+        .object_store_if_live()
+        .ok_or(ManagedBucketPrecheckError::Storage(Error::PreconditionFailed))?;
     if expected_store_id.is_nil() || store.id != expected_store_id || identity.kind() != BucketKind::Vector {
-        return Err(Error::PreconditionFailed);
+        return Err(ManagedBucketPrecheckError::Storage(Error::PreconditionFailed));
     }
     let bucket = identity.storage_bucket_id().as_str();
     // Lock order: lifecycle read, metadata transaction write, then metadata namespace.
     // Pin this instance through every acquisition and the complete metadata save.
-    let lifecycle_guard = store.acquire_bucket_lifecycle_read_lock(bucket).await?;
+    let lifecycle_guard = store
+        .acquire_bucket_lifecycle_read_lock(bucket)
+        .await
+        .map_err(ManagedBucketPrecheckError::Storage)?;
     let transaction_guard = await_bucket_namespace_operation(
         Some(&lifecycle_guard),
         bucket,
         "managed bucket config transaction acquisition",
         acquire_transaction_lock_for_store(store.clone(), bucket, "managed_bucket_config_update"),
     )
-    .await?;
+    .await
+    .map_err(ManagedBucketPrecheckError::Storage)?;
     let incarnation_id = validate_bucket_metadata_guard_incarnation(
         &metadata_sys,
         bucket,
@@ -1353,37 +1381,66 @@ pub(crate) async fn mutate_managed_bucket_config_in(
         &lifecycle_guard,
         &transaction_guard,
     )
-    .await?;
+    .await
+    .map_err(ManagedBucketPrecheckError::Storage)?;
     let guard = BucketMetadataMutationGuard {
         bucket: bucket.to_owned(),
         incarnation_id,
         lifecycle_guard,
         transaction_guard,
     };
-    let current_store = sys.read().await.object_store_if_live().ok_or(Error::PreconditionFailed)?;
+    let current_store = sys
+        .read()
+        .await
+        .object_store_if_live()
+        .ok_or(ManagedBucketPrecheckError::Storage(Error::PreconditionFailed))?;
     if current_store.id != expected_store_id {
-        return Err(Error::PreconditionFailed);
+        return Err(ManagedBucketPrecheckError::Storage(Error::PreconditionFailed));
     }
-    mutate_managed_bucket_config_under_guard(&metadata_sys, &guard, identity, mutation).await
+    mutate_managed_bucket_config_under_guard_with_precheck(&metadata_sys, &guard, identity, mutation, precheck).await
 }
 
+#[cfg(test)]
 async fn mutate_managed_bucket_config_under_guard(
     metadata_sys: &BucketMetadataSys,
     guard: &BucketMetadataMutationGuard,
     identity: &crate::storage_api_contracts::bucket::BucketHandle,
     mutation: crate::storage_api_contracts::bucket::ManagedBucketConfigMutation,
 ) -> Result<OffsetDateTime> {
-    use crate::storage_api_contracts::bucket::ManagedBucketConfigMutation;
+    match mutate_managed_bucket_config_under_guard_with_precheck(metadata_sys, guard, identity, mutation, |_| async {
+        Ok::<(), std::convert::Infallible>(())
+    })
+    .await
+    {
+        Ok(updated) => Ok(updated),
+        Err(crate::storage_api_contracts::bucket::ManagedBucketPrecheckError::Precheck(never)) => match never {},
+        Err(crate::storage_api_contracts::bucket::ManagedBucketPrecheckError::Storage(error)) => Err(error),
+    }
+}
+
+async fn mutate_managed_bucket_config_under_guard_with_precheck<P, PFut, E>(
+    metadata_sys: &BucketMetadataSys,
+    guard: &BucketMetadataMutationGuard,
+    identity: &crate::storage_api_contracts::bucket::BucketHandle,
+    mutation: crate::storage_api_contracts::bucket::ManagedBucketConfigMutation,
+    precheck: P,
+) -> std::result::Result<OffsetDateTime, crate::storage_api_contracts::bucket::ManagedBucketPrecheckError<E, Error>>
+where
+    P: FnOnce(&BucketMetadata) -> PFut + Send,
+    PFut: Future<Output = std::result::Result<(), E>> + Send,
+{
+    use crate::storage_api_contracts::bucket::{ManagedBucketConfigMutation, ManagedBucketPrecheckError};
 
     let bucket = identity.storage_bucket_id().as_str();
-    guard.ensure_valid(bucket)?;
+    guard.ensure_valid(bucket).map_err(ManagedBucketPrecheckError::Storage)?;
     let config_file = match &mutation {
         ManagedBucketConfigMutation::PutPolicy { .. } | ManagedBucketConfigMutation::DeletePolicy => {
             super::metadata::BUCKET_POLICY_CONFIG
         }
         ManagedBucketConfigMutation::Tag { .. } | ManagedBucketConfigMutation::Untag { .. } => BUCKET_TAGGING_CONFIG,
     };
-    let updated = await_bucket_namespace_operation(
+    let expected_incarnation_id = guard.incarnation_id;
+    let outcome = await_bucket_namespace_operation(
         Some(&guard.lifecycle_guard),
         bucket,
         "managed bucket config mutation",
@@ -1391,20 +1448,37 @@ async fn mutate_managed_bucket_config_under_guard(
             Some(&guard.transaction_guard),
             bucket,
             "managed bucket config mutation transaction",
-            Box::pin(metadata_sys.update_config_with_checked(
-                bucket,
-                config_file,
-                |metadata| {
-                    metadata.validate_bucket_handle(identity)?;
-                    metadata.managed_config_mutation_data(mutation)
-                },
-                guard.incarnation_id,
-            )),
+            Box::pin(async {
+                let mut bm = Box::pin(BucketMetadataSys::load_bucket_metadata_for_update(
+                    metadata_sys.object_store(),
+                    bucket,
+                    true,
+                ))
+                .await?;
+                if !bm.bucket_incarnation_sidecar || bm.bucket_incarnation_id != expected_incarnation_id {
+                    return Err(Error::BucketNotFound(bucket.to_string()));
+                }
+                if let Some(raw_len) = bm.xml_config_unreadable_len(config_file) {
+                    return Err(unreadable_config_error(bucket, config_file, raw_len));
+                }
+                bm.validate_managed_authoritative_configs()?;
+                bm.validate_bucket_handle(identity)?;
+
+                if let Err(error) = precheck(&bm).await {
+                    return Ok(Err(error));
+                }
+
+                let data = bm.managed_config_mutation_data(mutation)?;
+                let updated = bm.update_config(config_file, data)?;
+                Box::pin(metadata_sys.save(bm)).await?;
+                Ok(Ok(updated))
+            }),
         ),
     )
-    .await?;
-    guard.ensure_valid(bucket)?;
-    Ok(updated)
+    .await
+    .map_err(ManagedBucketPrecheckError::Storage)?;
+    guard.ensure_valid(bucket).map_err(ManagedBucketPrecheckError::Storage)?;
+    outcome.map_err(ManagedBucketPrecheckError::Precheck)
 }
 
 async fn update_config_with_expected<F>(

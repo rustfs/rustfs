@@ -97,10 +97,10 @@ pub(crate) mod contract {
     }
 
     pub(crate) mod multipart {
-        pub(crate) use super::super::storage_contracts::{CompletePart, MultipartCompletionAuthorization};
+        pub(crate) use super::super::storage_contracts::MultipartCompletionAuthorization;
         pub(crate) const MAX_MULTIPART_PART_NUMBER: i32 = 10000;
         #[cfg(test)]
-        pub(crate) use super::super::storage_contracts::{MultipartOperations, PartInfo};
+        pub(crate) use super::super::storage_contracts::{CompletePart, MultipartOperations, PartInfo};
     }
 
     pub(crate) mod object {
@@ -2132,9 +2132,9 @@ pub(crate) mod managed {
         AccountNamespaceId, BucketHandle, BucketIncarnation, BucketKind, BucketPublicName, ManagedTableId, StorageBucketId,
     };
     pub(crate) use super::storage_contracts::bucket::{
-        BucketIdentityError, ManagedBucketConfigMutation, ManagedObjectAccess, ManagedObjectOperation,
+        BucketIdentityError, ManagedBucketConfigMutation, ManagedBucketPrecheckError, ManagedObjectAccess, ManagedObjectOperation,
     };
-    use super::{Arc, ECStore, Result, ecstore_bucket};
+    use super::{Arc, ECStore, Result, StorageError, ecstore_bucket};
     pub(crate) use rustfs_heal_contracts::heal_channel::HealOpts;
 
     pub(crate) type BucketIncarnationFenceGuard = ecstore_bucket::BucketIncarnationFenceGuard;
@@ -2195,24 +2195,36 @@ pub(crate) mod managed {
             .await
     }
 
-    pub(crate) async fn mutate_managed_bucket_config(
+    pub(crate) async fn mutate_managed_bucket_config_with_precheck<P, PFut, E>(
         store: &ECStore,
         identity: &BucketHandle,
         mutation: ManagedBucketConfigMutation,
-    ) -> Result<time::OffsetDateTime> {
-        store.mutate_managed_bucket_config(identity, mutation).await
+        precheck: P,
+    ) -> core::result::Result<time::OffsetDateTime, ManagedBucketPrecheckError<E, StorageError>>
+    where
+        P: FnOnce(&BucketMetadata) -> PFut + Send,
+        PFut: std::future::Future<Output = core::result::Result<(), E>> + Send,
+    {
+        store
+            .mutate_managed_bucket_config_with_precheck(identity, mutation, precheck)
+            .await
     }
 
-    pub(crate) async fn delete_managed_bucket_with_preparation<F, Fut>(
+    pub(crate) async fn delete_managed_bucket_with_precheck_and_preparation<P, PFut, F, Fut, E>(
         store: &Arc<ECStore>,
         identity: &BucketHandle,
+        precheck: P,
         prepare: F,
-    ) -> Result<()>
+    ) -> core::result::Result<(), ManagedBucketPrecheckError<E, StorageError>>
     where
+        P: FnOnce(&BucketMetadata) -> PFut + Send,
+        PFut: std::future::Future<Output = core::result::Result<(), E>> + Send,
         F: FnOnce(Arc<BucketIncarnationFenceGuard>) -> Fut + Send,
         Fut: std::future::Future<Output = Result<()>> + Send,
     {
-        store.delete_managed_bucket_with_preparation(identity, prepare).await
+        store
+            .delete_managed_bucket_with_precheck_and_preparation(identity, precheck, prepare)
+            .await
     }
 }
 

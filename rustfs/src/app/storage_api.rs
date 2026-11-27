@@ -1629,12 +1629,13 @@ pub(crate) mod managed {
     pub(crate) use crate::storage::storage_api::managed::BUCKET_VECTOR_STORAGE_PREFIX;
     #[cfg(test)]
     pub(crate) use crate::storage::storage_api::managed::ManagedTableId;
-    pub(crate) use crate::storage::storage_api::managed::delete_managed_bucket_with_preparation;
+    pub(crate) use crate::storage::storage_api::managed::delete_managed_bucket_with_precheck_and_preparation;
     pub(crate) use crate::storage::storage_api::managed::{
         AccountNamespaceId, BUCKET_TAGGING_CONFIG, BucketHandle, BucketIdentityError, BucketIncarnation,
         BucketIncarnationFenceGuard, BucketKind, BucketMetadata, BucketPublicName, ConfigState, ManagedBucketConfigMutation,
-        ManagedObjectAccess, ManagedObjectOperation, StorageBucketId, acquire_bucket_incarnation_fence, get_bucket_metadata,
-        make_managed_bucket, mutate_managed_bucket_config, validate_bucket_incarnation_fence,
+        ManagedBucketPrecheckError, ManagedObjectAccess, ManagedObjectOperation, StorageBucketId,
+        acquire_bucket_incarnation_fence, get_bucket_metadata, make_managed_bucket, mutate_managed_bucket_config_with_precheck,
+        validate_bucket_incarnation_fence,
     };
     pub(crate) use crate::storage::storage_api::managed::{DeleteAccounting, HealOpts};
 }

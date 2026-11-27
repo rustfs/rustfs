@@ -15,7 +15,11 @@ const LOG_COMPONENT: &str = "vector";
 const LOG_SUBSYSTEM: &str = "maintenance";
 const EVENT_VECTOR_MAINTENANCE_ADMISSION: &str = "vector_maintenance_admission";
 
-pub(crate) fn spawn(server: Arc<ServerContextSlot>, shutdown: &CancellationToken) -> CatalogBackgroundTask {
+pub(crate) fn spawn(
+    server: Arc<ServerContextSlot>,
+    node_admission: Option<Arc<rustfs_concurrency::adaptive::NodeAdmission>>,
+    shutdown: &CancellationToken,
+) -> CatalogBackgroundTask {
     CatalogBackgroundTask::start_fallible(shutdown, move |cancellation| async move {
         let app = loop {
             if cancellation.is_cancelled() {
@@ -32,7 +36,7 @@ pub(crate) fn spawn(server: Arc<ServerContextSlot>, shutdown: &CancellationToken
                 _ = tokio::time::sleep(std::time::Duration::from_secs(1)) => {}
             }
         };
-        let result = admitted_runtime(app, server, &cancellation).await;
+        let result = admitted_runtime(app, server, node_admission, &cancellation).await;
         let mut worker = match result {
             Ok(Some(worker)) => worker,
             Ok(None) => return Ok(()),
@@ -67,6 +71,7 @@ pub(crate) fn spawn(server: Arc<ServerContextSlot>, shutdown: &CancellationToken
 async fn admitted_runtime(
     app: Arc<AppContext>,
     server: Arc<ServerContextSlot>,
+    node_admission: Option<Arc<rustfs_concurrency::adaptive::NodeAdmission>>,
     cancellation: &CancellationToken,
 ) -> Result<Option<CatalogBackgroundTask>, VectorMaintenanceExecutionError> {
     let snapshot = app.server_config().get().unwrap_or_default();
@@ -111,7 +116,7 @@ async fn admitted_runtime(
             source,
             executor,
         },
-        crate::startup_background::background_node_admission(),
+        node_admission,
         cancellation,
     )
     .map_err(Into::into)

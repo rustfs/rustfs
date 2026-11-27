@@ -5,9 +5,23 @@ use super::*;
 
 #[derive(Clone)]
 pub(super) struct CatalogRetirementPlannedTarget {
+    #[cfg(test)]
     pub(super) plan_page: CatalogMetadataRefRecordV1,
     pub(super) ordinal: u16,
     pub(super) target: VectorCatalogRetirementTargetV1,
+}
+
+#[derive(Clone)]
+pub(super) struct LoadedBucketRetirementPlanPage {
+    pub(super) reference: CatalogMetadataRefRecordV1,
+    pub(super) page: VectorBucketCatalogRetirementPlanPageV1,
+}
+
+#[derive(Clone)]
+pub(super) struct LoadedBucketRetirementPlan {
+    pub(super) pages: Vec<LoadedBucketRetirementPlanPage>,
+    pub(super) targets_by_key: BTreeMap<String, (usize, CatalogRetirementPlannedTarget)>,
+    pub(super) resources_by_key: BTreeMap<(String, String, String), VectorCatalogRetiredResourceProofV1>,
 }
 
 impl<B: TableCatalogObjectBackend> ObjectTableCatalogStore<B> {
@@ -59,77 +73,82 @@ impl<B: TableCatalogObjectBackend> ObjectTableCatalogStore<B> {
         fence.ensure_held()
     }
 
+    pub(super) async fn load_bucket_retirement_plan(
+        &self,
+        authority: &VectorBucketCatalogRetirementV1,
+        fence: &TableCatalogObjectMutationFence,
+    ) -> TableCatalogStoreResult<LoadedBucketRetirementPlan> {
+        let mut pages = Vec::with_capacity(usize::try_from(authority.plan_page_count).unwrap_or(0));
+        let mut seen_pages = BTreeSet::new();
+        let mut targets_by_key = BTreeMap::new();
+        let mut resources_by_key = BTreeMap::new();
+        let mut seen_table_ids = BTreeSet::new();
+        let mut seen_proof_ids = BTreeSet::new();
+        self.visit_bucket_retirement_plan(authority, fence, |reference, page| {
+            if !seen_pages.insert(page.page_id) {
+                return Err(maintenance_error("Catalog retirement plan repeats a page identity"));
+            }
+            let page_index = pages.len();
+            for (ordinal, target) in page.targets.iter().enumerate() {
+                self.validate_bucket_retirement_target_path(&authority.bucket, target)?;
+                let planned = CatalogRetirementPlannedTarget {
+                    #[cfg(test)]
+                    plan_page: reference.clone(),
+                    ordinal: u16::try_from(ordinal).map_err(|_| maintenance_error("Catalog target ordinal overflow"))?,
+                    target: target.clone(),
+                };
+                if targets_by_key
+                    .insert(target.object_key.clone(), (page_index, planned))
+                    .is_some()
+                {
+                    return Err(maintenance_error("duplicate target across Catalog plan pages"));
+                }
+            }
+            for descriptor in &page.resources {
+                let key = resource_key(&descriptor.resource);
+                if resources_by_key.contains_key(&key) {
+                    return Err(maintenance_error("duplicate resource across Catalog plan pages"));
+                }
+                if !seen_table_ids.insert(descriptor.resource.table_id.clone()) || !seen_proof_ids.insert(descriptor.proof_id) {
+                    return Err(maintenance_error("Catalog resource or proof identity is reused across pages"));
+                }
+                resources_by_key.insert(key, descriptor.clone());
+            }
+            pages.push(LoadedBucketRetirementPlanPage {
+                reference: reference.clone(),
+                page: page.clone(),
+            });
+            Ok(())
+        })
+        .await?;
+        if u64::try_from(targets_by_key.len()).ok() != Some(authority.target_count)
+            || u64::try_from(resources_by_key.len()).ok() != Some(authority.resource_count)
+        {
+            return Err(maintenance_error("Catalog retirement plan count mismatch"));
+        }
+        Ok(LoadedBucketRetirementPlan {
+            pages,
+            targets_by_key,
+            resources_by_key,
+        })
+    }
+
+    #[cfg(test)]
     pub(super) async fn next_bucket_retirement_target(
         &self,
         authority: &VectorBucketCatalogRetirementV1,
         after: Option<&str>,
         fence: &TableCatalogObjectMutationFence,
     ) -> TableCatalogStoreResult<Option<CatalogRetirementPlannedTarget>> {
-        let mut selected: Option<CatalogRetirementPlannedTarget> = None;
-        self.visit_bucket_retirement_plan(authority, fence, |reference, page| {
-            for (ordinal, target) in page.targets.iter().enumerate() {
-                self.validate_bucket_retirement_target_path(&authority.bucket, target)?;
-                if after.is_some_and(|after| target.object_key.as_str() <= after) {
-                    continue;
-                }
-                match &selected {
-                    Some(previous) if previous.target.object_key == target.object_key => {
-                        return Err(maintenance_error("duplicate target across Catalog plan pages"));
-                    }
-                    Some(previous) if previous.target.object_key < target.object_key => {}
-                    _ => {
-                        selected = Some(CatalogRetirementPlannedTarget {
-                            plan_page: reference.clone(),
-                            ordinal: u16::try_from(ordinal).map_err(|_| maintenance_error("Catalog target ordinal overflow"))?,
-                            target: target.clone(),
-                        })
-                    }
-                }
-            }
-            Ok(())
-        })
-        .await?;
-        Ok(selected)
-    }
-
-    pub(super) async fn next_bucket_retirement_resource(
-        &self,
-        authority: &VectorBucketCatalogRetirementV1,
-        after: Option<&(String, String, String)>,
-        fence: &TableCatalogObjectMutationFence,
-    ) -> TableCatalogStoreResult<Option<VectorCatalogRetiredResourceProofV1>> {
-        let mut selected: Option<VectorCatalogRetiredResourceProofV1> = None;
-        self.visit_bucket_retirement_plan(authority, fence, |_, page| {
-            for descriptor in &page.resources {
-                let key = resource_key(&descriptor.resource);
-                if after.is_some_and(|after| &key <= after) {
-                    continue;
-                }
-                match &selected {
-                    Some(previous) if resource_key(&previous.resource) == key => {
-                        return Err(maintenance_error("duplicate resource across Catalog plan pages"));
-                    }
-                    Some(previous) if resource_key(&previous.resource) < key => {}
-                    _ => selected = Some(descriptor.clone()),
-                }
-            }
-            Ok(())
-        })
-        .await?;
-        if let Some(selected) = &selected {
-            self.visit_bucket_retirement_plan(authority, fence, |_, page| {
-                for other in &page.resources {
-                    if other.resource != selected.resource
-                        && (other.resource.table_id == selected.resource.table_id || other.proof_id == selected.proof_id)
-                    {
-                        return Err(maintenance_error("Catalog resource or proof identity is reused across pages"));
-                    }
-                }
-                Ok(())
-            })
-            .await?;
-        }
-        Ok(selected)
+        let loaded = self.load_bucket_retirement_plan(authority, fence).await?;
+        let next = match after {
+            Some(after) => loaded
+                .targets_by_key
+                .range::<str, _>((std::ops::Bound::Excluded(after), std::ops::Bound::Unbounded))
+                .next(),
+            None => loaded.targets_by_key.iter().next(),
+        };
+        Ok(next.map(|(_, (_, planned))| planned.clone()))
     }
 
     pub(super) async fn visit_bucket_retirement_proof(
@@ -194,30 +213,20 @@ impl<B: TableCatalogObjectBackend> ObjectTableCatalogStore<B> {
         fence.ensure_held()
     }
 
-    pub(super) async fn require_bucket_retirement_source_fact(
+    pub(super) async fn collect_bucket_retirement_proof_facts(
         &self,
         authority: &VectorBucketCatalogRetirementV1,
         descriptor: &VectorCatalogRetiredResourceProofV1,
-        expected: &CatalogMetadataRefRecordV1,
         fence: &TableCatalogObjectMutationFence,
-    ) -> TableCatalogStoreResult<()> {
-        let mut found = false;
+    ) -> TableCatalogStoreResult<Vec<VectorCatalogRetirementProofFactV1>> {
+        let capacity = usize::try_from(descriptor.fact_count).map_err(|_| maintenance_error("Catalog proof count overflow"))?;
+        let mut facts = Vec::with_capacity(capacity.min(4096));
         self.visit_bucket_retirement_proof(authority, descriptor, fence, |fact| {
-            if let VectorCatalogRetirementProofFactV1::SourceRecord { reference } = fact
-                && reference.object_key == expected.object_key
-            {
-                if reference != expected || found {
-                    return Err(maintenance_error("Catalog proof source identity disagrees with its edge"));
-                }
-                found = true;
-            }
+            facts.push(fact.clone());
             Ok(())
         })
         .await?;
-        if !found {
-            return Err(maintenance_error("Catalog proof edge has no exact source record"));
-        }
-        Ok(())
+        Ok(facts)
     }
 
     pub(super) fn validate_bucket_retirement_target_path(
@@ -301,6 +310,67 @@ fn hashed_json_tail(key: &str, prefix: &str) -> bool {
 }
 
 impl<B: TableCatalogObjectBackend> ObjectTableCatalogStore<B> {
+    pub(super) async fn collect_bucket_catalog_sources(
+        &self,
+        bucket: &BucketHandle,
+        fence: &TableCatalogObjectMutationFence,
+    ) -> TableCatalogStoreResult<Vec<(String, TableCatalogObject)>> {
+        self.require_bucket_retirement_identity(bucket)?;
+        fence.ensure_held()?;
+        let prefix = self.paths.table_bucket_root_prefix(bucket.storage_bucket_id().as_str());
+        let limit = std::num::NonZeroUsize::new(VECTOR_RETIREMENT_MAX_TARGETS)
+            .ok_or_else(|| maintenance_error("invalid Catalog retirement scan limit"))?;
+        let mut cursor: Option<String> = None;
+        let mut collected = Vec::new();
+        loop {
+            fence.ensure_held()?;
+            let page = self
+                .backend
+                .list_catalog_objects_page(self.catalog_bucket(), &prefix, cursor.as_deref(), limit)
+                .await?;
+            if page.objects.len() > limit.get() || (page.is_truncated && page.objects.is_empty()) {
+                return Err(TableCatalogStoreError::Unavailable(
+                    "Catalog retirement received an invalid source page".into(),
+                ));
+            }
+            for candidate in page.objects {
+                if !candidate.key.starts_with(&prefix)
+                    || cursor.as_ref().is_some_and(|after| candidate.key <= *after)
+                    || candidate.delete_marker
+                    || candidate.version_id.is_some()
+                {
+                    return Err(maintenance_error(
+                        "Catalog retirement source page has a foreign, repeated or versioned key",
+                    ));
+                }
+                let etag = candidate
+                    .etag
+                    .filter(|etag| !etag.is_empty())
+                    .ok_or_else(|| maintenance_error("Catalog retirement source lacks ETag"))?;
+                let object = self
+                    .backend
+                    .read_object_limited(self.catalog_bucket(), &candidate.key, VECTOR_BUCKET_RETIREMENT_PAGE_MAX_BYTES)
+                    .await?
+                    .ok_or_else(|| {
+                        TableCatalogStoreError::Conflict("Catalog retirement source disappeared after discovery".into())
+                    })?;
+                if object.etag.as_deref() != Some(etag.as_str()) {
+                    return Err(TableCatalogStoreError::Conflict(
+                        "Catalog retirement source changed after discovery".into(),
+                    ));
+                }
+                cursor = Some(candidate.key.clone());
+                collected.push((candidate.key, object));
+            }
+            fence.ensure_held()?;
+            if !page.is_truncated {
+                break;
+            }
+        }
+        Ok(collected)
+    }
+
+    #[cfg(test)]
     pub(super) async fn next_bucket_catalog_source(
         &self,
         bucket: &BucketHandle,
@@ -350,55 +420,19 @@ impl<B: TableCatalogObjectBackend> ObjectTableCatalogStore<B> {
         Ok(Some((candidate.key, object)))
     }
 
-    pub(super) async fn bucket_retirement_target_by_key(
-        &self,
-        authority: &VectorBucketCatalogRetirementV1,
-        key: &str,
-        fence: &TableCatalogObjectMutationFence,
-    ) -> TableCatalogStoreResult<Option<CatalogRetirementPlannedTarget>> {
-        let mut found = None;
-        self.visit_bucket_retirement_plan(authority, fence, |reference, page| {
-            for (ordinal, target) in page.targets.iter().enumerate() {
-                if target.object_key != key {
-                    continue;
-                }
-                if found.is_some() {
-                    return Err(maintenance_error("Catalog plan repeats an exact target"));
-                }
-                self.validate_bucket_retirement_target_path(&authority.bucket, target)?;
-                found = Some(CatalogRetirementPlannedTarget {
-                    plan_page: reference.clone(),
-                    ordinal: u16::try_from(ordinal).map_err(|_| maintenance_error("Catalog target ordinal overflow"))?,
-                    target: target.clone(),
-                });
-            }
-            Ok(())
-        })
-        .await?;
-        Ok(found)
-    }
-
+    #[cfg(test)]
     pub(super) async fn bucket_retirement_resource_by_identity(
         &self,
         authority: &VectorBucketCatalogRetirementV1,
         owner: &VectorMaintenanceResourceV1,
         fence: &TableCatalogObjectMutationFence,
     ) -> TableCatalogStoreResult<VectorCatalogRetiredResourceProofV1> {
-        let mut found = None;
-        self.visit_bucket_retirement_plan(authority, fence, |_, page| {
-            for descriptor in &page.resources {
-                if descriptor.resource != *owner {
-                    continue;
-                }
-                if found.is_some() {
-                    return Err(maintenance_error("Catalog plan repeats a resource proof"));
-                }
-                found = Some(descriptor.clone());
-            }
-            Ok(())
-        })
-        .await?;
-        found.ok_or_else(|| maintenance_error("Catalog target has no resource proof"))
+        let loaded = self.load_bucket_retirement_plan(authority, fence).await?;
+        loaded
+            .resources_by_key
+            .get(&resource_key(owner))
+            .cloned()
+            .ok_or_else(|| maintenance_error("Catalog target has no resource proof"))
     }
 }
 

@@ -6,11 +6,12 @@ use super::*;
 type FactOrder = (u8, Vec<u8>, Vec<u8>, u64);
 
 impl VectorCatalogRetirementProofFactV1 {
+    #[cfg(test)]
     pub(in crate::table_catalog) fn compare_order(&self, other: &Self) -> std::cmp::Ordering {
         self.order().cmp(&other.order())
     }
 
-    pub(super) fn order(&self) -> FactOrder {
+    pub(in crate::table_catalog) fn order(&self) -> FactOrder {
         let empty = Vec::new();
         match self {
             Self::ResourceAnchor { .. } => (0, empty.clone(), empty, 0),

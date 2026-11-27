@@ -398,9 +398,13 @@ impl MaintenanceExecutor {
             Arc::new(ManagedMaintenanceContext::new(audit, authorizer)),
         )
         .map_err(maintenance_execution_error)?;
-        let objects =
-            crate::startup_services::maintenance_managed_lance_objects(self.app.clone(), context, operation.clone(), self.limits)
-                .map_err(maintenance_execution_error)?;
+        let objects = super::super::managed_objects::maintenance_managed_lance_objects(
+            self.app.clone(),
+            context,
+            operation.clone(),
+            self.limits,
+        )
+        .map_err(maintenance_execution_error)?;
         reader.bind(&objects);
         let name = operation.name().clone();
         let adapter = LanceManifestAdapter::new_guarded(

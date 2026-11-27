@@ -439,7 +439,7 @@ impl MaintenanceExecutor {
                 Arc::new(ManagedMaintenanceContext::new(audit_for(work, &self.identity), authorizer)),
             )
             .map_err(maintenance_execution_error)?;
-            let reader = crate::startup_services::maintenance_dispatch_candidate_reader(
+            let reader = super::super::managed_objects::maintenance_dispatch_candidate_reader(
                 self.app.clone(),
                 context,
                 guard.clone(),

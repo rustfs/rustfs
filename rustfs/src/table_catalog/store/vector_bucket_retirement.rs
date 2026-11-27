@@ -68,6 +68,27 @@ impl TableCatalogObjectPaths {
             self.vector_bucket_retirement_root(bucket)?
         ))
     }
+
+    fn is_uncommitted_retirement_page_subpath(&self, root: &str, key: &str) -> bool {
+        fn canonical_nonnil_uuid(segment: &str) -> bool {
+            Uuid::try_parse(segment).is_ok_and(|id| !id.is_nil() && id.hyphenated().to_string() == segment)
+        }
+        let Some(tail) = key.strip_prefix(root) else {
+            return false;
+        };
+        let mut parts = tail.split('/');
+        let Some(retirement_id) = parts.next().filter(|id| canonical_nonnil_uuid(id)) else {
+            return false;
+        };
+        let _ = retirement_id;
+        match (parts.next(), parts.next(), parts.next(), parts.next()) {
+            (Some("plan" | "progress"), Some(file), None, None) => file.strip_suffix(".json").is_some_and(canonical_nonnil_uuid),
+            (Some("proof"), Some(proof_id), Some(file), None) => {
+                canonical_nonnil_uuid(proof_id) && file.strip_suffix(".json").is_some_and(canonical_nonnil_uuid)
+            }
+            _ => false,
+        }
+    }
 }
 
 struct CatalogBucketRetirementAuthority {
@@ -233,6 +254,71 @@ impl<B: TableCatalogObjectBackend> ObjectTableCatalogStore<B> {
             "Catalog retirement write has no exact read-back confirmation".into(),
         ))
     }
+
+    /// Remove uncommitted proof/plan/progress staging objects left behind by an
+    /// interrupted attempt for this exact `(storage_bucket_id, bucket_incarnation)`
+    /// before `authority.json` was ever published.
+    async fn cleanup_uncommitted_bucket_retirement_pages(
+        &self,
+        bucket: &BucketHandle,
+        fence: &TableCatalogObjectMutationFence,
+    ) -> TableCatalogStoreResult<()> {
+        self.require_bucket_retirement_identity(bucket)?;
+        fence.ensure_held()?;
+        if self.read_bucket_retirement_authority(bucket, fence).await?.is_some() {
+            return Err(TableCatalogStoreError::Conflict("Catalog retirement authority already exists".into()));
+        }
+        let root = self.paths.vector_bucket_retirement_root(bucket)?;
+        let authority_path = self.paths.vector_bucket_retirement_authority_path(bucket)?;
+        let limit = std::num::NonZeroUsize::new(VECTOR_RETIREMENT_MAX_TARGETS)
+            .ok_or_else(|| maintenance_error("invalid Catalog retirement scan limit"))?;
+        let mut cursor: Option<String> = None;
+        loop {
+            fence.ensure_held()?;
+            let page = self
+                .backend
+                .list_catalog_objects_page(self.catalog_bucket(), &root, cursor.as_deref(), limit)
+                .await?;
+            if page.objects.len() > limit.get() || (page.is_truncated && page.objects.is_empty()) {
+                return Err(TableCatalogStoreError::Unavailable(
+                    "Catalog retirement uncommitted cleanup received an invalid page".into(),
+                ));
+            }
+            for candidate in page.objects {
+                if !candidate.key.starts_with(&root)
+                    || cursor.as_ref().is_some_and(|after| candidate.key <= *after)
+                    || candidate.delete_marker
+                    || candidate.version_id.is_some()
+                {
+                    return Err(maintenance_error(
+                        "Catalog retirement uncommitted cleanup saw a foreign, repeated or versioned key",
+                    ));
+                }
+                if candidate.key == authority_path {
+                    return Err(TableCatalogStoreError::Conflict(
+                        "Catalog retirement authority appeared during uncommitted cleanup".into(),
+                    ));
+                }
+                if !self.paths.is_uncommitted_retirement_page_subpath(&root, &candidate.key) {
+                    return Err(maintenance_error("unrecognized record under Catalog retirement prefix"));
+                }
+                let etag = candidate
+                    .etag
+                    .filter(|etag| !etag.is_empty())
+                    .ok_or_else(|| maintenance_error("uncommitted Catalog retirement page lacks ETag"))?;
+                begin_publication_mutation()?;
+                self.backend
+                    .delete_object_if_match_fenced(self.catalog_bucket(), &candidate.key, &etag, fence)
+                    .await?;
+                cursor = Some(candidate.key);
+            }
+            if !page.is_truncated {
+                break;
+            }
+        }
+        self.backend.revalidate_bucket_handle(bucket).await?;
+        fence.ensure_held()
+    }
 }
 
 #[path = "vector_bucket_retirement/pages.rs"]
@@ -262,7 +348,8 @@ impl<B: TableCatalogObjectBackend> ObjectTableCatalogStore<B> {
             return Ok(None);
         };
         let validated = self.validate_bucket_retirement_authority(authority, fence).await?;
-        self.execute_bucket_retirement(&validated, execution, fence).await?;
+        self.execute_bucket_retirement_after_validation(&validated, execution, fence)
+            .await?;
         Ok(Some(()))
     }
 
@@ -272,9 +359,9 @@ impl<B: TableCatalogObjectBackend> ObjectTableCatalogStore<B> {
         execution: &CatalogCleanupExecution,
         fence: &TableCatalogObjectMutationFence,
     ) -> TableCatalogStoreResult<()> {
-        let authority = self.prepare_bucket_retirement_plan(bucket, fence).await?;
-        let validated = self.validate_bucket_retirement_authority(authority, fence).await?;
-        self.execute_bucket_retirement(&validated, execution, fence).await
+        let validated = self.prepare_bucket_retirement_plan_validated(bucket, fence).await?;
+        self.execute_bucket_retirement_after_validation(&validated, execution, fence)
+            .await
     }
 }
 
