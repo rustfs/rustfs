@@ -119,7 +119,7 @@ Two differences from MinIO remain on MinIO-written SSE objects. Conditional requ
 
 ### Migration options for encrypted objects
 
-1. Static-KMS source: run the migration through a `m-compatible` build with the shared master key, serving in place or copying into a default-build cluster (the copy re-encrypts under RustFS's own KMS).
+1. Static-KMS source: run the migration through an `m-compatible` build with the shared master key, serving in place or copying into a default-build cluster (the copy re-encrypts under RustFS's own KMS).
 2. KES / MinKMS source, or no special-purpose build wanted: decrypt on the MinIO side (rewrite as plaintext, or copy out through MinIO's S3 endpoint) and let RustFS encrypt on ingest.
 3. Leave encrypted objects on MinIO and migrate only unencrypted data.
 
@@ -127,14 +127,14 @@ Inventory the source first: bucket default encryption means objects can be encry
 
 ## Part D — Objects RustFS Writes Onto A MinIO Drive Set
 
-A `m-compatible` build serving a MinIO-initialized drive set writes objects MinIO can read once it serves the drives again. Two stored shapes differ from a default build for that reason, and only in `m-compatible`:
+An `m-compatible` build serving a MinIO-initialized drive set writes objects MinIO can read once it serves the drives again. Two stored shapes differ from a default build for that reason, and only in `m-compatible`:
 
 | Metadata | Default build | `m-compatible` build | Why |
 |---|---|---|---|
 | Compression marker and plaintext size (`compression`, `actual-size`) | `x-rustfs-internal-*` and `x-minio-internal-*` | `x-rustfs-internal-*` and `X-Minio-Internal-*` | MinIO looks these two keys up with an exact-case map access (`cmd/object-api-utils.go`, `IsCompressed` / `GetActualSize`); the lowercase twin is invisible to it, so a compressed object is served as its raw S2 stream. `minio_key` in `crates/utils/src/http/metadata_compat.rs`. |
 | User metadata | bare key (`purpose`); reserved names keep `x-amz-meta-` | `x-amz-meta-<key>`; `internal-*` keys stay bare | MinIO answers a stored key without the prefix as an ordinary response header named after it, never as `x-amz-meta-*`. `stored_user_metadata_key` in `rustfs/src/storage/options.rs`. An `internal-*` key cannot be namespaced: `x-amz-meta-internal-*` is a legacy internal namespace the RustFS read side hides, so such a key is readable by RustFS only. |
 
-RustFS readers accept both shapes in every build, so a drive set can move between build variants. Replication convergence checks in a `m-compatible` build leave user metadata out of the source/target comparison (`comparable_metadata`, `crates/replication/src/object.rs`): the target reports it with the prefix stripped, so a prefix-keyed comparison could never match. SSE objects are the exception to MinIO readability; see Part C, reverse direction.
+RustFS readers accept both of these metadata shapes in every build. That covers these two shapes only: a default build still cannot read the sealed SSE objects or the S2-compressed objects on such a drive set (Part C, "How default builds fail"), and its replication comparison does not skip the prefixed user metadata, so moving a drive set back to a default build needs those objects rewritten first. Replication convergence checks in an `m-compatible` build leave user metadata out of the source/target comparison (`comparable_metadata`, `crates/replication/src/object.rs`): the target reports it with the prefix stripped, so a prefix-keyed comparison could never match. SSE objects are the exception to MinIO readability; see Part C, reverse direction.
 
 ## m-compatible variant lifecycle
 
@@ -146,7 +146,19 @@ RustFS readers accept both shapes in every build, so a drive set can move betwee
 | Pull-request coverage | `test-and-lint-m-compatible` in `.github/workflows/ci.yml`: clippy plus `cargo nextest` for `rustfs`, `rustfs-ecstore`, and `rustfs-sse` with `--features m-compatible`. This is the cfg-seam guard; it keeps the feature compiling and its unit suite green on every pull request. |
 | Full-suite lane | `build-rustfs-debug-binary-m-compatible` and `e2e-tests-m-compatible` in `ci.yml` run only on the nightly schedule and manual dispatch (`cache-warm.yml` keeps the `ci-feat-rio` cache warm so the scheduled build fits its timeout). |
 | Interop evidence | `.github/workflows/minio-interop.yml` (nightly plus manual) regenerates real MinIO backend trees via `crates/rio-v2/tests/minio_fixture_lab/` and runs the `#[ignore]` reader tests in `rustfs/src/storage/minio_generated_read_test.rs` with `--features m-compatible`. Its freshness is tracked in `.github/scheduled-validations.json`. |
-| Promote-or-delete condition | The variant stays dormant until one of two things happens. **Promote**: a release commits to shipping MinIO SSE migration as a supported capability; then `m-compatible` joins `default`/`full`, the scheduled lanes run on every pull request, and this section is rewritten. **Delete**: no release commits to it and the scheduled lanes are not kept green; then the feature flag, `crates/rio-v2`, the cfg seams under `crates/sse/src/`, the three `ci.yml` jobs, the `cache-warm.yml` warm step, `minio-interop.yml`, and its `scheduled-validations.json` entry are removed in one change. Either outcome must update `ARCHITECTURE.md` and the `ci.yml` job comments that cite this section. |
+| Promote-or-delete condition | The variant stays dormant until one of two things happens. **Promote**: a release commits to shipping MinIO SSE migration as a supported capability; then `m-compatible` joins `default`/`full`, the scheduled lanes run on every pull request, and this section is rewritten. **Delete**: no release commits to it and the scheduled lanes are not kept green; then the feature flag, `crates/rio-v2`, the variant modules and their selection points listed under "Where the variant lives in code", the three `ci.yml` jobs, the `cache-warm.yml` warm step, `minio-interop.yml`, and its `scheduled-validations.json` entry are removed in one change. Either outcome must update `ARCHITECTURE.md` and the `ci.yml` job comments that cite this section. |
+
+### Where the variant lives in code
+
+Code that differs between the two builds is kept in pairs of modules that export the same functions, selected in one place per pair. Call sites do not name the build.
+
+| Crate | Selection point | Pair |
+|---|---|---|
+| `rustfs-ecstore` | `src/io_support/rio.rs` | `io_support/rio/native.rs`, `io_support/rio/m_compatible.rs`: stream readers and writers, compression scheme and index encoding. |
+| `rustfs-ecstore` | `src/object_api/readers.rs` | `object_api/readers/native.rs`, `object_api/readers/m_compatible.rs`: range plans, multipart recognition and plaintext size of a stored layout. |
+| `rustfs-sse` | `src/core/keying/mod.rs` | `core/keying/direct.rs`, `core/keying/object.rs`: the key mode a build writes; `src/kms/` holds the data-key formats. Rules in `crates/sse/AGENTS.md`. |
+
+Outside the pairs the feature is named in single functions: `writes_canonical_case_twin` (`crates/utils/src/http/metadata_compat.rs`), `stored_user_metadata_key` (`rustfs/src/storage/options.rs`), `comparable_metadata` (`crates/replication/src/object.rs`), the message of the unresolved-decryption-material error (`rustfs/src/storage/sse.rs`), and the compiled-feature tables of the server binary.
 
 ## Fixture Evidence
 

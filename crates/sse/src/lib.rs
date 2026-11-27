@@ -97,11 +97,10 @@ pub use crate::core::s3::ssec::{ssec_invalid_request, validate_ssec_for_read};
 pub use crate::core::write::{EncryptionRequest, PrepareEncryptionRequest, sse_encryption, sse_prepare_encryption};
 pub use crate::error::{KMS_KEY_NOT_FOUND_ERROR_CODE, SseError, data_plane_kms_error};
 pub use crate::host::{BucketDefaultEncryption, BucketEncryption, KmsKeyAuthorizer, SseHost};
+pub use crate::kms::decrypt_kms_sealed_config;
 pub use crate::kms::local::LocalSseDekProvider;
 #[cfg(any(test, feature = "test-util"))]
 pub use crate::kms::local::TestSseDekProvider;
-#[cfg(feature = "m-compatible")]
-pub use crate::kms::minio::decrypt_minio_kms_config;
 pub use crate::kms::provider::SseDekProvider;
 #[cfg(any(test, feature = "test-util"))]
 pub use crate::kms::provider::{reset_sse_dek_provider, set_sse_dek_provider_for_test};

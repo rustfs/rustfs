@@ -15,7 +15,7 @@
 //! Object keying: a derived object key, sealed in the MinIO-compatible format.
 
 use crate::core::keying::material::{EncryptionKeyKind, EncryptionMaterial, ManagedSealedKey};
-use crate::core::keying::{NewObjectKey, StoredDataKey, StoredKeyMode};
+use crate::core::keying::{NewObjectKey, SealedEtag, StoredDataKey, StoredKeyMode};
 use crate::error::SseError;
 use aes_gcm::aead::{Aead, KeyInit, Payload};
 use aes_gcm::{Aes256Gcm, Nonce};
@@ -28,8 +28,8 @@ use rustfs_utils::http::object_encryption_keys::{
     INTERNAL_ENCRYPTION_ALGORITHM_HEADER, INTERNAL_ENCRYPTION_IV_HEADER, INTERNAL_ENCRYPTION_KEY_HEADER,
     MINIO_INTERNAL_ENCRYPTION_ALGORITHM_HEADER, MINIO_INTERNAL_ENCRYPTION_IV_HEADER,
     MINIO_INTERNAL_ENCRYPTION_KMS_DATA_KEY_HEADER, MINIO_INTERNAL_ENCRYPTION_KMS_KEY_ID_HEADER,
-    MINIO_INTERNAL_ENCRYPTION_KMS_SEALED_KEY_HEADER, MINIO_INTERNAL_ENCRYPTION_S3_SEALED_KEY_HEADER,
-    MINIO_INTERNAL_ENCRYPTION_SSEC_SEALED_KEY_HEADER, SSEType,
+    MINIO_INTERNAL_ENCRYPTION_KMS_SEALED_KEY_HEADER, MINIO_INTERNAL_ENCRYPTION_MULTIPART_HEADER,
+    MINIO_INTERNAL_ENCRYPTION_S3_SEALED_KEY_HEADER, MINIO_INTERNAL_ENCRYPTION_SSEC_SEALED_KEY_HEADER, SSEType,
 };
 use sha2::Sha256;
 use std::collections::HashMap;
@@ -234,6 +234,47 @@ pub(crate) fn unseal_etag(object_key: [u8; 32], sealed: &[u8]) -> Result<Vec<u8>
     let sealing_key: [u8; 32] = mac.finalize().into_bytes().into();
 
     decrypt_sealed_object_key_payload(sealing_key, header, sealed)
+}
+
+/// The sealed form of a stored ETag, when the object carries a sealed object
+/// key and its ETag is sealed.
+///
+/// `None` means the stored ETag is what a response shows: the object is a
+/// multipart upload (its ETag is stored as shown), the ETag is not sealed, or
+/// the object carries no sealed object key. A customer-key or KMS object is
+/// shown the last 32 hex characters of the sealed value, which needs no key.
+pub(crate) fn sealed_etag(metadata: &HashMap<String, String>, stored_etag: &str) -> Option<SealedEtag> {
+    if metadata.contains_key(MINIO_INTERNAL_ENCRYPTION_MULTIPART_HEADER) {
+        return None;
+    }
+    // A multipart ETag carries a `-<parts>` suffix and is not hex, so it
+    // stops here together with every unsealed digest.
+    let sealed = hex_simd::decode_to_vec(stored_etag)
+        .ok()
+        .filter(|sealed| sealed.len() >= SEALED_ETAG_MIN_SIZE)?;
+
+    if metadata.contains_key(MINIO_INTERNAL_ENCRYPTION_SSEC_SEALED_KEY_HEADER)
+        || metadata.contains_key(MINIO_INTERNAL_ENCRYPTION_KMS_SEALED_KEY_HEADER)
+    {
+        return stored_etag
+            .get(stored_etag.len() - 32..)
+            .map(|shown| SealedEtag::Shown(shown.to_owned()));
+    }
+    metadata
+        .contains_key(MINIO_INTERNAL_ENCRYPTION_S3_SEALED_KEY_HEADER)
+        .then_some(SealedEtag::UnderObjectKey(sealed))
+}
+
+/// The content MD5 a sealed ETag holds, as lowercase hex.
+///
+/// `None` when `key_bytes` is not an object key, or the
+/// sealed bytes do not authenticate under it.
+pub(crate) fn open_sealed_etag(key_kind: EncryptionKeyKind, key_bytes: [u8; 32], sealed: &[u8]) -> Option<String> {
+    if key_kind != EncryptionKeyKind::Object {
+        return None;
+    }
+    let etag = unseal_etag(key_bytes, sealed).ok()?;
+    Some(hex_simd::encode_to_string(etag, hex_simd::AsciiCase::Lower))
 }
 
 fn try_decode_minio_sealed_key(bytes: &str) -> Result<Option<[u8; SEALED_KEY_SIZE]>, SseError> {

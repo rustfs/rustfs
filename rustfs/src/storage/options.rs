@@ -852,13 +852,13 @@ const LEGACY_INTERNAL_METADATA_PREFIX: &str = "x-amz-meta-internal-";
 /// The key user metadata `key` (the header name behind `x-amz-meta-`) is stored under.
 ///
 /// A default build stores the bare key and namespaces only the keys a client
-/// must not be able to materialize bare. A `m-compatible` build keeps the
+/// must not be able to materialize bare. An `m-compatible` build keeps the
 /// `x-amz-meta-` prefix, the shape MinIO stores: MinIO answers a stored key
 /// without it as an ordinary response header named after the key, so user
 /// metadata RustFS wrote disappears from `x-amz-meta-*` once MinIO serves the
 /// drives. Readers strip the prefix in either build.
 ///
-/// The one key family a `m-compatible` build still stores bare is `internal-*`:
+/// The one key family an `m-compatible` build still stores bare is `internal-*`:
 /// namespaced, it would land under [`LEGACY_INTERNAL_METADATA_PREFIX`] and the
 /// server could no longer read back what it just stored. Such a key stays
 /// readable by RustFS and is not user metadata to MinIO.

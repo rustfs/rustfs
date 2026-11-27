@@ -309,20 +309,10 @@ pub(crate) async fn read_response_etag(
 }
 
 /// Decrypt an IAM record a MinIO server stored KMS-encrypted under
-/// `object_path` of its meta bucket. See [`rustfs_sse::decrypt_minio_kms_config`].
-///
-/// `None` in a build without the MinIO read path, which holds no reader for
-/// MinIO's builtin-KMS formats.
+/// `object_path` of its meta bucket. See [`rustfs_sse::decrypt_kms_sealed_config`],
+/// which answers `None` in a build that reads no such format.
 pub(crate) fn decrypt_minio_kms_iam_config(blob: &[u8], object_path: &str) -> Option<Vec<u8>> {
-    #[cfg(feature = "m-compatible")]
-    {
-        rustfs_sse::decrypt_minio_kms_config(blob, object_path)
-    }
-    #[cfg(not(feature = "m-compatible"))]
-    {
-        let _ = (blob, object_path);
-        None
-    }
+    rustfs_sse::decrypt_kms_sealed_config(blob, object_path)
 }
 
 pub(crate) async fn rewrap_object_encryption_metadata(
@@ -1088,7 +1078,7 @@ mod tests {
     }
 
     #[cfg(feature = "m-compatible")]
-    mod rio_v2 {
+    mod m_compatible {
         use super::{BASE64_STANDARD, enforcing_principal, md5_base64, ssec_read_headers};
         use crate::storage::sse::{
             EncryptionKeyKind, EncryptionRequest, ObjectEncryptionResolver, ReadEncryptionMode, ReadEncryptionRequest,

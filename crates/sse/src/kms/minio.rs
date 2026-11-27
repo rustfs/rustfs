@@ -378,7 +378,7 @@ fn decrypt_minio_kms_config_blob(
 /// not decrypt under it: not this format, another key, or a different path.
 /// Only the builtin static-secret KMS is covered; a blob whose key a KES or
 /// other external KMS sealed stays unreadable.
-pub fn decrypt_minio_kms_config(blob: &[u8], object_path: &str) -> Option<Vec<u8>> {
+pub(crate) fn decrypt_minio_kms_config(blob: &[u8], object_path: &str) -> Option<Vec<u8>> {
     let provider = LocalSseDekProvider::new_from_env().ok()?;
     [format!("{MINIO_META_BUCKET}/{object_path}"), object_path.to_owned()]
         .into_iter()

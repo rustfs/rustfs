@@ -1965,30 +1965,6 @@ impl Clone for ObjectInfo {
     }
 }
 
-/// Plaintext bytes one DARE 2.0 package carries at most.
-#[cfg(feature = "m-compatible")]
-const DARE_PAYLOAD_SIZE: i64 = 64 * 1024;
-/// Header and authentication tag every DARE 2.0 package adds to its payload.
-#[cfg(feature = "m-compatible")]
-const DARE_PACKAGE_OVERHEAD: i64 = 32;
-
-/// Plaintext size of a DARE 2.0 stream of `stored` bytes (`sio.DecryptedSize`).
-///
-/// Every package but the last is full; the last holds whatever remains, and a
-/// remainder too short to hold any payload behind its framing is not a stream.
-#[cfg(feature = "m-compatible")]
-fn dare_plaintext_size(stored: i64) -> std::io::Result<i64> {
-    let package_size = DARE_PAYLOAD_SIZE + DARE_PACKAGE_OVERHEAD;
-    let tail = stored % package_size;
-    if stored < 0 || (tail != 0 && tail <= DARE_PACKAGE_OVERHEAD) {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            format!("stored size {stored} is not a whole DARE stream"),
-        ));
-    }
-    Ok(stored / package_size * DARE_PAYLOAD_SIZE + (tail - DARE_PACKAGE_OVERHEAD).max(0))
-}
-
 impl ObjectInfo {
     /// Return the persisted EC block size exposed by the response-side
     /// projection.  Callers must not infer this value from request metadata.
@@ -2223,71 +2199,19 @@ impl ObjectInfo {
     }
 
     /// The plaintext size of an encrypted object, when it can be known without
-    /// decrypting: recorded in metadata, or — for MinIO's sealed layout in a
-    /// build that reads it — implied by the stored size.
+    /// decrypting: recorded in metadata, or implied by a stored layout this
+    /// build reads.
+    ///
+    /// # Errors
+    ///
+    /// When the recorded size is malformed, or the stored sizes cannot belong
+    /// to the layout the metadata names.
     pub fn encryption_original_size(&self) -> std::io::Result<Option<i64>> {
         if let Some(size) = rustfs_utils::http::get_object_encryption_original_size(&self.user_defined)? {
             return Ok(Some(size));
         }
 
-        #[cfg(feature = "m-compatible")]
-        {
-            self.sealed_object_plaintext_size()
-        }
-        #[cfg(not(feature = "m-compatible"))]
-        {
-            Ok(None)
-        }
-    }
-
-    /// True when MinIO's own marker records the object as an encrypted
-    /// multipart upload: one cipher stream per part, each under its part key.
-    #[cfg(feature = "m-compatible")]
-    pub(crate) fn is_marked_encrypted_multipart(&self) -> bool {
-        self.user_defined
-            .contains_key(rustfs_utils::http::MINIO_INTERNAL_ENCRYPTION_MULTIPART_HEADER)
-    }
-
-    /// Plaintext size of an object stored under MinIO's sealed object key.
-    ///
-    /// MinIO records no plaintext size for a single-part SSE object and derives
-    /// it from the stored size on every request (`cmd/encryption-v1.go`,
-    /// `DecryptedSize`): the payload is a DARE stream for the whole object, or
-    /// one per part of a multipart upload. Without this the stored size, which
-    /// includes the framing, is reported as the object's length.
-    ///
-    /// The stored sizes are read from the parts, of which a single-part object
-    /// has exactly one. A read rewrites `size` to the length it delivers while
-    /// leaving the parts alone, and callers ask for the object's size on that
-    /// rewritten value too.
-    ///
-    /// `None` when the object is not stored in that layout.
-    ///
-    /// # Errors
-    ///
-    /// When a stored size cannot be a whole DARE stream, which means the
-    /// metadata or the stored bytes are damaged.
-    #[cfg(feature = "m-compatible")]
-    fn sealed_object_plaintext_size(&self) -> std::io::Result<Option<i64>> {
-        let seal_algorithm = self
-            .user_defined
-            .get(rustfs_utils::http::MINIO_INTERNAL_ENCRYPTION_ALGORITHM_HEADER);
-        if seal_algorithm.map(String::as_str) != Some(rustfs_utils::http::MINIO_INTERNAL_ENCRYPTION_SEAL_ALGORITHM) {
-            return Ok(None);
-        }
-
-        if self.parts.is_empty() {
-            return dare_plaintext_size(self.size).map(Some);
-        }
-        self.parts
-            .iter()
-            .try_fold(0_i64, |total, part| {
-                let stored = i64::try_from(part.size).map_err(|_| std::io::Error::other("encrypted part size overflow"))?;
-                total
-                    .checked_add(dare_plaintext_size(stored)?)
-                    .ok_or_else(|| std::io::Error::other("encrypted object size overflow"))
-            })
-            .map(Some)
+        super::readers::unrecorded_plaintext_size(self)
     }
 
     pub fn decrypted_size(&self) -> std::io::Result<i64> {
@@ -2892,6 +2816,12 @@ fn versions_after_marker(file_infos: &rustfs_filemeta::FileInfoVersions, marker:
 mod tests {
     use super::*;
 
+    // Tests of code only one build variant compiles live in a module of their own.
+    #[cfg(feature = "m-compatible")]
+    mod m_compatible;
+    #[cfg(not(feature = "m-compatible"))]
+    mod native;
+
     #[test]
     fn replication_status_writeback_condition_remains_indirected() {
         fn assert_indirected(_: &Option<Box<ReplicationStatusWritebackCondition>>) {}
@@ -3431,101 +3361,6 @@ mod tests {
             metadata.insert(rustfs_utils::http::MINIO_INTERNAL_ENCRYPTION_MULTIPART_HEADER.to_string(), String::new());
         }
         Arc::new(metadata)
-    }
-
-    /// MinIO records no size for a single-part SSE object: the stored bytes are
-    /// DARE packages, each up to 64 KiB of payload behind 32 bytes of framing.
-    /// These are the stored sizes MinIO produced for 1 B, 4 KiB, 300 KiB,
-    /// 1 MiB + 1 and 9 MiB objects.
-    #[cfg(feature = "m-compatible")]
-    #[test]
-    fn get_actual_size_derives_the_plaintext_size_of_a_minio_sealed_object() {
-        for (stored, plaintext) in [
-            (0, 0),
-            (33, 1),
-            (4128, 4096),
-            (65_568, 65_536),
-            (307_360, 307_200),
-            (1_049_121, 1_048_577),
-            (9_441_792, 9_437_184),
-        ] {
-            let info = ObjectInfo {
-                size: stored,
-                user_defined: minio_sealed_object_metadata(false),
-                ..Default::default()
-            };
-            assert_eq!(info.get_actual_size().unwrap(), plaintext, "stored {stored}");
-            assert_eq!(info.decrypted_size().unwrap(), plaintext, "stored {stored}");
-            assert_eq!(info.get_actual_size_or_physical(), plaintext, "stored {stored}");
-        }
-
-        let part = |number: usize, size: usize| ObjectPartInfo {
-            number,
-            size,
-            ..Default::default()
-        };
-
-        // A read hands back the object with `size` rewritten to the length it
-        // delivers — the whole plaintext, or one byte of a ranged read — and the
-        // response length is then computed from that value. The parts still
-        // hold what is stored.
-        for delivered in [2_097_152, 1] {
-            let resized_by_a_read = ObjectInfo {
-                size: delivered,
-                parts: Arc::new(vec![part(1, 2_098_176)]),
-                user_defined: minio_sealed_object_metadata(false),
-                ..Default::default()
-            };
-            assert_eq!(resized_by_a_read.get_actual_size().unwrap(), 2_097_152, "delivered {delivered}");
-        }
-
-        // A multipart upload is one DARE stream per part.
-        let multipart = ObjectInfo {
-            size: 5_245_440 + 5_245_440 + 1_049_137,
-            parts: Arc::new(vec![part(1, 5_245_440), part(2, 5_245_440), part(3, 1_049_137)]),
-            user_defined: minio_sealed_object_metadata(true),
-            ..Default::default()
-        };
-        assert_eq!(multipart.get_actual_size().unwrap(), 5_242_880 + 5_242_880 + 1_048_593);
-
-        // A stored size that is not a whole number of packages is damage, not a
-        // size to report: 20 bytes cannot even hold one package's framing.
-        let damaged = ObjectInfo {
-            size: 20,
-            user_defined: minio_sealed_object_metadata(false),
-            ..Default::default()
-        };
-        assert!(damaged.get_actual_size().is_err());
-        assert_eq!(damaged.get_actual_size_or_physical(), 20, "listings fall back to the stored size");
-    }
-
-    /// A size the object recorded always wins over one derived from its layout.
-    #[cfg(feature = "m-compatible")]
-    #[test]
-    fn get_actual_size_prefers_a_recorded_size_over_the_dare_layout() {
-        let mut metadata = (*minio_sealed_object_metadata(false)).clone();
-        metadata.insert("x-rustfs-encryption-original-size".to_string(), "77".to_string());
-        let info = ObjectInfo {
-            size: 4128,
-            user_defined: Arc::new(metadata),
-            ..Default::default()
-        };
-
-        assert_eq!(info.get_actual_size().unwrap(), 77);
-    }
-
-    /// Only a build that reads the sealed layout may reason about its framing.
-    #[cfg(not(feature = "m-compatible"))]
-    #[test]
-    fn get_actual_size_keeps_the_stored_size_of_a_minio_sealed_object_without_the_minio_read_path() {
-        let info = ObjectInfo {
-            size: 4128,
-            user_defined: minio_sealed_object_metadata(false),
-            ..Default::default()
-        };
-
-        assert_eq!(info.get_actual_size().unwrap(), 4128);
-        assert_eq!(info.encryption_original_size().unwrap(), None);
     }
 
     #[test]

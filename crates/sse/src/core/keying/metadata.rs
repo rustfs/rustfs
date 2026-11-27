@@ -118,7 +118,7 @@ pub fn encryption_material_to_metadata(material: &EncryptionMaterial) -> Result<
         SSEType::SseC => {
             record_ssec_scheme(&mut metadata, material);
 
-            // A `m-compatible` build seals an object key instead, so a Direct key there is a
+            // An `m-compatible` build seals an object key instead, so a Direct key there is a
             // multipart session created without its customer key.
             if material.key_kind == EncryptionKeyKind::Direct {
                 record_customer_key_nonce(&mut metadata, material.base_nonce);

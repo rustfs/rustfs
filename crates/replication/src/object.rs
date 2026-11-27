@@ -234,7 +234,7 @@ fn tag_metadata_differs(source: &ReplicationSourceObject<'_>, target: &Replicati
 fn comparable_metadata(metadata: Option<&HashMap<String, String>>) -> HashMap<String, String> {
     let mut comparable = HashMap::new();
     for (key, value) in metadata.into_iter().flatten() {
-        // A `m-compatible` build stores user metadata under `x-amz-meta-` keys, while
+        // An `m-compatible` build stores user metadata under `x-amz-meta-` keys, while
         // a target's HEAD answers it with the prefix stripped: compared by that
         // prefix, a replica carrying the same user metadata could never match
         // and every check would re-send the metadata. Such a build therefore

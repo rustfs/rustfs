@@ -319,26 +319,27 @@ pub fn internal_key_strip_suffix_prefix(key: &str, suffix_prefix: &str) -> Optio
 }
 
 /// MinIO's reserved prefix in the casing MinIO itself persists for the keys
-/// listed in [`minio_reads_key_case_sensitively`].
-#[cfg(feature = "m-compatible")]
+/// listed in [`writes_canonical_case_twin`].
 const MINIO_INTERNAL_PREFIX_CANONICAL: &str = "X-Minio-Internal-";
 
 /// Keys MinIO looks up as `ReservedMetadataPrefix + suffix`, an exact-case map
 /// access (`cmd/object-api-utils.go`, `IsCompressed` / `GetActualSize`). The
 /// lowercase twin is invisible to it: a compressed object is then served as its
 /// raw stored stream and sized by its stored length.
-#[cfg(feature = "m-compatible")]
-fn minio_reads_key_case_sensitively(suffix: &str) -> bool {
-    matches!(suffix, SUFFIX_COMPRESSION | SUFFIX_ACTUAL_SIZE)
+///
+/// Only an `m-compatible` build claims MinIO can read what it wrote, so only
+/// it spells these twins that way. This is the one place in this module that
+/// names the build.
+fn writes_canonical_case_twin(suffix: &str) -> bool {
+    cfg!(feature = "m-compatible") && matches!(suffix, SUFFIX_COMPRESSION | SUFFIX_ACTUAL_SIZE)
 }
 
 /// The MinIO-branded twin written for `suffix`.
 ///
-/// Lowercase in every build except for the keys a `m-compatible` build must spell the
+/// Lowercase in every build except for the keys an `m-compatible` build must spell the
 /// way MinIO reads them. RustFS readers match either casing.
 fn minio_key(suffix: &str) -> String {
-    #[cfg(feature = "m-compatible")]
-    if minio_reads_key_case_sensitively(suffix) {
+    if writes_canonical_case_twin(suffix) {
         return format!("{MINIO_INTERNAL_PREFIX_CANONICAL}{suffix}");
     }
     format!("{MINIO_INTERNAL_PREFIX}{suffix}")
@@ -477,8 +478,7 @@ pub fn contains_key_bytes(map: &HashMap<String, Vec<u8>>, suffix: &str) -> bool 
 pub fn remove_bytes(map: &mut HashMap<String, Vec<u8>>, suffix: &str) {
     with_internal_key(RUSTFS_INTERNAL_PREFIX, suffix, |k1| map.remove(k1));
     with_internal_key(MINIO_INTERNAL_PREFIX, suffix, |k2| map.remove(k2));
-    #[cfg(feature = "m-compatible")]
-    if minio_reads_key_case_sensitively(suffix) {
+    if writes_canonical_case_twin(suffix) {
         map.remove(&minio_key(suffix));
     }
 }

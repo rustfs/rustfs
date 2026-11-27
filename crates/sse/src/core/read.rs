@@ -20,6 +20,7 @@ use crate::core::keying::metadata::stored_ssec_metadata;
 use crate::core::keying::stored::{
     StoredManagedKey, open_under_customer_key, open_under_stored_data_key, recognize_stored_managed_key,
 };
+use crate::core::keying::{SealedEtag, open_sealed_etag, sealed_etag};
 use crate::core::request::SseKmsPrincipal;
 use crate::core::s3::authorization::authorize_sse_kms_key;
 use crate::core::s3::headers::{SseReadResponseHeaders, managed_sse_public_header};
@@ -259,49 +260,16 @@ pub fn classify_unrecorded_sse_response(
 /// authorization, and the unwrap is not recorded in the KMS audit summary: it
 /// serves the response of a read that is recorded on its own.
 pub async fn sealed_etag_for_response(host: &dyn SseHost, request: DecryptionRequest<'_>, stored_etag: &str) -> Option<String> {
-    #[cfg(feature = "m-compatible")]
-    {
-        use crate::core::keying::object::{SEALED_ETAG_MIN_SIZE, unseal_etag};
-        use rustfs_utils::http::object_encryption_keys::{
-            MINIO_INTERNAL_ENCRYPTION_KMS_SEALED_KEY_HEADER, MINIO_INTERNAL_ENCRYPTION_MULTIPART_HEADER,
-            MINIO_INTERNAL_ENCRYPTION_S3_SEALED_KEY_HEADER, MINIO_INTERNAL_ENCRYPTION_SSEC_SEALED_KEY_HEADER,
-        };
+    let sealed = match sealed_etag(request.metadata, stored_etag)? {
+        SealedEtag::Shown(etag) => return Some(etag),
+        SealedEtag::UnderObjectKey(sealed) => sealed,
+    };
 
-        let metadata = request.metadata;
-        if metadata.contains_key(MINIO_INTERNAL_ENCRYPTION_MULTIPART_HEADER) {
-            return None;
-        }
-        // A multipart ETag carries a `-<parts>` suffix and is not hex, so it
-        // stops here together with every unsealed digest.
-        let sealed = hex_simd::decode_to_vec(stored_etag)
-            .ok()
-            .filter(|sealed| sealed.len() >= SEALED_ETAG_MIN_SIZE)?;
-
-        if metadata.contains_key(MINIO_INTERNAL_ENCRYPTION_SSEC_SEALED_KEY_HEADER)
-            || metadata.contains_key(MINIO_INTERNAL_ENCRYPTION_KMS_SEALED_KEY_HEADER)
-        {
-            return stored_etag.get(stored_etag.len() - 32..).map(str::to_owned);
-        }
-        if !metadata.contains_key(MINIO_INTERNAL_ENCRYPTION_S3_SEALED_KEY_HEADER) {
-            return None;
-        }
-
-        let (stored, kms_key_id) = resolve_stored_managed_key(host, metadata).await?;
-        let (opened, _) = open_under_stored_data_key(host, request.bucket, request.key, &stored, &kms_key_id)
-            .await
-            .ok()?;
-        if opened.key_kind != crate::core::keying::material::EncryptionKeyKind::Object {
-            return None;
-        }
-        let etag = unseal_etag(opened.key_bytes, &sealed).ok()?;
-        Some(hex_simd::encode_to_string(etag, hex_simd::AsciiCase::Lower))
-    }
-
-    #[cfg(not(feature = "m-compatible"))]
-    {
-        let _ = (host, request, stored_etag);
-        None
-    }
+    let (stored, kms_key_id) = resolve_stored_managed_key(host, request.metadata).await?;
+    let (opened, _) = open_under_stored_data_key(host, request.bucket, request.key, &stored, &kms_key_id)
+        .await
+        .ok()?;
+    open_sealed_etag(opened.key_kind, opened.key_bytes, &sealed)
 }
 
 /// Recognize a stored managed-SSE object and name the key it is read under.

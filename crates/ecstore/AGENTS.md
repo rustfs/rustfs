@@ -39,6 +39,13 @@ Applies to `crates/ecstore/`.
 - Do not add `#![allow(dead_code)]` at the crate root. If code is unused, remove it or gate it behind a feature flag.
 - Each `#[allow(dead_code)]` annotation must have a comment explaining why the code is kept.
 
+## Build Variants
+
+- The `m-compatible` feature swaps the stream layer and the stored layout a build writes. Code that differs between the two builds lives in a pair of modules, `native` and `m_compatible`, that export the same functions; the module that owns the pair selects one and everything else calls it without naming the build.
+- `#[cfg(feature = "m-compatible")]` in non-test code appears only where a pair is selected: `src/io_support/rio.rs` (stream readers and writers) and `src/object_api/readers.rs` (stored-layout answers a read needs). A new build-dependent answer is a function added to both modules of the pair that owns it, not a `cfg` branch at the call site.
+- A group of tests that only one build compiles goes in a child module of the test module (`tests/native.rs`, `tests/m_compatible.rs`), gated once where it is declared. A lone such test may carry the attribute itself.
+- Run both builds for a change that touches either pair: `cargo nextest run -p rustfs-ecstore --no-tests fail` with and without `--features m-compatible`.
+
 ## Cross-Module Coordination
 
 - Validate behavior impacts on:

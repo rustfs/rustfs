@@ -15,9 +15,9 @@
 //! Direct keying: the data key encrypts the object itself, under a stored base nonce.
 
 #[cfg(not(feature = "m-compatible"))]
-use crate::core::keying::NewObjectKey;
-#[cfg(not(feature = "m-compatible"))]
 use crate::core::keying::material::EncryptionKeyKind;
+#[cfg(not(feature = "m-compatible"))]
+use crate::core::keying::{NewObjectKey, SealedEtag};
 use crate::core::keying::{StoredDataKey, StoredKeyMode};
 use crate::error::SseError;
 use crate::host::SseHost;
@@ -209,4 +209,16 @@ pub(crate) fn new_key_under_data_key(
         key_kind: EncryptionKeyKind::Direct,
         sealed_key: None,
     })
+}
+
+/// The sealed form of a stored ETag. Direct mode stores ETags as they are shown.
+#[cfg(not(feature = "m-compatible"))]
+pub(crate) fn sealed_etag(_metadata: &HashMap<String, String>, _stored_etag: &str) -> Option<SealedEtag> {
+    None
+}
+
+/// What a sealed ETag holds. Direct mode seals none, so there is nothing to open.
+#[cfg(not(feature = "m-compatible"))]
+pub(crate) fn open_sealed_etag(_key_kind: EncryptionKeyKind, _key_bytes: [u8; 32], _sealed: &[u8]) -> Option<String> {
+    None
 }
