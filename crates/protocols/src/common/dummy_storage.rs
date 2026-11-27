@@ -32,7 +32,6 @@
 #[cfg(feature = "webdav")]
 use crate::common::client::s3::SessionCapacityView;
 use crate::common::client::s3::{MultipartRequest, StorageBackend};
-#[cfg(any(feature = "webdav", feature = "sftp"))]
 use crate::common::session::SessionContext;
 use async_trait::async_trait;
 use bytes::Bytes;
