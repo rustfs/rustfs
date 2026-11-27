@@ -184,12 +184,20 @@ impl DefaultMultipartUsecase {
         } = input;
 
         let server_side_encryption = server_side_encryption.or(extract_server_side_encryption_from_headers(headers)?);
-        let ssekms_key_id = ssekms_key_id.or_else(|| {
-            headers
-                .get("x-amz-server-side-encryption-aws-kms-key-id")
-                .and_then(|value| value.to_str().ok())
-                .map(ToOwned::to_owned)
-        });
+        // `arn:aws:kms:<name>` names the key `<name>` (see `requested_sse_kms_key_id`).
+        // Reduced here, where the request's own value is still apart from the bucket
+        // default and before the KMS authorization check, so the session is authorized,
+        // keyed and recorded under one key id. UploadPart and CompleteMultipartUpload
+        // take the key id from the session's recorded metadata, so they need no
+        // reduction of their own. The bucket default's key id is used as configured.
+        let ssekms_key_id = ssekms_key_id
+            .or_else(|| {
+                headers
+                    .get("x-amz-server-side-encryption-aws-kms-key-id")
+                    .and_then(|value| value.to_str().ok())
+                    .map(ToOwned::to_owned)
+            })
+            .map(requested_sse_kms_key_id);
 
         // Validate storage class if provided
         if let Some(storage_class) = storage_class.as_deref()
@@ -679,7 +687,14 @@ mod tests {
             ))
             .await
             .expect("configure test KMS");
-            for allowed in [false, true] {
+            // The key is authorized and used under its id however the request spells it:
+            // a peer may send a plain key name behind an AWS-style ARN prefix.
+            for (requested_key_id, object, allowed) in [
+                (key_id, "plain-key-id", false),
+                (key_id, "plain-key-id", true),
+                ("arn:aws:kms:multipart-test-key", "arn-prefixed-key-id", false),
+                ("arn:aws:kms:multipart-test-key", "arn-prefixed-key-id", true),
+            ] {
                 let authorizer = RecordingKmsKeyAuthorizer::new(allowed);
                 let mut extensions = Extensions::new();
                 extensions.insert(ReqInfo {
@@ -706,7 +721,7 @@ mod tests {
                 );
                 let fields = CreateMultipartUploadFields {
                     bucket: bucket.clone(),
-                    key: "object".to_owned(),
+                    key: object.to_owned(),
                     metadata: None,
                     tagging: None,
                     storage_class: None,
@@ -714,24 +729,29 @@ mod tests {
                     sse_customer_algorithm: None,
                     sse_customer_key: None,
                     sse_customer_key_md5: None,
-                    ssekms_key_id: Some(key_id.to_owned()),
+                    ssekms_key_id: Some(requested_key_id.to_owned()),
                     object_lock_legal_hold_status: None,
                     object_lock_mode: None,
                     object_lock_retain_until_date: None,
                 };
                 let result = usecase.execute_create_multipart_upload(envelope, fields, None).await;
                 let uploads = store
-                    .list_multipart_uploads(&bucket, "", None, None, None, 100)
+                    .list_multipart_uploads(&bucket, object, None, None, None, 100)
                     .await
                     .expect("list uploads after KMS decision")
                     .uploads;
-                assert_eq!(uploads.len(), usize::from(allowed));
-                assert_eq!(authorizer.calls(), [(KmsAction::GenerateDataKeyAction, key_id.to_owned())]);
+                assert_eq!(uploads.len(), usize::from(allowed), "requested {requested_key_id}");
+                assert_eq!(
+                    authorizer.calls(),
+                    [(KmsAction::GenerateDataKeyAction, key_id.to_owned())],
+                    "requested {requested_key_id}"
+                );
                 if allowed {
                     let Ok(output) = result else {
-                        panic!("KMS authorizes the selected key");
+                        panic!("KMS authorizes the selected key, requested as {requested_key_id}");
                     };
                     assert_eq!(output.upload_id.as_str(), uploads[0].upload_id.as_str());
+                    assert_eq!(output.ssekms_key_id.as_deref(), Some(key_id), "requested {requested_key_id}");
                 } else {
                     let Err(error) = result else {
                         panic!("KMS denied the selected key");

@@ -125,6 +125,67 @@ pub fn extract_ssekms_context_from_headers(headers: &HeaderMap) -> Result<Option
     })
 }
 
+/// AWS-style ARN prefix that some S3 clients and replication peers put in front of a
+/// plain key name in `x-amz-server-side-encryption-aws-kms-key-id`.
+const KMS_KEY_NAME_ARN_PREFIX: &str = "arn:aws:kms:";
+
+/// The key id an `x-amz-server-side-encryption-aws-kms-key-id` request header names.
+///
+/// # Why
+///
+/// Some S3-compatible servers address KMS keys by plain name but send the name behind
+/// an AWS-style ARN prefix: a key named `lab-key` arrives as `arn:aws:kms:lab-key`,
+/// from their clients and on the replica writes of their bucket replication. That
+/// spelling names the key `lab-key`. Looked up as sent it matches no key, the write
+/// fails with `KMS.NotFoundException`, and every SSE-KMS object replicated from such a
+/// source stays `FAILED` there even when a key of the same name exists here.
+///
+/// # Rule
+///
+/// - `arn:aws:kms:<name>` is reduced to `<name>` when `<name>` is not empty and holds
+///   neither `:` nor `/`.
+/// - Every other value is returned as sent. A complete key or alias ARN,
+///   `arn:aws:kms:<region>:<account>:key/<id>` or `...:alias/<name>`, has further
+///   `:`-separated fields and a `/` after the prefix, so it stays whole: the AWS
+///   backend addresses keys by it. The bare prefix, another partition
+///   (`arn:aws-cn:kms:`) and another casing are not matched either: the value must
+///   start with exactly this prefix, case-sensitively.
+///
+/// # Where to call it
+///
+/// On the request's own value, before the KMS authorization check and before the
+/// value is merged with a bucket default.
+///
+/// - Before authorization: a key policy is matched against the identifier the write
+///   is authorized under, and `rustfs_policy::policy::statement::RequestedKmsKey`
+///   reads `arn:aws:kms:<name>` literally, as a key of that whole name. Reducing the
+///   value only after the check would authorize one identifier and encrypt under
+///   another, and a `Deny` on `key/<name>` would not reach the prefixed spelling.
+/// - Before the merge: a bucket default `KMSMasterKeyID` is deliberately not reduced.
+///   The KMS key deletion gate and key-policy matching compare a configured key id as
+///   written. Reducing it on the write path alone would let a key be deleted while a
+///   bucket default still resolves to it. A bucket default written in the prefixed
+///   form therefore still fails with `KMS.NotFoundException`.
+///
+/// A write path that hands a request header to the encryption entry points without
+/// calling this keeps the old behavior for the prefixed spelling (`NotFound`); it
+/// cannot authorize one key and use another, because nothing downstream reduces.
+///
+/// # Consequences
+///
+/// - The reduced name is what is authorized, used and recorded. Object metadata and
+///   the response header carry `<name>`, not the spelling the request used, so the
+///   same object can show `arn:aws:kms:<name>` on the source and `<name>` here.
+/// - A key whose own name is `arn:aws:kms:<name>` can no longer be selected through
+///   this header. Objects already stored under such a key still read, because the
+///   read path works from the recorded key id.
+pub fn requested_sse_kms_key_id(header_value: String) -> String {
+    match header_value.strip_prefix(KMS_KEY_NAME_ARN_PREFIX) {
+        Some(name) if !name.is_empty() && !name.contains([':', '/']) => name.to_owned(),
+        _ => header_value,
+    }
+}
+
 /// Rejects a client encryption context that would replace the location binding.
 ///
 /// The request context binds the data key to `{bucket: bucket/key}` only when the

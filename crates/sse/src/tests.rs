@@ -30,7 +30,7 @@ use crate::core::rewrap::{ObjectDekRewrapOutcome, rewrap_object_encryption_metad
 use crate::core::s3::authorization::authorize_sse_kms_object_read;
 use crate::core::s3::headers::{
     extract_server_side_encryption_from_headers, extract_ssec_params_from_headers, extract_ssekms_context_from_headers,
-    project_sse_read_response_headers, validate_sse_headers_for_read, validate_sse_headers_for_write,
+    project_sse_read_response_headers, requested_sse_kms_key_id, validate_sse_headers_for_read, validate_sse_headers_for_write,
 };
 use crate::core::s3::scheme::{is_managed_sse, resolve_effective_kms_key_id, resolve_stored_kms_key_id};
 use crate::core::s3::ssec::{SsecParams, md5_base64, validate_ssec_for_read, validate_ssec_params, verify_ssec_key_match};
@@ -504,6 +504,72 @@ fn test_extract_ssekms_context_from_headers_decodes_base64_json() {
         .expect("kms context header should parse")
         .expect("kms context should exist");
     assert_eq!(context.get("tenant").map(String::as_str), Some("alpha"));
+}
+
+const AWS_KEY_ID: &str = "74e5921e-107a-4584-bfda-a5dadeb3e13e";
+const AWS_KEY_ARN: &str = "arn:aws:kms:eu-north-1:111122223333:key/74e5921e-107a-4584-bfda-a5dadeb3e13e";
+const AWS_ALIAS_ARN: &str = "arn:aws:kms:eu-north-1:111122223333:alias/payroll";
+
+#[test]
+fn requested_sse_kms_key_id_reduces_an_arn_prefixed_plain_name() {
+    for (sent, named) in [
+        ("arn:aws:kms:lab-key", "lab-key"),
+        ("arn:aws:kms:lab_key.v2", "lab_key.v2"),
+        ("arn:aws:kms:74e5921e-107a-4584-bfda-a5dadeb3e13e", AWS_KEY_ID),
+    ] {
+        assert_eq!(requested_sse_kms_key_id(sent.to_string()), named, "{sent} names the key {named}");
+    }
+}
+
+#[test]
+fn requested_sse_kms_key_id_returns_every_other_value_as_sent() {
+    for sent in [
+        // No prefix to take off.
+        "lab-key",
+        AWS_KEY_ID,
+        "alias/payroll",
+        // Complete ARNs, which the AWS backend addresses keys by.
+        AWS_KEY_ARN,
+        AWS_ALIAS_ARN,
+        "arn:aws-cn:kms:cn-north-1:111122223333:key/74e5921e-107a-4584-bfda-a5dadeb3e13e",
+        // Nothing, or nothing after the prefix: there is no name to reduce to.
+        "",
+        "arn:aws:kms:",
+        // The remainder is not a plain name.
+        "arn:aws:kms::lab-key",
+        "arn:aws:kms:eu-north-1:lab-key",
+        "arn:aws:kms:alias/payroll",
+        "arn:aws:kms:key/lab-key",
+        // Not the prefix.
+        "arn:aws-cn:kms:lab-key",
+        "arn:aws:s3:lab-key",
+        "ARN:AWS:KMS:lab-key",
+        " arn:aws:kms:lab-key",
+        "prefix-arn:aws:kms:lab-key",
+    ] {
+        assert_eq!(requested_sse_kms_key_id(sent.to_string()), sent, "{sent:?} must be returned as sent");
+    }
+}
+
+/// Key policies are matched against the identifier a write is authorized under,
+/// so the value has to be reduced before that check, not after it.
+#[test]
+fn requested_sse_kms_key_id_is_the_key_id_a_key_policy_matches() {
+    use rustfs_policy::policy::statement::RequestedKmsKey;
+
+    let reduced = requested_sse_kms_key_id("arn:aws:kms:lab-key".to_string());
+    assert_eq!(RequestedKmsKey::parse(&reduced), RequestedKmsKey::Key("lab-key"));
+    assert_eq!(
+        RequestedKmsKey::parse("arn:aws:kms:lab-key"),
+        RequestedKmsKey::Key("arn:aws:kms:lab-key"),
+        "left as sent, the prefixed spelling is matched as a different key than the one that would be used"
+    );
+
+    // An identifier key-policy matching already reduces by itself is not rewritten here.
+    assert_eq!(requested_sse_kms_key_id(AWS_KEY_ARN.to_string()), AWS_KEY_ARN);
+    assert_eq!(RequestedKmsKey::parse(AWS_KEY_ARN), RequestedKmsKey::Key(AWS_KEY_ID));
+    assert_eq!(requested_sse_kms_key_id(AWS_ALIAS_ARN.to_string()), AWS_ALIAS_ARN);
+    assert_eq!(RequestedKmsKey::parse(AWS_ALIAS_ARN), RequestedKmsKey::Alias);
 }
 
 #[test]
