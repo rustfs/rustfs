@@ -246,9 +246,8 @@ fn upload_part_copy_range_error_and_cancellation_release_foreground_permit() {
                 .new_multipart_upload(&bucket, "object", &opts)
                 .await
                 .expect("range destination session");
-            let input = UploadPartCopyWriteInput {
-                copy_source_range: Some("bytes=12345-1060920".to_owned()),
-                ..copy_part_input(
+            let copy_input = || {
+                copy_part_input(
                     &bucket,
                     "object",
                     &upload.upload_id,
@@ -260,7 +259,44 @@ fn upload_part_copy_range_error_and_cancellation_release_foreground_permit() {
                     },
                 )
             };
-            let response = Box::pin(usecase.execute_upload_part_copy_with_audit(owned_envelope(Method::PUT), input)).await;
+            let mut input = copy_input();
+            let envelope = if capped {
+                input.copy_source_range = Some("bytes=12345-1060920".to_owned());
+                owned_envelope(Method::PUT)
+            } else {
+                let presigned = |properties: &str| {
+                    let uri: http::Uri =
+                        format!("/?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=test&X-Amz-Signature=test&{properties}")
+                            .parse()
+                            .expect("copy query");
+                    let mut headers = HeaderMap::new();
+                    crate::auth::hoist_signed_query_params(&mut headers, uri.query()).expect("hoist signed copy properties");
+                    RequestEnvelope::from_parts(
+                        crate::app::RequestHead {
+                            method: Method::PUT,
+                            uri,
+                            headers,
+                            credentials: None,
+                            region: None,
+                            service: None,
+                        },
+                        Extensions::new(),
+                    )
+                };
+                for condition in [
+                    "x-amz-copy-source-if-match=%22stale%22",
+                    "x-amz-copy-source-if-unmodified-since=1970-01-01T00%3A00%3A00Z",
+                ] {
+                    let response =
+                        Box::pin(usecase.execute_upload_part_copy_with_audit(presigned(condition), copy_input())).await;
+                    assert_eq!(
+                        response.err().expect("stale copy source must be rejected").code(),
+                        &S3ErrorCode::PreconditionFailed
+                    );
+                }
+                presigned("x-amz-copy-source-range=bytes%3D12345-1060920")
+            };
+            let response = Box::pin(usecase.execute_upload_part_copy_with_audit(envelope, input)).await;
             assert_eq!(
                 manager.put_object_admission_snapshot().active,
                 Some(0),

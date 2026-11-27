@@ -747,8 +747,8 @@ pub fn hoist_signed_query_params(headers: &mut HeaderMap, query: Option<&str>) -
     }
 
     // One pass over the query: recognize the presigned-SigV4 marker set and
-    // stage allowlisted `x-amz-*` request properties. Nothing is validated or
-    // applied until the gate below passes, so a request whose query is not
+    // stage user metadata parameters. Nothing is validated
+    // or applied until the gate below passes, so a request whose query is not
     // signature-covered is never rejected here.
     let mut algorithm = false;
     let mut credential = false;

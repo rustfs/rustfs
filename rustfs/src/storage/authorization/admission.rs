@@ -148,11 +148,17 @@ fn validate_post_object_metadata(headers: &HeaderMap, raw_query: Option<&str>) -
             .iter()
             .any(|prefix| name.starts_with(prefix))
     }
-    if headers.keys().any(|name| object_property(name.as_str()))
-        || raw_query.is_some_and(|query| {
-            url::form_urlencoded::parse(query.as_bytes()).any(|(name, _)| object_property(&name.to_ascii_lowercase()))
-        })
-    {
+    // POST uses only form tags for policy and storage. Its checksum handler validates
+    // wire digests, including conflicts with form fields, before anything is written.
+    if headers.keys().any(|name| {
+        let name = name.as_str();
+        object_property(name)
+            && name != "x-amz-tagging"
+            && name != "x-amz-sdk-checksum-algorithm"
+            && !name.starts_with("x-amz-checksum-")
+    }) || raw_query.is_some_and(|query| {
+        url::form_urlencoded::parse(query.as_bytes()).any(|(name, _)| object_property(&name.to_ascii_lowercase()))
+    }) {
         return Err(s3_error!(AccessDenied, "POST object properties must be supplied as form fields"));
     }
     Ok(())
@@ -264,12 +270,9 @@ mod access_phase_tests {
             "x-amz-server-side-encryption-customer-algorithm",
             "x-amz-server-side-encryption-customer-key",
             "x-amz-server-side-encryption-customer-key-md5",
-            "x-amz-tagging",
             "x-amz-acl",
             "x-amz-grant-read",
             "x-amz-website-redirect-location",
-            "x-amz-checksum-sha256",
-            "x-amz-sdk-checksum-algorithm",
             "x-amz-copy-source",
             "x-amz-metadata-directive",
         ] {
@@ -277,6 +280,11 @@ mod access_phase_tests {
             let err = super::admit_operation(&http::Method::POST, &headers, None, "PostObject", VerifiedSignature::default())
                 .expect_err("out-of-form POST wire property must be rejected");
             assert_eq!(err.code(), &rustfs_s3_types::S3ErrorCode::AccessDenied, "{name}");
+            headers.remove(name);
+        }
+        for name in ["x-amz-tagging", "x-amz-checksum-sha256", "x-amz-sdk-checksum-algorithm"] {
+            headers.insert(name, "test".parse().unwrap());
+            super::validate_post_object_metadata(&headers, None).expect("POST form and digest handlers own these wire fields");
             headers.remove(name);
         }
         for query in [

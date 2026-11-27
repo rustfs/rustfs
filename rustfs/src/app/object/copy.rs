@@ -129,21 +129,6 @@ where
         .map_err(|err| ApiError::from(copy_namespace_lock_error(bucket, &object, "write", err)).into())
 }
 
-fn parse_hoisted_copy_condition(headers: &HeaderMap, name: &str) -> S3Result<Option<super::copy_input::CopySourceCondition>> {
-    let Some(raw) = super::shared::optional_header_string(headers, name)? else {
-        return Ok(None);
-    };
-    let tag = rustfs_gateway_types::ETag::parse_http_header(&raw)
-        .map_err(|_| s3_error!(InvalidArgument, "Invalid copy source ETag condition"))?;
-    Ok(Some(if tag.is_any() {
-        super::copy_input::CopySourceCondition::Any
-    } else if tag.is_weak() {
-        super::copy_input::CopySourceCondition::Weak
-    } else {
-        super::copy_input::CopySourceCondition::Strong(tag.opaque_tag().to_owned())
-    }))
-}
-
 #[inline(never)]
 fn apply_hoisted_copy_headers(input: &mut CopyObjectWriteInput, headers: &HeaderMap) -> S3Result<()> {
     if input.server_side_encryption.is_none() {
@@ -161,12 +146,10 @@ fn apply_hoisted_copy_headers(input: &mut CopyObjectWriteInput, headers: &Header
     if input.tagging_directive.is_none() {
         input.tagging_directive = super::shared::optional_header_string(headers, "x-amz-tagging-directive")?;
     }
-    if input.copy_source_if_match.is_none() {
-        input.copy_source_if_match = parse_hoisted_copy_condition(headers, "x-amz-copy-source-if-match")?;
-    }
-    if input.copy_source_if_none_match.is_none() {
-        input.copy_source_if_none_match = parse_hoisted_copy_condition(headers, "x-amz-copy-source-if-none-match")?;
-    }
+    input.copy_source_if_match =
+        CopySourceCondition::with_header(input.copy_source_if_match.take(), headers, "x-amz-copy-source-if-match")?;
+    input.copy_source_if_none_match =
+        CopySourceCondition::with_header(input.copy_source_if_none_match.take(), headers, "x-amz-copy-source-if-none-match")?;
     input.copy_source_dates.merge_headers(headers)?;
     if input.website_redirect_location.is_none() {
         input.website_redirect_location = super::shared::optional_header_string(headers, "x-amz-website-redirect-location")?;

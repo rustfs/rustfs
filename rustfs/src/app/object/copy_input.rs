@@ -14,7 +14,8 @@
 
 //! Owned input and output for the CopyObject storage path.
 
-use rustfs_gateway_types::CopySourceValue;
+use rustfs_gateway_types::{CopySourceValue, ETag};
+use rustfs_s3_types::{S3Result, s3_error};
 use std::collections::HashMap;
 use time::OffsetDateTime;
 
@@ -26,6 +27,27 @@ pub(crate) enum CopySourceCondition {
 }
 
 impl CopySourceCondition {
+    pub(crate) fn parse(value: &str) -> S3Result<Self> {
+        let tag = ETag::parse_http_header(value).map_err(|_| s3_error!(InvalidArgument, "Invalid copy source ETag condition"))?;
+        Ok(if tag.is_any() {
+            Self::Any
+        } else if tag.is_weak() {
+            Self::Weak
+        } else {
+            Self::Strong(tag.opaque_tag().to_owned())
+        })
+    }
+
+    pub(crate) fn with_header(decoded: Option<Self>, headers: &http::HeaderMap, name: &str) -> S3Result<Option<Self>> {
+        if decoded.is_some() {
+            return Ok(decoded);
+        }
+        super::shared::optional_header_string(headers, name)?
+            .as_deref()
+            .map(Self::parse)
+            .transpose()
+    }
+
     pub(crate) fn strong(&self) -> Option<&str> {
         match self {
             Self::Strong(value) => Some(value),
