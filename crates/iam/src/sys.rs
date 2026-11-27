@@ -173,12 +173,29 @@ enum PreparedServicePolicyMode {
 
 tokio::task_local! {
     static BUCKET_TAG_DELETION: ();
+    static SCOPED_ROOT_CREDENTIALS: Option<Credentials>;
 }
 
 /// Scope authorization to the server's DeleteBucketTagging operation. The IAM action is shared
 /// with PutBucketTagging, so policy arguments and client headers cannot identify this repair path.
 pub async fn with_bucket_tag_deletion<F: std::future::Future>(operation: F) -> F::Output {
     BUCKET_TAG_DELETION.scope((), operation).await
+}
+
+/// Scope IAM root-credential lookup for the duration of `operation` to the
+/// caller's request-scoped server context rather than the process-ambient root
+/// credentials (rustfs/backlog#1469).
+pub async fn with_scoped_root_credentials<F: std::future::Future>(
+    root_credentials: Option<Credentials>,
+    operation: F,
+) -> F::Output {
+    SCOPED_ROOT_CREDENTIALS.scope(root_credentials, operation).await
+}
+
+fn effective_root_credentials() -> Option<Credentials> {
+    SCOPED_ROOT_CREDENTIALS
+        .try_with(Clone::clone)
+        .unwrap_or_else(|_| crate::root_credentials::credentials())
 }
 
 #[derive(Clone)]
@@ -1439,6 +1456,10 @@ impl<T: Store> IamSys<T> {
             return Err(IamError::InvalidSecretKeyLength);
         }
 
+        if args.policy.as_deref().is_some_and(|policy| !policy.is_empty()) {
+            return Err(IamError::InvalidArgument);
+        }
+
         let (updated_at, secret_changed, parent_guard) = self
             .store
             .add_user_at_with_secret_change(access_key, args, updated_at, allow_status_change)
@@ -1578,8 +1599,8 @@ impl<T: Store> IamSys<T> {
     }
 
     pub async fn check_key(&self, access_key: &str) -> Result<(Option<UserIdentity>, bool)> {
-        if let Some(sys_cred) = crate::root_credentials::credentials()
-            && sys_cred.access_key == access_key
+        if let Some(sys_cred) = effective_root_credentials()
+            && bool::from(sys_cred.access_key.as_bytes().ct_eq(access_key.as_bytes()))
         {
             return Ok((Some(UserIdentity::new(sys_cred)), true));
         }
@@ -1607,12 +1628,17 @@ impl<T: Store> IamSys<T> {
             return Ok(true);
         }
         if identity.sts_generation.is_none() {
-            if cred.is_service_account() || crate::is_root_access_key(&cred.parent_user) {
+            let root_cred = effective_root_credentials();
+            if cred.is_service_account()
+                || root_cred
+                    .as_ref()
+                    .is_some_and(|root| bool::from(root.access_key.as_bytes().ct_eq(cred.parent_user.as_bytes())))
+            {
                 return Ok(true);
             }
             // OIDC and broker-issued plugin attempts have separate parent authorities.
             // A freshly published identity may not yet have its decoded claims cached.
-            if let Some(key) = crate::root_credentials::token_signing_key()
+            if let Some(key) = root_cred.map(|root| root.secret_key)
                 && let Ok(claims) = get_claims_from_token_with_secret(&cred.session_token, &key)
                 && claims.get("parent").and_then(Value::as_str) == Some(cred.parent_user.as_str())
                 && (is_verified_or_legacy_federated_session(&claims, &cred.parent_user)
@@ -8788,5 +8814,79 @@ mod tests {
             .await;
 
         assert!(matches!(result, Err(IamError::InvalidArgument)));
+    }
+
+    #[tokio::test]
+    async fn create_user_rejects_non_empty_policy_field_fail_closed() {
+        let iam_sys = IamSys::new(
+            IamCache::new(StsTestMockStore::new(true))
+                .await
+                .expect("IAM cache should initialize"),
+        );
+
+        let err = iam_sys
+            .create_user(
+                "alice-policy-reject",
+                &AddOrUpdateUserReq {
+                    secret_key: "secret-key-123456".to_string(),
+                    policy: Some("readwrite".to_string()),
+                    status: rustfs_madmin::AccountStatus::Enabled,
+                },
+            )
+            .await
+            .expect_err("non-empty AddOrUpdateUserReq.policy must fail closed");
+        assert!(matches!(err, IamError::InvalidArgument), "unexpected error: {err:?}");
+        assert!(
+            iam_sys.get_user("alice-policy-reject").await.is_none(),
+            "rejected user creation must not leave a user in cache"
+        );
+    }
+
+    #[tokio::test]
+    async fn check_key_respects_scoped_root_credentials() {
+        let _ = rustfs_credentials::init_global_action_credentials(
+            Some("ambient-root".to_string()),
+            Some("ambient-root-secret".to_string()),
+        );
+        let ambient_root = crate::root_credentials::credentials().expect("global action credentials should be initialized");
+        let iam_sys = IamSys::new(
+            IamCache::new(StsTestMockStore::new(true))
+                .await
+                .expect("IAM cache should initialize"),
+        );
+
+        let scoped_root = Credentials {
+            access_key: "scoped-server-b-root".to_string(),
+            secret_key: "scoped-server-b-secret".to_string(),
+            status: "on".to_string(),
+            ..Default::default()
+        };
+
+        let (ambient_in_b, ambient_valid) =
+            with_scoped_root_credentials(Some(scoped_root.clone()), iam_sys.check_key(&ambient_root.access_key))
+                .await
+                .expect("check_key should succeed cleanly");
+        assert!(
+            ambient_in_b.is_none() && !ambient_valid,
+            "process-ambient root key must not authenticate inside a different scoped root context"
+        );
+
+        let (scoped_in_b, scoped_valid) =
+            with_scoped_root_credentials(Some(scoped_root.clone()), iam_sys.check_key(&scoped_root.access_key))
+                .await
+                .expect("check_key should succeed cleanly");
+        assert!(scoped_valid);
+        assert_eq!(
+            scoped_in_b.expect("scoped root must resolve").credentials.access_key,
+            scoped_root.access_key
+        );
+
+        let (none_in_b, none_valid) = with_scoped_root_credentials(None, iam_sys.check_key(&ambient_root.access_key))
+            .await
+            .expect("check_key should succeed cleanly");
+        assert!(
+            none_in_b.is_none() && !none_valid,
+            "empty scoped root credentials must fail closed instead of falling back to ambient root"
+        );
     }
 }

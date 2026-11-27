@@ -31,7 +31,7 @@
 mod listen;
 mod replication;
 
-use crate::admin::auth::authenticate_envelope_credentials;
+use crate::admin::auth::authenticate_envelope_credentials_with_context;
 use crate::admin::operation::AdminRequest;
 use crate::admin::route_table;
 use crate::admin::router::{AdminOperation, EVENT_ADMIN_ROUTER_STATE, LOG_COMPONENT_ADMIN, S3Router};
@@ -104,7 +104,7 @@ async fn authorize(req: &mut AdminRequest, bucket: Option<&str>, action: Action)
     let Some(credentials) = req.credentials() else {
         return Err(S3Error::with_message(S3ErrorCode::AccessDenied, "Signature is required"));
     };
-    let (cred, is_owner) = authenticate_envelope_credentials(credentials).await?;
+    let (cred, is_owner) = authenticate_envelope_credentials_with_context(credentials, req.envelope()).await?;
     req.install_req_info(ReqInfo {
         cred: Some(cred),
         is_owner,

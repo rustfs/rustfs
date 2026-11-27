@@ -57,18 +57,18 @@ mod reserved_console;
 pub(crate) static CONFIG_HANDLER_CALLS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 use crate::app::dto_values::owner;
-use crate::runtime_sources::{ServerContextSlot, current_action_credentials};
+use crate::runtime_sources::ServerContextSlot;
 use crate::server::gateway_handlers::{GatewayBackend, OPERATIONS, OperationTable, metadata_listing, register};
 use crate::server::ssec_transport::{carries_ssec_headers, is_secure_transport, report_plaintext_ssec, require_tls};
 use crate::shared_types::{NativeTlsTransport, RemoteAddr};
 use crate::storage_api::server::http::request_context::RequestContext;
 use http::{Extensions, Request, Response};
-use rustfs_config::RUSTFS_REGION;
+use rustfs_config::{MAX_SINGLE_PUT_OBJECT_SIZE, RUSTFS_REGION};
 use rustfs_gateway::{
     AssemblyError, Authorizer, BoxFuture, BucketName, BucketOwnerError, BucketOwnerSource, ClientAddr, ConnectionIntent,
-    DEFAULT_MAX_BUFFERED_BODY_BYTES, HandlerDeadlineClass, HandlerDeadlineConfig, MintedTraces, PlaintextCustomerKeyAck,
+    DEFAULT_MAX_BUFFERED_BODY_BYTES, HandlerDeadlineClass, HandlerDeadlineConfig, Limits, MintedTraces, PlaintextCustomerKeyAck,
     RegionSet, RequestBodyDeadlineConfig, ServiceBuilder, ServiceConfig, SigV4Authenticator, SseConfig, TransportSecurity,
-    connection_intent_of,
+    connection_intent_of, max_framed_upload_bytes,
 };
 #[cfg(test)]
 use rustfs_gateway::{Decision, decide_with};
@@ -77,7 +77,6 @@ use rustfs_gateway_adapter::{
     RootSource, establish_keystone_identity, host_request_id, keystone_header_token_claim, rustfs_host_resolver,
 };
 use rustfs_iam::error::Error as IamError;
-use rustfs_iam::manager::get_token_signing_key;
 use rustfs_iam::store::object::ObjectStore;
 use rustfs_iam::sys::IamSys;
 use rustfs_policy::auth::UserIdentity;
@@ -179,6 +178,10 @@ impl GatewayStack {
     /// [`GatewayAssemblyError`] naming the input the gateway refused. The secret key is never
     /// part of it.
     pub(crate) fn assemble(assembly: GatewayAssembly) -> Result<Self, GatewayAssemblyError> {
+        // Ensure S3 operation and ListObjects metric descriptions are registered on S3-only
+        // servers, not only when optional protocol gateways (FTP/FTPS/WebDAV/SFTP) are enabled.
+        rustfs_io_metrics::init_s3_metrics();
+        rustfs_io_metrics::init_list_objects_metrics();
         let iam = Arc::new(ServerIam {
             server_ctx: Arc::clone(&assembly.server_ctx),
         });
@@ -293,6 +296,12 @@ impl GatewayStack {
         let credentials = Arc::new(IamCredentials::new(iam, root));
         let builder = base
             .rustfs_profile()
+            // Widen the wire-body limit for aws-chunked framing overhead while `service_config`
+            // enforces the 5 GiB single-request ceiling on the decoded object payload.
+            .limits(Limits {
+                max_body_bytes: max_framed_upload_bytes(MAX_SINGLE_PUT_OBJECT_SIZE),
+                ..Limits::default()
+            })
             // Shipped RustFS authorizes before it judges an SSE header; the handler entry answers
             // the refusal once authorization succeeds.
             .defer_encryption_header_refusals_to_handlers()
@@ -542,6 +551,7 @@ fn service_config(body_read_timeout: Duration, max_buffered_body_bytes: u64) -> 
         .without_deadline(HandlerDeadlineClass::Extended)
         .without_commit_progress_deadline();
     ServiceConfig::new(max_buffered_body_bytes)
+        .with_upload_object_ceiling(MAX_SINGLE_PUT_OBJECT_SIZE)
         .with_handler_deadlines(handlers)
         .with_request_body_deadlines(body_deadlines(body_read_timeout))
 }
@@ -616,19 +626,16 @@ impl RequestIdCarrier for RequestContext {
     }
 }
 
-/// The root credentials of one server as they are now, read on every call from where the legacy
-/// stack reads them, so a root change reaches both stacks at once. `None` while they are not
-/// initialized or cannot verify a signature, which the adapters answer as unavailable.
+/// The root credentials of one server as they are now, read strictly from this server's installed
+/// `AppContext` (never falling back to process-global credentials or token-signing keys). `None`
+/// while this server context is uninstalled, lacks root credentials, or cannot verify a signature,
+/// which the adapters answer as unavailable.
 fn live_root(server_ctx: Arc<ServerContextSlot>) -> impl Fn() -> Option<Arc<RootCredentials>> + Send + Sync + 'static {
     move || {
-        let root = match server_ctx.app_context() {
-            Some(context) => context.action_credentials().get(),
-            None => current_action_credentials(),
-        }?;
-        // IAM signs STS session tokens with its token-signing key, which is the root secret
-        // until IAM has published one of its own.
-        let signing_key = get_token_signing_key().unwrap_or_else(|| root.secret_key.clone());
-        RootCredentials::new(&root.access_key, &root.secret_key, &signing_key)
+        let root = server_ctx.installed_app_context()?.action_credentials().get()?;
+        // Match `check_claims_from_token_with_context`: STS session tokens are signed with this
+        // server context's root secret rather than a process-global key.
+        RootCredentials::new(&root.access_key, &root.secret_key, &root.secret_key)
             .ok()
             .map(Arc::new)
     }
@@ -854,6 +861,123 @@ mod object_lock_tests {
         assert_eq!(retention.mode.as_deref(), Some("GOVERNANCE"));
         assert_eq!(retention.days, Some(30));
         assert_eq!(retention.years, None);
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn sigv2_delete_objects_and_config_puts_enforce_content_md5_post_auth() {
+        let ambient = crate::app::gating_test_env::shared_gating_ambient().await;
+        let store = crate::app::gating_test_env::shared_gating_ecstore().await;
+        let context = Arc::new(crate::runtime_sources::AppContext::new(Arc::clone(&store), ambient.iam(), ambient.kms()));
+        let slot = ServerContextSlot::new();
+        assert!(slot.install(Arc::clone(&context)));
+        let gateway = TestGateway::over(&context, slot);
+        let bucket = format!("sigv2-digest-{}", Uuid::new_v4());
+        store
+            .make_bucket(&bucket, &MakeBucketOptions::default())
+            .await
+            .expect("create sigv2 digest test bucket");
+
+        let delete_xml = "<Delete><Object><Key>missing-key</Key></Object></Delete>";
+        let sign_v2 = |method: Method, uri: String, body: &str, with_md5: bool, secret: &str| {
+            let mut builder = http::Request::builder()
+                .method(method)
+                .uri(uri)
+                .header(http::header::HOST, "localhost")
+                .header("date", chrono::Utc::now().format("%a, %d %b %Y %H:%M:%S GMT").to_string())
+                .header(http::header::CONTENT_TYPE, "application/xml")
+                .header(http::header::CONTENT_LENGTH, body.len());
+            if with_md5 {
+                let md5 = base64_simd::STANDARD.encode_to_string(md5::Md5::digest(body.as_bytes()));
+                builder = builder.header("content-md5", md5);
+            }
+            let req = builder
+                .body(rustfs_gateway::Body::from_bytes(Bytes::copy_from_slice(body.as_bytes())))
+                .expect("build sigv2 request");
+            rustfs_signer::try_sign_v2(req, body.len() as i64, TestGateway::ACCESS_KEY, secret, false)
+                .expect("sign sigv2 request")
+        };
+
+        // Missing Content-MD5 on valid SigV2 DeleteObjects -> 400 MissingContentMD5 post-auth.
+        let missing = gateway
+            .call(sign_v2(
+                Method::POST,
+                format!("http://localhost/{bucket}?delete"),
+                delete_xml,
+                false,
+                TestGateway::SECRET_KEY,
+            ))
+            .await;
+        assert_eq!(missing.status(), StatusCode::BAD_REQUEST);
+        let missing_body = missing.into_body().collect().await.unwrap().to_bytes();
+        assert!(
+            String::from_utf8_lossy(&missing_body).contains("<Code>MissingContentMD5</Code>"),
+            "{}",
+            String::from_utf8_lossy(&missing_body)
+        );
+
+        // Wrong secret fails auth (403) rather than MissingContentMD5 (400).
+        let wrong_secret = gateway
+            .call(sign_v2(
+                Method::POST,
+                format!("http://localhost/{bucket}?delete"),
+                delete_xml,
+                false,
+                "wrong-sigv2-secret-key",
+            ))
+            .await;
+        assert_eq!(wrong_secret.status(), StatusCode::FORBIDDEN);
+
+        // Valid SigV2 DeleteObjects with matching Content-MD5 -> 200 OK.
+        let ok = gateway
+            .call(sign_v2(
+                Method::POST,
+                format!("http://localhost/{bucket}?delete"),
+                delete_xml,
+                true,
+                TestGateway::SECRET_KEY,
+            ))
+            .await;
+        let ok_status = ok.status();
+        let ok_body = ok.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(ok_status, StatusCode::OK, "{}", String::from_utf8_lossy(&ok_body));
+
+        // Tampered body after signing valid Content-MD5 -> 400 BadDigest.
+        let mut tampered = sign_v2(
+            Method::POST,
+            format!("http://localhost/{bucket}?delete"),
+            delete_xml,
+            true,
+            TestGateway::SECRET_KEY,
+        );
+        *tampered.body_mut() = rustfs_gateway::Body::from_bytes(Bytes::from(delete_xml.replace("missing-key", "other-key")));
+        let tampered_resp = gateway.call(tampered).await;
+        assert_eq!(tampered_resp.status(), StatusCode::BAD_REQUEST);
+        let tampered_body = tampered_resp.into_body().collect().await.unwrap().to_bytes();
+        assert!(
+            String::from_utf8_lossy(&tampered_body).contains("<Code>BadDigest</Code>"),
+            "{}",
+            String::from_utf8_lossy(&tampered_body)
+        );
+
+        // Non-empty SigV2 bucket config PUT without Content-MD5 -> 400 MissingContentMD5.
+        let versioning_xml = "<VersioningConfiguration><Status>Enabled</Status></VersioningConfiguration>";
+        let cfg_missing = gateway
+            .call(sign_v2(
+                Method::PUT,
+                format!("http://localhost/{bucket}?versioning"),
+                versioning_xml,
+                false,
+                TestGateway::SECRET_KEY,
+            ))
+            .await;
+        assert_eq!(cfg_missing.status(), StatusCode::BAD_REQUEST);
+        let cfg_body = cfg_missing.into_body().collect().await.unwrap().to_bytes();
+        assert!(
+            String::from_utf8_lossy(&cfg_body).contains("<Code>MissingContentMD5</Code>"),
+            "{}",
+            String::from_utf8_lossy(&cfg_body)
+        );
     }
 }
 

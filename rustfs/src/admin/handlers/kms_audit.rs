@@ -102,6 +102,8 @@ pub(super) enum KmsAdminOperation {
     Reconfigure,
     /// Reload of the persisted configuration.
     Reload,
+    /// Read-only status query for the KMS service.
+    Status,
     /// Start or restart of the KMS service.
     Start,
     /// Stop of the KMS service.
@@ -129,6 +131,7 @@ impl KmsAdminOperation {
             Self::Configure => "Configure",
             Self::Reconfigure => "Reconfigure",
             Self::Reload => "Reload",
+            Self::Status => "Status",
             Self::Start => "Start",
             Self::Stop => "Stop",
             Self::Backup => "Backup",
@@ -158,7 +161,7 @@ impl KmsAdminOperation {
             // event-name space is a fixed 64-bit mask that is nearly full, so
             // these reuse the existing access event rather than claiming two
             // more bits of it.
-            Self::Backup | Self::BackupStatus | Self::RestoreDryRun => EventName::KmsKeyAccessed,
+            Self::Backup | Self::BackupStatus | Self::RestoreDryRun | Self::Status => EventName::KmsKeyAccessed,
             // A restore publishes key material into the target directory.
             Self::Restore => EventName::KmsKeyCreated,
             // Aborting an interrupted restore removes the material a partial
@@ -665,6 +668,8 @@ mod tests {
             KmsAdminOperation::UntagResource,
             KmsAdminOperation::Configure,
             KmsAdminOperation::Reconfigure,
+            KmsAdminOperation::Reload,
+            KmsAdminOperation::Status,
             KmsAdminOperation::Start,
             KmsAdminOperation::Stop,
             KmsAdminOperation::Backup,

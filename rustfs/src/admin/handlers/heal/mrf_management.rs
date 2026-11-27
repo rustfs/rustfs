@@ -504,6 +504,7 @@ mod tests {
             enqueued_at_ms: 1,
             status: "legacy_generation_unobserved".into(),
             held_since_ms: Some(1),
+            delete_transaction_id: None,
             accepted: None,
             last_identity_probe_result: None,
             last_identity_probe_at_ms: None,

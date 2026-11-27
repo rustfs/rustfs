@@ -134,15 +134,18 @@ fn classify_iam_error(error: &IamError) -> Result<CredentialLookup, ProviderErro
 }
 
 /// Builds the gateway credential for one IAM identity. No authorization happens here: a
-/// disabled or invalid principal still resolves, marked disabled, and the gateway refuses it
-/// exactly as it refuses an unknown key.
+/// disabled or otherwise invalid principal still resolves, marked disabled, and the gateway
+/// refuses it identically to an unknown key. An expired STS session is the one exception: its
+/// expiry is carried in [`SessionBinding`] without calling `.disable()` so the gateway checks the
+/// signature and session token first and answers `400 ExpiredToken` to its holder.
 fn to_gateway_credentials(access_key: &str, identity: &UserIdentity, valid: bool) -> Result<Credentials, ProviderError> {
     let cred = &identity.credentials;
     let mut credentials = Credentials::new(access_key, cred.secret_key.as_bytes()).map_err(|_| ProviderError::Backend)?;
 
     // A service account carries a claims token internally, but its clients never present it, so
     // it authenticates as a long-term credential (as `check_session_token` treats it in legacy).
-    if !cred.session_token.is_empty() && !cred.is_service_account() {
+    let is_sts_session = !cred.session_token.is_empty() && !cred.is_service_account();
+    if is_sts_session {
         // A temporary credential without an expiry cannot become a gateway session, which always
         // ends. Refusing it as a fault is the fail-closed answer; a never-ending session is not.
         let expiration = cred.expiration.ok_or(ProviderError::Backend)?;
@@ -152,7 +155,16 @@ fn to_gateway_credentials(access_key: &str, identity: &UserIdentity, valid: bool
             .map_err(|_| ProviderError::Backend)?;
     }
 
-    if !valid || cred.status == ACCOUNT_OFF {
+    // Leave STS sessions enabled when expiration is the sole reason `valid` is false so the
+    // gateway evaluates `SessionBinding` against `RequestNow` and returns `400 ExpiredToken`.
+    // Disabled, structurally invalid, or non-expired invalid STS credentials, as well as expired
+    // service accounts and long-term users, remain disabled (`403`).
+    let expired_sts_only = is_sts_session
+        && cred.status != ACCOUNT_OFF
+        && cred.access_key.len() >= 3
+        && cred.secret_key.len() >= 8
+        && cred.is_expired();
+    if (!valid && !expired_sts_only) || cred.status == ACCOUNT_OFF {
         credentials = credentials.disable();
     }
     Ok(credentials)
@@ -458,5 +470,114 @@ mod tests {
         assert!(matches!(provider.lookup(ACCESS_KEY).await, Err(ProviderError::Unavailable)));
         assert!(matches!(provider.lookup("rootadmin").await, Err(ProviderError::Unavailable)));
         assert_eq!(iam.calls.load(Ordering::SeqCst), 0);
+    }
+
+    /// Positive — an expired STS credential keeps its session binding enabled so the gateway can
+    /// verify possession first and answer `400 ExpiredToken` via `SessionBinding`.
+    #[tokio::test]
+    async fn credentials_expired_sts_stays_enabled_for_gateway_expiry_refusal() {
+        let expires_at = (OffsetDateTime::now_utc() - time::Duration::hours(1)).unix_timestamp();
+        let iam = fake(true, move || {
+            let mut cred = user("on");
+            cred.session_token = "expired-sts-token".to_owned();
+            cred.parent_user = "parent".to_owned();
+            cred.expiration = Some(OffsetDateTime::from_unix_timestamp(expires_at).expect("valid timestamp"));
+            found(cred, false)
+        });
+        let credentials = expect_found(lookup(iam, ACCESS_KEY).await);
+        assert!(!credentials.is_disabled());
+        let binding = credentials
+            .session_binding()
+            .expect("expired STS retains its session binding");
+        assert_eq!(binding.expires_at_unix_seconds(), expires_at);
+        let now = RequestNow::from_unix_seconds(expires_at + 1);
+        assert_eq!(
+            credentials.admit(Some(b"expired-sts-token"), now),
+            Err(rustfs_gateway::CredentialRefusal::SessionExpired)
+        );
+        assert_eq!(
+            credentials.admit(Some(b"wrong-token"), now),
+            Err(rustfs_gateway::CredentialRefusal::SessionTokenMismatch)
+        );
+        assert_eq!(
+            credentials.admit(None, now),
+            Err(rustfs_gateway::CredentialRefusal::SessionCredentialWithoutToken)
+        );
+    }
+
+    /// Negative — disabled, structurally invalid, or non-expired invalid STS credentials, and
+    /// expired service accounts, must still be disabled so the gateway answers `403`.
+    #[tokio::test]
+    async fn credentials_non_expiry_invalid_sts_and_expired_service_account_stay_disabled() {
+        let past = OffsetDateTime::now_utc() - time::Duration::hours(1);
+        let future = OffsetDateTime::now_utc() + time::Duration::hours(1);
+
+        let disabled_expired_sts = expect_found(
+            lookup(
+                fake(true, move || {
+                    let mut cred = user("off");
+                    cred.session_token = "sts-token".to_owned();
+                    cred.parent_user = "parent".to_owned();
+                    cred.expiration = Some(past);
+                    found(cred, false)
+                }),
+                ACCESS_KEY,
+            )
+            .await,
+        );
+        assert!(disabled_expired_sts.is_disabled());
+        assert_eq!(
+            disabled_expired_sts.admit(Some(b"sts-token"), RequestNow::from_unix_seconds(past.unix_timestamp() + 1)),
+            Err(rustfs_gateway::CredentialRefusal::Disabled)
+        );
+
+        let invalid_unexpired_sts = expect_found(
+            lookup(
+                fake(true, move || {
+                    let mut cred = user("on");
+                    cred.session_token = "sts-token".to_owned();
+                    cred.parent_user = "parent".to_owned();
+                    cred.expiration = Some(future);
+                    found(cred, false)
+                }),
+                ACCESS_KEY,
+            )
+            .await,
+        );
+        assert!(invalid_unexpired_sts.is_disabled());
+
+        let short_key_expired_sts = expect_found(
+            lookup(
+                fake(true, move || {
+                    let mut cred = user("on");
+                    cred.access_key = "ab".to_owned();
+                    cred.session_token = "sts-token".to_owned();
+                    cred.parent_user = "parent".to_owned();
+                    cred.expiration = Some(past);
+                    found(cred, false)
+                }),
+                "ab",
+            )
+            .await,
+        );
+        assert!(short_key_expired_sts.is_disabled());
+
+        let expired_service_account = expect_found(
+            lookup(
+                fake(true, move || {
+                    let mut cred = user("on");
+                    cred.session_token = "service-account-claims-token".to_owned();
+                    cred.parent_user = "parent".to_owned();
+                    cred.expiration = Some(past);
+                    cred.claims =
+                        Some([(rustfs_credentials::IAM_POLICY_CLAIM_NAME_SA.to_owned(), "inherited-policy".into())].into());
+                    found(cred, false)
+                }),
+                ACCESS_KEY,
+            )
+            .await,
+        );
+        assert!(expired_service_account.is_disabled());
+        assert!(expired_service_account.session_binding().is_none());
     }
 }

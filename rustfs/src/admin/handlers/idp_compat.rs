@@ -976,15 +976,7 @@ async fn authorize(req: &AdminRequest, action: AdminAction) -> S3Result<(StoredC
 }
 
 async fn authorize_action(req: &AdminRequest, cred: &StoredCredentials, owner: bool, action: AdminAction) -> S3Result<()> {
-    validate_admin_request(
-        req.headers(),
-        cred,
-        owner,
-        false,
-        vec![Action::AdminAction(action)],
-        req.policy_source_addr(),
-    )
-    .await
+    validate_admin_request(req.headers(), cred, owner, false, vec![Action::AdminAction(action)], req.envelope()).await
 }
 
 fn json_response<T: Serialize>(path: &str, secret_key: &str, status: StatusCode, payload: &T) -> S3Result<AdminResponse> {
@@ -1197,5 +1189,130 @@ mod tests {
             Some(OffsetDateTime::UNIX_EPOCH)
         );
         assert_eq!(expiration_for_admin_path("/rustfs/admin/v3/idp/ldap/list-access-keys", None), None);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn provider_bulk_access_keys_requires_list_users_for_cross_user_queries() {
+        crate::app::gating_test_env::run_large_stack_test("idp-bulk-list-users", || async {
+            use crate::admin::operation::test_support::TestRequest;
+            use crate::admin::runtime_sources::{AppContext, IamInterface, KmsInterface, publish_test_app_context};
+            use rustfs_iam::store::{Store as _, UserType};
+            use rustfs_madmin::{AccountStatus, AddOrUpdateUserReq};
+            use rustfs_policy::policy::Policy;
+            use std::sync::Arc;
+
+            struct ReadyIam(Arc<rustfs_iam::sys::IamSys<rustfs_iam::store::object::ObjectStore>>);
+            impl IamInterface for ReadyIam {
+                fn handle(&self) -> Arc<rustfs_iam::sys::IamSys<rustfs_iam::store::object::ObjectStore>> {
+                    Arc::clone(&self.0)
+                }
+                fn is_ready(&self) -> bool {
+                    true
+                }
+            }
+            struct TestKms;
+            impl KmsInterface for TestKms {
+                fn handle(&self) -> Arc<rustfs_kms::KmsServiceManager> {
+                    Arc::new(rustfs_kms::KmsServiceManager::new())
+                }
+            }
+
+            let previous = crate::runtime_sources::current_app_context();
+            let (_dir, _paths, store) = crate::app::gating_test_env::isolated_multi_pool_ecstore().await;
+            rustfs_iam::store::object::ObjectStore::new(Arc::clone(&store))
+                .save_iam_config(
+                    serde_json::json!({"version": 1}),
+                    format!("{}/format.json", *rustfs_iam::store::object::IAM_CONFIG_PREFIX),
+                )
+                .await
+                .expect("seed IAM format");
+            let iam = rustfs_iam::build_iam_sys(Arc::clone(&store)).await.expect("init IAM");
+            let secret = "idp-bulk-secret-1234";
+            for (user, doc) in [
+                (
+                    "idp-sa-only",
+                    Some(r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":["admin:ListServiceAccounts"]}]}"#),
+                ),
+                (
+                    "idp-sa-and-users",
+                    Some(
+                        r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":["admin:ListServiceAccounts","admin:ListUsers"]}]}"#,
+                    ),
+                ),
+                ("other-user", None),
+            ] {
+                iam.create_user(
+                    user,
+                    &AddOrUpdateUserReq {
+                        secret_key: secret.to_owned(),
+                        policy: None,
+                        status: AccountStatus::Enabled,
+                    },
+                )
+                .await
+                .expect("create user");
+                if let Some(doc) = doc {
+                    iam.set_policy(user, Policy::parse_config(doc.as_bytes()).expect("parse policy"))
+                        .await
+                        .expect("save policy");
+                    iam.policy_db_set(user, UserType::Reg, false, user)
+                        .await
+                        .expect("attach policy");
+                }
+            }
+            let context = Arc::new(AppContext::new(store, Arc::new(ReadyIam(iam)), Arc::new(TestKms)));
+            assert!(context.publish_action_credentials(StoredCredentials {
+                access_key: "idp-bulk-root".to_owned(),
+                secret_key: "idp-bulk-root-secret".to_owned(),
+                status: "on".to_owned(),
+                ..Default::default()
+            }));
+            publish_test_app_context(context);
+
+            for (handler, prefix) in [
+                (ListAccessKeysProviderBulk::ldap(), "/rustfs/admin/v3/idp/ldap/list-access-keys-bulk"),
+                (ListAccessKeysProviderBulk::openid(), "/rustfs/admin/v3/idp/openid/list-access-keys-bulk"),
+            ] {
+                let self_ok = handler
+                    .call(
+                        TestRequest::new(Method::GET, format!("{prefix}?users=idp-sa-only").as_str())
+                            .credentials("idp-sa-only", secret, None)
+                            .build(),
+                        Params::new(),
+                    )
+                    .await
+                    .expect("self provider bulk list with ListServiceAccounts should succeed");
+                assert_eq!(self_ok.into_parts().0, StatusCode::OK);
+
+                for suffix in ["?users=other-user", "?all=true"] {
+                    let denied = handler
+                        .call(
+                            TestRequest::new(Method::GET, format!("{prefix}{suffix}").as_str())
+                                .credentials("idp-sa-only", secret, None)
+                                .build(),
+                            Params::new(),
+                        )
+                        .await
+                        .expect_err("cross-user or all=true provider bulk list must require ListUsers");
+                    assert_eq!(denied.code(), &S3ErrorCode::AccessDenied, "{prefix}{suffix}");
+
+                    let allowed = handler
+                        .call(
+                            TestRequest::new(Method::GET, format!("{prefix}{suffix}").as_str())
+                                .credentials("idp-sa-and-users", secret, None)
+                                .build(),
+                            Params::new(),
+                        )
+                        .await
+                        .expect("caller with ListServiceAccounts + ListUsers should succeed");
+                    assert_eq!(allowed.into_parts().0, StatusCode::OK, "{prefix}{suffix}");
+                }
+            }
+
+            if let Some(previous) = previous {
+                publish_test_app_context(previous);
+            }
+        });
     }
 }

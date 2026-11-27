@@ -389,6 +389,21 @@ impl AppContext {
         self.notification_system = notification_system;
         self
     }
+
+    pub(crate) fn with_empty_action_credentials(mut self) -> Self {
+        struct EmptyActionCredentials;
+        impl ActionCredentialInterface for EmptyActionCredentials {
+            fn get(&self) -> Option<rustfs_credentials::Credentials> {
+                None
+            }
+
+            fn publish(&self, _credentials: rustfs_credentials::Credentials) -> bool {
+                false
+            }
+        }
+        self.action_credentials = Arc::new(EmptyActionCredentials);
+        self
+    }
 }
 
 static APP_CONTEXT_SINGLETON: OnceLock<Arc<AppContext>> = OnceLock::new();

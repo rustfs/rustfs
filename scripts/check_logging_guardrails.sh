@@ -87,6 +87,8 @@ checked_files=(
   "crates/scanner/src/scanner.rs"
   "crates/scanner/src/scanner_io.rs"
   "crates/scanner/src/scanner_folder.rs"
+  "crates/scanner/src/scanner_folder/heal_walk.rs"
+  "crates/scanner/src/scanner_folder/queue_walk.rs"
   "crates/concurrency/src/workers.rs"
   "crates/concurrency/src/deadlock.rs"
   "crates/trusted-proxies/src/global.rs"

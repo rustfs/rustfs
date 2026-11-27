@@ -43,7 +43,7 @@ use super::account_audit::{
     AccountAuditContext, AccountAuditFailure, AccountAuditOperation, AccountAuditRecord, MfaMethod, emit as emit_audit,
 };
 use super::owned_admin_json_response;
-use crate::admin::auth::{SelfServiceMutation, validate_admin_request};
+use crate::admin::auth::{AdminRequestOrigin, SelfServiceMutation, action_credentials_from_envelope, validate_admin_request};
 use crate::admin::operation::{AdminRequest, AdminResponse, Operation};
 use crate::admin::router::{AdminOperation, S3Router};
 use crate::admin::runtime_sources::{current_token_signing_key, object_store_from_envelope};
@@ -151,7 +151,7 @@ fn store_from_req(req: &AdminRequest) -> S3Result<Arc<ECStore>> {
 /// Resolve the caller and confirm this credential kind may manage a second
 /// factor for its identity.
 async fn resolve_self_service_caller(req: &AdminRequest) -> S3Result<CallerIdentity> {
-    let caller = CallerIdentity::resolve_envelope(req.envelope()).await?;
+    let caller = CallerIdentity::resolve_envelope_with_context(req.envelope()).await?;
     // The MFA capability, not the password one: a root identity may enroll a
     // second factor even though its secret key is fixed for the life of the
     // process.
@@ -230,7 +230,7 @@ impl Operation for AccountMfaStatusHandler {
         // Reading state is allowed for every credential kind: a service account
         // may need to know whether its parent is protected, even though it may
         // not change that.
-        let caller = CallerIdentity::resolve_envelope(req.envelope()).await?;
+        let caller = CallerIdentity::resolve_envelope_with_context(req.envelope()).await?;
         let store = store_from_req(&req)?;
 
         let status = mfa_service::status(store, &caller.access_key, OffsetDateTime::now_utc())
@@ -500,7 +500,7 @@ pub struct MfaChallengeHandler {}
 #[async_trait::async_trait]
 impl Operation for MfaChallengeHandler {
     async fn call(&self, req: AdminRequest, _params: Params<'_, '_>) -> S3Result<AdminResponse> {
-        let caller = CallerIdentity::resolve_envelope(req.envelope()).await?;
+        let caller = CallerIdentity::resolve_envelope_with_context(req.envelope()).await?;
         let audit = AccountAuditContext::from_envelope(req.envelope());
         let store = store_from_req(&req)?;
         let now = OffsetDateTime::now_utc();
@@ -510,7 +510,7 @@ impl Operation for MfaChallengeHandler {
             .map_err(map_service_error)?;
 
         let response = if required {
-            let Some(signing_key) = current_token_signing_key() else {
+            let Some(signing_key) = action_credentials_from_envelope(req.envelope()).map(|cred| cred.secret_key) else {
                 return Err(s3::error(S3ErrorCode::InternalError, "the session signing key is not initialized"));
             };
             let challenge = mfa_service::issue_challenge(&caller.access_key, now, signing_key.as_bytes());
@@ -566,7 +566,7 @@ pub struct UserMfaStatusHandler {}
 impl Operation for UserMfaStatusHandler {
     async fn call(&self, req: AdminRequest, _params: Params<'_, '_>) -> S3Result<AdminResponse> {
         let target = parse_user_mfa_query(&req)?;
-        let caller = CallerIdentity::resolve_envelope(req.envelope()).await?;
+        let caller = CallerIdentity::resolve_envelope_with_context(req.envelope()).await?;
 
         validate_admin_request(
             req.headers(),
@@ -574,7 +574,7 @@ impl Operation for UserMfaStatusHandler {
             caller.is_owner,
             false,
             vec![Action::AdminAction(AdminAction::GetUserAdminAction)],
-            req.policy_source_addr(),
+            AdminRequestOrigin::with_server_context(req.envelope()),
         )
         .await?;
 
@@ -602,7 +602,7 @@ pub struct UserMfaResetHandler {}
 impl Operation for UserMfaResetHandler {
     async fn call(&self, req: AdminRequest, _params: Params<'_, '_>) -> S3Result<AdminResponse> {
         let target = parse_user_mfa_query(&req)?;
-        let caller = CallerIdentity::resolve_envelope(req.envelope()).await?;
+        let caller = CallerIdentity::resolve_envelope_with_context(req.envelope()).await?;
         let audit = AccountAuditContext::from_envelope(req.envelope());
 
         validate_admin_request(
@@ -611,7 +611,7 @@ impl Operation for UserMfaResetHandler {
             caller.is_owner,
             false,
             vec![Action::AdminAction(AdminAction::EnableUserAdminAction)],
-            req.policy_source_addr(),
+            AdminRequestOrigin::with_server_context(req.envelope()),
         )
         .await
         .inspect_err(|_| {

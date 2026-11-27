@@ -19,13 +19,13 @@
 //! use an empty object; table/view creation checks use their parent namespace resource.
 
 use crate::admin::auth::{
-    AdminResourceScope, authenticate_envelope_credentials, validate_admin_action_with_bucket_object_for_iam,
+    AdminResourceScope, authenticate_envelope_credentials_with_context, validate_admin_action_with_bucket_object_for_iam,
 };
 use crate::admin::operation::{AdminRequest, AdminResponse, Operation};
 use crate::admin::router::{AdminOperation, S3Router};
 use crate::admin::runtime_sources::current_ready_iam_handle;
 use crate::app::RequestEnvelope;
-use crate::auth::get_condition_values;
+use crate::auth::get_condition_values_with_client_info;
 use crate::server::ADMIN_PREFIX;
 use crate::storage::authorization::AuthorizationRequest;
 use crate::storage::authorization::{authorize_request_core, query_list_buckets_permission, s3_action_potential};
@@ -561,7 +561,14 @@ async fn evaluate_check(
                 potential: None,
             });
         };
-        let conditions = get_condition_values(probe.headers(), cred, None, None, envelope.policy_source_addr());
+        let conditions = get_condition_values_with_client_info(
+            probe.headers(),
+            cred,
+            None,
+            None,
+            envelope.policy_source_addr(),
+            envelope.client_info(),
+        );
         let bucket = bucket.unwrap_or_default();
         let object = check.key_id.as_deref().or(object).unwrap_or_default();
         let args = Args {
@@ -584,16 +591,8 @@ async fn evaluate_check(
             let scope = AdminResourceScope::bucket_object(bucket, object);
             (
                 classify(
-                    validate_admin_action_with_bucket_object_for_iam(
-                        iam,
-                        probe.headers(),
-                        cred,
-                        owner,
-                        action,
-                        envelope.policy_source_addr(),
-                        scope,
-                    )
-                    .await,
+                    validate_admin_action_with_bucket_object_for_iam(iam, probe.headers(), cred, owner, action, envelope, scope)
+                        .await,
                 ),
                 None,
             )
@@ -614,7 +613,7 @@ impl Operation for AccountPermissionsHandler {
         let credentials = req
             .credentials()
             .ok_or_else(|| s3_error!(AccessDenied, "authentication required"))?;
-        let (cred, owner) = authenticate_envelope_credentials(credentials).await?;
+        let (cred, owner) = authenticate_envelope_credentials_with_context(credentials, req.envelope()).await?;
         let body = req
             .take_body()
             .store_all_limited(MAX_BODY_SIZE)
