@@ -317,6 +317,16 @@ impl Drop for MultipartCommitStaging {
     }
 }
 
+#[derive(Clone)]
+pub(super) struct UploadLockHandle(Arc<UploadEntry>);
+
+impl UploadLockHandle {
+    #[cfg(test)]
+    pub(super) fn ptr_eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
 impl LocalDisk {
     pub(crate) fn has_clean_active_multipart_source(&self, upload_or_part_path: &str, part_path: bool) -> bool {
         let root = upload_scope_root(upload_or_part_path, part_path);
@@ -379,27 +389,37 @@ impl LocalDisk {
         }))
     }
 
-    pub(super) async fn multipart_source_owner(
+    pub(super) fn lookup_multipart_upload_lock(
         &self,
         volume: &str,
         path: &str,
         part_path: bool,
-        exclusive: bool,
-        owner: Option<Arc<dyn Send + Sync>>,
-    ) -> Result<Option<Arc<dyn Send + Sync>>> {
+    ) -> Result<Option<UploadLockHandle>> {
         reject_noncanonical_scope(&self.root, self.io_root(), volume, path)?;
         if volume != RUSTFS_META_MULTIPART_BUCKET {
-            return Ok(owner);
+            return Ok(None);
         }
         let root = upload_scope_root(path, part_path);
         // Only the internal relative scope is folded: the configured disk root
         // keeps its physical spelling. Case-sensitive filesystems may serialize
         // two case-only upload IDs; insensitive filesystems must share one lock.
         let key = self.root.join(RUSTFS_META_MULTIPART_BUCKET).join(root.to_ascii_lowercase());
-        let entry = UPLOAD_LOCKS.entry(key);
+        Ok(Some(UploadLockHandle(UPLOAD_LOCKS.entry(key))))
+    }
+
+    pub(super) async fn acquire_multipart_source_owner_with_handle(
+        handle: Option<&UploadLockHandle>,
+        exclusive: bool,
+        owner: Option<Arc<dyn Send + Sync>>,
+    ) -> Option<Arc<dyn Send + Sync>> {
+        let Some(handle) = handle else {
+            return owner;
+        };
+        let entry = Arc::clone(&handle.0);
+        // Lock ordering: usage_owner -> UploadEntry.lock -> NamespaceMutationLock.
         // Upload scope precedes the private attempt, object metadata and
         // publication leases. Independent parts retain shared ownership.
-        Ok(Some(if exclusive {
+        Some(if exclusive {
             Arc::new(UploadOwner {
                 _guard: Arc::clone(&entry.lock).write_owned().await,
                 _entry: entry,
@@ -411,7 +431,19 @@ impl LocalDisk {
                 _entry: entry,
                 _owner: owner,
             })
-        }))
+        })
+    }
+
+    pub(super) async fn multipart_source_owner(
+        &self,
+        volume: &str,
+        path: &str,
+        part_path: bool,
+        exclusive: bool,
+        owner: Option<Arc<dyn Send + Sync>>,
+    ) -> Result<Option<Arc<dyn Send + Sync>>> {
+        let handle = self.lookup_multipart_upload_lock(volume, path, part_path)?;
+        Ok(Self::acquire_multipart_source_owner_with_handle(handle.as_ref(), exclusive, owner).await)
     }
 
     pub(super) async fn prepare_multipart_commit_staging(
