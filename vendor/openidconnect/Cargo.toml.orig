@@ -1,0 +1,83 @@
+[package]
+name = "openidconnect"
+version = "4.1.0"
+authors = ["David A. Ramos <ramos@cs.stanford.edu>"]
+description = "OpenID Connect library"
+keywords = ["openid", "oidc", "oauth2", "authentication", "auth"]
+license = "MIT"
+repository = "https://github.com/ramosbugs/openidconnect-rs"
+edition = "2021"
+readme = "README.md"
+rust-version = "1.88"
+
+[package.metadata.docs.rs]
+all-features = true
+
+[badges]
+maintenance = { status = "actively-developed" }
+
+[features]
+accept-rfc3339-timestamps = []
+accept-string-booleans = []
+curl = ["oauth2/curl"]
+default = ["reqwest", "rustls-tls"]
+native-tls = ["oauth2/native-tls"]
+reqwest = ["oauth2/reqwest"]
+reqwest-blocking = ["oauth2/reqwest-blocking"]
+rustls-tls = ["oauth2/rustls-tls"]
+timing-resistant-secret-traits = ["oauth2/timing-resistant-secret-traits"]
+ureq = ["oauth2/ureq"]
+
+[[example]]
+name = "gitlab"
+required-features = ["reqwest-blocking"]
+
+[[example]]
+name = "google"
+required-features = ["reqwest-blocking"]
+
+[[example]]
+name = "okta_device_grant"
+required-features = ["reqwest-blocking"]
+
+[dependencies]
+base64 = "0.22"
+# Disable 'time' dependency since it triggers RUSTSEC-2020-0071 and we don't need it.
+chrono = { version = "0.4", default-features = false, features = [
+    "clock",
+    "std",
+    "wasmbind"
+] }
+thiserror = "1.0"
+http = "1.0"
+itertools = "0.14"
+log = "0.4"
+oauth2 = { version = "5.0.0", default-features = false }
+rand = "0.8.5"
+hmac = "0.12.1"
+rsa = { version = "0.10.0", features = ["pkcs1v15"] }
+sha2 = { version = "0.10.6", features = ["oid"] } # Object ID needed for pkcs1v15 padding
+p256 = "0.14"
+p384 = "0.14"
+dyn-clone = "1.0.10"
+serde = "1.0"
+serde_json = "1.0"
+serde_path_to_error = "0.1"
+serde_plain = "1.0"
+serde_with = "3"
+serde-value = "0.7"
+url = { version = "2.4", features = ["serde"] }
+subtle = "2.4"
+ed25519-dalek = { version = "3", features = ["pem"] }
+
+# For backward compatibility with earlier 4.x releases, enables the `wasm_js` feature on WASM
+# targets.
+getrandom = { version = "0.4", features = ["wasm_js"] }
+
+[dev-dependencies]
+color-backtrace = { version = "0.5" }
+env_logger = "0.9"
+pretty_assertions = "1.0"
+reqwest = { version = "0.12", features = ["blocking", "rustls-tls"], default-features = false }
+retry = "1.0"
+anyhow = "1.0"

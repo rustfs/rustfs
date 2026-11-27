@@ -21,12 +21,6 @@ no-default-features = false
 version = 2
 yanked = "deny"
 ignore = [
-    # `rsa` Marvin timing sidechannel (RUSTSEC-2023-0071, patched in >= 0.10.0).
-    # Direct workspace consumers migrated to `rsa 0.10.0` in PR #9492; only
-    # transitive `rsa 0.9.10` remains via `openidconnect 4.1.0` (`rustfs-iam`).
-    # Machine-enforced expiry and approval metadata live in `.config/advisory-exceptions.toml`.
-    # owner: rustfs-maintainers  review: 2026-07
-    { id = "RUSTSEC-2023-0071", reason = "rsa 0.9.10 Marvin timing sidechannel via openidconnect 4.1.0; tracked in .config/advisory-exceptions.toml" },
     # `chrono` is retained only at compatibility boundaries while the project
     # migrates its internal time model to jiff. The advisory reports no safe
     # upgrade for any chrono release. Tracked in `.config/advisory-exceptions.toml`.
