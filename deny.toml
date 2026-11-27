@@ -8,8 +8,10 @@
 #   - which non-crates.io sources we trust,
 #   - which duplicate crate versions we tolerate vs. flag.
 #
-# When adding an exception, include an `# owner: <github-handle> review: <yyyy-mm>`
+# When adding a non-advisory exception, include an `# owner: <github-handle> review: <yyyy-mm>`
 # comment so future audits know who signed off and when to revisit.
+# Advisory ignores below are machine-enforced against `.config/advisory-exceptions.toml`
+# by `scripts/security/check_advisories.py` (rustfs/backlog#2668); both files must match.
 
 [graph]
 all-features = true
@@ -19,24 +21,23 @@ no-default-features = false
 version = 2
 yanked = "deny"
 ignore = [
-    # `rsa` Marvin timing sidechannel (RUSTSEC-2023-0071). Pulled in via
-    # `openidconnect` (transitive) and historically used directly. No upstream
-    # fix is available yet. Tracked separately for follow-up; remove this
-    # entry once a patched `rsa` lands in the dependency graph and any
-    # in-process RSA decryption oracles are removed.
+    # `rsa` Marvin timing sidechannel (RUSTSEC-2023-0071, patched in >= 0.10.0).
+    # Direct workspace consumers migrated to `rsa 0.10.0` in PR #9492; only
+    # transitive `rsa 0.9.10` remains via `openidconnect 4.1.0` (`rustfs-iam`).
+    # Machine-enforced expiry and approval metadata live in `.config/advisory-exceptions.toml`.
     # owner: rustfs-maintainers  review: 2026-07
-    { id = "RUSTSEC-2023-0071", reason = "rsa Marvin timing sidechannel; no fixed upstream version; tracked separately" },
+    { id = "RUSTSEC-2023-0071", reason = "rsa 0.9.10 Marvin timing sidechannel via openidconnect 4.1.0; tracked in .config/advisory-exceptions.toml" },
     # `chrono` is retained only at compatibility boundaries while the project
     # migrates its internal time model to jiff. The advisory reports no safe
-    # upgrade for any chrono release.
+    # upgrade for any chrono release. Tracked in `.config/advisory-exceptions.toml`.
     # owner: rustfs-maintainers  review: 2026-11
     { id = "RUSTSEC-2026-0543", reason = "chrono is unmaintained; temporary exception during jiff migration" },
     # `chrono-tz` is retained by a narrow compatibility path during the same
-    # migration and has no safe upstream upgrade.
+    # migration and has no safe upstream upgrade. Tracked in `.config/advisory-exceptions.toml`.
     # owner: rustfs-maintainers  review: 2026-11
     { id = "RUSTSEC-2026-0555", reason = "chrono-tz is unmaintained; temporary exception during jiff migration" },
     # humantime wraps chrono and is retained transitively while the chrono
-    # graph is being removed.
+    # graph is being removed. Tracked in `.config/advisory-exceptions.toml`.
     # owner: rustfs-maintainers  review: 2026-11
     { id = "RUSTSEC-2026-0542", reason = "humantime is unmaintained through chrono; temporary exception during jiff migration" },
 ]

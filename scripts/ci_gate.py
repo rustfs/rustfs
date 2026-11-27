@@ -15,7 +15,7 @@ import tomllib
 import unittest
 
 ROOT = Path(__file__).resolve().parent.parent
-ALWAYS_JOBS = ("classify-changes", "typos", "quick-checks")
+ALWAYS_JOBS = ("classify-changes", "typos", "quick-checks", "security-advisories")
 CODE_JOBS = (
     "workspace-clippy", "workspace-lint-and-build", "workspace-tests", "core-contract", "connect-feature-boundaries", "fips-provider",
     "test-and-lint-protocols", "build-rustfs-debug-binary", "uring-integration",
@@ -34,7 +34,7 @@ NIGHTLY_JOBS = ("connect-feature-boundaries", "fips-provider", "uring-integratio
 # against this revision's expected job contract. The workflow refuses a plan
 # that does not carry the current marker and falls back to the full matrix, so
 # a base planner predating the contract cannot authorize a narrower selection.
-PLAN_CONTRACT = "9"
+PLAN_CONTRACT = "10"
 # These jobs still exercise the server and its black-box harness when only E2E
 # Rust sources change. Production code, manifests and shared test configuration
 # always select the full matrix. No production package depends on e2e_test.
@@ -59,6 +59,8 @@ SETUP = "./.github/actions/setup"
 # The condition every cache-warm.yml build carries: Rust-cache does not save over an exact key match.
 HIT_SKIP = "steps.setup.outputs.cache-hit != 'true'"
 LINT_COMMANDS = ("cargo clippy --all-targets -- -D warnings", "python3 scripts/ci_test_artifact.py cargo lint --configuration workspace")
+ADVISORIES_JOB = "security-advisories"
+ADVISORIES_COMMAND = "python3 scripts/security/check_advisories.py"
 OPTIONAL_JOBS = ("e2e-full",)
 NON_VALIDATION_JOBS = {"required-checks", "cancel-closed-pr-runs", "alert-on-failure"}
 
@@ -685,6 +687,22 @@ def check_plan_contract_marker(jobs: dict) -> list[str]:
     return []
 
 
+def check_advisories_lane(jobs: dict) -> list[str]:
+    """Keep security-advisories running the shared fail-closed checker without clock overrides."""
+    errors = []
+    block = jobs.get(ADVISORIES_JOB, {})
+    if block.get("runs-on") != "ubuntu-latest":
+        errors.append(f"{ADVISORIES_JOB} must run on ubuntu-latest")
+    steps = [step for step in block.get("steps", []) if ADVISORIES_COMMAND in step.get("run", "")]
+    if len(steps) != 1 or "if" in steps[0]:
+        errors.append(f"{ADVISORIES_JOB} must unconditionally run {ADVISORIES_COMMAND}")
+    else:
+        body = steps[0].get("run", "")
+        if "|| true" in body or "--now" in body or "--allow-ci-clock-override-for-test" in body:
+            errors.append(f"{ADVISORIES_JOB} must not mask failures or override the CI clock")
+    return errors
+
+
 def check_workflow(root: Path) -> list[str]:
     try:
         document = workflow_document((root / ".github/workflows/ci.yml").read_text())
@@ -720,6 +738,7 @@ def check_workflow(root: Path) -> list[str]:
                               or verifiers[0].get("shell") != "bash" or "if" in verifiers[0]):
         errors.append("required-checks must unconditionally verify actual needs and preserve its exit status")
     errors.extend(check_lint_lane(jobs))
+    errors.extend(check_advisories_lane(jobs))
     errors.extend(check_plan_contract_marker(jobs))
     matrix = jobs.get("test-and-lint-protocols", {}).get("strategy", {}).get("matrix", {})
     features = matrix.get("features", [])
