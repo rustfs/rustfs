@@ -4764,7 +4764,8 @@ impl SetDisks {
             fi.version_id = Some(Uuid::new_v4());
         }
 
-        fi.data_dir = Some(Uuid::new_v4());
+        let data_dir = Uuid::new_v4();
+        fi.data_dir = Some(data_dir);
 
         // Never inherit a frame-layout marker: an incoming one (replication
         // passthrough, data movement) describes some other object identity and
@@ -4791,9 +4792,6 @@ impl SetDisks {
         let mut shuffle_disks = Self::shuffle_disks_owned(disks, &fi.erasure.distribution);
 
         let tmp_dir = Uuid::new_v4().to_string();
-
-        let tmp_data_dir = format!("{}/{}", tmp_dir, fi.data_dir.ok_or(Error::FileCorrupt)?);
-        let tmp_object = format!("{tmp_data_dir}/part.1");
 
         let (operation_cancellation, mut commit_cancellation_handoff_tx, cancellation_wait) =
             if let Some(cancellation) = opts.put_object_cancellation.clone() {
@@ -4855,6 +4853,17 @@ impl SetDisks {
             }
             let write_path = classify_put_write_path(is_inline_buffer, put_object_size, fi.erasure.block_size);
             let direct_inline_commit = matches!(write_path, SmallWritePath::Inline);
+            // Buffered writers keep their shards in memory. Disk writers and
+            // verification share the staged part path and its parent.
+            let part_suffix = "/part.1";
+            let tmp_object = if is_inline_buffer {
+                String::new()
+            } else {
+                let mut uuid_buffer = Uuid::encode_buffer();
+                let data_dir = data_dir.as_hyphenated().encode_lower(&mut uuid_buffer);
+                [tmp_dir.as_str(), "/", data_dir, part_suffix].concat()
+            };
+            let tmp_data_dir = tmp_object.strip_suffix(part_suffix).unwrap_or_default();
             rustfs_io_metrics::record_put_object_path(write_path.metric_label());
             let writer_setup_stage_start = collect_stage_timing.then(Instant::now);
             let (mut writers, errors) = if direct_inline_commit {
@@ -5095,15 +5104,13 @@ impl SetDisks {
             // drop it below reconstructable quorum (backlog#852 / #799 B3).
             // `rename_data` re-checks write quorum over the surviving disks and
             // rolls back if too few remain.
-            let committed_shards = if matches!(write_path, SmallWritePath::Inline) {
-                shuffle_disks.iter().filter(|disk| disk.is_some()).count()
-            } else {
-                drop_failed_writer_disks(&mut shuffle_disks, &writers)
-            };
-            if committed_shards < write_quorum {
-                return Err(Error::other(format!(
-                    "put_object write quorum unavailable after encode: {committed_shards} shard(s) committed, need {write_quorum}"
-                )));
+            if !direct_inline_commit {
+                let committed_shards = drop_failed_writer_disks(&mut shuffle_disks, &writers);
+                if committed_shards < write_quorum {
+                    return Err(Error::other(format!(
+                        "put_object write quorum unavailable after encode: {committed_shards} shard(s) committed, need {write_quorum}"
+                    )));
+                }
             }
 
             let part_integrity = if let Some(integrity) = integrity {
@@ -5111,16 +5118,17 @@ impl SetDisks {
                     integrity.set_inline_metadata(&mut fi)?;
                     integrity.part
                 } else {
-                    integrity
-                        .write(&mut shuffle_disks, bucket, RUSTFS_META_TMP_BUCKET, &tmp_data_dir)
-                        .await?
+                    let part = integrity
+                        .write(&mut shuffle_disks, bucket, RUSTFS_META_TMP_BUCKET, tmp_data_dir)
+                        .await?;
+                    if shuffle_disks.iter().filter(|disk| disk.is_some()).count() < write_quorum {
+                        return Err(Error::ErasureWriteQuorum);
+                    }
+                    part
                 })
             } else {
                 None
             };
-            if shuffle_disks.iter().filter(|disk| disk.is_some()).count() < write_quorum {
-                return Err(Error::ErasureWriteQuorum);
-            }
             if let Some(inline_proof) =
                 rustfs_utils::http::get_consistent_str(&fi.metadata, rustfs_filemeta::shard_integrity::SUFFIX_INLINE_INTEGRITY)
             {
@@ -5222,7 +5230,7 @@ impl SetDisks {
                         WrittenBitrotShards::Inline(&parts_metadatas)
                     } else {
                         WrittenBitrotShards::Staged {
-                            directory: &tmp_data_dir,
+                            directory: tmp_data_dir,
                             layout: &parts_metadatas[response_metadata_slot].erasure,
                             part_size: w_size,
                         }
