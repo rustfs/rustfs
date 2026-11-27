@@ -4353,6 +4353,18 @@ pub(super) struct WriteLayout {
 }
 
 impl WriteLayout {
+    fn with_degraded_put_parity(self, drive_count: usize, offline_drives: usize) -> Result<Self> {
+        let parity_drives = (self.parity_drives + offline_drives).min(drive_count / 2);
+        if parity_drives == self.parity_drives {
+            return Ok(self);
+        }
+
+        let mut layout = Self::from_parity(drive_count, parity_drives)?;
+        // The higher parity improves reads without lowering the PUT commit floor.
+        layout.write_quorum = layout.write_quorum.max(self.write_quorum);
+        Ok(layout)
+    }
+
     fn from_parity(drive_count: usize, parity_drives: usize) -> Result<Self> {
         let max_parity = drive_count / 2;
         if parity_drives > max_parity {

@@ -21,6 +21,7 @@
 
 use crate::core::pools::DecommissionCapacityAdmission;
 use crate::disk::cleanup_runtime::{self, OLD_DATA_CLEANUP_RECEIPT_FILE};
+use crate::disk::health_state::RuntimeDriveHealthState;
 use rustfs_common::mrf_channel::MrfDeleteMarkerPurge;
 use rustfs_filemeta::metadata_keys;
 
@@ -4722,11 +4723,7 @@ impl SetDisks {
             rustfs_utils::http::metadata_compat::remove_str(&mut user_defined, SUFFIX_RESTORE_OPERATION_ID);
             rustfs_utils::http::metadata_compat::remove_str(&mut user_defined, SUFFIX_RESTORE_WORKER_LOCK);
         }
-        let WriteLayout {
-            data_drives,
-            parity_drives,
-            write_quorum,
-        } = resolve_write_layout(
+        let layout = resolve_write_layout(
             &storage_class_config,
             self.pool_index,
             disks.len(),
@@ -4734,14 +4731,32 @@ impl SetDisks {
             user_defined.get(metadata_keys::STORAGE_CLASS).map(String::as_str),
             opts.max_parity,
         )?;
-
-        // if filtered_online < write_quorum {
-        //     warn!(
-        //         "online disk snapshot {} below write quorum {} for {}/{}; returning erasure write quorum error",
-        //         filtered_online, write_quorum, bucket, object
-        //     );
-        //     return Err(to_object_err(Error::ErasureWriteQuorum, vec![bucket, object]));
-        // }
+        // A zero-parity pool's metadata paths always require every slot.
+        let layout = if storage_class_config.degraded_put_parity_enabled()
+            && self.default_parity_count > 0
+            && layout.parity_drives > 0
+            && layout.parity_drives < disks.len() / 2
+            && !is_meta_bucketname(bucket)
+            && !opts.data_movement
+            && !opts.restore_copyback
+            && expected_restore_operation_id.is_none()
+        {
+            let offline_drives = disks
+                .iter()
+                .filter(|slot| {
+                    slot.as_ref()
+                        .is_none_or(|disk| disk.runtime_state() == RuntimeDriveHealthState::Offline)
+                })
+                .count();
+            layout.with_degraded_put_parity(disks.len(), offline_drives)?
+        } else {
+            layout
+        };
+        let WriteLayout {
+            data_drives,
+            parity_drives,
+            write_quorum,
+        } = layout;
 
         let mut fi = FileInfo::new([bucket, object].join("/").as_str(), data_drives, parity_drives);
         if let Some(block_size) = requested_ec_block_size {
@@ -23183,7 +23198,7 @@ mod heterogeneous_pool_put_tests {
         hermetic_set_disks_isolated as hermetic_set_disks,
     };
     use super::*;
-    use crate::config::storageclass::lookup_config_for_pools_without_env;
+    use crate::config::storageclass::{OPTIMIZE_ENV, lookup_config_for_pools, lookup_config_for_pools_without_env};
     use crate::disk::ReadOptions;
     use crate::services::notification_sys::install_remote_version_state_fleet_proof_for_test;
     use rustfs_config::server_config::KVS;
@@ -23232,6 +23247,115 @@ mod heterogeneous_pool_put_tests {
 
     fn large_payload(fill: u8) -> Vec<u8> {
         vec![fill; 1024 * 1024]
+    }
+
+    #[tokio::test]
+    #[serial(storage_class_env)]
+    async fn degraded_put_parity_persists_layout_and_preserves_commit_floor() {
+        let (_temp_dirs, disk_stores, set_disks) = hermetic_set_disks_for_pool_with_default_parity(12, 0, 4).await;
+        let bucket = "degraded-put-layout";
+        make_bucket(&disk_stores, bucket).await;
+        let kvs = KVS::new();
+        let fixed = lookup_config_for_pools_without_env(&kvs, &[12]).expect("default storage class should resolve");
+        let upgraded = temp_env::with_vars(
+            [
+                (OPTIMIZE_ENV, Some("degraded_put_parity")),
+                (crate::config::storageclass::STANDARD_ENV, None),
+                (crate::config::storageclass::RRS_ENV, None),
+                (crate::config::storageclass::INLINE_BLOCK_ENV, None),
+            ],
+            || lookup_config_for_pools(&kvs, &[12]).expect("opt-in storage class should resolve"),
+        );
+        let opts = ObjectOptions {
+            write_completion: WriteCompletion::TailDrained,
+            ..Default::default()
+        };
+        let payload = [large_payload(0x3c), large_payload(0xa7)].concat();
+        let put = |object| {
+            let mut reader = PutObjReader::from_vec(payload.clone());
+            let set = &set_disks;
+            let opts = &opts;
+            async move { set.put_object(bucket, object, &mut reader, opts).await }
+        };
+        let check_layout = |object, data, parity, first_missing| {
+            let disks = &disk_stores;
+            async move {
+                for (index, disk) in disks.iter().enumerate() {
+                    let stored = disk.read_version("", bucket, object, "", &ReadOptions::default()).await;
+                    if index < first_missing {
+                        let fi = stored.expect("participating drive should persist object metadata");
+                        assert_eq!(
+                            (fi.erasure.data_blocks, fi.erasure.parity_blocks),
+                            (data, parity),
+                            "{object}, slot {index}"
+                        );
+                        let data_dir = fi.data_dir.expect("test object should be stored out-of-line");
+                        assert!(data_dir_exists(disk, bucket, object, data_dir).await, "{object}, slot {index}");
+                    } else {
+                        assert!(matches!(stored, Err(DiskError::FileNotFound)), "{object}, slot {index}: {stored:?}");
+                    }
+                }
+            }
+        };
+
+        set_disks.set_test_storage_class_config(upgraded.clone());
+        put("healthy").await.expect("healthy PUT should commit");
+        check_layout("healthy", 8, 4, 12).await;
+
+        let barrier = PutObjectCommitBarrier::install(bucket, "late-failure", PutObjectCommitPause::AfterNamespace);
+        let late_put = put("late-failure");
+        let (_, result) = tokio::join!(
+            async {
+                barrier.wait_until_paused().await;
+                disk_stores[11].force_runtime_state_for_test(RuntimeDriveHealthState::Offline);
+                barrier.release();
+            },
+            late_put,
+        );
+        result.expect("the remaining drives should commit after a late failure");
+        disk_stores[11].force_runtime_state_for_test(RuntimeDriveHealthState::Online);
+        check_layout("late-failure", 8, 4, 11).await;
+
+        set_disks.set_test_storage_class_config(fixed.clone());
+        set_disks.disks.write().await[11] = None;
+        put("fixed").await.expect("fixed-layout PUT should commit with 11 drives");
+        check_layout("fixed", 8, 4, 11).await;
+
+        set_disks.set_test_storage_class_config(upgraded);
+        set_disks.disks.write().await[11] = Some(disk_stores[11].clone());
+        disk_stores[11].force_runtime_state_for_test(RuntimeDriveHealthState::Offline);
+        put("upgraded").await.expect("a known offline handle should raise parity");
+        disk_stores[11].force_runtime_state_for_test(RuntimeDriveHealthState::Online);
+        check_layout("upgraded", 7, 5, 11).await;
+
+        set_disks.disks.write().await[8..].fill(None);
+        put("capped").await.expect("eight commits should satisfy the original quorum");
+        check_layout("capped", 6, 6, 8).await;
+
+        set_disks.disks.write().await[7] = None;
+        put("below-floor")
+            .await
+            .expect_err("seven commits must not satisfy the original eight-drive quorum");
+        check_layout("below-floor", 0, 0, 0).await;
+
+        set_disks.set_test_storage_class_config(fixed);
+        let mut object_reader = set_disks
+            .get_object_reader(bucket, "upgraded", None, HeaderMap::new(), &opts)
+            .await
+            .expect("seven remaining shards should serve the upgraded object after disabling the option");
+        let mut restored = Vec::new();
+        object_reader
+            .stream
+            .read_to_end(&mut restored)
+            .await
+            .expect("upgraded object should stream");
+        assert_eq!(restored, payload);
+        assert!(
+            set_disks
+                .get_object_reader(bucket, "fixed", None, HeaderMap::new(), &opts)
+                .await
+                .is_err()
+        );
     }
 
     #[tokio::test]
