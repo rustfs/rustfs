@@ -184,7 +184,8 @@ jobs:
       needs.select-targets.outputs.has_targets == 'true'
     # Self-hosted runner required: nightly libFuzzer builds exceed hosted disk budget.
     runs-on: sm-standard-4
-    timeout-minutes: 60
+    # A cold build links seven instrumented binaries, about 13 minutes each.
+    timeout-minutes: 120
     env:
       FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
       CARGO_BUILD_TARGET: x86_64-unknown-linux-gnu
@@ -311,7 +312,8 @@ jobs:
       needs.select-targets.outputs.run_mutants == 'true'
     # Self-hosted runner required: builds rustfs + rustfs-notify test targets.
     runs-on: sm-standard-4
-    timeout-minutes: 45
+    # Allow for the baseline and the isolated rebuilds, each with its own compile deadline.
+    timeout-minutes: 150
     env:
       FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
     steps:
