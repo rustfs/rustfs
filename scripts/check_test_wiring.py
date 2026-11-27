@@ -1247,11 +1247,14 @@ def check_scheduled_alerts(root: Path) -> list[str]:
         checkout_ref = SCHEDULED_ALERT_CHECKOUT_OVERRIDES.get(
             relative, "actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0"
         )
+        # A read-only caller can still alert the backlog using the required separate token.
+        reusable = yaml_block(on_block or [], "workflow_call", 2) is not None
+        source_permission = "actions: read" if reusable and "issues: write" not in job else "issues: write"
         required = (
             "always()",
             "github.event_name == 'schedule'",
             "contains(needs.*.result, 'failure')",
-            "issues: write",
+            source_permission,
             f"uses: {checkout_ref}",
             "uses: ./.github/actions/schedule-failure-issue",
             "github-token: ${{ secrets.BACKLOG_ISSUE_TOKEN }}",
@@ -1263,7 +1266,7 @@ def check_scheduled_alerts(root: Path) -> list[str]:
             errors.extend(
                 f"{relative}: {error}"
                 for error in alert_step_errors(
-                    job_lines, None, ("issues: write",),
+                    job_lines, None, (source_permission,),
                     ("github-token: ${{ secrets.BACKLOG_ISSUE_TOKEN }}",), checkout_ref=checkout_ref,
                 )
             )
@@ -6136,6 +6139,16 @@ class SelfTests(unittest.TestCase):
             checker.parent.mkdir()
             checker.write_text("")
             self.assertEqual(check_scheduled_alerts(root), [])
+
+            reusable = root / ".github/workflows/fuzz.yml"
+            original = reusable.read_text()
+            read_only = original.replace("on:\n", "on:\n  workflow_call:\n").replace("issues: write", "actions: read")
+            reusable.write_text(read_only)
+            self.assertEqual(check_scheduled_alerts(root), [])
+            for required in ("actions: read", "github-token: ${{ secrets.BACKLOG_ISSUE_TOKEN }}"):
+                reusable.write_text(read_only.replace(required, "missing"))
+                self.assertEqual(len(check_scheduled_alerts(root)), 1)
+            reusable.write_text(original)
 
             # Reverting a migrated workflow must fail, just as independently
             # upgrading an unmigrated one must fail: no shared two-pin allowlist.

@@ -96,7 +96,7 @@ Each mutation runs baseline green first and requires an explicit JUnit assertion
 
 The GitHub Actions workflow (`.github/workflows/fuzz.yml`) exposes `workflow_call` (invoked by `ci.yml` job `security-input-gate`) alongside `schedule` and `workflow_dispatch`, using a **build/run separation** pattern:
 
-1. **`select-targets`** — computes a trusted selection manifest from changed paths via `scripts/fuzz/select_targets.py` (recording explicit `N/A` for docs-only/unrelated PRs and failing closed to all 7 targets on unknown diffs or merge groups).
+1. **`select-targets`** uses `scripts/fuzz/select_targets.py` to select checks from changed paths. Documentation-only and unrelated PRs record `N/A`. Unknown diffs and merge groups select every target. A PR that changes the selector or target manifest runs the full matrix and rejection checks without executing the changed selector.
 2. **`fuzz-build`** — compiles the selected fuzz targets once under a cache key isolated by toolchain, target, lockfile, and harness digest, then uploads prebuilt binaries.
 3. **`pr-fuzz-smoke`** — matrix job running each selected target in parallel (60s execution budget per target) plus **`rejection-mutants`** verifying the fixed rejection-branch mutations.
 4. **`nightly-fuzz-corpus`** — matrix job running all 7 targets in parallel (300s each) on the daily schedule with failure alerting.

@@ -80,7 +80,8 @@ permissions:
   contents: read
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}
+  # The caller owns cancellation for its run, including main pushes and merge groups.
+  group: fuzz-${{ github.workflow }}-${{ github.event_name }}-${{ inputs.mode && github.run_id || github.ref }}
   cancel-in-progress: ${{ github.event_name != 'schedule' }}
 
 env:
@@ -116,9 +117,9 @@ jobs:
         id: select
         env:
           CALLER_EVENT: ${{ inputs.event_name || github.event_name }}
-          CALLER_MODE: ${{ github.event_name == 'schedule' && 'nightly' || (inputs.mode || (github.event.inputs.profile == 'nightly' && 'nightly' || 'smoke')) }}
-          CALLER_TARGETS: ${{ (github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && (github.event.inputs.profile == 'nightly' || github.event.inputs.profile == 'both'))) && 'all' || (inputs.targets || github.event.inputs.targets || 'auto') }}
-          CALLER_BUDGET: ${{ github.event_name == 'schedule' && '300' || (inputs.max_total_time || '60') }}
+          CALLER_MODE: ${{ inputs.mode || ((github.event_name == 'schedule' || inputs.profile == 'nightly') && 'nightly' || 'smoke') }}
+          CALLER_TARGETS: ${{ (inputs.mode == '' && (github.event_name == 'schedule' || inputs.profile == 'nightly' || inputs.profile == 'both')) && 'all' || inputs.targets || 'auto' }}
+          CALLER_BUDGET: ${{ inputs.max_total_time || (github.event_name == 'schedule' && '300' || '60') }}
           CALLER_BASE_SHA: ${{ inputs.base_sha || '' }}
           CALLER_HEAD_SHA: ${{ inputs.head_sha || github.sha }}
           CALLER_CI_MODE: ${{ inputs.ci_mode || '' }}
@@ -127,7 +128,33 @@ jobs:
             git cat-file -e "${CALLER_BASE_SHA}^{commit}" 2>/dev/null || git fetch --no-tags --depth=1 origin "$CALLER_BASE_SHA" || true
           fi
           mkdir -p artifacts/security-input-gate
-          python3 scripts/fuzz/select_targets.py \
+          # A PR may change the selector itself. In that case derive the full matrix
+          # from the manifest as data, without running the candidate's policy.
+          if [[ "$CALLER_EVENT" == pull_request ]] && ! git diff --quiet "$CALLER_BASE_SHA" HEAD -- scripts/fuzz/select_targets.py fuzz/Cargo.toml; then
+            python3 -I - <<'PY'
+          import hashlib, json, os, re, tomllib
+          from pathlib import Path
+
+          targets = sorted(item["name"] for item in tomllib.loads(Path("fuzz/Cargo.toml").read_text())["bin"])
+          if not targets or len(set(targets)) != len(targets) or not all(re.fullmatch(r"[a-z0-9_]+", name) for name in targets):
+              raise SystemExit("Invalid fuzz target manifest")
+          budget = int(os.environ["CALLER_BUDGET"])
+          mode = os.environ["CALLER_MODE"]
+          if not 1 <= budget <= 3600 or mode not in ("smoke", "nightly"):
+              raise SystemExit("Invalid fuzz execution parameters")
+          selection = dict(schema_version=1, applicable=True, reason="unverified_scope_policy", event_name="pull_request",
+                           mode=mode, max_total_time=budget, targets=targets, run_mutants=True, changed_files_count=None,
+                           base_sha=os.environ["CALLER_BASE_SHA"], head_sha=os.environ["CALLER_HEAD_SHA"])
+          selection["manifest_sha256"] = hashlib.sha256(json.dumps(selection, sort_keys=True).encode()).hexdigest()
+          Path("artifacts/security-input-gate/selection-manifest.json").write_text(json.dumps(selection, indent=2) + "\n")
+          with open(os.environ["GITHUB_OUTPUT"], "a") as output:
+              print("applicable=true", "reason=unverified_scope_policy", f"mode={mode}", f"max_total_time={budget}",
+                    f"targets_json={json.dumps(targets)}", f"targets_csv={','.join(targets)}", "has_targets=true",
+                    "run_mutants=true", sep="\n", file=output)
+          PY
+            exit 0
+          fi
+          python3 -I scripts/fuzz/select_targets.py \
             --event-name "$CALLER_EVENT" \
             --mode "$CALLER_MODE" \
             --max-total-time "$CALLER_BUDGET" \
@@ -221,7 +248,7 @@ jobs:
     if: >
       needs.select-targets.outputs.applicable == 'true' &&
       needs.select-targets.outputs.has_targets == 'true' && (
-        github.event_name == 'workflow_call' ||
+        inputs.mode != '' ||
         (github.event_name == 'workflow_dispatch' &&
           (github.event.inputs.profile == 'smoke' || github.event.inputs.profile == 'both'))
       )
@@ -330,9 +357,9 @@ jobs:
     needs: [select-targets, fuzz-build]
     # Scheduled failures are handled by alert-on-failure below.
     if: >
-      github.event_name == 'schedule' ||
+      inputs.mode == '' && (github.event_name == 'schedule' ||
       (github.event_name == 'workflow_dispatch' &&
-        (github.event.inputs.profile == 'nightly' || github.event.inputs.profile == 'both'))
+        (github.event.inputs.profile == 'nightly' || github.event.inputs.profile == 'both')))
     # Runs prebuilt binary on matching self-hosted runner architecture.
     runs-on: sm-standard-4
     timeout-minutes: 60
@@ -386,7 +413,7 @@ jobs:
   security-input-gate-verdict:
     name: Security Input Gate Verdict
     needs: [select-targets, fuzz-build, pr-fuzz-smoke, rejection-mutants]
-    if: github.repository == 'rustfs/rustfs' && always() && github.event_name == 'workflow_call'
+    if: github.repository == 'rustfs/rustfs' && always() && inputs.mode != ''
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -446,12 +473,12 @@ jobs:
     # `always()` is required: without it this job is skipped when a needed
     # job fails. Alerts only for scheduled (nightly) runs (backlog#1149
     # ci-8); PR and manual dispatch failures are already watched by a human.
-    if: github.repository == 'rustfs/rustfs' && (always() && github.event_name == 'schedule' && (contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled')))
+    if: github.repository == 'rustfs/rustfs' && always() && inputs.mode == '' && github.event_name == 'schedule' && (contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled'))
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
       contents: read
-      issues: write
+      actions: read
     steps:
       - uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7
         with:

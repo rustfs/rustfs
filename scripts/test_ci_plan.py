@@ -8,6 +8,7 @@ from pathlib import Path
 import subprocess
 import sys
 import tempfile
+import tomllib
 import unittest
 from unittest.mock import patch
 
@@ -825,6 +826,65 @@ class GateTests(unittest.TestCase):
             changed = copy.deepcopy(workflow)
             mutate(changed)
             self.assertIn(message, self.check(changed), case)
+
+    def test_pull_request_cannot_use_a_changed_scope_selector_to_skip_checks(self):
+        root = Path(gate.__file__).resolve().parent.parent
+        workflow = gate.workflow_document((root / '.github/workflows/fuzz.yml').read_text())
+        step = next(step for step in workflow['jobs']['select-targets']['steps'] if step.get('id') == 'select')
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Repository(Path(directory))
+            selector = 'scripts/fuzz/select_targets.py'
+            for name in (selector, 'fuzz/Cargo.toml'):
+                repo.write(name, (root / name).read_text())
+            base = repo.commit()
+            repo.write('README.md', 'docs only')
+            benign_head = repo.commit()
+            environment = dict(os.environ, CALLER_EVENT='pull_request', CALLER_MODE='smoke', CALLER_TARGETS='auto',
+                               CALLER_BUDGET='60', CALLER_BASE_SHA=base, CALLER_CI_MODE='full',
+                               GITHUB_OUTPUT=str(repo.root / 'outputs'))
+
+            def select(head):
+                subprocess.run(['bash', '-eo', 'pipefail', '-c', step['run']], cwd=repo.root, capture_output=True,
+                               env=dict(environment, CALLER_HEAD_SHA=head), check=True)
+                return json.loads((repo.root / 'artifacts/security-input-gate/selection-manifest.json').read_text())
+
+            self.assertFalse(select(benign_head)['applicable'])
+            repo.write(selector, 'raise RuntimeError("candidate policy executed")')
+            selection = select(repo.commit())
+            self.assertTrue(selection['applicable'])
+            self.assertTrue(selection['run_mutants'])
+            self.assertEqual(selection['reason'], 'unverified_scope_policy')
+            manifest = tomllib.loads((root / 'fuzz/Cargo.toml').read_text())
+            self.assertEqual(selection['targets'], sorted(item['name'] for item in manifest['bin']))
+
+    def test_security_input_jobs_use_the_callers_event(self):
+        root = Path(gate.__file__).resolve().parent.parent
+        caller = gate.workflow_document((root / '.github/workflows/ci.yml').read_text())
+        workflow = gate.workflow_document((root / '.github/workflows/fuzz.yml').read_text())
+        jobs = workflow['jobs']
+        caller_job = caller['jobs'][gate.SECURITY_INPUT_JOB]
+        self.assertNotEqual(caller['concurrency']['group'], workflow['concurrency']['group'])
+        for scope, access in jobs['alert-on-failure']['permissions'].items():
+            self.assertEqual(access, 'read')
+            self.assertEqual(caller_job['permissions'][scope], access)
+        for event, mode, profile, expected in (
+            ('pull_request', 'smoke', '', (True, False, True)),
+            ('merge_group', 'smoke', '', (True, False, True)),
+            ('push', 'smoke', '', (True, False, True)),
+            ('schedule', 'smoke', '', (True, False, True)),
+            ('workflow_dispatch', 'smoke', '', (True, False, True)),
+            ('schedule', '', '', (False, True, False)),
+            ('workflow_dispatch', '', 'both', (True, True, False)),
+            ('workflow_dispatch', '', 'nightly', (False, True, False)),
+            ('workflow_dispatch', '', 'smoke', (True, False, False)),
+        ):
+            context = {'github.repository': 'rustfs/rustfs', 'github.event_name': event, 'inputs.mode': mode,
+                       'github.event.inputs.profile': profile, 'needs.select-targets.outputs.applicable': 'true',
+                       'needs.select-targets.outputs.has_targets': 'true'}
+            with self.subTest(event=event, mode=mode, profile=profile):
+                actual = tuple(gate.condition(jobs[job]['if'], context)
+                               for job in ('pr-fuzz-smoke', 'nightly-fuzz-corpus', 'security-input-gate-verdict'))
+                self.assertEqual(actual, expected)
 
     def test_semantic_yaml_equivalence_and_wiring_boundaries(self):
         workflow = self.workflow()

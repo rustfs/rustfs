@@ -229,6 +229,9 @@ jobs:
     name: Security Input Gate
     needs: [ classify-changes ]
     if: github.event_name != 'pull_request' || github.event.action != 'closed'
+    permissions:
+      contents: read
+      actions: read
     uses: ./.github/workflows/fuzz.yml
     with:
       mode: smoke

@@ -37,6 +37,7 @@ Consumed by ``.github/workflows/coverage.yml`` and ``make coverage``
 from __future__ import annotations
 
 import argparse
+from itertools import groupby
 import json
 import os
 from pathlib import Path
@@ -87,27 +88,46 @@ def _line_counts(lines: dict[str, int], source: str) -> tuple[int, int]:
 
 
 def _merge_segment_line_counts(entries: list[dict]) -> tuple[int, int] | None:
-    """Merge per-line execution counts from llvm-cov segments when present."""
-    line_hits: dict[int, int] = {}
-    saw_segments = False
+    """Union mapped lines across aliases when the segments agree with LLVM's summaries."""
+    mapped: set[int] = set()
+    covered: set[int] = set()
     for entry in entries:
         segments = entry.get("segments")
-        if not isinstance(segments, list) or not segments:
+        if not isinstance(segments, list) or not segments or any(
+            not isinstance(seg, list) or len(seg) < 6 or type(seg[0]) is not int or seg[0] < 1
+            or type(seg[2]) is not int or seg[2] < 0 for seg in segments
+        ):
             return None
-        saw_segments = True
-        for seg in segments:
-            if not isinstance(seg, list) or len(seg) < 5:
+        expected_covered, expected_count = _line_counts(entry["summary"]["lines"], entry["filename"])
+        file_mapped: set[int] = set()
+        file_covered: set[int] = set()
+        previous_line = 0
+        wrapped = None
+        for line, group in groupby(segments, key=lambda seg: seg[0]):
+            if line <= previous_line:
                 return None
-            line_no, _col, count, has_count, is_region_entry = seg[0], seg[1], seg[2], seg[3], seg[4]
-            if not has_count or not is_region_entry:
-                continue
-            if type(line_no) is not int or type(count) is not int or count < 0:
-                return None
-            line_hits[line_no] = max(line_hits.get(line_no, 0), count)
-    if not saw_segments or not line_hits:
-        return None
-    covered = sum(1 for hits in line_hits.values() if hits > 0)
-    return covered, len(line_hits)
+            if wrapped is not None:
+                if line - previous_line - 1 > expected_count:
+                    return None
+                between = range(previous_line + 1, line)
+                file_mapped.update(between)
+                if wrapped:
+                    file_covered.update(between)
+            on_line = list(group)
+            starts = [seg for seg in on_line if seg[3] and seg[4]]
+            starts_skipped = not on_line[0][3] and on_line[0][4]
+            if starts or (wrapped is not None and not starts_skipped):
+                file_mapped.add(line)
+                if wrapped or any(seg[2] and not seg[5] for seg in starts):
+                    file_covered.add(line)
+            last = on_line[-1]
+            wrapped = last[2] if last[3] else None
+            previous_line = line
+        if (len(file_covered), len(file_mapped)) != (expected_covered, expected_count):
+            return None
+        mapped.update(file_mapped)
+        covered.update(file_covered)
+    return len(covered), len(mapped)
 
 
 def load_file_attribution(path: str, root: str) -> tuple[dict[str, dict], dict[str, int]]:
@@ -224,12 +244,16 @@ class CoveragePerCrateTests(unittest.TestCase):
                             {
                                 "filename": str(target),
                                 "summary": {"lines": {"covered": 1, "count": 3}},
-                                "segments": [[10, 1, 1, True, True, False], [20, 1, 0, True, True, False], [30, 1, 0, True, True, False]],
+                                "segments": [[10, 1, 1, True, True, False], [10, 2, 0, False, False, False],
+                                             [20, 1, 0, True, True, False], [20, 2, 0, False, False, False],
+                                             [30, 1, 0, True, True, False]],
                             },
                             {
                                 "filename": str(root / "rustfs/tests/../src/connect/diagnostics/logs.rs"),
                                 "summary": {"lines": {"covered": 1, "count": 3}},
-                                "segments": [[10, 1, 0, True, True, False], [20, 1, 4, True, True, False], [30, 1, 0, True, True, False]],
+                                "segments": [[10, 1, 0, True, True, False], [10, 2, 0, False, False, False],
+                                             [20, 1, 4, True, True, False], [20, 2, 0, False, False, False],
+                                             [30, 1, 0, True, True, False]],
                             },
                         ],
                         "totals": {"lines": {"covered": 2, "count": 3}},
@@ -242,6 +266,19 @@ class CoveragePerCrateTests(unittest.TestCase):
             rec = attributed["rustfs/src/connect/diagnostics/logs.rs"]
             self.assertEqual(rec["merge_method"], "segments_union")
             self.assertEqual((rec["covered"], rec["count"]), (2, 3))
+
+    def test_wrapped_regions_include_lines_without_segment_entries(self) -> None:
+        entries = []
+        for first, second in ((1, 0), (0, 1)):
+            entries.append({
+                "filename": "src/lib.rs",
+                "summary": {"lines": {"covered": 3, "count": 6}},
+                "segments": [[10, 1, first, True, True, False], [12, 2, 0, False, False, False],
+                             [20, 1, second, True, True, False], [22, 2, 0, False, False, False]],
+            })
+        self.assertEqual(_merge_segment_line_counts(entries), (6, 6))
+        entries[0]["summary"]["lines"]["count"] = 7
+        self.assertIsNone(_merge_segment_line_counts(entries))
 
     def test_single_parent_traversal_entry_marks_has_path_alias(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
