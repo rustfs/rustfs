@@ -235,7 +235,17 @@ impl Operation for AssumeRoleHandle {
         match body.action.as_str() {
             ASSUME_ROLE_ACTION => {
                 let remote_addr = req.policy_source_addr();
-                handle_assume_role(req.credentials(), req.uri(), req.headers(), remote_addr, body, store, &audit).await
+                handle_assume_role(
+                    req.credentials(),
+                    req.uri(),
+                    req.headers(),
+                    remote_addr,
+                    req.client_info(),
+                    body,
+                    store,
+                    &audit,
+                )
+                .await
             }
             ASSUME_ROLE_WITH_WEB_IDENTITY_ACTION => handle_assume_role_with_web_identity(body).await,
             _ => Err(s3_error!(InvalidArgument, "unsupported Action")),
@@ -244,11 +254,13 @@ impl Operation for AssumeRoleHandle {
 }
 
 /// Handle the standard AssumeRole action (requires SigV4 credentials).
+#[allow(clippy::too_many_arguments)]
 async fn handle_assume_role(
     credentials: Option<&RequestCredentials>,
     uri: &http::Uri,
     headers: &http::HeaderMap,
     remote_addr: Option<std::net::SocketAddr>,
+    client_info: Option<&rustfs_trusted_proxies::ClientInfo>,
     body: AssumeRoleRequest,
     store: Option<std::sync::Arc<crate::admin::storage_api::runtime::ECStore>>,
     audit: &AccountAuditContext,
@@ -277,7 +289,7 @@ async fn handle_assume_role(
     let Ok(iam_store) = crate::admin::runtime_sources::current_ready_iam_handle() else {
         return Err(s3_error!(InvalidRequest, "iam not init"));
     };
-    let mut conditions = crate::auth::get_condition_values(headers, &cred, None, None, remote_addr);
+    let mut conditions = crate::auth::get_condition_values_with_client_info(headers, &cred, None, None, remote_addr, client_info);
     let exp = set_assume_role_duration_condition(&mut conditions, body.duration_seconds);
     if !iam_store
         .is_allowed(&Args {

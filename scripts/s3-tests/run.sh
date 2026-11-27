@@ -949,43 +949,47 @@ if ! command -v awscurl >/dev/null 2>&1; then
 fi
 
 # Provision alt user (required by suite)
-log_info "Provisioning alt user (${S3_ALT_ACCESS_KEY})..."
-awscurl \
+log_info "Provisioning alt user..."
+provision_awscurl() {
+    local desc="$1"
+    shift
+    local response
+    local error_element='<([[:alnum:]_.-]+:)?Error([[:space:]/>])'
+    if ! response=$(awscurl --fail-with-body "$@" 2>/dev/null) || [[ "$response" =~ $error_element ]]; then
+        log_error "$desc"
+        return 1
+    fi
+}
+
+alt_user_payload=$(python3 -c 'import json, os; print(json.dumps({"secretKey": os.environ["S3_ALT_SECRET_KEY"], "status": "enabled"}))')
+alt_user_query=$(python3 -c 'import os, urllib.parse; print(urllib.parse.quote(os.environ["S3_ALT_ACCESS_KEY"], safe=""))')
+provision_awscurl "Failed to add alt user" \
     --service s3 \
     --region "${S3_REGION}" \
     --access_key "${S3_ACCESS_KEY}" \
     --secret_key "${S3_SECRET_KEY}" \
     -X PUT \
     -H 'Content-Type: application/json' \
-    -d "{\"secretKey\":\"${S3_ALT_SECRET_KEY}\",\"status\":\"enabled\",\"policy\":\"readwrite\"}" \
-    "http://${S3_HOST}:${S3_PORT}/rustfs/admin/v3/add-user?accessKey=${S3_ALT_ACCESS_KEY}" || {
-    log_error "Failed to add alt user"
-    exit 1
-}
+    -d "$alt_user_payload" \
+    "http://${S3_HOST}:${S3_PORT}/rustfs/admin/v3/add-user?accessKey=${alt_user_query}" || exit 1
 
 # Explicitly attach built-in policy via policy mapping
-awscurl \
+provision_awscurl "Failed to set user policy" \
     --service s3 \
     --region "${S3_REGION}" \
     --access_key "${S3_ACCESS_KEY}" \
     --secret_key "${S3_SECRET_KEY}" \
     -X PUT \
-    "http://${S3_HOST}:${S3_PORT}/rustfs/admin/v3/set-user-or-group-policy?policyName=readwrite&userOrGroup=${S3_ALT_ACCESS_KEY}&isGroup=false" || {
-    log_error "Failed to set user policy"
-    exit 1
-}
+    "http://${S3_HOST}:${S3_PORT}/rustfs/admin/v3/set-user-or-group-policy?policyName=readwrite&userOrGroup=${alt_user_query}&isGroup=false" || exit 1
 
 # Sanity check: alt user can list buckets
-awscurl \
+provision_awscurl "Alt user cannot list buckets" \
     --service s3 \
     --region "${S3_REGION}" \
     --access_key "${S3_ALT_ACCESS_KEY}" \
     --secret_key "${S3_ALT_SECRET_KEY}" \
     -X GET \
-    "http://${S3_HOST}:${S3_PORT}/" >/dev/null || {
-    log_error "Alt user cannot list buckets"
-    exit 1
-}
+    "http://${S3_HOST}:${S3_PORT}/" || exit 1
 
 log_info "Alt user provisioned successfully"
 

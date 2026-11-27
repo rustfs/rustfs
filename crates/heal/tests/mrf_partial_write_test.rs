@@ -366,6 +366,168 @@ async fn unversioned_deleted_partial_write_is_discharged_by_an_absence_proof_inn
     .await;
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn committed_delete_generation_conflict_parks_partial_write_until_recheck() {
+    use rustfs_common::mrf_channel::{MrfScope, persist_partial_write_intent_with_incarnation};
+    use storage_api::integration::{DeleteOptions, DeleteRecoveryAction, DeleteRecoveryState, lookup_config_for_pools};
+
+    let bucket = "partial-delete-conflict";
+    let object = "slice";
+    temp_env::async_with_vars(
+        [
+            ("RUSTFS_STORAGE_CLASS_STANDARD", Some("EC:3")),
+            ("RUSTFS_PUT_RENAME_EARLY_ACK_ENABLE", Some("false")),
+        ],
+        async {
+            let root = tempfile::tempdir().expect("fixture root");
+            let stop = tokio_util::sync::CancellationToken::new();
+            stop.cancel(); // The test owns recovery of the seeded receipts.
+            let env = TestECStoreEnv::builder()
+                .disk_count(9)
+                .base_dir(root.path())
+                .shutdown_token(stop)
+                .build()
+                .await;
+            env.ecstore.set_storage_class(
+                lookup_config_for_pools(&Default::default(), &[9]).expect("EC:3 storage class for the nine-drive set"),
+            );
+            env.make_bucket(bucket, false).await;
+            put(&env, bucket, object, &vec![1; 1024 * 1024], false).await;
+            put(&env, bucket, "other-generation", &vec![2; 1024 * 1024], false).await;
+            let live = env.disk_paths[8].join(bucket).join(object);
+            let matching = root.path().join("saved-source");
+            let foreign = env.disk_paths[8].join(bucket).join("other-generation");
+            std::fs::rename(&live, &matching).expect("save the matching ninth shard");
+            std::fs::rename(&foreign, &live).expect("return a drive with a different generation");
+            let foreign_meta = std::fs::read(live.join("xl.meta")).expect("live foreign metadata");
+            let set = env.ecstore.pools[0].get_disks(0);
+            let disks = set
+                .disks
+                .read()
+                .await
+                .iter()
+                .map(|d| d.clone().expect("online disk"))
+                .collect::<Vec<_>>();
+            let shard = disks[8]
+                .read_version("", bucket, object, "", &ReadOptions::default())
+                .await
+                .expect("live foreign shard");
+            assert_eq!((shard.erasure.data_blocks, shard.erasure.parity_blocks), (6, 3));
+            let foreign_payload = live
+                .join(shard.data_dir.expect("external shard data directory").to_string())
+                .join("part.1");
+            let foreign_bytes = std::fs::read(&foreign_payload).expect("original generation B shard");
+            let incarnation = set.bucket_incarnation_id_from_disk(bucket).await.expect("bucket incarnation");
+            let transaction = uuid::Uuid::new_v4();
+            for disk in &disks[..8] {
+                disk.delete_version_recoverable(
+                    bucket,
+                    object,
+                    rustfs_filemeta::FileInfo {
+                        name: object.to_owned(),
+                        ..Default::default()
+                    },
+                    false,
+                    DeleteOptions {
+                        old_data_dir: Some(transaction),
+                        delete_recovery_bucket_incarnation: Some(incarnation),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect("prepare delete of generation A");
+            }
+            let mut receipts = Vec::new();
+            for disk in &disks[..8] {
+                let prepared = disk
+                    .inspect_delete_transaction(bucket, object, transaction)
+                    .await
+                    .expect("prepared delete");
+                let committed = disk
+                    .settle_delete_transaction(
+                        bucket,
+                        object,
+                        transaction,
+                        prepared.fingerprint,
+                        DeleteRecoveryAction::PublishCommit,
+                    )
+                    .await
+                    .expect("publish committed receipt");
+                assert_eq!(committed.state, DeleteRecoveryState::QuorumCommitted);
+                receipts.push(committed);
+            }
+            let manager = manager(&env);
+            mrf_queue::spawn_mrf_consumer(manager.clone());
+            persist_partial_write_intent_with_incarnation(
+                bucket,
+                object,
+                None,
+                MrfScope {
+                    pool_index: 0,
+                    set_index: 0,
+                },
+                Some(incarnation),
+            )
+            .await
+            .expect("persist the original partial-write responsibility");
+            manager.start().await.expect("start scheduler");
+            assert!(
+                wait_until(|| async {
+                    mrf_queue::list_legacy_responsibilities(None, 16).await.is_ok_and(|page| {
+                        page.responsibilities.iter().any(|row| {
+                            row.bucket == bucket
+                                && row.object == object
+                                && row.status == "blocked_delete_generation_conflict"
+                                && row.delete_transaction_id == Some(transaction)
+                        })
+                    })
+                })
+                .await,
+                "confirmed conflict must park the exact responsibility"
+            );
+            let held = mrf_queue::list_legacy_responsibilities(None, 16)
+                .await
+                .expect("parked responsibilities")
+                .responsibilities
+                .into_iter()
+                .find(|row| row.delete_transaction_id == Some(transaction))
+                .expect("blocked transaction");
+            assert!(snapshot_contains(object).await);
+            assert_eq!(std::fs::read(live.join("xl.meta")).expect("preserved live metadata"), foreign_meta);
+            assert_eq!(std::fs::read(foreign_payload).expect("preserved live shard"), foreign_bytes);
+            for (disk, before) in disks.iter().zip(receipts) {
+                assert_eq!(
+                    disk.inspect_delete_transaction(bucket, object, transaction)
+                        .await
+                        .expect("retained receipt"),
+                    before
+                );
+            }
+            assert_eq!(
+                disks[8]
+                    .inspect_delete_transaction(bucket, object, transaction)
+                    .await
+                    .expect("untouched ninth disk")
+                    .state,
+                DeleteRecoveryState::Absent
+            );
+
+            std::fs::rename(&live, &foreign).expect("retain the conflicting generation separately");
+            std::fs::rename(&matching, &live).expect("restore matching evidence");
+            mrf_queue::recheck_legacy_responsibility(held.responsibility_id, incarnation)
+                .await
+                .expect("operator recheck");
+            assert!(
+                wait_until(|| async { !snapshot_contains(object).await }).await,
+                "matching source must let recovery finish"
+            );
+            assert!(!live.join("xl.meta").exists());
+            manager.stop().await.expect("stop scheduler");
+        },
+    )
+    .await;
+}
+
 #[test]
 fn degraded_deleted_partial_write_is_discharged_by_an_absence_proof() {
     const STACK_SIZE: usize = 8 * 1024 * 1024;

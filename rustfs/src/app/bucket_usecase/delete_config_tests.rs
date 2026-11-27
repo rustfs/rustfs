@@ -142,7 +142,7 @@ async fn check_mutation(config: Config, stale: bool, write: bool) {
             S3Operation::PutBucketPolicy,
             "put bucket policy",
             "policy",
-            200,
+            204,
         ),
         (Config::Tagging, true) => (
             "tagging",

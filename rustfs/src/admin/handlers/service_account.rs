@@ -18,7 +18,7 @@ use crate::admin::handlers::site_replication::{encode_service_account_replicatio
 use crate::admin::operation::{AdminRequest, AdminResponse, Operation};
 use crate::admin::runtime_sources::current_action_credentials;
 use crate::admin::utils::{encode_compatible_admin_payload, has_space_be, is_compat_admin_request, read_compatible_admin_body};
-use crate::auth::{constant_time_eq, get_condition_values, get_session_token};
+use crate::auth::{constant_time_eq, get_condition_values_with_client_info, get_session_token};
 use crate::server::ADMIN_PREFIX;
 use crate::{
     admin::router::{AdminOperation, S3Router},
@@ -514,13 +514,21 @@ impl Operation for AddServiceAccount {
         };
 
         create_req.expiration = bounded_service_account_expiration(&cred, create_req.expiration);
-        let mut conditions = get_condition_values(req.headers(), &cred, None, None, req.policy_source_addr());
+        let mut conditions =
+            get_condition_values_with_client_info(req.headers(), &cred, None, None, req.policy_source_addr(), req.client_info());
         set_service_account_duration_condition(&mut conditions, create_req.expiration, OffsetDateTime::now_utc());
 
         // The policy and the write must see the same resolved parent, including
         // when a derived credential names itself. OPA receives this map too.
         conditions.retain(|key, _| !key.eq_ignore_ascii_case(SVC_TARGET_USER));
         conditions.insert(SVC_TARGET_USER.to_owned(), vec![target_user.to_owned()]);
+        // This family deliberately calls `is_allowed` directly instead of going
+        // through `validate_admin_request`, and must keep doing so
+        // (backlog#1886). The shared helper returns as soon as *any* candidate
+        // action is allowed — an OR. The checks here are an AND: each one must
+        // pass, and later stages additionally need `owner` for the GHSA-5354
+        // parent-scope guard and drive `deny_only` dynamically. Replacing these
+        // with the shared gate would widen authorization.
         if self_scoped {
             if !iam_store
                 .is_allowed(&Args {
@@ -712,7 +720,8 @@ impl Operation for UpdateServiceAccount {
         if update_req.new_expiration.is_some() {
             update_req.new_expiration = bounded_service_account_expiration(&cred, update_req.new_expiration);
         }
-        let mut conditions = get_condition_values(req.headers(), &cred, None, None, req.policy_source_addr());
+        let mut conditions =
+            get_condition_values_with_client_info(req.headers(), &cred, None, None, req.policy_source_addr(), req.client_info());
         set_service_account_duration_condition(
             &mut conditions,
             update_req
@@ -834,7 +843,8 @@ impl Operation for InfoServiceAccount {
         // Keep lookup errors behind authorization so unauthorized callers cannot
         // distinguish missing service accounts from forbidden ones.
         let existing_account = iam_store.get_service_account(&access_key).await;
-        let conditions = get_condition_values(req.headers(), &cred, None, None, req.policy_source_addr());
+        let conditions =
+            get_condition_values_with_client_info(req.headers(), &cred, None, None, req.policy_source_addr(), req.client_info());
         let claims = cred.claims_or_empty();
 
         if !iam_store
@@ -927,7 +937,14 @@ impl Operation for TemporaryAccountInfo {
                 groups: &cred.groups,
                 action: Action::AdminAction(AdminAction::ListTemporaryAccountsAdminAction),
                 bucket: "",
-                conditions: &get_condition_values(req.headers(), &cred, None, None, req.policy_source_addr()),
+                conditions: &get_condition_values_with_client_info(
+                    req.headers(),
+                    &cred,
+                    None,
+                    None,
+                    req.policy_source_addr(),
+                    req.client_info(),
+                ),
                 is_owner: owner,
                 object: "",
                 claims: cred.claims_or_empty(),
@@ -987,7 +1004,8 @@ impl Operation for InfoAccessKey {
 
         let target_cred = iam_store.get_user(&access_key).await.map(|identity| identity.credentials);
 
-        let conditions = get_condition_values(req.headers(), &cred, None, None, req.policy_source_addr());
+        let conditions =
+            get_condition_values_with_client_info(req.headers(), &cred, None, None, req.policy_source_addr(), req.client_info());
         let claims = cred.claims_or_empty();
 
         if !iam_store
@@ -1118,7 +1136,14 @@ impl Operation for ListServiceAccount {
                 groups: &cred.groups,
                 action: Action::AdminAction(AdminAction::ListServiceAccountsAdminAction),
                 bucket: "",
-                conditions: &get_condition_values(req.headers(), &cred, None, None, req.policy_source_addr()),
+                conditions: &get_condition_values_with_client_info(
+                    req.headers(),
+                    &cred,
+                    None,
+                    None,
+                    req.policy_source_addr(),
+                    req.client_info(),
+                ),
                 is_owner: owner,
                 object: "",
                 claims: cred.claims_or_empty(),
@@ -1243,19 +1268,24 @@ impl Operation for ListAccessKeysBulk {
         let mut self_only = !query.all && requested_users.is_empty();
         if !query.all && requested_users.len() == 1 {
             let requested_user = &requested_users[0];
-            if requested_user == &cred.access_key || requested_user == &cred.parent_user {
+            if requested_user == &cred.access_key || (!cred.parent_user.is_empty() && requested_user == &cred.parent_user) {
                 self_only = true;
             }
         }
 
-        if query.all
+        let conditions =
+            get_condition_values_with_client_info(req.headers(), &cred, None, None, req.policy_source_addr(), req.client_info());
+
+        // Listing all users or any other named user requires ListUsers in addition
+        // to ListServiceAccounts, matching `/v3/idp/{ldap,openid}/list-access-keys-bulk`.
+        if (query.all || !self_only)
             && !iam_store
                 .is_allowed(&Args {
                     account: &cred.access_key,
                     groups: &cred.groups,
                     action: Action::AdminAction(AdminAction::ListUsersAdminAction),
                     bucket: "",
-                    conditions: &get_condition_values(req.headers(), &cred, None, None, req.policy_source_addr()),
+                    conditions: &conditions,
                     is_owner: owner,
                     object: "",
                     claims: cred.claims_or_empty(),
@@ -1272,7 +1302,7 @@ impl Operation for ListAccessKeysBulk {
                 groups: &cred.groups,
                 action: Action::AdminAction(AdminAction::ListServiceAccountsAdminAction),
                 bucket: "",
-                conditions: &get_condition_values(req.headers(), &cred, None, None, req.policy_source_addr()),
+                conditions: &conditions,
                 is_owner: owner,
                 object: "",
                 claims: cred.claims_or_empty(),
@@ -1448,7 +1478,8 @@ impl Operation for DeleteServiceAccount {
             return Err(s3_error!(InvalidRequest, "iam not init"));
         };
 
-        let conditions = get_condition_values(req.headers(), &cred, None, None, req.policy_source_addr());
+        let conditions =
+            get_condition_values_with_client_info(req.headers(), &cred, None, None, req.policy_source_addr(), req.client_info());
         let claims = cred.claims_or_empty();
 
         let deleted_at = if iam_store
@@ -3914,6 +3945,142 @@ mod tests {
                     &S3ErrorCode::AccessDenied,
                     "root-derived bounded SA self payload {payload}"
                 );
+            }
+        });
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn list_access_keys_bulk_requires_list_users_for_cross_user_queries() {
+        crate::app::gating_test_env::run_large_stack_test("bulk-access-keys-list-users-parity", || async {
+            use crate::admin::operation::test_support::TestRequest;
+            use crate::admin::runtime_sources::{AppContext, IamInterface, KmsInterface, publish_test_app_context};
+            use rustfs_iam::store::{Store as _, UserType};
+            use rustfs_madmin::{AccountStatus, AddOrUpdateUserReq};
+            use rustfs_policy::policy::Policy;
+            use std::sync::Arc;
+
+            struct ReadyIam(Arc<rustfs_iam::sys::IamSys<rustfs_iam::store::object::ObjectStore>>);
+            impl IamInterface for ReadyIam {
+                fn handle(&self) -> Arc<rustfs_iam::sys::IamSys<rustfs_iam::store::object::ObjectStore>> {
+                    Arc::clone(&self.0)
+                }
+                fn is_ready(&self) -> bool {
+                    true
+                }
+            }
+            struct TestKms;
+            impl KmsInterface for TestKms {
+                fn handle(&self) -> Arc<rustfs_kms::KmsServiceManager> {
+                    Arc::new(rustfs_kms::KmsServiceManager::new())
+                }
+            }
+
+            let previous = crate::runtime_sources::current_app_context();
+            let (_dir, _paths, store) = crate::app::gating_test_env::isolated_multi_pool_ecstore().await;
+            rustfs_iam::store::object::ObjectStore::new(Arc::clone(&store))
+                .save_iam_config(
+                    serde_json::json!({"version": 1}),
+                    format!("{}/format.json", *rustfs_iam::store::object::IAM_CONFIG_PREFIX),
+                )
+                .await
+                .expect("seed IAM format");
+            let iam = rustfs_iam::build_iam_sys(Arc::clone(&store)).await.expect("init IAM");
+            let secret = "bulk-parity-secret-1234";
+            for (user, doc) in [
+                (
+                    "sa-only-user",
+                    Some(r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":["admin:ListServiceAccounts"]}]}"#),
+                ),
+                (
+                    "sa-and-users",
+                    Some(
+                        r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":["admin:ListServiceAccounts","admin:ListUsers"]}]}"#,
+                    ),
+                ),
+                ("bob-target", None),
+            ] {
+                iam.create_user(
+                    user,
+                    &AddOrUpdateUserReq {
+                        secret_key: secret.to_owned(),
+                        policy: None,
+                        status: AccountStatus::Enabled,
+                    },
+                )
+                .await
+                .expect("create user");
+                if let Some(doc) = doc {
+                    iam.set_policy(user, Policy::parse_config(doc.as_bytes()).expect("parse policy"))
+                        .await
+                        .expect("save policy");
+                    iam.policy_db_set(user, UserType::Reg, false, user)
+                        .await
+                        .expect("attach policy");
+                }
+            }
+            let context = Arc::new(AppContext::new(store, Arc::new(ReadyIam(iam)), Arc::new(TestKms)));
+            assert!(context.publish_action_credentials(rustfs_credentials::Credentials {
+                access_key: "bulk-parity-root".to_owned(),
+                secret_key: "bulk-parity-root-secret".to_owned(),
+                status: "on".to_owned(),
+                ..Default::default()
+            }));
+            publish_test_app_context(context);
+
+            // Caller with only ListServiceAccounts may list self, but is denied for other users or all=true.
+            for uri in [
+                "/rustfs/admin/v3/list-access-keys-bulk",
+                "/rustfs/admin/v3/list-access-keys-bulk?users=sa-only-user",
+            ] {
+                let resp = ListAccessKeysBulk {}
+                    .call(
+                        TestRequest::new(http::Method::GET, uri)
+                            .credentials("sa-only-user", secret, None)
+                            .build(),
+                        Params::new(),
+                    )
+                    .await
+                    .unwrap_or_else(|err| panic!("self bulk list `{uri}` must succeed: {err}"));
+                assert_eq!(resp.into_parts().0, StatusCode::OK, "{uri}");
+            }
+
+            for uri in [
+                "/rustfs/admin/v3/list-access-keys-bulk?users=bob-target",
+                "/rustfs/admin/v3/list-access-keys-bulk?users=sa-only-user&users=bob-target",
+                "/rustfs/admin/v3/list-access-keys-bulk?all=true",
+            ] {
+                let err = ListAccessKeysBulk {}
+                    .call(
+                        TestRequest::new(http::Method::GET, uri)
+                            .credentials("sa-only-user", secret, None)
+                            .build(),
+                        Params::new(),
+                    )
+                    .await
+                    .expect_err("cross-user or all=true bulk list must require ListUsersAdminAction");
+                assert_eq!(err.code(), &S3ErrorCode::AccessDenied, "{uri}");
+            }
+
+            // Caller holding both ListServiceAccounts and ListUsers succeeds for cross-user and all=true queries.
+            for uri in [
+                "/rustfs/admin/v3/list-access-keys-bulk?users=bob-target",
+                "/rustfs/admin/v3/list-access-keys-bulk?all=true",
+            ] {
+                let resp = ListAccessKeysBulk {}
+                    .call(
+                        TestRequest::new(http::Method::GET, uri)
+                            .credentials("sa-and-users", secret, None)
+                            .build(),
+                        Params::new(),
+                    )
+                    .await
+                    .unwrap_or_else(|err| panic!("authorized bulk list `{uri}` must succeed: {err}"));
+                assert_eq!(resp.into_parts().0, StatusCode::OK, "{uri}");
+            }
+
+            if let Some(previous) = previous {
+                publish_test_app_context(previous);
             }
         });
     }
