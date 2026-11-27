@@ -49,6 +49,7 @@ pub mod object;
 pub mod quota;
 pub mod router;
 pub mod slo;
+pub mod sse;
 pub mod staticweb;
 mod storage_api;
 pub mod symlink;
@@ -105,7 +106,10 @@ pub(crate) fn validate_metadata(metadata: &std::collections::HashMap<String, Str
 // Note: Container, Object, and SwiftMetadata types used by Swift implementation
 pub use storage_api::public_api::{SwiftGetObjectReader, SwiftObjectInfo, SwiftObjectOptions, SwiftPutObjReader};
 pub(crate) use storage_api::public_api::{
-    get_swift_bucket_metadata, get_swift_bucket_usage, resolve_swift_object_store_handle, update_swift_bucket_tagging,
+    SwiftWriteCommitGuard, SwiftWriteCompletion, SwiftWritePlan, acquire_swift_self_copy_lock, get_swift_bucket_metadata,
+    get_swift_bucket_sse_config, get_swift_bucket_usage, prepare_swift_get_object_reader,
+    record_swift_bucket_object_delete_memory, record_swift_bucket_object_write_memory, resolve_swift_object_store_handle,
+    update_swift_bucket_tagging,
 };
 #[allow(unused_imports)]
 pub use types::{Container, Object, SwiftMetadata};

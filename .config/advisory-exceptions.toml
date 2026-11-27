@@ -14,18 +14,6 @@
 schema_version = 1
 
 [[exceptions]]
-advisory_id = "RUSTSEC-2023-0071"
-crate = "rsa"
-affected_versions = "=0.9.10"
-owner = "rustfs-maintainers"
-tracking_issue = "https://github.com/rustfs/backlog/issues/2668"
-reason = "Transitive rsa 0.9.10 pulled exclusively via openidconnect 4.1.0 <- rustfs-iam; direct workspace rsa consumers already upgraded to patched rsa 0.10.0 in PR #9492. Historical 2026-07 review window has expired and requires maintainer risk-acceptance sign-off or upstream openidconnect upgrade to rsa >=0.10.0 before promotion."
-mitigation = "crates/iam/src/oidc uses openidconnect only for public-key JWS ID-token verification and rejects signed or encrypted UserInfo responses (crates/iam/src/oidc/runtime.rs), exposing no remote RSA private-key decryption oracle on rsa 0.9.10. Track upstream openidconnect migration off rsa 0.9.x."
-approved_at = "2026-05-06T07:47:19Z"
-expires_at = "2026-07-31T23:59:59Z"
-approval_reference = "https://github.com/rustfs/rustfs/pull/2769"
-
-[[exceptions]]
 advisory_id = "RUSTSEC-2026-0543"
 crate = "chrono"
 affected_versions = "=0.4.45"

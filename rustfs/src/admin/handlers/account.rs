@@ -380,7 +380,7 @@ impl Operation for SetUserSecretKeyHandler {
             caller.is_owner,
             false,
             vec![Action::AdminAction(AdminAction::CreateUserAdminAction)],
-            req.policy_source_addr(),
+            req.envelope(),
         )
         .await
         .inspect_err(|_| {

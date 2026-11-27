@@ -434,7 +434,7 @@ async fn delegation_v2_persists_and_vends_with_real_parent_intersection() {
             assert_eq!(headers[http::header::CACHE_CONTROL], "no-store");
             let issued: Value =
                 serde_json::from_slice(&issued_body.store_all_limited(1 << 20).await.expect("issued body")).expect("issued JSON");
-            let (credential, root) = check_key_valid_with_context(
+            let (credential, root) = check_admin_key_valid_with_context(
                 issued["session_token"].as_str().expect("token"),
                 issued["access_key_id"].as_str().expect("access key"),
                 Some(fixture.context.as_ref()),

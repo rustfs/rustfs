@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::admin::auth::{authenticate_envelope_credentials, validate_admin_request};
+use crate::admin::auth::{AdminRequestOrigin, authenticate_envelope_credentials_with_context, validate_admin_request};
 use crate::admin::operation::{AdminRequest, AdminResponse, Operation};
 use crate::admin::router::{AdminOperation, S3Router};
 use crate::admin::runtime_sources::app_context_from_envelope;
@@ -1471,7 +1471,7 @@ async fn authenticate_heal_admin_request(req: &AdminRequest) -> S3Result<String>
         return Err(s3_error!(InvalidRequest, "authentication required"));
     };
 
-    let (cred, owner) = authenticate_envelope_credentials(input_cred).await?;
+    let (cred, owner) = authenticate_envelope_credentials_with_context(input_cred, req.envelope()).await?;
 
     validate_admin_request(
         req.headers(),
@@ -1479,7 +1479,7 @@ async fn authenticate_heal_admin_request(req: &AdminRequest) -> S3Result<String>
         owner,
         false,
         vec![Action::AdminAction(AdminAction::HealAdminAction)],
-        req.policy_source_addr(),
+        AdminRequestOrigin::with_server_context(req.envelope()),
     )
     .await?;
     Ok(cred.access_key)

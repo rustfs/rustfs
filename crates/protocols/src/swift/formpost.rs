@@ -90,7 +90,95 @@ const LOG_COMPONENT_PROTOCOLS: &str = "protocols";
 const LOG_SUBSYSTEM_SWIFT_FORMPOST: &str = "swift_formpost";
 const EVENT_SWIFT_FORMPOST_STATE: &str = "swift_formpost_state";
 
+/// Maximum request body size accepted for a Swift FormPost upload (64 MiB).
+pub const MAX_FORMPOST_BODY_SIZE: usize = 64 * 1024 * 1024;
+/// Maximum number of multipart parts accepted in a FormPost body.
+pub const MAX_FORMPOST_PARTS: usize = 1_000;
+/// Maximum byte length accepted for a single non-file FormPost field value (64 KiB).
+pub const MAX_FORMPOST_FIELD_VALUE_SIZE: usize = 64 * 1024;
+
 type HmacSha1 = Hmac<Sha1>;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum RedirectOrigin {
+    Relative,
+    Absolute { scheme: String, host: String, port: u16 },
+}
+
+/// Validate a FormPost redirect URL and extract its normalized origin.
+///
+/// Only `http://`, `https://`, or safe origin-relative paths (`/path`) are permitted.
+/// Control characters, whitespace, backslashes, userinfo (`@`), protocol-relative
+/// URLs (`//host`), and non-HTTP schemes (`javascript:`, `data:`, etc.) are rejected.
+fn parse_safe_redirect_origin(url: &str) -> Option<RedirectOrigin> {
+    if url.is_empty() || url.bytes().any(|b| b <= 0x20 || b == 0x7f || b == b'\\') {
+        return None;
+    }
+
+    if url.starts_with('/') {
+        if url.starts_with("//") {
+            return None;
+        }
+        return Some(RedirectOrigin::Relative);
+    }
+
+    let (scheme_raw, rest) = url.split_once("://")?;
+    let scheme = scheme_raw.to_ascii_lowercase();
+    let default_port = match scheme.as_str() {
+        "http" => 80u16,
+        "https" => 443u16,
+        _ => return None,
+    };
+
+    let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let authority = &rest[..authority_end];
+    if authority.is_empty() || authority.contains('@') {
+        return None;
+    }
+
+    let (host, port) = if let Some(after_open) = authority.strip_prefix('[') {
+        let close_idx = after_open.find(']')?;
+        let ipv6_host = &after_open[..close_idx];
+        if ipv6_host.is_empty() {
+            return None;
+        }
+        let tail = &after_open[close_idx + 1..];
+        let port = if tail.is_empty() {
+            default_port
+        } else {
+            let port_str = tail.strip_prefix(':')?;
+            let parsed = port_str.parse::<u16>().ok()?;
+            if parsed == 0 {
+                return None;
+            }
+            parsed
+        };
+        (format!("[{}]", ipv6_host.to_ascii_lowercase()), port)
+    } else if let Some((host_raw, port_str)) = authority.rsplit_once(':') {
+        if host_raw.is_empty() || host_raw.contains([':', '[', ']']) {
+            return None;
+        }
+        let parsed = port_str.parse::<u16>().ok()?;
+        if parsed == 0 {
+            return None;
+        }
+        (host_raw.to_ascii_lowercase(), parsed)
+    } else {
+        if authority.contains(['[', ']']) {
+            return None;
+        }
+        (authority.to_ascii_lowercase(), default_port)
+    };
+
+    Some(RedirectOrigin::Absolute { scheme, host, port })
+}
+
+fn is_same_redirect_origin(signed_redirect: &str, candidate: &str) -> bool {
+    matches!(
+        (parse_safe_redirect_origin(signed_redirect), parse_safe_redirect_origin(candidate)),
+        (Some(signed_origin), Some(candidate_origin)) if signed_origin == candidate_origin
+    )
+}
 
 /// FormPost request parameters
 #[derive(Debug, Clone)]
@@ -159,9 +247,19 @@ impl FormPostRequest {
         })
     }
 
-    /// Get redirect URL for errors (falls back to redirect if redirect_error not set)
+    /// Get redirect URL for post-authentication errors.
+    ///
+    /// Because `redirect_error` is not covered by the standard Swift FormPost HMAC,
+    /// it is honored only when it uses a safe HTTP(S) or origin-relative target whose
+    /// normalized origin (scheme, host, port) matches the HMAC-signed `redirect`.
+    /// Otherwise it falls back to `redirect`.
     pub fn error_redirect_url(&self) -> &str {
-        self.redirect_error.as_deref().unwrap_or(&self.redirect)
+        if let Some(candidate) = self.redirect_error.as_deref()
+            && is_same_redirect_origin(&self.redirect, candidate)
+        {
+            return candidate;
+        }
+        &self.redirect
     }
 }
 
@@ -255,7 +353,8 @@ pub struct UploadedFile {
 /// Build redirect URL with status and message
 pub fn build_redirect_url(base_url: &str, status: u16, message: &str) -> String {
     let encoded_message = urlencoding::encode(message);
-    format!("{}?status={}&message={}", base_url, status, encoded_message)
+    let sep = if base_url.contains('?') { '&' } else { '?' };
+    format!("{}{}status={}&message={}", base_url, sep, status, encoded_message)
 }
 
 /// Parse multipart/form-data boundary from Content-Type header
@@ -268,81 +367,148 @@ pub fn parse_boundary(content_type: &str) -> Option<String> {
     for part in content_type.split(';') {
         let part = part.trim();
         if let Some(boundary) = part.strip_prefix("boundary=") {
-            return Some(boundary.to_string());
+            let trimmed = boundary.trim().trim_matches('"');
+            if !trimmed.is_empty() && trimmed.len() <= 200 {
+                return Some(trimmed.to_string());
+            }
         }
     }
 
     None
 }
 
-/// Simple multipart form data parser
+fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    if needle.is_empty() || needle.len() > haystack.len() {
+        return None;
+    }
+    haystack.windows(needle.len()).position(|window| window == needle)
+}
+
+fn split_headers_and_body(part: &[u8]) -> Option<(&[u8], &[u8])> {
+    let crlf_pos = find_subslice(part, b"\r\n\r\n").map(|pos| (pos, 4usize));
+    let lf_pos = find_subslice(part, b"\n\n").map(|pos| (pos, 2usize));
+    let (pos, sep_len) = match (crlf_pos, lf_pos) {
+        (Some(a), Some(b)) => {
+            if a.0 <= b.0 {
+                a
+            } else {
+                b
+            }
+        }
+        (Some(a), None) => a,
+        (None, Some(b)) => b,
+        (None, None) => return None,
+    };
+    Some((&part[..pos], &part[pos + sep_len..]))
+}
+
+/// Binary-safe, bounded multipart/form-data parser.
 ///
-/// This is a basic implementation that extracts form fields and file uploads.
-/// For production use, consider using a dedicated multipart library.
+/// Parses parts directly from byte slices without lossy UTF-8 re-encoding or
+/// line-splitting amplification, enforcing part-count and form-field size bounds.
 pub fn parse_multipart_form(
     body: &[u8],
     boundary: &str,
 ) -> SwiftResult<(std::collections::HashMap<String, String>, Vec<UploadedFile>)> {
+    if boundary.is_empty() || boundary.len() > 200 {
+        return Err(SwiftError::BadRequest("Invalid multipart boundary".to_string()));
+    }
+
     let mut fields = std::collections::HashMap::new();
     let mut files = Vec::new();
 
-    let boundary_marker = format!("--{}", boundary);
-    let body_str = String::from_utf8_lossy(body);
+    let marker = format!("--{}", boundary);
+    let marker_bytes = marker.as_bytes();
 
-    // Split by boundary
-    let parts: Vec<&str> = body_str.split(&boundary_marker).collect();
+    let Some(first_marker) = find_subslice(body, marker_bytes) else {
+        return Ok((fields, files));
+    };
 
-    for part in parts.iter().skip(1) {
-        // Skip empty parts and final boundary
-        if part.trim().is_empty() || part.starts_with("--") {
+    let mut cursor = first_marker + marker_bytes.len();
+    let mut part_count = 0usize;
+
+    while cursor < body.len() {
+        let rest = &body[cursor..];
+        if rest.starts_with(b"--") {
+            break;
+        }
+
+        // Skip leading CRLF or LF immediately following the boundary marker.
+        let part_start = if rest.starts_with(b"\r\n") {
+            cursor + 2
+        } else if rest.starts_with(b"\n") {
+            cursor + 1
+        } else {
+            cursor
+        };
+
+        let next_rel = find_subslice(&body[part_start..], marker_bytes);
+        let (raw_part, next_cursor) = match next_rel {
+            Some(rel) => (&body[part_start..part_start + rel], part_start + rel + marker_bytes.len()),
+            None => (&body[part_start..], body.len()),
+        };
+
+        cursor = next_cursor;
+
+        if raw_part.is_empty() {
             continue;
         }
 
-        // Split headers from content
-        let lines = part.lines();
-        let mut headers = Vec::new();
-        let mut content_start = 0;
-
-        for (i, line) in lines.clone().enumerate() {
-            if line.trim().is_empty() {
-                content_start = i + 1;
-                break;
-            }
-            headers.push(line);
+        part_count += 1;
+        if part_count > MAX_FORMPOST_PARTS {
+            return Err(SwiftError::RequestEntityTooLarge(format!(
+                "FormPost exceeds maximum of {} multipart parts",
+                MAX_FORMPOST_PARTS
+            )));
         }
 
-        // Parse Content-Disposition header
-        let content_disposition = headers
-            .iter()
-            .find(|h| h.to_lowercase().starts_with("content-disposition:"))
-            .map(|h| h.to_string());
+        let Some((header_bytes, raw_content)) = split_headers_and_body(raw_part) else {
+            continue;
+        };
 
-        if let Some(disposition) = content_disposition {
-            let field_name = extract_field_name(&disposition);
-            let filename = extract_filename(&disposition);
+        // Strip only the single CRLF/LF delimiter that precedes the next boundary.
+        let content_bytes = raw_content
+            .strip_suffix(b"\r\n")
+            .or_else(|| raw_content.strip_suffix(b"\n"))
+            .unwrap_or(raw_content);
 
-            // Get content (everything after headers)
-            let content: Vec<&str> = part.lines().skip(content_start).collect();
-            let content_str = content.join("\n");
-            let content_bytes = content_str.trim_end().as_bytes().to_vec();
+        let header_str = std::str::from_utf8(header_bytes)
+            .map_err(|_| SwiftError::BadRequest("Invalid UTF-8 in FormPost part headers".to_string()))?;
+
+        let mut disposition = None;
+        let mut content_type = None;
+        for line in header_str.lines() {
+            let line = line.trim_end_matches('\r');
+            if let Some((name, value)) = line.split_once(':') {
+                if name.eq_ignore_ascii_case("content-disposition") {
+                    disposition = Some(line);
+                } else if name.eq_ignore_ascii_case("content-type") {
+                    content_type = Some(value.trim().to_string());
+                }
+            }
+        }
+
+        if let Some(disposition) = disposition {
+            let field_name = extract_field_name(disposition);
+            let filename = extract_filename(disposition);
 
             if let Some(fname) = filename {
-                // This is a file upload
-                let content_type = headers
-                    .iter()
-                    .find(|h| h.to_lowercase().starts_with("content-type:"))
-                    .and_then(|h| h.split(':').nth(1))
-                    .map(|s| s.trim().to_string());
-
                 files.push(UploadedFile {
                     field_name,
                     filename: fname,
-                    contents: content_bytes,
+                    contents: content_bytes.to_vec(),
                     content_type,
                 });
             } else {
-                // This is a regular form field
-                fields.insert(field_name, String::from_utf8_lossy(&content_bytes).to_string());
+                if content_bytes.len() > MAX_FORMPOST_FIELD_VALUE_SIZE {
+                    return Err(SwiftError::RequestEntityTooLarge(format!(
+                        "FormPost field '{}' exceeds maximum size of {} bytes",
+                        field_name, MAX_FORMPOST_FIELD_VALUE_SIZE
+                    )));
+                }
+                let value = String::from_utf8(content_bytes.to_vec())
+                    .map_err(|_| SwiftError::BadRequest(format!("Invalid UTF-8 in FormPost field '{}'", field_name)))?;
+                fields.insert(field_name, value);
             }
         }
     }
@@ -378,6 +544,26 @@ fn extract_filename(disposition: &str) -> Option<String> {
     None
 }
 
+fn build_formpost_response(redirect_target: &str, status: u16, message: &str) -> SwiftResult<http::Response<Body>> {
+    use axum::http::{Response, StatusCode};
+
+    if redirect_target.is_empty() {
+        let http_status = StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_REQUEST);
+        return Response::builder()
+            .status(http_status)
+            .header("content-type", "text/plain; charset=utf-8")
+            .body(Body::from(message.to_string()))
+            .map_err(|e| SwiftError::InternalServerError(format!("Failed to build response: {}", e)));
+    }
+
+    let redirect_url = build_redirect_url(redirect_target, status, message);
+    Response::builder()
+        .status(StatusCode::SEE_OTHER)
+        .header("location", redirect_url)
+        .body(Body::empty())
+        .map_err(|e| SwiftError::InternalServerError(format!("Failed to build response: {}", e)))
+}
+
 /// Handle FormPost upload request
 pub async fn handle_formpost(
     account: &str,
@@ -388,7 +574,12 @@ pub async fn handle_formpost(
     tempurl_key: &str,
     credentials: &rustfs_credentials::Credentials,
 ) -> SwiftResult<http::Response<Body>> {
-    use axum::http::{Response, StatusCode};
+    if body.len() > MAX_FORMPOST_BODY_SIZE {
+        return Err(SwiftError::RequestEntityTooLarge(format!(
+            "FormPost request body exceeds maximum size of {} bytes",
+            MAX_FORMPOST_BODY_SIZE
+        )));
+    }
 
     // Parse multipart boundary
     let boundary =
@@ -400,61 +591,51 @@ pub async fn handle_formpost(
     // Parse FormPost request parameters
     let request = FormPostRequest::from_form_fields(&fields)?;
 
-    // Validate signature and expiration
-    if let Err(e) = validate_formpost(path, &request, tempurl_key) {
-        // Redirect to error URL
-        let redirect_url = build_redirect_url(request.error_redirect_url(), 401, &format!("Unauthorized: {}", e));
+    // Validate HMAC signature and expiration BEFORE trusting any redirect target.
+    // Never issue a 303 redirect on signature failure: neither `redirect` nor
+    // `redirect_error` is authenticated when validation fails.
+    validate_formpost(path, &request, tempurl_key)?;
 
-        return Response::builder()
-            .status(StatusCode::SEE_OTHER)
-            .header("location", redirect_url)
-            .body(Body::empty())
-            .map_err(|e| SwiftError::InternalServerError(format!("Failed to build response: {}", e)));
+    // Ensure the signed redirect URL (if non-empty) uses a safe redirect scheme/origin.
+    if !request.redirect.is_empty() && parse_safe_redirect_origin(&request.redirect).is_none() {
+        return Err(SwiftError::BadRequest("Invalid FormPost 'redirect' URL".to_string()));
     }
 
     // Check file count
     if files.len() as u64 > request.max_file_count {
-        let redirect_url = build_redirect_url(
+        return build_formpost_response(
             request.error_redirect_url(),
             400,
             &format!("Too many files: {} > {}", files.len(), request.max_file_count),
         );
-
-        return Response::builder()
-            .status(StatusCode::SEE_OTHER)
-            .header("location", redirect_url)
-            .body(Body::empty())
-            .map_err(|e| SwiftError::InternalServerError(format!("Failed to build response: {}", e)));
     }
 
-    // Upload files
+    // Upload files, taking ownership of each file's bytes to avoid extra copies.
     let mut upload_errors = Vec::new();
 
-    for file in &files {
+    for file in files {
+        let file_len = file.contents.len() as u64;
         // Check file size
-        if file.contents.len() as u64 > request.max_file_size {
-            upload_errors.push(format!(
-                "{}: File too large ({} > {})",
-                file.filename,
-                file.contents.len(),
-                request.max_file_size
-            ));
+        if file_len > request.max_file_size {
+            upload_errors.push(format!("{}: File too large ({} > {})", file.filename, file_len, request.max_file_size));
             continue;
         }
 
-        // Upload file to container
-        let object_name = &file.filename;
-        let reader = std::io::Cursor::new(file.contents.clone());
-
-        // Create headers for upload
+        // Create headers for upload, including exact Content-Length for quota & SSE checks
         let mut upload_headers = http::HeaderMap::new();
+        if let Ok(len_header) = http::HeaderValue::from_str(&file_len.to_string()) {
+            upload_headers.insert("content-length", len_header);
+        }
         if let Some(ct) = &file.content_type
             && let Ok(header_value) = http::HeaderValue::from_str(ct)
         {
             upload_headers.insert("content-type", header_value);
         }
 
-        match super::object::put_object(account, container, object_name, credentials, reader, &upload_headers).await {
+        let filename = file.filename;
+        let reader = std::io::Cursor::new(file.contents);
+
+        match super::object::put_object(account, container, &filename, credentials, reader, &upload_headers).await {
             Ok(_) => {
                 debug!(
                     event = EVENT_SWIFT_FORMPOST_STATE,
@@ -463,34 +644,24 @@ pub async fn handle_formpost(
                     state = "uploaded",
                     account = %account,
                     container = %container,
-                    object = %object_name,
+                    object = %filename,
                     "swift formpost state changed"
                 );
             }
             Err(e) => {
-                upload_errors.push(format!("{}: {}", file.filename, e));
+                upload_errors.push(format!("{}: {}", filename, e));
             }
         }
     }
 
-    // Build redirect response
-    let (status, message, redirect_url_str) = if upload_errors.is_empty() {
-        (201, "Created".to_string(), request.redirect.clone())
+    // Build redirect (or direct status) response
+    let (status, message, redirect_target) = if upload_errors.is_empty() {
+        (201, "Created".to_string(), request.redirect.as_str())
     } else {
-        (
-            400,
-            format!("Upload errors: {}", upload_errors.join(", ")),
-            request.error_redirect_url().to_string(),
-        )
+        (400, format!("Upload errors: {}", upload_errors.join(", ")), request.error_redirect_url())
     };
 
-    let redirect_url = build_redirect_url(&redirect_url_str, status, &message);
-
-    Response::builder()
-        .status(StatusCode::SEE_OTHER)
-        .header("location", redirect_url)
-        .body(Body::empty())
-        .map_err(|e| SwiftError::InternalServerError(format!("Failed to build response: {}", e)))
+    build_formpost_response(redirect_target, status, &message)
 }
 
 #[cfg(test)]
@@ -801,5 +972,246 @@ mod tests {
 
         let result = FormPostRequest::from_form_fields(&fields);
         assert!(result.is_err());
+    }
+
+    fn build_multipart_body(boundary: &str, fields: &[(&str, &str)], files: &[(&str, &str, &[u8])]) -> Vec<u8> {
+        let mut out = Vec::new();
+        for (name, value) in fields {
+            out.extend_from_slice(format!("--{boundary}\r\n").as_bytes());
+            out.extend_from_slice(format!("Content-Disposition: form-data; name=\"{name}\"\r\n\r\n").as_bytes());
+            out.extend_from_slice(value.as_bytes());
+            out.extend_from_slice(b"\r\n");
+        }
+        for (name, filename, data) in files {
+            out.extend_from_slice(format!("--{boundary}\r\n").as_bytes());
+            out.extend_from_slice(
+                format!(
+                    "Content-Disposition: form-data; name=\"{name}\"; filename=\"{filename}\"\r\n\
+                     Content-Type: application/octet-stream\r\n\r\n"
+                )
+                .as_bytes(),
+            );
+            out.extend_from_slice(data);
+            out.extend_from_slice(b"\r\n");
+        }
+        out.extend_from_slice(format!("--{boundary}--\r\n").as_bytes());
+        out
+    }
+
+    #[test]
+    fn test_error_redirect_url_blocks_open_redirect_vectors() {
+        let signed = "https://app.example.com/ok";
+        let make_req = |redirect: &str, redirect_error: Option<&str>| FormPostRequest {
+            redirect: redirect.to_string(),
+            redirect_error: redirect_error.map(ToString::to_string),
+            max_file_size: 1024,
+            max_file_count: 1,
+            expires: 1700000000,
+            signature: "sig".to_string(),
+        };
+
+        // Same-origin absolute redirect_error targets are honored.
+        assert_eq!(
+            make_req(signed, Some("https://app.example.com/err")).error_redirect_url(),
+            "https://app.example.com/err"
+        );
+        assert_eq!(
+            make_req(signed, Some("https://APP.EXAMPLE.COM:443/err?code=1")).error_redirect_url(),
+            "https://APP.EXAMPLE.COM:443/err?code=1"
+        );
+        // Relative signed redirect allows relative redirect_error on the same host.
+        assert_eq!(make_req("/ok", Some("/err/page")).error_redirect_url(), "/err/page");
+
+        // All cross-origin, scheme-downgrade, port-mismatch, userinfo, protocol-relative,
+        // backslash, non-HTTP scheme, and CRLF vectors must fall back to the signed `redirect`.
+        for evil in [
+            "https://evil.example.net/phish",
+            "https://app.example.com.evil.net/phish",
+            "http://app.example.com/err",
+            "https://app.example.com:8443/err",
+            "https://app.example.com@evil.example.net/err",
+            "//evil.example.net/err",
+            "https://evil.example.net\\@app.example.com/err",
+            "javascript:alert(1)",
+            "data:text/html,<script>alert(1)</script>",
+            "https://app.example.com/err\r\nSet-Cookie: a=1",
+            "/err-against-absolute-signed-redirect",
+        ] {
+            assert_eq!(
+                make_req(signed, Some(evil)).error_redirect_url(),
+                signed,
+                "redirect_error {evil:?} must fall back to signed redirect"
+            );
+        }
+
+        // Empty signed redirect never redirects via unsigned redirect_error.
+        assert_eq!(make_req("", Some("https://evil.example.net/phish")).error_redirect_url(), "");
+    }
+
+    #[tokio::test]
+    async fn test_handle_formpost_invalid_and_expired_signature_never_redirect() {
+        let mut claims = std::collections::HashMap::new();
+        claims.insert("keystone_project_id".to_string(), serde_json::json!("proj1"));
+        let creds = rustfs_credentials::Credentials {
+            access_key: "keystone:test".to_string(),
+            claims: Some(claims),
+            ..Default::default()
+        };
+        let boundary = "----FormPostTestBoundary";
+        let ct = format!("multipart/form-data; boundary={boundary}");
+        let future = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs() + 3600;
+
+        // Invalid signature with attacker-controlled redirect_error must return 401 Unauthorized,
+        // NEVER a 303 See Other redirect.
+        let bad_sig_body = build_multipart_body(
+            boundary,
+            &[
+                ("redirect", "https://app.example.com/ok"),
+                ("redirect_error", "https://evil.example.net/phish"),
+                ("max_file_size", "1024"),
+                ("max_file_count", "1"),
+                ("expires", &future.to_string()),
+                ("signature", "0000000000000000000000000000000000000000"),
+            ],
+            &[("file", "a.txt", b"hello")],
+        );
+        let err = handle_formpost("AUTH_proj1", "c", "/v1/AUTH_proj1/c", &ct, bad_sig_body, "secret-key", &creds)
+            .await
+            .expect_err("invalid signature must return error, not 303 redirect");
+        assert!(matches!(err, SwiftError::Unauthorized(_)));
+
+        // Expired signature must also return 401 Unauthorized, never redirect.
+        let expired = 1_000_000_000u64;
+        let expired_sig =
+            generate_signature("/v1/AUTH_proj1/c", "https://app.example.com/ok", 1024, 1, expired, "secret-key").unwrap();
+        let expired_body = build_multipart_body(
+            boundary,
+            &[
+                ("redirect", "https://app.example.com/ok"),
+                ("redirect_error", "https://evil.example.net/phish"),
+                ("max_file_size", "1024"),
+                ("max_file_count", "1"),
+                ("expires", &expired.to_string()),
+                ("signature", &expired_sig),
+            ],
+            &[("file", "a.txt", b"hello")],
+        );
+        let err = handle_formpost("AUTH_proj1", "c", "/v1/AUTH_proj1/c", &ct, expired_body, "secret-key", &creds)
+            .await
+            .expect_err("expired signature must return error, not 303 redirect");
+        assert!(matches!(err, SwiftError::Unauthorized(_)));
+    }
+
+    #[tokio::test]
+    async fn test_handle_formpost_post_auth_error_blocks_cross_origin_redirect_and_unsafe_signed_scheme() {
+        let mut claims = std::collections::HashMap::new();
+        claims.insert("keystone_project_id".to_string(), serde_json::json!("proj1"));
+        let creds = rustfs_credentials::Credentials {
+            access_key: "keystone:test".to_string(),
+            claims: Some(claims),
+            ..Default::default()
+        };
+        let boundary = "----FormPostTestBoundary2";
+        let ct = format!("multipart/form-data; boundary={boundary}");
+        let future = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs() + 3600;
+        let path = "/v1/AUTH_proj1/c";
+
+        // Post-auth error (too many files) with attacker-supplied cross-origin redirect_error
+        // must redirect to the signed `redirect` URL instead of `redirect_error`.
+        let signed_redirect = "https://app.example.com/done";
+        let sig = generate_signature(path, signed_redirect, 1024, 1, future, "secret-key").unwrap();
+        let body = build_multipart_body(
+            boundary,
+            &[
+                ("redirect", signed_redirect),
+                ("redirect_error", "https://evil.example.net/phish"),
+                ("max_file_size", "1024"),
+                ("max_file_count", "1"),
+                ("expires", &future.to_string()),
+                ("signature", &sig),
+            ],
+            &[("file1", "a.txt", b"1"), ("file2", "b.txt", b"2")],
+        );
+        let resp = handle_formpost("AUTH_proj1", "c", path, &ct, body, "secret-key", &creds)
+            .await
+            .expect("authenticated post-auth error returns 303 to signed origin");
+        assert_eq!(resp.status(), axum::http::StatusCode::SEE_OTHER);
+        let location = resp.headers().get("location").and_then(|v| v.to_str().ok()).unwrap();
+        assert!(
+            location.starts_with("https://app.example.com/done?status=400&"),
+            "Location must target signed redirect origin, got {location}"
+        );
+
+        // Signed redirect with unsafe scheme (javascript:) is rejected with 400 BadRequest.
+        let unsafe_redirect = "javascript:alert(1)";
+        let unsafe_sig = generate_signature(path, unsafe_redirect, 1024, 1, future, "secret-key").unwrap();
+        let unsafe_body = build_multipart_body(
+            boundary,
+            &[
+                ("redirect", unsafe_redirect),
+                ("max_file_size", "1024"),
+                ("max_file_count", "1"),
+                ("expires", &future.to_string()),
+                ("signature", &unsafe_sig),
+            ],
+            &[("file1", "a.txt", b"1")],
+        );
+        let err = handle_formpost("AUTH_proj1", "c", path, &ct, unsafe_body, "secret-key", &creds)
+            .await
+            .expect_err("unsafe redirect scheme must be rejected");
+        assert!(matches!(err, SwiftError::BadRequest(_)));
+
+        // Empty signed redirect returns a direct status response with no Location header.
+        let empty_sig = generate_signature(path, "", 1024, 0, future, "secret-key").unwrap();
+        let empty_body = build_multipart_body(
+            boundary,
+            &[
+                ("redirect", ""),
+                ("redirect_error", "https://evil.example.net/phish"),
+                ("max_file_size", "1024"),
+                ("max_file_count", "0"),
+                ("expires", &future.to_string()),
+                ("signature", &empty_sig),
+            ],
+            &[("file1", "a.txt", b"1")],
+        );
+        let direct_resp = handle_formpost("AUTH_proj1", "c", path, &ct, empty_body, "secret-key", &creds)
+            .await
+            .expect("empty redirect should return direct status");
+        assert_eq!(direct_resp.status(), axum::http::StatusCode::BAD_REQUEST);
+        assert!(direct_resp.headers().get("location").is_none());
+    }
+
+    #[test]
+    fn test_parse_multipart_preserves_binary_bytes_and_enforces_limits() {
+        let boundary = "----BinBoundary";
+        let raw_binary: &[u8] = &[0xFF, 0xFE, 0x00, 0x80, b'\r', b'\n', 0xAB, 0xCD, b'\n', 0x01];
+        let body = build_multipart_body(
+            boundary,
+            &[("redirect", "https://example.com/ok")],
+            &[("file", "payload.bin", raw_binary)],
+        );
+        let (fields, files) = parse_multipart_form(&body, boundary).expect("binary multipart should parse");
+        assert_eq!(fields.get("redirect").map(String::as_str), Some("https://example.com/ok"));
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].filename, "payload.bin");
+        assert_eq!(files[0].contents, raw_binary, "binary payload must not be corrupted by UTF-8 conversion");
+
+        // Too many parts -> 413 RequestEntityTooLarge.
+        let mut many_parts = Vec::new();
+        for i in 0..=MAX_FORMPOST_PARTS {
+            many_parts.extend_from_slice(
+                format!("--{boundary}\r\nContent-Disposition: form-data; name=\"f{i}\"\r\n\r\nv\r\n").as_bytes(),
+            );
+        }
+        many_parts.extend_from_slice(format!("--{boundary}--\r\n").as_bytes());
+        let err = parse_multipart_form(&many_parts, boundary).expect_err("part flood must be rejected");
+        assert!(matches!(err, SwiftError::RequestEntityTooLarge(_)));
+
+        // Oversized non-file field value -> 413 RequestEntityTooLarge.
+        let huge_val = "a".repeat(MAX_FORMPOST_FIELD_VALUE_SIZE + 1);
+        let huge_field_body = build_multipart_body(boundary, &[("redirect", &huge_val)], &[]);
+        let err = parse_multipart_form(&huge_field_body, boundary).expect_err("oversized text field must be rejected");
+        assert!(matches!(err, SwiftError::RequestEntityTooLarge(_)));
     }
 }

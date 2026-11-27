@@ -20,8 +20,16 @@
 //! same boundary `crates/protocols/src/swift/storage_api.rs` provides for the
 //! Swift implementation.
 
-pub use rustfs_ecstore::api::bucket::metadata::load_bucket_metadata;
+#![allow(unused_imports)]
+
+pub use rustfs_ecstore::api::bucket::metadata::{BUCKET_SSECONFIG, load_bucket_metadata};
 pub use rustfs_ecstore::api::bucket::metadata_sys::{
-    get as get_bucket_metadata, get_s3_tagging_config, set_bucket_metadata, update_s3_tagging_config,
+    get as get_bucket_metadata, get_s3_tagging_config, get_sse_config, set_bucket_metadata, update as update_bucket_config,
+    update_s3_tagging_config,
 };
-pub use rustfs_ecstore::api::runtime::object_store_handle;
+pub use rustfs_ecstore::api::data_usage::{invalidate_data_usage_snapshot_cache, store_data_usage_in_backend};
+pub use rustfs_ecstore::api::object::{
+    EncryptionResolutionError, EncryptionResolutionErrorKind, ObjectEncryptionResolver, ReadEncryptionMaterial,
+    ReadEncryptionMode, ReadEncryptionRequest,
+};
+pub use rustfs_ecstore::api::runtime::{bootstrap_ctx, object_store_handle};

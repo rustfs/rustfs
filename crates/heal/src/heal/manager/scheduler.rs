@@ -290,6 +290,24 @@ impl HealManager {
                                 "Heal scheduler task completed"
                             );
                         }
+                        Err(Error::Storage(crate::heal::StorageError::DeleteRecoveryGenerationConflict {
+                            bucket,
+                            object,
+                            transaction,
+                        })) => {
+                            error!(
+                                target: "rustfs::heal::manager",
+                                event = EVENT_HEAL_SCHEDULER_STATE,
+                                component = LOG_COMPONENT_HEAL,
+                                subsystem = LOG_SUBSYSTEM_MANAGER,
+                                state = "blocked_delete_generation_conflict",
+                                task_id,
+                                bucket,
+                                object,
+                                %transaction,
+                                "Committed delete conflicts with the live object generation"
+                            );
+                        }
                         Err(e @ Error::LegacyMrfUnverified { .. }) => {
                             warn!(
                                 target: "rustfs::heal::manager",
@@ -492,6 +510,23 @@ impl HealManager {
                         }
                         publish_verified_mrf_repair_events(&notice_targets, &completed_status_for_verified_events);
                         publish_unverified_legacy_mrf_events(&notice_targets, &completed_status_for_verified_events, &result);
+                        if matches!(completed_status, HealTaskStatus::Failed { .. })
+                            && let Err(Error::Storage(crate::heal::StorageError::DeleteRecoveryGenerationConflict {
+                                bucket,
+                                object,
+                                transaction,
+                            })) = &result
+                        {
+                            for anchor in notice_targets.iter().filter_map(|target| target.durable_anchor.as_ref()) {
+                                if anchor.kind == rustfs_common::mrf_channel::MrfKind::PartialWrite
+                                    && anchor.bucket.as_ref() == bucket
+                                    && anchor.object.as_ref() == object
+                                    && Some(anchor.bucket_incarnation_id) == task.expected_mrf_bucket_incarnation_id
+                                {
+                                    crate::heal::mrf_queue::note_delete_generation_conflict(anchor, *transaction);
+                                }
+                            }
+                        }
                         // Single-object MRF attempts retain one storage result.
                         // Use the original result even if the report was size
                         // limited, without certifying independent integrity.
