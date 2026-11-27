@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import subprocess
 import tempfile
@@ -117,14 +118,20 @@ log_error() { printf '%s\n' "$*" >&2; }
                 self.assertEqual(dependencies.count("pytest-xdist==3.8.0"), int(workers != "0"))
                 self.assertEqual(result.stdout, "" if workers == "0" else "-n 2 --dist=loadgroup")
 
-    def test_alt_user_provisioning_omits_deprecated_policy_and_fails_on_xml_error(self) -> None:
+    def test_alt_user_provisioning_encodes_credentials_and_stops_on_errors(self) -> None:
         stubs = r'''
 log_info() { printf 'INFO %s\n' "$*"; }
 log_error() { printf 'ERROR %s\n' "$*" >&2; }
 awscurl() {
     printf 'CALL %s\n' "$*" >> "$PROVISION_LOG"
     if [[ "$FAIL_STAGE" == "add-user" && "$*" == *"/rustfs/admin/v3/add-user"* ]]; then
-        printf '<Error><Code>InvalidArgument</Code><Message>bad payload</Message></Error>'
+        printf '<Error xmlns="urn:s3"><Message>private-response</Message></Error>'
+        return 0
+    fi
+    if [[ "$FAIL_STAGE" == "set-policy" && "$*" == *"/set-user-or-group-policy"* ]]; then
+        printf '{"message":"private-response"}'
+        printf 'private-diagnostic' >&2
+        if [[ "$1" == "--fail-with-body" ]]; then return 22; fi
         return 0
     fi
     if [[ "$FAIL_STAGE" == "list-buckets" && "$*" == *"-X GET"* ]]; then
@@ -141,8 +148,8 @@ awscurl() {
             "S3_REGION": "us-east-1",
             "S3_ACCESS_KEY": "rustfsadmin",
             "S3_SECRET_KEY": "rustfsadmin",
-            "S3_ALT_ACCESS_KEY": "altuser",
-            "S3_ALT_SECRET_KEY": "altsecret",
+            "S3_ALT_ACCESS_KEY": "alt+user&x",
+            "S3_ALT_SECRET_KEY": r'alt"secret\tail',
         }
         with tempfile.TemporaryDirectory() as directory:
             call_log = Path(directory) / "calls.log"
@@ -156,12 +163,14 @@ awscurl() {
             self.assertIn("Alt user provisioned successfully", ok.stdout)
             calls = call_log.read_text().splitlines()
             self.assertEqual(len(calls), 3)
-            self.assertIn('/rustfs/admin/v3/add-user?accessKey=altuser', calls[0])
-            self.assertIn('{"secretKey":"altsecret","status":"enabled"}', calls[0])
-            self.assertNotIn('"policy"', calls[0])
-            self.assertIn('/rustfs/admin/v3/set-user-or-group-policy?policyName=readwrite&userOrGroup=altuser&isGroup=false', calls[1])
+            self.assertIn('/rustfs/admin/v3/add-user?accessKey=alt%2Buser%26x', calls[0])
+            payload, _ = json.JSONDecoder().raw_decode(calls[0].split(" -d ", 1)[1])
+            self.assertEqual(payload, {"secretKey": base_env["S3_ALT_SECRET_KEY"], "status": "enabled"})
+            self.assertIn('policyName=readwrite&userOrGroup=alt%2Buser%26x&isGroup=false', calls[1])
 
-            for stage in ("add-user", "list-buckets"):
+            for count, (stage, message) in enumerate((("add-user", "Failed to add alt user"),
+                                                       ("set-policy", "Failed to set user policy"),
+                                                       ("list-buckets", "Alt user cannot list buckets")), start=1):
                 with self.subTest(stage=stage):
                     fail_log = Path(directory) / f"fail-{stage}.log"
                     res = subprocess.run(
@@ -171,7 +180,10 @@ awscurl() {
                         text=True,
                     )
                     self.assertNotEqual(res.returncode, 0)
-                    self.assertIn("<Error>", res.stderr)
+                    self.assertIn(message, res.stderr)
+                    self.assertNotIn("private-response", res.stderr + res.stdout)
+                    self.assertNotIn("private-diagnostic", res.stderr + res.stdout)
+                    self.assertEqual(len(fail_log.read_text().splitlines()), count)
                     self.assertNotIn("Alt user provisioned successfully", res.stdout)
 
 
