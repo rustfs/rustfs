@@ -100,6 +100,9 @@ async fn degraded_put_parity_survives_node_loss_and_heals() -> TestResult {
 
     dist.cluster.stop_node_gracefully(0).await?;
     std::fs::rename(missing, &detached)?;
+    // The missing drive prevents full peer re-admission. Exercise the normal
+    // bounded startup fallback without spending the production wait twice.
+    dist.cluster.set_node_env(0, "RUSTFS_STARTUP_READINESS_MAX_WAIT_SECS", "30")?;
     dist.cluster.start_node(0).await?;
     wait_for_slots(1, 0, "fixed writer sees exactly one missing drive").await?;
     let payload = payload_for("degraded-parity-streamed", 2 * 1024 * 1024);
