@@ -34,6 +34,10 @@ pub struct ObjectInfo {
     pub etag: Option<String>,
 }
 
+fn segment_size_u64(segment: &ObjectInfo) -> u64 {
+    u64::try_from(segment.size).unwrap_or(0)
+}
+
 /// Check if object is a DLO by checking for manifest metadata
 pub async fn is_dlo_object(
     account: &str,
@@ -175,7 +179,7 @@ fn calculate_dlo_segments_for_range(
     let mut current_offset = 0u64;
 
     for (idx, segment) in segments.iter().enumerate() {
-        let seg_size = segment.size as u64;
+        let seg_size = segment_size_u64(segment);
 
         // Empty segments contribute no bytes; skip them so the `seg_size - 1`
         // arithmetic below cannot underflow.
@@ -230,8 +234,8 @@ pub async fn handle_dlo_get(
         return Err(SwiftError::NotFound("No DLO segments found".to_string()));
     }
 
-    // 3. Calculate total size
-    let total_size: u64 = segments.iter().map(|s| s.size as u64).sum();
+    // 3. Calculate total logical plaintext size
+    let total_size: u64 = segments.iter().map(segment_size_u64).sum();
 
     // 4. Parse range header if present
     let range = headers
@@ -299,9 +303,11 @@ async fn create_dlo_stream(
         segments
             .iter()
             .enumerate()
-            // Skip empty segments so `s.size - 1` cannot underflow; they carry no bytes.
-            .filter(|(_, s)| s.size as u64 > 0)
-            .map(|(i, s)| (i, 0, s.size as u64 - 1, s.clone()))
+            // Skip empty segments so `seg_size - 1` cannot underflow; they carry no bytes.
+            .filter_map(|(i, s)| {
+                let seg_size = segment_size_u64(s);
+                (seg_size > 0).then(|| (i, 0, seg_size - 1, s.clone()))
+            })
             .collect()
     };
 
@@ -316,7 +322,8 @@ async fn create_dlo_stream(
             let creds = creds.clone();
 
             async move {
-                let range_spec = if byte_start > 0 || byte_end < segment.size as u64 - 1 {
+                let seg_size = segment_size_u64(&segment);
+                let range_spec = if byte_start > 0 || byte_end < seg_size.saturating_sub(1) {
                     Some(HTTPRangeSpec {
                         is_suffix_length: false,
                         start: byte_start as i64,
@@ -347,6 +354,11 @@ pub async fn handle_dlo_register(
     manifest_value: &str,
     credentials: &Option<Credentials>,
 ) -> Result<Response<Body>, SwiftError> {
+    // Require credentials for DLO write operations (consistent with handle_slo_put)
+    if credentials.is_none() {
+        return Err(SwiftError::Unauthorized("Credentials required for DLO operations".to_string()));
+    }
+
     // Validate manifest format
     let _ = parse_dlo_manifest(manifest_value)?;
 
@@ -355,9 +367,18 @@ pub async fn handle_dlo_register(
     let mut metadata = HashMap::new();
     metadata.insert("x-object-manifest".to_string(), manifest_value.to_string());
 
-    // Use put_object_with_metadata to store the marker
-    object::put_object_with_metadata(account, container, object, credentials, std::io::Cursor::new(Vec::new()), &metadata)
-        .await?;
+    // Use put_object_with_metadata_and_size so quota and default bucket SSE apply cleanly
+    object::put_object_with_metadata_and_size(
+        account,
+        container,
+        object,
+        credentials,
+        std::io::Cursor::new(Vec::new()),
+        &metadata,
+        Some(0),
+        None,
+    )
+    .await?;
 
     let trans_id = generate_trans_id();
     Response::builder()
