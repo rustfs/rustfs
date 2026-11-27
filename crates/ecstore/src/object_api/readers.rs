@@ -764,7 +764,7 @@ impl ReadPlan {
             let material = resolved;
             #[cfg(feature = "rio-v2")]
             let uses_legacy_encryption = matches!(material.mode, ReadEncryptionMode::Direct { .. });
-            let is_multipart = is_multipart_encrypted_object(&oi.parts, oi.etag.as_deref());
+            let is_multipart = is_multipart_encrypted_object(oi, &material.mode);
             let recorded_plaintext_size = oi.encryption_original_size()?;
             let plaintext_size = encrypted_plaintext_size(oi, is_multipart, is_compressed, recorded_plaintext_size)?;
             let full_plaintext_size =
@@ -1428,12 +1428,29 @@ fn encrypted_plaintext_size(
     Ok(recorded_plaintext_size.unwrap_or(oi.size))
 }
 
-fn is_multipart_encrypted_object(parts: &[ObjectPartInfo], etag: Option<&str>) -> bool {
-    if parts.len() > 1 {
+/// Whether the stored bytes are one cipher stream per part rather than one for
+/// the whole object.
+fn is_multipart_encrypted_object(oi: &ObjectInfo, mode: &ReadEncryptionMode) -> bool {
+    if oi.parts.len() > 1 {
         return true;
     }
 
-    etag.map(|etag| etag.trim_matches('"').len() != 32).unwrap_or(false)
+    // A sealed object key is MinIO's layout, and MinIO records a multipart
+    // upload in its own marker (`crypto.IsMultiPart`). The ETag cannot stand in
+    // for it there: MinIO seals the ETag of a single-part object, so it is never
+    // the 32 hex characters the heuristic below takes for a single-part upload,
+    // and reading such an object under part keys fails authentication.
+    #[cfg(feature = "rio-v2")]
+    if matches!(mode, ReadEncryptionMode::Object) {
+        return oi.is_marked_encrypted_multipart();
+    }
+    #[cfg(not(feature = "rio-v2"))]
+    let _ = mode;
+
+    oi.etag
+        .as_deref()
+        .map(|etag| etag.trim_matches('"').len() != 32)
+        .unwrap_or(false)
 }
 
 fn multipart_part_numbers(parts: &[ObjectPartInfo]) -> Vec<usize> {
@@ -2993,6 +3010,156 @@ mod tests {
         assert_eq!(offset, 0);
         assert_eq!(length, encrypted.len() as i64);
         assert_eq!(reader.object_info.size, plaintext.len() as i64);
+        assert_eq!(actual, plaintext);
+    }
+
+    /// A sealed single-part ETag as MinIO stores it: one DARE package, 96 hex
+    /// characters, never the 32 of a bare MD5.
+    #[cfg(feature = "rio-v2")]
+    const MINIO_SEALED_ETAG: &str =
+        "20010f00cbc498738108113178f20c5507f319f350e962a89c610c16699bca30b4f4914b6552c532550cca4ec1eb39b3";
+
+    /// The metadata MinIO leaves on a single-part SSE object: the seal
+    /// algorithm of its sealed object key and nothing that records a size.
+    #[cfg(feature = "rio-v2")]
+    fn minio_single_part_sse_object(encrypted_len: usize, plaintext_len: usize, object_key: [u8; 32]) -> ObjectInfo {
+        ObjectInfo {
+            bucket: "bucket".to_string(),
+            name: "minio-single-part".to_string(),
+            size: encrypted_len as i64,
+            etag: Some(MINIO_SEALED_ETAG.to_string()),
+            parts: Arc::new(vec![ObjectPartInfo {
+                number: 1,
+                size: encrypted_len,
+                actual_size: plaintext_len as i64,
+                ..Default::default()
+            }]),
+            user_defined: Arc::new(HashMap::from([
+                (TEST_OBJECT_KEY_HEADER.to_string(), BASE64_STANDARD.encode_to_string(object_key)),
+                (
+                    rustfs_utils::http::MINIO_INTERNAL_ENCRYPTION_ALGORITHM_HEADER.to_string(),
+                    rustfs_utils::http::MINIO_INTERNAL_ENCRYPTION_SEAL_ALGORITHM.to_string(),
+                ),
+                (
+                    rustfs_utils::http::MINIO_INTERNAL_ENCRYPTION_S3_SEALED_KEY_HEADER.to_string(),
+                    "sealed-object-key".to_string(),
+                ),
+            ])),
+            ..Default::default()
+        }
+    }
+
+    /// MinIO seals the ETag of a single-part SSE object, so its length says
+    /// nothing about how the object was uploaded: the whole object is one DARE
+    /// stream under the object key, not a stream per part under part keys.
+    #[cfg(feature = "rio-v2")]
+    #[tokio::test]
+    async fn minio_single_part_sse_object_reads_as_one_stream_despite_its_sealed_etag() {
+        let object_key = [0x67; 32];
+        // Every interesting shape: one short package, an exact package, and
+        // several packages with a short tail.
+        for plaintext_len in [1usize, 4096, 64 * 1024, 300 * 1024, 1024 * 1024 + 1] {
+            let plaintext: Vec<u8> = (0..plaintext_len).map(|index| (index % 251) as u8).collect();
+            let mut encrypted = Vec::new();
+            crate::io_support::rio::EncryptReader::new_with_object_key(Cursor::new(plaintext.clone()), object_key)
+                .read_to_end(&mut encrypted)
+                .await
+                .expect("encrypt as one DARE stream");
+            let object_info = minio_single_part_sse_object(encrypted.len(), plaintext_len, object_key);
+
+            let (mut reader, offset, length) = GetObjectReader::new(
+                Box::new(Cursor::new(encrypted.clone())),
+                None,
+                &object_info,
+                &ObjectOptions::default(),
+                &HeaderMap::new(),
+            )
+            .await
+            .expect("plan a full read");
+            let mut actual = Vec::new();
+            reader
+                .read_to_end(&mut actual)
+                .await
+                .unwrap_or_else(|error| panic!("full read of {plaintext_len} bytes: {error}"));
+
+            assert_eq!((offset, length), (0, encrypted.len() as i64));
+            assert_eq!(
+                reader.object_info.size, plaintext_len as i64,
+                "the response length is the plaintext length"
+            );
+            assert_eq!(actual, plaintext, "{plaintext_len} bytes");
+            assert_eq!(
+                reader
+                    .object_info
+                    .get_actual_size()
+                    .expect("size of the object behind the read"),
+                plaintext_len as i64,
+                "the object's size is still derivable from what the read hands back"
+            );
+
+            // The last byte lies beyond the plaintext size a reader that takes
+            // the stored size for the plaintext size would compute offsets from.
+            let last = plaintext_len as i64 - 1;
+            let range = HTTPRangeSpec {
+                is_suffix_length: false,
+                start: last,
+                end: last,
+            };
+            let plan = ReadPlan::build(Some(range), &object_info, &ObjectOptions::default(), &HeaderMap::new())
+                .await
+                .expect("plan a read of the last byte");
+            let storage_offset = plan.storage_offset;
+            let (mut reader, _, _) = plan
+                .into_reader(Box::new(Cursor::new(encrypted[storage_offset..].to_vec())), &object_info)
+                .expect("build the ranged reader");
+            let mut tail = Vec::new();
+            reader.read_to_end(&mut tail).await.expect("read the last byte");
+            assert_eq!(tail, plaintext[plaintext_len - 1..], "last byte of {plaintext_len}");
+            assert_eq!(reader.object_info.size, 1, "a ranged read hands back the length it delivers");
+            assert_eq!(
+                reader
+                    .object_info
+                    .get_actual_size()
+                    .expect("size of the object behind the ranged read"),
+                plaintext_len as i64,
+                "a ranged response still needs the whole object's size for Content-Range"
+            );
+        }
+    }
+
+    /// MinIO's own marker, not the part count, says an object is one cipher
+    /// stream per part: a one-part multipart upload is still keyed per part.
+    #[cfg(feature = "rio-v2")]
+    #[tokio::test]
+    async fn minio_one_part_multipart_sse_object_reads_under_its_part_key() {
+        let object_key = [0x67; 32];
+        let plaintext: Vec<u8> = (0..70_000usize).map(|index| (index % 251) as u8).collect();
+        let mut encrypted = Vec::new();
+        crate::io_support::rio::EncryptReader::new_multipart_with_object_key(Cursor::new(plaintext.clone()), object_key, 1)
+            .read_to_end(&mut encrypted)
+            .await
+            .expect("encrypt as part 1 of a multipart upload");
+
+        let mut object_info = minio_single_part_sse_object(encrypted.len(), plaintext.len(), object_key);
+        object_info.etag = Some("b228928307afa1ffeb9aa36de4526de8-1".to_string());
+        Arc::make_mut(&mut object_info.user_defined)
+            .insert(rustfs_utils::http::MINIO_INTERNAL_ENCRYPTION_MULTIPART_HEADER.to_string(), String::new());
+
+        let (mut reader, _, _) = GetObjectReader::new(
+            Box::new(Cursor::new(encrypted)),
+            None,
+            &object_info,
+            &ObjectOptions::default(),
+            &HeaderMap::new(),
+        )
+        .await
+        .expect("plan a full read");
+        let mut actual = Vec::new();
+        reader
+            .read_to_end(&mut actual)
+            .await
+            .expect("read the one-part multipart object");
+
         assert_eq!(actual, plaintext);
     }
 

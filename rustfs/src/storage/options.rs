@@ -845,12 +845,32 @@ fn is_reserved_user_metadata_key(key: &str) -> bool {
         || starts_with_ignore_ascii_case(key, "x-minio-")
 }
 
+/// Stored keys under this prefix are internal metadata of early releases. The
+/// read side never returns them as user metadata.
+const LEGACY_INTERNAL_METADATA_PREFIX: &str = "x-amz-meta-internal-";
+
+/// The key user metadata `key` (the header name behind `x-amz-meta-`) is stored under.
+///
+/// A default build stores the bare key and namespaces only the keys a client
+/// must not be able to materialize bare. A `rio-v2` build keeps the
+/// `x-amz-meta-` prefix, the shape MinIO stores: MinIO answers a stored key
+/// without it as an ordinary response header named after the key, so user
+/// metadata RustFS wrote disappears from `x-amz-meta-*` once MinIO serves the
+/// drives. Readers strip the prefix in either build.
+///
+/// The one key family a `rio-v2` build still stores bare is `internal-*`:
+/// namespaced, it would land under [`LEGACY_INTERNAL_METADATA_PREFIX`] and the
+/// server could no longer read back what it just stored. Such a key stays
+/// readable by RustFS and is not user metadata to MinIO.
 fn stored_user_metadata_key(key: &str) -> String {
+    let namespaced = format!("{CANONICAL_USER_METADATA_PREFIX}{key}");
     if is_reserved_user_metadata_key(key) {
-        format!("{CANONICAL_USER_METADATA_PREFIX}{key}")
-    } else {
-        key.to_owned()
+        return namespaced;
     }
+    if cfg!(feature = "rio-v2") && !starts_with_ignore_ascii_case(&namespaced, LEGACY_INTERNAL_METADATA_PREFIX) {
+        return namespaced;
+    }
+    key.to_owned()
 }
 
 pub(crate) fn namespace_reserved_user_metadata(metadata: &mut HashMap<String, String>) {
@@ -987,7 +1007,7 @@ pub(crate) fn filter_object_metadata(metadata: &HashMap<String, String>) -> Opti
 
     let mut filtered_metadata = None;
     for (k, v) in metadata {
-        if starts_with_ignore_ascii_case(k, "x-amz-meta-internal-")
+        if starts_with_ignore_ascii_case(k, LEGACY_INTERNAL_METADATA_PREFIX)
             || k.eq_ignore_ascii_case(AMZ_META_UNENCRYPTED_CONTENT_MD5)
             || k.eq_ignore_ascii_case(AMZ_META_UNENCRYPTED_CONTENT_LENGTH)
         {
@@ -1274,8 +1294,9 @@ mod tests {
         extract_metadata_from_mime_with_object_name, filter_object_metadata, get_complete_multipart_upload_opts,
         get_complete_multipart_upload_opts_with_replication_authorization, get_default_opts, get_opts,
         has_replication_retention_update, is_reserved_user_metadata_key, namespace_reserved_user_metadata,
-        parse_copy_source_range, put_opts, put_opts_from_headers, put_opts_from_headers_with_replication_authorization,
-        put_opts_with_replication_authorization, should_skip_object_metadata_key, validate_archive_content_encoding,
+        parse_copy_source_range, preserve_unclassified_user_metadata, put_opts, put_opts_from_headers,
+        put_opts_from_headers_with_replication_authorization, put_opts_with_replication_authorization,
+        should_skip_object_metadata_key, validate_archive_content_encoding,
     };
     use http::{HeaderMap, HeaderValue};
     use rustfs_s3_types::S3ErrorCode;
@@ -1287,6 +1308,15 @@ mod tests {
     };
     use std::collections::HashMap;
     use uuid::Uuid;
+
+    /// User metadata `key` as a client reads it back from stored `metadata`.
+    ///
+    /// The key user metadata is stored under differs between build variants
+    /// (pinned by `user_metadata_is_stored_under_the_key_the_build_interoperates_with`);
+    /// the value a client reads back does not.
+    fn user_metadata(metadata: &HashMap<String, String>, key: &str) -> Option<String> {
+        filter_object_metadata(metadata).and_then(|visible| visible.get(key).cloned())
+    }
 
     #[test]
     fn replication_etags_reject_xml_and_header_delimiters_before_persistence() {
@@ -2186,7 +2216,7 @@ mod tests {
                 "{bare} must be namespaced under x-amz-meta-"
             );
         }
-        assert_eq!(copied.get("department").map(String::as_str), Some("finance"));
+        assert_eq!(user_metadata(&copied, "department").as_deref(), Some("finance"));
     }
 
     #[test]
@@ -2437,10 +2467,8 @@ mod tests {
         assert_eq!(metadata.get("content-type"), Some(&"application/json".to_string()));
         assert!(metadata.contains_key("cache-control"));
         assert_eq!(metadata.get("cache-control"), Some(&"no-cache".to_string()));
-        assert!(metadata.contains_key("custom"));
-        assert_eq!(metadata.get("custom"), Some(&"custom-value".to_string()));
-        assert!(metadata.contains_key("internal"));
-        assert_eq!(metadata.get("internal"), Some(&"internal-value".to_string()));
+        assert_eq!(user_metadata(&metadata, "custom").as_deref(), Some("custom-value"));
+        assert_eq!(user_metadata(&metadata, "internal").as_deref(), Some("internal-value"));
     }
 
     #[test]
@@ -2453,9 +2481,9 @@ mod tests {
         let mut metadata = HashMap::new();
         extract_metadata_from_mime(&headers, &mut metadata);
 
-        assert_eq!(metadata.get("user-id"), Some(&"12345".to_string()));
-        assert_eq!(metadata.get("project"), Some(&"test-project".to_string()));
-        assert!(!metadata.contains_key(""));
+        assert_eq!(user_metadata(&metadata, "user-id").as_deref(), Some("12345"));
+        assert_eq!(user_metadata(&metadata, "project").as_deref(), Some("test-project"));
+        assert_eq!(metadata.len(), 3, "the empty key is not stored beside the two keys and the content type");
     }
 
     #[test]
@@ -2467,14 +2495,21 @@ mod tests {
         headers.insert("x-amz-meta-literal", HeaderValue::from_static("=?UTF-8?Q?=3D=3FUTF-8=3FB=3F5Lit=3F=3D?="));
         headers.insert("x-amz-meta-plain", HeaderValue::from_static("ordinary text"));
         headers.insert("x-amz-meta-old", HeaderValue::from_static("=?malformed"));
+        // The typed request metadata reaches storage through the same namespacing step.
         let mut metadata = HashMap::from([("caption".to_owned(), "中文".to_owned())]);
+        namespace_reserved_user_metadata(&mut metadata);
         extract_metadata_from_mime(&headers, &mut metadata);
 
-        assert_eq!(metadata["caption"], "中文");
-        assert_eq!(metadata["literal"], "=?UTF-8?B?5Lit?=");
-        assert_eq!(metadata["alias"], "=?UTF-8?B?5Lit?=   =?UTF-8?B?5paH?=");
-        assert_eq!(metadata["plain"], "ordinary text");
-        assert_eq!(metadata["old"], "=?malformed");
+        assert_eq!(user_metadata(&metadata, "caption").as_deref(), Some("中文"));
+        assert_eq!(user_metadata(&metadata, "literal").as_deref(), Some("=?UTF-8?B?5Lit?="));
+        assert_eq!(user_metadata(&metadata, "alias").as_deref(), Some("=?UTF-8?B?5Lit?=   =?UTF-8?B?5paH?="));
+        assert_eq!(user_metadata(&metadata, "plain").as_deref(), Some("ordinary text"));
+        assert_eq!(user_metadata(&metadata, "old").as_deref(), Some("=?malformed"));
+        assert_eq!(
+            metadata.len(),
+            6,
+            "the raw header overlays the typed caption instead of adding a second key"
+        );
     }
 
     #[test]
@@ -2486,8 +2521,8 @@ mod tests {
         let mut metadata = HashMap::new();
         extract_metadata_from_mime(&headers, &mut metadata);
 
-        assert_eq!(metadata.get("internal-id"), Some(&"67890".to_string()));
-        assert_eq!(metadata.get("category"), Some(&"documents".to_string()));
+        assert_eq!(user_metadata(&metadata, "internal-id").as_deref(), Some("67890"));
+        assert_eq!(user_metadata(&metadata, "category").as_deref(), Some("documents"));
     }
 
     #[test]
@@ -2500,9 +2535,9 @@ mod tests {
         let mut metadata = HashMap::new();
         extract_metadata_from_mime(&headers, &mut metadata);
 
-        assert_eq!(metadata.get("origin"), Some(&"gateway".to_string()));
-        assert_eq!(metadata.get("source-id"), Some(&"abc123".to_string()));
-        assert!(!metadata.contains_key(""));
+        assert_eq!(user_metadata(&metadata, "origin").as_deref(), Some("gateway"));
+        assert_eq!(user_metadata(&metadata, "source-id").as_deref(), Some("abc123"));
+        assert_eq!(metadata.len(), 3, "the empty key is not stored beside the two keys and the content type");
     }
 
     #[test]
@@ -2604,8 +2639,8 @@ mod tests {
         let mut metadata = HashMap::new();
         extract_metadata_from_mime(&headers, &mut metadata);
 
-        assert_eq!(metadata.get("chinese"), Some(&"test-value".to_string()));
-        assert_eq!(metadata.get("emoji"), Some(&"🚀".to_string()));
+        assert_eq!(user_metadata(&metadata, "chinese").as_deref(), Some("test-value"));
+        assert_eq!(user_metadata(&metadata, "emoji").as_deref(), Some("🚀"));
     }
 
     #[test]
@@ -2671,9 +2706,9 @@ mod tests {
         let metadata = extract_metadata(&headers);
 
         assert_eq!(metadata.get("content-type"), Some(&"application/xml".to_string()));
-        assert_eq!(metadata.get("version"), Some(&"1.0".to_string()));
-        assert_eq!(metadata.get("source"), Some(&"upload".to_string()));
-        assert_eq!(metadata.get("origin"), Some(&"replication".to_string()));
+        assert_eq!(user_metadata(&metadata, "version").as_deref(), Some("1.0"));
+        assert_eq!(user_metadata(&metadata, "source").as_deref(), Some("upload"));
+        assert_eq!(user_metadata(&metadata, "origin").as_deref(), Some("replication"));
         assert_eq!(metadata.get("cache-control"), Some(&"public".to_string()));
         assert!(!metadata.contains_key("authorization"));
     }
@@ -2847,6 +2882,53 @@ mod tests {
         ]);
         let filtered = filter_object_metadata(&metadata).expect("user metadata should remain");
         assert_eq!(filtered, HashMap::from([("x-rustfs-interna".to_string(), "user-value".to_string())]));
+    }
+
+    /// The stored key is the build's on-disk contract; the key a client reads
+    /// back is the same in every build.
+    #[test]
+    fn user_metadata_is_stored_under_the_key_the_build_interoperates_with() {
+        let stored_key = if cfg!(feature = "rio-v2") {
+            // MinIO answers a stored key without the prefix as a plain header
+            // named after it, never as `x-amz-meta-*`.
+            "x-amz-meta-purpose"
+        } else {
+            "purpose"
+        };
+
+        let mut typed = HashMap::from([("purpose".to_owned(), "compat".to_owned())]);
+        namespace_reserved_user_metadata(&mut typed);
+        assert_eq!(typed, HashMap::from([(stored_key.to_owned(), "compat".to_owned())]));
+
+        let mut headers = HeaderMap::new();
+        headers.insert("x-amz-meta-purpose", HeaderValue::from_static("compat"));
+        let mut from_headers = typed.clone();
+        extract_metadata_from_mime(&headers, &mut from_headers);
+        assert_eq!(from_headers.get(stored_key).map(String::as_str), Some("compat"));
+        assert_eq!(
+            from_headers.keys().filter(|key| key.ends_with("purpose")).count(),
+            1,
+            "the typed input and the raw header land on one stored key"
+        );
+
+        let mut unclassified = HashMap::new();
+        preserve_unclassified_user_metadata(&mut unclassified, "purpose", "compat");
+        assert_eq!(unclassified, HashMap::from([(stored_key.to_owned(), "compat".to_owned())]));
+
+        assert_eq!(
+            filter_object_metadata(&from_headers),
+            Some(HashMap::from([("purpose".to_owned(), "compat".to_owned())]))
+        );
+
+        // Namespaced, an `internal-*` key would sit in the legacy internal
+        // namespace the read side hides, so every build stores it bare: reading
+        // back what was just written comes before being visible to MinIO.
+        for key in ["internal-id", "Internal-Id"] {
+            let mut internal = HashMap::from([(key.to_owned(), "67890".to_owned())]);
+            namespace_reserved_user_metadata(&mut internal);
+            assert_eq!(internal, HashMap::from([(key.to_owned(), "67890".to_owned())]));
+            assert_eq!(user_metadata(&internal, key).as_deref(), Some("67890"));
+        }
     }
 
     #[test]

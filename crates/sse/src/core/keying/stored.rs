@@ -123,6 +123,28 @@ pub(crate) struct StoredManagedKey<'a> {
     pub(crate) recorded_kms_key_id: Option<String>,
 }
 
+/// Prefix MinIO puts on the key id of every `aws:kms` response
+/// (`internal/crypto`, `ARNPrefix`).
+const MINIO_KMS_KEY_ARN_PREFIX: &str = "arn:aws:kms:";
+
+impl StoredManagedKey<'_> {
+    /// The key id an `aws:kms` response advertises for this object.
+    ///
+    /// An object that stores its public scheme header is answered with the key
+    /// id it recorded. One that stores none was written by MinIO, which
+    /// advertises its key ids in ARN form (`cmd/encryption-v1.go`,
+    /// `kmsKeyIDFromMetadata`); a client that recorded the id MinIO returned
+    /// must see the same value after the drives move to RustFS. `kms_key_id`
+    /// stays the bare id everywhere else: authorization and the unwrap name the
+    /// key itself.
+    pub(crate) fn response_kms_key_id(&self, kms_key_id: String) -> String {
+        if self.metadata.contains_key("x-amz-server-side-encryption") || kms_key_id.starts_with(MINIO_KMS_KEY_ARN_PREFIX) {
+            return kms_key_id;
+        }
+        format!("{MINIO_KMS_KEY_ARN_PREFIX}{kms_key_id}")
+    }
+}
+
 /// Recognize a stored managed-SSE object.
 ///
 /// `None` means the object carries no managed-SSE metadata, or carries some whose

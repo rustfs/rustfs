@@ -973,7 +973,7 @@ mod tests {
         let metadata = &stored.user_defined;
         assert_eq!(metadata.get("content-type").map(String::as_str), Some("text/plain"));
         assert_eq!(metadata.get("cache-control").map(String::as_str), Some("max-age=60"));
-        assert_eq!(metadata.get("origin").map(String::as_str), Some("unit-test"));
+        assert_eq!(visible_user_metadata(metadata, "origin").as_deref(), Some("unit-test"));
         assert_eq!(stored.user_tags.as_str(), "team=storage", "tags must be committed as object tags");
         for suffix in [
             SUFFIX_ODM_SOURCE,
@@ -1224,7 +1224,7 @@ mod tests {
             .await
             .expect("completed multipart object must be readable");
         assert_eq!(stored.user_defined.get("content-type").map(String::as_str), Some("text/plain"));
-        assert_eq!(stored.user_defined.get("origin").map(String::as_str), Some("unit-test"));
+        assert_eq!(visible_user_metadata(&stored.user_defined, "origin").as_deref(), Some("unit-test"));
         assert!(contains_key_str(&stored.user_defined, SUFFIX_ODM_SOURCE));
 
         let aborted_upload_id = Box::pin(usecase.internal_create_multipart_upload(&ctx))

@@ -1835,7 +1835,7 @@ mod tests {
             .await
             .expect("preserved meta-replace UUID version must remain readable");
         assert_eq!(meta_preserved.content_type.as_deref(), Some("text/plain"));
-        assert_eq!(meta_preserved.user_defined.get("author").map(String::as_str), Some("alice"));
+        assert_eq!(visible_user_metadata(&meta_preserved.user_defined, "author").as_deref(), Some("alice"));
         assert_eq!(meta_preserved.user_tags.as_str(), "class=secret");
         assert_eq!(meta_preserved.mod_time, Some(original_mod_time));
         assert_eq!(meta_preserved.data_dir, meta_seeded.data_dir);
@@ -1847,7 +1847,7 @@ mod tests {
         assert!(meta_current.version_id.is_none_or(|v| v.is_nil()));
         assert_ne!(meta_current.data_dir, meta_seeded.data_dir);
         assert_eq!(meta_current.content_type.as_deref(), Some("text/html"));
-        assert_eq!(meta_current.user_defined.get("author").map(String::as_str), Some("mallory"));
+        assert_eq!(visible_user_metadata(&meta_current.user_defined, "author").as_deref(), Some("mallory"));
         assert_eq!(meta_current.user_tags.as_str(), "class=secret");
         assert!(meta_current.mod_time > Some(original_mod_time));
         assert_eq!(
@@ -1886,7 +1886,7 @@ mod tests {
             .expect("updated null version should be readable");
         assert_eq!(meta_current_2.data_dir, null_data_dir, "null-to-null self-copy remains zero-copy");
         assert_eq!(meta_current_2.content_type.as_deref(), Some("application/json"));
-        assert_eq!(meta_current_2.user_defined.get("author").map(String::as_str), Some("null-v2"));
+        assert_eq!(visible_user_metadata(&meta_current_2.user_defined, "author").as_deref(), Some("null-v2"));
 
         // 2. Tag-replace-only self-copy (no MetadataDirective) must preserve UUID tags & metadata.
         let tag_resp = gateway
@@ -1932,7 +1932,7 @@ mod tests {
             .expect("preserved tag-replace UUID version must remain readable");
         assert_eq!(tag_preserved.user_tags.as_str(), "class=secret");
         assert_eq!(tag_preserved.content_type.as_deref(), Some("text/plain"));
-        assert_eq!(tag_preserved.user_defined.get("author").map(String::as_str), Some("alice"));
+        assert_eq!(visible_user_metadata(&tag_preserved.user_defined, "author").as_deref(), Some("alice"));
         assert_eq!(tag_preserved.mod_time, Some(original_mod_time));
         assert_eq!(tag_preserved.data_dir, tag_seeded.data_dir);
 
@@ -1943,7 +1943,7 @@ mod tests {
         assert!(tag_current.version_id.is_none_or(|v| v.is_nil()));
         assert_eq!(tag_current.user_tags.as_str(), "class=public");
         assert_eq!(tag_current.content_type.as_deref(), Some("text/plain"));
-        assert_eq!(tag_current.user_defined.get("author").map(String::as_str), Some("alice"));
+        assert_eq!(visible_user_metadata(&tag_current.user_defined, "author").as_deref(), Some("alice"));
         assert!(tag_current.mod_time > Some(original_mod_time));
         assert_eq!(
             read_store_object_bytes(&store, &bucket, "tag-replace.txt", &ObjectOptions::default()).await,
@@ -2003,7 +2003,7 @@ mod tests {
         assert!(sc_current.version_id.is_none_or(|v| v.is_nil()));
         assert_eq!(sc_current.storage_class.as_deref(), Some(storageclass::RRS));
         assert_eq!(sc_current.content_type.as_deref(), Some("text/plain"));
-        assert_eq!(sc_current.user_defined.get("author").map(String::as_str), Some("alice"));
+        assert_eq!(visible_user_metadata(&sc_current.user_defined, "author").as_deref(), Some("alice"));
         assert_eq!(sc_current.user_tags.as_str(), "class=secret");
         assert!(sc_current.mod_time > Some(original_mod_time));
         assert_eq!(
@@ -2059,7 +2059,7 @@ mod tests {
             .expect("read updated unversioned object");
         assert_eq!(unversioned_after.data_dir, unversioned_seeded.data_dir);
         assert_eq!(unversioned_after.content_type.as_deref(), Some("text/markdown"));
-        assert_eq!(unversioned_after.user_defined.get("author").map(String::as_str), Some("bob"));
+        assert_eq!(visible_user_metadata(&unversioned_after.user_defined, "author").as_deref(), Some("bob"));
         assert_eq!(
             read_store_object_bytes(&store, &unversioned_bucket, "plain.txt", &ObjectOptions::default()).await,
             unversioned_payload
@@ -2177,7 +2177,7 @@ mod tests {
             .await
             .expect("pre-exclusion UUID version must remain readable");
         assert_eq!(preserved.content_type.as_deref(), Some("text/plain"));
-        assert_eq!(preserved.user_defined.get("author").map(String::as_str), Some("alice"));
+        assert_eq!(visible_user_metadata(&preserved.user_defined, "author").as_deref(), Some("alice"));
         assert_eq!(preserved.mod_time, Some(original_mod_time));
         assert_eq!(preserved.data_dir, seeded.data_dir);
 
@@ -2187,7 +2187,7 @@ mod tests {
             .expect("new null version under excluded prefix should be readable");
         assert!(current.version_id.is_none_or(|v| v.is_nil()));
         assert_eq!(current.content_type.as_deref(), Some("text/html"));
-        assert_eq!(current.user_defined.get("author").map(String::as_str), Some("mallory"));
+        assert_eq!(visible_user_metadata(&current.user_defined, "author").as_deref(), Some("mallory"));
         assert!(current.mod_time > Some(original_mod_time));
         assert_eq!(read_store_object_bytes(&store, &bucket, key, &ObjectOptions::default()).await, payload);
 

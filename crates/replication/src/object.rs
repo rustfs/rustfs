@@ -234,6 +234,15 @@ fn tag_metadata_differs(source: &ReplicationSourceObject<'_>, target: &Replicati
 fn comparable_metadata(metadata: Option<&HashMap<String, String>>) -> HashMap<String, String> {
     let mut comparable = HashMap::new();
     for (key, value) in metadata.into_iter().flatten() {
+        // A `rio-v2` build stores user metadata under `x-amz-meta-` keys, while
+        // a target's HEAD answers it with the prefix stripped: compared by that
+        // prefix, a replica carrying the same user metadata could never match
+        // and every check would re-send the metadata. Such a build therefore
+        // leaves user metadata out of the comparison, which is what a build
+        // storing bare keys has always done.
+        if cfg!(feature = "rio-v2") && has_prefix_fold(key, AMZ_META_PREFIX) {
+            continue;
+        }
         if REPLICATION_METADATA_COMPARE_KEYS
             .iter()
             .any(|prefix| has_prefix_fold(key, prefix))
@@ -496,6 +505,36 @@ mod tests {
 
         assert!(content_matches_by_etag(&source, &target));
         assert!(replication_etags_match(source.etag, target.etag));
+    }
+
+    /// The stored key shape decides whether user metadata takes part in the
+    /// comparison: the target side always arrives with the prefix stripped.
+    #[test]
+    fn an_identical_replica_matches_whatever_shape_user_metadata_is_stored_in() {
+        let target_metadata = HashMap::from([("owner".to_string(), "alice".to_string())]);
+        let target = ReplicationTargetObject {
+            tag_count: 0,
+            ..target_object(&target_metadata)
+        };
+        let action = |stored_key: &str| {
+            let source_metadata = HashMap::from([(stored_key.to_string(), "alice".to_string())]);
+            let source = ReplicationSourceObject {
+                user_tags: "",
+                ..source_object(&source_metadata)
+            };
+            replication_action_for_target(&source, &target, ReplicationType::Object)
+        };
+
+        assert_eq!(action("owner"), ReplicationAction::None, "a bare stored key is never compared");
+        // A build that stores the prefixed key must not see a perpetual
+        // difference against the stripped key the target reports.
+        let prefixed = if cfg!(feature = "rio-v2") {
+            ReplicationAction::None
+        } else {
+            ReplicationAction::Metadata
+        };
+        assert_eq!(action("x-amz-meta-owner"), prefixed);
+        assert_eq!(action("X-Amz-Meta-Owner"), prefixed);
     }
 
     #[test]

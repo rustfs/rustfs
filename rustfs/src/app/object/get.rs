@@ -4286,9 +4286,10 @@ impl DefaultObjectUsecase {
         record_get_object_s3_handler_stage_duration(GET_OBJECT_STAGE_METADATA_FILTER, metadata_filter_start);
         let output_struct_start = rustfs_io_metrics::get_stage_metrics_enabled().then(std::time::Instant::now);
         let parts_count = Self::get_object_parts_count(part_number, &info);
+        let response_etag = crate::storage::sse::read_response_etag(bucket, key, &info.user_defined, info.etag.as_deref()).await;
         let output = GetObjectOutputFacts {
             body: Some(body),
-            etag: info.etag.as_deref().map(ResponseEtag::from_stored),
+            etag: response_etag.as_deref().map(ResponseEtag::from_stored),
             dto: gateway_dto::GetObjectOutput {
                 content_length: Some(http_content_length),
                 last_modified: last_modified.map(timestamp),

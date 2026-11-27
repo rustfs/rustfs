@@ -641,13 +641,14 @@ impl DefaultObjectUsecase {
         })?;
 
         let metadata_map = info.user_defined.clone();
-        let sse_customer_algorithm = metadata_map.get("x-amz-server-side-encryption-customer-algorithm").cloned();
-        let server_side_encryption = metadata_map
-            .get("x-amz-server-side-encryption")
-            .filter(|_| sse_customer_algorithm.is_none())
-            .map(|v| gateway_dto::ServerSideEncryption::custom(v.clone()));
-        let sse_customer_key_md5 = metadata_map.get("x-amz-server-side-encryption-customer-key-md5").cloned();
-        let sse_kms_key_id = metadata_map.get("x-amz-server-side-encryption-aws-kms-key-id").cloned();
+        let HeadSseResponseFields {
+            server_side_encryption,
+            sse_customer_algorithm,
+            sse_customer_key_md5,
+            sse_kms_key_id,
+        } = head_sse_response_fields(&metadata_map, input.sse_customer_key_md5.as_ref());
+        let response_etag =
+            crate::storage::sse::read_response_etag(&bucket, &key, &info.user_defined, info.etag.as_deref()).await;
         let storage_class = response_storage_class_name(&info, &metadata_map);
         // checksum: classify once; additional algorithms (XXHash3/64/128, SHA-512, MD5)
         // land in `extra` and are emitted as raw headers below (s3s has no typed field).
@@ -726,7 +727,7 @@ impl DefaultObjectUsecase {
         };
         let output = HeadObjectOutputFacts {
             dto,
-            etag: info.etag.as_deref().map(ResponseEtag::from_stored),
+            etag: response_etag.as_deref().map(ResponseEtag::from_stored),
         };
 
         let version_id = input.version_id.clone().unwrap_or_default();
@@ -862,6 +863,48 @@ impl DefaultObjectUsecase {
     }
 }
 
+/// The SSE fields of a HeadObject answer.
+struct HeadSseResponseFields {
+    server_side_encryption: Option<gateway_dto::ServerSideEncryption>,
+    sse_customer_algorithm: Option<String>,
+    sse_customer_key_md5: Option<String>,
+    sse_kms_key_id: Option<String>,
+}
+
+/// Derive the SSE fields of a HeadObject answer from stored metadata.
+///
+/// RustFS persists the public SSE headers with the object and they are answered
+/// as stored. An object that persisted none of them — MinIO synthesizes them
+/// onto each response instead — is classified from its sealed-key slot, with
+/// the request's customer-key MD5 echoed for SSE-C because none is stored.
+fn head_sse_response_fields(
+    metadata: &HashMap<String, String>,
+    request_sse_customer_key_md5: Option<&String>,
+) -> HeadSseResponseFields {
+    if let Some(headers) = crate::storage::sse::classify_unrecorded_sse_response(metadata, request_sse_customer_key_md5) {
+        return HeadSseResponseFields {
+            server_side_encryption: headers
+                .sse_customer_algorithm
+                .is_none()
+                .then(|| gateway_dto::ServerSideEncryption::custom(headers.server_side_encryption)),
+            sse_customer_algorithm: headers.sse_customer_algorithm,
+            sse_customer_key_md5: headers.sse_customer_key_md5,
+            sse_kms_key_id: headers.ssekms_key_id,
+        };
+    }
+
+    let sse_customer_algorithm = metadata.get("x-amz-server-side-encryption-customer-algorithm").cloned();
+    HeadSseResponseFields {
+        server_side_encryption: metadata
+            .get("x-amz-server-side-encryption")
+            .filter(|_| sse_customer_algorithm.is_none())
+            .map(|v| gateway_dto::ServerSideEncryption::custom(v.clone())),
+        sse_customer_algorithm,
+        sse_customer_key_md5: metadata.get("x-amz-server-side-encryption-customer-key-md5").cloned(),
+        sse_kms_key_id: metadata.get("x-amz-server-side-encryption-aws-kms-key-id").cloned(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -914,6 +957,110 @@ mod tests {
 
     fn head_count(state: &BucketOdmState, outcome: OdmOutcome) -> u64 {
         state.stats().snapshot(state.breaker().state()).requests_total["head"][outcome.as_str()]
+    }
+
+    type SseFields<'a> = (Option<&'a str>, Option<&'a str>, Option<&'a str>, Option<&'a str>);
+
+    /// `(scheme, customer algorithm, customer key MD5, KMS key id)` of a HEAD answer.
+    fn sse_fields(fields: &HeadSseResponseFields) -> SseFields<'_> {
+        (
+            fields.server_side_encryption.as_ref().map(|scheme| scheme.as_str()),
+            fields.sse_customer_algorithm.as_deref(),
+            fields.sse_customer_key_md5.as_deref(),
+            fields.sse_kms_key_id.as_deref(),
+        )
+    }
+
+    fn stored_metadata(entries: &[(&str, &str)]) -> HashMap<String, String> {
+        entries
+            .iter()
+            .map(|(key, value)| ((*key).to_owned(), (*value).to_owned()))
+            .collect()
+    }
+
+    #[test]
+    fn head_answers_the_public_sse_headers_an_object_stores() {
+        let request_md5 = "request-key-md5".to_owned();
+
+        let fields = head_sse_response_fields(&stored_metadata(&[("content-type", "text/plain")]), None);
+        assert_eq!(sse_fields(&fields), (None, None, None, None));
+
+        let sse_s3 = stored_metadata(&[("x-amz-server-side-encryption", "AES256")]);
+        assert_eq!(sse_fields(&head_sse_response_fields(&sse_s3, None)), (Some("AES256"), None, None, None));
+
+        let sse_kms = stored_metadata(&[
+            ("x-amz-server-side-encryption", "aws:kms"),
+            ("x-amz-server-side-encryption-aws-kms-key-id", "finance-key"),
+        ]);
+        assert_eq!(
+            sse_fields(&head_sse_response_fields(&sse_kms, None)),
+            (Some("aws:kms"), None, None, Some("finance-key")),
+            "a recorded key id is answered as recorded"
+        );
+
+        let sse_c = stored_metadata(&[
+            ("x-amz-server-side-encryption", "AES256"),
+            ("x-amz-server-side-encryption-customer-algorithm", "AES256"),
+            ("x-amz-server-side-encryption-customer-key-md5", "stored-key-md5"),
+        ]);
+        assert_eq!(
+            sse_fields(&head_sse_response_fields(&sse_c, Some(&request_md5))),
+            (None, Some("AES256"), Some("stored-key-md5"), None),
+            "SSE-C names no managed scheme and answers the stored key MD5"
+        );
+    }
+
+    /// MinIO stores only its sealed-key slots and synthesizes the public headers
+    /// per response; HEAD must report what GET already reports for such objects.
+    #[cfg(feature = "rio-v2")]
+    #[test]
+    fn head_synthesizes_the_sse_headers_minio_never_stored() {
+        use rustfs_utils::http::{
+            MINIO_INTERNAL_ENCRYPTION_KMS_KEY_ID_HEADER, MINIO_INTERNAL_ENCRYPTION_KMS_SEALED_KEY_HEADER,
+            MINIO_INTERNAL_ENCRYPTION_S3_SEALED_KEY_HEADER, MINIO_INTERNAL_ENCRYPTION_SSEC_SEALED_KEY_HEADER,
+        };
+        let request_md5 = "request-key-md5".to_owned();
+
+        let sse_s3 = stored_metadata(&[
+            (MINIO_INTERNAL_ENCRYPTION_S3_SEALED_KEY_HEADER, "sealed"),
+            (MINIO_INTERNAL_ENCRYPTION_KMS_KEY_ID_HEADER, "compat-key"),
+        ]);
+        assert_eq!(sse_fields(&head_sse_response_fields(&sse_s3, None)), (Some("AES256"), None, None, None));
+
+        let sse_kms = stored_metadata(&[
+            (MINIO_INTERNAL_ENCRYPTION_KMS_SEALED_KEY_HEADER, "sealed"),
+            (MINIO_INTERNAL_ENCRYPTION_KMS_KEY_ID_HEADER, "compat-key"),
+        ]);
+        assert_eq!(
+            sse_fields(&head_sse_response_fields(&sse_kms, None)),
+            (Some("aws:kms"), None, None, Some("arn:aws:kms:compat-key")),
+            "the key id in the form MinIO answered with"
+        );
+
+        let sse_c = stored_metadata(&[(MINIO_INTERNAL_ENCRYPTION_SSEC_SEALED_KEY_HEADER, "sealed")]);
+        assert_eq!(
+            sse_fields(&head_sse_response_fields(&sse_c, Some(&request_md5))),
+            (None, Some("AES256"), Some("request-key-md5"), None),
+            "MinIO stores no customer-key MD5, so the validated request value is echoed"
+        );
+    }
+
+    /// A build that cannot read MinIO's sealed layout does not claim a scheme for it.
+    #[cfg(not(feature = "rio-v2"))]
+    #[test]
+    fn head_reports_no_sse_headers_for_a_minio_sealed_object_without_the_minio_read_path() {
+        use rustfs_utils::http::{
+            MINIO_INTERNAL_ENCRYPTION_KMS_KEY_ID_HEADER, MINIO_INTERNAL_ENCRYPTION_KMS_SEALED_KEY_HEADER,
+            MINIO_INTERNAL_ENCRYPTION_S3_SEALED_KEY_HEADER,
+        };
+
+        for slot in [
+            MINIO_INTERNAL_ENCRYPTION_S3_SEALED_KEY_HEADER,
+            MINIO_INTERNAL_ENCRYPTION_KMS_SEALED_KEY_HEADER,
+        ] {
+            let metadata = stored_metadata(&[(slot, "sealed"), (MINIO_INTERNAL_ENCRYPTION_KMS_KEY_ID_HEADER, "compat-key")]);
+            assert_eq!(sse_fields(&head_sse_response_fields(&metadata, None)), (None, None, None, None), "{slot}");
+        }
     }
 
     fn assert_no_head_traffic(state: &BucketOdmState) {

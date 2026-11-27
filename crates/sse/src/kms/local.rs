@@ -189,6 +189,12 @@ impl LocalSseDekProvider {
         Ok(Self { master_key })
     }
 
+    /// The master key, for the MinIO builtin-KMS formats that seal with it directly.
+    #[cfg(feature = "rio-v2")]
+    pub(crate) fn master_key(&self) -> &[u8; 32] {
+        &self.master_key
+    }
+
     // Simple encryption of DEK
     pub fn encrypt_dek(dek: [u8; 32], cmk_value: [u8; 32]) -> Result<String, SseError> {
         // Use AES-256-GCM to encrypt DEK

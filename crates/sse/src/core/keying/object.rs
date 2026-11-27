@@ -34,7 +34,7 @@ use rustfs_utils::http::object_encryption_keys::{
 use sha2::Sha256;
 use std::collections::HashMap;
 
-pub(crate) const MINIO_INTERNAL_ENCRYPTION_SEAL_ALGORITHM: &str = "DAREv2-HMAC-SHA256";
+pub(crate) use rustfs_utils::http::object_encryption_keys::MINIO_INTERNAL_ENCRYPTION_SEAL_ALGORITHM;
 
 const DARE_VERSION_20: u8 = 0x20;
 
@@ -198,6 +198,42 @@ pub(crate) fn unseal_object_key(
         .try_into()
         .map_err(|_| SseError::internal("Sealed object key must decrypt to 32 bytes"))?;
     Ok(object_key)
+}
+
+/// Domain string MinIO derives the ETag sealing key under (`internal/crypto/key.go`).
+const ETAG_SEALING_KEY_CONTEXT: &[u8] = b"SSE-etag";
+
+/// Shortest stored ETag MinIO treats as sealed rather than as a bare digest
+/// (`internal/etag`, `ETag.IsEncrypted`).
+pub(crate) const SEALED_ETAG_MIN_SIZE: usize = 32;
+
+/// Recover the content MD5 MinIO sealed as the stored ETag of a single-part SSE object.
+///
+/// The sealed ETag is one final DARE 2.0 package keyed by
+/// `HMAC-SHA256(object_key, "SSE-etag")`.
+///
+/// # Errors
+///
+/// When `sealed` is not exactly one final package, or does not authenticate
+/// under `object_key`.
+pub(crate) fn unseal_etag(object_key: [u8; 32], sealed: &[u8]) -> Result<Vec<u8>, SseError> {
+    let Some((header, ciphertext)) = sealed.split_at_checked(DARE_HEADER_SIZE) else {
+        return Err(SseError::internal("Sealed ETag is shorter than a DARE header"));
+    };
+    if header[0] != DARE_VERSION_20 || !is_supported_sealed_object_key_cipher(header[1]) {
+        return Err(SseError::internal("Unsupported sealed ETag DARE header"));
+    }
+    let payload_len = usize::from(u16::from_le_bytes([header[2], header[3]])) + 1;
+    if ciphertext.len() != payload_len + DARE_TAG_SIZE || header[4] & 0x80 == 0 {
+        return Err(SseError::internal("Sealed ETag is not a single final DARE package"));
+    }
+
+    let mut mac = HmacSha256::new_from_slice(&object_key)
+        .map_err(|err| SseError::internal(format!("Invalid HMAC key for ETag sealing-key derivation: {err}")))?;
+    mac.update(ETAG_SEALING_KEY_CONTEXT);
+    let sealing_key: [u8; 32] = mac.finalize().into_bytes().into();
+
+    decrypt_sealed_object_key_payload(sealing_key, header, sealed)
 }
 
 fn try_decode_minio_sealed_key(bytes: &str) -> Result<Option<[u8; SEALED_KEY_SIZE]>, SseError> {

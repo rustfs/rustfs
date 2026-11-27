@@ -182,8 +182,126 @@ pub async fn classify_sse_read_response(
         sse_customer_key_md5: None,
         // The key id was needed above to authorize the read, but an AES256
         // object's wrapping key is internal: only aws:kms objects advertise it.
-        ssekms_key_id: matches!(stored.sse_type, SSEType::SseKms).then_some(kms_key_id),
+        ssekms_key_id: matches!(stored.sse_type, SSEType::SseKms).then(|| stored.response_kms_key_id(kms_key_id)),
     }))
+}
+
+/// Response headers for a metadata-only read of an object that stores none of
+/// the public SSE headers.
+///
+/// RustFS persists the public scheme headers with every encrypted write, and a
+/// metadata-only read answers with them as stored; such an object classifies
+/// as `None` here. MinIO persists only its internal sealed-key slots and
+/// synthesizes the public headers onto each response, so for a MinIO-written
+/// object the scheme is inferred from the slot, the way
+/// [`classify_sse_read_response`] infers it for a full read.
+///
+/// `None` also covers a plaintext object and — in a build without the MinIO
+/// read path — every object whose scheme only the sealed-key slot names.
+///
+/// No key is unwrapped and nothing is authorized here: this reports how the
+/// object is stored, exactly as the stored-header path does. For SSE-C the
+/// request's customer-key MD5 is echoed because MinIO stores none; it is the
+/// value the request declared, which the caller has checked against the
+/// request's key but which only an unseal can prove against the object.
+pub fn classify_unrecorded_sse_response(
+    metadata: &HashMap<String, String>,
+    sse_customer_key_md5: Option<&String>,
+) -> Option<SseReadResponseHeaders> {
+    if metadata.contains_key("x-amz-server-side-encryption")
+        || metadata.contains_key("x-amz-server-side-encryption-customer-algorithm")
+    {
+        return None;
+    }
+
+    if stored_ssec_metadata(metadata) {
+        return Some(SseReadResponseHeaders {
+            server_side_encryption: String::from(AMZ_ENCRYPTION_AES),
+            sse_customer_algorithm: Some(String::from(stored_ssec_algorithm(metadata))),
+            sse_customer_key_md5: sse_customer_key_md5.cloned(),
+            ssekms_key_id: None,
+        });
+    }
+
+    let stored = recognize_stored_managed_key(metadata)?;
+    let ssekms_key_id = if matches!(stored.sse_type, SSEType::SseKms) {
+        stored
+            .recorded_kms_key_id
+            .clone()
+            .map(|kms_key_id| stored.response_kms_key_id(kms_key_id))
+    } else {
+        None
+    };
+    Some(SseReadResponseHeaders {
+        server_side_encryption: managed_sse_public_header(stored.sse_type).to_string(),
+        sse_customer_algorithm: None,
+        sse_customer_key_md5: None,
+        ssekms_key_id,
+    })
+}
+
+/// The ETag a client is shown for an object whose stored ETag MinIO sealed.
+///
+/// MinIO stores the ETag of a single-part SSE object encrypted under the object
+/// key and never returns that stored form (`cmd/encryption-v1.go`,
+/// `getDecryptedETag`): an SSE-S3 object is answered with the unsealed content
+/// MD5, an SSE-KMS or SSE-C object with the last 32 hex characters of the
+/// sealed value. Returning the stored form instead changes the ETag every
+/// client recorded before the drives moved to RustFS.
+///
+/// `None` means the stored ETag is what the client sees: it is not sealed, the
+/// object is a multipart upload (its ETag is stored as shown), the object does
+/// not carry MinIO's sealed object key, or — for SSE-S3 — the object key could
+/// not be recovered. MinIO falls back to the stored value in that last case
+/// too, and the read itself reports the key failure.
+///
+/// Only an SSE-S3 object costs a data-key unwrap. SSE-S3 keys carry no per-key
+/// authorization, and the unwrap is not recorded in the KMS audit summary: it
+/// serves the response of a read that is recorded on its own.
+pub async fn sealed_etag_for_response(host: &dyn SseHost, request: DecryptionRequest<'_>, stored_etag: &str) -> Option<String> {
+    #[cfg(feature = "rio-v2")]
+    {
+        use crate::core::keying::object::{SEALED_ETAG_MIN_SIZE, unseal_etag};
+        use rustfs_utils::http::object_encryption_keys::{
+            MINIO_INTERNAL_ENCRYPTION_KMS_SEALED_KEY_HEADER, MINIO_INTERNAL_ENCRYPTION_MULTIPART_HEADER,
+            MINIO_INTERNAL_ENCRYPTION_S3_SEALED_KEY_HEADER, MINIO_INTERNAL_ENCRYPTION_SSEC_SEALED_KEY_HEADER,
+        };
+
+        let metadata = request.metadata;
+        if metadata.contains_key(MINIO_INTERNAL_ENCRYPTION_MULTIPART_HEADER) {
+            return None;
+        }
+        // A multipart ETag carries a `-<parts>` suffix and is not hex, so it
+        // stops here together with every unsealed digest.
+        let sealed = hex_simd::decode_to_vec(stored_etag)
+            .ok()
+            .filter(|sealed| sealed.len() >= SEALED_ETAG_MIN_SIZE)?;
+
+        if metadata.contains_key(MINIO_INTERNAL_ENCRYPTION_SSEC_SEALED_KEY_HEADER)
+            || metadata.contains_key(MINIO_INTERNAL_ENCRYPTION_KMS_SEALED_KEY_HEADER)
+        {
+            return stored_etag.get(stored_etag.len() - 32..).map(str::to_owned);
+        }
+        if !metadata.contains_key(MINIO_INTERNAL_ENCRYPTION_S3_SEALED_KEY_HEADER) {
+            return None;
+        }
+
+        let (stored, kms_key_id) = resolve_stored_managed_key(host, metadata).await?;
+        let (opened, _) = open_under_stored_data_key(host, request.bucket, request.key, &stored, &kms_key_id)
+            .await
+            .ok()?;
+        if opened.key_kind != crate::core::keying::material::EncryptionKeyKind::Object {
+            return None;
+        }
+        let etag = unseal_etag(opened.key_bytes, &sealed).ok()?;
+        Some(hex_simd::encode_to_string(etag, hex_simd::AsciiCase::Lower))
+    }
+
+    #[cfg(not(feature = "rio-v2"))]
+    {
+        let _ = (host, request, stored_etag);
+        None
+    }
 }
 
 /// Recognize a stored managed-SSE object and name the key it is read under.

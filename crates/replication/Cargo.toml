@@ -27,6 +27,9 @@ documentation = "https://docs.rs/rustfs-replication/latest/rustfs_replication/"
 
 [features]
 default = []
+# MinIO on-disk interoperability: user metadata is stored under `x-amz-meta-`
+# keys. Mirrors the `rio-v2` feature of the server binary.
+rio-v2 = []
 hotpath = []
 hotpath-alloc = ["hotpath"]
 hotpath-cpu = ["hotpath"]

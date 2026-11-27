@@ -14,11 +14,13 @@ Build variants are the `rustfs` crate features in `rustfs/Cargo.toml`: `default`
 | Unencrypted `xl.meta` (meta_ver 1-3, inline, multipart, versioned, delete marker) | Read | Read | Part A. Normalized to meta_ver 3 on rewrite. |
 | Transitioned (tiered) `xl.meta` | Not fixture-proven | Not fixture-proven | Out of scope; see erasure-coding.md for the tolerant `transitioned-versionID` read rule. |
 | `.metadata.bin` bucket config | Read and imported | Read and imported | Part B. Importer reads a `.minio.sys` layout end to end. |
-| IAM config under `config/iam/` | Imported | Imported | `try_migrate_iam_config`; legacy field aliases normalized. |
+| IAM config under `config/iam/`, plaintext or encrypted with the root credentials | Imported | Imported | `try_migrate_iam_config`; legacy field aliases normalized. |
+| IAM config under `config/iam/`, encrypted by MinIO's builtin static KMS | Startup fails, record named | Imported | Part B. MinIO encrypts every IAM record, `format.json` included, once a KMS is configured. Requires the shared master key. |
 | SSE-S3 / SSE-KMS objects, MinIO builtin static KMS | Fail closed, diagnosed | Read | Part C. Requires the shared master key. |
 | SSE-C objects | Fail closed, diagnosed | Read | Part C. Customer key supplied per request. |
 | Any SSE object, MinIO backed by KES / KMS plugin / MinKMS | Fail closed | Fail closed | Not planned; the DEK is sealed by the KES service. |
 | RustFS-written drive set read by a live MinIO binary | Unsupported | Unsupported | Set-level divergence: MinIO looks for `.minio.sys`, RustFS writes `.rustfs.sys`. |
+| Objects RustFS wrote onto a MinIO-initialized drive set, read by MinIO afterwards | Unsupported | Read, SSE objects excepted | Part D. A default build stores compression markers and user metadata under keys MinIO does not look up. |
 | RustFS-written SSE objects read by MinIO | Unsupported | Unsupported | Part C, reverse direction. |
 
 ## Version Anchors
@@ -68,6 +70,16 @@ MinIO stores an inlined object body as `[HighwayHash256 (32 B)][body]`. Feeding 
 | `try_migrate_bucket_metadata` | `buckets/{bucket}/.metadata.bin` plus the replication resync blob (`normalize_bucket_meta_blob` via `ReplicationMigrationBridge`) |
 | `try_migrate_iam_config` | `config/iam/` records; `normalize_iam_config_blob` rewrites legacy timestamp and policy-mapping aliases |
 
+MinIO stores IAM records in one of three forms, and the importer decrypts before it normalizes (`decrypt_legacy_iam_blob` in `rustfs/src/storage/storage_api.rs`):
+
+| Stored form | Reader | Builds |
+|---|---|---|
+| Plaintext JSON | none needed | all |
+| Encrypted with a key derived from the root credentials (no KMS configured) | `rustfs_iam::try_decrypt_iam_blob` | all |
+| Encrypted under a builtin-KMS data key bound to the record's path (`internal/config/crypto.go`: a 5-byte header, JSON metadata, a `sio-go` stream) | `decrypt_minio_kms_config` in `crates/sse/src/kms/minio.rs` | `rio-v2` |
+
+A record no reader opens fails the migration with `incompatible legacy metadata: <path>` and the server does not start; it is never imported as if it were plaintext. KES and other external KMS backends are out of scope, as for objects. The server config blob (`config/config.json`), which MinIO encrypts the same way, is imported best-effort and is skipped when it does not decrypt.
+
 ## Part C — Server-Side Encryption (SSE)
 
 The `xl.meta` around a MinIO SSE object parses in every build, so such objects list, HEAD, and report plausible sizes; only payload readability depends on the build. KMS wire protocols (AWS `awsJson1_1` client in `crates/kms/src/backends/aws.rs`, MinIO KES) are non-targets.
@@ -88,7 +100,10 @@ The cryptography (DARE v2 stream format, object-key derivation, sealing) was nev
 | Managed-SSE detection required the persisted public `x-amz-server-side-encryption` key, which MinIO synthesizes at response time | `infer_minio_managed_sse_type` infers the scheme from which MinIO sealed-key slot is present; the slot also selects the sealing-key domain, so a wrong inference cannot derive a wrong key. |
 | MinIO's wrapped-DEK ciphertext was accepted by no envelope parser | `decrypt_minio_kms_data_key` implements MinIO's builtin-KMS sealing for both the raw `sealed‖iv‖nonce` layout and the legacy `{"aead": ...}` JSON. Routing is by byte shape: `LocalSseDekEnvelope` (`deny_unknown_fields`) is recognized positively, everything else goes to the MinIO decoder. |
 | SSE-C detection keyed on the stored customer-algorithm header, which MinIO also never persists, and demanded a stored key MD5 | `stored_ssec_metadata` accepts MinIO's SSE-C sealed-key slot (`rio-v2` only); `verify_ssec_key_match` tolerates a missing stored MD5 for exactly that shape. |
-| Multipart classification used an ETag-length heuristic (MinIO stores encrypted ETags) | Trusts MinIO's own `X-Minio-Internal-Encrypted-Multipart` marker (`crates/utils/src/http/header_compat.rs`). |
+| Multipart classification used an ETag-length heuristic, and MinIO seals the ETag of a single-part SSE object into 96 hex characters, so every such object was read under part keys and failed authentication | For a sealed object key, `is_multipart_encrypted_object` (`crates/ecstore/src/object_api/readers.rs`) trusts MinIO's own `X-Minio-Internal-Encrypted-Multipart` marker, as MinIO's `crypto.IsMultiPart` does. |
+| MinIO records no plaintext size for a single-part SSE object, so the stored size, DARE framing included, was reported as the object's length | `ObjectInfo::encryption_original_size` (`crates/ecstore/src/object_api/types.rs`) derives it from the DARE layout when nothing records it, per part for a marked multipart upload (`sio.DecryptedSize`). |
+| HEAD answered only stored public SSE headers, which MinIO never persists | `classify_unrecorded_sse_response` (`read.rs`) classifies from the sealed-key slot. An `aws:kms` key id is answered in the `arn:aws:kms:` form MinIO used, on GET as well. |
+| HEAD and GET answered the sealed ETag | `sealed_etag_for_response` (`read.rs`) answers what MinIO did: the unsealed content MD5 for SSE-S3, the last 32 hex characters for SSE-KMS and SSE-C. |
 
 ### How default builds fail
 
@@ -96,7 +111,11 @@ The cryptography (DARE v2 stream format, object-key derivation, sealing) was nev
 
 ### Reverse direction
 
-Under `rio-v2` RustFS writes its own DEK envelope into MinIO's sealed-key metadata slots labelled with MinIO's seal algorithm, so the metadata is MinIO-shaped while the key bytes are not MinIO-openable. Default builds do not populate those slots. Treat RustFS-written SSE objects as readable only by RustFS. Known unverified edge: MinIO seals ETags on SSE objects; RustFS does not unseal them, so ETag display and `If-Match` on migrated SSE objects are not guaranteed to match MinIO.
+Under `rio-v2` RustFS writes its own DEK envelope into MinIO's sealed-key metadata slots labelled with MinIO's seal algorithm, so the metadata is MinIO-shaped while the key bytes are not MinIO-openable. Default builds do not populate those slots. Treat RustFS-written SSE objects as readable only by RustFS: MinIO answers HEAD for them and fails GET with `kms:KeyNotFound`.
+
+### ETag limits
+
+Two differences from MinIO remain on MinIO-written SSE objects. Conditional request headers (`If-Match`, `If-None-Match`) are evaluated against the stored, sealed ETag, not the one the response carries. Listings omit the ETag of every encrypted object that does not record RustFS's own protected-ETag format, which includes all MinIO-written ones; that is RustFS listing policy (`etag_can_be_listed`, `crates/utils/src/http/object_encryption_keys.rs`), not a read gap.
 
 ### Migration options for encrypted objects
 
@@ -105,6 +124,17 @@ Under `rio-v2` RustFS writes its own DEK envelope into MinIO's sealed-key metada
 3. Leave encrypted objects on MinIO and migrate only unencrypted data.
 
 Inventory the source first: bucket default encryption means objects can be encrypted without the uploader asking, so "we never set SSE headers" is not evidence that a bucket has no encrypted objects.
+
+## Part D — Objects RustFS Writes Onto A MinIO Drive Set
+
+A `rio-v2` build serving a MinIO-initialized drive set writes objects MinIO can read once it serves the drives again. Two stored shapes differ from a default build for that reason, and only in `rio-v2`:
+
+| Metadata | Default build | `rio-v2` build | Why |
+|---|---|---|---|
+| Compression marker and plaintext size (`compression`, `actual-size`) | `x-rustfs-internal-*` and `x-minio-internal-*` | `x-rustfs-internal-*` and `X-Minio-Internal-*` | MinIO looks these two keys up with an exact-case map access (`cmd/object-api-utils.go`, `IsCompressed` / `GetActualSize`); the lowercase twin is invisible to it, so a compressed object is served as its raw S2 stream. `minio_key` in `crates/utils/src/http/metadata_compat.rs`. |
+| User metadata | bare key (`purpose`); reserved names keep `x-amz-meta-` | `x-amz-meta-<key>`; `internal-*` keys stay bare | MinIO answers a stored key without the prefix as an ordinary response header named after it, never as `x-amz-meta-*`. `stored_user_metadata_key` in `rustfs/src/storage/options.rs`. An `internal-*` key cannot be namespaced: `x-amz-meta-internal-*` is a legacy internal namespace the RustFS read side hides, so such a key is readable by RustFS only. |
+
+RustFS readers accept both shapes in every build, so a drive set can move between build variants. Replication convergence checks in a `rio-v2` build leave user metadata out of the source/target comparison (`comparable_metadata`, `crates/replication/src/object.rs`): the target reports it with the prefix stripped, so a prefix-keyed comparison could never match. SSE objects are the exception to MinIO readability; see Part C, reverse direction.
 
 ## rio-v2 variant lifecycle
 

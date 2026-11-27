@@ -275,6 +275,56 @@ pub async fn classify_sse_read_response(request: DecryptionRequest<'_>) -> Resul
     Ok(rustfs_sse::classify_sse_read_response(&HOST, request).await?)
 }
 
+/// SSE response headers of a metadata-only read for an object that stores none
+/// of the public ones. See [`rustfs_sse::classify_unrecorded_sse_response`].
+pub(crate) fn classify_unrecorded_sse_response(
+    metadata: &HashMap<String, String>,
+    sse_customer_key_md5: Option<&String>,
+) -> Option<SseReadResponseHeaders> {
+    rustfs_sse::classify_unrecorded_sse_response(metadata, sse_customer_key_md5)
+}
+
+/// The ETag a read of this object answers with.
+///
+/// The stored ETag, except where it is the sealed form MinIO never showed a
+/// client: see [`rustfs_sse::sealed_etag_for_response`]. Conditional request
+/// headers are still evaluated against the stored ETag.
+pub(crate) async fn read_response_etag(
+    bucket: &str,
+    key: &str,
+    metadata: &HashMap<String, String>,
+    stored_etag: Option<&str>,
+) -> Option<String> {
+    let stored_etag = stored_etag?;
+    let request = DecryptionRequest {
+        bucket,
+        key,
+        metadata,
+        sse_customer_key: None,
+        sse_customer_key_md5: None,
+        principal: None,
+    };
+    let presented = rustfs_sse::sealed_etag_for_response(&HOST, request, stored_etag).await;
+    Some(presented.unwrap_or_else(|| stored_etag.to_owned()))
+}
+
+/// Decrypt an IAM record a MinIO server stored KMS-encrypted under
+/// `object_path` of its meta bucket. See [`rustfs_sse::decrypt_minio_kms_config`].
+///
+/// `None` in a build without the MinIO read path, which holds no reader for
+/// MinIO's builtin-KMS formats.
+pub(crate) fn decrypt_minio_kms_iam_config(blob: &[u8], object_path: &str) -> Option<Vec<u8>> {
+    #[cfg(feature = "rio-v2")]
+    {
+        rustfs_sse::decrypt_minio_kms_config(blob, object_path)
+    }
+    #[cfg(not(feature = "rio-v2"))]
+    {
+        let _ = (blob, object_path);
+        None
+    }
+}
+
 pub(crate) async fn rewrap_object_encryption_metadata(
     bucket: &str,
     key: &str,

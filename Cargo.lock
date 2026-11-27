@@ -11583,6 +11583,7 @@ dependencies = [
  "axum",
  "base64-simd",
  "chacha20poly1305",
+ "hex-simd",
  "hmac 0.13.0",
  "http 1.5.0",
  "md-5",

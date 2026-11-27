@@ -520,7 +520,7 @@ fn build_list_object_versions_metadata_output(
                     object: MetadataObject {
                         key: object_name,
                         last_modified: object.mod_time,
-                        size: Some(object.size),
+                        size: Some(object.get_actual_size_or_physical()),
                         version_id: Some(version_id),
                         is_latest: Some(object.is_latest),
                         storage_class: Some(
@@ -1336,6 +1336,43 @@ mod tests {
                 assert_eq!(extension.user_metadata.clone(), Some(vec![("marker".to_string(), "true".to_string())]));
             }
             other => panic!("expected delete marker entry, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn build_list_object_versions_metadata_output_reports_the_logical_size() {
+        let mut compressed = HashMap::new();
+        rustfs_utils::http::insert_str(
+            &mut compressed,
+            rustfs_utils::http::SUFFIX_COMPRESSION,
+            "klauspost/compress/s2".to_owned(),
+        );
+        rustfs_utils::http::insert_str(&mut compressed, rustfs_utils::http::SUFFIX_ACTUAL_SIZE, "307200".to_owned());
+        let object_infos = ListObjectVersionsInfo {
+            objects: vec![ObjectInfo {
+                bucket: "demo-bucket".to_string(),
+                name: "compressed".to_string(),
+                size: 106,
+                user_defined: Arc::new(compressed),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let params = ListObjectVersionsParams {
+            prefix: String::new(),
+            delimiter: None,
+            key_marker: None,
+            version_id_marker: None,
+            max_keys: 1000,
+        };
+
+        let output = build_list_object_versions_metadata_output(object_infos, "demo-bucket", &params, None, &HashMap::new());
+
+        match &output.entries[0] {
+            ListObjectVersionMetadataEntry::Version(ObjectMetadataEntry { object: version, .. }) => {
+                assert_eq!(version.size, Some(307200));
+            }
+            other => panic!("expected version entry, got {other:?}"),
         }
     }
 

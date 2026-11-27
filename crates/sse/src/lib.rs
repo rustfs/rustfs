@@ -79,7 +79,9 @@ pub use crate::core::keying::metadata::{
     ConflictingEncryptionMetadata, encryption_material_to_metadata, mark_encrypted_multipart_metadata,
     normalize_encryption_metadata_case, stored_ssec_metadata, strip_managed_encryption_metadata,
 };
-pub use crate::core::read::{DecryptionRequest, classify_sse_read_response, sse_decryption};
+pub use crate::core::read::{
+    DecryptionRequest, classify_sse_read_response, classify_unrecorded_sse_response, sealed_etag_for_response, sse_decryption,
+};
 pub use crate::core::request::SseKmsPrincipal;
 #[cfg(any(test, feature = "test-util"))]
 pub use crate::core::request::TestAuthorizationHooks;
@@ -98,6 +100,8 @@ pub use crate::host::{BucketDefaultEncryption, BucketEncryption, KmsKeyAuthorize
 pub use crate::kms::local::LocalSseDekProvider;
 #[cfg(any(test, feature = "test-util"))]
 pub use crate::kms::local::TestSseDekProvider;
+#[cfg(feature = "rio-v2")]
+pub use crate::kms::minio::decrypt_minio_kms_config;
 pub use crate::kms::provider::SseDekProvider;
 #[cfg(any(test, feature = "test-util"))]
 pub use crate::kms::provider::{reset_sse_dek_provider, set_sse_dek_provider_for_test};

@@ -4770,3 +4770,303 @@ fn recorded_key_versions_reach_the_audit_tags() {
     assert_eq!(audit_tag(&tags, "kmsKeyVersion").as_deref(), Some("3"));
     assert_eq!(audit_tag(&tags, "kmsOutcome").as_deref(), Some("success"));
 }
+
+/// Object key `0x40..=0x5f`, the key the sealed-ETag reference vectors use.
+#[cfg(feature = "rio-v2")]
+fn sealed_etag_object_key() -> [u8; 32] {
+    std::array::from_fn(|index| 0x40 + u8::try_from(index).expect("an index below 32 fits in u8"))
+}
+
+/// `MD5("rustfs-minio-etag-vector")`, and that digest sealed under
+/// [`sealed_etag_object_key`] with MinIO's own `sio` library exactly as
+/// `ObjectKey.SealETag` does, once per DARE cipher suite.
+#[cfg(feature = "rio-v2")]
+const SEALED_ETAG_PLAINTEXT_HEX: &str = "b228928307afa1ffeb9aa36de4526de8";
+#[cfg(feature = "rio-v2")]
+const SEALED_ETAG_AES_GCM_HEX: &str =
+    "20000f00ae1b28a996b85ecef920fb8da6843e2838328dbfef3a9a266201f27ee3f8c64555ea36a2196275c2261d745d";
+#[cfg(feature = "rio-v2")]
+const SEALED_ETAG_CHACHA20_HEX: &str =
+    "20010f00cbc498738108113178f20c5507f319f350e962a89c610c16699bca30b4f4914b6552c532550cca4ec1eb39b3";
+
+#[cfg(feature = "rio-v2")]
+#[test]
+fn unseal_etag_recovers_the_md5_minio_sealed_under_either_cipher_suite() {
+    use crate::core::keying::object::unseal_etag;
+
+    for sealed in [SEALED_ETAG_AES_GCM_HEX, SEALED_ETAG_CHACHA20_HEX] {
+        let sealed = hex_simd::decode_to_vec(sealed).expect("test vector is valid hex");
+        let etag = unseal_etag(sealed_etag_object_key(), &sealed).expect("unseal a MinIO-sealed ETag");
+        assert_eq!(hex_simd::encode_to_string(etag, hex_simd::AsciiCase::Lower), SEALED_ETAG_PLAINTEXT_HEX);
+    }
+}
+
+#[cfg(feature = "rio-v2")]
+#[test]
+fn unseal_etag_rejects_a_wrong_key_and_malformed_packages() {
+    use crate::core::keying::object::unseal_etag;
+
+    let sealed = hex_simd::decode_to_vec(SEALED_ETAG_AES_GCM_HEX).expect("test vector is valid hex");
+    unseal_etag([0x11; 32], &sealed).expect_err("a different object key must not authenticate");
+
+    let mut tampered = sealed.clone();
+    *tampered.last_mut().expect("a sealed ETag is not empty") ^= 0x01;
+    unseal_etag(sealed_etag_object_key(), &tampered).expect_err("a flipped bit must not authenticate");
+
+    unseal_etag(sealed_etag_object_key(), &sealed[..sealed.len() - 1]).expect_err("length disagrees with the header");
+    unseal_etag(sealed_etag_object_key(), &sealed[..8]).expect_err("shorter than a DARE header");
+
+    let mut not_final = sealed.clone();
+    not_final[4] &= 0x7F;
+    unseal_etag(sealed_etag_object_key(), &not_final).expect_err("a sealed ETag is one final package");
+
+    let mut unknown_cipher = sealed;
+    unknown_cipher[1] = 0x7F;
+    unseal_etag(sealed_etag_object_key(), &unknown_cipher).expect_err("an unknown cipher suite");
+}
+
+/// Metadata of a single-part managed-SSE object as MinIO's builtin KMS stores
+/// it: internal sealed-key slots only, no public scheme header.
+#[cfg(feature = "rio-v2")]
+fn minio_managed_object_metadata(
+    sse_type: SSEType,
+    master_key: &[u8; 32],
+    bucket: &str,
+    object: &str,
+    object_key: [u8; 32],
+) -> HashMap<String, String> {
+    let data_key = [0x33u8; 32];
+    let context = ObjectEncryptionContext::new(bucket.to_string(), object.to_string());
+    let wrapped_data_key = seal_minio_kms_data_key(&data_key, master_key, &context);
+    let sealed = crate::core::keying::object::seal_object_key(object_key, data_key, sse_type, bucket, object)
+        .expect("seal the object key under the data key");
+    let sealed_key_slot = match sse_type {
+        SSEType::SseS3 => MINIO_INTERNAL_ENCRYPTION_S3_SEALED_KEY_HEADER,
+        SSEType::SseKms => MINIO_INTERNAL_ENCRYPTION_KMS_SEALED_KEY_HEADER,
+        SSEType::SseC => MINIO_INTERNAL_ENCRYPTION_SSEC_SEALED_KEY_HEADER,
+    };
+
+    HashMap::from([
+        (
+            MINIO_INTERNAL_ENCRYPTION_ALGORITHM_HEADER.to_string(),
+            crate::core::keying::object::MINIO_INTERNAL_ENCRYPTION_SEAL_ALGORITHM.to_string(),
+        ),
+        (
+            MINIO_INTERNAL_ENCRYPTION_IV_HEADER.to_string(),
+            BASE64_STANDARD.encode_to_string(sealed.iv),
+        ),
+        (sealed_key_slot.to_string(), BASE64_STANDARD.encode_to_string(sealed.sealed_key)),
+        (MINIO_INTERNAL_ENCRYPTION_KMS_KEY_ID_HEADER.to_string(), "compat-key".to_string()),
+        (
+            MINIO_INTERNAL_ENCRYPTION_KMS_DATA_KEY_HEADER.to_string(),
+            BASE64_STANDARD.encode_to_string(wrapped_data_key),
+        ),
+    ])
+}
+
+#[cfg(feature = "rio-v2")]
+fn decryption_request<'a>(metadata: &'a HashMap<String, String>) -> DecryptionRequest<'a> {
+    DecryptionRequest {
+        bucket: "bucket",
+        key: "dir/object",
+        metadata,
+        sse_customer_key: None,
+        sse_customer_key_md5: None,
+        principal: None,
+    }
+}
+
+/// The ETag half of reading a MinIO drive set: what MinIO stored is not what
+/// MinIO answered with, and a client only ever saw the answer.
+#[cfg(feature = "rio-v2")]
+#[tokio::test]
+async fn sealed_etag_is_presented_the_way_minio_presented_it() {
+    use crate::core::read::sealed_etag_for_response;
+
+    let _guard = lock_sse_test_state().await;
+    let master_key = [0x5Au8; 32];
+    crate::kms::provider::set_sse_dek_provider_for_test(Arc::new(TestSseDekProvider::new_with_key(master_key)));
+
+    // SSE-S3: the content MD5, recovered with the object key.
+    let sse_s3 = minio_managed_object_metadata(SSEType::SseS3, &master_key, "bucket", "dir/object", sealed_etag_object_key());
+    for sealed in [SEALED_ETAG_AES_GCM_HEX, SEALED_ETAG_CHACHA20_HEX] {
+        assert_eq!(
+            sealed_etag_for_response(&HOST, decryption_request(&sse_s3), sealed)
+                .await
+                .as_deref(),
+            Some(SEALED_ETAG_PLAINTEXT_HEX)
+        );
+    }
+
+    // SSE-KMS and SSE-C: the tail of the sealed value, no key involved.
+    let sealed_tail = &SEALED_ETAG_CHACHA20_HEX[SEALED_ETAG_CHACHA20_HEX.len() - 32..];
+    let sse_kms = minio_managed_object_metadata(SSEType::SseKms, &master_key, "bucket", "dir/object", sealed_etag_object_key());
+    let sse_c = minio_managed_object_metadata(SSEType::SseC, &master_key, "bucket", "dir/object", sealed_etag_object_key());
+    for metadata in [&sse_kms, &sse_c] {
+        assert_eq!(
+            sealed_etag_for_response(&HOST, decryption_request(metadata), SEALED_ETAG_CHACHA20_HEX)
+                .await
+                .as_deref(),
+            Some(sealed_tail)
+        );
+    }
+
+    // Stored as shown: an unsealed digest, a multipart ETag, a marked multipart
+    // object, and an object without MinIO's sealed object key.
+    for stored in [SEALED_ETAG_PLAINTEXT_HEX, "b228928307afa1ffeb9aa36de4526de8-3", "not-an-etag"] {
+        assert_eq!(
+            sealed_etag_for_response(&HOST, decryption_request(&sse_s3), stored).await,
+            None,
+            "{stored}"
+        );
+    }
+    let mut multipart = sse_s3.clone();
+    mark_encrypted_multipart_metadata(&mut multipart);
+    assert_eq!(
+        sealed_etag_for_response(&HOST, decryption_request(&multipart), SEALED_ETAG_AES_GCM_HEX).await,
+        None
+    );
+    let plaintext_object = HashMap::from([("content-type".to_string(), "text/plain".to_string())]);
+    assert_eq!(
+        sealed_etag_for_response(&HOST, decryption_request(&plaintext_object), SEALED_ETAG_AES_GCM_HEX).await,
+        None
+    );
+
+    // SSE-S3 whose object key cannot be recovered keeps the stored value, as
+    // MinIO does: another object's key, then no usable master key at all.
+    let other_object = minio_managed_object_metadata(SSEType::SseS3, &master_key, "bucket", "dir/object", [0x77u8; 32]);
+    assert_eq!(
+        sealed_etag_for_response(&HOST, decryption_request(&other_object), SEALED_ETAG_AES_GCM_HEX).await,
+        None
+    );
+    crate::kms::provider::set_sse_dek_provider_for_test(Arc::new(TestSseDekProvider::new_with_key([0x01u8; 32])));
+    assert_eq!(
+        sealed_etag_for_response(&HOST, decryption_request(&sse_s3), SEALED_ETAG_AES_GCM_HEX).await,
+        None
+    );
+
+    reset_sse_dek_provider();
+}
+
+/// A build without the MinIO read path never rewrites an ETag.
+#[cfg(not(feature = "rio-v2"))]
+#[tokio::test]
+async fn sealed_etag_is_left_alone_without_the_minio_read_path() {
+    let metadata = HashMap::from([(MINIO_INTERNAL_ENCRYPTION_KMS_SEALED_KEY_HEADER.to_string(), "sealed".to_string())]);
+    let sealed = "20010f00cbc498738108113178f20c5507f319f350e962a89c610c16699bca30b4f4914b6552c532550cca4ec1eb39b3";
+
+    let presented = crate::core::read::sealed_etag_for_response(
+        &HOST,
+        DecryptionRequest {
+            bucket: "bucket",
+            key: "object",
+            metadata: &metadata,
+            sse_customer_key: None,
+            sse_customer_key_md5: None,
+            principal: None,
+        },
+        sealed,
+    )
+    .await;
+
+    assert_eq!(presented, None);
+}
+
+/// HEAD answers with the stored public headers; this covers the objects that
+/// store none.
+#[test]
+fn unrecorded_sse_response_leaves_objects_with_stored_headers_to_the_stored_path() {
+    use crate::core::read::classify_unrecorded_sse_response;
+
+    assert!(classify_unrecorded_sse_response(&HashMap::new(), None).is_none(), "a plaintext object");
+    assert!(
+        classify_unrecorded_sse_response(&sse_kms_object_metadata(), None).is_none(),
+        "RustFS-written SSE-KMS"
+    );
+    let recorded_ssec = HashMap::from([
+        (SSEC_ALGORITHM_HEADER.to_string(), "AES256".to_string()),
+        (MINIO_INTERNAL_ENCRYPTION_SSEC_SEALED_KEY_HEADER.to_string(), "sealed".to_string()),
+    ]);
+    assert!(classify_unrecorded_sse_response(&recorded_ssec, None).is_none(), "RustFS-written SSE-C");
+}
+
+#[cfg(feature = "rio-v2")]
+#[test]
+fn unrecorded_sse_response_synthesizes_what_minio_synthesized() {
+    use crate::core::read::classify_unrecorded_sse_response;
+
+    let master_key = [0x5Au8; 32];
+    let object_key = [0x67u8; 32];
+
+    let sse_s3 = minio_managed_object_metadata(SSEType::SseS3, &master_key, "bucket", "dir/object", object_key);
+    let headers = classify_unrecorded_sse_response(&sse_s3, None).expect("MinIO SSE-S3 object");
+    assert_eq!(headers.server_side_encryption, "AES256");
+    // MinIO records a key id on SSE-S3 objects too; only aws:kms advertises it.
+    assert_eq!((headers.ssekms_key_id, headers.sse_customer_algorithm), (None, None));
+
+    let mut sse_kms = minio_managed_object_metadata(SSEType::SseKms, &master_key, "bucket", "dir/object", object_key);
+    let headers = classify_unrecorded_sse_response(&sse_kms, None).expect("MinIO SSE-KMS object");
+    assert_eq!(headers.server_side_encryption, "aws:kms");
+    assert_eq!(
+        headers.ssekms_key_id.as_deref(),
+        Some("arn:aws:kms:compat-key"),
+        "MinIO answers in ARN form"
+    );
+    sse_kms.insert(
+        MINIO_INTERNAL_ENCRYPTION_KMS_KEY_ID_HEADER.to_string(),
+        "arn:aws:kms:compat-key".to_string(),
+    );
+    let headers = classify_unrecorded_sse_response(&sse_kms, None).expect("MinIO SSE-KMS object");
+    assert_eq!(
+        headers.ssekms_key_id.as_deref(),
+        Some("arn:aws:kms:compat-key"),
+        "an ARN is not prefixed twice"
+    );
+
+    let sse_c = HashMap::from([(MINIO_INTERNAL_ENCRYPTION_SSEC_SEALED_KEY_HEADER.to_string(), "sealed".to_string())]);
+    let key_md5 = "customer-key-md5".to_string();
+    let headers = classify_unrecorded_sse_response(&sse_c, Some(&key_md5)).expect("MinIO SSE-C object");
+    assert_eq!(headers.sse_customer_algorithm.as_deref(), Some("AES256"));
+    assert_eq!(headers.sse_customer_key_md5.as_deref(), Some("customer-key-md5"));
+    assert_eq!(headers.ssekms_key_id, None);
+}
+
+/// Without the MinIO read path the scheme of such an object cannot be
+/// established, so no header claims one.
+#[cfg(not(feature = "rio-v2"))]
+#[test]
+fn unrecorded_sse_response_reports_nothing_without_the_minio_read_path() {
+    use crate::core::read::classify_unrecorded_sse_response;
+
+    for slot in [
+        MINIO_INTERNAL_ENCRYPTION_S3_SEALED_KEY_HEADER,
+        MINIO_INTERNAL_ENCRYPTION_KMS_SEALED_KEY_HEADER,
+        MINIO_INTERNAL_ENCRYPTION_SSEC_SEALED_KEY_HEADER,
+    ] {
+        let metadata = HashMap::from([(slot.to_string(), "sealed".to_string())]);
+        assert!(classify_unrecorded_sse_response(&metadata, None).is_none(), "{slot}");
+    }
+}
+
+/// GET of a MinIO-written `aws:kms` object names its key the way MinIO did,
+/// while authorization keeps naming the key itself.
+#[cfg(feature = "rio-v2")]
+#[tokio::test]
+async fn read_response_reports_a_minio_written_kms_key_in_arn_form() {
+    let master_key = [0x5Au8; 32];
+    let sse_kms = minio_managed_object_metadata(SSEType::SseKms, &master_key, "bucket", "dir/object", [0x67u8; 32]);
+
+    let headers = classify_sse_read_response(&HOST, decryption_request(&sse_kms))
+        .await
+        .expect("classification needs no key")
+        .expect("MinIO SSE-KMS object");
+    assert_eq!(headers.ssekms_key_id.as_deref(), Some("arn:aws:kms:compat-key"));
+
+    // An object that stores its public header keeps the key id it recorded.
+    let recorded = sse_kms_object_metadata();
+    let headers = classify_sse_read_response(&HOST, decryption_request(&recorded))
+        .await
+        .expect("classification needs no key")
+        .expect("RustFS SSE-KMS object");
+    assert_eq!(headers.ssekms_key_id.as_deref(), Some("finance-key"));
+}

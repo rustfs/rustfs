@@ -4649,8 +4649,8 @@ mod tests {
                 .unwrap();
 
         assert_eq!(metadata.get("content-type").map(String::as_str), Some("text/plain"));
-        assert_eq!(metadata.get("owner").map(String::as_str), Some("alice"));
-        assert_eq!(metadata.get("project").map(String::as_str), Some("alpha-demo"));
+        assert_eq!(visible_user_metadata(&metadata, "owner").as_deref(), Some("alice"));
+        assert_eq!(visible_user_metadata(&metadata, "project").as_deref(), Some("alpha-demo"));
         assert_eq!(metadata.get(AMZ_OBJECT_TAGGING).map(String::as_str), Some("classification=public"));
         assert!(!metadata.contains_key("x-amz-tagging"));
         assert_eq!(metadata.get(AMZ_OBJECT_LOCK_MODE_LOWER).map(String::as_str), Some("GOVERNANCE"));
@@ -5020,7 +5020,9 @@ mod tests {
         local
             .overlay_record("minio.metadata.x-amz-tagging", "classification=public")
             .expect("local tags should parse");
+        // The outer request's user metadata, in the shape the PUT path stores it.
         let mut local_metadata = HashMap::from([("owner".to_string(), "outer".to_string())]);
+        namespace_reserved_user_metadata(&mut local_metadata);
         let authorization = apply_extract_pax_overrides(
             &local,
             "bucket",
@@ -5030,9 +5032,9 @@ mod tests {
             &mut ObjectOptions::default(),
         )
         .expect("local PAX metadata should apply");
-        assert_eq!(local_metadata.get("owner").map(String::as_str), Some("local"));
+        assert_eq!(visible_user_metadata(&local_metadata, "owner").as_deref(), Some("local"));
         assert_eq!(local_metadata.get(AMZ_OBJECT_TAGGING).map(String::as_str), Some("classification=public"));
-        assert!(!local_metadata.contains_key("snowball-auto-extract"));
+        assert_eq!(visible_user_metadata(&local_metadata, "snowball-auto-extract"), None);
         assert!(!authorization.headers.contains_key(AMZ_SNOWBALL_EXTRACT));
     }
 
