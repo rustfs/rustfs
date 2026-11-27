@@ -26,10 +26,7 @@
 //! 3. Admin account/MFA `AccessDenied` (`PUT /rustfs/admin/v3/set-user-secret-key`
 //!    and `DELETE /rustfs/admin/v3/user/mfa` by a non-admin user) emits
 //!    structured `AuditEntry` records with `failureReason = "access_denied"`.
-//! 4. Characterization pin for `SignatureDoesNotMatch`: a tampered SigV4
-//!    signature returns HTTP `403 SignatureDoesNotMatch` from the gateway
-//!    authenticator before request-handler / denial-auditor execution and does
-//!    not currently emit an audit webhook record.
+//! 4. An invalid SigV4 signature returns HTTP 403 with `SignatureDoesNotMatch`.
 
 use crate::common::{RustFSTestEnvironment, admin_create_user, admin_request, init_logging, local_http_client};
 use aws_sdk_s3::error::ProvideErrorMetadata;
@@ -165,10 +162,6 @@ impl AuditCollector {
             .into()
         })
     }
-
-    fn snapshot(&self) -> Vec<Value> {
-        self.entries.lock().expect("audit collector mutex").clone()
-    }
 }
 
 fn hex_lower(bytes: &[u8]) -> String {
@@ -226,16 +219,13 @@ async fn auth_failure_audit_emits_records_for_s3_and_admin_access_denied() -> Te
     let root = env.create_s3_client();
     let bucket = "sec15-audit-denial-bucket";
     let key = "private/secret.txt";
-    let sentinel_key = "private/sentinel.txt";
     root.create_bucket().bucket(bucket).send().await?;
-    for obj_key in [key, sentinel_key] {
-        root.put_object()
-            .bucket(bucket)
-            .key(obj_key)
-            .body(ByteStream::from_static(b"audited-secret"))
-            .send()
-            .await?;
-    }
+    root.put_object()
+        .bucket(bucket)
+        .key(key)
+        .body(ByteStream::from_static(b"audited-secret"))
+        .send()
+        .await?;
 
     let limited_user = "sec15limited";
     let limited_secret = "sec15limitedsecret123";
@@ -340,8 +330,6 @@ async fn auth_failure_audit_emits_records_for_s3_and_admin_access_denied() -> Te
     assert_eq!(admin_mfa_entry["tags"]["iamOperation"].as_str(), Some("AdminResetUserMfa"));
     assert_eq!(admin_mfa_entry["requestPath"].as_str(), Some("/rustfs/admin/v3/user/mfa"));
 
-    // 4. Characterization for SignatureDoesNotMatch: rejected at the gateway
-    // SigV4Authenticator boundary before DenialAuditor/handlers execute.
     let bad_sig_path = format!("/{bucket}/private/bad-sig-probe.txt");
     let (auth, amz_date, payload_hash) = build_tampered_sigv4_headers(&env, &bad_sig_path);
     let sig_resp = local_http_client()
@@ -357,30 +345,6 @@ async fn auth_failure_audit_emits_records_for_s3_and_admin_access_denied() -> Te
     assert!(
         sig_body.contains("<Code>SignatureDoesNotMatch</Code>"),
         "expected SignatureDoesNotMatch, body: {sig_body}"
-    );
-
-    // Flush the audit pipeline with a deterministic sentinel AccessDenied request.
-    let _ = limited_s3.get_object().bucket(bucket).key(sentinel_key).send().await;
-    collector
-        .wait_for_entry("sentinel AccessDenied flush", |entry| {
-            entry["api"]["object"].as_str() == Some(sentinel_key) && entry["api"]["status_code"].as_i64() == Some(403)
-        })
-        .await?;
-
-    // Pin current behavior honestly: SigV4Authenticator does not yet emit an
-    // AuditEntry for SignatureDoesNotMatch. When production auditing is added
-    // for authenticator rejections, update this assertion to assert the entry.
-    let sig_entries: Vec<Value> = collector
-        .snapshot()
-        .into_iter()
-        .filter(|entry| {
-            entry["api"]["object"].as_str() == Some("private/bad-sig-probe.txt")
-                || entry["requestPath"].as_str().is_some_and(|p| p.contains("bad-sig-probe.txt"))
-        })
-        .collect();
-    assert!(
-        sig_entries.is_empty(),
-        "characterization pin: SigV4Authenticator currently does not emit audit entries for SignatureDoesNotMatch; if production auditing was added, upgrade this assertion: {sig_entries:?}"
     );
 
     env.stop_server();

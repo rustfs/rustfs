@@ -381,7 +381,11 @@ async fn table_list_isolation_covers_v2_versions_multipart_uploads_and_cursor_at
     for page_size in [1, 2] {
         let mut seen = BTreeSet::new();
         let mut token: Option<String> = None;
-        loop {
+        for page_number in 1.. {
+            assert!(
+                page_number <= 16,
+                "ListObjectsV2 pagination did not terminate within the fixture page limit"
+            );
             let page = reader_a
                 .list_objects_v2()
                 .bucket(bucket)
@@ -416,7 +420,11 @@ async fn table_list_isolation_covers_v2_versions_multipart_uploads_and_cursor_at
     // Delimiter="/" CommonPrefixes must fold only visible tables, never b_hidden/ or reserved catalog keys.
     let mut v2_prefixes = Vec::new();
     let mut token: Option<String> = None;
-    loop {
+    for page_number in 1.. {
+        assert!(
+            page_number <= 16,
+            "ListObjectsV2 pagination did not terminate within the fixture page limit"
+        );
         let page = reader_a
             .list_objects_v2()
             .bucket(bucket)
@@ -452,7 +460,11 @@ async fn table_list_isolation_covers_v2_versions_multipart_uploads_and_cursor_at
         let mut seen = BTreeSet::new();
         let mut key_marker: Option<String> = None;
         let mut version_marker: Option<String> = None;
-        loop {
+        for page_number in 1.. {
+            assert!(
+                page_number <= 16,
+                "ListObjectVersions pagination did not terminate within the fixture page limit"
+            );
             let page = reader_a
                 .list_object_versions()
                 .bucket(bucket)
@@ -500,7 +512,11 @@ async fn table_list_isolation_covers_v2_versions_multipart_uploads_and_cursor_at
     let mut version_prefixes = Vec::new();
     let mut key_marker: Option<String> = None;
     let mut version_marker: Option<String> = None;
-    loop {
+    for page_number in 1.. {
+        assert!(
+            page_number <= 16,
+            "ListObjectVersions pagination did not terminate within the fixture page limit"
+        );
         let page = reader_a
             .list_object_versions()
             .bucket(bucket)
@@ -542,7 +558,11 @@ async fn table_list_isolation_covers_v2_versions_multipart_uploads_and_cursor_at
         let mut seen = BTreeSet::new();
         let mut key_marker: Option<String> = None;
         let mut upload_marker: Option<String> = None;
-        loop {
+        for page_number in 1.. {
+            assert!(
+                page_number <= 16,
+                "ListMultipartUploads pagination did not terminate within the fixture page limit"
+            );
             let page = reader_a
                 .list_multipart_uploads()
                 .bucket(bucket)
@@ -584,7 +604,11 @@ async fn table_list_isolation_covers_v2_versions_multipart_uploads_and_cursor_at
     let mut upload_prefixes = Vec::new();
     let mut key_marker: Option<String> = None;
     let mut upload_marker: Option<String> = None;
-    loop {
+    for page_number in 1.. {
+        assert!(
+            page_number <= 16,
+            "ListMultipartUploads pagination did not terminate within the fixture page limit"
+        );
         let page = reader_a
             .list_multipart_uploads()
             .bucket(bucket)
