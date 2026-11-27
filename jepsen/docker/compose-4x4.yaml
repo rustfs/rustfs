@@ -1,0 +1,79 @@
+# Four Debian SSH nodes, four drives each. Jepsen installs RustFS 1.0.7.
+# Do not start this while compose-3x2.yaml or a smoke stack is running.
+# OrbStack Docker budget on the Mac mini is about 14 GB. Four containers at 2 GB
+# is 8 GB. The Jepsen JVM runs on macOS, outside that budget.
+name: rustfs-jepsen-4x4
+
+x-node: &node
+  build: .
+  init: true
+  restart: "no"
+  mem_limit: 2g
+  memswap_limit: 2g
+  cpus: 1.0
+  cap_add:
+    - NET_ADMIN
+  environment: &env
+    JEPSEN_SSH_PUBKEY: ${JEPSEN_SSH_PUBKEY:?export JEPSEN_SSH_PUBKEY to a public key line}
+    CLUSTER_NODES: n1,n2,n3,n4
+    DRIVES: "4"
+  networks: [jepsen]
+
+services:
+  n1:
+    <<: *node
+    container_name: n1
+    hostname: rustfs-n1
+    volumes: &n1
+      - n1d1:/var/lib/rustfs/data1
+      - n1d2:/var/lib/rustfs/data2
+      - n1d3:/var/lib/rustfs/data3
+      - n1d4:/var/lib/rustfs/data4
+  n2:
+    <<: *node
+    container_name: n2
+    hostname: rustfs-n2
+    volumes:
+      - n2d1:/var/lib/rustfs/data1
+      - n2d2:/var/lib/rustfs/data2
+      - n2d3:/var/lib/rustfs/data3
+      - n2d4:/var/lib/rustfs/data4
+  n3:
+    <<: *node
+    container_name: n3
+    hostname: rustfs-n3
+    volumes:
+      - n3d1:/var/lib/rustfs/data1
+      - n3d2:/var/lib/rustfs/data2
+      - n3d3:/var/lib/rustfs/data3
+      - n3d4:/var/lib/rustfs/data4
+  n4:
+    <<: *node
+    container_name: n4
+    hostname: rustfs-n4
+    volumes:
+      - n4d1:/var/lib/rustfs/data1
+      - n4d2:/var/lib/rustfs/data2
+      - n4d3:/var/lib/rustfs/data3
+      - n4d4:/var/lib/rustfs/data4
+
+networks:
+  jepsen:
+
+volumes:
+  n1d1: {}
+  n1d2: {}
+  n1d3: {}
+  n1d4: {}
+  n2d1: {}
+  n2d2: {}
+  n2d3: {}
+  n2d4: {}
+  n3d1: {}
+  n3d2: {}
+  n3d3: {}
+  n3d4: {}
+  n4d1: {}
+  n4d2: {}
+  n4d3: {}
+  n4d4: {}

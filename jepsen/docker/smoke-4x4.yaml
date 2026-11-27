@@ -1,0 +1,89 @@
+# Optional health check of the official 1.0.7 image. This is not the Jepsen
+# node image: it has no SSH daemon, and its clock is the OrbStack VM clock.
+# Stop it with `down -v` before compose-4x4.yaml. Container names are
+# smoke-n*, so they do not take the n1.orb.local names Jepsen uses.
+name: rustfs-smoke-4x4
+
+x-rustfs: &rustfs
+  image: rustfs/rustfs:1.0.7
+  init: true
+  restart: "no"
+  mem_limit: 2g
+  memswap_limit: 2g
+  cpus: 1.0
+  environment: &env
+    RUSTFS_VOLUMES: http://n{1...4}:9000/data/disk{1...4}
+    RUSTFS_ACCESS_KEY: rustfsadmin
+    RUSTFS_SECRET_KEY: rustfsadmin
+    RUSTFS_ADDRESS: 0.0.0.0:9000
+    RUSTFS_CONSOLE_ENABLE: "false"
+    RUSTFS_REGION: us-east-1
+  networks:
+    cluster: {}
+
+services:
+  n1:
+    <<: *rustfs
+    container_name: smoke-n1
+    networks:
+      cluster:
+        aliases: [n1]
+    volumes:
+      - s1d1:/data/disk1
+      - s1d2:/data/disk2
+      - s1d3:/data/disk3
+      - s1d4:/data/disk4
+  n2:
+    <<: *rustfs
+    container_name: smoke-n2
+    networks:
+      cluster:
+        aliases: [n2]
+    volumes:
+      - s2d1:/data/disk1
+      - s2d2:/data/disk2
+      - s2d3:/data/disk3
+      - s2d4:/data/disk4
+  n3:
+    <<: *rustfs
+    container_name: smoke-n3
+    networks:
+      cluster:
+        aliases: [n3]
+    volumes:
+      - s3d1:/data/disk1
+      - s3d2:/data/disk2
+      - s3d3:/data/disk3
+      - s3d4:/data/disk4
+  n4:
+    <<: *rustfs
+    container_name: smoke-n4
+    networks:
+      cluster:
+        aliases: [n4]
+    volumes:
+      - s4d1:/data/disk1
+      - s4d2:/data/disk2
+      - s4d3:/data/disk3
+      - s4d4:/data/disk4
+
+networks:
+  cluster:
+
+volumes:
+  s1d1: {}
+  s1d2: {}
+  s1d3: {}
+  s1d4: {}
+  s2d1: {}
+  s2d2: {}
+  s2d3: {}
+  s2d4: {}
+  s3d1: {}
+  s3d2: {}
+  s3d3: {}
+  s3d4: {}
+  s4d1: {}
+  s4d2: {}
+  s4d3: {}
+  s4d4: {}

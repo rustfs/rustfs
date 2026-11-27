@@ -1,0 +1,60 @@
+# Optional 3x2 health check of rustfs/rustfs:1.0.7. Not a Jepsen node.
+# `down -v` before compose-3x2.yaml. Do not run beside the 4x4 smoke stack.
+name: rustfs-smoke-3x2
+
+x-rustfs: &rustfs
+  image: rustfs/rustfs:1.0.7
+  init: true
+  restart: "no"
+  mem_limit: 2g
+  memswap_limit: 2g
+  cpus: 1.0
+  environment:
+    RUSTFS_VOLUMES: http://n{1...3}:9000/data/disk{1...2}
+    RUSTFS_ACCESS_KEY: rustfsadmin
+    RUSTFS_SECRET_KEY: rustfsadmin
+    RUSTFS_ADDRESS: 0.0.0.0:9000
+    RUSTFS_CONSOLE_ENABLE: "false"
+    RUSTFS_REGION: us-east-1
+  networks:
+    cluster: {}
+
+services:
+  n1:
+    <<: *rustfs
+    container_name: smoke-n1
+    networks:
+      cluster:
+        aliases: [n1]
+    volumes:
+      - s1d1:/data/disk1
+      - s1d2:/data/disk2
+  n2:
+    <<: *rustfs
+    container_name: smoke-n2
+    networks:
+      cluster:
+        aliases: [n2]
+    volumes:
+      - s2d1:/data/disk1
+      - s2d2:/data/disk2
+  n3:
+    <<: *rustfs
+    container_name: smoke-n3
+    networks:
+      cluster:
+        aliases: [n3]
+    volumes:
+      - s3d1:/data/disk1
+      - s3d2:/data/disk2
+
+networks:
+  cluster:
+
+volumes:
+  s1d1: {}
+  s1d2: {}
+  s2d1: {}
+  s2d2: {}
+  s3d1: {}
+  s3d2: {}

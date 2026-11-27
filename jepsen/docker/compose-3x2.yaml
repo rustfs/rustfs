@@ -1,0 +1,52 @@
+# Three Debian SSH nodes, two drives each. Start this only after the 4x4
+# project has been removed with `down -v`. Three containers at 2 GB is 6 GB.
+name: rustfs-jepsen-3x2
+
+x-node: &node
+  build: .
+  init: true
+  restart: "no"
+  mem_limit: 2g
+  memswap_limit: 2g
+  cpus: 1.0
+  cap_add:
+    - NET_ADMIN
+  environment:
+    JEPSEN_SSH_PUBKEY: ${JEPSEN_SSH_PUBKEY:?export JEPSEN_SSH_PUBKEY to a public key line}
+    CLUSTER_NODES: n1,n2,n3
+    DRIVES: "2"
+  networks: [jepsen]
+
+services:
+  n1:
+    <<: *node
+    container_name: n1
+    hostname: rustfs-n1
+    volumes:
+      - n1d1:/var/lib/rustfs/data1
+      - n1d2:/var/lib/rustfs/data2
+  n2:
+    <<: *node
+    container_name: n2
+    hostname: rustfs-n2
+    volumes:
+      - n2d1:/var/lib/rustfs/data1
+      - n2d2:/var/lib/rustfs/data2
+  n3:
+    <<: *node
+    container_name: n3
+    hostname: rustfs-n3
+    volumes:
+      - n3d1:/var/lib/rustfs/data1
+      - n3d2:/var/lib/rustfs/data2
+
+networks:
+  jepsen:
+
+volumes:
+  n1d1: {}
+  n1d2: {}
+  n2d1: {}
+  n2d2: {}
+  n3d1: {}
+  n3d2: {}

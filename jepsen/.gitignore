@@ -1,0 +1,6 @@
+target/
+store/
+.lein-*
+.nrepl-port
+*.iml
+docker/state/
