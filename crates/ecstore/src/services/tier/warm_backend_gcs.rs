@@ -37,7 +37,7 @@ use rustfs_s3_client::{
     api_put_object::PutObjectOptions,
     transition_api::{Options, ReadCloser, ReaderImpl},
 };
-use rustfs_utils::egress::validate_outbound_url;
+use rustfs_utils::egress::OutboundPolicy;
 use tracing::warn;
 
 const _MAX_PART_SIZE: i64 = 1024 * 1024 * 1024 * 5;
@@ -154,7 +154,12 @@ impl WarmBackendGCS {
 
         if !conf.endpoint.is_empty() {
             let endpoint_url = url::Url::parse(&conf.endpoint).map_err(|e| std::io::Error::other(e.to_string()))?;
-            validate_outbound_url(&endpoint_url)
+            let outbound_policy = OutboundPolicy::from_env_cached().map_err(|err| {
+                std::io::Error::new(std::io::ErrorKind::InvalidInput, format!("invalid outbound policy: {err}"))
+            })?;
+            outbound_policy
+                .resolve_and_validate_url(&endpoint_url)
+                .await
                 .map_err(|err| std::io::Error::other(format!("tier endpoint is not allowed: {err}")))?;
         }
 

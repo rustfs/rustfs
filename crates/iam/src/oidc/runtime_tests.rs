@@ -1044,3 +1044,48 @@ async fn userinfo_request_is_bound_by_outbound_policy() {
     .unwrap_err();
     assert!(error.starts_with("userinfo request failed:"), "{error}");
 }
+
+#[test]
+fn resolve_post_logout_redirect_uri_resolves_relative_against_configured_origin_and_blocks_protocol_relative() {
+    assert_eq!(
+        resolve_post_logout_redirect_uri(
+            Some("https://console.example.test:9001/rustfs/admin/v3/oidc/callback"),
+            "/rustfs/console/auth/login",
+        ),
+        Some("https://console.example.test:9001/rustfs/console/auth/login".to_string())
+    );
+    assert_eq!(resolve_post_logout_redirect_uri(None, "/rustfs/console/auth/login"), None);
+    assert_eq!(
+        resolve_post_logout_redirect_uri(
+            Some("https://console.example.test/rustfs/admin/v3/oidc/callback"),
+            "//evil.example/login",
+        ),
+        None
+    );
+    assert_eq!(
+        resolve_post_logout_redirect_uri(Some("https://console.example.test/callback"), "   "),
+        None
+    );
+    assert_eq!(
+        resolve_post_logout_redirect_uri(None, "https://browser.example.test/rustfs/console/auth/login"),
+        Some("https://browser.example.test/rustfs/console/auth/login".to_string())
+    );
+}
+
+#[tokio::test]
+async fn userinfo_request_rejects_plaintext_http_for_non_loopback_host() {
+    let http_client = ReqwestHttpClient::with_policy(OutboundPolicy::default());
+    let error = fetch_userinfo_profile(
+        &http_client,
+        "http://idp.example.com/userinfo",
+        "test-access-token",
+        "existing-user",
+        &test_config("console"),
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        error.contains("plaintext http:// OIDC URLs are forbidden"),
+        "expected plaintext HTTP rejection, got: {error}"
+    );
+}

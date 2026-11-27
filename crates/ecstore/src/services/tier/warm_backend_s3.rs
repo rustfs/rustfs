@@ -42,7 +42,7 @@ use rustfs_s3_client::{
     transition_api::{BucketLookupType, ObjectInfo, Options, TransitionClient, TransitionCore},
     transition_api::{ReadCloser, ReaderImpl},
 };
-use rustfs_utils::egress::validate_outbound_url_allow_private;
+use rustfs_utils::egress::OutboundPolicy;
 use rustfs_utils::path::SLASH_SEPARATOR;
 
 pub struct WarmBackendS3 {
@@ -103,7 +103,10 @@ impl WarmBackendS3 {
                 return Err(std::io::Error::other(err.to_string()));
             }
         };
-        validate_outbound_url_allow_private(&u)
+        let outbound_policy = OutboundPolicy::from_env_cached()
+            .map_err(|err| std::io::Error::new(std::io::ErrorKind::InvalidInput, format!("invalid outbound policy: {err}")))?;
+        let dns_resolver = outbound_policy
+            .resolver_for_allow_private(&u)
             .map_err(|err| std::io::Error::other(format!("tier endpoint is not allowed: {err}")))?;
 
         let has_web_identity_token_file = !conf.aws_role_web_identity_token_file.is_empty();
@@ -140,6 +143,7 @@ impl WarmBackendS3 {
             secure: u.scheme() == "https",
             region: conf.region.clone(),
             bucket_lookup,
+            dns_resolver: Some(dns_resolver),
             ..Default::default()
         };
         let endpoint = endpoint_authority(&u)?;

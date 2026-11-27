@@ -19,7 +19,7 @@ use rustfs_config::{
     CONSOLE_OIDC_SESSION_DURATION_MAX_SECS, DEFAULT_CONSOLE_OIDC_SESSION_DURATION_SECS, DEFAULT_DELIMITER, ENABLE_KEY,
     ENV_CONSOLE_OIDC_SESSION_DURATION, EnableState,
 };
-use rustfs_utils::egress::{OutboundUrlError, validate_outbound_url};
+use rustfs_utils::egress::{OutboundPolicy, OutboundPolicyError};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
@@ -205,11 +205,15 @@ pub enum OidcConfigError {
     OpenidScopeRequired,
     #[error("{0} must be an absolute http/https URL")]
     InvalidAbsoluteUrl(&'static str),
+    #[error(
+        "{field} must use https:// for non-loopback hosts (set {ENV_IDENTITY_OPENID_ALLOW_INSECURE_TRANSPORT}=true to opt in for development)"
+    )]
+    InsecureHttpNotAllowed { field: &'static str },
     #[error("{field} is not allowed: {source}")]
     ForbiddenOutbound {
         field: &'static str,
         #[source]
-        source: OutboundUrlError,
+        source: OutboundPolicyError,
     },
 }
 
@@ -379,13 +383,46 @@ fn or_default(value: &str, default: &str) -> String {
     }
 }
 
+/// Returns true when the operator explicitly opted into plaintext `http://` OIDC URLs
+/// for non-loopback hosts via `RUSTFS_IDENTITY_OPENID_ALLOW_INSECURE_TRANSPORT`.
+pub(super) fn oidc_insecure_transport_allowed() -> bool {
+    rustfs_utils::get_env_bool(ENV_IDENTITY_OPENID_ALLOW_INSECURE_TRANSPORT, false)
+}
+
+/// True only for canonical loopback hosts (`localhost`, `127.0.0.0/8`, `::1`).
+pub(super) fn is_loopback_oidc_url(url: &Url) -> bool {
+    match url.host() {
+        Some(url::Host::Domain(host)) => host.trim_end_matches('.').eq_ignore_ascii_case("localhost"),
+        Some(url::Host::Ipv4(ip)) => ip.is_loopback(),
+        Some(url::Host::Ipv6(ip)) => ip.is_loopback(),
+        None => false,
+    }
+}
+
+/// Enforce HTTPS for non-loopback OIDC URLs unless `RUSTFS_IDENTITY_OPENID_ALLOW_INSECURE_TRANSPORT`
+/// is explicitly enabled.
+pub(super) fn ensure_oidc_url_transport_security(url: &Url) -> Result<(), String> {
+    if url.scheme().eq_ignore_ascii_case("https") || is_loopback_oidc_url(url) || oidc_insecure_transport_allowed() {
+        return Ok(());
+    }
+    Err(format!(
+        "plaintext http:// OIDC URLs are forbidden for non-loopback hosts; use https:// or set {ENV_IDENTITY_OPENID_ALLOW_INSECURE_TRANSPORT}=true for development"
+    ))
+}
+
 fn validate_absolute_http_url(value: &str, field: &'static str, check_outbound: bool) -> Result<(), OidcConfigError> {
     let parsed = Url::parse(value).map_err(|_| OidcConfigError::InvalidAbsoluteUrl(field))?;
     if !matches!(parsed.scheme(), "http" | "https") || parsed.host_str().is_none() {
         return Err(OidcConfigError::InvalidAbsoluteUrl(field));
     }
     if check_outbound {
-        validate_outbound_url(&parsed).map_err(|source| OidcConfigError::ForbiddenOutbound { field, source })?;
+        let policy = OutboundPolicy::from_env_cached().map_err(|source| OidcConfigError::ForbiddenOutbound { field, source })?;
+        policy
+            .validate_url(&parsed)
+            .map_err(|source| OidcConfigError::ForbiddenOutbound { field, source })?;
+    }
+    if ensure_oidc_url_transport_security(&parsed).is_err() {
+        return Err(OidcConfigError::InsecureHttpNotAllowed { field });
     }
     Ok(())
 }

@@ -742,15 +742,18 @@ impl OidcSys {
             .id_token
             .parse()
             .map_err(|e: serde_json::Error| format!("failed to parse ID token for logout: {e}"))?;
-        let post_logout_redirect_uri = PostLogoutRedirectUrl::new(post_logout_redirect_uri.to_string())
-            .map_err(|e| format!("invalid post logout redirect URI: {e}"))?;
-
-        let logout_url = LogoutRequest::from(end_session_endpoint)
+        let mut logout_request = LogoutRequest::from(end_session_endpoint)
             .set_id_token_hint(&id_token)
-            .set_client_id(ClientId::new(config.client_id.clone()))
-            .set_post_logout_redirect_uri(post_logout_redirect_uri)
-            .http_get_url()
-            .to_string();
+            .set_client_id(ClientId::new(config.client_id.clone()));
+
+        if let Some(post_logout_uri) = resolve_post_logout_redirect_uri(config.redirect_uri.as_deref(), post_logout_redirect_uri)
+        {
+            let post_logout_redirect_uri =
+                PostLogoutRedirectUrl::new(post_logout_uri).map_err(|e| format!("invalid post logout redirect URI: {e}"))?;
+            logout_request = logout_request.set_post_logout_redirect_uri(post_logout_redirect_uri);
+        }
+
+        let logout_url = logout_request.http_get_url().to_string();
 
         Ok(Some(logout_url))
     }
@@ -867,6 +870,28 @@ impl OidcSys {
     pub(crate) fn get_provider_config(&self, id: &str) -> Option<&OidcProviderConfig> {
         self.configs.get(id).map(|provider| &provider.config)
     }
+}
+
+/// Resolve a post-logout redirect URI against the provider's configured `redirect_uri` origin
+/// when the caller passes a same-origin relative path, rejecting protocol-relative paths.
+pub(super) fn resolve_post_logout_redirect_uri(
+    configured_redirect_uri: Option<&str>,
+    post_logout_redirect_uri: &str,
+) -> Option<String> {
+    let trimmed = post_logout_redirect_uri.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    if trimmed.starts_with('/') {
+        if trimmed.starts_with("//") {
+            return None;
+        }
+        return configured_redirect_uri
+            .and_then(|uri| url::Url::parse(uri).ok())
+            .filter(|url| matches!(url.scheme(), "http" | "https") && url.host_str().is_some())
+            .map(|url| format!("{}{trimmed}", url.origin().ascii_serialization()));
+    }
+    Some(trimmed.to_string())
 }
 
 /// Fetch display profile claims from the provider's UserInfo endpoint.

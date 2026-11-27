@@ -36,6 +36,7 @@ use aws_sdk_s3::config::retry::RetryConfig;
 use aws_sdk_s3::{Client as S3Client, Config as S3Config};
 use aws_smithy_http_client::{Builder as SmithyHttpClientBuilder, tls as smithy_tls};
 use aws_smithy_runtime_api::box_error::BoxError;
+use aws_smithy_runtime_api::client::dns::{DnsFuture, ResolveDns, ResolveDnsError};
 use aws_smithy_runtime_api::client::http::{
     HttpConnector as SmithyHttpConnector, HttpConnectorFuture, SharedHttpConnector, http_client_fn,
 };
@@ -51,13 +52,19 @@ use aws_smithy_types::config_bag::ConfigBag;
 use aws_smithy_types::timeout::TimeoutConfig;
 use http::Uri;
 use hyper_util::client::legacy::Client as HyperClient;
+use hyper_util::client::legacy::connect::HttpConnector;
+use hyper_util::client::legacy::connect::dns::Name as HyperDnsName;
 use hyper_util::rt::{TokioExecutor, TokioTimer};
 use rustfs_config::{DEFAULT_TRUST_LEAF_CERT_AS_CA, ENV_TRUST_LEAF_CERT_AS_CA, RUSTFS_CA_CERT, RUSTFS_TLS_CERT};
-use rustfs_utils::egress::{OutboundUrlError, validate_outbound_url};
+use rustfs_utils::egress::{OutboundDnsResolver, OutboundPolicy, OutboundPolicyError, OutboundUrlError, validate_outbound_url};
 use rustls_pki_types::pem::PemObject;
 use std::fmt;
+use std::future::Future;
+use std::net::SocketAddr;
 use std::path::Path;
+use std::pin::Pin;
 use std::sync::Arc;
+use std::task::{Context, Poll};
 use std::time::{Duration, SystemTime};
 use tower::Service;
 use tracing::warn;
@@ -426,6 +433,29 @@ pub async fn build_remote_s3_config(spec: &RemoteS3EndpointSpec) -> Result<aws_s
     let endpoint = spec.endpoint_url();
     let parsed_endpoint = Url::parse(&endpoint).map_err(|err| RemoteS3ClientError::InvalidEndpoint(err.to_string()))?;
     validate_remote_endpoint(&parsed_endpoint).map_err(RemoteS3ClientError::EndpointNotAllowed)?;
+    let dns_resolver = build_remote_endpoint_dns_resolver(&parsed_endpoint)?;
+    build_remote_s3_config_with_creds_and_resolver(spec, creds, dns_resolver).await
+}
+
+#[cfg(test)]
+async fn build_remote_s3_config_with_resolver(
+    spec: &RemoteS3EndpointSpec,
+    dns_resolver: OutboundDnsResolver,
+) -> Result<aws_sdk_s3::config::Builder, RemoteS3ClientError> {
+    let Some(credentials) = &spec.credentials else {
+        return Err(RemoteS3ClientError::MissingCredentials);
+    };
+    let creds = remote_sdk_credentials(credentials, SystemTime::now()).map_err(RemoteS3ClientError::Credentials)?;
+    build_remote_s3_config_with_creds_and_resolver(spec, creds, dns_resolver).await
+}
+
+async fn build_remote_s3_config_with_creds_and_resolver(
+    spec: &RemoteS3EndpointSpec,
+    creds: SdkCredentials,
+    dns_resolver: OutboundDnsResolver,
+) -> Result<aws_sdk_s3::config::Builder, RemoteS3ClientError> {
+    let endpoint = spec.endpoint_url();
+    let http_client = build_aws_s3_http_client_for_spec_with_resolver(spec, dns_resolver).await?;
 
     let mut config_builder = S3Config::builder()
         .endpoint_url(endpoint)
@@ -435,14 +465,11 @@ pub async fn build_remote_s3_config(spec: &RemoteS3EndpointSpec) -> Result<aws_s
         .request_checksum_calculation(replication_request_checksum_calculation())
         .interceptor(ControlResponseLimit(16 * 1024 * 1024))
         .retry_classifier(OversizedResponseRetryClassifier)
-        .retry_config(spec.retry.retry_config());
+        .retry_config(spec.retry.retry_config())
+        .http_client(http_client);
 
     if spec.path_style.force_path_style() {
         config_builder = config_builder.force_path_style(true);
-    }
-
-    if let Some(http_client) = build_aws_s3_http_client_for_spec(spec).await? {
-        config_builder = config_builder.http_client(http_client);
     }
 
     if spec.connect_timeout.is_some() || spec.read_timeout.is_some() || spec.operation_timeout.is_some() {
@@ -617,6 +644,63 @@ pub(crate) fn validate_remote_endpoint_inner(url: &Url, allow_loopback: bool) ->
     }
 }
 
+#[derive(Clone, Debug)]
+struct OutboundSmithyDnsResolver(OutboundDnsResolver);
+
+impl ResolveDns for OutboundSmithyDnsResolver {
+    fn resolve_dns<'a>(&'a self, name: &'a str) -> DnsFuture<'a> {
+        let resolver = self.0.clone();
+        let host = name.to_owned();
+        DnsFuture::new(async move {
+            let addrs = resolver.resolve_host(&host).await.map_err(ResolveDnsError::new)?;
+            Ok(addrs.into_iter().map(|addr| addr.ip()).collect())
+        })
+    }
+}
+
+#[derive(Clone)]
+struct OutboundHyperDnsResolver(OutboundDnsResolver);
+
+impl Service<HyperDnsName> for OutboundHyperDnsResolver {
+    type Response = std::vec::IntoIter<SocketAddr>;
+    type Error = std::io::Error;
+    type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
+
+    fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        Poll::Ready(Ok(()))
+    }
+
+    fn call(&mut self, name: HyperDnsName) -> Self::Future {
+        let resolver = self.0.clone();
+        let host = name.as_str().to_owned();
+        Box::pin(async move {
+            let addrs = resolver.resolve_host(&host).await?;
+            Ok(addrs.into_iter())
+        })
+    }
+}
+
+fn outbound_policy_error_to_remote_client_error(err: OutboundPolicyError) -> RemoteS3ClientError {
+    match err {
+        OutboundPolicyError::MissingHost => RemoteS3ClientError::EndpointNotAllowed(OutboundUrlError::MissingHost),
+        OutboundPolicyError::ForbiddenHost { host, reason } => {
+            RemoteS3ClientError::EndpointNotAllowed(OutboundUrlError::ForbiddenHost { host, reason })
+        }
+        other => RemoteS3ClientError::InvalidEndpoint(other.to_string()),
+    }
+}
+
+/// Build a connection-time DNS egress resolver for an operator-configured remote
+/// storage endpoint (replication target or on-demand migration source).
+pub fn build_remote_endpoint_dns_resolver(url: &Url) -> Result<OutboundDnsResolver, RemoteS3ClientError> {
+    let policy = OutboundPolicy::from_env_cached()
+        .map_err(|err| RemoteS3ClientError::InvalidEndpoint(format!("invalid outbound policy: {err}")))?;
+    policy
+        .resolver_for_storage_endpoint(url, true, loopback_replication_targets_allowed())
+        .map_err(outbound_policy_error_to_remote_client_error)
+}
+
+#[cfg(test)]
 pub(crate) fn build_insecure_aws_s3_http_client() -> SharedHttpClient {
     ensure_rustls_crypto_provider();
 
@@ -631,6 +715,30 @@ pub(crate) fn build_insecure_aws_s3_http_client() -> SharedHttpClient {
         .enable_http1()
         .enable_http2()
         .build();
+    let mut client_builder = HyperClient::builder(TokioExecutor::new());
+    client_builder.pool_timer(TokioTimer::new());
+    let client = client_builder.build(https);
+    let connector = SharedHttpConnector::new(TargetHyperHttpConnector { client });
+
+    http_client_fn(move |_settings, _components| connector.clone())
+}
+
+fn build_insecure_aws_s3_http_client_with_resolver(dns_resolver: OutboundDnsResolver) -> SharedHttpClient {
+    ensure_rustls_crypto_provider();
+
+    let tls_config = rustls::ClientConfig::builder()
+        .dangerous()
+        .with_custom_certificate_verifier(Arc::new(AcceptAnyServerCertVerifier))
+        .with_no_client_auth();
+
+    let mut http = HttpConnector::new_with_resolver(OutboundHyperDnsResolver(dns_resolver));
+    http.enforce_http(false);
+    let https = hyper_rustls::HttpsConnectorBuilder::new()
+        .with_tls_config(tls_config)
+        .https_or_http()
+        .enable_http1()
+        .enable_http2()
+        .wrap_connector(http);
     let mut client_builder = HyperClient::builder(TokioExecutor::new());
     client_builder.pool_timer(TokioTimer::new());
     let client = client_builder.build(https);
@@ -682,6 +790,7 @@ pub(crate) fn compose_replication_trust_store(
     (trust_store, custom_bundle_count)
 }
 
+#[cfg(test)]
 pub(crate) fn build_aws_s3_http_client_with_trust_store(
     trust_store: smithy_tls::TrustStore,
 ) -> Result<SharedHttpClient, RemoteS3ClientError> {
@@ -694,6 +803,21 @@ pub(crate) fn build_aws_s3_http_client_with_trust_store(
         .tls_provider(smithy_tls::Provider::rustls(smithy_tls::rustls_provider::CryptoMode::AwsLc))
         .tls_context(tls_context)
         .build_https())
+}
+
+fn build_aws_s3_http_client_with_trust_store_and_resolver(
+    trust_store: smithy_tls::TrustStore,
+    dns_resolver: OutboundDnsResolver,
+) -> Result<SharedHttpClient, RemoteS3ClientError> {
+    let tls_context = smithy_tls::TlsContext::builder()
+        .with_trust_store(trust_store)
+        .build()
+        .map_err(|err| RemoteS3ClientError::InvalidCaPem(err.to_string()))?;
+
+    Ok(SmithyHttpClientBuilder::new()
+        .tls_provider(smithy_tls::Provider::rustls(smithy_tls::rustls_provider::CryptoMode::AwsLc))
+        .tls_context(tls_context)
+        .build_with_resolver(OutboundSmithyDnsResolver(dns_resolver)))
 }
 
 pub(crate) async fn load_tls_path_ca_bundles(tls_dir: &Path, trust_leaf_cert_as_ca: bool) -> Vec<Vec<u8>> {
@@ -740,6 +864,7 @@ async fn load_configured_tls_ca_bundles() -> Vec<Vec<u8>> {
     .await
 }
 
+#[cfg(test)]
 pub(crate) async fn build_aws_s3_http_client_from_target_ca_pem(
     ca_cert_pem: &str,
 ) -> Result<SharedHttpClient, RemoteS3ClientError> {
@@ -752,40 +877,68 @@ pub(crate) async fn build_aws_s3_http_client_from_target_ca_pem(
     build_aws_s3_http_client_with_trust_store(trust_store)
 }
 
-/// Selects the HTTP client for `spec`: `None` keeps the SDK default (plain
-/// HTTP, or HTTPS with platform roots when no custom trust is configured).
+async fn build_aws_s3_http_client_from_target_ca_pem_with_resolver(
+    ca_cert_pem: &str,
+    dns_resolver: OutboundDnsResolver,
+) -> Result<SharedHttpClient, RemoteS3ClientError> {
+    validate_target_ca_pem(ca_cert_pem)?;
+
+    let mut certificate_bundles = load_configured_tls_ca_bundles().await;
+    certificate_bundles.push(ca_cert_pem.as_bytes().to_vec());
+    let (trust_store, _) = compose_replication_trust_store(certificate_bundles);
+
+    build_aws_s3_http_client_with_trust_store_and_resolver(trust_store, dns_resolver)
+}
+
+#[cfg(test)]
 pub(crate) async fn build_aws_s3_http_client_for_spec(
     spec: &RemoteS3EndpointSpec,
 ) -> Result<Option<SharedHttpClient>, RemoteS3ClientError> {
+    let fallback_url = Url::parse("https://remote-target.invalid").expect("static URL should parse");
+    let dns_resolver = match Url::parse(&spec.endpoint_url())
+        .ok()
+        .and_then(|url| build_remote_endpoint_dns_resolver(&url).ok())
+    {
+        Some(resolver) => resolver,
+        None => OutboundPolicy::default()
+            .resolver_for_storage_endpoint(&fallback_url, true, loopback_replication_targets_allowed())
+            .map_err(outbound_policy_error_to_remote_client_error)?,
+    };
+    build_aws_s3_http_client_for_spec_with_resolver(spec, dns_resolver)
+        .await
+        .map(Some)
+}
+
+/// Builds the DNS-pinned HTTP client for `spec`, covering plain HTTP, default
+/// HTTPS, `RUSTFS_TLS_PATH` / custom CA PEM, and `skip_tls_verify` uniformly.
+async fn build_aws_s3_http_client_for_spec_with_resolver(
+    spec: &RemoteS3EndpointSpec,
+    dns_resolver: OutboundDnsResolver,
+) -> Result<SharedHttpClient, RemoteS3ClientError> {
     if !spec.secure {
-        return Ok(None);
+        return build_aws_s3_http_client_with_trust_store_and_resolver(smithy_tls::TrustStore::default(), dns_resolver);
     }
 
     if spec.skip_tls_verify {
-        return Ok(Some(build_insecure_aws_s3_http_client()));
+        return Ok(build_insecure_aws_s3_http_client_with_resolver(dns_resolver));
     }
 
     if let Some(ca_cert_pem) = spec.custom_ca_pem() {
-        return build_aws_s3_http_client_from_target_ca_pem(ca_cert_pem).await.map(Some);
+        return build_aws_s3_http_client_from_target_ca_pem_with_resolver(ca_cert_pem, dns_resolver).await;
     }
 
-    Ok(build_aws_s3_http_client_from_tls_path().await)
-}
-
-async fn build_aws_s3_http_client_from_tls_path() -> Option<SharedHttpClient> {
     let certificate_bundles = load_configured_tls_ca_bundles().await;
-    if certificate_bundles.is_empty() {
-        return None;
-    }
-
-    let (trust_store, _) = compose_replication_trust_store(certificate_bundles);
-    match build_aws_s3_http_client_with_trust_store(trust_store) {
-        Ok(client) => Some(client),
-        Err(e) => {
-            warn!("failed to build AWS SDK TLS context for replication client: {}", e);
-            None
+    if !certificate_bundles.is_empty() {
+        let (trust_store, _) = compose_replication_trust_store(certificate_bundles);
+        match build_aws_s3_http_client_with_trust_store_and_resolver(trust_store, dns_resolver.clone()) {
+            Ok(client) => return Ok(client),
+            Err(e) => {
+                warn!("failed to build AWS SDK TLS context for replication client: {}", e);
+            }
         }
     }
+
+    build_aws_s3_http_client_with_trust_store_and_resolver(smithy_tls::TrustStore::default(), dns_resolver)
 }
 
 #[cfg(test)]
@@ -1277,6 +1430,149 @@ mod tests {
         assert!(
             headers.iter().any(|(k, _)| k.eq_ignore_ascii_case("authorization")),
             "request must still be signed"
+        );
+    }
+
+    #[tokio::test]
+    async fn remote_s3_client_blocks_dns_rebinding_across_http_and_skip_tls_verify() {
+        use rustfs_utils::egress::find_outbound_dns_policy_rejection;
+        use std::collections::VecDeque;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let listener = match TcpListener::bind("127.0.0.1:0").await {
+            Ok(listener) => listener,
+            Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => return,
+            Err(err) => panic!("test listener should bind: {err}"),
+        };
+        let address = listener.local_addr().expect("listener address");
+        let endpoint = format!("rebind-remote.test:{}", address.port());
+        let endpoint_url = Url::parse(&format!("http://{endpoint}")).expect("endpoint URL");
+
+        // 1. Without loopback opt-in, a hostname resolving to 127.0.0.1 fails closed at connect time
+        // (and private RFC1918 answers remain allowed by the resolver).
+        let no_loopback_resolver = OutboundPolicy::default()
+            .resolver_for_storage_endpoint(&endpoint_url, true, false)
+            .expect("hostname should pass URL check")
+            .with_resolve_override(move |host| {
+                if host == "rebind-remote.test" {
+                    Some(vec![SocketAddr::new(address.ip(), 0)])
+                } else {
+                    None
+                }
+            });
+        assert!(
+            no_loopback_resolver
+                .filter_resolved_addresses(
+                    "rebind-remote.test",
+                    vec![
+                        SocketAddr::new("10.0.0.5".parse().expect("private ip"), 0),
+                        SocketAddr::new("169.254.169.254".parse().expect("metadata ip"), 0),
+                        SocketAddr::new("fe80::1".parse().expect("link-local"), 0),
+                        SocketAddr::new("127.0.0.1".parse().expect("loopback"), 0),
+                    ],
+                )
+                .expect("private IP must survive filtering")
+                == vec![SocketAddr::new("10.0.0.5".parse().expect("private ip"), 0)]
+        );
+        let no_loopback_client = S3Client::from_conf(
+            build_remote_s3_config_with_resolver(&spec(&endpoint, false), no_loopback_resolver)
+                .await
+                .expect("config should build")
+                .build(),
+        );
+        let err = no_loopback_client
+            .head_bucket()
+            .bucket("bucket")
+            .send()
+            .await
+            .expect_err("loopback DNS answer must be rejected when loopback opt-in is disabled");
+        assert!(
+            find_outbound_dns_policy_rejection(&err).is_some(),
+            "DNS policy rejection must remain in error chain: {err:?}"
+        );
+
+        // 2. With loopback opt-in enabled, first connect reaches local listener, then DNS rebinding
+        // to metadata (169.254.169.254) fails closed on the second connect.
+        let answers = Arc::new(Mutex::new(VecDeque::from([
+            vec![SocketAddr::new(address.ip(), 0)],
+            vec![SocketAddr::new("169.254.169.254".parse().expect("metadata ip"), 0)],
+        ])));
+        let rebinding_resolver = OutboundPolicy::default()
+            .resolver_for_storage_endpoint(&endpoint_url, true, true)
+            .expect("loopback opt-in should allow hostname")
+            .with_resolve_override(move |host| {
+                if host != "rebind-remote.test" {
+                    return None;
+                }
+                let mut guard = answers.lock().expect("override lock");
+                if guard.len() > 1 {
+                    guard.pop_front()
+                } else {
+                    guard.front().cloned()
+                }
+            });
+
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("first connection should succeed");
+            let mut buf = [0_u8; 1024];
+            let _ = stream.read(&mut buf).await.expect("read request");
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                .await
+                .expect("write response");
+        });
+
+        let rebinding_client = S3Client::from_conf(
+            build_remote_s3_config_with_resolver(&spec(&endpoint, false), rebinding_resolver)
+                .await
+                .expect("rebinding config should build")
+                .build(),
+        );
+        rebinding_client
+            .head_bucket()
+            .bucket("bucket")
+            .send()
+            .await
+            .expect("first request to local listener should succeed");
+        server.await.expect("server should finish");
+
+        let rebind_err = rebinding_client
+            .head_bucket()
+            .bucket("bucket")
+            .send()
+            .await
+            .expect_err("rebound metadata DNS answer must fail closed");
+        assert!(
+            find_outbound_dns_policy_rejection(&rebind_err).is_some(),
+            "rebound metadata rejection must remain in error chain: {rebind_err:?}"
+        );
+
+        // 3. `skip_tls_verify` HTTPS client also enforces connection-time DNS egress policy.
+        let mut insecure_spec = spec(&endpoint, true);
+        insecure_spec.skip_tls_verify = true;
+        let insecure_url = Url::parse(&insecure_spec.endpoint_url()).expect("https endpoint URL");
+        let metadata_resolver = OutboundPolicy::default()
+            .resolver_for_storage_endpoint(&insecure_url, true, true)
+            .expect("https hostname should pass URL check")
+            .with_resolve_override(|host| {
+                (host == "rebind-remote.test").then(|| vec![SocketAddr::new("169.254.169.254".parse().expect("metadata ip"), 0)])
+            });
+        let insecure_client = S3Client::from_conf(
+            build_remote_s3_config_with_resolver(&insecure_spec, metadata_resolver)
+                .await
+                .expect("skip_tls_verify config should build")
+                .build(),
+        );
+        let insecure_err = insecure_client
+            .head_bucket()
+            .bucket("bucket")
+            .send()
+            .await
+            .expect_err("skip_tls_verify client must still reject metadata DNS answers");
+        assert!(
+            find_outbound_dns_policy_rejection(&insecure_err).is_some(),
+            "skip_tls_verify DNS rejection must remain in error chain: {insecure_err:?}"
         );
     }
 }

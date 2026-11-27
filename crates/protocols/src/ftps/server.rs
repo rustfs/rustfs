@@ -16,13 +16,13 @@ use super::config::{FtpsConfig, FtpsInitError};
 use super::driver::FtpsDriver;
 use crate::common::client::s3::StorageBackend;
 use crate::common::session::{Protocol, ProtocolPrincipal, SessionContext, is_temporary_credential};
-use crate::constants::{network::DEFAULT_SOURCE_IP, paths::ROOT_PATH};
+use crate::constants::paths::ROOT_PATH;
 use libunftp::options::FtpsRequired;
 use rustfs_config::{DEFAULT_TLS_RELOAD_ENABLE, DEFAULT_TLS_RELOAD_INTERVAL, ENV_TLS_RELOAD_ENABLE, ENV_TLS_RELOAD_INTERVAL};
 use rustfs_tls_runtime::{ReloadableServerCertResolver, TlsReloadOptions, spawn_server_cert_reload_loop};
 use rustfs_utils::MaskedAccessKey;
 use std::fmt::{Debug, Display, Formatter};
-use std::net::IpAddr;
+use std::net::{IpAddr, Ipv4Addr};
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
@@ -329,13 +329,15 @@ where
 #[derive(Debug)]
 pub struct FtpsUserDetailProvider;
 
-#[async_trait::async_trait]
-impl UserDetailProvider for FtpsUserDetailProvider {
-    type User = FtpsUser;
-
-    async fn provide_user_detail(&self, principal: &Principal) -> Result<Self::User, UserDetailError> {
+impl FtpsUserDetailProvider {
+    async fn provide_user_detail_with_context(
+        &self,
+        username: &str,
+        source_ip: IpAddr,
+        secure_transport: bool,
+    ) -> Result<FtpsUser, UserDetailError> {
         use rustfs_iam::get;
-        let masked_username = MaskedAccessKey(&principal.username);
+        let masked_username = MaskedAccessKey(username);
 
         // Access IAM system
         let iam_sys = get().map_err(|e| {
@@ -351,7 +353,7 @@ impl UserDetailProvider for FtpsUserDetailProvider {
             UserDetailError::ImplPropagated("Internal authentication service unavailable".to_string(), Some(Box::new(e)))
         })?;
 
-        let (user_identity, _is_valid) = iam_sys.check_key(&principal.username).await.map_err(|e| {
+        let (user_identity, _is_valid) = iam_sys.check_key(username).await.map_err(|e| {
             error!(
                 event = EVENT_FTPS_AUTH_STATE,
                 component = LOG_COMPONENT_PROTOCOLS,
@@ -376,21 +378,31 @@ impl UserDetailProvider for FtpsUserDetailProvider {
                 "FTPS user-detail identity missing"
             );
             UserDetailError::UserNotFound {
-                username: principal.username.clone(),
+                username: username.to_string(),
             }
         })?;
 
-        let source_ip: IpAddr = DEFAULT_SOURCE_IP.parse().unwrap();
-
-        let session_context = SessionContext::new(ProtocolPrincipal::new(Arc::new(identity.clone())), Protocol::Ftps, source_ip);
+        let mut session_context =
+            SessionContext::new(ProtocolPrincipal::new(Arc::new(identity.clone())), Protocol::Ftps, source_ip);
+        session_context.secure_transport = secure_transport;
 
         let ftps_user = FtpsUser {
-            username: principal.username.clone(),
+            username: username.to_string(),
             name: identity.credentials.name,
             session_context,
         };
 
         Ok(ftps_user)
+    }
+}
+
+#[async_trait::async_trait]
+impl UserDetailProvider for FtpsUserDetailProvider {
+    type User = FtpsUser;
+
+    async fn provide_user_detail(&self, principal: &Principal) -> Result<Self::User, UserDetailError> {
+        self.provide_user_detail_with_context(&principal.username, IpAddr::V4(Ipv4Addr::UNSPECIFIED), false)
+            .await
     }
 }
 
@@ -425,10 +437,9 @@ impl UserDetailProvider for ConnectionUserDetailProvider {
     async fn provide_user_detail(&self, principal: &Principal) -> Result<Self::User, UserDetailError> {
         let (username, source_ip, secure_transport): (String, IpAddr, bool) = serde_json::from_str(&principal.username)
             .map_err(|error| UserDetailError::with_source("Invalid connection context", error))?;
-        let mut user = FtpsUserDetailProvider.provide_user_detail(&Principal { username }).await?;
-        user.session_context.source_ip = source_ip;
-        user.session_context.secure_transport = secure_transport;
-        Ok(user)
+        FtpsUserDetailProvider
+            .provide_user_detail_with_context(&username, source_ip, secure_transport)
+            .await
     }
 }
 
@@ -684,5 +695,17 @@ mod tests {
 
         shutdown_tx.send(()).expect("signal shutdown");
         server_task.await.expect("server task").expect("clean server exit");
+    }
+
+    #[tokio::test]
+    async fn connection_user_detail_provider_rejects_malformed_context_without_panicking() {
+        let provider = ConnectionUserDetailProvider;
+        let err = provider
+            .provide_user_detail(&Principal {
+                username: "not-valid-connection-context".to_string(),
+            })
+            .await
+            .expect_err("malformed connection context must fail closed");
+        assert!(matches!(err, UserDetailError::ImplPropagated(_, _)), "unexpected error: {err:?}");
     }
 }

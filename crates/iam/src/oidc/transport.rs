@@ -375,6 +375,7 @@ pub(super) fn build_oidc_http_client(
             OutboundPolicy::from_allowed_origins(&origin).is_ok_and(|allowlisted| allowlisted.validate_url(&url).is_ok());
         oidc_forbidden_outbound_error(&url, base, can_allow_origin)
     })?;
+    super::config::ensure_oidc_url_transport_security(&url).map_err(OidcHttpError::ForbiddenOutbound)?;
     let bypass_proxy = should_bypass_proxy_for_oidc_uri(uri);
     #[cfg(test)]
     let bypass_proxy = bypass_proxy || dns_resolver_override.is_some();

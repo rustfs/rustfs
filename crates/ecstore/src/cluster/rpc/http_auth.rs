@@ -29,7 +29,9 @@
 use crate::cluster::rpc::context_propagation::{inject_request_id_into_http_headers, inject_trace_context_into_http_headers};
 use crate::storage_api_contracts::internode::{
     NS_SCANNER_PROTOCOL_VERSION, PUT_FILE_AUTH_TRAILER_DIGEST_LEN, PUT_FILE_AUTH_TRAILER_LEN, PUT_FILE_AUTH_TRAILER_MAC_LEN,
-    PUT_FILE_AUTH_TRAILER_MAGIC, PUT_FILE_CAPABILITY_VERSION,
+    PUT_FILE_AUTH_TRAILER_MAGIC, PUT_FILE_CAPABILITY_VERSION, STREAM_RESPONSE_DATA_HEADER_LEN, STREAM_RESPONSE_EOF_FRAME_LEN,
+    STREAM_RESPONSE_FRAME_KIND_DATA, STREAM_RESPONSE_FRAME_KIND_EOF, STREAM_RESPONSE_FRAME_MAGIC,
+    STREAM_RESPONSE_FRAME_MAX_PAYLOAD,
 };
 
 use hashbrown::HashSet;
@@ -51,7 +53,8 @@ use rustfs_utils::crypto::{HmacSha256, KeyInit, Mac};
 use rustfs_utils::get_env_bool;
 use sha2::Digest as _;
 use sha2::Sha256;
-use std::collections::{BTreeMap, hash_map::RandomState};
+use std::collections::{BTreeMap, HashMap, hash_map::RandomState};
+use std::net::IpAddr;
 use std::sync::{LazyLock, Mutex, Once};
 use std::thread;
 #[cfg(test)]
@@ -368,6 +371,9 @@ pub enum RpcReplayCacheAdmissionError {
     /// The next allocation would exceed the automatic byte budget.
     #[error("RPC replay cache memory budget exceeded")]
     MemoryBudget,
+    /// One peer reached its isolated share of the replay cache.
+    #[error("RPC replay cache peer quota exceeded")]
+    PeerQuota,
 }
 
 /// Whether an RPC verifier failed because replay admission exhausted resources.
@@ -388,6 +394,7 @@ pub fn rpc_auth_is_resource_exhausted(error: &std::io::Error) -> bool {
 struct RpcNonceBucket {
     nonces: HashSet<Uuid, RandomState>,
     charged_bytes: u64,
+    peer_counts: HashMap<IpAddr, usize>,
 }
 
 struct RpcNonceCache {
@@ -395,6 +402,7 @@ struct RpcNonceCache {
     entries: usize,
     table_bytes: u64,
     max_wall_time: i64,
+    peer_entries: HashMap<IpAddr, usize>,
 }
 
 impl Default for RpcNonceCache {
@@ -404,6 +412,7 @@ impl Default for RpcNonceCache {
             entries: 0,
             table_bytes: 0,
             max_wall_time: i64::MIN,
+            peer_entries: HashMap::new(),
         }
     }
 }
@@ -423,6 +432,7 @@ struct RpcNonceRecord<'a> {
     wall_time: i64,
     capacity: usize,
     memory_budget_bytes: Option<u64>,
+    peer: Option<IpAddr>,
     metric_scope: RpcReplayCacheMetricScope<'a>,
 }
 
@@ -475,13 +485,61 @@ impl RpcNonceCache {
             .first_key_value()
             .is_some_and(|(signed, _)| *signed < first_valid)
         {
-            if let Some((_, nonces)) = self.signed_times.pop_first() {
-                removed += nonces.nonces.len();
-                self.table_bytes -= nonces.charged_bytes;
+            if let Some((_, bucket)) = self.signed_times.pop_first() {
+                removed += bucket.nonces.len();
+                self.table_bytes -= bucket.charged_bytes;
+                for (peer, count) in bucket.peer_counts {
+                    if let Some(total) = self.peer_entries.get_mut(&peer) {
+                        *total = total.saturating_sub(count);
+                        if *total == 0 {
+                            self.peer_entries.remove(&peer);
+                        }
+                    }
+                }
             }
         }
         self.entries -= removed;
         removed
+    }
+
+    fn check_peer_quota(&self, record: &RpcNonceRecord<'_>, additional: usize, growth: u64) -> std::io::Result<()> {
+        let Some(peer) = record.peer.map(|ip| ip.to_canonical()) else {
+            return Ok(());
+        };
+        let current_peer_entries = self.peer_entries.get(&peer).copied().unwrap_or(0);
+        // Reserve at least half the cache headroom even when only one peer is active so a
+        // noisy peer cannot starve healthy peers that arrive later.
+        let active_peers = self.peer_entries.len() + usize::from(current_peer_entries == 0);
+        let peer_divisor = active_peers.max(2);
+        let peer_capacity_limit = (record.capacity / peer_divisor).max(1);
+        let projected_peer_entries = current_peer_entries
+            .checked_add(additional)
+            .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::WouldBlock, RpcReplayCacheAdmissionError::PeerQuota))?;
+        if projected_peer_entries > peer_capacity_limit {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::WouldBlock,
+                RpcReplayCacheAdmissionError::PeerQuota,
+            ));
+        }
+
+        if let Some(budget) = record.memory_budget_bytes
+            && current_peer_entries > 0
+        {
+            let usable_budget = budget.saturating_sub(REPLAY_CACHE_METADATA_BYTES);
+            let peer_budget_limit = usable_budget / (peer_divisor as u64);
+            let projected_total_entries = self.entries.saturating_add(additional).max(1);
+            let projected_total_bytes = self.table_bytes.saturating_add(growth);
+            let projected_peer_bytes = u128::from(projected_total_bytes).saturating_mul(projected_peer_entries as u128)
+                / (projected_total_entries as u128);
+            if projected_peer_bytes > u128::from(peer_budget_limit) {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::WouldBlock,
+                    RpcReplayCacheAdmissionError::PeerQuota,
+                ));
+            }
+        }
+
+        Ok(())
     }
 
     fn reserve_nonces(&mut self, record: &RpcNonceRecord<'_>) -> std::io::Result<()> {
@@ -491,10 +549,15 @@ impl RpcNonceCache {
         let needed = len
             .checked_add(additional)
             .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::OutOfMemory, hashbrown::TryReserveError::CapacityOverflow))?;
-        if needed > capacity {
-            let growth = replay_cache_table_growth_bytes(needed).ok_or_else(|| {
+        let growth = if needed > capacity {
+            replay_cache_table_growth_bytes(needed).ok_or_else(|| {
                 std::io::Error::new(std::io::ErrorKind::OutOfMemory, hashbrown::TryReserveError::CapacityOverflow)
-            })?;
+            })?
+        } else {
+            0
+        };
+        self.check_peer_quota(record, additional, growth)?;
+        if needed > capacity {
             // The old table stays live until growth completes. Do not subtract
             // it here, even though it will be replaced immediately afterwards.
             let peak = self
@@ -525,6 +588,10 @@ impl RpcNonceCache {
         bucket.nonces.insert(record.nonce);
         if let Some(nonce) = record.compatibility_nonce {
             bucket.nonces.insert(nonce);
+        }
+        if let Some(peer) = record.peer.map(|ip| ip.to_canonical()) {
+            *bucket.peer_counts.entry(peer).or_default() += additional;
+            *self.peer_entries.entry(peer).or_default() += additional;
         }
         self.entries += additional;
         debug_assert!(self.signed_times.len() <= REPLAY_CACHE_CAPACITY_WINDOW_SECS);
@@ -764,6 +831,222 @@ pub fn verify_put_file_auth_trailer(url: &str, method: &Method, nonce: Uuid, tra
     let mac_end = mac_start + PUT_FILE_AUTH_TRAILER_MAC_LEN;
     verify_put_file_auth_mac(url, method, nonce, body_sha256, &trailer[mac_start..mac_end])?;
     Ok(body_sha256.to_string())
+}
+
+/// Cryptographic domain separator for framed internode HTTP response streams.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StreamResponseAuthDomain {
+    ReadFileStream,
+    WalkDir,
+}
+
+impl StreamResponseAuthDomain {
+    const fn domain_bytes(self) -> &'static [u8] {
+        match self {
+            Self::ReadFileStream => b"rustfs-http-read-stream-auth-v1\0",
+            Self::WalkDir => b"rustfs-http-walk-dir-auth-v1\0",
+        }
+    }
+}
+
+fn stream_auth_data_frame_mac(
+    domain: StreamResponseAuthDomain,
+    url: &str,
+    method: &Method,
+    nonce: Uuid,
+    seq: u64,
+    payload: &[u8],
+) -> std::io::Result<HmacSha256> {
+    if nonce.is_nil() {
+        return Err(std::io::Error::other("Invalid stream response auth nonce"));
+    }
+    if payload.is_empty() || payload.len() > STREAM_RESPONSE_FRAME_MAX_PAYLOAD {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "stream response auth frame payload size is out of bounds",
+        ));
+    }
+    let payload_len = u32::try_from(payload.len())
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidData, "stream response frame length overflow"))?;
+    let path_and_query = canonical_path_and_query(url)?;
+    let mut mac = <HmacSha256 as KeyInit>::new_from_slice(get_shared_secret()?.as_bytes())
+        .map_err(|_| std::io::Error::other("Invalid RPC HMAC key"))?;
+    mac.update(domain.domain_bytes());
+    mac.update(b"data\0");
+    mac.update(path_and_query.as_bytes());
+    mac.update(b"|");
+    mac.update(method.as_str().as_bytes());
+    mac.update(b"|");
+    mac.update(nonce.as_bytes());
+    mac.update(b"|");
+    mac.update(&seq.to_be_bytes());
+    mac.update(&payload_len.to_be_bytes());
+    mac.update(payload);
+    Ok(mac)
+}
+
+pub fn encode_stream_auth_data_frame(
+    domain: StreamResponseAuthDomain,
+    url: &str,
+    method: &Method,
+    nonce: Uuid,
+    seq: u64,
+    payload: &[u8],
+) -> std::io::Result<Vec<u8>> {
+    let payload_len = u32::try_from(payload.len())
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidData, "stream response frame length overflow"))?;
+    let mac = stream_auth_data_frame_mac(domain, url, method, nonce, seq, payload)?
+        .finalize()
+        .into_bytes();
+    let mut frame = Vec::with_capacity(STREAM_RESPONSE_DATA_HEADER_LEN + payload.len());
+    frame.extend_from_slice(STREAM_RESPONSE_FRAME_MAGIC);
+    frame.push(STREAM_RESPONSE_FRAME_KIND_DATA);
+    frame.extend_from_slice(&seq.to_be_bytes());
+    frame.extend_from_slice(&payload_len.to_be_bytes());
+    frame.extend_from_slice(&mac);
+    frame.extend_from_slice(payload);
+    Ok(frame)
+}
+
+pub fn verify_stream_auth_data_frame(
+    domain: StreamResponseAuthDomain,
+    url: &str,
+    method: &Method,
+    nonce: Uuid,
+    expected_seq: u64,
+    header: &[u8; STREAM_RESPONSE_DATA_HEADER_LEN],
+    payload: &[u8],
+) -> std::io::Result<()> {
+    if &header[..8] != STREAM_RESPONSE_FRAME_MAGIC || header[8] != STREAM_RESPONSE_FRAME_KIND_DATA {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "invalid authenticated internode stream data frame header",
+        ));
+    }
+    let seq = u64::from_be_bytes(
+        header[9..17]
+            .try_into()
+            .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidData, "invalid stream frame sequence"))?,
+    );
+    if seq != expected_seq {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "authenticated internode stream frame sequence mismatch",
+        ));
+    }
+    let declared_len = u32::from_be_bytes(
+        header[17..21]
+            .try_into()
+            .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidData, "invalid stream frame length"))?,
+    ) as usize;
+    if declared_len == 0 || declared_len != payload.len() || declared_len > STREAM_RESPONSE_FRAME_MAX_PAYLOAD {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "authenticated internode stream frame length mismatch",
+        ));
+    }
+    stream_auth_data_frame_mac(domain, url, method, nonce, expected_seq, payload)?
+        .verify_slice(&header[21..53])
+        .map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "invalid authenticated internode stream data frame MAC",
+            )
+        })
+}
+
+fn stream_auth_eof_frame_mac(
+    domain: StreamResponseAuthDomain,
+    url: &str,
+    method: &Method,
+    nonce: Uuid,
+    seq: u64,
+    total_bytes: u64,
+    running_sha256: &[u8; 32],
+) -> std::io::Result<HmacSha256> {
+    if nonce.is_nil() {
+        return Err(std::io::Error::other("Invalid stream response auth nonce"));
+    }
+    let path_and_query = canonical_path_and_query(url)?;
+    let mut mac = <HmacSha256 as KeyInit>::new_from_slice(get_shared_secret()?.as_bytes())
+        .map_err(|_| std::io::Error::other("Invalid RPC HMAC key"))?;
+    mac.update(domain.domain_bytes());
+    mac.update(b"eof\0");
+    mac.update(path_and_query.as_bytes());
+    mac.update(b"|");
+    mac.update(method.as_str().as_bytes());
+    mac.update(b"|");
+    mac.update(nonce.as_bytes());
+    mac.update(b"|");
+    mac.update(&seq.to_be_bytes());
+    mac.update(&total_bytes.to_be_bytes());
+    mac.update(running_sha256);
+    Ok(mac)
+}
+
+pub fn encode_stream_auth_eof_frame(
+    domain: StreamResponseAuthDomain,
+    url: &str,
+    method: &Method,
+    nonce: Uuid,
+    seq: u64,
+    total_bytes: u64,
+    running_sha256: &[u8; 32],
+) -> std::io::Result<[u8; STREAM_RESPONSE_EOF_FRAME_LEN]> {
+    let mac = stream_auth_eof_frame_mac(domain, url, method, nonce, seq, total_bytes, running_sha256)?
+        .finalize()
+        .into_bytes();
+    let mut frame = [0u8; STREAM_RESPONSE_EOF_FRAME_LEN];
+    frame[..8].copy_from_slice(STREAM_RESPONSE_FRAME_MAGIC);
+    frame[8] = STREAM_RESPONSE_FRAME_KIND_EOF;
+    frame[9..17].copy_from_slice(&seq.to_be_bytes());
+    frame[17..25].copy_from_slice(&total_bytes.to_be_bytes());
+    frame[25..57].copy_from_slice(running_sha256);
+    frame[57..89].copy_from_slice(&mac);
+    Ok(frame)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn verify_stream_auth_eof_frame(
+    domain: StreamResponseAuthDomain,
+    url: &str,
+    method: &Method,
+    nonce: Uuid,
+    expected_seq: u64,
+    expected_total_bytes: u64,
+    expected_sha256: &[u8; 32],
+    frame: &[u8; STREAM_RESPONSE_EOF_FRAME_LEN],
+) -> std::io::Result<()> {
+    if &frame[..8] != STREAM_RESPONSE_FRAME_MAGIC || frame[8] != STREAM_RESPONSE_FRAME_KIND_EOF {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "invalid authenticated internode stream EOF frame header",
+        ));
+    }
+    let seq = u64::from_be_bytes(
+        frame[9..17]
+            .try_into()
+            .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidData, "invalid stream EOF sequence"))?,
+    );
+    let total_bytes = u64::from_be_bytes(
+        frame[17..25]
+            .try_into()
+            .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidData, "invalid stream EOF byte count"))?,
+    );
+    if seq != expected_seq || total_bytes != expected_total_bytes || &frame[25..57] != expected_sha256 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "authenticated internode stream EOF summary mismatch",
+        ));
+    }
+    stream_auth_eof_frame_mac(domain, url, method, nonce, expected_seq, expected_total_bytes, expected_sha256)?
+        .verify_slice(&frame[57..89])
+        .map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "invalid authenticated internode stream EOF frame MAC",
+            )
+        })
 }
 
 fn update_put_file_capability_mac(mac: &mut HmacSha256, challenge: Uuid, server_epoch: Uuid, version: u16) {
@@ -1631,6 +1914,7 @@ fn check_and_record_nonce_with_scope(
     rpc_path: &str,
     operation: &'static str,
     backend: &'static str,
+    peer: Option<IpAddr>,
 ) -> std::io::Result<()> {
     let wall_time = OffsetDateTime::now_utc().unix_timestamp();
     let (result, metrics) = {
@@ -1644,6 +1928,7 @@ fn check_and_record_nonce_with_scope(
             wall_time,
             capacity: REPLAY_CACHE_CAPACITY.capacity,
             memory_budget_bytes: REPLAY_CACHE_CAPACITY.memory_budget_bytes,
+            peer,
             metric_scope: RpcReplayCacheMetricScope {
                 operation,
                 backend,
@@ -1660,6 +1945,7 @@ fn check_and_record_tonic_nonce(
     compatibility_nonce: Option<Uuid>,
     signed_at: i64,
     rpc_path: &str,
+    peer: Option<IpAddr>,
 ) -> std::io::Result<()> {
     check_and_record_nonce_with_scope(
         nonce,
@@ -1668,6 +1954,7 @@ fn check_and_record_tonic_nonce(
         rpc_path,
         tonic_rpc_metric_operation(rpc_path),
         INTERNODE_TRANSPORT_BACKEND_GRPC,
+        peer,
     )
 }
 
@@ -1677,6 +1964,17 @@ pub fn check_and_record_signed_rpc_nonce(
     rpc_path: &str,
     operation: &'static str,
     backend: &'static str,
+) -> std::io::Result<()> {
+    check_and_record_signed_rpc_nonce_for_peer(headers, nonce, rpc_path, operation, backend, None)
+}
+
+pub fn check_and_record_signed_rpc_nonce_for_peer(
+    headers: &HeaderMap,
+    nonce: Uuid,
+    rpc_path: &str,
+    operation: &'static str,
+    backend: &'static str,
+    peer: Option<IpAddr>,
 ) -> std::io::Result<()> {
     if nonce.is_nil() {
         return Err(std::io::Error::other("Invalid RPC nonce"));
@@ -1689,7 +1987,7 @@ pub fn check_and_record_signed_rpc_nonce(
         .parse::<i64>()
         .map_err(|_| std::io::Error::other("Invalid timestamp format"))?;
     check_timestamp(timestamp)?;
-    check_and_record_nonce_with_scope(nonce, None, timestamp, rpc_path, operation, backend)
+    check_and_record_nonce_with_scope(nonce, None, timestamp, rpc_path, operation, backend, peer)
 }
 
 /// Build headers with authentication signature
@@ -2006,7 +2304,12 @@ fn internode_rpc_replay_scope_strict() -> bool {
     *INTERNODE_RPC_REPLAY_SCOPE_STRICT
 }
 
-fn verify_tonic_replay_scope_signature(audience: &str, path: &str, headers: &HeaderMap) -> std::io::Result<()> {
+fn verify_tonic_replay_scope_signature(
+    audience: &str,
+    path: &str,
+    headers: &HeaderMap,
+    peer: Option<IpAddr>,
+) -> std::io::Result<()> {
     if audience.is_empty() {
         return Err(std::io::Error::other("Missing RPC audience"));
     }
@@ -2078,18 +2381,19 @@ fn verify_tonic_replay_scope_signature(audience: &str, path: &str, headers: &Hea
     } else {
         None
     };
-    check_and_record_tonic_nonce(nonce, compatibility_nonce, signed_at, path)
+    check_and_record_tonic_nonce(nonce, compatibility_nonce, signed_at, path, peer)
 }
 
 /// Verify gRPC authentication, preferring v2 without downgrade on malformed v2 metadata.
 pub fn verify_tonic_rpc_signature(audience: &str, path: &str, headers: &HeaderMap) -> std::io::Result<()> {
-    verify_tonic_rpc_signature_with_policy(
+    verify_tonic_rpc_signature_with_policy_and_peer(
         audience,
         path,
         headers,
         internode_rpc_signature_strict(),
         internode_rpc_replay_scope_strict(),
         false,
+        None,
     )
 }
 
@@ -2101,13 +2405,25 @@ pub fn verify_tonic_rpc_signature_with_bootstrap(
     headers: &HeaderMap,
     allow_replay_scope_bootstrap: bool,
 ) -> std::io::Result<()> {
-    verify_tonic_rpc_signature_with_policy(
+    verify_tonic_rpc_signature_with_bootstrap_and_peer(audience, path, headers, allow_replay_scope_bootstrap, None)
+}
+
+/// Verify gRPC authentication while isolating replay-cache quota per peer address.
+pub fn verify_tonic_rpc_signature_with_bootstrap_and_peer(
+    audience: &str,
+    path: &str,
+    headers: &HeaderMap,
+    allow_replay_scope_bootstrap: bool,
+    peer: Option<IpAddr>,
+) -> std::io::Result<()> {
+    verify_tonic_rpc_signature_with_policy_and_peer(
         audience,
         path,
         headers,
         internode_rpc_signature_strict(),
         internode_rpc_replay_scope_strict(),
         allow_replay_scope_bootstrap,
+        peer,
     )
 }
 
@@ -2131,6 +2447,7 @@ pub fn tonic_rpc_auth_failure_reason(error: &std::io::Error) -> &'static str {
         "RPC request replay detected" => "replay_detected",
         "RPC replay cache capacity exceeded" => "replay_cache_capacity",
         "RPC replay cache memory budget exceeded" => "replay_cache_memory",
+        "RPC replay cache peer quota exceeded" => "replay_cache_peer_quota",
         "RPC replay cache unavailable" => "replay_cache_unavailable",
         "RPC replay expiry overflow" => "replay_expiry_overflow",
         "RPC request timestamp expired after clock regression" => "timestamp_expired_after_clock_regression",
@@ -2157,6 +2474,7 @@ pub fn tonic_rpc_auth_failure_reason(error: &std::io::Error) -> &'static str {
     }
 }
 
+#[cfg(test)]
 fn verify_tonic_rpc_signature_with_policy(
     audience: &str,
     path: &str,
@@ -2165,8 +2483,28 @@ fn verify_tonic_rpc_signature_with_policy(
     replay_scope_strict: bool,
     allow_replay_scope_bootstrap: bool,
 ) -> std::io::Result<()> {
+    verify_tonic_rpc_signature_with_policy_and_peer(
+        audience,
+        path,
+        headers,
+        signature_strict,
+        replay_scope_strict,
+        allow_replay_scope_bootstrap,
+        None,
+    )
+}
+
+fn verify_tonic_rpc_signature_with_policy_and_peer(
+    audience: &str,
+    path: &str,
+    headers: &HeaderMap,
+    signature_strict: bool,
+    replay_scope_strict: bool,
+    allow_replay_scope_bootstrap: bool,
+    peer: Option<IpAddr>,
+) -> std::io::Result<()> {
     if has_replay_scope_headers(headers) {
-        return verify_tonic_replay_scope_signature(audience, path, headers);
+        return verify_tonic_replay_scope_signature(audience, path, headers, peer);
     }
 
     // Only a method-bound v2 Ping with a syntactically valid challenge may bootstrap a strict
@@ -2182,21 +2520,32 @@ fn verify_tonic_rpc_signature_with_policy(
         return Err(std::io::Error::other("RPC replay-scoped authentication required"));
     }
 
-    verify_tonic_rpc_signature_with_strictness(audience, path, headers, signature_strict)?;
+    verify_tonic_rpc_signature_with_strictness_and_peer(audience, path, headers, signature_strict, peer)?;
     global_internode_metrics().record_replay_scope_fallback();
     Ok(())
 }
 
 /// [`verify_tonic_rpc_signature`] with the strict gate injected as a parameter, so both rollout
 /// postures are unit-testable without racing on process-global environment variables.
+#[cfg(test)]
 fn verify_tonic_rpc_signature_with_strictness(
     audience: &str,
     path: &str,
     headers: &HeaderMap,
     strict: bool,
 ) -> std::io::Result<()> {
+    verify_tonic_rpc_signature_with_strictness_and_peer(audience, path, headers, strict, None)
+}
+
+fn verify_tonic_rpc_signature_with_strictness_and_peer(
+    audience: &str,
+    path: &str,
+    headers: &HeaderMap,
+    strict: bool,
+    peer: Option<IpAddr>,
+) -> std::io::Result<()> {
     if let Some((nonce, signed_at)) = verified_tonic_rpc_nonce(audience, path, headers, strict)? {
-        check_and_record_tonic_nonce(nonce, None, signed_at, path)?;
+        check_and_record_tonic_nonce(nonce, None, signed_at, path, peer)?;
     }
     Ok(())
 }
@@ -2484,11 +2833,11 @@ mod tests {
                 };
                 assert!(verify_rpc_signature("/rustfs/rpc/read?disk=a", &Method::GET, &alter(&http)).is_err());
                 assert!(verify_tonic_rpc_signature_with_strictness("node-a:9000", path, &alter(&tonic), true).is_err());
-                assert!(verify_tonic_replay_scope_signature("node-a:9000", path, &alter(&replay)).is_err());
+                assert!(verify_tonic_replay_scope_signature("node-a:9000", path, &alter(&replay), None).is_err());
             }
-            verify_tonic_replay_scope_signature("node-a:9000", path, &replay).expect("v3 authentication");
+            verify_tonic_replay_scope_signature("node-a:9000", path, &replay, None).expect("v3 authentication");
             assert!(
-                verify_tonic_replay_scope_signature("node-a:9000", path, &replay).is_err(),
+                verify_tonic_replay_scope_signature("node-a:9000", path, &replay, None).is_err(),
                 "replay rejected"
             );
 
@@ -3201,8 +3550,9 @@ mod tests {
             .expect_err("the random replay-scope nonce must be single-use");
         assert_eq!(replay.to_string(), "RPC request replay detected");
 
-        let path_error = verify_tonic_replay_scope_signature("node-a:9000", "/node_service.NodeService/SignalService", &headers)
-            .expect_err("a replay-scoped signature must not move to another method");
+        let path_error =
+            verify_tonic_replay_scope_signature("node-a:9000", "/node_service.NodeService/SignalService", &headers, None)
+                .expect_err("a replay-scoped signature must not move to another method");
         assert_eq!(path_error.to_string(), "Invalid RPC replay scope signature");
     }
 
@@ -3870,6 +4220,7 @@ mod tests {
             wall_time,
             capacity,
             memory_budget_bytes: None,
+            peer: None,
             metric_scope: RpcReplayCacheMetricScope {
                 operation: INTERNODE_OPERATION_GRPC_READ_ALL,
                 backend: INTERNODE_TRANSPORT_BACKEND_GRPC,
@@ -4764,5 +5115,191 @@ mod tests {
             check_test_nonce_record(&mut cache, test_nonce_record(Uuid::new_v4(), 600, after_expiry, 900, after_expiry, 2))
                 .expect_err("the monotonic wall-clock high-water mark must fail closed");
         assert_eq!(stale.to_string(), "RPC request timestamp expired after clock regression");
+    }
+
+    #[test]
+    fn nonce_cache_isolates_noisy_peer_by_entry_and_memory_quota() {
+        let now = Instant::now();
+        let peer_a: IpAddr = "10.0.0.10".parse().expect("peer a");
+        let peer_b: IpAddr = "10.0.0.20".parse().expect("peer b");
+
+        // 1. Entry capacity quota: with capacity=10, a single peer cannot consume more than
+        // half the slots (5), leaving headroom for an honest peer.
+        let mut cache = RpcNonceCache::default();
+        for i in 1..=5_u128 {
+            let mut rec = test_nonce_record(Uuid::from_u128(i), 1_000, now, 1_000, now, 10);
+            rec.peer = Some(peer_a);
+            cache.check_and_record(rec).0.expect("peer A within isolated share");
+        }
+        let mut overflow = test_nonce_record(Uuid::from_u128(6), 1_000, now, 1_000, now, 10);
+        overflow.peer = Some(peer_a);
+        let err = cache
+            .check_and_record(overflow)
+            .0
+            .expect_err("peer A must hit PeerQuota before exhausting global capacity");
+        assert!(rpc_auth_is_resource_exhausted(&err));
+        assert_eq!(tonic_rpc_auth_failure_reason(&err), "replay_cache_peer_quota");
+
+        // IPv4-mapped IPv6 for the same peer shares the canonical peer quota bucket.
+        let mut mapped_overflow = test_nonce_record(Uuid::from_u128(100), 1_000, now, 1_000, now, 10);
+        mapped_overflow.peer = Some("::ffff:10.0.0.10".parse().expect("mapped peer a"));
+        let mapped_err = cache
+            .check_and_record(mapped_overflow)
+            .0
+            .expect_err("IPv4-mapped IPv6 peer must share the canonical IPv4 quota");
+        assert_eq!(tonic_rpc_auth_failure_reason(&mapped_err), "replay_cache_peer_quota");
+
+        // Honest peer B must still be admitted into the remaining slots.
+        for i in 101..=105_u128 {
+            let mut rec = test_nonce_record(Uuid::from_u128(i), 1_000, now, 1_000, now, 10);
+            rec.peer = Some(peer_b);
+            cache
+                .check_and_record(rec)
+                .0
+                .expect("honest peer B must succeed despite peer A flood");
+        }
+
+        // After expiration, peer A's tracked entry count is reclaimed so it can send again.
+        let mut after_expiry = test_nonce_record(Uuid::from_u128(200), 1_400, now, 1_400, now, 10);
+        after_expiry.peer = Some(peer_a);
+        cache
+            .check_and_record(after_expiry)
+            .0
+            .expect("expired entries must free peer A quota");
+        assert_eq!(cache.peer_entries.get(&peer_a), Some(&1));
+        assert!(!cache.peer_entries.contains_key(&peer_b));
+
+        // 2. Memory budget quota: peer A flooding distinct timestamps hits PeerQuota before
+        // exhausting the memory budget so peer B can still register its request.
+        let mut mem_cache = RpcNonceCache::default();
+        let budget = REPLAY_CACHE_METADATA_BYTES + 12_000;
+        let mut peer_a_hit_quota = false;
+        for ts in 0..64_i64 {
+            let mut rec = test_nonce_record(Uuid::from_u128((ts + 1) as u128), 2_000 + ts, now, 2_000 + ts, now, 10_000);
+            rec.memory_budget_bytes = Some(budget);
+            rec.peer = Some(peer_a);
+            match mem_cache.check_and_record(rec).0 {
+                Ok(()) => {}
+                Err(err) => {
+                    assert_eq!(tonic_rpc_auth_failure_reason(&err), "replay_cache_peer_quota");
+                    peer_a_hit_quota = true;
+                    break;
+                }
+            }
+        }
+        assert!(peer_a_hit_quota, "flooding peer must hit per-peer memory quota before global exhaustion");
+
+        let mut honest = test_nonce_record(Uuid::from_u128(9_999), 2_000, now, 2_000, now, 10_000);
+        honest.memory_budget_bytes = Some(budget);
+        honest.peer = Some(peer_b);
+        mem_cache
+            .check_and_record(honest)
+            .0
+            .expect("honest peer must succeed when noisy peer hit memory quota");
+    }
+
+    #[test]
+    fn stream_auth_frames_verify_and_reject_tamper_reorder_and_cross_domain_replay() {
+        crate::runtime::sources::ensure_test_rpc_secret();
+        let nonce = Uuid::new_v4();
+        let url =
+            format!("http://127.0.0.1:9000/rustfs/rpc/read_file_stream?disk=d1&stream_auth=framed-v1&stream_auth_nonce={nonce}");
+        let payload = b"erasure-shard-bytes";
+
+        let frame =
+            encode_stream_auth_data_frame(StreamResponseAuthDomain::ReadFileStream, &url, &Method::GET, nonce, 0, payload)
+                .expect("data frame should encode");
+        let header: [u8; STREAM_RESPONSE_DATA_HEADER_LEN] =
+            frame[..STREAM_RESPONSE_DATA_HEADER_LEN].try_into().expect("header length");
+        verify_stream_auth_data_frame(StreamResponseAuthDomain::ReadFileStream, &url, &Method::GET, nonce, 0, &header, payload)
+            .expect("valid data frame must verify");
+
+        // Payload bit flip rejected.
+        let mut tampered_payload = payload.to_vec();
+        tampered_payload[0] ^= 0x01;
+        assert!(
+            verify_stream_auth_data_frame(
+                StreamResponseAuthDomain::ReadFileStream,
+                &url,
+                &Method::GET,
+                nonce,
+                0,
+                &header,
+                &tampered_payload,
+            )
+            .is_err()
+        );
+
+        // Sequence reorder rejected.
+        assert!(
+            verify_stream_auth_data_frame(
+                StreamResponseAuthDomain::ReadFileStream,
+                &url,
+                &Method::GET,
+                nonce,
+                1,
+                &header,
+                payload,
+            )
+            .is_err()
+        );
+
+        // Cross-domain replay (ReadFileStream frame verified as WalkDir) rejected.
+        assert!(
+            verify_stream_auth_data_frame(StreamResponseAuthDomain::WalkDir, &url, &Method::GET, nonce, 0, &header, payload,)
+                .is_err()
+        );
+
+        // Cross-request replay (different nonce) rejected.
+        assert!(
+            verify_stream_auth_data_frame(
+                StreamResponseAuthDomain::ReadFileStream,
+                &url,
+                &Method::GET,
+                Uuid::new_v4(),
+                0,
+                &header,
+                payload,
+            )
+            .is_err()
+        );
+
+        // EOF frame verification and digest/length mismatch rejection.
+        let digest: [u8; 32] = Sha256::digest(payload).into();
+        let eof = encode_stream_auth_eof_frame(
+            StreamResponseAuthDomain::ReadFileStream,
+            &url,
+            &Method::GET,
+            nonce,
+            1,
+            payload.len() as u64,
+            &digest,
+        )
+        .expect("eof frame should encode");
+        verify_stream_auth_eof_frame(
+            StreamResponseAuthDomain::ReadFileStream,
+            &url,
+            &Method::GET,
+            nonce,
+            1,
+            payload.len() as u64,
+            &digest,
+            &eof,
+        )
+        .expect("valid EOF frame must verify");
+
+        assert!(
+            verify_stream_auth_eof_frame(
+                StreamResponseAuthDomain::ReadFileStream,
+                &url,
+                &Method::GET,
+                nonce,
+                1,
+                payload.len() as u64 + 1,
+                &digest,
+                &eof,
+            )
+            .is_err()
+        );
     }
 }

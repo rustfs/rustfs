@@ -14,11 +14,13 @@
 
 use crate::{EC2Credential, KeystoneError, KeystoneToken, KeystoneVersion, Result};
 use reqwest::{Client, StatusCode};
+use rustfs_utils::egress::{OutboundDnsResolver, OutboundPolicy};
 use serde_json::json;
 use std::sync::Arc;
 use time::OffsetDateTime;
 use tokio::sync::RwLock;
 use tracing::{debug, error, info, warn};
+use url::Url;
 
 /// Keystone client for API interactions
 #[derive(Clone)]
@@ -74,9 +76,10 @@ impl KeystoneClient {
 
         let client = Client::builder()
             .danger_accept_invalid_certs(!verify_ssl)
+            .redirect(reqwest::redirect::Policy::none())
             .timeout(timeout)
             .build()
-            .unwrap();
+            .expect("Keystone reqwest client builder should succeed");
 
         Self {
             client,
@@ -90,6 +93,105 @@ impl KeystoneClient {
             verify_ssl,
             timeout,
         }
+    }
+
+    /// Create a Keystone client bound to the process outbound DNS egress policy and
+    /// disabling automatic HTTP redirects.
+    #[allow(clippy::too_many_arguments)]
+    pub fn try_new(
+        auth_url: String,
+        version: KeystoneVersion,
+        admin_user: Option<String>,
+        admin_password: Option<String>,
+        admin_project: Option<String>,
+        admin_domain: String,
+        verify_ssl: bool,
+        timeout: std::time::Duration,
+    ) -> Result<Self> {
+        let outbound_policy = OutboundPolicy::from_env_cached()
+            .map_err(|err| KeystoneError::ConfigError(format!("invalid outbound policy: {err}")))?;
+        Self::try_new_with_policy(
+            auth_url,
+            version,
+            admin_user,
+            admin_password,
+            admin_project,
+            admin_domain,
+            verify_ssl,
+            timeout,
+            outbound_policy,
+        )
+    }
+
+    /// Create a Keystone client bound to an explicit [`OutboundPolicy`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn try_new_with_policy(
+        auth_url: String,
+        version: KeystoneVersion,
+        admin_user: Option<String>,
+        admin_password: Option<String>,
+        admin_project: Option<String>,
+        admin_domain: String,
+        verify_ssl: bool,
+        timeout: std::time::Duration,
+        outbound_policy: &OutboundPolicy,
+    ) -> Result<Self> {
+        let parsed = Url::parse(&auth_url).map_err(|err| KeystoneError::ConfigError(format!("invalid auth_url: {err}")))?;
+        let dns_resolver = outbound_policy
+            .resolver_for(&parsed)
+            .map_err(|err| KeystoneError::ConfigError(format!("auth_url is not allowed: {err}")))?;
+        Self::try_new_with_resolver(
+            auth_url,
+            version,
+            admin_user,
+            admin_password,
+            admin_project,
+            admin_domain,
+            verify_ssl,
+            timeout,
+            dns_resolver,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn try_new_with_resolver(
+        auth_url: String,
+        version: KeystoneVersion,
+        admin_user: Option<String>,
+        admin_password: Option<String>,
+        admin_project: Option<String>,
+        admin_domain: String,
+        verify_ssl: bool,
+        timeout: std::time::Duration,
+        dns_resolver: OutboundDnsResolver,
+    ) -> Result<Self> {
+        if !verify_ssl {
+            warn!(
+                "Keystone client for '{}' is configured to skip TLS certificate verification. This permits MITM attacks and should not be used in production.",
+                auth_url
+            );
+        }
+
+        let client = Client::builder()
+            .danger_accept_invalid_certs(!verify_ssl)
+            .redirect(reqwest::redirect::Policy::none())
+            .dns_resolver(dns_resolver)
+            .timeout(timeout)
+            .build()
+            .map_err(|err| KeystoneError::HttpError(format!("failed to build Keystone HTTP client: {err}")))?;
+
+        Ok(Self {
+            client,
+            auth_url,
+            version,
+            admin_token: Arc::new(RwLock::new(None)),
+            admin_user,
+            admin_password,
+            admin_project,
+            admin_domain,
+            verify_ssl,
+            timeout,
+        })
     }
 
     /// Request timeout applied to the underlying HTTP client.
@@ -561,5 +663,111 @@ mod tests {
 
         assert_eq!(client.auth_url, "http://keystone:5000");
         assert_eq!(client.version, KeystoneVersion::V3);
+    }
+
+    #[tokio::test]
+    async fn try_new_with_policy_rejects_dns_rebind_and_redirects() {
+        use std::collections::VecDeque;
+        use std::io::{Read, Write};
+        use std::net::SocketAddr;
+        use std::sync::Mutex;
+
+        // 1. Literal loopback rejected by default policy.
+        let err = match KeystoneClient::try_new_with_policy(
+            "http://127.0.0.1:5000".to_string(),
+            KeystoneVersion::V3,
+            None,
+            None,
+            None,
+            "Default".to_string(),
+            true,
+            std::time::Duration::from_secs(2),
+            &OutboundPolicy::default(),
+        ) {
+            Ok(_) => panic!("loopback auth_url must fail closed"),
+            Err(err) => err,
+        };
+        assert!(err.to_string().contains("not allowed"), "unexpected error: {err}");
+
+        // 2. Hostname DNS rebinding to metadata address fails closed at connection time.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind redirect listener");
+        let addr = listener.local_addr().expect("listener addr");
+        let endpoint = format!("http://keystone-rebind.test:{}", addr.port());
+        let parsed = Url::parse(&endpoint).expect("endpoint URL");
+        let policy = OutboundPolicy::from_allowed_origins(&parsed.origin().ascii_serialization())
+            .expect("allowlisted test origin should parse");
+
+        let answers = Arc::new(Mutex::new(VecDeque::from([
+            vec![SocketAddr::new(addr.ip(), 0)],
+            vec![SocketAddr::new("169.254.169.254".parse().expect("metadata ip"), 0)],
+        ])));
+        let resolver = policy
+            .resolver_for(&parsed)
+            .expect("resolver should construct")
+            .with_resolve_override(move |host| {
+                if host != "keystone-rebind.test" {
+                    return None;
+                }
+                let mut guard = answers.lock().expect("override lock");
+                if guard.len() > 1 {
+                    guard.pop_front()
+                } else {
+                    guard.front().cloned()
+                }
+            });
+
+        // First connection receives a 302 redirect to metadata endpoint; redirects must NOT be followed.
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept request");
+            stream.set_read_timeout(Some(std::time::Duration::from_secs(5))).unwrap();
+            let mut req = [0_u8; 2048];
+            let _ = stream.read(&mut req).expect("read request");
+            stream
+                .write_all(
+                    b"HTTP/1.1 302 Found\r\nLocation: http://169.254.169.254/latest/meta-data/\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                )
+                .expect("write redirect");
+        });
+
+        let mut client = KeystoneClient::try_new_with_resolver(
+            endpoint,
+            KeystoneVersion::V3,
+            None,
+            None,
+            None,
+            "Default".to_string(),
+            true,
+            std::time::Duration::from_secs(2),
+            resolver.clone(),
+        )
+        .expect("keystone client should build");
+        client.client = Client::builder()
+            .no_proxy()
+            .redirect(reqwest::redirect::Policy::none())
+            .dns_resolver(resolver)
+            .timeout(std::time::Duration::from_secs(2))
+            .build()
+            .expect("test client");
+
+        // Redirect response must be treated as non-success auth failure, never followed.
+        let redirect_err = client
+            .validate_token("token-1")
+            .await
+            .expect_err("302 redirect must not be followed");
+        assert!(
+            matches!(redirect_err, KeystoneError::AuthenticationFailed(ref msg) if msg.contains("302")),
+            "expected non-followed 302 failure, got: {redirect_err:?}"
+        );
+        server.join().expect("redirect server finished");
+
+        // Second request rebinds DNS to 169.254.169.254 and must be blocked at DNS policy layer.
+        let rebind_err = client
+            .validate_token("token-2")
+            .await
+            .expect_err("rebound metadata DNS answer must fail closed");
+        assert!(
+            matches!(rebind_err, KeystoneError::HttpError(_)),
+            "expected HTTP transport policy error, got: {rebind_err:?}"
+        );
     }
 }

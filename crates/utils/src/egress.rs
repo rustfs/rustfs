@@ -17,9 +17,9 @@ use std::collections::HashSet;
 use std::collections::{HashMap, VecDeque};
 use std::fmt;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
-use std::sync::OnceLock;
 #[cfg(test)]
-use std::sync::{Arc, Mutex};
+use std::sync::Mutex;
+use std::sync::{Arc, OnceLock};
 use url::Url;
 
 /// Comma-separated exact HTTP(S) origins that may resolve to otherwise restricted addresses.
@@ -179,13 +179,26 @@ impl OutboundPolicy {
     }
 
     pub fn validate_url(&self, url: &Url) -> Result<(), OutboundPolicyError> {
+        self.validate_storage_url(url, false, false)
+    }
+
+    /// Validate an outbound URL while allowing non-metadata private storage endpoints
+    /// (RFC1918 and IPv6 ULA excluding cloud metadata addresses).
+    pub fn validate_url_allow_private(&self, url: &Url) -> Result<(), OutboundPolicyError> {
+        self.validate_storage_url(url, true, false)
+    }
+
+    /// Validate an outbound storage endpoint URL with explicit private-network and
+    /// loopback opt-ins. Link-local, metadata, unspecified, and translation ranges
+    /// remain unconditionally forbidden.
+    pub fn validate_storage_url(&self, url: &Url, allow_private: bool, allow_loopback: bool) -> Result<(), OutboundPolicyError> {
         validate_http_url_shape(url)?;
         let raw_host = url.host_str().ok_or(OutboundPolicyError::MissingHost)?;
         let normalized_host = raw_host.trim_end_matches('.').trim_matches(['[', ']']);
         let result = if normalized_host.eq_ignore_ascii_case("localhost") {
-            Err("loopback host")
+            if allow_loopback { Ok(()) } else { Err("loopback host") }
         } else if let Ok(ip) = normalized_host.parse::<IpAddr>() {
-            validate_policy_ip(ip)
+            validate_policy_ip_with_options(ip, allow_private, allow_loopback)
         } else {
             Ok(())
         };
@@ -200,9 +213,54 @@ impl OutboundPolicy {
     }
 
     pub fn resolver_for(&self, url: &Url) -> Result<OutboundDnsResolver, OutboundPolicyError> {
-        self.validate_url(url)?;
+        self.resolver_for_storage_endpoint(url, false, false)
+    }
+
+    /// Validate an outbound URL and construct a connection-time DNS resolver that allows
+    /// non-metadata private storage endpoints while still blocking loopback, link-local,
+    /// metadata, unspecified, shared, and special-use addresses (including via DNS rebinding).
+    pub fn resolver_for_allow_private(&self, url: &Url) -> Result<OutboundDnsResolver, OutboundPolicyError> {
+        self.resolver_for_storage_endpoint(url, true, false)
+    }
+
+    /// Validate a storage endpoint URL and construct a connection-time DNS resolver with
+    /// explicit private-network and loopback opt-ins.
+    pub fn resolver_for_storage_endpoint(
+        &self,
+        url: &Url,
+        allow_private: bool,
+        allow_loopback: bool,
+    ) -> Result<OutboundDnsResolver, OutboundPolicyError> {
+        self.validate_storage_url(url, allow_private, allow_loopback)?;
         let host = normalized_host(url).ok_or(OutboundPolicyError::MissingHost)?;
-        Ok(OutboundDnsResolver::new(host, self.allows_restricted_origin(url)))
+        Ok(OutboundDnsResolver::with_options(
+            host,
+            self.allows_restricted_origin(url),
+            allow_private,
+            allow_loopback,
+        ))
+    }
+
+    /// Validate a URL and resolve + filter its current DNS addresses against this policy.
+    ///
+    /// Prefer binding [`Self::resolver_for`] (or [`Self::resolver_for_allow_private`]) directly
+    /// to the HTTP client's connection-time DNS resolver whenever the transport supports it, so
+    /// DNS rebinding between validation and connection is also prevented.
+    pub async fn resolve_and_validate_url(&self, url: &Url) -> std::io::Result<Vec<SocketAddr>> {
+        let resolver = self
+            .resolver_for(url)
+            .map_err(|err| std::io::Error::new(std::io::ErrorKind::PermissionDenied, err))?;
+        let host = normalized_host(url)
+            .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidInput, OutboundPolicyError::MissingHost))?;
+        let port = url.port_or_known_default().unwrap_or(0);
+        if let Ok(ip) = host.parse::<IpAddr>() {
+            return Ok(vec![SocketAddr::new(ip, port)]);
+        }
+        let mut addrs = resolver.resolve_host(&host).await?;
+        for addr in &mut addrs {
+            addr.set_port(port);
+        }
+        Ok(addrs)
     }
 
     fn allows_restricted_origin(&self, url: &Url) -> bool {
@@ -210,23 +268,53 @@ impl OutboundPolicy {
     }
 }
 
-#[derive(Clone, Debug)]
+type CustomDnsLookup = Arc<dyn Fn(&str) -> Option<Vec<SocketAddr>> + Send + Sync>;
+
+#[derive(Clone)]
 pub struct OutboundDnsResolver {
     allowed_restricted_host: Option<String>,
+    allow_private: bool,
+    allow_loopback_host: Option<String>,
+    custom_lookup: Option<CustomDnsLookup>,
     #[cfg(test)]
     overrides: Option<DnsOverrideAnswers>,
+}
+
+impl fmt::Debug for OutboundDnsResolver {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("OutboundDnsResolver")
+            .field("allowed_restricted_host", &self.allowed_restricted_host)
+            .field("allow_private", &self.allow_private)
+            .field("allow_loopback_host", &self.allow_loopback_host)
+            .field("has_custom_lookup", &self.custom_lookup.is_some())
+            .finish()
+    }
 }
 
 #[cfg(test)]
 type DnsOverrideAnswers = Arc<Mutex<HashMap<String, VecDeque<Vec<SocketAddr>>>>>;
 
 impl OutboundDnsResolver {
-    fn new(host: String, allow_restricted: bool) -> Self {
+    fn with_options(host: String, allow_restricted: bool, allow_private: bool, allow_loopback: bool) -> Self {
         Self {
-            allowed_restricted_host: allow_restricted.then_some(host),
+            allowed_restricted_host: allow_restricted.then(|| host.clone()),
+            allow_private,
+            allow_loopback_host: allow_loopback.then_some(host),
+            custom_lookup: None,
             #[cfg(test)]
             overrides: None,
         }
+    }
+
+    /// Install a test-only DNS lookup callback whose returned addresses are still strictly
+    /// filtered by this resolver's outbound IP policy.
+    #[doc(hidden)]
+    pub fn with_resolve_override<F>(mut self, lookup: F) -> Self
+    where
+        F: Fn(&str) -> Option<Vec<SocketAddr>> + Send + Sync + 'static,
+    {
+        self.custom_lookup = Some(Arc::new(lookup));
+        self
     }
 
     #[cfg(test)]
@@ -247,69 +335,96 @@ impl OutboundDnsResolver {
         self.overrides = Some(Arc::new(Mutex::new(HashMap::from([(host.to_string(), VecDeque::from(answers))]))));
         self
     }
-}
 
-impl reqwest::dns::Resolve for OutboundDnsResolver {
-    fn resolve(&self, name: reqwest::dns::Name) -> reqwest::dns::Resolving {
-        let host = name.as_str().trim_end_matches('.').to_ascii_lowercase();
-        let allow_restricted = self.allowed_restricted_host.as_deref() == Some(host.as_str());
-        #[cfg(test)]
-        let overrides = self.overrides.clone();
-        Box::pin(async move {
-            #[cfg(test)]
-            let overridden = overrides.as_ref().and_then(|entries| {
-                let mut entries = entries.lock().expect("test DNS overrides must not be poisoned");
-                let answers = entries.get_mut(&host)?;
-                if answers.len() > 1 {
-                    answers.pop_front()
-                } else {
-                    answers.front().cloned()
-                }
-            });
-            #[cfg(not(test))]
-            let overridden: Option<Vec<SocketAddr>> = None;
+    /// Filter resolved addresses for `host` according to this resolver's outbound policy.
+    pub fn filter_resolved_addresses(&self, host: &str, addresses: Vec<SocketAddr>) -> std::io::Result<Vec<SocketAddr>> {
+        let normalized_host = host.trim_end_matches('.').trim_matches(['[', ']']).to_ascii_lowercase();
+        if addresses.is_empty() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!("DNS resolution for '{normalized_host}' returned no addresses"),
+            ));
+        }
 
-            let addresses = if let Some(addresses) = overridden {
-                addresses
-            } else {
-                // Do not use the cached resolver in `crate::net`: every new connection must
-                // classify the addresses returned at that boundary so DNS rebinding fails closed.
-                tokio::net::lookup_host((host.as_str(), 0))
-                    .await
-                    .map_err(|err| std::io::Error::new(std::io::ErrorKind::NotFound, err))?
-                    .collect()
-            };
-            if addresses.is_empty() {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::NotFound,
-                    format!("DNS resolution for '{host}' returned no addresses"),
-                )
-                .into());
-            }
-            let mut allow_origin_can_recover = false;
-            let addrs = addresses
-                .into_iter()
-                .filter(|address| match validate_policy_ip(address.ip()) {
+        let allow_restricted = self.allowed_restricted_host.as_deref() == Some(normalized_host.as_str());
+        let allow_loopback = self.allow_loopback_host.as_deref() == Some(normalized_host.as_str());
+        let allow_private = self.allow_private;
+        let mut allow_origin_can_recover = false;
+        let addrs = addresses
+            .into_iter()
+            .filter(
+                |address| match validate_policy_ip_with_options(address.ip(), allow_private, allow_loopback) {
                     Ok(()) => true,
                     Err(reason) => {
                         let recoverable = restricted_reason_can_be_overridden(reason);
                         allow_origin_can_recover |= recoverable;
                         allow_restricted && recoverable
                     }
-                })
-                .collect::<Vec<_>>();
-            if addrs.is_empty() {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::PermissionDenied,
-                    OutboundDnsPolicyRejection::new(host, allow_origin_can_recover),
-                )
-                .into());
-            }
+                },
+            )
+            .collect::<Vec<_>>();
+        if addrs.is_empty() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                OutboundDnsPolicyRejection::new(normalized_host, allow_origin_can_recover),
+            ));
+        }
+        Ok(addrs)
+    }
+
+    /// Perform a fresh uncached DNS lookup for `host` and filter every returned address
+    /// against this resolver's outbound policy.
+    pub async fn resolve_host(&self, host: &str) -> std::io::Result<Vec<SocketAddr>> {
+        let normalized_host = host.trim_end_matches('.').trim_matches(['[', ']']).to_ascii_lowercase();
+        let custom = self.custom_lookup.as_ref().and_then(|lookup| lookup(&normalized_host));
+
+        #[cfg(test)]
+        let overridden = custom.or_else(|| {
+            self.overrides.as_ref().and_then(|entries| {
+                let mut entries = entries.lock().expect("test DNS overrides must not be poisoned");
+                let answers = entries.get_mut(&normalized_host)?;
+                if answers.len() > 1 {
+                    answers.pop_front()
+                } else {
+                    answers.front().cloned()
+                }
+            })
+        });
+        #[cfg(not(test))]
+        let overridden = custom;
+
+        let addresses = if let Some(addresses) = overridden {
+            addresses
+        } else {
+            // Do not use the cached resolver in `crate::net`: every new connection must
+            // classify the addresses returned at that boundary so DNS rebinding fails closed.
+            tokio::net::lookup_host((normalized_host.as_str(), 0))
+                .await
+                .map_err(|err| std::io::Error::new(std::io::ErrorKind::NotFound, err))?
+                .collect()
+        };
+
+        self.filter_resolved_addresses(&normalized_host, addresses)
+    }
+}
+
+impl reqwest::dns::Resolve for OutboundDnsResolver {
+    fn resolve(&self, name: reqwest::dns::Name) -> reqwest::dns::Resolving {
+        let resolver = self.clone();
+        let host = name.as_str().to_string();
+        Box::pin(async move {
+            let addrs = resolver.resolve_host(&host).await?;
             Ok(Box::new(addrs.into_iter()) as reqwest::dns::Addrs)
         })
     }
 }
 
+/// Syntax and literal-IP preflight check for outbound URLs.
+///
+/// This helper rejects `localhost` and forbidden literal IP addresses, but does not
+/// resolve hostnames or prevent DNS rebinding. Callers making outbound HTTP requests to
+/// hostname-bearing URLs must pair URL validation with [`OutboundPolicy::resolver_for`]
+/// at the connection boundary.
 pub fn validate_outbound_url(url: &Url) -> Result<(), OutboundUrlError> {
     let Some(raw_host) = url.host_str() else {
         return Err(OutboundUrlError::MissingHost);
@@ -391,6 +506,41 @@ fn restricted_reason_can_be_overridden(reason: &str) -> bool {
         reason,
         "loopback host" | "loopback address" | "private address" | "shared address" | "reserved address"
     )
+}
+
+fn validate_policy_ip_with_options(ip: IpAddr, allow_private: bool, allow_loopback: bool) -> Result<(), &'static str> {
+    match validate_policy_ip(ip) {
+        Ok(()) => Ok(()),
+        Err("private address") if allow_private && is_storage_private_ip(ip) => Ok(()),
+        Err("loopback address") if allow_loopback && is_direct_loopback_ip(ip) => Ok(()),
+        Err(reason) => Err(reason),
+    }
+}
+
+fn is_storage_private_ip(ip: IpAddr) -> bool {
+    if is_metadata_endpoint(ip) {
+        return false;
+    }
+    let ip = match ip {
+        IpAddr::V6(v6) => {
+            if v6.is_unique_local() {
+                return true;
+            }
+            match embedded_ipv4(v6) {
+                Some(v4) => IpAddr::V4(v4),
+                None => return false,
+            }
+        }
+        IpAddr::V4(v4) => IpAddr::V4(v4),
+    };
+    !is_metadata_endpoint(ip) && matches!(ip, IpAddr::V4(v4) if v4.is_private())
+}
+
+fn is_direct_loopback_ip(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => v4.is_loopback(),
+        IpAddr::V6(v6) => v6.is_loopback() || embedded_ipv4(v6).is_some_and(|v4| v4.is_loopback()),
+    }
 }
 
 fn validate_policy_ip(ip: IpAddr) -> Result<(), &'static str> {
@@ -1236,5 +1386,74 @@ mod tests {
 
         assert_eq!(rejection.host, "metadata.internal");
         assert!(!rejection.allow_origin_can_recover());
+    }
+
+    #[tokio::test]
+    async fn resolver_for_allow_private_permits_private_storage_but_blocks_loopback_and_metadata() {
+        let policy = OutboundPolicy::default();
+        let endpoint = Url::parse("https://private-tier.internal:9443").expect("endpoint should parse");
+        let resolver = policy
+            .resolver_for_allow_private(&endpoint)
+            .expect("private-storage policy should accept hostname")
+            .with_resolve_override(|host| match host {
+                "private-tier.internal" => Some(vec![
+                    SocketAddr::new("10.20.30.40".parse().expect("RFC1918"), 0),
+                    SocketAddr::new("fd12:3456::1".parse().expect("ULA"), 0),
+                    SocketAddr::new("127.0.0.1".parse().expect("loopback"), 0),
+                    SocketAddr::new("169.254.169.254".parse().expect("metadata"), 0),
+                    SocketAddr::new("fd00:ec2::254".parse().expect("ipv6 metadata"), 0),
+                    SocketAddr::new("64:ff9b::a00:1".parse().expect("nat64 private"), 0),
+                    SocketAddr::new("2002:a00:1::".parse().expect("6to4 private"), 0),
+                ]),
+                "rebound-loopback.internal" => Some(vec![SocketAddr::new("127.0.0.1".parse().expect("loopback"), 0)]),
+                "rebound-metadata.internal" => Some(vec![SocketAddr::new("169.254.169.254".parse().expect("metadata"), 0)]),
+                _ => None,
+            });
+
+        let resolved = resolver
+            .resolve_host("private-tier.internal")
+            .await
+            .expect("RFC1918 and non-metadata ULA answers should remain");
+        let ips = resolved.into_iter().map(|addr| addr.ip()).collect::<Vec<_>>();
+        assert_eq!(
+            ips,
+            vec![
+                "10.20.30.40".parse::<std::net::IpAddr>().expect("RFC1918"),
+                "fd12:3456::1".parse::<std::net::IpAddr>().expect("ULA"),
+            ]
+        );
+
+        let loopback_err = resolver
+            .resolve_host("rebound-loopback.internal")
+            .await
+            .expect_err("loopback DNS rebind must fail closed even in private-storage mode");
+        assert_eq!(loopback_err.kind(), std::io::ErrorKind::PermissionDenied);
+        assert!(find_outbound_dns_policy_rejection(&loopback_err).is_some());
+
+        let metadata_err = resolver
+            .resolve_host("rebound-metadata.internal")
+            .await
+            .expect_err("metadata DNS rebind must fail closed even in private-storage mode");
+        assert_eq!(metadata_err.kind(), std::io::ErrorKind::PermissionDenied);
+        let rejection = find_outbound_dns_policy_rejection(&metadata_err).expect("typed metadata rejection");
+        assert!(!rejection.allow_origin_can_recover());
+    }
+
+    #[tokio::test]
+    async fn resolve_and_validate_url_blocks_literal_and_hostname_forbidden_targets() {
+        let policy = OutboundPolicy::default();
+        let loopback = Url::parse("http://127.0.0.1:9000/test").expect("loopback URL");
+        let err = policy
+            .resolve_and_validate_url(&loopback)
+            .await
+            .expect_err("literal loopback must be rejected");
+        assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied);
+
+        let public_ip = Url::parse("https://8.8.8.8:8443/test").expect("public IP URL");
+        let addrs = policy
+            .resolve_and_validate_url(&public_ip)
+            .await
+            .expect("public literal IP should resolve without DNS");
+        assert_eq!(addrs, vec![SocketAddr::new("8.8.8.8".parse().expect("ip"), 8443)]);
     }
 }

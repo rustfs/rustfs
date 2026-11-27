@@ -291,8 +291,9 @@ pub mod bucket {
 
     pub mod remote_s3_client {
         pub use crate::bucket::remote_s3_client::{
-            PathStyle, RemoteCredentials, RemoteS3ClientError, RemoteS3EndpointSpec, RemoteS3RetryPolicy, build_remote_s3_client,
-            build_remote_s3_config, validate_remote_endpoint, validate_target_ca_pem,
+            PathStyle, RemoteCredentials, RemoteS3ClientError, RemoteS3EndpointSpec, RemoteS3RetryPolicy,
+            build_remote_endpoint_dns_resolver, build_remote_s3_client, build_remote_s3_config, validate_remote_endpoint,
+            validate_target_ca_pem,
         };
     }
 
@@ -711,23 +712,26 @@ pub mod rpc {
         PEER_RESTSIGNAL, PEER_RESTSUB_SYS, PeerRestClient, PeerS3Client, RpcReplayCacheAdmissionError, S3PeerSys,
         SERVICE_SIGNAL_REFRESH_CONFIG, SERVICE_SIGNAL_RELOAD_DYNAMIC, ScannerBucketListing, ScannerDirtyUsageAcknowledgement,
         ScannerPeerActivity, ScannerPeerDirtyUsageBucket, ScannerPeerDirtyUsageSnapshot, ScannerPublicationLease,
-        ScannerScopedDirtyUsageAckEntry, TONIC_RPC_PREFIX, TonicInterceptor, build_put_file_auth_trailer,
-        check_and_record_signed_rpc_nonce, decode_heal_bucket_rpc_options, encode_heal_bucket_rpc_options, gen_signature_headers,
-        gen_tonic_replay_scope_headers, gen_tonic_signature_headers, gen_tonic_signature_interceptor,
-        node_service_time_out_client, node_service_time_out_client_no_auth, normalize_tonic_rpc_audience,
-        rpc_auth_is_resource_exhausted, rpc_background_admission, set_tonic_canonical_body_digest, sign_ns_scanner_capability,
-        sign_ns_scanner_capability_with_checkpoint_coverage, sign_ns_scanner_capability_with_durable_progress,
-        sign_ns_scanner_capability_with_tier_registry_generation, sign_ns_scanner_capability_with_usage_capabilities,
-        sign_ns_scanner_tier_registry_preflight_capability, sign_ns_scanner_usage_watch_capability, sign_put_file_capability,
-        sign_tonic_rpc_response_proof, tonic_boot_epoch_challenge, tonic_boot_epoch_response_headers,
-        tonic_boot_epoch_response_headers_with_msgpack_capability, tonic_msgpack_manifest_capability_requested,
-        tonic_rpc_auth_failure_reason, verify_ns_scanner_capability, verify_ns_scanner_capability_with_checkpoint_coverage,
-        verify_ns_scanner_capability_with_durable_progress, verify_ns_scanner_capability_with_tier_registry_generation,
-        verify_ns_scanner_capability_with_usage_capabilities, verify_ns_scanner_tier_registry_preflight_capability,
-        verify_ns_scanner_usage_watch_capability, verify_put_file_auth_trailer, verify_put_file_capability, verify_rpc_signature,
-        verify_tonic_boot_epoch_response, verify_tonic_canonical_body_digest, verify_tonic_mutation_body_digest,
-        verify_tonic_mutation_body_digest_reject_unsigned, verify_tonic_rpc_response_proof, verify_tonic_rpc_signature,
-        verify_tonic_rpc_signature_with_bootstrap,
+        ScannerScopedDirtyUsageAckEntry, StreamResponseAuthDomain, TONIC_RPC_PREFIX, TonicInterceptor,
+        build_put_file_auth_trailer, check_and_record_signed_rpc_nonce, check_and_record_signed_rpc_nonce_for_peer,
+        decode_heal_bucket_rpc_options, encode_heal_bucket_rpc_options, encode_stream_auth_data_frame,
+        encode_stream_auth_eof_frame, gen_signature_headers, gen_tonic_replay_scope_headers, gen_tonic_signature_headers,
+        gen_tonic_signature_interceptor, node_service_time_out_client, node_service_time_out_client_no_auth,
+        normalize_tonic_rpc_audience, rpc_auth_is_resource_exhausted, rpc_background_admission, set_tonic_canonical_body_digest,
+        sign_ns_scanner_capability, sign_ns_scanner_capability_with_checkpoint_coverage,
+        sign_ns_scanner_capability_with_durable_progress, sign_ns_scanner_capability_with_tier_registry_generation,
+        sign_ns_scanner_capability_with_usage_capabilities, sign_ns_scanner_tier_registry_preflight_capability,
+        sign_ns_scanner_usage_watch_capability, sign_put_file_capability, sign_tonic_rpc_response_proof,
+        tonic_boot_epoch_challenge, tonic_boot_epoch_response_headers, tonic_boot_epoch_response_headers_with_msgpack_capability,
+        tonic_msgpack_manifest_capability_requested, tonic_rpc_auth_failure_reason, verify_ns_scanner_capability,
+        verify_ns_scanner_capability_with_checkpoint_coverage, verify_ns_scanner_capability_with_durable_progress,
+        verify_ns_scanner_capability_with_tier_registry_generation, verify_ns_scanner_capability_with_usage_capabilities,
+        verify_ns_scanner_tier_registry_preflight_capability, verify_ns_scanner_usage_watch_capability,
+        verify_put_file_auth_trailer, verify_put_file_capability, verify_rpc_signature, verify_stream_auth_data_frame,
+        verify_stream_auth_eof_frame, verify_tonic_boot_epoch_response, verify_tonic_canonical_body_digest,
+        verify_tonic_mutation_body_digest, verify_tonic_mutation_body_digest_reject_unsigned, verify_tonic_rpc_response_proof,
+        verify_tonic_rpc_signature, verify_tonic_rpc_signature_with_bootstrap,
+        verify_tonic_rpc_signature_with_bootstrap_and_peer,
     };
 }
 

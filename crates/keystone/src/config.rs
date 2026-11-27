@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use crate::{KeystoneError, KeystoneVersion, Result};
-use rustfs_utils::egress::validate_outbound_url;
+use rustfs_utils::egress::OutboundPolicy;
 use rustfs_utils::{get_env_bool, get_env_opt_str, get_env_str, get_env_u64};
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
@@ -167,7 +167,11 @@ impl KeystoneConfig {
         }
 
         let parsed = Url::parse(&self.auth_url).map_err(|err| KeystoneError::ConfigError(format!("invalid auth_url: {err}")))?;
-        validate_outbound_url(&parsed).map_err(|err| KeystoneError::ConfigError(format!("auth_url is not allowed: {err}")))?;
+        let outbound_policy = OutboundPolicy::from_env_cached()
+            .map_err(|err| KeystoneError::ConfigError(format!("invalid outbound policy: {err}")))?;
+        outbound_policy
+            .validate_url(&parsed)
+            .map_err(|err| KeystoneError::ConfigError(format!("auth_url is not allowed: {err}")))?;
 
         // Validate version
         self.get_version()?;

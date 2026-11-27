@@ -187,6 +187,18 @@ pub const DEFAULT_INTERNODE_RPC_REPLAY_SCOPE_STRICT: bool = false;
 // observed fallback counter an explicit strictness decision.
 const _: () = assert!(!DEFAULT_INTERNODE_RPC_REPLAY_SCOPE_STRICT);
 
+/// Require authenticated response framing (`framed-v1`) on internode HTTP read and walk-dir
+/// streams, rejecting unauthenticated legacy streams during plaintext transport.
+///
+/// Defaults to `false` so mixed-version clusters survive rolling upgrades; once a peer responds
+/// with authenticated framing it is pinned for this process, and enabling this flag enforces
+/// authenticated framing unconditionally on both client and server.
+pub const ENV_INTERNODE_RPC_STREAM_AUTH_STRICT: &str = "RUSTFS_INTERNODE_RPC_STREAM_AUTH_STRICT";
+pub const DEFAULT_INTERNODE_RPC_STREAM_AUTH_STRICT: bool = false;
+
+// Compile-time invariant: mixed-version clusters must remain available during rolling upgrades.
+const _: () = assert!(!DEFAULT_INTERNODE_RPC_STREAM_AUTH_STRICT);
+
 /// Capacity (distinct nonces) of the process-local internode RPC replay cache that enforces
 /// one-time consumption of authenticated RPC signatures.
 ///

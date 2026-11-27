@@ -21,13 +21,12 @@ use std::collections::HashMap;
 use crate::services::tier::{
     tier_config::TierR2,
     warm_backend::{
-        S3CompatibleWarmBackendParams, TransitionCandidateProbe, WarmBackend, WarmBackendGetOpts, build_transition_put_options,
-        new_s3_compatible_warm_backend, optimal_part_size,
+        S3CompatibleWarmBackendParams, TierEndpointPolicy, TransitionCandidateProbe, WarmBackend, WarmBackendGetOpts,
+        build_transition_put_options, new_s3_compatible_warm_backend, optimal_part_size,
     },
     warm_backend_s3::WarmBackendS3,
 };
 use rustfs_s3_client::transition_api::{BucketLookupType, ReadCloser, ReaderImpl};
-use rustfs_utils::egress::validate_outbound_url;
 
 const _MAX_PART_SIZE: i64 = 1024 * 1024 * 1024 * 5;
 const MIN_PART_SIZE: i64 = 1024 * 1024 * 128;
@@ -48,7 +47,7 @@ impl WarmBackendR2 {
                 // `BucketLookupAuto`; pinning DNS here would break those deployments.
                 bucket_lookup: BucketLookupType::BucketLookupAuto,
                 provider_tag: "r2",
-                validate_endpoint: validate_outbound_url,
+                endpoint_policy: TierEndpointPolicy::PublicOnly,
             })
             .await?,
         ))

@@ -103,7 +103,7 @@ fn build_oidc_http_client_honors_explicit_allowlist_for_loopback() {
 }
 #[tokio::test]
 async fn oidc_nonrecoverable_dns_policy_rejection_omits_allowlist_hint() {
-    let uri = "http://metadata.internal/latest/meta-data";
+    let uri = "https://metadata.internal/latest/meta-data";
     let http_client = ReqwestHttpClient::with_policy_and_dns_resolver(
         OutboundPolicy::default(),
         Arc::new(RejectingDnsResolver {
@@ -124,7 +124,30 @@ async fn oidc_nonrecoverable_dns_policy_rejection_omits_allowlist_hint() {
 
     assert!(matches!(error, OidcHttpError::ForbiddenOutbound(_)));
     assert!(message.contains("metadata.internal"));
-    assert!(!message.contains(&format!("add http://metadata.internal to {ENV_OUTBOUND_ALLOW_ORIGINS}")));
+    assert!(!message.contains(&format!("add https://metadata.internal to {ENV_OUTBOUND_ALLOW_ORIGINS}")));
+}
+
+#[test]
+#[serial_test::serial]
+fn build_oidc_http_client_rejects_plaintext_http_for_non_loopback_by_default() {
+    temp_env::with_var(rustfs_config::oidc::ENV_IDENTITY_OPENID_ALLOW_INSECURE_TRANSPORT, None::<&str>, || {
+        let err = build_oidc_http_client("http://idp.example.com/.well-known/openid-configuration", None, &[], None)
+            .expect_err("non-loopback plaintext http:// OIDC URL must be rejected");
+        assert!(matches!(err, OidcHttpError::ForbiddenOutbound(ref msg) if msg.contains("plaintext http://")));
+
+        // Loopback http:// stays allowed when explicitly allowlisted in OutboundPolicy.
+        let policy = OutboundPolicy::from_allowed_origins("http://127.0.0.1:8080").expect("origin should parse");
+        assert!(
+            build_oidc_http_client("http://127.0.0.1:8080/.well-known/openid-configuration", Some(&policy), &[], None).is_ok()
+        );
+    });
+
+    temp_env::with_var(rustfs_config::oidc::ENV_IDENTITY_OPENID_ALLOW_INSECURE_TRANSPORT, Some("true"), || {
+        assert!(
+            build_oidc_http_client("http://idp.example.com/.well-known/openid-configuration", None, &[], None).is_ok(),
+            "explicit opt-in must permit plaintext http:// OIDC URLs"
+        );
+    });
 }
 #[test]
 fn oidc_metadata_endpoint_rejection_does_not_offer_allowlist_bypass() {

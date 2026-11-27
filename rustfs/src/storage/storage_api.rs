@@ -338,6 +338,9 @@ pub(crate) mod rpc_consumer {
         pub(crate) use rustfs_ecstore::api::disk::{BackgroundPipeWriter, BackgroundReaderStream, background_pipe};
         pub(crate) use rustfs_ecstore::api::rpc::with_rpc_background_request;
         pub(crate) const DEFAULT_READ_BUFFER_SIZE: usize = super::super::DEFAULT_READ_BUFFER_SIZE;
+        pub(crate) use super::super::ecstore_rpc::StreamResponseAuthDomain;
+        #[cfg(test)]
+        pub(crate) use super::super::ecstore_rpc::{verify_stream_auth_data_frame, verify_stream_auth_eof_frame};
         #[cfg(test)]
         pub(crate) use super::super::storage_contracts::{
             NS_SCANNER_BODY_SHA256_QUERY, NS_SCANNER_CAPABILITY_CHALLENGE_QUERY, NS_SCANNER_CYCLE_QUERY,
@@ -347,10 +350,17 @@ pub(crate) mod rpc_consumer {
         };
         pub(crate) use super::super::storage_contracts::{
             NS_SCANNER_PROTOCOL_VERSION, NsScannerCapabilityResponse, PUT_FILE_AUTH_TRAILER_LEN, PUT_FILE_AUTH_V1,
-            PUT_FILE_CAPABILITY_VERSION, PutFileCapabilityResponse, WALK_DIR_STREAM_COMPLETION_V1,
+            PUT_FILE_CAPABILITY_VERSION, PutFileCapabilityResponse, STREAM_RESPONSE_AUTH_HEADER, STREAM_RESPONSE_AUTH_V1,
+            STREAM_RESPONSE_FRAME_MAX_PAYLOAD, WALK_DIR_STREAM_COMPLETION_V1,
+        };
+        #[cfg(test)]
+        pub(crate) use super::super::storage_contracts::{
+            STREAM_RESPONSE_AUTH_NONCE_QUERY, STREAM_RESPONSE_AUTH_QUERY, STREAM_RESPONSE_DATA_HEADER_LEN,
+            STREAM_RESPONSE_EOF_FRAME_LEN,
         };
         pub(crate) use super::super::{
-            DeleteOptions, DiskStore, RemoteBackgroundIo, StorageDiskRpcExt, WalkDirOptions, check_and_record_signed_rpc_nonce,
+            DeleteOptions, DiskStore, RemoteBackgroundIo, StorageDiskRpcExt, WalkDirOptions,
+            check_and_record_signed_rpc_nonce_for_peer, encode_stream_auth_data_frame, encode_stream_auth_eof_frame,
             find_local_disk_by_ref_for_rpc, find_local_disk_by_ref_for_scanner_rpc, rpc_background_admission,
             sign_ns_scanner_capability_with_usage_capabilities, sign_ns_scanner_tier_registry_preflight_capability,
             sign_ns_scanner_usage_watch_capability, sign_put_file_capability, verify_put_file_auth_trailer, verify_rpc_signature,
@@ -401,6 +411,8 @@ pub(crate) mod rpc_consumer {
             }
 
             pub(crate) mod bucket {
+                #[cfg(test)]
+                pub(crate) use super::super::super::super::contract::bucket::BucketInfo;
                 pub(crate) use super::super::super::super::contract::bucket::{
                     BucketOptions, DeleteBucketOptions, MakeBucketOptions,
                 };
@@ -692,24 +704,28 @@ pub(crate) mod ecstore_internode {
 }
 
 pub(crate) mod ecstore_rpc {
+    #[cfg(any(feature = "internode-transport", all(feature = "nixl", target_os = "linux")))]
+    pub(crate) use rustfs_ecstore::api::rpc::check_and_record_signed_rpc_nonce;
     pub(crate) use rustfs_ecstore::api::rpc::{
         KMS_SIGNAL_SUBSYSTEM, LocalPeerS3Client, MAX_NETWORK_PROBE_BYTES, MAX_NETWORK_PROBE_DURATION, NetworkPeerProbeClient,
         NetworkPeerProbeError, PEER_RESTDRY_RUN, PEER_RESTSIGNAL, PEER_RESTSUB_SYS, PeerRestClient, PeerS3Client,
-        SERVICE_SIGNAL_REFRESH_CONFIG, SERVICE_SIGNAL_RELOAD_DYNAMIC, TONIC_RPC_PREFIX, check_and_record_signed_rpc_nonce,
-        decode_heal_bucket_rpc_options, normalize_tonic_rpc_audience, rpc_auth_is_resource_exhausted, rpc_background_admission,
+        SERVICE_SIGNAL_REFRESH_CONFIG, SERVICE_SIGNAL_RELOAD_DYNAMIC, StreamResponseAuthDomain, TONIC_RPC_PREFIX,
+        check_and_record_signed_rpc_nonce_for_peer, decode_heal_bucket_rpc_options, encode_stream_auth_data_frame,
+        encode_stream_auth_eof_frame, normalize_tonic_rpc_audience, rpc_auth_is_resource_exhausted, rpc_background_admission,
         sign_ns_scanner_capability_with_usage_capabilities, sign_ns_scanner_tier_registry_preflight_capability,
         sign_ns_scanner_usage_watch_capability, sign_put_file_capability, sign_tonic_rpc_response_proof,
         tonic_boot_epoch_challenge, tonic_boot_epoch_response_headers_with_msgpack_capability,
         tonic_msgpack_manifest_capability_requested, tonic_rpc_auth_failure_reason, verify_put_file_auth_trailer,
         verify_rpc_signature, verify_tonic_canonical_body_digest, verify_tonic_mutation_body_digest,
-        verify_tonic_mutation_body_digest_reject_unsigned, verify_tonic_rpc_signature_with_bootstrap,
+        verify_tonic_mutation_body_digest_reject_unsigned, verify_tonic_rpc_signature_with_bootstrap_and_peer,
     };
     #[cfg(test)]
     pub(crate) use rustfs_ecstore::api::rpc::{
         RpcReplayCacheAdmissionError, ScannerScopedDirtyUsageAckEntry, build_put_file_auth_trailer, gen_signature_headers,
         gen_tonic_replay_scope_headers, gen_tonic_signature_headers, set_tonic_canonical_body_digest,
         tonic_boot_epoch_response_headers, verify_ns_scanner_capability_with_usage_capabilities, verify_put_file_capability,
-        verify_tonic_boot_epoch_response, verify_tonic_rpc_response_proof,
+        verify_stream_auth_data_frame, verify_stream_auth_eof_frame, verify_tonic_boot_epoch_response,
+        verify_tonic_rpc_response_proof,
     };
     #[cfg(test)]
     pub(crate) use rustfs_ecstore::api::rpc::{
@@ -2452,6 +2468,7 @@ pub(crate) fn verify_rpc_signature(url: &str, method: &http::Method, headers: &h
     ecstore_rpc::verify_rpc_signature(url, method, headers)
 }
 
+#[cfg(any(feature = "internode-transport", all(feature = "nixl", target_os = "linux")))]
 pub(crate) fn check_and_record_signed_rpc_nonce(
     headers: &http::HeaderMap,
     nonce: uuid::Uuid,
@@ -2460,6 +2477,40 @@ pub(crate) fn check_and_record_signed_rpc_nonce(
     backend: &'static str,
 ) -> std::io::Result<()> {
     ecstore_rpc::check_and_record_signed_rpc_nonce(headers, nonce, rpc_path, operation, backend)
+}
+
+pub(crate) fn check_and_record_signed_rpc_nonce_for_peer(
+    headers: &http::HeaderMap,
+    nonce: uuid::Uuid,
+    rpc_path: &str,
+    operation: &'static str,
+    backend: &'static str,
+    peer: Option<std::net::IpAddr>,
+) -> std::io::Result<()> {
+    ecstore_rpc::check_and_record_signed_rpc_nonce_for_peer(headers, nonce, rpc_path, operation, backend, peer)
+}
+
+pub(crate) fn encode_stream_auth_data_frame(
+    domain: ecstore_rpc::StreamResponseAuthDomain,
+    url: &str,
+    method: &http::Method,
+    nonce: uuid::Uuid,
+    seq: u64,
+    payload: &[u8],
+) -> std::io::Result<Vec<u8>> {
+    ecstore_rpc::encode_stream_auth_data_frame(domain, url, method, nonce, seq, payload)
+}
+
+pub(crate) fn encode_stream_auth_eof_frame(
+    domain: ecstore_rpc::StreamResponseAuthDomain,
+    url: &str,
+    method: &http::Method,
+    nonce: uuid::Uuid,
+    seq: u64,
+    total_bytes: u64,
+    running_sha256: &[u8; 32],
+) -> std::io::Result<[u8; 89]> {
+    ecstore_rpc::encode_stream_auth_eof_frame(domain, url, method, nonce, seq, total_bytes, running_sha256)
 }
 
 pub(crate) fn verify_put_file_auth_trailer(
@@ -2511,13 +2562,14 @@ pub(crate) fn sign_put_file_capability(
     ecstore_rpc::sign_put_file_capability(challenge, server_epoch, version)
 }
 
-pub(crate) fn verify_tonic_rpc_signature_with_bootstrap(
+pub(crate) fn verify_tonic_rpc_signature_with_bootstrap_and_peer(
     audience: &str,
     path: &str,
     headers: &http::HeaderMap,
     allow_replay_scope_bootstrap: bool,
+    peer: Option<std::net::IpAddr>,
 ) -> std::io::Result<()> {
-    ecstore_rpc::verify_tonic_rpc_signature_with_bootstrap(audience, path, headers, allow_replay_scope_bootstrap)
+    ecstore_rpc::verify_tonic_rpc_signature_with_bootstrap_and_peer(audience, path, headers, allow_replay_scope_bootstrap, peer)
 }
 
 pub(crate) fn rpc_auth_is_resource_exhausted(error: &std::io::Error) -> bool {

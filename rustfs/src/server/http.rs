@@ -49,7 +49,7 @@ use crate::storage_api::server::http::tonic_service::make_server;
 use crate::storage_api::server::http::tonic_service::make_server_for_slot;
 use crate::storage_api::server::http::{
     ServerContextSlot, TONIC_RPC_PREFIX, normalize_tonic_rpc_audience, tonic_boot_epoch_challenge,
-    verify_tonic_rpc_signature_with_bootstrap,
+    verify_tonic_rpc_signature_with_bootstrap_and_peer,
 };
 use bytes::Bytes;
 use futures::stream::FuturesUnordered;
@@ -3720,13 +3720,21 @@ fn check_auth(req: Request<()>) -> std::result::Result<Request<()>, Status> {
         .filter(|method| !method.is_empty() && !method.contains('/'))
         .ok_or_else(|| Status::unauthenticated("Invalid RPC request path"))?;
     debug_assert!(!rpc_method.is_empty());
+    let peer_remote_addr = req
+        .extensions()
+        .get::<Option<RemoteAddr>>()
+        .copied()
+        .flatten()
+        .or_else(|| req.extensions().get::<RemoteAddr>().copied());
+    let peer_ip = peer_remote_addr.map(|addr| addr.0.ip());
     let allow_replay_scope_bootstrap = target.uri.path() == "/node_service.NodeService/Ping"
         && tonic_boot_epoch_challenge(req.metadata().as_ref()).is_ok_and(|challenge| challenge.is_some());
-    verify_tonic_rpc_signature_with_bootstrap(
+    verify_tonic_rpc_signature_with_bootstrap_and_peer(
         &audience,
         target.uri.path(),
         req.metadata().as_ref(),
         allow_replay_scope_bootstrap,
+        peer_ip,
     )
     .map_err(|e| {
         let rpc_path = target.uri.path();
@@ -3735,12 +3743,7 @@ fn check_auth(req: Request<()>) -> std::result::Result<Request<()>, Status> {
             .and_then(|path| path.split_once('/'))
             .map(|(service, _)| service)
             .unwrap_or("unknown");
-        let peer_addr = req
-            .extensions()
-            .get::<Option<RemoteAddr>>()
-            .copied()
-            .flatten()
-            .or_else(|| req.extensions().get::<RemoteAddr>().copied())
+        let peer_addr = peer_remote_addr
             .map(|addr| addr.0.to_string())
             .unwrap_or_else(|| "unknown".to_string());
         let failure_reason = storage::tonic_rpc_auth_failure_reason(&e);

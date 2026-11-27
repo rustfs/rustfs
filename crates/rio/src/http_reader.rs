@@ -1004,6 +1004,7 @@ pub type ChunkReaderBox = Box<dyn ChunkReader>;
 
 struct HttpReaderInit {
     stream: HttpByteStream,
+    response_headers: HeaderMap,
     track_internode_metrics: bool,
     internode_operation: Option<&'static str>,
     stall_timeout: Option<Duration>,
@@ -1015,6 +1016,7 @@ pin_project! {
         url:String,
         method: Method,
         headers: HeaderMap,
+        response_headers: HeaderMap,
         track_internode_metrics: bool,
         internode_operation: Option<&'static str>,
         stall_timeout: Option<Duration>,
@@ -1028,6 +1030,7 @@ pin_project! {
 
 pin_project! {
     pub struct HttpChunkReader {
+        response_headers: HeaderMap,
         track_internode_metrics: bool,
         internode_operation: Option<&'static str>,
         stall_timeout: Option<Duration>,
@@ -1085,6 +1088,7 @@ impl HttpReader {
             url,
             method,
             headers,
+            response_headers: init.response_headers,
             track_internode_metrics: init.track_internode_metrics,
             internode_operation: init.internode_operation,
             stall_timer: None,
@@ -1191,6 +1195,7 @@ impl HttpReader {
 
         record_internode_outgoing_request(track_internode_metrics, internode_operation);
 
+        let response_headers = resp.headers().clone();
         let stream_error_url = url.to_owned();
         let stream_error_method = method.clone();
         let stream = resp.bytes_stream().map_err(move |e| {
@@ -1202,6 +1207,7 @@ impl HttpReader {
 
         Ok(HttpReaderInit {
             stream: Box::pin(stream),
+            response_headers,
             track_internode_metrics,
             internode_operation,
             stall_timeout,
@@ -1216,6 +1222,9 @@ impl HttpReader {
     }
     pub fn headers(&self) -> &HeaderMap {
         &self.headers
+    }
+    pub fn response_headers(&self) -> &HeaderMap {
+        &self.response_headers
     }
 }
 
@@ -1282,6 +1291,7 @@ impl HttpChunkReader {
         let init = HttpReader::open(&url, &method, &headers, body, stall_timeout, ReaderConnection::Pooled).await?;
         Ok(Self {
             inner: init.stream,
+            response_headers: init.response_headers,
             current: None,
             track_internode_metrics: init.track_internode_metrics,
             internode_operation: init.internode_operation,
@@ -1303,6 +1313,7 @@ impl HttpChunkReader {
         let init = HttpReader::open(&url, &method, &headers, body, stall_timeout, ReaderConnection::Fresh).await?;
         Ok(Self {
             inner: init.stream,
+            response_headers: init.response_headers,
             current: None,
             track_internode_metrics: init.track_internode_metrics,
             internode_operation: init.internode_operation,
@@ -1312,6 +1323,10 @@ impl HttpChunkReader {
             duration_recorded: false,
             consecutive_empty_chunks: 0,
         })
+    }
+
+    pub fn response_headers(&self) -> &HeaderMap {
+        &self.response_headers
     }
 }
 
@@ -2846,6 +2861,7 @@ mod tests {
             request_started: Instant::now(),
             duration_recorded: false,
             consecutive_empty_chunks: 0,
+            response_headers: HeaderMap::new(),
             inner,
             current: None,
         };

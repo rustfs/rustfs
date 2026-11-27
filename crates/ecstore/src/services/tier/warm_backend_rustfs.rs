@@ -21,35 +21,30 @@ use std::collections::HashMap;
 use crate::services::tier::{
     tier_config::TierRustFS,
     warm_backend::{
-        S3CompatibleWarmBackendParams, TransitionCandidateProbe, WarmBackend, WarmBackendGetOpts, build_transition_put_options,
-        new_s3_compatible_warm_backend, optimal_part_size,
+        S3CompatibleWarmBackendParams, TierEndpointPolicy, TransitionCandidateProbe, WarmBackend, WarmBackendGetOpts,
+        build_transition_put_options, new_s3_compatible_warm_backend, optimal_part_size,
     },
     warm_backend_s3::WarmBackendS3,
 };
 use rustfs_s3_client::transition_api::{BucketLookupType, ReadCloser, ReaderImpl};
-use rustfs_utils::egress::{OutboundUrlError, validate_outbound_url_allow_private};
+#[cfg(test)]
+use rustfs_utils::egress::{OutboundPolicy, OutboundPolicyError};
 
 const _MAX_PART_SIZE: i64 = 1024 * 1024 * 1024 * 5;
 const MIN_PART_SIZE: i64 = 1024 * 1024 * 128;
 // Debug-only opt-in for single-host test/dev setups; release builds always reject loopback.
 const ALLOW_LOOPBACK_TIER_ENDPOINT_ENV: &str = "RUSTFS_TIER_RUSTFS_ALLOW_LOOPBACK_ENDPOINT";
 
-fn validate_rustfs_tier_endpoint(url: &url::Url) -> Result<(), OutboundUrlError> {
-    let allow_loopback = cfg!(debug_assertions)
+fn allow_loopback_rustfs_tier_endpoint() -> bool {
+    cfg!(debug_assertions)
         && std::env::var(ALLOW_LOOPBACK_TIER_ENDPOINT_ENV)
             .map(|value| value == "1" || value.eq_ignore_ascii_case("true"))
-            .unwrap_or(false);
-    validate_rustfs_tier_endpoint_inner(url, allow_loopback)
+            .unwrap_or(false)
 }
 
-fn validate_rustfs_tier_endpoint_inner(url: &url::Url, allow_loopback: bool) -> Result<(), OutboundUrlError> {
-    match validate_outbound_url_allow_private(url) {
-        Err(OutboundUrlError::ForbiddenHost {
-            reason: "loopback address" | "loopback host",
-            ..
-        }) if allow_loopback => Ok(()),
-        result => result,
-    }
+#[cfg(test)]
+fn validate_rustfs_tier_endpoint_inner(url: &url::Url, allow_loopback: bool) -> Result<(), OutboundPolicyError> {
+    OutboundPolicy::default().validate_storage_url(url, true, allow_loopback)
 }
 
 pub struct WarmBackendRustFS(WarmBackendS3);
@@ -92,7 +87,9 @@ impl WarmBackendRustFS {
                 provider_tag: "rustfs",
                 // Private storage endpoints are allowed; loopback remains a debug-only,
                 // env-gated exception for this provider's own e2e tier tests.
-                validate_endpoint: validate_rustfs_tier_endpoint,
+                endpoint_policy: TierEndpointPolicy::AllowPrivateAndDebugLoopback {
+                    allow_loopback: allow_loopback_rustfs_tier_endpoint(),
+                },
             })
             .await?,
         ))

@@ -17,6 +17,16 @@
 pub const WALK_DIR_STREAM_COMPLETION_QUERY: &str = "walk_dir_stream_completion";
 pub const WALK_DIR_STREAM_COMPLETION_V1: &str = "error-v1";
 pub const WALK_DIR_BODY_SHA256_QUERY: &str = "walk_dir_body_sha256";
+pub const STREAM_RESPONSE_AUTH_QUERY: &str = "stream_auth";
+pub const STREAM_RESPONSE_AUTH_V1: &str = "framed-v1";
+pub const STREAM_RESPONSE_AUTH_NONCE_QUERY: &str = "stream_auth_nonce";
+pub const STREAM_RESPONSE_AUTH_HEADER: &str = "x-rustfs-rpc-stream-auth";
+pub const STREAM_RESPONSE_FRAME_MAGIC: &[u8; 8] = b"RFS-SF1\0";
+pub const STREAM_RESPONSE_FRAME_KIND_DATA: u8 = 1;
+pub const STREAM_RESPONSE_FRAME_KIND_EOF: u8 = 2;
+pub const STREAM_RESPONSE_FRAME_MAX_PAYLOAD: usize = 4 * 1024 * 1024;
+pub const STREAM_RESPONSE_DATA_HEADER_LEN: usize = STREAM_RESPONSE_FRAME_MAGIC.len() + 1 + 8 + 4 + 32;
+pub const STREAM_RESPONSE_EOF_FRAME_LEN: usize = STREAM_RESPONSE_FRAME_MAGIC.len() + 1 + 8 + 8 + 32 + 32;
 pub const PUT_FILE_AUTH_QUERY: &str = "put_file_auth";
 pub const PUT_FILE_AUTH_V1: &str = "digest-trailer-v1";
 pub const PUT_FILE_NONCE_QUERY: &str = "put_file_nonce";

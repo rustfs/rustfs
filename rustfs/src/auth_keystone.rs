@@ -54,7 +54,7 @@ pub async fn init_keystone_auth(config: KeystoneConfig) -> Result<(), Box<dyn st
     config.validate()?;
 
     let version = config.get_version()?;
-    let client = KeystoneClient::new(
+    let client = KeystoneClient::try_new(
         config.auth_url.clone(),
         version,
         config.admin_user.clone(),
@@ -63,7 +63,7 @@ pub async fn init_keystone_auth(config: KeystoneConfig) -> Result<(), Box<dyn st
         config.get_admin_domain(),
         config.verify_ssl,
         config.get_timeout(),
-    );
+    )?;
 
     let auth_provider = KeystoneAuthProvider::new(client.clone(), config.cache_size, config.get_cache_ttl(), config.enable_cache);
 

@@ -254,6 +254,21 @@ fn pool_write_quorum(participant_count: usize) -> usize {
 /// dominant error into `ErasureWriteQuorum`.
 ///
 /// `peer_rest_client` carries the same helper over `StorageError` for the same response shape.
+fn decode_bucket_infos(bucket_infos: Vec<String>) -> Result<Vec<BucketInfo>> {
+    bucket_infos
+        .into_iter()
+        .enumerate()
+        .map(|(index, json_str)| {
+            serde_json::from_str::<BucketInfo>(&json_str).map_err(|err| {
+                Error::Io(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("decode BucketInfo entry {index} failed: {err}"),
+                ))
+            })
+        })
+        .collect()
+}
+
 fn peer_failure_without_details(op: &str, bucket: Option<&str>) -> Error {
     match bucket {
         Some(bucket) => Error::other(format!("{op}({bucket}): peer returned failure without error details")),
@@ -1329,11 +1344,7 @@ impl PeerS3Client for RemotePeerS3Client {
                         Err(peer_failure_without_details("list_bucket", None))
                     };
                 }
-                let bucket_infos = response
-                    .bucket_infos
-                    .into_iter()
-                    .filter_map(|json_str| serde_json::from_str::<BucketInfo>(&json_str).ok())
-                    .collect();
+                let bucket_infos = decode_bucket_infos(response.bucket_infos)?;
 
                 Ok(bucket_infos)
             },
@@ -3066,5 +3077,26 @@ mod tests {
             peer_failure_without_details("delete_bucket", Some("shared")),
             peer_failure_without_details("get_bucket_info", Some("shared"))
         );
+    }
+
+    #[test]
+    fn decode_bucket_infos_rejects_malformed_entry_instead_of_dropping() {
+        let valid = BucketInfo {
+            name: "alpha".to_string(),
+            created: None,
+            deleted: None,
+            versioning: false,
+            object_locking: false,
+        };
+        let encoded = serde_json::to_string(&valid).expect("valid bucket info should serialize");
+
+        let decoded = decode_bucket_infos(vec![encoded.clone()]).expect("valid list should decode");
+        assert_eq!(decoded.len(), 1);
+        assert_eq!(decoded[0].name, "alpha");
+
+        let err = decode_bucket_infos(vec![encoded, "{not-valid-json".to_string()])
+            .expect_err("malformed BucketInfo entry must fail closed");
+        let msg = err.to_string();
+        assert!(msg.contains("entry 1"), "error must identify failing index: {msg}");
     }
 }

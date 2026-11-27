@@ -37,7 +37,7 @@ use quick_xml::{Reader, events::Event};
 use rustfs_s3_client::transition_api::{ReadCloser, ReaderImpl};
 use rustfs_signer::azure_shared_key_signature;
 use rustfs_utils::crypto::hex;
-use rustfs_utils::egress::validate_outbound_url;
+use rustfs_utils::egress::OutboundPolicy;
 use rustfs_utils::hash::FastMd5;
 use rustfs_utils::http::metadata_compat::{
     MINIO_INTERNAL_PREFIX, SUFFIX_TRANSITION_TIER_DESTINATION_ID, SUFFIX_TRANSITION_TRANSACTION_ID, internal_key_rustfs,
@@ -119,13 +119,18 @@ impl WarmBackendAzureBlob {
                 "Azure Blob endpoint must be an HTTP(S) origin without credentials, path or query",
             ));
         }
-        validate_outbound_url(&endpoint).map_err(|_| invalid_input("Azure Blob endpoint is not allowed"))?;
+        let outbound_policy =
+            OutboundPolicy::from_env_cached().map_err(|_| invalid_input("Azure Blob outbound policy is invalid"))?;
+        let dns_resolver = outbound_policy
+            .resolver_for(&endpoint)
+            .map_err(|_| invalid_input("Azure Blob endpoint is not allowed"))?;
         let key = decode_key(&conf.secret_key)?;
         rustfs_tls_runtime::ensure_crypto_provider().map_err(io::Error::other)?;
         let timeouts = transition_client_timeouts_from_env();
         let client = reqwest::Client::builder()
             .connect_timeout(timeouts.connect_timeout)
             .read_timeout(timeouts.response_body_idle_timeout)
+            .dns_resolver(dns_resolver)
             .redirect(reqwest::redirect::Policy::none())
             .retry(reqwest::retry::never())
             .no_gzip()

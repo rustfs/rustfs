@@ -13,9 +13,10 @@
 // limitations under the License.
 
 use crate::cluster::rpc::{
-    build_auth_headers, build_put_file_auth_trailer, verify_ns_scanner_capability_with_checkpoint_coverage,
-    verify_ns_scanner_capability_with_durable_progress, verify_ns_scanner_capability_with_tier_registry_generation,
-    verify_ns_scanner_capability_with_usage_capabilities, verify_put_file_capability,
+    StreamResponseAuthDomain, build_auth_headers, build_put_file_auth_trailer,
+    verify_ns_scanner_capability_with_checkpoint_coverage, verify_ns_scanner_capability_with_durable_progress,
+    verify_ns_scanner_capability_with_tier_registry_generation, verify_ns_scanner_capability_with_usage_capabilities,
+    verify_put_file_capability, verify_stream_auth_data_frame, verify_stream_auth_eof_frame,
 };
 use crate::disk::error::{Error, Result};
 use crate::disk::{FileReader, FileWriter};
@@ -27,26 +28,31 @@ use crate::storage_api_contracts::internode::{
     NS_SCANNER_TIER_REGISTRY_GENERATION_QUERY, NS_SCANNER_TIER_REGISTRY_PREFLIGHT_QUERY, NsScannerCapabilityResponse,
     PUT_FILE_AUTH_QUERY, PUT_FILE_AUTH_V1, PUT_FILE_CAPABILITY_CHALLENGE_QUERY, PUT_FILE_CAPABILITY_QUERY,
     PUT_FILE_CAPABILITY_VERSION, PUT_FILE_NONCE_QUERY, PUT_FILE_SERVER_EPOCH_QUERY, PutFileCapabilityResponse,
-    WALK_DIR_BODY_SHA256_QUERY, WALK_DIR_STREAM_COMPLETION_QUERY, WALK_DIR_STREAM_COMPLETION_V1,
+    STREAM_RESPONSE_AUTH_HEADER, STREAM_RESPONSE_AUTH_NONCE_QUERY, STREAM_RESPONSE_AUTH_QUERY, STREAM_RESPONSE_AUTH_V1,
+    STREAM_RESPONSE_DATA_HEADER_LEN, STREAM_RESPONSE_EOF_FRAME_LEN, STREAM_RESPONSE_FRAME_KIND_DATA,
+    STREAM_RESPONSE_FRAME_KIND_EOF, STREAM_RESPONSE_FRAME_MAGIC, STREAM_RESPONSE_FRAME_MAX_PAYLOAD, WALK_DIR_BODY_SHA256_QUERY,
+    WALK_DIR_STREAM_COMPLETION_QUERY, WALK_DIR_STREAM_COMPLETION_V1,
 };
 use async_trait::async_trait;
+use bytes::Bytes;
 use http::{HeaderMap, HeaderValue, Method, header::CONTENT_TYPE};
 use rustfs_config::{
-    DEFAULT_INTERNODE_DATA_TRANSPORT, ENV_RUSTFS_INTERNODE_DATA_TRANSPORT, INTERNODE_DATA_TRANSPORT_NIXL,
-    INTERNODE_DATA_TRANSPORT_TCP, KNOWN_INTERNODE_DATA_TRANSPORT_BACKENDS,
+    DEFAULT_INTERNODE_DATA_TRANSPORT, DEFAULT_INTERNODE_RPC_STREAM_AUTH_STRICT, ENV_INTERNODE_RPC_STREAM_AUTH_STRICT,
+    ENV_RUSTFS_INTERNODE_DATA_TRANSPORT, INTERNODE_DATA_TRANSPORT_NIXL, INTERNODE_DATA_TRANSPORT_TCP,
+    KNOWN_INTERNODE_DATA_TRANSPORT_BACKENDS,
 };
 use rustfs_rio::{
-    ChunkReaderBox, HttpChunkReader, HttpReader, HttpWriter, HttpWriterMemoryReservation, HttpWriterMemoryReserver,
+    ChunkReader, ChunkReaderBox, HttpChunkReader, HttpReader, HttpWriter, HttpWriterMemoryReservation, HttpWriterMemoryReserver,
 };
 use sha2::{Digest, Sha256};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::io;
 use std::pin::Pin;
 use std::sync::{Arc, LazyLock, OnceLock};
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
-use tokio::io::{AsyncReadExt, AsyncWrite};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, ReadBuf};
 use tokio::sync::OnceCell;
 use uuid::Uuid;
 
@@ -134,6 +140,271 @@ pub(super) type PutFileCapabilityCacheEntry = Arc<parking_lot::RwLock<PutFileCap
 
 static PUT_FILE_CAPABILITY_CACHE: LazyLock<parking_lot::RwLock<HashMap<String, PutFileCapabilityCacheEntry>>> =
     LazyLock::new(|| parking_lot::RwLock::new(HashMap::new()));
+
+static STREAM_RESPONSE_AUTH_STRICT: LazyLock<bool> =
+    LazyLock::new(|| rustfs_utils::get_env_bool(ENV_INTERNODE_RPC_STREAM_AUTH_STRICT, DEFAULT_INTERNODE_RPC_STREAM_AUTH_STRICT));
+
+// Once a peer proves cryptographic support for authenticated framed response streams,
+// pin it so an on-path attacker cannot strip the header and downgrade subsequent responses.
+static STREAM_AUTH_PINNED_ENDPOINTS: LazyLock<parking_lot::RwLock<HashSet<String>>> =
+    LazyLock::new(|| parking_lot::RwLock::new(HashSet::new()));
+
+fn normalize_stream_auth_endpoint(endpoint: &str) -> String {
+    endpoint.trim().trim_end_matches('/').to_ascii_lowercase()
+}
+
+fn pin_stream_auth_endpoint(endpoint: &str) {
+    let key = normalize_stream_auth_endpoint(endpoint);
+    if !key.is_empty() && !STREAM_AUTH_PINNED_ENDPOINTS.read().contains(&key) {
+        STREAM_AUTH_PINNED_ENDPOINTS.write().insert(key);
+    }
+}
+
+fn should_authenticate_response_stream(endpoint: &str, response_headers: &HeaderMap, strict: bool) -> Result<bool> {
+    let mut values = response_headers.get_all(STREAM_RESPONSE_AUTH_HEADER).iter();
+    match (values.next(), values.next()) {
+        (Some(value), None) if value == STREAM_RESPONSE_AUTH_V1 => Ok(true),
+        (Some(_), _) => Err(Error::other("unsupported or duplicate internode stream response auth header")),
+        (None, _) => {
+            let key = normalize_stream_auth_endpoint(endpoint);
+            if strict || STREAM_AUTH_PINNED_ENDPOINTS.read().contains(&key) {
+                return Err(Error::other("internode stream response auth missing or downgraded"));
+            }
+            Ok(false)
+        }
+    }
+}
+
+struct AuthenticatedStreamReader<R> {
+    inner: R,
+    endpoint: String,
+    pinned: bool,
+    domain: StreamResponseAuthDomain,
+    url: String,
+    method: Method,
+    nonce: Uuid,
+    seq: u64,
+    total_bytes: u64,
+    hasher: Sha256,
+    raw_buf: Vec<u8>,
+    raw_pos: usize,
+    decoded: Bytes,
+    eof_verified: bool,
+    failed: Option<String>,
+}
+
+impl<R> AuthenticatedStreamReader<R> {
+    fn new(inner: R, endpoint: String, domain: StreamResponseAuthDomain, url: String, method: Method, nonce: Uuid) -> Self {
+        Self {
+            inner,
+            endpoint,
+            pinned: false,
+            domain,
+            url,
+            method,
+            nonce,
+            seq: 0,
+            total_bytes: 0,
+            hasher: Sha256::new(),
+            raw_buf: Vec::new(),
+            raw_pos: 0,
+            decoded: Bytes::new(),
+            eof_verified: false,
+            failed: None,
+        }
+    }
+
+    fn note_authenticated_peer(&mut self) {
+        if !self.pinned {
+            pin_stream_auth_endpoint(&self.endpoint);
+            self.pinned = true;
+        }
+    }
+
+    fn compact_raw_buf(&mut self) {
+        if self.raw_pos == self.raw_buf.len() {
+            self.raw_buf.clear();
+            self.raw_pos = 0;
+        } else if self.raw_pos >= 64 * 1024 {
+            self.raw_buf.drain(..self.raw_pos);
+            self.raw_pos = 0;
+        }
+    }
+
+    fn record_failure(&mut self, err: io::Error) -> io::Error {
+        self.failed = Some(err.to_string());
+        err
+    }
+
+    fn try_decode_buffered_frame(&mut self) -> io::Result<bool> {
+        let avail = &self.raw_buf[self.raw_pos..];
+        if avail.len() >= 8 && &avail[..8] != STREAM_RESPONSE_FRAME_MAGIC {
+            return Err(self.record_failure(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "invalid authenticated internode stream frame magic",
+            )));
+        }
+        if avail.len() < 9 {
+            return Ok(false);
+        }
+        match avail[8] {
+            STREAM_RESPONSE_FRAME_KIND_DATA => {
+                if avail.len() < STREAM_RESPONSE_DATA_HEADER_LEN {
+                    return Ok(false);
+                }
+                let declared_len = u32::from_be_bytes(
+                    avail[17..21]
+                        .try_into()
+                        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid stream frame length"))?,
+                ) as usize;
+                if declared_len == 0 || declared_len > STREAM_RESPONSE_FRAME_MAX_PAYLOAD {
+                    return Err(self.record_failure(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "authenticated internode stream frame payload size is out of bounds",
+                    )));
+                }
+                let frame_len = STREAM_RESPONSE_DATA_HEADER_LEN + declared_len;
+                if avail.len() < frame_len {
+                    return Ok(false);
+                }
+                let header: [u8; STREAM_RESPONSE_DATA_HEADER_LEN] = avail[..STREAM_RESPONSE_DATA_HEADER_LEN]
+                    .try_into()
+                    .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid stream header"))?;
+                let payload = &avail[STREAM_RESPONSE_DATA_HEADER_LEN..frame_len];
+                if let Err(err) =
+                    verify_stream_auth_data_frame(self.domain, &self.url, &self.method, self.nonce, self.seq, &header, payload)
+                {
+                    return Err(self.record_failure(err));
+                }
+                self.hasher.update(payload);
+                self.total_bytes = self.total_bytes.saturating_add(payload.len() as u64);
+                self.seq = self.seq.saturating_add(1);
+                self.decoded = Bytes::copy_from_slice(payload);
+                self.raw_pos += frame_len;
+                self.compact_raw_buf();
+                self.note_authenticated_peer();
+                Ok(true)
+            }
+            STREAM_RESPONSE_FRAME_KIND_EOF => {
+                if avail.len() < STREAM_RESPONSE_EOF_FRAME_LEN {
+                    return Ok(false);
+                }
+                let frame: [u8; STREAM_RESPONSE_EOF_FRAME_LEN] = avail[..STREAM_RESPONSE_EOF_FRAME_LEN]
+                    .try_into()
+                    .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid stream EOF frame"))?;
+                let digest: [u8; 32] = self.hasher.clone().finalize().into();
+                if let Err(err) = verify_stream_auth_eof_frame(
+                    self.domain,
+                    &self.url,
+                    &self.method,
+                    self.nonce,
+                    self.seq,
+                    self.total_bytes,
+                    &digest,
+                    &frame,
+                ) {
+                    return Err(self.record_failure(err));
+                }
+                self.note_authenticated_peer();
+                self.raw_pos += STREAM_RESPONSE_EOF_FRAME_LEN;
+                if self.raw_pos < self.raw_buf.len() {
+                    return Err(self.record_failure(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "unexpected trailing bytes after authenticated internode stream EOF",
+                    )));
+                }
+                self.raw_buf.clear();
+                self.raw_pos = 0;
+                self.eof_verified = true;
+                Ok(true)
+            }
+            _ => Err(self.record_failure(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "invalid authenticated internode stream frame kind",
+            ))),
+        }
+    }
+
+    fn poll_next_verified_bytes(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<bool>>
+    where
+        R: AsyncRead + Unpin,
+    {
+        loop {
+            if !self.decoded.is_empty() {
+                return Poll::Ready(Ok(true));
+            }
+            if let Some(msg) = &self.failed {
+                return Poll::Ready(Err(io::Error::new(io::ErrorKind::InvalidData, msg.clone())));
+            }
+            if !self.eof_verified && self.try_decode_buffered_frame()? {
+                continue;
+            }
+            let mut scratch = [0u8; 8192];
+            let mut read_buf = ReadBuf::new(&mut scratch);
+            match Pin::new(&mut self.inner).poll_read(cx, &mut read_buf) {
+                Poll::Pending => return Poll::Pending,
+                Poll::Ready(Err(err)) => return Poll::Ready(Err(self.record_failure(err))),
+                Poll::Ready(Ok(())) => {
+                    let n = read_buf.filled().len();
+                    if n == 0 {
+                        if self.eof_verified {
+                            return Poll::Ready(Ok(false));
+                        }
+                        return Poll::Ready(Err(self.record_failure(io::Error::new(
+                            io::ErrorKind::UnexpectedEof,
+                            "truncated authenticated internode stream before EOF frame",
+                        ))));
+                    }
+                    if self.eof_verified {
+                        return Poll::Ready(Err(self.record_failure(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "unexpected trailing bytes after authenticated internode stream EOF",
+                        ))));
+                    }
+                    self.raw_buf.extend_from_slice(read_buf.filled());
+                }
+            }
+        }
+    }
+}
+
+impl<R> AsyncRead for AuthenticatedStreamReader<R>
+where
+    R: AsyncRead + Unpin,
+{
+    fn poll_read(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<io::Result<()>> {
+        if buf.remaining() == 0 {
+            return Poll::Ready(Ok(()));
+        }
+        let this = self.as_mut().get_mut();
+        match std::task::ready!(this.poll_next_verified_bytes(cx)) {
+            Ok(false) => Poll::Ready(Ok(())),
+            Ok(true) => {
+                let take = buf.remaining().min(this.decoded.len());
+                buf.put_slice(&this.decoded.split_to(take));
+                Poll::Ready(Ok(()))
+            }
+            Err(err) => Poll::Ready(Err(err)),
+        }
+    }
+}
+
+impl<R> ChunkReader for AuthenticatedStreamReader<R>
+where
+    R: AsyncRead + Send + Sync + Unpin,
+{
+    fn poll_read_chunk(mut self: Pin<&mut Self>, cx: &mut Context<'_>, max: usize) -> Poll<io::Result<Option<Bytes>>> {
+        let this = self.as_mut().get_mut();
+        match std::task::ready!(this.poll_next_verified_bytes(cx)) {
+            Ok(false) => Poll::Ready(Ok(None)),
+            Ok(true) => {
+                let take = max.min(this.decoded.len());
+                Poll::Ready(Ok(Some(this.decoded.split_to(take))))
+            }
+            Err(err) => Poll::Ready(Err(err)),
+        }
+    }
+}
 
 pub(super) fn put_file_capability_cache_entry(endpoint: &str) -> PutFileCapabilityCacheEntry {
     if let Some(entry) = PUT_FILE_CAPABILITY_CACHE.read().get(endpoint).cloned() {
@@ -349,40 +620,93 @@ pub struct TcpHttpInternodeDataTransport;
 #[async_trait]
 impl InternodeDataTransport for TcpHttpInternodeDataTransport {
     async fn open_read(&self, request: ReadStreamRequest) -> Result<FileReader> {
-        let url = build_read_file_stream_url(&request);
+        let auth_nonce = Uuid::new_v4();
+        let url = build_authenticated_read_file_stream_url(&request, auth_nonce);
         let mut headers = json_headers();
         build_auth_headers(&url, &Method::GET, &mut headers)?;
-        Ok(Box::new(
-            HttpReader::new_with_stall_timeout(url, Method::GET, headers, None, request.stall_timeout).await?,
-        ))
+        let reader = HttpReader::new_with_stall_timeout(url.clone(), Method::GET, headers, None, request.stall_timeout).await?;
+        if should_authenticate_response_stream(&request.endpoint, reader.response_headers(), *STREAM_RESPONSE_AUTH_STRICT)? {
+            Ok(Box::new(AuthenticatedStreamReader::new(
+                reader,
+                request.endpoint,
+                StreamResponseAuthDomain::ReadFileStream,
+                url,
+                Method::GET,
+                auth_nonce,
+            )))
+        } else {
+            Ok(Box::new(reader))
+        }
     }
 
     async fn open_read_fresh(&self, request: ReadStreamRequest) -> Result<FileReader> {
-        let url = build_read_file_stream_url(&request);
+        let auth_nonce = Uuid::new_v4();
+        let url = build_authenticated_read_file_stream_url(&request, auth_nonce);
         let mut headers = json_headers();
         build_auth_headers(&url, &Method::GET, &mut headers)?;
-        Ok(Box::new(
-            HttpReader::new_fresh_connection_with_stall_timeout(url, Method::GET, headers, None, request.stall_timeout).await?,
-        ))
+        let reader =
+            HttpReader::new_fresh_connection_with_stall_timeout(url.clone(), Method::GET, headers, None, request.stall_timeout)
+                .await?;
+        if should_authenticate_response_stream(&request.endpoint, reader.response_headers(), *STREAM_RESPONSE_AUTH_STRICT)? {
+            Ok(Box::new(AuthenticatedStreamReader::new(
+                reader,
+                request.endpoint,
+                StreamResponseAuthDomain::ReadFileStream,
+                url,
+                Method::GET,
+                auth_nonce,
+            )))
+        } else {
+            Ok(Box::new(reader))
+        }
     }
 
     async fn open_read_chunks(&self, request: ReadStreamRequest) -> Result<Option<ChunkReaderBox>> {
-        let url = build_read_file_stream_url(&request);
+        let auth_nonce = Uuid::new_v4();
+        let url = build_authenticated_read_file_stream_url(&request, auth_nonce);
         let mut headers = json_headers();
         build_auth_headers(&url, &Method::GET, &mut headers)?;
-        Ok(Some(Box::new(
-            HttpChunkReader::new_with_stall_timeout(url, Method::GET, headers, None, request.stall_timeout).await?,
-        )))
+        let reader =
+            HttpChunkReader::new_with_stall_timeout(url.clone(), Method::GET, headers, None, request.stall_timeout).await?;
+        if should_authenticate_response_stream(&request.endpoint, reader.response_headers(), *STREAM_RESPONSE_AUTH_STRICT)? {
+            Ok(Some(Box::new(AuthenticatedStreamReader::new(
+                reader,
+                request.endpoint,
+                StreamResponseAuthDomain::ReadFileStream,
+                url,
+                Method::GET,
+                auth_nonce,
+            ))))
+        } else {
+            Ok(Some(Box::new(reader)))
+        }
     }
 
     async fn open_read_chunks_fresh(&self, request: ReadStreamRequest) -> Result<Option<ChunkReaderBox>> {
-        let url = build_read_file_stream_url(&request);
+        let auth_nonce = Uuid::new_v4();
+        let url = build_authenticated_read_file_stream_url(&request, auth_nonce);
         let mut headers = json_headers();
         build_auth_headers(&url, &Method::GET, &mut headers)?;
-        Ok(Some(Box::new(
-            HttpChunkReader::new_fresh_connection_with_stall_timeout(url, Method::GET, headers, None, request.stall_timeout)
-                .await?,
-        )))
+        let reader = HttpChunkReader::new_fresh_connection_with_stall_timeout(
+            url.clone(),
+            Method::GET,
+            headers,
+            None,
+            request.stall_timeout,
+        )
+        .await?;
+        if should_authenticate_response_stream(&request.endpoint, reader.response_headers(), *STREAM_RESPONSE_AUTH_STRICT)? {
+            Ok(Some(Box::new(AuthenticatedStreamReader::new(
+                reader,
+                request.endpoint,
+                StreamResponseAuthDomain::ReadFileStream,
+                url,
+                Method::GET,
+                auth_nonce,
+            ))))
+        } else {
+            Ok(Some(Box::new(reader)))
+        }
     }
 
     async fn open_write(&self, request: WriteStreamRequest) -> Result<FileWriter> {
@@ -404,12 +728,25 @@ impl InternodeDataTransport for TcpHttpInternodeDataTransport {
     }
 
     async fn open_walk_dir(&self, request: WalkDirStreamRequest) -> Result<FileReader> {
-        let url = build_walk_dir_url(&request);
+        let auth_nonce = Uuid::new_v4();
+        let url = build_authenticated_walk_dir_url(&request, auth_nonce);
         let mut headers = json_headers();
         build_auth_headers(&url, &Method::GET, &mut headers)?;
-        Ok(Box::new(
-            HttpReader::new_with_stall_timeout(url, Method::GET, headers, Some(request.body), request.stall_timeout).await?,
-        ))
+        let reader =
+            HttpReader::new_with_stall_timeout(url.clone(), Method::GET, headers, Some(request.body), request.stall_timeout)
+                .await?;
+        if should_authenticate_response_stream(&request.endpoint, reader.response_headers(), *STREAM_RESPONSE_AUTH_STRICT)? {
+            Ok(Box::new(AuthenticatedStreamReader::new(
+                reader,
+                request.endpoint,
+                StreamResponseAuthDomain::WalkDir,
+                url,
+                Method::GET,
+                auth_nonce,
+            )))
+        } else {
+            Ok(Box::new(reader))
+        }
     }
 
     async fn open_ns_scanner(&self, request: NsScannerStreamRequest) -> Result<FileReader> {
@@ -825,6 +1162,17 @@ pub(super) fn build_read_file_stream_url(request: &ReadStreamRequest) -> String 
     )
 }
 
+fn build_authenticated_read_file_stream_url(request: &ReadStreamRequest, auth_nonce: Uuid) -> String {
+    format!(
+        "{}&{}={}&{}={}",
+        build_read_file_stream_url(request),
+        STREAM_RESPONSE_AUTH_QUERY,
+        STREAM_RESPONSE_AUTH_V1,
+        STREAM_RESPONSE_AUTH_NONCE_QUERY,
+        auth_nonce
+    )
+}
+
 fn build_put_file_stream_url(request: &WriteStreamRequest, auth_scope: Option<(Uuid, Uuid)>) -> String {
     let stream_path = if auth_scope.is_some() {
         PUT_FILE_AUTH_STREAM_PATH
@@ -994,17 +1342,21 @@ where
     }
 }
 
-fn build_walk_dir_url(request: &WalkDirStreamRequest) -> String {
+fn build_authenticated_walk_dir_url(request: &WalkDirStreamRequest, auth_nonce: Uuid) -> String {
     let body_sha256 = hex_simd::encode_to_string(Sha256::digest(&request.body), hex_simd::AsciiCase::Lower);
     format!(
-        "{}{}?disk={}&{}={}&{}={}",
+        "{}{}?disk={}&{}={}&{}={}&{}={}&{}={}",
         request.endpoint,
         WALK_DIR_PATH,
         urlencoding::encode(&request.disk),
         WALK_DIR_STREAM_COMPLETION_QUERY,
         WALK_DIR_STREAM_COMPLETION_V1,
         WALK_DIR_BODY_SHA256_QUERY,
-        body_sha256
+        body_sha256,
+        STREAM_RESPONSE_AUTH_QUERY,
+        STREAM_RESPONSE_AUTH_V1,
+        STREAM_RESPONSE_AUTH_NONCE_QUERY,
+        auth_nonce
     )
 }
 
@@ -2634,19 +2986,25 @@ mod tests {
 
     #[test]
     fn walk_dir_url_encodes_disk_ref() {
-        let url = build_walk_dir_url(&WalkDirStreamRequest {
-            endpoint: "http://node1:9000".to_string(),
-            disk: "http://node1:9000/data/rustfs0".to_string(),
-            body: Vec::new(),
-            stall_timeout: None,
-        });
+        let auth_nonce = Uuid::parse_str("22222222-3333-4444-8555-666666666666").expect("auth nonce");
+        let url = build_authenticated_walk_dir_url(
+            &WalkDirStreamRequest {
+                endpoint: "http://node1:9000".to_string(),
+                disk: "http://node1:9000/data/rustfs0".to_string(),
+                body: Vec::new(),
+                stall_timeout: None,
+            },
+            auth_nonce,
+        );
 
         assert_eq!(
             url,
             concat!(
                 "http://node1:9000/rustfs/rpc/walk_dir?disk=http%3A%2F%2Fnode1%3A9000%2Fdata%2Frustfs0",
                 "&walk_dir_stream_completion=error-v1",
-                "&walk_dir_body_sha256=e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+                "&walk_dir_body_sha256=e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+                "&stream_auth=framed-v1",
+                "&stream_auth_nonce=22222222-3333-4444-8555-666666666666"
             )
         );
     }
@@ -2870,5 +3228,197 @@ mod tests {
         assert!(!err.starts_with("io error "));
         assert!(err.contains(ENV_RUSTFS_INTERNODE_DATA_TRANSPORT));
         assert!(err.contains("unsupported-backend"));
+    }
+
+    #[tokio::test]
+    async fn authenticated_stream_reader_verifies_roundtrip_and_rejects_tamper_truncation_and_trailing() {
+        use crate::cluster::rpc::{encode_stream_auth_data_frame, encode_stream_auth_eof_frame};
+        use std::io::Cursor;
+
+        crate::runtime::sources::ensure_test_rpc_secret();
+        let nonce = Uuid::new_v4();
+        let url =
+            format!("http://127.0.0.1:9000/rustfs/rpc/read_file_stream?disk=d1&stream_auth=framed-v1&stream_auth_nonce={nonce}");
+        let part1 = b"chunk-one-";
+        let part2 = b"chunk-two";
+        let mut combined = Vec::new();
+        combined.extend_from_slice(part1);
+        combined.extend_from_slice(part2);
+
+        let frame0 = encode_stream_auth_data_frame(StreamResponseAuthDomain::ReadFileStream, &url, &Method::GET, nonce, 0, part1)
+            .expect("frame 0");
+        let frame1 = encode_stream_auth_data_frame(StreamResponseAuthDomain::ReadFileStream, &url, &Method::GET, nonce, 1, part2)
+            .expect("frame 1");
+        let digest: [u8; 32] = Sha256::digest(&combined).into();
+        let eof = encode_stream_auth_eof_frame(
+            StreamResponseAuthDomain::ReadFileStream,
+            &url,
+            &Method::GET,
+            nonce,
+            2,
+            combined.len() as u64,
+            &digest,
+        )
+        .expect("eof");
+
+        let mut wire = Vec::new();
+        wire.extend_from_slice(&frame0);
+        wire.extend_from_slice(&frame1);
+        wire.extend_from_slice(&eof);
+
+        let test_endpoint = format!("http://auth-reader-test-{}.invalid:9000", Uuid::new_v4());
+
+        // 1. Valid multi-frame stream succeeds via AsyncRead.
+        let mut reader = AuthenticatedStreamReader::new(
+            Cursor::new(wire.clone()),
+            test_endpoint.clone(),
+            StreamResponseAuthDomain::ReadFileStream,
+            url.clone(),
+            Method::GET,
+            nonce,
+        );
+        let mut out = Vec::new();
+        reader.read_to_end(&mut out).await.expect("valid stream should read");
+        assert_eq!(out, combined);
+
+        // 2. Valid multi-frame stream succeeds via ChunkReader.
+        let mut chunk_reader = AuthenticatedStreamReader::new(
+            Cursor::new(wire.clone()),
+            test_endpoint.clone(),
+            StreamResponseAuthDomain::ReadFileStream,
+            url.clone(),
+            Method::GET,
+            nonce,
+        );
+        let mut chunked = Vec::new();
+        while let Some(chunk) = std::future::poll_fn(|cx| Pin::new(&mut chunk_reader).poll_read_chunk(cx, 5))
+            .await
+            .expect("valid chunk read")
+        {
+            chunked.extend_from_slice(&chunk);
+        }
+        assert_eq!(chunked, combined);
+
+        // 3. Single flipped payload byte fails closed BEFORE returning tampered bytes.
+        let mut tampered = wire.clone();
+        tampered[STREAM_RESPONSE_DATA_HEADER_LEN] ^= 0xff;
+        let mut bad_reader = AuthenticatedStreamReader::new(
+            Cursor::new(tampered),
+            test_endpoint.clone(),
+            StreamResponseAuthDomain::ReadFileStream,
+            url.clone(),
+            Method::GET,
+            nonce,
+        );
+        let mut bad_out = Vec::new();
+        let err = bad_reader
+            .read_to_end(&mut bad_out)
+            .await
+            .expect_err("tampered payload must fail closed");
+        assert_eq!(err.kind(), io::ErrorKind::PermissionDenied);
+        assert!(bad_out.is_empty(), "tampered frame must not emit unverified bytes");
+
+        // 4. Truncated stream (missing EOF frame) fails closed with UnexpectedEof.
+        let truncated = wire[..frame0.len() + frame1.len()].to_vec();
+        let mut trunc_reader = AuthenticatedStreamReader::new(
+            Cursor::new(truncated),
+            test_endpoint.clone(),
+            StreamResponseAuthDomain::ReadFileStream,
+            url.clone(),
+            Method::GET,
+            nonce,
+        );
+        let mut trunc_out = Vec::new();
+        let err = trunc_reader
+            .read_to_end(&mut trunc_out)
+            .await
+            .expect_err("missing EOF frame must fail closed");
+        assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof);
+
+        // 5. Trailing garbage after EOF frame fails closed.
+        let mut trailing = wire.clone();
+        trailing.extend_from_slice(b"junk");
+        let mut trail_reader = AuthenticatedStreamReader::new(
+            Cursor::new(trailing),
+            test_endpoint.clone(),
+            StreamResponseAuthDomain::ReadFileStream,
+            url.clone(),
+            Method::GET,
+            nonce,
+        );
+        let mut trail_out = Vec::new();
+        let err = trail_reader
+            .read_to_end(&mut trail_out)
+            .await
+            .expect_err("trailing bytes after EOF frame must fail closed");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        STREAM_AUTH_PINNED_ENDPOINTS
+            .write()
+            .remove(&normalize_stream_auth_endpoint(&test_endpoint));
+    }
+
+    #[tokio::test]
+    async fn stream_response_auth_pins_peer_only_after_crypto_verification_and_blocks_downgrade() {
+        use crate::cluster::rpc::encode_stream_auth_eof_frame;
+        use std::io::Cursor;
+
+        crate::runtime::sources::ensure_test_rpc_secret();
+        let endpoint = format!("http://pin-stream-test-{}.invalid:9000", Uuid::new_v4());
+        let empty = HeaderMap::new();
+        assert!(
+            !should_authenticate_response_stream(&endpoint, &empty, false)
+                .expect("unpinned legacy peer allowed when strict is off")
+        );
+        assert!(
+            should_authenticate_response_stream(&endpoint, &empty, true).is_err(),
+            "strict mode must reject missing stream auth header"
+        );
+
+        // Header alone must NOT pin the endpoint before a frame cryptographically verifies
+        // (prevents an unauthenticated on-path attacker from DoS-pinning a legacy peer).
+        let mut valid_headers = HeaderMap::new();
+        valid_headers.insert(STREAM_RESPONSE_AUTH_HEADER, HeaderValue::from_static(STREAM_RESPONSE_AUTH_V1));
+        assert!(should_authenticate_response_stream(&endpoint, &valid_headers, false).expect("valid header should enable auth"));
+        assert!(
+            !should_authenticate_response_stream(&endpoint, &empty, false)
+                .expect("header without verified MAC must not pin legacy peer")
+        );
+
+        // Duplicate or unknown header values fail closed.
+        let mut dup_headers = valid_headers.clone();
+        dup_headers.append(STREAM_RESPONSE_AUTH_HEADER, HeaderValue::from_static(STREAM_RESPONSE_AUTH_V1));
+        assert!(should_authenticate_response_stream(&endpoint, &dup_headers, false).is_err());
+        let mut unknown_headers = HeaderMap::new();
+        unknown_headers.insert(STREAM_RESPONSE_AUTH_HEADER, HeaderValue::from_static("framed-v99"));
+        assert!(should_authenticate_response_stream(&endpoint, &unknown_headers, false).is_err());
+
+        // Once a peer proves possession of the RPC secret with a valid authenticated stream,
+        // it is pinned (case/trailing-slash normalized) and header stripping is rejected.
+        let nonce = Uuid::new_v4();
+        let url = format!("{endpoint}/rustfs/rpc/walk_dir?disk=d1&stream_auth=framed-v1&stream_auth_nonce={nonce}");
+        let empty_digest: [u8; 32] = Sha256::digest([]).into();
+        let eof = encode_stream_auth_eof_frame(StreamResponseAuthDomain::WalkDir, &url, &Method::GET, nonce, 0, 0, &empty_digest)
+            .expect("empty EOF");
+        let mut reader = AuthenticatedStreamReader::new(
+            Cursor::new(eof.to_vec()),
+            endpoint.clone(),
+            StreamResponseAuthDomain::WalkDir,
+            url,
+            Method::GET,
+            nonce,
+        );
+        let mut out = Vec::new();
+        reader.read_to_end(&mut out).await.expect("verified empty stream");
+        assert!(out.is_empty());
+
+        let variant = format!("{}/", endpoint.to_ascii_uppercase());
+        assert!(
+            should_authenticate_response_stream(&variant, &empty, false).is_err(),
+            "stripping auth header from a cryptographically pinned peer must be rejected as a downgrade"
+        );
+
+        STREAM_AUTH_PINNED_ENDPOINTS
+            .write()
+            .remove(&normalize_stream_auth_endpoint(&endpoint));
     }
 }

@@ -200,7 +200,7 @@ pub(crate) mod server {
             RemoteBackgroundIo, ServerContextSlot, TONIC_RPC_PREFIX, normalize_tonic_rpc_audience,
             rpc_auth_is_resource_exhausted, rpc_background_admission, tonic_boot_epoch_challenge,
             tonic_boot_epoch_response_headers_with_msgpack_capability, tonic_msgpack_manifest_capability_requested,
-            tonic_rpc_auth_failure_reason, verify_tonic_rpc_signature_with_bootstrap, with_remote_background_io,
+            tonic_rpc_auth_failure_reason, verify_tonic_rpc_signature_with_bootstrap_and_peer, with_remote_background_io,
         };
 
         pub(crate) fn try_current_local_node_name() -> Option<String> {

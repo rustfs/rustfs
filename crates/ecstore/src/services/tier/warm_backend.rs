@@ -48,7 +48,7 @@ use rustfs_s3_client::{
     transition_api::{ReadCloser, ReaderImpl},
 };
 use rustfs_scanner_metrics::metrics::{TierRequestOperation, TierRequestOutcome, global_metrics};
-use rustfs_utils::egress::validate_outbound_url;
+use rustfs_utils::egress::OutboundPolicy;
 use rustfs_utils::http::headers::{
     CACHE_CONTROL, CONTENT_DISPOSITION, CONTENT_ENCODING, CONTENT_LANGUAGE, CONTENT_TYPE, EXPIRES, HeaderExt as _,
 };
@@ -309,6 +309,36 @@ pub fn build_transition_put_options(storage_class: String, mut metadata: HashMap
     opts
 }
 
+/// Outbound address policy enforced at both URL validation and connection-time DNS resolution
+/// for S3-compatible warm backends.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum TierEndpointPolicy {
+    /// Cloud object stores: public destinations only unless explicitly allowlisted via
+    /// `RUSTFS_OUTBOUND_ALLOW_ORIGINS`.
+    PublicOnly,
+    /// Self-hosted S3-compatible tiers (MinIO, S3): public and non-metadata RFC1918/ULA
+    /// private destinations allowed; loopback, link-local, metadata, and special-use blocked.
+    AllowPrivate,
+    /// RustFS tier: private destinations allowed plus debug-only env-gated loopback for tests.
+    AllowPrivateAndDebugLoopback { allow_loopback: bool },
+}
+
+impl TierEndpointPolicy {
+    pub(crate) fn build_resolver(
+        self,
+        policy: &OutboundPolicy,
+        url: &url::Url,
+    ) -> Result<rustfs_utils::egress::OutboundDnsResolver, rustfs_utils::egress::OutboundPolicyError> {
+        match self {
+            Self::PublicOnly => policy.resolver_for(url),
+            Self::AllowPrivate => policy.resolver_for_allow_private(url),
+            Self::AllowPrivateAndDebugLoopback { allow_loopback } => {
+                policy.resolver_for_storage_endpoint(url, true, allow_loopback)
+            }
+        }
+    }
+}
+
 /// Connection parameters every S3-compatible warm backend provider supplies.
 ///
 /// The Aliyun, legacy Azure, Huaweicloud, Tencent, MinIO, R2, and RustFS backends all
@@ -328,11 +358,8 @@ pub(crate) struct S3CompatibleWarmBackendParams<'a> {
     /// Tag handed to [`TransitionClient::new`] so per-provider client behavior
     /// and metrics stay attributable.
     pub provider_tag: &'a str,
-    /// SSRF guard run against the parsed endpoint once it's known to have a
-    /// host. Cloud providers use [`rustfs_utils::egress::validate_outbound_url`];
-    /// MinIO allows private storage endpoints, and RustFS additionally wraps
-    /// that policy with its debug-only, env-gated loopback exception.
-    pub validate_endpoint: fn(&url::Url) -> Result<(), rustfs_utils::egress::OutboundUrlError>,
+    /// Connection-time DNS and URL SSRF policy for this tier provider.
+    pub endpoint_policy: TierEndpointPolicy,
 }
 
 /// A bucket can become a host prefix or the first path segment. Keep legacy
@@ -420,18 +447,24 @@ pub(crate) async fn new_s3_compatible_warm_backend(
         ..Default::default()
     }));
     let timeouts = transition_client_timeouts_from_env();
+    let endpoint = endpoint_authority(&u)?;
+    // Run the SSRF guard after the host-presence check so a host-less endpoint
+    // keeps this constructor's stable error text.
+    let outbound_policy = OutboundPolicy::from_env_cached()
+        .map_err(|err| std::io::Error::new(std::io::ErrorKind::InvalidInput, format!("invalid outbound policy: {err}")))?;
+    let dns_resolver = params
+        .endpoint_policy
+        .build_resolver(outbound_policy, &u)
+        .map_err(|err| std::io::Error::other(format!("tier endpoint is not allowed: {err}")))?;
     let opts = Options {
         creds,
         secure: u.scheme() == "https",
         trailing_headers: true,
         region: params.region.to_string(),
         bucket_lookup: params.bucket_lookup,
+        dns_resolver: Some(dns_resolver),
         ..Default::default()
     };
-    let endpoint = endpoint_authority(&u)?;
-    // Run the SSRF guard after the host-presence check so a host-less endpoint
-    // keeps this constructor's stable error text.
-    (params.validate_endpoint)(&u).map_err(|err| std::io::Error::other(format!("tier endpoint is not allowed: {err}")))?;
     let client = TransitionClient::new_with_timeouts(&endpoint, opts, params.provider_tag, timeouts).await?;
 
     let client = Arc::new(client);
@@ -2001,7 +2034,7 @@ mod tests {
             region: "us-east-1",
             bucket_lookup: BucketLookupType::BucketLookupDNS,
             provider_tag: "aliyun",
-            validate_endpoint: validate_outbound_url,
+            endpoint_policy: TierEndpointPolicy::PublicOnly,
         }
     }
 

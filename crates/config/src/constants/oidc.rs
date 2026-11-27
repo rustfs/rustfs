@@ -50,6 +50,9 @@ pub const ENV_IDENTITY_OPENID_ROLES_CLAIM: &str = "RUSTFS_IDENTITY_OPENID_ROLES_
 pub const ENV_IDENTITY_OPENID_EMAIL_CLAIM: &str = "RUSTFS_IDENTITY_OPENID_EMAIL_CLAIM";
 pub const ENV_IDENTITY_OPENID_USERNAME_CLAIM: &str = "RUSTFS_IDENTITY_OPENID_USERNAME_CLAIM";
 pub const ENV_IDENTITY_OPENID_HIDE_FROM_UI: &str = "RUSTFS_IDENTITY_OPENID_HIDE_FROM_UI";
+/// Explicit opt-in allowing plaintext `http://` OIDC provider URLs for non-loopback hosts.
+/// Defaults to off; loopback hosts remain subject to the shared outbound egress policy.
+pub const ENV_IDENTITY_OPENID_ALLOW_INSECURE_TRANSPORT: &str = "RUSTFS_IDENTITY_OPENID_ALLOW_INSECURE_TRANSPORT";
 
 /// List of all environment variable keys for an OIDC provider.
 pub const ENV_IDENTITY_OPENID_KEYS: &[&str; 18] = &[
