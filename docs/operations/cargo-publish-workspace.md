@@ -21,9 +21,9 @@ Out of scope:
 
 ## Current Branch Snapshot
 
-On this branch, `cargo metadata --format-version 1 --no-deps` reports 51 workspace members. None of the workspace package manifests set `publish = false`, so every member is eligible from Cargo's manifest perspective.
+On this branch, `cargo metadata --format-version 1 --no-deps` reports 52 workspace members. `tests/dst` (`rustfs-dst`) sets `publish = false`. Every other member is eligible from Cargo's manifest perspective.
 
-The script always filters out the test-only `e2e_test` package, leaving 50 packages in the default publish plan. If another test-only or internal crate should not be published, set `publish = false` in that crate's manifest before publication. The script also supports `--exclude <package>`, but it will fail if any selected publishable crate still depends on the excluded package.
+The script always filters out the test-only `e2e_test` package and skips `publish = false`, leaving 50 packages in the default publish plan. If another test-only or internal crate should not be published, set `publish = false` in that crate's manifest before publication. The script also supports `--exclude <package>`, but it will fail if any selected publishable crate still depends on the excluded package.
 
 The publish order below is the current topological order of workspace path dependencies:
 

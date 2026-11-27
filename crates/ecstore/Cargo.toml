@@ -117,6 +117,9 @@ hotpath-cpu = [
 # injection, xl.meta transition assertions) via `api::tier::test_util`.
 # Enable only from `[dev-dependencies]` (rustfs/backlog#1148 ilm-6).
 test-util = []
+# Re-exports durability primitives for the deterministic simulation harness.
+# Absent from production binaries. Enabling it does not change storage behavior.
+dst = []
 # Observes real startup CAS only in the dedicated E2E binary.
 e2e-test-hooks = []
 

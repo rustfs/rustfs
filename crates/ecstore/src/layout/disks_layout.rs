@@ -117,17 +117,25 @@ pub struct DisksLayout {
 
 impl DisksLayout {
     pub fn from_volumes<T: AsRef<str>>(args: &[T]) -> Result<Self> {
-        if args.is_empty() {
-            return Err(Error::other("Invalid argument"));
-        }
-
-        let is_ellipses = args.iter().any(|v| has_ellipses(&[v]));
-
         let set_drive_count_env = env::var(ENV_RUSTFS_ERASURE_SET_DRIVE_COUNT).unwrap_or_else(|err| {
             debug!("{} not set use default:0, {:?}", ENV_RUSTFS_ERASURE_SET_DRIVE_COUNT, err);
             "0".to_string()
         });
         let set_drive_count: usize = set_drive_count_env.parse().map_err(Error::other)?;
+        Self::from_volumes_with_set_drive_count(args, set_drive_count)
+    }
+
+    /// Same selector as [`Self::from_volumes`] with an explicit set width.
+    ///
+    /// `set_drive_count == 0` selects the default symmetric width. Callers that
+    /// need the production default regardless of `RUSTFS_ERASURE_SET_DRIVE_COUNT`
+    /// pass `0` here.
+    pub(crate) fn from_volumes_with_set_drive_count<T: AsRef<str>>(args: &[T], set_drive_count: usize) -> Result<Self> {
+        if args.is_empty() {
+            return Err(Error::other("Invalid argument"));
+        }
+
+        let is_ellipses = args.iter().any(|v| has_ellipses(&[v]));
 
         // None of the args have ellipses use the old style.
         if !is_ellipses {

@@ -36,14 +36,16 @@ pub mod api;
 mod bucket;
 mod cache_value;
 mod cluster;
-mod config;
+pub(crate) mod config;
 mod core;
 mod crash_inject;
 mod data_movement;
 mod data_usage;
 mod diagnostics;
-mod disk;
-mod erasure;
+pub(crate) mod disk;
+#[cfg(feature = "dst")]
+pub mod dst_seam;
+pub(crate) mod erasure;
 mod error;
 mod io_support;
 pub(crate) mod layout;
@@ -51,7 +53,7 @@ mod multipart_listing;
 mod object_api;
 mod runtime;
 mod services;
-mod set_disk;
+pub(crate) mod set_disk;
 mod storage_api_contracts;
 mod store;
 

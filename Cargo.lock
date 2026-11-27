@@ -9813,6 +9813,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "rustfs-dst"
+version = "1.0.7"
+dependencies = [
+ "rustfs-ecstore",
+ "rustfs-filemeta",
+ "rustfs-utils",
+]
+
+[[package]]
 name = "rustfs-ecstore"
 version = "1.0.7"
 dependencies = [

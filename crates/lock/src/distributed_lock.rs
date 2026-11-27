@@ -634,12 +634,7 @@ impl DistributedLock {
     }
 
     fn read_quorum(&self) -> usize {
-        let client_count = self.clients.len();
-        if client_count <= 1 {
-            1
-        } else {
-            client_count - (client_count / 2)
-        }
+        crate::quorum::shared_lock_quorum(self.clients.len())
     }
 
     fn required_quorum(&self, lock_type: LockType) -> usize {

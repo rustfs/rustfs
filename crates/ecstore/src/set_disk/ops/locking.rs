@@ -77,7 +77,7 @@ impl SetDisks {
             };
             // Calculate quorum from the exact client domain used by this lock.
             let lockers_count = lockers.len();
-            let write_quorum = if lockers_count > 1 { (lockers_count / 2) + 1 } else { 1 };
+            let write_quorum = rustfs_lock::exclusive_lock_quorum(lockers_count);
             NamespaceLock::with_clients_and_quorum_shared(self.set_lock_namespace.clone(), lockers, write_quorum)
         } else {
             NamespaceLock::with_local_manager_shared(self.set_lock_namespace.clone(), self.local_lock_manager.clone())

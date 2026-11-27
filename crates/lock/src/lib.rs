@@ -29,7 +29,10 @@ pub mod fast_lock;
 
 // Core Modules
 pub mod error;
+pub mod quorum;
 pub mod types;
+
+pub use quorum::{exclusive_lock_quorum, shared_lock_quorum};
 
 // ============================================================================
 // Public API Exports

@@ -901,6 +901,8 @@ mod core;
 pub(crate) use core::io_primitives::disk_call_counters;
 #[cfg(test)]
 pub(crate) use core::io_primitives::{ENV_RUSTFS_PUT_RENAME_EARLY_ACK_ENABLE, rename_fanout_barrier};
+#[cfg(feature = "dst")]
+pub(crate) use core::quorum_math;
 mod ctx;
 mod metadata;
 mod ops;
@@ -6426,11 +6428,7 @@ impl SetDisks {
             })
             .collect();
 
-        let write_quorum = if self.lockers.len() > 1 {
-            (self.lockers.len() / 2) + 1
-        } else {
-            1
-        };
+        let write_quorum = rustfs_lock::exclusive_lock_quorum(self.lockers.len());
 
         let mut lock_ids_by_object: Vec<Vec<(usize, rustfs_lock::LockId)>> = vec![Vec::new(); requests.len()];
         let mut errors_by_object: Vec<Option<String>> = vec![None; requests.len()];

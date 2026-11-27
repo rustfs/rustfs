@@ -76,6 +76,7 @@ rustfs-webdav.code-workspace
 *.bak
 # Local test/benchmark artifacts
 benchmarks.logs
+tests/dst/results/
 tmp/
 crates/*/docs
 fuzz/target

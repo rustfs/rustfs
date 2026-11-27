@@ -3756,16 +3756,11 @@ where
 
 impl SetDisks {
     pub(in crate::set_disk) fn default_read_quorum(&self) -> usize {
-        self.set_drive_count - self.default_parity_count
+        super::quorum_math::read_quorum(self.set_drive_count, self.default_parity_count)
     }
 
     pub(crate) fn default_write_quorum(&self) -> usize {
-        let mut data_count = self.set_drive_count - self.default_parity_count;
-        if data_count == self.default_parity_count {
-            data_count += 1
-        }
-
-        data_count
+        super::quorum_math::write_quorum(self.set_drive_count, self.default_parity_count)
     }
 
     pub(in crate::set_disk) async fn prepare_quota_mutation_fences(

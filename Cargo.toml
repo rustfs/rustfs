@@ -25,6 +25,7 @@ members = [
     "crates/crypto", # Cryptography and security features
     "crates/ecstore", # Erasure coding storage implementation
     "crates/e2e_test", # End-to-end test suite
+    "tests/dst", # Deterministic simulation harness (publish = false)
     "crates/filemeta", # File metadata management
     "crates/heal", # Erasure set and object healing
     "crates/heal-contracts", # Heal request/response channel contracts
