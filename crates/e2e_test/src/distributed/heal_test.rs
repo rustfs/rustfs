@@ -46,6 +46,7 @@ async fn degraded_put_parity_survives_node_loss_and_heals() -> TestResult {
             ("RUSTFS_HEAL_ENABLED", "true"),
             ("RUSTFS_HEAL_AUTO_HEAL_ENABLE", "true"),
             ("RUSTFS_HEAL_MRF_ENABLE", "true"),
+            ("RUSTFS_HEAL_OBJECT_SELECT_PROB", "1"),
             ("RUSTFS_SCANNER_ENABLED", "true"),
             ("RUSTFS_SCANNER_CYCLE", "1"),
             ("RUSTFS_SCANNER_START_DELAY_SECS", "0"),
@@ -74,15 +75,16 @@ async fn degraded_put_parity_survives_node_loss_and_heals() -> TestResult {
             wait_until(
                 Duration::from_secs(60),
                 || async {
-                    let response: Value = http
-                        .get(control_url)
-                        .timeout(Duration::from_secs(3))
-                        .send()
-                        .await?
-                        .json()
-                        .await?;
-                    let storage = &response["details"]["storage"];
-                    Ok(storage["source"] == "local_runtime"
+                    let response = match http.get(control_url).timeout(Duration::from_secs(3)).send().await {
+                        Ok(response) => response,
+                        Err(error) if error.is_connect() || error.is_timeout() => return Ok(false),
+                        Err(error) => return Err(error.into()),
+                    };
+                    let ready = response.status().is_success();
+                    let body: Value = response.json().await?;
+                    let storage = &body["details"]["storage"];
+                    Ok((ready || unavailable_count > 0)
+                        && storage["source"] == "local_runtime"
                         && storage["missingDrives"]
                             .as_array()
                             .is_some_and(|drives| drives.len() == missing_count)

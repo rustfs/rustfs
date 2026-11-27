@@ -23342,6 +23342,19 @@ mod heterogeneous_pool_put_tests {
         put("capped").await.expect("eight commits should satisfy the original quorum");
         check_layout("capped", 6, 6, 8).await;
 
+        let barrier = PutObjectCommitBarrier::install(bucket, "commit-below-floor", PutObjectCommitPause::AfterNamespace);
+        let (_, result) = tokio::join!(
+            async {
+                barrier.wait_until_paused().await;
+                disk_stores[7].force_runtime_state_for_test(RuntimeDriveHealthState::Offline);
+                barrier.release();
+            },
+            put("commit-below-floor"),
+        );
+        result.expect_err("losing the eighth drive after encoding must abort the commit");
+        disk_stores[7].force_runtime_state_for_test(RuntimeDriveHealthState::Online);
+        check_layout("commit-below-floor", 0, 0, 0).await;
+
         set_disks.disks.write().await[7] = None;
         put("below-floor")
             .await
