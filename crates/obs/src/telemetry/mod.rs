@@ -47,6 +47,7 @@ mod guard;
 mod http2_ping;
 mod local;
 mod otel;
+mod rate_limit;
 mod recorder;
 mod resource;
 mod rolling;

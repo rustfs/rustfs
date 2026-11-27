@@ -26,17 +26,19 @@ use rustfs_config::observability::{
     DEFAULT_OBS_ENVIRONMENT_PRODUCTION, DEFAULT_OBS_LOG_CLEANUP_INTERVAL_SECONDS, DEFAULT_OBS_LOG_COMPRESS_OLD_FILES,
     DEFAULT_OBS_LOG_COMPRESSED_FILE_RETENTION_DAYS, DEFAULT_OBS_LOG_COMPRESSION_ALGORITHM, DEFAULT_OBS_LOG_DELETE_EMPTY_FILES,
     DEFAULT_OBS_LOG_DRY_RUN, DEFAULT_OBS_LOG_GZIP_COMPRESSION_LEVEL, DEFAULT_OBS_LOG_MATCH_MODE,
-    DEFAULT_OBS_LOG_MAX_TOTAL_SIZE_BYTES, DEFAULT_OBS_LOG_MIN_FILE_AGE_SECONDS, DEFAULT_OBS_LOG_PARALLEL_COMPRESS,
-    DEFAULT_OBS_LOG_PARALLEL_WORKERS, DEFAULT_OBS_LOG_ZSTD_COMPRESSION_LEVEL, DEFAULT_OBS_LOG_ZSTD_FALLBACK_TO_GZIP,
-    DEFAULT_OBS_LOG_ZSTD_WORKERS, ENV_OBS_ENDPOINT, ENV_OBS_ENDPOINT_HEADERS, ENV_OBS_ENDPOINT_LOGS_HEADERS,
-    ENV_OBS_ENDPOINT_LOGS_TIMEOUT_MILLIS, ENV_OBS_ENDPOINT_METRICS_HEADERS, ENV_OBS_ENDPOINT_METRICS_TIMEOUT_MILLIS,
-    ENV_OBS_ENDPOINT_TIMEOUT_MILLIS, ENV_OBS_ENDPOINT_TRACES_HEADERS, ENV_OBS_ENDPOINT_TRACES_TIMEOUT_MILLIS,
-    ENV_OBS_ENVIRONMENT, ENV_OBS_LOG_CLEANUP_INTERVAL_SECONDS, ENV_OBS_LOG_COMPRESS_OLD_FILES,
-    ENV_OBS_LOG_COMPRESSED_FILE_RETENTION_DAYS, ENV_OBS_LOG_COMPRESSION_ALGORITHM, ENV_OBS_LOG_DELETE_EMPTY_FILES,
-    ENV_OBS_LOG_DIRECTORY, ENV_OBS_LOG_DRY_RUN, ENV_OBS_LOG_ENDPOINT, ENV_OBS_LOG_EXCLUDE_PATTERNS, ENV_OBS_LOG_FILENAME,
-    ENV_OBS_LOG_GZIP_COMPRESSION_LEVEL, ENV_OBS_LOG_KEEP_FILES, ENV_OBS_LOG_MATCH_MODE, ENV_OBS_LOG_MAX_SINGLE_FILE_SIZE_BYTES,
-    ENV_OBS_LOG_MAX_TOTAL_SIZE_BYTES, ENV_OBS_LOG_MIN_FILE_AGE_SECONDS, ENV_OBS_LOG_PARALLEL_COMPRESS,
-    ENV_OBS_LOG_PARALLEL_WORKERS, ENV_OBS_LOG_ROTATION_TIME, ENV_OBS_LOG_STDOUT_ENABLED, ENV_OBS_LOG_ZSTD_COMPRESSION_LEVEL,
+    DEFAULT_OBS_LOG_MAX_COMPRESS_FILES_PER_PASS, DEFAULT_OBS_LOG_MAX_TOTAL_SIZE_BYTES, DEFAULT_OBS_LOG_MIN_FILE_AGE_SECONDS,
+    DEFAULT_OBS_LOG_PARALLEL_COMPRESS, DEFAULT_OBS_LOG_PARALLEL_WORKERS, DEFAULT_OBS_LOG_SINK_MAX_EVENTS_PER_SEC,
+    DEFAULT_OBS_LOG_ZSTD_COMPRESSION_LEVEL, DEFAULT_OBS_LOG_ZSTD_FALLBACK_TO_GZIP, DEFAULT_OBS_LOG_ZSTD_WORKERS,
+    ENV_OBS_ENDPOINT, ENV_OBS_ENDPOINT_HEADERS, ENV_OBS_ENDPOINT_LOGS_HEADERS, ENV_OBS_ENDPOINT_LOGS_TIMEOUT_MILLIS,
+    ENV_OBS_ENDPOINT_METRICS_HEADERS, ENV_OBS_ENDPOINT_METRICS_TIMEOUT_MILLIS, ENV_OBS_ENDPOINT_TIMEOUT_MILLIS,
+    ENV_OBS_ENDPOINT_TRACES_HEADERS, ENV_OBS_ENDPOINT_TRACES_TIMEOUT_MILLIS, ENV_OBS_ENVIRONMENT,
+    ENV_OBS_LOG_CLEANUP_INTERVAL_SECONDS, ENV_OBS_LOG_COMPRESS_OLD_FILES, ENV_OBS_LOG_COMPRESSED_FILE_RETENTION_DAYS,
+    ENV_OBS_LOG_COMPRESSION_ALGORITHM, ENV_OBS_LOG_DELETE_EMPTY_FILES, ENV_OBS_LOG_DIRECTORY, ENV_OBS_LOG_DRY_RUN,
+    ENV_OBS_LOG_ENDPOINT, ENV_OBS_LOG_EXCLUDE_PATTERNS, ENV_OBS_LOG_FILENAME, ENV_OBS_LOG_GZIP_COMPRESSION_LEVEL,
+    ENV_OBS_LOG_KEEP_FILES, ENV_OBS_LOG_MATCH_MODE, ENV_OBS_LOG_MAX_ARCHIVE_SIZE_BYTES, ENV_OBS_LOG_MAX_COMPRESS_FILES_PER_PASS,
+    ENV_OBS_LOG_MAX_SINGLE_FILE_SIZE_BYTES, ENV_OBS_LOG_MAX_TOTAL_SIZE_BYTES, ENV_OBS_LOG_MIN_FILE_AGE_SECONDS,
+    ENV_OBS_LOG_PARALLEL_COMPRESS, ENV_OBS_LOG_PARALLEL_WORKERS, ENV_OBS_LOG_ROTATION_TIME, ENV_OBS_LOG_SINK_MAX_EVENTS_PER_SEC,
+    ENV_OBS_LOG_SINK_PER_CALLSITE_MAX_EVENTS_PER_SEC, ENV_OBS_LOG_STDOUT_ENABLED, ENV_OBS_LOG_ZSTD_COMPRESSION_LEVEL,
     ENV_OBS_LOG_ZSTD_FALLBACK_TO_GZIP, ENV_OBS_LOG_ZSTD_WORKERS, ENV_OBS_LOGGER_LEVEL, ENV_OBS_LOGS_EXPORT_ENABLED,
     ENV_OBS_METER_INTERVAL, ENV_OBS_METRIC_ENDPOINT, ENV_OBS_METRICS_EXPORT_ENABLED, ENV_OBS_PROFILING_ENDPOINT,
     ENV_OBS_PROFILING_EXPORT_ENABLED, ENV_OBS_SAMPLE_RATIO, ENV_OBS_SERVICE_NAME, ENV_OBS_SERVICE_VERSION, ENV_OBS_TLS_CA_FILE,
@@ -188,14 +190,34 @@ pub struct OtelConfig {
     pub log_keep_files: Option<usize>,
 
     // ── Log cleanup ───────────────────────────────────────────────────────────
-    /// Byte budget for rolled log files, and separately for compressed
-    /// archives (default: 2 GiB); `0` means no budget. The active file is not
-    /// counted.
+    /// Byte budget for rolled log files (and shared with compressed archives
+    /// when `log_max_archive_size_bytes` is unset); default 2 GiB, `0` = no
+    /// budget. The active file is not counted.
     pub log_max_total_size_bytes: Option<u64>,
+    /// Optional separate byte budget for compressed archives (`.gz`/`.zst`).
+    /// When unset, archives share the remaining `log_max_total_size_bytes`
+    /// budget with surviving rolled logs. `Some(0)` removes the archive byte
+    /// cap while keeping retention days active.
+    #[serde(default)]
+    pub log_max_archive_size_bytes: Option<u64>,
     /// Per-file size ceiling (bytes). Unset or unparsable: the active file
     /// rolls at 256 MiB (less under a small byte budget) and the cleaner
     /// applies no per-file trim. `0`: no size roll and no trim.
     pub log_max_single_file_size_bytes: Option<u64>,
+    /// Maximum rolled log files compressed in a single cleanup pass (default:
+    /// `32`; `0` = unlimited). Over-budget files beyond this cap are deleted
+    /// directly without compression so disk usage remains bounded.
+    #[serde(default)]
+    pub log_max_compress_files_per_pass: Option<usize>,
+    /// Global file-sink event rate limit in events/sec (default: `10_000`;
+    /// `0` = unlimited).
+    #[serde(default)]
+    pub log_sink_max_events_per_sec: Option<u64>,
+    /// Per-callsite file-sink event rate limit in events/sec. Unset defaults
+    /// to `(log_sink_max_events_per_sec / 4).max(1)`; `0` disables per-callsite
+    /// isolation while retaining the global sink ceiling.
+    #[serde(default)]
+    pub log_sink_per_callsite_max_events_per_sec: Option<u64>,
     /// Compress eligible files with gzip before deletion (default: `true`).
     pub log_compress_old_files: Option<bool>,
     /// Gzip compression level `1`–`9` (default: `6`).
@@ -347,8 +369,19 @@ impl OtelConfig {
             log_keep_files,
             // Log cleanup
             log_max_total_size_bytes: Some(get_env_u64(ENV_OBS_LOG_MAX_TOTAL_SIZE_BYTES, DEFAULT_OBS_LOG_MAX_TOTAL_SIZE_BYTES)),
+            // Unset stays `None`: archives then share the remaining total budget.
+            log_max_archive_size_bytes: get_env_opt_u64(ENV_OBS_LOG_MAX_ARCHIVE_SIZE_BYTES),
             // Unset stays `None`: the appender and the cleaner default differently.
             log_max_single_file_size_bytes: get_env_opt_u64(ENV_OBS_LOG_MAX_SINGLE_FILE_SIZE_BYTES),
+            log_max_compress_files_per_pass: Some(get_env_usize(
+                ENV_OBS_LOG_MAX_COMPRESS_FILES_PER_PASS,
+                DEFAULT_OBS_LOG_MAX_COMPRESS_FILES_PER_PASS,
+            )),
+            log_sink_max_events_per_sec: Some(get_env_u64(
+                ENV_OBS_LOG_SINK_MAX_EVENTS_PER_SEC,
+                DEFAULT_OBS_LOG_SINK_MAX_EVENTS_PER_SEC,
+            )),
+            log_sink_per_callsite_max_events_per_sec: get_env_opt_u64(ENV_OBS_LOG_SINK_PER_CALLSITE_MAX_EVENTS_PER_SEC),
             log_compress_old_files: Some(get_env_bool(ENV_OBS_LOG_COMPRESS_OLD_FILES, DEFAULT_OBS_LOG_COMPRESS_OLD_FILES)),
             log_gzip_compression_level: Some(get_env_u64(
                 ENV_OBS_LOG_GZIP_COMPRESSION_LEVEL,
@@ -640,6 +673,42 @@ mod tests {
                     Some("/etc/rustfs/otlp-ca.pem")
                 );
             });
+        });
+    }
+
+    #[test]
+    fn log_disk_bounds_and_sink_rate_limit_env_defaults_and_overrides() {
+        with_profiling_env_lock(|| {
+            temp_env::with_vars_unset(
+                [
+                    ENV_OBS_LOG_MAX_ARCHIVE_SIZE_BYTES,
+                    ENV_OBS_LOG_MAX_COMPRESS_FILES_PER_PASS,
+                    ENV_OBS_LOG_SINK_MAX_EVENTS_PER_SEC,
+                    ENV_OBS_LOG_SINK_PER_CALLSITE_MAX_EVENTS_PER_SEC,
+                ],
+                || {
+                    let config = OtelConfig::extract_otel_config_from_env(None);
+                    assert_eq!(config.log_max_archive_size_bytes, None);
+                    assert_eq!(config.log_max_compress_files_per_pass, Some(DEFAULT_OBS_LOG_MAX_COMPRESS_FILES_PER_PASS));
+                    assert_eq!(config.log_sink_max_events_per_sec, Some(DEFAULT_OBS_LOG_SINK_MAX_EVENTS_PER_SEC));
+                    assert_eq!(config.log_sink_per_callsite_max_events_per_sec, None);
+                },
+            );
+            temp_env::with_vars(
+                [
+                    (ENV_OBS_LOG_MAX_ARCHIVE_SIZE_BYTES, Some("4096")),
+                    (ENV_OBS_LOG_MAX_COMPRESS_FILES_PER_PASS, Some("8")),
+                    (ENV_OBS_LOG_SINK_MAX_EVENTS_PER_SEC, Some("500")),
+                    (ENV_OBS_LOG_SINK_PER_CALLSITE_MAX_EVENTS_PER_SEC, Some("100")),
+                ],
+                || {
+                    let config = OtelConfig::extract_otel_config_from_env(None);
+                    assert_eq!(config.log_max_archive_size_bytes, Some(4096));
+                    assert_eq!(config.log_max_compress_files_per_pass, Some(8));
+                    assert_eq!(config.log_sink_max_events_per_sec, Some(500));
+                    assert_eq!(config.log_sink_per_callsite_max_events_per_sec, Some(100));
+                },
+            );
         });
     }
 }

@@ -14938,12 +14938,36 @@ const LOCAL_BATCH_PARALLEL_MIN_SHARD_BYTES: usize = 512 * 1024;
 /// multi-disk topologies. When every window reaches
 /// `LOCAL_BATCH_PARALLEL_MIN_SHARD_BYTES`, each shard gets its own dispatch so
 /// copies and device reads proceed concurrently.
-#[cfg(unix)]
+///
+/// Enforces the process-wide in-flight read memory budget before allocating
+/// shard buffers and binds each permit to the returned [`Bytes`] lifetime.
+#[cfg(all(unix, test))]
 pub(crate) async fn batch_shard_pread(requests: Vec<(std::path::PathBuf, usize, usize)>) -> Vec<Result<Bytes>> {
+    let lengths: Vec<usize> = requests.iter().map(|(_, _, length)| *length).collect();
+    let Some(permits) = crate::set_disk::read_budget::global_in_flight_read_budget().try_reserve_batch(&lengths) else {
+        return (0..requests.len())
+            .map(|_| Err(crate::set_disk::read_budget::in_flight_read_budget_exhausted_error()))
+            .collect();
+    };
+    let permitted = requests
+        .into_iter()
+        .zip(permits)
+        .map(|((path, offset, length), permit)| (path, offset, length, permit))
+        .collect();
+    batch_shard_pread_with_permits(permitted).await
+}
+
+#[cfg(unix)]
+pub(crate) type PermittedShardPreadRequest = (std::path::PathBuf, usize, usize, crate::set_disk::read_budget::ReadMemoryPermit);
+
+/// Positioned reads for local EC shard files with pre-reserved in-flight byte
+/// permits, returned in request order.
+#[cfg(unix)]
+pub(crate) async fn batch_shard_pread_with_permits(requests: Vec<PermittedShardPreadRequest>) -> Vec<Result<Bytes>> {
     if requests.len() < 2
         || requests
             .iter()
-            .any(|(_, _, length)| *length < LOCAL_BATCH_PARALLEL_MIN_SHARD_BYTES)
+            .any(|(_, _, length, _)| *length < LOCAL_BATCH_PARALLEL_MIN_SHARD_BYTES)
     {
         return batch_shard_pread_blocking(requests).await;
     }
@@ -14956,7 +14980,7 @@ pub(crate) async fn batch_shard_pread(requests: Vec<(std::path::PathBuf, usize, 
 
 /// Read every request in turn inside one `spawn_blocking`.
 #[cfg(unix)]
-async fn batch_shard_pread_blocking(requests: Vec<(std::path::PathBuf, usize, usize)>) -> Vec<Result<Bytes>> {
+async fn batch_shard_pread_blocking(requests: Vec<PermittedShardPreadRequest>) -> Vec<Result<Bytes>> {
     let n = requests.len();
     let metrics = rustfs_io_metrics::LocalBatchReadMetrics::capture();
     let submitted = metrics.as_ref().map(|_| std::time::Instant::now());
@@ -14999,7 +15023,7 @@ async fn batch_shard_pread_blocking(requests: Vec<(std::path::PathBuf, usize, us
             metrics.record_batch(n);
         }
         let mut results = Vec::with_capacity(n);
-        for (file_path, offset, length) in requests {
+        for (file_path, offset, length, permit) in requests {
             #[cfg(feature = "diagnostic-local-batch")]
             let _index = results.len();
             let mut total = 0usize;
@@ -15080,7 +15104,7 @@ async fn batch_shard_pread_blocking(requests: Vec<(std::path::PathBuf, usize, us
                         }
                     ))?;
                 }
-                Ok(Bytes::from(buf))
+                Ok(permit.wrap_vec(buf))
             })();
             #[cfg(feature = "diagnostic-local-batch")]
             if let Some(sample) = &diagnostic {
@@ -17315,7 +17339,14 @@ impl DiskAPI for LocalDisk {
         length: usize,
         metrics: Option<MmapCopyStageMetrics>,
     ) -> Result<Bytes> {
-        self.io_backend.pread_bytes(volume, path, offset, length, metrics).await
+        if offset.checked_add(length).is_none() {
+            return self.io_backend.pread_bytes(volume, path, offset, length, metrics).await;
+        }
+        let in_flight_permit = crate::set_disk::read_budget::global_in_flight_read_budget()
+            .try_reserve(length)
+            .ok_or_else(crate::set_disk::read_budget::in_flight_read_budget_exhausted_error)?;
+        let bytes = self.io_backend.pread_bytes(volume, path, offset, length, metrics).await?;
+        Ok(in_flight_permit.wrap_bytes(bytes))
     }
 
     /// List a single directory. `count < 0` enumerates the *whole* directory in

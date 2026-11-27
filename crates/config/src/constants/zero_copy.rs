@@ -86,3 +86,25 @@ pub const ENV_OBJECT_MMAP_READ_MAX_LENGTH: &str = "RUSTFS_OBJECT_MMAP_READ_MAX_L
 /// materialize up to `data_shards x cap` bytes; raising the cap raises that
 /// per-request bound proportionally.
 pub const DEFAULT_OBJECT_MMAP_READ_MAX_LENGTH: usize = 32 * 1024 * 1024;
+
+/// Environment variable capping total process-wide in-flight bytes retained by
+/// buffered local shard reads (both batch positioned reads and mmap-copy reads).
+///
+/// Bounding only individual shard length still allows many concurrent unread or
+/// slow-consumed `GetObject` responses to accumulate unbounded in-memory shard
+/// buffers. When this process-wide budget cannot admit a read, the read falls
+/// back to the bounded streaming reader path; reserved bytes are released on
+/// `Drop` (including reader cancellation).
+///
+/// - Purpose: Bound process-wide heap memory retained by in-memory shard reads
+/// - Acceptable values: byte count as an unsigned integer; `0` disables
+///   in-memory buffered shard reads so every read streams
+/// - Example: `export RUSTFS_OBJECT_MMAP_READ_MAX_INFLIGHT_BYTES=268435456`
+pub const ENV_OBJECT_MMAP_READ_MAX_INFLIGHT_BYTES: &str = "RUSTFS_OBJECT_MMAP_READ_MAX_INFLIGHT_BYTES";
+
+/// Default process-wide in-flight byte budget for buffered shard reads: 256 MiB.
+///
+/// Large enough to keep the fast in-memory path active for concurrent typical
+/// reads (including multiple full 32 MiB/shard reads) while placing a strict
+/// process-wide ceiling on unread in-memory shard allocations.
+pub const DEFAULT_OBJECT_MMAP_READ_MAX_INFLIGHT_BYTES: usize = 256 * 1024 * 1024;
