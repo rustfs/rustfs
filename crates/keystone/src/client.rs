@@ -175,6 +175,7 @@ impl KeystoneClient {
         let client = Client::builder()
             .danger_accept_invalid_certs(!verify_ssl)
             .redirect(reqwest::redirect::Policy::none())
+            .no_proxy()
             .dns_resolver(dns_resolver)
             .timeout(timeout)
             .build()
@@ -729,7 +730,7 @@ mod tests {
                 .expect("write redirect");
         });
 
-        let mut client = KeystoneClient::try_new_with_resolver(
+        let client = KeystoneClient::try_new_with_resolver(
             endpoint,
             KeystoneVersion::V3,
             None,
@@ -738,16 +739,9 @@ mod tests {
             "Default".to_string(),
             true,
             std::time::Duration::from_secs(2),
-            resolver.clone(),
+            resolver,
         )
         .expect("keystone client should build");
-        client.client = Client::builder()
-            .no_proxy()
-            .redirect(reqwest::redirect::Policy::none())
-            .dns_resolver(resolver)
-            .timeout(std::time::Duration::from_secs(2))
-            .build()
-            .expect("test client");
 
         // Redirect response must be treated as non-success auth failure, never followed.
         let redirect_err = client

@@ -75,15 +75,29 @@ fn build_oidc_http_client_rejects_forbidden_targets_without_allowlist() {
         "public https endpoint should build"
     );
 }
-#[test]
-fn test_should_bypass_proxy_for_oidc_uri_loopback_only() {
-    assert!(should_bypass_proxy_for_oidc_uri("http://127.0.0.1:9000/.well-known/openid-configuration"));
-    assert!(should_bypass_proxy_for_oidc_uri("http://localhost:9000/.well-known/openid-configuration"));
-    assert!(should_bypass_proxy_for_oidc_uri("http://[::1]:9000/.well-known/openid-configuration"));
-    assert!(!should_bypass_proxy_for_oidc_uri(
-        "https://idp.example.com/.well-known/openid-configuration"
-    ));
-    assert!(!should_bypass_proxy_for_oidc_uri("not-a-url"));
+#[tokio::test]
+async fn oidc_resolves_the_provider_directly_with_an_environment_proxy() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind proxy listener");
+    let proxy = format!("http://{}", listener.local_addr().expect("proxy address"));
+    temp_env::async_with_vars(
+        [
+            ("HTTPS_PROXY", Some(proxy.as_str())),
+            ("https_proxy", Some(proxy.as_str())),
+            ("NO_PROXY", None),
+            ("no_proxy", None),
+        ],
+        async {
+            let (client, url) = build_oidc_http_client("https://provider.invalid", Some(&OutboundPolicy::default()), &[], None)
+                .expect("build the provider client");
+            tokio::select! {
+                result = client.get(url).send() => assert!(result.expect_err("reserved .invalid domain").is_connect()),
+                _ = listener.accept() => panic!("OIDC connected to the environment proxy"),
+            }
+        },
+    )
+    .await;
 }
 #[test]
 fn build_oidc_http_client_honors_explicit_allowlist_for_loopback() {

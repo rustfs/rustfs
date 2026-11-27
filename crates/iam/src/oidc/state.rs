@@ -41,6 +41,7 @@ pub(super) struct OidcAuthSession {
 pub(super) struct OidcLogoutSession {
     pub(super) provider_id: String,
     pub(super) id_token: String,
+    pub(super) callback_origin: url::Origin,
 }
 
 /// TTL cache for OIDC auth state (PKCE verifiers + nonces) during the authorization flow.
@@ -252,6 +253,7 @@ mod tests {
         let session = OidcLogoutSession {
             provider_id: "corp".to_string(),
             id_token: "jwt-token".to_string(),
+            callback_origin: url::Url::parse("https://console.example.test/callback").unwrap().origin(),
         };
 
         for i in 0..OIDC_STATE_CAPACITY {
@@ -366,6 +368,7 @@ mod tests {
         let session = OidcLogoutSession {
             provider_id: "okta".to_string(),
             id_token: "jwt-token".to_string(),
+            callback_origin: url::Url::parse("https://console.example.test/callback").unwrap().origin(),
         };
 
         store.insert_logout("logout_abc".to_string(), session.clone()).await;

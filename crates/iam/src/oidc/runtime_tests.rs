@@ -231,6 +231,8 @@ async fn assert_complete_console_login(initially_unavailable: bool) {
             };
             let mut config = build_mocked_oidc_provider_config("console", &format!("{base}/.well-known/openid-configuration"));
             config.hide_from_ui = hidden;
+            config.redirect_uri = None;
+            config.redirect_uri_dynamic = true;
             config.claim_name = "groups".into();
             config.claim_prefix = "team/".into();
             config.issuer = explicit.then(|| issuer.clone());
@@ -288,6 +290,7 @@ async fn assert_complete_console_login(initially_unavailable: bool) {
                             serde_json::json!({
                                 "issuer": issuer, "authorization_endpoint": format!("{server_base}/authorize"),
                                 "token_endpoint": format!("{server_base}/token"), "jwks_uri": format!("{server_base}/jwks"),
+                                "end_session_endpoint": format!("{server_base}/logout"),
                                 "response_types_supported": ["code"], "subject_types_supported": ["public"],
                                 "id_token_signing_alg_values_supported": ["ES256"]
                             })
@@ -395,7 +398,16 @@ async fn assert_complete_console_login(initially_unavailable: bool) {
                 .exchange_identity("console", &state, "test-authorization-code", redirect)
                 .await
                 .unwrap_or_else(|err| panic!("hidden={hidden}, explicit={explicit}: {err}"));
-            let (identity, redirect_after, _) = exchange.into_parts();
+            let (identity, redirect_after, continuation) = exchange.into_parts();
+            let logout_token = adapter.create_logout_token(continuation).await.expect("logout token");
+            let logout = adapter
+                .build_logout_url(&logout_token, "/console/login")
+                .await
+                .unwrap()
+                .expect("end-session URL");
+            let logout = Url::parse(&logout).unwrap();
+            let logout_params: HashMap<_, _> = logout.query_pairs().into_owned().collect();
+            assert_eq!(logout_params["post_logout_redirect_uri"], "https://console.example.com/console/login");
             assert_eq!(identity.source_groups(), ["readwrite"]);
             let authorization = mapper.map(identity);
             assert_eq!(authorization.provider_id(), "console");
@@ -1046,29 +1058,17 @@ async fn userinfo_request_is_bound_by_outbound_policy() {
 }
 
 #[test]
-fn resolve_post_logout_redirect_uri_resolves_relative_against_configured_origin_and_blocks_protocol_relative() {
+fn resolve_post_logout_redirect_uri_uses_login_origin_and_rejects_protocol_relative_paths() {
+    let origin = Url::parse("https://console.example.test/callback").unwrap().origin();
     assert_eq!(
-        resolve_post_logout_redirect_uri(
-            Some("https://console.example.test:9001/rustfs/admin/v3/oidc/callback"),
-            "/rustfs/console/auth/login",
-        ),
-        Some("https://console.example.test:9001/rustfs/console/auth/login".to_string())
+        resolve_post_logout_redirect_uri(&origin, "/console/login").as_deref(),
+        Some("https://console.example.test/console/login")
     );
-    assert_eq!(resolve_post_logout_redirect_uri(None, "/rustfs/console/auth/login"), None);
+    assert_eq!(resolve_post_logout_redirect_uri(&origin, "//other.example.test/login"), None);
+    assert_eq!(resolve_post_logout_redirect_uri(&origin, "  "), None);
     assert_eq!(
-        resolve_post_logout_redirect_uri(
-            Some("https://console.example.test/rustfs/admin/v3/oidc/callback"),
-            "//evil.example/login",
-        ),
-        None
-    );
-    assert_eq!(
-        resolve_post_logout_redirect_uri(Some("https://console.example.test/callback"), "   "),
-        None
-    );
-    assert_eq!(
-        resolve_post_logout_redirect_uri(None, "https://browser.example.test/rustfs/console/auth/login"),
-        Some("https://browser.example.test/rustfs/console/auth/login".to_string())
+        resolve_post_logout_redirect_uri(&origin, "https://browser.example.test/login").as_deref(),
+        Some("https://browser.example.test/login")
     );
 }
 

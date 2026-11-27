@@ -216,6 +216,25 @@ impl OutboundPolicy {
         self.resolver_for_storage_endpoint(url, false, false)
     }
 
+    /// Virtual-hosted S3 requests may connect to the endpoint or its bucket subdomain.
+    /// Each needs its own exact origin allowance to use restricted addresses.
+    pub fn resolver_for_virtual_bucket(&self, endpoint: &Url, bucket: &str) -> Result<OutboundDnsResolver, OutboundPolicyError> {
+        let mut resolver = self.resolver_for(endpoint)?;
+        let host = format!("{bucket}.{}", endpoint.host_str().ok_or(OutboundPolicyError::MissingHost)?);
+        let mut target = endpoint.clone();
+        target.set_host(Some(&host)).map_err(|_| OutboundPolicyError::ForbiddenHost {
+            host,
+            reason: "invalid tier bucket hostname",
+        })?;
+        self.validate_url(&target)?;
+        if self.allows_restricted_origin(&target) {
+            resolver
+                .allowed_restricted_hosts
+                .push(normalized_host(&target).ok_or(OutboundPolicyError::MissingHost)?);
+        }
+        Ok(resolver)
+    }
+
     /// Validate an outbound URL and construct a connection-time DNS resolver that allows
     /// non-metadata private storage endpoints while still blocking loopback, link-local,
     /// metadata, unspecified, shared, and special-use addresses (including via DNS rebinding).
@@ -231,8 +250,8 @@ impl OutboundPolicy {
         allow_private: bool,
         allow_loopback: bool,
     ) -> Result<OutboundDnsResolver, OutboundPolicyError> {
-        self.validate_storage_url(url, allow_private, allow_loopback)?;
         let host = normalized_host(url).ok_or(OutboundPolicyError::MissingHost)?;
+        self.validate_storage_url(url, allow_private, allow_loopback)?;
         Ok(OutboundDnsResolver::with_options(
             host,
             self.allows_restricted_origin(url),
@@ -272,7 +291,7 @@ type CustomDnsLookup = Arc<dyn Fn(&str) -> Option<Vec<SocketAddr>> + Send + Sync
 
 #[derive(Clone)]
 pub struct OutboundDnsResolver {
-    allowed_restricted_host: Option<String>,
+    allowed_restricted_hosts: Vec<String>,
     allow_private: bool,
     allow_loopback_host: Option<String>,
     custom_lookup: Option<CustomDnsLookup>,
@@ -283,7 +302,7 @@ pub struct OutboundDnsResolver {
 impl fmt::Debug for OutboundDnsResolver {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("OutboundDnsResolver")
-            .field("allowed_restricted_host", &self.allowed_restricted_host)
+            .field("allowed_restricted_hosts", &self.allowed_restricted_hosts)
             .field("allow_private", &self.allow_private)
             .field("allow_loopback_host", &self.allow_loopback_host)
             .field("has_custom_lookup", &self.custom_lookup.is_some())
@@ -297,7 +316,7 @@ type DnsOverrideAnswers = Arc<Mutex<HashMap<String, VecDeque<Vec<SocketAddr>>>>>
 impl OutboundDnsResolver {
     fn with_options(host: String, allow_restricted: bool, allow_private: bool, allow_loopback: bool) -> Self {
         Self {
-            allowed_restricted_host: allow_restricted.then(|| host.clone()),
+            allowed_restricted_hosts: allow_restricted.then(|| host.clone()).into_iter().collect(),
             allow_private,
             allow_loopback_host: allow_loopback.then_some(host),
             custom_lookup: None,
@@ -346,7 +365,7 @@ impl OutboundDnsResolver {
             ));
         }
 
-        let allow_restricted = self.allowed_restricted_host.as_deref() == Some(normalized_host.as_str());
+        let allow_restricted = self.allowed_restricted_hosts.contains(&normalized_host);
         let allow_loopback = self.allow_loopback_host.as_deref() == Some(normalized_host.as_str());
         let allow_private = self.allow_private;
         let mut allow_origin_can_recover = false;
@@ -729,6 +748,36 @@ mod tests {
     use std::collections::HashMap;
     use std::net::SocketAddr;
     use url::Url;
+
+    #[test]
+    fn virtual_bucket_dns_checks_the_exact_origin_for_private_addresses() {
+        let endpoint = Url::parse("https://oss.example.test:8443").unwrap();
+        let policy = OutboundPolicy::from_allowed_origins(
+            "https://oss.example.test:8443,https://archive.oss.example.test:8443,https://other.oss.example.test:443",
+        )
+        .unwrap();
+        let private = vec!["10.10.0.8:0".parse::<SocketAddr>().unwrap()];
+        for (bucket, allowed) in [("archive", true), ("other", false)] {
+            let resolver = policy.resolver_for_virtual_bucket(&endpoint, bucket).unwrap();
+            assert_eq!(
+                resolver
+                    .filter_resolved_addresses("oss.example.test", private.clone())
+                    .unwrap(),
+                private
+            );
+            assert_eq!(
+                resolver
+                    .filter_resolved_addresses(&format!("{bucket}.oss.example.test"), private.clone())
+                    .is_ok(),
+                allowed
+            );
+            assert!(
+                resolver
+                    .filter_resolved_addresses("unlisted.oss.example.test", private.clone())
+                    .is_err()
+            );
+        }
+    }
 
     #[test]
     fn validate_outbound_url_allows_public_hostname() {

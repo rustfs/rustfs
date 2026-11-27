@@ -130,6 +130,7 @@ impl WarmBackendAzureBlob {
         let client = reqwest::Client::builder()
             .connect_timeout(timeouts.connect_timeout)
             .read_timeout(timeouts.response_body_idle_timeout)
+            .no_proxy()
             .dns_resolver(dns_resolver)
             .redirect(reqwest::redirect::Policy::none())
             .retry(reqwest::retry::never())

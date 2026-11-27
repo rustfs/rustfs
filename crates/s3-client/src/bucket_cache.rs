@@ -62,7 +62,7 @@ impl BucketLocationCache {
     }
 }
 
-impl TransitionClient {
+impl<C: crate::transition_api::TransitionConnector> TransitionClient<C> {
     pub async fn get_bucket_location(&self, bucket_name: &str) -> Result<String, std::io::Error> {
         Ok(self.get_bucket_location_inner(bucket_name).await?)
     }
@@ -196,8 +196,8 @@ impl TransitionClient {
     }
 }
 
-async fn process_bucket_location_response(
-    client: &TransitionClient,
+async fn process_bucket_location_response<C: crate::transition_api::TransitionConnector>(
+    client: &TransitionClient<C>,
     mut resp: http::Response<Incoming>,
     bucket_name: &str,
     tier_type: &str,

@@ -76,7 +76,7 @@ impl NativeHttp {
         }
         validate_remote_endpoint(&endpoint).map_err(RemoteS3ClientError::EndpointNotAllowed)?;
         let dns_resolver = build_remote_endpoint_dns_resolver(&endpoint)?;
-        Self::new_with_resolver(endpoint, timeouts, skip_tls_verify, ca_cert_pem, dns_resolver, false)
+        Self::new_with_resolver(endpoint, timeouts, skip_tls_verify, ca_cert_pem, dns_resolver)
     }
 
     fn new_with_resolver(
@@ -85,17 +85,14 @@ impl NativeHttp {
         skip_tls_verify: bool,
         ca_cert_pem: Option<&str>,
         dns_resolver: OutboundDnsResolver,
-        bypass_proxy: bool,
     ) -> Result<Self, RemoteS3ClientError> {
         let mut builder = reqwest::Client::builder()
             .connect_timeout(timeouts.connect)
             .read_timeout(timeouts.read)
+            .no_proxy()
             .dns_resolver(dns_resolver)
             .redirect(reqwest::redirect::Policy::none())
             .user_agent(USER_AGENT_SUFFIX);
-        if bypass_proxy {
-            builder = builder.no_proxy();
-        }
         if skip_tls_verify {
             builder = builder.danger_accept_invalid_certs(true);
         } else if let Some(pem) = ca_cert_pem.map(str::trim).filter(|pem| !pem.is_empty()) {
@@ -543,7 +540,7 @@ mod tests {
             .expect("hostname should pass URL validation")
             .with_resolve_override(move |host| (host == "rebind-native.test").then(|| vec![SocketAddr::new(address.ip(), 0)]));
         let no_loopback_http =
-            NativeHttp::new_with_resolver(endpoint.clone(), SourceTimeouts::default(), false, None, no_loopback_resolver, true)
+            NativeHttp::new_with_resolver(endpoint.clone(), SourceTimeouts::default(), false, None, no_loopback_resolver)
                 .expect("native http client should build");
         let req = no_loopback_http
             .client
@@ -587,9 +584,8 @@ mod tests {
                 .expect("write response");
         });
 
-        let rebinding_http =
-            NativeHttp::new_with_resolver(endpoint, SourceTimeouts::default(), false, None, rebinding_resolver, true)
-                .expect("rebinding native http client should build");
+        let rebinding_http = NativeHttp::new_with_resolver(endpoint, SourceTimeouts::default(), false, None, rebinding_resolver)
+            .expect("rebinding native http client should build");
         let req1 = rebinding_http
             .client
             .get(rebinding_http.url(["probe"]).expect("probe url"))

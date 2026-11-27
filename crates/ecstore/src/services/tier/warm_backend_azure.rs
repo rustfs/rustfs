@@ -107,7 +107,7 @@ mod tests {
     use crate::services::tier::tier_config::TierAzure;
     use rustfs_s3_client::{
         credentials::{Credentials, SignatureType, Static, Value},
-        transition_api::{Options, TransitionClient, TransitionCore},
+        transition_api::{Options, TransitionCore},
     };
     use std::sync::Arc;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -174,7 +174,7 @@ mod tests {
             (get_request, delete_request)
         });
         let client = Arc::new(
-            TransitionClient::new(
+            super::super::warm_backend::fixture_transition_client(
                 &endpoint,
                 Options {
                     creds: Credentials::new(Static(Value {

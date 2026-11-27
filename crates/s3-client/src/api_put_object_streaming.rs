@@ -81,7 +81,7 @@ async fn read_multipart_part(reader: &mut ReaderImpl, want: usize) -> Result<Vec
     }
 }
 
-impl TransitionClient {
+impl<C: crate::transition_api::TransitionConnector> TransitionClient<C> {
     pub async fn put_object_multipart_stream(
         self: Arc<Self>,
         bucket_name: &str,

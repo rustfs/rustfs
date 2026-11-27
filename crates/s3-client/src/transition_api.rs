@@ -48,10 +48,7 @@ use hyper::body::Incoming;
 use hyper_rustls::{ConfigBuilderExt, HttpsConnector};
 use hyper_util::{
     client::legacy::Client,
-    client::legacy::connect::{
-        HttpConnector,
-        dns::{GaiAddrs, GaiResolver, Name as HyperDnsName},
-    },
+    client::legacy::connect::{HttpConnector, dns::Name as HyperDnsName},
     rt::TokioExecutor,
 };
 use md5::Digest;
@@ -133,65 +130,27 @@ fn transition_transport_error(err: hyper_util::client::legacy::Error) -> std::io
 }
 
 #[derive(Clone, Debug)]
-pub enum OutboundHyperDnsResolver {
-    Enforced(OutboundDnsResolver),
-    Passthrough(GaiResolver),
-}
-
-impl OutboundHyperDnsResolver {
-    fn new(resolver: Option<OutboundDnsResolver>) -> Self {
-        match resolver {
-            Some(resolver) => Self::Enforced(resolver),
-            None => Self::Passthrough(GaiResolver::new()),
-        }
-    }
-}
-
-pub enum OutboundHyperAddrs {
-    Enforced(std::vec::IntoIter<std::net::SocketAddr>),
-    Passthrough(GaiAddrs),
-}
-
-impl Iterator for OutboundHyperAddrs {
-    type Item = std::net::SocketAddr;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        match self {
-            Self::Enforced(iter) => iter.next(),
-            Self::Passthrough(iter) => iter.next(),
-        }
-    }
-}
+pub struct OutboundHyperDnsResolver(OutboundDnsResolver);
 
 impl tower::Service<HyperDnsName> for OutboundHyperDnsResolver {
-    type Response = OutboundHyperAddrs;
+    type Response = std::vec::IntoIter<std::net::SocketAddr>;
     type Error = std::io::Error;
     type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
 
-    fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
-        match self {
-            Self::Enforced(_) => Poll::Ready(Ok(())),
-            Self::Passthrough(gai) => gai.poll_ready(cx),
-        }
+    fn poll_ready(&mut self, _: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        Poll::Ready(Ok(()))
     }
 
     fn call(&mut self, name: HyperDnsName) -> Self::Future {
-        match self {
-            Self::Enforced(resolver) => {
-                let resolver = resolver.clone();
-                let host = name.as_str().to_string();
-                Box::pin(async move {
-                    let addrs = resolver.resolve_host(&host).await?;
-                    Ok(OutboundHyperAddrs::Enforced(addrs.into_iter()))
-                })
-            }
-            Self::Passthrough(gai) => {
-                let fut = gai.call(name);
-                Box::pin(async move { fut.await.map(OutboundHyperAddrs::Passthrough) })
-            }
-        }
+        let resolver = self.0.clone();
+        Box::pin(async move { Ok(resolver.resolve_host(name.as_str()).await?.into_iter()) })
     }
 }
+
+pub type TierConnector = HttpsConnector<HttpConnector<OutboundHyperDnsResolver>>;
+
+pub trait TransitionConnector: hyper_util::client::legacy::connect::Connect + Clone + Send + Sync + 'static {}
+impl<C: hyper_util::client::legacy::connect::Connect + Clone + Send + Sync + 'static> TransitionConnector for C {}
 
 fn is_retryable_transport_error(error: &std::io::Error) -> bool {
     // Hyper wraps connection and body errors; the outer io::Error is often Other.
@@ -372,12 +331,12 @@ pub enum ReaderImpl {
 pub type ReadCloser = ObjectReader;
 
 #[derive(Debug)]
-pub struct TransitionClient {
+pub struct TransitionClient<C = HttpsConnector<HttpConnector>> {
     pub endpoint_url: Url,
     pub creds_provider: Arc<Mutex<Credentials<Static>>>,
     pub override_signer_type: SignatureType,
     pub secure: bool,
-    pub http_client: Client<HttpsConnector<HttpConnector<OutboundHyperDnsResolver>>, rustfs_s3_types::Body>,
+    pub http_client: Client<C, rustfs_s3_types::Body>,
     pub bucket_loc_cache: Arc<Mutex<BucketLocationCache>>,
     pub is_trace_enabled: Arc<Mutex<bool>>,
     pub trace_errors_only: Arc<Mutex<bool>>,
@@ -460,7 +419,6 @@ pub struct Options {
     pub custom_md5: Option<HashAlgorithm>,
     pub custom_sha256: Option<HashAlgorithm>,
     pub max_retries: i64,
-    pub dns_resolver: Option<OutboundDnsResolver>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -541,7 +499,7 @@ async fn build_tls_config() -> Result<rustls::ClientConfig, std::io::Error> {
 
 impl TransitionClient {
     pub async fn new(endpoint: &str, opts: Options, tier_type: &str) -> Result<TransitionClient, std::io::Error> {
-        Self::private_new(endpoint, opts, tier_type, TransitionClientTimeouts::default()).await
+        Self::new_with_timeouts(endpoint, opts, tier_type, TransitionClientTimeouts::default()).await
     }
 
     /// Builds a transition client with explicit transport timeout budgets.
@@ -554,15 +512,39 @@ impl TransitionClient {
         tier_type: &str,
         timeouts: TransitionClientTimeouts,
     ) -> Result<TransitionClient, std::io::Error> {
-        Self::private_new(endpoint, opts, tier_type, timeouts).await
+        Self::from_connector(endpoint, opts, tier_type, timeouts, HttpConnector::new()).await
     }
 
-    async fn private_new(
+    /// Build a tier client whose connector filters DNS answers on every connection.
+    pub async fn new_with_dns_resolver(
         endpoint: &str,
         opts: Options,
         tier_type: &str,
         timeouts: TransitionClientTimeouts,
-    ) -> Result<TransitionClient, std::io::Error> {
+        resolver: OutboundDnsResolver,
+    ) -> std::io::Result<TransitionClient<TierConnector>> {
+        TransitionClient::from_connector(
+            endpoint,
+            opts,
+            tier_type,
+            timeouts,
+            HttpConnector::new_with_resolver(OutboundHyperDnsResolver(resolver)),
+        )
+        .await
+    }
+}
+
+impl<R> TransitionClient<HttpsConnector<HttpConnector<R>>>
+where
+    HttpsConnector<HttpConnector<R>>: TransitionConnector,
+{
+    async fn from_connector(
+        endpoint: &str,
+        opts: Options,
+        tier_type: &str,
+        timeouts: TransitionClientTimeouts,
+        mut http: HttpConnector<R>,
+    ) -> Result<Self, std::io::Error> {
         rustfs_tls_runtime::ensure_crypto_provider().map_err(std::io::Error::other)?;
 
         let endpoint_url = get_endpoint_url(endpoint, opts.secure)?;
@@ -570,7 +552,6 @@ impl TransitionClient {
 
         let tls = build_tls_config().await?;
 
-        let mut http = HttpConnector::new_with_resolver(OutboundHyperDnsResolver::new(opts.dns_resolver));
         http.enforce_http(false);
         http.set_connect_timeout(Some(timeouts.connect_timeout));
         let https = hyper_rustls::HttpsConnectorBuilder::new()
@@ -624,7 +605,9 @@ impl TransitionClient {
 
         Ok(client)
     }
+}
 
+impl<C: TransitionConnector> TransitionClient<C> {
     #[allow(
         dead_code,
         reason = "MinIO-parity transition client surface with no caller in this port (backlog#1823)"
@@ -1223,14 +1206,16 @@ pub struct RequestMetadata {
     pub trailer: HeaderMap,
 }
 
-pub struct TransitionCore(pub Arc<TransitionClient>);
+pub struct TransitionCore<C = HttpsConnector<HttpConnector>>(pub Arc<TransitionClient<C>>);
 
 impl TransitionCore {
     pub async fn new(endpoint: &str, opts: Options) -> Result<Self, std::io::Error> {
         let client = TransitionClient::new(endpoint, opts, "").await?;
         Ok(Self(Arc::new(client)))
     }
+}
 
+impl<C: TransitionConnector> TransitionCore<C> {
     pub fn list_objects(
         &self,
         bucket: &str,
@@ -2169,15 +2154,15 @@ mod tests {
                 .expect("write response");
         });
 
-        let client = super::TransitionClient::new_with_timeouts(
+        let client = super::TransitionClient::new_with_dns_resolver(
             &endpoint,
             super::Options {
                 secure: false,
-                dns_resolver: Some(resolver),
                 ..Default::default()
             },
             "s3",
             super::TransitionClientTimeouts::new(StdDuration::from_secs(2), StdDuration::from_secs(2), StdDuration::from_secs(2)),
+            resolver,
         )
         .await
         .expect("transition client should build");

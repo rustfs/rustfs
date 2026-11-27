@@ -288,7 +288,11 @@ async fn recovery_preserves_ready_provider_and_inflight_sessions() {
         .into_owned()
         .collect();
     let logout = sys
-        .create_logout_token("ready", "verified-id-token")
+        .create_logout_token(
+            "ready",
+            "verified-id-token",
+            url::Url::parse("https://console.example.com/callback").unwrap().origin(),
+        )
         .await
         .expect("retain logout continuation");
     let discovered_at = sys

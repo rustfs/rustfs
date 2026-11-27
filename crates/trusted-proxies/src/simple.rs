@@ -314,18 +314,15 @@ fn resolve_client_info_with_proxies(
         return ClientInfo::direct(peer_addr);
     }
 
-    match forwarded_client_ip(headers) {
-        Some(real_ip) if is_usable_ip(real_ip) && real_ip != peer_addr.ip() => ClientInfo::from_trusted_proxy(
-            real_ip,
-            forwarded_host(headers),
-            forwarded_proto(headers),
-            peer_addr.ip(),
-            1,
-            ValidationMode::Lenient,
-            Vec::new(),
-        ),
-        _ => ClientInfo::direct(peer_addr),
+    let real_ip = forwarded_client_ip(headers)
+        .filter(|ip| is_usable_ip(*ip))
+        .unwrap_or(peer_addr.ip());
+    let host = forwarded_host(headers);
+    let proto = forwarded_proto(headers);
+    if real_ip == peer_addr.ip() && host.is_none() && proto.is_none() {
+        return ClientInfo::direct(peer_addr);
     }
+    ClientInfo::from_trusted_proxy(real_ip, host, proto, peer_addr.ip(), 1, ValidationMode::Lenient, Vec::new())
 }
 
 fn forwarded_client_ip(headers: &HeaderMap) -> Option<IpAddr> {
@@ -555,6 +552,22 @@ mod tests {
         assert!(!outside.is_from_trusted_proxy);
         assert_eq!(outside.forwarded_host, None);
         assert_eq!(outside.forwarded_proto, None);
+    }
+
+    #[test]
+    fn trusted_tls_terminator_can_forward_origin_without_client_ip() {
+        let mut headers = HeaderMap::new();
+        headers.insert(HEADER_X_FORWARDED_PROTO, HeaderValue::from_static("https"));
+        headers.insert(HEADER_X_FORWARDED_HOST, HeaderValue::from_static("console.example.test"));
+        let proxies = vec![TrustedProxy::Single(IpAddr::from([10, 0, 0, 5]))];
+        for (last, trusted) in [(5, true), (6, false)] {
+            let peer = SocketAddr::from(([10, 0, 0, last], 9000));
+            let info = resolve_client_info_with_proxies(Some(peer), &headers, &proxies);
+            assert_eq!(info.real_ip, peer.ip());
+            assert_eq!(info.is_from_trusted_proxy, trusted);
+            assert_eq!(info.forwarded_proto.as_deref(), trusted.then_some("https"));
+            assert_eq!(info.forwarded_host.as_deref(), trusted.then_some("console.example.test"));
+        }
     }
 
     #[test]

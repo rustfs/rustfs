@@ -3358,6 +3358,107 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn rolling_back_one_peer_requires_the_pinned_caller_to_restart() {
+        use bytes::Bytes;
+        use http_body_util::Full;
+        use hyper::{server::conn::http1, service::service_fn};
+        use hyper_util::rt::TokioIo;
+
+        crate::runtime::sources::ensure_test_rpc_secret();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let peer = endpoint.clone();
+        let server = tokio::spawn(async move {
+            for signed in [false, true, false, false, false] {
+                let (socket, _) = listener.accept().await.unwrap();
+                let peer = peer.clone();
+                let service = service_fn(move |request: http::Request<hyper::body::Incoming>| {
+                    let mut response = http::Response::builder();
+                    let body = if signed {
+                        let url = format!("{peer}{}", request.uri());
+                        let parsed = url::Url::parse(&url).unwrap();
+                        let nonce = parsed
+                            .query_pairs()
+                            .find(|(key, _)| key == STREAM_RESPONSE_AUTH_NONCE_QUERY)
+                            .unwrap()
+                            .1
+                            .parse()
+                            .unwrap();
+                        response = response.header(STREAM_RESPONSE_AUTH_HEADER, STREAM_RESPONSE_AUTH_V1);
+                        let digest = Sha256::digest([]).into();
+                        Bytes::copy_from_slice(
+                            &crate::cluster::rpc::encode_stream_auth_eof_frame(
+                                StreamResponseAuthDomain::ReadFileStream,
+                                &url,
+                                request.method(),
+                                nonce,
+                                0,
+                                0,
+                                &digest,
+                            )
+                            .unwrap(),
+                        )
+                    } else {
+                        Bytes::new()
+                    };
+                    async move { Ok::<_, std::convert::Infallible>(response.body(Full::new(body)).unwrap()) }
+                });
+                http1::Builder::new()
+                    .keep_alive(false)
+                    .serve_connection(TokioIo::new(socket), service)
+                    .await
+                    .unwrap();
+            }
+        });
+        let transport = TcpHttpInternodeDataTransport;
+        let read = || ReadStreamRequest {
+            endpoint: endpoint.clone(),
+            disk: "disk-a".into(),
+            volume: "bucket".into(),
+            path: "part.1".into(),
+            offset: 0,
+            length: 0,
+            stall_timeout: Some(Duration::from_secs(2)),
+        };
+        let walk = || WalkDirStreamRequest {
+            endpoint: endpoint.clone(),
+            disk: "disk-a".into(),
+            body: b"{}".to_vec(),
+            stall_timeout: Some(Duration::from_secs(2)),
+        };
+        tokio::time::timeout(Duration::from_secs(10), async {
+            for _ in 0..2 {
+                let mut reader = transport.open_read(read()).await.unwrap();
+                assert_eq!(reader.read_to_end(&mut Vec::new()).await.unwrap(), 0);
+            }
+            let read_error = transport
+                .open_read(read())
+                .await
+                .err()
+                .expect("rolled-back reads must fail on the pinned caller");
+            let walk_error = transport
+                .open_walk_dir(walk())
+                .await
+                .err()
+                .expect("rolled-back walks must fail on the pinned caller");
+            for error in [read_error, walk_error] {
+                assert!(error.to_string().contains("downgraded"), "{error}");
+            }
+            // A caller restart clears its in-memory peer pins.
+            assert!(
+                STREAM_AUTH_PINNED_ENDPOINTS
+                    .write()
+                    .remove(&normalize_stream_auth_endpoint(&endpoint))
+            );
+            let mut reader = transport.open_walk_dir(walk()).await.unwrap();
+            assert_eq!(reader.read_to_end(&mut Vec::new()).await.unwrap(), 0);
+            server.await.unwrap();
+        })
+        .await
+        .expect("rolling peer fixture must finish");
+    }
+
+    #[tokio::test]
     async fn stream_response_auth_pins_peer_only_after_crypto_verification_and_blocks_downgrade() {
         use crate::cluster::rpc::encode_stream_auth_eof_frame;
         use std::io::Cursor;

@@ -693,9 +693,7 @@ fn outbound_policy_error_to_remote_client_error(err: OutboundPolicyError) -> Rem
 /// Build a connection-time DNS egress resolver for an operator-configured remote
 /// storage endpoint (replication target or on-demand migration source).
 pub fn build_remote_endpoint_dns_resolver(url: &Url) -> Result<OutboundDnsResolver, RemoteS3ClientError> {
-    let policy = OutboundPolicy::from_env_cached()
-        .map_err(|err| RemoteS3ClientError::InvalidEndpoint(format!("invalid outbound policy: {err}")))?;
-    policy
+    OutboundPolicy::default()
         .resolver_for_storage_endpoint(url, true, loopback_replication_targets_allowed())
         .map_err(outbound_policy_error_to_remote_client_error)
 }
@@ -1430,6 +1428,30 @@ mod tests {
         assert!(
             headers.iter().any(|(k, _)| k.eq_ignore_ascii_case("authorization")),
             "request must still be signed"
+        );
+    }
+
+    #[test]
+    fn storage_dns_keeps_the_replication_loopback_setting_independent() {
+        let host = "storage.example.test";
+        let origin = "https://storage.example.test";
+        temp_env::with_vars(
+            [
+                ("RUSTFS_OUTBOUND_ALLOW_ORIGINS", Some(origin)),
+                (ALLOW_LOOPBACK_REPLICATION_TARGET_ENV, Some("false")),
+            ],
+            || {
+                let url = Url::parse(origin).expect("storage origin");
+                let resolver = build_remote_endpoint_dns_resolver(&url).expect("valid storage hostname");
+                let loopback = "127.0.0.1:443".parse().expect("loopback socket address");
+                assert_eq!(
+                    resolver
+                        .filter_resolved_addresses(host, vec![loopback])
+                        .expect_err("replication loopback is disabled")
+                        .kind(),
+                    std::io::ErrorKind::PermissionDenied
+                );
+            },
         );
     }
 

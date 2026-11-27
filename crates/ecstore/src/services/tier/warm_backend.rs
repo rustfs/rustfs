@@ -326,14 +326,20 @@ pub(crate) enum TierEndpointPolicy {
 impl TierEndpointPolicy {
     pub(crate) fn build_resolver(
         self,
-        policy: &OutboundPolicy,
         url: &url::Url,
+        virtual_bucket: Option<&str>,
     ) -> Result<rustfs_utils::egress::OutboundDnsResolver, rustfs_utils::egress::OutboundPolicyError> {
         match self {
-            Self::PublicOnly => policy.resolver_for(url),
-            Self::AllowPrivate => policy.resolver_for_allow_private(url),
+            Self::PublicOnly => {
+                let policy = OutboundPolicy::from_env_cached()?;
+                match virtual_bucket {
+                    Some(bucket) => policy.resolver_for_virtual_bucket(url, bucket),
+                    None => policy.resolver_for(url),
+                }
+            }
+            Self::AllowPrivate => OutboundPolicy::default().resolver_for_allow_private(url),
             Self::AllowPrivateAndDebugLoopback { allow_loopback } => {
-                policy.resolver_for_storage_endpoint(url, true, allow_loopback)
+                OutboundPolicy::default().resolver_for_storage_endpoint(url, true, allow_loopback)
             }
         }
     }
@@ -450,11 +456,9 @@ pub(crate) async fn new_s3_compatible_warm_backend(
     let endpoint = endpoint_authority(&u)?;
     // Run the SSRF guard after the host-presence check so a host-less endpoint
     // keeps this constructor's stable error text.
-    let outbound_policy = OutboundPolicy::from_env_cached()
-        .map_err(|err| std::io::Error::new(std::io::ErrorKind::InvalidInput, format!("invalid outbound policy: {err}")))?;
     let dns_resolver = params
         .endpoint_policy
-        .build_resolver(outbound_policy, &u)
+        .build_resolver(&u, (params.bucket_lookup == BucketLookupType::BucketLookupDNS).then_some(params.bucket))
         .map_err(|err| std::io::Error::other(format!("tier endpoint is not allowed: {err}")))?;
     let opts = Options {
         creds,
@@ -462,10 +466,9 @@ pub(crate) async fn new_s3_compatible_warm_backend(
         trailing_headers: true,
         region: params.region.to_string(),
         bucket_lookup: params.bucket_lookup,
-        dns_resolver: Some(dns_resolver),
         ..Default::default()
     };
-    let client = TransitionClient::new_with_timeouts(&endpoint, opts, params.provider_tag, timeouts).await?;
+    let client = TransitionClient::new_with_dns_resolver(&endpoint, opts, params.provider_tag, timeouts, dns_resolver).await?;
 
     let client = Arc::new(client);
     let core = TransitionCore(Arc::clone(&client));
@@ -476,6 +479,19 @@ pub(crate) async fn new_s3_compatible_warm_backend(
         prefix: params.prefix.strip_suffix("/").unwrap_or(params.prefix).to_owned(),
         storage_class: "".to_string(),
     })
+}
+
+#[cfg(test)]
+pub(super) async fn fixture_transition_client(
+    endpoint: &str,
+    options: Options,
+    provider: &str,
+) -> std::io::Result<TransitionClient<rustfs_s3_client::transition_api::TierConnector>> {
+    let url = url::Url::parse(&format!("http://{endpoint}")).unwrap();
+    let resolver = OutboundPolicy::default()
+        .resolver_for_storage_endpoint(&url, true, true)
+        .unwrap();
+    TransitionClient::new_with_dns_resolver(endpoint, options, provider, TransitionClientTimeouts::default(), resolver).await
 }
 
 /// Round the multipart part size up to a whole multiple of `min_part_size` that

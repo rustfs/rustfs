@@ -317,7 +317,7 @@ mod tests {
             Ok(VerifiedFederatedCodeExchange::new(
                 self.identity(self.browser_provider_id),
                 Some("/browser".to_string()),
-                OpaqueLogoutContinuation::new(provider, "id-token".to_string()),
+                OpaqueLogoutContinuation::new(provider, "id-token".to_string(), url::Url::parse(redirect_uri).unwrap().origin()),
             ))
         }
 
@@ -331,7 +331,7 @@ mod tests {
 
         async fn create_logout_token(&self, continuation: OpaqueLogoutContinuation) -> Result<String> {
             self.record("logout");
-            let (provider, id_token) = continuation.into_parts();
+            let (provider, id_token, _) = continuation.into_parts();
             assert_eq!((provider.as_str(), id_token.as_str()), self.expected_logout);
             if self.failure == ProviderFailure::Logout {
                 return Err(FederationError::Logout("logout failed".to_string()));
