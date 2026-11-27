@@ -875,6 +875,24 @@ def check_s3_tests_runner(root: Path) -> list[str]:
         or signed_commands[-1] != "return 1"
     ):
         errors.append("scripts/s3-tests/run.sh: readiness must bind success to the signed probe")
+    provisioning = re.search(
+        r"^# Provision alt user \(required by suite\)\n(?P<body>.*?)^log_info \"Alt user provisioned successfully\"$",
+        runner,
+        re.DOTALL | re.MULTILINE,
+    )
+    provisioning_body = provisioning.group("body") if provisioning else ""
+    provisioning_code = "\n".join(line.split("#", 1)[0] for line in provisioning_body.splitlines())
+    provisioning_calls = re.findall(r"(?<![\w-])awscurl[ \t](?:[^\n]*\\\n)*[^\n]*", provisioning_code)
+    add_user_calls = [call for call in provisioning_calls if "/admin/v3/add-user?" in call]
+    if (
+        len(add_user_calls) != 1
+        or "policy" in add_user_calls[0]
+        or not any("/admin/v3/set-user-or-group-policy?" in call for call in provisioning_calls)
+        or any("--fail-with-body" not in call for call in provisioning_calls)
+    ):
+        errors.append(
+            "scripts/s3-tests/run.sh: alt user provisioning must fail on HTTP errors and attach the policy separately"
+        )
     return errors
 
 
@@ -5810,10 +5828,38 @@ class SelfTests(unittest.TestCase):
                 "    fi\n"
                 "    return 0\n"
                 "}\n\n# First, wait\n"
+                "# Provision alt user (required by suite)\n"
+                "awscurl \\\n"
+                "    --fail-with-body \\\n"
+                '    -d "{\\"secretKey\\":\\"${S3_ALT_SECRET_KEY}\\",\\"status\\":\\"enabled\\"}" \\\n'
+                '    "http://${S3_HOST}:${S3_PORT}/rustfs/admin/v3/add-user?accessKey=${S3_ALT_ACCESS_KEY}" || {\n'
+                "    exit 1\n"
+                "}\n"
+                "awscurl \\\n"
+                "    --fail-with-body \\\n"
+                '    "http://${S3_HOST}:${S3_PORT}/rustfs/admin/v3/set-user-or-group-policy?policyName=readwrite" || {\n'
+                "    exit 1\n"
+                "}\n"
+                "ALT_LIST_RESPONSE=$(awscurl \\\n"
+                "    --fail-with-body \\\n"
+                '    "http://${S3_HOST}:${S3_PORT}/" 2>&1) || {\n'
+                "    exit 1\n"
+                "}\n"
+                'log_info "Alt user provisioned successfully"\n'
                 "tox -- -vv -ra --tb=long\n"
             )
             runner.write_text(valid_runner)
             self.assertEqual(check_s3_tests_runner(root), [])
+            for valid, invalid in (
+                ('\\"status\\":\\"enabled\\"}', '\\"status\\":\\"enabled\\",\\"policy\\":\\"readwrite\\"}'),
+                ("awscurl \\\n    --fail-with-body \\\n    -d", "awscurl \\\n    -d"),
+                ("$(awscurl \\\n    --fail-with-body \\\n", "$(awscurl \\\n"),
+                ("set-user-or-group-policy?", "info-canned-policy?"),
+                ("# Provision alt user (required by suite)\n", ""),
+            ):
+                self.assertIn(valid, valid_runner)
+                runner.write_text(valid_runner.replace(valid, invalid))
+                self.assertEqual(len(check_s3_tests_runner(root)), 1)
             runner.write_text(valid_runner.replace("--tb=long", "--showlocals --tb=long"))
             self.assertEqual(len(check_s3_tests_runner(root)), 1)
             runner.write_text(valid_runner.replace("/health/ready", "/health"))

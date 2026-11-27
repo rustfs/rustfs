@@ -949,15 +949,21 @@ if ! command -v awscurl >/dev/null 2>&1; then
 fi
 
 # Provision alt user (required by suite)
+# awscurl exits 0 on HTTP error statuses unless --fail-with-body is set. Every
+# request below passes it so a rejected provisioning call stops the run here
+# instead of surfacing later as InvalidAccessKeyId inside the suite.
 log_info "Provisioning alt user (${S3_ALT_ACCESS_KEY})..."
+# add-user manages credentials and status only and rejects a "policy" field;
+# the policy is attached through the policy mapping endpoint below.
 awscurl \
+    --fail-with-body \
     --service s3 \
     --region "${S3_REGION}" \
     --access_key "${S3_ACCESS_KEY}" \
     --secret_key "${S3_SECRET_KEY}" \
     -X PUT \
     -H 'Content-Type: application/json' \
-    -d "{\"secretKey\":\"${S3_ALT_SECRET_KEY}\",\"status\":\"enabled\",\"policy\":\"readwrite\"}" \
+    -d "{\"secretKey\":\"${S3_ALT_SECRET_KEY}\",\"status\":\"enabled\"}" \
     "http://${S3_HOST}:${S3_PORT}/rustfs/admin/v3/add-user?accessKey=${S3_ALT_ACCESS_KEY}" || {
     log_error "Failed to add alt user"
     exit 1
@@ -965,6 +971,7 @@ awscurl \
 
 # Explicitly attach built-in policy via policy mapping
 awscurl \
+    --fail-with-body \
     --service s3 \
     --region "${S3_REGION}" \
     --access_key "${S3_ACCESS_KEY}" \
@@ -976,14 +983,15 @@ awscurl \
 }
 
 # Sanity check: alt user can list buckets
-awscurl \
+ALT_LIST_RESPONSE=$(awscurl \
+    --fail-with-body \
     --service s3 \
     --region "${S3_REGION}" \
     --access_key "${S3_ALT_ACCESS_KEY}" \
     --secret_key "${S3_ALT_SECRET_KEY}" \
     -X GET \
-    "http://${S3_HOST}:${S3_PORT}/" >/dev/null || {
-    log_error "Alt user cannot list buckets"
+    "http://${S3_HOST}:${S3_PORT}/" 2>&1) || {
+    log_error "Alt user cannot list buckets: ${ALT_LIST_RESPONSE}"
     exit 1
 }
 
