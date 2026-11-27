@@ -1966,17 +1966,17 @@ impl Clone for ObjectInfo {
 }
 
 /// Plaintext bytes one DARE 2.0 package carries at most.
-#[cfg(feature = "rio-v2")]
+#[cfg(feature = "m-compatible")]
 const DARE_PAYLOAD_SIZE: i64 = 64 * 1024;
 /// Header and authentication tag every DARE 2.0 package adds to its payload.
-#[cfg(feature = "rio-v2")]
+#[cfg(feature = "m-compatible")]
 const DARE_PACKAGE_OVERHEAD: i64 = 32;
 
 /// Plaintext size of a DARE 2.0 stream of `stored` bytes (`sio.DecryptedSize`).
 ///
 /// Every package but the last is full; the last holds whatever remains, and a
 /// remainder too short to hold any payload behind its framing is not a stream.
-#[cfg(feature = "rio-v2")]
+#[cfg(feature = "m-compatible")]
 fn dare_plaintext_size(stored: i64) -> std::io::Result<i64> {
     let package_size = DARE_PAYLOAD_SIZE + DARE_PACKAGE_OVERHEAD;
     let tail = stored % package_size;
@@ -2230,11 +2230,11 @@ impl ObjectInfo {
             return Ok(Some(size));
         }
 
-        #[cfg(feature = "rio-v2")]
+        #[cfg(feature = "m-compatible")]
         {
             self.sealed_object_plaintext_size()
         }
-        #[cfg(not(feature = "rio-v2"))]
+        #[cfg(not(feature = "m-compatible"))]
         {
             Ok(None)
         }
@@ -2242,7 +2242,7 @@ impl ObjectInfo {
 
     /// True when MinIO's own marker records the object as an encrypted
     /// multipart upload: one cipher stream per part, each under its part key.
-    #[cfg(feature = "rio-v2")]
+    #[cfg(feature = "m-compatible")]
     pub(crate) fn is_marked_encrypted_multipart(&self) -> bool {
         self.user_defined
             .contains_key(rustfs_utils::http::MINIO_INTERNAL_ENCRYPTION_MULTIPART_HEADER)
@@ -2267,7 +2267,7 @@ impl ObjectInfo {
     ///
     /// When a stored size cannot be a whole DARE stream, which means the
     /// metadata or the stored bytes are damaged.
-    #[cfg(feature = "rio-v2")]
+    #[cfg(feature = "m-compatible")]
     fn sealed_object_plaintext_size(&self) -> std::io::Result<Option<i64>> {
         let seal_algorithm = self
             .user_defined
@@ -3437,7 +3437,7 @@ mod tests {
     /// DARE packages, each up to 64 KiB of payload behind 32 bytes of framing.
     /// These are the stored sizes MinIO produced for 1 B, 4 KiB, 300 KiB,
     /// 1 MiB + 1 and 9 MiB objects.
-    #[cfg(feature = "rio-v2")]
+    #[cfg(feature = "m-compatible")]
     #[test]
     fn get_actual_size_derives_the_plaintext_size_of_a_minio_sealed_object() {
         for (stored, plaintext) in [
@@ -3500,7 +3500,7 @@ mod tests {
     }
 
     /// A size the object recorded always wins over one derived from its layout.
-    #[cfg(feature = "rio-v2")]
+    #[cfg(feature = "m-compatible")]
     #[test]
     fn get_actual_size_prefers_a_recorded_size_over_the_dare_layout() {
         let mut metadata = (*minio_sealed_object_metadata(false)).clone();
@@ -3515,7 +3515,7 @@ mod tests {
     }
 
     /// Only a build that reads the sealed layout may reason about its framing.
-    #[cfg(not(feature = "rio-v2"))]
+    #[cfg(not(feature = "m-compatible"))]
     #[test]
     fn get_actual_size_keeps_the_stored_size_of_a_minio_sealed_object_without_the_minio_read_path() {
         let info = ObjectInfo {

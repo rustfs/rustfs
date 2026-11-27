@@ -18,7 +18,7 @@ pub(crate) mod context;
 pub(crate) mod direct;
 pub(crate) mod material;
 pub(crate) mod metadata;
-#[cfg(feature = "rio-v2")]
+#[cfg(feature = "m-compatible")]
 pub(crate) mod object;
 pub(crate) mod stored;
 
@@ -51,17 +51,17 @@ pub(crate) enum StoredKeyMode {
     /// The data key is the object's key, under the nonce stored beside it.
     Direct { base_nonce: [u8; 12] },
     /// The data key unseals the object's key.
-    #[cfg(feature = "rio-v2")]
+    #[cfg(feature = "m-compatible")]
     Object { sealed_key: ManagedSealedKey },
 }
 
 // The mode new objects are written in. Every build reads every mode it can
 // recognize; writing picks exactly one, and this is the only place that says which.
-#[cfg(not(feature = "rio-v2"))]
+#[cfg(not(feature = "m-compatible"))]
 pub(crate) use direct::{
     SESSION_KEY_NEEDS_CUSTOMER_KEY, new_key_under_customer_key, new_key_under_data_key, new_session_key_under_customer_key,
 };
-#[cfg(feature = "rio-v2")]
+#[cfg(feature = "m-compatible")]
 pub(crate) use object::{
     SESSION_KEY_NEEDS_CUSTOMER_KEY, new_key_under_customer_key, new_key_under_data_key, new_session_key_under_customer_key,
 };

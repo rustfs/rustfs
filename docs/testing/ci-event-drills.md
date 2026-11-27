@@ -10,7 +10,7 @@ Every event class the planner serves must have at least one reviewable drill: an
 |---|---|---|
 | `pull_request` (ordinary code) | reverse-dependency closure + fixed core inventory; shared/unknown inputs expand to full | `Test and Lint` requires exactly the planned job results |
 | `pull_request` (documentation only) | `docs` mode: no code jobs | Quick Checks and Typos run; expensive jobs are required **skipped** |
-| `pull_request` (isolated E2E) | `e2e` mode: workspace + server build + E2E smoke + S3 lanes | Connect boundary, serial ILM, protocol/rio-v2, real io_uring required **skipped** |
+| `pull_request` (isolated E2E) | `e2e` mode: workspace + server build + E2E smoke + S3 lanes | Connect boundary, serial ILM, protocol/m-compatible, real io_uring required **skipped** |
 | `pull_request` (closed) | `Cancel Closed PR Runs` only | in-flight validation for that PR is cancelled; no new validation is claimed |
 | `pull_request` (merged) | entry into `merge_group` | combined candidate is validated as its own SHA/tree with the full matrix |
 | `push` to `main` | full | complete validation; no reuse inferred from tree equality |
@@ -34,7 +34,7 @@ Run URLs are `https://github.com/rustfs/rustfs/actions/runs/<id>`. Re-open the r
 | `workflow_run` | `Scheduled Validation Watchdog` | [41161431618](https://github.com/rustfs/rustfs/actions/runs/41161431618) | independent filter/monitor path executed against the registry |
 | `merge_group` | first queued candidate after queue enablement | see below | live evidence attached after the first queue entry completes |
 | Documentation-only PR | PR #9088, this document's own PR | [41162871854](https://github.com/rustfs/rustfs/actions/runs/41162871854) | `docs` mode: `Select CI scope` recorded `mode: docs`; `Test and Lint` accepted in 8 s with every expensive job required **skipped** |
-| Isolated E2E PR | PR #9089, comment-only change under `crates/e2e_test/src/` | [41163203959](https://github.com/rustfs/rustfs/actions/runs/41163203959) | `e2e` mode: Connect boundary, serial ILM, rio-v2/protocol lanes and real io_uring required **skipped**; workspace build, E2E and both S3 lanes retained |
+| Isolated E2E PR | PR #9089, comment-only change under `crates/e2e_test/src/` | [41163203959](https://github.com/rustfs/rustfs/actions/runs/41163203959) | `e2e` mode: Connect boundary, serial ILM, m-compatible/protocol lanes and real io_uring required **skipped**; workspace build, E2E and both S3 lanes retained |
 
 ## Repeating a drill
 

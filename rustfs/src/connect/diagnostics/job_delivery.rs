@@ -450,7 +450,7 @@ fn enabled_build_features() -> Vec<String> {
         (cfg!(feature = "metrics-gpu"), "metrics-gpu"),
         (cfg!(feature = "offline-enrollment-e2e-root"), "offline-enrollment-e2e-root"),
         (cfg!(feature = "pyroscope"), "pyroscope"),
-        (cfg!(feature = "rio-v2"), "rio-v2"),
+        (cfg!(feature = "m-compatible"), "m-compatible"),
         (cfg!(feature = "sftp"), "sftp"),
         (cfg!(feature = "swift"), "swift"),
         (cfg!(feature = "tracing-chunk-debug"), "tracing-chunk-debug"),

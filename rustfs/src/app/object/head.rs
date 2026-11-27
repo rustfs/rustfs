@@ -1012,7 +1012,7 @@ mod tests {
 
     /// MinIO stores only its sealed-key slots and synthesizes the public headers
     /// per response; HEAD must report what GET already reports for such objects.
-    #[cfg(feature = "rio-v2")]
+    #[cfg(feature = "m-compatible")]
     #[test]
     fn head_synthesizes_the_sse_headers_minio_never_stored() {
         use rustfs_utils::http::{
@@ -1046,7 +1046,7 @@ mod tests {
     }
 
     /// A build that cannot read MinIO's sealed layout does not claim a scheme for it.
-    #[cfg(not(feature = "rio-v2"))]
+    #[cfg(not(feature = "m-compatible"))]
     #[test]
     fn head_reports_no_sse_headers_for_a_minio_sealed_object_without_the_minio_read_path() {
         use rustfs_utils::http::{

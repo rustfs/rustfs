@@ -531,8 +531,8 @@ jobs:
           done
           cargo clippy --locked -p rustfs --lib "${args[@]}" -- -D warnings
 
-  test-and-lint-rio-v2:
-    name: Test and Lint (rio-v2)
+  test-and-lint-m-compatible:
+    name: Test and Lint (m-compatible)
     # Specialized boundary, hardware and alternate-feature lanes run only on
     # the nightly schedule and manual dispatch. They do not gate a merge: the
     # nightly run reports a regression within a day, and repeating these builds
@@ -562,10 +562,10 @@ jobs:
       - name: Protect Connect test home
         run: chmod go-w "$(realpath "$HOME")"
 
-      - name: Run rio-v2 clippy lints
-        run: cargo clippy -p rustfs -p rustfs-ecstore -p rustfs-sse --all-targets --features rio-v2 -- -D warnings
+      - name: Run m-compatible clippy lints
+        run: cargo clippy -p rustfs -p rustfs-ecstore -p rustfs-sse --all-targets --features m-compatible -- -D warnings
 
-      - name: Run rio-v2 feature tests
+      - name: Run m-compatible feature tests
         shell: bash
         env:
           # Match the main nextest lane's #5394 link-I/O guard. A cold feature
@@ -578,17 +578,17 @@ jobs:
           # profile and silently ignored quarantined flakes here (rustfs#6703).
           mkdir -p artifacts/workspace
           rm -f target/nextest/ci/junit.xml
-          ./scripts/ci/resource_sampler.sh start nextest-rio-v2
+          ./scripts/ci/resource_sampler.sh start nextest-m-compatible
           trap './scripts/ci/resource_sampler.sh stop' EXIT
-          cargo nextest run --profile ci -p rustfs -p rustfs-ecstore -p rustfs-sse --features rio-v2 \
+          cargo nextest run --profile ci -p rustfs -p rustfs-ecstore -p rustfs-sse --features m-compatible \
             2>&1 | tee artifacts/workspace/nextest.log
-          cargo test -p rustfs --doc --features rio-v2
+          cargo test -p rustfs --doc --features m-compatible
 
-      - name: Upload rio-v2 test reports and diagnostics
+      - name: Upload m-compatible test reports and diagnostics
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: junit-test-and-lint-rio-v2-${{ github.run_number }}-${{ github.run_attempt }}
+          name: junit-test-and-lint-m-compatible-${{ github.run_number }}-${{ github.run_attempt }}
           path: |
             target/nextest/ci/junit.xml
             artifacts/workspace
@@ -597,7 +597,7 @@ jobs:
 
   test-and-lint-protocols:
     name: "Test and Lint (${{ matrix.features.name }})"
-    # Same cadence as test-and-lint-rio-v2 above.
+    # Same cadence as test-and-lint-m-compatible above.
     if: needs.classify-changes.outputs.mode == 'full' && contains(fromJSON('["schedule", "workflow_dispatch"]'), github.event_name)
     needs: [ quick-checks, classify-changes ]
     runs-on: sm-standard-4
@@ -774,13 +774,13 @@ jobs:
           if-no-files-found: error
           retention-days: 1
 
-  build-rustfs-debug-binary-rio-v2:
-    name: Build RustFS Debug Binary (rio-v2)
-    # Dormant rio-v2 variant (rustfs/backlog#1835): the feature ships in no
+  build-rustfs-debug-binary-m-compatible:
+    name: Build RustFS Debug Binary (m-compatible)
+    # Dormant m-compatible variant (rustfs/backlog#1835): the feature ships in no
     # default build, so this full-suite lane runs only on the nightly schedule
     # and manual dispatch. Per-PR cfg-seam coverage stays with
-    # test-and-lint-rio-v2. Lifecycle and the promote-or-delete condition:
-    # docs/architecture/minio-file-format-compat.md ("rio-v2 variant lifecycle").
+    # test-and-lint-m-compatible. Lifecycle and the promote-or-delete condition:
+    # docs/architecture/minio-file-format-compat.md ("m-compatible variant lifecycle").
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
     needs: [ quick-checks ]
     runs-on: sm-standard-4
@@ -801,13 +801,13 @@ jobs:
           cache-save-if: 'false'
           install-build-packaging-tools: 'false'
 
-      - name: Build debug binary with rio-v2
-        run: python3 scripts/e2e_binary.py build --bins --features rio-v2,e2e-test-hooks
+      - name: Build debug binary with m-compatible
+        run: python3 scripts/e2e_binary.py build --bins --features m-compatible,e2e-test-hooks
 
       - name: Upload debug binary
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: rustfs-debug-binary-rio-v2
+          name: rustfs-debug-binary-m-compatible
           overwrite: true
           path: |
             target/debug/rustfs
@@ -1252,12 +1252,12 @@ jobs:
           if-no-files-found: warn
           retention-days: 7
 
-  e2e-tests-rio-v2:
-    name: End-to-End Tests (rio-v2)
+  e2e-tests-m-compatible:
+    name: End-to-End Tests (m-compatible)
     # Inherits the schedule/dispatch-only gate through needs: on every other
-    # event build-rustfs-debug-binary-rio-v2 is skipped, so this job skips
+    # event build-rustfs-debug-binary-m-compatible is skipped, so this job skips
     # with it (see the dormant-variant comment on that job).
-    needs: [ build-rustfs-debug-binary-rio-v2 ]
+    needs: [ build-rustfs-debug-binary-m-compatible ]
     runs-on: sm-standard-2
     timeout-minutes: 30
     steps:
@@ -1274,7 +1274,7 @@ jobs:
       - name: Download debug binary
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
-          name: rustfs-debug-binary-rio-v2
+          name: rustfs-debug-binary-m-compatible
           path: target/debug
 
       - name: Make binary executable
@@ -1301,13 +1301,13 @@ jobs:
       - name: Run end-to-end tests
         run: |
           s3s-e2e --version
-          python3 scripts/e2e_binary.py run --features rio-v2,e2e-test-hooks -- ./scripts/e2e-run.sh ./target/debug/rustfs /tmp/rustfs
+          python3 scripts/e2e_binary.py run --features m-compatible,e2e-test-hooks -- ./scripts/e2e-run.sh ./target/debug/rustfs /tmp/rustfs
 
       - name: Upload test logs
         if: failure()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: e2e-test-logs-rio-v2-${{ github.run_number }}-${{ github.run_attempt }}
+          name: e2e-test-logs-m-compatible-${{ github.run_number }}-${{ github.run_attempt }}
           path: /tmp/rustfs.log
           retention-days: 3
 
@@ -1440,15 +1440,15 @@ jobs:
       - core-contract
       - connect-feature-boundaries
       - fips-provider
-      - test-and-lint-rio-v2
+      - test-and-lint-m-compatible
       - test-and-lint-protocols
       - build-rustfs-debug-binary
       - uring-integration
       - e2e-tests
       - s3-implemented-tests
       - s3-lifecycle-behavior-tests
-      - build-rustfs-debug-binary-rio-v2
-      - e2e-tests-rio-v2
+      - build-rustfs-debug-binary-m-compatible
+      - e2e-tests-m-compatible
       - e2e-full
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -1475,14 +1475,14 @@ jobs:
       - workspace-lint-and-build
       - workspace-tests
       - core-contract
-      - test-and-lint-rio-v2
+      - test-and-lint-m-compatible
       - test-and-lint-protocols
       - build-rustfs-debug-binary
-      - build-rustfs-debug-binary-rio-v2
+      - build-rustfs-debug-binary-m-compatible
       - uring-integration
       - e2e-tests
       - e2e-full
-      - e2e-tests-rio-v2
+      - e2e-tests-m-compatible
       - s3-implemented-tests
       - s3-lifecycle-behavior-tests
     if: >-

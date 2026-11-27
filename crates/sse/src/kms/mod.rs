@@ -16,6 +16,6 @@
 
 pub(crate) mod kms_backed;
 pub(crate) mod local;
-#[cfg(feature = "rio-v2")]
+#[cfg(feature = "m-compatible")]
 pub(crate) mod minio;
 pub(crate) mod provider;

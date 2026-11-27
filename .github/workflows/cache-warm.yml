@@ -197,12 +197,12 @@ jobs:
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
 
-  # Readers: test-and-lint-rio-v2 (nightly schedule, merge group, dispatch),
-  # build-rustfs-debug-binary-rio-v2 (nightly schedule / manual dispatch only —
-  # dormant rio-v2 variant, see rustfs/backlog#1835 and
+  # Readers: test-and-lint-m-compatible (nightly schedule, merge group, dispatch),
+  # build-rustfs-debug-binary-m-compatible (nightly schedule / manual dispatch only —
+  # dormant m-compatible variant, see rustfs/backlog#1835 and
   # docs/architecture/minio-file-format-compat.md).
   # The second build below stays despite the reduced cadence: it warms the
-  # rio-v2,e2e-test-hooks feature resolution the scheduled build restores,
+  # m-compatible,e2e-test-hooks feature resolution the scheduled build restores,
   # which keeps that lane inside its 30-minute timeout.
   warm-ci-feat-rio:
     name: Warm ci-feat-rio
@@ -231,8 +231,8 @@ jobs:
           # --all-targets links the same test binaries as the reader lane.
           CARGO_BUILD_JOBS: "2"
         run: |
-          cargo build -p rustfs -p rustfs-ecstore -p rustfs-sse --all-targets --features rio-v2
-          cargo build -p rustfs --bins --features rio-v2,e2e-test-hooks
+          cargo build -p rustfs -p rustfs-ecstore -p rustfs-sse --all-targets --features m-compatible
+          cargo build -p rustfs --bins --features m-compatible,e2e-test-hooks
 
   # Readers: the swift and sftp legs of test-and-lint-protocols. Built in
   # sequence rather than as `--features swift,sftp`, which is a combination no

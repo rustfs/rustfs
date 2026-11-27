@@ -73,7 +73,7 @@ class ArtifactIdentityTests(unittest.TestCase):
         mutations = {"source": {"head": "e" * 40, "sha256": "f" * 64}, "tree": "e" * 40,
                      "workspace_root": "/different/checkout", "lock_sha256": "e" * 64,
                      "rustc": "rustc 1.93.0", "nextest": "cargo-nextest 0.9.140",
-                     "configuration": "e2e", "profile": "release", "features": ["rio-v2"],
+                     "configuration": "e2e", "profile": "release", "features": ["m-compatible"],
                      "build_environment": {**self.identity["build_environment"], "RUSTFLAGS": "-C opt-level=3"},
                      "system": "Darwin", "machine": "aarch64", "repository": "other/repo",
                      "run_id": "124"}

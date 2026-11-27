@@ -159,7 +159,7 @@ impl SseDekProvider for KmsSseDekProvider<'_> {
         Ok(data_key.plaintext_key)
     }
 
-    #[cfg(feature = "rio-v2")]
+    #[cfg(feature = "m-compatible")]
     async fn decrypt_legacy_sse_dek(
         &self,
         encrypted_dek: &[u8],

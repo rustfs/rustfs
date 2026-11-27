@@ -2043,7 +2043,7 @@ mod lifecycle_delete_all_plan_tests {
         );
     }
 
-    #[cfg(not(feature = "rio-v2"))]
+    #[cfg(not(feature = "m-compatible"))]
     #[tokio::test]
     async fn put_object_stamps_the_v2_frame_layout_marker_only_when_enabled() {
         use rustfs_utils::http::headers::SSEC_ALGORITHM_HEADER;
@@ -4770,7 +4770,7 @@ impl SetDisks {
             &mut user_defined,
             crate::object_api::ENCRYPTED_FRAME_LAYOUT_FIXED8K_SUFFIX,
         );
-        #[cfg(not(feature = "rio-v2"))]
+        #[cfg(not(feature = "m-compatible"))]
         if crate::io_support::rio::encryption_frame_v2_enabled()
             && !opts.preserve_ciphertext
             && !opts.data_movement
@@ -7444,12 +7444,12 @@ mod legacy_duplex_producer_reader_tests {
         }
     }
 
-    #[cfg(feature = "rio-v2")]
+    #[cfg(feature = "m-compatible")]
     struct ObjectKeyResolver {
         object_key: [u8; 32],
     }
 
-    #[cfg(feature = "rio-v2")]
+    #[cfg(feature = "m-compatible")]
     #[async_trait::async_trait]
     impl ObjectEncryptionResolver for ObjectKeyResolver {
         async fn resolve_read_material(
@@ -7463,10 +7463,10 @@ mod legacy_duplex_producer_reader_tests {
         }
     }
 
-    #[cfg(feature = "rio-v2")]
+    #[cfg(feature = "m-compatible")]
     const RIO_V2_FIXTURE_OBJECT_KEY: [u8; 32] = [0x67; 32];
 
-    #[cfg(feature = "rio-v2")]
+    #[cfg(feature = "m-compatible")]
     fn rio_v2_fixture_plaintext(len: usize, seed: usize) -> Vec<u8> {
         (0..len)
             .map(|index| u8::try_from((index + seed) % 251).expect("a remainder below 251 fits in u8"))
@@ -7479,7 +7479,7 @@ mod legacy_duplex_producer_reader_tests {
     /// wherever a DARE package outruns the pipe. `parts` lists each part's
     /// `(plaintext, stored)` length as the object metadata records it, and
     /// `stored` is what the drives actually hold, which a test may cut short.
-    #[cfg(feature = "rio-v2")]
+    #[cfg(feature = "m-compatible")]
     async fn read_rio_v2_object_through_get_pipe(
         stored: Vec<u8>,
         parts: &[(usize, usize)],
@@ -7560,7 +7560,7 @@ mod legacy_duplex_producer_reader_tests {
         Ok(out)
     }
 
-    #[cfg(feature = "rio-v2")]
+    #[cfg(feature = "m-compatible")]
     #[tokio::test]
     async fn rio_v2_encrypted_get_survives_pipe_refills_mid_package() {
         const MIB: usize = 1024 * 1024;
@@ -7590,7 +7590,7 @@ mod legacy_duplex_producer_reader_tests {
         assert!(failures.is_empty(), "rio-v2 encrypted GET failed for: {failures:#?}");
     }
 
-    #[cfg(feature = "rio-v2")]
+    #[cfg(feature = "m-compatible")]
     #[tokio::test]
     async fn rio_v2_encrypted_multipart_get_survives_pipe_refills_mid_package() {
         const MIB: usize = 1024 * 1024;
@@ -7607,7 +7607,7 @@ mod legacy_duplex_producer_reader_tests {
 
     /// Encrypts each part with its own part key and returns the concatenated
     /// stored stream with every part's `(plaintext, stored)` length.
-    #[cfg(feature = "rio-v2")]
+    #[cfg(feature = "m-compatible")]
     async fn rio_v2_multipart_fixture(part_plaintexts: &[Vec<u8>]) -> (Vec<u8>, Vec<(usize, usize)>) {
         let mut stored = Vec::new();
         let mut parts = Vec::new();
@@ -7626,7 +7626,7 @@ mod legacy_duplex_producer_reader_tests {
         (stored, parts)
     }
 
-    #[cfg(feature = "rio-v2")]
+    #[cfg(feature = "m-compatible")]
     #[tokio::test]
     async fn rio_v2_encrypted_multipart_range_get_rejects_a_missing_trailing_part() {
         let part_plaintexts = [rio_v2_fixture_plaintext(70_000, 1), rio_v2_fixture_plaintext(140_000, 2)];
@@ -7648,7 +7648,7 @@ mod legacy_duplex_producer_reader_tests {
         }
     }
 
-    #[cfg(feature = "rio-v2")]
+    #[cfg(feature = "m-compatible")]
     #[tokio::test]
     async fn rio_v2_encrypted_multipart_get_accepts_an_empty_trailing_part() {
         let part_plaintexts = [rio_v2_fixture_plaintext(70_000, 1), Vec::new()];

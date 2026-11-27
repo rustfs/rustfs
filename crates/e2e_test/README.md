@@ -192,7 +192,7 @@ the same profile for membership and execution with one nightly worker.
 | --- | --- | --- |
 | Smoke subset (`e2e-smoke` profile) | `e2e-tests` job, every PR | **Active** (backlog#1149 ci-4) |
 | Full single-node suite (`e2e-full` profile) | `e2e-full` job, merge queue + main | **Active** (backlog#1149 ci-5) |
-| `s3s-e2e` black-box | `e2e-tests` + `e2e-tests-rio-v2` jobs | **Active** (external conformance tool) |
+| `s3s-e2e` black-box | `e2e-tests` + `e2e-tests-m-compatible` jobs | **Active** (external conformance tool) |
 | ILM / lifecycle (ignored) | `test-ilm-integration-serial` lane, `-j1` | **Active** (backlog#1148 ilm-1) |
 | KMS suite | `e2e-full` job, merge queue + main | **Active** |
 | Direct and mixed-version rolling upgrades from pinned previous release | `e2e-upgrade.yml`, release tags + weekly schedule + manual dispatch | **Active** |

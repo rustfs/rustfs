@@ -14,7 +14,7 @@ Default API endpoints:
 
 - RustFS `1.0.0-beta.5`: `http://127.0.0.1:9100`
 - MinIO: `http://127.0.0.1:9200`
-- current main with `rio-v2`: `http://127.0.0.1:9300`
+- current main with `m-compatible`: `http://127.0.0.1:9300`
 
 ## Reading old datasets with rio-v2
 

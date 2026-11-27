@@ -41,7 +41,7 @@ diagnostic-read-version-caller = ["rustfs-io-metrics/diagnostic-read-version-cal
 # Sampled wall/CPU diagnostics only; does not change the read backend.
 diagnostic-local-batch = ["rustix/time"]
 gcs = ["dep:google-cloud-storage", "dep:google-cloud-auth"]
-rio-v2 = ["dep:rustfs-rio-v2", "rustfs-replication/rio-v2", "rustfs-utils/rio-v2"]
+m-compatible = ["dep:rustfs-rio-v2", "rustfs-replication/m-compatible", "rustfs-utils/m-compatible"]
 hotpath = [
     "hotpath/hotpath",
     "hotpath/tokio",

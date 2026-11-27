@@ -1,4 +1,4 @@
-#![cfg(feature = "rio-v2")]
+#![cfg(feature = "m-compatible")]
 
 use std::fs;
 use std::io::Cursor;

@@ -2483,8 +2483,8 @@ mod tests {
         verify_e2e_binary_receipt(&receipt, &directory, &binary, Some("sftp,webdav")).expect("resolved feature subset");
         verify_e2e_binary_receipt(&receipt, &directory, &binary, Some("full")).expect("full was actually requested");
         assert_eq!(
-            verify_e2e_binary_receipt(&receipt, &directory, &binary, Some("rio-v2"))
-                .expect_err("full does not enable rio-v2")
+            verify_e2e_binary_receipt(&receipt, &directory, &binary, Some("m-compatible"))
+                .expect_err("full does not enable m-compatible")
                 .kind(),
             ErrorKind::InvalidInput
         );

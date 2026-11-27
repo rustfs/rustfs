@@ -697,10 +697,10 @@ fn feature_specs() -> &'static [FeatureSpec] {
             default_enabled: false,
         },
         FeatureSpec {
-            name: "rio-v2",
-            enabled: cfg!(feature = "rio-v2"),
+            name: "m-compatible",
+            enabled: cfg!(feature = "m-compatible"),
             description: "RIO v2 storage path support",
-            dependencies: "rustfs-ecstore/rio-v2",
+            dependencies: "rustfs-ecstore/m-compatible",
             default_enabled: false,
         },
         FeatureSpec {
@@ -1113,7 +1113,7 @@ mod tests {
         assert!(feature_names.contains(&"e2e-test-hooks"));
         assert!(feature_names.contains(&"connect-e2e-short-credentials"));
         assert!(feature_names.contains(&"offline-enrollment-e2e-root"));
-        assert!(feature_names.contains(&"rio-v2"));
+        assert!(feature_names.contains(&"m-compatible"));
         assert!(feature_names.contains(&"pyroscope"));
         assert!(feature_names.contains(&"dial9"));
         assert!(feature_names.contains(&"hotpath"));
@@ -1132,7 +1132,7 @@ mod tests {
         assert!(output.contains("| io-scheduler-debug |"));
         assert!(output.contains("| tracing-chunk-debug |"));
         assert!(output.contains("| sftp |"));
-        assert!(output.contains("| rio-v2 |"));
+        assert!(output.contains("| m-compatible |"));
         assert!(output.contains("| dial9 |"));
         assert!(output.contains("| hotpath-cpu |"));
         assert!(output.contains("| default | enabled by default |"));

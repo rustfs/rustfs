@@ -17,9 +17,9 @@ use super::*;
 use crate::io_support::rio::Index;
 use std::mem::MaybeUninit;
 
-#[cfg(feature = "rio-v2")]
+#[cfg(feature = "m-compatible")]
 const DARE_PAYLOAD_SIZE: i64 = 64 * 1024;
-#[cfg(feature = "rio-v2")]
+#[cfg(feature = "m-compatible")]
 const DARE_PACKAGE_SIZE: i64 = DARE_PAYLOAD_SIZE + 32;
 
 fn part_plaintext_size(part: &ObjectPartInfo) -> i64 {
@@ -63,9 +63,9 @@ fn get_compressed_offsets(oi: &ObjectInfo, offset: i64) -> (i64, i64, usize, i64
     }
 
     let mut part_skip = offset - skip_length;
-    #[cfg(feature = "rio-v2")]
+    #[cfg(feature = "m-compatible")]
     let (mut decrypt_skip, mut seq_num) = (0_i64, 0_u64);
-    #[cfg(not(feature = "rio-v2"))]
+    #[cfg(not(feature = "m-compatible"))]
     let (decrypt_skip, seq_num) = (0_i64, 0_u64);
 
     if part_skip > 0
@@ -74,7 +74,7 @@ fn get_compressed_offsets(oi: &ObjectInfo, offset: i64) -> (i64, i64, usize, i64
         && let Ok((comp_off, uncomp_off)) = index.find(part_skip)
         && comp_off > 0
     {
-        #[cfg(feature = "rio-v2")]
+        #[cfg(feature = "m-compatible")]
         if oi.is_encrypted() {
             seq_num = (comp_off / DARE_PAYLOAD_SIZE) as u64;
             decrypt_skip = comp_off % DARE_PAYLOAD_SIZE;
@@ -83,7 +83,7 @@ fn get_compressed_offsets(oi: &ObjectInfo, offset: i64) -> (i64, i64, usize, i64
             compressed_offset += comp_off;
         }
 
-        #[cfg(not(feature = "rio-v2"))]
+        #[cfg(not(feature = "m-compatible"))]
         {
             compressed_offset += comp_off;
         }
@@ -94,7 +94,7 @@ fn get_compressed_offsets(oi: &ObjectInfo, offset: i64) -> (i64, i64, usize, i64
     (compressed_offset, part_skip, first_part_idx, decrypt_skip, seq_num)
 }
 
-#[cfg(feature = "rio-v2")]
+#[cfg(feature = "m-compatible")]
 fn get_encrypted_offsets(oi: &ObjectInfo, offset: i64) -> Result<(i64, usize, usize, u32, i64)> {
     if oi.parts.is_empty() {
         let plaintext_size = oi.decrypted_size()?;
@@ -762,7 +762,7 @@ impl ReadPlan {
                     ))
                 })?;
             let material = resolved;
-            #[cfg(feature = "rio-v2")]
+            #[cfg(feature = "m-compatible")]
             let uses_legacy_encryption = matches!(material.mode, ReadEncryptionMode::Direct { .. });
             let is_multipart = is_multipart_encrypted_object(oi, &material.mode);
             let recorded_plaintext_size = oi.encryption_original_size()?;
@@ -780,7 +780,7 @@ impl ReadPlan {
                 part_numbers,
             ) = if let Some(rs) = rs {
                 let (requested_offset, requested_length) = rs.get_offset_length(plaintext_size)?;
-                #[cfg(feature = "rio-v2")]
+                #[cfg(feature = "m-compatible")]
                 {
                     if uses_legacy_encryption {
                         legacy_encrypted_range_plan(
@@ -827,7 +827,7 @@ impl ReadPlan {
                         )
                     }
                 }
-                #[cfg(not(feature = "rio-v2"))]
+                #[cfg(not(feature = "m-compatible"))]
                 {
                     legacy_encrypted_range_plan(
                         oi,
@@ -911,19 +911,19 @@ impl ReadPlan {
                 total_plaintext_size,
             } => {
                 let dec_reader = crate::io_support::rio::decompression_reader(reader, algorithm, backend);
-                #[cfg(feature = "rio-v2")]
+                #[cfg(feature = "m-compatible")]
                 let dec_reader = StreamConsumer::new(dec_reader);
                 let final_reader: Box<dyn AsyncRead + Unpin + Send + Sync> = if decompressed_offset > 0
                     || decompressed_length != total_plaintext_size as i64
                 {
-                    #[cfg(feature = "rio-v2")]
+                    #[cfg(feature = "m-compatible")]
                     let ranged_result = RangedDecompressReader::new_draining(
                         dec_reader,
                         decompressed_offset,
                         decompressed_length,
                         total_plaintext_size,
                     );
-                    #[cfg(not(feature = "rio-v2"))]
+                    #[cfg(not(feature = "m-compatible"))]
                     let ranged_result =
                         RangedDecompressReader::new(dec_reader, decompressed_offset, decompressed_length, total_plaintext_size);
 
@@ -970,14 +970,14 @@ impl ReadPlan {
                 total_plaintext_size,
                 compression,
             } => {
-                #[cfg(not(feature = "rio-v2"))]
+                #[cfg(not(feature = "m-compatible"))]
                 let _ = sequence_number;
                 let decrypted_reader: Box<dyn AsyncRead + Unpin + Send + Sync> = if is_multipart {
                     match material.mode {
                         ReadEncryptionMode::Object => {
                             // The rio-v2 reader fails a stream that ends before a
                             // listed part, so it must not hear about empty ones.
-                            #[cfg(feature = "rio-v2")]
+                            #[cfg(feature = "m-compatible")]
                             let part_numbers = without_empty_parts(part_numbers, &oi.parts);
                             crate::io_support::rio::decrypt_multipart_reader_with_object_key(
                                 reader,
@@ -1021,17 +1021,17 @@ impl ReadPlan {
                     if let Some((algo, compression_backend)) = compression {
                         let decompressed_reader =
                             crate::io_support::rio::decompression_reader(decrypted_reader, algo, compression_backend);
-                        #[cfg(feature = "rio-v2")]
+                        #[cfg(feature = "m-compatible")]
                         let decompressed_reader = StreamConsumer::new(decompressed_reader);
                         if plaintext_offset > 0 || plaintext_length != total_plaintext_size_i64 {
-                            #[cfg(feature = "rio-v2")]
+                            #[cfg(feature = "m-compatible")]
                             let ranged_reader = RangedDecompressReader::new_draining(
                                 decompressed_reader,
                                 plaintext_offset,
                                 plaintext_length,
                                 total_plaintext_size,
                             )?;
-                            #[cfg(not(feature = "rio-v2"))]
+                            #[cfg(not(feature = "m-compatible"))]
                             let ranged_reader = RangedDecompressReader::new(
                                 decompressed_reader,
                                 plaintext_offset,
@@ -1440,11 +1440,11 @@ fn is_multipart_encrypted_object(oi: &ObjectInfo, mode: &ReadEncryptionMode) -> 
     // for it there: MinIO seals the ETag of a single-part object, so it is never
     // the 32 hex characters the heuristic below takes for a single-part upload,
     // and reading such an object under part keys fails authentication.
-    #[cfg(feature = "rio-v2")]
+    #[cfg(feature = "m-compatible")]
     if matches!(mode, ReadEncryptionMode::Object) {
         return oi.is_marked_encrypted_multipart();
     }
-    #[cfg(not(feature = "rio-v2"))]
+    #[cfg(not(feature = "m-compatible"))]
     let _ = mode;
 
     oi.etag
@@ -1459,7 +1459,7 @@ fn multipart_part_numbers(parts: &[ObjectPartInfo]) -> Vec<usize> {
 
 /// Drops from `part_numbers` the parts that stored no bytes: a DARE writer
 /// emits no package for an empty part, so none follows on disk.
-#[cfg(feature = "rio-v2")]
+#[cfg(feature = "m-compatible")]
 fn without_empty_parts(mut part_numbers: Vec<usize>, parts: &[ObjectPartInfo]) -> Vec<usize> {
     let empty_parts: Vec<usize> = parts.iter().filter(|part| part.size == 0).map(|part| part.number).collect();
     if !empty_parts.is_empty() {
@@ -1924,7 +1924,7 @@ mod tests {
         assert_eq!(&buf2[..1], b"e");
     }
 
-    #[cfg(feature = "rio-v2")]
+    #[cfg(feature = "m-compatible")]
     #[tokio::test]
     async fn test_ranged_decompress_reader_with_rio_v2_s2_stream() {
         let plaintext = b"abcdefghijklmnopqrstuvwxyz".to_vec();
@@ -2779,7 +2779,7 @@ mod tests {
         ));
     }
 
-    #[cfg(feature = "rio-v2")]
+    #[cfg(feature = "m-compatible")]
     #[tokio::test]
     async fn test_read_plan_accepts_minio_s2_compression_scheme() {
         let object_info = ObjectInfo {
@@ -2806,7 +2806,7 @@ mod tests {
         assert_eq!(plan.object_size, 4_194_304);
     }
 
-    #[cfg(feature = "rio-v2")]
+    #[cfg(feature = "m-compatible")]
     #[tokio::test]
     async fn test_read_plan_accepts_minio_headerless_compression_index() {
         let mut index = Index::new();
@@ -2860,7 +2860,7 @@ mod tests {
         assert_eq!(plan.object_size, 10);
     }
 
-    #[cfg(feature = "rio-v2")]
+    #[cfg(feature = "m-compatible")]
     #[test]
     fn test_get_compressed_offsets_aligns_encrypted_ranges_to_dare_packages() {
         let mut index = Index::new();
@@ -2958,7 +2958,7 @@ mod tests {
         assert_eq!(actual, plaintext);
     }
 
-    #[cfg(feature = "rio-v2")]
+    #[cfg(feature = "m-compatible")]
     #[tokio::test]
     async fn test_get_object_reader_decrypts_ssec_sealed_object_key_full_object() {
         let plaintext = b"ecstore-rio-v2-ssec-sealed-object-key".repeat(4096);
@@ -3015,13 +3015,13 @@ mod tests {
 
     /// A sealed single-part ETag as MinIO stores it: one DARE package, 96 hex
     /// characters, never the 32 of a bare MD5.
-    #[cfg(feature = "rio-v2")]
+    #[cfg(feature = "m-compatible")]
     const MINIO_SEALED_ETAG: &str =
         "20010f00cbc498738108113178f20c5507f319f350e962a89c610c16699bca30b4f4914b6552c532550cca4ec1eb39b3";
 
     /// The metadata MinIO leaves on a single-part SSE object: the seal
     /// algorithm of its sealed object key and nothing that records a size.
-    #[cfg(feature = "rio-v2")]
+    #[cfg(feature = "m-compatible")]
     fn minio_single_part_sse_object(encrypted_len: usize, plaintext_len: usize, object_key: [u8; 32]) -> ObjectInfo {
         ObjectInfo {
             bucket: "bucket".to_string(),
@@ -3052,7 +3052,7 @@ mod tests {
     /// MinIO seals the ETag of a single-part SSE object, so its length says
     /// nothing about how the object was uploaded: the whole object is one DARE
     /// stream under the object key, not a stream per part under part keys.
-    #[cfg(feature = "rio-v2")]
+    #[cfg(feature = "m-compatible")]
     #[tokio::test]
     async fn minio_single_part_sse_object_reads_as_one_stream_despite_its_sealed_etag() {
         let object_key = [0x67; 32];
@@ -3129,7 +3129,7 @@ mod tests {
 
     /// MinIO's own marker, not the part count, says an object is one cipher
     /// stream per part: a one-part multipart upload is still keyed per part.
-    #[cfg(feature = "rio-v2")]
+    #[cfg(feature = "m-compatible")]
     #[tokio::test]
     async fn minio_one_part_multipart_sse_object_reads_under_its_part_key() {
         let object_key = [0x67; 32];
@@ -4057,8 +4057,8 @@ mod tests {
             let key_bytes = [0x78; 32];
             let fixture = build_legacy_ssec_multipart_fixture(key_bytes, &[20_000, 9_000, 5_000]).await;
             let mut user_defined = fixture.object_info.user_defined.as_ref().clone();
-            // "lz4" parses in both the default and the rio-v2 build (the MinIO
-            // "klauspost/compress/s2" token is only recognized under rio-v2).
+            // "lz4" parses in both the default and the m-compatible build (the MinIO
+            // "klauspost/compress/s2" token is only recognized under m-compatible).
             user_defined.insert("x-minio-internal-compression".to_string(), "lz4".to_string());
             user_defined.insert("x-minio-internal-actual-size".to_string(), "34000".to_string());
             let mut object_info = fixture.object_info.clone();
@@ -4116,7 +4116,7 @@ mod tests {
         .await;
     }
 
-    #[cfg(feature = "rio-v2")]
+    #[cfg(feature = "m-compatible")]
     #[tokio::test]
     async fn test_get_object_reader_uses_dare_package_offset_for_large_ssec_ranges() {
         const DARE_PACKAGE_SIZE: usize = 64 * 1024 + 32;
@@ -4246,7 +4246,7 @@ mod tests {
         assert_eq!(actual, b"fghijkl");
     }
 
-    #[cfg(feature = "rio-v2")]
+    #[cfg(feature = "m-compatible")]
     #[tokio::test]
     async fn test_get_object_reader_uses_compression_index_for_encrypted_ranges() {
         use crate::io_support::rio::TryGetIndex;

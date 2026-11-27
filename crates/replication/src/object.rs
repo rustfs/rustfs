@@ -234,13 +234,13 @@ fn tag_metadata_differs(source: &ReplicationSourceObject<'_>, target: &Replicati
 fn comparable_metadata(metadata: Option<&HashMap<String, String>>) -> HashMap<String, String> {
     let mut comparable = HashMap::new();
     for (key, value) in metadata.into_iter().flatten() {
-        // A `rio-v2` build stores user metadata under `x-amz-meta-` keys, while
+        // A `m-compatible` build stores user metadata under `x-amz-meta-` keys, while
         // a target's HEAD answers it with the prefix stripped: compared by that
         // prefix, a replica carrying the same user metadata could never match
         // and every check would re-send the metadata. Such a build therefore
         // leaves user metadata out of the comparison, which is what a build
         // storing bare keys has always done.
-        if cfg!(feature = "rio-v2") && has_prefix_fold(key, AMZ_META_PREFIX) {
+        if cfg!(feature = "m-compatible") && has_prefix_fold(key, AMZ_META_PREFIX) {
             continue;
         }
         if REPLICATION_METADATA_COMPARE_KEYS
@@ -528,7 +528,7 @@ mod tests {
         assert_eq!(action("owner"), ReplicationAction::None, "a bare stored key is never compared");
         // A build that stores the prefixed key must not see a perpetual
         // difference against the stripped key the target reports.
-        let prefixed = if cfg!(feature = "rio-v2") {
+        let prefixed = if cfg!(feature = "m-compatible") {
             ReplicationAction::None
         } else {
             ReplicationAction::Metadata

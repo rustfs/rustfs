@@ -14,7 +14,7 @@
 
 //! The key material an encrypted write or read runs on.
 
-#[cfg(feature = "rio-v2")]
+#[cfg(feature = "m-compatible")]
 use crate::core::keying::object::{SEALED_KEY_IV_SIZE, SEALED_KEY_SIZE};
 use rustfs_utils::http::object_encryption_keys::SSEType;
 use std::collections::HashMap;
@@ -44,7 +44,7 @@ pub struct EncryptionMaterial {
     /// Original client-provided SSE-KMS context, stored in MinIO-compatible metadata.
     pub managed_kms_context: Option<HashMap<String, String>>,
     /// MinIO-compatible sealed object-key metadata for managed SSE object-key mode.
-    #[cfg_attr(not(feature = "rio-v2"), allow(dead_code))]
+    #[cfg_attr(not(feature = "m-compatible"), allow(dead_code))]
     pub managed_sealed_key: Option<ManagedSealedKey>,
 }
 
@@ -93,9 +93,9 @@ pub enum EncryptionKeyKind {
 
 #[derive(Debug, Clone)]
 pub struct ManagedSealedKey {
-    #[cfg(feature = "rio-v2")]
+    #[cfg(feature = "m-compatible")]
     pub iv: [u8; SEALED_KEY_IV_SIZE],
-    #[cfg(feature = "rio-v2")]
+    #[cfg(feature = "m-compatible")]
     pub sealed_key: [u8; SEALED_KEY_SIZE],
 }
 

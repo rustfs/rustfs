@@ -738,7 +738,7 @@ pub(crate) use ecstore_object::{
     EC_BLOCK_SIZE_HINT_STATUS_HEADER, EC_BLOCK_SIZE_RESPONSE_HEADER, EcBlockSizeHintOutcome, resolve_ec_block_size_hint,
 };
 
-#[cfg(all(test, feature = "rio-v2"))]
+#[cfg(all(test, feature = "m-compatible"))]
 pub(crate) mod ecstore_test_support {
     pub(crate) use rustfs_ecstore::api::bitrot::create_bitrot_reader;
     pub(crate) use rustfs_ecstore::api::disk::{DiskAPI, DiskOption, endpoint::Endpoint, new_disk};
@@ -2930,9 +2930,9 @@ mod legacy_iam_blob_tests {
         assert_eq!(decrypt_legacy_iam_blob(FORMAT_PATH, plaintext).as_deref(), Some(plaintext.as_slice()));
     }
 
-    /// The record that kept a rio-v2 build from starting on a MinIO drive set
+    /// The record that kept an m-compatible build from starting on a MinIO drive set
     /// whose server had a KMS configured: MinIO encrypts even `format.json`.
-    #[cfg(feature = "rio-v2")]
+    #[cfg(feature = "m-compatible")]
     #[test]
     fn minio_kms_encrypted_iam_record_decrypts_under_the_shared_master_key_and_its_path() {
         let blob = minio_kms_iam_format_blob();
@@ -2955,7 +2955,7 @@ mod legacy_iam_blob_tests {
 
     /// Without the MinIO read path there is no reader for MinIO's builtin-KMS
     /// formats: the record stays undecrypted and the migration reports it.
-    #[cfg(not(feature = "rio-v2"))]
+    #[cfg(not(feature = "m-compatible"))]
     #[test]
     fn minio_kms_encrypted_iam_record_stays_sealed_without_the_minio_read_path() {
         let blob = minio_kms_iam_format_blob();

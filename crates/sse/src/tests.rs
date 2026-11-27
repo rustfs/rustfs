@@ -19,7 +19,7 @@ use crate::core::keying::metadata::{
     encryption_material_to_metadata, mark_encrypted_multipart_metadata, recode_minio_kms_context,
     strip_managed_encryption_metadata,
 };
-#[cfg(feature = "rio-v2")]
+#[cfg(feature = "m-compatible")]
 use crate::core::keying::object::{
     DARE_CIPHER_AES_256_GCM, DARE_CIPHER_CHACHA20_POLY1305, MINIO_INTERNAL_ENCRYPTION_SEAL_ALGORITHM, SEALED_KEY_IV_SIZE,
     SEALED_KEY_SIZE, is_legacy_rustfs_managed_metadata, is_supported_sealed_object_key_cipher,
@@ -767,10 +767,10 @@ async fn test_sse_prepare_encryption_rejects_ssec_headers_without_customer_key()
 }
 
 // ------------------------------------------------------------------------
-// SSE-C Direct (default, non-`rio-v2` build) random-nonce persistence
+// SSE-C Direct (default, non-`m-compatible` build) random-nonce persistence
 // ------------------------------------------------------------------------
 
-#[cfg(not(feature = "rio-v2"))]
+#[cfg(not(feature = "m-compatible"))]
 async fn ssec_direct_put_metadata(
     bucket: &str,
     key: &str,
@@ -802,7 +802,7 @@ async fn ssec_direct_put_metadata(
 // (a) Overwriting the same bucket/key under the same SSE-C key must persist a DIFFERENT
 // random IV each time, and each stored IV must be read back on decrypt. This is the core
 // of the fix: no (key, nonce) reuse across overwrites.
-#[cfg(not(feature = "rio-v2"))]
+#[cfg(not(feature = "m-compatible"))]
 #[tokio::test]
 async fn test_ssec_direct_random_nonce_is_unique_per_put_and_read_back() {
     let bucket = "bucket";
@@ -844,7 +844,7 @@ async fn test_ssec_direct_random_nonce_is_unique_per_put_and_read_back() {
 // (b) Legacy compatibility: objects encrypted before this change carry no IV header. Decrypt
 // must fall back to the deterministic `generate_ssec_nonce(bucket, key)` they were encrypted
 // with, so previously stored objects keep decrypting.
-#[cfg(not(feature = "rio-v2"))]
+#[cfg(not(feature = "m-compatible"))]
 #[tokio::test]
 async fn test_ssec_direct_legacy_object_without_iv_falls_back_to_deterministic_nonce() {
     let bucket = "bucket";
@@ -871,7 +871,7 @@ async fn test_ssec_direct_legacy_object_without_iv_falls_back_to_deterministic_n
 
 // (c) Byte-level round trip: data encrypted with the material's key + persisted nonce must
 // decrypt with the key + nonce resolved from the stored metadata.
-#[cfg(not(feature = "rio-v2"))]
+#[cfg(not(feature = "m-compatible"))]
 #[tokio::test]
 async fn test_ssec_direct_persisted_nonce_round_trips_plaintext() {
     use aes_gcm::{
@@ -916,7 +916,7 @@ async fn test_ssec_direct_persisted_nonce_round_trips_plaintext() {
 // (d) Multipart: the random nonce generated at CreateMultipartUpload is persisted in the
 // session metadata, and every part resolves the SAME nonce via `sse_decryption` on that
 // session metadata. Parts must never diverge, and the value must not be deterministic.
-#[cfg(not(feature = "rio-v2"))]
+#[cfg(not(feature = "m-compatible"))]
 #[tokio::test]
 async fn test_ssec_direct_multipart_all_parts_share_one_persisted_nonce() {
     let bucket = "bucket";
@@ -986,7 +986,7 @@ async fn test_ssec_direct_multipart_all_parts_share_one_persisted_nonce() {
     assert_eq!(BASE64_STANDARD.encode_to_string(part_one_nonce), session_iv);
 }
 
-#[cfg(feature = "rio-v2")]
+#[cfg(feature = "m-compatible")]
 #[tokio::test]
 async fn test_sse_prepare_encryption_ssec_with_customer_key_stores_sealed_key_metadata() {
     let bucket = "test-bucket";
@@ -1567,7 +1567,7 @@ async fn test_sse_encryption_persists_aws_kms_header_for_kms_objects() {
     );
 }
 
-#[cfg(feature = "rio-v2")]
+#[cfg(feature = "m-compatible")]
 #[tokio::test]
 async fn test_sse_kms_roundtrip_persists_and_uses_minio_context() {
     use rustfs_kms::types::{CreateKeyRequest, KeyUsage};
@@ -1668,7 +1668,7 @@ async fn test_sse_kms_roundtrip_persists_and_uses_minio_context() {
     reset_sse_dek_provider();
 }
 
-#[cfg(feature = "rio-v2")]
+#[cfg(feature = "m-compatible")]
 #[test]
 fn test_encryption_material_to_metadata_persists_minio_managed_headers() {
     let encoded_nonce = BASE64_STANDARD.encode_to_string([9u8; 12]);
@@ -1891,7 +1891,7 @@ fn plain_object_metadata_is_not_flagged_as_encrypted() {
     );
 }
 
-#[cfg(feature = "rio-v2")]
+#[cfg(feature = "m-compatible")]
 #[test]
 fn test_legacy_managed_metadata_excludes_sealed_keys() {
     let legacy_metadata = HashMap::from([
@@ -1908,7 +1908,7 @@ fn test_legacy_managed_metadata_excludes_sealed_keys() {
     assert!(!is_legacy_rustfs_managed_metadata(&sealed_metadata));
 }
 
-#[cfg(feature = "rio-v2")]
+#[cfg(feature = "m-compatible")]
 #[test]
 fn test_normalize_managed_metadata_accepts_minio_only_headers() {
     let metadata = HashMap::from([
@@ -1944,7 +1944,7 @@ fn test_normalize_managed_metadata_accepts_minio_only_headers() {
     assert_eq!(normalized.get(INTERNAL_ENCRYPTION_KEY_ID_HEADER), Some(&"default".to_string()));
 }
 
-#[cfg(feature = "rio-v2")]
+#[cfg(feature = "m-compatible")]
 #[test]
 fn test_supported_sealed_object_key_cipher_accepts_current_minio_fixture_value() {
     assert!(is_supported_sealed_object_key_cipher(DARE_CIPHER_AES_256_GCM));
@@ -1956,14 +1956,14 @@ fn test_supported_sealed_object_key_cipher_accepts_current_minio_fixture_value()
 /// only the internal sealed-key slot, IV, and seal algorithm — the public
 /// scheme, customer-algorithm, and customer-key-MD5 keys are synthesized
 /// onto responses by MinIO and never hit disk (backlog#1638).
-#[cfg(feature = "rio-v2")]
+#[cfg(feature = "m-compatible")]
 fn strip_to_minio_ssec_shape(metadata: &mut HashMap<String, String>) {
     metadata.remove("x-amz-server-side-encryption");
     metadata.remove("x-amz-server-side-encryption-customer-algorithm");
     metadata.remove("x-amz-server-side-encryption-customer-key-md5");
 }
 
-#[cfg(feature = "rio-v2")]
+#[cfg(feature = "m-compatible")]
 #[tokio::test]
 async fn test_minio_shaped_ssec_metadata_decrypts_with_the_right_key_only() {
     let customer_key_bytes = [0x42u8; 32];
@@ -2051,7 +2051,7 @@ async fn test_minio_shaped_ssec_metadata_decrypts_with_the_right_key_only() {
     assert!(error.message.contains("must be provided"), "got: {}", error.message);
 }
 
-#[cfg(feature = "rio-v2")]
+#[cfg(feature = "m-compatible")]
 #[test]
 fn test_mark_encrypted_multipart_metadata_sets_minio_marker() {
     let mut metadata = HashMap::new();
@@ -2720,7 +2720,7 @@ async fn sse_kms_object_written_through_the_aws_backend_reads_back() {
 
 /// Objects written by releases through 1.0.5 keep the AWS blob bare in
 /// their metadata. They are intact and must decrypt as they are, without
-/// being rewritten. A `rio-v2` build stored the same bare blob beside a
+/// being rewritten. A `m-compatible` build stored the same bare blob beside a
 /// sealed object key, which is the shape MinIO's own objects have, so the
 /// route has to hold there too.
 #[tokio::test]
@@ -2809,13 +2809,13 @@ async fn bare_data_key_stays_with_the_local_provider_without_an_aws_backend() {
 }
 
 /// A KMS stand-in that owns bare data keys and records what it is asked to unwrap.
-#[cfg(feature = "rio-v2")]
+#[cfg(feature = "m-compatible")]
 struct BareKmsProvider {
     data_key: [u8; 32],
     unwrapped: std::sync::Mutex<Vec<Vec<u8>>>,
 }
 
-#[cfg(feature = "rio-v2")]
+#[cfg(feature = "m-compatible")]
 #[async_trait::async_trait]
 impl SseDekProvider for BareKmsProvider {
     async fn generate_sse_dek(
@@ -2843,7 +2843,7 @@ impl SseDekProvider for BareKmsProvider {
 
 /// Seal a data key the way MinIO's builtin KMS does, in its raw layout:
 /// `sealed || iv[16] || nonce[12]`, AES-256-GCM under `HMAC-SHA256(master, iv)`.
-#[cfg(feature = "rio-v2")]
+#[cfg(feature = "m-compatible")]
 fn seal_minio_kms_data_key(data_key: &[u8; 32], master_key: &[u8; 32], context: &ObjectEncryptionContext) -> Vec<u8> {
     use aes_gcm::{Aes256Gcm, KeyInit, aead::Aead};
     use hmac::Mac;
@@ -2868,10 +2868,10 @@ fn seal_minio_kms_data_key(data_key: &[u8; 32], master_key: &[u8; 32], context: 
 }
 
 /// A sealed object key with no RustFS envelope comes from MinIO or from a
-/// `rio-v2` build on a backend that stored its ciphertext bare. Opening it
+/// `m-compatible` build on a backend that stored its ciphertext bare. Opening it
 /// as MinIO's is an authenticated proof, so the genuine MinIO object keeps
 /// its route and only the remainder reaches the KMS.
-#[cfg(feature = "rio-v2")]
+#[cfg(feature = "m-compatible")]
 #[tokio::test]
 async fn unenveloped_sealed_data_key_goes_to_minio_first_and_the_kms_otherwise() {
     let context = ObjectEncryptionContext::new("bucket".to_string(), "dir/object".to_string());
@@ -3106,7 +3106,7 @@ async fn test_kms_sse_dek_provider_uses_latest_reconfigured_service() {
         .await
         .expect_err("stopped KMS must reject data-key decryption");
     assert_eq!(decrypt_error.code, S3ErrorCode::ServiceUnavailable);
-    #[cfg(feature = "rio-v2")]
+    #[cfg(feature = "m-compatible")]
     {
         let legacy_error = provider
             .decrypt_legacy_sse_dek(b"{}", "second-key", &context)
@@ -3440,7 +3440,7 @@ fn sse_kms_write(principal: Option<&SseKmsPrincipal>) -> EncryptionRequest<'_> {
     }
 }
 
-#[cfg(feature = "rio-v2")]
+#[cfg(feature = "m-compatible")]
 #[tokio::test]
 async fn test_managed_sse_rio_v2_uses_object_key_metadata_roundtrip() {
     let _guard = lock_sse_test_state().await;
@@ -3515,7 +3515,7 @@ async fn test_managed_sse_rio_v2_uses_object_key_metadata_roundtrip() {
     reset_sse_dek_provider();
 }
 
-#[cfg(feature = "rio-v2")]
+#[cfg(feature = "m-compatible")]
 #[tokio::test]
 async fn test_ssec_rio_v2_uses_sealed_object_key_metadata_roundtrip() {
     let customer_key_bytes = [0x42u8; 32];
@@ -3570,7 +3570,7 @@ async fn test_ssec_rio_v2_uses_sealed_object_key_metadata_roundtrip() {
     assert_eq!(decrypted.key_bytes, material.key_bytes);
 }
 
-#[cfg(feature = "rio-v2")]
+#[cfg(feature = "m-compatible")]
 #[tokio::test]
 async fn test_minio_shaped_ssec_metadata_resolves_and_classifies() {
     let customer_key_bytes = [0x51u8; 32];
@@ -4772,7 +4772,7 @@ fn recorded_key_versions_reach_the_audit_tags() {
 }
 
 /// Object key `0x40..=0x5f`, the key the sealed-ETag reference vectors use.
-#[cfg(feature = "rio-v2")]
+#[cfg(feature = "m-compatible")]
 fn sealed_etag_object_key() -> [u8; 32] {
     std::array::from_fn(|index| 0x40 + u8::try_from(index).expect("an index below 32 fits in u8"))
 }
@@ -4780,16 +4780,16 @@ fn sealed_etag_object_key() -> [u8; 32] {
 /// `MD5("rustfs-minio-etag-vector")`, and that digest sealed under
 /// [`sealed_etag_object_key`] with MinIO's own `sio` library exactly as
 /// `ObjectKey.SealETag` does, once per DARE cipher suite.
-#[cfg(feature = "rio-v2")]
+#[cfg(feature = "m-compatible")]
 const SEALED_ETAG_PLAINTEXT_HEX: &str = "b228928307afa1ffeb9aa36de4526de8";
-#[cfg(feature = "rio-v2")]
+#[cfg(feature = "m-compatible")]
 const SEALED_ETAG_AES_GCM_HEX: &str =
     "20000f00ae1b28a996b85ecef920fb8da6843e2838328dbfef3a9a266201f27ee3f8c64555ea36a2196275c2261d745d";
-#[cfg(feature = "rio-v2")]
+#[cfg(feature = "m-compatible")]
 const SEALED_ETAG_CHACHA20_HEX: &str =
     "20010f00cbc498738108113178f20c5507f319f350e962a89c610c16699bca30b4f4914b6552c532550cca4ec1eb39b3";
 
-#[cfg(feature = "rio-v2")]
+#[cfg(feature = "m-compatible")]
 #[test]
 fn unseal_etag_recovers_the_md5_minio_sealed_under_either_cipher_suite() {
     use crate::core::keying::object::unseal_etag;
@@ -4801,7 +4801,7 @@ fn unseal_etag_recovers_the_md5_minio_sealed_under_either_cipher_suite() {
     }
 }
 
-#[cfg(feature = "rio-v2")]
+#[cfg(feature = "m-compatible")]
 #[test]
 fn unseal_etag_rejects_a_wrong_key_and_malformed_packages() {
     use crate::core::keying::object::unseal_etag;
@@ -4827,7 +4827,7 @@ fn unseal_etag_rejects_a_wrong_key_and_malformed_packages() {
 
 /// Metadata of a single-part managed-SSE object as MinIO's builtin KMS stores
 /// it: internal sealed-key slots only, no public scheme header.
-#[cfg(feature = "rio-v2")]
+#[cfg(feature = "m-compatible")]
 fn minio_managed_object_metadata(
     sse_type: SSEType,
     master_key: &[u8; 32],
@@ -4864,7 +4864,7 @@ fn minio_managed_object_metadata(
     ])
 }
 
-#[cfg(feature = "rio-v2")]
+#[cfg(feature = "m-compatible")]
 fn decryption_request<'a>(metadata: &'a HashMap<String, String>) -> DecryptionRequest<'a> {
     DecryptionRequest {
         bucket: "bucket",
@@ -4878,7 +4878,7 @@ fn decryption_request<'a>(metadata: &'a HashMap<String, String>) -> DecryptionRe
 
 /// The ETag half of reading a MinIO drive set: what MinIO stored is not what
 /// MinIO answered with, and a client only ever saw the answer.
-#[cfg(feature = "rio-v2")]
+#[cfg(feature = "m-compatible")]
 #[tokio::test]
 async fn sealed_etag_is_presented_the_way_minio_presented_it() {
     use crate::core::read::sealed_etag_for_response;
@@ -4949,7 +4949,7 @@ async fn sealed_etag_is_presented_the_way_minio_presented_it() {
 }
 
 /// A build without the MinIO read path never rewrites an ETag.
-#[cfg(not(feature = "rio-v2"))]
+#[cfg(not(feature = "m-compatible"))]
 #[tokio::test]
 async fn sealed_etag_is_left_alone_without_the_minio_read_path() {
     let metadata = HashMap::from([(MINIO_INTERNAL_ENCRYPTION_KMS_SEALED_KEY_HEADER.to_string(), "sealed".to_string())]);
@@ -4990,7 +4990,7 @@ fn unrecorded_sse_response_leaves_objects_with_stored_headers_to_the_stored_path
     assert!(classify_unrecorded_sse_response(&recorded_ssec, None).is_none(), "RustFS-written SSE-C");
 }
 
-#[cfg(feature = "rio-v2")]
+#[cfg(feature = "m-compatible")]
 #[test]
 fn unrecorded_sse_response_synthesizes_what_minio_synthesized() {
     use crate::core::read::classify_unrecorded_sse_response;
@@ -5033,7 +5033,7 @@ fn unrecorded_sse_response_synthesizes_what_minio_synthesized() {
 
 /// Without the MinIO read path the scheme of such an object cannot be
 /// established, so no header claims one.
-#[cfg(not(feature = "rio-v2"))]
+#[cfg(not(feature = "m-compatible"))]
 #[test]
 fn unrecorded_sse_response_reports_nothing_without_the_minio_read_path() {
     use crate::core::read::classify_unrecorded_sse_response;
@@ -5050,7 +5050,7 @@ fn unrecorded_sse_response_reports_nothing_without_the_minio_read_path() {
 
 /// GET of a MinIO-written `aws:kms` object names its key the way MinIO did,
 /// while authorization keeps naming the key itself.
-#[cfg(feature = "rio-v2")]
+#[cfg(feature = "m-compatible")]
 #[tokio::test]
 async fn read_response_reports_a_minio_written_kms_key_in_arn_form() {
     let master_key = [0x5Au8; 32];

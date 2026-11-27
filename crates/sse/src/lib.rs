@@ -100,7 +100,7 @@ pub use crate::host::{BucketDefaultEncryption, BucketEncryption, KmsKeyAuthorize
 pub use crate::kms::local::LocalSseDekProvider;
 #[cfg(any(test, feature = "test-util"))]
 pub use crate::kms::local::TestSseDekProvider;
-#[cfg(feature = "rio-v2")]
+#[cfg(feature = "m-compatible")]
 pub use crate::kms::minio::decrypt_minio_kms_config;
 pub use crate::kms::provider::SseDekProvider;
 #[cfg(any(test, feature = "test-util"))]

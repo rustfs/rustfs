@@ -259,7 +259,7 @@ pub fn classify_unrecorded_sse_response(
 /// authorization, and the unwrap is not recorded in the KMS audit summary: it
 /// serves the response of a read that is recorded on its own.
 pub async fn sealed_etag_for_response(host: &dyn SseHost, request: DecryptionRequest<'_>, stored_etag: &str) -> Option<String> {
-    #[cfg(feature = "rio-v2")]
+    #[cfg(feature = "m-compatible")]
     {
         use crate::core::keying::object::{SEALED_ETAG_MIN_SIZE, unseal_etag};
         use rustfs_utils::http::object_encryption_keys::{
@@ -297,7 +297,7 @@ pub async fn sealed_etag_for_response(host: &dyn SseHost, request: DecryptionReq
         Some(hex_simd::encode_to_string(etag, hex_simd::AsciiCase::Lower))
     }
 
-    #[cfg(not(feature = "rio-v2"))]
+    #[cfg(not(feature = "m-compatible"))]
     {
         let _ = (host, request, stored_etag);
         None

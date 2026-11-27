@@ -12,10 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#[cfg(feature = "rio-v2")]
+#[cfg(feature = "m-compatible")]
 pub use rustfs_rio_v2::*;
 
-#[cfg(not(feature = "rio-v2"))]
+#[cfg(not(feature = "m-compatible"))]
 pub use rustfs_rio::*;
 
 use bytes::Bytes;
@@ -23,12 +23,12 @@ use rustfs_utils::CompressionAlgorithm;
 use std::str::FromStr;
 use tokio::io::AsyncRead;
 
-#[cfg(feature = "rio-v2")]
+#[cfg(feature = "m-compatible")]
 const MINIO_S2_COMPRESSION_SCHEME: &str = "klauspost/compress/s2";
 // The S2 padding multiple rio-v2 pads compressed streams to before
 // encryption. Only the padding test asserts it today, so the lib target sees
 // it as unused (backlog#1823).
-#[cfg(feature = "rio-v2")]
+#[cfg(feature = "m-compatible")]
 #[allow(dead_code, reason = "on-disk contract asserted by the rio-v2 padding test (backlog#1823)")]
 const ENCRYPTED_S2_PADDING_MULTIPLE: usize = 256;
 
@@ -40,25 +40,25 @@ const ENCRYPTED_S2_PADDING_MULTIPLE: usize = 256;
     reason = "asserted by the rio backend feature-seam test in lib.rs (backlog#1823)"
 )]
 pub const fn backend_name() -> &'static str {
-    #[cfg(feature = "rio-v2")]
+    #[cfg(feature = "m-compatible")]
     {
         "rio-v2"
     }
 
-    #[cfg(not(feature = "rio-v2"))]
+    #[cfg(not(feature = "m-compatible"))]
     {
         "legacy-rio"
     }
 }
 
 pub fn compression_metadata_value(algorithm: CompressionAlgorithm) -> String {
-    #[cfg(feature = "rio-v2")]
+    #[cfg(feature = "m-compatible")]
     {
         let _ = algorithm;
         MINIO_S2_COMPRESSION_SCHEME.to_string()
     }
 
-    #[cfg(not(feature = "rio-v2"))]
+    #[cfg(not(feature = "m-compatible"))]
     {
         algorithm.to_string()
     }
@@ -71,7 +71,7 @@ pub enum ReadCompressionBackend {
 }
 
 pub fn compression_scheme_to_read_plan(scheme: &str) -> std::io::Result<(CompressionAlgorithm, ReadCompressionBackend)> {
-    #[cfg(feature = "rio-v2")]
+    #[cfg(feature = "m-compatible")]
     if scheme.eq_ignore_ascii_case(MINIO_S2_COMPRESSION_SCHEME) {
         return Ok((CompressionAlgorithm::default(), ReadCompressionBackend::V2));
     }
@@ -99,19 +99,19 @@ pub enum ReadEncryptionBackend {
 }
 
 pub fn compression_index_storage_bytes(index: &Index) -> Bytes {
-    #[cfg(feature = "rio-v2")]
+    #[cfg(feature = "m-compatible")]
     {
         minio_index_storage_bytes(index)
     }
 
-    #[cfg(not(feature = "rio-v2"))]
+    #[cfg(not(feature = "m-compatible"))]
     {
         index.clone().into_vec()
     }
 }
 
 pub fn decode_compression_index_bytes(bytes: &Bytes) -> Option<Index> {
-    #[cfg(feature = "rio-v2")]
+    #[cfg(feature = "m-compatible")]
     {
         if let Some(decoded) = decode_minio_index_bytes(bytes) {
             return Some(decoded);
@@ -123,7 +123,7 @@ pub fn decode_compression_index_bytes(bytes: &Bytes) -> Option<Index> {
         return Some(decoded);
     }
 
-    #[cfg(feature = "rio-v2")]
+    #[cfg(feature = "m-compatible")]
     {
         let restored = restore_legacy_index_headers(bytes.as_ref());
         let mut decoded = Index::new();
@@ -139,14 +139,14 @@ pub fn compression_reader<R>(reader: R, algorithm: CompressionAlgorithm, encrypt
 where
     R: AsyncRead + Unpin + Send + Sync,
 {
-    #[cfg(feature = "rio-v2")]
+    #[cfg(feature = "m-compatible")]
     {
         if encrypted {
             return CompressReader::with_encrypted_padding(reader, algorithm);
         }
     }
 
-    #[cfg(not(feature = "rio-v2"))]
+    #[cfg(not(feature = "m-compatible"))]
     let _ = encrypted;
 
     CompressReader::new(reader, algorithm)
@@ -160,7 +160,7 @@ pub fn decompression_reader<R>(
 where
     R: AsyncRead + Unpin + Send + Sync + 'static,
 {
-    #[cfg(feature = "rio-v2")]
+    #[cfg(feature = "m-compatible")]
     {
         match backend {
             ReadCompressionBackend::Legacy => Box::new(rustfs_rio::DecompressReader::new(reader, algorithm)),
@@ -168,7 +168,7 @@ where
         }
     }
 
-    #[cfg(not(feature = "rio-v2"))]
+    #[cfg(not(feature = "m-compatible"))]
     {
         let _ = backend;
         Box::new(rustfs_rio::DecompressReader::new(reader, algorithm))
@@ -185,7 +185,7 @@ pub fn decrypt_reader<R>(
 where
     R: AsyncRead + Unpin + Send + Sync + 'static,
 {
-    #[cfg(feature = "rio-v2")]
+    #[cfg(feature = "m-compatible")]
     {
         match backend {
             // The legacy family includes v2 fixed-frame objects, whose plans
@@ -201,7 +201,7 @@ where
         }
     }
 
-    #[cfg(not(feature = "rio-v2"))]
+    #[cfg(not(feature = "m-compatible"))]
     {
         let _ = backend;
         if sequence_number > 0 {
@@ -222,7 +222,7 @@ pub fn decrypt_reader_with_object_key<R>(
 where
     R: AsyncRead + Unpin + Send + Sync + 'static,
 {
-    #[cfg(feature = "rio-v2")]
+    #[cfg(feature = "m-compatible")]
     {
         Box::new(rustfs_rio_v2::DecryptReader::new_with_object_key_and_sequence(
             reader,
@@ -231,7 +231,7 @@ where
         ))
     }
 
-    #[cfg(not(feature = "rio-v2"))]
+    #[cfg(not(feature = "m-compatible"))]
     {
         let _ = sequence_number;
         Box::new(rustfs_rio::DecryptReader::new(reader, object_key, [0u8; 12]))
@@ -249,7 +249,7 @@ pub fn decrypt_multipart_reader<R>(
 where
     R: AsyncRead + Unpin + Send + Sync + 'static,
 {
-    #[cfg(feature = "rio-v2")]
+    #[cfg(feature = "m-compatible")]
     {
         match backend {
             ReadEncryptionBackend::Legacy => {
@@ -265,7 +265,7 @@ where
         }
     }
 
-    #[cfg(not(feature = "rio-v2"))]
+    #[cfg(not(feature = "m-compatible"))]
     {
         let _ = (backend, sequence_number);
         Box::new(rustfs_rio::DecryptReader::new_multipart(reader, key, base_nonce, multipart_parts))
@@ -281,7 +281,7 @@ pub fn decrypt_multipart_reader_with_object_key<R>(
 where
     R: AsyncRead + Unpin + Send + Sync + 'static,
 {
-    #[cfg(feature = "rio-v2")]
+    #[cfg(feature = "m-compatible")]
     {
         Box::new(rustfs_rio_v2::DecryptReader::new_multipart_with_object_key_and_sequence(
             reader,
@@ -291,14 +291,14 @@ where
         ))
     }
 
-    #[cfg(not(feature = "rio-v2"))]
+    #[cfg(not(feature = "m-compatible"))]
     {
         let _ = sequence_number;
         Box::new(rustfs_rio::DecryptReader::new_multipart(reader, object_key, [0u8; 12], multipart_parts))
     }
 }
 
-#[cfg(feature = "rio-v2")]
+#[cfg(feature = "m-compatible")]
 fn restore_legacy_index_headers(bytes: &[u8]) -> Vec<u8> {
     if bytes.is_empty() {
         return Vec::new();
@@ -336,12 +336,12 @@ pub struct WriteEncryption {
 /// after every node (and every RustFS warm/replication target that receives
 /// raw ciphertext) runs a release with v2 read support. Reading v2 objects
 /// needs no switch — the decrypt reader dispatches on the frame type byte.
-#[cfg(not(feature = "rio-v2"))]
+#[cfg(not(feature = "m-compatible"))]
 pub(crate) const ENV_RUSTFS_ENCRYPTION_FRAME_V2: &str = "RUSTFS_ENCRYPTION_FRAME_V2";
-#[cfg(not(feature = "rio-v2"))]
+#[cfg(not(feature = "m-compatible"))]
 pub(crate) const DEFAULT_RUSTFS_ENCRYPTION_FRAME_V2: bool = false;
 
-#[cfg(not(feature = "rio-v2"))]
+#[cfg(not(feature = "m-compatible"))]
 pub(crate) fn encryption_frame_v2_enabled() -> bool {
     #[cfg(test)]
     {
@@ -463,9 +463,9 @@ impl WritePlan {
                 .with_inner_etag_delegation(delegate_inner_etag);
             reader = match encryption.mode {
                 WriteEncryptionMode::SinglepartObjectKey => HashReader::from_reader(
-                    #[cfg(feature = "rio-v2")]
+                    #[cfg(feature = "m-compatible")]
                     EncryptReader::new_with_object_key(protected_reader, encryption.key_bytes),
-                    #[cfg(not(feature = "rio-v2"))]
+                    #[cfg(not(feature = "m-compatible"))]
                     EncryptReader::new(protected_reader, encryption.key_bytes, [0u8; 12]),
                     HashReader::SIZE_PRESERVE_LAYER,
                     actual_size,
@@ -474,13 +474,13 @@ impl WritePlan {
                     false,
                 )?,
                 WriteEncryptionMode::Singlepart { base_nonce } => {
-                    #[cfg(not(feature = "rio-v2"))]
+                    #[cfg(not(feature = "m-compatible"))]
                     let encrypt_reader = if encryption_frame_v2_enabled() {
                         EncryptReader::new_v2(protected_reader, encryption.key_bytes, base_nonce)
                     } else {
                         EncryptReader::new(protected_reader, encryption.key_bytes, base_nonce)
                     };
-                    #[cfg(feature = "rio-v2")]
+                    #[cfg(feature = "m-compatible")]
                     let encrypt_reader = EncryptReader::new(protected_reader, encryption.key_bytes, base_nonce);
                     HashReader::from_reader(encrypt_reader, HashReader::SIZE_PRESERVE_LAYER, actual_size, None, None, false)?
                 }
@@ -488,21 +488,21 @@ impl WritePlan {
                     base_nonce,
                     multipart_part_number,
                 } => {
-                    #[cfg(not(feature = "rio-v2"))]
+                    #[cfg(not(feature = "m-compatible"))]
                     let encrypt_reader = if encryption_frame_v2_enabled() {
                         EncryptReader::new_multipart_v2(protected_reader, encryption.key_bytes, base_nonce, multipart_part_number)
                     } else {
                         EncryptReader::new_multipart(protected_reader, encryption.key_bytes, base_nonce, multipart_part_number)
                     };
-                    #[cfg(feature = "rio-v2")]
+                    #[cfg(feature = "m-compatible")]
                     let encrypt_reader =
                         EncryptReader::new_multipart(protected_reader, encryption.key_bytes, base_nonce, multipart_part_number);
                     HashReader::from_reader(encrypt_reader, HashReader::SIZE_PRESERVE_LAYER, actual_size, None, None, false)?
                 }
                 WriteEncryptionMode::MultipartObjectKey { multipart_part_number } => HashReader::from_reader(
-                    #[cfg(feature = "rio-v2")]
+                    #[cfg(feature = "m-compatible")]
                     EncryptReader::new_multipart_with_object_key(protected_reader, encryption.key_bytes, multipart_part_number),
-                    #[cfg(not(feature = "rio-v2"))]
+                    #[cfg(not(feature = "m-compatible"))]
                     EncryptReader::new_multipart(
                         protected_reader,
                         encryption.key_bytes,
@@ -593,13 +593,13 @@ mod tests {
                     tags.insert(tag),
                     "different part numbers and retries must not identify matching plaintext"
                 );
-                #[cfg(feature = "rio-v2")]
+                #[cfg(feature = "m-compatible")]
                 let mut decrypt = if object_key_mode {
                     DecryptReader::new_multipart_with_object_key(Cursor::new(ciphertext), [7; 32], vec![part_number as usize])
                 } else {
                     DecryptReader::new_multipart(Cursor::new(ciphertext), [7; 32], [9; 12], vec![part_number as usize])
                 };
-                #[cfg(not(feature = "rio-v2"))]
+                #[cfg(not(feature = "m-compatible"))]
                 let mut decrypt = DecryptReader::new_multipart(
                     Cursor::new(ciphertext),
                     [7; 32],
@@ -677,7 +677,7 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "rio-v2")]
+    #[cfg(feature = "m-compatible")]
     fn s2_chunk_types(stream: &[u8]) -> Vec<u8> {
         let mut chunk_types = Vec::new();
         let mut offset = 0usize;
@@ -749,7 +749,7 @@ mod tests {
         assert_eq!(actual, plaintext);
     }
 
-    #[cfg(feature = "rio-v2")]
+    #[cfg(feature = "m-compatible")]
     #[tokio::test]
     async fn write_plan_supports_singlepart_object_key_encryption_roundtrip() {
         let plaintext = b"singlepart-object-key".repeat(512);
@@ -777,7 +777,7 @@ mod tests {
         assert_eq!(actual, plaintext);
     }
 
-    #[cfg(feature = "rio-v2")]
+    #[cfg(feature = "m-compatible")]
     #[tokio::test]
     async fn write_plan_supports_multipart_object_key_encryption_roundtrip() {
         let plaintext = b"multipart-object-key-".repeat(4096);
@@ -808,7 +808,7 @@ mod tests {
         assert_eq!(actual, plaintext);
     }
 
-    #[cfg(feature = "rio-v2")]
+    #[cfg(feature = "m-compatible")]
     #[tokio::test]
     async fn write_plan_rio_v2_compression_emits_s2_stream_and_seekable_index() {
         let plaintext = b"rustfs-rio-v2-s2-".repeat(600_000);
@@ -848,7 +848,7 @@ mod tests {
         assert_eq!(actual, plaintext);
     }
 
-    #[cfg(feature = "rio-v2")]
+    #[cfg(feature = "m-compatible")]
     #[tokio::test]
     async fn write_plan_rio_v2_small_compression_skips_index_below_minio_threshold() {
         let plaintext = b"rustfs-rio-v2-s2-".repeat(32_768);
@@ -879,7 +879,7 @@ mod tests {
         assert_eq!(actual, plaintext);
     }
 
-    #[cfg(feature = "rio-v2")]
+    #[cfg(feature = "m-compatible")]
     #[tokio::test]
     async fn rio_v2_singlepart_encrypt_decrypt_roundtrip_preserves_small_compressed_stream() {
         let plaintext = b"abcdefghijklmnopqrstuvwxyz".to_vec();
@@ -909,7 +909,7 @@ mod tests {
         assert_eq!(actual, plaintext);
     }
 
-    #[cfg(feature = "rio-v2")]
+    #[cfg(feature = "m-compatible")]
     #[tokio::test]
     async fn rio_v2_compress_then_encrypt_adds_s2_padding_frames() {
         let plaintext = b"padding-check-".repeat(4097);
@@ -955,7 +955,7 @@ mod tests {
         assert_eq!(actual, plaintext);
     }
 
-    #[cfg(feature = "rio-v2")]
+    #[cfg(feature = "m-compatible")]
     #[tokio::test]
     async fn rio_v2_decompress_reader_returns_bytes_on_first_read() {
         let plaintext = b"abcdefghijklmnopqrstuvwxyz".to_vec();
@@ -974,7 +974,7 @@ mod tests {
         assert_eq!(&buf[..n], plaintext.as_slice());
     }
 
-    #[cfg(feature = "rio-v2")]
+    #[cfg(feature = "m-compatible")]
     #[tokio::test]
     async fn rio_v2_decompress_reader_returns_bytes_on_first_large_read() {
         let plaintext = b"abcdefghijklmnopqrstuvwxyz".to_vec();

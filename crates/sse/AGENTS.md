@@ -20,7 +20,7 @@ Applies to `crates/sse/`.
 Rules that keep the layers apart:
 
 - `core/keying/` never imports from `core/s3/`. `core/s3/` reads stored metadata only through `core/keying/metadata.rs`. Anything else that needs both layers is joined in an entry point.
-- `#[cfg(feature = "rio-v2")]` appears only under `core/keying/` and `kms/`. An entry point or `core/s3/` that needs a build-dependent answer asks `core/keying/` for it.
+- `#[cfg(feature = "m-compatible")]` appears only under `core/keying/` and `kms/`. An entry point or `core/s3/` that needs a build-dependent answer asks `core/keying/` for it.
 - A new stored format, including a MinIO-compatible one, is added under `core/keying/` (and `kms/` when it brings its own wrapping) without changes under `core/s3/`: a mode file with its record and read functions, one entry in the recognition order of `stored.rs`, and its key names in the lists of `metadata.rs`.
 - A read decides from what the object recorded. The scheme a request advertises and whether a KMS is running now are write policy and runtime state; neither says how an existing object was keyed.
 
@@ -41,11 +41,11 @@ When changing key resolution, metadata, or error classification, verify compatib
 
 ## Testing
 
-Run both builds; the `rio-v2` feature swaps the object-key scheme and compiles different code paths:
+Run both builds; the `m-compatible` feature swaps the object-key scheme and compiles different code paths:
 
 ```bash
 cargo nextest run -p rustfs-sse --no-tests fail
-cargo nextest run -p rustfs-sse --features rio-v2 --no-tests fail
+cargo nextest run -p rustfs-sse --features m-compatible --no-tests fail
 ```
 
 The adapter tests live with the adapter:

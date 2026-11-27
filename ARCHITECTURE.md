@@ -93,7 +93,7 @@ refactors.
 | Domain | Current workspace crates | Responsibility |
 |--------|--------------------------|----------------|
 | Foundation | `checksums`, `common`, `config`, `data-usage`, `heal-contracts`, `scanner-metrics`, `utils` | Shared configuration, data-usage models, heal domain contracts, scanner telemetry types, utilities, and checksums. |
-| I/O and storage | `concurrency`, `ecstore`, `filemeta`, `heal`, `io-core`, `io-metrics`, `lifecycle`, `lock`, `object-capacity`, `object-data-cache`, `replication`, `rio`, `rio-v2`, `s3-client`, `scanner`, `storage-api` | Erasure-coded object storage, metadata, recovery, lifecycle, replication, locking, cache, I/O pipelines, and the engine-side S3 client for remote tier/transition targets. |
+| I/O and storage | `concurrency`, `ecstore`, `filemeta`, `heal`, `io-core`, `io-metrics`, `lifecycle`, `lock`, `object-capacity`, `object-data-cache`, `replication`, `rio`, `m-compatible`, `s3-client`, `scanner`, `storage-api` | Erasure-coded object storage, metadata, recovery, lifecycle, replication, locking, cache, I/O pipelines, and the engine-side S3 client for remote tier/transition targets. |
 | Security and identity | `credentials`, `crypto`, `iam`, `keystone`, `kms`, `policy`, `security-governance`, `signer`, `sse`, `tls-runtime`, `trusted-proxies` | Credentials, authentication, authorization, encryption, key management, server-side encryption key resolution, TLS, and security contracts. |
 | Protocols and contracts | `extension-schema`, `madmin`, `protos`, `protocols`, `s3-ops`, `s3-types`, `s3select-api`, `s3select-query` | Admin, inter-node, S3, S3 Select, and optional protocol contracts. |
 | Operations and integration | `audit`, `notify`, `obs`, `targets`, `zip` | Auditing, observability, event delivery, notification targets, and archive support. |
@@ -101,7 +101,7 @@ refactors.
 
 The `rustfs` binary crate composes these libraries into the running server.
 `ecstore` remains the storage engine at the architectural center; its internal
-module split is tracked under `docs/architecture/`. `rio-v2` is the
+module split is tracked under `docs/architecture/`. `m-compatible` is the
 feature-gated MinIO on-disk format compatibility I/O layer; it ships in no
 default build (lifecycle:
 [docs/architecture/minio-file-format-compat.md](docs/architecture/minio-file-format-compat.md)).

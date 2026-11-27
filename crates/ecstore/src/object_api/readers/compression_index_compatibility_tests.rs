@@ -12,7 +12,7 @@ const HISTORICAL_INDEX: &[u8] = include_bytes!(concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/tests/fixtures/compression-index/pre-zigzag-index.bin"
 ));
-#[cfg(not(feature = "rio-v2"))]
+#[cfg(not(feature = "m-compatible"))]
 const CURRENT_INDEX: &[u8] =
     include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/compression-index/zigzag-index.bin"));
 const PLAINTEXT_LEN: usize = 3 * 1024 * 1024 + 123;
@@ -102,7 +102,7 @@ async fn historical_index_preserves_ranges_across_compression_blocks() {
     }
 }
 
-#[cfg(not(feature = "rio-v2"))]
+#[cfg(not(feature = "m-compatible"))]
 #[tokio::test]
 async fn current_index_selects_a_fixed_compressed_block_for_a_range() {
     let info = fixture_info(CURRENT_INDEX);

@@ -653,7 +653,7 @@ async fn create_multipart_encryption(server: RustFSServer, legacy: bool) {
     };
     let uploads = || store.list_multipart_uploads(bucket, "", None, None, None, 100);
     let supplied_md5 = "1B2M2Y8AsgTpgAmY7PhCfg==";
-    if legacy && !cfg!(feature = "rio-v2") {
+    if legacy && !cfg!(feature = "m-compatible") {
         let before = count();
         let output = ssec(supplied_md5).send().await.expect("initiate with the supplied digest");
         let upload_id = output.upload_id().expect("upload ID for the supplied digest");

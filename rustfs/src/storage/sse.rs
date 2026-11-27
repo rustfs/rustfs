@@ -47,7 +47,7 @@ use std::borrow::Cow;
 use std::collections::HashMap;
 use std::sync::Arc;
 
-#[cfg(all(test, feature = "rio-v2"))]
+#[cfg(all(test, feature = "m-compatible"))]
 pub(crate) use rustfs_sse::reset_sse_dek_provider;
 pub(crate) use rustfs_sse::startup::init as init_sse_startup;
 #[cfg(test)]
@@ -314,11 +314,11 @@ pub(crate) async fn read_response_etag(
 /// `None` in a build without the MinIO read path, which holds no reader for
 /// MinIO's builtin-KMS formats.
 pub(crate) fn decrypt_minio_kms_iam_config(blob: &[u8], object_path: &str) -> Option<Vec<u8>> {
-    #[cfg(feature = "rio-v2")]
+    #[cfg(feature = "m-compatible")]
     {
         rustfs_sse::decrypt_minio_kms_config(blob, object_path)
     }
-    #[cfg(not(feature = "rio-v2"))]
+    #[cfg(not(feature = "m-compatible"))]
     {
         let _ = (blob, object_path);
         None
@@ -545,12 +545,12 @@ impl ObjectEncryptionResolver for SseObjectEncryptionResolver {
                 .keys()
                 .any(|key| rustfs_utils::http::is_object_encryption_marker(key))
             {
-                #[cfg(not(feature = "rio-v2"))]
+                #[cfg(not(feature = "m-compatible"))]
                 let message = "object is stored encrypted, but its decryption material could not be resolved: the \
                                encryption metadata is incomplete, or it is in the MinIO-compatible sealed format, \
                                which this server build has no read path for (reading it requires a build with the \
-                               `rio-v2` feature)";
-                #[cfg(feature = "rio-v2")]
+                               `m-compatible` feature)";
+                #[cfg(feature = "m-compatible")]
                 let message = "object is stored encrypted, but its decryption material could not be resolved: the \
                                encryption metadata is incomplete or in an unrecognized sealed format";
                 return Err(EncryptionResolutionError::new(EncryptionResolutionErrorKind::InvalidMetadata, message));
@@ -895,7 +895,7 @@ mod tests {
         // no public scheme header, no customer-algorithm metadata. The read
         // must fail closed either way, but the failure differs by build: a
         // default build has no read path for the shape and diagnoses that; a
-        // rio-v2 build recognizes it as SSE-C and asks for the customer key.
+        // m-compatible build recognizes it as SSE-C and asks for the customer key.
         let metadata = HashMap::from([(
             MINIO_INTERNAL_ENCRYPTION_SSEC_SEALED_KEY_HEADER.to_string(),
             "c2VhbGVkLWtleQ==".to_string(),
@@ -913,7 +913,7 @@ mod tests {
             Ok(_) => panic!("encryption markers without resolvable material must fail closed"),
         };
 
-        #[cfg(not(feature = "rio-v2"))]
+        #[cfg(not(feature = "m-compatible"))]
         {
             assert_eq!(error.kind(), EncryptionResolutionErrorKind::InvalidMetadata);
             assert!(
@@ -921,7 +921,7 @@ mod tests {
                 "error must diagnose the unresolvable metadata, got: {error}"
             );
         }
-        #[cfg(feature = "rio-v2")]
+        #[cfg(feature = "m-compatible")]
         {
             assert_eq!(error.kind(), EncryptionResolutionErrorKind::InvalidRequest);
             assert!(
@@ -1087,7 +1087,7 @@ mod tests {
         assert_eq!(audit_tag(&audit.audit_tags(), "kmsKeyId").as_deref(), Some("finance-key"));
     }
 
-    #[cfg(feature = "rio-v2")]
+    #[cfg(feature = "m-compatible")]
     mod rio_v2 {
         use super::{BASE64_STANDARD, enforcing_principal, md5_base64, ssec_read_headers};
         use crate::storage::sse::{

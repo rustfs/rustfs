@@ -20,5 +20,5 @@ Example:
 ```powershell
 $env:RUSTFS_MINIO_FIXTURE_ROOT = '.\rustfs\tmp\minio-fixture-lab-local-key'
 $env:RUSTFS_MINIO_STATIC_KMS_KEY_B64 = '<base64-32-byte-local-minio-kms-key>'
-cargo +1.97.1 test -p rustfs --features rio-v2 storage::minio_generated_read_test --lib -- --ignored
+cargo +1.97.1 test -p rustfs --features m-compatible storage::minio_generated_read_test --lib -- --ignored
 ```
