@@ -1,0 +1,19 @@
+<NotificationConfiguration xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
+  <QueueConfiguration>
+    <Id>notify-1</Id>
+    <Queue>arn:rustfs:sqs:us-east-1:1:webhook</Queue>
+    <Event>s3:ObjectCreated:Put</Event>
+    <Filter>
+      <S3Key>
+        <FilterRule>
+          <Name>prefix</Name>
+          <Value>logs/</Value>
+        </FilterRule>
+        <FilterRule>
+          <Name>suffix</Name>
+          <Value>.json</Value>
+        </FilterRule>
+      </S3Key>
+    </Filter>
+  </QueueConfiguration>
+</NotificationConfiguration>

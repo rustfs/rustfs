@@ -1,0 +1,19 @@
+<NotificationConfiguration>
+  <QueueConfiguration>
+    <Id>bad-filter</Id>
+    <Queue>arn:rustfs:sqs:us-east-1:1:webhook</Queue>
+    <Event>s3:ObjectCreated:Put</Event>
+    <Filter>
+      <S3Key>
+        <FilterRule>
+          <Name>prefix</Name>
+          <Value>../escape</Value>
+        </FilterRule>
+        <FilterRule>
+          <Name>prefix</Name>
+          <Value>second</Value>
+        </FilterRule>
+      </S3Key>
+    </Filter>
+  </QueueConfiguration>
+</NotificationConfiguration>

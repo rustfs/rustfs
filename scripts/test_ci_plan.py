@@ -560,6 +560,22 @@ class GateTests(unittest.TestCase):
         jobs[gate.LINT_JOB]['steps'] = [{'run': 'cargo clippy --all-targets -- -D warnings'}]
         jobs[gate.ADVISORIES_JOB]['runs-on'] = 'ubuntu-latest'
         jobs[gate.ADVISORIES_JOB]['steps'] = [{'run': 'python3 scripts/security/check_advisories.py --output artifacts/advisories/advisories-gate.json'}]
+        jobs[gate.SECURITY_INPUT_JOB] = {
+            'name': 'Security Input Gate',
+            'needs': ['classify-changes'],
+            'if': "github.event_name != 'pull_request' || github.event.action != 'closed'",
+            'uses': gate.SECURITY_INPUT_WORKFLOW,
+            'with': {
+                'mode': 'smoke',
+                'targets': 'auto',
+                'max_total_time': '60',
+                'base_sha': '${{ github.event.pull_request.base.sha }}',
+                'head_sha': '${{ github.sha }}',
+                'event_name': '${{ github.event_name }}',
+                'ref_name': '${{ github.ref }}',
+                'ci_mode': '${{ needs.classify-changes.outputs.mode }}',
+            },
+        }
         jobs['workspace-tests']['needs'] = [gate.ARCHIVE_PRODUCER]
         jobs['classify-changes']['steps'] = [{'id': 'scope', 'run': f"grep -q '^plan_contract={gate.PLAN_CONTRACT}$' \"$GITHUB_OUTPUT\""}]
         jobs['test-and-lint-protocols']['strategy'] = {'matrix': {'features': [
@@ -775,6 +791,36 @@ class GateTests(unittest.TestCase):
             (lambda w: w['jobs'][advisories]['steps'][0].update({'run': f'{gate.ADVISORIES_COMMAND} || true'}), f'{advisories} must not mask failures or override the CI clock'),
             (lambda w: w['jobs'][advisories]['steps'][0].update({'run': f'{gate.ADVISORIES_COMMAND} --now 2026-01-01T00:00:00Z'}), f'{advisories} must not mask failures or override the CI clock'),
             (lambda w: w['jobs'][advisories].update({'continue-on-error': 'true'}), f'{advisories} cannot convert a validation failure into success'),
+        )):
+            changed = copy.deepcopy(workflow)
+            mutate(changed)
+            self.assertIn(message, self.check(changed), case)
+
+    def test_security_input_gate_lane_gates_every_event_and_validates_contract(self):
+        job = gate.SECURITY_INPUT_JOB
+        self.assertIn(job, gate.ALWAYS_JOBS)
+        for event, mode in (('pull_request', 'docs'), ('pull_request', 'e2e'), ('pull_request', 'full'),
+                            ('push', 'full'), ('push', 'proven'), ('merge_group', 'full'),
+                            ('schedule', 'full'), ('workflow_dispatch', 'full')):
+            plan = self.plan(event, mode)
+            self.assertEqual(plan['jobs'][job], 'success', (event, mode))
+            self.assertEqual(gate.verify_results(self.needs(plan), event, plan['ref']), [])
+            for bad in ('failure', 'cancelled', 'skipped', None):
+                needs = self.needs(plan)
+                needs[job]['result'] = bad
+                errors = gate.verify_results(needs, event, plan['ref'])
+                self.assertTrue(any(error.startswith(f'{job}: expected success') for error in errors), (event, mode, bad, errors))
+        workflow = self.workflow()
+        self.assertEqual(self.check(workflow), [])
+        for case, (mutate, message) in enumerate((
+            (lambda w: w['jobs']['required-checks']['needs'].remove(job), 'required-checks must directly depend on every verification job exactly once'),
+            (lambda w: w['jobs'][job].update({'name': 'Dynamic ${{ github.ref }}'}), f"{job} must keep stable display name 'Security Input Gate'"),
+            (lambda w: w['jobs'][job].update({'uses': './.github/workflows/other.yml'}), f'{job} must call reusable workflow {gate.SECURITY_INPUT_WORKFLOW}'),
+            (lambda w: w['jobs'][job].update({'needs': []}), f'{job} must depend on classify-changes for ci_mode'),
+            (lambda w: w['jobs'][job]['with'].pop('base_sha'), f'{job} missing required with inputs: base_sha'),
+            (lambda w: w['jobs'][job]['with'].update({'shell_cmd': 'id'}), f'{job} has unexpected with inputs: shell_cmd'),
+            (lambda w: w['jobs'][job]['with'].update({'mode': 'nightly'}), f'{job} must invoke fuzz.yml in smoke mode'),
+            (lambda w: w['jobs'][job].update({'continue-on-error': 'true'}), f'{job} cannot convert a validation failure into success'),
         )):
             changed = copy.deepcopy(workflow)
             mutate(changed)

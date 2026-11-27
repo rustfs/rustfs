@@ -334,11 +334,14 @@ pub(super) fn init_observability_http(
         .map_err(|err| TelemetryError::SubscriberInit(err.to_string()))?;
 
     counter!("rustfs_start_total").increment(1);
+    let redacted_trace_ep = sanitize_otlp_endpoint_for_log(&trace_ep);
+    let redacted_metric_ep = sanitize_otlp_endpoint_for_log(&metric_ep);
+    let redacted_log_ep = sanitize_otlp_endpoint_for_log(&log_ep);
     info!(
         backend = "otlp_http",
-        trace_endpoint = %trace_ep,
-        metric_endpoint = %metric_ep,
-        log_endpoint = %log_ep,
+        trace_endpoint = %redacted_trace_ep,
+        metric_endpoint = %redacted_metric_ep,
+        log_endpoint = %redacted_log_ep,
         local_file_fallback_enabled,
         stdout_mirror_enabled,
         output_format = "json",
@@ -439,6 +442,25 @@ fn resolve_otlp_use_stdout(config_use_stdout: Option<bool>, is_production: bool)
 
 fn normalize_otlp_root_endpoint(root_ep: &str) -> &str {
     root_ep.trim_end_matches('/')
+}
+
+/// Strip userinfo, query parameters, and fragments from OTLP endpoint URLs
+/// before emitting them in structured startup logs.
+fn sanitize_otlp_endpoint_for_log(endpoint: &str) -> String {
+    if endpoint.is_empty() {
+        return String::new();
+    }
+    let Ok(mut parsed) = url::Url::parse(endpoint) else {
+        return "[redacted]".to_string();
+    };
+    if !matches!(parsed.scheme(), "http" | "https") {
+        return "[redacted]".to_string();
+    }
+    let _ = parsed.set_username("");
+    let _ = parsed.set_password(None);
+    parsed.set_query(None);
+    parsed.set_fragment(None);
+    parsed.to_string()
 }
 
 fn resolve_signal_endpoint(signal_endpoint: Option<&str>, root_ep: &str, suffix: &str) -> String {
@@ -1420,5 +1442,451 @@ mod tests {
         ] {
             assert!(!rendered.contains(leaked), "LogTracer path leaked {leaked}: {rendered}");
         }
+    }
+
+    const FAKE_OTLP_CHILD_ENV: &str = "RUSTFS_OBS_FAKE_OTLP_CHILD";
+    const FAKE_OTLP_ENDPOINT_ENV: &str = "RUSTFS_OBS_FAKE_OTLP_ENDPOINT";
+    const FAKE_OTLP_TIMEOUT_MS_ENV: &str = "RUSTFS_OBS_FAKE_OTLP_TIMEOUT_MS";
+    const FAKE_OTLP_SCENARIO_ENV: &str = "RUSTFS_OBS_FAKE_OTLP_SCENARIO";
+    const SENTINEL_OTLP_BEARER: &str = "SENTINEL_OTLP_BEARER_TOKEN_98765";
+    const SENTINEL_OTLP_URL_PASS: &str = "SENTINEL_OTLP_URL_PASS_54321";
+    const SENTINEL_OTLP_URL_QUERY: &str = "SENTINEL_OTLP_QUERY_KEY_24680";
+
+    #[derive(Clone, Debug)]
+    struct RecordedOtlpRequest {
+        path: String,
+        headers: Vec<(String, String)>,
+        body_len: usize,
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    enum FakeOtlpBehavior {
+        Status(u16),
+        DelayThenStatus(Duration, u16),
+    }
+
+    struct FakeOtlpCollector {
+        addr: std::net::SocketAddr,
+        behavior: Arc<Mutex<FakeOtlpBehavior>>,
+        requests: Arc<Mutex<Vec<RecordedOtlpRequest>>>,
+        shutdown_tx: Option<tokio::sync::oneshot::Sender<()>>,
+        task: Option<tokio::task::JoinHandle<()>>,
+    }
+
+    impl FakeOtlpCollector {
+        async fn start(initial: FakeOtlpBehavior) -> Self {
+            let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind fake OTLP collector");
+            let addr = listener.local_addr().expect("fake OTLP collector local addr");
+            let behavior = Arc::new(Mutex::new(initial));
+            let requests = Arc::new(Mutex::new(Vec::new()));
+            let (shutdown_tx, mut shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+
+            let behavior_bg = Arc::clone(&behavior);
+            let requests_bg = Arc::clone(&requests);
+
+            let task = tokio::spawn(async move {
+                loop {
+                    tokio::select! {
+                        _ = &mut shutdown_rx => break,
+                        accept_res = listener.accept() => {
+                            let Ok((mut stream, _)) = accept_res else { break };
+                            let behavior_conn = Arc::clone(&behavior_bg);
+                            let requests_conn = Arc::clone(&requests_bg);
+                            tokio::spawn(async move {
+                                let mut raw = Vec::new();
+                                let mut buf = [0_u8; 4096];
+                                let header_end = loop {
+                                    let Ok(read) = stream.read(&mut buf).await else { return };
+                                    if read == 0 {
+                                        return;
+                                    }
+                                    raw.extend_from_slice(&buf[..read]);
+                                    if let Some(pos) = raw.windows(4).position(|w| w == b"\r\n\r\n") {
+                                        break pos + 4;
+                                    }
+                                    if raw.len() > 64 * 1024 {
+                                        return;
+                                    }
+                                };
+                                let head = String::from_utf8_lossy(&raw[..header_end]);
+                                let mut lines = head.split("\r\n");
+                                let path = lines
+                                    .next()
+                                    .and_then(|line| line.split_whitespace().nth(1))
+                                    .unwrap_or_default()
+                                    .to_string();
+                                let mut headers = Vec::new();
+                                let mut content_length: usize = 0;
+                                for line in lines {
+                                    if let Some((k, v)) = line.split_once(':') {
+                                        let key = k.trim().to_ascii_lowercase();
+                                        let val = v.trim().to_string();
+                                        if key == "content-length" {
+                                            content_length = val.parse().unwrap_or(0);
+                                        }
+                                        headers.push((key, val));
+                                    }
+                                }
+                                while raw.len().saturating_sub(header_end) < content_length {
+                                    let Ok(read) = stream.read(&mut buf).await else { break };
+                                    if read == 0 {
+                                        break;
+                                    }
+                                    raw.extend_from_slice(&buf[..read]);
+                                }
+                                let body_len = raw.len().saturating_sub(header_end);
+                                requests_conn.lock().expect("lock recorded OTLP requests").push(RecordedOtlpRequest {
+                                    path,
+                                    headers,
+                                    body_len,
+                                });
+
+                                let mode = *behavior_conn.lock().expect("lock fake OTLP behavior");
+                                let status = match mode {
+                                    FakeOtlpBehavior::Status(code) => code,
+                                    FakeOtlpBehavior::DelayThenStatus(delay, code) => {
+                                        tokio::time::sleep(delay).await;
+                                        code
+                                    }
+                                };
+                                let reason = match status {
+                                    200 => "OK",
+                                    401 => "Unauthorized",
+                                    500 => "Internal Server Error",
+                                    _ => "Error",
+                                };
+                                let resp = format!(
+                                    "HTTP/1.1 {status} {reason}\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
+                                );
+                                let _ = stream.write_all(resp.as_bytes()).await;
+                                let _ = stream.shutdown().await;
+                            });
+                        }
+                    }
+                }
+            });
+
+            Self {
+                addr,
+                behavior,
+                requests,
+                shutdown_tx: Some(shutdown_tx),
+                task: Some(task),
+            }
+        }
+
+        fn set_behavior(&self, mode: FakeOtlpBehavior) {
+            *self.behavior.lock().expect("lock fake OTLP behavior") = mode;
+        }
+
+        fn base_url(&self) -> String {
+            format!("http://{}", self.addr)
+        }
+
+        fn credentialed_url(&self) -> String {
+            format!(
+                "http://otel-user:{SENTINEL_OTLP_URL_PASS}@{}?api_key={SENTINEL_OTLP_URL_QUERY}",
+                self.addr
+            )
+        }
+
+        fn recorded_requests(&self) -> Vec<RecordedOtlpRequest> {
+            self.requests.lock().expect("lock recorded OTLP requests").clone()
+        }
+
+        async fn stop(mut self) {
+            if let Some(tx) = self.shutdown_tx.take() {
+                let _ = tx.send(());
+            }
+            if let Some(handle) = self.task.take() {
+                handle.abort();
+                let _ = handle.await;
+            }
+        }
+    }
+
+    async fn run_isolated_otlp_child(test_name: &str, scenario: &str, endpoint: &str, timeout_ms: u64) -> std::process::Output {
+        let test_name = test_name.to_string();
+        let scenario = scenario.to_string();
+        let endpoint = endpoint.to_string();
+        tokio::task::spawn_blocking(move || {
+            Command::new(env::current_exe().expect("resolve test executable"))
+                .args(["--exact", &test_name, "--nocapture"])
+                .env_remove("HTTP_PROXY")
+                .env_remove("HTTPS_PROXY")
+                .env_remove("http_proxy")
+                .env_remove("https_proxy")
+                .env_remove("ALL_PROXY")
+                .env_remove("all_proxy")
+                .env("NO_PROXY", "127.0.0.1,localhost")
+                .env("no_proxy", "127.0.0.1,localhost")
+                .env(FAKE_OTLP_CHILD_ENV, "1")
+                .env(FAKE_OTLP_SCENARIO_ENV, &scenario)
+                .env(FAKE_OTLP_ENDPOINT_ENV, &endpoint)
+                .env(FAKE_OTLP_TIMEOUT_MS_ENV, timeout_ms.to_string())
+                .output()
+                .expect("spawn isolated OTLP fault test child")
+        })
+        .await
+        .expect("join isolated OTLP fault test child")
+    }
+
+    fn assert_no_otlp_sentinels(label: &str, text: &str) {
+        for sentinel in [SENTINEL_OTLP_BEARER, SENTINEL_OTLP_URL_PASS, SENTINEL_OTLP_URL_QUERY] {
+            assert!(!text.contains(sentinel), "{label} leaked secret sentinel `{sentinel}`:\n{text}");
+        }
+    }
+
+    #[test]
+    fn test_sanitize_otlp_endpoint_for_log_strips_userinfo_and_query() {
+        assert_eq!(sanitize_otlp_endpoint_for_log(""), "");
+        assert_eq!(
+            sanitize_otlp_endpoint_for_log("http://otel-user:secret-pass@127.0.0.1:4318/v1/traces?api_key=query-secret#frag"),
+            "http://127.0.0.1:4318/v1/traces"
+        );
+        assert_eq!(
+            sanitize_otlp_endpoint_for_log("http://127.0.0.1:4318/v1/metrics"),
+            "http://127.0.0.1:4318/v1/metrics"
+        );
+        assert_eq!(sanitize_otlp_endpoint_for_log("not-a-valid-url://user:secret@bad"), "[redacted]");
+        assert_eq!(sanitize_otlp_endpoint_for_log("://user:secret@bad:port"), "[redacted]");
+    }
+
+    #[tokio::test]
+    async fn test_otlp_export_handles_401_500_connection_refused_and_recovers() {
+        use opentelemetry::trace::Tracer as _;
+
+        if env::var_os(FAKE_OTLP_CHILD_ENV).is_some() {
+            let endpoint = env::var(FAKE_OTLP_ENDPOINT_ENV).expect("child endpoint env");
+            let timeout_ms: u64 = env::var(FAKE_OTLP_TIMEOUT_MS_ENV)
+                .expect("child timeout env")
+                .parse()
+                .expect("valid timeout_ms");
+            let scenario = env::var(FAKE_OTLP_SCENARIO_ENV).expect("child scenario env");
+
+            let config = OtelConfig {
+                endpoint: endpoint.clone(),
+                endpoint_headers: Some(format!("Authorization=Bearer%20{SENTINEL_OTLP_BEARER}")),
+                endpoint_timeout_millis: Some(timeout_ms),
+                traces_export_enabled: Some(true),
+                metrics_export_enabled: Some(false),
+                logs_export_enabled: Some(false),
+                use_stdout: Some(false),
+                ..OtelConfig::default()
+            };
+            let res = build_resource(&config);
+            let trace_ep = resolve_signal_endpoint(None, normalize_otlp_root_endpoint(&config.endpoint), "/v1/traces");
+            let provider = build_tracer_provider(&trace_ep, &config, None, res, Sampler::AlwaysOn, false)
+                .expect("build tracer provider")
+                .expect("tracer provider should be enabled");
+
+            let emit_and_flush = |provider: &SdkTracerProvider, span_name: &'static str| {
+                let tracer = provider.tracer("rustfs-obs-fault-test");
+                tracer.in_span(span_name, |_cx| {});
+                provider.force_flush()
+            };
+
+            let flush_result = tokio::task::spawn_blocking({
+                let provider = provider.clone();
+                move || emit_and_flush(&provider, "fault-span")
+            })
+            .await
+            .expect("flush task");
+
+            match scenario.as_str() {
+                "status_401" | "status_500" | "conn_refused" => {
+                    let err = flush_result.expect_err("faulty OTLP export must return an observable error");
+                    assert_no_otlp_sentinels("force_flush error", &err.to_string());
+                }
+                "status_200" => {
+                    flush_result.expect("healthy OTLP export must succeed");
+                }
+                other => panic!("unexpected scenario: {other}"),
+            }
+
+            let _ = tokio::task::spawn_blocking(move || provider.shutdown())
+                .await
+                .expect("shutdown task");
+            return;
+        }
+
+        let test_name = "telemetry::otel::tests::test_otlp_export_handles_401_500_connection_refused_and_recovers";
+
+        // 1. HTTP 401 Unauthorized
+        let collector = FakeOtlpCollector::start(FakeOtlpBehavior::Status(401)).await;
+        let out_401 = run_isolated_otlp_child(test_name, "status_401", &collector.base_url(), 1_000).await;
+        let combined_401 = format!("{}{}", String::from_utf8_lossy(&out_401.stdout), String::from_utf8_lossy(&out_401.stderr));
+        assert!(out_401.status.success(), "401 child failed:\n{combined_401}");
+        assert_no_otlp_sentinels("401 child output", &combined_401);
+        let reqs_401 = collector.recorded_requests();
+        assert!(!reqs_401.is_empty(), "401 collector must receive at least one OTLP POST");
+        assert!(
+            reqs_401.iter().any(|r| {
+                r.path == "/v1/traces"
+                    && r.body_len > 0
+                    && r.headers
+                        .iter()
+                        .any(|(k, v)| k == "authorization" && v == &format!("Bearer {SENTINEL_OTLP_BEARER}"))
+            }),
+            "401 OTLP export must carry non-empty body and configured Authorization header to /v1/traces: {reqs_401:?}"
+        );
+
+        // 2. HTTP 500 Internal Server Error
+        collector.set_behavior(FakeOtlpBehavior::Status(500));
+        let before_500 = collector.recorded_requests().len();
+        let out_500 = run_isolated_otlp_child(test_name, "status_500", &collector.base_url(), 1_000).await;
+        let combined_500 = format!("{}{}", String::from_utf8_lossy(&out_500.stdout), String::from_utf8_lossy(&out_500.stderr));
+        assert!(out_500.status.success(), "500 child failed:\n{combined_500}");
+        assert_no_otlp_sentinels("500 child output", &combined_500);
+        assert!(
+            collector.recorded_requests().len() > before_500,
+            "500 collector must observe export attempt"
+        );
+
+        // 3. Recovery to HTTP 200 OK
+        collector.set_behavior(FakeOtlpBehavior::Status(200));
+        let before_200 = collector.recorded_requests().len();
+        let out_200 = run_isolated_otlp_child(test_name, "status_200", &collector.base_url(), 1_000).await;
+        let combined_200 = format!("{}{}", String::from_utf8_lossy(&out_200.stdout), String::from_utf8_lossy(&out_200.stderr));
+        assert!(out_200.status.success(), "200 recovery child failed:\n{combined_200}");
+        assert_no_otlp_sentinels("200 recovery child output", &combined_200);
+        assert!(
+            collector.recorded_requests().len() > before_200,
+            "recovered collector must receive subsequent OTLP export"
+        );
+        collector.stop().await;
+
+        // 4. Connection refused (unbound local port)
+        let closed_listener = TcpListener::bind("127.0.0.1:0").await.expect("bind ephemeral port");
+        let closed_addr = closed_listener.local_addr().expect("ephemeral port addr");
+        drop(closed_listener);
+        let started = std::time::Instant::now();
+        let out_refused = run_isolated_otlp_child(test_name, "conn_refused", &format!("http://{closed_addr}"), 1_000).await;
+        let combined_refused = format!(
+            "{}{}",
+            String::from_utf8_lossy(&out_refused.stdout),
+            String::from_utf8_lossy(&out_refused.stderr)
+        );
+        assert!(out_refused.status.success(), "connection-refused child failed:\n{combined_refused}");
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "connection-refused export must terminate promptly"
+        );
+        assert_no_otlp_sentinels("connection-refused child output", &combined_refused);
+    }
+
+    #[tokio::test]
+    async fn test_otlp_export_enforces_configured_timeout_on_stalled_collector() {
+        use opentelemetry::trace::Tracer as _;
+
+        if env::var_os(FAKE_OTLP_CHILD_ENV).is_some() {
+            let endpoint = env::var(FAKE_OTLP_ENDPOINT_ENV).expect("child endpoint env");
+            let timeout_ms: u64 = env::var(FAKE_OTLP_TIMEOUT_MS_ENV)
+                .expect("child timeout env")
+                .parse()
+                .expect("valid timeout_ms");
+            let config = OtelConfig {
+                endpoint,
+                endpoint_headers: Some(format!("Authorization=Bearer%20{SENTINEL_OTLP_BEARER}")),
+                endpoint_timeout_millis: Some(timeout_ms),
+                traces_export_enabled: Some(true),
+                metrics_export_enabled: Some(false),
+                logs_export_enabled: Some(false),
+                use_stdout: Some(false),
+                ..OtelConfig::default()
+            };
+            let res = build_resource(&config);
+            let trace_ep = resolve_signal_endpoint(None, normalize_otlp_root_endpoint(&config.endpoint), "/v1/traces");
+            let provider = build_tracer_provider(&trace_ep, &config, None, res, Sampler::AlwaysOn, false)
+                .expect("build tracer provider")
+                .expect("tracer provider should be enabled");
+
+            let started = std::time::Instant::now();
+            let flush_result = tokio::task::spawn_blocking({
+                let provider = provider.clone();
+                move || {
+                    let tracer = provider.tracer("rustfs-obs-timeout-test");
+                    tracer.in_span("stalled-span", |_cx| {});
+                    provider.force_flush()
+                }
+            })
+            .await
+            .expect("flush task");
+            let elapsed = started.elapsed();
+
+            let err = flush_result.expect_err("stalled collector must fail with timeout");
+            assert_no_otlp_sentinels("timeout error", &err.to_string());
+            assert!(
+                elapsed < Duration::from_secs(4),
+                "export waited {elapsed:?} instead of respecting 1000ms timeout against 5s stalled collector"
+            );
+
+            let _ = tokio::task::spawn_blocking(move || provider.shutdown())
+                .await
+                .expect("shutdown task");
+            return;
+        }
+
+        let collector = FakeOtlpCollector::start(FakeOtlpBehavior::DelayThenStatus(Duration::from_secs(5), 200)).await;
+        let test_name = "telemetry::otel::tests::test_otlp_export_enforces_configured_timeout_on_stalled_collector";
+        let out = run_isolated_otlp_child(test_name, "timeout", &collector.base_url(), 1_000).await;
+        let combined = format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+        assert!(out.status.success(), "timeout child failed:\n{combined}");
+        assert_no_otlp_sentinels("timeout child output", &combined);
+        assert!(
+            !collector.recorded_requests().is_empty(),
+            "stalled collector must have received the OTLP request before client timeout"
+        );
+        collector.stop().await;
+    }
+
+    #[tokio::test]
+    async fn test_init_observability_http_redacts_secrets_across_export_faults_and_shutdown() {
+        if env::var_os(FAKE_OTLP_CHILD_ENV).is_some() {
+            let endpoint = env::var(FAKE_OTLP_ENDPOINT_ENV).expect("child endpoint env");
+            let timeout_ms: u64 = env::var(FAKE_OTLP_TIMEOUT_MS_ENV)
+                .expect("child timeout env")
+                .parse()
+                .expect("valid timeout_ms");
+            let config = OtelConfig {
+                endpoint,
+                endpoint_headers: Some(format!("Authorization=Bearer%20{SENTINEL_OTLP_BEARER}")),
+                endpoint_timeout_millis: Some(timeout_ms),
+                traces_export_enabled: Some(true),
+                metrics_export_enabled: Some(true),
+                logs_export_enabled: Some(true),
+                meter_interval: Some(1),
+                use_stdout: Some(false),
+                log_stdout_enabled: Some(true),
+                ..OtelConfig::default()
+            };
+            let guard = init_observability_http(&config, "info", false).expect("init_observability_http should succeed");
+            let span = tracing::info_span!("fault_isolated_span");
+            {
+                let _enter = span.enter();
+                tracing::info!("observability fault probe");
+                counter!("rustfs_obs_fault_probe_total").increment(1);
+            }
+            tokio::task::spawn_blocking(move || drop(guard))
+                .await
+                .expect("drop OtelGuard cleanly");
+            return;
+        }
+
+        let collector = FakeOtlpCollector::start(FakeOtlpBehavior::Status(401)).await;
+        let test_name = "telemetry::otel::tests::test_init_observability_http_redacts_secrets_across_export_faults_and_shutdown";
+        let out = run_isolated_otlp_child(test_name, "full_init_401", &collector.credentialed_url(), 1_000).await;
+        let combined = format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+        assert!(out.status.success(), "isolated init_observability_http child failed:\n{combined}");
+        assert!(
+            combined.contains("Initialized observability"),
+            "startup log should still be emitted after endpoint redaction:\n{combined}"
+        );
+        assert!(
+            !collector.recorded_requests().is_empty(),
+            "fake OTLP collector must receive export attempt(s) during full init + shutdown"
+        );
+        assert_no_otlp_sentinels("init_observability_http stdout/stderr", &combined);
+        collector.stop().await;
     }
 }

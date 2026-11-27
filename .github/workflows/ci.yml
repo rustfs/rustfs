@@ -113,7 +113,7 @@ jobs:
             printf '%s\n' 'mode=full' >> "$GITHUB_OUTPUT"
             echo "Base CI policy unavailable; running the full matrix."
           fi
-          if ! grep -q '^plan=' "$GITHUB_OUTPUT" || ! grep -q '^plan_contract=10$' "$GITHUB_OUTPUT"; then
+          if ! grep -q '^plan=' "$GITHUB_OUTPUT" || ! grep -q '^plan_contract=11$' "$GITHUB_OUTPUT"; then
             printf '%s\n' 'mode=full' 'connect=true' 'full_validation=true' 'packages=' 'plan=' >> "$GITHUB_OUTPUT"
             echo "Base policy does not cover this workflow contract; retaining the full matrix."
           fi
@@ -221,6 +221,24 @@ jobs:
           path: artifacts/advisories
           if-no-files-found: error
           retention-days: 7
+
+  # Stable PR/merge-group caller for fuzz smoke and rejection-branch mutants
+  # (rustfs/backlog#2677). Relevant paths run selected targets and mutants;
+  # docs-only or unrelated changes record an explicit N/A inside fuzz.yml.
+  security-input-gate:
+    name: Security Input Gate
+    needs: [ classify-changes ]
+    if: github.event_name != 'pull_request' || github.event.action != 'closed'
+    uses: ./.github/workflows/fuzz.yml
+    with:
+      mode: smoke
+      targets: auto
+      max_total_time: "60"
+      base_sha: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha || github.event.before }}
+      head_sha: ${{ github.sha }}
+      event_name: ${{ github.event_name }}
+      ref_name: ${{ github.ref }}
+      ci_mode: ${{ needs.classify-changes.outputs.mode }}
 
   # Clippy runs beside the test-binary build instead of in front of it. The two
   # share no compiler output: Clippy writes check-mode metadata, the archive
@@ -1325,6 +1343,7 @@ jobs:
       - typos
       - quick-checks
       - security-advisories
+      - security-input-gate
       - workspace-clippy
       - workspace-lint-and-build
       - workspace-tests
@@ -1360,6 +1379,7 @@ jobs:
       - typos
       - quick-checks
       - security-advisories
+      - security-input-gate
       - workspace-clippy
       - workspace-lint-and-build
       - workspace-tests
