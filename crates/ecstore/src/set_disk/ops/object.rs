@@ -5973,6 +5973,7 @@ impl SetDisks {
                 namespace_lock_acquired_to_commit_ready_started,
             );
 
+            let slow_rename_trace_id = crate::set_disk::core::io_primitives::capture_slow_rename_trace_id();
             let commit = move |commit_submit_to_closure_enter_started: Option<Instant>,
                                cancellation: Option<CancellationToken>| async move {
                 let write_context = write_context;
@@ -6262,6 +6263,7 @@ impl SetDisks {
                         commit_scanner_publication_lease_tokens.as_ref(),
                     )
                     .with_publication_scope(commit_scanner_publication_scope.clone())
+                    .with_slow_trace_id(slow_rename_trace_id)
                     .with_quorum_bounded_dispatch(bound_rename_dispatch)
                     .with_rollback_receipt(commit_rollback_receipt.clone())
                     .with_namespace_commit_guard(

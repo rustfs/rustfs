@@ -95,6 +95,12 @@ Internode clients retain up to 8,192 locally reset streams per connection so lat
 
 Verify `RUSTFS_OBS_METRICS_EXPORT_ENABLED=true` and that the Collector exports the intended node/process identities. The client `success` outcome denotes an `Ok` tonic exchange. Interpret payload-level success using the returned operation result and operation error counters. RPC duration buckets use milliseconds and resolve sub-millisecond samples; object-lock duration buckets use seconds. The active-client metric counts the complete measured unary future, while tonic's transport concurrency limit ends when its HTTP response future completes. The two counts have different lifetimes. `BatchReadVersion` traffic requires the batch gate, such as `RUSTFS_GET_METADATA_READ_VERSION_COALESCE=on` on compatible peers; verify actual batch request counts and keep that setting identical across A/B legs.
 
+### Slow synchronous rename slots
+
+For a diagnostic run, enable `RUSTFS_OBS_PUT_STAGE_METRICS_ENABLED=true` with the local stage summary or metrics export. Add `rustfs_ecstore::rename_slot_diag=trace` to the log filter. A completed unary slot in the synchronous fanout emits `set_disk_rename_slot_slow` when its total time from fanout setup reaches 50 ms.
+
+Group slots by `fanout_id` and use `trace_id` to join the request trace when available. The configured pool, set, and disk indices identify the endpoint. `fanout_slot` is the position after shuffling. `before_disk_call_us` covers fanout setup, scheduling, and slot preparation. `disk_call_us` covers the local disk call or the coordinator's remote call, including remote execution. Consult peer timing and per-connection transport evidence to resolve a slow remote call.
+
 ## Isolated bulk tuning
 
 These settings apply when `RUSTFS_INTERNODE_CHANNEL_ISOLATION=true` selects an isolated bulk cache key. Control and dedicated recovery channels use their existing transport settings. Defaults preserve the existing transport behavior.

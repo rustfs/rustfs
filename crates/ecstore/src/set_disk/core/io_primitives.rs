@@ -3376,6 +3376,9 @@ fn rename_tail_cleanup_queue() -> &'static RenameTailCleanupQueue {
 }
 
 const EVENT_SET_DISK_RENAME_ROLLBACK: &str = "set_disk_rename_rollback";
+const EVENT_SET_DISK_RENAME_SLOT_SLOW: &str = "set_disk_rename_slot_slow";
+const RENAME_SLOT_DIAGNOSTIC_TARGET: &str = "rustfs_ecstore::rename_slot_diag";
+const RENAME_SLOT_DIAGNOSTIC_THRESHOLD: Duration = Duration::from_millis(50);
 const PUT_RENAME_POST_QUORUM_DISPATCH_GRACE: Duration = Duration::from_secs(1);
 
 #[derive(Clone, Copy)]
@@ -3408,6 +3411,7 @@ struct RenameSlotPaths {
     src_object: String,
     dst_bucket: String,
     dst_object: String,
+    slow_unary_trace: Option<Box<SlowUnaryRenameTrace>>,
 }
 
 impl RenameSlotPaths {
@@ -3417,7 +3421,79 @@ impl RenameSlotPaths {
             src_object: src_object.to_owned(),
             dst_bucket: dst_bucket.to_owned(),
             dst_object: dst_object.to_owned(),
+            slow_unary_trace: None,
         }
+    }
+}
+
+struct SlowUnaryRenameTrace {
+    fanout_id: Uuid,
+    started_at: Instant,
+    trace_id: Option<String>,
+}
+
+fn slow_rename_slot_trace_enabled() -> bool {
+    rustfs_io_metrics::put_stage_metrics_enabled()
+        && tracing::event_enabled!(target: RENAME_SLOT_DIAGNOSTIC_TARGET, tracing::Level::TRACE)
+}
+
+pub(in crate::set_disk) fn capture_slow_rename_trace_id() -> Option<String> {
+    if slow_rename_slot_trace_enabled() {
+        crate::cluster::rpc::context_propagation::current_trace_id()
+    } else {
+        None
+    }
+}
+
+impl SlowUnaryRenameTrace {
+    fn start(trace_id: Option<String>) -> Option<Box<Self>> {
+        slow_rename_slot_trace_enabled().then(|| {
+            Box::new(Self {
+                fanout_id: Uuid::new_v4(),
+                started_at: Instant::now(),
+                trace_id,
+            })
+        })
+    }
+
+    fn slow_durations(&self, disk_started_at: Instant, now: Instant) -> Option<(Duration, Duration)> {
+        if now.duration_since(self.started_at) < RENAME_SLOT_DIAGNOSTIC_THRESHOLD {
+            return None;
+        }
+        Some((disk_started_at.duration_since(self.started_at), now.duration_since(disk_started_at)))
+    }
+
+    fn record(&self, disk: &DiskStore, slot: usize, started_at: Instant, completed_at: Instant, success: bool) {
+        let Some((before_disk_call, disk_call)) = self.slow_durations(started_at, completed_at) else {
+            return;
+        };
+        // JSON formatters may still render the current span for a root event.
+        // Keep that context free of request and endpoint data.
+        let scope = tracing::trace_span!(target: RENAME_SLOT_DIAGNOSTIC_TARGET, parent: None, "rename_slot_diagnostic");
+        if scope.is_disabled() && tracing::Span::current().id().is_some() {
+            return;
+        }
+        let endpoint = disk.endpoint();
+        scope.in_scope(|| {
+            tracing::trace!(
+                target: RENAME_SLOT_DIAGNOSTIC_TARGET,
+                parent: None,
+                event = EVENT_SET_DISK_RENAME_SLOT_SLOW,
+                component = LOG_COMPONENT_ECSTORE,
+                subsystem = LOG_SUBSYSTEM_SET_DISK,
+                result = if success { "ok" } else { "error" },
+                fanout_id = %self.fanout_id,
+                trace_id = self.trace_id.as_deref(),
+                fanout_slot = slot,
+                pool_index = endpoint.pool_idx,
+                set_index = endpoint.set_idx,
+                disk_index = endpoint.disk_idx,
+                location = if disk.is_local() { "local" } else { "remote" },
+                before_disk_call_us = u64::try_from(before_disk_call.as_micros()).unwrap_or(u64::MAX),
+                disk_call_us = u64::try_from(disk_call.as_micros()).unwrap_or(u64::MAX),
+                "Slow unary rename slot"
+            );
+        });
     }
 }
 
@@ -3938,6 +4014,7 @@ pub(in crate::set_disk) struct RenameDataFenceOptions<'a> {
     multipart_proof_authority: Option<crate::disk::multipart_source::ProofVerificationContext>,
     multipart_commit_owner: Option<Arc<MultipartLogicalGuards>>,
     bound_dispatch_after_quorum: bool,
+    slow_trace_id: Option<String>,
 }
 
 impl<'a> RenameDataFenceOptions<'a> {
@@ -3954,11 +4031,17 @@ impl<'a> RenameDataFenceOptions<'a> {
             multipart_proof_authority: None,
             multipart_commit_owner: None,
             bound_dispatch_after_quorum: false,
+            slow_trace_id: None,
         }
     }
 
     pub(in crate::set_disk) fn with_quorum_bounded_dispatch(mut self, enabled: bool) -> Self {
         self.bound_dispatch_after_quorum = enabled;
+        self
+    }
+
+    pub(in crate::set_disk) fn with_slow_trace_id(mut self, trace_id: Option<String>) -> Self {
+        self.slow_trace_id = trace_id;
         self
     }
 
@@ -4528,6 +4611,7 @@ impl SetDisks {
             return Err(DiskError::other("scanner publication commit scope deadline or cancellation reached"));
         }
         let disk = context.disk.as_ref().ok_or(DiskError::DiskNotFound)?;
+        let direct_unary = observation.is_none();
         let observation = match observation {
             Some(observation) => observation,
             None => RenameSlotObservation::start(prepared)?,
@@ -4554,7 +4638,15 @@ impl SetDisks {
         if result.is_ok() {
             rollback_fault_injection::after_rename(&context.paths.dst_object, context.slot)?;
         }
+        let trace_times = if direct_unary && context.paths.slow_unary_trace.is_some() {
+            observation.started_at.map(|started_at| (started_at, Instant::now()))
+        } else {
+            None
+        };
         observation.finish(&result);
+        if let (Some(trace), Some((started_at, completed_at))) = (&context.paths.slow_unary_trace, trace_times) {
+            trace.record(disk, context.slot, started_at, completed_at, result.is_ok());
+        }
         if rejected_before_publication {
             *dispatch_state = RenameDispatchState::RejectedBeforePublication;
         }
@@ -4972,6 +5064,7 @@ impl SetDisks {
             multipart_proof_authority: _,
             multipart_commit_owner: _,
             bound_dispatch_after_quorum: _,
+            slow_trace_id: _,
         } = fence_options;
         if let Some(file_info) = disks
             .iter()
@@ -5334,6 +5427,7 @@ impl SetDisks {
             multipart_proof_authority,
             multipart_commit_owner,
             bound_dispatch_after_quorum,
+            slow_trace_id,
         } = fence_options;
         if let Some(file_info) = disks
             .iter()
@@ -5357,7 +5451,10 @@ impl SetDisks {
         };
         let mut errs = vec![Some(DiskError::Unexpected); disks.len()];
 
-        let paths = Arc::new(RenameSlotPaths::new(src_bucket, src_object, dst_bucket, dst_object));
+        let paths = Arc::new(RenameSlotPaths {
+            slow_unary_trace: SlowUnaryRenameTrace::start(slow_trace_id),
+            ..RenameSlotPaths::new(src_bucket, src_object, dst_bucket, dst_object)
+        });
 
         let disk_count = disks.len();
         let fanout_disks = Arc::new(disks.to_vec());
@@ -8455,6 +8552,110 @@ mod tests {
     use std::io::Cursor;
     use tempfile::TempDir;
     use tokio::io::AsyncReadExt;
+
+    #[test]
+    fn slow_unary_rename_trace_measures_before_disk_and_disk_call() {
+        let trace = SlowUnaryRenameTrace {
+            fanout_id: Uuid::nil(),
+            started_at: Instant::now(),
+            trace_id: None,
+        };
+        let ms = Duration::from_millis;
+        let start = trace.started_at;
+        assert_eq!(trace.slow_durations(start + ms(30), start + ms(49)), None);
+        assert_eq!(trace.slow_durations(start + ms(45), start + ms(50)), Some((ms(45), ms(5))));
+        assert_eq!(trace.slow_durations(start + ms(5), start + ms(180)), Some((ms(5), ms(175))));
+    }
+
+    #[tokio::test]
+    async fn slow_unary_rename_trace_emits_only_diagnostic_fields() {
+        let (dir, disk) = read_multiple_test_disk("private-test-bucket", &[]).await;
+        let output = tempfile::NamedTempFile::new().expect("trace output file");
+        let subscriber = tracing_subscriber::fmt()
+            .json()
+            .with_max_level(tracing::Level::TRACE)
+            .with_writer(output.reopen().expect("open trace writer"))
+            .finish();
+        let trace = SlowUnaryRenameTrace {
+            fanout_id: Uuid::nil(),
+            started_at: Instant::now(),
+            trace_id: Some("01020304050607080910111213141516".to_owned()),
+        };
+        let start = trace.started_at;
+        let ms = Duration::from_millis;
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::info_span!("private_context", object = "private-test-object").in_scope(|| {
+                trace.record(&disk, 3, start + ms(30), start + ms(49), true);
+                trace.record(&disk, 3, start + ms(45), start + ms(50), false);
+            });
+        });
+        let text = std::fs::read_to_string(output.path()).expect("UTF-8 trace");
+        assert_eq!(text.lines().count(), 1);
+        assert!(!text.contains(dir.path().to_str().expect("test disk path")));
+        assert!(!text.contains("private-test"));
+        let event: serde_json::Value = serde_json::from_str(&text).expect("JSON slow-slot event");
+        assert_eq!(
+            event["fields"],
+            serde_json::json!({
+                "event": EVENT_SET_DISK_RENAME_SLOT_SLOW,
+                "component": LOG_COMPONENT_ECSTORE,
+                "subsystem": LOG_SUBSYSTEM_SET_DISK,
+                "result": "error",
+                "fanout_id": Uuid::nil().to_string(),
+                "trace_id": "01020304050607080910111213141516",
+                "fanout_slot": 3,
+                "pool_index": disk.endpoint().pool_idx,
+                "set_index": disk.endpoint().set_idx,
+                "disk_index": disk.endpoint().disk_idx,
+                "location": "local",
+                "before_disk_call_us": 45_000,
+                "disk_call_us": 5_000,
+                "message": "Slow unary rename slot",
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn slow_unary_rename_trace_excludes_already_observed_batch_fallback() {
+        let (_dir, disk) = read_multiple_test_disk("rename-trace-target", &[]).await;
+        let started_at = Instant::now() - Duration::from_millis(75);
+        let paths = Arc::new(RenameSlotPaths {
+            slow_unary_trace: Some(Box::new(SlowUnaryRenameTrace {
+                fanout_id: Uuid::nil(),
+                started_at,
+                trace_id: None,
+            })),
+            ..RenameSlotPaths::new(RUSTFS_META_TMP_BUCKET, "missing", "rename-trace-target", "fallback")
+        });
+        let admitted = SetDisks::prepare_and_admit_rename_slot(RenameSlotContext {
+            slot: 0,
+            disk: Some(disk),
+            file_infos: Arc::new(vec![metadata_test_fileinfo("fallback")]),
+            scanner_token: None,
+            namespace_owner: None,
+            publication_scope: None,
+            paths,
+            successful_completion_rank: None,
+            write_quorum: 1,
+            dispatch_deadline: None,
+        })
+        .await
+        .expect("prepare a fallback slot");
+        let mut observation = RenameSlotObservation::start(&admitted.prepared).expect("observe fallback");
+        observation.started_at = Some(started_at);
+        let output = tempfile::NamedTempFile::new().expect("trace output file");
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::TRACE)
+            .with_writer(output.reopen().expect("open trace writer"))
+            .finish();
+        let subscriber = tracing::subscriber::set_default(subscriber);
+        let mut dispatch_state = RenameDispatchState::NotDispatched;
+        let _ = SetDisks::execute_prepared_unary_slot(admitted, &mut dispatch_state, Some(observation)).await;
+        drop(subscriber);
+        assert!(!matches!(dispatch_state, RenameDispatchState::NotDispatched));
+        let output = std::fs::read_to_string(output.path()).expect("trace output");
+        assert!(!output.contains(EVENT_SET_DISK_RENAME_SLOT_SLOW));
+    }
 
     #[tokio::test]
     #[serial_test::serial]
