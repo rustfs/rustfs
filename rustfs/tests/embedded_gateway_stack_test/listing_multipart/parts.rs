@@ -175,7 +175,15 @@ async fn list_parts_wire(server: RustFSServer, legacy: bool) {
         (Some("invalid"), None, "invalid query: part-number-marker: invalid"),
         (Some(""), None, "invalid query: part-number-marker: "),
         (Some("2147483648"), None, "invalid query: part-number-marker: 2147483648"),
-        (None, Some(-1), "max-parts must be between 1 and 1000"),
+        (
+            None,
+            Some(-1),
+            if legacy {
+                "max-parts must be between 1 and 1000"
+            } else {
+                "the request carries a value this member cannot hold"
+            },
+        ),
         (None, Some(0), "max-parts must be between 1 and 1000"),
         (None, Some(1001), "max-parts must be between 1 and 1000"),
         (Some("-1"), Some(0), "part-number-marker must be non-negative"),

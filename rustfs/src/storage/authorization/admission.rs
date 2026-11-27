@@ -56,8 +56,11 @@ impl VerifiedSignature {
     /// The legacy edge's reading: s3s verified the signature form these headers name.
     pub(crate) fn from_auth_type(auth_type: AuthType) -> Self {
         Self {
-            sigv4: matches!(auth_type, AuthType::Presigned | AuthType::Signed),
-            presigned: matches!(auth_type, AuthType::Presigned),
+            sigv4: matches!(
+                auth_type,
+                AuthType::Presigned | AuthType::PresignedV4a | AuthType::Signed | AuthType::SignedV4a
+            ),
+            presigned: matches!(auth_type, AuthType::Presigned | AuthType::PresignedV4a),
         }
     }
 }
@@ -177,7 +180,9 @@ pub(crate) fn admit_operation(
         request_validation::RequestViolation::DeleteAcl => S3Error::new(S3ErrorCode::MethodNotAllowed),
     })?;
     crate::auth::reject_unsigned_amz_headers_on_sigv4_request(headers, raw_query)?;
-    if (signature.presigned || operation == "PostObject") && super::decision::has_replication_only_put_headers(headers) {
+    if (signature.presigned || crate::auth::is_presigned_request_head(headers, raw_query) || operation == "PostObject")
+        && super::decision::has_replication_only_put_headers(headers)
+    {
         return Err(s3_error!(AccessDenied, "Access Denied"));
     }
     if operation == "PostObject" {
@@ -289,9 +294,12 @@ mod access_phase_tests {
         for (auth_type, expected) in [
             (AuthType::Signed, (true, false)),
             (AuthType::Presigned, (true, true)),
+            (AuthType::SignedV4a, (true, false)),
+            (AuthType::PresignedV4a, (true, true)),
             (AuthType::SignedV2, (false, false)),
             (AuthType::PresignedV2, (false, false)),
             (AuthType::StreamingSigned, (false, false)),
+            (AuthType::StreamingSignedV4a, (false, false)),
             (AuthType::PostPolicy, (false, false)),
             (AuthType::Anonymous, (false, false)),
         ] {
@@ -369,6 +377,26 @@ mod access_phase_tests {
             )
             .expect_err("presigned request must never pass replication-only headers");
             assert_eq!(err.code(), &rustfs_s3_types::S3ErrorCode::AccessDenied, "{operation} {header_name}");
+        }
+
+        // Defense in depth: presigned SigV4a replication headers on UploadPart/PutObject are
+        // denied both when `signature.presigned` is set and even if a caller passes default markers.
+        let presigned_v4a_host_only = "X-Amz-Algorithm=AWS4-ECDSA-P256-SHA256&X-Amz-Date=20260827T000000Z&X-Amz-Expires=900&X-Amz-Region-Set=*&X-Amz-SignedHeaders=host&X-Amz-Credential=test/20260827/s3/aws4_request&X-Amz-Signature=deadbeef";
+        for signature in [
+            VerifiedSignature {
+                sigv4: true,
+                presigned: true,
+            },
+            VerifiedSignature::default(),
+        ] {
+            let signed_v4a_replication = presigned_v4a_host_only
+                .replace("SignedHeaders=host", "SignedHeaders=host%3Bx-rustfs-replication-part-actual-size");
+            let mut headers = http::HeaderMap::new();
+            headers.insert("x-rustfs-replication-part-actual-size", "1024".parse().unwrap());
+            let err =
+                super::admit_operation(&http::Method::PUT, &headers, Some(&signed_v4a_replication), "UploadPart", signature)
+                    .expect_err("presigned SigV4a UploadPart must never pass replication-only headers");
+            assert_eq!(err.code(), &rustfs_s3_types::S3ErrorCode::AccessDenied, "{signature:?}");
         }
 
         // Browser POST policy requests do not sign HTTP headers, so replication-only headers are rejected too.

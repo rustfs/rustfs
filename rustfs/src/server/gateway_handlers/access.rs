@@ -156,11 +156,11 @@ fn require_server_context(envelope: &RequestEnvelope) -> S3Result<Arc<ServerCont
         .ok_or_else(|| rustfs_s3_types::s3_error!(InternalError, "the request carries no server context"))
 }
 
-/// The gateway's verdict as the access markers read it: a SigV4 signature in the header or the
-/// query. SigV2, a POST policy and an anonymous request mark nothing, as on the legacy edge.
+/// The gateway's verdict as the access markers read it: a SigV4 or SigV4a signature in the header
+/// or the query. SigV2, a POST policy and an anonymous request mark nothing, as on the legacy edge.
 pub(in crate::server) fn verified_signature(context: &RequestContextView) -> VerifiedSignature {
     match context.principal().map(RequestPrincipal::scheme) {
-        Some(scheme) if scheme.family() == SigFamily::V4 => VerifiedSignature {
+        Some(scheme) if matches!(scheme.family(), SigFamily::V4 | SigFamily::V4a) => VerifiedSignature {
             sigv4: matches!(scheme.location(), SigLocation::Header | SigLocation::Query),
             presigned: scheme.location() == SigLocation::Query,
         },

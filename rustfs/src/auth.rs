@@ -100,8 +100,11 @@ pub fn constant_time_eq(a: &str, b: &str) -> bool {
 const JWT_ALGORITHM: &str = "Bearer ";
 const SIGN_V2_ALGORITHM: &str = "AWS ";
 const SIGN_V4_ALGORITHM: &str = "AWS4-HMAC-SHA256";
+const SIGN_V4A_ALGORITHM: &str = "AWS4-ECDSA-P256-SHA256";
 const STREAMING_CONTENT_SHA256: &str = "STREAMING-AWS4-HMAC-SHA256-PAYLOAD";
 const STREAMING_CONTENT_SHA256_TRAILER: &str = "STREAMING-AWS4-HMAC-SHA256-PAYLOAD-TRAILER";
+const STREAMING_V4A_CONTENT_SHA256: &str = "STREAMING-AWS4-ECDSA-P256-SHA256-PAYLOAD";
+const STREAMING_V4A_CONTENT_SHA256_TRAILER: &str = "STREAMING-AWS4-ECDSA-P256-SHA256-PAYLOAD-TRAILER";
 pub(crate) const UNSIGNED_PAYLOAD_TRAILER: &str = "STREAMING-UNSIGNED-PAYLOAD-TRAILER";
 const ACTION_HEADER: &str = "Action";
 pub const UNSIGNED_PAYLOAD: &str = "UNSIGNED-PAYLOAD";
@@ -113,17 +116,22 @@ pub enum AuthType {
     Unknown,
     Anonymous,
     Presigned,
+    PresignedV4a,
     PresignedV2,
     PostPolicy,
     StreamingSigned,
+    StreamingSignedV4a,
     Signed,
+    SignedV4a,
     SignedV2,
     #[allow(clippy::upper_case_acronyms)]
     JWT,
     #[allow(clippy::upper_case_acronyms)]
     STS,
     StreamingSignedTrailer,
+    StreamingSignedTrailerV4a,
     StreamingUnsignedTrailer,
+    StreamingUnsignedTrailerV4a,
 }
 
 /// Owner status of a validated Keystone identity, shared by both request edges.
@@ -558,6 +566,8 @@ pub(crate) fn get_request_auth_type_with_method_and_query(
         AuthType::PostPolicy
     } else if is_request_presigned_signature_v2(query) {
         AuthType::PresignedV2
+    } else if is_request_presigned_signature_v4a_with_query(query) {
+        AuthType::PresignedV4a
     } else if is_request_presigned_signature_v4_with_query(query) {
         AuthType::Presigned
     } else if is_request_signature_v2(header) {
@@ -571,6 +581,16 @@ pub(crate) fn get_request_auth_type_with_method_and_query(
             AuthType::StreamingUnsignedTrailer
         } else {
             AuthType::Signed
+        }
+    } else if is_request_signature_v4a(header) {
+        if is_request_sign_streaming_v4a(header) {
+            AuthType::StreamingSignedV4a
+        } else if is_request_sign_streaming_trailer_v4a(header) {
+            AuthType::StreamingSignedTrailerV4a
+        } else if is_request_unsigned_trailer_v4(header) {
+            AuthType::StreamingUnsignedTrailerV4a
+        } else {
+            AuthType::SignedV4a
         }
     } else if is_request_jwt(header) {
         AuthType::JWT
@@ -620,6 +640,13 @@ fn is_request_jwt(header: &HeaderMap) -> bool {
 /// * `bool` - True if request has AWS Signature Version '4', false otherwise
 fn is_request_signature_v4(header: &HeaderMap) -> bool {
     get_unique_header_str(header, "authorization").is_some_and(|auth| auth.starts_with(SIGN_V4_ALGORITHM))
+}
+
+/// Verify if request has AWS Signature Version '4a' (`AWS4-ECDSA-P256-SHA256`).
+fn is_request_signature_v4a(header: &HeaderMap) -> bool {
+    get_unique_header_str(header, "authorization")
+        .and_then(|auth| auth.strip_prefix(SIGN_V4A_ALGORITHM))
+        .is_some_and(|rest| rest.starts_with(' '))
 }
 
 /// Verify if request has AWS Signature Version '2'
@@ -681,13 +708,22 @@ pub fn hoist_signed_query_params(headers: &mut HeaderMap, query: Option<&str>) -
         return Ok(());
     }
 
-    // One pass over the query: recognize the presigned-SigV4 marker set and
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum PresignedAlgorithm {
+        None,
+        V4,
+        V4a,
+    }
+
+    // One pass over the query: recognize the presigned-SigV4/SigV4a marker set and
     // stage user metadata parameters. Nothing is validated
     // or applied until the gate below passes, so a request whose query is not
     // signature-covered is never rejected here.
-    let mut algorithm = false;
+    let mut algorithm = PresignedAlgorithm::None;
+    let mut algorithm_seen = false;
     let mut credential = false;
     let mut signature = false;
+    let mut region_set = false;
     let mut staged: Vec<(String, String)> = Vec::new();
     let mut seen = std::collections::HashSet::new();
     let mut duplicate = false;
@@ -702,7 +738,16 @@ pub fn hoist_signed_query_params(headers: &mut HeaderMap, query: Option<&str>) -
             continue;
         }
         if name.eq_ignore_ascii_case("x-amz-algorithm") {
-            algorithm = value == SIGN_V4_ALGORITHM;
+            if algorithm_seen {
+                algorithm = PresignedAlgorithm::None;
+            } else {
+                algorithm_seen = true;
+                algorithm = match value.as_ref() {
+                    SIGN_V4_ALGORITHM => PresignedAlgorithm::V4,
+                    SIGN_V4A_ALGORITHM => PresignedAlgorithm::V4a,
+                    _ => PresignedAlgorithm::None,
+                };
+            }
             continue;
         }
         if name.eq_ignore_ascii_case("x-amz-credential") {
@@ -711,6 +756,10 @@ pub fn hoist_signed_query_params(headers: &mut HeaderMap, query: Option<&str>) -
         }
         if name.eq_ignore_ascii_case("x-amz-signature") {
             signature = !value.is_empty();
+            continue;
+        }
+        if name.eq_ignore_ascii_case("x-amz-region-set") {
+            region_set = !value.is_empty();
             continue;
         }
         // Parameter names keep whatever case the signer used (`X-Amz-Meta-User-Id`
@@ -723,7 +772,12 @@ pub fn hoist_signed_query_params(headers: &mut HeaderMap, query: Option<&str>) -
         staged.push((stored_name, value.into_owned()));
     }
 
-    if !is_request_signature_v4(headers) && !(algorithm && credential && signature) {
+    let presigned_covered = match algorithm {
+        PresignedAlgorithm::V4 => credential && signature,
+        PresignedAlgorithm::V4a => credential && signature && region_set,
+        PresignedAlgorithm::None => false,
+    };
+    if !is_request_signature_v4(headers) && !is_request_signature_v4a(headers) && !presigned_covered {
         return Ok(());
     }
     if duplicate {
@@ -747,6 +801,26 @@ pub fn hoist_signed_query_params(headers: &mut HeaderMap, query: Option<&str>) -
         headers.insert(header_name, header_value);
     }
     Ok(())
+}
+
+/// Verify request has AWS PreSign Version '4a' (`AWS4-ECDSA-P256-SHA256`) from the decoded query string.
+fn is_request_presigned_signature_v4a_with_query(query: Option<&str>) -> bool {
+    query.is_some_and(|query| {
+        let mut has_signature = false;
+        let mut algorithm: Option<String> = None;
+        let mut duplicate_algorithm = false;
+        for (name, value) in form_urlencoded::parse(query.as_bytes()) {
+            if name == "X-Amz-Signature" {
+                has_signature = true;
+            } else if name == "X-Amz-Algorithm" {
+                if algorithm.is_some() {
+                    duplicate_algorithm = true;
+                }
+                algorithm = Some(value.into_owned());
+            }
+        }
+        has_signature && !duplicate_algorithm && algorithm.as_deref() == Some(SIGN_V4A_ALGORITHM)
+    })
 }
 
 /// Verify request has AWS PreSign Version '4' from the decoded query string.
@@ -782,12 +856,32 @@ fn is_request_sign_streaming_v4(header: &HeaderMap) -> bool {
     false
 }
 
+/// Verify if the request has AWS Streaming Signature Version '4a'
+fn is_request_sign_streaming_v4a(header: &HeaderMap) -> bool {
+    if let Some(content_sha256) = header.get("x-amz-content-sha256")
+        && let Ok(sha256_str) = content_sha256.to_str()
+    {
+        return sha256_str == STREAMING_V4A_CONTENT_SHA256;
+    }
+    false
+}
+
 // Verify if the request has AWS Streaming Signature Version '4' with trailer
 fn is_request_sign_streaming_trailer_v4(header: &HeaderMap) -> bool {
     if let Some(content_sha256) = header.get("x-amz-content-sha256")
         && let Ok(sha256_str) = content_sha256.to_str()
     {
         return sha256_str == STREAMING_CONTENT_SHA256_TRAILER;
+    }
+    false
+}
+
+/// Verify if the request has AWS Streaming Signature Version '4a' with trailer
+fn is_request_sign_streaming_trailer_v4a(header: &HeaderMap) -> bool {
+    if let Some(content_sha256) = header.get("x-amz-content-sha256")
+        && let Ok(sha256_str) = content_sha256.to_str()
+    {
+        return sha256_str == STREAMING_V4A_CONTENT_SHA256_TRAILER;
     }
     false
 }
@@ -915,48 +1009,68 @@ fn reject_unsigned_headers_matching(header: &HeaderMap, query: Option<&str>, che
         let Ok(value) = value.to_str() else {
             continue;
         };
-        let authorization = match rustfs_gateway::sig::SigV4HeaderCoverage::parse(value) {
-            Some(authorization) => authorization,
-            None if value.starts_with(SIGN_V4_ALGORITHM) => {
+        if let Some(authorization) = rustfs_gateway::sig::SigV4HeaderCoverage::parse(value) {
+            if authorization.algorithm() != SIGN_V4_ALGORITHM {
+                warn!(
+                    event = EVENT_SIGV4_UNSUPPORTED_ALGORITHM,
+                    component = LOG_COMPONENT_AUTH,
+                    subsystem = LOG_SUBSYSTEM_REQUEST,
+                    reason = "unsupported_algorithm",
+                    "SigV4 request rejected"
+                );
+                return Err(owned_error!(AccessDenied, "{UNSUPPORTED_SIGV4_ALGORITHM_MESSAGE}"));
+            }
+            reject_uncovered_signed_headers(header, check_header, |name| authorization.covers_header(name))?;
+            continue;
+        }
+        if value.starts_with(SIGN_V4_ALGORITHM) {
+            return Err(owned_error!(AccessDenied, "Invalid SigV4 authorization header"));
+        }
+        if value.starts_with(SIGN_V4A_ALGORITHM) {
+            let Ok(v4a) =
+                rustfs_gateway::sig::SigV4aAuthorization::parse_with(value, rustfs_gateway::sig::ServiceReading::AnyName)
+            else {
                 return Err(owned_error!(AccessDenied, "Invalid SigV4 authorization header"));
-            }
-            None if value.trim_start().starts_with(SIGN_V2_ALGORITHM) => {
-                reject_extension_headers_on_sigv2_request(header)?;
-                continue;
-            }
-            None => continue,
-        };
-        if authorization.algorithm() != SIGN_V4_ALGORITHM {
-            warn!(
-                event = EVENT_SIGV4_UNSUPPORTED_ALGORITHM,
-                component = LOG_COMPONENT_AUTH,
-                subsystem = LOG_SUBSYSTEM_REQUEST,
-                reason = "unsupported_algorithm",
-                "SigV4 request rejected"
-            );
-            return Err(owned_error!(AccessDenied, "{UNSUPPORTED_SIGV4_ALGORITHM_MESSAGE}"));
+            };
+            reject_uncovered_signed_headers(header, check_header, |name| {
+                v4a.signed_headers()
+                    .split(';')
+                    .any(|signed| signed.eq_ignore_ascii_case(name))
+            })?;
+            continue;
         }
-        for name in header.keys() {
-            // `HeaderName` is already lowercase; the verifier looks signed
-            // names up case-insensitively, so compare them the same way.
-            let name = name.as_str();
-            if !check_header(name)
-                || SIGV4_UNSIGNED_ENVELOPE_HEADERS.contains(&name)
-                || PRESIGNED_UNSIGNED_AMZ_HEADER_ALLOWLIST.contains(&name)
-                || authorization.covers_header(name)
-            {
-                continue;
-            }
-            warn!(
-                event = EVENT_SIGV4_UNSIGNED_AMZ_HEADER,
-                component = LOG_COMPONENT_AUTH,
-                subsystem = LOG_SUBSYSTEM_REQUEST,
-                reason = "unsigned_amz_header",
-                header = name,
-                "SigV4 request rejected"
-            );
-            return Err(owned_error!(AccessDenied, "{UNSIGNED_HEADERS_MESSAGE}"));
+        if value.trim_start().starts_with(SIGN_V2_ALGORITHM) {
+            reject_extension_headers_on_sigv2_request(header)?;
         }
+    }
+    Ok(())
+}
+
+fn reject_uncovered_signed_headers(
+    header: &HeaderMap,
+    check_header: fn(&str) -> bool,
+    covers_header: impl Fn(&str) -> bool,
+) -> OwnedResult<()> {
+    for name in header.keys() {
+        // `HeaderName` is already lowercase; the verifier looks signed
+        // names up case-insensitively, so compare them the same way.
+        let name = name.as_str();
+        if !check_header(name)
+            || SIGV4_UNSIGNED_ENVELOPE_HEADERS.contains(&name)
+            || PRESIGNED_UNSIGNED_AMZ_HEADER_ALLOWLIST.contains(&name)
+            || covers_header(name)
+        {
+            continue;
+        }
+        warn!(
+            event = EVENT_SIGV4_UNSIGNED_AMZ_HEADER,
+            component = LOG_COMPONENT_AUTH,
+            subsystem = LOG_SUBSYSTEM_REQUEST,
+            reason = "unsigned_amz_header",
+            header = name,
+            "SigV4 request rejected"
+        );
+        return Err(owned_error!(AccessDenied, "{UNSIGNED_HEADERS_MESSAGE}"));
     }
     Ok(())
 }
@@ -1102,11 +1216,37 @@ fn header_as_signed_query_value(header: &HeaderMap, query: &str, name: &str) -> 
         .any(|(param, param_value)| param.eq_ignore_ascii_case(name) && param_value.as_bytes() == value.as_bytes())
 }
 
+/// Returns whether `decoded_query` carries all required presigned SigV4 or SigV4a parameters
+/// (requiring `X-Amz-Region-Set` for SigV4a).
+fn is_complete_presigned_v4_or_v4a_query(decoded_query: &[(String, String)]) -> bool {
+    let query_value = |wanted: &str| {
+        decoded_query
+            .iter()
+            .find(|(name, _)| name.eq_ignore_ascii_case(wanted))
+            .map(|(_, value)| value.as_str())
+    };
+    let is_v4a = match query_value("x-amz-algorithm") {
+        Some(SIGN_V4_ALGORITHM) => false,
+        Some(SIGN_V4A_ALGORITHM) => true,
+        _ => return false,
+    };
+    let common_present = [
+        "x-amz-date",
+        "x-amz-expires",
+        "x-amz-signedheaders",
+        "x-amz-credential",
+        "x-amz-signature",
+    ]
+    .into_iter()
+    .all(|name| query_value(name).is_some_and(|value| !value.is_empty()));
+    common_present && (!is_v4a || query_value("x-amz-region-set").is_some_and(|value| !value.is_empty()))
+}
+
 /// Parse the RustFS presigned PutObject size capability after authentication.
 ///
-/// The query value is covered by SigV4 when it is present before presigning, but
+/// The query value is covered by SigV4/SigV4a when it is present before presigning, but
 /// the signature does not assign any semantics to the extension. Keep parsing
-/// strict and only enable the capability for a verified SigV4 presigned request.
+/// strict and only enable the capability for a verified SigV4 or SigV4a presigned request.
 pub(crate) fn parse_presigned_put_max_content_length(
     header: &HeaderMap,
     query: Option<&str>,
@@ -1137,27 +1277,13 @@ pub(crate) fn parse_presigned_put_max_content_length(
         return Ok(None);
     };
 
-    let query_value = |wanted: &str| {
-        decoded_query
-            .iter()
-            .find(|(name, _)| name.eq_ignore_ascii_case(wanted))
-            .map(|(_, value)| value.as_str())
-    };
-    let is_complete_sigv4_query = [
-        ("x-amz-algorithm", "AWS4-HMAC-SHA256"),
-        ("x-amz-date", ""),
-        ("x-amz-expires", ""),
-        ("x-amz-signedheaders", ""),
-        ("x-amz-credential", ""),
-        ("x-amz-signature", ""),
-    ]
-    .into_iter()
-    .all(|(name, expected)| {
-        query_value(name).is_some_and(|value| !value.is_empty() && (expected.is_empty() || value == expected))
-    });
+    let is_complete_sigv4_query = is_complete_presigned_v4_or_v4a_query(&decoded_query);
     if !verified_presigned
         || !is_complete_sigv4_query
-        || !matches!(get_request_auth_type_with_query(header, Some(query)), AuthType::Presigned)
+        || !matches!(
+            get_request_auth_type_with_query(header, Some(query)),
+            AuthType::Presigned | AuthType::PresignedV4a
+        )
     {
         return Err(owned_error!(
             InvalidRequest,
@@ -1188,9 +1314,9 @@ pub(crate) fn reject_presigned_put_max_content_length_for_other_operation(
     Ok(())
 }
 
-/// Parse the V2 multipart total-size capability after SigV4 authentication.
+/// Parse the V2 multipart total-size capability after SigV4/SigV4a authentication.
 /// Header-authenticated CreateMultipartUpload requests are accepted because the
-/// custom query is covered by the SigV4 canonical request; later multipart
+/// custom query is covered by the SigV4/SigV4a canonical request; later multipart
 /// operations read the immutable value from the upload session metadata.
 pub(crate) fn parse_presigned_multipart_max_total_object_size(
     header: &HeaderMap,
@@ -1226,23 +1352,9 @@ pub(crate) fn parse_presigned_multipart_max_total_object_size(
     };
 
     let auth_type = get_request_auth_type_with_query(header, Some(query));
-    let is_presigned = matches!(auth_type, AuthType::Presigned);
-    let is_header_signed = matches!(auth_type, AuthType::Signed);
-    let complete_presigned_query = [
-        ("x-amz-algorithm", "AWS4-HMAC-SHA256"),
-        ("x-amz-date", ""),
-        ("x-amz-expires", ""),
-        ("x-amz-signedheaders", ""),
-        ("x-amz-credential", ""),
-        ("x-amz-signature", ""),
-    ]
-    .into_iter()
-    .all(|(name, expected)| {
-        decoded_query
-            .iter()
-            .find(|(candidate, _)| candidate.eq_ignore_ascii_case(name))
-            .is_some_and(|(_, candidate)| !candidate.is_empty() && (expected.is_empty() || candidate == expected))
-    });
+    let is_presigned = matches!(auth_type, AuthType::Presigned | AuthType::PresignedV4a);
+    let is_header_signed = matches!(auth_type, AuthType::Signed | AuthType::SignedV4a);
+    let complete_presigned_query = is_complete_presigned_v4_or_v4a_query(&decoded_query);
 
     let authenticated = verified_sigv4 && (is_header_signed || (is_presigned && complete_presigned_query));
     if !authenticated {
@@ -2693,6 +2805,195 @@ mod tests {
     }
 
     #[test]
+    fn header_and_presigned_sigv4a_reject_unsigned_amz_and_extension_headers() {
+        use rustfs_gateway::sig::{AmzDate, PayloadMode, SigService, SigV4aSigner, SigningCredentials, SigningRequest};
+        use rustfs_gateway::{Limits, WireRequest};
+
+        let build_v4a = |extra: &[(&str, &str)]| {
+            let mut headers = HeaderMap::new();
+            headers.insert(http::header::HOST, HeaderValue::from_static("localhost"));
+            for &(name, value) in extra {
+                headers.insert(
+                    HeaderName::from_bytes(name.as_bytes()).expect("header name"),
+                    HeaderValue::from_str(value).expect("header value"),
+                );
+            }
+            let probe = http::Request::builder()
+                .method(Method::GET)
+                .uri("/bucket/key")
+                .header(http::header::HOST, "localhost")
+                .body(bytes::Bytes::new())
+                .expect("request");
+            let accepted = WireRequest::accept(probe, &Limits::default()).expect("host");
+            let stamp = AmzDate::parse("20260827T000000Z").expect("stamp");
+            let creds = SigningCredentials::new("AKIAV4ATEST", b"secret-key-for-sigv4a-test").expect("creds");
+            let signer = SigV4aSigner::new(creds, stamp.day(), SigService::S3, "*").expect("signer");
+            let req = SigningRequest::new(
+                &Method::GET,
+                "/bucket/key",
+                "",
+                &headers,
+                accepted.host().raw_for_signing(),
+                PayloadMode::Empty,
+                stamp,
+            );
+            (
+                signer.sign_headers(&req).expect("header sign"),
+                signer.presign(&req, 300).expect("presign"),
+            )
+        };
+
+        let (signed_header, signed_query) = build_v4a(&[]);
+        reject_unsigned_amz_headers_on_sigv4_request(signed_header.headers(), None).expect("clean SigV4a header passes");
+        reject_unsigned_extension_headers_on_signed_request(signed_header.headers(), None)
+            .expect("clean SigV4a header passes extension guard");
+
+        let mut with_unsigned_copy = signed_header.headers().clone();
+        with_unsigned_copy.insert("x-amz-copy-source", HeaderValue::from_static("/src/secret"));
+        assert_unsigned_headers_denied(reject_unsigned_amz_headers_on_sigv4_request(&with_unsigned_copy, None));
+
+        for name in EXTENSION_HEADERS {
+            let mut with_unsigned_ext = signed_header.headers().clone();
+            with_unsigned_ext.insert(name, HeaderValue::from_static("true"));
+            assert_unsigned_headers_denied(reject_unsigned_amz_headers_on_sigv4_request(&with_unsigned_ext, None));
+            assert_unsigned_headers_denied(reject_unsigned_extension_headers_on_signed_request(&with_unsigned_ext, None));
+
+            let (signed_with_ext, presigned_with_ext) = build_v4a(&[(name, "true")]);
+            reject_unsigned_amz_headers_on_sigv4_request(signed_with_ext.headers(), None)
+                .expect("signed SigV4a extension header passes");
+            reject_unsigned_extension_headers_on_signed_request(signed_with_ext.headers(), None)
+                .expect("signed SigV4a extension header passes gateway guard");
+
+            let signed_target = signed_query.target();
+            let (_, raw_query) = signed_target.split_once('?').expect("presigned query");
+            let mut presigned_unsigned_ext = HeaderMap::new();
+            presigned_unsigned_ext.insert(name, HeaderValue::from_static("true"));
+            assert_unsigned_headers_denied(reject_unsigned_extension_headers_on_signed_request(
+                &presigned_unsigned_ext,
+                Some(raw_query),
+            ));
+
+            let ext_target = presigned_with_ext.target();
+            let (_, ext_query) = ext_target.split_once('?').expect("presigned ext query");
+            reject_unsigned_extension_headers_on_signed_request(&presigned_unsigned_ext, Some(ext_query))
+                .expect("signed presigned SigV4a extension header passes");
+        }
+
+        let mut malformed_v4a = HeaderMap::new();
+        malformed_v4a.insert("x-rustfs-force-delete", HeaderValue::from_static("true"));
+        malformed_v4a.insert("authorization", HeaderValue::from_static("AWS4-ECDSA-P256-SHA256 invalid"));
+        let err = reject_unsigned_extension_headers_on_signed_request(&malformed_v4a, None)
+            .expect_err("malformed SigV4a header must fail closed");
+        assert_eq!(err.code(), &S3ErrorCode::AccessDenied);
+    }
+
+    #[test]
+    fn sigv4a_classification_conditions_hoisting_and_size_caps() {
+        use crate::auth::facts::{AuthzFacts, AuthzPrincipal, AuthzTarget, build_conditions};
+        use rustfs_policy::policy::action::{Action, S3Action};
+
+        const V4A_AUTH: &str = "AWS4-ECDSA-P256-SHA256 Credential=AKIAV4A/20260827/s3/aws4_request, SignedHeaders=host;x-amz-date;x-amz-region-set, Signature=30440220";
+        const V4A_PRESIGNED: &str = "X-Amz-Algorithm=AWS4-ECDSA-P256-SHA256&X-Amz-Credential=AKIAV4A%2F20260827%2Fs3%2Faws4_request&X-Amz-Date=20260827T000000Z&X-Amz-Expires=300&X-Amz-Region-Set=%2A&X-Amz-SignedHeaders=host&X-Amz-Signature=30440220";
+        const V4A_PRESIGNED_NO_REGION: &str = "X-Amz-Algorithm=AWS4-ECDSA-P256-SHA256&X-Amz-Credential=AKIAV4A%2F20260827%2Fs3%2Faws4_request&X-Amz-Date=20260827T000000Z&X-Amz-Expires=300&X-Amz-SignedHeaders=host&X-Amz-Signature=30440220";
+
+        let cred = Credentials {
+            access_key: "AKIAV4A".to_owned(),
+            ..Default::default()
+        };
+        let principal = AuthzPrincipal::new(&cred, "");
+        let target = || AuthzTarget {
+            action: Action::S3Action(S3Action::GetObjectAction),
+            bucket: "bucket",
+            object: "key",
+            version_id: None,
+            location_constraint: None,
+        };
+
+        // 1. Header and streaming SigV4a classify cleanly and emit REST-HEADER + AWS4-ECDSA-P256-SHA256.
+        for (content_sha256, expected_type) in [
+            (None, AuthType::SignedV4a),
+            (Some(STREAMING_V4A_CONTENT_SHA256), AuthType::StreamingSignedV4a),
+            (Some(STREAMING_V4A_CONTENT_SHA256_TRAILER), AuthType::StreamingSignedTrailerV4a),
+            (Some(UNSIGNED_PAYLOAD_TRAILER), AuthType::StreamingUnsignedTrailerV4a),
+        ] {
+            let mut headers = HeaderMap::new();
+            headers.insert(http::header::AUTHORIZATION, HeaderValue::from_static(V4A_AUTH));
+            if let Some(sha) = content_sha256 {
+                headers.insert("x-amz-content-sha256", HeaderValue::from_static(sha));
+            }
+            assert_eq!(get_request_auth_type_with_query(&headers, None), expected_type, "{content_sha256:?}");
+            let facts = AuthzFacts::from_request_parts(&headers, None, None, None, target(), time::OffsetDateTime::now_utc());
+            let conditions = build_conditions(&principal, &facts);
+            assert_eq!(conditions.get("authType"), Some(&vec!["REST-HEADER".to_owned()]));
+            assert_eq!(conditions.get("signatureversion"), Some(&vec![SIGN_V4A_ALGORITHM.to_owned()]));
+        }
+
+        // 2. Presigned SigV4a emits REST-QUERY-STRING + AWS4-ECDSA-P256-SHA256 (never AWS4-HMAC-SHA256).
+        let empty = HeaderMap::new();
+        assert_eq!(get_request_auth_type_with_query(&empty, Some(V4A_PRESIGNED)), AuthType::PresignedV4a);
+        let facts =
+            AuthzFacts::from_request_parts(&empty, Some(V4A_PRESIGNED), None, None, target(), time::OffsetDateTime::now_utc());
+        let conditions = build_conditions(&principal, &facts);
+        assert_eq!(conditions.get("authType"), Some(&vec!["REST-QUERY-STRING".to_owned()]));
+        assert_eq!(conditions.get("signatureversion"), Some(&vec![SIGN_V4A_ALGORITHM.to_owned()]));
+
+        // 3. hoist_signed_query_params supports header SigV4a and complete presigned SigV4a,
+        //    and refuses to hoist presigned SigV4a missing X-Amz-Region-Set.
+        let mut v4a_header_req = HeaderMap::new();
+        v4a_header_req.insert(http::header::AUTHORIZATION, HeaderValue::from_static(V4A_AUTH));
+        hoist_signed_query_params(&mut v4a_header_req, Some("X-Amz-Meta-Tag=alpha"))
+            .expect("header SigV4a hoists query metadata");
+        assert_eq!(v4a_header_req.get("x-amz-meta-tag"), Some(&HeaderValue::from_static("alpha")));
+
+        let mut v4a_presigned_req = HeaderMap::new();
+        let presigned_meta_query = format!("{V4A_PRESIGNED}&X-Amz-Meta-Tag=beta");
+        hoist_signed_query_params(&mut v4a_presigned_req, Some(&presigned_meta_query))
+            .expect("presigned SigV4a with region-set hoists query metadata");
+        assert_eq!(v4a_presigned_req.get("x-amz-meta-tag"), Some(&HeaderValue::from_static("beta")));
+
+        let mut missing_region_req = HeaderMap::new();
+        let missing_region_query = format!("{V4A_PRESIGNED_NO_REGION}&X-Amz-Meta-Tag=gamma");
+        hoist_signed_query_params(&mut missing_region_req, Some(&missing_region_query))
+            .expect("incomplete presigned SigV4a ignores metadata");
+        assert!(!missing_region_req.contains_key("x-amz-meta-tag"));
+
+        // 4. Upload size-cap parsers accept verified SigV4a (requiring X-Amz-Region-Set when presigned)
+        //    and reject incomplete presigned SigV4a.
+        let put_cap_query = format!("{V4A_PRESIGNED}&{RUSTFS_MAX_CONTENT_LENGTH_QUERY}=4096");
+        assert_eq!(
+            parse_presigned_put_max_content_length(&empty, Some(&put_cap_query), true).expect("presigned SigV4a put cap"),
+            Some(4096)
+        );
+        let incomplete_put_cap = format!("{V4A_PRESIGNED_NO_REGION}&{RUSTFS_MAX_CONTENT_LENGTH_QUERY}=4096");
+        assert_eq!(
+            parse_presigned_put_max_content_length(&empty, Some(&incomplete_put_cap), true)
+                .expect_err("presigned SigV4a without region-set must fail")
+                .code(),
+            &S3ErrorCode::InvalidRequest
+        );
+
+        let mpu_cap_query = format!("{V4A_PRESIGNED}&{RUSTFS_MAX_TOTAL_OBJECT_SIZE_QUERY}=8192");
+        assert_eq!(
+            parse_presigned_multipart_max_total_object_size(&empty, Some(&mpu_cap_query), true)
+                .expect("presigned SigV4a mpu cap"),
+            Some(8192)
+        );
+        let incomplete_mpu_cap = format!("{V4A_PRESIGNED_NO_REGION}&{RUSTFS_MAX_TOTAL_OBJECT_SIZE_QUERY}=8192");
+        assert_eq!(
+            parse_presigned_multipart_max_total_object_size(&empty, Some(&incomplete_mpu_cap), true)
+                .expect_err("presigned SigV4a mpu cap without region-set must fail")
+                .code(),
+            &S3ErrorCode::InvalidRequest
+        );
+        let header_mpu_cap_query = format!("{RUSTFS_MAX_TOTAL_OBJECT_SIZE_QUERY}=16384");
+        assert_eq!(
+            parse_presigned_multipart_max_total_object_size(&v4a_header_req, Some(&header_mpu_cap_query), true)
+                .expect("header SigV4a mpu cap"),
+            Some(16384)
+        );
+    }
+
+    #[test]
     fn sigv2_request_rejects_extension_headers() {
         let sigv2_query = "AWSAccessKeyId=test&Expires=1893456000&Signature=abc";
 
@@ -3937,6 +4238,11 @@ pub(crate) mod legacy_condition_oracle {
             }
             AuthType::Signed => ("REST-HEADER".to_string(), "AWS4-HMAC-SHA256".to_string()),
             AuthType::Presigned => ("REST-QUERY-STRING".to_string(), "AWS4-HMAC-SHA256".to_string()),
+            AuthType::StreamingSignedV4a
+            | AuthType::StreamingSignedTrailerV4a
+            | AuthType::StreamingUnsignedTrailerV4a
+            | AuthType::SignedV4a => ("REST-HEADER".to_string(), "AWS4-ECDSA-P256-SHA256".to_string()),
+            AuthType::PresignedV4a => ("REST-QUERY-STRING".to_string(), "AWS4-ECDSA-P256-SHA256".to_string()),
             AuthType::PostPolicy => ("POST".to_string(), String::new()),
             AuthType::STS => ("STS".to_string(), String::new()),
             AuthType::Anonymous => ("Anonymous".to_string(), String::new()),

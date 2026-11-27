@@ -13,7 +13,8 @@
 // limitations under the License.
 
 //! RustFS's side of the gateway's host-verified header token claim for OpenStack Keystone
-//! (gateway ADR-0054): the claim, the value a validated token establishes, and the verifier.
+//! (gateway ADR-0054 / ADR-0056): the claim, the value a validated token establishes, and the
+//! verifier installed exclusively through `ServiceBuilder::host_verified_header_token`.
 //!
 //! NOT responsible for: validating tokens (`rustfs-keystone`), wiring any of this into the
 //! server, or authorising a Keystone principal.
@@ -87,6 +88,15 @@ pub fn establish_keystone_identity(
 }
 
 /// The gateway's `HeaderTokenVerifier` for Keystone: answers from its two arguments alone.
+///
+/// Under gateway ADR-0056, header-token admission and verdict construction are sealed behind the
+/// gateway facade, so host code installs [`KeystoneVerifier`] exclusively via
+/// `ServiceBuilder::host_verified_header_token` and cannot mint header-token verdicts directly:
+///
+/// ```compile_fail
+/// use rustfs_gateway::HeaderTokenAdmission;
+/// fn forge(_admission: HeaderTokenAdmission) {}
+/// ```
 ///
 /// NOT responsible for: revocation after validation, or authorisation.
 pub struct KeystoneVerifier;

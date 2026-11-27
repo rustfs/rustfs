@@ -132,6 +132,7 @@ impl AuthTypeCondition {
 pub(crate) enum SignatureVersionCondition {
     V2,
     V4,
+    V4a,
 }
 
 impl SignatureVersionCondition {
@@ -139,6 +140,7 @@ impl SignatureVersionCondition {
         match self {
             Self::V2 => "AWS2",
             Self::V4 => "AWS4-HMAC-SHA256",
+            Self::V4a => "AWS4-ECDSA-P256-SHA256",
         }
     }
 }
@@ -147,7 +149,7 @@ impl SignatureVersionCondition {
 /// edge classified; `None` is a key the condition values leave out.
 fn scheme_conditions(auth_type: &AuthType) -> (Option<AuthTypeCondition>, Option<SignatureVersionCondition>) {
     use AuthTypeCondition::{Anonymous, Jwt, Post, RestHeader, RestQueryString, Sts};
-    use SignatureVersionCondition::{V2, V4};
+    use SignatureVersionCondition::{V2, V4, V4a};
     match auth_type {
         AuthType::JWT => (Some(Jwt), None),
         AuthType::SignedV2 => (Some(RestHeader), Some(V2)),
@@ -156,6 +158,11 @@ fn scheme_conditions(auth_type: &AuthType) -> (Option<AuthTypeCondition>, Option
             (Some(RestHeader), Some(V4))
         }
         AuthType::Presigned => (Some(RestQueryString), Some(V4)),
+        AuthType::StreamingSignedV4a
+        | AuthType::StreamingSignedTrailerV4a
+        | AuthType::StreamingUnsignedTrailerV4a
+        | AuthType::SignedV4a => (Some(RestHeader), Some(V4a)),
+        AuthType::PresignedV4a => (Some(RestQueryString), Some(V4a)),
         AuthType::PostPolicy => (Some(Post), None),
         AuthType::STS => (Some(Sts), None),
         AuthType::Anonymous => (Some(Anonymous), None),
