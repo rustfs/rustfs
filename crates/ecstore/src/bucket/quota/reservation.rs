@@ -488,61 +488,28 @@ impl QuotaContext {
         } else {
             Span::none()
         };
-        let ledger_data = LedgerReservationData {
-            store: Arc::clone(&store),
+        let data = Arc::new(LedgerReservationData {
+            store,
             bucket: self.bucket,
             ledger_object: self.ledger_object,
             operation_id,
-            reservation: reservation.clone(),
-            diagnostic_span: diagnostic_span.clone(),
-            operation_guard: Arc::new(operation_guard),
-        };
-        let metadata_guard = self.metadata_guard;
-
-        let admit = async move {
-            let (ledger_guard, ledger) = lock_and_reap_v1_ledger(&store, &ledger_data.bucket, &ledger_data.ledger_object).await?;
-            let ledger = current_v1_ledger(ledger, bucket_incarnation, quota_revision)?;
-            let job = ReconcileJob::new(Arc::clone(&store), ledger_data.bucket.clone(), bucket_incarnation, quota_revision);
-            let Some(mut ledger) = ledger else {
-                // Bootstrap has no authoritative usage yet. Release every
-                // request-owned fence by returning; the worker owns no request.
-                job.schedule();
-                return Err(StorageError::SlowDown);
-            };
-            let growth = reservation.growth();
-            let current_usage = ledger.admitted_usage()?;
-            let expected_usage = current_usage.checked_add(growth).ok_or(StorageError::PartMissingOrCorrupt)?;
-            if ledger.reconcile_required
-                || (growth > 0 && expected_usage > quota_limit && growth <= quota_limit && ledger.should_reconcile_after_denial())
-            {
-                job.schedule();
-            }
-            if growth > 0 && expected_usage > quota_limit {
-                return Err(StorageError::QuotaExceeded {
-                    current: current_usage,
-                    limit: quota_limit,
-                });
-            }
-            if ledger_data.operation_guard.is_lock_lost() || metadata_guard.as_ref().is_some_and(|guard| guard.is_lock_lost()) {
-                return Err(StorageError::NamespaceLockQuorumUnavailable {
-                    mode: "quota_reservation",
-                    bucket: ledger_data.bucket.clone(),
-                    object: ledger_data.ledger_object.clone(),
-                    required: 1,
-                    achieved: 0,
-                });
-            }
-            ledger.reserve(operation_id, reservation)?;
-            save_ledger_locked(Arc::clone(&store), &ledger_data.ledger_object, &mut ledger, &ledger_guard).await?;
-
-            Ok(QuotaReservation {
-                ledger: Some(ReservationLedgerData::Single(ledger_data)),
-                shard_operation_guard: None,
-                metadata_guard,
-                state: ReservationState::Pending,
-            })
-        };
-        tokio::spawn(admit.instrument(diagnostic_span))
+            reservation,
+            diagnostic_span,
+            operation_guard,
+        });
+        let (reply, receiver) = oneshot::channel();
+        enqueue_v1_ledger_request(
+            data,
+            V1LedgerCommand::Admit {
+                quota_limit,
+                bucket_incarnation,
+                quota_revision,
+                reply,
+            },
+            self.metadata_guard,
+            get_lock_acquire_timeout(),
+        );
+        receiver
             .await
             .map_err(|err| StorageError::other_with_context("quota ledger reservation task failed", err))?
     }
@@ -649,7 +616,7 @@ async fn reserve_sharded(context: QuotaContext, old_size: u64, new_size: u64) ->
             shard.reserve(data.operation_id, data.reservation.clone())?;
             save_shard_locked(Arc::clone(&store), &data.shard_object, &shard, &shard_guard).await?;
             return Ok(QuotaReservation {
-                ledger: Some(ReservationLedgerData::Sharded(data)),
+                ledger: Some(ReservationLedgerData::Sharded(Arc::new(data))),
                 shard_operation_guard: Some(operation_guard),
                 metadata_guard,
                 state: ReservationState::Pending,
@@ -693,7 +660,6 @@ async fn reserve_sharded(context: QuotaContext, old_size: u64, new_size: u64) ->
     })
 }
 
-#[derive(Clone)]
 struct LedgerReservationData {
     store: Arc<ECStore>,
     bucket: String,
@@ -701,16 +667,14 @@ struct LedgerReservationData {
     operation_id: Uuid,
     reservation: PersistedReservation,
     diagnostic_span: Span,
-    operation_guard: Arc<NamespaceLockGuard>,
+    operation_guard: NamespaceLockGuard,
 }
 
-#[derive(Clone)]
 enum ReservationLedgerData {
-    Single(LedgerReservationData),
-    Sharded(ShardedReservationData),
+    Single(Arc<LedgerReservationData>),
+    Sharded(Arc<ShardedReservationData>),
 }
 
-#[derive(Clone)]
 struct ShardedReservationData {
     store: Arc<ECStore>,
     bucket: String,
@@ -1121,50 +1085,146 @@ enum V1LedgerUpdateKind {
     Settle { committed: bool },
 }
 
-impl V1LedgerUpdateKind {
-    fn diagnostic_operation(self) -> &'static str {
+enum V1LedgerCommand {
+    Admit {
+        quota_limit: u64,
+        bucket_incarnation: Uuid,
+        quota_revision: OffsetDateTime,
+        reply: oneshot::Sender<Result<QuotaReservation>>,
+    },
+    Update {
+        kind: V1LedgerUpdateKind,
+        reply: oneshot::Sender<Result<()>>,
+    },
+}
+
+impl V1LedgerCommand {
+    fn diagnostic_operation(&self) -> &'static str {
         match self {
-            Self::MarkCommitStarted => "quota_ledger_mark_commit_started",
-            Self::Settle { .. } => "quota_ledger_settlement",
+            Self::Admit { .. } => "quota_ledger_admission",
+            Self::Update {
+                kind: V1LedgerUpdateKind::MarkCommitStarted,
+                ..
+            } => "quota_ledger_mark_commit_started",
+            Self::Update {
+                kind: V1LedgerUpdateKind::Settle { .. },
+                ..
+            } => "quota_ledger_settlement",
         }
     }
 }
 
-struct V1LedgerUpdate {
-    kind: V1LedgerUpdateKind,
-    operation_id: Uuid,
-    reservation: PersistedReservation,
-    _operation_guard: Arc<NamespaceLockGuard>,
-    _metadata_guard: Option<Arc<NamespaceLockGuard>>,
-    diagnostic_span: Span,
+struct V1LedgerRequest {
+    data: Arc<LedgerReservationData>,
+    metadata_guard: Option<Arc<NamespaceLockGuard>>,
+    command: V1LedgerCommand,
     submitted_at: Instant,
     timeout: Duration,
-    reply: oneshot::Sender<Result<()>>,
 }
 
-impl V1LedgerUpdate {
-    async fn lock(&self, store: &Arc<ECStore>, object: &str) -> Result<Arc<NamespaceLockGuard>> {
+impl V1LedgerRequest {
+    async fn lock(&self) -> Result<Arc<NamespaceLockGuard>> {
+        let object = self.data.ledger_object.as_str();
         let remaining = self.timeout.saturating_sub(self.submitted_at.elapsed());
         if remaining.is_zero() && !self.timeout.is_zero() {
             let key = rustfs_lock::ObjectKey::new(RUSTFS_META_BUCKET, object);
             return Err(rustfs_lock::error::LockError::timeout(key.to_string(), self.timeout).into());
         }
-        lock_v1_ledger(store, object, self.kind.diagnostic_operation(), remaining)
-            .instrument(self.diagnostic_span.clone())
+        lock_v1_ledger(&self.data.store, object, self.command.diagnostic_operation(), remaining)
+            .instrument(self.data.diagnostic_span.clone())
             .await
     }
 
-    fn apply(&self, ledger: &mut QuotaLedger) -> Result<()> {
-        match self.kind {
-            V1LedgerUpdateKind::MarkCommitStarted => ledger.mark_commit_started(self.operation_id, &self.reservation),
-            V1LedgerUpdateKind::Settle { committed: true } => ledger.commit(self.operation_id, &self.reservation),
-            V1LedgerUpdateKind::Settle { committed: false } => ledger.abort(self.operation_id, &self.reservation),
+    fn apply(&self, ledger: &mut Option<QuotaLedger>) -> Result<()> {
+        let data = &self.data;
+        match &self.command {
+            V1LedgerCommand::Admit {
+                quota_limit,
+                bucket_incarnation,
+                quota_revision,
+                reply,
+            } => {
+                // Drop a cancelled request before charging it. If it cancels
+                // during persistence, complete() drops the reservation owner.
+                if reply.is_closed() {
+                    return Err(StorageError::OperationCanceled);
+                }
+                if data.operation_guard.is_lock_lost() || self.metadata_guard.as_ref().is_some_and(|guard| guard.is_lock_lost()) {
+                    return Err(StorageError::NamespaceLockQuorumUnavailable {
+                        mode: "quota_reservation",
+                        bucket: data.bucket.clone(),
+                        object: data.ledger_object.clone(),
+                        required: 1,
+                        achieved: 0,
+                    });
+                }
+                let reconcile = || {
+                    ReconcileJob::new(Arc::clone(&data.store), data.bucket.clone(), *bucket_incarnation, *quota_revision)
+                        .schedule();
+                };
+                let Some(ledger) = current_v1_ledger(ledger.as_mut(), *bucket_incarnation, *quota_revision)? else {
+                    reconcile();
+                    return Err(StorageError::SlowDown);
+                };
+                // Loading the ledger validates the pending reservations.
+                // Each accepted request then advances the guarded balance.
+                let current = ledger.accounted_usage;
+                let growth = data.reservation.growth();
+                let expected = current.checked_add(growth).ok_or(StorageError::PartMissingOrCorrupt)?;
+                let denied = growth > 0 && expected > *quota_limit;
+                if ledger.reconcile_required || (denied && growth <= *quota_limit && ledger.should_reconcile_after_denial()) {
+                    reconcile();
+                }
+                if denied {
+                    return Err(StorageError::QuotaExceeded {
+                        current,
+                        limit: *quota_limit,
+                    });
+                }
+                ledger.reserve(data.operation_id, data.reservation.clone())
+            }
+            V1LedgerCommand::Update { kind, .. } => {
+                let ledger = ledger.as_mut().ok_or(StorageError::ConfigNotFound)?;
+                match kind {
+                    V1LedgerUpdateKind::MarkCommitStarted => ledger.mark_commit_started(data.operation_id, &data.reservation),
+                    V1LedgerUpdateKind::Settle { committed: true } => ledger.commit(data.operation_id, &data.reservation),
+                    V1LedgerUpdateKind::Settle { committed: false } => ledger.abort(data.operation_id, &data.reservation),
+                }
+            }
+        }
+    }
+
+    fn complete(self, result: Result<()>, saved: &Result<()>) {
+        // A denial can depend on earlier reservations in this batch. If the
+        // save failed, report that failure instead of a speculative balance.
+        let result = match result {
+            Err(StorageError::QuotaExceeded { .. }) if saved.is_err() => saved.clone(),
+            result => result.and(saved.clone()),
+        };
+        match self.command {
+            V1LedgerCommand::Admit { reply, .. } => {
+                let _ = reply.send(result.map(|()| QuotaReservation {
+                    ledger: Some(ReservationLedgerData::Single(self.data)),
+                    shard_operation_guard: None,
+                    metadata_guard: self.metadata_guard,
+                    state: ReservationState::Pending,
+                }));
+            }
+            V1LedgerCommand::Update { reply, .. } => {
+                let _ = reply.send(result);
+            }
         }
     }
 }
 
-type V1LedgerKey = (Uuid, String);
-type V1LedgerLanes = HashMap<V1LedgerKey, Vec<V1LedgerUpdate>>;
+#[derive(Clone, PartialEq, Eq, Hash)]
+struct V1LedgerKey {
+    store_id: Uuid,
+    object: String,
+    admission: bool,
+}
+
+type V1LedgerLanes = HashMap<V1LedgerKey, Vec<V1LedgerRequest>>;
 
 fn v1_ledger_lanes() -> std::sync::MutexGuard<'static, V1LedgerLanes> {
     static LANES: OnceLock<Mutex<V1LedgerLanes>> = OnceLock::new();
@@ -1177,7 +1237,7 @@ fn v1_ledger_lanes() -> std::sync::MutexGuard<'static, V1LedgerLanes> {
 struct V1LedgerLane(Option<V1LedgerKey>);
 
 impl V1LedgerLane {
-    fn drain(mut self) -> Vec<V1LedgerUpdate> {
+    fn drain(mut self) -> Vec<V1LedgerRequest> {
         self.0
             .take()
             .and_then(|key| v1_ledger_lanes().remove(&key))
@@ -1194,7 +1254,7 @@ impl Drop for V1LedgerLane {
 }
 
 async fn v1_ledger_update(
-    data: &LedgerReservationData,
+    data: &Arc<LedgerReservationData>,
     kind: V1LedgerUpdateKind,
     metadata_guard: Option<&Arc<NamespaceLockGuard>>,
 ) -> Result<()> {
@@ -1204,31 +1264,49 @@ async fn v1_ledger_update(
 }
 
 fn enqueue_v1_ledger_update(
-    data: &LedgerReservationData,
+    data: &Arc<LedgerReservationData>,
     kind: V1LedgerUpdateKind,
     metadata_guard: Option<&Arc<NamespaceLockGuard>>,
     timeout: Duration,
 ) -> oneshot::Receiver<Result<()>> {
     let (reply, receiver) = oneshot::channel();
+    enqueue_v1_ledger_request(
+        Arc::clone(data),
+        V1LedgerCommand::Update { kind, reply },
+        metadata_guard.cloned(),
+        timeout,
+    );
+    receiver
+}
+
+fn enqueue_v1_ledger_request(
+    data: Arc<LedgerReservationData>,
+    command: V1LedgerCommand,
+    metadata_guard: Option<Arc<NamespaceLockGuard>>,
+    timeout: Duration,
+) {
+    // Recovery can drop the ledger lock and probe operation owners. Keep
+    // that admission work independent of already admitted writers.
+    let admission = matches!(command, V1LedgerCommand::Admit { .. });
+    let key = V1LedgerKey {
+        store_id: data.store.id,
+        object: data.ledger_object.clone(),
+        admission,
+    };
     let mut lanes = v1_ledger_lanes();
-    let update = V1LedgerUpdate {
-        kind,
-        operation_id: data.operation_id,
-        reservation: data.reservation.clone(),
-        // The waiter can be cancelled while the detached batch is in flight.
-        _operation_guard: Arc::clone(&data.operation_guard),
-        _metadata_guard: metadata_guard.cloned(),
-        diagnostic_span: data.diagnostic_span.clone(),
+    let request = V1LedgerRequest {
+        data,
+        command,
+        metadata_guard,
         submitted_at: Instant::now(),
         timeout,
-        reply,
     };
-    let lane = match lanes.entry((data.store.id, data.ledger_object.clone())) {
+    let lane = match lanes.entry(key) {
         Entry::Occupied(mut lane) if lane.get().len() < MAX_V1_LEDGER_BATCH - 1 => {
-            lane.get_mut().push(update);
-            return receiver;
+            lane.get_mut().push(request);
+            return;
         }
-        Entry::Occupied(_) => None, // A full batch leaves excess requests on the same direct lock path.
+        Entry::Occupied(_) => None,
         Entry::Vacant(lane) => {
             let key = lane.key().clone();
             lane.insert(Vec::new());
@@ -1236,67 +1314,88 @@ fn enqueue_v1_ledger_update(
         }
     };
     drop(lanes);
-    tokio::spawn(flush_v1_ledger(Arc::clone(&data.store), data.ledger_object.clone(), update, lane));
-    receiver
+    spawn_v1_ledger(request, lane);
 }
 
-async fn flush_v1_ledger(store: Arc<ECStore>, object: String, first: V1LedgerUpdate, lane: Option<V1LedgerLane>) {
-    // Join only operations already waiting for the same ledger. Never delay
-    // a lock holder to wait for followers, or acquire operation locks here.
-    let mut leader = first;
-    let mut acquired = leader.lock(&store, &object).await;
+fn spawn_v1_ledger(request: V1LedgerRequest, lane: Option<V1LedgerLane>) {
+    tokio::spawn(flush_v1_ledger(request, lane));
+}
+
+async fn flush_v1_ledger(mut leader: V1LedgerRequest, lane: Option<V1LedgerLane>) {
+    // Join only operations already waiting on the ledger.
+    let mut acquired = leader.lock().await;
     let mut followers = lane.map_or_else(Vec::new, V1LedgerLane::drain).into_iter();
     let guard = loop {
         match acquired {
             Err(err @ StorageError::Lock(rustfs_lock::error::LockError::Timeout { .. })) => {
-                // A follower must not inherit an earlier writer's deadline.
-                let _ = leader.reply.send(Err(err));
+                leader.complete(Err(err), &Ok(()));
                 let Some(next) = followers.next() else {
                     return;
                 };
                 leader = next;
-                acquired = leader.lock(&store, &object).await;
+                acquired = leader.lock().await;
             }
             other => break other,
         }
     };
+    let data = Arc::clone(&leader.data);
+    let store = &data.store;
+    let object = &data.ledger_object;
+    let admission = matches!(leader.command, V1LedgerCommand::Admit { .. });
     let authority = async {
         let guard = guard?;
-        let ledger = load_ledger_locked(Arc::clone(&store), &object).await?;
-        Ok::<_, StorageError>((guard, ledger))
+        if admission {
+            return reap_v1_ledger_locked(store, &data.bucket, object, guard, || {
+                // Recovery has a bounded quota per request. Preserve that
+                // recovery opportunity for each writer instead of charging
+                // the whole group against a single orphan sweep.
+                for request in followers.by_ref() {
+                    spawn_v1_ledger(request, None);
+                }
+            })
+            .await;
+        }
+        let ledger = load_ledger_locked(Arc::clone(store), object).await?;
+        Ok((guard, Some(ledger)))
     }
+    .instrument(data.diagnostic_span.clone())
     .await;
     let (guard, mut ledger) = match authority {
         Ok(authority) => authority,
         Err(err) => {
-            for update in std::iter::once(leader).chain(followers) {
-                let _ = update.reply.send(Err(err.clone()));
+            for request in std::iter::once(leader).chain(followers) {
+                request.complete(Err(err.clone()), &Ok(()));
             }
             return;
         }
     };
 
     let first_result = leader.apply(&mut ledger);
-    let outcomes: Vec<_> = followers.as_slice().iter().map(|update| update.apply(&mut ledger)).collect();
-    let saved = if first_result.is_ok() || outcomes.iter().any(Result::is_ok) {
-        save_ledger_locked(store, &object, &mut ledger, &guard)
-            .instrument(leader.diagnostic_span.clone())
-            .await
-    } else {
-        Ok(())
+    let outcomes: Vec<_> = followers
+        .as_slice()
+        .iter()
+        .map(|request| request.apply(&mut ledger))
+        .collect();
+    let saved = match ledger.as_mut() {
+        Some(ledger) if first_result.is_ok() || outcomes.iter().any(Result::is_ok) => {
+            save_ledger_locked(Arc::clone(store), object, ledger, &guard)
+                .instrument(data.diagnostic_span.clone())
+                .await
+        }
+        _ => Ok(()),
     };
     drop(guard);
-    let _ = leader.reply.send(first_result.and(saved.clone()));
-    for (update, result) in followers.zip(outcomes) {
-        let _ = update.reply.send(result.and(saved.clone()));
+    leader.complete(first_result, &saved);
+    for (request, result) in followers.zip(outcomes) {
+        request.complete(result, &saved);
     }
 }
 
 fn current_v1_ledger(
-    ledger: Option<QuotaLedger>,
+    ledger: Option<&mut QuotaLedger>,
     bucket_incarnation: Uuid,
     quota_revision: OffsetDateTime,
-) -> Result<Option<QuotaLedger>> {
+) -> Result<Option<&mut QuotaLedger>> {
     match ledger {
         Some(ledger) if ledger.matches(bucket_incarnation, quota_revision) => Ok(Some(ledger)),
         Some(ledger) if !ledger.reservations.is_empty() => Err(StorageError::PartMissingOrCorrupt),
@@ -1408,12 +1507,23 @@ async fn load_v1_ledger_if_present(store: &Arc<ECStore>, ledger_object: &str) ->
     }
 }
 
+#[cfg(any(test, feature = "test-util"))]
 async fn lock_and_reap_v1_ledger(
     store: &Arc<ECStore>,
     bucket: &str,
     ledger_object: &str,
 ) -> Result<(Arc<NamespaceLockGuard>, Option<QuotaLedger>)> {
     let ledger_guard = lock_v1_ledger(store, ledger_object, "quota_ledger_admission", get_lock_acquire_timeout()).await?;
+    reap_v1_ledger_locked(store, bucket, ledger_object, ledger_guard, || {}).await
+}
+
+async fn reap_v1_ledger_locked(
+    store: &Arc<ECStore>,
+    bucket: &str,
+    ledger_object: &str,
+    ledger_guard: Arc<NamespaceLockGuard>,
+    on_recovery: impl FnOnce(),
+) -> Result<(Arc<NamespaceLockGuard>, Option<QuotaLedger>)> {
     let Some(ledger) = load_v1_ledger_if_present(store, ledger_object).await? else {
         return Ok((ledger_guard, None));
     };
@@ -1425,6 +1535,7 @@ async fn lock_and_reap_v1_ledger(
     // Probe operation owners without the ledger lock. Admission and
     // settlement take the operation lock before the ledger lock.
     let epoch = (ledger.bucket_incarnation, ledger.quota_revision_unix_nanos);
+    let full_probe_batch = candidates.len() == MAX_ORPHAN_PROBES_PER_WRITE;
     drop(ledger);
     drop(ledger_guard);
 
@@ -1453,6 +1564,9 @@ async fn lock_and_reap_v1_ledger(
         }
     }
 
+    if full_probe_batch || !orphan_guards.is_empty() {
+        on_recovery();
+    }
     let ledger_guard = lock_v1_ledger(store, ledger_object, "quota_ledger_reap", get_lock_acquire_timeout()).await?;
     let Some(mut ledger) = load_v1_ledger_if_present(store, ledger_object).await? else {
         return Ok((ledger_guard, None));
@@ -2187,10 +2301,10 @@ async fn reap_sharded_reservations(
     Ok(removed || cursor_changed || had_orphan_guards)
 }
 
-async fn mark_commit_started_sharded(data: &ShardedReservationData) -> Result<()> {
-    let store = Arc::clone(&data.store);
-    let data = data.clone();
+async fn mark_commit_started_sharded(data: &Arc<ShardedReservationData>) -> Result<()> {
+    let data = Arc::clone(data);
     tokio::spawn(async move {
+        let store = &data.store;
         let allocator_lock = store.new_ns_lock(RUSTFS_META_BUCKET, &data.allocator_object).await?;
         let allocator_guard = allocator_lock.get_read_lock(get_lock_acquire_timeout()).await?;
         if allocator_guard.is_lock_lost() {
@@ -2202,11 +2316,11 @@ async fn mark_commit_started_sharded(data: &ShardedReservationData) -> Result<()
                 achieved: 0,
             });
         }
-        let allocator = load_allocator_locked(Arc::clone(&store), &data.allocator_object).await?;
+        let allocator = load_allocator_locked(Arc::clone(store), &data.allocator_object).await?;
         let shard_lock = store.new_ns_lock(RUSTFS_META_BUCKET, &data.shard_object).await?;
         let shard_guard = Arc::new(shard_lock.get_write_lock(get_lock_acquire_timeout()).await?);
         let (mut shard, _) = load_current_shard_locked(
-            Arc::clone(&store),
+            Arc::clone(store),
             &data.shard_object,
             data.bucket_incarnation,
             data.quota_revision,
@@ -2215,7 +2329,7 @@ async fn mark_commit_started_sharded(data: &ShardedReservationData) -> Result<()
             &allocator,
         )
         .await?;
-        fence_namespace_mutations(&store, RUSTFS_META_BUCKET, &data.shard_object, None).await?;
+        fence_namespace_mutations(store, RUSTFS_META_BUCKET, &data.shard_object, None).await?;
         if allocator_guard.is_lock_lost() || shard_guard.is_lock_lost() {
             return Err(StorageError::NamespaceLockQuorumUnavailable {
                 mode: "quota_sharded_commit_marker",
@@ -2226,16 +2340,16 @@ async fn mark_commit_started_sharded(data: &ShardedReservationData) -> Result<()
             });
         }
         shard.mark_commit_started(data.operation_id, &data.reservation)?;
-        save_shard_locked(Arc::clone(&store), &data.shard_object, &shard, &shard_guard).await
+        save_shard_locked(Arc::clone(store), &data.shard_object, &shard, &shard_guard).await
     })
     .await
     .map_err(|err| StorageError::other_with_context("quota sharded commit marker task failed", err))?
 }
 
-async fn settle_sharded(data: &ShardedReservationData, committed: bool) -> Result<()> {
-    let store = Arc::clone(&data.store);
-    let data = data.clone();
+async fn settle_sharded(data: &Arc<ShardedReservationData>, committed: bool) -> Result<()> {
+    let data = Arc::clone(data);
     tokio::spawn(async move {
+        let store = &data.store;
         let allocator_lock = store.new_ns_lock(RUSTFS_META_BUCKET, &data.allocator_object).await?;
         let allocator_guard = allocator_lock.get_read_lock(get_lock_acquire_timeout()).await?;
         if allocator_guard.is_lock_lost() {
@@ -2247,11 +2361,11 @@ async fn settle_sharded(data: &ShardedReservationData, committed: bool) -> Resul
                 achieved: 0,
             });
         }
-        let allocator = load_allocator_locked(Arc::clone(&store), &data.allocator_object).await?;
+        let allocator = load_allocator_locked(Arc::clone(store), &data.allocator_object).await?;
         let shard_lock = store.new_ns_lock(RUSTFS_META_BUCKET, &data.shard_object).await?;
         let shard_guard = Arc::new(shard_lock.get_write_lock(get_lock_acquire_timeout()).await?);
         let (mut shard, _) = load_current_shard_locked(
-            Arc::clone(&store),
+            Arc::clone(store),
             &data.shard_object,
             data.bucket_incarnation,
             data.quota_revision,
@@ -2260,7 +2374,7 @@ async fn settle_sharded(data: &ShardedReservationData, committed: bool) -> Resul
             &allocator,
         )
         .await?;
-        fence_namespace_mutations(&store, RUSTFS_META_BUCKET, &data.shard_object, None).await?;
+        fence_namespace_mutations(store, RUSTFS_META_BUCKET, &data.shard_object, None).await?;
         if allocator_guard.is_lock_lost() || shard_guard.is_lock_lost() {
             return Err(StorageError::NamespaceLockQuorumUnavailable {
                 mode: "quota_sharded_settlement",
@@ -2276,9 +2390,9 @@ async fn settle_sharded(data: &ShardedReservationData, committed: bool) -> Resul
             shard.abort(data.operation_id, &data.reservation)?;
         }
         if shard.reservations.is_empty() && shard.reconcile_required {
-            reconcile_shard_exact(&store, &data.bucket, &mut shard).await?;
+            reconcile_shard_exact(store, &data.bucket, &mut shard).await?;
         }
-        save_shard_locked(Arc::clone(&store), &data.shard_object, &shard, &shard_guard).await
+        save_shard_locked(Arc::clone(store), &data.shard_object, &shard, &shard_guard).await
     })
     .await
     .map_err(|err| StorageError::other_with_context("quota sharded settlement task failed", err))?
@@ -2456,7 +2570,11 @@ pub async fn initialize_quota_ledger_for_test(store: Arc<ECStore>, bucket: &str)
     ReconcileJob::new(Arc::clone(&store), bucket.to_owned(), incarnation, revision)
         .run()
         .await?;
-    match current_v1_ledger(load_v1_ledger_if_present(&store, &ledger_object(bucket)).await?, incarnation, revision)? {
+    match current_v1_ledger(
+        load_v1_ledger_if_present(&store, &ledger_object(bucket)).await?.as_mut(),
+        incarnation,
+        revision,
+    )? {
         Some(_) => Ok(()),
         None => Err(StorageError::SlowDown),
     }
@@ -2671,6 +2789,134 @@ mod tests {
             .expect("owner guard");
     }
 
+    async fn queue_v1_test_admissions(
+        job: &ReconcileJob,
+        names: &[&str],
+    ) -> Vec<tokio::task::JoinHandle<Result<QuotaReservation>>> {
+        let key = V1LedgerKey {
+            store_id: job.store.id,
+            object: ledger_object(&job.bucket),
+            admission: true,
+        };
+        let mut requests = Vec::with_capacity(names.len());
+        for (followers, name) in names.iter().enumerate() {
+            let context = begin(&job.store.ctx, &job.bucket, name, &ObjectOptions::default(), 0, 0)
+                .await
+                .expect("quota context");
+            requests.push(tokio::spawn(async move { context.reserve(0, 1).await }));
+            tokio::time::timeout(Duration::from_secs(10), async {
+                while !v1_ledger_lanes().get(&key).is_some_and(|waiting| waiting.len() == followers) {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("request joined the admission batch");
+        }
+        requests
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn v1_admission_batch_enforces_the_cap_and_only_reports_durable_balances() {
+        let (_directories, job) = reconciliation_fixture(12).await;
+        job.run().await.expect("bootstrap");
+        let object = ledger_object(&job.bucket);
+        for (fail_save, cancel_first) in [(true, false), (false, false), (false, true)] {
+            let guard = lock_v1_ledger(&job.store, &object, "quota_ledger_test_hold", get_lock_acquire_timeout())
+                .await
+                .expect("hold the ledger while the admissions join");
+            let mut requests = queue_v1_test_admissions(&job, &["first", "second", "third"]).await;
+            let first = requests.remove(0);
+            let second = requests.remove(0);
+            let third = requests.remove(0);
+            if fail_save {
+                fail_next_quota_ledger_save_for_test();
+            }
+            if cancel_first {
+                first.abort();
+                assert!(first.await.is_err());
+                drop(guard);
+                let second = second.await.expect("second task").expect("first available byte");
+                let third = third.await.expect("third task").expect("second available byte");
+                assert_eq!(read_test_ledger(&job).await.accounted_usage, 12);
+                second.abort().await;
+                third.abort().await;
+                assert!(read_test_ledger(&job).await.reservations.is_empty());
+                continue;
+            }
+            drop(guard);
+            let first = first.await.expect("first task");
+            let second = second.await.expect("second task");
+            let third = third.await.expect("third task");
+            if fail_save {
+                assert!(matches!(first, Err(StorageError::Unexpected)));
+                assert!(matches!(second, Err(StorageError::Unexpected)));
+                assert!(
+                    matches!(third, Err(StorageError::Unexpected)),
+                    "a failed save must not look like a full bucket"
+                );
+            } else {
+                let first = first.expect("first available byte");
+                let second = second.expect("second available byte");
+                assert!(matches!(third, Err(StorageError::QuotaExceeded { current: 12, limit: 12 })));
+                let ledger = read_test_ledger(&job).await;
+                assert_eq!(ledger.accounted_usage, 12);
+                assert_eq!(ledger.reservations.len(), 2);
+                first.abort().await;
+                second.abort().await;
+            }
+            let ledger = read_test_ledger(&job).await;
+            assert_eq!(ledger.accounted_usage, 10);
+            assert!(ledger.reservations.is_empty());
+        }
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn v1_admission_recovery_keeps_other_writers_independent() {
+        let (_directories, job) = reconciliation_fixture(12).await;
+        job.run().await.expect("bootstrap");
+        let object = ledger_object(&job.bucket);
+        let guard = lock_v1_ledger(&job.store, &object, "quota_ledger_test_hold", get_lock_acquire_timeout())
+            .await
+            .expect("hold the ledger while seeding an orphan");
+        let mut ledger = read_test_ledger(&job).await;
+        let orphan = Uuid::new_v4();
+        ledger
+            .reserve(
+                orphan,
+                PersistedReservation {
+                    object: "abandoned".to_owned(),
+                    old_size: 0,
+                    new_size: 1,
+                    created_at: now_unix() - 60,
+                    pool_index: Some(0),
+                    set_index: Some(0),
+                    commit_started: false,
+                },
+            )
+            .expect("seed a precharged orphan");
+        save_ledger_locked(Arc::clone(&job.store), &object, &mut ledger, &guard)
+            .await
+            .expect("persist the orphan");
+        let requests = queue_v1_test_admissions(&job, &["first", "second"]).await;
+        fail_next_quota_ledger_save_for_test();
+        drop(guard);
+        let mut successes = 0;
+        let mut faults = 0;
+        for request in requests {
+            match request.await.expect("admission task") {
+                Ok(reservation) => {
+                    successes += 1;
+                    reservation.abort().await;
+                }
+                Err(StorageError::Unexpected) => faults += 1,
+                Err(other) => panic!("unexpected error: {other}"),
+            }
+        }
+        assert_eq!((successes, faults), (1, 1));
+    }
+
     #[tokio::test]
     #[serial]
     async fn v1_group_commit_shares_durability_and_isolates_rejected_updates() {
@@ -2727,9 +2973,16 @@ mod tests {
         let guard = lock_v1_ledger(&job.store, &object, "quota_ledger_test_hold", get_lock_acquire_timeout())
             .await
             .expect("hold the ledger while submitting invalid and valid updates");
-        let mut wrong_size = first_data.clone();
-        wrong_size.reservation.new_size = 99;
-        let invalid = enqueue(&first, &wrong_size, V1LedgerUpdateKind::Settle { committed: false });
+        let mut ledger = read_test_ledger(&job).await;
+        ledger
+            .reservations
+            .get_mut(&first_data.operation_id)
+            .expect("first record")
+            .object = "different-object".to_owned();
+        save_ledger_locked(Arc::clone(&job.store), &object, &mut ledger, &guard)
+            .await
+            .expect("persist a record that mismatches the first settlement");
+        let invalid = enqueue(&first, first_data, V1LedgerUpdateKind::Settle { committed: false });
         let valid = enqueue(&second, second_data, V1LedgerUpdateKind::Settle { committed: false });
         drop(guard);
         assert!(matches!(
@@ -2741,9 +2994,9 @@ mod tests {
         assert_eq!(ledger.accounted_usage, 12);
         assert!(!ledger.reservations[&first_data.operation_id].commit_started);
         assert!(!ledger.reservations.contains_key(&second_data.operation_id));
-        first.abort().await;
+        assert_eq!(ledger.reservations[&first_data.operation_id].object, "different-object");
+        first.defer_after_fence();
         second.defer_after_fence();
-        assert_eq!(read_test_ledger(&job).await.accounted_usage, 10);
     }
 
     #[tokio::test]
@@ -3205,7 +3458,10 @@ mod tests {
 
         assert!(matches!(
             current_v1_ledger(
-                load_v1_ledger_if_present(&store, &ledger_path).await.expect("load ledger"),
+                load_v1_ledger_if_present(&store, &ledger_path)
+                    .await
+                    .expect("load ledger")
+                    .as_mut(),
                 new_incarnation,
                 OffsetDateTime::now_utc(),
             ),
@@ -3248,12 +3504,9 @@ mod tests {
             read_config_no_lock(Arc::clone(&store), &stale_control).await,
             Err(StorageError::ConfigNotFound)
         ));
-        let replacement = current_v1_ledger(
-            load_v1_ledger_if_present(&store, &ledger_path).await.expect("load ledger"),
-            new_incarnation,
-            OffsetDateTime::now_utc(),
-        )
-        .expect("new quota admission must not inherit a fresh stale reservation");
+        let mut replacement = load_v1_ledger_if_present(&store, &ledger_path).await.expect("load ledger");
+        let replacement = current_v1_ledger(replacement.as_mut(), new_incarnation, OffsetDateTime::now_utc())
+            .expect("new quota admission must not inherit a fresh stale reservation");
         assert!(replacement.is_none(), "replacement must await authoritative bootstrap before admission");
     }
 
