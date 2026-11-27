@@ -321,7 +321,7 @@ impl Operation for CreateKeyHandler {
         let audit = KmsAdminAudit::from_envelope(req.envelope(), &cred);
 
         audit.gate(
-            validate_admin_request(req.headers(), &cred, owner, false, kms_create_key_actions(), req.policy_source_addr()).await,
+            validate_admin_request(req.headers(), &cred, owner, false, kms_create_key_actions(), req.envelope()).await,
             KmsAuditOperation::CreateKey,
             None,
         )?;
@@ -412,7 +412,7 @@ impl Operation for DescribeKeyHandler {
                 owner,
                 false,
                 kms_describe_key_actions(),
-                req.policy_source_addr(),
+                req.envelope(),
                 requested_key_id.as_deref().unwrap_or_default(),
             )
             .await,
@@ -1517,7 +1517,7 @@ impl Operation for ListKeysHandler {
         let audit = KmsAdminAudit::from_envelope(req.envelope(), &cred);
 
         audit.gate(
-            validate_admin_request(req.headers(), &cred, owner, false, kms_list_keys_actions(), req.policy_source_addr()).await,
+            validate_admin_request(req.headers(), &cred, owner, false, kms_list_keys_actions(), req.envelope()).await,
             KmsAuditOperation::ListKeys,
             None,
         )?;
@@ -1610,7 +1610,7 @@ impl Operation for GenerateDataKeyHandler {
                 owner,
                 false,
                 kms_generate_data_key_actions(),
-                req.policy_source_addr(),
+                req.envelope(),
                 parsed.as_ref().map(|request| request.key_id.as_str()).unwrap_or_default(),
             )
             .await,
@@ -1685,7 +1685,7 @@ impl Operation for CreateKmsKeyHandler {
         let audit = KmsAdminAudit::from_envelope(req.envelope(), &cred);
 
         audit.gate(
-            validate_admin_request(req.headers(), &cred, owner, false, kms_create_key_actions(), req.policy_source_addr()).await,
+            validate_admin_request(req.headers(), &cred, owner, false, kms_create_key_actions(), req.envelope()).await,
             KmsAuditOperation::CreateKey,
             None,
         )?;
@@ -1962,7 +1962,7 @@ impl Operation for DeleteKmsKeyHandler {
                 owner,
                 false,
                 kms_delete_key_actions(),
-                req.policy_source_addr(),
+                req.envelope(),
                 scoped.as_deref().unwrap_or_default(),
             )
             .await,
@@ -2130,7 +2130,7 @@ impl Operation for CancelKmsKeyDeletionHandler {
                 owner,
                 false,
                 kms_delete_key_actions(),
-                req.policy_source_addr(),
+                req.envelope(),
                 scoped.as_deref().unwrap_or_default(),
             )
             .await,
@@ -2276,7 +2276,7 @@ impl Operation for ListKmsKeysHandler {
         let audit = KmsAdminAudit::from_envelope(req.envelope(), &cred);
 
         audit.gate(
-            validate_admin_request(req.headers(), &cred, owner, false, kms_list_keys_actions(), req.policy_source_addr()).await,
+            validate_admin_request(req.headers(), &cred, owner, false, kms_list_keys_actions(), req.envelope()).await,
             KmsAuditOperation::ListKeys,
             None,
         )?;
@@ -2489,7 +2489,7 @@ impl Operation for DescribeKmsKeyHandler {
                 owner,
                 false,
                 kms_describe_key_actions(),
-                req.policy_source_addr(),
+                req.envelope(),
                 path_key_id.as_deref().unwrap_or_default(),
             )
             .await,

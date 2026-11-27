@@ -83,7 +83,7 @@ impl Operation for BucketPrefixUsageHandler {
             owner,
             false,
             data_usage_info_gate_actions(),
-            req.policy_source_addr(),
+            req.envelope(),
             &bucket,
         )
         .await?;

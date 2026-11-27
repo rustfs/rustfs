@@ -272,7 +272,7 @@ async fn handle_lifecycle_request(
             owner,
             false,
             actions,
-            req.policy_source_addr(),
+            req.envelope(),
             scoped.as_deref().unwrap_or_default(),
         )
         .await,

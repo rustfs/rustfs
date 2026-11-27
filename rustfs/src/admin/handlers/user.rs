@@ -339,10 +339,22 @@ impl Operation for AddUser {
                 owner,
                 false,
                 vec![Action::AdminAction(AdminAction::CreateUserAdminAction)],
-                req.policy_source_addr(),
+                req.envelope(),
             )
             .await?;
         }
+
+        // `/admin/v3/add-user` manages user credentials and status only (matching
+        // MinIO semantics); policy attachment requires `admin:AttachUserOrGroupPolicy`
+        // via the dedicated policy-attachment endpoints. Fail closed rather than
+        // silently ignoring a caller-supplied policy (rustfs/backlog#1246).
+        if args.policy.as_deref().is_some_and(|policy| !policy.is_empty()) {
+            return Err(s3_error!(
+                InvalidArgument,
+                "policy attachment is not supported by add-user; use policy attachment endpoints"
+            ));
+        }
+        args.policy = None;
 
         let rotation_secret = self_rotation_secret(check_deny_only, input_secret.as_deref())?;
         let updated_at = if let Some(current_secret) = rotation_secret {
@@ -351,8 +363,6 @@ impl Operation for AddUser {
                 .await
                 .map_err(map_add_user_create_error)?;
             args.status = status;
-            // A self-service secret rotation does not change policy attachment.
-            args.policy = None;
             updated_at
         } else {
             if validate_admin_request(
@@ -361,7 +371,7 @@ impl Operation for AddUser {
                 owner,
                 false,
                 vec![Action::AdminAction(AdminAction::EnableUserAdminAction)],
-                req.policy_source_addr(),
+                req.envelope(),
             )
             .await
             .is_ok()
@@ -681,7 +691,7 @@ impl Operation for GetUserInfo {
             owner,
             check_deny_only,
             vec![Action::AdminAction(AdminAction::GetUserAdminAction)],
-            req.policy_source_addr(),
+            req.envelope(),
         )
         .await?;
 
@@ -970,7 +980,7 @@ impl Operation for ImportIam {
             owner,
             false,
             vec![Action::AdminAction(AdminAction::ImportIAMAction)],
-            req.policy_source_addr(),
+            req.envelope(),
         )
         .await?;
 
@@ -2139,5 +2149,178 @@ mod tests {
                 "{handler} must not use a secondary shared gate"
             );
         }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn add_user_fails_closed_on_non_empty_policy_and_allows_empty_or_omitted() {
+        crate::app::gating_test_env::run_large_stack_test("add-user-policy-fail-closed", || async {
+            use super::AddUser;
+            use crate::admin::operation::test_support::TestRequest;
+            use crate::admin::runtime_sources::{AppContext, IamInterface, KmsInterface, publish_test_app_context};
+            use http::StatusCode;
+            use rustfs_iam::store::{Store as _, UserType};
+            use rustfs_madmin::{AccountStatus, AddOrUpdateUserReq};
+            use rustfs_policy::policy::Policy;
+            use std::sync::Arc;
+
+            struct ReadyIam(Arc<rustfs_iam::sys::IamSys<rustfs_iam::store::object::ObjectStore>>);
+            impl IamInterface for ReadyIam {
+                fn handle(&self) -> Arc<rustfs_iam::sys::IamSys<rustfs_iam::store::object::ObjectStore>> {
+                    Arc::clone(&self.0)
+                }
+                fn is_ready(&self) -> bool {
+                    true
+                }
+            }
+            struct TestKms;
+            impl KmsInterface for TestKms {
+                fn handle(&self) -> Arc<rustfs_kms::KmsServiceManager> {
+                    Arc::new(rustfs_kms::KmsServiceManager::new())
+                }
+            }
+
+            let previous = crate::runtime_sources::current_app_context();
+            let (_dir, _paths, store) = crate::app::gating_test_env::isolated_multi_pool_ecstore().await;
+            rustfs_iam::store::object::ObjectStore::new(Arc::clone(&store))
+                .save_iam_config(
+                    serde_json::json!({"version": 1}),
+                    format!("{}/format.json", *rustfs_iam::store::object::IAM_CONFIG_PREFIX),
+                )
+                .await
+                .expect("seed IAM format");
+            let iam = rustfs_iam::build_iam_sys(Arc::clone(&store)).await.expect("init IAM");
+            for (user, secret, policy_doc) in [
+                (
+                    "creator-only",
+                    "creator-secret-1234",
+                    Some(r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":["admin:CreateUser"]}]}"#),
+                ),
+                ("unprivileged", "unpriv-secret-1234", None),
+            ] {
+                iam.create_user(
+                    user,
+                    &AddOrUpdateUserReq {
+                        secret_key: secret.to_owned(),
+                        policy: None,
+                        status: AccountStatus::Enabled,
+                    },
+                )
+                .await
+                .expect("seed user");
+                if let Some(doc) = policy_doc {
+                    iam.set_policy(user, Policy::parse_config(doc.as_bytes()).expect("parse policy"))
+                        .await
+                        .expect("save policy");
+                    iam.policy_db_set(user, UserType::Reg, false, user)
+                        .await
+                        .expect("attach policy");
+                }
+            }
+            let context = Arc::new(AppContext::new(store, Arc::new(ReadyIam(Arc::clone(&iam))), Arc::new(TestKms)));
+            assert!(context.publish_action_credentials(Credentials {
+                access_key: "add-user-test-root".to_owned(),
+                secret_key: "add-user-root-secret".to_owned(),
+                status: "on".to_owned(),
+                ..Default::default()
+            }));
+            publish_test_app_context(context);
+
+            // 1. Unauthorized caller sending policy still gets AccessDenied.
+            let unauth_req = TestRequest::new(Method::PUT, "/rustfs/admin/v3/add-user?accessKey=victim-unauth")
+                .credentials("unprivileged", "unpriv-secret-1234", None)
+                .body(
+                    serde_json::to_vec(&serde_json::json!({
+                        "secretKey": "new-secret-123456",
+                        "policy": "consoleAdmin",
+                        "status": "enabled"
+                    }))
+                    .expect("serialize payload"),
+                )
+                .build();
+            let err = AddUser {}
+                .call(unauth_req, Params::new())
+                .await
+                .expect_err("unprivileged caller must be denied");
+            assert_eq!(err.code(), &S3ErrorCode::AccessDenied);
+            assert!(iam.get_user("victim-unauth").await.is_none());
+
+            // 2. Authorized creator (and root) sending non-empty policy must fail closed with InvalidArgument.
+            for (caller, secret, target) in [
+                ("creator-only", "creator-secret-1234", "victim-creator"),
+                ("add-user-test-root", "add-user-root-secret", "victim-root"),
+            ] {
+                let req = TestRequest::new(Method::PUT, format!("/rustfs/admin/v3/add-user?accessKey={target}").as_str())
+                    .credentials(caller, secret, None)
+                    .body(
+                        serde_json::to_vec(&serde_json::json!({
+                            "secretKey": "new-secret-123456",
+                            "policy": "readwrite",
+                            "status": "enabled"
+                        }))
+                        .expect("serialize payload"),
+                    )
+                    .build();
+                let err = AddUser {}
+                    .call(req, Params::new())
+                    .await
+                    .expect_err("non-empty policy in add-user must fail closed");
+                assert_eq!(err.code(), &S3ErrorCode::InvalidArgument, "caller={caller}");
+                assert!(iam.get_user(target).await.is_none(), "rejected add-user must not create `{target}`");
+            }
+
+            // 3. Self-rotation with a non-empty policy must also fail closed without changing secret.
+            let self_req = TestRequest::new(Method::PUT, "/rustfs/admin/v3/add-user?accessKey=unprivileged")
+                .credentials("unprivileged", "unpriv-secret-1234", None)
+                .body(
+                    serde_json::to_vec(&serde_json::json!({
+                        "secretKey": "rotated-secret-123456",
+                        "policy": "consoleAdmin",
+                        "status": "enabled"
+                    }))
+                    .expect("serialize payload"),
+                )
+                .build();
+            let err = AddUser {}
+                .call(self_req, Params::new())
+                .await
+                .expect_err("self-rotation with policy must fail closed");
+            assert_eq!(err.code(), &S3ErrorCode::InvalidArgument);
+            assert_eq!(
+                iam.get_user("unprivileged")
+                    .await
+                    .expect("user still exists")
+                    .credentials
+                    .secret_key,
+                "unpriv-secret-1234"
+            );
+
+            // 4. Omitted or empty policy continues creating and updating users normally.
+            for (target, body) in [
+                (
+                    "valid-omitted",
+                    serde_json::json!({"secretKey": "valid-secret-123456", "status": "enabled"}),
+                ),
+                (
+                    "valid-empty",
+                    serde_json::json!({"secretKey": "valid-secret-123456", "policy": "", "status": "enabled"}),
+                ),
+            ] {
+                let req = TestRequest::new(Method::PUT, format!("/rustfs/admin/v3/add-user?accessKey={target}").as_str())
+                    .credentials("creator-only", "creator-secret-1234", None)
+                    .body(serde_json::to_vec(&body).expect("serialize payload"))
+                    .build();
+                let resp = AddUser {}
+                    .call(req, Params::new())
+                    .await
+                    .expect("add-user without policy should succeed");
+                assert_eq!(resp.into_parts().0, StatusCode::OK);
+                assert!(iam.get_user(target).await.is_some(), "`{target}` must be created");
+            }
+
+            if let Some(previous) = previous {
+                publish_test_app_context(previous);
+            }
+        });
     }
 }
