@@ -816,31 +816,46 @@ fn rename_in_same_dir_fd(
 }
 
 #[cfg(unix)]
+fn part_txn_files_ready_with_stamp(
+    txn_dir_fd: Option<&std::fs::File>,
+    publish_meta_path: &Path,
+    transaction_meta_path: &Path,
+    expected_len: u64,
+) -> Option<Option<multipart_source_state::FileStamp>> {
+    if let Some(d_fd) = txn_dir_fd {
+        use rustix::fs::{AtFlags, statat};
+        let pub_st = statat(d_fd, PART_TRANSACTION_PUBLISH_META, AtFlags::SYMLINK_NOFOLLOW)
+            .ok()
+            .filter(|st| (st.st_mode & libc::S_IFMT) == libc::S_IFREG)?;
+        let new_ok = statat(d_fd, PART_TRANSACTION_NEW_META, AtFlags::SYMLINK_NOFOLLOW)
+            .is_ok_and(|st| (st.st_mode & libc::S_IFMT) == libc::S_IFREG && st.st_size as u64 == expected_len);
+        return new_ok.then(|| multipart_source_state::FileStamp::from_stat(&pub_st));
+    }
+    (publish_meta_path.is_file()
+        && std::fs::metadata(transaction_meta_path).is_ok_and(|m| m.is_file() && m.len() == expected_len))
+    .then_some(None)
+}
+
+#[cfg(not(unix))]
+fn part_txn_files_ready_with_stamp(
+    _txn_dir_fd: Option<&std::fs::File>,
+    publish_meta_path: &Path,
+    transaction_meta_path: &Path,
+    expected_len: u64,
+) -> Option<Option<multipart_source_state::FileStamp>> {
+    (publish_meta_path.is_file()
+        && std::fs::metadata(transaction_meta_path).is_ok_and(|m| m.is_file() && m.len() == expected_len))
+    .then_some(None)
+}
+
+#[cfg(test)]
 fn part_txn_files_ready(
     txn_dir_fd: Option<&std::fs::File>,
     publish_meta_path: &Path,
     transaction_meta_path: &Path,
     expected_len: u64,
 ) -> bool {
-    if let Some(d_fd) = txn_dir_fd {
-        use rustix::fs::{AtFlags, statat};
-        let pub_ok = statat(d_fd, PART_TRANSACTION_PUBLISH_META, AtFlags::SYMLINK_NOFOLLOW)
-            .is_ok_and(|st| (st.st_mode & libc::S_IFMT) == libc::S_IFREG);
-        let new_ok = statat(d_fd, PART_TRANSACTION_NEW_META, AtFlags::SYMLINK_NOFOLLOW)
-            .is_ok_and(|st| (st.st_mode & libc::S_IFMT) == libc::S_IFREG && st.st_size as u64 == expected_len);
-        return pub_ok && new_ok;
-    }
-    publish_meta_path.is_file() && std::fs::metadata(transaction_meta_path).is_ok_and(|m| m.is_file() && m.len() == expected_len)
-}
-
-#[cfg(not(unix))]
-fn part_txn_files_ready(
-    _txn_dir_fd: Option<&std::fs::File>,
-    publish_meta_path: &Path,
-    transaction_meta_path: &Path,
-    expected_len: u64,
-) -> bool {
-    publish_meta_path.is_file() && std::fs::metadata(transaction_meta_path).is_ok_and(|m| m.is_file() && m.len() == expected_len)
+    part_txn_files_ready_with_stamp(txn_dir_fd, publish_meta_path, transaction_meta_path, expected_len).is_some()
 }
 
 #[cfg(unix)]
@@ -913,9 +928,12 @@ struct PreparedPartTxnReceipt {
     dst_meta_path: PathBuf,
     transaction_path: PathBuf,
     meta: Bytes,
+    part_info: ObjectPartInfo,
     had_old_data: bool,
     had_old_meta: bool,
     admission: Option<multipart_staging::MultipartSourceAdmission>,
+    upload_lock: Option<multipart_staging::UploadLockHandle>,
+    txn_namespace_lock: os::NamespaceMutationLockHandle,
     src_parent_fd: Option<Arc<std::fs::File>>,
     txn_dir_fd: Option<Arc<std::fs::File>>,
     txn_parent_fd: Option<Arc<std::fs::File>>,
@@ -928,6 +946,8 @@ struct PublishedPartTxnReceipt {
     had_old_data: bool,
     had_old_meta: bool,
     admission: Option<multipart_staging::MultipartSourceAdmission>,
+    upload_lock: Option<multipart_staging::UploadLockHandle>,
+    txn_namespace_lock: os::NamespaceMutationLockHandle,
     txn_dir_fd: Option<Arc<std::fs::File>>,
     txn_parent_fd: Option<Arc<std::fs::File>>,
 }
@@ -5025,7 +5045,7 @@ impl LazyLocalFileWriter {
         let sync_on_close = self.sync_on_close;
         let mark_dir_presynced = self.mark_dir_presynced;
         let parent_exists = self.parent_exists;
-        let volume_dir_for_presync = self.volume_dir.clone();
+        let volume_dir_for_presync = (close_after && sync_on_close).then(|| self.volume_dir.clone());
         self.last_integrity_digest = None;
         let write_and_finish = move |mut file: std::fs::File, file_path: PathBuf| {
             let digest = match integrity_spec {
@@ -5053,8 +5073,8 @@ impl LazyLocalFileWriter {
                 }
                 reclaim_std_file_cache(&file, reclaim_len, reclaim_on_shutdown);
                 drop(file);
-                if sync_on_close {
-                    mark_presynced_after_lazy_write(&file_path, &volume_dir_for_presync, mark_dir_presynced);
+                if let Some(ref volume_dir) = volume_dir_for_presync {
+                    mark_presynced_after_lazy_write(&file_path, volume_dir, mark_dir_presynced);
                 }
                 Ok((None, wire_len, digest))
             } else {
@@ -15106,6 +15126,18 @@ fn measure_local_batch_stage<T>(
     result
 }
 
+impl LocalDisk {
+    async fn check_deferred_org_volume(&self, org_volume: &str) -> Result<()> {
+        let org_volume_path = self.io_get_bucket_path(org_volume)?;
+        if !skip_access_checks(org_volume) {
+            cached_access(&org_volume_path)
+                .await
+                .map_err(|e| to_access_error(e, DiskError::VolumeAccessDenied))?;
+        }
+        Ok(())
+    }
+}
+
 #[async_trait::async_trait]
 impl DiskAPI for LocalDisk {
     async fn list_multipart_index_roots(
@@ -15889,9 +15921,9 @@ impl DiskAPI for LocalDisk {
         } else {
             self.usage_watch_binding.owner(dst_volume, usage_owner)
         };
-        let source_owner = self
-            .multipart_source_owner(dst_volume, dst_path, true, false, usage_owner)
-            .await?;
+        // Lock ordering: usage_owner -> UploadEntry.lock -> NamespaceMutationLock.
+        let upload_lock = self.lookup_multipart_upload_lock(dst_volume, dst_path, true)?;
+        let source_owner = Self::acquire_multipart_source_owner_with_handle(upload_lock.as_ref(), false, usage_owner).await;
         let (src_volume_dir, src_file_path) = self.io_get_bucket_and_object_path(src_volume, src_path)?;
         let (dst_volume_dir, dst_file_path) = self.io_get_bucket_and_object_path(dst_volume, dst_path)?;
         let admission = self.multipart_source_admission_after_validated_part_path(dst_volume, dst_path)?;
@@ -15910,7 +15942,7 @@ impl DiskAPI for LocalDisk {
 
         let durability = effective_durability(dst_volume);
         let part = ObjectPartInfo::unmarshal(&meta)?;
-        let integrity_prep = if let Some(integrity) = part.integrity {
+        let integrity_prep = if let Some(integrity) = part.integrity.clone() {
             integrity.validate()?;
             if usize::try_from(integrity.number).map_err(|_| DiskError::FileCorrupt)? != part.number
                 || usize::try_from(integrity.size).map_err(|_| DiskError::FileCorrupt)? != part.size
@@ -15935,7 +15967,13 @@ impl DiskAPI for LocalDisk {
             multipart_source_state::begin_active_multipart_part_transaction(source, part.number);
         }
         os::record_native_publication(&transaction_path);
-        let lease = os::acquire_namespace_mutation_lease_with_owner(&transaction_path, source_owner).await;
+        let txn_namespace_lock = os::lookup_namespace_mutation_lock(&transaction_path);
+        let lease = os::acquire_namespace_mutation_lease_with_lock_and_queue(
+            &txn_namespace_lock,
+            Arc::clone(&self.blocking_queue),
+            source_owner,
+        )
+        .await;
         let res = os::run_blocking_namespace_operation_with_sync(
             lease,
             sync,
@@ -16261,9 +16299,12 @@ impl DiskAPI for LocalDisk {
                         dst_meta_path,
                         transaction_path,
                         meta,
+                        part_info: part,
                         had_old_data,
                         had_old_meta,
                         admission,
+                        upload_lock,
+                        txn_namespace_lock,
                         src_parent_fd,
                         txn_dir_fd,
                         txn_parent_fd,
@@ -16289,10 +16330,21 @@ impl DiskAPI for LocalDisk {
 
     #[tracing::instrument(level = "trace", skip_all)]
     async fn settle_part_transaction(&self, volume: &str, path: &str, action: PartTransactionAction) -> Result<()> {
+        multipart_staging::reject_noncanonical_scope(&self.root, self.io_root(), volume, path)?;
         let usage_owner = self.usage_watch_binding.owner(volume, None);
-        let source_owner = self.multipart_source_owner(volume, path, true, false, usage_owner).await?;
         let txn_rel_path = crate::disk::part_transaction_path(path);
         let txn_open_path = self.io_get_object_open_path(volume, &txn_rel_path).ok();
+        let cached_upload_lock = txn_open_path.as_deref().and_then(|txn_open| {
+            PUBLISHED_PART_TXN_RECEIPTS
+                .with_get(txn_open, |entry| entry.upload_lock.clone())
+                .or_else(|| PREPARED_PART_TXN_RECEIPTS.with_get(txn_open, |entry| entry.upload_lock.clone()))
+        });
+        // Lock ordering: usage_owner -> UploadEntry.lock -> NamespaceMutationLock.
+        let upload_lock = match cached_upload_lock {
+            Some(lock) => lock,
+            None => self.lookup_multipart_upload_lock(volume, path, true)?,
+        };
+        let source_owner = Self::acquire_multipart_source_owner_with_handle(upload_lock.as_ref(), false, usage_owner).await;
         let cached_published = txn_open_path.as_deref().and_then(take_published_part_txn_receipt);
         if cached_published.is_none()
             && let Some(ref txn_open) = txn_open_path
@@ -16306,6 +16358,7 @@ impl DiskAPI for LocalDisk {
             skip_obsolete_read_on_commit,
             cached_old_flags,
             admission,
+            cached_txn_namespace_lock,
             mut txn_dir_fd,
             mut txn_parent_fd,
         ) = match cached_published {
@@ -16316,6 +16369,7 @@ impl DiskAPI for LocalDisk {
                 !entry.had_old_meta,
                 Some((entry.had_old_data, entry.had_old_meta)),
                 entry.admission,
+                Some(entry.txn_namespace_lock),
                 entry.txn_dir_fd,
                 entry.txn_parent_fd,
             ),
@@ -16327,7 +16381,17 @@ impl DiskAPI for LocalDisk {
                 for candidate in [&current_data_path, &current_meta_path, &transaction_path] {
                     check_path_length(candidate.to_string_lossy().as_ref())?;
                 }
-                (current_data_path, current_meta_path, transaction_path, false, None, admission, None, None)
+                (
+                    current_data_path,
+                    current_meta_path,
+                    transaction_path,
+                    false,
+                    None,
+                    admission,
+                    None,
+                    None,
+                    None,
+                )
             }
         };
         let admission_source = admission.as_ref().map(|a| a.source().to_path_buf());
@@ -16338,7 +16402,16 @@ impl DiskAPI for LocalDisk {
             .and_then(|name| name.to_str())
             .and_then(|name| name.strip_prefix("part."))
             .and_then(|num| num.parse::<usize>().ok());
-        let lease = os::acquire_namespace_mutation_lease_with_owner(&transaction_path, source_owner).await;
+        let lease = match cached_txn_namespace_lock {
+            Some(ref lock) => {
+                os::acquire_namespace_mutation_lease_with_lock_and_queue(lock, Arc::clone(&self.blocking_queue), source_owner)
+                    .await
+            }
+            None => {
+                os::acquire_namespace_mutation_lease_with_queue(&transaction_path, Arc::clone(&self.blocking_queue), source_owner)
+                    .await
+            }
+        };
 
         os::record_native_publication(&current_data_path);
         let res = os::run_blocking_namespace_operation_with_sync(lease, sync, move || -> std::io::Result<Result<bool>> {
@@ -16502,14 +16575,26 @@ impl DiskAPI for LocalDisk {
         } else {
             self.usage_watch_binding.owner(dst_volume, usage_owner)
         };
-        let source_owner = self
-            .multipart_source_owner(dst_volume, dst_path, true, false, usage_owner)
-            .await?;
+        let src_is_dir = has_suffix(src_path, SLASH_SEPARATOR);
+        let dst_is_dir = has_suffix(dst_path, SLASH_SEPARATOR);
+        let txn_open_path = (!src_is_dir)
+            .then(|| {
+                let txn_rel = crate::disk::part_transaction_path(dst_path);
+                self.io_get_object_open_path(dst_volume, &txn_rel).ok()
+            })
+            .flatten();
+        let cached_upload_lock = txn_open_path
+            .as_deref()
+            .and_then(|txn_open| PREPARED_PART_TXN_RECEIPTS.with_get(txn_open, |entry| entry.upload_lock.clone()));
+        // Lock ordering: usage_owner -> UploadEntry.lock -> NamespaceMutationLock.
+        let upload_lock = match cached_upload_lock {
+            Some(lock) => lock,
+            None => self.lookup_multipart_upload_lock(dst_volume, dst_path, true)?,
+        };
+        let source_owner = Self::acquire_multipart_source_owner_with_handle(upload_lock.as_ref(), false, usage_owner).await;
         multipart_staging::reject_reserved_anchor(dst_path)?;
         pool_meta_native::reject_raw_path(&self.root, src_volume, src_path)?;
         pool_meta_native::reject_raw_path(&self.root, dst_volume, dst_path)?;
-        let src_is_dir = has_suffix(src_path, SLASH_SEPARATOR);
-        let dst_is_dir = has_suffix(dst_path, SLASH_SEPARATOR);
 
         if !src_is_dir && dst_is_dir || src_is_dir && !dst_is_dir {
             warn!(
@@ -16524,20 +16609,15 @@ impl DiskAPI for LocalDisk {
             return Err(DiskError::FileAccessDenied);
         }
 
-        let cached_prepared = if !src_is_dir {
-            let txn_rel = crate::disk::part_transaction_path(dst_path);
-            self.io_get_object_open_path(dst_volume, &txn_rel)
-                .ok()
-                .and_then(|txn_open| take_prepared_part_txn_receipt(&txn_open))
-                .filter(|entry| {
-                    entry.meta == meta
-                        && self
-                            .io_get_object_open_path(src_volume, src_path)
-                            .is_ok_and(|src_open| src_open == entry.src_file_path)
-                })
-        } else {
-            None
-        };
+        let cached_prepared = txn_open_path
+            .as_deref()
+            .and_then(take_prepared_part_txn_receipt)
+            .filter(|entry| {
+                entry.meta == meta
+                    && self
+                        .io_get_object_open_path(src_volume, src_path)
+                        .is_ok_and(|src_open| src_open == entry.src_file_path)
+            });
 
         let (
             src_volume_dir,
@@ -16548,6 +16628,8 @@ impl DiskAPI for LocalDisk {
             transaction_path,
             preverified_meta_and_old_flags,
             admission,
+            cached_part_info,
+            cached_txn_namespace_lock,
             mut src_parent_fd,
             txn_dir_fd,
             txn_parent_fd,
@@ -16561,6 +16643,8 @@ impl DiskAPI for LocalDisk {
                 Some(entry.transaction_path),
                 Some((entry.had_old_data, entry.had_old_meta)),
                 entry.admission,
+                Some(entry.part_info),
+                Some(entry.txn_namespace_lock),
                 entry.src_parent_fd,
                 entry.txn_dir_fd,
                 entry.txn_parent_fd,
@@ -16603,6 +16687,8 @@ impl DiskAPI for LocalDisk {
                     None,
                     None,
                     None,
+                    None,
+                    None,
                 )
             }
         };
@@ -16619,12 +16705,20 @@ impl DiskAPI for LocalDisk {
         let src_file_for_cleanup = src_file_path.clone();
         let src_volume_for_cleanup = src_volume_dir.clone();
         let meta_for_legacy = meta.clone();
-        let lease = os::acquire_namespace_mutation_lease_with_owner(&dst_file_path, source_owner.clone()).await;
+        let lease = os::acquire_namespace_mutation_lease_with_queue(
+            &dst_file_path,
+            Arc::clone(&self.blocking_queue),
+            source_owner.clone(),
+        )
+        .await;
 
-        let published_transaction_meta = os::run_blocking_namespace_operation_with_sync(
-            lease,
-            sync,
-            move || -> std::io::Result<(bool, Option<(PathBuf, PublishedPartTxnReceipt)>)> {
+        type RenamePartOutcome = (
+            bool,
+            Option<multipart_source_state::FileStamp>,
+            Option<(PathBuf, PublishedPartTxnReceipt)>,
+        );
+        let published_transaction_meta =
+            os::run_blocking_namespace_operation_with_sync(lease, sync, move || -> std::io::Result<RenamePartOutcome> {
                 if let Some(check) = &admission {
                     check.validate().map_err(to_file_error)?;
                 }
@@ -16676,18 +16770,20 @@ impl DiskAPI for LocalDisk {
                     }
                 }
 
+                let mut precomputed_publish_stamp = None;
                 let transaction_publish_meta = if let Some(transaction_path) = transaction_path.as_ref() {
                     let transaction_meta_path = transaction_path.join(PART_TRANSACTION_NEW_META);
                     let publish_meta_path = transaction_path.join(PART_TRANSACTION_PUBLISH_META);
                     if !cfg!(test)
                         && preverified_meta_and_old_flags.is_some()
-                        && part_txn_files_ready(
+                        && let Some(stamp) = part_txn_files_ready_with_stamp(
                             txn_dir_fd.as_deref(),
                             &publish_meta_path,
                             &transaction_meta_path,
                             meta.len() as u64,
                         )
                     {
+                        precomputed_publish_stamp = stamp;
                         Some(publish_meta_path)
                     } else {
                         match std::fs::File::open(&transaction_meta_path) {
@@ -16845,6 +16941,7 @@ impl DiskAPI for LocalDisk {
                     let fast_meta_renamed = false;
 
                     if !fast_meta_renamed {
+                        precomputed_publish_stamp = None;
                         os::rename_all_with_precondition_and_parent_sync_std(
                             &transaction_publish_meta,
                             dst_meta_path,
@@ -16876,6 +16973,8 @@ impl DiskAPI for LocalDisk {
                     let published_entry = if let (Some((had_old_data, had_old_meta)), Some(txn_path), Some(meta_path)) =
                         (preverified_meta_and_old_flags, transaction_path, dst_meta_path.as_path().into())
                     {
+                        let txn_namespace_lock =
+                            cached_txn_namespace_lock.unwrap_or_else(|| os::lookup_namespace_mutation_lock(&txn_path));
                         Some((
                             txn_path.clone(),
                             PublishedPartTxnReceipt {
@@ -16885,6 +16984,8 @@ impl DiskAPI for LocalDisk {
                                 had_old_data,
                                 had_old_meta,
                                 admission,
+                                upload_lock,
+                                txn_namespace_lock,
                                 txn_dir_fd,
                                 txn_parent_fd,
                             },
@@ -16892,20 +16993,19 @@ impl DiskAPI for LocalDisk {
                     } else {
                         None
                     };
-                    Ok((true, published_entry))
+                    Ok((true, precomputed_publish_stamp, published_entry))
                 } else {
-                    Ok((false, None))
+                    Ok((false, None, None))
                 }
-            },
-        )
-        .await
-        .map_err(DiskError::from);
-        let published_transaction_meta = match published_transaction_meta {
-            Ok((published, maybe_entry)) => {
+            })
+            .await
+            .map_err(DiskError::from);
+        let (published_transaction_meta, precomputed_publish_stamp) = match published_transaction_meta {
+            Ok((published, stamp, maybe_entry)) => {
                 if let Some((txn_path, entry)) = maybe_entry {
                     put_published_part_txn_receipt(&txn_path, entry);
                 }
-                published
+                (published, stamp)
             }
             Err(err) => {
                 if let Some(ref source) = admission_source {
@@ -16933,9 +17033,13 @@ impl DiskAPI for LocalDisk {
         }
         if !src_is_dir
             && let Some(ref source) = admission_source
-            && let Ok(part_info) = ObjectPartInfo::unmarshal(&meta_for_legacy)
+            && let Some(part_info) = cached_part_info.or_else(|| ObjectPartInfo::unmarshal(&meta_for_legacy).ok())
         {
-            multipart_source_state::record_active_multipart_part_committed(source, part_info);
+            multipart_source_state::record_active_multipart_part_committed(
+                source,
+                part_info,
+                published_transaction_meta.then_some(precomputed_publish_stamp).flatten(),
+            );
         }
 
         if src_is_dir {
@@ -17853,22 +17957,40 @@ impl DiskAPI for LocalDisk {
         } else {
             GET_OBJECT_PATH_LEGACY_DUPLEX
         };
-        if !org_volume.is_empty() {
-            let org_volume_path = self.io_get_bucket_path(org_volume)?;
-            if !skip_access_checks(org_volume) {
-                cached_access(&org_volume_path)
-                    .await
-                    .map_err(|e| to_access_error(e, DiskError::VolumeAccessDenied))?;
-            }
+        #[cfg(target_os = "linux")]
+        let defer_org_volume_check = !org_volume.is_empty()
+            && org_volume == volume
+            && volume != RUSTFS_META_MULTIPART_BUCKET
+            && is_clean_relative_segment(volume);
+        #[cfg(not(target_os = "linux"))]
+        let defer_org_volume_check = false;
+
+        if !org_volume.is_empty() && !defer_org_volume_check {
+            self.check_deferred_org_volume(org_volume).await?;
         }
 
         let path_resolve_start = get_stage_timer_if_enabled(stage_metrics_enabled);
-        let (volume_dir, file_path) = self.io_get_bucket_and_object_open_path(volume, path)?;
+        let resolved_paths = self.io_get_bucket_and_object_open_path(volume, path);
         record_get_stage_duration_if_enabled(metrics_path, GET_STAGE_READ_VERSION_PATH_RESOLVE, path_resolve_start);
+        let (volume_dir, file_path) = match resolved_paths {
+            Ok(paths) => paths,
+            Err(err) => {
+                if defer_org_volume_check {
+                    self.check_deferred_org_volume(org_volume).await?;
+                }
+                return Err(err);
+            }
+        };
 
         let path_check_start = get_stage_timer_if_enabled(stage_metrics_enabled);
-        check_path_length(file_path.to_string_lossy().as_ref())?;
+        let len_check = check_path_length(file_path.to_string_lossy().as_ref());
         record_get_stage_duration_if_enabled(metrics_path, GET_STAGE_READ_VERSION_PATH_CHECK, path_check_start);
+        if let Err(err) = len_check {
+            if defer_org_volume_check {
+                self.check_deferred_org_volume(org_volume).await?;
+            }
+            return Err(err);
+        }
 
         if volume == RUSTFS_META_MULTIPART_BUCKET
             && !opts.read_data
@@ -17884,13 +18006,19 @@ impl DiskAPI for LocalDisk {
         let xlmeta_read_start = get_stage_timer_if_enabled(stage_metrics_enabled);
         let raw_read_result = self.read_raw(volume, &volume_dir, &file_path, read_data).await;
         record_get_stage_duration_if_enabled(metrics_path, GET_STAGE_READ_VERSION_XLMETA_READ, xlmeta_read_start);
-        let (data, _) = raw_read_result.map_err(|e| {
-            if e == DiskError::FileNotFound && !version_id.is_empty() {
-                DiskError::FileVersionNotFound
-            } else {
-                e
+        let (data, _) = match raw_read_result {
+            Ok(res) => res,
+            Err(e) => {
+                if defer_org_volume_check {
+                    self.check_deferred_org_volume(org_volume).await?;
+                }
+                return Err(if e == DiskError::FileNotFound && !version_id.is_empty() {
+                    DiskError::FileVersionNotFound
+                } else {
+                    e
+                });
             }
-        })?;
+        };
 
         let decode_start = get_stage_timer_if_enabled(stage_metrics_enabled);
         let file_info_result: Result<FileInfo> = (|| {
@@ -42375,7 +42503,7 @@ mod test {
         let source_root = multipart_staging::upload_scope_root(mp_dst_path, true);
         let mut upload = FileInfo::new(source_root, 2, 2);
         upload.erasure.index = 1;
-        upload.data_dir = Some(Uuid::new_v4());
+        upload.data_dir = Some(Uuid::parse_str("58ba822c-06e4-4332-81cc-be2c9d921900").expect("valid part data_dir uuid"));
         upload.mod_time = Some(time::OffsetDateTime::now_utc());
         upload.fresh = true;
         disk.write_metadata("", RUSTFS_META_MULTIPART_BUCKET, source_root, upload)
@@ -42397,6 +42525,14 @@ mod test {
             .expect("stage multipart part");
 
         let mp_dir = disk.io_root().join(RUSTFS_META_MULTIPART_BUCKET);
+        let mp_txn_open_path = disk
+            .io_get_object_open_path(RUSTFS_META_MULTIPART_BUCKET, &crate::disk::part_transaction_path(mp_dst_path))
+            .expect("multipart txn open path");
+        let expected_upload_lock = disk
+            .lookup_multipart_upload_lock(RUSTFS_META_MULTIPART_BUCKET, mp_dst_path, true)
+            .expect("lookup upload lock")
+            .expect("multipart upload lock present");
+        let expected_txn_ns_lock = os::lookup_namespace_mutation_lock(&mp_txn_open_path);
         let jobs_before_mp = disk.blocking_queue.submitted_jobs_for_test();
         let fsync_jobs_before_mp = disk.blocking_queue.submitted_fsync_jobs_for_test();
         let mp_syncs_before = os::fsync_dir_recorder::count_under(&mp_dir);
@@ -42409,6 +42545,19 @@ mod test {
         )
         .await
         .expect("prepare_part_transaction");
+        assert!(
+            PREPARED_PART_TXN_RECEIPTS
+                .with_get(&mp_txn_open_path, |entry| {
+                    entry.part_info.number == 1
+                        && entry
+                            .upload_lock
+                            .as_ref()
+                            .is_some_and(|lock| lock.ptr_eq(&expected_upload_lock))
+                        && entry.txn_namespace_lock.ptr_eq(&expected_txn_ns_lock)
+                })
+                .unwrap_or(false),
+            "PreparedPartTxnReceipt must retain parsed part_info, UploadLockHandle, and NamespaceMutationLockHandle"
+        );
         disk.rename_part(
             RUSTFS_META_TMP_BUCKET,
             "mp-stage/part.1",
@@ -42418,6 +42567,38 @@ mod test {
         )
         .await
         .expect("rename_part");
+        assert!(
+            PUBLISHED_PART_TXN_RECEIPTS
+                .with_get(&mp_txn_open_path, |entry| {
+                    entry
+                        .upload_lock
+                        .as_ref()
+                        .is_some_and(|lock| lock.ptr_eq(&expected_upload_lock))
+                        && entry.txn_namespace_lock.ptr_eq(&expected_txn_ns_lock)
+                })
+                .unwrap_or(false),
+            "PublishedPartTxnReceipt must carry UploadLockHandle and NamespaceMutationLockHandle into settle_part_transaction"
+        );
+        let alias_meta_path = format!("multipart/{mp_dst_path}");
+        assert_eq!(
+            disk.settle_part_transaction(RUSTFS_META_BUCKET, &alias_meta_path, PartTransactionAction::Commit)
+                .await
+                .expect_err("volume/path alias must be rejected before consuming PublishedPartTxnReceipt"),
+            DiskError::ConditionalDeleteConflict
+        );
+        let dot_segment_mp_path = mp_dst_path.replacen('/', "/./", 1);
+        assert_eq!(
+            disk.settle_part_transaction(RUSTFS_META_MULTIPART_BUCKET, &dot_segment_mp_path, PartTransactionAction::Commit)
+                .await
+                .expect_err("dot-segment path must be rejected before consuming PublishedPartTxnReceipt"),
+            DiskError::ConditionalDeleteConflict
+        );
+        assert!(
+            PUBLISHED_PART_TXN_RECEIPTS
+                .with_get(&mp_txn_open_path, |_| true)
+                .unwrap_or(false),
+            "rejected settle_part_transaction calls must not consume warm PublishedPartTxnReceipt"
+        );
         disk.settle_part_transaction(RUSTFS_META_MULTIPART_BUCKET, mp_dst_path, PartTransactionAction::Commit)
             .await
             .expect("settle_part_transaction");
@@ -42443,8 +42624,76 @@ mod test {
                 .expect("read settled part"),
             part_payload
         );
+        let source_open_path = disk
+            .io_get_object_open_path(RUSTFS_META_MULTIPART_BUCKET, source_root)
+            .expect("source open path");
+        assert_eq!(
+            multipart_source_state::get_active_multipart_source_part_with_head(&source_open_path, 1, false)
+                .map(|part| (part.number, part.size)),
+            Some((1, part_payload.len())),
+            "ACTIVE_MULTIPART_SOURCE_HEADS must serve committed part metadata after rename_part + settle_part_transaction"
+        );
+
+        // 4. Deferred org_volume check in read_version must preserve VolumeNotFound precedence
+        //    when org_volume == volume does not exist on disk, and FileVersionNotFound when
+        //    org_volume == volume exists and version_id is non-empty.
+        let missing_bucket = "nonexistent-read-version-bucket";
+        assert_eq!(
+            disk.read_version(missing_bucket, missing_bucket, "missing-obj", "", &ReadOptions::default())
+                .await
+                .expect_err("missing org_volume == volume must fail"),
+            DiskError::VolumeNotFound,
+            "read_version must preserve VolumeNotFound when org_volume == volume does not exist"
+        );
+        assert_eq!(
+            disk.read_version(missing_bucket, missing_bucket, "../escape", "", &ReadOptions::default())
+                .await
+                .expect_err("missing org_volume with invalid path must still report VolumeNotFound first"),
+            DiskError::VolumeNotFound,
+            "read_version must preserve VolumeNotFound precedence over path-resolve errors when org_volume == volume is missing"
+        );
+        assert_eq!(
+            disk.read_version(
+                bucket,
+                bucket,
+                "missing-versioned-obj",
+                "00000000-0000-0000-0000-000000000001",
+                &ReadOptions::default(),
+            )
+            .await
+            .expect_err("existing bucket with missing object and non-empty version_id must return FileVersionNotFound"),
+            DiskError::FileVersionNotFound,
+            "read_version must preserve FileNotFound -> FileVersionNotFound mapping when org_volume == volume exists"
+        );
 
         println!("HOTPATH_BUDGET_OK");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn part_txn_files_ready_with_stamp_matches_post_rename_file_stamp() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let txn_dir = dir.path().join("part.1.part-txn");
+        std::fs::create_dir_all(&txn_dir).expect("create txn dir");
+        let publish_meta = txn_dir.join(PART_TRANSACTION_PUBLISH_META);
+        let new_meta = txn_dir.join(PART_TRANSACTION_NEW_META);
+        let payload = b"serialized-part-meta";
+        std::fs::write(&publish_meta, payload).expect("write publish.meta");
+        std::fs::write(&new_meta, payload).expect("write new.meta");
+        let txn_fd = std::fs::File::open(&txn_dir).expect("open txn_dir_fd");
+
+        let pre_rename_stamp = part_txn_files_ready_with_stamp(Some(&txn_fd), &publish_meta, &new_meta, payload.len() as u64)
+            .expect("part_txn_files_ready_with_stamp must report ready")
+            .expect("unix statat path must return precomputed FileStamp");
+
+        let committed_meta = dir.path().join("part.1.meta");
+        std::fs::rename(&publish_meta, &committed_meta).expect("rename publish.meta to part.1.meta");
+        let post_rename_stamp =
+            multipart_source_state::FileStamp::from_path(&committed_meta).expect("post-rename FileStamp::from_path");
+        assert_eq!(
+            pre_rename_stamp, post_rename_stamp,
+            "FileStamp::from_stat before rename must match FileStamp::from_path after rename"
+        );
     }
 
     #[test]

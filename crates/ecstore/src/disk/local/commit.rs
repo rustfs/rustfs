@@ -1248,13 +1248,14 @@ impl LocalDisk {
                     }
                     #[cfg(test)]
                     run_owned_file_before_open(&backup_path);
-                    if let Err(err) = os::stage_inline_rollback_backup_with_commit_guard_std(
+                    if let Err(err) = os::stage_inline_rollback_backup_in_dir_with_commit_guard_std(
                         &dst_file_path_owned,
                         &backup_parent,
                         &backup_path,
                         old_file,
                         sync_recovery_protocol,
                         !should_fail_local_inline_rollback_hardlink(&dst_file_path_owned),
+                        has_old_data_dir.is_some(),
                         &guard,
                     ) {
                         drop(prepared_metadata_source);
