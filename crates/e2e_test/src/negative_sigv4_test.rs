@@ -230,6 +230,34 @@ fn encode_unsigned_aws_chunked_with_sha256_trailer(decoded: &[u8]) -> Vec<u8> {
     encoded
 }
 
+/// Sign multiple chunks and the terminating 0-length chunk independently of the
+/// server decoder, returning each framed chunk separately so tests can reorder
+/// or truncate individual frames.
+fn encode_signed_aws_chunked_frames(signer: &SigV4, headers: &SignedHeaders, chunks: &[&[u8]]) -> Vec<Vec<u8>> {
+    let mut previous = headers
+        .authorization
+        .rsplit_once("Signature=")
+        .expect("seed signature")
+        .1
+        .to_string();
+    let mut frames = Vec::with_capacity(chunks.len() + 1);
+    for chunk in chunks.iter().copied().chain(std::iter::once(b"".as_slice())) {
+        let string_to_sign = format!(
+            "AWS4-HMAC-SHA256-PAYLOAD\n{}\n{}\n{previous}\n{}\n{}",
+            headers.amz_date,
+            get_scope(REGION, signer.time, "s3"),
+            sha256_hex(b""),
+            sha256_hex(chunk),
+        );
+        previous = get_signature(get_signing_key(&signer.secret_key, REGION, signer.time, "s3"), &string_to_sign);
+        let mut frame = format!("{:x};chunk-signature={previous}\r\n", chunk.len()).into_bytes();
+        frame.extend_from_slice(chunk);
+        frame.extend_from_slice(b"\r\n");
+        frames.push(frame);
+    }
+    frames
+}
+
 /// Sign the data and terminating chunks independently of the server decoder.
 fn encode_signed_aws_chunked(signer: &SigV4, headers: &SignedHeaders, decoded: &[u8], trailer: bool) -> Vec<u8> {
     let mut previous = headers
@@ -467,6 +495,159 @@ async fn aws_chunked_named_errors_reject_put_and_upload_part() -> Result<(), Box
         }
     }
     assert!(failures.is_empty(), "{}", failures.join("\n"));
+    Ok(())
+}
+
+/// Covers the remaining two `backlog#1151` `sec-3` streaming signed-chunk negative
+/// cases across both `PutObject` and `UploadPart`:
+/// 1. Truncated terminating 0-length chunk (stream ends after data chunks with no
+///    terminating `0;chunk-signature=...` frame, or cuts off mid-terminator).
+/// 2. Reordered signed chunks (two validly signed chunks swapped on the wire so
+///    the `previous_signature` HMAC chain breaks -> `403 SignatureDoesNotMatch`).
+#[tokio::test]
+async fn aws_chunked_signed_truncated_terminator_and_reordered_chunks_are_rejected()
+-> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    init_logging();
+    let mut env = RustFSTestEnvironment::new().await?;
+    setup(&mut env).await?;
+    let client = env.create_s3_client();
+    let chunk_a = b"sec3-signed-chunk-alpha|";
+    let chunk_b = b"sec3-signed-chunk-beta!";
+    let mut combined = Vec::with_capacity(chunk_a.len() + chunk_b.len());
+    combined.extend_from_slice(chunk_a);
+    combined.extend_from_slice(chunk_b);
+    let decoded_len = combined.len().to_string();
+
+    // Positive multi-chunk control: validly ordered signed chunks + terminator succeed.
+    {
+        let key = "sec3-signed-multichunk-valid.bin";
+        let path = format!("/{BUCKET}/{key}");
+        let signer = SigV4::new(&env);
+        let extra = [
+            ("content-encoding", "aws-chunked"),
+            ("x-amz-decoded-content-length", decoded_len.as_str()),
+        ];
+        let headers = signer.sign_with_extra_headers("PUT", &path, "", "STREAMING-AWS4-HMAC-SHA256-PAYLOAD", &extra);
+        let body: Vec<u8> = encode_signed_aws_chunked_frames(&signer, &headers, &[chunk_a, chunk_b])
+            .into_iter()
+            .flatten()
+            .collect();
+        let resp = local_http_client()
+            .put(format!("{}{path}", env.url))
+            .header("authorization", &headers.authorization)
+            .header("x-amz-content-sha256", &headers.content_sha256)
+            .header("x-amz-date", &headers.amz_date)
+            .header("content-encoding", "aws-chunked")
+            .header("x-amz-decoded-content-length", &decoded_len)
+            .body(body)
+            .timeout(std::time::Duration::from_secs(20))
+            .send()
+            .await?;
+        assert_eq!(resp.status().as_u16(), 200, "valid 2-chunk signed control must succeed");
+        let stored = client.get_object().bucket(BUCKET).key(key).send().await?;
+        assert_eq!(stored.body.collect().await?.into_bytes().as_ref(), combined.as_slice());
+    }
+
+    for multipart in [false, true] {
+        for case in ["truncated-terminator", "partial-terminator", "reordered-chunks"] {
+            let key = format!("sec3-{case}-{multipart}.bin");
+            let upload_id = if multipart {
+                Some(
+                    client
+                        .create_multipart_upload()
+                        .bucket(BUCKET)
+                        .key(&key)
+                        .send()
+                        .await?
+                        .upload_id()
+                        .ok_or("missing upload ID")?
+                        .to_owned(),
+                )
+            } else {
+                None
+            };
+            let query = upload_id
+                .as_ref()
+                .map(|id| format!("partNumber=1&uploadId={}", urlencoding::encode(id)))
+                .unwrap_or_default();
+            let path = format!("/{BUCKET}/{key}");
+            let target = if query.is_empty() {
+                path.clone()
+            } else {
+                format!("{path}?{query}")
+            };
+            let signer = SigV4::new(&env);
+            let extra = [
+                ("content-encoding", "aws-chunked"),
+                ("x-amz-decoded-content-length", decoded_len.as_str()),
+            ];
+            let headers = signer.sign_with_extra_headers("PUT", &path, &query, "STREAMING-AWS4-HMAC-SHA256-PAYLOAD", &extra);
+            let frames = encode_signed_aws_chunked_frames(&signer, &headers, &[chunk_a, chunk_b]);
+            assert_eq!(frames.len(), 3, "expected 2 data frames + 1 terminating 0-length frame");
+
+            let body = match case {
+                // Omit the terminating 0-length signed chunk completely.
+                "truncated-terminator" => [frames[0].as_slice(), frames[1].as_slice()].concat(),
+                // Cut off halfway through the terminating 0-length chunk header.
+                "partial-terminator" => [frames[0].as_slice(), frames[1].as_slice(), b"0;chunk-signature=deadbeef"].concat(),
+                // Swap chunk 1 and chunk 2 while keeping each chunk's original signature.
+                "reordered-chunks" => [frames[1].as_slice(), frames[0].as_slice(), frames[2].as_slice()].concat(),
+                _ => unreachable!("enumerated sec-3 negative cases"),
+            };
+
+            let resp = local_http_client()
+                .put(format!("{}{target}", env.url))
+                .header("authorization", &headers.authorization)
+                .header("x-amz-content-sha256", &headers.content_sha256)
+                .header("x-amz-date", &headers.amz_date)
+                .header("content-encoding", "aws-chunked")
+                .header("x-amz-decoded-content-length", &decoded_len)
+                .body(body)
+                .timeout(std::time::Duration::from_secs(20))
+                .send()
+                .await?;
+            let status = resp.status().as_u16();
+            let text = resp.text().await?;
+            match case {
+                "reordered-chunks" => {
+                    assert_eq!(
+                        status, 403,
+                        "reordered signed chunks (multipart={multipart}) must return 403, got {status}: {text}"
+                    );
+                    assert_error_code(&text, "SignatureDoesNotMatch");
+                }
+                "truncated-terminator" | "partial-terminator" => {
+                    assert_eq!(
+                        status, 400,
+                        "{case} (multipart={multipart}) must return 400 client error, got {status}: {text}"
+                    );
+                    assert_error_code(&text, "IncompleteBody");
+                }
+                _ => unreachable!(),
+            }
+
+            let absent = client
+                .get_object()
+                .bucket(BUCKET)
+                .key(&key)
+                .send()
+                .await
+                .expect_err("rejected signed-chunk request must not publish an object");
+            assert_eq!(absent.as_service_error().and_then(ProvideErrorMetadata::code), Some("NoSuchKey"));
+            if let Some(id) = upload_id {
+                let parts = client.list_parts().bucket(BUCKET).key(&key).upload_id(&id).send().await?;
+                assert!(parts.parts().is_empty(), "{case}: rejected UploadPart published a part");
+                client
+                    .abort_multipart_upload()
+                    .bucket(BUCKET)
+                    .key(&key)
+                    .upload_id(id)
+                    .send()
+                    .await?;
+            }
+        }
+    }
+
     Ok(())
 }
 
