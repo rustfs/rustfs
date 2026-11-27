@@ -3730,10 +3730,27 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
                 let opts = &commit_opts;
                 let result: Result<PartInfo> = async {
                     let commit_check_started = rustfs_io_metrics::put_stage_timer();
-                    let (commit_fi, _) = commit_set
-                        .check_upload_id_exists_with_opts(bucket, object, upload_id, multipart_size_limit.is_some(), opts)
-                        .await?;
-                    rustfs_io_metrics::record_put_object_stage_duration_from("multipart_set_disk_commit_upload_check", commit_check_started);
+                    let fast_commit_head_verified = _upload_commit_guard.is_some() && multipart_size_limit.is_none() && {
+                        let commit_disks = commit_set.get_disks_internal().await;
+                        commit_disks.len() == commit_set.set_drive_count
+                            && commit_disks.iter().all(|disk| {
+                                disk.as_ref().is_some_and(|disk| {
+                                    disk.has_active_multipart_source_matching(&upload_id_path, fi.data_dir, fi.mod_time)
+                                })
+                            })
+                    };
+                    let commit_fi = if fast_commit_head_verified {
+                        fi.clone()
+                    } else {
+                        let (commit_fi, _) = commit_set
+                            .check_upload_id_exists_with_opts(bucket, object, upload_id, multipart_size_limit.is_some(), opts)
+                            .await?;
+                        commit_fi
+                    };
+                    rustfs_io_metrics::record_put_object_stage_duration_from(
+                        "multipart_set_disk_commit_upload_check",
+                        commit_check_started,
+                    );
                     let commit_size_limit = multipart_size_limit_from_metadata(&commit_fi.metadata)?;
                     if commit_size_limit != multipart_size_limit {
                         return Err(Error::InvalidArgument(

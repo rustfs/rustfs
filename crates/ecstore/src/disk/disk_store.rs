@@ -2465,7 +2465,22 @@ impl LocalDiskWrapper {
     }
 
     pub(crate) fn has_clean_active_multipart_source(&self, upload_or_part_path: &str, part_path: bool) -> bool {
-        self.disk.has_clean_active_multipart_source(upload_or_part_path, part_path)
+        !self.health.is_faulty()
+            && !self.retired.is_cancelled()
+            && self.disk.has_clean_active_multipart_source(upload_or_part_path, part_path)
+    }
+
+    pub(crate) fn has_active_multipart_source_matching(
+        &self,
+        upload_path: &str,
+        expected_data_dir: Option<uuid::Uuid>,
+        expected_mod_time: Option<::time::OffsetDateTime>,
+    ) -> bool {
+        !self.health.is_faulty()
+            && !self.retired.is_cancelled()
+            && self
+                .disk
+                .has_active_multipart_source_matching(upload_path, expected_data_dir, expected_mod_time)
     }
 
     pub(crate) async fn try_publish_prepared_delete_local(
