@@ -47,4 +47,16 @@ jobs:
           "$HOME/bin/lein" version
       - name: Run Jepsen checker tests
         working-directory: jepsen
-        run: lein test
+        run: |
+          set -euo pipefail
+          # Clojars occasionally drops the jepsen and generator jars mid-download.
+          for attempt in 1 2 3; do
+            if lein test; then
+              exit 0
+            fi
+            echo "lein test attempt ${attempt} failed"
+            if [ "$attempt" -eq 3 ]; then
+              exit 1
+            fi
+            sleep $((attempt * 15))
+          done
