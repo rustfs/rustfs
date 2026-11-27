@@ -645,7 +645,7 @@ impl LocalDiskWrapper {
             get_max_timeout_duration()
         };
         let observed = run_owned_mutation(external_guard, move || async move {
-            let mut preflight_rejection = None;
+            let mut rejected_before_publication = false;
             let result = operation
                 .track_disk_health_mutation(
                     "rename_data",
@@ -661,7 +661,7 @@ impl LocalDiskWrapper {
                             namespace_owner,
                         ))
                         .await;
-                        preflight_rejection = observed.preflight_rejection;
+                        rejected_before_publication = observed.rejected_before_publication();
                         observed.result
                     },
                     timeout_duration,
@@ -670,7 +670,7 @@ impl LocalDiskWrapper {
             // Health tracking must observe the real disk error, not an Ok tuple.
             Ok(super::RenameDataObservation {
                 result,
-                preflight_rejection,
+                rejected_before_publication,
             })
         })
         .await;

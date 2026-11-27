@@ -665,10 +665,11 @@ pub async fn list_objects(
             String::new()
         };
 
+        let bytes = obj_info.get_actual_size().unwrap_or(obj_info.size).max(0) as u64;
         swift_objects.push(Object {
             name: obj_info.name,
             hash: obj_info.etag.unwrap_or_default(),
-            bytes: obj_info.size as u64,
+            bytes,
             content_type: obj_info
                 .content_type
                 .unwrap_or_else(|| "application/octet-stream".to_string()),

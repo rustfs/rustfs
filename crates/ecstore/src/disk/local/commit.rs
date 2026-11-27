@@ -540,7 +540,7 @@ async fn prepare_rename_commit_and_destination_metadata(
 /// Proof produced only when the local rename returns at an existing access
 /// preflight, before metadata, backups, or object data can be published.
 #[derive(Debug)]
-pub(in crate::disk) struct LocalRenamePreflightRejection(());
+struct LocalRenamePreflightRejection(());
 
 #[derive(Default)]
 pub(super) struct RenameDataState {
@@ -1248,13 +1248,14 @@ impl LocalDisk {
                     }
                     #[cfg(test)]
                     run_owned_file_before_open(&backup_path);
-                    if let Err(err) = os::stage_inline_rollback_backup_with_commit_guard_std(
+                    if let Err(err) = os::stage_inline_rollback_backup_in_dir_with_commit_guard_std(
                         &dst_file_path_owned,
                         &backup_parent,
                         &backup_path,
                         old_file,
                         sync_recovery_protocol,
                         !should_fail_local_inline_rollback_hardlink(&dst_file_path_owned),
+                        has_old_data_dir.is_some(),
                         &guard,
                     ) {
                         drop(prepared_metadata_source);
@@ -2152,9 +2153,17 @@ impl LocalDisk {
                 && let Some(parent) = dst_file_path.parent()
             {
                 let fsync_started = rustfs_io_metrics::put_stage_timer();
-                if let Err(err) =
-                    os::fsync_commit_directory(parent, &commit.directory_guard, commit.mutation_lease.clone(), None).await
-                {
+                let fsync_result = async {
+                    let admission = if dst_dir_group_commit {
+                        Some(os::acquire_file_sync_admission(self.file_sync_permits.clone()).await?)
+                    } else {
+                        None
+                    };
+                    os::fsync_commit_directory(parent, &commit.directory_guard, commit.mutation_lease.clone(), admission.as_ref())
+                        .await
+                }
+                .await;
+                if let Err(err) = fsync_result {
                     rustfs_io_metrics::record_put_object_stage_duration_from(
                         rustfs_io_metrics::PUT_STAGE_SET_DISK_RENAME_DST_DIR_FSYNC,
                         fsync_started,
@@ -2939,7 +2948,7 @@ impl LocalDisk {
             .await;
         super::super::RenameDataObservation {
             result,
-            preflight_rejection: state.preflight_rejection,
+            rejected_before_publication: state.preflight_rejection.is_some(),
         }
     }
 }

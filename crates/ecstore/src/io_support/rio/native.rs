@@ -45,9 +45,14 @@ pub fn compression_index_storage_bytes(index: &Index) -> Bytes {
     index.clone().into_vec()
 }
 
+/// Decodes one complete stored compression index for Range GET planning.
 pub fn decode_compression_index_bytes(bytes: &Bytes) -> Option<Index> {
+    // Metadata contains exactly one index, so reject partial parses.
     let mut decoded = Index::new();
-    decoded.load(bytes.as_ref()).is_ok().then_some(decoded)
+    decoded
+        .load(bytes.as_ref())
+        .is_ok_and(|remaining| remaining.is_empty())
+        .then_some(decoded)
 }
 
 pub fn compression_reader<R>(reader: R, algorithm: CompressionAlgorithm, _encrypted: bool) -> CompressReader<R>

@@ -31,7 +31,7 @@ use crate::storage_api::server::http::access::{
 use rustfs_gateway::sig::{SigFamily, SigLocation};
 use rustfs_gateway::{RequestContextView, RequestPrincipal};
 use rustfs_policy::policy::action::Action;
-use rustfs_s3_types::S3Result;
+use rustfs_s3_types::{S3Error, S3ErrorCode, S3Result};
 use std::future::Future;
 use std::sync::Arc;
 use zeroize::Zeroizing;
@@ -41,13 +41,18 @@ use zeroize::Zeroizing;
 /// # Errors
 ///
 /// Credential errors from the key lookup, `MethodNotAllowed` for ACL deletion,
-/// `InvalidRequest` for a misplaced capability query, `AccessDenied` for a refused license, and
+/// `InvalidRequest` for a misplaced capability query, `MissingContentMD5` for a SigV2
+/// control-plane mutation without a digest, `AccessDenied` for a refused license, and
 /// `InternalError` when IAM or the license cannot be read or the request cannot be read back.
 pub(super) fn admit<'a>(
     server_ctx: &'a Arc<ServerContextSlot>,
     context: &RequestContextView,
 ) -> impl Future<Output = S3Result<RequestEnvelope>> + Send + use<'a> {
     let signature = verified_signature(context);
+    let is_sigv2 = context
+        .principal()
+        .map(RequestPrincipal::scheme)
+        .is_some_and(|scheme| scheme.family() == SigFamily::V2);
     let operation = context.operation();
     let envelope = RequestEnvelope::from_gateway(context, server_ctx, signature);
     let keystone = context.header_token_principal().map(|_| {
@@ -75,8 +80,52 @@ pub(super) fn admit<'a>(
         };
         envelope.install_req_info(req_info);
         admit_operation(envelope.method(), envelope.headers(), envelope.uri().query(), operation, signature)?;
+        enforce_sigv2_body_digest_requirement(is_sigv2, envelope.method(), envelope.headers(), operation)?;
         Ok(envelope)
     }
+}
+
+/// SigV2 does not sign request bodies, and `rustfs_profile()` waives the AWS checksum-required
+/// check globally for legacy clients. Require a signed `Content-MD5` post-auth on SigV2
+/// `DeleteObjects` and non-empty configuration `PUT`s so a signed request cannot be replayed
+/// with a tampered XML body; the gateway verifies the supplied `Content-MD5` post-auth.
+fn enforce_sigv2_body_digest_requirement(
+    is_sigv2: bool,
+    method: &http::Method,
+    headers: &http::HeaderMap,
+    operation: &str,
+) -> S3Result<()> {
+    if !is_sigv2 {
+        return Ok(());
+    }
+    let has_content_md5 = headers
+        .get("content-md5")
+        .is_some_and(|value| !value.as_bytes().iter().all(u8::is_ascii_whitespace));
+    if has_content_md5 {
+        return Ok(());
+    }
+    if operation == "DeleteObjects" {
+        return Err(missing_content_md5_error());
+    }
+    if method == http::Method::PUT && operation.starts_with("Put") && operation != "PutObject" {
+        let declared_empty = headers
+            .get(http::header::CONTENT_LENGTH)
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|value| value.trim() == "0");
+        if !declared_empty {
+            return Err(missing_content_md5_error());
+        }
+    }
+    Ok(())
+}
+
+fn missing_content_md5_error() -> S3Error {
+    let mut err = S3Error::with_message(
+        S3ErrorCode::Custom("MissingContentMD5".into()),
+        "A Content-MD5 header is required for this request.",
+    );
+    err.set_status_code(http::StatusCode::BAD_REQUEST);
+    err
 }
 
 /// The bucket-configuration mutation shape on the gateway edge: the shared function the legacy
@@ -147,5 +196,45 @@ mod tests {
 
         assert_eq!(refusal.code(), &rustfs_s3_types::S3ErrorCode::InternalError);
         assert_eq!(refusal.message(), Some("the request carries no server context"));
+    }
+
+    #[test]
+    fn sigv2_body_digest_requirement_enforces_content_md5_on_delete_objects_and_config_puts() {
+        let empty_headers = HeaderMap::new();
+        let err = enforce_sigv2_body_digest_requirement(true, &Method::POST, &empty_headers, "DeleteObjects")
+            .expect_err("SigV2 DeleteObjects without Content-MD5 must fail");
+        assert_eq!(err.code().as_str(), "MissingContentMD5");
+        assert_eq!(err.status_code(), Some(http::StatusCode::BAD_REQUEST));
+
+        let mut blank_md5 = HeaderMap::new();
+        blank_md5.insert("content-md5", http::HeaderValue::from_static("   "));
+        let err = enforce_sigv2_body_digest_requirement(true, &Method::POST, &blank_md5, "DeleteObjects")
+            .expect_err("blank Content-MD5 must not satisfy SigV2 DeleteObjects");
+        assert_eq!(err.code().as_str(), "MissingContentMD5");
+
+        let mut checksum_only = HeaderMap::new();
+        checksum_only.insert("x-amz-checksum-sha256", http::HeaderValue::from_static("placeholder"));
+        let err = enforce_sigv2_body_digest_requirement(true, &Method::POST, &checksum_only, "DeleteObjects")
+            .expect_err("x-amz-checksum alone must not satisfy SigV2 DeleteObjects");
+        assert_eq!(err.code().as_str(), "MissingContentMD5");
+
+        let mut with_md5 = HeaderMap::new();
+        with_md5.insert("content-md5", http::HeaderValue::from_static("1B2M2Y8AsgTpgAmY7PhCfg=="));
+        assert!(enforce_sigv2_body_digest_requirement(true, &Method::POST, &with_md5, "DeleteObjects").is_ok());
+
+        let err = enforce_sigv2_body_digest_requirement(true, &Method::PUT, &empty_headers, "PutBucketVersioning")
+            .expect_err("non-empty SigV2 config PUT without Content-MD5 must fail");
+        assert_eq!(err.code().as_str(), "MissingContentMD5");
+        assert_eq!(err.status_code(), Some(http::StatusCode::BAD_REQUEST));
+
+        let mut declared_empty = HeaderMap::new();
+        declared_empty.insert(http::header::CONTENT_LENGTH, http::HeaderValue::from_static("0"));
+        assert!(enforce_sigv2_body_digest_requirement(true, &Method::PUT, &declared_empty, "PutBucketAcl").is_ok());
+        assert!(enforce_sigv2_body_digest_requirement(true, &Method::PUT, &with_md5, "PutBucketVersioning").is_ok());
+
+        // SigV2 PutObject streaming uploads and SigV4 operations remain unaffected.
+        assert!(enforce_sigv2_body_digest_requirement(true, &Method::PUT, &empty_headers, "PutObject").is_ok());
+        assert!(enforce_sigv2_body_digest_requirement(false, &Method::POST, &empty_headers, "DeleteObjects").is_ok());
+        assert!(enforce_sigv2_body_digest_requirement(false, &Method::PUT, &empty_headers, "PutBucketVersioning").is_ok());
     }
 }

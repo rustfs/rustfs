@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-pub use rustfs_s3select_api::query::parser::RustFsDialect;
+pub use rustfs_s3select_api::query::parser::{BoundedRustFsDialect, RustFsDialect};
 
 #[cfg(test)]
 use datafusion::sql::sqlparser::dialect::Dialect;

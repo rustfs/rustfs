@@ -151,6 +151,15 @@ pub enum ObjectLockConfigState {
     Fabricated,
 }
 
+// Only namespace probes can name the requested bucket. Internal metadata
+// storage errors must not be mistaken for absence of that bucket.
+fn bucket_namespace_error(bucket: &str, error: Error) -> Error {
+    match error {
+        Error::VolumeNotFound => Error::BucketNotFound(bucket.to_owned()),
+        error => error,
+    }
+}
+
 enum BucketMetadataAuthority {
     Authoritative(Arc<BucketMetadata>),
     Fabricated,
@@ -1695,6 +1704,24 @@ pub async fn get_object_lock_config_state(bucket: &str) -> Result<ObjectLockConf
     bucket_meta_sys.get_object_lock_config_state(bucket).await
 }
 
+/// Read Object Lock state from authoritative bucket metadata.
+///
+/// `Ok(None)` means the bucket is confirmed missing. An existing bucket with
+/// no Object Lock configuration returns `Some(ConfirmedAbsent)`.
+///
+/// # Errors
+///
+/// Returns storage, migration, or validation errors when the state cannot be read.
+pub async fn find_object_lock_config_state(bucket: &str) -> Result<Option<ObjectLockConfigState>> {
+    let bucket_meta_sys_lock = get_bucket_metadata_sys()?;
+    let bucket_meta_sys = bucket_meta_sys_lock.read().await.clone();
+
+    match bucket_meta_sys.find_object_lock_config_state(bucket).await {
+        Err(Error::BucketNotFound(name)) if name == bucket => Ok(None),
+        result => result,
+    }
+}
+
 pub(crate) async fn get_object_lock_config_state_in(
     ctx: &crate::runtime::instance::InstanceContext,
     bucket: &str,
@@ -3201,15 +3228,15 @@ impl BucketMetadataSys {
                     Box::pin(async {
                         let store = self.object_store();
                         let options = crate::storage_api_contracts::bucket::BucketOptions::default();
-                        let info = if require_write_quorum {
-                            store.get_bucket_info_from_sets(bucket, &options).await
+                        if require_write_quorum {
+                            store.get_bucket_info_from_sets(bucket, &options).await.map(|_| ())
                         } else {
-                            store.get_bucket_info_from_sets_at_read_quorum(bucket, &options).await
-                        };
-                        info.map(|_| ())
+                            store.check_bucket_presence_at_read_quorum(bucket).await
+                        }
                     }),
                 )
-                .await?;
+                .await
+                .map_err(|err| bucket_namespace_error(bucket, err))?;
                 if guard.is_lock_lost() {
                     return Err(Error::other(format!(
                         "bucket namespace lock was lost before lazy bucket metadata publish: {bucket}"
@@ -3369,14 +3396,18 @@ impl BucketMetadataSys {
     }
 
     pub async fn get_object_lock_config_state(&self, bucket: &str) -> Result<ObjectLockConfigState> {
-        match self.get_metadata_authority(bucket).await? {
-            BucketMetadataAuthority::Authoritative(bm) => object_lock_config_state_from_authoritative_metadata(&bm),
-            BucketMetadataAuthority::Fabricated => match self.migrate_legacy_metadata(bucket).await? {
-                BucketMetadataAuthority::Authoritative(bm) => object_lock_config_state_from_authoritative_metadata(&bm),
-                BucketMetadataAuthority::MissingBucket => Err(Error::ConfigNotFound),
-                BucketMetadataAuthority::Fabricated => Ok(ObjectLockConfigState::Fabricated),
-            },
-            BucketMetadataAuthority::MissingBucket => Err(Error::ConfigNotFound),
+        self.find_object_lock_config_state(bucket).await?.ok_or(Error::ConfigNotFound)
+    }
+
+    async fn find_object_lock_config_state(&self, bucket: &str) -> Result<Option<ObjectLockConfigState>> {
+        let authority = match self.get_metadata_authority(bucket).await? {
+            BucketMetadataAuthority::Fabricated => self.migrate_legacy_metadata(bucket).await?,
+            authority => authority,
+        };
+        match authority {
+            BucketMetadataAuthority::Authoritative(bm) => object_lock_config_state_from_authoritative_metadata(&bm).map(Some),
+            BucketMetadataAuthority::Fabricated => Ok(Some(ObjectLockConfigState::Fabricated)),
+            BucketMetadataAuthority::MissingBucket => Ok(None),
         }
     }
 
@@ -3516,7 +3547,8 @@ impl BucketMetadataSys {
             self.object_store()
                 .get_bucket_info_from_sets(bucket, &crate::storage_api_contracts::bucket::BucketOptions::default()),
         )
-        .await?;
+        .await
+        .map_err(|err| bucket_namespace_error(bucket, err))?;
 
         let (mut metadata, persisted) = await_bucket_namespace_operation(
             Some(&namespace_guard),
@@ -3769,19 +3801,12 @@ impl BucketMetadataSys {
         #[cfg(test)]
         self.authority_disk_loads.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
-        let (bucket_info_res, metadata_res) = tokio::join!(
+        let (bucket_presence_res, metadata_res) = tokio::join!(
             Box::pin(await_bucket_namespace_operation(
                 Some(guard),
                 bucket,
                 "bucket metadata snapshot existence check",
-                async {
-                    store
-                        .get_bucket_info_from_sets_at_read_quorum(
-                            bucket,
-                            &crate::storage_api_contracts::bucket::BucketOptions::default(),
-                        )
-                        .await
-                },
+                store.check_bucket_presence_at_read_quorum(bucket),
             )),
             Box::pin(await_bucket_namespace_operation(
                 Some(guard),
@@ -3790,8 +3815,8 @@ impl BucketMetadataSys {
                 load_bucket_metadata_parse_with_presence(Arc::clone(&store), bucket, false),
             )),
         );
-        match bucket_info_res {
-            Ok(_) => {}
+        match bucket_presence_res {
+            Ok(()) => {}
             Err(Error::VolumeNotFound) => return Ok(BucketMetadataAuthority::MissingBucket),
             Err(err) => return Err(err),
         }
@@ -4564,14 +4589,17 @@ mod tests {
             sys.get_bucket_policy("migration-write-failure").await,
             Err(Error::ConfigNotFound)
         ));
-        assert!(sys.get_object_lock_config_state("migration-write-failure").await.is_err());
+        assert!(sys.find_object_lock_config_state("migration-write-failure").await.is_err());
         assert!(sys.get("migration-write-failure").await.is_err());
         sys.legacy_migration_write_error.store(false, Ordering::Relaxed);
 
+        let loads_before = sys.lazy_disk_loads.load(Ordering::Relaxed);
+        assert!(sys.find_object_lock_config_state("missing-bucket").await.unwrap().is_none());
         assert!(matches!(
             sys.get_object_lock_config_state("missing-bucket").await,
             Err(Error::ConfigNotFound)
         ));
+        assert_eq!(sys.lazy_disk_loads.load(Ordering::Relaxed), loads_before + 1);
         assert!(matches!(sys.get_bucket_policy("missing-bucket").await, Err(Error::ConfigNotFound)));
         assert!(matches!(sys.get_bucket_policy_raw("missing-bucket").await, Err(Error::ConfigNotFound)));
 
@@ -5290,14 +5318,14 @@ mod tests {
         // be lazily republished as a live bucket generation.
         let mut deleted_lazy = BucketMetadata::new("deleted-lazy-bucket");
         deleted_lazy.policy_config_json = b"stale-generation".to_vec();
-        sys.persist_and_set(deleted_lazy)
+        sys.persist_new_and_set(deleted_lazy)
             .await
-            .expect("stale metadata should persist");
+            .expect("stale committed metadata should persist");
         sys.metadata_map.write().await.remove("deleted-lazy-bucket");
-        assert!(
-            sys.get_config("deleted-lazy-bucket").await.is_err(),
-            "lazy load must fail when the physical bucket no longer exists"
-        );
+        assert!(matches!(
+            sys.get_config("deleted-lazy-bucket").await,
+            Err(Error::BucketNotFound(name)) if name == "deleted-lazy-bucket"
+        ));
         assert!(sys.get("deleted-lazy-bucket").await.is_err());
 
         // (d) The namespace generation fence must be acquired before lazy

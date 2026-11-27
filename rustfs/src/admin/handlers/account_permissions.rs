@@ -19,13 +19,13 @@
 //! use an empty object; table/view creation checks use their parent namespace resource.
 
 use crate::admin::auth::{
-    AdminResourceScope, authenticate_envelope_credentials, validate_admin_action_with_bucket_object_for_iam,
+    AdminResourceScope, authenticate_envelope_credentials_with_context, validate_admin_action_with_bucket_object_for_iam,
 };
 use crate::admin::operation::{AdminRequest, AdminResponse, Operation};
 use crate::admin::router::{AdminOperation, S3Router};
 use crate::admin::runtime_sources::current_ready_iam_handle;
 use crate::app::RequestEnvelope;
-use crate::auth::get_condition_values;
+use crate::auth::get_condition_values_with_client_info;
 use crate::server::ADMIN_PREFIX;
 use crate::storage::authorization::AuthorizationRequest;
 use crate::storage::authorization::{authorize_request_core, query_list_buckets_permission, s3_action_potential};
@@ -561,7 +561,14 @@ async fn evaluate_check(
                 potential: None,
             });
         };
-        let conditions = get_condition_values(probe.headers(), cred, None, None, envelope.policy_source_addr());
+        let conditions = get_condition_values_with_client_info(
+            probe.headers(),
+            cred,
+            None,
+            None,
+            envelope.policy_source_addr(),
+            envelope.client_info(),
+        );
         let bucket = bucket.unwrap_or_default();
         let object = check.key_id.as_deref().or(object).unwrap_or_default();
         let args = Args {
@@ -584,16 +591,8 @@ async fn evaluate_check(
             let scope = AdminResourceScope::bucket_object(bucket, object);
             (
                 classify(
-                    validate_admin_action_with_bucket_object_for_iam(
-                        iam,
-                        probe.headers(),
-                        cred,
-                        owner,
-                        action,
-                        envelope.policy_source_addr(),
-                        scope,
-                    )
-                    .await,
+                    validate_admin_action_with_bucket_object_for_iam(iam, probe.headers(), cred, owner, action, envelope, scope)
+                        .await,
                 ),
                 None,
             )
@@ -614,7 +613,7 @@ impl Operation for AccountPermissionsHandler {
         let credentials = req
             .credentials()
             .ok_or_else(|| s3_error!(AccessDenied, "authentication required"))?;
-        let (cred, owner) = authenticate_envelope_credentials(credentials).await?;
+        let (cred, owner) = authenticate_envelope_credentials_with_context(credentials, req.envelope()).await?;
         let body = req
             .take_body()
             .store_all_limited(MAX_BODY_SIZE)
@@ -1295,9 +1294,10 @@ mod tests {
             bucket_policy(&store, &bucket, serde_json::json!({"Version":"2012-10-17","Statement":[
                 {"Effect":"Allow","Principal":"*","Action":["s3:GetObject","s3:PutObject","s3:DeleteObject"],"Resource":format!("arn:aws:s3:::{bucket}/*")}
             ]})).await;
+            let denied_object = "explicitly-denied";
             let denied = rustfs_policy::policy::Policy::parse_config(
                 serde_json::to_string(&serde_json::json!({"Version":"2012-10-17","Statement":[
-                    {"Effect":"Deny","Action":["s3:PutObject","s3:DeleteObject"],"Resource":format!("arn:aws:s3:::{bucket}/*")}
+                    {"Effect":"Deny","Action":["s3:PutObject","s3:DeleteObject"],"Resource":format!("arn:aws:s3:::{bucket}/{denied_object}")}
                 ]}))
                 .expect("identity denial JSON")
                 .as_bytes(),
@@ -1307,22 +1307,24 @@ mod tests {
             iam.policy_db_set(&cred.access_key, UserType::Reg, false, "permission-denial")
                 .await
                 .expect("attach denial");
-            for (action, expected) in [
-                ("s3:GetObject", Decision::Allowed),
-                ("s3:PutObject", Decision::Denied),
-                ("s3:DeleteObject", Decision::Denied),
+            for (action, object, expected) in [
+                ("s3:PutObject", "bucket-grant", Decision::Allowed),
+                ("s3:DeleteObject", "bucket-grant", Decision::Allowed),
+                ("s3:GetObject", denied_object, Decision::Allowed),
+                ("s3:PutObject", denied_object, Decision::Denied),
+                ("s3:DeleteObject", denied_object, Decision::Denied),
             ] {
-                let request = parse(serde_json::json!({"checks":[{"id":"x","action":action,"bucket":bucket,"object":"object"}]}));
+                let request = parse(serde_json::json!({"checks":[{"id":"x","action":action,"bucket":bucket,"object":object}]}));
                 let result = evaluate_check(
                     &envelope,
                     &cred,
                     false,
                     &request.checks[0],
-                    request.validate().expect("valid denial query")[0],
+                    request.validate().expect("valid permission query")[0],
                 )
                 .await
                 .expect("non-owner query");
-                assert_eq!(result.decision, expected, "real gate semantics for {action}");
+                assert_eq!(result.decision, expected, "real gate semantics for {action} on {object}");
             }
         });
     }

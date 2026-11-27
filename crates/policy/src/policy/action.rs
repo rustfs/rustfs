@@ -85,12 +85,25 @@ impl ActionSet {
     /// `NotAction` always uses plain wildcard matching, so `NotAction: "s3:*"`
     /// still excludes force-delete. An Allow grants force-delete only when its
     /// `Action` list names it: an Allow built from `NotAction` alone never does.
+    ///
+    /// An Allow built from `NotAction` stays within the action families named in
+    /// `not_actions`: excluding S3 actions never implies `admin:*`, `sts:*`, or
+    /// `kms:*` grants even when the statement carries a wildcard resource, while
+    /// an explicit admin `NotAction` keeps covering sibling admin actions. A Deny
+    /// keeps its full reach across every action family.
     pub fn statement_covers(&self, not_actions: &ActionSet, action: &Action, deny: bool) -> bool {
         if not_actions.is_match_for_effect(action, true) {
             return false;
         }
         if self.is_empty() {
-            return deny || !action_requires_explicit_grant(action);
+            if not_actions.is_empty() {
+                return false;
+            }
+            if deny {
+                return true;
+            }
+            return !action_requires_explicit_grant(action)
+                && not_actions.iter().any(|excluded| same_action_family(excluded, action));
         }
         self.is_match_for_effect(action, deny)
     }
@@ -214,6 +227,16 @@ fn action_requires_explicit_grant(action: &Action) -> bool {
     matches!(
         action,
         Action::S3Action(S3Action::ForceDeleteBucketAction | S3Action::ForceDeleteObjectAction)
+    )
+}
+
+fn same_action_family(left: &Action, right: &Action) -> bool {
+    matches!(
+        (left, right),
+        (Action::S3Action(_), Action::S3Action(_))
+            | (Action::AdminAction(_), Action::AdminAction(_))
+            | (Action::StsAction(_), Action::StsAction(_))
+            | (Action::KmsAction(_), Action::KmsAction(_))
     )
 }
 
@@ -645,6 +668,17 @@ pub enum AdminAction {
 }
 
 impl AdminAction {
+    pub(crate) fn is_resource_scoped(&self) -> bool {
+        self.is_table_resource_scoped()
+            || matches!(
+                self,
+                AdminAction::SetBucketQuotaAdminAction
+                    | AdminAction::SetBucketTargetAction
+                    | AdminAction::GetBucketTargetAction
+                    | AdminAction::InspectDataAction
+            )
+    }
+
     pub(crate) fn is_table_resource_scoped(&self) -> bool {
         matches!(
             self,

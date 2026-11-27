@@ -59,20 +59,6 @@ failures = [
 ]
 expires = 2027-02-01
 
-# Tracked IAM gap (R-065): https://github.com/rustfs/backlog/issues/2684#issuecomment-7163283798
-
-[[ruling]]
-case = "c-cred-0020"
-ledger = "R-065"
-reason = "Tracked IAM gap (rustfs/rustfs#9559, rustfs/backlog#2684): expired STS session token returns 403 InvalidAccessKeyId instead of 400 ExpiredToken."
-failures = [
-  "[expect/status] at /expect/status: exchange #1, attempt 1: expected status 400, observed 403",
-  "[expect/error.code] at /expect/error/code: exchange #1, attempt 1: expected <Code>ExpiredToken</Code>, the body carried <Code>InvalidAccessKeyId</Code>",
-  "[expect/body.exact_utf8] at /expect/body: exchange #1, attempt 1: bodies differ at byte 52 (expected 196 bytes, observed 200 bytes)\n    expected: …F-8\\\"?>\\n<Error><Code>ExpiredToken</Code><Message>the session …\n    observed: …F-8\\\"?>\\n<Error><Code>InvalidAccessKeyId</Code><Message>The Ac…",
-  "[expect/body.not_contains_utf8] at /expect/body: exchange #1, attempt 1: the body must not contain \"InvalidAccessKeyId\", found at byte 52",
-]
-expires = 2027-02-01
-
 # Outer CORS middleware and HTTP/2 OPTIONS parity: https://github.com/rustfs/backlog/issues/2684#issuecomment-7163283798
 
 [[ruling]]

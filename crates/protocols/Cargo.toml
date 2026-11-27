@@ -84,7 +84,9 @@ ftps = ["dep:libunftp", "dep:unftp-core", "dep:rustls", "dep:rustfs-tls-runtime"
 swift = [
     "dep:rustfs-keystone",
     "dep:rustfs-ecstore",
+    "dep:rustfs-kms",
     "dep:rustfs-rio",
+    "dep:rustfs-sse",
     "dep:axum",
     "dep:tower",
     "dep:regex",
@@ -150,8 +152,10 @@ rustls = { workspace = true, default-features = false, optional = true, features
 # Swift specific dependencies (optional)
 rustfs-keystone = { workspace = true, optional = true }
 rustfs-ecstore = { workspace = true, optional = true }
+rustfs-kms = { workspace = true, optional = true }
 rustfs-gateway-types = { workspace = true }
 rustfs-rio = { workspace = true, optional = true }
+rustfs-sse = { workspace = true, optional = true }
 axum = { workspace = true, optional = true }
 tower = { workspace = true, optional = true, features = ["timeout"] }
 regex = { workspace = true, optional = true }
@@ -191,7 +195,10 @@ socket2 = { workspace = true, optional = true, features = ["all"] }
 [dev-dependencies]
 rcgen = { workspace = true }
 tempfile = { workspace = true }
+temp-env = { workspace = true }
 proptest = "1"
+rustfs-data-usage = { workspace = true }
+rustfs-madmin = { workspace = true }
 rustfs-test-utils = { workspace = true }
 tracing-subscriber = { workspace = true, features = ["env-filter", "time"] }
 tokio = { workspace = true, features = ["test-util", "macros", "fs"] }

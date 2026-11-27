@@ -245,7 +245,8 @@ pub(crate) mod ecfs_consumer {
 
     pub(crate) mod object_lock {
         pub(crate) use super::super::super::{
-            load_bucket_object_lock_config_state, validate_bucket_object_lock_enabled, validate_bucket_object_lock_enabled_state,
+            load_bucket_object_lock_config_state, validate_bucket_object_lock_enabled,
+            validate_bucket_object_lock_enabled_for_read, validate_bucket_object_lock_enabled_state,
         };
     }
 
@@ -485,6 +486,7 @@ pub(crate) mod tonic_service_consumer {
 #[cfg(test)]
 pub(crate) mod test_consumer {
     pub(crate) use super::super::access_owned::object_read::authorize_head_object;
+    pub(crate) use rustfs_ecstore::api::object::test_util::DeleteAfterObjectLockSnapshotBarrier;
     pub(crate) mod sse {
         pub(crate) use super::super::super::sse::{RecordingKmsKeyAuthorizer, TestAuthorizationHooks, sse_kms_object_metadata};
     }
@@ -553,12 +555,12 @@ pub(crate) mod ecstore_config {
 
 pub(crate) mod ecstore_data_usage {
     pub(crate) use rustfs_ecstore::api::data_usage::{
-        get_bucket_usage_memory, init_compression_total_memory_from_backend, load_admin_data_usage_from_backend_cached,
-        load_admin_data_usage_with_memory_overlay, load_bucket_scan_progress_for_admin, load_bucket_usage_from_backend_cached,
-        load_data_usage_from_backend, lookup_degraded_bucket_usage_baseline, quota_object_size,
-        record_bucket_delete_marker_memory, record_bucket_object_delete_memory, record_bucket_object_version_write_memory,
-        record_bucket_object_write_memory, record_bucket_object_write_unknown_previous_memory,
-        store_compression_total_in_backend, verified_account_bucket_usage,
+        BucketUsagePendingReason, BucketUsageStatus, get_bucket_usage_memory, init_compression_total_memory_from_backend,
+        load_admin_data_usage_from_backend_cached, load_admin_data_usage_with_memory_overlay,
+        load_bucket_scan_progress_for_admin, load_bucket_usage_certification_from_backend_cached, load_data_usage_from_backend,
+        lookup_degraded_bucket_usage_baseline, quota_object_size, record_bucket_delete_marker_memory,
+        record_bucket_object_delete_memory, record_bucket_object_version_write_memory, record_bucket_object_write_memory,
+        record_bucket_object_write_unknown_previous_memory, store_compression_total_in_backend, verified_account_bucket_usage,
     };
     // Test-only observables for the rustfs/backlog#1306 revert detector.
     #[cfg(test)]

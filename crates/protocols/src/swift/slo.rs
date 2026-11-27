@@ -29,8 +29,10 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::io::Cursor;
 
-/// Maximum accepted size of an SLO manifest document
-const MAX_SLO_MANIFEST_SIZE: usize = 2 * 1024 * 1024;
+/// Maximum accepted size of an SLO manifest document (2 MiB).
+pub const MAX_SLO_MANIFEST_SIZE: usize = 2 * 1024 * 1024;
+/// Maximum number of segments allowed in an SLO manifest (OpenStack Swift default).
+pub const MAX_SLO_SEGMENTS: usize = 1_000;
 
 /// SLO manifest segment descriptor
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -116,11 +118,12 @@ impl SLOManifest {
                 )));
             }
 
-            // Validate size match
-            if info.size != segment.size_bytes as i64 {
+            // Validate size match against logical plaintext size (default SSE inflates physical size)
+            let actual_size = info.get_actual_size().unwrap_or(info.size);
+            if actual_size != segment.size_bytes as i64 {
                 return Err(SwiftError::Conflict(format!(
                     "Segment {} size mismatch: expected {}, got {}",
-                    segment.path, segment.size_bytes, info.size
+                    segment.path, segment.size_bytes, actual_size
                 )));
             }
         }
@@ -269,30 +272,30 @@ pub async fn handle_slo_put(
     headers: &HeaderMap,
     credentials: &Option<Credentials>,
 ) -> Result<Response<Body>, SwiftError> {
-    use http_body_util::BodyExt;
-
     // Require credentials
     let creds = credentials
         .as_ref()
         .ok_or_else(|| SwiftError::Unauthorized("Credentials required for SLO operations".to_string()))?;
 
-    // 1. Read manifest JSON from body
-    let manifest_bytes = body
-        .collect()
-        .await
-        .map_err(|e| SwiftError::BadRequest(format!("Failed to read manifest: {}", e)))?
-        .to_bytes();
+    // 1. Stream-read manifest JSON bounded at MAX_SLO_MANIFEST_SIZE (fails closed mid-stream)
+    super::handler::check_declared_body_limit(headers, MAX_SLO_MANIFEST_SIZE, "SLO manifest")?;
+    let manifest_bytes = super::handler::collect_limited_body(body, MAX_SLO_MANIFEST_SIZE, "SLO manifest").await?;
 
-    // 2. Validate manifest size (2MB limit)
-    if manifest_bytes.len() > MAX_SLO_MANIFEST_SIZE {
-        return Err(SwiftError::BadRequest("Manifest exceeds 2MB".to_string()));
+    // 2. Parse manifest
+    let manifest = SLOManifest::from_json(&manifest_bytes)?;
+    if manifest.segments.len() > MAX_SLO_SEGMENTS {
+        return Err(SwiftError::BadRequest(format!(
+            "SLO manifest exceeds maximum of {} segments",
+            MAX_SLO_SEGMENTS
+        )));
     }
 
-    // 3. Parse manifest
-    let manifest = SLOManifest::from_json(&manifest_bytes)?;
-
-    // 4. Validate segments exist and match ETags/sizes
+    // 3. Validate segments exist and match ETags/sizes
     manifest.validate(account, creds).await?;
+
+    // 4. Atomically reserve container quota for both the manifest object and marker object
+    let manifest_len = manifest_bytes.len() as u64;
+    let _slo_quota_guard = super::quota::reserve_upload_quota(account, container, Some(manifest_len), 2, creds).await?;
 
     // 5. Store manifest as S3 object with metadata marker
     let mut metadata = HashMap::new();
@@ -311,18 +314,30 @@ pub async fn handle_slo_put(
 
     // Store manifest JSON as object content with special key
     let manifest_key = format!("{}.slo-manifest", object);
-    object::put_object_with_metadata(
+    object::put_object_with_metadata_and_size(
         account,
         container,
         &manifest_key,
         credentials,
         Cursor::new(manifest_bytes.to_vec()),
         &metadata,
+        Some(manifest_len),
+        Some(super::quota::QuotaReservationGuard::noop()),
     )
     .await?;
 
     // 6. Create zero-byte marker object at original path
-    object::put_object_with_metadata(account, container, object, credentials, Cursor::new(Vec::new()), &metadata).await?;
+    object::put_object_with_metadata_and_size(
+        account,
+        container,
+        object,
+        credentials,
+        Cursor::new(Vec::new()),
+        &metadata,
+        Some(0),
+        Some(super::quota::QuotaReservationGuard::noop()),
+    )
+    .await?;
 
     // 7. Return response
     let trans_id = generate_trans_id();
@@ -1024,5 +1039,106 @@ mod tests {
             consumed,
             MAX_SLO_MANIFEST_SIZE + 1
         );
+    }
+
+    #[tokio::test]
+    async fn test_handle_slo_put_rejects_declared_oversized_manifest() {
+        use http_body_util::{BodyExt, Full};
+
+        let mut claims = HashMap::new();
+        claims.insert("keystone_project_id".to_string(), serde_json::json!("proj1"));
+        let creds = Some(Credentials {
+            access_key: "keystone:test".to_string(),
+            claims: Some(claims),
+            ..Default::default()
+        });
+
+        let mut headers = HeaderMap::new();
+        headers.insert("content-length", (MAX_SLO_MANIFEST_SIZE + 1).to_string().parse().expect("valid header"));
+        let body = http_body_util::combinators::UnsyncBoxBody::new(
+            Full::new(bytes::Bytes::new()).map_err(|never: std::convert::Infallible| match never {}),
+        );
+
+        let err = handle_slo_put("AUTH_proj1", "container", "slo-obj", body, &headers, &creds)
+            .await
+            .expect_err("oversized declared Content-Length must fail closed");
+        assert!(matches!(err, SwiftError::RequestEntityTooLarge(_)));
+    }
+
+    #[tokio::test]
+    async fn test_handle_slo_put_aborts_streaming_oversized_chunked_manifest() {
+        use futures::{StreamExt, stream};
+        use http_body_util::BodyExt;
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let mut claims = HashMap::new();
+        claims.insert("keystone_project_id".to_string(), serde_json::json!("proj1"));
+        let creds = Some(Credentials {
+            access_key: "keystone:test".to_string(),
+            claims: Some(claims),
+            ..Default::default()
+        });
+
+        let yielded = Arc::new(AtomicUsize::new(0));
+        let yielded_clone = Arc::clone(&yielded);
+        // 100 chunks x 64 KiB = 6.4 MiB > 2 MiB MAX_SLO_MANIFEST_SIZE, with NO Content-Length.
+        let chunk_stream = stream::iter(0..100usize).map(move |_| {
+            yielded_clone.fetch_add(1, Ordering::SeqCst);
+            Ok::<_, std::io::Error>(bytes::Bytes::from(vec![b' '; 64 * 1024]))
+        });
+        let body: SwiftRequestBody = http_body_util::combinators::UnsyncBoxBody::new(
+            Body::from_stream(chunk_stream).map_err(rustfs_s3_types::StdError::from),
+        );
+
+        let err = handle_slo_put("AUTH_proj1", "container", "slo-obj", body, &HeaderMap::new(), &creds)
+            .await
+            .expect_err("oversized chunked SLO manifest must fail closed mid-stream");
+        assert!(
+            matches!(err, SwiftError::RequestEntityTooLarge(_)),
+            "expected RequestEntityTooLarge, got {err:?}"
+        );
+        assert!(
+            yielded.load(Ordering::SeqCst) <= 35,
+            "SLO PUT must stop reading at 2 MiB rather than draining all 100 chunks, yielded {}",
+            yielded.load(Ordering::SeqCst)
+        );
+    }
+
+    #[tokio::test]
+    async fn test_handle_slo_put_rejects_too_many_segments() {
+        use http_body_util::{BodyExt, Full};
+
+        let mut claims = HashMap::new();
+        claims.insert("keystone_project_id".to_string(), serde_json::json!("proj1"));
+        let creds = Some(Credentials {
+            access_key: "keystone:test".to_string(),
+            claims: Some(claims),
+            ..Default::default()
+        });
+
+        let segments: Vec<SLOSegment> = (0..=MAX_SLO_SEGMENTS)
+            .map(|i| SLOSegment {
+                path: format!("/c/s{i}"),
+                size_bytes: 1,
+                etag: "a".to_string(),
+                range: None,
+            })
+            .collect();
+        let manifest_json = serde_json::to_vec(&SLOManifest {
+            segments,
+            created_at: None,
+        })
+        .expect("serialize manifest");
+        assert!(manifest_json.len() <= MAX_SLO_MANIFEST_SIZE);
+
+        let body: SwiftRequestBody = http_body_util::combinators::UnsyncBoxBody::new(
+            Full::new(bytes::Bytes::from(manifest_json)).map_err(|never: std::convert::Infallible| match never {}),
+        );
+
+        let err = handle_slo_put("AUTH_proj1", "container", "slo-obj", body, &HeaderMap::new(), &creds)
+            .await
+            .expect_err("manifest exceeding MAX_SLO_SEGMENTS must fail");
+        assert!(matches!(err, SwiftError::BadRequest(_)));
     }
 }

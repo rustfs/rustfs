@@ -149,7 +149,7 @@ use std::{
     time::{Duration, Instant},
 };
 use tokio::io::{AsyncRead, ReadBuf};
-use tokio::sync::{RwLock, mpsc, oneshot};
+use tokio::sync::{RwLock, mpsc, oneshot, watch};
 use tokio::task::JoinSet;
 
 pub(in crate::set_disk) const EVENT_SET_DISK_READ: &str = "set_disk_read";
@@ -1307,12 +1307,21 @@ pub(in crate::set_disk) fn record_bitrot_reader_setup_strategy(
     }
 }
 
+#[cfg(unix)]
+enum BatchPreadOutcome {
+    Selected(Box<BitrotReaderSetup>),
+    BudgetExhausted,
+    NotEligible,
+}
+
 /// When all online shards are local and mmap-read is enabled, materialize
-/// shard bytes through `batch_shard_pread` instead of the per-shard
-/// `open_disk_reader` path. Demand-bound reads add parity batches only as needed.
+/// shard bytes through `batch_shard_pread_with_permits` instead of the
+/// per-shard `open_disk_reader` path. Demand-bound reads add parity batches
+/// only as needed, and every batch reserves its full in-flight byte budget
+/// before allocating buffers.
 #[cfg(unix)]
 #[allow(clippy::too_many_arguments)]
-async fn try_create_bitrot_readers_via_batch_pread(
+async fn try_create_bitrot_readers_via_batch_pread_with_outcome(
     files: &[FileInfo],
     disks: &[Option<DiskStore>],
     bucket: &str,
@@ -1328,15 +1337,16 @@ async fn try_create_bitrot_readers_via_batch_pread(
     parity_shards: usize,
     mode: BitrotReaderSetupMode,
     strategy: BitrotReaderSetupStrategy,
-) -> Option<BitrotReaderSetup> {
-    use crate::disk::local::batch_shard_pread;
+) -> BatchPreadOutcome {
+    use crate::disk::local::batch_shard_pread_with_permits;
+    use crate::set_disk::core::read_budget::global_in_flight_read_budget;
     use rustfs_io_metrics::{LocalBatchReadDecision, record_local_batch_read_decision};
     use std::io::Cursor;
 
     // Scoped q reads retain the normal source's disk admission and memory
     // receipts; the foreground batch worker does not carry resource units.
     if frame_size != shard_size && crate::disk::has_resource_io_scope() {
-        return None;
+        return BatchPreadOutcome::NotEligible;
     }
 
     let prepare_started = rustfs_io_metrics::get_stage_metrics_enabled().then(std::time::Instant::now);
@@ -1347,14 +1357,14 @@ async fn try_create_bitrot_readers_via_batch_pread(
         bitrot_encoded_range_with_frame_size(read_offset, read_length, shard_size, frame_size, checksum_algo.clone());
     if adj_len > object_mmap_read_max_length() {
         record_decision(LocalBatchReadDecision::ReadCapExceeded);
-        return None;
+        return BatchPreadOutcome::NotEligible;
     }
 
     let mut batch_items: Vec<(usize, std::path::PathBuf, usize, usize)> = Vec::new();
     for (idx, disk_op) in disks.iter().enumerate() {
         if files.get(idx).is_some_and(|fi| fi.data.is_some()) {
             record_decision(LocalBatchReadDecision::InlineData);
-            return None;
+            return BatchPreadOutcome::NotEligible;
         }
         if let Some(disk) = disk_op.as_ref() {
             let data_dir = files[idx].data_dir.unwrap_or_default();
@@ -1363,11 +1373,11 @@ async fn try_create_bitrot_readers_via_batch_pread(
                 Some(Ok(p)) => batch_items.push((idx, p, adj_off, adj_len)),
                 Some(Err(_)) => {
                     record_decision(LocalBatchReadDecision::InvalidPath);
-                    return None;
+                    return BatchPreadOutcome::NotEligible;
                 }
                 None => {
                     record_decision(LocalBatchReadDecision::NonLocalShard);
-                    return None;
+                    return BatchPreadOutcome::NotEligible;
                 }
             }
         }
@@ -1375,7 +1385,7 @@ async fn try_create_bitrot_readers_via_batch_pread(
 
     if batch_items.is_empty() {
         record_decision(LocalBatchReadDecision::NoLocalShards);
-        return None;
+        return BatchPreadOutcome::NotEligible;
     }
 
     // Legacy lockstep consumes every shard, so retain its coalesced batch for
@@ -1398,22 +1408,38 @@ async fn try_create_bitrot_readers_via_batch_pread(
         batch_items.len()
     };
     let mut pending = batch_items.into_iter();
-    record_decision(LocalBatchReadDecision::Selected);
+    let mut selected_recorded = false;
     loop {
-        let mut indices = Vec::with_capacity(batch_size.min(pending.len()));
-        let requests: Vec<_> = pending
-            .by_ref()
-            .take(batch_size)
-            .map(|(idx, path, offset, length)| {
-                setup.mark_scheduled(idx);
-                indices.push(idx);
-                #[cfg(test)]
-                disk_call_counters::record(object, disk_call_counters::KIND_DISK_SHARD_OPEN, idx);
-                (path, offset, length)
-            })
-            .collect();
-        if !requests.is_empty() {
-            for (idx, result) in indices.into_iter().zip(batch_shard_pread(requests).await) {
+        let batch_slice: Vec<_> = pending.by_ref().take(batch_size).collect();
+        if !batch_slice.is_empty() {
+            let lengths: Vec<usize> = batch_slice.iter().map(|(_, _, _, length)| *length).collect();
+            let Some(permits) = global_in_flight_read_budget().try_reserve_batch(&lengths) else {
+                // Drop any shard readers materialized in earlier loop rounds so
+                // their permits return to the global budget before falling back
+                // to the streaming path.
+                drop(setup);
+                if !selected_recorded {
+                    record_decision(LocalBatchReadDecision::ReadCapExceeded);
+                }
+                return BatchPreadOutcome::BudgetExhausted;
+            };
+            if !selected_recorded {
+                record_decision(LocalBatchReadDecision::Selected);
+                selected_recorded = true;
+            }
+            let mut indices = Vec::with_capacity(batch_slice.len());
+            let requests: Vec<_> = batch_slice
+                .into_iter()
+                .zip(permits)
+                .map(|((idx, path, offset, length), permit)| {
+                    setup.mark_scheduled(idx);
+                    indices.push(idx);
+                    #[cfg(test)]
+                    disk_call_counters::record(object, disk_call_counters::KIND_DISK_SHARD_OPEN, idx);
+                    (path, offset, length, permit)
+                })
+                .collect();
+            for (idx, result) in indices.into_iter().zip(batch_shard_pread_with_permits(requests).await) {
                 let result = result.map(|bytes| {
                     Some(BitrotReader::new_with_frame_size(
                         ShardReader::InMemory(Cursor::new(bytes)),
@@ -1437,10 +1463,19 @@ async fn try_create_bitrot_readers_via_batch_pread(
             .saturating_sub(setup.available_shards());
     }
 
-    Some(setup)
+    if !selected_recorded {
+        record_decision(LocalBatchReadDecision::Selected);
+    }
+    BatchPreadOutcome::Selected(Box::new(setup))
 }
 
 #[cfg(not(unix))]
+#[allow(clippy::too_many_arguments)]
+async fn try_create_bitrot_readers_via_batch_pread_unsupported() {
+    rustfs_io_metrics::record_local_batch_read_decision(rustfs_io_metrics::LocalBatchReadDecision::UnsupportedPlatform, None);
+}
+
+#[cfg(all(test, not(unix)))]
 #[allow(clippy::too_many_arguments)]
 async fn try_create_bitrot_readers_via_batch_pread(
     _files: &[FileInfo],
@@ -1459,8 +1494,51 @@ async fn try_create_bitrot_readers_via_batch_pread(
     _mode: BitrotReaderSetupMode,
     _strategy: BitrotReaderSetupStrategy,
 ) -> Option<BitrotReaderSetup> {
-    rustfs_io_metrics::record_local_batch_read_decision(rustfs_io_metrics::LocalBatchReadDecision::UnsupportedPlatform, None);
+    try_create_bitrot_readers_via_batch_pread_unsupported().await;
     None
+}
+
+#[cfg(all(test, unix))]
+#[allow(clippy::too_many_arguments)]
+async fn try_create_bitrot_readers_via_batch_pread(
+    files: &[FileInfo],
+    disks: &[Option<DiskStore>],
+    bucket: &str,
+    object: &str,
+    part_number: usize,
+    read_offset: usize,
+    read_length: usize,
+    shard_size: usize,
+    frame_size: usize,
+    checksum_algo: HashAlgorithm,
+    skip_verify_bitrot: bool,
+    data_shards: usize,
+    parity_shards: usize,
+    mode: BitrotReaderSetupMode,
+    strategy: BitrotReaderSetupStrategy,
+) -> Option<BitrotReaderSetup> {
+    match try_create_bitrot_readers_via_batch_pread_with_outcome(
+        files,
+        disks,
+        bucket,
+        object,
+        part_number,
+        read_offset,
+        read_length,
+        shard_size,
+        frame_size,
+        checksum_algo,
+        skip_verify_bitrot,
+        data_shards,
+        parity_shards,
+        mode,
+        strategy,
+    )
+    .await
+    {
+        BatchPreadOutcome::Selected(setup) => Some(*setup),
+        BatchPreadOutcome::BudgetExhausted | BatchPreadOutcome::NotEligible => None,
+    }
 }
 
 #[allow(dead_code, reason = "compatibility wrapper for the legacy shard geometry")]
@@ -1726,48 +1804,67 @@ pub(in crate::set_disk) async fn create_bitrot_readers_until_quorum_with_prefere
     } else {
         true
     };
-    if batch_read_enabled
-        && let Some(mut setup) = try_create_bitrot_readers_via_batch_pread(
-            files,
-            disks,
-            bucket,
-            object,
-            part_number,
-            read_offset,
-            read_length,
-            shard_size,
-            frame_size,
-            checksum_algo.clone(),
-            skip_verify_bitrot,
-            data_shards,
-            parity_shards,
-            mode,
-            strategy,
-        )
-        .await
-    {
-        record_bitrot_reader_setup_strategy(strategy, mode, attribution);
-        fill_deferred_bitrot_readers_with_frame_size(
-            &mut setup,
-            files,
-            disks,
-            bucket,
-            object,
-            part_number,
-            read_offset,
-            read_length,
-            shard_size,
-            frame_size,
-            checksum_algo,
-            skip_verify_bitrot,
-            use_mmap_read,
-            data_shards,
-            parity_shards,
-            mode,
-        );
-        record_bitrot_reader_setup_fanout(strategy, mode, &setup, attribution);
-        return setup;
-    }
+    let use_mmap_read = if batch_read_enabled {
+        #[cfg(unix)]
+        {
+            match try_create_bitrot_readers_via_batch_pread_with_outcome(
+                files,
+                disks,
+                bucket,
+                object,
+                part_number,
+                read_offset,
+                read_length,
+                shard_size,
+                frame_size,
+                checksum_algo.clone(),
+                skip_verify_bitrot,
+                data_shards,
+                parity_shards,
+                mode,
+                strategy,
+            )
+            .await
+            {
+                BatchPreadOutcome::Selected(mut setup) => {
+                    record_bitrot_reader_setup_strategy(strategy, mode, attribution);
+                    fill_deferred_bitrot_readers_with_frame_size(
+                        &mut setup,
+                        files,
+                        disks,
+                        bucket,
+                        object,
+                        part_number,
+                        read_offset,
+                        read_length,
+                        shard_size,
+                        frame_size,
+                        checksum_algo,
+                        skip_verify_bitrot,
+                        use_mmap_read,
+                        data_shards,
+                        parity_shards,
+                        mode,
+                    );
+                    record_bitrot_reader_setup_fanout(strategy, mode, &setup, attribution);
+                    return *setup;
+                }
+                BatchPreadOutcome::BudgetExhausted => {
+                    // Fall straight through to the bounded streaming reader path
+                    // instead of re-attempting per-shard in-memory mmap copies.
+                    false
+                }
+                BatchPreadOutcome::NotEligible => use_mmap_read,
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            try_create_bitrot_readers_via_batch_pread_unsupported().await;
+            use_mmap_read
+        }
+    } else {
+        use_mmap_read
+    };
 
     if strategy == BitrotReaderSetupStrategy::AllShards {
         return create_bitrot_readers_until_quorum_all_shards_with_frame_size(
@@ -3279,6 +3376,7 @@ fn rename_tail_cleanup_queue() -> &'static RenameTailCleanupQueue {
 }
 
 const EVENT_SET_DISK_RENAME_ROLLBACK: &str = "set_disk_rename_rollback";
+const PUT_RENAME_POST_QUORUM_DISPATCH_GRACE: Duration = Duration::from_secs(1);
 
 #[derive(Clone, Copy)]
 enum RenameDispatchState {
@@ -3305,12 +3403,22 @@ struct RenameBatchGroup {
     slots: Vec<usize>,
 }
 
-#[derive(Clone)]
 struct RenameSlotPaths {
-    src_bucket: Arc<String>,
-    src_object: Arc<String>,
-    dst_bucket: Arc<String>,
-    dst_object: Arc<String>,
+    src_bucket: String,
+    src_object: String,
+    dst_bucket: String,
+    dst_object: String,
+}
+
+impl RenameSlotPaths {
+    fn new(src_bucket: &str, src_object: &str, dst_bucket: &str, dst_object: &str) -> Self {
+        Self {
+            src_bucket: src_bucket.to_owned(),
+            src_object: src_object.to_owned(),
+            dst_bucket: dst_bucket.to_owned(),
+            dst_object: dst_object.to_owned(),
+        }
+    }
 }
 
 struct RenameSlotContext {
@@ -3320,20 +3428,22 @@ struct RenameSlotContext {
     scanner_token: Option<Uuid>,
     namespace_owner: Option<Arc<dyn Send + Sync>>,
     publication_scope: Option<crate::object_api::ScannerPublicationCommitScope>,
-    paths: RenameSlotPaths,
+    paths: Arc<RenameSlotPaths>,
     successful_completion_rank: Option<Arc<AtomicUsize>>,
     write_quorum: usize,
+    dispatch_deadline: Option<disk::RenameDispatchDeadline>,
 }
 
 struct RenameOutcomeProducerArgs {
     disks: Arc<Vec<Option<DiskStore>>>,
     file_infos: Arc<Vec<FileInfo>>,
     fence_tokens: Arc<Vec<Option<Uuid>>>,
-    paths: RenameSlotPaths,
+    paths: Arc<RenameSlotPaths>,
     namespace_owner: Option<Arc<dyn Send + Sync>>,
     publication_scope: Option<crate::object_api::ScannerPublicationCommitScope>,
     write_quorum: usize,
     allow_batch: bool,
+    dispatch_deadline: Option<disk::RenameDispatchDeadline>,
 }
 
 struct RenameOutcomeProducers {
@@ -3827,6 +3937,7 @@ pub(in crate::set_disk) struct RenameDataFenceOptions<'a> {
     rollback_receipt: Option<RenameRollbackReceipt>,
     multipart_proof_authority: Option<crate::disk::multipart_source::ProofVerificationContext>,
     multipart_commit_owner: Option<Arc<MultipartLogicalGuards>>,
+    bound_dispatch_after_quorum: bool,
 }
 
 impl<'a> RenameDataFenceOptions<'a> {
@@ -3842,7 +3953,13 @@ impl<'a> RenameDataFenceOptions<'a> {
             rollback_receipt: None,
             multipart_proof_authority: None,
             multipart_commit_owner: None,
+            bound_dispatch_after_quorum: false,
         }
+    }
+
+    pub(in crate::set_disk) fn with_quorum_bounded_dispatch(mut self, enabled: bool) -> Self {
+        self.bound_dispatch_after_quorum = enabled;
+        self
     }
 
     pub(in crate::set_disk) fn with_multipart_commit_owner(mut self, owner: Arc<MultipartLogicalGuards>) -> Self {
@@ -4426,6 +4543,7 @@ impl SetDisks {
                 disk::RenameDataGuards {
                     scanner_publication_lease_token: context.scanner_token,
                     namespace_owner: context.namespace_owner.clone(),
+                    dispatch_deadline: context.dispatch_deadline.clone(),
                     ..Default::default()
                 },
             )
@@ -4602,6 +4720,7 @@ impl SetDisks {
             publication_scope,
             write_quorum,
             allow_batch,
+            dispatch_deadline,
         } = args;
         debug_assert!(!allow_batch || publication_scope.is_none());
         let disk_count = disks.len();
@@ -4626,6 +4745,10 @@ impl SetDisks {
                 continue;
             }
             let outcome_tx = outcome_tx.clone();
+            let dispatch_deadline = dispatch_deadline
+                .as_ref()
+                .filter(|_| disk.as_ref().is_some_and(|disk| !disk.is_local()))
+                .cloned();
             let context = RenameSlotContext {
                 slot,
                 disk,
@@ -4636,6 +4759,7 @@ impl SetDisks {
                 paths: paths.clone(),
                 successful_completion_rank: successful_completion_rank.clone(),
                 write_quorum,
+                dispatch_deadline,
             };
             let resource_unit = resource_unit.clone();
             let producer = crate::disk::with_optional_resource_unit(resource_unit, async move {
@@ -4653,6 +4777,7 @@ impl SetDisks {
             let group_disks = disks.clone();
             let group_tokens = fence_tokens.clone();
             let resource_unit = resource_unit.clone();
+            let dispatch_deadline = dispatch_deadline.clone();
             let producer = crate::disk::with_optional_resource_unit(resource_unit, async move {
                 let prepared = join_all(group.slots.into_iter().map(|slot| {
                     let context = RenameSlotContext {
@@ -4665,6 +4790,7 @@ impl SetDisks {
                         paths: paths.clone(),
                         successful_completion_rank: successful_completion_rank.clone(),
                         write_quorum,
+                        dispatch_deadline: dispatch_deadline.clone(),
                     };
                     async move { (slot, Self::prepare_and_admit_rename_slot(context).await) }
                 }))
@@ -4736,6 +4862,7 @@ impl SetDisks {
                                     &paths.dst_bucket,
                                     &paths.dst_object,
                                     items,
+                                    dispatch_deadline,
                                 )
                                 .await
                         }
@@ -4844,6 +4971,7 @@ impl SetDisks {
             rollback_receipt,
             multipart_proof_authority: _,
             multipart_commit_owner: _,
+            bound_dispatch_after_quorum: _,
         } = fence_options;
         if let Some(file_info) = disks
             .iter()
@@ -4864,19 +4992,13 @@ impl SetDisks {
             Arc::new(Self::scanner_publication_lease_tokens_for_disks(disks, scanner_publication_lease_tokens)?);
         Self::record_rename_batch_candidates(disks, &file_infos, &fanout_fence_tokens, src_bucket, dst_bucket, dst_object);
         let coordinator_disks = fanout_disks.clone();
-        let src_bucket = Arc::new(src_bucket.to_string());
-        let src_object = Arc::new(src_object.to_string());
-        let dst_bucket = Arc::new(dst_bucket.to_string());
-        let dst_object = Arc::new(dst_object.to_string());
+        let paths = Arc::new(RenameSlotPaths::new(src_bucket, src_object, dst_bucket, dst_object));
         let (commit_tx, commit_rx) = oneshot::channel();
 
         let coordinator_failure_receipt = rollback_receipt.clone();
         let early_ack_spawn_to_quorum_wait_started = rustfs_io_metrics::put_stage_timer();
         let tail_drain = tokio::spawn(crate::disk::with_detached_disk_io_context({
-            let fanout_src_bucket = src_bucket.clone();
-            let fanout_src_object = src_object.clone();
-            let fanout_dst_bucket = dst_bucket.clone();
-            let fanout_dst_object = dst_object.clone();
+            let paths = paths.clone();
             async move {
                 let allow_batch = scanner_publication_commit_scope.is_none();
                 let RenameOutcomeProducers {
@@ -4886,16 +5008,12 @@ impl SetDisks {
                     disks: fanout_disks.clone(),
                     file_infos: file_infos.clone(),
                     fence_tokens: fanout_fence_tokens.clone(),
-                    paths: RenameSlotPaths {
-                        src_bucket: fanout_src_bucket.clone(),
-                        src_object: fanout_src_object.clone(),
-                        dst_bucket: fanout_dst_bucket.clone(),
-                        dst_object: fanout_dst_object.clone(),
-                    },
+                    paths: paths.clone(),
                     namespace_owner: namespace_commit_guard.clone().map(|owner| owner as Arc<dyn Send + Sync>),
                     publication_scope: scanner_publication_commit_scope,
                     write_quorum,
                     allow_batch,
+                    dispatch_deadline: None,
                 });
 
                 let mut commit_tx = Some(commit_tx);
@@ -4980,7 +5098,7 @@ impl SetDisks {
                         }
                         if let Some(commit_tx) = commit_tx.take() {
                             #[cfg(test)]
-                            rename_fanout_barrier::wait_for_armed_rename_before_early_ack(&fanout_dst_object).await;
+                            rename_fanout_barrier::wait_for_armed_rename_before_early_ack(&paths.dst_object).await;
                             let _ = commit_tx.send(snapshot_commit);
                         }
                         sent_commit = true;
@@ -4998,7 +5116,7 @@ impl SetDisks {
                 );
 
                 #[cfg(test)]
-                rollback_fault_injection::after_fanout(&fanout_dst_object);
+                rollback_fault_injection::after_fanout(&paths.dst_object);
                 if rustfs_io_metrics::put_stage_metrics_enabled() {
                     let fanout_success = errs.iter().filter(|err| err.is_none()).count();
                     let fanout_error = errs.len().saturating_sub(fanout_success + fanout_panic);
@@ -5021,7 +5139,7 @@ impl SetDisks {
                         &errs,
                         &dispatch_states,
                         &data_dirs,
-                        (&fanout_dst_bucket, &fanout_dst_object),
+                        (&paths.dst_bucket, &paths.dst_object),
                         RenameRollbackOwnership {
                             receipt: rollback_receipt,
                             namespace_commit_guard,
@@ -5068,11 +5186,10 @@ impl SetDisks {
                     let Some(disk) = disk.clone() else {
                         continue;
                     };
-                    let dst_bucket = fanout_dst_bucket.clone();
-                    let dst_object = fanout_dst_object.clone();
+                    let paths = paths.clone();
                     backup_reclaims.push(tokio::spawn(async move {
-                        let backup_path = format!("{dst_object}/{rollback_dir}/{STORAGE_FORMAT_FILE_BACKUP}");
-                        disk.delete(&dst_bucket, &backup_path, DeleteOptions::default()).await
+                        let backup_path = format!("{}/{rollback_dir}/{STORAGE_FORMAT_FILE_BACKUP}", paths.dst_object);
+                        disk.delete(&paths.dst_bucket, &backup_path, DeleteOptions::default()).await
                     }));
                 }
                 for result in join_all(backup_reclaims).await {
@@ -5081,16 +5198,16 @@ impl SetDisks {
                         Ok(Err(DiskError::FileNotFound | DiskError::VolumeNotFound)) => {}
                         Ok(Err(err)) => {
                             warn!(
-                                dst_bucket = %fanout_dst_bucket,
-                                dst_object = %fanout_dst_object,
+                                dst_bucket = %paths.dst_bucket,
+                                dst_object = %paths.dst_object,
                                 error = %err,
                                 "rollback backup reclamation failed after committed rename"
                             );
                         }
                         Err(join_err) => {
                             warn!(
-                                dst_bucket = %fanout_dst_bucket,
-                                dst_object = %fanout_dst_object,
+                                dst_bucket = %paths.dst_bucket,
+                                dst_object = %paths.dst_object,
                                 error = %join_err,
                                 "rollback backup reclamation task failed after committed rename"
                             );
@@ -5136,7 +5253,7 @@ impl SetDisks {
         let commit = match commit_rx.await {
             Ok(commit) => commit,
             Err(_) => {
-                record_indeterminate_rename(disks, (&dst_bucket, &dst_object), coordinator_failure_receipt).await;
+                record_indeterminate_rename(disks, (dst_bucket, dst_object), coordinator_failure_receipt).await;
                 return Err(DiskError::Unexpected);
             }
         };
@@ -5216,6 +5333,7 @@ impl SetDisks {
             rollback_receipt,
             multipart_proof_authority,
             multipart_commit_owner,
+            bound_dispatch_after_quorum,
         } = fence_options;
         if let Some(file_info) = disks
             .iter()
@@ -5239,28 +5357,15 @@ impl SetDisks {
         };
         let mut errs = vec![Some(DiskError::Unexpected); disks.len()];
 
-        let src_bucket = Arc::new(src_bucket.to_string());
-        let src_object = Arc::new(src_object.to_string());
-        let dst_bucket = Arc::new(dst_bucket.to_string());
-        let dst_object = Arc::new(dst_object.to_string());
+        let paths = Arc::new(RenameSlotPaths::new(src_bucket, src_object, dst_bucket, dst_object));
 
         let disk_count = disks.len();
         let fanout_disks = Arc::new(disks.to_vec());
         let fanout_file_infos = Arc::new(file_infos);
         let fanout_fence_tokens =
             Arc::new(Self::scanner_publication_lease_tokens_for_disks(disks, scanner_publication_lease_tokens)?);
-        Self::record_rename_batch_candidates(
-            disks,
-            &fanout_file_infos,
-            &fanout_fence_tokens,
-            src_bucket.as_str(),
-            dst_bucket.as_str(),
-            dst_object.as_str(),
-        );
-        let fanout_src_bucket = src_bucket.clone();
-        let fanout_src_object = src_object.clone();
-        let fanout_dst_bucket = dst_bucket.clone();
-        let fanout_dst_object = dst_object.clone();
+        Self::record_rename_batch_candidates(disks, &fanout_file_infos, &fanout_fence_tokens, src_bucket, dst_bucket, dst_object);
+        let fanout_paths = paths.clone();
         let fanout_publication_scope = scanner_publication_commit_scope.clone();
         let logical_guards = multipart_commit_owner;
         let multipart_commit_owner = logical_guards
@@ -5278,13 +5383,16 @@ impl SetDisks {
             // fan-out owner, even if the caller future is cancelled.
             let _fanout_publication_scope = fanout_publication_scope;
             let _namespace_commit_guard = fanout_namespace_commit_guard.clone();
-            let paths = RenameSlotPaths {
-                src_bucket: fanout_src_bucket,
-                src_object: fanout_src_object,
-                dst_bucket: fanout_dst_bucket,
-                dst_object: fanout_dst_object.clone(),
-            };
             let allow_batch = !protected_multipart && scanner_publication_commit_scope.is_none();
+            let (dispatch_deadline_tx, dispatch_deadline) = if bound_dispatch_after_quorum
+                && fanout_disks.iter().flatten().count() > write_quorum
+                && fanout_disks.iter().flatten().any(|disk| !disk.is_local())
+            {
+                let (tx, rx) = watch::channel(None);
+                (Some(tx), Some(rx))
+            } else {
+                (None, None)
+            };
             let RenameOutcomeProducers {
                 outcomes: mut outcome_rx,
                 mut tasks,
@@ -5292,19 +5400,29 @@ impl SetDisks {
                 disks: fanout_disks,
                 file_infos: fanout_file_infos.clone(),
                 fence_tokens: fanout_fence_tokens,
-                paths,
+                paths: fanout_paths.clone(),
                 namespace_owner: fanout_namespace_owner,
                 publication_scope: scanner_publication_commit_scope,
                 write_quorum,
                 allow_batch,
+                dispatch_deadline,
             });
             let mut results = Vec::with_capacity(disk_count);
+            let mut successful = 0;
             while let Some(outcome) = outcome_rx.recv().await {
+                if let Some(tx) = dispatch_deadline_tx.as_ref()
+                    && matches!(&outcome.completion, Ok(Ok(_)))
+                {
+                    successful += 1;
+                    if successful == write_quorum {
+                        tx.send_replace(Some(tokio::time::Instant::now() + PUT_RENAME_POST_QUORUM_DISPATCH_GRACE));
+                    }
+                }
                 results.push(outcome);
             }
             while tasks.join_next().await.is_some() {}
             #[cfg(test)]
-            rollback_fault_injection::after_fanout(&fanout_dst_object);
+            rollback_fault_injection::after_fanout(&fanout_paths.dst_object);
             (results, fanout_file_infos)
         };
         let fanout_future = crate::disk::with_detached_disk_io_context(fanout_future);
@@ -5338,7 +5456,7 @@ impl SetDisks {
         let (results, file_infos) = match fanout_result {
             Ok(result) => result,
             Err(_) => {
-                record_indeterminate_rename(disks, (&dst_bucket, &dst_object), rollback_receipt).await;
+                record_indeterminate_rename(disks, (dst_bucket, dst_object), rollback_receipt).await;
                 return Err(DiskError::Unexpected);
             }
         };
@@ -5471,7 +5589,7 @@ impl SetDisks {
                 // Destination-only Undo cannot restore a consumed MPU head.
                 // Only this failed owner can spend the original native caps.
                 owner
-                    .failed_owned(disks, &file_infos, &src_object, (&dst_bucket, &dst_object), namespace_commit_guard)
+                    .failed_owned(disks, &file_infos, src_object, (dst_bucket, dst_object), namespace_commit_guard)
                     .await;
             } else {
                 rollback_failed_rename(
@@ -5480,7 +5598,7 @@ impl SetDisks {
                     &errs,
                     &dispatch_states,
                     &data_dirs,
-                    (&dst_bucket, &dst_object),
+                    (dst_bucket, dst_object),
                     RenameRollbackOwnership {
                         receipt: rollback_receipt,
                         namespace_commit_guard,
@@ -5526,11 +5644,10 @@ impl SetDisks {
             let Some(disk) = disk.clone() else {
                 continue;
             };
-            let dst_bucket = dst_bucket.clone();
-            let dst_object = dst_object.clone();
+            let paths = paths.clone();
             backup_reclaims.push(tokio::spawn(async move {
-                let backup_path = format!("{dst_object}/{rollback_dir}/{STORAGE_FORMAT_FILE_BACKUP}");
-                disk.delete(&dst_bucket, &backup_path, DeleteOptions::default()).await
+                let backup_path = format!("{}/{rollback_dir}/{STORAGE_FORMAT_FILE_BACKUP}", paths.dst_object);
+                disk.delete(&paths.dst_bucket, &backup_path, DeleteOptions::default()).await
             }));
         }
         for result in join_all(backup_reclaims).await {
@@ -10003,6 +10120,228 @@ mod tests {
         assert_eq!(recorder.histogram_sample_count("rustfs_io_get_object_local_batch_prepare_seconds"), 8);
     }
 
+    #[cfg(unix)]
+    #[test]
+    #[serial_test::serial]
+    fn in_flight_read_budget_falls_back_to_streaming_and_reclaims_on_drop() {
+        use crate::set_disk::core::read_budget::global_in_flight_read_budget;
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("in-flight read budget test runtime");
+
+        runtime.block_on(temp_env::async_with_vars(
+            [
+                (rustfs_config::ENV_OBJECT_MMAP_READ_MAX_LENGTH, Some("65536")),
+                (rustfs_config::ENV_OBJECT_MMAP_READ_MAX_INFLIGHT_BYTES, Some("4096")),
+                (rustfs_config::ENV_INTERNODE_PREWARM, Some("false")),
+            ],
+            async {
+                let budget = global_in_flight_read_budget();
+                assert_eq!(budget.in_flight_bytes(), 0, "budget must start clean");
+
+                let bucket = "in-flight-read-budget";
+                let object = "object";
+                let (_dirs, disks) = call_counter_local_disks(bucket, 2).await;
+                let data_dir = Uuid::new_v4();
+                let payload = vec![0x5a_u8; 4096];
+                let mut files = vec![FileInfo::new(object, 1, 1); 2];
+                for (file, disk) in files.iter_mut().zip(&disks) {
+                    file.data_dir = Some(data_dir);
+                    disk.as_ref()
+                        .expect("local disk")
+                        .write_all(bucket, &format!("{object}/{data_dir}/part.1"), Bytes::from(payload.clone()))
+                        .await
+                        .expect("write shard fixture");
+                }
+
+                // First read consumes the 4096-byte data shard via batch pread
+                // (parity shard stays deferred), filling the exact 4096-byte budget.
+                let first = create_bitrot_readers_until_quorum_with_preference(
+                    &files,
+                    &disks,
+                    bucket,
+                    object,
+                    1,
+                    0,
+                    payload.len(),
+                    payload.len(),
+                    HashAlgorithm::None,
+                    false,
+                    true,
+                    1,
+                    1,
+                    BitrotReaderSetupMode::ReadQuorum,
+                    false,
+                    None,
+                    None,
+                )
+                .await;
+                assert!(
+                    matches!(
+                        first.readers[0].as_ref().expect("data shard reader").inner_ref(),
+                        ShardReader::InMemory(_)
+                    ),
+                    "first read under budget must keep the batch pread InMemory fast path"
+                );
+                assert_eq!(
+                    budget.in_flight_bytes(),
+                    4096,
+                    "unread in-memory shard reader must charge the process-wide budget"
+                );
+
+                // Second concurrent unread read exceeds budget -> must fall back to streaming
+                // without overshooting the budget and still return intact shard bytes.
+                let mut second = create_bitrot_readers_until_quorum_with_preference(
+                    &files,
+                    &disks,
+                    bucket,
+                    object,
+                    1,
+                    0,
+                    payload.len(),
+                    payload.len(),
+                    HashAlgorithm::None,
+                    false,
+                    true,
+                    1,
+                    1,
+                    BitrotReaderSetupMode::ReadQuorum,
+                    false,
+                    None,
+                    None,
+                )
+                .await;
+                assert_eq!(budget.in_flight_bytes(), 4096, "exhausted budget must never overshoot");
+                assert!(
+                    second
+                        .readers
+                        .iter()
+                        .flatten()
+                        .all(|reader| !matches!(reader.inner_ref(), ShardReader::InMemory(_))),
+                    "concurrent read when budget is exhausted must fall back to streaming readers"
+                );
+                let mut streamed = vec![0u8; payload.len()];
+                let read_n = second.readers[0]
+                    .as_mut()
+                    .expect("streaming reader must be present")
+                    .read(&mut streamed)
+                    .await
+                    .expect("fallback streaming reader must serve exact bytes");
+                assert_eq!(read_n, payload.len());
+                assert_eq!(streamed, payload);
+                drop(second);
+
+                // Dropping/cancelling the unread first reader must immediately reclaim all bytes.
+                drop(first);
+                assert_eq!(
+                    budget.in_flight_bytes(),
+                    0,
+                    "dropping unread readers must immediately release reserved budget"
+                );
+
+                // After reclamation, subsequent reads resume the InMemory batch fast path.
+                let third = create_bitrot_readers_until_quorum_with_preference(
+                    &files,
+                    &disks,
+                    bucket,
+                    object,
+                    1,
+                    0,
+                    payload.len(),
+                    payload.len(),
+                    HashAlgorithm::None,
+                    false,
+                    true,
+                    1,
+                    1,
+                    BitrotReaderSetupMode::ReadQuorum,
+                    false,
+                    None,
+                    None,
+                )
+                .await;
+                assert!(
+                    matches!(
+                        third.readers[0].as_ref().expect("data shard reader").inner_ref(),
+                        ShardReader::InMemory(_)
+                    ),
+                    "after drop reclamation, batch pread fast path must be re-admitted"
+                );
+                assert_eq!(budget.in_flight_bytes(), 4096);
+                drop(third);
+                assert_eq!(budget.in_flight_bytes(), 0);
+            },
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[serial_test::serial]
+    fn zero_in_flight_read_budget_forces_streaming_fallback() {
+        use crate::set_disk::core::read_budget::global_in_flight_read_budget;
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("zero budget test runtime");
+
+        runtime.block_on(temp_env::async_with_vars(
+            [
+                (rustfs_config::ENV_OBJECT_MMAP_READ_MAX_LENGTH, Some("65536")),
+                (rustfs_config::ENV_OBJECT_MMAP_READ_MAX_INFLIGHT_BYTES, Some("0")),
+                (rustfs_config::ENV_INTERNODE_PREWARM, Some("false")),
+            ],
+            async {
+                let budget = global_in_flight_read_budget();
+                let bucket = "zero-in-flight-budget";
+                let object = "object";
+                let (_dirs, disks) = call_counter_local_disks(bucket, 2).await;
+                let data_dir = Uuid::new_v4();
+                let mut files = vec![FileInfo::new(object, 1, 1); 2];
+                for (file, disk) in files.iter_mut().zip(&disks) {
+                    file.data_dir = Some(data_dir);
+                    disk.as_ref()
+                        .expect("local disk")
+                        .write_all(bucket, &format!("{object}/{data_dir}/part.1"), Bytes::from_static(b"abcd"))
+                        .await
+                        .expect("write shard fixture");
+                }
+
+                let setup = create_bitrot_readers_until_quorum_with_preference(
+                    &files,
+                    &disks,
+                    bucket,
+                    object,
+                    1,
+                    0,
+                    4,
+                    4,
+                    HashAlgorithm::None,
+                    false,
+                    true,
+                    1,
+                    1,
+                    BitrotReaderSetupMode::ReadQuorum,
+                    false,
+                    None,
+                    None,
+                )
+                .await;
+                assert_eq!(budget.in_flight_bytes(), 0);
+                assert!(
+                    setup
+                        .readers
+                        .iter()
+                        .flatten()
+                        .all(|reader| !matches!(reader.inner_ref(), ShardReader::InMemory(_))),
+                    "zero in-flight budget must force streaming readers"
+                );
+            },
+        ));
+    }
+
     async fn reopen_local_disk(dir: &TempDir) -> DiskStore {
         let endpoint =
             Endpoint::try_from(dir.path().to_str().expect("tempdir path should be utf8")).expect("endpoint should parse");
@@ -12815,6 +13154,66 @@ mod tests {
                 dir.path().join(bucket).join(object).join(STORAGE_FORMAT_FILE).exists(),
                 "disk {idx} must finish the rename after caller cancellation"
             );
+        }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(capacity_dirty_scope)]
+    async fn rename_data_bounds_cold_connect_after_durable_quorum() {
+        const DISKS: usize = 4;
+        let bucket = "rename-connect-tail-bucket";
+        let object = "rename-connect-tail-object";
+        let (dirs, mut disks) = call_counter_local_disks(bucket, DISKS).await;
+        prepare_rename_source_dirs(&dirs, &disks, "source").await;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind cold peer");
+        // The TCP socket remains open, but there is no TLS server to finish the dial.
+        let endpoint = crate::disk::endpoint::Endpoint {
+            url: url::Url::parse(&format!("https://{}/data/rustfs0", listener.local_addr().expect("cold peer address")))
+                .expect("cold peer URL"),
+            is_local: false,
+            pool_idx: 0,
+            set_idx: 0,
+            disk_idx: 3,
+        };
+        disks[DISKS - 1] = Some(
+            crate::disk::new_disk(
+                &endpoint,
+                &crate::disk::DiskOption {
+                    cleanup: false,
+                    health_check: false,
+                },
+            )
+            .await
+            .expect("construct remote disk"),
+        );
+        let file_infos = rename_commit_fileinfos(object, DISKS, "bounded-connect-etag");
+        let commit = temp_env::async_with_vars([(rustfs_config::ENV_INTERNODE_CONNECT_TIMEOUT_SECS, Some("15"))], async {
+            tokio::time::timeout(
+                Duration::from_secs(5),
+                SetDisks::rename_data_owned_with_fence(
+                    &disks,
+                    (RUSTFS_META_TMP_BUCKET, "source"),
+                    file_infos,
+                    (bucket, object),
+                    false,
+                    RenameDataFenceOptions::new(3, None).with_quorum_bounded_dispatch(true),
+                ),
+            )
+            .await
+            .expect("durable quorum must finish before the silent peer's dial deadline")
+            .expect("three durable renames must satisfy write quorum")
+        })
+        .await;
+        assert_eq!(commit.convergence, RenameConvergence::PartialCommit);
+        assert!(commit.needs_immediate_heal());
+        assert!(commit.tail_drain.is_none());
+        for dir in dirs.iter().take(3) {
+            let reopened = reopen_local_disk(dir).await;
+            let stored = reopened
+                .read_version("", bucket, object, "", &ReadOptions::default())
+                .await
+                .expect("quorum metadata survives reopening");
+            assert_eq!(stored.metadata.get("etag").map(String::as_str), Some("bounded-connect-etag"));
         }
     }
 

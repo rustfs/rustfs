@@ -29,6 +29,12 @@ use crate::on_demand_migration::{
     BucketOdmState, HeadPolicy, OdmLookup, OdmOp, OdmOutcome, OnDemandMigrationSys, SourceClient, SourceError, SourceHead,
 };
 
+fn err_meta(message: &'static str) -> S3Error {
+    let mut err = S3Error::with_message(S3ErrorCode::Custom("ErrMeta".into()), message);
+    err.set_status_code(StatusCode::INTERNAL_SERVER_ERROR);
+    err
+}
+
 /// The DTO holds ordinary fields; ETag remains a native fact until either edge encodes it.
 #[derive(Debug)]
 pub(crate) struct HeadObjectOutputFacts {
@@ -818,7 +824,7 @@ impl DefaultObjectUsecase {
 
         if let Some(amz_restore) = metadata_map.get(AMZ_RESTORE) {
             let Ok(restore_status) = parse_restore_obj_status(amz_restore) else {
-                return Err(S3Error::with_message(S3ErrorCode::Custom("ErrMeta".into()), "parse amz_restore failed."));
+                return Err(err_meta("parse amz_restore failed."));
             };
             if let Ok(header_value) = HeaderValue::from_str(restore_status.to_string2().as_str()) {
                 response.headers.insert(AMZ_RESTORE, header_value);
@@ -828,16 +834,10 @@ impl DefaultObjectUsecase {
             && let Ok(header_name) = http::HeaderName::from_bytes(AMZ_RESTORE_REQUEST_DATE.as_bytes())
         {
             let Ok(amz_restore_request_date) = OffsetDateTime::parse(amz_restore_request_date, &Rfc3339) else {
-                return Err(S3Error::with_message(
-                    S3ErrorCode::Custom("ErrMeta".into()),
-                    "parse amz_restore_request_date failed.",
-                ));
+                return Err(err_meta("parse amz_restore_request_date failed."));
             };
             let Ok(amz_restore_request_date) = amz_restore_request_date.format(&RFC1123) else {
-                return Err(S3Error::with_message(
-                    S3ErrorCode::Custom("ErrMeta".into()),
-                    "format amz_restore_request_date failed.",
-                ));
+                return Err(err_meta("format amz_restore_request_date failed."));
             };
             if let Ok(header_value) = HeaderValue::from_str(&amz_restore_request_date) {
                 response.headers.insert(header_name, header_value);
@@ -1681,6 +1681,14 @@ mod tests {
         .await
         .unwrap_err();
         assert_eq!(err.code().as_str(), "InvalidArgument");
+    }
+
+    #[test]
+    fn err_meta_sets_internal_server_error_status() {
+        let err = err_meta("parse amz_restore failed.");
+        assert_eq!(err.code(), &S3ErrorCode::Custom("ErrMeta".into()));
+        assert_eq!(err.status_code(), Some(StatusCode::INTERNAL_SERVER_ERROR));
+        assert_eq!(err.message(), Some("parse amz_restore failed."));
     }
 }
 

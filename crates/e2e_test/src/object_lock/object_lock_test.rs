@@ -680,13 +680,11 @@ async fn test_copy_object_does_not_inherit_source_legal_hold() {
         .key("implicit-copy")
         .send()
         .await
-        .unwrap();
+        .expect_err("copy should not inherit the source hold");
+    assert_eq!(implicit_legal_hold.raw_response().map(|response| response.status().as_u16()), Some(404));
     assert_eq!(
-        implicit_legal_hold
-            .legal_hold()
-            .and_then(|value| value.status())
-            .map(|value| value.as_str()),
-        Some("OFF")
+        implicit_legal_hold.as_service_error().and_then(ProvideErrorMetadata::code),
+        Some("NoSuchObjectLockConfiguration")
     );
 
     client
@@ -2028,12 +2026,12 @@ async fn test_copy_object_retention_uses_destination_policy() {
         .key("no-default-copy")
         .send()
         .await
-        .unwrap();
-    let no_default_retention = no_default_retention
-        .retention()
-        .expect("retention response should be present");
-    assert!(no_default_retention.mode().is_none());
-    assert!(no_default_retention.retain_until_date().is_none());
+        .expect_err("copy should have no retention without a destination default");
+    assert_eq!(no_default_retention.raw_response().map(|response| response.status().as_u16()), Some(404));
+    assert_eq!(
+        no_default_retention.as_service_error().and_then(ProvideErrorMetadata::code),
+        Some("NoSuchObjectLockConfiguration")
+    );
 
     let retained_version_id = put_object_with_retention(
         &client,

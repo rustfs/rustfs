@@ -74,7 +74,7 @@ static GET_STAGE_LOCAL_SUMMARY_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 type GetStageLocalSummaryKey = (&'static str, &'static str, &'static str, &'static str);
 
-/// Sampled local aggregate for one bounded GetObject stage label set.
+/// Sampled local aggregate for one bounded stage label set.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct GetStageLocalSummary {
     pub path: &'static str,
@@ -85,7 +85,21 @@ pub struct GetStageLocalSummary {
     pub duration_nanoseconds: u64,
 }
 
-static GET_STAGE_LOCAL_SUMMARY: LazyLock<Mutex<HashMap<GetStageLocalSummaryKey, GetStageLocalSummary>>> =
+impl GetStageLocalSummary {
+    fn key(&self) -> GetStageLocalSummaryKey {
+        (self.path, self.stage, self.object_class, self.size_bucket)
+    }
+}
+
+/// A local summary row with its peak in the same sampling window.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GetStageLocalSummaryWithMax {
+    pub summary: GetStageLocalSummary,
+    /// Largest sampled duration since the previous drain.
+    pub max_duration_nanoseconds: u64,
+}
+
+static GET_STAGE_LOCAL_SUMMARY: LazyLock<Mutex<HashMap<GetStageLocalSummaryKey, GetStageLocalSummaryWithMax>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
 /// Global switch for all remaining (non GET/PUT-stage) metric emission in this
@@ -130,12 +144,23 @@ pub fn get_stage_local_summary_sample_rate() -> u64 {
 }
 
 pub fn take_get_stage_local_summary() -> Vec<GetStageLocalSummary> {
+    let mut rows = drain_get_stage_local_summary(|row| row.summary);
+    rows.sort_unstable_by_key(GetStageLocalSummary::key);
+    rows
+}
+
+/// Drain the same sampling window as [`take_get_stage_local_summary`] and include each sorted row's maximum.
+pub fn take_get_stage_local_summary_with_max() -> Vec<GetStageLocalSummaryWithMax> {
+    let mut rows = drain_get_stage_local_summary(std::convert::identity);
+    rows.sort_unstable_by_key(|row| row.summary.key());
+    rows
+}
+
+fn drain_get_stage_local_summary<T>(mut project: impl FnMut(GetStageLocalSummaryWithMax) -> T) -> Vec<T> {
     let Ok(mut summary) = GET_STAGE_LOCAL_SUMMARY.lock() else {
         return Vec::new();
     };
-    let mut rows = summary.drain().map(|(_, row)| row).collect::<Vec<_>>();
-    rows.sort_unstable_by_key(|row| (row.path, row.stage, row.object_class, row.size_bucket));
-    rows
+    summary.drain().map(|(_, row)| project(row)).collect()
 }
 
 fn record_get_stage_local_summary(
@@ -165,16 +190,20 @@ fn record_get_stage_local_summary(
     let Ok(mut summary) = GET_STAGE_LOCAL_SUMMARY.lock() else {
         return;
     };
-    let row = summary.entry(key).or_insert_with(|| GetStageLocalSummary {
-        path,
-        stage,
-        object_class,
-        size_bucket,
-        sampled_count: 0,
-        duration_nanoseconds: 0,
+    let row = summary.entry(key).or_insert_with(|| GetStageLocalSummaryWithMax {
+        summary: GetStageLocalSummary {
+            path,
+            stage,
+            object_class,
+            size_bucket,
+            sampled_count: 0,
+            duration_nanoseconds: 0,
+        },
+        max_duration_nanoseconds: 0,
     });
-    row.sampled_count = row.sampled_count.saturating_add(1);
-    row.duration_nanoseconds = row.duration_nanoseconds.saturating_add(duration_nanoseconds);
+    row.summary.sampled_count = row.summary.sampled_count.saturating_add(1);
+    row.summary.duration_nanoseconds = row.summary.duration_nanoseconds.saturating_add(duration_nanoseconds);
+    row.max_duration_nanoseconds = row.max_duration_nanoseconds.max(duration_nanoseconds);
 }
 
 /// Enable or disable general (non GET/PUT-stage) metric emission.
@@ -232,6 +261,9 @@ pub const PUT_STAGE_PUT_OBJECT_OPERATION_AWAIT_TOTAL: &str = "put_object_operati
 pub const PUT_STAGE_PUT_OBJECT_OPERATION_BODY_TO_COMMIT_SUBMIT: &str = "put_object_operation_body_to_commit_submit";
 pub const PUT_STAGE_PUT_OBJECT_OPERATION_RESULT_RETURN: &str = "put_object_operation_result_return";
 pub const PUT_STAGE_PUT_OBJECT_OPERATION_FIRST_POLL_DELAY: &str = "put_object_operation_first_poll_delay";
+pub const PUT_STAGE_PUT_OBJECT_COMMIT_READY_SNAPSHOT_LIFECYCLE_LOCK: &str = "put_object_commit_ready_snapshot_lifecycle_lock";
+pub const PUT_STAGE_PUT_OBJECT_COMMIT_READY_SNAPSHOT_METADATA_LOCK: &str = "put_object_commit_ready_snapshot_metadata_lock";
+pub const PUT_STAGE_PUT_OBJECT_COMMIT_READY_SNAPSHOT_AUTHORITY_READ: &str = "put_object_commit_ready_snapshot_authority_read";
 pub const PUT_STAGE_PUT_OBJECT_COMMIT_NAMESPACE_LOCK_ACQUIRED_TO_COMMIT_READY: &str =
     "put_object_commit_namespace_lock_acquired_to_commit_ready";
 pub const PUT_STAGE_PUT_OBJECT_COMMIT_READY_PRECONDITION_AND_TIMESTAMP: &str =
@@ -4547,6 +4579,9 @@ mod tests {
             PUT_STAGE_PUT_OBJECT_OPERATION_BODY_TO_COMMIT_SUBMIT,
             PUT_STAGE_PUT_OBJECT_OPERATION_RESULT_RETURN,
             PUT_STAGE_PUT_OBJECT_OPERATION_FIRST_POLL_DELAY,
+            PUT_STAGE_PUT_OBJECT_COMMIT_READY_SNAPSHOT_LIFECYCLE_LOCK,
+            PUT_STAGE_PUT_OBJECT_COMMIT_READY_SNAPSHOT_METADATA_LOCK,
+            PUT_STAGE_PUT_OBJECT_COMMIT_READY_SNAPSHOT_AUTHORITY_READ,
             PUT_STAGE_PUT_OBJECT_COMMIT_NAMESPACE_LOCK_ACQUIRED_TO_COMMIT_READY,
             PUT_STAGE_PUT_OBJECT_COMMIT_READY_PRECONDITION_AND_TIMESTAMP,
             PUT_STAGE_PUT_OBJECT_COMMIT_READY_EXPECTED_VERSION_LOOKUP,

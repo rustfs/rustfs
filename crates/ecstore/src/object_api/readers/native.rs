@@ -15,21 +15,11 @@
 //! Stored-layout answers of a default build: every encrypted object it reads
 //! is in RustFS's own framing, so nothing here is derived from another layout.
 
-use super::{CompressedPartSeek, EncryptedRangePlan, RangedDecompressReader};
+use super::EncryptedRangePlan;
 use crate::error::Result;
 use crate::object_api::{ObjectInfo, ReadEncryptionMode};
 use rustfs_filemeta::ObjectPartInfo;
 use tokio::io::AsyncRead;
-
-/// Where a read resumes after seeking `compressed_offset` bytes into a
-/// compressed part: the stored bytes are the compressed bytes.
-pub(super) fn compressed_part_seek(_oi: &ObjectInfo, compressed_offset: i64) -> CompressedPartSeek {
-    CompressedPartSeek {
-        storage_advance: compressed_offset,
-        decrypt_skip: 0,
-        sequence_number: 0,
-    }
-}
 
 /// The range plan of an object whose layout differs from RustFS's own framing.
 /// A default build reads no such layout, so the caller plans every range itself.
@@ -69,22 +59,10 @@ pub(super) fn readable_part_numbers(part_numbers: Vec<usize>, _parts: &[ObjectPa
     part_numbers
 }
 
-/// The decompressed stream as the range and limit readers consume it.
+/// The decompressed stream of a whole-object read.
 pub(super) fn decompressed_stream<R>(reader: R) -> R
 where
     R: AsyncRead + Unpin + Send + 'static,
 {
     reader
-}
-
-pub(super) fn ranged_decompress_reader<R>(
-    reader: R,
-    offset: usize,
-    length: i64,
-    total_size: usize,
-) -> Result<RangedDecompressReader<R>>
-where
-    R: AsyncRead + Unpin + Send + Sync + 'static,
-{
-    RangedDecompressReader::new(reader, offset, length, total_size)
 }

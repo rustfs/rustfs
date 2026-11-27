@@ -143,10 +143,9 @@ RustFS readers accept both of these metadata shapes in every build. That covers 
 | Fact | Value |
 |---|---|
 | Shipping status | Ships in no default build: absent from `default` and `full` in `rustfs/Cargo.toml`; released binaries and container images never include it. Enable with `--features m-compatible`. |
-| Pull-request coverage | `test-and-lint-m-compatible` in `.github/workflows/ci.yml`: clippy plus `cargo nextest` for `rustfs`, `rustfs-ecstore`, and `rustfs-sse` with `--features m-compatible`. This is the cfg-seam guard; it keeps the feature compiling and its unit suite green on every pull request. |
-| Full-suite lane | `build-rustfs-debug-binary-m-compatible` and `e2e-tests-m-compatible` in `ci.yml` run only on the nightly schedule and manual dispatch (`cache-warm.yml` keeps the `ci-feat-rio` cache warm so the scheduled build fits its timeout). |
+| CI coverage | `.github/workflows/ci.yml` does not compile or test `m-compatible`. The former schedule and dispatch lanes, named after the feature's earlier name `rio-v2`, `test-and-lint-rio-v2`, `build-rustfs-debug-binary-rio-v2`, and `e2e-tests-rio-v2` are removed, as is the `cache-warm.yml` job `warm-ci-feat-rio` that warmed `ci-feat-rio` for them. The default debug binary, e2e, and S3 lanes do not enable the feature. |
 | Interop evidence | `.github/workflows/minio-interop.yml` (nightly plus manual) regenerates real MinIO backend trees via `crates/rio-v2/tests/minio_fixture_lab/` and runs the `#[ignore]` reader tests in `rustfs/src/storage/minio_generated_read_test.rs` with `--features m-compatible`. Its freshness is tracked in `.github/scheduled-validations.json`. |
-| Promote-or-delete condition | The variant stays dormant until one of two things happens. **Promote**: a release commits to shipping MinIO SSE migration as a supported capability; then `m-compatible` joins `default`/`full`, the scheduled lanes run on every pull request, and this section is rewritten. **Delete**: no release commits to it and the scheduled lanes are not kept green; then the feature flag, `crates/rio-v2`, the variant modules and their selection points listed under "Where the variant lives in code", the three `ci.yml` jobs, the `cache-warm.yml` warm step, `minio-interop.yml`, and its `scheduled-validations.json` entry are removed in one change. Either outcome must update `ARCHITECTURE.md` and the `ci.yml` job comments that cite this section. |
+| Promote-or-delete condition | The variant stays dormant until one of two things happens. **Promote**: a release commits to shipping MinIO SSE migration as a supported capability; then `m-compatible` joins `default`/`full`, pull-request validation for that build is added, and this section is rewritten. **Delete**: no release commits to it; then the feature flag, `crates/rio-v2`, the cfg seams under `crates/sse/src/`, `minio-interop.yml`, and its `scheduled-validations.json` entry are removed in one change. That deletion is separate from the removed `ci.yml` lanes. Either outcome must update `ARCHITECTURE.md`. |
 
 ### Where the variant lives in code
 
@@ -187,7 +186,7 @@ Not fixture-proven: transitioned `xl.meta`; CORS, public-access-block, and bucke
 
 - Any change to `crates/filemeta` or `crates/ecstore/src/bucket` metadata encoding is a storage-format change and follows the migration and readiness contracts in [README.md](README.md) and the ecstore layout boundary rules.
 - Do not bump a Version Anchor without a read path for the prior value; see [erasure-coding.md](erasure-coding.md) for the accept-older, reject-newer rule.
-- `.github/workflows/ci.yml`, `.github/workflows/cache-warm.yml`, and `ARCHITECTURE.md` cite the [m-compatible variant lifecycle](#m-compatible-variant-lifecycle) heading; keep it when editing this file.
+- `ARCHITECTURE.md` points at this document for the `m-compatible` lifecycle. Keep this heading when editing the file.
 
 ## Independent integrity upgrade contract
 

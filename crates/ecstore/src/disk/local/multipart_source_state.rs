@@ -261,8 +261,8 @@ pub(super) fn read_optional_in_pinned(
         Err(error) => Err(error.into()),
     }
 }
-#[derive(Clone, Copy, PartialEq, Eq)]
-struct FileStamp {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct FileStamp {
     len: u64,
     modified: Option<std::time::SystemTime>,
     #[cfg(unix)]
@@ -270,7 +270,7 @@ struct FileStamp {
 }
 
 impl FileStamp {
-    fn from_path(path: &Path) -> Option<Self> {
+    pub(super) fn from_path(path: &Path) -> Option<Self> {
         let meta = std::fs::symlink_metadata(path).ok()?;
         Some(Self {
             len: meta.len(),
@@ -281,6 +281,22 @@ impl FileStamp {
                 meta.ino()
             },
         })
+    }
+
+    #[cfg(unix)]
+    pub(super) fn from_stat(st: &rustix::fs::Stat) -> Option<Self> {
+        fn try_u64<T: TryInto<u64>>(v: T) -> Option<u64> {
+            v.try_into().ok()
+        }
+        fn try_u32<T: TryInto<u32>>(v: T) -> Option<u32> {
+            v.try_into().ok()
+        }
+        let len = try_u64(st.st_size)?;
+        let sec = try_u64(st.st_mtime)?;
+        let nsec = try_u32(st.st_mtime_nsec).filter(|&n| n < 1_000_000_000)?;
+        let ino = try_u64(st.st_ino)?;
+        let modified = Some(std::time::UNIX_EPOCH.checked_add(std::time::Duration::new(sec, nsec))?);
+        Some(Self { len, modified, ino })
     }
 }
 
@@ -371,7 +387,19 @@ pub(super) fn begin_active_multipart_part_transaction(source: &Path, part_number
     });
 }
 
-pub(super) fn record_active_multipart_part_committed(source: &Path, part: rustfs_filemeta::ObjectPartInfo) {
+pub(super) fn record_active_multipart_part_committed(
+    source: &Path,
+    part: rustfs_filemeta::ObjectPartInfo,
+    precomputed_stamp: Option<FileStamp>,
+) {
+    if let Some(part_stamp) = precomputed_stamp {
+        ACTIVE_MULTIPART_SOURCE_HEADS.with_get_mut(source, |entry| {
+            if entry.fi.data_dir.is_some_and(|dir| !dir.is_nil()) {
+                entry.parts.insert(part.number, (part_stamp, part));
+            }
+        });
+        return;
+    }
     let Some(data_dir) = ACTIVE_MULTIPART_SOURCE_HEADS
         .with_get(source, |entry| entry.fi.data_dir)
         .flatten()
@@ -755,7 +783,7 @@ impl SourceStore {
             .await?;
         Ok(state)
     }
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     pub async fn write_owned_backup(&self, owner: Uuid, target: bool, bytes: &[u8]) -> Result<()> {
         if owner.is_nil() {
             return Err(DiskError::FileCorrupt);

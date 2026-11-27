@@ -309,6 +309,7 @@ fn no_handler_runs_under_a_total_deadline_and_the_body_keeps_the_rustfs_idle_bou
     assert_eq!(config.request_body_deadlines().read_idle(), Duration::from_secs(300));
     assert_eq!(config.request_body_deadlines().first_byte(), Duration::from_secs(300));
     assert_eq!(config.request_body_deadlines().throughput_window(), NO_DEADLINE);
+    assert_eq!(config.upload_object_ceiling(), Some(MAX_SINGLE_PUT_OBJECT_SIZE));
 }
 
 #[test]
@@ -607,4 +608,546 @@ async fn the_reported_owner_is_every_bucket_s_owner_and_without_one_nothing_is()
         Ok(reported.as_str())
     );
     assert_eq!(ReportedOwner(None).owner(&photos).await, Err(BucketOwnerError::unavailable()));
+}
+
+struct CountingStalledBody {
+    polled: Arc<std::sync::atomic::AtomicUsize>,
+    dropped: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl Drop for CountingStalledBody {
+    fn drop(&mut self) {
+        self.dropped.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+impl http_body::Body for CountingStalledBody {
+    type Data = Bytes;
+    type Error = std::convert::Infallible;
+
+    fn poll_frame(
+        self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Result<http_body::Frame<Self::Data>, Self::Error>>> {
+        self.polled.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        std::task::Poll::Pending
+    }
+}
+
+struct TableIam {
+    users: std::collections::HashMap<String, (UserIdentity, bool)>,
+}
+
+impl IamKeyLookup for TableIam {
+    fn is_ready(&self) -> bool {
+        true
+    }
+
+    fn check_key<'a>(&'a self, access_key: &'a str) -> BoxFuture<'a, Result<(Option<UserIdentity>, bool), IamError>> {
+        let answer = self
+            .users
+            .get(access_key)
+            .cloned()
+            .map_or((None, false), |(id, ok)| (Some(id), ok));
+        Box::pin(async move { Ok(answer) })
+    }
+}
+
+#[tokio::test]
+async fn expired_sts_returns_400_expired_token_only_to_holder_and_keeps_disabled_403() {
+    use crate::server::gateway_handlers::test_support::signed_request_with_headers;
+    use rustfs_credentials::Credentials as IamCredential;
+
+    const EXPIRED_STS_AK: &str = "AKIAEXPIREDSTS01";
+    const EXPIRED_STS_SK: &str = "expired-sts-secret-key-01";
+    const EXPIRED_STS_TOKEN: &str = "expired-sts-session-token-01";
+    const DISABLED_STS_AK: &str = "AKIADISABLEDSTS1";
+    const DISABLED_STS_SK: &str = "disabled-sts-secret-key-01";
+    const DISABLED_STS_TOKEN: &str = "disabled-sts-session-token-01";
+    const EXPIRED_SA_AK: &str = "AKIAEXPIREDSA001";
+    const EXPIRED_SA_SK: &str = "expired-sa-secret-key-01";
+
+    let past = time::OffsetDateTime::now_utc() - time::Duration::hours(1);
+    let mut users = std::collections::HashMap::new();
+    users.insert(
+        EXPIRED_STS_AK.to_owned(),
+        (
+            UserIdentity::new(IamCredential {
+                access_key: EXPIRED_STS_AK.to_owned(),
+                secret_key: EXPIRED_STS_SK.to_owned(),
+                session_token: EXPIRED_STS_TOKEN.to_owned(),
+                parent_user: "parent".to_owned(),
+                status: "on".to_owned(),
+                expiration: Some(past),
+                ..Default::default()
+            }),
+            false,
+        ),
+    );
+    users.insert(
+        DISABLED_STS_AK.to_owned(),
+        (
+            UserIdentity::new(IamCredential {
+                access_key: DISABLED_STS_AK.to_owned(),
+                secret_key: DISABLED_STS_SK.to_owned(),
+                session_token: DISABLED_STS_TOKEN.to_owned(),
+                parent_user: "parent".to_owned(),
+                status: "off".to_owned(),
+                expiration: Some(past),
+                ..Default::default()
+            }),
+            false,
+        ),
+    );
+    users.insert(
+        EXPIRED_SA_AK.to_owned(),
+        (
+            UserIdentity::new(IamCredential {
+                access_key: EXPIRED_SA_AK.to_owned(),
+                secret_key: EXPIRED_SA_SK.to_owned(),
+                session_token: "sa-internal-claims-token".to_owned(),
+                parent_user: "parent".to_owned(),
+                status: "on".to_owned(),
+                expiration: Some(past),
+                claims: Some([(rustfs_credentials::IAM_POLICY_CLAIM_NAME_SA.to_owned(), "inherited-policy".into())].into()),
+                ..Default::default()
+            }),
+            false,
+        ),
+    );
+
+    let assembly = assembly();
+    let server_ctx = Arc::clone(&assembly.server_ctx);
+    let stack = GatewayStack::assemble_with(
+        assembly,
+        Arc::new(TableIam { users }),
+        root().source(),
+        early_gate(OPERATIONS, server_ctx),
+    )
+    .expect("stack assembles");
+
+    let sign_with_token = |ak: &str, sk: &str, token: Option<&str>| {
+        let mut headers = HeaderMap::new();
+        if let Some(token) = token {
+            headers.insert("x-amz-security-token", token.parse().expect("token header"));
+        }
+        signed_request_with_headers(Signed::Header, Method::GET, "/", "", ak, sk, headers)
+    };
+
+    // Holder proves possession with matching secret and token -> 400 ExpiredToken.
+    let (status, _, body) =
+        answer_request(&stack, sign_with_token(EXPIRED_STS_AK, EXPIRED_STS_SK, Some(EXPIRED_STS_TOKEN))).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert!(body.contains("<Code>ExpiredToken</Code>"), "{body}");
+    assert!(!body.contains("InvalidAccessKeyId"), "{body}");
+
+    // Wrong secret, wrong token, or missing token must never leak ExpiredToken -> 403.
+    for (label, req) in [
+        (
+            "wrong secret",
+            sign_with_token(EXPIRED_STS_AK, "wrong-secret-key-01", Some(EXPIRED_STS_TOKEN)),
+        ),
+        ("wrong token", sign_with_token(EXPIRED_STS_AK, EXPIRED_STS_SK, Some("other-token"))),
+        ("missing token", sign_with_token(EXPIRED_STS_AK, EXPIRED_STS_SK, None)),
+    ] {
+        let (status, _, body) = answer_request(&stack, req).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{label}: {body}");
+        assert!(!body.contains("ExpiredToken"), "{label}: {body}");
+    }
+
+    // Disabled STS and expired service account stay disabled -> 403 InvalidAccessKeyId.
+    for (label, req) in [
+        (
+            "disabled expired STS",
+            sign_with_token(DISABLED_STS_AK, DISABLED_STS_SK, Some(DISABLED_STS_TOKEN)),
+        ),
+        ("expired service account", sign_with_token(EXPIRED_SA_AK, EXPIRED_SA_SK, None)),
+    ] {
+        let (status, _, body) = answer_request(&stack, req).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{label}: {body}");
+        assert!(body.contains("<Code>InvalidAccessKeyId</Code>"), "{label}: {body}");
+    }
+}
+
+#[tokio::test]
+async fn delete_objects_fails_auth_before_body_read_and_verifies_digests_post_auth() {
+    use crate::server::gateway_handlers::test_support::{signed_request_with_headers, signed_streaming_trailer_request};
+    use md5::Digest as _;
+    use rustfs_gateway::{Handler, HandlerResult, Req, Resp, dto};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    const DELETE_XML: &str = "<Delete><Object><Key>safe-object</Key></Object></Delete>";
+
+    struct DeleteProbe(Arc<AtomicUsize>);
+    impl Handler<dto::DeleteObjects> for DeleteProbe {
+        async fn call(&self, request: Req<dto::DeleteObjects>) -> HandlerResult<dto::DeleteObjects> {
+            let keys: Vec<_> = request
+                .resources()
+                .resolve_objects(request.read_proof())
+                .expect("DeleteObjects resources")
+                .map(|object| object.key.as_str())
+                .collect();
+            assert_eq!(keys, ["safe-object"]);
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Ok(Resp::new(dto::DeleteObjectsOutput::default()))
+        }
+    }
+
+    let calls = Arc::new(AtomicUsize::new(0));
+    let assembly = assembly();
+    let builder = GatewayStack::configured_builder(
+        &assembly,
+        Arc::new(ScriptedIam { ready: true }),
+        root().source(),
+        decide_with(|_| Decision::Allow),
+        std::convert::identity,
+    )
+    .expect("configured builder");
+    let stack = GatewayStack {
+        service: builder
+            .register::<dto::DeleteObjects, _>(Arc::new(DeleteProbe(Arc::clone(&calls))))
+            .build()
+            .expect("delete probe stack"),
+        keystone_auth: None,
+        control_plane: false,
+        object_lambda_fallback: None,
+    };
+
+    // 1. Unauthenticated / wrongly-signed POST /bucket?delete fails auth before polling a byte.
+    let polled = Arc::new(AtomicUsize::new(0));
+    let dropped = Arc::new(AtomicBool::new(false));
+    let bad_auth_req = signed_with_a_wrong_signature(request(Method::POST, "/bucket?delete"), ROOT_ACCESS_KEY)
+        .header(http::header::CONTENT_LENGTH, 20 * 1024 * 1024)
+        .header("content-md5", "not-valid-base64")
+        .body(CountingStalledBody {
+            polled: Arc::clone(&polled),
+            dropped: Arc::clone(&dropped),
+        })
+        .expect("bad auth delete request");
+    let response = stack.call(bad_auth_req).await;
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    assert_eq!(polled.load(Ordering::SeqCst), 0, "auth refusal must not read body bytes");
+    assert!(dropped.load(Ordering::SeqCst), "unread body must be released on auth refusal");
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+
+    // 2. Signed aws-chunked + x-amz-trailer DeleteObjects reaches gateway post-auth trailer
+    // verification (no pre-auth MissingContentMD5 from ControlBodyDigestService). A tampered
+    // trailer is rejected post-auth with 400 BadDigest; a valid trailer passes trailer checking
+    // and currently hits gateway's rustfs_profile() refuse_unsized_buffered_bodies_as_legacy_rustfs
+    // gate (400 IncompleteBody) until gateway drops that switch from rustfs_profile().
+    let crc32 = rustfs_rio::Checksum::new_from_data(rustfs_rio::ChecksumType::CRC32, DELETE_XML.as_bytes())
+        .expect("crc32 checksum")
+        .encoded;
+    let chunked_request = |trailer_value: &str| {
+        let wire = format!(
+            "{:x}\r\n{DELETE_XML}\r\n0\r\nx-amz-checksum-crc32:{trailer_value}\r\n\r\n",
+            DELETE_XML.len()
+        );
+        let signed = signed_streaming_trailer_request(
+            Method::POST,
+            "/bucket",
+            "delete=",
+            ROOT_ACCESS_KEY,
+            ROOT_SECRET_KEY,
+            DELETE_XML.len() as u64,
+            "x-amz-checksum-crc32",
+        );
+        let wire_bytes = Bytes::from(wire);
+        let mut req = signed.map(|_| http_body_util::Full::new(wire_bytes.clone()));
+        req.headers_mut()
+            .insert(http::header::CONTENT_LENGTH, http::HeaderValue::from(wire_bytes.len()));
+        req
+    };
+
+    let tampered = stack.call(chunked_request("AAAAAA==")).await;
+    let tampered_status = tampered.status();
+    let tampered_body = tampered.into_body().collect().await.unwrap().to_bytes();
+    assert_eq!(tampered_status, StatusCode::BAD_REQUEST);
+    assert!(
+        String::from_utf8_lossy(&tampered_body).contains("<Code>BadDigest</Code>"),
+        "{}",
+        String::from_utf8_lossy(&tampered_body)
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+
+    let valid_chunked = stack.call(chunked_request(&crc32)).await;
+    let valid_chunked_status = valid_chunked.status();
+    let valid_chunked_body = valid_chunked.into_body().collect().await.unwrap().to_bytes();
+    let valid_chunked_text = String::from_utf8_lossy(&valid_chunked_body);
+    assert!(
+        !valid_chunked_text.contains("<Code>MissingContentMD5</Code>"),
+        "pre-auth ControlBodyDigestService must not reject trailer DeleteObjects: {valid_chunked_text}"
+    );
+    assert!(
+        valid_chunked_status == StatusCode::OK
+            || (valid_chunked_status == StatusCode::BAD_REQUEST && valid_chunked_text.contains("<Code>IncompleteBody</Code>")),
+        "{valid_chunked_status}: {valid_chunked_text}"
+    );
+    let baseline_calls = calls.load(Ordering::SeqCst);
+
+    // 3. Supplied Content-MD5, head x-amz-checksum-*, and SigV4 without MD5/checksum are all
+    // verified post-auth by gateway.
+    let good_md5 = base64_simd::STANDARD.encode_to_string(md5::Md5::digest(DELETE_XML.as_bytes()));
+    for (header_pair, payload, expected_status, expected_code) in [
+        (Some(("content-md5", good_md5.as_str())), DELETE_XML, StatusCode::OK, None),
+        (
+            Some(("content-md5", good_md5.as_str())),
+            "<Delete><Object><Key>evil-object</Key></Object></Delete>",
+            StatusCode::BAD_REQUEST,
+            Some("BadDigest"),
+        ),
+        (
+            Some(("content-md5", "invalid-md5")),
+            DELETE_XML,
+            StatusCode::BAD_REQUEST,
+            Some("InvalidDigest"),
+        ),
+        (Some(("x-amz-checksum-crc32", crc32.as_str())), DELETE_XML, StatusCode::OK, None),
+        (
+            Some(("x-amz-checksum-crc32", "AAAAAA==")),
+            DELETE_XML,
+            StatusCode::BAD_REQUEST,
+            Some("BadDigest"),
+        ),
+        (None, DELETE_XML, StatusCode::OK, None),
+    ] {
+        let mut headers = HeaderMap::new();
+        if let Some((name, value)) = header_pair {
+            headers.insert(name, value.parse().unwrap());
+        }
+        let signed = signed_request_with_headers(
+            Signed::Header,
+            Method::POST,
+            "/bucket",
+            "delete=",
+            ROOT_ACCESS_KEY,
+            ROOT_SECRET_KEY,
+            headers,
+        );
+        let payload_bytes = Bytes::from_static(payload.as_bytes());
+        let mut req = signed.map(|_| http_body_util::Full::new(payload_bytes.clone()));
+        req.headers_mut()
+            .insert(http::header::CONTENT_LENGTH, http::HeaderValue::from(payload_bytes.len()));
+        let resp = stack.call(req).await;
+        let status = resp.status();
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        let text = String::from_utf8_lossy(&body);
+        assert_eq!(status, expected_status, "{header_pair:?}: {text}");
+        if let Some(code) = expected_code {
+            assert!(text.contains(&format!("<Code>{code}</Code>")), "{header_pair:?}: {text}");
+        }
+    }
+    assert_eq!(calls.load(Ordering::SeqCst), baseline_calls + 3);
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn live_root_reads_strictly_from_server_context_and_ignores_global_signing_key() {
+    // Seed a weak process-global secret if not yet set in this process (in nextest each test runs
+    // in its own process, so `get_token_signing_key()` observes `"weak"`, which previously caused
+    // `RootCredentials::new` to fail with `WeakSigningKey` and return `None`).
+    let _ = rustfs_credentials::init_global_action_credentials(Some("global-weak-root".to_owned()), Some("weak".to_owned()));
+
+    // An uninstalled ServerContextSlot must never fall back to global action credentials.
+    let uninstalled = ServerContextSlot::new();
+    assert!(
+        live_root(uninstalled)().is_none(),
+        "uninstalled ServerContextSlot must not fall back to process-global action credentials"
+    );
+
+    let store = crate::app::gating_test_env::shared_gating_ecstore().await;
+    if crate::runtime_sources::current_app_context().is_none() {
+        crate::runtime_sources::install_test_app_context(Arc::clone(&store)).await;
+    }
+    let ambient = crate::runtime_sources::current_app_context().expect("ambient context");
+    let context = Arc::new(crate::runtime_sources::AppContext::new(Arc::clone(&store), ambient.iam(), ambient.kms()));
+    const SLOT_AK: &str = "slotisolatedroot";
+    const SLOT_SK: &str = "slot-isolated-root-secret";
+    assert!(context.publish_action_credentials(rustfs_credentials::Credentials {
+        access_key: SLOT_AK.to_owned(),
+        secret_key: SLOT_SK.to_owned(),
+        status: "on".to_owned(),
+        ..Default::default()
+    }));
+    let slot = ServerContextSlot::new();
+    assert!(slot.install(context));
+
+    let root = live_root(Arc::clone(&slot))()
+        .expect("live_root must stay healthy despite a weak or unrelated process-global signing key");
+    assert_eq!(root.access_key(), SLOT_AK);
+
+    // End-to-end check: a GatewayStack assembled with `live_root(slot)` verifies the slot's root
+    // secret (returning SignatureDoesNotMatch rather than 500 InternalError or InvalidAccessKeyId).
+    let assembly = GatewayAssembly {
+        server_ctx: Arc::clone(&slot),
+        root_access_key: SLOT_AK.to_owned(),
+        root_secret_key: SLOT_SK.to_owned(),
+        ..assembly()
+    };
+    let stack = GatewayStack::assemble(assembly).expect("stack assembles");
+    let (status, _, body) = answer(&stack, signed_with_a_wrong_signature(request(Method::GET, "/"), SLOT_AK)).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    assert!(body.contains("<Code>SignatureDoesNotMatch</Code>"), "{body}");
+}
+
+#[tokio::test]
+async fn upload_ceilings_admit_5_gib_framed_upload_and_refuse_above_5_gib_before_body_read() {
+    use crate::server::gateway_handlers::test_support::signed_streaming_trailer_request;
+    use rustfs_gateway::{Handler, HandlerError, HandlerResult, Req, dto};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    struct PutProbe(Arc<AtomicUsize>);
+    impl Handler<dto::PutObject> for PutProbe {
+        async fn call(&self, _request: Req<dto::PutObject>) -> HandlerResult<dto::PutObject> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            // Return an explicit sentinel error so the test verifies handler admission for a 5 GiB
+            // declared upload without materializing 5 GiB of body bytes for BodyMonitor completion.
+            Err(HandlerError::not_implemented("admitted-5gib-probe"))
+        }
+    }
+
+    let calls = Arc::new(AtomicUsize::new(0));
+    let assembly = assembly();
+    let builder = GatewayStack::configured_builder(
+        &assembly,
+        Arc::new(ScriptedIam { ready: true }),
+        root().source(),
+        decide_with(|_| Decision::Allow),
+        std::convert::identity,
+    )
+    .expect("configured builder");
+    let stack = GatewayStack {
+        service: builder
+            .register::<dto::PutObject, _>(Arc::new(PutProbe(Arc::clone(&calls))))
+            .build()
+            .expect("put probe stack"),
+        keystone_auth: None,
+        control_plane: false,
+        object_lambda_fallback: None,
+    };
+
+    let wire_limit = max_framed_upload_bytes(MAX_SINGLE_PUT_OBJECT_SIZE);
+    assert_eq!(
+        stack.service.limits().max_body_bytes,
+        wire_limit,
+        "wire limit must accommodate aws-chunked framing for a 5 GiB object"
+    );
+    assert!(stack.service.limits().max_body_bytes > MAX_SINGLE_PUT_OBJECT_SIZE);
+
+    // 1. A 5 GiB + 1 byte decoded upload is refused with 400 EntityTooLarge before body read.
+    let polled = Arc::new(AtomicUsize::new(0));
+    let dropped = Arc::new(AtomicBool::new(false));
+    let mut oversized = signed_streaming_trailer_request(
+        Method::PUT,
+        "/bucket/oversized",
+        "",
+        ROOT_ACCESS_KEY,
+        ROOT_SECRET_KEY,
+        MAX_SINGLE_PUT_OBJECT_SIZE + 1,
+        "x-amz-checksum-crc32",
+    )
+    .map(|_| CountingStalledBody {
+        polled: Arc::clone(&polled),
+        dropped: Arc::clone(&dropped),
+    });
+    oversized.headers_mut().insert(
+        http::header::CONTENT_LENGTH,
+        (MAX_SINGLE_PUT_OBJECT_SIZE + 128).to_string().parse().unwrap(),
+    );
+    let resp = stack.call(oversized).await;
+    let status = resp.status();
+    let body = resp.into_body().collect().await.unwrap().to_bytes();
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{}", String::from_utf8_lossy(&body));
+    assert!(
+        String::from_utf8_lossy(&body).contains("<Code>EntityTooLarge</Code>"),
+        "{}",
+        String::from_utf8_lossy(&body)
+    );
+    assert_eq!(polled.load(Ordering::SeqCst), 0, "oversized upload must fail before reading body");
+    assert!(dropped.load(Ordering::SeqCst));
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+
+    // 2. A wire Content-Length above `max_framed_upload_bytes(5 GiB)` is refused before body read.
+    let wire_polled = Arc::new(AtomicUsize::new(0));
+    let wire_dropped = Arc::new(AtomicBool::new(false));
+    let mut over_wire = signed_streaming_trailer_request(
+        Method::PUT,
+        "/bucket/over-wire",
+        "",
+        ROOT_ACCESS_KEY,
+        ROOT_SECRET_KEY,
+        MAX_SINGLE_PUT_OBJECT_SIZE,
+        "x-amz-checksum-crc32",
+    )
+    .map(|_| CountingStalledBody {
+        polled: Arc::clone(&wire_polled),
+        dropped: Arc::clone(&wire_dropped),
+    });
+    over_wire
+        .headers_mut()
+        .insert(http::header::CONTENT_LENGTH, (wire_limit + 1).to_string().parse().unwrap());
+    let resp = stack.call(over_wire).await;
+    let status = resp.status();
+    let body = resp.into_body().collect().await.unwrap().to_bytes();
+    assert!(
+        matches!(status, StatusCode::BAD_REQUEST | StatusCode::PAYLOAD_TOO_LARGE),
+        "{status}: {}",
+        String::from_utf8_lossy(&body)
+    );
+    assert_eq!(wire_polled.load(Ordering::SeqCst), 0, "over-wire upload must fail before reading body");
+    assert!(wire_dropped.load(Ordering::SeqCst));
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+
+    // 3. A 5 GiB decoded aws-chunked upload whose framed wire Content-Length exceeds 5 GiB passes
+    // both the wire limit and object ceiling gates and reaches the handler.
+    let mut framed_5gib = signed_streaming_trailer_request(
+        Method::PUT,
+        "/bucket/five-gib",
+        "",
+        ROOT_ACCESS_KEY,
+        ROOT_SECRET_KEY,
+        MAX_SINGLE_PUT_OBJECT_SIZE,
+        "x-amz-checksum-crc32",
+    );
+    framed_5gib.headers_mut().insert(
+        http::header::CONTENT_LENGTH,
+        (MAX_SINGLE_PUT_OBJECT_SIZE + 65_536).to_string().parse().unwrap(),
+    );
+    let resp = stack.call(framed_5gib).await;
+    let status = resp.status();
+    let body = resp.into_body().collect().await.unwrap().to_bytes();
+    let text = String::from_utf8_lossy(&body);
+    assert_eq!(status, StatusCode::NOT_IMPLEMENTED, "{text}");
+    assert!(text.contains("admitted-5gib-probe"), "{text}");
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn assemble_initializes_s3_and_list_objects_metrics() {
+    const S3_OPS_METRIC: &str = "rustfs_s3_operations_total";
+    const LIST_OBJECTS_GATHER_TOTAL: &str = "rustfs_s3_list_objects_gather_total";
+
+    let recorder = metrics_util::debugging::DebuggingRecorder::new();
+    let snapshotter = recorder.snapshotter();
+    metrics::with_local_recorder(&recorder, || {
+        let _stack = GatewayStack::assemble(assembly()).expect("stack assembles");
+        rustfs_io_metrics::record_s3_op(rustfs_s3_ops::S3Operation::ListBuckets);
+        metrics::counter!(LIST_OBJECTS_GATHER_TOTAL).increment(1);
+    });
+    let entries = snapshotter.snapshot().into_vec();
+    let description_for = |name: &str| {
+        entries
+            .iter()
+            .find(|(key, _, _, _)| key.key().name() == name)
+            .and_then(|(_, _, desc, _)| desc.as_deref())
+            .map(str::to_owned)
+    };
+    assert!(
+        description_for(S3_OPS_METRIC).is_some(),
+        "GatewayStack::assemble must initialize S3 operation metrics"
+    );
+    assert!(
+        description_for(LIST_OBJECTS_GATHER_TOTAL).is_some(),
+        "GatewayStack::assemble must initialize ListObjects metrics"
+    );
 }

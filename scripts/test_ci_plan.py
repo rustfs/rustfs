@@ -496,10 +496,12 @@ class GateTests(unittest.TestCase):
 
     def test_plan_from_a_previous_contract_cannot_authorize_the_new_job_set(self):
         # A base planner predating the NIGHTLY_JOBS contract still emits
-        # connect-feature-boundaries as required success on a pull request. The
-        # current verifier must reject that plan instead of accepting the old
-        # responsibility, so the workflow's contract-marker fallback is the only
-        # path that can widen or narrow the required set.
+        # connect-feature-boundaries as required success on a pull request, and
+        # one that predates the rio-v2 lane removal still names
+        # test-and-lint-rio-v2. The current verifier must reject that plan
+        # instead of accepting the old responsibility, so the workflow's
+        # contract-marker fallback is the only path that can widen or narrow
+        # the required set.
         stale = self.plan()
         stale['jobs'] = dict(stale['jobs'], **{'connect-feature-boundaries': 'success',
                                               'uring-integration': 'success',
@@ -513,6 +515,29 @@ class GateTests(unittest.TestCase):
                                                 'connect': 'true', 'full_validation': 'true'}
         self.assertTrue(gate.verify_results(needs, 'pull_request', 'refs/heads/main'))
 
+    def test_retired_rio_v2_lanes_stay_out_of_the_aggregate(self):
+        retired = ("test-and-lint-rio-v2", "build-rustfs-debug-binary-rio-v2", "e2e-tests-rio-v2")
+        for event in gate.EVENTS:
+            jobs = gate.expected_results("full", event, "refs/heads/main")
+            self.assertTrue(set(retired).isdisjoint(jobs), event)
+            self.assertEqual(jobs["build-rustfs-debug-binary"], "success")
+            self.assertEqual(jobs["e2e-tests"], "success")
+            self.assertEqual(jobs["s3-implemented-tests"], "success")
+            self.assertEqual(jobs["s3-lifecycle-behavior-tests"], "success")
+            self.assertTrue(all(item["job"] not in retired and "rio-v2" not in item["features"] for item in gate.configurations(jobs)))
+        root = Path(gate.__file__).resolve().parent.parent
+        workflow = (root / ".github/workflows/ci.yml").read_text()
+        warm = (root / ".github/workflows/cache-warm.yml").read_text()
+        for name in (*retired, "warm-ci-feat-rio", "ci-feat-rio"):
+            self.assertNotIn(name, workflow)
+            self.assertNotIn(name, warm)
+        self.assertIn("\n  build-rustfs-debug-binary:\n", workflow)
+        self.assertIn("\n  e2e-tests:\n", workflow)
+        plan = self.plan("schedule")
+        needs = self.needs(plan)
+        needs["test-and-lint-rio-v2"] = {"result": "success"}
+        self.assertTrue(gate.verify_results(needs, "schedule", plan["ref"], plan["head"], plan["tree"]))
+
     def workflow(self):
         jobs = {}
         for job in gate.ALWAYS_JOBS + gate.CODE_JOBS + gate.OPTIONAL_JOBS:
@@ -523,8 +548,6 @@ class GateTests(unittest.TestCase):
                 expression = "needs.classify-changes.outputs.mode == 'full' && needs.classify-changes.outputs.connect == 'true' && contains(fromJSON('[\"schedule\",\"workflow_dispatch\"]'), github.event_name)"
             elif job in gate.NIGHTLY_JOBS:
                 expression = "needs.classify-changes.outputs.mode == 'full' && contains(fromJSON('[\"schedule\",\"workflow_dispatch\"]'), github.event_name)"
-            elif job in gate.OPTIONAL_JOBS[:2]:
-                expression = "contains(fromJSON('[\"schedule\",\"workflow_dispatch\"]'), github.event_name)"
             elif job == 'e2e-full':
                 expression = "needs.classify-changes.outputs.mode == 'full' && (github.event_name == 'merge_group' || github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && github.ref == 'refs/heads/main'))"
             elif job in gate.E2E_JOBS:
@@ -535,6 +558,8 @@ class GateTests(unittest.TestCase):
             jobs[job] = {'name': job, 'if': expression, 'steps': []}
         jobs['classify-changes']['outputs'] = {'mode': '${{ steps.scope.outputs.mode }}'}
         jobs[gate.LINT_JOB]['steps'] = [{'run': 'cargo clippy --all-targets -- -D warnings'}]
+        jobs[gate.ADVISORIES_JOB]['runs-on'] = 'ubuntu-latest'
+        jobs[gate.ADVISORIES_JOB]['steps'] = [{'run': 'python3 scripts/security/check_advisories.py --output artifacts/advisories/advisories-gate.json'}]
         jobs['workspace-tests']['needs'] = [gate.ARCHIVE_PRODUCER]
         jobs['classify-changes']['steps'] = [{'id': 'scope', 'run': f"grep -q '^plan_contract={gate.PLAN_CONTRACT}$' \"$GITHUB_OUTPUT\""}]
         jobs['test-and-lint-protocols']['strategy'] = {'matrix': {'features': [
@@ -597,8 +622,8 @@ class GateTests(unittest.TestCase):
             (lambda d: step(d['cache-warm.yml'], 'warm-ci-dev', e2e).pop('if'), 'warm-ci-dev builds after an exact cache hit'),
             (lambda d: step(d['cache-warm.yml'], 'warm-ci-dev', gate.LINT_COMMANDS[1]).update({'if': 'always()'}), 'warm-ci-dev builds after an exact cache hit'),
             (lambda d: step(d['cache-warm.yml'], 'warm-ci-uring', 'cargo build').pop('if'), 'warm-ci-uring builds after an exact cache hit'),
-            (lambda d: step(d['cache-warm.yml'], 'warm-ci-feat-rio', './.github/actions/setup').pop('id'),
-             'warm-ci-feat-rio builds after an exact cache hit'),
+            (lambda d: step(d['cache-warm.yml'], 'warm-ci-feat-proto', './.github/actions/setup').pop('id'),
+             'warm-ci-feat-proto builds after an exact cache hit'),
         ]
         warm_key = key(json.loads(original)['cache-warm.yml'], 'warm-ci-dev')['cache-shared-key']
         readers = [(workflow, job) for workflow in ('ci.yml', 'reference-parity.yml') for job, block in json.loads(original)[workflow].items()
@@ -725,6 +750,35 @@ class GateTests(unittest.TestCase):
             self.assertIn(message, self.check(changed), case)
         # The checked-in workflow satisfies the same contract.
         self.assertEqual(gate.check_workflow(Path(gate.__file__).resolve().parent.parent), [])
+
+    def test_security_advisories_lane_gates_every_event_including_docs_and_proven(self):
+        advisories = gate.ADVISORIES_JOB
+        self.assertIn(advisories, gate.ALWAYS_JOBS)
+        for event, mode in (('pull_request', 'docs'), ('pull_request', 'e2e'), ('pull_request', 'full'),
+                            ('push', 'full'), ('push', 'proven'), ('merge_group', 'full'),
+                            ('schedule', 'full'), ('workflow_dispatch', 'full')):
+            plan = self.plan(event, mode)
+            self.assertEqual(plan['jobs'][advisories], 'success', (event, mode))
+            self.assertEqual(gate.verify_results(self.needs(plan), event, plan['ref']), [])
+            for bad in ('failure', 'cancelled', 'skipped', None):
+                needs = self.needs(plan)
+                needs[advisories]['result'] = bad
+                errors = gate.verify_results(needs, event, plan['ref'])
+                self.assertTrue(any(error.startswith(f'{advisories}: expected success') for error in errors), (event, mode, bad, errors))
+        workflow = self.workflow()
+        self.assertEqual(self.check(workflow), [])
+        for case, (mutate, message) in enumerate((
+            (lambda w: w['jobs']['required-checks']['needs'].remove(advisories), 'required-checks must directly depend on every verification job exactly once'),
+            (lambda w: w['jobs'][advisories].update({'runs-on': 'sm-standard-4'}), f'{advisories} must run on ubuntu-latest'),
+            (lambda w: w['jobs'][advisories].update({'steps': []}), f'{advisories} must unconditionally run {gate.ADVISORIES_COMMAND}'),
+            (lambda w: w['jobs'][advisories]['steps'][0].update({'if': "github.event_name != 'pull_request'"}), f'{advisories} must unconditionally run {gate.ADVISORIES_COMMAND}'),
+            (lambda w: w['jobs'][advisories]['steps'][0].update({'run': f'{gate.ADVISORIES_COMMAND} || true'}), f'{advisories} must not mask failures or override the CI clock'),
+            (lambda w: w['jobs'][advisories]['steps'][0].update({'run': f'{gate.ADVISORIES_COMMAND} --now 2026-01-01T00:00:00Z'}), f'{advisories} must not mask failures or override the CI clock'),
+            (lambda w: w['jobs'][advisories].update({'continue-on-error': 'true'}), f'{advisories} cannot convert a validation failure into success'),
+        )):
+            changed = copy.deepcopy(workflow)
+            mutate(changed)
+            self.assertIn(message, self.check(changed), case)
 
     def test_semantic_yaml_equivalence_and_wiring_boundaries(self):
         workflow = self.workflow()

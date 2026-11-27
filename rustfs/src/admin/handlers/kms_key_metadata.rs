@@ -329,7 +329,7 @@ async fn handle_metadata_request(
             owner,
             false,
             actions,
-            req.policy_source_addr(),
+            req.envelope(),
             scoped.as_deref().unwrap_or_default(),
         )
         .await,

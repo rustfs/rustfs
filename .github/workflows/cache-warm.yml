@@ -197,43 +197,6 @@ jobs:
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
 
-  # Readers: test-and-lint-m-compatible (nightly schedule, merge group, dispatch),
-  # build-rustfs-debug-binary-m-compatible (nightly schedule / manual dispatch only —
-  # dormant m-compatible variant, see rustfs/backlog#1835 and
-  # docs/architecture/minio-file-format-compat.md).
-  # The second build below stays despite the reduced cadence: it warms the
-  # m-compatible,e2e-test-hooks feature resolution the scheduled build restores,
-  # which keeps that lane inside its 30-minute timeout.
-  warm-ci-feat-rio:
-    name: Warm ci-feat-rio
-    runs-on: sm-standard-4
-    timeout-minutes: 120
-    env:
-      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7
-        with:
-          persist-credentials: false
-
-      - name: Setup Rust environment
-        id: setup
-        uses: ./.github/actions/setup
-        with:
-          rust-version: stable
-          cache-shared-key: ci-feat-rio
-          cache-save-if: 'true'
-          install-build-packaging-tools: 'false'
-
-      - name: Build ci-feat-rio superset
-        if: steps.setup.outputs.cache-hit != 'true'
-        env:
-          # --all-targets links the same test binaries as the reader lane.
-          CARGO_BUILD_JOBS: "2"
-        run: |
-          cargo build -p rustfs -p rustfs-ecstore -p rustfs-sse --all-targets --features m-compatible
-          cargo build -p rustfs --bins --features m-compatible,e2e-test-hooks
-
   # Readers: the swift and sftp legs of test-and-lint-protocols. Built in
   # sequence rather than as `--features swift,sftp`, which is a combination no
   # lane actually compiles; running both leaves the union in target/.

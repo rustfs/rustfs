@@ -15,7 +15,7 @@
 //! Tests of what only an `m-compatible` build compiles.
 
 use super::*;
-use crate::object_api::readers::layout::{DARE_PACKAGE_SIZE, DARE_PAYLOAD_SIZE};
+use crate::object_api::readers::layout::{DARE_PACKAGE_SIZE, DARE_PAYLOAD_SIZE, get_encrypted_compressed_offsets};
 
 #[tokio::test]
 async fn test_ranged_decompress_reader_with_rio_v2_s2_stream() {
@@ -105,7 +105,8 @@ async fn test_read_plan_accepts_minio_headerless_compression_index() {
     assert!(compressed_offset > 0);
     assert_eq!(uncompressed_offset, range.start);
 
-    let (physical_offset, decompressed_skip, _, _, _) = get_compressed_offsets(&object_info, range.start);
+    let (physical_offset, _, decompressed_skip) =
+        compressed_storage_window(&object_info, range.start as usize, 10).expect("indexed range");
     assert!(physical_offset > 0);
     assert_eq!(decompressed_skip, 0);
 
@@ -113,13 +114,13 @@ async fn test_read_plan_accepts_minio_headerless_compression_index() {
         .await
         .expect("MinIO headerless compression index should be decoded");
 
-    assert_eq!(plan.storage_offset as i64, physical_offset);
+    assert_eq!(plan.storage_offset, physical_offset);
     assert_eq!(plan.storage_length, object_info.size - plan.storage_offset as i64);
     assert_eq!(plan.object_size, 10);
 }
 
 #[test]
-fn test_get_compressed_offsets_aligns_encrypted_ranges_to_dare_packages() {
+fn test_get_encrypted_compressed_offsets_aligns_encrypted_ranges_to_dare_packages() {
     let mut index = Index::new();
     index.add(0, 0).unwrap();
     index.add(200_000, 2_097_152).unwrap();
@@ -153,7 +154,7 @@ fn test_get_compressed_offsets_aligns_encrypted_ranges_to_dare_packages() {
     };
 
     let (physical_offset, decompressed_skip, first_part_idx, decrypt_skip, seq_num) =
-        get_compressed_offsets(&object_info, 2_097_152);
+        get_encrypted_compressed_offsets(&object_info, 2_097_152);
 
     assert_eq!(first_part_idx, 0);
     assert_eq!(physical_offset, (expected_comp_off / DARE_PAYLOAD_SIZE) * DARE_PACKAGE_SIZE);

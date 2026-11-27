@@ -15,9 +15,9 @@ import tomllib
 import unittest
 
 ROOT = Path(__file__).resolve().parent.parent
-ALWAYS_JOBS = ("classify-changes", "typos", "quick-checks")
+ALWAYS_JOBS = ("classify-changes", "typos", "quick-checks", "security-advisories")
 CODE_JOBS = (
-    "workspace-clippy", "workspace-lint-and-build", "workspace-tests", "core-contract", "connect-feature-boundaries", "fips-provider", "test-and-lint-m-compatible",
+    "workspace-clippy", "workspace-lint-and-build", "workspace-tests", "core-contract", "connect-feature-boundaries", "fips-provider",
     "test-and-lint-protocols", "build-rustfs-debug-binary", "uring-integration",
     "e2e-tests", "s3-implemented-tests", "s3-lifecycle-behavior-tests",
 )
@@ -29,12 +29,12 @@ CODE_JOBS = (
 # wall). Workspace lint and tests, the short core contract, the debug build,
 # E2E smoke and the S3 lanes stay on the pull-request path because they cover
 # the product's core correctness and S3 compatibility surface.
-NIGHTLY_JOBS = ("connect-feature-boundaries", "fips-provider", "uring-integration", "test-and-lint-m-compatible", "test-and-lint-protocols")
+NIGHTLY_JOBS = ("connect-feature-boundaries", "fips-provider", "uring-integration", "test-and-lint-protocols")
 # Bump when a plan produced by an older `select` can no longer be checked
 # against this revision's expected job contract. The workflow refuses a plan
 # that does not carry the current marker and falls back to the full matrix, so
 # a base planner predating the contract cannot authorize a narrower selection.
-PLAN_CONTRACT = "8"
+PLAN_CONTRACT = "10"
 # These jobs still exercise the server and its black-box harness when only E2E
 # Rust sources change. Production code, manifests and shared test configuration
 # always select the full matrix. No production package depends on e2e_test.
@@ -59,7 +59,9 @@ SETUP = "./.github/actions/setup"
 # The condition every cache-warm.yml build carries: Rust-cache does not save over an exact key match.
 HIT_SKIP = "steps.setup.outputs.cache-hit != 'true'"
 LINT_COMMANDS = ("cargo clippy --all-targets -- -D warnings", "python3 scripts/ci_test_artifact.py cargo lint --configuration workspace")
-OPTIONAL_JOBS = ("build-rustfs-debug-binary-m-compatible", "e2e-tests-m-compatible", "e2e-full")
+ADVISORIES_JOB = "security-advisories"
+ADVISORIES_COMMAND = "python3 scripts/security/check_advisories.py"
+OPTIONAL_JOBS = ("e2e-full",)
 NON_VALIDATION_JOBS = {"required-checks", "cancel-closed-pr-runs", "alert-on-failure"}
 
 
@@ -241,7 +243,6 @@ def expected_results(mode: str, event: str, ref: str, connect: bool = True, acti
     nightly = mode == "full" and event in ("schedule", "workflow_dispatch")
     expected.update({job: "success" if nightly else "skipped" for job in NIGHTLY_JOBS})
     expected["connect-feature-boundaries"] = "success" if nightly and connect else "skipped"
-    expected.update({job: "success" if nightly else "skipped" for job in OPTIONAL_JOBS[:2]})
     full = mode == "full" and (event in ("merge_group", "workflow_dispatch") or (event == "push" and ref == "refs/heads/main"))
     expected["e2e-full"] = "success" if full else "skipped"
     if event == "pull_request" and action == "closed":
@@ -282,15 +283,12 @@ def configurations(jobs: dict[str, str]) -> list[dict]:
         ("fips-s3-client-default", "fips-provider", "test", []),
         ("fips-provider-default", "fips-provider", "test", []),
         ("fips-provider-fips", "fips-provider", "test", ["fips"]),
-        ("m-compatible-lint", "test-and-lint-m-compatible", "dev", ["m-compatible"]),
-        ("m-compatible-tests", "test-and-lint-m-compatible", "test", ["m-compatible"]),
         ("protocol-swift-lint", "test-and-lint-protocols", "dev", ["swift"]),
         ("protocol-swift-tests", "test-and-lint-protocols", "test", ["swift"]),
         ("protocol-sftp-lint", "test-and-lint-protocols", "dev", ["sftp"]),
         ("protocol-sftp-tests", "test-and-lint-protocols", "test", ["sftp"]),
         ("protocol-http3-lint", "test-and-lint-protocols", "dev", ["http3", "swift"]),
         ("protocol-http3-tests", "test-and-lint-protocols", "test", ["http3", "swift"]),
-        ("server-m-compatible", "build-rustfs-debug-binary-m-compatible", "dev", ["e2e-test-hooks", "m-compatible"]),
     ]
     return [{"id": identity, "job": job, "target": "x86_64-unknown-linux-gnu", "profile": profile,
              "default_features": True, "features": features} for identity, job, profile, features in values if jobs[job] == "success"]
@@ -689,6 +687,22 @@ def check_plan_contract_marker(jobs: dict) -> list[str]:
     return []
 
 
+def check_advisories_lane(jobs: dict) -> list[str]:
+    """Keep security-advisories running the shared fail-closed checker without clock overrides."""
+    errors = []
+    block = jobs.get(ADVISORIES_JOB, {})
+    if block.get("runs-on") != "ubuntu-latest":
+        errors.append(f"{ADVISORIES_JOB} must run on ubuntu-latest")
+    steps = [step for step in block.get("steps", []) if ADVISORIES_COMMAND in step.get("run", "")]
+    if len(steps) != 1 or "if" in steps[0]:
+        errors.append(f"{ADVISORIES_JOB} must unconditionally run {ADVISORIES_COMMAND}")
+    else:
+        body = steps[0].get("run", "")
+        if "|| true" in body or "--now" in body or "--allow-ci-clock-override-for-test" in body:
+            errors.append(f"{ADVISORIES_JOB} must not mask failures or override the CI clock")
+    return errors
+
+
 def check_workflow(root: Path) -> list[str]:
     try:
         document = workflow_document((root / ".github/workflows/ci.yml").read_text())
@@ -724,6 +738,7 @@ def check_workflow(root: Path) -> list[str]:
                               or verifiers[0].get("shell") != "bash" or "if" in verifiers[0]):
         errors.append("required-checks must unconditionally verify actual needs and preserve its exit status")
     errors.extend(check_lint_lane(jobs))
+    errors.extend(check_advisories_lane(jobs))
     errors.extend(check_plan_contract_marker(jobs))
     matrix = jobs.get("test-and-lint-protocols", {}).get("strategy", {}).get("matrix", {})
     features = matrix.get("features", [])

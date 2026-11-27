@@ -84,8 +84,6 @@ use rustfs_protos::proto_gen::node_service::{
 };
 use rustfs_trusted_proxies::ClientInfo;
 use rustfs_utils::net::parse_and_resolve_address;
-#[cfg(test)]
-use s3s::host::MultiDomain;
 use socket2::{SockRef, TcpKeepalive};
 use std::io::{Error, Result};
 use std::net::{IpAddr, SocketAddr};
@@ -302,6 +300,23 @@ struct RpcRequestTarget {
     method: Method,
 }
 
+/// Set by `check_auth` once the caller's internode request HMAC has been verified.
+///
+/// Boot-epoch and capability response proofs are HMACs keyed with the internode RPC secret over
+/// caller-known values, so `RpcRequestPathService` only emits them when this marker is raised.
+#[derive(Clone, Debug, Default)]
+struct RpcSignatureVerified(Arc<AtomicBool>);
+
+impl RpcSignatureVerified {
+    fn mark_verified(&self) {
+        self.0.store(true, Ordering::Release);
+    }
+
+    fn is_verified(&self) -> bool {
+        self.0.load(Ordering::Acquire)
+    }
+}
+
 #[derive(Clone)]
 struct RpcRequestPathService<S> {
     inner: S,
@@ -434,22 +449,10 @@ where
             method: req.method().clone(),
         };
         req.extensions_mut().insert(target);
+        let signature_verified = RpcSignatureVerified::default();
+        req.extensions_mut().insert(signature_verified.clone());
         let msgpack_manifest_capability_requested = storage::tonic_msgpack_manifest_capability_requested(req.headers());
-        let response_headers = tonic_boot_epoch_challenge(req.headers())
-            .ok()
-            .flatten()
-            .and_then(|challenge| {
-                storage::try_current_local_node_name()
-                    .and_then(|node| normalize_tonic_rpc_audience(&node).ok())
-                    .and_then(|audience| {
-                        storage::tonic_boot_epoch_response_headers_with_msgpack_capability(
-                            &audience,
-                            challenge,
-                            msgpack_manifest_capability_requested,
-                        )
-                        .ok()
-                    })
-            });
+        let challenge = tonic_boot_epoch_challenge(req.headers()).ok().flatten();
         let future = self.inner.call(req);
         Box::pin(async move {
             let mut response = storage::with_remote_background_io(resource_context, async move {
@@ -463,6 +466,20 @@ where
                 result
             })
             .await?;
+            // Answer the challenge only after `check_auth` verified the caller's request HMAC.
+            // Unauthenticated, forged, or unrouted requests must never receive secret-keyed proofs.
+            let response_headers = challenge.filter(|_| signature_verified.is_verified()).and_then(|challenge| {
+                storage::try_current_local_node_name()
+                    .and_then(|node| normalize_tonic_rpc_audience(&node).ok())
+                    .and_then(|audience| {
+                        storage::tonic_boot_epoch_response_headers_with_msgpack_capability(
+                            &audience,
+                            challenge,
+                            msgpack_manifest_capability_requested,
+                        )
+                        .ok()
+                    })
+            });
             if let Some(headers) = response_headers {
                 response.headers_mut().extend(headers);
             }
@@ -1539,36 +1556,6 @@ impl http_body::Body for EdgeBody {
     }
 }
 
-// Validate control-plane digests before the body reaches the stack.
-// Object uploads and multipart/form-data must retain their streaming readers.
-struct ControlRequestBody(EdgeBody);
-
-impl http_body::Body for ControlRequestBody {
-    type Data = Bytes;
-    type Error = Error;
-
-    fn poll_frame(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-    ) -> Poll<Option<std::result::Result<http_body::Frame<Self::Data>, Self::Error>>> {
-        Pin::new(&mut self.0)
-            .poll_frame(cx)
-            .map(|frame| frame.map(|result| result.map_err(Error::other)))
-    }
-
-    fn is_end_stream(&self) -> bool {
-        http_body::Body::is_end_stream(&self.0)
-    }
-
-    fn size_hint(&self) -> http_body::SizeHint {
-        http_body::Body::size_hint(&self.0)
-    }
-}
-
-fn control_request_body(body: EdgeBody) -> ControlRequestBody {
-    ControlRequestBody(body)
-}
-
 #[cfg(feature = "corpus-record")]
 mod corpus;
 
@@ -1606,11 +1593,17 @@ where
 }
 
 #[derive(Clone)]
-struct NativeConsoleEdgeService(axum::Router);
+struct NativeConsoleEdgeService {
+    router: axum::Router,
+    server_ctx: Arc<ServerContextSlot>,
+}
 
 impl NativeConsoleEdgeService {
-    fn for_config(config: &config::Config) -> Option<Self> {
-        config.console_enable.then(|| Self(admin::console::make_console_server()))
+    fn for_config(config: &config::Config, server_ctx: Arc<ServerContextSlot>) -> Option<Self> {
+        config.console_enable.then(|| Self {
+            router: admin::console::make_console_server(),
+            server_ctx,
+        })
     }
 }
 
@@ -1628,7 +1621,9 @@ where
     }
 
     fn call(&mut self, request: HttpRequest<B>) -> Self::Future {
-        let answer = self.0.call(request.map(axum::body::Body::new));
+        let mut request = request.map(axum::body::Body::new);
+        request.extensions_mut().insert(Arc::clone(&self.server_ctx));
+        let answer = self.router.call(request);
         Box::pin(async move {
             let response = match answer.await {
                 Ok(response) => response,
@@ -1685,8 +1680,9 @@ fn assemble_s3_stack(
     website: Option<crate::app::website::WebsiteHost>,
     assembly: GatewayAssembly,
 ) -> Result<S3EdgeService> {
+    let server_ctx = Arc::clone(&assembly.server_ctx);
     let native_admin = GatewayEdgeService(GatewayStack::assemble_admin(assembly.clone()).map_err(Error::other)?);
-    let router = admin::make_admin_router(config.console_enable, Arc::clone(&assembly.server_ctx))?;
+    let router = admin::make_admin_router(config.console_enable, Arc::clone(&server_ctx))?;
     let control_plane =
         GatewayEdgeService(GatewayStack::assemble_control_plane(assembly.clone(), Arc::new(router)).map_err(Error::other)?);
     let reserved_console = (!config.console_enable)
@@ -1707,221 +1703,35 @@ fn assemble_s3_stack(
         )
     };
     Ok(S3StackService::new(s3)
-        .with_native_console(NativeConsoleEdgeService::for_config(config))
+        .with_native_console(NativeConsoleEdgeService::for_config(config, server_ctx))
         .with_reserved_console(reserved_console)
         .with_native_website(NativeWebsiteEdgeService::claiming(website))
         .with_native_admin(Some(native_admin))
         .with_control_plane(Some(control_plane)))
 }
 
+/// Restricts dedicated console listeners to control-plane routes without reading or buffering any
+/// request body. S3 request integrity and digest checks are enforced post-auth by `rustfs-gateway`
+/// (and post-auth SigV2 `Content-MD5` admission in `gateway_handlers::access`).
 #[derive(Clone)]
-struct ControlBodyDigestService<S> {
+struct ConsoleListenerRouteService<S> {
     inner: S,
     console_listener: bool,
-    idle_timeout: Duration,
-    total_timeout: Duration,
-    max_body_size: usize,
-    virtual_host: Option<Arc<LegacyRustfsVirtualHosts>>,
 }
 
-/// The largest control-plane XML body read for digest validation: 20 MiB, the XML body limit
-/// the legacy s3s edge applied.
-const CONTROL_BODY_MAX_BYTES: usize = 20 * 1024 * 1024;
-
-impl<S> ControlBodyDigestService<S> {
-    fn new(inner: S, idle_timeout: Duration) -> Self {
-        Self {
-            inner,
-            console_listener: false,
-            idle_timeout,
-            total_timeout: Duration::from_secs(30),
-            max_body_size: CONTROL_BODY_MAX_BYTES,
-            virtual_host: None,
-        }
-    }
-
-    fn with_console_listener(mut self, enabled: bool) -> Self {
-        self.console_listener = enabled;
-        self
-    }
-
-    fn with_virtual_host_domains(mut self, domains: Arc<[String]>) -> Self {
-        if !domains.is_empty() {
-            // Startup already validated this same domain set for S3Service.
-            self.virtual_host = Some(Arc::new(
-                LegacyRustfsVirtualHosts::new(domains.iter()).expect("validated S3 host domains"),
-            ));
-        }
-        self
+impl<S> ConsoleListenerRouteService<S> {
+    fn new(inner: S, console_listener: bool) -> Self {
+        Self { inner, console_listener }
     }
 }
 
-fn control_body_digest_required<B>(request: &HttpRequest<B>, virtual_host: Option<&LegacyRustfsVirtualHosts>) -> Option<bool> {
-    let query = url::form_urlencoded::parse(request.uri().query().unwrap_or_default().as_bytes());
-    // Match s3s' multipart POST precedence, including its unique-header rule.
-    if request.method() == Method::POST
-        && request.headers().get_all("content-type").iter().count() == 1
-        && request
-            .headers()
-            .get("content-type")
-            .and_then(|value| value.to_str().ok())
-            .and_then(|value| value.parse::<mime_guess::Mime>().ok())
-            .is_some_and(|mime| mime.type_() == mime_guess::mime::MULTIPART && mime.subtype() == mime_guess::mime::FORM_DATA)
-    {
-        return None;
-    }
-    let mut operation_ids = query.filter(|(key, _)| key == "x-id");
-    let operation_id = operation_ids.next().map(|(_, value)| value);
-    // s3s rejects duplicate declarations and treats a unique x-id as authoritative.
-    if operation_ids.next().is_some() {
-        return None;
-    }
-    if request.method() == Method::POST {
-        let decoded_path = urlencoding::decode(request.uri().path()).ok()?;
-        use rustfs_gateway_types::{LegacyRustfsNameValidator, NameValidator};
-        // This middleware selects Host first, with an authority fallback on HTTP/2 and HTTP/3.
-        let mut host_values = request.headers().get_all("host").iter();
-        let host = host_values.next().and_then(|value| value.to_str().ok()).or_else(|| {
-            matches!(request.version(), Version::HTTP_2 | Version::HTTP_3)
-                .then(|| request.uri().authority().map(|value| value.as_str()))
-                .flatten()
-        });
-        if host_values.next().is_some() {
-            return None;
-        }
-        let virtual_bucket = match (virtual_host, host) {
-            (Some(parser), Some(host)) => parser.bucket_for_host_header(host).ok()?,
-            _ => None,
-        };
-        let path = decoded_path.strip_prefix('/')?;
-        let is_bucket = if virtual_bucket.is_some() {
-            path.is_empty()
-        } else {
-            // A path-style bucket can end in one slash. Any remaining slash denotes an object.
-            let bucket = path.strip_suffix('/').unwrap_or(path);
-            LegacyRustfsNameValidator.check_bucket(bucket).into_result().is_ok()
-        };
-        if !is_bucket {
-            return None;
-        }
-        let delete_objects = match operation_id.as_deref() {
-            Some("DeleteObjects") => true,
-            Some(_) => false,
-            None => {
-                // These bucket POST routes precede DeleteObjects in s3s' router.
-                query.clone().any(|(key, _)| key == "delete")
-                    && !query
-                        .clone()
-                        .any(|(key, _)| matches!(key.as_ref(), "metadataConfiguration" | "metadataTable"))
-            }
-        };
-        return delete_objects.then_some(true);
-    }
-    if request.method() == Method::PUT
-        && operation_id
-            .as_deref()
-            .is_some_and(|operation| matches!(operation, "PutObject" | "UploadPart"))
-    {
-        return None;
-    }
-    // Other configuration APIs keep their optional-MD5 contract for SigV4,
-    // whose payload hash binds the body. A supplied MD5 must match, and a
-    // SigV2 request (which signs no body) must supply one.
-    if request.method() == Method::PUT
-        && query.clone().any(|(key, value)| {
-            (key == "x-id" && value.starts_with("Put") && value != "PutObject")
-                || matches!(
-                    key.as_ref(),
-                    "acl"
-                        | "cors"
-                        | "lifecycle"
-                        | "logging"
-                        | "notification"
-                        | "policy"
-                        | "replication"
-                        | "requestPayment"
-                        | "tagging"
-                        | "versioning"
-                        | "website"
-                        | "object-lock"
-                        | "retention"
-                        | "legal-hold"
-                        | "ownershipControls"
-                        | "encryption"
-                        | "accelerate"
-                        | "intelligent-tiering"
-                        | "analytics"
-                        | "metrics"
-                        | "inventory"
-                        | "publicAccessBlock"
-                )
-        })
-    {
-        return Some(false);
-    }
-    None
-}
-
-fn control_body_digest_error<R: From<Bytes>>(code: &'static str) -> Response<R> {
-    // Only static protocol error codes reach this function; never reflect headers or bodies.
-    let xml = format!("<?xml version=\"1.0\" encoding=\"UTF-8\"?><Error><Code>{code}</Code><Message>{code}</Message></Error>");
-    let length = xml.len();
-    let mut response = Response::new(R::from(Bytes::from(xml)));
-    *response.status_mut() = http::StatusCode::BAD_REQUEST;
-    response
-        .headers_mut()
-        .insert("content-type", HeaderValue::from_static("application/xml"));
-    response.headers_mut().insert("content-length", HeaderValue::from(length));
-    response
-}
-
-fn control_body_checksum_headers() -> impl Iterator<Item = (&'static str, rustfs_rio::ChecksumType)> {
-    rustfs_rio::BASE_CHECKSUM_TYPES
-        .iter()
-        .filter_map(|&kind| kind.key().map(|name| (name, kind)))
-}
-
-fn verify_control_body_digest(headers: &HeaderMap, bytes: &[u8]) -> std::result::Result<(), &'static str> {
-    use md5::Digest;
-    if let Some(expected) = headers.get("content-md5") {
-        if headers.get_all("content-md5").iter().count() != 1 {
-            return Err("InvalidDigest");
-        }
-        let expected = base64_simd::STANDARD
-            .decode_to_vec(expected.as_bytes())
-            .map_err(|_| "InvalidDigest")?;
-        if expected.len() != 16 {
-            return Err("InvalidDigest");
-        }
-        if md5::Md5::digest(bytes).as_slice() != expected.as_slice() {
-            return Err("BadDigest");
-        }
-    }
-    for (name, kind) in control_body_checksum_headers() {
-        let mut values = headers.get_all(name).iter();
-        let Some(expected) = values.next() else {
-            continue;
-        };
-        if values.next().is_some() {
-            return Err("BadDigest");
-        }
-        let computed = rustfs_rio::Checksum::new_from_data(kind, bytes).ok_or("BadDigest")?;
-        if expected.as_bytes() != computed.encoded.as_bytes() {
-            return Err("BadDigest");
-        }
-    }
-    Ok(())
-}
-
-impl<S, B, R> Service<HttpRequest<B>> for ControlBodyDigestService<S>
+impl<S, B, R> Service<HttpRequest<B>> for ConsoleListenerRouteService<S>
 where
-    S: Service<HttpRequest<ControlRequestBody>, Response = Response<R>> + Clone + Send + 'static,
+    S: Service<HttpRequest<B>, Response = Response<R>> + Clone + Send + 'static,
     S::Future: Send + 'static,
     S::Error: Send + 'static,
-    B: http_body::Body<Data = Bytes> + Send + 'static,
-    B::Error: Send + Sync + 'static,
-    Box<dyn std::error::Error + Send + Sync>: From<B::Error>,
-    R: From<Bytes> + Default + Send + 'static,
+    B: Send + 'static,
+    R: Default + Send + 'static,
 {
     type Response = Response<R>;
     type Error = S::Error;
@@ -1932,96 +1742,12 @@ where
     }
 
     fn call(&mut self, request: HttpRequest<B>) -> Self::Future {
-        use http_body_util::BodyExt;
         if self.console_listener && !admin::router::console_listener_route(request.method(), request.uri(), request.headers()) {
             let mut response = Response::new(R::default());
             *response.status_mut() = http::StatusCode::NOT_FOUND;
             return Box::pin(async move { Ok(response) });
         }
-        let clone = self.inner.clone();
-        let mut inner = std::mem::replace(&mut self.inner, clone);
-        let required = control_body_digest_required(&request, self.virtual_host.as_deref());
-        let idle_timeout = self.idle_timeout;
-        let total_timeout = self.total_timeout;
-        let limit = self.max_body_size;
-        Box::pin(async move {
-            let mut request = request.map(EdgeBody::new);
-            let Some(required) = required else {
-                return inner.call(request.map(control_request_body)).await;
-            };
-            let headers = request.headers();
-            let sig_v2 = headers
-                .get("authorization")
-                .is_some_and(|value| value.as_bytes().starts_with(b"AWS "))
-                || url::form_urlencoded::parse(request.uri().query().unwrap_or_default().as_bytes())
-                    .any(|(key, _)| key == "AWSAccessKeyId");
-            let has_checksum = control_body_checksum_headers().any(|(name, _)| headers.contains_key(name));
-            let has_md5 = headers.contains_key("content-md5");
-            if required && !has_md5 && (sig_v2 || !has_checksum) {
-                return Ok(control_body_digest_error("MissingContentMD5"));
-            }
-            if !required && !has_md5 {
-                // SigV2 signs no body: a configuration PUT without a digest
-                // could be replayed with another body. A declared empty body
-                // (a canned-ACL PUT, for example) has nothing to replay.
-                let declared_empty = headers
-                    .get("content-length")
-                    .and_then(|value| value.to_str().ok())
-                    .is_some_and(|value| value.trim() == "0");
-                if sig_v2 && !declared_empty {
-                    return Ok(control_body_digest_error("MissingContentMD5"));
-                }
-                return inner.call(request.map(control_request_body)).await;
-            }
-            if headers
-                .get("content-length")
-                .and_then(|value| value.to_str().ok())
-                .and_then(|value| value.parse::<u64>().ok())
-                .is_some_and(|length| length > limit as u64)
-            {
-                return Ok(control_body_digest_error("EntityTooLarge"));
-            }
-            let deadline = tokio::time::Instant::now() + total_timeout;
-            let collected = tokio::time::timeout_at(deadline, async {
-                let mut bytes = bytes::BytesMut::new();
-                loop {
-                    // Zero disables inactivity detection, as everywhere else this knob is read.
-                    let next_frame = request.body_mut().frame();
-                    let frame = if idle_timeout.is_zero() {
-                        next_frame.await
-                    } else {
-                        tokio::time::timeout(idle_timeout, next_frame)
-                            .await
-                            .map_err(|_| "RequestTimeout")?
-                    };
-                    let Some(frame) = frame else {
-                        break;
-                    };
-                    if tokio::time::Instant::now() >= deadline {
-                        return Err("RequestTimeout");
-                    }
-                    let frame = frame.map_err(|_| "IncompleteBody")?;
-                    if let Ok(data) = frame.into_data() {
-                        if data.len() > limit.saturating_sub(bytes.len()) {
-                            return Err("EntityTooLarge");
-                        }
-                        bytes.extend_from_slice(&data);
-                    }
-                }
-                Ok(bytes.freeze())
-            })
-            .await
-            .unwrap_or(Err("RequestTimeout"));
-            let bytes = match collected {
-                Ok(bytes) => bytes,
-                Err(code) => return Ok(control_body_digest_error(code)),
-            };
-            if let Err(code) = verify_control_body_digest(request.headers(), &bytes) {
-                return Ok(control_body_digest_error(code));
-            }
-            *request.body_mut() = EdgeBody::from(bytes);
-            inner.call(request.map(control_request_body)).await
-        })
+        Box::pin(self.inner.call(request))
     }
 }
 
@@ -2680,8 +2406,7 @@ async fn start_http_server_inner(
         let make_service = move |peer_addr: SocketAddr| -> Http3ExternalService {
             let remote_addr = RemoteAddr(peer_addr);
 
-            let service = ControlBodyDigestService::new(h3_s3_service.clone(), http_request_body_read_timeout)
-                .with_virtual_host_domains(h3_vh_domain_hosts.clone());
+            let service = h3_s3_service.clone();
             #[cfg(feature = "swift")]
             let service = SwiftService::new(true, None, service);
             let service = EarlyResponseBodyService::new(service, http_request_body_read_timeout);
@@ -3293,9 +3018,7 @@ fn process_connection(
                 .prepare(),
         );
 
-        let http_service = ControlBodyDigestService::new(s3_service, request_body_idle_timeout)
-            .with_console_listener(is_console)
-            .with_virtual_host_domains(vh_domain_hosts.clone());
+        let http_service = ConsoleListenerRouteService::new(s3_service, is_console);
         #[cfg(feature = "swift")]
         let http_service = SwiftService::new(!is_console, None, http_service);
         let http_service =
@@ -3636,6 +3359,34 @@ fn hyper_body_write_close_kind(debug: &str) -> Option<&'static str> {
     }
 }
 
+fn mark_rpc_signature_verified(req: &Request<()>) {
+    if let Some(verified) = req.extensions().get::<RpcSignatureVerified>() {
+        verified.mark_verified();
+    }
+}
+
+/// Whether an error from `verify_tonic_rpc_signature_with_bootstrap` was raised only after the
+/// caller's request HMAC verified.
+///
+/// Only post-HMAC rejections may receive secret-keyed boot-epoch and capability proofs so cluster
+/// restart recovery, strict replay-scope bootstrap, and replay-cache overload retries keep working
+/// without emitting secret-keyed proofs to unauthenticated callers.
+fn rpc_auth_failure_verified_signature(error: &std::io::Error, failure_reason: &str) -> bool {
+    storage::rpc_auth_is_resource_exhausted(error)
+        || matches!(
+            failure_reason,
+            "stale_boot_epoch"
+                | "replay_scope_required"
+                | "replay_detected"
+                | "replay_cache_capacity"
+                | "replay_cache_memory"
+                | "replay_cache_allocation"
+                | "replay_cache_unavailable"
+                | "replay_expiry_overflow"
+                | "timestamp_expired_after_clock_regression"
+        )
+}
+
 fn rpc_auth_failure_status(error: &std::io::Error) -> Status {
     if storage::rpc_auth_is_resource_exhausted(error) {
         crate::error::rpc_replay_admission_exhausted_status()
@@ -3697,6 +3448,9 @@ fn check_auth(req: Request<()>) -> std::result::Result<Request<()>, Status> {
             .map(|addr| addr.0.to_string())
             .unwrap_or_else(|| "unknown".to_string());
         let failure_reason = storage::tonic_rpc_auth_failure_reason(&e);
+        if rpc_auth_failure_verified_signature(&e, failure_reason) {
+            mark_rpc_signature_verified(&req);
+        }
         let operation = match rpc_method {
             "ReadAll" => INTERNODE_OPERATION_GRPC_READ_ALL,
             "ReadMultiple" => INTERNODE_OPERATION_GRPC_READ_MULTIPLE,
@@ -3753,6 +3507,7 @@ fn check_auth(req: Request<()>) -> std::result::Result<Request<()>, Status> {
             rejection
         }
     })?;
+    mark_rpc_signature_verified(&req);
 
     if storage::rpc_background_admission(req.metadata().as_ref())
         .map_err(|_| Status::unauthenticated("Invalid background admission request"))?
@@ -3977,8 +3732,7 @@ mod tests {
 
     use super::*;
     use crate::server::compress::RequestPathCategory;
-    use s3s::config::{S3Config, StaticConfigProvider};
-    use s3s::service::{S3Service, S3ServiceBuilder};
+    use s3s::service::S3ServiceBuilder;
 
     use crate::storage_api::server::http::ScannerScopedDirtyUsageAckEntry;
     use bytes::Bytes;
@@ -4003,545 +3757,13 @@ mod tests {
     use tower::{Layer, Service, ServiceBuilder};
     use tracing::Level;
 
-    fn rustfs_s3_config() -> S3Config {
-        let mut s3_config = S3Config::default();
-        s3_config.normalize_forward_slash_path = true;
-        s3_config.enable_sig_v2 = true;
-        s3_config.put_object_max_size = Some(rustfs_config::MAX_SINGLE_PUT_OBJECT_SIZE);
-        s3_config.sig_v4_allowed_services.push("s3tables".to_string());
-        s3_config
-    }
-
-    const DIGEST_DELETE_XML: &str = "<Delete><Object><Key>safe-object</Key></Object></Delete>";
-
-    struct DigestCheckedS3(Arc<AtomicUsize>);
-
-    #[async_trait::async_trait]
-    impl s3s::S3 for DigestCheckedS3 {
-        async fn delete_objects(
-            &self,
-            request: s3s::S3Request<s3s::dto::DeleteObjectsInput>,
-        ) -> s3s::S3Result<s3s::S3Response<s3s::dto::DeleteObjectsOutput>> {
-            assert_eq!(request.credentials.expect("authenticated request").access_key, "digest-key");
-            assert_eq!(request.input.delete.objects[0].key, "safe-object");
-            self.0.fetch_add(1, Ordering::SeqCst);
-            Ok(s3s::S3Response::new(s3s::dto::DeleteObjectsOutput::default()))
-        }
-    }
-
-    struct DigestMultipartS3(Arc<AtomicUsize>);
-
-    #[async_trait::async_trait]
-    impl s3s::S3 for DigestMultipartS3 {
-        async fn create_multipart_upload(
-            &self,
-            request: s3s::S3Request<s3s::dto::CreateMultipartUploadInput>,
-        ) -> s3s::S3Result<s3s::S3Response<s3s::dto::CreateMultipartUploadOutput>> {
-            assert_eq!(request.credentials.expect("authenticated request").access_key, "digest-key");
-            assert_eq!(request.input.bucket, "bucket");
-            assert_eq!(request.input.key, "object");
-            self.0.fetch_add(1, Ordering::SeqCst);
-            Ok(s3s::S3Response::new(s3s::dto::CreateMultipartUploadOutput::default()))
-        }
-
-        async fn complete_multipart_upload(
-            &self,
-            request: s3s::S3Request<s3s::dto::CompleteMultipartUploadInput>,
-        ) -> s3s::S3Result<s3s::S3Response<s3s::dto::CompleteMultipartUploadOutput>> {
-            assert_eq!(request.credentials.expect("authenticated request").access_key, "digest-key");
-            assert_eq!(request.input.bucket, "bucket");
-            assert_eq!(request.input.key, "object");
-            self.0.fetch_add(1, Ordering::SeqCst);
-            Ok(s3s::S3Response::new(s3s::dto::CompleteMultipartUploadOutput::default()))
-        }
-    }
-
-    fn signed_digest_route_request(uri: &str, body: &'static str, with_md5: bool, virtual_host: bool) -> HttpRequest<s3s::Body> {
-        use md5::Digest;
-        let uri: Uri = uri.parse().unwrap();
-        let mut request = HttpRequest::builder()
-            .method("POST")
-            .header("date", chrono::Utc::now().format("%a, %d %b %Y %H:%M:%S GMT").to_string())
-            .header("host", uri.authority().unwrap().as_str())
-            .uri(uri)
-            .header("content-length", body.len())
-            .header("content-type", "application/xml")
-            .body(s3s::Body::from(body.to_string()))
-            .unwrap();
-        if with_md5 {
-            request.headers_mut().insert(
-                "content-md5",
-                base64_simd::STANDARD
-                    .encode_to_string(md5::Md5::digest(body.as_bytes()))
-                    .parse()
-                    .unwrap(),
-            );
-        }
-        let wire_uri = request.uri().clone();
-        if virtual_host {
-            // The repository V2 signer currently ignores its virtual_host flag.
-            // Sign the canonical bucket-prefixed resource, then restore the wire URI.
-            let bucket = wire_uri.host().unwrap().split('.').next().unwrap();
-            let mut parts = wire_uri.clone().into_parts();
-            parts.path_and_query = Some(format!("/{bucket}{}", wire_uri.path_and_query().unwrap()).parse().unwrap());
-            *request.uri_mut() = Uri::from_parts(parts).unwrap();
-        }
-        let mut request = rustfs_signer::try_sign_v2(request, body.len() as i64, "digest-key", "digest-secret", false).unwrap();
-        *request.uri_mut() = wire_uri;
-        request
-    }
-
-    #[tokio::test]
-    async fn control_body_digest_follows_s3_multipart_routing_with_delete_query() {
-        use tower::ServiceExt;
-        let calls = Arc::new(AtomicUsize::new(0));
-        let mut builder = S3ServiceBuilder::new(DigestMultipartS3(calls.clone()));
-        builder.set_auth(s3s::auth::SimpleAuth::from_single("digest-key", "digest-secret"));
-        builder.set_config(Arc::new(StaticConfigProvider::new(Arc::new(rustfs_s3_config()))));
-        builder.set_host(MultiDomain::new(["example.com"]).unwrap());
-        let service = ControlBodyDigestService::new(builder.build(), Duration::from_secs(2))
-            .with_virtual_host_domains(vec!["example.com".to_owned()].into());
-        for virtual_host in [false, true] {
-            let base = if virtual_host {
-                "http://bucket.example.com/object"
-            } else {
-                "http://example.com/bucket/object"
-            };
-            for (query, body) in [
-                ("x-id=CreateMultipartUpload&uploads&delete", ""),
-                ("uploads&delete", ""),
-                (
-                    "x-id=CompleteMultipartUpload&uploadId=id&delete",
-                    "<CompleteMultipartUpload><Part><ETag>etag</ETag><PartNumber>1</PartNumber></Part></CompleteMultipartUpload>",
-                ),
-                (
-                    "uploadId=id&delete",
-                    "<CompleteMultipartUpload><Part><ETag>etag</ETag><PartNumber>1</PartNumber></Part></CompleteMultipartUpload>",
-                ),
-            ] {
-                let uri = format!("{base}?{query}");
-                let response = service
-                    .clone()
-                    .oneshot(signed_digest_route_request(&uri, body, false, virtual_host))
-                    .await
-                    .unwrap();
-                let status = response.status();
-                let bytes = response.into_body().collect().await.unwrap().to_bytes();
-                assert_eq!(status, StatusCode::OK, "{uri}: {}", String::from_utf8_lossy(&bytes));
-            }
-        }
-        assert_eq!(calls.load(Ordering::SeqCst), 8);
-    }
-
-    #[tokio::test]
-    async fn control_body_digest_keeps_bucket_deletes_guarded_with_multipart_query() {
-        use tower::ServiceExt;
-        let calls = Arc::new(AtomicUsize::new(0));
-        let mut builder = S3ServiceBuilder::new(DigestCheckedS3(calls.clone()));
-        builder.set_auth(s3s::auth::SimpleAuth::from_single("digest-key", "digest-secret"));
-        builder.set_config(Arc::new(StaticConfigProvider::new(Arc::new(rustfs_s3_config()))));
-        builder.set_host(MultiDomain::new(["example.com"]).unwrap());
-        let service = ControlBodyDigestService::new(builder.build(), Duration::from_secs(2))
-            .with_virtual_host_domains(vec!["example.com".to_owned()].into());
-        for virtual_host in [false, true] {
-            let base = if virtual_host {
-                "http://bucket.example.com/"
-            } else {
-                "http://example.com/bucket"
-            };
-            for query in ["delete&uploads", "delete&uploadId=id", "x-id=DeleteObjects&uploads"] {
-                let uri = format!("{base}?{query}");
-                digest_error(
-                    service
-                        .clone()
-                        .oneshot(signed_digest_route_request(&uri, DIGEST_DELETE_XML, false, virtual_host))
-                        .await
-                        .unwrap(),
-                    "MissingContentMD5",
-                )
-                .await;
-                let response = service
-                    .clone()
-                    .oneshot(signed_digest_route_request(&uri, DIGEST_DELETE_XML, true, virtual_host))
-                    .await
-                    .unwrap();
-                let status = response.status();
-                let bytes = response.into_body().collect().await.unwrap().to_bytes();
-                assert_eq!(status, StatusCode::OK, "{uri}: {}", String::from_utf8_lossy(&bytes));
-                let mut tampered = signed_digest_route_request(&uri, DIGEST_DELETE_XML, true, virtual_host);
-                *tampered.body_mut() = s3s::Body::from(DIGEST_DELETE_XML.replace("safe-object", "evil-object"));
-                digest_error(service.clone().oneshot(tampered).await.unwrap(), "BadDigest").await;
-            }
-        }
-        assert_eq!(calls.load(Ordering::SeqCst), 6);
-    }
-
-    #[tokio::test]
-    async fn control_body_digest_guards_cname_and_host_header_precedence() {
-        use tower::ServiceExt;
-        let calls = Arc::new(AtomicUsize::new(0));
-        let mut builder = S3ServiceBuilder::new(DigestCheckedS3(calls.clone()));
-        builder.set_auth(s3s::auth::SimpleAuth::from_single("digest-key", "digest-secret"));
-        builder.set_config(Arc::new(StaticConfigProvider::new(Arc::new(rustfs_s3_config()))));
-        builder.set_host(MultiDomain::new(["example.com"]).unwrap());
-        let service = ControlBodyDigestService::new(builder.build(), Duration::from_secs(2))
-            .with_virtual_host_domains(vec!["example.com".to_owned()].into());
-        for different_authority in [false, true] {
-            for md5 in [false, true] {
-                // SigV2 canonicalizes a CNAME request as /<whole-host>/.
-                let mut request = signed_digest_route_request(
-                    "http://alias.example.net/alias.example.net/?delete",
-                    DIGEST_DELETE_XML,
-                    md5,
-                    false,
-                );
-                *request.uri_mut() = if different_authority {
-                    "http://example.com/?delete"
-                } else {
-                    "http://alias.example.net/?delete"
-                }
-                .parse()
-                .unwrap();
-                let response = service.clone().oneshot(request).await.unwrap();
-                if md5 {
-                    let status = response.status();
-                    let body = response.into_body().collect().await.unwrap().to_bytes();
-                    assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
-                } else {
-                    digest_error(response, "MissingContentMD5").await;
-                }
-            }
-        }
-        assert_eq!(calls.load(Ordering::SeqCst), 2);
-    }
-
-    fn digest_checked_s3(calls: Arc<AtomicUsize>) -> ControlBodyDigestService<S3Service> {
-        let mut builder = S3ServiceBuilder::new(DigestCheckedS3(calls));
-        builder.set_auth(s3s::auth::SimpleAuth::from_single("digest-key", "digest-secret"));
-        builder.set_config(Arc::new(StaticConfigProvider::new(Arc::new(rustfs_s3_config()))));
-        ControlBodyDigestService::new(builder.build(), Duration::from_secs(2))
-    }
-
-    fn digest_v2_request(presigned: bool, md5: bool, secret: &str) -> HttpRequest<s3s::Body> {
-        digest_v2_request_at(presigned, md5, secret, "http://localhost/bucket?delete")
-    }
-
-    fn digest_v2_request_at(presigned: bool, md5: bool, secret: &str, uri: &str) -> HttpRequest<s3s::Body> {
-        use md5::Digest;
-        let signing_uri = uri.replace("%64elete", "delete");
-        let mut request = HttpRequest::builder()
-            .method("POST")
-            .header("date", chrono::Utc::now().format("%a, %d %b %Y %H:%M:%S GMT").to_string())
-            .uri(signing_uri)
-            .header("host", "localhost")
-            .header("content-type", "application/xml")
-            .header("content-length", DIGEST_DELETE_XML.len())
-            .body(s3s::Body::from(DIGEST_DELETE_XML.to_string()))
-            .unwrap();
-        if md5 {
-            request.headers_mut().insert(
-                "content-md5",
-                base64_simd::STANDARD
-                    .encode_to_string(md5::Md5::digest(DIGEST_DELETE_XML.as_bytes()))
-                    .parse()
-                    .unwrap(),
-            );
-        }
-        let mut request = if presigned {
-            let mut request = rustfs_signer::try_pre_sign_v2(request, "digest-key", secret, 60, false).unwrap();
-            // The signer leaves the final base64 query value unescaped.
-            let uri = request.uri().to_string();
-            let (prefix, signature) = uri.rsplit_once("&Signature=").unwrap();
-            let encoded = url::form_urlencoded::Serializer::new(String::new())
-                .append_pair("Signature", signature)
-                .finish();
-            *request.uri_mut() = format!("{prefix}&{encoded}").parse().unwrap();
-            request
-        } else {
-            rustfs_signer::try_sign_v2(request, DIGEST_DELETE_XML.len() as i64, "digest-key", secret, false).unwrap()
-        };
-        if uri.contains("%64elete") {
-            *request.uri_mut() = request
-                .uri()
-                .to_string()
-                .replace("?delete", "?%64elete")
-                .replace("&delete", "&%64elete")
-                .parse()
-                .unwrap();
-        }
-        request
-    }
-
-    async fn digest_error(response: Response<s3s::Body>, code: &str) {
-        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-        let bytes = response.into_body().collect().await.unwrap().to_bytes();
-        assert!(String::from_utf8_lossy(&bytes).contains(&format!("<Code>{code}</Code>")));
-    }
-
-    #[tokio::test]
-    async fn delete_objects_digest_binds_sigv2_header_and_query_bodies() {
-        use tower::ServiceExt;
-        for presigned in [false, true] {
-            let calls = Arc::new(AtomicUsize::new(0));
-            let service = digest_checked_s3(calls.clone());
-            let response = service
-                .clone()
-                .oneshot(digest_v2_request(presigned, true, "digest-secret"))
-                .await
-                .unwrap();
-            let status = response.status();
-            let body = response.into_body().collect().await.unwrap().to_bytes();
-            assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
-            assert_eq!(calls.load(Ordering::SeqCst), 1);
-
-            let mut tampered = digest_v2_request(presigned, true, "digest-secret");
-            *tampered.body_mut() = s3s::Body::from(DIGEST_DELETE_XML.replace("safe-object", "evil-object"));
-            digest_error(service.clone().oneshot(tampered).await.unwrap(), "BadDigest").await;
-            digest_error(
-                service
-                    .clone()
-                    .oneshot(digest_v2_request(presigned, false, "digest-secret"))
-                    .await
-                    .unwrap(),
-                "MissingContentMD5",
-            )
-            .await;
-            let mut checksum_only = digest_v2_request(presigned, false, "digest-secret");
-            checksum_only
-                .headers_mut()
-                .insert("x-amz-checksum-sha256", HeaderValue::from_static("placeholder"));
-            digest_error(service.clone().oneshot(checksum_only).await.unwrap(), "MissingContentMD5").await;
-
-            let mut malformed = digest_v2_request(presigned, true, "digest-secret");
-            malformed
-                .headers_mut()
-                .insert("content-md5", HeaderValue::from_static("invalid"));
-            digest_error(service.clone().oneshot(malformed).await.unwrap(), "InvalidDigest").await;
-            let response = service
-                .oneshot(digest_v2_request(presigned, true, "wrong-secret"))
-                .await
-                .unwrap();
-            assert_eq!(
-                response.status(),
-                StatusCode::FORBIDDEN,
-                "digest verification must not replace authentication"
-            );
-            assert_eq!(calls.load(Ordering::SeqCst), 1, "only the original authenticated XML may dispatch");
-        }
-    }
-
-    #[tokio::test]
-    async fn delete_objects_digest_covers_operation_id_and_encoded_query_routes() {
-        use tower::ServiceExt;
-        for uri in [
-            "http://localhost/bucket?x-id=DeleteObjects",
-            "http://localhost/bucket?%64elete",
-        ] {
-            for presigned in [false, true] {
-                let calls = Arc::new(AtomicUsize::new(0));
-                let service = digest_checked_s3(calls.clone());
-                let request = digest_v2_request_at(presigned, true, "digest-secret", uri);
-                let response = service.clone().oneshot(request).await.unwrap();
-                let status = response.status();
-                let body = response.into_body().collect().await.unwrap().to_bytes();
-                assert_eq!(status, StatusCode::OK, "{uri}: {}", String::from_utf8_lossy(&body));
-                let mut request = digest_v2_request_at(presigned, true, "digest-secret", uri);
-                *request.body_mut() = s3s::Body::from(DIGEST_DELETE_XML.replace("safe-object", "evil-object"));
-                digest_error(service.clone().oneshot(request).await.unwrap(), "BadDigest").await;
-                digest_error(
-                    service
-                        .oneshot(digest_v2_request_at(presigned, false, "digest-secret", uri))
-                        .await
-                        .unwrap(),
-                    "MissingContentMD5",
-                )
-                .await;
-                assert_eq!(calls.load(Ordering::SeqCst), 1);
-            }
-        }
-    }
-
-    #[test]
-    fn control_body_checksums_match_wire_values_for_all_algorithms() {
-        let body = b"123456789";
-        let vectors = [
-            ("x-amz-checksum-crc32", "y/Q5Jg=="),
-            ("x-amz-checksum-crc32c", "4waSgw=="),
-            ("x-amz-checksum-crc64nvme", "rosUhgp5mIg="),
-            ("x-amz-checksum-sha1", "98O8HYCOBHMq32eZZczDTKeuNEE="),
-            ("x-amz-checksum-sha256", "FeKw08M4keuw8e9gnsQZQgwg4yDOlMZfvIwzEkSOsiU="),
-            (
-                "x-amz-checksum-sha512",
-                "2eZ2LdHI6vbWGzxhkvxAjU1tXxF20MKRabwk5xw/J0rSf81YEbMT1oH35V7ALXPUmclUVba1u1A6z1dPuo/+hQ==",
-            ),
-            ("x-amz-checksum-xxhash64", "jLhB20DmroM="),
-            ("x-amz-checksum-xxhash3", "ctyxi2ehff8="),
-            ("x-amz-checksum-xxhash128", "MxGUd+3l3NXpcWQnaB1YYA=="),
-            ("x-amz-checksum-md5", "JfnnlDI7RTiF9RgfG2JNCw=="),
-        ];
-        let mut headers = HeaderMap::new();
-        for (name, value) in vectors {
-            headers.insert(name, HeaderValue::from_static(value));
-        }
-        assert_eq!(verify_control_body_digest(&headers, body), Ok(()));
-        for (name, value) in vectors {
-            headers.insert(name, HeaderValue::from_static("mismatch"));
-            assert_eq!(verify_control_body_digest(&headers, body), Err("BadDigest"), "{name}");
-            headers.insert(name, HeaderValue::from_static(value));
-            headers.append(name, HeaderValue::from_static(value));
-            assert_eq!(verify_control_body_digest(&headers, body), Err("BadDigest"), "duplicate {name}");
-            headers.insert(name, HeaderValue::from_static(value));
-        }
-    }
-
-    fn digest_v4_request(checksum: &str) -> HttpRequest<s3s::Body> {
-        use s3s_sigv4::{AmzDate, Payload, calculate_signature, create_canonical_request, create_string_to_sign};
-        let timestamp = chrono::Utc::now().format("%Y%m%dT%H%M%SZ").to_string();
-        let date = AmzDate::parse(&timestamp).unwrap();
-        let canonical = create_canonical_request(
-            "POST",
-            "/bucket",
-            &[("delete", "")],
-            [
-                ("host", "localhost"),
-                ("x-amz-checksum-sha256", checksum),
-                ("x-amz-content-sha256", "UNSIGNED-PAYLOAD"),
-                ("x-amz-date", timestamp.as_str()),
-            ],
-            Payload::Unsigned,
-        );
-        let to_sign = create_string_to_sign(&canonical, &date, "us-east-1", "s3");
-        let signature = calculate_signature(&to_sign, "digest-secret", &date, "us-east-1", "s3");
-        HttpRequest::builder().method("POST").uri("http://localhost/bucket?delete")
-            .header("host", "localhost").header("content-length", DIGEST_DELETE_XML.len())
-            .header("x-amz-checksum-sha256", checksum).header("x-amz-content-sha256", "UNSIGNED-PAYLOAD")
-            .header("x-amz-date", &timestamp)
-            .header("authorization", format!("AWS4-HMAC-SHA256 Credential=digest-key/{}/us-east-1/s3/aws4_request, SignedHeaders=host;x-amz-checksum-sha256;x-amz-content-sha256;x-amz-date, Signature={signature}", date.fmt_date()))
-            .body(s3s::Body::from(DIGEST_DELETE_XML.to_string())).unwrap()
-    }
-
-    #[tokio::test]
-    async fn delete_objects_digest_preserves_sigv4_checksum_requests() {
-        use sha2::Digest;
-        use tower::ServiceExt;
-        let checksum = base64_simd::STANDARD.encode_to_string(sha2::Sha256::digest(DIGEST_DELETE_XML.as_bytes()));
-        let calls = Arc::new(AtomicUsize::new(0));
-        let service = digest_checked_s3(calls.clone());
-        let response = service.clone().oneshot(digest_v4_request(&checksum)).await.unwrap();
-        let status = response.status();
-        let body = response.into_body().collect().await.unwrap().to_bytes();
-        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
-        let mut tampered = digest_v4_request(&checksum);
-        *tampered.body_mut() = s3s::Body::from(DIGEST_DELETE_XML.replace("safe-object", "evil-object"));
-        digest_error(service.oneshot(tampered).await.unwrap(), "BadDigest").await;
-        assert_eq!(calls.load(Ordering::SeqCst), 1);
-    }
-
-    #[tokio::test]
-    async fn control_body_digest_bounds_declared_and_undeclared_bodies() {
-        use tower::ServiceExt;
-        let calls = Arc::new(AtomicUsize::new(0));
-        let mut service = digest_checked_s3(calls.clone());
-        service.max_body_size = DIGEST_DELETE_XML.len();
-        for declared in [false, true] {
-            let mut request = digest_v2_request(false, true, "digest-secret");
-            let (sender, receiver) = mpsc::unbounded_channel();
-            let polled = Arc::new(AtomicUsize::new(0));
-            let dropped = Arc::new(AtomicBool::new(false));
-            sender.send(Bytes::from_static(DIGEST_DELETE_XML.as_bytes())).unwrap();
-            sender.send(Bytes::from_static(b" ")).unwrap();
-            if declared {
-                request
-                    .headers_mut()
-                    .insert(CONTENT_LENGTH, HeaderValue::from(DIGEST_DELETE_XML.len() + 1));
-            } else {
-                request.headers_mut().remove(CONTENT_LENGTH);
-            }
-            let request = request.map(|_| TrackedRequestBody {
-                receiver,
-                bytes_polled: polled.clone(),
-                dropped: dropped.clone(),
-            });
-            digest_error(service.clone().oneshot(request).await.unwrap(), "EntityTooLarge").await;
-            assert!(dropped.load(Ordering::SeqCst));
-            assert_eq!(polled.load(Ordering::SeqCst), if declared { 0 } else { DIGEST_DELETE_XML.len() + 1 });
-        }
-        let mut request = digest_v2_request(false, true, "digest-secret");
-        request.headers_mut().remove(CONTENT_LENGTH);
-        let (sender, receiver) = mpsc::unbounded_channel();
-        sender.send(Bytes::from_static(DIGEST_DELETE_XML.as_bytes())).unwrap();
-        drop(sender);
-        let response = service
-            .oneshot(request.map(|_| TrackedRequestBody {
-                receiver,
-                bytes_polled: Arc::default(),
-                dropped: Arc::default(),
-            }))
-            .await
-            .unwrap();
-        let status = response.status();
-        let body = response.into_body().collect().await.unwrap().to_bytes();
-        assert_eq!(status, StatusCode::LENGTH_REQUIRED, "{}", String::from_utf8_lossy(&body));
-        assert_eq!(
-            calls.load(Ordering::SeqCst),
-            0,
-            "preserve s3s' missing-length rejection after bounded collection"
-        );
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn control_body_digest_idle_total_deadlines_and_cancellation_release_body() {
-        use tower::ServiceExt;
-        for trickle in [false, true] {
-            let calls = Arc::new(AtomicUsize::new(0));
-            let mut service = digest_checked_s3(calls.clone());
-            service.total_timeout = Duration::from_secs(5);
-            let (sender, receiver) = mpsc::unbounded_channel();
-            let dropped = Arc::new(AtomicBool::new(false));
-            let request = digest_v2_request(false, true, "digest-secret").map(|_| TrackedRequestBody {
-                receiver,
-                bytes_polled: Arc::default(),
-                dropped: dropped.clone(),
-            });
-            let task = tokio::spawn(service.oneshot(request));
-            for _ in 0..6 {
-                if trickle {
-                    let _ = sender.send(Bytes::from_static(b" "));
-                }
-                tokio::task::yield_now().await;
-                tokio::time::advance(Duration::from_secs(1)).await;
-            }
-            digest_error(task.await.unwrap().unwrap(), "RequestTimeout").await;
-            assert!(dropped.load(Ordering::SeqCst));
-            assert_eq!(calls.load(Ordering::SeqCst), 0);
-        }
-        let calls = Arc::new(AtomicUsize::new(0));
-        let (_sender, receiver) = mpsc::unbounded_channel();
-        let dropped = Arc::new(AtomicBool::new(false));
-        let task = tokio::spawn(
-            digest_checked_s3(calls.clone()).oneshot(digest_v2_request(false, true, "digest-secret").map(|_| {
-                TrackedRequestBody {
-                    receiver,
-                    bytes_polled: Arc::default(),
-                    dropped: dropped.clone(),
-                }
-            })),
-        );
-        tokio::task::yield_now().await;
-        task.abort();
-        assert!(task.await.unwrap_err().is_cancelled());
-        assert!(dropped.load(Ordering::SeqCst));
-        assert_eq!(calls.load(Ordering::SeqCst), 0);
-    }
-
     #[tokio::test]
     async fn console_listener_isolates_object_routes() {
         use tower::ServiceExt;
-        let inner = tower::service_fn(|_: HttpRequest<ControlRequestBody>| async {
-            Ok::<_, Infallible>(Response::new(s3s::Body::empty()))
-        });
-        let data = ControlBodyDigestService::new(inner, Duration::from_secs(1));
-        let console = data.clone().with_console_listener(true);
+        let inner =
+            tower::service_fn(|_: HttpRequest<Empty<Bytes>>| async { Ok::<_, Infallible>(Response::new(EdgeBody::default())) });
+        let data = ConsoleListenerRouteService::new(inner, false);
+        let console = ConsoleListenerRouteService::new(inner, true);
         for (uri, expected) in [
             ("/", StatusCode::NOT_FOUND),
             ("/bucket/notes.txt", StatusCode::NOT_FOUND),
@@ -4557,7 +3779,7 @@ mod tests {
                     if signed {
                         req = req.header("authorization", "routing-test");
                     }
-                    req.body(s3s::Body::empty()).unwrap()
+                    req.body(Empty::<Bytes>::new()).unwrap()
                 };
                 assert_eq!(console.clone().oneshot(request()).await.unwrap().status(), expected, "{uri}");
                 assert_eq!(data.clone().oneshot(request()).await.unwrap().status(), StatusCode::OK, "{uri}");
@@ -4566,87 +3788,91 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn control_body_digest_preserves_streaming_uploads_and_checks_config_md5() {
+    async fn console_listener_forwards_delete_objects_without_pre_auth_body_buffering() {
         use tower::ServiceExt;
-        for (method, uri) in [
-            ("PUT", "/bucket/key"),
-            ("PUT", "/bucket/key?partNumber=1&uploadId=id"),
-            ("POST", "/bucket?uploads"),
-            ("POST", "/bucket"),
-            ("POST", "/bucket/key?uploadId=id"),
-            ("POST", "/bucket?delete"),
-            ("PUT", "/bucket/key?x-id=PutObject&tagging"),
-        ] {
-            let (_sender, receiver) = mpsc::unbounded_channel();
-            let polled = Arc::new(AtomicUsize::new(0));
-            let inner_polled = polled.clone();
-            let inner = tower::service_fn(move |_: HttpRequest<ControlRequestBody>| {
-                assert_eq!(inner_polled.load(Ordering::SeqCst), 0, "uploads must reach dispatch without buffering");
-                async { Ok::<_, Infallible>(Response::new(s3s::Body::empty())) }
-            });
-            let request = HttpRequest::builder()
-                .method(method)
-                .uri(uri)
-                .header("content-md5", "invalid")
-                .header("content-type", "multipart/form-data; boundary=upload")
-                .body(TrackedRequestBody {
-                    receiver,
-                    bytes_polled: polled,
-                    dropped: Arc::default(),
-                })
-                .unwrap();
-            let response = ControlBodyDigestService::new(inner, Duration::from_secs(1))
-                .oneshot(request)
-                .await
-                .unwrap();
-            assert_eq!(response.status(), StatusCode::OK);
-        }
-        let calls = Arc::new(AtomicUsize::new(0));
-        let inner_calls = calls.clone();
-        let inner = tower::service_fn(move |_: HttpRequest<ControlRequestBody>| {
-            inner_calls.fetch_add(1, Ordering::SeqCst);
-            async { Ok::<_, Infallible>(Response::new(s3s::Body::empty())) }
+        let (_sender, receiver) = mpsc::unbounded_channel();
+        let polled = Arc::new(AtomicUsize::new(0));
+        let inner_polled = polled.clone();
+        let inner = tower::service_fn(move |_: HttpRequest<TrackedRequestBody>| {
+            assert_eq!(
+                inner_polled.load(Ordering::SeqCst),
+                0,
+                "POST /bucket?delete must reach the gateway stack without pre-auth buffering"
+            );
+            async { Ok::<_, Infallible>(Response::new(EdgeBody::default())) }
         });
-        let service = ControlBodyDigestService::new(inner, Duration::from_secs(1));
-        // SigV2 signs no body: a configuration PUT without Content-MD5 could be
-        // replayed with any other body, so it is refused.
-        let mut request = digest_v2_request(false, false, "digest-secret");
-        *request.method_mut() = Method::PUT;
-        *request.uri_mut() = "/bucket?versioning".parse().unwrap();
-        digest_error(service.clone().oneshot(request).await.unwrap(), "MissingContentMD5").await;
-        // A SigV2 configuration PUT that declares an empty body carries nothing
-        // to replay (a canned-ACL PUT), so it needs no digest.
         let request = HttpRequest::builder()
-            .method("PUT")
-            .uri("/bucket?acl")
-            .header("authorization", "AWS digest-key:c2lnbmF0dXJl")
-            .header("x-amz-acl", "private")
-            .header("content-length", "0")
-            .body(s3s::Body::empty())
+            .method(Method::POST)
+            .uri("/bucket?delete")
+            .header("content-md5", "invalid")
+            .body(TrackedRequestBody {
+                receiver,
+                bytes_polled: polled.clone(),
+                dropped: Arc::default(),
+            })
             .unwrap();
-        assert_eq!(service.clone().oneshot(request).await.unwrap().status(), StatusCode::OK);
-        // A SigV4 configuration PUT keeps its optional-MD5 contract (the payload
-        // hash binds the body) and streams through without buffering.
-        let request = HttpRequest::builder()
-            .method("PUT")
-            .uri("/bucket?versioning")
-            .body(s3s::Body::from(String::from("<VersioningConfiguration/>")))
-            .unwrap();
-        assert_eq!(service.clone().oneshot(request).await.unwrap().status(), StatusCode::OK);
-        // A supplied MD5 must match on either signature version.
-        let mut request = digest_v2_request(false, true, "digest-secret");
-        *request.method_mut() = Method::PUT;
-        *request.uri_mut() = "/bucket?versioning".parse().unwrap();
-        assert_eq!(service.clone().oneshot(request).await.unwrap().status(), StatusCode::OK);
-        let request = HttpRequest::builder()
-            .method("PUT")
-            .uri("/bucket?versioning")
-            .header("content-md5", "1B2M2Y8AsgTpgAmY7PhCfg==")
-            .body(s3s::Body::from(String::from("<VersioningConfiguration/>")))
-            .unwrap();
-        digest_error(service.oneshot(request).await.unwrap(), "BadDigest").await;
-        // The declared-empty SigV2 PUT, the SigV4 PUT and the matching-MD5 PUT reached the service.
-        assert_eq!(calls.load(Ordering::SeqCst), 3);
+        let response = ConsoleListenerRouteService::new(inner, false).oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(polled.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn native_console_edge_service_injects_bound_server_context_slot() {
+        use tower::ServiceExt;
+        temp_env::async_with_vars([(rustfs_config::ENV_HEALTH_MINIMAL_RESPONSE_ENABLE, Some("false"))], async {
+            let stalled_health =
+                Arc::new(crate::app::object_traffic_health::ObjectTrafficHealth::enabled_for_test(Duration::ZERO));
+            let stalled_guard = stalled_health.track_write_storage().expect("write tracking must be enabled");
+            let stalled_ctx =
+                crate::app::gating_test_env::app_context_with_object_traffic_health(Arc::clone(&stalled_health)).await;
+            let stalled_slot = ServerContextSlot::new();
+            assert!(stalled_slot.install(stalled_ctx));
+
+            let healthy_health = Arc::new(crate::app::object_traffic_health::ObjectTrafficHealth::enabled_for_test(
+                Duration::from_secs(60),
+            ));
+            let healthy_ctx =
+                crate::app::gating_test_env::app_context_with_object_traffic_health(Arc::clone(&healthy_health)).await;
+            let healthy_slot = ServerContextSlot::new();
+            assert!(healthy_slot.install(healthy_ctx));
+
+            let mut cfg = config::Config::new("127.0.0.1:9001", Vec::new());
+            cfg.console_enable = true;
+
+            let stalled_service = NativeConsoleEdgeService::for_config(&cfg, stalled_slot).expect("console service enabled");
+            let healthy_service = NativeConsoleEdgeService::for_config(&cfg, healthy_slot).expect("console service enabled");
+
+            let readiness_req = || {
+                HttpRequest::builder()
+                    .method(Method::GET)
+                    .uri(format!("{}{}", crate::server::CONSOLE_PREFIX, crate::server::HEALTH_READY_PATH))
+                    .body(Empty::<Bytes>::new())
+                    .expect("console readiness request")
+            };
+
+            let stalled_resp = stalled_service.oneshot(readiness_req()).await.expect("stalled readiness");
+            assert_eq!(
+                stalled_resp.status(),
+                StatusCode::SERVICE_UNAVAILABLE,
+                "NativeConsoleEdgeService must inject its bound ServerContextSlot rather than falling back to global context"
+            );
+            let stalled_body = stalled_resp.into_body().collect().await.expect("body").to_bytes();
+            let stalled_json: serde_json::Value = serde_json::from_slice(&stalled_body).expect("readiness JSON");
+            assert_eq!(stalled_json["ready"], false);
+            assert_eq!(stalled_json["degradedReasons"], serde_json::json!(["object_write_stalled"]));
+
+            let healthy_resp = healthy_service.oneshot(readiness_req()).await.expect("healthy readiness");
+            let healthy_body = healthy_resp.into_body().collect().await.expect("body").to_bytes();
+            let healthy_json: serde_json::Value = serde_json::from_slice(&healthy_body).expect("readiness JSON");
+            assert_ne!(
+                healthy_json["degradedReasons"],
+                serde_json::json!(["object_write_stalled"]),
+                "distinct ServerContextSlot must not inherit another server's stalled traffic state"
+            );
+            drop(stalled_guard);
+        })
+        .await;
     }
 
     mod native_admin_tests {
@@ -6232,7 +5458,8 @@ mod tests {
             config.console_enable = enabled;
             let control_plane = counted(answering(StatusCode::ACCEPTED), calls[0].clone());
             let gateway = counted(answering(StatusCode::IM_A_TEAPOT), calls[1].clone());
-            let console = NativeConsoleEdgeService::for_config(&config).map(|service| counted(service, calls[2].clone()));
+            let console = NativeConsoleEdgeService::for_config(&config, ServerContextSlot::new())
+                .map(|service| counted(service, calls[2].clone()));
             let edge = S3StackService::new(gateway)
                 .with_native_console(console)
                 .with_control_plane(Some(control_plane));
@@ -8348,7 +7575,11 @@ mod tests {
 
     #[test]
     fn rustfs_s3_config_preserves_compatibility_over_s3s_defaults() {
-        let s3_config = rustfs_s3_config();
+        let mut s3_config = s3s::config::S3Config::default();
+        s3_config.normalize_forward_slash_path = true;
+        s3_config.enable_sig_v2 = true;
+        s3_config.put_object_max_size = Some(rustfs_config::MAX_SINGLE_PUT_OBJECT_SIZE);
+        s3_config.sig_v4_allowed_services.push("s3tables".to_string());
 
         assert!(s3_config.normalize_forward_slash_path);
         assert!(s3_config.normalize_content_length);
@@ -8591,30 +7822,40 @@ mod tests {
         let audience = "127.0.0.1:9000";
         rustfs_common::set_global_local_node_name(audience).await;
         let challenge = uuid::Uuid::new_v4();
+        let node = InterceptedService::new(NodeServiceServer::new(make_server()), check_auth);
+        let service = RpcRequestPathService::new(Routes::new(node).prepare());
 
-        let response_for = |request_capability: bool| async move {
-            let mut request = HttpRequest::builder()
-                .method(Method::POST)
-                .uri("/node_service.NodeService/Ping")
-                .body(())
-                .expect("capability request");
-            request.headers_mut().insert(
-                "x-rustfs-rpc-boot-epoch-challenge",
-                challenge.to_string().parse().expect("challenge header"),
-            );
-            if request_capability {
+        let response_for = |signed: bool, request_capability: bool| {
+            let mut service = service.clone();
+            async move {
+                let mut request = HttpRequest::builder()
+                    .method(Method::POST)
+                    .uri(format!("http://{audience}/node_service.NodeService/Ping"))
+                    .header("content-type", "application/grpc")
+                    .body(Empty::<Bytes>::new())
+                    .expect("capability request");
+                if signed {
+                    let auth = storage::gen_tonic_signature_headers(audience, "node_service.NodeService", "Ping", None)
+                        .expect("signed capability request");
+                    request.headers_mut().extend(auth);
+                }
                 request.headers_mut().insert(
-                    "x-rustfs-rpc-msgpack-manifest-request",
-                    HeaderValue::from_static("msgpack-compat-manifest-v1"),
+                    "x-rustfs-rpc-boot-epoch-challenge",
+                    challenge.to_string().parse().expect("challenge header"),
                 );
+                if request_capability {
+                    request.headers_mut().insert(
+                        "x-rustfs-rpc-msgpack-manifest-request",
+                        HeaderValue::from_static("msgpack-compat-manifest-v1"),
+                    );
+                }
+                service.call(request).await.expect("capability response")
             }
-            RpcRequestPathService::new(RpcPathObserver)
-                .call(request)
-                .await
-                .expect("capability response")
         };
 
-        let legacy = response_for(false).await;
+        let legacy = response_for(true, false).await;
+        storage::verify_tonic_boot_epoch_response(audience, challenge, legacy.headers())
+            .expect("signed legacy request must still receive boot-epoch proof");
         assert!(!legacy.headers().contains_key("x-rustfs-rpc-msgpack-manifest-capability"));
         assert!(
             !legacy
@@ -8622,7 +7863,9 @@ mod tests {
                 .contains_key("x-rustfs-rpc-msgpack-manifest-capability-proof")
         );
 
-        let capable = response_for(true).await;
+        let capable = response_for(true, true).await;
+        storage::verify_tonic_boot_epoch_response(audience, challenge, capable.headers())
+            .expect("signed capable request must receive boot-epoch proof");
         assert_eq!(
             capable
                 .headers()
@@ -8635,6 +7878,18 @@ mod tests {
                 .headers()
                 .contains_key("x-rustfs-rpc-msgpack-manifest-capability-proof")
         );
+
+        let unsigned = response_for(false, true).await;
+        for name in [
+            "x-rustfs-rpc-boot-epoch",
+            "x-rustfs-rpc-boot-epoch-proof",
+            "x-rustfs-rpc-replay-cache-capability",
+            "x-rustfs-rpc-replay-cache-capability-proof",
+            "x-rustfs-rpc-msgpack-manifest-capability",
+            "x-rustfs-rpc-msgpack-manifest-capability-proof",
+        ] {
+            assert!(!unsigned.headers().contains_key(name), "unsigned request must not receive {name}");
+        }
 
         rustfs_common::set_global_local_node_name(&previous_node_name).await;
     }
@@ -9614,6 +8869,178 @@ mod tests {
         );
     }
 
+    #[test]
+    fn rpc_auth_failure_verified_signature_classifies_post_hmac_errors_only() {
+        for error in [
+            std::io::Error::new(std::io::ErrorKind::WouldBlock, storage::RpcReplayCacheAdmissionError::Capacity),
+            std::io::Error::new(std::io::ErrorKind::WouldBlock, storage::RpcReplayCacheAdmissionError::MemoryBudget),
+            std::io::Error::new(std::io::ErrorKind::OutOfMemory, "replay cache allocation failed"),
+            std::io::Error::other("RPC boot epoch is stale"),
+            std::io::Error::other("RPC replay-scoped authentication required"),
+            std::io::Error::other("RPC request replay detected"),
+            std::io::Error::other("RPC replay cache unavailable"),
+            std::io::Error::other("RPC request timestamp expired after clock regression"),
+        ] {
+            let reason = storage::tonic_rpc_auth_failure_reason(&error);
+            assert!(
+                rpc_auth_failure_verified_signature(&error, reason),
+                "post-HMAC error ({reason}) must allow boot-epoch/capability proofs"
+            );
+        }
+
+        for error in [
+            std::io::Error::other("Missing signature header"),
+            std::io::Error::other("Invalid signature"),
+            std::io::Error::other("RPC v2 authentication required"),
+            std::io::Error::other("Invalid RPC v2 signature"),
+            std::io::Error::other("Invalid RPC replay scope signature"),
+            std::io::Error::other("Request timestamp expired"),
+            std::io::Error::other("Missing RPC boot epoch"),
+            std::io::Error::other("RPC background admission requires v2 authentication"),
+            std::io::Error::other("opaque failure"),
+        ] {
+            let reason = storage::tonic_rpc_auth_failure_reason(&error);
+            assert!(
+                !rpc_auth_failure_verified_signature(&error, reason),
+                "pre-HMAC error ({reason}) must never receive boot-epoch/capability proofs"
+            );
+        }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn rpc_boot_epoch_proof_requires_verified_request_signature() {
+        let _ = rustfs_credentials::set_global_rpc_secret("rpc-http-test-secret".to_string());
+        let previous_node_name = rustfs_common::get_global_local_node_name().await;
+        let audience = "127.0.0.1:9000";
+        let ping = "/node_service.NodeService/Ping";
+        let read_all = "/node_service.NodeService/ReadAll";
+        rustfs_common::set_global_local_node_name(audience).await;
+
+        let node = InterceptedService::new(NodeServiceServer::new(make_server()), check_auth);
+        let mut service = RpcRequestPathService::new(Routes::new(node).prepare());
+
+        let epoch_probe_challenge = uuid::Uuid::new_v4();
+        let current_epoch = storage::verify_tonic_boot_epoch_response(
+            audience,
+            epoch_probe_challenge,
+            &storage::tonic_boot_epoch_response_headers(audience, epoch_probe_challenge).expect("current epoch proof"),
+        )
+        .expect("current boot epoch");
+        let stale_epoch = uuid::Uuid::from_u128(current_epoch.as_u128() ^ 1);
+
+        let signed_v2 = storage::gen_tonic_signature_headers(audience, "node_service.NodeService", "Ping", None)
+            .expect("method-bound signature");
+        let mut signed_v3_current = signed_v2.clone();
+        signed_v3_current.extend(
+            storage::gen_tonic_replay_scope_headers(
+                audience,
+                ping,
+                signed_v2["x-rustfs-timestamp"].to_str().expect("timestamp"),
+                signed_v2["x-rustfs-content-sha256"].to_str().expect("body digest"),
+                current_epoch,
+            )
+            .expect("current-epoch replay-scoped signature"),
+        );
+        let signed_v3_replay = signed_v3_current.clone();
+        let mut signed_v3_stale = signed_v2.clone();
+        signed_v3_stale.extend(
+            storage::gen_tonic_replay_scope_headers(
+                audience,
+                ping,
+                signed_v2["x-rustfs-timestamp"].to_str().expect("timestamp"),
+                signed_v2["x-rustfs-content-sha256"].to_str().expect("body digest"),
+                stale_epoch,
+            )
+            .expect("stale-epoch replay-scoped signature"),
+        );
+        let mut forged_v2 = signed_v2.clone();
+        forged_v2.insert("x-rustfs-rpc-signature-v2", HeaderValue::from_static("invalid"));
+        let mut forged_v3 = signed_v3_stale.clone();
+        forged_v3.insert("x-rustfs-rpc-signature-v3", HeaderValue::from_static("invalid"));
+        let cross_method = signed_v2.clone();
+        let unrouted_signed = signed_v2.clone();
+
+        for (label, path, headers, expect_proof) in [
+            ("signed v2 ping", ping, signed_v2, true),
+            ("signed v3 current epoch ping", ping, signed_v3_current, true),
+            ("replayed signed v3 ping", ping, signed_v3_replay, true),
+            ("signed v3 stale epoch ping", ping, signed_v3_stale, true),
+            ("forged v2 ping", ping, forged_v2, false),
+            ("forged v3 ping", ping, forged_v3, false),
+            ("cross-method v2 read_all", read_all, cross_method, false),
+            ("unsigned ping", ping, HeaderMap::new(), false),
+            ("unrouted unsigned", "/unrouted.Service/Method", HeaderMap::new(), false),
+            ("unrouted signed", "/unrouted.Service/Method", unrouted_signed, false),
+        ] {
+            let challenge = uuid::Uuid::new_v4();
+            let mut request = HttpRequest::builder()
+                .method(Method::POST)
+                .uri(format!("http://{audience}{path}"))
+                .header("content-type", "application/grpc")
+                .header("x-rustfs-rpc-boot-epoch-challenge", challenge.to_string())
+                .header("x-rustfs-rpc-msgpack-manifest-request", "msgpack-compat-manifest-v1")
+                .body(Empty::<Bytes>::new())
+                .expect("request");
+            request.headers_mut().extend(headers);
+            let response = service.call(request).await.expect("response");
+            if expect_proof {
+                let verified_epoch = storage::verify_tonic_boot_epoch_response(audience, challenge, response.headers())
+                    .unwrap_or_else(|err| panic!("{label} must receive verifiable boot-epoch proof: {err}"));
+                assert_eq!(verified_epoch, current_epoch, "{label} must return current boot epoch");
+                assert!(
+                    response.headers().contains_key("x-rustfs-rpc-replay-cache-capability-proof"),
+                    "{label} must receive replay-cache capability proof"
+                );
+                assert!(
+                    response
+                        .headers()
+                        .contains_key("x-rustfs-rpc-msgpack-manifest-capability-proof"),
+                    "{label} must receive requested msgpack capability proof"
+                );
+                continue;
+            }
+            for name in [
+                "x-rustfs-rpc-boot-epoch",
+                "x-rustfs-rpc-boot-epoch-proof",
+                "x-rustfs-rpc-replay-cache-capability",
+                "x-rustfs-rpc-replay-cache-capability-proof",
+                "x-rustfs-rpc-msgpack-manifest-capability",
+                "x-rustfs-rpc-msgpack-manifest-capability-proof",
+            ] {
+                assert!(
+                    !response.headers().contains_key(name),
+                    "{label} ({path}) must not return {name} to an unverified caller"
+                );
+            }
+        }
+
+        // Verify that a post-HMAC ResourceExhausted rejection from background admission still
+        // raises `RpcSignatureVerified` so the peer does not falsely revoke capabilities.
+        let bg_owner = rustfs_concurrency::adaptive::NodeAdmission::new(std::num::NonZeroU16::MIN);
+        let bg_headers = storage::with_remote_background_io(Some(storage::RemoteBackgroundIo::new(bg_owner)), async {
+            storage::gen_tonic_signature_headers(audience, "node_service.NodeService", "ReadAll", None)
+        })
+        .await
+        .expect("signed background RPC headers");
+        let verified_marker = RpcSignatureVerified::default();
+        let mut bg_request = Request::new(());
+        bg_request.metadata_mut().as_mut().extend(bg_headers);
+        bg_request.extensions_mut().insert(RpcRequestTarget {
+            uri: format!("http://{audience}{read_all}").parse().expect("RPC URI"),
+            method: Method::POST,
+        });
+        bg_request.extensions_mut().insert(verified_marker.clone());
+        let bg_error = check_auth(bg_request).expect_err("background request without admission token must reject");
+        assert_eq!(bg_error.code(), tonic::Code::ResourceExhausted);
+        assert!(
+            verified_marker.is_verified(),
+            "post-HMAC ResourceExhausted rejection must still mark RpcSignatureVerified"
+        );
+
+        rustfs_common::set_global_local_node_name(&previous_node_name).await;
+    }
+
     #[tokio::test]
     #[serial_test::serial]
     async fn rpc_auth_rejection_records_failure_reason_metric() {
@@ -10137,7 +9564,7 @@ mod tests {
                     assert_eq!(info.real_ip, peer.ip());
                     assert_eq!(info.forwarded_proto.as_deref(), Some("https"));
                     let identity = rustfs_keystone::KEYSTONE_CREDENTIALS.try_with(Clone::clone).ok().flatten().map(|credentials| credentials.parent_user).unwrap_or_else(|| "anonymous".to_owned());
-                    if request.headers().contains_key("x-auth-token") { assert_eq!(identity, "test-user"); }
+                    if request.headers().contains_key("x-auth-token") { assert_eq!(identity, "keystone:user-id"); }
                     Ok::<_, Box<dyn std::error::Error + Send + Sync>>(Response::new(HybridBody::<EdgeBody, http_body_util::Empty<Bytes>>::Rest { rest_body: EdgeBody::from(Bytes::from(identity)) }))
                 });
                 let inner = Http3CoreService::new(inner);
@@ -10153,7 +9580,7 @@ mod tests {
             assert_eq!(request(&mut client, HttpRequest::builder().uri("https://localhost/bucket/key").header("x-auth-token", "invalid-token").body(())?, Bytes::new()).await?.0, http::StatusCode::UNAUTHORIZED);
             let (status, headers, body) = request(&mut client, HttpRequest::builder().uri("https://localhost/bucket/key").header("x-auth-token", "valid-token").header("x-forwarded-for", "203.0.113.1").body(())?, Bytes::new()).await?;
             assert_eq!(status, http::StatusCode::OK);
-            assert_eq!(body, "test-user");
+            assert_eq!(body, "keystone:user-id");
             assert!(headers.contains_key("x-amz-request-id"), "request context must survive HTTP/3 dispatch");
             assert_eq!(request(&mut client, make_request()?, Bytes::new()).await?.2, "anonymous", "Keystone task-local credentials must not leak between streams");
             assert_eq!(request(&mut client, make_request()?, Bytes::new()).await?.0, http::StatusCode::TOO_MANY_REQUESTS);

@@ -1,0 +1,50 @@
+# Machine-enforced RustSec advisory exception registry.
+#
+# Validated by `scripts/security/check_advisories.py` in both `ci.yml`
+# (`security-advisories`, required via `Test and Lint`) and daily `audit.yml`.
+#
+# Rules (rustfs/backlog#2668):
+# - Every `[advisories].ignore` entry in `deny.toml` must match an entry here
+#   bidirectionally; comment-only or untracked ignores fail closed.
+# - Timestamps use strict UTC RFC 3339 (`YYYY-MM-DDTHH:MM:SSZ`).
+# - Maximum validity window is 90 days (`expires_at - approved_at <= 90d`).
+# - Expired exceptions fail closed; renewals require explicit maintainer review
+#   and cannot be auto-extended or self-approved in a PR.
+
+schema_version = 1
+
+[[exceptions]]
+advisory_id = "RUSTSEC-2026-0543"
+crate = "chrono"
+affected_versions = "=0.4.45"
+owner = "rustfs-maintainers"
+tracking_issue = "https://github.com/rustfs/backlog/issues/2668"
+reason = "chrono is marked unmaintained with no patched release; retained temporarily at compatibility boundaries and transitive datafusion/arrow/openidconnect dependencies during the jiff 1.0 migration reviewed in PR #9492."
+mitigation = "Informational unmaintained advisory with no CVE or memory-safety vulnerability; core server timestamp paths already migrated to jiff 1.0 in PR #9492 while remaining compatibility boundaries and upstream crates transition off chrono."
+approved_at = "2026-11-18T12:17:44Z"
+expires_at = "2026-11-30T23:59:59Z"
+approval_reference = "https://github.com/rustfs/rustfs/pull/9492"
+
+[[exceptions]]
+advisory_id = "RUSTSEC-2026-0555"
+crate = "chrono-tz"
+affected_versions = "=0.10.4"
+owner = "rustfs-maintainers"
+tracking_issue = "https://github.com/rustfs/backlog/issues/2668"
+reason = "chrono-tz is marked unmaintained with no patched release; pulled transitively by arrow-array 59.3.3 and datafusion-functions 55.3.0 during the jiff migration reviewed in PR #9492."
+mitigation = "Informational unmaintained advisory with no known security vulnerability; confined to transitive DataFusion/Arrow SQL timezone handling until upstream removes chrono-tz."
+approved_at = "2026-11-18T12:17:44Z"
+expires_at = "2026-11-30T23:59:59Z"
+approval_reference = "https://github.com/rustfs/rustfs/pull/9492"
+
+[[exceptions]]
+advisory_id = "RUSTSEC-2026-0542"
+crate = "humantime"
+affected_versions = "=2.4.0"
+owner = "rustfs-maintainers"
+tracking_issue = "https://github.com/rustfs/backlog/issues/2668"
+reason = "humantime is marked unmaintained through chrono with no patched release; used by rustfs-madmin and transitively by object_store 0.13.2 / datafusion 55.3.0 as temporarily reviewed in PR #9492."
+mitigation = "Informational unmaintained advisory with no known security vulnerability; limited to duration formatting and tracked for removal alongside the remaining chrono/jiff migration."
+approved_at = "2026-11-18T12:17:44Z"
+expires_at = "2026-11-30T23:59:59Z"
+approval_reference = "https://github.com/rustfs/rustfs/pull/9492"

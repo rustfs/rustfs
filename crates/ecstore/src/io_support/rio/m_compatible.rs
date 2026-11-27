@@ -58,19 +58,16 @@ pub fn compression_index_storage_bytes(index: &Index) -> Bytes {
     minio_index_storage_bytes(index)
 }
 
+/// Decodes one complete stored compression index for Range GET planning.
 pub fn decode_compression_index_bytes(bytes: &Bytes) -> Option<Index> {
-    if let Some(decoded) = decode_minio_index_bytes(bytes) {
+    // Check the legacy frame before attempting to restore a headerless S2
+    // index. Metadata contains exactly one index, so reject partial parses.
+    let mut decoded = Index::new();
+    if decoded.load(bytes.as_ref()).is_ok_and(|remaining| remaining.is_empty()) {
         return Some(decoded);
     }
 
-    let mut decoded = Index::new();
-    if decoded.load(bytes.as_ref()).is_ok() {
-        return Some(decoded);
-    }
-
-    let restored = restore_legacy_index_headers(bytes.as_ref());
-    let mut decoded = Index::new();
-    decoded.load(&restored).is_ok().then_some(decoded)
+    decode_minio_index_bytes(bytes)
 }
 
 pub fn compression_reader<R>(reader: R, algorithm: CompressionAlgorithm, encrypted: bool) -> CompressReader<R>
@@ -171,29 +168,6 @@ where
         multipart_parts,
         sequence_number,
     ))
-}
-
-fn restore_legacy_index_headers(bytes: &[u8]) -> Vec<u8> {
-    if bytes.is_empty() {
-        return Vec::new();
-    }
-
-    const S2_INDEX_HEADER: &[u8] = b"s2idx\x00";
-    const S2_INDEX_TRAILER: &[u8] = b"\x00xdi2s";
-    let mut restored = Vec::with_capacity(4 + S2_INDEX_HEADER.len() + bytes.len() + 4 + S2_INDEX_TRAILER.len());
-    restored.extend_from_slice(&[0x99, 0x2A, 0x4D, 0x18]);
-    restored.extend_from_slice(S2_INDEX_HEADER);
-    restored.extend_from_slice(bytes);
-
-    let total_size = (restored.len() + 4 + S2_INDEX_TRAILER.len()) as u32;
-    restored.extend_from_slice(&total_size.to_le_bytes());
-    restored.extend_from_slice(S2_INDEX_TRAILER);
-
-    let chunk_len = restored.len() - 4;
-    restored[1] = chunk_len as u8;
-    restored[2] = (chunk_len >> 8) as u8;
-    restored[3] = (chunk_len >> 16) as u8;
-    restored
 }
 
 /// The fixed-frame legacy layout is a default-build write format; this build

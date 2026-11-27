@@ -21,7 +21,7 @@ use datafusion::{
     },
     datasource::file_format::{DEFAULT_SCHEMA_INFER_MAX_RECORD, csv::CsvFormat},
     error::{DataFusionError, Result},
-    execution::memory_pool::{MemoryConsumer, MemoryPool, MemoryReservation},
+    execution::memory_pool::{MemoryConsumer, MemoryLimit, MemoryPool, MemoryReservation},
     object_store::Error as ObjectStoreError,
 };
 use futures::{StreamExt, stream::BoxStream};
@@ -65,7 +65,7 @@ impl PrefixBoundary {
         }
     }
 
-    fn consume(&mut self, input: &[u8], prefix: &[u8]) -> Result<(usize, bool)> {
+    fn consume(&mut self, input: &[u8], prefix: &[u8], json_sample_limit: usize) -> Result<(usize, bool)> {
         match self {
             Self::JsonLines { records, line_start } => {
                 for (index, byte) in input.iter().enumerate() {
@@ -83,7 +83,7 @@ impl PrefixBoundary {
                     if nonblank {
                         *records += 1;
                     }
-                    if *records == DEFAULT_SCHEMA_INFER_MAX_RECORD {
+                    if *records == DEFAULT_SCHEMA_INFER_MAX_RECORD || (*records > 0 && end >= json_sample_limit) {
                         return Ok((index + 1, true));
                     }
                 }
@@ -129,17 +129,31 @@ pub(super) async fn read_schema_prefix(
     mut boundary: PrefixBoundary,
 ) -> Result<SchemaPrefix> {
     let reservation = MemoryConsumer::new("S3 Select schema prefix").register(memory_pool);
+    // Keep multi-record JSON Lines inference samples within the query memory budget
+    // (accounting for downstream schema-inference working memory) while still allowing
+    // a single record to probe up to MAX_SCHEMA_PREFIX_BYTES.
+    let json_sample_limit = match memory_pool.memory_limit() {
+        MemoryLimit::Finite(limit) => MAX_SCHEMA_PREFIX_BYTES.min((limit / 32).max(1)),
+        MemoryLimit::Infinite | MemoryLimit::Unknown => MAX_SCHEMA_PREFIX_BYTES,
+    };
     let mut bytes = Vec::new();
     let mut parsed = 0;
     while let Some(chunk) = stream.next().await.transpose()? {
         let mut offset = 0;
         while offset < chunk.len() {
-            let remaining = MAX_SCHEMA_PREFIX_BYTES - bytes.len();
+            let step_limit = match &boundary {
+                PrefixBoundary::JsonLines { records, .. } if *records > 0 => json_sample_limit,
+                PrefixBoundary::JsonLines { .. } if bytes.len() < json_sample_limit => json_sample_limit,
+                _ => MAX_SCHEMA_PREFIX_BYTES,
+            };
+            let remaining = step_limit.saturating_sub(bytes.len());
             if remaining == 0 {
                 if let PrefixBoundary::JsonLines { records, line_start } = &boundary
                     && *records > 0
                 {
                     bytes.truncate(*line_start);
+                    bytes.shrink_to_fit();
+                    reservation.try_resize(bytes.capacity())?;
                     return Ok(SchemaPrefix { bytes, reservation });
                 }
                 return Err(prefix_limit_error());
@@ -162,19 +176,21 @@ pub(super) async fn read_schema_prefix(
                 offset = end;
                 continue;
             }
-            let (consumed, done) = boundary.consume(&bytes[parsed..], &bytes)?;
+            let (consumed, done) = boundary.consume(&bytes[parsed..], &bytes, json_sample_limit)?;
             parsed += consumed;
             bytes.truncate(parsed);
             offset = end;
             if done {
+                bytes.shrink_to_fit();
+                reservation.try_resize(bytes.capacity())?;
                 return Ok(SchemaPrefix { bytes, reservation });
             }
         }
     }
     if parsed < bytes.len() {
-        boundary.consume(&bytes[parsed..], &bytes)?;
+        boundary.consume(&bytes[parsed..], &bytes, json_sample_limit)?;
     }
-    boundary.consume(&[], &bytes)?;
+    boundary.consume(&[], &bytes, json_sample_limit)?;
     Ok(SchemaPrefix { bytes, reservation })
 }
 

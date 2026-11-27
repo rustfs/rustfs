@@ -16,10 +16,7 @@
 //! framing it reads objects sealed under an object key, whose payload is a
 //! DARE 2.0 stream (one for the object, or one per part).
 
-use super::{
-    CompressedPartSeek, EncryptedRangePlan, RangedDecompressReader, StreamConsumer, get_compressed_offsets,
-    multipart_part_numbers, part_plaintext_size,
-};
+use super::{EncryptedRangePlan, StreamConsumer, multipart_part_numbers, part_plaintext_size};
 use crate::error::{Error, Result};
 use crate::object_api::{ObjectInfo, ReadEncryptionMode};
 use rustfs_filemeta::ObjectPartInfo;
@@ -32,23 +29,48 @@ const DARE_PACKAGE_OVERHEAD: i64 = 32;
 /// Stored size of a full DARE 2.0 package.
 pub(super) const DARE_PACKAGE_SIZE: i64 = DARE_PAYLOAD_SIZE + DARE_PACKAGE_OVERHEAD;
 
-/// Where a read resumes after seeking `compressed_offset` bytes into a
-/// compressed part. An encrypted part stores the compressed bytes in whole
-/// packages, so the read starts at a package boundary and skips into it.
-pub(super) fn compressed_part_seek(oi: &ObjectInfo, compressed_offset: i64) -> CompressedPartSeek {
-    if !oi.is_encrypted() {
-        return CompressedPartSeek {
-            storage_advance: compressed_offset,
-            decrypt_skip: 0,
-            sequence_number: 0,
-        };
+/// Where the read of a compressed object sealed under an object key starts
+/// for a plaintext `offset`: the stored offset of the package holding the
+/// nearest indexed block, the plaintext still to skip after decompression,
+/// the part it falls in, the decrypted bytes to drop, and the package's
+/// sequence number.
+pub(super) fn get_encrypted_compressed_offsets(oi: &ObjectInfo, offset: i64) -> (i64, i64, usize, i64, u64) {
+    let mut skip_length = 0_i64;
+    let mut cumulative_actual_size = 0_i64;
+    let mut first_part_idx = 0_usize;
+    let mut compressed_offset = 0_i64;
+
+    for (i, part) in oi.parts.iter().enumerate() {
+        cumulative_actual_size += part_plaintext_size(part);
+        if cumulative_actual_size <= offset {
+            compressed_offset += part.size as i64;
+        } else {
+            first_part_idx = i;
+            skip_length = cumulative_actual_size - part_plaintext_size(part);
+            break;
+        }
     }
 
-    CompressedPartSeek {
-        storage_advance: (compressed_offset / DARE_PAYLOAD_SIZE) * DARE_PACKAGE_SIZE,
-        decrypt_skip: compressed_offset % DARE_PAYLOAD_SIZE,
-        sequence_number: (compressed_offset / DARE_PAYLOAD_SIZE) as u64,
+    let mut part_skip = offset - skip_length;
+    let (mut decrypt_skip, mut seq_num) = (0_i64, 0_u64);
+
+    if part_skip > 0
+        && let Some(part) = oi.parts.get(first_part_idx)
+        && let Some(index) = part
+            .index
+            .as_ref()
+            .and_then(crate::io_support::rio::decode_compression_index_bytes)
+        && let Ok((comp_off, uncomp_off)) = index.find(part_skip)
+        && comp_off > 0
+    {
+        seq_num = (comp_off / DARE_PAYLOAD_SIZE) as u64;
+        decrypt_skip = comp_off % DARE_PAYLOAD_SIZE;
+        compressed_offset += (comp_off / DARE_PAYLOAD_SIZE) * DARE_PACKAGE_SIZE;
+
+        part_skip -= uncomp_off;
     }
+
+    (compressed_offset, part_skip, first_part_idx, decrypt_skip, seq_num)
 }
 
 /// The range plan of an object sealed under an object key, whose stored bytes
@@ -73,7 +95,7 @@ pub(super) fn object_key_range_plan(
 
     if is_compressed {
         let (physical_off, decompressed_skip, first_part_idx, decrypt_skip, seq_num) =
-            get_compressed_offsets(oi, requested_offset as i64);
+            get_encrypted_compressed_offsets(oi, requested_offset as i64);
         return Ok(Some((
             usize::try_from(physical_off)
                 .map_err(|_| Error::other(format!("invalid encrypted compressed offset {physical_off}")))?,
@@ -228,24 +250,11 @@ pub(super) fn readable_part_numbers(mut part_numbers: Vec<usize>, parts: &[Objec
     part_numbers
 }
 
-/// The decompressed stream as the range and limit readers consume it: read to
-/// its end even when the caller stops early, which the erasure writer feeding
-/// it requires.
+/// The decompressed stream of a whole-object read: read to its end even when
+/// the caller stops early, which the erasure writer feeding it requires.
 pub(super) fn decompressed_stream<R>(reader: R) -> StreamConsumer<R>
 where
     R: AsyncRead + Unpin + Send + 'static,
 {
     StreamConsumer::new(reader)
-}
-
-pub(super) fn ranged_decompress_reader<R>(
-    reader: R,
-    offset: usize,
-    length: i64,
-    total_size: usize,
-) -> Result<RangedDecompressReader<R>>
-where
-    R: AsyncRead + Unpin + Send + Sync + 'static,
-{
-    RangedDecompressReader::new_draining(reader, offset, length, total_size)
 }
