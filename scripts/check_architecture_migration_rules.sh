@@ -5592,6 +5592,10 @@ if ! bash "${ROOT_DIR}/scripts/check_oidc_architecture_boundaries.sh"; then
   report_failure "OIDC architecture boundary check"
 fi
 
+if ! "${ROOT_DIR}/scripts/python_bin.sh" "${ROOT_DIR}/scripts/check_kms_format_versions.py"; then
+  report_failure "KMS format version policy check"
+fi
+
 if (( FAILURES > 0 )); then
   exit 1
 fi
