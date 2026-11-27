@@ -135,6 +135,8 @@ pub(crate) struct DeleteRecoverySummary {
     /// Superseded write backups discarded because every drive holds the same
     /// live generation.
     pub discarded_write_backups: usize,
+    /// First committed transaction with a confirmed live generation conflict.
+    pub conflicting_transaction: Option<Uuid>,
     pub pending: usize,
     pub failed: usize,
     pub reclaimed: usize,
@@ -152,6 +154,8 @@ pub(crate) struct DeleteRecoveryContext<'a> {
     pub work_budget: Option<Arc<crate::object_api::DeleteRecoveryWorkBudget>>,
     pub dry_run: bool,
     pub explicit_delete: bool,
+    /// A heal can report a blocked group. Foreground deletes retain the settlement error.
+    pub classify_generation_conflicts: bool,
     /// Only the locked heal path may repair a live marker-creation source.
     pub repair_marker_source: bool,
     /// Only the locked heal path may discard the backup of an overwritten
@@ -171,6 +175,7 @@ impl<'a> DeleteRecoveryContext<'a> {
             work_budget: None,
             dry_run: false,
             explicit_delete: false,
+            classify_generation_conflicts: false,
             repair_marker_source: false,
             discard_superseded_write_backups: false,
             namespace_owner: None,
@@ -191,16 +196,28 @@ impl DeleteRecoverySummary {
         self.legacy_ambiguous += other.legacy_ambiguous;
         self.superseded_write_backups += other.superseded_write_backups;
         self.discarded_write_backups += other.discarded_write_backups;
+        self.conflicting_transaction = self.conflicting_transaction.or(other.conflicting_transaction);
         self.pending += other.pending;
         self.failed += other.failed;
         self.reclaimed += other.reclaimed;
     }
 
-    /// The error a heal must return when recovery left this key unresolved.
-    /// An ambiguous legacy residue is permanent and gets its own error; other
-    /// pending or blocked groups remain the retryable `SlowDown`.
-    pub(crate) fn unresolved_heal_error(&self) -> Option<StorageError> {
-        if self.legacy_ambiguous > 0 {
+    pub(crate) fn generation_conflict_error(&self, bucket: &str, object: &str) -> Option<StorageError> {
+        self.conflicting_transaction
+            .map(|transaction| StorageError::DeleteRecoveryGenerationConflict {
+                bucket: bucket.to_owned(),
+                object: rustfs_utils::path::decode_dir_object(object),
+                transaction,
+            })
+    }
+
+    /// The error an exact-key heal must return when recovery left it unresolved.
+    pub(crate) fn unresolved_heal_error(&self, bucket: &str, object: &str) -> Option<StorageError> {
+        if self.pending == 0
+            && let Some(error) = self.generation_conflict_error(bucket, object)
+        {
+            Some(error)
+        } else if self.legacy_ambiguous > 0 {
             Some(StorageError::DeleteRecoveryLegacyAmbiguous)
         } else if self.pending > 0 || self.blocked > 0 {
             Some(StorageError::SlowDown)
@@ -283,6 +300,30 @@ impl From<&DeleteRecoveryJournal> for DecisionEvidence {
 
 fn receipt(state: DeleteRecoveryState) -> bool {
     matches!(state, DeleteRecoveryState::QuorumCommitted | DeleteRecoveryState::CommitFinished)
+}
+
+fn has_conflicting_null_generation(copies: &[DeleteRecoveryInspection], authority: &DeleteRecoveryJournal) -> bool {
+    if authority.requests.is_empty() || !authority.deleted_versions.contains(&Uuid::nil()) {
+        return false;
+    }
+    let null_generation = |version: &&DeleteRecoveryVersionIdentity| version.version_id.is_none_or(|id| id.is_nil());
+    let Some(source) = authority.original_versions.iter().find(null_generation) else {
+        return false;
+    };
+    copies.iter().any(|copy| {
+        copy.state == DeleteRecoveryState::Absent
+            && copy.current_digest.is_some()
+            && copy
+                .current_versions
+                .iter()
+                .find(null_generation)
+                .is_some_and(|live| live != source)
+            && copies.iter().filter(|peer| receipt(peer.state)).all(|peer| {
+                peer.journal
+                    .as_ref()
+                    .is_some_and(|journal| !journal.matches_adoption_source(&copy.current_versions))
+            })
+    })
 }
 
 fn validate(inspection: &DeleteRecoveryInspection, object: &str, transaction: Uuid) -> Result<()> {
@@ -905,6 +946,7 @@ impl SetDisks {
             work_budget,
             dry_run,
             explicit_delete,
+            classify_generation_conflicts,
             repair_marker_source,
             discard_superseded_write_backups,
             namespace_owner,
@@ -1240,6 +1282,25 @@ impl SetDisks {
             if can_finish {
                 let certified_same_transaction = authority.is_some();
                 let reference = authority.or(prepared).ok_or(DiskError::FileCorrupt)?;
+                if classify_generation_conflicts
+                    && !dry_run
+                    && certified_same_transaction
+                    && has_conflicting_null_generation(copies, reference)
+                {
+                    // A stale settlement fingerprint alone is retryable. Confirm the same
+                    // evidence on every participant under the key and transaction fences.
+                    let fresh = inspect(&disks, bucket, object, transaction, work_budget.as_deref())
+                        .await
+                        .into_iter()
+                        .collect::<Result<Vec<_>>>()?;
+                    if !can_commit() || fresh != *copies {
+                        return Err(DiskError::OutdatedXLMeta);
+                    }
+                    summary.blocked += 1;
+                    summary.conflicting_transaction.get_or_insert(transaction);
+                    unresolved = true;
+                    continue;
+                }
                 if dry_run {
                     if copies.iter().any(|copy| {
                         if certified_same_transaction
@@ -1379,6 +1440,10 @@ impl SetDisks {
                     summary.rolled_back += 1;
                 }
             }
+        }
+        // A sibling settlement may have changed the live generation after inspection.
+        if mutated {
+            summary.conflicting_transaction = None;
         }
         if !unresolved && !dry_run {
             // GC is a key-wide barrier: every predecessor must have settled
@@ -1570,17 +1635,17 @@ mod tests {
         // rustfs/rustfs#8608: a legacy residue is deterministic and must not be
         // reported as request-rate pressure.
         let resolved = DeleteRecoverySummary::default();
-        assert!(resolved.unresolved_heal_error().is_none());
+        assert!(resolved.unresolved_heal_error("bucket", "object").is_none());
         let pending = DeleteRecoverySummary {
             pending: 1,
             ..Default::default()
         };
-        assert!(matches!(pending.unresolved_heal_error(), Some(StorageError::SlowDown)));
+        assert!(matches!(pending.unresolved_heal_error("bucket", "object"), Some(StorageError::SlowDown)));
         let blocked = DeleteRecoverySummary {
             blocked: 1,
             ..Default::default()
         };
-        assert!(matches!(blocked.unresolved_heal_error(), Some(StorageError::SlowDown)));
+        assert!(matches!(blocked.unresolved_heal_error("bucket", "object"), Some(StorageError::SlowDown)));
         let ambiguous = DeleteRecoverySummary {
             blocked: 1,
             legacy_ambiguous: 1,
@@ -1588,7 +1653,7 @@ mod tests {
             ..Default::default()
         };
         assert!(matches!(
-            ambiguous.unresolved_heal_error(),
+            ambiguous.unresolved_heal_error("bucket", "object"),
             Some(StorageError::DeleteRecoveryLegacyAmbiguous)
         ));
         let mut total = DeleteRecoverySummary::default();

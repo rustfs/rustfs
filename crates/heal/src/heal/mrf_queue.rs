@@ -189,6 +189,10 @@ pub async fn accept_unverified_legacy_risk(request: MrfLegacyRiskAcceptanceReque
 }
 
 enum MrfLifecycleCommand {
+    BlockDeleteGenerationConflict {
+        anchor: MrfDurableRepairAnchor,
+        transaction: Uuid,
+    },
     Get {
         id: Uuid,
         _permit: tokio::sync::OwnedSemaphorePermit,
@@ -214,6 +218,16 @@ enum MrfLifecycleCommand {
         request: MrfLegacyRiskAcceptanceRequest,
         response: tokio::sync::oneshot::Sender<Result<(), MrfLifecycleControlError>>,
     },
+}
+
+pub(super) fn note_delete_generation_conflict(anchor: &MrfDurableRepairAnchor, transaction: Uuid) {
+    if let Some(sender) = GLOBAL_MRF_LIFECYCLE_SENDER.get() {
+        // A busy controller still owns the active responsibility and will retry it.
+        let _ = sender.try_send(MrfLifecycleCommand::BlockDeleteGenerationConflict {
+            anchor: anchor.clone(),
+            transaction,
+        });
+    }
 }
 
 /// Committed checkpoint publication, inspection and owner-scoped cleanup.
@@ -1154,7 +1168,7 @@ impl MrfRuntime {
             node_local: true,
             checkpoint_owner: self.runtime_checkpoint.map(|(owner, _)| owner),
             checkpoint_sequence: self.runtime_checkpoint.map(|(_, sequence)| sequence),
-            held_count: lifecycle.held_count,
+            held_count: lifecycle.held_count + lifecycle.blocked_delete_generation_count,
             legacy_generation_unknown_count: lifecycle.legacy_generation_unknown_count,
             bucket_incarnation_changed_count: lifecycle.bucket_incarnation_changed_count,
             operator_accepted_count: lifecycle.operator_accepted_count,
@@ -1339,6 +1353,9 @@ impl MrfRuntime {
 
     async fn handle_lifecycle_command(&mut self, manager: &HealManager, command: MrfLifecycleCommand) {
         match command {
+            MrfLifecycleCommand::BlockDeleteGenerationConflict { anchor, transaction } => {
+                self.partial_writes.park_delete_generation_conflict(&anchor, transaction);
+            }
             MrfLifecycleCommand::List {
                 after,
                 limit,
@@ -2537,6 +2554,8 @@ async fn finalize_mrf_consumer(
     lifecycle_receiver.close();
     while let Some(command) = lifecycle_receiver.recv().await {
         match command {
+            // Replay re-inspects the durable receipts after restart.
+            MrfLifecycleCommand::BlockDeleteGenerationConflict { .. } => {}
             MrfLifecycleCommand::Get { response, .. } => {
                 let _ = response.send(Err(MrfLifecycleControlError::Unavailable));
             }

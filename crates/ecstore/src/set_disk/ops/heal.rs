@@ -3766,6 +3766,7 @@ impl SetDisks {
                     crate::set_disk::DeleteRecoveryContext {
                         dry_run: opts.dry_run,
                         explicit_delete,
+                        classify_generation_conflicts: true,
                         repair_marker_source: true,
                         discard_superseded_write_backups: true,
                         transaction_guard: transaction_guard.clone(),
@@ -3814,7 +3815,7 @@ impl SetDisks {
                     None,
                 ));
             }
-            if let Some(error) = recovery.unresolved_heal_error() {
+            if let Some(error) = recovery.unresolved_heal_error(bucket, object) {
                 if !recovery.blocked_only_by_superseded_write_backups() {
                     return Err(error);
                 }
