@@ -5885,7 +5885,7 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
             )
             .await;
             if let Ok(rename_commit) = rename_result.as_mut() {
-                commit_set.record_capacity_scope_if_needed(commit_capacity_scope_token, &rename_commit.capacity_disks);
+                commit_set.record_capacity_scope_if_needed(commit_capacity_scope_token, rename_commit.capacity_disks());
                 debug_assert!(
                     rename_commit.tail_drain.is_none(),
                     "multipart completion disables early ACK and must not detach a rename tail"

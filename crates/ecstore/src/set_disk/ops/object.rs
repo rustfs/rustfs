@@ -6301,7 +6301,7 @@ impl SetDisks {
                             rename_commit.tail_drain.is_none() && rename_commit.old_current_source_all_successful_checked,
                         );
                     }
-                    commit_set.record_capacity_scope_if_needed(commit_capacity_scope_token, &rename_commit.capacity_disks);
+                    commit_set.record_capacity_scope_if_needed(commit_capacity_scope_token, rename_commit.capacity_disks());
                     // Install the tail watcher before any post-commit await. The
                     // latch keeps namespace guards through their prior handoff point.
                     needs_immediate_heal = rename_commit.needs_immediate_heal();

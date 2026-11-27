@@ -907,8 +907,8 @@ impl LocalDisk {
             .await?;
         }
 
-        check_path_length(src_file_path.to_string_lossy().to_string().as_str())?;
-        check_path_length(dst_file_path.to_string_lossy().to_string().as_str())?;
+        check_path_length(src_file_path.to_string_lossy().as_ref())?;
+        check_path_length(dst_file_path.to_string_lossy().as_ref())?;
 
         let src_file_parent = src_file_path
             .parent()

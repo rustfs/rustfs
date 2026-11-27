@@ -2854,9 +2854,9 @@ struct RenameDataObservations<'a> {
 
 pub(in crate::set_disk) struct RenameDataCommit {
     pub(in crate::set_disk) online_disks: Vec<Option<DiskStore>>,
-    /// Disks whose capacity must be marked for this commit. Under early ACK,
-    /// this includes the unresolved tail beyond the quorum snapshot.
-    pub(in crate::set_disk) capacity_disks: Vec<Option<DiskStore>>,
+    /// An early ACK marks candidates that include the unresolved tail beyond
+    /// the quorum snapshot. A fully joined fanout uses its online disks.
+    early_ack_capacity_disks: Option<Vec<Option<DiskStore>>>,
     pub(in crate::set_disk) convergence: RenameConvergence,
     pub(in crate::set_disk) data_dir: Option<Uuid>,
     pub(in crate::set_disk) cleanup_disks: Vec<Option<DiskStore>>,
@@ -3437,7 +3437,7 @@ struct RenameSlotContext {
 struct RenameOutcomeProducerArgs {
     disks: Arc<Vec<Option<DiskStore>>>,
     file_infos: Arc<Vec<FileInfo>>,
-    fence_tokens: Arc<Vec<Option<Uuid>>>,
+    fence_tokens: Option<Arc<Vec<Option<Uuid>>>>,
     paths: Arc<RenameSlotPaths>,
     namespace_owner: Option<Arc<dyn Send + Sync>>,
     publication_scope: Option<crate::object_api::ScannerPublicationCommitScope>,
@@ -4011,6 +4011,10 @@ fn put_rename_early_ack_enabled() -> bool {
 }
 
 impl RenameDataCommit {
+    pub(in crate::set_disk) fn capacity_disks(&self) -> &[Option<DiskStore>] {
+        self.early_ack_capacity_disks.as_deref().unwrap_or(&self.online_disks)
+    }
+
     /// Whether the quorum snapshot is final enough to admit heal immediately.
     /// An early-ACK snapshot deliberately leaves the unresolved tail as
     /// `DiskNotFound`; only the tail's final observations may decide heal.
@@ -4361,7 +4365,7 @@ impl SetDisks {
         };
 
         Ok(RenameDataCommit {
-            capacity_disks: disks.to_vec(),
+            early_ack_capacity_disks: Some(disks.to_vec()),
             online_disks,
             convergence,
             data_dir,
@@ -4443,11 +4447,15 @@ impl SetDisks {
     pub(in crate::set_disk) fn scanner_publication_lease_tokens_for_disks(
         disks: &[Option<DiskStore>],
         scanner_publication_lease_tokens: Option<&HashMap<String, Uuid>>,
-    ) -> disk::error::Result<Vec<Option<Uuid>>> {
+    ) -> disk::error::Result<Option<Vec<Option<Uuid>>>> {
+        let Some(tokens) = scanner_publication_lease_tokens else {
+            return Ok(None);
+        };
         disks
             .iter()
-            .map(|disk| Self::scanner_publication_lease_token_for_disk(disk.as_ref(), scanner_publication_lease_tokens))
-            .collect()
+            .map(|disk| Self::scanner_publication_lease_token_for_disk(disk.as_ref(), Some(tokens)))
+            .collect::<disk::error::Result<_>>()
+            .map(Some)
     }
 
     fn ordinary_rename_batch_eligible(
@@ -4618,7 +4626,7 @@ impl SetDisks {
     fn plan_rename_fanout(
         disks: &[Option<DiskStore>],
         file_infos: &[FileInfo],
-        scanner_publication_lease_tokens: &[Option<Uuid>],
+        scanner_publication_lease_tokens: Option<&[Option<Uuid>]>,
         src_bucket: &str,
         dst_bucket: &str,
         dst_object: &str,
@@ -4633,20 +4641,16 @@ impl SetDisks {
         let multipart = src_bucket == crate::disk::RUSTFS_META_MULTIPART_BUCKET;
         let incarnation_bound = crate::store::bucket_heal_scope_for_object(dst_bucket, dst_object).is_some();
         let mut groups: Vec<RenameBatchGroup> = Vec::new();
-        for (slot, ((disk, file_info), scanner_lease)) in disks
-            .iter()
-            .zip(file_infos.iter())
-            .zip(scanner_publication_lease_tokens.iter())
-            .enumerate()
-        {
+        for (slot, (disk, file_info)) in disks.iter().zip(file_infos.iter()).enumerate() {
             let Some(disk) = disk.as_ref() else {
                 continue;
             };
             let Disk::Remote(remote) = disk.as_ref() else {
                 continue;
             };
+            let scanner_lease = scanner_publication_lease_tokens.and_then(|tokens| tokens[slot]);
             if !remote.rename_stream_batch_enabled()
-                || !Self::ordinary_rename_batch_eligible(file_info, *scanner_lease, multipart, incarnation_bound)
+                || !Self::ordinary_rename_batch_eligible(file_info, scanner_lease, multipart, incarnation_bound)
             {
                 continue;
             }
@@ -4675,7 +4679,7 @@ impl SetDisks {
     fn record_rename_batch_candidates(
         disks: &[Option<DiskStore>],
         file_infos: &[FileInfo],
-        scanner_publication_lease_tokens: &[Option<Uuid>],
+        scanner_publication_lease_tokens: Option<&[Option<Uuid>]>,
         src_bucket: &str,
         dst_bucket: &str,
         dst_object: &str,
@@ -4686,18 +4690,15 @@ impl SetDisks {
         let multipart = src_bucket == crate::disk::RUSTFS_META_MULTIPART_BUCKET;
         let incarnation_bound = crate::store::bucket_heal_scope_for_object(dst_bucket, dst_object).is_some();
         let mut peers: Vec<(&str, usize, usize)> = Vec::new();
-        for ((disk, file_info), scanner_lease) in disks
-            .iter()
-            .zip(file_infos.iter())
-            .zip(scanner_publication_lease_tokens.iter())
-        {
+        for (slot, (disk, file_info)) in disks.iter().zip(file_infos.iter()).enumerate() {
             let Some(disk) = disk.as_deref() else {
                 continue;
             };
             let Disk::Remote(remote) = disk else {
                 continue;
             };
-            let batchable = Self::ordinary_rename_batch_eligible(file_info, *scanner_lease, multipart, incarnation_bound);
+            let scanner_lease = scanner_publication_lease_tokens.and_then(|tokens| tokens[slot]);
+            let batchable = Self::ordinary_rename_batch_eligible(file_info, scanner_lease, multipart, incarnation_bound);
             if let Some((_, remote_disks, batchable_disks)) = peers.iter_mut().find(|(addr, _, _)| *addr == remote.addr) {
                 *remote_disks += 1;
                 *batchable_disks += usize::from(batchable);
@@ -4728,7 +4729,7 @@ impl SetDisks {
             Self::plan_rename_fanout(
                 disks.as_slice(),
                 file_infos.as_slice(),
-                fence_tokens.as_slice(),
+                fence_tokens.as_deref().map(Vec::as_slice),
                 &paths.src_bucket,
                 &paths.dst_bucket,
                 &paths.dst_object,
@@ -4740,7 +4741,7 @@ impl SetDisks {
         let resource_unit = crate::disk::current_resource_unit();
         let mut tasks = JoinSet::new();
         let (outcome_tx, outcome_rx) = mpsc::channel(disk_count.max(1));
-        for (slot, (disk, scanner_token)) in disks.iter().cloned().zip(fence_tokens.iter().copied()).enumerate() {
+        for (slot, disk) in disks.iter().cloned().enumerate() {
             if fanout_plan.batch_slot_mask & (1_u16 << slot) != 0 {
                 continue;
             }
@@ -4753,7 +4754,7 @@ impl SetDisks {
                 slot,
                 disk,
                 file_infos: file_infos.clone(),
-                scanner_token,
+                scanner_token: fence_tokens.as_ref().and_then(|tokens| tokens[slot]),
                 namespace_owner: namespace_owner.clone(),
                 publication_scope: publication_scope.clone(),
                 paths: paths.clone(),
@@ -4784,7 +4785,7 @@ impl SetDisks {
                         slot,
                         disk: group_disks[slot].clone(),
                         file_infos: file_infos.clone(),
-                        scanner_token: group_tokens[slot],
+                        scanner_token: group_tokens.as_ref().and_then(|tokens| tokens[slot]),
                         namespace_owner: namespace_owner.clone(),
                         publication_scope: None,
                         paths: paths.clone(),
@@ -4989,8 +4990,15 @@ impl SetDisks {
         let disk_count = disks.len();
         let fanout_disks = Arc::new(disks.to_vec());
         let fanout_fence_tokens =
-            Arc::new(Self::scanner_publication_lease_tokens_for_disks(disks, scanner_publication_lease_tokens)?);
-        Self::record_rename_batch_candidates(disks, &file_infos, &fanout_fence_tokens, src_bucket, dst_bucket, dst_object);
+            Self::scanner_publication_lease_tokens_for_disks(disks, scanner_publication_lease_tokens)?.map(Arc::new);
+        Self::record_rename_batch_candidates(
+            disks,
+            &file_infos,
+            fanout_fence_tokens.as_deref().map(Vec::as_slice),
+            src_bucket,
+            dst_bucket,
+            dst_object,
+        );
         let coordinator_disks = fanout_disks.clone();
         let paths = Arc::new(RenameSlotPaths::new(src_bucket, src_object, dst_bucket, dst_object));
         let (commit_tx, commit_rx) = oneshot::channel();
@@ -5363,8 +5371,15 @@ impl SetDisks {
         let fanout_disks = Arc::new(disks.to_vec());
         let fanout_file_infos = Arc::new(file_infos);
         let fanout_fence_tokens =
-            Arc::new(Self::scanner_publication_lease_tokens_for_disks(disks, scanner_publication_lease_tokens)?);
-        Self::record_rename_batch_candidates(disks, &fanout_file_infos, &fanout_fence_tokens, src_bucket, dst_bucket, dst_object);
+            Self::scanner_publication_lease_tokens_for_disks(disks, scanner_publication_lease_tokens)?.map(Arc::new);
+        Self::record_rename_batch_candidates(
+            disks,
+            &fanout_file_infos,
+            fanout_fence_tokens.as_deref().map(Vec::as_slice),
+            src_bucket,
+            dst_bucket,
+            dst_object,
+        );
         let fanout_paths = paths.clone();
         let fanout_publication_scope = scanner_publication_commit_scope.clone();
         let logical_guards = multipart_commit_owner;
@@ -5712,7 +5727,7 @@ impl SetDisks {
         };
 
         Ok(RenameDataCommit {
-            capacity_disks: online_disks.clone(),
+            early_ack_capacity_disks: None,
             online_disks,
             convergence,
             data_dir,
@@ -7037,8 +7052,9 @@ impl SetDisks {
 
         let mut futures = Vec::with_capacity(disks.len());
 
-        for (disk_op, scanner_publication_lease_token) in disks.iter().zip(fanout_fence_tokens) {
+        for (slot, disk_op) in disks.iter().enumerate() {
             let disk_op = disk_op.clone();
+            let scanner_publication_lease_token = fanout_fence_tokens.as_ref().and_then(|tokens| tokens[slot]);
             let bucket = bucket.to_string();
             let prefix = prefix.to_string();
             let scanner_publication_commit_scope = scanner_publication_commit_scope.clone();
@@ -8562,11 +8578,33 @@ mod tests {
                 ));
             }
             let file_infos = vec![FileInfo::default(); disks.len()];
-            let tokens = vec![None; disks.len()];
-            let plan = SetDisks::plan_rename_fanout(&disks, &file_infos, &tokens, "src", "dst", "object");
+            let plan = SetDisks::plan_rename_fanout(&disks, &file_infos, None, "src", "dst", "object");
             assert_eq!(plan.batch_slot_mask, 0b0111);
             assert_eq!(plan.batch_groups.len(), 1);
             assert_eq!(plan.batch_groups[0].slots, vec![0, 1, 2]);
+
+            let mut sparse_disks = disks.clone();
+            sparse_disks[1] = None;
+            let first_peer = disks[0].as_ref().expect("first peer").endpoint().grid_host();
+            let second_peer = disks[3].as_ref().expect("second peer").endpoint().grid_host();
+            let first_lease = Uuid::from_u128(1);
+            let second_lease = Uuid::from_u128(2);
+            assert!(
+                SetDisks::scanner_publication_lease_tokens_for_disks(&sparse_disks, None)
+                    .expect("ordinary writes have no token table")
+                    .is_none()
+            );
+            let mut leases = HashMap::new();
+            assert!(SetDisks::scanner_publication_lease_tokens_for_disks(&sparse_disks, Some(&leases)).is_err());
+            leases.insert(first_peer, first_lease);
+            assert!(SetDisks::scanner_publication_lease_tokens_for_disks(&sparse_disks, Some(&leases)).is_err());
+            leases.insert(second_peer, second_lease);
+            let tokens = SetDisks::scanner_publication_lease_tokens_for_disks(&sparse_disks, Some(&leases))
+                .expect("all remote peers have leases")
+                .expect("fenced writes retain a slot table");
+            assert_eq!(tokens, vec![Some(first_lease), None, Some(first_lease), Some(second_lease)]);
+            let fenced = SetDisks::plan_rename_fanout(&sparse_disks, &file_infos, Some(&tokens), "src", "dst", "object");
+            assert!(fenced.batch_groups.is_empty(), "scanner-fenced peers use unary rename");
 
             let mut protected = file_infos;
             rustfs_utils::http::metadata_compat::insert_str(
@@ -8574,7 +8612,7 @@ mod tests {
                 crate::disk::QUOTA_MUTATION_FENCE_METADATA_SUFFIX,
                 Uuid::new_v4().to_string(),
             );
-            let plan = SetDisks::plan_rename_fanout(&disks, &protected, &tokens, "src", "dst", "object");
+            let plan = SetDisks::plan_rename_fanout(&disks, &protected, None, "src", "dst", "object");
             assert_eq!(plan.batch_slot_mask, 0b0101);
             assert_eq!(plan.batch_groups[0].slots, vec![0, 2]);
         })
@@ -13207,6 +13245,8 @@ mod tests {
         assert_eq!(commit.convergence, RenameConvergence::PartialCommit);
         assert!(commit.needs_immediate_heal());
         assert!(commit.tail_drain.is_none());
+        assert!(std::ptr::eq(commit.capacity_disks(), commit.online_disks.as_slice()));
+        assert!(commit.capacity_disks()[3].is_none(), "failed disks are excluded after the full join");
         for dir in dirs.iter().take(3) {
             let reopened = reopen_local_disk(dir).await;
             let stored = reopened
@@ -13303,6 +13343,8 @@ mod tests {
             let commit = rename
                 .await
                 .expect("early ACK must return once the other three disks satisfy write quorum");
+            assert!(commit.online_disks[0].is_none(), "the paused slot has no observed success yet");
+            assert!(commit.capacity_disks()[0].is_some(), "capacity scope retains the unresolved candidate");
             assert!(
                 tracker.running() >= 1,
                 "the paused tail disk must continue in the background after early ACK"
