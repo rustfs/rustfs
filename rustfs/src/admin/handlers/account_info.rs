@@ -12,17 +12,19 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::admin::auth::authenticate_envelope_credentials;
+use crate::admin::auth::{
+    action_credentials_from_envelope, authenticate_envelope_credentials_with_context, ready_iam_handle_from_envelope,
+};
 use crate::admin::operation::{AdminRequest, AdminResponse, Operation};
 use crate::admin::router::{AdminOperation, S3Router};
-use crate::admin::runtime_sources::{current_action_credentials, object_store_from_envelope};
+use crate::admin::runtime_sources::object_store_from_envelope;
 use crate::admin::service::caller_identity::{OidcProfileFields, oidc_profile_fields};
 use crate::admin::storage_api::bucket::versioning_sys::BucketVersioningSys;
 use crate::admin::storage_api::contract::admin::StorageAdminApi;
 use crate::admin::storage_api::contract::bucket::{BucketOperations, BucketOptions};
 use crate::admin::storage_api::data_usage::{load_admin_data_usage_with_memory_overlay, load_bucket_scan_progress_for_admin};
 use crate::admin::storage_api::metadata_sys;
-use crate::auth::get_condition_values;
+use crate::auth::get_condition_values_with_client_info;
 use crate::server::ADMIN_PREFIX;
 use http::header::CONTENT_TYPE;
 use http::{HeaderMap, HeaderValue};
@@ -173,18 +175,23 @@ impl Operation for AccountInfoHandler {
             return Err(s3_error!(InvalidRequest, "get cred failed"));
         };
 
-        let (cred, owner) = authenticate_envelope_credentials(input_cred).await?;
+        let (cred, owner) = authenticate_envelope_credentials_with_context(input_cred, req.envelope()).await?;
 
-        let Ok(iam_store) = crate::admin::runtime_sources::current_ready_iam_handle() else {
-            return Err(s3_error!(InvalidRequest, "iam not init"));
-        };
+        let iam_store = ready_iam_handle_from_envelope(Some(req.envelope())).map_err(|err| {
+            if err.code() == &S3ErrorCode::ServiceUnavailable {
+                err
+            } else {
+                s3_error!(InvalidRequest, "iam not init")
+            }
+        })?;
 
         let default_claims = HashMap::new();
         let claims = cred.claims.as_ref().unwrap_or(&default_claims);
 
         let cred_clone = cred.clone();
         let remote_addr = req.policy_source_addr();
-        let conditions = get_condition_values(req.headers(), &cred_clone, None, None, remote_addr);
+        let conditions =
+            get_condition_values_with_client_info(req.headers(), &cred_clone, None, None, remote_addr, req.client_info());
         let cred_clone = Arc::new(cred_clone);
         let conditions = Arc::new(conditions);
 
@@ -250,7 +257,7 @@ impl Operation for AccountInfoHandler {
             cred.access_key.clone()
         };
 
-        let Some(admin_cred) = current_action_credentials() else {
+        let Some(admin_cred) = action_credentials_from_envelope(req.envelope()) else {
             return Err(S3Error::with_message(
                 S3ErrorCode::InternalError,
                 "action credentials are not initialized".to_string(),

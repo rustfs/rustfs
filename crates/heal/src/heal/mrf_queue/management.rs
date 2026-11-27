@@ -99,7 +99,8 @@ pub(super) fn now_ms() -> u64 {
 }
 
 pub(super) fn publish_summary(runtime: &MrfRuntime, counts: &super::partial_write::PartialWriteLifecycleSummary) {
-    let unverified = counts.held_count
+    let held_count = counts.held_count + counts.blocked_delete_generation_count;
+    let unverified = held_count
         + counts.legacy_generation_unknown_count
         + counts.bucket_incarnation_changed_count
         + counts.operator_accepted_count;
@@ -110,7 +111,7 @@ pub(super) fn publish_summary(runtime: &MrfRuntime, counts: &super::partial_writ
         checkpoint_owner: runtime.runtime_checkpoint.map(|(owner, _)| owner),
         checkpoint_sequence: runtime.runtime_checkpoint.map(|(_, sequence)| sequence),
         active_responsibility_count: runtime.partial_writes.depth().saturating_sub(unverified),
-        held_count: counts.held_count,
+        held_count,
         legacy_generation_unknown_count: counts.legacy_generation_unknown_count,
         bucket_incarnation_changed_count: counts.bucket_incarnation_changed_count,
         operator_accepted_count: counts.operator_accepted_count,

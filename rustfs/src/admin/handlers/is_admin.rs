@@ -14,7 +14,7 @@
 
 use crate::admin::operation::{AdminRequest, AdminResponse, Operation};
 use crate::admin::runtime_sources::current_action_credentials;
-use crate::auth::{check_key_valid, constant_time_eq, get_condition_values, get_session_token};
+use crate::auth::{check_key_valid, constant_time_eq, get_condition_values_with_client_info, get_session_token};
 use http::header::CONTENT_TYPE;
 use http::{HeaderMap, HeaderValue};
 use hyper::StatusCode;
@@ -66,7 +66,14 @@ impl Operation for IsAdminHandler {
             let empty_claims = HashMap::new();
             let iam_store = crate::admin::runtime_sources::current_ready_iam_handle()
                 .map_err(|_| s3_error!(InternalError, "iam not init"))?;
-            let conditions = get_condition_values(req.headers(), &cred, None, None, req.policy_source_addr());
+            let conditions = get_condition_values_with_client_info(
+                req.headers(),
+                &cred,
+                None,
+                None,
+                req.policy_source_addr(),
+                req.client_info(),
+            );
             iam_store
                 .is_allowed(&Args {
                     account: &cred.access_key,

@@ -73,7 +73,7 @@ members = [
     "crates/zip", # ZIP file handling and compression
     "crates/zstd-compat", # Fixed codec for dependencies requiring zstd 0.13
 ]
-exclude = ["vendor/hyper"]
+exclude = ["vendor/hyper", "vendor/openidconnect"]
 resolver = "3"
 
 [workspace.package]
@@ -243,6 +243,7 @@ chacha20poly1305 = { version = "0.11.0" }
 crc-fast = "1.10.0"
 hmac = { version = "0.13.0" }
 jsonwebtoken = { version = "12.0.0" }
+# Patched onto rsa 0.10 in vendor/openidconnect until upstream releases that dependency.
 openidconnect = { default-features = false, version = "4.1.0" }
 pbkdf2 = "0.13.0"
 p256 = { version = "0.14.0", features = ["ecdsa", "pkcs8"] }
@@ -460,4 +461,6 @@ strip = "none"
 [patch.crates-io]
 # Remove after Hyper releases HTTP/2 Expect support (hyperium/hyper#4217).
 hyper = { path = "vendor/hyper" }
+# Remove after openidconnect releases an rsa >= 0.10 build (ramosbugs/openidconnect-rs#140).
+openidconnect = { path = "vendor/openidconnect" }
 zstd = { path = "crates/zstd-compat" }

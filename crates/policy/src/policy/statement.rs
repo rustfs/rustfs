@@ -144,7 +144,7 @@ impl Statement {
             return false;
         }
 
-        !matches!(args.action, Action::AdminAction(action) if action.is_table_resource_scoped())
+        !matches!(args.action, Action::AdminAction(action) if action.is_resource_scoped())
     }
 
     fn is_kms(&self) -> bool {

@@ -25,7 +25,9 @@
 //! credentials but must *not* be allowed to rewrite the parent's secret. This
 //! module is the single place those distinctions are made.
 
-use crate::admin::auth::authenticate_envelope_credentials;
+use crate::admin::auth::{
+    action_credentials_from_envelope, authenticate_envelope_credentials, authenticate_envelope_credentials_with_context,
+};
 use crate::admin::runtime_sources::current_action_credentials;
 use crate::admin::storage_api::s3::{self, S3ErrorCode, S3Result};
 use crate::app::RequestEnvelope;
@@ -168,20 +170,42 @@ pub(crate) struct CallerIdentity {
 }
 
 impl CallerIdentity {
-    /// Authenticate the request and resolve who it acts as.
+    /// Authenticate the request against the process-ambient IAM domain and
+    /// resolve who it acts as.
     ///
-    /// Authentication only: callers that need an authorization decision must
-    /// still enforce their action policy and credential eligibility checks.
+    /// Use this for ambient-store handlers (such as `account.rs`) so auth,
+    /// authz, and IAM mutation share the same server domain. Handlers that
+    /// execute against the request's `ServerContextSlot` must call
+    /// [`Self::resolve_envelope_with_context`] instead.
     pub(crate) async fn resolve_envelope(envelope: &RequestEnvelope) -> S3Result<Self> {
         let Some(input_cred) = envelope.credentials() else {
             return Err(s3::error(S3ErrorCode::InvalidRequest, "authentication required"));
         };
 
         let (credentials, is_owner) = authenticate_envelope_credentials(input_cred).await?;
-        Ok(Self::from_credentials(credentials, is_owner))
+        let root_cred = current_action_credentials();
+        Ok(Self::from_credentials_with_root(credentials, is_owner, root_cred.as_ref()))
     }
 
+    /// Authenticate the request against its `ServerContextSlot` (when present)
+    /// and resolve who it acts as against that server context's root identity.
+    pub(crate) async fn resolve_envelope_with_context(envelope: &RequestEnvelope) -> S3Result<Self> {
+        let Some(input_cred) = envelope.credentials() else {
+            return Err(s3::error(S3ErrorCode::InvalidRequest, "authentication required"));
+        };
+
+        let (credentials, is_owner) = authenticate_envelope_credentials_with_context(input_cred, envelope).await?;
+        let root_cred = action_credentials_from_envelope(envelope);
+        Ok(Self::from_credentials_with_root(credentials, is_owner, root_cred.as_ref()))
+    }
+
+    #[cfg(test)]
     fn from_credentials(credentials: Credentials, is_owner: bool) -> Self {
+        let root_cred = current_action_credentials();
+        Self::from_credentials_with_root(credentials, is_owner, root_cred.as_ref())
+    }
+
+    fn from_credentials_with_root(credentials: Credentials, is_owner: bool, root_cred: Option<&Credentials>) -> Self {
         let presented_access_key = credentials.access_key.clone();
         let is_service_account = credentials.is_service_account();
         let is_temp = credentials.is_temp();
@@ -209,7 +233,7 @@ impl CallerIdentity {
             (IdentityType::Iam, presented_access_key.clone(), false)
         };
 
-        let is_root = current_action_credentials().is_some_and(|root| constant_time_eq(&root.access_key, &access_key));
+        let is_root = root_cred.is_some_and(|root| constant_time_eq(&root.access_key, &access_key));
 
         let identity_type = if is_root && matches!(identity_type, IdentityType::Iam) {
             IdentityType::Root
