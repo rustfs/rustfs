@@ -4731,28 +4731,21 @@ impl SetDisks {
             opts.max_parity,
         )?;
         // A zero-parity pool's metadata paths always require every slot.
-        let layout = if storage_class_config.degraded_put_parity_enabled()
+        let WriteLayout {
+            data_drives,
+            parity_drives,
+            write_quorum,
+        } = if storage_class_config.degraded_put_parity_enabled()
             && self.default_parity_count > 0
-            && layout.parity_drives > 0
-            && layout.parity_drives < disks.len() / 2
             && !is_meta_bucketname(bucket)
             && !opts.data_movement
             && !opts.restore_copyback
             && expected_restore_operation_id.is_none()
         {
-            let offline_drives = disks
-                .iter()
-                .filter(|slot| slot.as_ref().is_none_or(|disk| disk.is_faulty()))
-                .count();
-            layout.with_degraded_put_parity(disks.len(), offline_drives)?
+            layout.with_degraded_put_parity(&disks)
         } else {
             layout
         };
-        let WriteLayout {
-            data_drives,
-            parity_drives,
-            write_quorum,
-        } = layout;
 
         let mut fi = FileInfo::new([bucket, object].join("/").as_str(), data_drives, parity_drives);
         if let Some(block_size) = requested_ec_block_size {
@@ -4884,47 +4877,42 @@ impl SetDisks {
                 }
                 (std::iter::repeat_with(|| None).take(shuffle_disks.len()).collect(), errors)
             } else {
-                let writer_futs: Vec<_> = shuffle_disks
-                    .iter()
-                    .map(|disk_op| {
-                        let tmp_obj = tmp_object.clone();
-                        async move {
-                            if let Some(disk) = disk_op
-                                && disk.is_online().await
-                            {
-                                match create_bitrot_writer_with_orig_volume(
-                                    is_inline_buffer,
-                                    Some(disk),
-                                    bucket,
-                                    RUSTFS_META_TMP_BUCKET,
-                                    &tmp_obj,
-                                    shard_file_size,
-                                    frame_size,
-                                    HashAlgorithm::HighwayHash256S,
-                                )
-                                .await
-                                {
-                                    Ok(writer) => (Some(writer), None),
-                                    Err(err) => {
-                                        warn!(
-                                            event = EVENT_SET_DISK_WRITE,
-                                            component = LOG_COMPONENT_ECSTORE,
-                                            subsystem = LOG_SUBSYSTEM_SET_DISK,
-                                            disk = ?disk,
-                                            state = "bitrot_writer_skipped",
-                                            error = ?err,
-                                            "Set disk bitrot writer skipped"
-                                        );
-                                        (None, Some(err))
-                                    }
-                                }
-                            } else {
-                                (None, Some(DiskError::DiskNotFound))
+                let tmp_object = tmp_object.as_str();
+                let writer_results = join_all(shuffle_disks.iter().map(|disk_op| async move {
+                    if let Some(disk) = disk_op
+                        && disk.is_online().await
+                    {
+                        match create_bitrot_writer_with_orig_volume(
+                            is_inline_buffer,
+                            Some(disk),
+                            bucket,
+                            RUSTFS_META_TMP_BUCKET,
+                            tmp_object,
+                            shard_file_size,
+                            frame_size,
+                            HashAlgorithm::HighwayHash256S,
+                        )
+                        .await
+                        {
+                            Ok(writer) => (Some(writer), None),
+                            Err(err) => {
+                                warn!(
+                                    event = EVENT_SET_DISK_WRITE,
+                                    component = LOG_COMPONENT_ECSTORE,
+                                    subsystem = LOG_SUBSYSTEM_SET_DISK,
+                                    disk = ?disk,
+                                    state = "bitrot_writer_skipped",
+                                    error = ?err,
+                                    "Set disk bitrot writer skipped"
+                                );
+                                (None, Some(err))
                             }
                         }
-                    })
-                    .collect();
-                let writer_results = join_all(writer_futs).await;
+                    } else {
+                        (None, Some(DiskError::DiskNotFound))
+                    }
+                }))
+                .await;
                 let mut writers = Vec::with_capacity(writer_results.len());
                 let mut errors = Vec::with_capacity(writer_results.len());
                 for (writer, error) in writer_results {
