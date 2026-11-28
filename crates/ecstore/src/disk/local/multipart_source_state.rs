@@ -272,7 +272,17 @@ pub(super) struct FileStamp {
 impl FileStamp {
     pub(super) fn from_path(path: &Path) -> Option<Self> {
         let meta = std::fs::symlink_metadata(path).ok()?;
-        Some(Self {
+        Some(Self::from_metadata(&meta))
+    }
+
+    #[cfg(unix)]
+    pub(in crate::disk) fn from_file(file: &std::fs::File) -> Option<Self> {
+        let meta = file.metadata().ok()?;
+        Some(Self::from_metadata(&meta))
+    }
+
+    fn from_metadata(meta: &std::fs::Metadata) -> Self {
+        Self {
             len: meta.len(),
             modified: meta.modified().ok(),
             #[cfg(unix)]
@@ -280,7 +290,7 @@ impl FileStamp {
                 use std::os::unix::fs::MetadataExt;
                 meta.ino()
             },
-        })
+        }
     }
 
     #[cfg(unix)]
@@ -314,9 +324,14 @@ const ACTIVE_MULTIPART_SOURCE_HEADS_PER_SHARD: usize = 64;
 static ACTIVE_MULTIPART_SOURCE_HEADS: std::sync::LazyLock<os::ShardedPathCache<ActiveMultipartSourceEntry>> =
     std::sync::LazyLock::new(|| os::ShardedPathCache::new(ACTIVE_MULTIPART_SOURCE_HEADS_PER_SHARD));
 
-pub(super) fn put_active_multipart_source_head(source: impl AsRef<Path>, raw: Bytes, fi: FileInfo) {
+pub(super) fn put_active_multipart_source_head_with_stamp(
+    source: impl AsRef<Path>,
+    raw: Bytes,
+    fi: FileInfo,
+    precomputed_stamp: Option<FileStamp>,
+) {
     let source = source.as_ref();
-    let Some(head_stamp) = FileStamp::from_path(&source.join(STORAGE_FORMAT_FILE)) else {
+    let Some(head_stamp) = precomputed_stamp.or_else(|| FileStamp::from_path(&source.join(STORAGE_FORMAT_FILE))) else {
         return;
     };
     ACTIVE_MULTIPART_SOURCE_HEADS.insert(
@@ -432,8 +447,37 @@ pub(super) fn finish_active_multipart_part_transaction(
     ACTIVE_MULTIPART_SOURCE_HEADS.remove_if_mut(source, |entry| !entry.unsettled_parts.remove(&part_number));
 }
 
+#[inline]
+fn data_dir_matches_str(data_dir: Uuid, expected_data_dir: &str) -> bool {
+    let mut buf = Uuid::encode_buffer();
+    data_dir.hyphenated().encode_lower(&mut buf) == expected_data_dir
+}
+
+pub(super) fn has_cached_active_multipart_source_part(source: &Path, expected_data_dir: &str, part_number: usize) -> bool {
+    ACTIVE_MULTIPART_SOURCE_HEADS
+        .with_get(source, |entry| {
+            entry.unsettled_parts.is_empty()
+                && entry
+                    .fi
+                    .data_dir
+                    .filter(|dir| !dir.is_nil())
+                    .is_some_and(|dir| data_dir_matches_str(dir, expected_data_dir))
+                && entry.parts.contains_key(&part_number)
+        })
+        .unwrap_or(false)
+}
+
 pub(super) fn get_active_multipart_source_part_with_head(
     source: &Path,
+    part_number: usize,
+    head_already_verified: bool,
+) -> Option<rustfs_filemeta::ObjectPartInfo> {
+    get_active_multipart_source_part_with_head_in_dir(source, None, part_number, head_already_verified)
+}
+
+pub(super) fn get_active_multipart_source_part_with_head_in_dir(
+    source: &Path,
+    expected_data_dir: Option<&str>,
     part_number: usize,
     head_already_verified: bool,
 ) -> Option<rustfs_filemeta::ObjectPartInfo> {
@@ -443,6 +487,11 @@ pub(super) fn get_active_multipart_source_part_with_head(
                 return None;
             }
             let data_dir = entry.fi.data_dir.filter(|dir| !dir.is_nil())?;
+            if let Some(expected_dir) = expected_data_dir
+                && !data_dir_matches_str(data_dir, expected_dir)
+            {
+                return None;
+            }
             let (expected_stamp, part) = entry.parts.get(&part_number)?;
             Some((entry.head_stamp, data_dir, *expected_stamp, part.clone()))
         })

@@ -5460,25 +5460,6 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
             }
         }
 
-        let completed_part_numbers = fi.parts.iter().map(|part| part.number).collect::<HashSet<_>>();
-        let mut parts = Vec::with_capacity(staged_part_numbers.len());
-
-        for part_number in staged_part_numbers {
-            parts.push(path_join_buf(&[
-                &upload_id_path,
-                upload_data_dir.as_str(),
-                format!("part.{part_number}.meta").as_str(),
-            ]));
-
-            if !completed_part_numbers.contains(&part_number) {
-                parts.push(path_join_buf(&[
-                    &upload_id_path,
-                    upload_data_dir.as_str(),
-                    format!("part.{part_number}").as_str(),
-                ]));
-            }
-        }
-
         // Phase 2 (backlog#899): fence the commit on lock loss before any destructive
         // step. If the refresh heartbeat has observed a refresh-quorum loss, another
         // writer may have re-acquired this object's lock; proceeding would race a
@@ -5710,6 +5691,31 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
             }
         } else {
             (shuffle_disks.clone(), vec![None; shuffle_disks.len()])
+        };
+        let can_skip_part_cleanup = !needs_upgrade
+            && commit_disks
+                .iter()
+                .all(|disk| disk.as_ref().is_some_and(|disk| disk.is_local()));
+        let parts = if can_skip_part_cleanup {
+            Vec::new()
+        } else {
+            let completed_part_numbers = fi.parts.iter().map(|part| part.number).collect::<HashSet<_>>();
+            let mut parts = Vec::with_capacity(staged_part_numbers.len());
+            for part_number in staged_part_numbers {
+                parts.push(path_join_buf(&[
+                    &upload_id_path,
+                    upload_data_dir.as_str(),
+                    format!("part.{part_number}.meta").as_str(),
+                ]));
+                if !completed_part_numbers.contains(&part_number) {
+                    parts.push(path_join_buf(&[
+                        &upload_id_path,
+                        upload_data_dir.as_str(),
+                        format!("part.{part_number}").as_str(),
+                    ]));
+                }
+            }
+            parts
         };
         let commit_set = self.clone();
         let commit_bucket = bucket.to_owned();
@@ -5981,10 +5987,6 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
             // parts; deleting them before the commit would strand the upload
             // permanently. This mirrors the "clean up only after commit" pattern
             // already used for the old data-dir GC and the upload-dir delete_all below.
-            let can_skip_part_cleanup = !needs_upgrade
-                && commit_disks
-                    .iter()
-                    .all(|disk| disk.as_ref().is_some_and(|disk| disk.is_local()));
             if !can_skip_part_cleanup {
                 commit_set.cleanup_multipart_path(&parts).await;
             }
