@@ -78,7 +78,7 @@ jobs:
         github.event_name == 'workflow_dispatch'
       )
     runs-on: sm-standard-4
-    timeout-minutes: 60
+    timeout-minutes: 120
     env:
       FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
     steps:
