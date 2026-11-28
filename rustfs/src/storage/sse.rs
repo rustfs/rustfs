@@ -287,8 +287,9 @@ pub(crate) fn classify_unrecorded_sse_response(
 /// The ETag a read of this object answers with.
 ///
 /// The stored ETag, except where it is the sealed form MinIO never showed a
-/// client: see [`rustfs_sse::sealed_etag_for_response`]. Conditional request
-/// headers are still evaluated against the stored ETag.
+/// client: see [`rustfs_sse::sealed_etag_for_response`]. It is also the ETag
+/// conditional request headers are compared with: a client can only send back
+/// the one it was answered with.
 pub(crate) async fn read_response_etag(
     bucket: &str,
     key: &str,
@@ -306,6 +307,12 @@ pub(crate) async fn read_response_etag(
     };
     let presented = rustfs_sse::sealed_etag_for_response(&HOST, request, stored_etag).await;
     Some(presented.unwrap_or_else(|| stored_etag.to_owned()))
+}
+
+/// Whether [`read_response_etag`] may answer with an ETag other than the
+/// stored one. Decided from the ETag alone, for a caller that cannot await.
+pub(crate) fn stored_etag_may_be_sealed(stored_etag: Option<&str>) -> bool {
+    stored_etag.is_some_and(rustfs_sse::stored_etag_may_be_sealed)
 }
 
 /// Decrypt an IAM record a MinIO server stored KMS-encrypted under

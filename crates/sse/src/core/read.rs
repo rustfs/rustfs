@@ -20,7 +20,7 @@ use crate::core::keying::metadata::stored_ssec_metadata;
 use crate::core::keying::stored::{
     StoredManagedKey, open_under_customer_key, open_under_stored_data_key, recognize_stored_managed_key,
 };
-use crate::core::keying::{SealedEtag, open_sealed_etag, sealed_etag};
+use crate::core::keying::{SealedEtag, has_sealed_etag_form, open_sealed_etag, sealed_etag};
 use crate::core::request::SseKmsPrincipal;
 use crate::core::s3::authorization::authorize_sse_kms_key;
 use crate::core::s3::headers::{SseReadResponseHeaders, managed_sse_public_header};
@@ -270,6 +270,16 @@ pub async fn sealed_etag_for_response(host: &dyn SseHost, request: DecryptionReq
         .await
         .ok()?;
     open_sealed_etag(opened.key_kind, opened.key_bytes, &sealed)
+}
+
+/// Whether [`sealed_etag_for_response`] may answer with an ETag other than
+/// `stored_etag`, judged from the ETag alone and without a key.
+///
+/// For a caller that has to decide before it can await the answer: `false`
+/// means the stored ETag is the one a response carries, `true` that only
+/// [`sealed_etag_for_response`] can tell.
+pub fn stored_etag_may_be_sealed(stored_etag: &str) -> bool {
+    has_sealed_etag_form(stored_etag)
 }
 
 /// Recognize a stored managed-SSE object and name the key it is read under.

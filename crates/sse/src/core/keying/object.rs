@@ -236,6 +236,15 @@ pub(crate) fn unseal_etag(object_key: [u8; 32], sealed: &[u8]) -> Result<Vec<u8>
     decrypt_sealed_object_key_payload(sealing_key, header, sealed)
 }
 
+/// Whether a stored ETag has the form of a sealed one, whatever the object
+/// it belongs to: hex, and at least [`SEALED_ETAG_MIN_SIZE`] bytes of it. A
+/// bare digest is shorter and a multipart ETag is not hex.
+pub(crate) fn has_sealed_etag_form(stored_etag: &str) -> bool {
+    stored_etag.len() >= SEALED_ETAG_MIN_SIZE * 2
+        && stored_etag.len().is_multiple_of(2)
+        && stored_etag.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
 /// The sealed form of a stored ETag, when the object carries a sealed object
 /// key and its ETag is sealed.
 ///

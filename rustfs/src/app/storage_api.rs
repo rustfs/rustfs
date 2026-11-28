@@ -1715,10 +1715,10 @@ pub(crate) mod object_usecase {
         EC_BLOCK_SIZE_HINT_REASON_HEADER, EC_BLOCK_SIZE_HINT_STATUS_HEADER, EC_BLOCK_SIZE_RESPONSE_HEADER, ECStore,
         EcBlockSizeHintOutcome, GetObjectReader, OldCurrentSize, RFC1123, StorageDeletedObject, StorageObjectInfo,
         StorageObjectLockDeleteOptions, StorageObjectOptions, StorageObjectToDelete, StoragePutObjReader, check_preconditions,
-        parse_object_lock_legal_hold_native, parse_object_lock_retention_native, parse_part_number_i32_to_usize,
-        remove_object_lock_metadata_for_copy, resolve_ec_block_size_hint, strip_managed_encryption_metadata,
-        validate_bucket_exists, validate_new_object_key, validate_object_key, validate_sse_headers_for_read,
-        validate_sse_headers_for_write, validate_ssec_for_read,
+        check_preconditions_with_etag, parse_object_lock_legal_hold_native, parse_object_lock_retention_native,
+        parse_part_number_i32_to_usize, remove_object_lock_metadata_for_copy, resolve_ec_block_size_hint,
+        strip_managed_encryption_metadata, validate_bucket_exists, validate_new_object_key, validate_object_key,
+        validate_sse_headers_for_read, validate_sse_headers_for_write, validate_ssec_for_read,
     };
     #[cfg(all(any(feature = "cuobject", feature = "nixl"), target_os = "linux"))]
     pub(crate) use crate::storage::storage_api::{

@@ -217,6 +217,12 @@ pub(crate) fn sealed_etag(_metadata: &HashMap<String, String>, _stored_etag: &st
     None
 }
 
+/// Whether a stored ETag has the form of a sealed one. Direct mode seals none.
+#[cfg(not(feature = "m-compatible"))]
+pub(crate) fn has_sealed_etag_form(_stored_etag: &str) -> bool {
+    false
+}
+
 /// What a sealed ETag holds. Direct mode seals none, so there is nothing to open.
 #[cfg(not(feature = "m-compatible"))]
 pub(crate) fn open_sealed_etag(_key_kind: EncryptionKeyKind, _key_bytes: [u8; 32], _sealed: &[u8]) -> Option<String> {

@@ -5177,6 +5177,157 @@ mod tests {
         }
     }
 
+    /// A client can only send back the ETag a read answered with. Where the
+    /// stored ETag is sealed that is not the stored one, and a conditional GET
+    /// or HEAD has to compare the one the client holds: the ETag from HEAD
+    /// must satisfy `If-Match` and turn `If-None-Match` into a 304.
+    #[cfg(feature = "m-compatible")]
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn etag_answered_by_head_round_trips_through_conditional_reads_of_a_sealed_etag() {
+        use md5::{Digest as _, Md5};
+
+        // The stored ETag form of a single-part customer-key object on an
+        // imported drive set; a response shows its last 32 characters.
+        const SEALED: &str = "20000f00ae1b28a996b85ecef920fb8da6843e2838328dbfef3a9a266201f27ee3f8c64555ea36a2196275c2261d745d";
+
+        let context = crate::storage::storage_api::bootstrap_instance_ctx();
+        assert!(
+            context.object_encryption_resolver().is_some(),
+            "real SSE-C reads need the production encryption resolver"
+        );
+        let (store, bucket) = crate::app::gating_test_env::durable_quota_test_bucket("sealed-etag-round-trip", 1 << 20).await;
+        let object = "ledger.csv";
+
+        let customer_key = [0x2a_u8; 32];
+        let encoded_key = base64_simd::STANDARD.encode_to_string(customer_key);
+        let key_md5 = {
+            let mut hasher = Md5::new();
+            hasher.update(customer_key);
+            base64_simd::STANDARD.encode_to_string(hasher.finalize())
+        };
+        let payload = Bytes::from_static(b"customer-key protected payload");
+        let usecase = DefaultObjectUsecase::from_global();
+        Box::pin(usecase.execute_put_object_owned(
+            method_only_put_envelope(),
+            PutObjectWriteInput {
+                sse_customer_algorithm: Some("AES256".to_string()),
+                sse_customer_key: Some(encoded_key.clone()),
+                sse_customer_key_md5: Some(key_md5.clone()),
+                ..put_bytes(bucket.clone(), object, payload.clone())
+            },
+        ))
+        .await
+        .expect("SSE-C PUT");
+        store
+            .put_object_metadata(
+                &bucket,
+                object,
+                &ObjectOptions {
+                    eval_metadata: Some(HashMap::from([("etag".to_owned(), SEALED.to_owned())])),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("store the sealed ETag form");
+        let stored = store
+            .get_object_info(&bucket, object, &ObjectOptions::default())
+            .await
+            .expect("stored object");
+        assert_eq!(stored.etag.as_deref(), Some(SEALED), "the fixture must reach the read path sealed");
+
+        let read_headers = |condition: Option<(http::HeaderName, &str)>| {
+            let mut headers = HeaderMap::new();
+            headers.insert("x-amz-server-side-encryption-customer-algorithm", HeaderValue::from_static("AES256"));
+            headers.insert(
+                "x-amz-server-side-encryption-customer-key",
+                HeaderValue::from_str(&encoded_key).expect("encoded customer key is a valid header"),
+            );
+            headers.insert(
+                "x-amz-server-side-encryption-customer-key-md5",
+                HeaderValue::from_str(&key_md5).expect("customer key MD5 is a valid header"),
+            );
+            if let Some((name, etag)) = condition {
+                headers.insert(name, HeaderValue::from_str(&format!("\"{etag}\"")).expect("condition header"));
+            }
+            headers
+        };
+        let head = |condition: Option<(http::HeaderName, &'static str)>| {
+            let input = rustfs_gateway_types::dto::HeadObjectInput {
+                sse_customer_algorithm: Some("AES256".to_owned()),
+                sse_customer_key: Some(SseCustomerKey::new(encoded_key.clone())),
+                sse_customer_key_md5: Some(key_md5.clone()),
+                ..head_object_input(&bucket, object, None)
+            };
+            let envelope = head_envelope(read_headers(condition), http::Extensions::new());
+            let usecase = &usecase;
+            async move { Box::pin(crate::app::test_seams::head_object_gateway(usecase, envelope, input)).await }
+        };
+        let get = |condition: Option<(http::HeaderName, &'static str)>| {
+            let input = rustfs_gateway_types::dto::GetObjectInput {
+                sse_customer_algorithm: Some("AES256".to_owned()),
+                sse_customer_key: Some(SseCustomerKey::new(encoded_key.clone())),
+                sse_customer_key_md5: Some(key_md5.clone()),
+                ..get_object_input(&bucket, object, None)
+            };
+            let envelope = get_envelope(read_headers(condition), http::Extensions::new());
+            let usecase = &usecase;
+            async move { Box::pin(get_object_gateway(usecase, envelope, input)).await }
+        };
+
+        let answered: &'static str = Box::leak(
+            head(None)
+                .await
+                .expect("unconditional HEAD")
+                .output
+                .etag
+                .expect("HEAD answers with an ETag")
+                .opaque
+                .into_boxed_str(),
+        );
+        assert_eq!(
+            answered,
+            &SEALED[SEALED.len() - 32..],
+            "HEAD answers with the presented ETag, not the stored form"
+        );
+
+        // If-Match with the ETag HEAD answered with: both reads go through.
+        head(Some((http::header::IF_MATCH, answered)))
+            .await
+            .expect("HEAD If-Match with the ETag HEAD answered with");
+        let matched = get(Some((http::header::IF_MATCH, answered)))
+            .await
+            .expect("GET If-Match with the ETag HEAD answered with");
+        assert_eq!(matched.output.etag.as_ref().map(|etag| etag.opaque.as_str()), Some(answered));
+        assert_eq!(read_get_body(matched.output.body.expect("GET body")).await, payload);
+
+        // If-None-Match with it: both reads are a 304 that carries the same ETag.
+        let quoted = format!("\"{answered}\"");
+        for not_modified in [
+            head(Some((http::header::IF_NONE_MATCH, answered))).await.err(),
+            get(Some((http::header::IF_NONE_MATCH, answered))).await.err(),
+        ] {
+            let not_modified = not_modified.expect("If-None-Match with the ETag HEAD answered with is a 304");
+            assert_eq!(not_modified.code(), &OwnedS3ErrorCode::NotModified);
+            assert_eq!(not_modified.headers().expect("304 validators")["etag"], quoted.as_str());
+        }
+
+        // The stored form was never shown to a client and matches nothing.
+        for precondition_failed in [
+            head(Some((http::header::IF_MATCH, SEALED))).await.err(),
+            get(Some((http::header::IF_MATCH, SEALED))).await.err(),
+        ] {
+            assert_eq!(
+                precondition_failed.expect("If-Match with the stored form fails").code(),
+                &OwnedS3ErrorCode::PreconditionFailed
+            );
+        }
+        let unmatched = get(Some((http::header::IF_NONE_MATCH, SEALED)))
+            .await
+            .expect("If-None-Match with the stored form reads the object");
+        assert_eq!(read_get_body(unmatched.output.body.expect("GET body")).await, payload);
+    }
+
     #[tokio::test]
     #[serial_test::serial]
     async fn quota_rejects_ciphertext_replication_before_polling_the_body() {

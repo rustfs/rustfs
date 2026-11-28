@@ -73,11 +73,11 @@ pub(crate) enum SealedEtag {
 // an object key seals the ETag with it.
 #[cfg(not(feature = "m-compatible"))]
 pub(crate) use direct::{
-    SESSION_KEY_NEEDS_CUSTOMER_KEY, new_key_under_customer_key, new_key_under_data_key, new_session_key_under_customer_key,
-    open_sealed_etag, sealed_etag,
+    SESSION_KEY_NEEDS_CUSTOMER_KEY, has_sealed_etag_form, new_key_under_customer_key, new_key_under_data_key,
+    new_session_key_under_customer_key, open_sealed_etag, sealed_etag,
 };
 #[cfg(feature = "m-compatible")]
 pub(crate) use object::{
-    SESSION_KEY_NEEDS_CUSTOMER_KEY, new_key_under_customer_key, new_key_under_data_key, new_session_key_under_customer_key,
-    open_sealed_etag, sealed_etag,
+    SESSION_KEY_NEEDS_CUSTOMER_KEY, has_sealed_etag_form, new_key_under_customer_key, new_key_under_data_key,
+    new_session_key_under_customer_key, open_sealed_etag, sealed_etag,
 };

@@ -81,6 +81,7 @@ pub use crate::core::keying::metadata::{
 };
 pub use crate::core::read::{
     DecryptionRequest, classify_sse_read_response, classify_unrecorded_sse_response, sealed_etag_for_response, sse_decryption,
+    stored_etag_may_be_sealed,
 };
 pub use crate::core::request::SseKmsPrincipal;
 #[cfg(any(test, feature = "test-util"))]

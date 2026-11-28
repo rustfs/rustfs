@@ -913,3 +913,23 @@ async fn read_response_reports_a_minio_written_kms_key_in_arn_form() {
         .expect("RustFS SSE-KMS object");
     assert_eq!(headers.ssekms_key_id.as_deref(), Some("finance-key"));
 }
+
+/// A caller that cannot await the presented ETag still has to know when the
+/// stored one may not be it. The form test must say so for every stored ETag
+/// that is presented differently, and only a sealed form may make it say so.
+#[test]
+fn every_sealed_etag_has_the_sealed_form() {
+    use crate::core::read::stored_etag_may_be_sealed;
+
+    for sealed in [SEALED_ETAG_AES_GCM_HEX, SEALED_ETAG_CHACHA20_HEX] {
+        assert!(stored_etag_may_be_sealed(sealed), "{sealed}");
+    }
+    for shown in [
+        SEALED_ETAG_PLAINTEXT_HEX,
+        "b228928307afa1ffeb9aa36de4526de8-3",
+        "not-an-etag",
+        "",
+    ] {
+        assert!(!stored_etag_may_be_sealed(shown), "{shown}");
+    }
+}

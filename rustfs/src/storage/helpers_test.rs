@@ -46,11 +46,12 @@ mod tests {
     use crate::storage::storage_api::ecstore_bucket::metadata_sys::ObjectLockConfigState;
     use crate::storage::storage_api::test_consumer::{
         BucketMetadata, DEFAULT_READ_BUFFER_SIZE, StorageObjectInfo as ObjectInfo, apply_cors_headers,
-        apply_default_lock_retention_metadata, bucket_metadata_sys_initialized, check_preconditions, decode_tags_to_map,
-        get_adaptive_buffer_size_with_profile, get_buffer_size_opt_in, get_global_bucket_metadata_sys, matches_origin_pattern,
-        parse_etag, process_lambda_configurations, process_queue_configurations, process_topic_configurations,
-        remove_object_lock_metadata_for_copy, remove_object_lock_retention_metadata, set_bucket_metadata,
-        validate_bucket_object_lock_enabled, validate_list_object_unordered_with_delimiter,
+        apply_default_lock_retention_metadata, bucket_metadata_sys_initialized, check_preconditions,
+        check_preconditions_with_etag, decode_tags_to_map, get_adaptive_buffer_size_with_profile, get_buffer_size_opt_in,
+        get_global_bucket_metadata_sys, matches_origin_pattern, parse_etag, process_lambda_configurations,
+        process_queue_configurations, process_topic_configurations, remove_object_lock_metadata_for_copy,
+        remove_object_lock_retention_metadata, set_bucket_metadata, validate_bucket_object_lock_enabled,
+        validate_list_object_unordered_with_delimiter,
     };
     use http::{HeaderMap, HeaderValue, StatusCode};
     use rustfs_config::MI_B;
@@ -1045,6 +1046,31 @@ mod tests {
             wire.source()
                 .is_some_and(|cause| cause.is::<http::header::InvalidHeaderValue>())
         );
+    }
+
+    /// A read that answers with an ETag other than the stored one compares the
+    /// ETag conditions with the one it answers with, and a 304 carries it.
+    #[test]
+    fn preconditions_compare_the_etag_the_response_carries() {
+        let info = ObjectInfo {
+            etag: Some("stored-form".to_owned()),
+            ..Default::default()
+        };
+        let check = |name: http::HeaderName, condition: &str| {
+            let mut headers = HeaderMap::new();
+            headers.insert(name, HeaderValue::from_str(condition).unwrap());
+            check_preconditions_with_etag(&headers, &info, Some("answered"))
+        };
+
+        assert!(check(http::header::IF_MATCH, "\"answered\"").is_ok());
+        assert_eq!(
+            check(http::header::IF_MATCH, "\"stored-form\"").unwrap_err().code(),
+            &S3ErrorCode::PreconditionFailed
+        );
+        assert!(check(http::header::IF_NONE_MATCH, "\"stored-form\"").is_ok());
+        let not_modified = check(http::header::IF_NONE_MATCH, "\"answered\"").unwrap_err();
+        assert_eq!(not_modified.code(), &S3ErrorCode::NotModified);
+        assert_eq!(not_modified.headers().expect("304 validators")["etag"], "\"answered\"");
     }
 
     #[test]

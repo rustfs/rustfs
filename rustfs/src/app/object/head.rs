@@ -625,7 +625,11 @@ impl DefaultObjectUsecase {
             validate_ssec_for_read(&info.user_defined, input.sse_customer_key.as_ref(), input.sse_customer_key_md5.as_ref())?;
         }
 
-        let conditions = check_preconditions(req.headers(), &info);
+        // The ETag this response carries is the one the conditions are compared
+        // with: it is the only one a client has seen for this object.
+        let response_etag =
+            crate::storage::sse::read_response_etag(&bucket, &key, &info.user_defined, info.etag.as_deref()).await;
+        let conditions = check_preconditions_with_etag(req.headers(), &info, response_etag.as_deref());
         if conditions.is_err() && !replication_check {
             let principal = SseKmsPrincipal::from_request(&req);
             crate::storage::sse::validate_conditional_read(&bucket, &key, &info.user_defined, req.headers(), principal.as_ref())
@@ -653,8 +657,6 @@ impl DefaultObjectUsecase {
             sse_customer_key_md5,
             sse_kms_key_id,
         } = head_sse_response_fields(&metadata_map, input.sse_customer_key_md5.as_ref());
-        let response_etag =
-            crate::storage::sse::read_response_etag(&bucket, &key, &info.user_defined, info.etag.as_deref()).await;
         let storage_class = response_storage_class_name(&info, &metadata_map);
         // checksum: classify once; additional algorithms (XXHash3/64/128, SHA-512, MD5)
         // land in `extra` and are emitted as raw headers below (s3s has no typed field).

@@ -269,3 +269,11 @@ fn unrecorded_sse_response_reports_nothing_without_the_minio_read_path() {
         assert!(classify_unrecorded_sse_response(&metadata, None).is_none(), "{slot}");
     }
 }
+
+/// A default build answers with every stored ETag as it is stored.
+#[test]
+fn no_stored_etag_has_a_sealed_form_in_a_default_build() {
+    assert!(!crate::core::read::stored_etag_may_be_sealed(
+        "20000f00ae1b28a996b85ecef920fb8da6843e2838328dbfef3a9a266201f27ee3f8c64555ea36a2196275c2261d745d"
+    ));
+}
