@@ -17,7 +17,7 @@
 
 use super::{
     OpRow, Served,
-    object_write::{request_version_id, retain_until},
+    object_write::{request_version_id, retain_until_with_offset},
     row,
 };
 use crate::app::RequestEnvelope;
@@ -207,7 +207,7 @@ impl Served for dto::CreateMultipartUpload {
             bucket: input.bucket.as_str(),
             key: input.key.as_str(),
             query_version: version.as_deref(),
-            retain_until: retain_until(input.object_lock_retain_until_date.as_ref())?,
+            retain_until: retain_until_with_offset(input.object_lock_retain_until_date.as_ref(, request.context().object_lock_retain_until_offset_seconds()))?,
             legal_hold_present: input.object_lock_legal_hold_status.is_some(),
             retention_present: input.object_lock_mode.is_some() || input.object_lock_retain_until_date.is_some(),
         };
@@ -216,6 +216,7 @@ impl Served for dto::CreateMultipartUpload {
 
     async fn execute(context: Option<Arc<AppContext>>, envelope: RequestEnvelope, request: Req<Self>) -> S3Result<Resp<Self>> {
         let version = request_version_id(&envelope);
+        let retain_until_offset = request.context().object_lock_retain_until_offset_seconds();
         let input = request.into_input();
         let fields = CreateMultipartUploadFields {
             bucket: input.bucket.as_str().to_owned(),
@@ -230,7 +231,7 @@ impl Served for dto::CreateMultipartUpload {
             ssekms_key_id: input.ssekms_key_id,
             object_lock_legal_hold_status: input.object_lock_legal_hold_status.map(|value| value.as_str().to_owned()),
             object_lock_mode: input.object_lock_mode.map(|value| value.as_str().to_owned()),
-            object_lock_retain_until_date: retain_until(input.object_lock_retain_until_date.as_ref())?,
+            object_lock_retain_until_date: retain_until_with_offset(input.object_lock_retain_until_date.as_ref, retain_until_offset())?,
         };
         let output = DefaultMultipartUsecase::with_context(context)
             .execute_create_multipart_upload(envelope, fields, version)
