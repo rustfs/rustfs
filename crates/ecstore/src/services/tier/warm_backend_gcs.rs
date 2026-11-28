@@ -37,7 +37,6 @@ use rustfs_s3_client::{
     api_put_object::PutObjectOptions,
     transition_api::{Options, ReadCloser, ReaderImpl},
 };
-use rustfs_utils::egress::validate_outbound_url;
 use tracing::warn;
 
 const _MAX_PART_SIZE: i64 = 1024 * 1024 * 1024 * 5;
@@ -135,6 +134,21 @@ where
     })
 }
 
+const GCS_SERVICE_ENDPOINT: &str = "https://storage.googleapis.com";
+
+fn gcs_service_endpoint(configured: &str) -> std::io::Result<&'static str> {
+    // Both SDK clients resolve hosts internally. Only pass the fixed Google origin to them.
+    if configured.is_empty()
+        || url::Url::parse(configured).is_ok_and(|url| url.as_str().strip_suffix('/') == Some(GCS_SERVICE_ENDPOINT))
+    {
+        return Ok(GCS_SERVICE_ENDPOINT);
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::InvalidInput,
+        "custom GCS tier endpoint is not allowed; omit the endpoint or use https://storage.googleapis.com",
+    ))
+}
+
 pub struct WarmBackendGCS {
     pub client: Arc<Storage>,
     pub control: Arc<StorageControl>,
@@ -152,11 +166,7 @@ impl WarmBackendGCS {
             return Err(std::io::Error::other("no bucket name was provided"));
         }
 
-        if !conf.endpoint.is_empty() {
-            let endpoint_url = url::Url::parse(&conf.endpoint).map_err(|e| std::io::Error::other(e.to_string()))?;
-            validate_outbound_url(&endpoint_url)
-                .map_err(|err| std::io::Error::other(format!("tier endpoint is not allowed: {err}")))?;
-        }
+        let endpoint = gcs_service_endpoint(&conf.endpoint)?;
 
         let service_account = serde_json::from_str(&conf.creds)?;
         let credentials = Builder::new(service_account)
@@ -165,21 +175,16 @@ impl WarmBackendGCS {
             .build()
             .map_err(|e| std::io::Error::other(format!("Invalid credentials JSON: {}", e)))?;
 
-        let Ok(client) = Storage::builder()
-            .with_endpoint(conf.endpoint.clone())
+        let data_builder = Storage::builder()
             .with_credentials(credentials.clone())
-            .build()
-            .await
-        else {
+            .with_endpoint(endpoint);
+        let control_builder = StorageControl::builder()
+            .with_credentials(credentials)
+            .with_endpoint(endpoint);
+        let Ok(client) = data_builder.build().await else {
             return Err(std::io::Error::other("Storage::builder error"));
         };
         let client = Arc::new(client);
-        // Control-plane client: the data-plane `Storage` client cannot delete or list objects;
-        // delete_object/list_objects live on StorageControl.
-        let mut control_builder = StorageControl::builder().with_credentials(credentials);
-        if !conf.endpoint.is_empty() {
-            control_builder = control_builder.with_endpoint(conf.endpoint.clone());
-        }
         let Ok(control) = control_builder.build().await else {
             return Err(std::io::Error::other("StorageControl::builder error"));
         };
@@ -716,6 +721,27 @@ mod tests {
             requests[2].to_ascii_lowercase().contains("\r\nrange: bytes=0-6\r\n"),
             "the oversized response must be fetched under the same seven-byte request boundary"
         );
+    }
+
+    #[test]
+    fn native_gcs_tier_uses_only_the_google_storage_origin() {
+        for configured in ["", "https://storage.googleapis.com", "https://STORAGE.GOOGLEAPIS.COM:443/"] {
+            assert_eq!(super::gcs_service_endpoint(configured).unwrap(), super::GCS_SERVICE_ENDPOINT);
+        }
+        for configured in [
+            "https://storage.gcs.example.test",
+            "http://storage.googleapis.com",
+            "https://storage.googleapis.com:8443",
+            "https://storage.googleapis.com/other",
+            "https://storage.googleapis.com/?endpoint=other",
+            "https://user@storage.googleapis.com",
+        ] {
+            assert_eq!(
+                super::gcs_service_endpoint(configured).unwrap_err().kind(),
+                std::io::ErrorKind::InvalidInput,
+                "{configured}"
+            );
+        }
     }
 
     #[tokio::test]

@@ -42,7 +42,7 @@ use crate::{
 };
 use rustfs_utils::path::trim_etag;
 
-impl TransitionClient {
+impl<C: crate::transition_api::TransitionConnector> TransitionClient<C> {
     pub async fn put_object_multipart(
         &self,
         bucket_name: &str,

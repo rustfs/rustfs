@@ -14,6 +14,8 @@ The external request stack is shared with TCP, including readiness, Keystone aut
 
 ## What RustFS requires from the proxy
 
+Simple trusted-proxy mode trusts loopback by default. For a reverse proxy on another host, put its address or CIDR in `RUSTFS_TRUSTED_PROXY_NETWORKS` so RustFS can use its forwarded client address and scheme.
+
 S3 clients sign requests with AWS SigV4. RustFS (via `s3s`) re-derives the signature from the forwarded request and streams the request body to storage, so the proxy must forward the signed material and the body byte-for-byte:
 
 | Requirement | Why |

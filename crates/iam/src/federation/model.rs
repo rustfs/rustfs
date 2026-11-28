@@ -137,15 +137,20 @@ impl VerifiedFederatedIdentity {
 pub(crate) struct OpaqueLogoutContinuation {
     provider: FederatedProviderRef,
     id_token: String,
+    callback_origin: url::Origin,
 }
 
 impl OpaqueLogoutContinuation {
-    pub(crate) fn new(provider: FederatedProviderRef, id_token: String) -> Self {
-        Self { provider, id_token }
+    pub(crate) fn new(provider: FederatedProviderRef, id_token: String, callback_origin: url::Origin) -> Self {
+        Self {
+            provider,
+            id_token,
+            callback_origin,
+        }
     }
 
-    pub(crate) fn into_parts(self) -> (FederatedProviderRef, String) {
-        (self.provider, self.id_token)
+    pub(crate) fn into_parts(self) -> (FederatedProviderRef, String, url::Origin) {
+        (self.provider, self.id_token, self.callback_origin)
     }
 }
 
@@ -237,10 +242,14 @@ mod tests {
 
     #[test]
     fn logout_continuation_binds_provider_and_redacts_token() {
-        let continuation =
-            OpaqueLogoutContinuation::new(FederatedProviderRef::new("standard_oidc".to_string()), "secret-id-token".to_string());
+        let continuation = OpaqueLogoutContinuation::new(
+            FederatedProviderRef::new("standard_oidc".to_string()),
+            "secret-id-token".to_string(),
+            url::Url::parse("https://console.example.test/callback").unwrap().origin(),
+        );
         let continuation_debug = format!("{continuation:?}");
-        let (provider, id_token) = continuation.into_parts();
+        let (provider, id_token, origin) = continuation.into_parts();
+        assert_eq!(origin.ascii_serialization(), "https://console.example.test");
 
         assert_eq!(provider.as_str(), "standard_oidc");
         assert_eq!(id_token, "secret-id-token");

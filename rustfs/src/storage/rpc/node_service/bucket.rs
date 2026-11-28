@@ -225,17 +225,18 @@ impl NodeService {
             }
         };
         match self.local_peer.list_bucket(&options).await {
-            Ok(bucket_infos) => {
-                let bucket_infos = bucket_infos
-                    .into_iter()
-                    .filter_map(|bucket_info| serde_json::to_string(&bucket_info).ok())
-                    .collect();
-                Ok(Response::new(ListBucketResponse {
+            Ok(bucket_infos) => match encode_bucket_infos(&bucket_infos) {
+                Ok(bucket_infos) => Ok(Response::new(ListBucketResponse {
                     success: true,
                     bucket_infos,
                     error: None,
-                }))
-            }
+                })),
+                Err(err) => Ok(Response::new(ListBucketResponse {
+                    success: false,
+                    bucket_infos: Vec::new(),
+                    error: Some(err.into()),
+                })),
+            },
 
             Err(err) => Ok(Response::new(ListBucketResponse {
                 success: false,
@@ -295,5 +296,50 @@ impl NodeService {
                 error: Some(err.into()),
             })),
         }
+    }
+}
+
+fn encode_bucket_infos<T: serde::Serialize>(bucket_infos: &[T]) -> Result<Vec<String>, DiskError> {
+    bucket_infos
+        .iter()
+        .enumerate()
+        .map(|(index, bucket_info)| {
+            serde_json::to_string(bucket_info)
+                .map_err(|err| DiskError::other(format!("encode BucketInfo entry {index} failed: {err}")))
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::encode_bucket_infos;
+    use crate::storage::storage_api::rpc_consumer::node_service::contract::bucket::BucketInfo;
+    use serde::ser::{Error as SerError, Serializer};
+
+    struct FailingBucketInfo;
+
+    impl serde::Serialize for FailingBucketInfo {
+        fn serialize<S: Serializer>(&self, _serializer: S) -> Result<S::Ok, S::Error> {
+            Err(S::Error::custom("injected serialization failure"))
+        }
+    }
+
+    #[test]
+    fn encode_bucket_infos_serializes_valid_entries_and_fails_closed_on_error() {
+        let valid = vec![BucketInfo {
+            name: "alpha".to_string(),
+            created: None,
+            deleted: None,
+            versioning: false,
+            object_locking: false,
+        }];
+        let encoded = encode_bucket_infos(&valid).expect("valid bucket list should serialize");
+        assert_eq!(encoded.len(), 1);
+        let roundtrip: BucketInfo = serde_json::from_str(&encoded[0]).expect("encoded entry must deserialize");
+        assert_eq!(roundtrip.name, "alpha");
+
+        let err = encode_bucket_infos(&[FailingBucketInfo]).expect_err("serialization error must fail closed");
+        let msg = err.to_string();
+        assert!(msg.contains("entry 0"), "error must identify failing index: {msg}");
     }
 }

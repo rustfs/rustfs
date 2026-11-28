@@ -46,7 +46,11 @@ use http_body_util::BodyExt;
 use hyper::body::Bytes;
 use hyper::body::Incoming;
 use hyper_rustls::{ConfigBuilderExt, HttpsConnector};
-use hyper_util::{client::legacy::Client, client::legacy::connect::HttpConnector, rt::TokioExecutor};
+use hyper_util::{
+    client::legacy::Client,
+    client::legacy::connect::{HttpConnector, dns::Name as HyperDnsName},
+    rt::TokioExecutor,
+};
 use md5::Digest;
 use md5::Md5;
 use rand::{Rng, RngExt};
@@ -54,6 +58,7 @@ use rustfs_config::MAX_S3_CLIENT_RESPONSE_SIZE;
 use rustfs_gateway_types::dto::{Owner, ReplicationStatus};
 use rustfs_rio::HashReader;
 use rustfs_utils::HashAlgorithm;
+use rustfs_utils::egress::{OutboundDnsResolver, find_outbound_dns_policy_rejection};
 use rustfs_utils::{
     http::headers::{
         AMZ_CHECKSUM_CRC32, AMZ_CHECKSUM_CRC32C, AMZ_CHECKSUM_CRC64NVME, AMZ_CHECKSUM_MODE, AMZ_CHECKSUM_SHA1,
@@ -118,8 +123,34 @@ fn transition_transport_error(err: hyper_util::client::legacy::Error) -> std::io
     if source_chain_has_io_kind(&err, std::io::ErrorKind::TimedOut) {
         return remote_tier_timeout_error("remote tier connection timed out");
     }
+    if find_outbound_dns_policy_rejection(&err).is_some() {
+        return std::io::Error::new(std::io::ErrorKind::PermissionDenied, err);
+    }
     std::io::Error::other(err)
 }
+
+#[derive(Clone, Debug)]
+pub struct OutboundHyperDnsResolver(OutboundDnsResolver);
+
+impl tower::Service<HyperDnsName> for OutboundHyperDnsResolver {
+    type Response = std::vec::IntoIter<std::net::SocketAddr>;
+    type Error = std::io::Error;
+    type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
+
+    fn poll_ready(&mut self, _: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        Poll::Ready(Ok(()))
+    }
+
+    fn call(&mut self, name: HyperDnsName) -> Self::Future {
+        let resolver = self.0.clone();
+        Box::pin(async move { Ok(resolver.resolve_host(name.as_str()).await?.into_iter()) })
+    }
+}
+
+pub type TierConnector = HttpsConnector<HttpConnector<OutboundHyperDnsResolver>>;
+
+pub trait TransitionConnector: hyper_util::client::legacy::connect::Connect + Clone + Send + Sync + 'static {}
+impl<C: hyper_util::client::legacy::connect::Connect + Clone + Send + Sync + 'static> TransitionConnector for C {}
 
 fn is_retryable_transport_error(error: &std::io::Error) -> bool {
     // Hyper wraps connection and body errors; the outer io::Error is often Other.
@@ -300,12 +331,12 @@ pub enum ReaderImpl {
 pub type ReadCloser = ObjectReader;
 
 #[derive(Debug)]
-pub struct TransitionClient {
+pub struct TransitionClient<C = HttpsConnector<HttpConnector>> {
     pub endpoint_url: Url,
     pub creds_provider: Arc<Mutex<Credentials<Static>>>,
     pub override_signer_type: SignatureType,
     pub secure: bool,
-    pub http_client: Client<HttpsConnector<HttpConnector>, rustfs_s3_types::Body>,
+    pub http_client: Client<C, rustfs_s3_types::Body>,
     pub bucket_loc_cache: Arc<Mutex<BucketLocationCache>>,
     pub is_trace_enabled: Arc<Mutex<bool>>,
     pub trace_errors_only: Arc<Mutex<bool>>,
@@ -468,7 +499,7 @@ async fn build_tls_config() -> Result<rustls::ClientConfig, std::io::Error> {
 
 impl TransitionClient {
     pub async fn new(endpoint: &str, opts: Options, tier_type: &str) -> Result<TransitionClient, std::io::Error> {
-        Self::private_new(endpoint, opts, tier_type, TransitionClientTimeouts::default()).await
+        Self::new_with_timeouts(endpoint, opts, tier_type, TransitionClientTimeouts::default()).await
     }
 
     /// Builds a transition client with explicit transport timeout budgets.
@@ -481,15 +512,39 @@ impl TransitionClient {
         tier_type: &str,
         timeouts: TransitionClientTimeouts,
     ) -> Result<TransitionClient, std::io::Error> {
-        Self::private_new(endpoint, opts, tier_type, timeouts).await
+        Self::from_connector(endpoint, opts, tier_type, timeouts, HttpConnector::new()).await
     }
 
-    async fn private_new(
+    /// Build a tier client whose connector filters DNS answers on every connection.
+    pub async fn new_with_dns_resolver(
         endpoint: &str,
         opts: Options,
         tier_type: &str,
         timeouts: TransitionClientTimeouts,
-    ) -> Result<TransitionClient, std::io::Error> {
+        resolver: OutboundDnsResolver,
+    ) -> std::io::Result<TransitionClient<TierConnector>> {
+        TransitionClient::from_connector(
+            endpoint,
+            opts,
+            tier_type,
+            timeouts,
+            HttpConnector::new_with_resolver(OutboundHyperDnsResolver(resolver)),
+        )
+        .await
+    }
+}
+
+impl<R> TransitionClient<HttpsConnector<HttpConnector<R>>>
+where
+    HttpsConnector<HttpConnector<R>>: TransitionConnector,
+{
+    async fn from_connector(
+        endpoint: &str,
+        opts: Options,
+        tier_type: &str,
+        timeouts: TransitionClientTimeouts,
+        mut http: HttpConnector<R>,
+    ) -> Result<Self, std::io::Error> {
         rustfs_tls_runtime::ensure_crypto_provider().map_err(std::io::Error::other)?;
 
         let endpoint_url = get_endpoint_url(endpoint, opts.secure)?;
@@ -497,7 +552,6 @@ impl TransitionClient {
 
         let tls = build_tls_config().await?;
 
-        let mut http = HttpConnector::new();
         http.enforce_http(false);
         http.set_connect_timeout(Some(timeouts.connect_timeout));
         let https = hyper_rustls::HttpsConnectorBuilder::new()
@@ -551,7 +605,9 @@ impl TransitionClient {
 
         Ok(client)
     }
+}
 
+impl<C: TransitionConnector> TransitionClient<C> {
     #[allow(
         dead_code,
         reason = "MinIO-parity transition client surface with no caller in this port (backlog#1823)"
@@ -1150,14 +1206,16 @@ pub struct RequestMetadata {
     pub trailer: HeaderMap,
 }
 
-pub struct TransitionCore(pub Arc<TransitionClient>);
+pub struct TransitionCore<C = HttpsConnector<HttpConnector>>(pub Arc<TransitionClient<C>>);
 
 impl TransitionCore {
     pub async fn new(endpoint: &str, opts: Options) -> Result<Self, std::io::Error> {
         let client = TransitionClient::new(endpoint, opts, "").await?;
         Ok(Self(Arc::new(client)))
     }
+}
 
+impl<C: TransitionConnector> TransitionCore<C> {
     pub fn list_objects(
         &self,
         bucket: &str,
@@ -2043,5 +2101,92 @@ mod tests {
         let info = to_object_info_for_provider("bucket", "object", &headers, ProviderVersionCapabilities::for_tier_type("s3"))
             .expect("nil s3 uuid version should parse");
         assert_eq!(info.version_id, None);
+    }
+
+    #[tokio::test]
+    async fn transition_client_rechecks_outbound_dns_policy_on_rebinding() {
+        use super::find_outbound_dns_policy_rejection;
+        use http::StatusCode;
+        use rustfs_utils::egress::OutboundPolicy;
+        use std::collections::VecDeque;
+        use std::net::SocketAddr;
+        use std::sync::{Arc, Mutex};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use url::Url;
+
+        let listener = match TcpListener::bind("127.0.0.1:0").await {
+            Ok(listener) => listener,
+            Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => return,
+            Err(err) => panic!("test listener should bind: {err}"),
+        };
+        let address = listener.local_addr().expect("listener address");
+        let endpoint = format!("rebind-tier.test:{}", address.port());
+        let endpoint_url = Url::parse(&format!("http://{endpoint}")).expect("endpoint URL");
+        let policy = OutboundPolicy::from_allowed_origins(&endpoint_url.origin().ascii_serialization())
+            .expect("allowlisted test origin should parse");
+
+        let answers = Arc::new(Mutex::new(VecDeque::from([
+            vec![SocketAddr::new(address.ip(), 0)],
+            vec![SocketAddr::new("169.254.169.254".parse().expect("metadata ip"), 0)],
+        ])));
+        let resolver = policy
+            .resolver_for_allow_private(&endpoint_url)
+            .expect("resolver should construct")
+            .with_resolve_override(move |host| {
+                if host != "rebind-tier.test" {
+                    return None;
+                }
+                let mut guard = answers.lock().expect("override lock");
+                if guard.len() > 1 {
+                    guard.pop_front()
+                } else {
+                    guard.front().cloned()
+                }
+            });
+
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("first connection should succeed");
+            let mut buf = [0_u8; 1024];
+            let _ = stream.read(&mut buf).await.expect("read request");
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                .await
+                .expect("write response");
+        });
+
+        let client = super::TransitionClient::new_with_dns_resolver(
+            &endpoint,
+            super::Options {
+                secure: false,
+                ..Default::default()
+            },
+            "s3",
+            super::TransitionClientTimeouts::new(StdDuration::from_secs(2), StdDuration::from_secs(2), StdDuration::from_secs(2)),
+            resolver,
+        )
+        .await
+        .expect("transition client should build");
+
+        let req1 = Request::builder()
+            .uri(format!("http://{endpoint}/probe"))
+            .body(rustfs_s3_types::Body::empty())
+            .expect("first request");
+        let resp = client.doit(req1).await.expect("first connection should succeed");
+        assert_eq!(resp.status(), StatusCode::OK);
+        server.await.expect("server should finish");
+
+        let req2 = Request::builder()
+            .uri(format!("http://{endpoint}/probe"))
+            .body(rustfs_s3_types::Body::empty())
+            .expect("second request");
+        let err = client
+            .doit(req2)
+            .await
+            .expect_err("rebound metadata DNS answer must fail closed");
+        assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied);
+        assert!(
+            find_outbound_dns_policy_rejection(&err).is_some(),
+            "DNS policy rejection must remain typed in error chain: {err}"
+        );
     }
 }

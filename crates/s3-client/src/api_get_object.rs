@@ -77,7 +77,7 @@ fn response_limit_from_range(opts: &GetObjectOptions) -> Result<Option<usize>, s
     Ok(Some(limit))
 }
 
-impl TransitionClient {
+impl<C: crate::transition_api::TransitionConnector> TransitionClient<C> {
     pub fn get_object(&self, bucket_name: &str, object_name: &str, opts: &GetObjectOptions) -> Result<Object, std::io::Error> {
         let _ = opts;
         Err(std::io::Error::new(

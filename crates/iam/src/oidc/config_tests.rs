@@ -420,6 +420,58 @@ fn config_input_rejects_invalid_fields() {
 }
 
 #[test]
+#[serial_test::serial]
+fn config_input_rejects_plaintext_http_for_non_loopback_unless_opted_in() {
+    temp_env::with_var(ENV_IDENTITY_OPENID_ALLOW_INSECURE_TRANSPORT, None::<&str>, || {
+        let http_config = OidcProviderConfigInput {
+            config_url: "http://idp.example.com/.well-known/openid-configuration".to_string(),
+            client_id: "client".to_string(),
+            ..Default::default()
+        };
+        assert!(matches!(
+            build_upsert_provider_config("default", http_config, None),
+            Err(OidcConfigError::InsecureHttpNotAllowed { field: "config_url" })
+        ));
+
+        let http_issuer = OidcProviderConfigInput {
+            config_url: "https://idp.example.com/.well-known/openid-configuration".to_string(),
+            issuer: Some("http://issuer.example.com".to_string()),
+            client_id: "client".to_string(),
+            ..Default::default()
+        };
+        assert!(matches!(
+            build_upsert_provider_config("default", http_issuer, None),
+            Err(OidcConfigError::InsecureHttpNotAllowed { field: "issuer" })
+        ));
+
+        let http_redirect = OidcProviderConfigInput {
+            config_url: "https://idp.example.com/.well-known/openid-configuration".to_string(),
+            redirect_uri: Some("http://console.example.com/rustfs/admin/v3/oidc/callback/default".to_string()),
+            redirect_uri_dynamic: false,
+            client_id: "client".to_string(),
+            ..Default::default()
+        };
+        assert!(matches!(
+            build_upsert_provider_config("default", http_redirect, None),
+            Err(OidcConfigError::InsecureHttpNotAllowed { field: "redirect_uri" })
+        ));
+    });
+
+    temp_env::with_var(ENV_IDENTITY_OPENID_ALLOW_INSECURE_TRANSPORT, Some("true"), || {
+        let opted_in = OidcProviderConfigInput {
+            config_url: "http://idp.example.com/.well-known/openid-configuration".to_string(),
+            issuer: Some("http://issuer.example.com".to_string()),
+            redirect_uri: Some("http://console.example.com/rustfs/admin/v3/oidc/callback/default".to_string()),
+            redirect_uri_dynamic: false,
+            client_id: "client".to_string(),
+            ..Default::default()
+        };
+        build_upsert_provider_config("default", opted_in, None)
+            .expect("explicit insecure transport opt-in should allow http:// URLs");
+    });
+}
+
+#[test]
 fn validation_input_defaults_to_default_provider() {
     let input = OidcProviderValidationInput {
         provider_id: "  ".to_string(),

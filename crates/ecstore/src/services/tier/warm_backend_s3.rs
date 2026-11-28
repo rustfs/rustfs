@@ -42,12 +42,12 @@ use rustfs_s3_client::{
     transition_api::{BucketLookupType, ObjectInfo, Options, TransitionClient, TransitionCore},
     transition_api::{ReadCloser, ReaderImpl},
 };
-use rustfs_utils::egress::validate_outbound_url_allow_private;
+use rustfs_utils::egress::OutboundPolicy;
 use rustfs_utils::path::SLASH_SEPARATOR;
 
 pub struct WarmBackendS3 {
-    pub client: Arc<TransitionClient>,
-    pub core: TransitionCore,
+    pub client: Arc<TransitionClient<rustfs_s3_client::transition_api::TierConnector>>,
+    pub core: TransitionCore<rustfs_s3_client::transition_api::TierConnector>,
     pub bucket: String,
     pub prefix: String,
     pub storage_class: String,
@@ -103,7 +103,8 @@ impl WarmBackendS3 {
                 return Err(std::io::Error::other(err.to_string()));
             }
         };
-        validate_outbound_url_allow_private(&u)
+        let dns_resolver = OutboundPolicy::default()
+            .resolver_for_allow_private(&u)
             .map_err(|err| std::io::Error::other(format!("tier endpoint is not allowed: {err}")))?;
 
         let has_web_identity_token_file = !conf.aws_role_web_identity_token_file.is_empty();
@@ -143,7 +144,7 @@ impl WarmBackendS3 {
             ..Default::default()
         };
         let endpoint = endpoint_authority(&u)?;
-        let client = TransitionClient::new_with_timeouts(&endpoint, opts, tier_type, timeouts).await?;
+        let client = TransitionClient::new_with_dns_resolver(&endpoint, opts, tier_type, timeouts, dns_resolver).await?;
 
         let client = Arc::new(client);
         let core = TransitionCore(Arc::clone(&client));
@@ -518,7 +519,7 @@ mod tests {
             .expect("listener local address should be available")
             .to_string();
         let client = Arc::new(
-            TransitionClient::new(
+            super::super::warm_backend::fixture_transition_client(
                 &endpoint,
                 Options {
                     creds: Credentials::new(Static(Value {
@@ -619,7 +620,7 @@ mod tests {
             requests
         });
         let client = Arc::new(
-            TransitionClient::new(
+            super::super::warm_backend::fixture_transition_client(
                 &endpoint,
                 Options {
                     creds: Credentials::new(Static(Value {

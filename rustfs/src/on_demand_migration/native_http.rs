@@ -26,11 +26,14 @@
 //! the log line and the admin response.
 
 use super::source_client::{SourceError, SourceHead, SourceTimeouts, USER_AGENT_SUFFIX, classify_status, is_multipart_etag};
-use super::storage_api::remote_s3_client::{RemoteS3ClientError, validate_remote_endpoint, validate_target_ca_pem};
+use super::storage_api::remote_s3_client::{
+    RemoteS3ClientError, build_remote_endpoint_dns_resolver, validate_remote_endpoint, validate_target_ca_pem,
+};
 use aws_sdk_s3::primitives::ByteStream;
 use aws_smithy_types::body::SdkBody;
 use futures::StreamExt;
 use http::HeaderMap;
+use rustfs_utils::egress::OutboundDnsResolver;
 use std::collections::HashMap;
 use std::time::SystemTime;
 use time::OffsetDateTime;
@@ -72,10 +75,22 @@ impl NativeHttp {
             ));
         }
         validate_remote_endpoint(&endpoint).map_err(RemoteS3ClientError::EndpointNotAllowed)?;
+        let dns_resolver = build_remote_endpoint_dns_resolver(&endpoint)?;
+        Self::new_with_resolver(endpoint, timeouts, skip_tls_verify, ca_cert_pem, dns_resolver)
+    }
 
+    fn new_with_resolver(
+        endpoint: Url,
+        timeouts: SourceTimeouts,
+        skip_tls_verify: bool,
+        ca_cert_pem: Option<&str>,
+        dns_resolver: OutboundDnsResolver,
+    ) -> Result<Self, RemoteS3ClientError> {
         let mut builder = reqwest::Client::builder()
             .connect_timeout(timeouts.connect)
             .read_timeout(timeouts.read)
+            .no_proxy()
+            .dns_resolver(dns_resolver)
             .redirect(reqwest::redirect::Policy::none())
             .user_agent(USER_AGENT_SUFFIX);
         if skip_tls_verify {
@@ -496,5 +511,99 @@ mod tests {
             assert!(url.query().is_none());
             assert!(url.fragment().is_none());
         }
+    }
+
+    #[tokio::test]
+    async fn native_http_enforces_outbound_dns_policy_on_rebinding_and_loopback() {
+        use rustfs_utils::egress::OutboundPolicy;
+        use std::collections::VecDeque;
+        use std::net::SocketAddr;
+        use std::sync::{Arc, Mutex};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        // Literal policy checks: private IP is allowed; loopback/metadata rejected by default.
+        assert!(NativeHttp::new("http://10.0.0.5:9000", SourceTimeouts::default(), false, None).is_ok());
+        assert!(NativeHttp::new("http://169.254.169.254", SourceTimeouts::default(), false, None).is_err());
+
+        let listener = match TcpListener::bind("127.0.0.1:0").await {
+            Ok(listener) => listener,
+            Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => return,
+            Err(err) => panic!("test listener should bind: {err}"),
+        };
+        let address = listener.local_addr().expect("listener address");
+        let endpoint = Url::parse(&format!("http://rebind-native.test:{}", address.port())).expect("endpoint URL");
+
+        // 1. Without loopback opt-in, a hostname resolving to 127.0.0.1 fails closed at connect time.
+        let no_loopback_resolver = OutboundPolicy::default()
+            .resolver_for_storage_endpoint(&endpoint, true, false)
+            .expect("hostname should pass URL validation")
+            .with_resolve_override(move |host| (host == "rebind-native.test").then(|| vec![SocketAddr::new(address.ip(), 0)]));
+        let no_loopback_http =
+            NativeHttp::new_with_resolver(endpoint.clone(), SourceTimeouts::default(), false, None, no_loopback_resolver)
+                .expect("native http client should build");
+        let req = no_loopback_http
+            .client
+            .get(no_loopback_http.url(["probe"]).expect("probe url"))
+            .build()
+            .expect("request");
+        let err = no_loopback_http
+            .execute(req)
+            .await
+            .expect_err("loopback DNS answer must fail closed without loopback opt-in");
+        assert!(matches!(err, SourceError::Connect(_)), "unexpected error: {err:?}");
+
+        // 2. With loopback opt-in enabled, first request hits local listener, then DNS rebinding to
+        // cloud metadata (169.254.169.254) fails closed on the next connection.
+        let answers = Arc::new(Mutex::new(VecDeque::from([
+            vec![SocketAddr::new(address.ip(), 0)],
+            vec![SocketAddr::new("169.254.169.254".parse().expect("metadata ip"), 0)],
+        ])));
+        let rebinding_resolver = OutboundPolicy::default()
+            .resolver_for_storage_endpoint(&endpoint, true, true)
+            .expect("loopback opt-in should allow hostname")
+            .with_resolve_override(move |host| {
+                if host != "rebind-native.test" {
+                    return None;
+                }
+                let mut guard = answers.lock().expect("override lock");
+                if guard.len() > 1 {
+                    guard.pop_front()
+                } else {
+                    guard.front().cloned()
+                }
+            });
+
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("first connection should succeed");
+            let mut buf = [0_u8; 1024];
+            let _ = stream.read(&mut buf).await.expect("read request");
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                .await
+                .expect("write response");
+        });
+
+        let rebinding_http = NativeHttp::new_with_resolver(endpoint, SourceTimeouts::default(), false, None, rebinding_resolver)
+            .expect("rebinding native http client should build");
+        let req1 = rebinding_http
+            .client
+            .get(rebinding_http.url(["probe"]).expect("probe url"))
+            .build()
+            .expect("first request");
+        let resp1 = rebinding_http.execute(req1).await.expect("first request should succeed");
+        assert_eq!(resp1.status(), reqwest::StatusCode::OK);
+        server.await.expect("server should finish");
+
+        let req2 = rebinding_http
+            .client
+            .get(rebinding_http.url(["probe"]).expect("probe url"))
+            .build()
+            .expect("second request");
+        let err2 = rebinding_http
+            .execute(req2)
+            .await
+            .expect_err("rebound metadata DNS answer must fail closed");
+        assert!(matches!(err2, SourceError::Connect(_)), "unexpected error: {err2:?}");
     }
 }

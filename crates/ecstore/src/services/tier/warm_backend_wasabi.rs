@@ -222,7 +222,7 @@ mod tests {
 
     async fn backend_for_endpoint(endpoint: &str, max_retries: i64) -> WarmBackendWasabi {
         let client = Arc::new(
-            rustfs_s3_client::transition_api::TransitionClient::new(
+            super::super::warm_backend::fixture_transition_client(
                 endpoint,
                 Options {
                     creds: Credentials::new(Static(Value {

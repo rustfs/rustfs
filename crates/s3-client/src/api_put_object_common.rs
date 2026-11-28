@@ -95,7 +95,7 @@ pub fn optimal_part_info(object_size: i64, configured_part_size: u64) -> Result<
     Ok((total_parts_count, part_size, last_part_size))
 }
 
-impl TransitionClient {
+impl<C: crate::transition_api::TransitionConnector> TransitionClient<C> {
     pub async fn new_upload_id(
         &self,
         bucket_name: &str,

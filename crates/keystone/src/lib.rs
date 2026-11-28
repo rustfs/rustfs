@@ -32,7 +32,7 @@
 //!
 //! # async fn example() -> Result<(), Box<dyn std::error::Error>> {
 //! let config = KeystoneConfig::from_env()?;
-//! let client = KeystoneClient::new(
+//! let client = KeystoneClient::try_new(
 //!     config.auth_url.clone(),
 //!     config.get_version()?,
 //!     config.admin_user.clone(),
@@ -41,7 +41,7 @@
 //!     config.get_admin_domain(),
 //!     config.verify_ssl,
 //!     config.get_timeout(),
-//! );
+//! )?;
 //!
 //! let auth_provider = KeystoneAuthProvider::new(
 //!     client,

@@ -16,13 +16,14 @@ use axum::{
     body::{self, Body},
     http::{Request, Response},
 };
-use rustfs_trusted_proxies::{ClientInfo, TrustedProxyLayer};
+use rustfs_trusted_proxies::{ClientInfo, TrustedProxy, TrustedProxyLayer};
 use std::convert::Infallible;
 use std::net::SocketAddr;
 use tower::{Layer, ServiceExt, service_fn};
 
 #[tokio::test]
 async fn simple_proxy_uses_only_the_rightmost_observed_peer() {
+    let trusted_peer: SocketAddr = "[::ffff:10.0.0.5]:9000".parse().expect("peer");
     for (chain, expected) in [
         ("203.0.113.7, 198.51.100.9", "198.51.100.9"),
         ("203.0.113.7, 10.20.0.9", "10.20.0.9"),
@@ -34,11 +35,9 @@ async fn simple_proxy_uses_only_the_rightmost_observed_peer() {
             assert_eq!(info.forwarded_proto.as_deref(), Some("http"));
             Ok::<_, Infallible>(Response::new(Body::from(info.real_ip.to_string())))
         });
-        let service = TrustedProxyLayer::enabled().layer(service);
+        let service = TrustedProxyLayer::with_trusted_proxies(vec![TrustedProxy::Single(trusted_peer.ip())]).layer(service);
         let mut request = Request::builder().body(Body::empty()).expect("request");
-        request
-            .extensions_mut()
-            .insert("[::ffff:10.0.0.5]:9000".parse::<SocketAddr>().expect("peer"));
+        request.extensions_mut().insert(trusted_peer);
         request
             .headers_mut()
             .append("x-forwarded-for", "203.0.113.1".parse().expect("forged line"));
@@ -84,7 +83,7 @@ async fn invalid_proxy_chains_never_reach_the_inner_service() {
                 async { Ok::<_, Infallible>(Response::new(Body::empty())) }
             });
             let layer = match mode {
-                None => TrustedProxyLayer::enabled(),
+                None => TrustedProxyLayer::with_trusted_proxies(vec![TrustedProxy::Single(peer.ip())]),
                 Some(mode) => TrustedProxyLayer::legacy(LegacyTrustedProxyLayer::enabled(
                     TrustedProxyConfig::new(vec![TrustedProxy::Single(peer.ip())], mode, false, 3, false, vec![]),
                     None,
@@ -185,21 +184,36 @@ async fn legacy_proxy_selects_one_family_and_preserves_repeated_lines() {
 #[tokio::test]
 async fn test_layer_inserts_client_info_for_internal_proxy() {
     let peer_addr = SocketAddr::from(([10, 0, 0, 5], 9000));
-    let service = service_fn(|request: Request<Body>| async move {
+
+    // Unconfigured RFC1918 peer is NOT trusted by default; forwarding headers are ignored.
+    let default_service = TrustedProxyLayer::enabled().layer(service_fn(|request: Request<Body>| async move {
         let client_info = request.extensions().get::<ClientInfo>().cloned().unwrap();
         Ok::<_, Infallible>(Response::new(Body::from(client_info.real_ip.to_string())))
-    });
-    let service = TrustedProxyLayer::enabled().layer(service);
+    }));
+    let mut untrusted_request = Request::builder()
+        .uri("/")
+        .header("x-forwarded-for", "203.0.113.10")
+        .body(Body::empty())
+        .unwrap();
+    untrusted_request.extensions_mut().insert(peer_addr);
+    let untrusted_response = default_service.oneshot(untrusted_request).await.unwrap();
+    let untrusted_body = body::to_bytes(untrusted_response.into_body(), usize::MAX).await.unwrap();
+    assert_eq!(std::str::from_utf8(&untrusted_body).unwrap(), "10.0.0.5");
 
+    // Explicitly configured proxy peer IS trusted and resolves the forwarded client IP.
+    let configured_service = TrustedProxyLayer::with_trusted_proxies(vec![TrustedProxy::Single(peer_addr.ip())]).layer(
+        service_fn(|request: Request<Body>| async move {
+            let client_info = request.extensions().get::<ClientInfo>().cloned().unwrap();
+            Ok::<_, Infallible>(Response::new(Body::from(client_info.real_ip.to_string())))
+        }),
+    );
     let mut request = Request::builder()
         .uri("/")
         .header("x-forwarded-for", "203.0.113.10")
         .body(Body::empty())
         .unwrap();
     request.extensions_mut().insert(peer_addr);
-
-    let response = service.oneshot(request).await.unwrap();
-
+    let response = configured_service.oneshot(request).await.unwrap();
     let body = body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
     assert_eq!(std::str::from_utf8(&body).unwrap(), "203.0.113.10");
 }

@@ -143,13 +143,20 @@ async fn run_case(
             region: "us-east-1".into(),
             bucket_lookup: BucketLookupType::BucketLookupPath,
             max_retries: attempts,
-            ..Default::default()
+            secure: false,
+            trailing_headers: false,
+            custom_md5: None,
+            custom_sha256: None,
         },
         "s3",
         TransitionClientTimeouts::new(Duration::from_secs(1), Duration::from_secs(1), Duration::from_secs(1)),
     )
     .await
     .expect("build real transition client");
+    let _: &hyper_util::client::legacy::Client<
+        hyper_rustls::HttpsConnector<hyper_util::client::legacy::connect::HttpConnector>,
+        rustfs_s3_types::Body,
+    > = &client.http_client;
     let result = tokio::time::timeout(Duration::from_secs(5), client.execute_method(method, metadata)).await;
     let _ = stop.send(());
     let requests = tokio::time::timeout(Duration::from_secs(2), server)

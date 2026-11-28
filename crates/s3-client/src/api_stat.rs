@@ -85,7 +85,7 @@ fn parse_bucket_versioning_response(
     })
 }
 
-impl TransitionClient {
+impl<C: crate::transition_api::TransitionConnector> TransitionClient<C> {
     pub async fn bucket_exists(&self, bucket_name: &str) -> Result<bool, std::io::Error> {
         let resp = self
             .execute_method(

@@ -18,7 +18,9 @@
 //! runtime path uses the simplified rule set, and an environment variable can
 //! switch the global entrypoints to the legacy chain validator.
 
-use crate::{ClientInfo, LegacyTrustedProxyLayer, LegacyTrustedProxyMiddleware, ValidationMode, global};
+use crate::{
+    ClientInfo, ConfigLoader, LegacyTrustedProxyLayer, LegacyTrustedProxyMiddleware, TrustedProxy, ValidationMode, global,
+};
 use axum::http::{HeaderMap, Request, Response, StatusCode};
 use futures::future::{Either, Ready, ready};
 use rustfs_config::{
@@ -28,13 +30,17 @@ use rustfs_config::{
 use std::fmt;
 use std::net::{IpAddr, SocketAddr};
 use std::str::FromStr;
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 use std::task::{Context, Poll};
 use tower::{Layer, Service};
 use tracing::debug;
 
 /// Constant switch for the crate's default integration path.
-pub const SIMPLE_INTERNAL_ONLY_DEFAULT: bool = true;
+///
+/// Simple mode now honors the configured trusted-proxy allowlist
+/// (`RUSTFS_TRUSTED_PROXY_NETWORKS`, defaulting to loopback-only) rather than
+/// trusting every private/internal IP range.
+pub const SIMPLE_INTERNAL_ONLY_DEFAULT: bool = false;
 
 #[cfg(test)]
 const HEADER_FORWARDED: &str = "forwarded";
@@ -128,6 +134,10 @@ impl TrustedProxyLayer {
         Self::Simple(SimpleTrustedProxyLayer::enabled())
     }
 
+    pub fn with_trusted_proxies(trusted_proxies: Vec<TrustedProxy>) -> Self {
+        Self::Simple(SimpleTrustedProxyLayer::with_trusted_proxies(trusted_proxies))
+    }
+
     pub fn disabled() -> Self {
         Self::Simple(SimpleTrustedProxyLayer::disabled())
     }
@@ -195,19 +205,42 @@ where
 #[derive(Clone, Debug, Default)]
 pub struct SimpleTrustedProxyLayer {
     enabled: bool,
+    trusted_proxies: Arc<Vec<TrustedProxy>>,
 }
 
 impl SimpleTrustedProxyLayer {
+    /// Creates an enabled simple layer using the operator-configured trusted proxy list
+    /// (`RUSTFS_TRUSTED_PROXY_NETWORKS`, `RUSTFS_TRUSTED_PROXY_EXTRA_NETWORKS`,
+    /// `RUSTFS_TRUSTED_PROXY_IPS`), falling back to loopback-only (`127.0.0.1`, `::1`).
     pub fn enabled() -> Self {
-        Self { enabled: true }
+        Self {
+            enabled: true,
+            trusted_proxies: Arc::new(ConfigLoader::from_env_or_default().proxy.proxies),
+        }
+    }
+
+    /// Creates an enabled simple layer trusting only the explicitly supplied proxy entries.
+    pub fn with_trusted_proxies(trusted_proxies: Vec<TrustedProxy>) -> Self {
+        Self {
+            enabled: true,
+            trusted_proxies: Arc::new(trusted_proxies),
+        }
     }
 
     pub fn disabled() -> Self {
-        Self { enabled: false }
+        Self {
+            enabled: false,
+            trusted_proxies: Arc::new(Vec::new()),
+        }
     }
 
     pub fn is_enabled(&self) -> bool {
         self.enabled
+    }
+
+    /// Returns the configured trusted proxy entries enforced by this layer.
+    pub fn trusted_proxies(&self) -> &[TrustedProxy] {
+        &self.trusted_proxies
     }
 }
 
@@ -218,6 +251,7 @@ impl<S> Layer<S> for SimpleTrustedProxyLayer {
         SimpleTrustedProxyMiddleware {
             inner,
             enabled: self.enabled,
+            trusted_proxies: Arc::clone(&self.trusted_proxies),
         }
     }
 }
@@ -227,6 +261,7 @@ impl<S> Layer<S> for SimpleTrustedProxyLayer {
 pub struct SimpleTrustedProxyMiddleware<S> {
     inner: S,
     enabled: bool,
+    trusted_proxies: Arc<Vec<TrustedProxy>>,
 }
 
 impl<S, ReqBody, ResBody> Service<Request<ReqBody>> for SimpleTrustedProxyMiddleware<S>
@@ -246,7 +281,7 @@ where
     fn call(&mut self, mut req: Request<ReqBody>) -> Self::Future {
         if self.enabled {
             let peer_addr = req.extensions().get::<SocketAddr>().copied();
-            if peer_addr.is_some_and(|peer| is_internal_ip(peer.ip()))
+            if peer_addr.is_some_and(|peer| is_trusted_proxy_ip(peer.ip(), &self.trusted_proxies))
                 && (req.headers().contains_key(HEADER_X_FORWARDED_FOR)
                     || req.headers().contains_key("forwarded")
                     || req.headers().contains_key("x-real-ip"))
@@ -256,7 +291,7 @@ where
                 *response.status_mut() = StatusCode::BAD_REQUEST;
                 return Either::Right(ready(Ok(response)));
             }
-            let client_info = resolve_client_info(peer_addr, req.headers());
+            let client_info = resolve_client_info_with_proxies(peer_addr, req.headers(), &self.trusted_proxies);
             req.extensions_mut().insert(client_info);
         } else {
             debug!("Simple trusted proxy middleware is disabled");
@@ -266,27 +301,28 @@ where
     }
 }
 
-fn resolve_client_info(peer_addr: Option<SocketAddr>, headers: &HeaderMap) -> ClientInfo {
+fn resolve_client_info_with_proxies(
+    peer_addr: Option<SocketAddr>,
+    headers: &HeaderMap,
+    trusted_proxies: &[TrustedProxy],
+) -> ClientInfo {
     let Some(peer_addr) = peer_addr else {
         return ClientInfo::direct(SocketAddr::new(IpAddr::from([0, 0, 0, 0]), 0));
     };
 
-    if !is_internal_ip(peer_addr.ip()) {
+    if !is_trusted_proxy_ip(peer_addr.ip(), trusted_proxies) {
         return ClientInfo::direct(peer_addr);
     }
 
-    match forwarded_client_ip(headers) {
-        Some(real_ip) if is_usable_ip(real_ip) && real_ip != peer_addr.ip() => ClientInfo::from_trusted_proxy(
-            real_ip,
-            forwarded_host(headers),
-            forwarded_proto(headers),
-            peer_addr.ip(),
-            1,
-            ValidationMode::Lenient,
-            Vec::new(),
-        ),
-        _ => ClientInfo::direct(peer_addr),
+    let real_ip = forwarded_client_ip(headers)
+        .filter(|ip| is_usable_ip(*ip))
+        .unwrap_or(peer_addr.ip());
+    let host = forwarded_host(headers);
+    let proto = forwarded_proto(headers);
+    if real_ip == peer_addr.ip() && host.is_none() && proto.is_none() {
+        return ClientInfo::direct(peer_addr);
     }
+    ClientInfo::from_trusted_proxy(real_ip, host, proto, peer_addr.ip(), 1, ValidationMode::Lenient, Vec::new())
 }
 
 fn forwarded_client_ip(headers: &HeaderMap) -> Option<IpAddr> {
@@ -367,11 +403,9 @@ fn parse_ip_token(value: &str) -> Option<IpAddr> {
     None
 }
 
-fn is_internal_ip(ip: IpAddr) -> bool {
-    match ip.to_canonical() {
-        IpAddr::V4(ip) => ip.is_private() || ip.is_loopback() || ip.is_link_local(),
-        IpAddr::V6(ip) => ip.is_loopback() || ip.is_unique_local() || ip.is_unicast_link_local(),
-    }
+fn is_trusted_proxy_ip(ip: IpAddr, trusted_proxies: &[TrustedProxy]) -> bool {
+    let canonical = ip.to_canonical();
+    trusted_proxies.iter().any(|proxy| proxy.contains(&canonical))
 }
 
 fn is_usable_ip(ip: IpAddr) -> bool {
@@ -393,14 +427,22 @@ fn parse_implementation(value: Option<&str>) -> TrustedProxyImplementation {
 mod tests {
     use super::{
         ENV_TRUSTED_PROXY_IMPLEMENTATION, HEADER_FORWARDED, HEADER_X_FORWARDED_FOR, HEADER_X_FORWARDED_HOST,
-        HEADER_X_FORWARDED_PROTO, HEADER_X_FORWARDED_SCHEME, HEADER_X_REAL_IP, TrustedProxyImplementation, TrustedProxyLayer,
-        forwarded_client_ip, forwarded_host, forwarded_proto, is_internal_ip, parse_implementation, parse_ip_token,
-        resolve_client_info,
+        HEADER_X_FORWARDED_PROTO, HEADER_X_FORWARDED_SCHEME, HEADER_X_REAL_IP, SimpleTrustedProxyLayer,
+        TrustedProxyImplementation, TrustedProxyLayer, forwarded_client_ip, forwarded_host, forwarded_proto, is_trusted_proxy_ip,
+        parse_implementation, parse_ip_token, resolve_client_info_with_proxies,
     };
-    use crate::ClientInfo;
-    use axum::http::{HeaderMap, HeaderValue};
+    use crate::{ClientInfo, ConfigLoader, TrustedProxy};
+    use axum::http::{HeaderMap, HeaderValue, Request, Response, StatusCode};
+    use ipnetwork::IpNetwork;
+    use rustfs_config::{ENV_TRUSTED_PROXY_EXTRA_PROXIES, ENV_TRUSTED_PROXY_IPS, ENV_TRUSTED_PROXY_PROXIES};
     use serial_test::serial;
+    use std::convert::Infallible;
     use std::net::{IpAddr, SocketAddr};
+    use tower::{Layer, Service, service_fn};
+
+    fn default_loopback_proxies() -> Vec<TrustedProxy> {
+        ConfigLoader::default_config().proxy.proxies
+    }
 
     #[test]
     fn test_simple_mode_is_default() {
@@ -442,36 +484,100 @@ mod tests {
     }
 
     #[test]
-    fn test_internal_peer_can_override_real_ip() {
+    fn test_default_loopback_peer_can_override_real_ip() {
         let mut headers = HeaderMap::new();
         headers.insert(HEADER_X_FORWARDED_FOR, HeaderValue::from_static("203.0.113.10"));
 
-        let client_info = resolve_client_info(Some(SocketAddr::from(([10, 0, 0, 5], 9000))), &headers);
+        let proxies = default_loopback_proxies();
+        let client_info = resolve_client_info_with_proxies(Some(SocketAddr::from(([127, 0, 0, 1], 9000))), &headers, &proxies);
         assert_eq!(client_info.real_ip, IpAddr::from([203, 0, 113, 10]));
         assert!(client_info.is_from_trusted_proxy);
-        assert_eq!(client_info.proxy_ip, Some(IpAddr::from([10, 0, 0, 5])));
+        assert_eq!(client_info.proxy_ip, Some(IpAddr::from([127, 0, 0, 1])));
+
+        let ipv6_loopback: SocketAddr = "[::1]:9000".parse().expect("IPv6 loopback should parse");
+        let ipv6_info = resolve_client_info_with_proxies(Some(ipv6_loopback), &headers, &proxies);
+        assert_eq!(ipv6_info.real_ip, IpAddr::from([203, 0, 113, 10]));
+        assert!(ipv6_info.is_from_trusted_proxy);
     }
 
     #[test]
-    fn test_internal_peer_preserves_forwarded_proto_and_host() {
+    fn test_untrusted_private_and_link_local_peers_cannot_spoof_forwarding_headers_by_default() {
         let mut headers = HeaderMap::new();
         headers.insert(HEADER_X_FORWARDED_FOR, HeaderValue::from_static("203.0.113.10"));
+        headers.insert(HEADER_X_FORWARDED_HOST, HeaderValue::from_static("spoofed.example.test"));
+        headers.insert(HEADER_X_FORWARDED_PROTO, HeaderValue::from_static("https"));
+
+        let proxies = default_loopback_proxies();
+        for peer_ip in [
+            IpAddr::from([10, 0, 0, 5]),
+            IpAddr::from([172, 16, 0, 5]),
+            IpAddr::from([192, 168, 1, 20]),
+            IpAddr::from([169, 254, 1, 10]),
+            "fd00::1".parse().expect("ULA IPv6"),
+            "fe80::1".parse().expect("link-local IPv6"),
+            "::ffff:10.0.0.5".parse().expect("IPv4-mapped RFC1918"),
+        ] {
+            let peer_addr = SocketAddr::new(peer_ip, 9000);
+            let client_info = resolve_client_info_with_proxies(Some(peer_addr), &headers, &proxies);
+            assert_eq!(
+                client_info.real_ip,
+                peer_ip.to_canonical(),
+                "untrusted internal peer {peer_ip} must not spoof real_ip"
+            );
+            assert!(!client_info.is_from_trusted_proxy, "peer {peer_ip} must not be trusted by default");
+            assert_eq!(client_info.forwarded_host, None, "peer {peer_ip} must not spoof forwarded_host");
+            assert_eq!(client_info.forwarded_proto, None, "peer {peer_ip} must not spoof forwarded_proto");
+        }
+    }
+
+    #[test]
+    fn test_explicitly_configured_proxy_cidr_is_honored_and_bounded() {
+        let mut headers = HeaderMap::new();
+        headers.insert(HEADER_X_FORWARDED_FOR, HeaderValue::from_static("198.51.100.7, 203.0.113.10"));
         headers.insert(HEADER_X_FORWARDED_HOST, HeaderValue::from_static("s3.example.test"));
         headers.insert(HEADER_X_FORWARDED_PROTO, HeaderValue::from_static("https"));
 
-        let client_info = resolve_client_info(Some(SocketAddr::from(([10, 0, 0, 5], 9000))), &headers);
+        let proxies = vec![TrustedProxy::Cidr("10.0.0.0/24".parse::<IpNetwork>().expect("CIDR"))];
 
-        assert_eq!(client_info.forwarded_host.as_deref(), Some("s3.example.test"));
-        assert_eq!(client_info.forwarded_proto.as_deref(), Some("https"));
+        let allowed = resolve_client_info_with_proxies(Some(SocketAddr::from(([10, 0, 0, 5], 9000))), &headers, &proxies);
+        assert_eq!(allowed.real_ip, IpAddr::from([203, 0, 113, 10]));
+        assert!(allowed.is_from_trusted_proxy);
+        assert_eq!(allowed.proxy_ip, Some(IpAddr::from([10, 0, 0, 5])));
+        assert_eq!(allowed.forwarded_host.as_deref(), Some("s3.example.test"));
+        assert_eq!(allowed.forwarded_proto.as_deref(), Some("https"));
+
+        // An adjacent RFC1918 peer outside the configured CIDR must not be trusted.
+        let outside = resolve_client_info_with_proxies(Some(SocketAddr::from(([10, 0, 1, 5], 9000))), &headers, &proxies);
+        assert_eq!(outside.real_ip, IpAddr::from([10, 0, 1, 5]));
+        assert!(!outside.is_from_trusted_proxy);
+        assert_eq!(outside.forwarded_host, None);
+        assert_eq!(outside.forwarded_proto, None);
     }
 
     #[test]
-    fn test_internal_peer_ignores_unselected_forwarded_scheme() {
+    fn trusted_tls_terminator_can_forward_origin_without_client_ip() {
+        let mut headers = HeaderMap::new();
+        headers.insert(HEADER_X_FORWARDED_PROTO, HeaderValue::from_static("https"));
+        headers.insert(HEADER_X_FORWARDED_HOST, HeaderValue::from_static("console.example.test"));
+        let proxies = vec![TrustedProxy::Single(IpAddr::from([10, 0, 0, 5]))];
+        for (last, trusted) in [(5, true), (6, false)] {
+            let peer = SocketAddr::from(([10, 0, 0, last], 9000));
+            let info = resolve_client_info_with_proxies(Some(peer), &headers, &proxies);
+            assert_eq!(info.real_ip, peer.ip());
+            assert_eq!(info.is_from_trusted_proxy, trusted);
+            assert_eq!(info.forwarded_proto.as_deref(), trusted.then_some("https"));
+            assert_eq!(info.forwarded_host.as_deref(), trusted.then_some("console.example.test"));
+        }
+    }
+
+    #[test]
+    fn test_trusted_peer_ignores_unselected_forwarded_scheme() {
         let mut headers = HeaderMap::new();
         headers.insert(HEADER_X_FORWARDED_FOR, HeaderValue::from_static("203.0.113.10"));
         headers.insert(HEADER_X_FORWARDED_SCHEME, HeaderValue::from_static("https"));
 
-        let client_info = resolve_client_info(Some(SocketAddr::from(([10, 0, 0, 5], 9000))), &headers);
+        let proxies = vec![TrustedProxy::Single(IpAddr::from([10, 0, 0, 5]))];
+        let client_info = resolve_client_info_with_proxies(Some(SocketAddr::from(([10, 0, 0, 5], 9000))), &headers, &proxies);
 
         assert_eq!(client_info.forwarded_proto, None);
     }
@@ -484,7 +590,8 @@ mod tests {
             HeaderValue::from_static("for=203.0.113.10;proto=https;host=s3.example.test"),
         );
 
-        let client_info = resolve_client_info(Some(SocketAddr::from(([10, 0, 0, 5], 9000))), &headers);
+        let proxies = vec![TrustedProxy::Single(IpAddr::from([10, 0, 0, 5]))];
+        let client_info = resolve_client_info_with_proxies(Some(SocketAddr::from(([10, 0, 0, 5], 9000))), &headers, &proxies);
 
         assert_eq!(client_info.real_ip, IpAddr::from([10, 0, 0, 5]));
         assert_eq!(client_info.forwarded_host, None);
@@ -507,22 +614,22 @@ mod tests {
         headers.insert(HEADER_X_FORWARDED_FOR, HeaderValue::from_static("203.0.113.10"));
 
         let peer_addr = SocketAddr::from(([8, 8, 8, 8], 9000));
-        let client_info = resolve_client_info(Some(peer_addr), &headers);
+        let client_info = resolve_client_info_with_proxies(Some(peer_addr), &headers, &default_loopback_proxies());
         assert_eq!(client_info.real_ip, peer_addr.ip());
         assert!(!client_info.is_from_trusted_proxy);
     }
 
     #[test]
     fn test_missing_headers_keep_direct_ip() {
-        let peer_addr = SocketAddr::from(([192, 168, 1, 20], 9000));
-        let client_info = resolve_client_info(Some(peer_addr), &HeaderMap::new());
+        let peer_addr = SocketAddr::from(([127, 0, 0, 1], 9000));
+        let client_info = resolve_client_info_with_proxies(Some(peer_addr), &HeaderMap::new(), &default_loopback_proxies());
         assert_eq!(client_info.real_ip, peer_addr.ip());
         assert!(!client_info.is_from_trusted_proxy);
     }
 
     #[test]
     fn test_missing_peer_addr_uses_direct_placeholder() {
-        let client_info = resolve_client_info(None, &HeaderMap::new());
+        let client_info = resolve_client_info_with_proxies(None, &HeaderMap::new(), &default_loopback_proxies());
         assert_eq!(
             client_info.real_ip,
             ClientInfo::direct(SocketAddr::new(IpAddr::from([0, 0, 0, 0]), 0)).real_ip
@@ -546,11 +653,77 @@ mod tests {
     }
 
     #[test]
-    fn test_internal_ip_detection() {
-        assert!(is_internal_ip(IpAddr::from([10, 0, 0, 1])));
-        assert!(is_internal_ip(IpAddr::from([127, 0, 0, 1])));
-        assert!(is_internal_ip("fd00::1".parse().unwrap()));
-        assert!(!is_internal_ip(IpAddr::from([203, 0, 113, 10])));
+    fn test_trusted_proxy_ip_matching() {
+        let proxies = vec![
+            TrustedProxy::Single(IpAddr::from([127, 0, 0, 1])),
+            TrustedProxy::Cidr("10.20.0.0/24".parse::<IpNetwork>().expect("CIDR")),
+        ];
+        assert!(is_trusted_proxy_ip(IpAddr::from([127, 0, 0, 1]), &proxies));
+        assert!(is_trusted_proxy_ip("::ffff:127.0.0.1".parse().expect("mapped loopback"), &proxies));
+        assert!(is_trusted_proxy_ip(IpAddr::from([10, 20, 0, 42]), &proxies));
+        assert!(!is_trusted_proxy_ip(IpAddr::from([10, 20, 1, 1]), &proxies));
+        assert!(!is_trusted_proxy_ip(IpAddr::from([192, 168, 1, 1]), &proxies));
+        assert!(!is_trusted_proxy_ip("fd00::1".parse().expect("ULA"), &proxies));
+        assert!(!is_trusted_proxy_ip(IpAddr::from([203, 0, 113, 10]), &proxies));
+    }
+
+    #[tokio::test]
+    async fn test_middleware_rejects_malformed_forwarded_from_trusted_proxy_but_ignores_untrusted_private_peer() {
+        let layer = SimpleTrustedProxyLayer::with_trusted_proxies(default_loopback_proxies());
+        let mut svc = layer.layer(service_fn(|req: Request<()>| async move {
+            let info = req
+                .extensions()
+                .get::<ClientInfo>()
+                .cloned()
+                .expect("middleware must attach ClientInfo");
+            let mut resp = Response::new(String::new());
+            resp.headers_mut()
+                .insert("x-observed-real-ip", HeaderValue::from_str(&info.real_ip.to_string()).expect("header"));
+            resp.headers_mut().insert(
+                "x-observed-trusted",
+                HeaderValue::from_static(if info.is_from_trusted_proxy { "true" } else { "false" }),
+            );
+            Ok::<_, Infallible>(resp)
+        }));
+
+        // Untrusted private peer sending malformed X-Forwarded-For is treated as direct (not trusted, not 400).
+        let mut untrusted_req = Request::builder()
+            .header(HEADER_X_FORWARDED_FOR, "not-an-ip")
+            .body(())
+            .expect("request");
+        untrusted_req.extensions_mut().insert(SocketAddr::from(([10, 0, 0, 9], 4321)));
+        let untrusted_resp = svc.call(untrusted_req).await.expect("infallible");
+        assert_eq!(untrusted_resp.status(), StatusCode::OK);
+        assert_eq!(untrusted_resp.headers().get("x-observed-real-ip").unwrap(), "10.0.0.9");
+        assert_eq!(untrusted_resp.headers().get("x-observed-trusted").unwrap(), "false");
+
+        // Trusted loopback proxy sending malformed X-Forwarded-For fails closed with 400.
+        let mut trusted_req = Request::builder()
+            .header(HEADER_X_FORWARDED_FOR, "not-an-ip")
+            .body(())
+            .expect("request");
+        trusted_req.extensions_mut().insert(SocketAddr::from(([127, 0, 0, 1], 4321)));
+        let trusted_resp = svc.call(trusted_req).await.expect("infallible");
+        assert_eq!(trusted_resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    #[serial]
+    fn test_simple_layer_loads_configured_networks_from_env() {
+        temp_env::with_vars(
+            [
+                (ENV_TRUSTED_PROXY_PROXIES, Some("10.42.0.0/24")),
+                (ENV_TRUSTED_PROXY_EXTRA_PROXIES, Some("")),
+                (ENV_TRUSTED_PROXY_IPS, Some("198.51.100.5")),
+            ],
+            || {
+                let layer = SimpleTrustedProxyLayer::enabled();
+                assert!(is_trusted_proxy_ip(IpAddr::from([10, 42, 0, 9]), layer.trusted_proxies()));
+                assert!(is_trusted_proxy_ip(IpAddr::from([198, 51, 100, 5]), layer.trusted_proxies()));
+                assert!(!is_trusted_proxy_ip(IpAddr::from([10, 42, 1, 9]), layer.trusted_proxies()));
+                assert!(!is_trusted_proxy_ip(IpAddr::from([192, 168, 1, 1]), layer.trusted_proxies()));
+            },
+        );
     }
 
     #[test]

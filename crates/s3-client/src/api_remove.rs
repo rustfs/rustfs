@@ -79,7 +79,7 @@ pub struct RemoveObjectOptions {
     pub internal: AdvancedRemoveOptions,
 }
 
-impl TransitionClient {
+impl<C: crate::transition_api::TransitionConnector> TransitionClient<C> {
     pub async fn remove_bucket_with_options(&self, bucket_name: &str, opts: &RemoveBucketOptions) -> Result<(), std::io::Error> {
         let headers = HeaderMap::new();
 

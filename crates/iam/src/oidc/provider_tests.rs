@@ -626,7 +626,7 @@ async fn oidc_reqwest_dns_policy_rejection_stays_typed() {
     let calls = Arc::new(AtomicUsize::new(0));
     let config = build_mocked_oidc_provider_config(
         "default",
-        "http://keycloak.internal:8080/realms/rustfs/.well-known/openid-configuration",
+        "https://keycloak.internal:8443/realms/rustfs/.well-known/openid-configuration",
     );
     let http_client = ReqwestHttpClient::with_policy_and_dns_resolver(
         OutboundPolicy::default(),
@@ -642,7 +642,7 @@ async fn oidc_reqwest_dns_policy_rejection_stays_typed() {
     };
 
     assert!(error.contains("OIDC provider discovery blocked by outbound policy"));
-    assert!(error.contains(&format!("add http://keycloak.internal:8080 to {ENV_OUTBOUND_ALLOW_ORIGINS}")));
+    assert!(error.contains(&format!("add https://keycloak.internal:8443 to {ENV_OUTBOUND_ALLOW_ORIGINS}")));
     assert_eq!(calls.load(Ordering::Relaxed), 1, "policy rejection must not be retried");
 }
 #[tokio::test]
@@ -650,7 +650,7 @@ async fn oidc_explicit_issuer_preserves_dns_policy_rejection() {
     let calls = Arc::new(AtomicUsize::new(0));
     let mut config = build_mocked_oidc_provider_config(
         "default",
-        "http://keycloak.internal:8080/realms/rustfs/.well-known/openid-configuration",
+        "https://keycloak.internal:8443/realms/rustfs/.well-known/openid-configuration",
     );
     config.issuer = Some("https://idp.example.com/realms/rustfs".to_string());
     let http_client = ReqwestHttpClient::with_policy_and_dns_resolver(
@@ -667,8 +667,22 @@ async fn oidc_explicit_issuer_preserves_dns_policy_rejection() {
     };
 
     assert!(error.contains("OIDC provider discovery blocked by outbound policy"));
-    assert!(error.contains(&format!("add http://keycloak.internal:8080 to {ENV_OUTBOUND_ALLOW_ORIGINS}")));
+    assert!(error.contains(&format!("add https://keycloak.internal:8443 to {ENV_OUTBOUND_ALLOW_ORIGINS}")));
     assert_eq!(calls.load(Ordering::Relaxed), 1, "policy rejection must not be retried");
+}
+
+#[tokio::test]
+async fn oidc_discovery_rejects_plaintext_http_for_non_loopback_hosts() {
+    let config = build_mocked_oidc_provider_config("default", "http://idp.example.com/.well-known/openid-configuration");
+    let http_client = ReqwestHttpClient::with_policy(OutboundPolicy::default());
+
+    let error = match discover_provider(&config, &http_client).await {
+        Ok(_) => panic!("plaintext http:// non-loopback OIDC provider must fail closed"),
+        Err(error) => error,
+    };
+
+    assert!(error.contains("OIDC provider discovery blocked by outbound policy"));
+    assert!(error.contains("plaintext http://"));
 }
 
 #[tokio::test]

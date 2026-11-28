@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 use super::{
-    config::{OidcProviderConfig, OidcProviderValidationResult, SourcedOidcProviderConfig},
+    config::{OidcProviderConfig, OidcProviderValidationResult, SourcedOidcProviderConfig, ensure_oidc_url_transport_security},
     transport::{DiscoveryRequest, OidcHttpError, ReqwestHttpClient, oidc_extra_root_certs, oidc_http_error_diagnostics},
 };
 use crate::{EVENT_OIDC_DIAGNOSTICS, LOG_COMPONENT_IAM, LOG_SUBSYSTEM_OIDC};
@@ -202,6 +202,24 @@ impl DiscoveredProviderMetadata {
             Self::Console(metadata) => metadata.token_endpoint(),
             Self::Workload(metadata) => metadata.token_endpoint.as_ref(),
         }
+    }
+
+    pub(super) fn validate_transport_security(&self) -> Result<(), String> {
+        ensure_oidc_url_transport_security(self.issuer().url())?;
+        ensure_oidc_url_transport_security(self.jwks_uri().url())?;
+        if let Some(token_endpoint) = self.token_endpoint() {
+            ensure_oidc_url_transport_security(token_endpoint.url())?;
+        }
+        if let Self::Console(metadata) = self {
+            ensure_oidc_url_transport_security(metadata.authorization_endpoint().url())?;
+            if let Some(userinfo) = metadata.userinfo_endpoint() {
+                ensure_oidc_url_transport_security(userinfo.url())?;
+            }
+            if let Some(end_session) = metadata.additional_metadata().end_session_endpoint.as_ref() {
+                ensure_oidc_url_transport_security(end_session.url())?;
+            }
+        }
+        Ok(())
     }
 
     pub(super) fn verifier(&self, config: &OidcProviderConfig) -> CoreIdTokenVerifier<'static> {
@@ -474,11 +492,17 @@ pub(super) async fn discover_provider_for_recovery(
                 };
                 ProviderMetadataWithLogout::discover_async(issuer_url.clone(), &client)
                     .await
-                    .map(|metadata| ProviderState {
-                        metadata: DiscoveredProviderMetadata::Console(Box::new(metadata)),
-                        discovered_at: Instant::now(),
-                    })
                     .map_err(|err| discovery_failure(err, "discovery failed", OIDC_DISCOVERY_BLOCKED_BY_OUTBOUND_POLICY))
+                    .and_then(|metadata| {
+                        let metadata = DiscoveredProviderMetadata::Console(Box::new(metadata));
+                        metadata.validate_transport_security().map_err(|reason| {
+                            DiscoveryFailure::from(format!("{OIDC_DISCOVERY_BLOCKED_BY_OUTBOUND_POLICY}: {reason}"))
+                        })?;
+                        Ok(ProviderState {
+                            metadata,
+                            discovered_at: Instant::now(),
+                        })
+                    })
             };
             match discovered {
                 Ok(state) => return Ok(state),
@@ -637,7 +661,6 @@ async fn discover_provider_from_config_url(
         )
         .into());
     }
-
     let jwks_url = if explicit_issuer {
         jwks_url_from_config_url(&config.config_url, &issuer_url, provider_metadata.jwks_uri())?
     } else {
@@ -655,6 +678,9 @@ async fn discover_provider_from_config_url(
         Ok(jwks) => jwks,
         Err(err) => return Err(discovery_failure(err, "failed to fetch JWKS", OIDC_JWKS_BLOCKED_BY_OUTBOUND_POLICY)),
     };
+    provider_metadata
+        .validate_transport_security()
+        .map_err(|reason| DiscoveryFailure::from(format!("{OIDC_DISCOVERY_BLOCKED_BY_OUTBOUND_POLICY}: {reason}")))?;
 
     Ok(ProviderState {
         metadata: provider_metadata.set_jwks(jwks),

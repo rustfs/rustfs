@@ -75,15 +75,29 @@ fn build_oidc_http_client_rejects_forbidden_targets_without_allowlist() {
         "public https endpoint should build"
     );
 }
-#[test]
-fn test_should_bypass_proxy_for_oidc_uri_loopback_only() {
-    assert!(should_bypass_proxy_for_oidc_uri("http://127.0.0.1:9000/.well-known/openid-configuration"));
-    assert!(should_bypass_proxy_for_oidc_uri("http://localhost:9000/.well-known/openid-configuration"));
-    assert!(should_bypass_proxy_for_oidc_uri("http://[::1]:9000/.well-known/openid-configuration"));
-    assert!(!should_bypass_proxy_for_oidc_uri(
-        "https://idp.example.com/.well-known/openid-configuration"
-    ));
-    assert!(!should_bypass_proxy_for_oidc_uri("not-a-url"));
+#[tokio::test]
+async fn oidc_resolves_the_provider_directly_with_an_environment_proxy() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind proxy listener");
+    let proxy = format!("http://{}", listener.local_addr().expect("proxy address"));
+    temp_env::async_with_vars(
+        [
+            ("HTTPS_PROXY", Some(proxy.as_str())),
+            ("https_proxy", Some(proxy.as_str())),
+            ("NO_PROXY", None),
+            ("no_proxy", None),
+        ],
+        async {
+            let (client, url) = build_oidc_http_client("https://provider.invalid", Some(&OutboundPolicy::default()), &[], None)
+                .expect("build the provider client");
+            tokio::select! {
+                result = client.get(url).send() => assert!(result.expect_err("reserved .invalid domain").is_connect()),
+                _ = listener.accept() => panic!("OIDC connected to the environment proxy"),
+            }
+        },
+    )
+    .await;
 }
 #[test]
 fn build_oidc_http_client_honors_explicit_allowlist_for_loopback() {
@@ -103,7 +117,7 @@ fn build_oidc_http_client_honors_explicit_allowlist_for_loopback() {
 }
 #[tokio::test]
 async fn oidc_nonrecoverable_dns_policy_rejection_omits_allowlist_hint() {
-    let uri = "http://metadata.internal/latest/meta-data";
+    let uri = "https://metadata.internal/latest/meta-data";
     let http_client = ReqwestHttpClient::with_policy_and_dns_resolver(
         OutboundPolicy::default(),
         Arc::new(RejectingDnsResolver {
@@ -124,7 +138,30 @@ async fn oidc_nonrecoverable_dns_policy_rejection_omits_allowlist_hint() {
 
     assert!(matches!(error, OidcHttpError::ForbiddenOutbound(_)));
     assert!(message.contains("metadata.internal"));
-    assert!(!message.contains(&format!("add http://metadata.internal to {ENV_OUTBOUND_ALLOW_ORIGINS}")));
+    assert!(!message.contains(&format!("add https://metadata.internal to {ENV_OUTBOUND_ALLOW_ORIGINS}")));
+}
+
+#[test]
+#[serial_test::serial]
+fn build_oidc_http_client_rejects_plaintext_http_for_non_loopback_by_default() {
+    temp_env::with_var(rustfs_config::oidc::ENV_IDENTITY_OPENID_ALLOW_INSECURE_TRANSPORT, None::<&str>, || {
+        let err = build_oidc_http_client("http://idp.example.com/.well-known/openid-configuration", None, &[], None)
+            .expect_err("non-loopback plaintext http:// OIDC URL must be rejected");
+        assert!(matches!(err, OidcHttpError::ForbiddenOutbound(ref msg) if msg.contains("plaintext http://")));
+
+        // Loopback http:// stays allowed when explicitly allowlisted in OutboundPolicy.
+        let policy = OutboundPolicy::from_allowed_origins("http://127.0.0.1:8080").expect("origin should parse");
+        assert!(
+            build_oidc_http_client("http://127.0.0.1:8080/.well-known/openid-configuration", Some(&policy), &[], None).is_ok()
+        );
+    });
+
+    temp_env::with_var(rustfs_config::oidc::ENV_IDENTITY_OPENID_ALLOW_INSECURE_TRANSPORT, Some("true"), || {
+        assert!(
+            build_oidc_http_client("http://idp.example.com/.well-known/openid-configuration", None, &[], None).is_ok(),
+            "explicit opt-in must permit plaintext http:// OIDC URLs"
+        );
+    });
 }
 #[test]
 fn oidc_metadata_endpoint_rejection_does_not_offer_allowlist_bypass() {

@@ -35,7 +35,7 @@ use rustfs_utils::hash::EMPTY_STRING_SHA256_HASH;
 use std::collections::HashMap;
 use std::io::ErrorKind;
 
-impl TransitionClient {
+impl<C: crate::transition_api::TransitionConnector> TransitionClient<C> {
     pub fn list_buckets(&self) -> Result<Vec<BucketInfo>, std::io::Error> {
         Err(std::io::Error::new(
             ErrorKind::Unsupported,

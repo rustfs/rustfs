@@ -32,20 +32,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let config = KeystoneConfig::from_env()?;
 
     // Create Keystone client
-    let client = KeystoneClient::new(
+    let client = KeystoneClient::try_new(
         config.auth_url.clone(),
         config.get_version()?,
         config.admin_user.clone(),
         config.admin_password.clone(),
         config.admin_project.clone(),
+        config.get_admin_domain(),
         config.verify_ssl,
-    );
+        config.get_timeout(),
+    )?;
 
     // Create authentication provider
     let auth_provider = KeystoneAuthProvider::new(
         client,
         config.cache_size,
         config.get_cache_ttl(),
+        config.enable_cache,
     );
 
     // Authenticate with Keystone token
@@ -53,7 +56,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let credentials = auth_provider.authenticate_with_token(token).await?;
 
     println!("Authenticated user: {}", credentials.parent_user);
-    println!("Project: {:?}", credentials.claims);
 
     Ok(())
 }
@@ -67,6 +69,7 @@ Configure via environment variables:
 # Enable Keystone
 export RUSTFS_KEYSTONE_ENABLE=true
 export RUSTFS_KEYSTONE_AUTH_URL=http://keystone:5000
+export RUSTFS_OUTBOUND_ALLOW_ORIGINS=http://keystone:5000
 export RUSTFS_KEYSTONE_VERSION=v3
 
 # Admin credentials (optional, for privileged operations)
@@ -93,14 +96,16 @@ MITM attacks against the Keystone connection and emits a startup warning.
 The `KeystoneClient` provides low-level API access to Keystone services:
 
 ```rust
-let client = KeystoneClient::new(
+let client = KeystoneClient::try_new(
     "http://keystone:5000".to_string(),
     KeystoneVersion::V3,
     Some("admin".to_string()),
     Some("secret".to_string()),
     Some("admin".to_string()),
+    "Default".to_string(),
     true, // verify SSL
-);
+    std::time::Duration::from_secs(30),
+)?;
 
 // Validate a token
 let token_info = client.validate_token("token123").await?;
@@ -358,6 +363,7 @@ To enable Keystone authentication in RustFS:
 ```bash
 export RUSTFS_KEYSTONE_ENABLE=true
 export RUSTFS_KEYSTONE_AUTH_URL=http://keystone:5000
+export RUSTFS_OUTBOUND_ALLOW_ORIGINS=http://keystone:5000
 export RUSTFS_KEYSTONE_VERSION=v3
 export RUSTFS_KEYSTONE_ADMIN_USER=admin
 export RUSTFS_KEYSTONE_ADMIN_PASSWORD=secret

@@ -275,7 +275,7 @@ impl PutObjectOptions {
     }
 }
 
-impl TransitionClient {
+impl<C: crate::transition_api::TransitionConnector> TransitionClient<C> {
     pub async fn put_object(
         self: Arc<Self>,
         bucket_name: &str,

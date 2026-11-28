@@ -17,19 +17,21 @@ use crate::storage::request_context::spawn_traced;
 use crate::storage::storage_api::rpc_consumer::http_service::{
     BackgroundPipeWriter, BackgroundReaderStream, DEFAULT_READ_BUFFER_SIZE, DeleteOptions, DiskStore,
     NS_SCANNER_PROTOCOL_VERSION, NsScannerCapabilityResponse, PUT_FILE_AUTH_TRAILER_LEN, PUT_FILE_AUTH_V1,
-    PUT_FILE_CAPABILITY_VERSION, PutFileCapabilityResponse, RemoteBackgroundIo, StorageDiskRpcExt as _,
-    WALK_DIR_STREAM_COMPLETION_V1, WalkDirOptions, background_pipe, check_and_record_signed_rpc_nonce,
-    find_local_disk_by_ref_for_rpc, find_local_disk_by_ref_for_scanner_rpc, rpc_background_admission,
-    sign_ns_scanner_capability_with_usage_capabilities, sign_ns_scanner_tier_registry_preflight_capability,
-    sign_ns_scanner_usage_watch_capability, sign_put_file_capability, verify_put_file_auth_trailer, verify_rpc_signature,
-    with_remote_background_io, with_rpc_background_request,
+    PUT_FILE_CAPABILITY_VERSION, PutFileCapabilityResponse, RemoteBackgroundIo, STREAM_RESPONSE_AUTH_HEADER,
+    STREAM_RESPONSE_AUTH_V1, STREAM_RESPONSE_FRAME_MAX_PAYLOAD, StorageDiskRpcExt as _, StreamResponseAuthDomain,
+    WALK_DIR_STREAM_COMPLETION_V1, WalkDirOptions, background_pipe, check_and_record_signed_rpc_nonce_for_peer,
+    encode_stream_auth_data_frame, encode_stream_auth_eof_frame, find_local_disk_by_ref_for_rpc,
+    find_local_disk_by_ref_for_scanner_rpc, rpc_background_admission, sign_ns_scanner_capability_with_usage_capabilities,
+    sign_ns_scanner_tier_registry_preflight_capability, sign_ns_scanner_usage_watch_capability, sign_put_file_capability,
+    verify_put_file_auth_trailer, verify_rpc_signature, with_remote_background_io, with_rpc_background_request,
 };
 #[cfg(test)]
 use crate::storage::storage_api::rpc_consumer::http_service::{
     NS_SCANNER_BODY_SHA256_QUERY, NS_SCANNER_CAPABILITY_CHALLENGE_QUERY, NS_SCANNER_CYCLE_QUERY, NS_SCANNER_LEADER_EPOCH_QUERY,
     NS_SCANNER_REQUEST_ID_QUERY, NS_SCANNER_SERVER_EPOCH_QUERY, NS_SCANNER_SESSION_ID_QUERY, NS_SCANNER_SESSION_SEQUENCE_QUERY,
     NS_SCANNER_TIER_REGISTRY_GENERATION_QUERY, PUT_FILE_CAPABILITY_CHALLENGE_QUERY, PUT_FILE_CAPABILITY_QUERY,
-    WALK_DIR_BODY_SHA256_QUERY,
+    STREAM_RESPONSE_AUTH_NONCE_QUERY, STREAM_RESPONSE_AUTH_QUERY, STREAM_RESPONSE_DATA_HEADER_LEN, STREAM_RESPONSE_EOF_FRAME_LEN,
+    WALK_DIR_BODY_SHA256_QUERY, verify_stream_auth_data_frame, verify_stream_auth_eof_frame,
 };
 use crate::storage::storage_api::runtime_sources_consumer::runtime_sources;
 use crate::storage::storage_api::tonic_rpc_auth_failure_reason;
@@ -91,6 +93,12 @@ pub(super) static PUT_FILE_AUTH_STRICT: LazyLock<bool> = LazyLock::new(|| {
     rustfs_utils::get_env_bool(
         rustfs_config::ENV_INTERNODE_RPC_BODY_DIGEST_STRICT,
         rustfs_config::DEFAULT_INTERNODE_RPC_BODY_DIGEST_STRICT,
+    )
+});
+static STREAM_RESPONSE_AUTH_STRICT: LazyLock<bool> = LazyLock::new(|| {
+    rustfs_utils::get_env_bool(
+        rustfs_config::ENV_INTERNODE_RPC_STREAM_AUTH_STRICT,
+        rustfs_config::DEFAULT_INTERNODE_RPC_STREAM_AUTH_STRICT,
     )
 });
 const PUT_FILE_TARGET_LOCK_SHARDS: usize = 64;
@@ -365,6 +373,8 @@ struct ReadFileQuery {
     path: String,
     offset: usize,
     length: usize,
+    stream_auth: Option<String>,
+    stream_auth_nonce: Option<uuid::Uuid>,
 }
 
 #[derive(Debug, Default, serde::Deserialize)]
@@ -372,6 +382,138 @@ struct WalkDirQuery {
     disk: String,
     walk_dir_stream_completion: Option<String>,
     walk_dir_body_sha256: Option<String>,
+    stream_auth: Option<String>,
+    stream_auth_nonce: Option<uuid::Uuid>,
+}
+
+#[derive(Clone, Debug)]
+struct StreamResponseAuthContext {
+    domain: StreamResponseAuthDomain,
+    url: String,
+    method: Method,
+    nonce: uuid::Uuid,
+}
+
+fn parse_stream_response_auth(
+    stream_auth: Option<&str>,
+    stream_auth_nonce: Option<uuid::Uuid>,
+    strict: bool,
+) -> io::Result<Option<uuid::Uuid>> {
+    match stream_auth {
+        None => {
+            if stream_auth_nonce.is_some() {
+                return Err(io::Error::other("unexpected stream_auth_nonce without stream_auth"));
+            }
+            if strict {
+                return Err(io::Error::other("internode stream response auth required"));
+            }
+            Ok(None)
+        }
+        Some(STREAM_RESPONSE_AUTH_V1) => {
+            let nonce = stream_auth_nonce
+                .filter(|nonce| !nonce.is_nil())
+                .ok_or_else(|| io::Error::other("Invalid stream response auth nonce"))?;
+            Ok(Some(nonce))
+        }
+        Some(_) => Err(io::Error::other("Unsupported stream response auth version")),
+    }
+}
+
+struct AuthenticatedResponseStream<S> {
+    inner: Pin<Box<S>>,
+    auth: StreamResponseAuthContext,
+    seq: u64,
+    total_bytes: u64,
+    hasher: Sha256,
+    pending_frames: std::collections::VecDeque<Bytes>,
+    done: bool,
+}
+
+impl<S> AuthenticatedResponseStream<S> {
+    fn new(inner: S, auth: StreamResponseAuthContext) -> Self {
+        Self {
+            inner: Box::pin(inner),
+            auth,
+            seq: 0,
+            total_bytes: 0,
+            hasher: Sha256::new(),
+            pending_frames: std::collections::VecDeque::new(),
+            done: false,
+        }
+    }
+}
+
+impl<S> Stream for AuthenticatedResponseStream<S>
+where
+    S: Stream<Item = io::Result<Bytes>>,
+{
+    type Item = io::Result<Bytes>;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let this = self.as_mut().get_mut();
+        if let Some(frame) = this.pending_frames.pop_front() {
+            return Poll::Ready(Some(Ok(frame)));
+        }
+        if this.done {
+            return Poll::Ready(None);
+        }
+
+        loop {
+            match this.inner.as_mut().poll_next(cx) {
+                Poll::Pending => return Poll::Pending,
+                Poll::Ready(Some(Ok(bytes))) => {
+                    if bytes.is_empty() {
+                        continue;
+                    }
+                    for chunk in bytes.chunks(STREAM_RESPONSE_FRAME_MAX_PAYLOAD) {
+                        let frame = match encode_stream_auth_data_frame(
+                            this.auth.domain,
+                            &this.auth.url,
+                            &this.auth.method,
+                            this.auth.nonce,
+                            this.seq,
+                            chunk,
+                        ) {
+                            Ok(frame) => frame,
+                            Err(err) => {
+                                this.done = true;
+                                return Poll::Ready(Some(Err(err)));
+                            }
+                        };
+                        this.hasher.update(chunk);
+                        this.total_bytes = this.total_bytes.saturating_add(chunk.len() as u64);
+                        this.seq = this.seq.saturating_add(1);
+                        this.pending_frames.push_back(Bytes::from(frame));
+                    }
+                    if let Some(frame) = this.pending_frames.pop_front() {
+                        return Poll::Ready(Some(Ok(frame)));
+                    }
+                }
+                Poll::Ready(Some(Err(err))) => {
+                    // Never emit a signed EOF frame when the producer fails.
+                    this.done = true;
+                    return Poll::Ready(Some(Err(err)));
+                }
+                Poll::Ready(None) => {
+                    this.done = true;
+                    let digest: [u8; 32] = this.hasher.clone().finalize().into();
+                    let eof = match encode_stream_auth_eof_frame(
+                        this.auth.domain,
+                        &this.auth.url,
+                        &this.auth.method,
+                        this.auth.nonce,
+                        this.seq,
+                        this.total_bytes,
+                        &digest,
+                    ) {
+                        Ok(eof) => eof,
+                        Err(err) => return Poll::Ready(Some(Err(err))),
+                    };
+                    return Poll::Ready(Some(Ok(Bytes::copy_from_slice(&eof))));
+                }
+            }
+        }
+    }
 }
 
 #[derive(Debug, Default, serde::Deserialize)]
@@ -827,10 +969,29 @@ async fn handle_read_file(req: Request<Incoming>) -> Response<Body> {
         return empty_ok();
     }
 
+    let request_url = req.uri().to_string();
+    let request_method = req.method().clone();
     let query = match parse_query::<ReadFileQuery>(&req) {
         Ok(query) => query,
         Err(response) => return *response,
     };
+    let stream_auth_nonce =
+        match parse_stream_response_auth(query.stream_auth.as_deref(), query.stream_auth_nonce, *STREAM_RESPONSE_AUTH_STRICT) {
+            Ok(nonce) => nonce,
+            Err(err) => {
+                log_internode_rpc_response_failure!(
+                    StatusCode::FORBIDDEN,
+                    req.uri().path(),
+                    &request_method,
+                    Some(INTERNODE_OPERATION_READ_FILE_STREAM),
+                    "stream_response_auth_invalid",
+                    "rejected",
+                    Some(("disk", query.disk.as_str())),
+                    Some(&err)
+                );
+                return response_with_status(StatusCode::FORBIDDEN, format!("invalid stream response auth: {err}"));
+            }
+        };
 
     let disk = match find_local_disk_by_ref_for_rpc(&query.disk).await {
         Ok(disk) => disk,
@@ -888,14 +1049,36 @@ async fn handle_read_file(req: Request<Incoming>) -> Response<Body> {
         INTERNODE_OPERATION_READ_FILE_STREAM,
         INTERNODE_TRANSPORT_BACKEND_TCP_HTTP,
     );
-    read_file_response(file, query.length)
+    let stream_auth = stream_auth_nonce.map(|nonce| StreamResponseAuthContext {
+        domain: StreamResponseAuthDomain::ReadFileStream,
+        url: request_url,
+        method: request_method,
+        nonce,
+    });
+    read_file_response_with_auth(file, query.length, stream_auth)
 }
 
+#[cfg(test)]
 fn read_file_response<R>(reader: R, length: usize) -> Response<Body>
 where
     R: tokio::io::AsyncRead + Unpin + Send + Sync + 'static,
 {
+    read_file_response_with_auth(reader, length, None)
+}
+
+fn read_file_response_with_auth<R>(reader: R, length: usize, stream_auth: Option<StreamResponseAuthContext>) -> Response<Body>
+where
+    R: tokio::io::AsyncRead + Unpin + Send + Sync + 'static,
+{
     let stream = read_file_body_stream(reader, length, INTERNODE_OPERATION_READ_FILE_STREAM);
+    if let Some(auth) = stream_auth {
+        let auth_stream = AuthenticatedResponseStream::new(stream, auth);
+        let mut response = Response::new(Body::from_stream(auth_stream));
+        response
+            .headers_mut()
+            .insert(STREAM_RESPONSE_AUTH_HEADER, HeaderValue::from_static(STREAM_RESPONSE_AUTH_V1));
+        return response;
+    }
     let mut response = Response::new(Body::from_stream(stream));
     if length != 0 {
         // Bounded shard readers stop at the requested byte count. Exact framing
@@ -1060,10 +1243,29 @@ async fn handle_walk_dir(req: Request<Incoming>) -> Response<Body> {
         return empty_ok();
     }
 
+    let request_url = req.uri().to_string();
+    let request_method = req.method().clone();
     let query = match parse_query::<WalkDirQuery>(&req) {
         Ok(query) => query,
         Err(response) => return *response,
     };
+    let stream_auth_nonce =
+        match parse_stream_response_auth(query.stream_auth.as_deref(), query.stream_auth_nonce, *STREAM_RESPONSE_AUTH_STRICT) {
+            Ok(nonce) => nonce,
+            Err(err) => {
+                log_internode_rpc_response_failure!(
+                    StatusCode::FORBIDDEN,
+                    req.uri().path(),
+                    &request_method,
+                    Some(INTERNODE_OPERATION_WALK_DIR),
+                    "stream_response_auth_invalid",
+                    "rejected",
+                    Some(("disk", query.disk.as_str())),
+                    Some(&err)
+                );
+                return response_with_status(StatusCode::FORBIDDEN, format!("invalid stream response auth: {err}"));
+            }
+        };
     let disk = match find_local_disk_by_ref_for_rpc(&query.disk).await {
         Ok(disk) => disk,
         Err(_) => return response_with_status(StatusCode::SERVICE_UNAVAILABLE, "background storage admission deferred"),
@@ -1159,32 +1361,44 @@ async fn handle_walk_dir(req: Request<Incoming>) -> Response<Body> {
     runtime_sources::current_internode_metrics()
         .record_incoming_request_for_operation_and_backend(INTERNODE_OPERATION_WALK_DIR, INTERNODE_TRANSPORT_BACKEND_TCP_HTTP);
 
-    let body = walk_dir_response_body(propagate_completion_errors, preflight_missing_path_error, move |mut writer| async move {
-        walk_dir_with_legacy_meta_fallback(&disk, args, &mut writer)
-            .await
-            .map_err(|e| {
-                warn!(
-                    event = EVENT_RPC_BACKGROUND_TASK_FAILED,
-                    component = LOG_COMPONENT_INTERNODE_RPC,
-                    subsystem = LOG_SUBSYSTEM_DIRECTORY_WALK,
-                    operation = INTERNODE_OPERATION_WALK_DIR,
-                    result = "failed",
-                    disk = %log_disk,
-                    bucket = %log_bucket,
-                    base_dir = %log_base_dir,
-                    recursive = log_recursive,
-                    report_notfound = log_report_notfound,
-                    filter_prefix = ?log_filter_prefix,
-                    forward_to = ?log_forward_to,
-                    limit = log_limit,
-                    disk_id = %log_disk_id,
-                    skip_total_timeout = log_skip_total_timeout,
-                    error = %e,
-                    "internode rpc background task failed"
-                );
-                e
-            })
-    })
+    let stream_auth = stream_auth_nonce.map(|nonce| StreamResponseAuthContext {
+        domain: StreamResponseAuthDomain::WalkDir,
+        url: request_url,
+        method: request_method,
+        nonce,
+    });
+    let has_stream_auth = stream_auth.is_some();
+    let body = walk_dir_response_body_with_auth(
+        propagate_completion_errors,
+        preflight_missing_path_error,
+        stream_auth,
+        move |mut writer| async move {
+            walk_dir_with_legacy_meta_fallback(&disk, args, &mut writer)
+                .await
+                .map_err(|e| {
+                    warn!(
+                        event = EVENT_RPC_BACKGROUND_TASK_FAILED,
+                        component = LOG_COMPONENT_INTERNODE_RPC,
+                        subsystem = LOG_SUBSYSTEM_DIRECTORY_WALK,
+                        operation = INTERNODE_OPERATION_WALK_DIR,
+                        result = "failed",
+                        disk = %log_disk,
+                        bucket = %log_bucket,
+                        base_dir = %log_base_dir,
+                        recursive = log_recursive,
+                        report_notfound = log_report_notfound,
+                        filter_prefix = ?log_filter_prefix,
+                        forward_to = ?log_forward_to,
+                        limit = log_limit,
+                        disk_id = %log_disk_id,
+                        skip_total_timeout = log_skip_total_timeout,
+                        error = %e,
+                        "internode rpc background task failed"
+                    );
+                    e
+                })
+        },
+    )
     .await;
 
     let body = match body {
@@ -1192,10 +1406,11 @@ async fn handle_walk_dir(req: Request<Incoming>) -> Response<Body> {
         Err(error) => return response_with_disk_error(&error, error.to_string()),
     };
 
-    Response::builder()
-        .status(StatusCode::OK)
-        .body(body)
-        .expect("failed to build walk dir response")
+    let mut builder = Response::builder().status(StatusCode::OK);
+    if has_stream_auth {
+        builder = builder.header(STREAM_RESPONSE_AUTH_HEADER, STREAM_RESPONSE_AUTH_V1);
+    }
+    builder.body(body).expect("failed to build walk dir response")
 }
 
 fn legacy_meta_bucket_alias(volume: &str) -> Option<String> {
@@ -1556,9 +1771,33 @@ fn remote_scanner_claim_rejection(error: &rustfs_scanner::ScannerError) -> (Stat
     }
 }
 
+#[cfg(test)]
 async fn walk_dir_response_body<F, Fut>(
     propagate_completion_errors: bool,
     preflight_missing_path_error: bool,
+    producer: F,
+) -> Result<Body, DiskError>
+where
+    F: FnOnce(BackgroundPipeWriter) -> Fut + Send + 'static,
+    Fut: Future<Output = Result<(), DiskError>> + Send + 'static,
+{
+    walk_dir_response_body_with_auth(propagate_completion_errors, preflight_missing_path_error, None, producer).await
+}
+
+fn wrap_walk_dir_body<S>(stream: S, stream_auth: Option<StreamResponseAuthContext>) -> Body
+where
+    S: Stream<Item = io::Result<Bytes>> + Send + Sync + 'static,
+{
+    match stream_auth {
+        Some(auth) => Body::from_stream(AuthenticatedResponseStream::new(stream, auth)),
+        None => Body::from_stream(stream),
+    }
+}
+
+async fn walk_dir_response_body_with_auth<F, Fut>(
+    propagate_completion_errors: bool,
+    preflight_missing_path_error: bool,
+    stream_auth: Option<StreamResponseAuthContext>,
     producer: F,
 ) -> Result<Body, DiskError>
 where
@@ -1594,7 +1833,7 @@ where
     let mut stream = Box::pin(stream);
     if !preflight_missing_path_error {
         let stream = append_walk_dir_completion(stream, completion_rx, propagate_completion_errors);
-        return Ok(Body::from_stream(stream));
+        return Ok(wrap_walk_dir_body(stream, stream_auth));
     }
 
     // Keep the first chunk bounded in memory so a missing-path error can use
@@ -1603,15 +1842,23 @@ where
         Some(Ok(first_bytes)) => {
             let stream = stream::once(async move { Ok(first_bytes) }).chain(stream);
             let stream = append_walk_dir_completion(stream, completion_rx, propagate_completion_errors);
-            Ok(Body::from_stream(stream))
+            Ok(wrap_walk_dir_body(stream, stream_auth))
         }
         Some(Err(first_error)) => {
             let stream = stream::once(async move { Err(first_error) }).chain(stream);
             let stream = append_walk_dir_completion(stream, completion_rx, propagate_completion_errors);
-            Ok(Body::from_stream(stream))
+            Ok(wrap_walk_dir_body(stream, stream_auth))
         }
         None => match completion_rx.await {
-            Ok(Ok(())) => Ok(Body::empty()),
+            Ok(Ok(())) => match stream_auth {
+                Some(auth) => {
+                    let digest: [u8; 32] = Sha256::digest([]).into();
+                    let eof = encode_stream_auth_eof_frame(auth.domain, &auth.url, &auth.method, auth.nonce, 0, 0, &digest)
+                        .map_err(DiskError::other)?;
+                    Ok(Body::from(Bytes::copy_from_slice(&eof)))
+                }
+                None => Ok(Body::empty()),
+            },
             Ok(Err(error)) if propagate_completion_errors => match error {
                 DiskError::FileNotFound | DiskError::VolumeNotFound => Err(error),
                 _ => Ok(walk_dir_error_body("remote walk_dir failed")),
@@ -1918,13 +2165,15 @@ async fn handle_put_file(req: Request<Incoming>, require_auth: bool) -> Response
     if require_auth && !put_file_server_epoch_accepted(&query, *PUT_FILE_AUTH_STRICT) {
         return response_with_status(StatusCode::CONFLICT, "put_file capability server epoch changed");
     }
+    let peer_ip = req.extensions().get::<std::net::SocketAddr>().map(std::net::SocketAddr::ip);
     if let Some(nonce) = auth_nonce
-        && let Err(e) = check_and_record_signed_rpc_nonce(
+        && let Err(e) = check_and_record_signed_rpc_nonce_for_peer(
             req.headers(),
             nonce,
             &path,
             INTERNODE_OPERATION_PUT_FILE_STREAM,
             INTERNODE_TRANSPORT_BACKEND_TCP_HTTP,
+            peer_ip,
         )
     {
         if crate::storage::storage_api::rpc_auth_is_resource_exhausted(&e) {
@@ -2267,14 +2516,16 @@ mod tests {
         NS_SCANNER_REQUEST_ID_QUERY, NS_SCANNER_SERVER_EPOCH_QUERY, NS_SCANNER_SESSION_ID_QUERY,
         NS_SCANNER_SESSION_SEQUENCE_QUERY, NS_SCANNER_TIER_REGISTRY_GENERATION_QUERY, NsScannerCapabilityResponse,
         NsScannerQuery, PUT_FILE_AUTH_STREAM_PATH, PUT_FILE_CAPABILITY_PATH, PUT_FILE_STREAM_PATH, PutFileQuery,
-        READ_FILE_STREAM_PATH, WALK_DIR_BODY_SHA256_QUERY, WALK_DIR_PATH, WalkDirQuery, append_walk_dir_completion,
-        internode_http_operation, internode_rpc_subsystem, is_internode_rpc_path, legacy_meta_bucket_alias,
-        ns_scanner_response_body, ns_scanner_server_epoch_matches, put_body_size_mismatch, put_file_auth_nonce,
-        put_file_capability_response, put_file_server_epoch_accepted, put_file_server_epoch_matches,
-        put_file_stage_error_message, put_file_target_lock, read_file_body_stream, read_file_response,
-        read_file_stream_buffer_size, remote_scanner_claim_rejection, response_with_disk_error,
-        supports_walk_dir_stream_completion, validate_walk_dir_completion_request, verify_internode_rpc_signature,
-        verify_ns_scanner_body_digest, verify_walk_dir_body_digest, walk_dir_response_body, write_authenticated_put_file,
+        READ_FILE_STREAM_PATH, STREAM_RESPONSE_AUTH_HEADER, STREAM_RESPONSE_AUTH_NONCE_QUERY, STREAM_RESPONSE_AUTH_QUERY,
+        STREAM_RESPONSE_AUTH_V1, STREAM_RESPONSE_DATA_HEADER_LEN, STREAM_RESPONSE_EOF_FRAME_LEN, StreamResponseAuthDomain,
+        WALK_DIR_BODY_SHA256_QUERY, WALK_DIR_PATH, WalkDirQuery, append_walk_dir_completion, internode_http_operation,
+        internode_rpc_subsystem, is_internode_rpc_path, legacy_meta_bucket_alias, ns_scanner_response_body,
+        ns_scanner_server_epoch_matches, put_body_size_mismatch, put_file_auth_nonce, put_file_capability_response,
+        put_file_server_epoch_accepted, put_file_server_epoch_matches, put_file_stage_error_message, put_file_target_lock,
+        read_file_body_stream, read_file_response, read_file_stream_buffer_size, remote_scanner_claim_rejection,
+        response_with_disk_error, supports_walk_dir_stream_completion, validate_walk_dir_completion_request,
+        verify_internode_rpc_signature, verify_ns_scanner_body_digest, verify_stream_auth_data_frame,
+        verify_stream_auth_eof_frame, verify_walk_dir_body_digest, walk_dir_response_body, write_authenticated_put_file,
         write_body_chunks_to_writer, write_put_file_body_chunks_to_writer,
     };
     use crate::storage::storage_api::ecstore_rpc::{build_put_file_auth_trailer, gen_signature_headers};
@@ -2291,7 +2542,7 @@ mod tests {
         INTERNODE_OPERATION_READ_FILE_STREAM, INTERNODE_OPERATION_WALK_DIR, INTERNODE_TRANSPORT_BACKEND_TCP_HTTP,
         global_internode_metrics,
     };
-    use sha2::Digest as _;
+    use sha2::{Digest as _, Sha256};
     use std::collections::HashMap;
     use std::convert::Infallible;
     use std::future::Future as _;
@@ -4573,5 +4824,109 @@ mod tests {
             let guard = shard.lock();
             assert!(guard.entries.len() <= guard.next_gc_threshold);
         }
+    }
+
+    #[tokio::test]
+    async fn read_file_and_walk_dir_responses_emit_verified_framed_auth_streams() {
+        let _ = rustfs_credentials::set_global_rpc_secret("stream-response-auth-test-secret".to_string());
+        let read_nonce = uuid::Uuid::new_v4();
+        let read_url = format!(
+            "/rustfs/rpc/read_file_stream?disk=d1&volume=b&path=p&offset=0&length=11&{STREAM_RESPONSE_AUTH_QUERY}={STREAM_RESPONSE_AUTH_V1}&{STREAM_RESPONSE_AUTH_NONCE_QUERY}={read_nonce}"
+        );
+        let read_ctx = super::StreamResponseAuthContext {
+            domain: StreamResponseAuthDomain::ReadFileStream,
+            url: read_url.clone(),
+            method: Method::GET,
+            nonce: read_nonce,
+        };
+        let response = super::read_file_response_with_auth(std::io::Cursor::new(b"hello world".to_vec()), 11, Some(read_ctx));
+        assert_eq!(
+            response
+                .headers()
+                .get(STREAM_RESPONSE_AUTH_HEADER)
+                .and_then(|v| v.to_str().ok()),
+            Some(STREAM_RESPONSE_AUTH_V1)
+        );
+        assert!(
+            response.headers().get(http::header::CONTENT_LENGTH).is_none(),
+            "authenticated framed response must omit raw payload Content-Length"
+        );
+        let wire = response.into_body().collect().await.expect("framed body").to_bytes();
+        assert_eq!(wire.len(), STREAM_RESPONSE_DATA_HEADER_LEN + 11 + STREAM_RESPONSE_EOF_FRAME_LEN);
+        let header: [u8; STREAM_RESPONSE_DATA_HEADER_LEN] = wire[..STREAM_RESPONSE_DATA_HEADER_LEN].try_into().unwrap();
+        let payload = &wire[STREAM_RESPONSE_DATA_HEADER_LEN..STREAM_RESPONSE_DATA_HEADER_LEN + 11];
+        assert_eq!(payload, b"hello world");
+        verify_stream_auth_data_frame(
+            StreamResponseAuthDomain::ReadFileStream,
+            &read_url,
+            &Method::GET,
+            read_nonce,
+            0,
+            &header,
+            payload,
+        )
+        .expect("read_file data frame must verify");
+        let eof: [u8; STREAM_RESPONSE_EOF_FRAME_LEN] = wire[STREAM_RESPONSE_DATA_HEADER_LEN + 11..].try_into().unwrap();
+        let digest: [u8; 32] = Sha256::digest(payload).into();
+        verify_stream_auth_eof_frame(
+            StreamResponseAuthDomain::ReadFileStream,
+            &read_url,
+            &Method::GET,
+            read_nonce,
+            1,
+            11,
+            &digest,
+            &eof,
+        )
+        .expect("read_file EOF frame must verify");
+
+        // Empty walk_dir still emits an authenticated EOF frame.
+        let walk_nonce = uuid::Uuid::new_v4();
+        let walk_url = format!(
+            "/rustfs/rpc/walk_dir?disk=d1&{STREAM_RESPONSE_AUTH_QUERY}={STREAM_RESPONSE_AUTH_V1}&{STREAM_RESPONSE_AUTH_NONCE_QUERY}={walk_nonce}"
+        );
+        let walk_ctx = super::StreamResponseAuthContext {
+            domain: StreamResponseAuthDomain::WalkDir,
+            url: walk_url.clone(),
+            method: Method::GET,
+            nonce: walk_nonce,
+        };
+        let empty_walk = super::walk_dir_response_body_with_auth(true, true, Some(walk_ctx.clone()), |_w| async { Ok(()) })
+            .await
+            .expect("empty authenticated walk_dir should succeed");
+        let empty_wire = empty_walk.collect().await.expect("empty walk wire").to_bytes();
+        assert_eq!(empty_wire.len(), STREAM_RESPONSE_EOF_FRAME_LEN);
+        let empty_eof: [u8; STREAM_RESPONSE_EOF_FRAME_LEN] = empty_wire[..].try_into().unwrap();
+        let empty_digest: [u8; 32] = Sha256::digest([]).into();
+        verify_stream_auth_eof_frame(
+            StreamResponseAuthDomain::WalkDir,
+            &walk_url,
+            &Method::GET,
+            walk_nonce,
+            0,
+            0,
+            &empty_digest,
+            &empty_eof,
+        )
+        .expect("empty walk_dir EOF frame must verify");
+
+        // Failed mid-stream walk_dir must abort without emitting a signed EOF frame.
+        let failed_walk = super::walk_dir_response_body_with_auth(true, false, Some(walk_ctx), |mut w| async move {
+            w.write_all(b"partial-entry").await.expect("write partial");
+            Err(DiskError::other("injected walk failure"))
+        })
+        .await
+        .expect("stream starts before producer error");
+        assert!(
+            failed_walk.collect().await.is_err(),
+            "failed walk_dir stream must error rather than emit an EOF frame"
+        );
+
+        // Strict query parsing rejects missing or unknown stream_auth.
+        assert!(super::parse_stream_response_auth(None, None, false).unwrap().is_none());
+        assert!(super::parse_stream_response_auth(None, None, true).is_err());
+        assert!(super::parse_stream_response_auth(Some(STREAM_RESPONSE_AUTH_V1), None, false).is_err());
+        assert!(super::parse_stream_response_auth(Some(STREAM_RESPONSE_AUTH_V1), Some(uuid::Uuid::nil()), false).is_err());
+        assert!(super::parse_stream_response_auth(Some("framed-v99"), Some(read_nonce), false).is_err());
     }
 }

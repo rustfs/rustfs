@@ -16,6 +16,8 @@ use rustfs_policy::policy::action::S3Action as PolicyS3Action;
 use serde_json;
 use std::collections::HashMap;
 use thiserror::Error;
+use time::OffsetDateTime;
+use time::format_description::well_known::Rfc3339;
 use tracing::error;
 
 use super::session::SessionContext;
@@ -294,13 +296,14 @@ pub async fn is_authorized(
 
     // Check if user is the owner (admin)
     let is_owner = rustfs_iam::is_root_access_key(session_context.principal.access_key());
+    let conditions = policy_conditions_for_session(session_context, is_owner);
 
     let args = rustfs_policy::policy::Args {
         account: session_context.principal.access_key(),
         groups: &session_context.principal.user_identity.credentials.groups,
         action: policy_action,
         bucket,
-        conditions: &HashMap::new(),
+        conditions: &conditions,
         is_owner,
         object: object.unwrap_or(""),
         claims: &claims,
@@ -308,6 +311,63 @@ pub async fn is_authorized(
     };
 
     Ok(iam_sys.is_allowed(&args).await)
+}
+
+/// Build IAM policy condition values from the authenticated protocol session context.
+///
+/// Server-derived transport and identity facts (`SourceIp`, `SecureTransport`, `CurrentTime`,
+/// `EpochTime`, `userid`, `username`, `principaltype`) are always authoritative and cannot be
+/// shadowed by caller-controlled request headers.
+pub(crate) fn policy_conditions_for_session(session_context: &SessionContext, is_owner: bool) -> HashMap<String, Vec<String>> {
+    policy_conditions_for_session_at(session_context, is_owner, OffsetDateTime::now_utc())
+}
+
+fn policy_conditions_for_session_at(
+    session_context: &SessionContext,
+    is_owner: bool,
+    now: OffsetDateTime,
+) -> HashMap<String, Vec<String>> {
+    let mut conditions = HashMap::new();
+
+    conditions.insert("CurrentTime".to_owned(), vec![now.format(&Rfc3339).unwrap_or_default()]);
+    conditions.insert("EpochTime".to_owned(), vec![now.unix_timestamp().to_string()]);
+    conditions.insert("SecureTransport".to_owned(), vec![session_context.secure_transport.to_string()]);
+    // An unspecified source address renders as the empty string so IpAddress / NotIpAddress
+    // conditions evaluate deterministically without matching 0.0.0.0/0 as a concrete peer.
+    let source_ip = if session_context.source_ip.is_unspecified() {
+        String::new()
+    } else {
+        session_context.source_ip.to_string()
+    };
+    conditions.insert("SourceIp".to_owned(), vec![source_ip]);
+
+    if let Some(user_agent) = session_context.request_headers.get(http::header::USER_AGENT)
+        && let Ok(value) = user_agent.to_str()
+    {
+        conditions.insert("UserAgent".to_owned(), vec![value.to_owned()]);
+    }
+    if let Some(referer) = session_context.request_headers.get(http::header::REFERER)
+        && let Ok(value) = referer.to_str()
+    {
+        conditions.insert("Referer".to_owned(), vec![value.to_owned()]);
+    }
+
+    let username = session_context.principal.access_key();
+    if !username.is_empty() {
+        conditions.insert("userid".to_owned(), vec![username.to_owned()]);
+        conditions.insert("username".to_owned(), vec![username.to_owned()]);
+    }
+    let creds = session_context.credentials();
+    let principal_type = if is_owner {
+        "Account"
+    } else if creds.is_temp() && !creds.is_service_account() {
+        "AssumedRole"
+    } else {
+        "User"
+    };
+    conditions.insert("principaltype".to_owned(), vec![principal_type.to_owned()]);
+
+    conditions
 }
 
 fn policy_claims_for_session(session_context: &SessionContext) -> HashMap<String, serde_json::Value> {
@@ -630,5 +690,107 @@ mod tests {
         )
         .await;
         assert!(matches!(result, Err(AuthorizationError::IamUnavailable)));
+    }
+
+    #[tokio::test]
+    async fn policy_conditions_enforce_source_ip_and_secure_transport() {
+        use rustfs_policy::policy::{Args, Policy, action::Action};
+        use std::net::{IpAddr, Ipv4Addr};
+
+        let policy: Policy = serde_json::from_str(
+            r#"{
+                "Version": "2012-10-17",
+                "Statement": [
+                    {
+                        "Effect": "Allow",
+                        "Action": ["s3:GetObject"],
+                        "Resource": ["arn:aws:s3:::restricted/*"],
+                        "Condition": {
+                            "IpAddress": {"aws:SourceIp": ["203.0.113.0/24"]},
+                            "Bool": {"aws:SecureTransport": ["true"]}
+                        }
+                    },
+                    {
+                        "Effect": "Deny",
+                        "Action": ["s3:*"],
+                        "Resource": ["arn:aws:s3:::restricted/*"],
+                        "Condition": {
+                            "Bool": {"aws:SecureTransport": ["false"]}
+                        }
+                    }
+                ]
+            }"#,
+        )
+        .expect("policy JSON should parse");
+
+        let mut allowed_session = test_session();
+        allowed_session.source_ip = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 42));
+        allowed_session.secure_transport = true;
+        allowed_session
+            .request_headers
+            .insert(http::header::USER_AGENT, http::HeaderValue::from_static("proto-client/1.0"));
+        allowed_session
+            .request_headers
+            .insert("x-forwarded-for", http::HeaderValue::from_static("198.51.100.1"));
+
+        let allowed_conditions = policy_conditions_for_session(&allowed_session, false);
+        assert_eq!(allowed_conditions.get("SourceIp"), Some(&vec!["203.0.113.42".to_string()]));
+        assert_eq!(allowed_conditions.get("SecureTransport"), Some(&vec!["true".to_string()]));
+        assert_eq!(allowed_conditions.get("UserAgent"), Some(&vec!["proto-client/1.0".to_string()]));
+        assert!(!allowed_conditions.contains_key("x-forwarded-for"));
+
+        let claims = policy_claims_for_session(&allowed_session);
+        let allowed_args = Args {
+            account: "alice",
+            groups: &None,
+            action: Action::from(S3Action::GetObject),
+            bucket: "restricted",
+            conditions: &allowed_conditions,
+            is_owner: false,
+            object: "secret.txt",
+            claims: &claims,
+            deny_only: false,
+        };
+        assert!(
+            policy.is_allowed(&allowed_args).await,
+            "matching SourceIp and SecureTransport=true must be allowed"
+        );
+
+        // Plaintext transport must be denied even from an allowed IP.
+        let mut insecure_session = allowed_session.clone();
+        insecure_session.secure_transport = false;
+        let insecure_conditions = policy_conditions_for_session(&insecure_session, false);
+        let insecure_args = Args {
+            conditions: &insecure_conditions,
+            ..allowed_args
+        };
+        assert!(
+            !policy.is_allowed(&insecure_args).await,
+            "SecureTransport=false must fail the policy condition and match explicit Deny"
+        );
+
+        // Disallowed source IP must fail closed even over TLS.
+        let mut wrong_ip_session = allowed_session.clone();
+        wrong_ip_session.source_ip = IpAddr::V4(Ipv4Addr::new(198, 51, 100, 9));
+        let wrong_ip_conditions = policy_conditions_for_session(&wrong_ip_session, false);
+        let wrong_ip_args = Args {
+            conditions: &wrong_ip_conditions,
+            ..allowed_args
+        };
+        assert!(!policy.is_allowed(&wrong_ip_args).await, "non-matching SourceIp must be denied");
+
+        // Unspecified source IP renders empty string and must not match the CIDR.
+        let mut unspecified_session = allowed_session;
+        unspecified_session.source_ip = IpAddr::V4(Ipv4Addr::UNSPECIFIED);
+        let unspecified_conditions = policy_conditions_for_session(&unspecified_session, false);
+        assert_eq!(unspecified_conditions.get("SourceIp"), Some(&vec![String::new()]));
+        let unspecified_args = Args {
+            conditions: &unspecified_conditions,
+            ..allowed_args
+        };
+        assert!(
+            !policy.is_allowed(&unspecified_args).await,
+            "unspecified SourceIp must never satisfy an IpAddress allow condition"
+        );
     }
 }

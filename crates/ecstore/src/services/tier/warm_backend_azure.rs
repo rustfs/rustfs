@@ -21,13 +21,12 @@ use std::collections::HashMap;
 use crate::services::tier::{
     tier_config::TierAzure,
     warm_backend::{
-        S3CompatibleWarmBackendParams, TransitionCandidateProbe, WarmBackend, WarmBackendGetOpts, build_transition_put_options,
-        new_s3_compatible_warm_backend, optimal_part_size,
+        S3CompatibleWarmBackendParams, TierEndpointPolicy, TransitionCandidateProbe, WarmBackend, WarmBackendGetOpts,
+        build_transition_put_options, new_s3_compatible_warm_backend, optimal_part_size,
     },
     warm_backend_s3::WarmBackendS3,
 };
 use rustfs_s3_client::transition_api::{BucketLookupType, ReadCloser, ReaderImpl};
-use rustfs_utils::egress::validate_outbound_url;
 
 const MIN_PART_SIZE: i64 = 1024 * 1024 * 128;
 
@@ -45,7 +44,7 @@ impl WarmBackendAzure {
                 region: &conf.region,
                 bucket_lookup: BucketLookupType::BucketLookupDNS,
                 provider_tag: "azure",
-                validate_endpoint: validate_outbound_url,
+                endpoint_policy: TierEndpointPolicy::PublicOnly,
             })
             .await?,
         ))
@@ -108,7 +107,7 @@ mod tests {
     use crate::services::tier::tier_config::TierAzure;
     use rustfs_s3_client::{
         credentials::{Credentials, SignatureType, Static, Value},
-        transition_api::{Options, TransitionClient, TransitionCore},
+        transition_api::{Options, TransitionCore},
     };
     use std::sync::Arc;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -175,7 +174,7 @@ mod tests {
             (get_request, delete_request)
         });
         let client = Arc::new(
-            TransitionClient::new(
+            super::super::warm_backend::fixture_transition_client(
                 &endpoint,
                 Options {
                     creds: Credentials::new(Static(Value {

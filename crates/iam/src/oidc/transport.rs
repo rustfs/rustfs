@@ -18,7 +18,6 @@ use rustfs_config::MAX_OIDC_RESPONSE_SIZE;
 use rustfs_utils::egress::{ENV_OUTBOUND_ALLOW_ORIGINS, OutboundPolicy, find_outbound_dns_policy_rejection};
 use std::collections::VecDeque;
 use std::future::Future;
-use std::net::IpAddr;
 use std::pin::Pin;
 use std::sync::{Arc, LazyLock, Mutex, MutexGuard, RwLock};
 use std::time::{Duration as StdDuration, Instant};
@@ -375,20 +374,16 @@ pub(super) fn build_oidc_http_client(
             OutboundPolicy::from_allowed_origins(&origin).is_ok_and(|allowlisted| allowlisted.validate_url(&url).is_ok());
         oidc_forbidden_outbound_error(&url, base, can_allow_origin)
     })?;
-    let bypass_proxy = should_bypass_proxy_for_oidc_uri(uri);
-    #[cfg(test)]
-    let bypass_proxy = bypass_proxy || dns_resolver_override.is_some();
+    super::config::ensure_oidc_url_transport_security(&url).map_err(OidcHttpError::ForbiddenOutbound)?;
     #[cfg(test)]
     let resolver: Arc<dyn reqwest::dns::Resolve> = dns_resolver_override.unwrap_or_else(|| Arc::new(resolver));
 
     let mut builder = reqwest::Client::builder()
+        .no_proxy()
         .dns_resolver(resolver)
         .redirect(reqwest::redirect::Policy::none())
         .timeout(OIDC_HTTP_REQUEST_TIMEOUT)
         .connect_timeout(OIDC_HTTP_CONNECT_TIMEOUT);
-    if bypass_proxy {
-        builder = builder.no_proxy();
-    }
     if !extra_root_certs.is_empty() {
         builder = builder.tls_certs_merge(extra_root_certs.iter().cloned());
     }
@@ -433,15 +428,6 @@ async fn read_bounded_response_body(response: reqwest::Response, limit: usize) -
         body.extend_from_slice(&chunk);
     }
     Ok(body)
-}
-
-pub(super) fn should_bypass_proxy_for_oidc_uri(uri: &str) -> bool {
-    let Some(host) = Url::parse(uri).ok().and_then(|url| url.host_str().map(str::to_owned)) else {
-        return false;
-    };
-    let host = host.trim_matches(['[', ']']);
-
-    host.eq_ignore_ascii_case("localhost") || host.parse::<IpAddr>().is_ok_and(|addr| addr.is_loopback())
 }
 
 impl ReqwestHttpClient {
