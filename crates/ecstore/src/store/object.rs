@@ -2590,8 +2590,107 @@ fn detached_delete_failed(operation: &'static str, err: tokio::task::JoinError) 
     }
 }
 
-fn sorted_unique_delete_object_names(objects: &[ObjectToDelete]) -> Vec<&str> {
-    let mut object_names: Vec<&str> = objects.iter().map(|object| object.object_name.as_str()).collect();
+const BULK_DELETE_MIN_WINDOW_KEYS: usize = 8;
+const BULK_DELETE_MAX_WINDOWS: usize = 4;
+
+fn delete_paths_are_independent<'a>(names: impl Iterator<Item = &'a str>, fold_case: bool) -> bool {
+    let mut paths = HashSet::new();
+    for name in names {
+        if name.split('/').any(|segment| {
+            matches!(segment, "" | "." | "..")
+                || (fold_case
+                    && (!segment
+                        .bytes()
+                        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+                        || rustfs_utils::check_windows_file_name(segment).is_err()))
+        }) {
+            return false;
+        }
+        let path = if fold_case {
+            std::borrow::Cow::Owned(name.to_ascii_lowercase())
+        } else {
+            std::borrow::Cow::Borrowed(name)
+        };
+        if !paths.insert(path) {
+            return false;
+        }
+    }
+    paths
+        .iter()
+        .all(|path| path.match_indices('/').all(|(end, _)| !paths.contains(&path[..end])))
+}
+
+fn delete_lock_windows(objects: Vec<ObjectToDelete>, distributed: bool) -> Vec<Vec<(usize, ObjectToDelete)>> {
+    let mut identities = HashMap::new();
+    let mut key_slots = Vec::new();
+    let mut ordinals = Vec::with_capacity(objects.len());
+    for object in &objects {
+        let identity = rustfs_utils::path::object_name_disk_identity(&object.object_name);
+        let ordinal = *identities.entry(identity).or_insert_with(|| {
+            key_slots.push(0);
+            key_slots.len() - 1
+        });
+        key_slots[ordinal] += 1;
+        ordinals.push(ordinal);
+    }
+
+    // Check the already encoded disk names for the entire request before
+    // splitting. Overlaps must reach one disk batch so its ordering rules
+    // also cover keys that would otherwise land in separate windows.
+    if !delete_paths_are_independent(identities.keys().map(AsRef::as_ref), cfg!(any(windows, target_os = "macos"))) {
+        return vec![objects.into_iter().enumerate().collect()];
+    }
+
+    let key_count = key_slots.len();
+    let repeated = key_slots.iter().filter(|&&slots| slots > 1).count();
+    let mut assignments = Vec::with_capacity(key_count);
+    if distributed && repeated > 0 && repeated < key_count {
+        // Repeated keys share a single physical transaction. Let those guards
+        // go when their transactions finish, independently of the distinct
+        // keys in this request. Both classes share the four quorum windows.
+        let repeated_lanes = (repeated * BULK_DELETE_MAX_WINDOWS)
+            .div_ceil(key_count)
+            .min(BULK_DELETE_MAX_WINDOWS - 1);
+        let repeated_width = repeated.div_ceil(repeated_lanes);
+        let repeated_windows = repeated.div_ceil(repeated_width);
+        let single_width = (key_count - repeated)
+            .div_ceil(BULK_DELETE_MAX_WINDOWS - repeated_windows)
+            .max(BULK_DELETE_MIN_WINDOW_KEYS);
+        let (mut next_repeated, mut next_single) = (0, 0);
+        for slots in key_slots {
+            let window = if slots > 1 {
+                let index = next_repeated / repeated_width;
+                next_repeated += 1;
+                index
+            } else {
+                let index = repeated_windows + next_single / single_width;
+                next_single += 1;
+                index
+            };
+            assignments.push(window);
+        }
+    } else {
+        let width = if distributed {
+            key_count.div_ceil(BULK_DELETE_MAX_WINDOWS).max(BULK_DELETE_MIN_WINDOW_KEYS)
+        } else {
+            BULK_DELETE_MIN_WINDOW_KEYS
+        };
+        assignments.extend((0..key_count).map(|i| i / width));
+    }
+    let mut windows: Vec<Vec<_>> = (0..assignments.iter().max().map_or(0, |n| n + 1))
+        .map(|_| Vec::new())
+        .collect();
+    for (index, (object, ordinal)) in objects.into_iter().zip(ordinals).enumerate() {
+        windows[assignments[ordinal]].push((index, object));
+    }
+    windows
+}
+
+fn sorted_unique_delete_object_names(objects: &[ObjectToDelete]) -> Vec<std::borrow::Cow<'_, str>> {
+    let mut object_names: Vec<_> = objects
+        .iter()
+        .map(|object| rustfs_utils::path::object_name_disk_identity(&object.object_name))
+        .collect();
     object_names.sort_unstable();
     object_names.dedup();
     object_names
@@ -3664,7 +3763,8 @@ impl ECStore {
             return Ok((Vec::new(), HashMap::new()));
         }
 
-        let object_names = sorted_unique_delete_object_names(objects);
+        let identities = sorted_unique_delete_object_names(objects);
+        let object_names: Vec<&str> = identities.iter().map(AsRef::as_ref).collect();
         let acquire_started = Instant::now();
         let acquired = self.pools[0].disk_set[0]
             .acquire_object_write_locks_batch(bucket, &object_names, get_lock_acquire_timeout())
@@ -6461,7 +6561,50 @@ impl ECStore {
         if current_bucket_incarnation_id.is_some() {
             pause_delete_after_object_lock_snapshot(bucket).await;
         }
-        self.delete_batch_under_bucket_guards(bucket, objects, opts).await
+        // A conditional request preflights all relevant peers before its first mutation.
+        // Multi-pool marker creation also admits all selected destinations together.
+        // Keep those request-wide decisions and caller-owned lock scopes intact.
+        let config = opts
+            .delete_replication_config_snapshot
+            .as_deref()
+            .expect("delete config installed");
+        let distributed = self.ctx.is_dist_erasure().await;
+        if objects.len() <= BULK_DELETE_MIN_WINDOW_KEYS
+            || opts.no_lock
+            || objects.iter().any(|object| object.delete_condition.is_some())
+            || (!self.single_pool()
+                && objects
+                    .iter()
+                    .any(|object| batch_delete_creates_latest_marker(object, config)))
+        {
+            return self.delete_batch_under_bucket_guards(bucket, objects, opts).await;
+        }
+
+        let len = objects.len();
+        let mut deleted = vec![DeletedObject::default(); len];
+        let mut errors = vec![None; len];
+        let mut accounting = vec![None; len];
+        // Bucket lifecycle/configuration fences, the recovery work budget and the tier
+        // receipt sink are shared by the request. Each window adds its own key guards.
+        // An inactive window owns no key locks. Refill local work only after
+        // an active window finishes; distributed planning fits in one wave.
+        let mut windows = futures::stream::iter(delete_lock_windows(objects, distributed))
+            .map(|window| {
+                let opts = opts.clone();
+                async move {
+                    let (indices, entries): (Vec<_>, Vec<_>) = window.into_iter().unzip();
+                    (indices, self.delete_batch_under_bucket_guards(bucket, entries, opts).await)
+                }
+            })
+            .buffer_unordered(BULK_DELETE_MAX_WINDOWS);
+        while let Some((indices, (results, failures, receipts))) = windows.next().await {
+            for (i, ((result, failure), receipt)) in indices.into_iter().zip(results.into_iter().zip(failures).zip(receipts)) {
+                deleted[i] = result;
+                errors[i] = failure;
+                accounting[i] = receipt;
+            }
+        }
+        (deleted, errors, accounting)
     }
 
     async fn delete_batch_under_bucket_guards(
@@ -6482,7 +6625,8 @@ impl ECStore {
         // of the batch proceeds, matching the set layer's per-key lock errors.
         if !object_lock_failures.is_empty() {
             for (index, object) in objects.iter().enumerate() {
-                if let Some(error) = object_lock_failures.get(&object.object_name) {
+                let identity = rustfs_utils::path::object_name_disk_identity(&object.object_name);
+                if let Some(error) = object_lock_failures.get(identity.as_ref()) {
                     del_errs[index] = Some(error.clone());
                 }
             }
@@ -14474,6 +14618,19 @@ mod missing_key_delete_quorum_tests {
                 )
                 .await
                 .expect("seed real external object");
+            let mut completed_reader = PutObjReader::from_vec(b"earlier window".to_vec());
+            store
+                .put_object(
+                    bucket,
+                    "completed-0",
+                    &mut completed_reader,
+                    &ObjectOptions {
+                        write_completion: crate::object_api::WriteCompletion::TailDrained,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect("seed the key whose progress is checked");
             let disks = store.pools[0].disk_set[0].disk_inventory().await;
             let disk = disks[0].as_ref().expect("online drive");
             let info = disk
@@ -14496,17 +14653,20 @@ mod missing_key_delete_quorum_tests {
                 let _ = entered_tx.send(());
                 let _ = release_rx.recv();
             });
+            let mut entries = (0..BULK_DELETE_MIN_WINDOW_KEYS)
+                .map(|i| ObjectToDelete {
+                    object_name: format!("completed-{i}"),
+                    ..Default::default()
+                })
+                .collect::<Vec<_>>();
+            entries.push(ObjectToDelete {
+                object_name: key.to_owned(),
+                ..Default::default()
+            });
             let deleting = store.clone();
             let delete = tokio::spawn(async move {
                 deleting
-                    .delete_objects_with_tier_delete_journal_and_accounting(
-                        bucket,
-                        vec![ObjectToDelete {
-                            object_name: key.to_owned(),
-                            ..Default::default()
-                        }],
-                        ObjectOptions::default(),
-                    )
+                    .delete_objects_with_tier_delete_journal_and_accounting(bucket, entries, ObjectOptions::default())
                     .await
             });
             tokio::time::timeout(Duration::from_secs(10), entered_rx)
@@ -14514,6 +14674,27 @@ mod missing_key_delete_quorum_tests {
                 .expect("physical cleanup entry")
                 .expect("entry hook");
             assert!(part.exists(), "payload unlink has not run");
+            // The other window has a real acknowledged key. Wait until its delete is
+            // visible, then prove a writer can acquire it before the blocked batch returns.
+            tokio::time::timeout(Duration::from_secs(15), async {
+                loop {
+                    match store.get_object_info(bucket, "completed-0", &ObjectOptions::default()).await {
+                        Ok(_) => tokio::time::sleep(Duration::from_millis(10)).await,
+                        Err(err) if is_err_object_not_found(&err) => break,
+                        Err(err) => panic!("read completed key: {err}"),
+                    }
+                }
+            })
+            .await
+            .expect("completed window must release its key while the other window is paused");
+            let completed = store
+                .handle_new_ns_lock(bucket, "completed-0")
+                .await
+                .expect("completed key lock");
+            let completed_guard = completed.get_write_lock(Duration::from_secs(1)).await;
+            let completed_available = completed_guard.is_ok();
+            drop(completed_guard);
+            assert!(!delete.is_finished(), "the unrelated disk operation must still be pending");
             let (_, errors, _) = tokio::time::timeout(Duration::from_secs(40), delete)
                 .await
                 .expect("real settlement timeout must return")
@@ -14529,6 +14710,7 @@ mod missing_key_delete_quorum_tests {
             drop(probe);
             drop(release);
             drop(hook);
+            assert!(completed_available, "a settled window retained its key guards for unrelated physical I/O");
             assert!(
                 !acquired_while_pending,
                 "batch released the exact-key guard while physical cleanup was still paused after its real recovery timeout"
@@ -14586,6 +14768,174 @@ mod batch_delete_lock_tests {
             .collect()
     }
 
+    #[test]
+    fn full_size_bulk_delete_dispatches_at_most_one_bounded_wave() {
+        let objects = (0..1000)
+            .map(|i| ObjectToDelete {
+                object_name: format!("key-{i}"),
+                ..Default::default()
+            })
+            .collect();
+        let windows = delete_lock_windows(objects, true);
+        assert_eq!(windows.len(), BULK_DELETE_MAX_WINDOWS);
+        assert!(windows.iter().all(|window| window.len() == 250));
+    }
+
+    #[test]
+    fn distributed_repeated_key_can_complete_independently_of_unrelated_keys() {
+        let mut objects: Vec<_> = (0..985)
+            .map(|i| ObjectToDelete {
+                object_name: format!("key-{i}"),
+                ..Default::default()
+            })
+            .collect();
+        for _ in 0..15 {
+            objects.push(objects[800].clone());
+        }
+        let windows = delete_lock_windows(objects, true);
+        assert_eq!(windows.len(), BULK_DELETE_MAX_WINDOWS);
+        let repeated = windows
+            .iter()
+            .find(|window| window.iter().any(|(index, _)| *index == 800))
+            .unwrap();
+        assert_eq!(repeated.len(), 16);
+        assert!(repeated.iter().all(|(_, object)| object.object_name == "key-800"));
+        assert_eq!(windows.iter().map(Vec::len).sum::<usize>(), 1000);
+    }
+
+    #[test]
+    fn full_size_local_bulk_delete_covers_each_key_in_small_ordered_windows() {
+        let objects = (0..1000)
+            .map(|i| ObjectToDelete {
+                object_name: format!("key-{i}"),
+                ..Default::default()
+            })
+            .collect();
+        let windows = delete_lock_windows(objects, false);
+        assert_eq!(windows.len(), 1000_usize.div_ceil(BULK_DELETE_MIN_WINDOW_KEYS));
+        assert!(windows.iter().all(|window| window.len() <= BULK_DELETE_MIN_WINDOW_KEYS));
+        for (i, (index, object)) in windows.into_iter().flatten().enumerate() {
+            assert_eq!(index, i);
+            assert_eq!(object.object_name, format!("key-{i}"));
+        }
+    }
+
+    #[test]
+    fn bulk_delete_keeps_cross_window_path_overlaps_in_one_batch() {
+        let mut overlapping = vec![
+            ("parent", "parent/child"),
+            ("parent/child", "parent"),
+            ("name/child", "name//child"),
+            ("name/child", "name/./child"),
+            ("child", "name/../child"),
+        ];
+        if cfg!(any(windows, target_os = "macos")) {
+            overlapping.extend([
+                ("Parent", "parent/child"),
+                ("Name", "name"),
+                ("a", "unknown/é"),
+                ("a", "special~1"),
+            ]);
+        }
+        if cfg!(target_os = "macos") {
+            overlapping.push(("a", r"literal\name"));
+        }
+        for (first, last) in overlapping {
+            let objects: Vec<_> = std::iter::once(first.to_owned())
+                .chain((0..BULK_DELETE_MIN_WINDOW_KEYS).map(|i| format!("separate/{i}")))
+                .chain([last.to_owned(), first.to_owned()])
+                .map(|object_name| ObjectToDelete {
+                    object_name,
+                    ..Default::default()
+                })
+                .collect();
+            for distributed in [false, true] {
+                let windows = delete_lock_windows(objects.clone(), distributed);
+                assert_eq!(windows.len(), 1, "{first:?} and {last:?}");
+                assert!(windows[0].iter().enumerate().all(|(index, (original, object))| {
+                    index == *original && object.object_name == objects[index].object_name
+                }));
+            }
+        }
+    }
+
+    #[test]
+    fn bulk_delete_path_safety_accounts_for_case_and_special_names() {
+        for names in [
+            ["Object", "object"],
+            ["PARENT", "parent/child"],
+            ["object", "NUL"],
+            ["object", "name."],
+            ["object", "longna~1"],
+            ["object", "café"],
+        ] {
+            assert!(!delete_paths_are_independent(names.into_iter(), true), "{names:?}");
+        }
+        assert!(delete_paths_are_independent(["Object", "object"].into_iter(), false));
+        assert!(delete_paths_are_independent(["prefix/first.txt", "PREFIX/second"].into_iter(), true));
+    }
+
+    #[test]
+    fn bulk_delete_can_split_unrelated_encoded_directory_objects() {
+        let mut objects: Vec<_> = (0..BULK_DELETE_MIN_WINDOW_KEYS)
+            .map(|i| ObjectToDelete {
+                object_name: format!("prefix/item-{i}.txt"),
+                ..Default::default()
+            })
+            .collect();
+        objects.push(ObjectToDelete {
+            object_name: encode_dir_object("prefix/"),
+            ..Default::default()
+        });
+        for distributed in [false, true] {
+            let windows = delete_lock_windows(objects.clone(), distributed);
+            assert_eq!(windows.len(), 2);
+            assert_eq!(windows[1][0].1.object_name, encode_dir_object("prefix/"));
+        }
+    }
+
+    #[test]
+    fn lock_windows_keep_nonadjacent_versions_and_result_indices_together() {
+        let width = BULK_DELETE_MIN_WINDOW_KEYS;
+        for distributed in [false, true] {
+            let mut objects = (0..=width)
+                .map(|i| ObjectToDelete {
+                    object_name: format!("key/{i}"),
+                    ..Default::default()
+                })
+                .collect::<Vec<_>>();
+            let version = Uuid::new_v4();
+            objects.push(ObjectToDelete {
+                object_name: "key/0".to_owned(),
+                version_id: Some(version),
+                ..Default::default()
+            });
+            if !cfg!(target_os = "macos") {
+                objects.push(ObjectToDelete {
+                    object_name: r"key\0".to_owned(),
+                    ..Default::default()
+                });
+            }
+            let count = objects.len();
+            let windows = delete_lock_windows(objects, distributed);
+            assert!(windows.len() > 1);
+            let window = windows
+                .iter()
+                .find(|window| window.iter().any(|(index, _)| *index == 0))
+                .unwrap();
+            assert!(
+                window
+                    .iter()
+                    .any(|(index, object)| *index == width + 1 && object.version_id == Some(version))
+            );
+            let alias_in_same_window = window.iter().any(|(index, _)| *index == width + 2);
+            assert_eq!(alias_in_same_window, cfg!(windows));
+            let mut indices: Vec<_> = windows.into_iter().flatten().map(|(index, _)| index).collect();
+            indices.sort_unstable();
+            assert_eq!(indices, (0..count).collect::<Vec<_>>());
+        }
+    }
+
     #[tokio::test]
     async fn uncontended_batch_deletes_every_key() {
         let (_dirs, store) = seeded_store("lock-batch-success").await;
@@ -14626,6 +14976,47 @@ mod batch_delete_lock_tests {
         assert!(errors[0].is_none(), "b-object must proceed: {errors:?}");
         assert!(deleted[1].object_name.is_empty(), "failed key must not report success");
         assert_eq!(deleted[0].object_name, "b-object");
+        drop(held);
+    }
+
+    #[tokio::test]
+    async fn windows_bulk_delete_acquires_each_physical_lock_once_and_reports_alias_errors() {
+        let bucket = "lock-batch-physical-identity";
+        let (_dirs, store) = seeded_store(bucket).await;
+        let entries = ["alias/key", "b-object", r"alias\key"].map(|name| ObjectToDelete {
+            object_name: name.to_owned(),
+            ..Default::default()
+        });
+
+        let mut opts = ObjectOptions::default();
+        let (guards, failures) = store
+            .acquire_delete_objects_write_locks(bucket, &entries, &mut opts)
+            .await
+            .expect("acquire real namespace locks");
+        assert!(failures.is_empty(), "uncontended aliases must share an acquisition: {failures:?}");
+        assert_eq!(guards.len(), if cfg!(windows) { 2 } else { 3 });
+        drop(guards);
+
+        let held = store
+            .acquire_object_write_lock("delete_objects", bucket, "alias/key")
+            .await
+            .expect("hold the physical namespace lock");
+        let (deleted, errors, _) = tokio::time::timeout(
+            Duration::from_secs(30),
+            store.delete_objects_with_tier_delete_journal_and_accounting(bucket, entries.to_vec(), ObjectOptions::default()),
+        )
+        .await
+        .expect("return per-entry outcomes while the physical lock is held");
+
+        assert!(matches!(errors[0], Some(StorageError::Lock(_))), "{errors:?}");
+        assert!(errors[1].is_none(), "independent key must delete: {errors:?}");
+        assert_eq!(deleted[1].object_name, "b-object");
+        if cfg!(windows) {
+            assert!(matches!(errors[2], Some(StorageError::Lock(_))), "{errors:?}");
+            assert!(deleted[2].object_name.is_empty(), "the contended alias must not report success");
+        } else {
+            assert!(errors[2].is_none(), "the backslash is a literal key byte: {errors:?}");
+        }
         drop(held);
     }
 

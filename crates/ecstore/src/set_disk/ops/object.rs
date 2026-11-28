@@ -20,6 +20,7 @@
 //! SetDisks core (io_primitives) via inherent calls.
 
 use crate::core::pools::DecommissionCapacityAdmission;
+use crate::disk::CurrentDeleteGeneration;
 use crate::disk::cleanup_runtime::{self, OLD_DATA_CLEANUP_RECEIPT_FILE};
 use rustfs_common::mrf_channel::MrfDeleteMarkerPurge;
 use rustfs_filemeta::metadata_keys;
@@ -10287,6 +10288,51 @@ where
     futures::future::try_join_all(probes).await.map(|_| ()).map_err(Error::from)
 }
 
+/// Resolve the preflight generation of one physical delete group using its
+/// original input slots. Different expectations for one disk key cannot both
+/// authorize its mutation.
+fn batch_delete_group_generation<'a>(
+    group: &FileInfoVersions,
+    objects: &[ObjectToDelete],
+    generations: &'a HashMap<String, CurrentDeleteGeneration>,
+) -> Result<Option<&'a CurrentDeleteGeneration>> {
+    let mut observed = group
+        .versions
+        .iter()
+        .filter_map(|version| generations.get(&objects[version.idx].object_name));
+    let expected = observed.next();
+    if let Some(expected) = expected
+        && observed.any(|generation| generation != expected)
+    {
+        return Err(StorageError::PreconditionFailed);
+    }
+    Ok(expected)
+}
+
+fn project_coalesced_marker_results(
+    deleted: &mut [DeletedObject],
+    errors: &mut [Option<Error>],
+    accounting: &mut [Option<DeleteAccounting>],
+    coalesced_slots: &[(usize, usize)],
+) {
+    for &(slot, representative) in coalesced_slots {
+        if errors[slot].is_some() {
+            continue;
+        }
+        if let Some(error) = errors[representative].clone() {
+            errors[slot] = Some(error);
+            continue;
+        }
+        let mut committed = deleted[representative].clone();
+        if committed.coalesced_delete_marker_key.is_none() {
+            committed.coalesced_delete_marker_key = Some(decode_dir_object(&committed.object_name));
+        }
+        committed.object_name = std::mem::take(&mut deleted[slot].object_name);
+        deleted[slot] = committed;
+        accounting[slot] = None;
+    }
+}
+
 /// Per-key source-read inputs for the bulk-delete admission loop. The bounded
 /// metadata pre-fetch and the loop itself must resolve these identically, so
 /// both sides derive them here.
@@ -10912,20 +10958,42 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
                 },
             }
         };
-        // Per-key read inputs are resolved exactly once; the pre-fetch and the
-        // admission loop below consume this table so the two cannot disagree
-        // on eligibility or read options.
+        // Identical, unguarded current-marker requests share one physical
+        // commit and one source lookup. Keep their wire slots for projection
+        // after the commit. Leave distinct versions and replication inputs
+        // in the normal admission path.
+        let mut marker_representatives = HashMap::new();
+        let mut duplicate_markers = Vec::new();
         let mut source_inputs: Vec<Option<BatchDeleteSourceInputs>> = Vec::with_capacity(objects.len());
-        for dobj in &objects {
+        for (index, dobj) in objects.iter().enumerate() {
+            if del_errs[index].is_some() {
+                source_inputs.push(None);
+                continue;
+            }
             let guarded = current_generations.is_some_and(|generations| generations.contains_key(&dobj.object_name));
-            source_inputs.push(Some(batch_delete_source_inputs(
-                bucket,
-                dobj,
-                &opts,
-                &delete_config_snapshot,
-                &object_lock_config,
-                guarded,
-            )));
+            let source = batch_delete_source_inputs(bucket, dobj, &opts, &delete_config_snapshot, &object_lock_config, guarded);
+            if set_disk_delete_creates_delete_marker(&source.check_opts)
+                && !guarded
+                && !dobj.synthetic_version_id
+                && dobj.expected_identity.is_none()
+                && !source.replicate_delete
+                && dobj.delete_marker_replication_status.is_none()
+                && dobj.version_purge_status.is_none()
+                && dobj.version_purge_statuses.is_none()
+                && dobj.replicate_decision_str.is_none()
+                && !opts.replication_request
+                && !opts.data_movement
+                && opts.http_preconditions.is_none()
+            {
+                let representative = *marker_representatives.entry(dobj.object_name.as_str()).or_insert(index);
+                if representative != index {
+                    duplicate_markers.push((index, representative));
+                    del_objects[index].object_name.clone_from(&dobj.object_name);
+                    source_inputs.push(None);
+                    continue;
+                }
+            }
+            source_inputs.push(Some(source));
         }
         // Bounded-parallel pre-fetch of the source metadata each admitted key
         // needs below. These reads are pure quorum lookups under the locks
@@ -10934,7 +11002,7 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
         const DELETE_OBJECTS_SOURCE_READ_CONCURRENCY: usize = 16;
         let mut source_reads: HashMap<usize, (ObjectInfo, FileInfo, Option<Error>)> =
             HashMap::with_capacity(DELETE_OBJECTS_SOURCE_READ_CONCURRENCY);
-        let mut vers_map: HashMap<&String, FileInfoVersions> = HashMap::new();
+        let mut vers_map: HashMap<&str, FileInfoVersions> = HashMap::new();
         let mut tier_reference_leases: Vec<(usize, String, Option<TierDestinationId>)> = Vec::new();
         let mut tier_free_version_receipt_candidates: HashMap<usize, TierFreeVersionReceiptCandidate> = HashMap::new();
         let mut delete_marker_purge_candidates = vec![None; objects.len()];
@@ -11034,7 +11102,7 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
                 // duplicate of the same name would still report the stale
                 // miss and skip its object-lock check — bypassing retention —
                 // so evict those entries and let the loop re-read them live.
-                source_reads.retain(|index, _| objects[*index].object_name != dobj.object_name);
+                source_reads.retain(|index, _| lock_names[*index] != lock_names[i]);
                 let recovery = self
                     .recover_delete_key(
                         bucket,
@@ -11302,10 +11370,10 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
                 );
             }
 
-            // Only add to vers_map if we hold the lock
+            // One raw and transaction lock protect one disk identity.
             if locked_objects.contains(lock_names[i].as_ref()) {
                 vers_map
-                    .entry(&dobj.object_name)
+                    .entry(lock_names[i].as_ref())
                     .or_insert_with(|| FileInfoVersions {
                         name: vr.name.clone(),
                         ..Default::default()
@@ -11316,11 +11384,43 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
         }
 
         let mut vers = Vec::with_capacity(vers_map.len());
+        let mut group_generations = HashMap::new();
+        let mut coalesced_markers = Vec::new();
 
-        for (_, mut fi_vers) in vers_map {
+        for (identity, mut fi_vers) in vers_map {
+            // Use one canonical journal for distinct wire spellings that share
+            // xl.meta. Preserve the existing physical request when they all
+            // use the same spelling, and keep wire names in del_objects.
+            let has_aliases = fi_vers.versions.iter().any(|version| version.name != fi_vers.name);
+            if has_aliases {
+                fi_vers.name = identity.to_owned();
+                for version in &mut fi_vers.versions {
+                    version.name.clone_from(&fi_vers.name);
+                }
+            }
+            if let Some(generations) = current_generations {
+                match batch_delete_group_generation(&fi_vers, &objects, generations) {
+                    Ok(Some(generation)) => {
+                        group_generations.insert(fi_vers.name.clone(), generation);
+                    }
+                    Ok(None) => {}
+                    Err(error) => {
+                        for version in &fi_vers.versions {
+                            del_errs[version.idx] = Some(error.clone());
+                        }
+                        continue;
+                    }
+                }
+            }
             fi_vers.versions.sort_by_key(|a| a.deleted);
 
             if let Some(index) = fi_vers.versions.iter().position(|fi| fi.deleted) {
+                let representative = fi_vers.versions[index].idx;
+                coalesced_markers.extend(
+                    fi_vers.versions[index + 1..]
+                        .iter()
+                        .map(|version| (version.idx, representative)),
+                );
                 fi_vers.versions.truncate(index + 1);
             }
 
@@ -11437,6 +11537,7 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
         for (disk_index, disk) in disks.iter().enumerate() {
             let disk_namespace_owner = namespace_owner.clone();
             let group_inputs = &vers;
+            let group_generations = &group_generations;
             let vers = vers.clone();
             let namespace_lock_fence = opts.namespace_lock_fence.clone();
             let lock_lost_during_commit = Arc::clone(&lock_lost_during_commit);
@@ -11457,16 +11558,14 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
                         requires_bounded_delete_recovery,
                         ..Default::default()
                     };
-                    if current_generations
-                        .is_some_and(|generations| vers.iter().any(|group| generations.contains_key(&group.name)))
-                    {
+                    if !group_generations.is_empty() && vers.iter().any(|group| group_generations.contains_key(&group.name)) {
                         let mut guarded = Vec::new();
                         let mut ordinary = Vec::new();
                         let mut guarded_indices = Vec::new();
                         let mut ordinary_indices = Vec::new();
                         let count = vers.len();
                         for (index, group) in vers.into_iter().enumerate() {
-                            if let Some(generation) = current_generations.and_then(|generations| generations.get(&group.name)) {
+                            if let Some(&generation) = group_generations.get(&group.name) {
                                 guarded_indices.push(index);
                                 guarded.push(crate::disk::GuardedFileInfoVersions {
                                     group,
@@ -11918,6 +12017,10 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
             });
         let _ = join_all(purge_submissions).await;
 
+        // Resolve physical groups before projecting slots skipped during
+        // admission, since their representative can itself share a marker.
+        project_coalesced_marker_results(&mut del_objects, &mut del_errs, &mut accounting, &coalesced_markers);
+        project_coalesced_marker_results(&mut del_objects, &mut del_errs, &mut accounting, &duplicate_markers);
         for (object, err) in objects.iter().zip(del_errs.iter()) {
             if err.is_none() {
                 self.invalidate_get_object_metadata_cache(bucket, &object.object_name).await;
@@ -30108,6 +30211,349 @@ mod batch_delete_marker_tests {
     use crate::bucket::metadata_sys::test_support::isolated_store_over_temp_disks;
     use crate::storage_api_contracts::bucket::{BucketOperations, DeleteBucketOptions, MakeBucketOptions};
     use crate::storage_api_contracts::list::ListOperations;
+
+    #[test]
+    fn alias_delete_group_rejects_conflicting_conditional_generations() {
+        let objects = ["nested/object", r"nested\object"].map(|name| ObjectToDelete {
+            object_name: name.to_owned(),
+            ..Default::default()
+        });
+        let group = FileInfoVersions {
+            name: "nested/object".to_owned(),
+            versions: (0..objects.len())
+                .map(|idx| FileInfo {
+                    idx,
+                    ..Default::default()
+                })
+                .collect(),
+            ..Default::default()
+        };
+        let present = CurrentDeleteGeneration::Present {
+            version_id: Some(Uuid::from_u128(1)),
+            data_dir: Some(Uuid::from_u128(2)),
+            mod_time: OffsetDateTime::UNIX_EPOCH,
+            delete_marker: false,
+            etag: "historical-object".to_owned(),
+            transition: None,
+        };
+        let mut generations = HashMap::from([
+            (objects[0].object_name.clone(), CurrentDeleteGeneration::Absent),
+            (objects[1].object_name.clone(), present.clone()),
+        ]);
+        assert_eq!(
+            batch_delete_group_generation(&group, &objects, &generations),
+            Err(StorageError::PreconditionFailed)
+        );
+        generations.insert(objects[0].object_name.clone(), present.clone());
+        assert_eq!(batch_delete_group_generation(&group, &objects, &generations).unwrap(), Some(&present));
+    }
+
+    #[test]
+    fn coalesced_marker_slots_follow_the_commit_and_keep_their_own_errors() {
+        let mut deleted = [
+            "nested/object",
+            r"nested\object",
+            r"nested\object",
+            "other/key",
+            r"other\key",
+            r"nested\object",
+        ]
+        .map(|name| DeletedObject {
+            object_name: name.to_owned(),
+            ..Default::default()
+        });
+        let committed_version = Uuid::from_u128(1);
+        deleted[0].delete_marker = true;
+        deleted[0].delete_marker_version_id = Some(committed_version);
+        deleted[0].delete_marker_mtime = Some(OffsetDateTime::UNIX_EPOCH);
+        deleted[0].found = true;
+        let mut errors = [
+            None,
+            None,
+            Some(StorageError::PreconditionFailed),
+            Some(StorageError::ErasureWriteQuorum),
+            None,
+            None,
+        ];
+        let mut accounting = [None, Some(DeleteAccounting::default()), None, None, None, None];
+
+        project_coalesced_marker_results(&mut deleted, &mut errors, &mut accounting, &[(1, 0), (2, 0), (4, 3)]);
+        project_coalesced_marker_results(&mut deleted, &mut errors, &mut accounting, &[(5, 1)]);
+
+        assert_eq!(deleted[1].object_name, r"nested\object");
+        assert_eq!(deleted[1].coalesced_delete_marker_key.as_deref(), Some("nested/object"));
+        assert!(deleted[1].delete_marker && deleted[1].found);
+        assert_eq!(deleted[1].delete_marker_version_id, Some(committed_version));
+        assert_eq!(deleted[1].delete_marker_mtime, deleted[0].delete_marker_mtime);
+        assert!(accounting[1].is_none());
+        assert_eq!(errors[2], Some(StorageError::PreconditionFailed));
+        assert!(!deleted[2].found);
+        assert_eq!(errors[4], Some(StorageError::ErasureWriteQuorum));
+        assert!(!deleted[4].found);
+        assert_eq!(deleted[5].coalesced_delete_marker_key.as_deref(), Some("nested/object"));
+        assert_eq!(deleted[5].delete_marker_version_id, Some(committed_version));
+    }
+
+    #[tokio::test]
+    async fn repeated_versionless_bulk_deletes_report_only_the_persisted_marker() {
+        let (_dirs, store) = isolated_store_over_temp_disks().await;
+        crate::bucket::metadata_sys::init_bucket_metadata_sys(store.clone(), Vec::new()).await;
+        let bucket = "batch-repeated-marker-slots";
+        let key = "target/key";
+        store
+            .make_bucket(
+                bucket,
+                &MakeBucketOptions {
+                    versioning_enabled: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("create versioned bucket");
+        let put_opts = ObjectOptions {
+            versioned: true,
+            write_completion: crate::object_api::WriteCompletion::TailDrained,
+            ..Default::default()
+        };
+        let mut versions = Vec::new();
+        for body in [b"remove this version".as_slice(), b"retain this version".as_slice()] {
+            let object = store
+                .put_object(bucket, key, &mut PutObjReader::from_vec(body.to_vec()), &put_opts)
+                .await
+                .expect("seed version");
+            versions.push(object.version_id.expect("version ID"));
+        }
+
+        let marker_request = ObjectToDelete {
+            object_name: key.to_owned(),
+            ..Default::default()
+        };
+        let mut requested = vec![marker_request; 16];
+        requested.insert(
+            1,
+            ObjectToDelete {
+                object_name: key.to_owned(),
+                version_id: Some(versions[0]),
+                ..Default::default()
+            },
+        );
+        let (deleted, errors, _) = store
+            .delete_objects_with_tier_delete_journal_and_accounting(bucket, requested, ObjectOptions::default())
+            .await;
+        assert_eq!(errors, vec![None; 17]);
+        assert_eq!(deleted.len(), 17);
+        assert_eq!(deleted[1].version_id, Some(versions[0]));
+        assert!(!deleted[1].delete_marker);
+        let marker = deleted[0].delete_marker_version_id.expect("committed marker ID");
+        assert!(!marker.is_nil());
+        for (slot, receipt) in deleted.iter().enumerate().filter(|(slot, _)| *slot != 1) {
+            assert_eq!(receipt.object_name, key);
+            assert!(receipt.delete_marker && receipt.found);
+            assert_eq!(receipt.delete_marker_version_id, Some(marker));
+            assert_eq!(receipt.coalesced_delete_marker_key.as_deref(), (slot != 0).then_some(key));
+        }
+
+        let listed = store
+            .clone()
+            .list_object_versions(bucket, "", None, None, None, 100)
+            .await
+            .expect("list committed versions");
+        assert!(!listed.is_truncated);
+        assert_eq!(listed.objects.len(), 2);
+        assert!(listed.objects.iter().all(|version| version.name == key));
+        assert!(
+            listed
+                .objects
+                .iter()
+                .any(|version| version.delete_marker && version.version_id == Some(marker))
+        );
+        assert!(
+            listed
+                .objects
+                .iter()
+                .any(|version| !version.delete_marker && version.version_id == Some(versions[1]))
+        );
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn windows_batch_delete_mixed_marker_aliases_return_the_listed_marker() {
+        let (_dirs, store) = isolated_store_over_temp_disks().await;
+        crate::bucket::metadata_sys::init_bucket_metadata_sys(store.clone(), Vec::new()).await;
+        let bucket = "batch-alias-marker-slots";
+        let key = "nested/object";
+        store
+            .make_bucket(
+                bucket,
+                &MakeBucketOptions {
+                    versioning_enabled: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("create versioned bucket");
+        let uploaded = store
+            .put_object(
+                bucket,
+                key,
+                &mut PutObjReader::from_vec(b"retained data version".to_vec()),
+                &ObjectOptions {
+                    versioned: true,
+                    write_completion: crate::object_api::WriteCompletion::TailDrained,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("seed a version behind the marker");
+        let data_version = uploaded.version_id.expect("versioned PUT returns an ID");
+
+        let requested = [key, r"nested\object", key];
+        let (deleted, errors, accounting) = store
+            .delete_objects_with_tier_delete_journal_and_accounting(
+                bucket,
+                requested
+                    .iter()
+                    .map(|&name| ObjectToDelete {
+                        object_name: name.to_owned(),
+                        ..Default::default()
+                    })
+                    .collect(),
+                ObjectOptions::default(),
+            )
+            .await;
+        assert_eq!(errors, [None, None, None]);
+        assert_eq!(deleted.len(), requested.len());
+        assert_eq!(accounting, [None, None, None]);
+        let marker = deleted[0].delete_marker_version_id.expect("committed marker ID");
+        assert!(!marker.is_nil());
+        for (slot, (result, requested_key)) in deleted.iter().zip(requested).enumerate() {
+            assert_eq!(result.object_name, requested_key);
+            assert_eq!(result.coalesced_delete_marker_key.as_deref(), (slot != 0).then_some(key));
+            assert!(result.delete_marker && result.found);
+            assert_eq!(result.delete_marker_version_id, Some(marker));
+            assert_eq!(result.delete_marker_mtime, deleted[0].delete_marker_mtime);
+        }
+
+        let listed = store
+            .clone()
+            .list_object_versions(bucket, "", None, None, None, 100)
+            .await
+            .expect("list committed versions");
+        assert!(!listed.is_truncated);
+        assert_eq!(listed.objects.len(), 2);
+        assert!(listed.objects.iter().all(|version| version.name == key));
+        assert!(
+            listed
+                .objects
+                .iter()
+                .any(|version| version.delete_marker && version.version_id == Some(marker))
+        );
+        assert!(
+            listed
+                .objects
+                .iter()
+                .any(|version| !version.delete_marker && version.version_id == Some(data_version))
+        );
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn windows_batch_delete_aliases_remove_two_historical_versions_in_original_slots() {
+        let (_dirs, store) = isolated_store_over_temp_disks().await;
+        crate::bucket::metadata_sys::init_bucket_metadata_sys(store.clone(), Vec::new()).await;
+        let bucket = "batch-alias-historical-versions";
+        let canonical = "nested/object";
+        let alias = r"nested\object";
+        store
+            .make_bucket(
+                bucket,
+                &MakeBucketOptions {
+                    versioning_enabled: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("create versioned bucket");
+        let mut ids = Vec::new();
+        for (key, body) in [
+            (canonical, b"first".as_slice()),
+            (canonical, b"second".as_slice()),
+            (canonical, b"retained current".as_slice()),
+            ("unaffected", b"other key".as_slice()),
+        ] {
+            let uploaded = store
+                .put_object(
+                    bucket,
+                    key,
+                    &mut PutObjReader::from_vec(body.to_vec()),
+                    &ObjectOptions {
+                        versioned: true,
+                        write_completion: crate::object_api::WriteCompletion::TailDrained,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect("seed version");
+            ids.push(uploaded.version_id.expect("version ID"));
+        }
+        assert_ne!(ids[0], ids[1]);
+        let requested = [(canonical, ids[1]), (alias, ids[0])];
+        for (name, version) in requested {
+            let info = store
+                .get_object_info_for_delete(
+                    bucket,
+                    name,
+                    &ObjectOptions {
+                        version_id: Some(version.to_string()),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect("both wire spellings can address stored versions");
+            assert_eq!(info.version_id, Some(version));
+        }
+        let (deleted, errors, accounting) = store
+            .delete_objects_with_tier_delete_journal_and_accounting(
+                bucket,
+                requested
+                    .iter()
+                    .map(|&(name, version)| ObjectToDelete {
+                        object_name: name.to_owned(),
+                        version_id: Some(version),
+                        ..Default::default()
+                    })
+                    .collect(),
+                ObjectOptions::default(),
+            )
+            .await;
+        assert_eq!(errors, [None, None], "two historical aliases must delete in the same batch");
+        assert_eq!(deleted.len(), requested.len());
+        assert_eq!(accounting.len(), requested.len());
+        for (slot, (name, version)) in requested.into_iter().enumerate() {
+            assert_eq!(deleted[slot].object_name, name);
+            assert_eq!(deleted[slot].version_id, Some(version));
+            assert_eq!(accounting[slot].as_ref().and_then(|receipt| receipt.version_id), Some(version));
+            let error = store
+                .get_object_info_for_delete(
+                    bucket,
+                    name,
+                    &ObjectOptions {
+                        version_id: Some(version.to_string()),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect_err("the requested version must be absent");
+            assert!(is_err_version_not_found(&error) || is_err_object_not_found(&error), "{error}");
+        }
+        for (name, version) in [(canonical, ids[2]), ("unaffected", ids[3])] {
+            let info = store
+                .get_object_info(bucket, name, &ObjectOptions::default())
+                .await
+                .expect("unaffected version");
+            assert_eq!(info.version_id, Some(version));
+        }
+    }
 
     async fn marker_history(store: &Arc<ECStore>, bucket: &str) -> (Vec<Uuid>, Vec<Uuid>) {
         crate::bucket::metadata_sys::init_bucket_metadata_sys(store.clone(), Vec::new()).await;

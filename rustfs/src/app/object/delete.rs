@@ -172,13 +172,17 @@ fn delete_objects_action_identity(
     requested_version_id: Option<Uuid>,
 ) -> (String, Option<Uuid>, bool) {
     let creates_delete_marker = deleted.delete_marker && requested_version_id.is_none();
-    let target_version = if creates_delete_marker {
-        deleted.delete_marker_version_id
+    // Only aliases known to share the committed marker also share side effects.
+    let (action_key, target_version) = if creates_delete_marker {
+        (
+            deleted.coalesced_delete_marker_key.as_ref().unwrap_or(&deleted.object_name),
+            deleted.delete_marker_version_id,
+        )
     } else {
-        deleted.version_id.or(requested_version_id)
+        (&deleted.object_name, deleted.version_id.or(requested_version_id))
     };
     (
-        deleted.object_name.clone(),
+        action_key.clone(),
         target_version.filter(|version| !version.is_nil()),
         creates_delete_marker,
     )
@@ -3306,6 +3310,50 @@ mod tests {
             delete_objects_action_identity(&marker, None),
             delete_objects_action_identity(&marker, Some(historical))
         );
+    }
+
+    #[test]
+    fn delete_objects_action_identity_counts_a_shared_marker_once() {
+        let marker = StorageDeletedObject {
+            object_name: "nested/object".to_owned(),
+            delete_marker: true,
+            delete_marker_version_id: Some(Uuid::from_u128(1)),
+            ..Default::default()
+        };
+        let alias = StorageDeletedObject {
+            object_name: r"nested\object".to_owned(),
+            coalesced_delete_marker_key: Some(marker.object_name.clone()),
+            ..marker.clone()
+        };
+        let mut committed_actions = HashSet::new();
+        assert!(committed_actions.insert(delete_objects_action_identity(&marker, None)));
+        assert!(!committed_actions.insert(delete_objects_action_identity(&alias, None)));
+
+        let another_marker = StorageDeletedObject {
+            delete_marker_version_id: Some(Uuid::from_u128(2)),
+            ..alias.clone()
+        };
+        assert!(committed_actions.insert(delete_objects_action_identity(&another_marker, None)));
+        for id in [Uuid::from_u128(1), Uuid::from_u128(2)] {
+            assert!(committed_actions.insert(delete_objects_action_identity(&marker, Some(id))));
+        }
+
+        let null_marker = StorageDeletedObject {
+            delete_marker_version_id: None,
+            ..marker
+        };
+        let null_alias = StorageDeletedObject {
+            delete_marker_version_id: Some(Uuid::nil()),
+            ..alias
+        };
+        assert!(committed_actions.insert(delete_objects_action_identity(&null_marker, None)));
+        assert!(!committed_actions.insert(delete_objects_action_identity(&null_alias, None)));
+        assert!(committed_actions.insert(delete_objects_action_identity(&null_marker, Some(Uuid::nil()))));
+        let independent_null_marker = StorageDeletedObject {
+            coalesced_delete_marker_key: None,
+            ..null_alias
+        };
+        assert!(committed_actions.insert(delete_objects_action_identity(&independent_null_marker, None)));
     }
 
     #[test]

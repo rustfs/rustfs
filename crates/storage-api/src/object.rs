@@ -323,6 +323,8 @@ pub struct DeletedObject {
     /// an idempotent success and reports `found` regardless.
     pub source_missing: bool,
     pub delete_marker_version_id: Option<Uuid>,
+    /// Logical key of the committed request slot when this slot shares its marker creation.
+    pub coalesced_delete_marker_key: Option<String>,
     pub object_name: String,
     pub version_id: Option<Uuid>,
     pub delete_marker_mtime: Option<OffsetDateTime>,
