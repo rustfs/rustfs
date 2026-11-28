@@ -5899,8 +5899,7 @@ impl SetDisks {
                 );
                 prepared
             } else {
-                let tokens = vec![None; shuffle_disks.len()];
-                (shuffle_disks, tokens)
+                (shuffle_disks, Vec::new())
             };
             let commit_context_prepare_started = rustfs_io_metrics::put_stage_timer();
             let transaction_epoch =
@@ -6330,10 +6329,14 @@ impl SetDisks {
                         let heal_set = commit_set.clone();
                         let cleanup_set = commit_set.clone();
                         let cleanup_tmp_dir = commit_tmp_dir.clone();
-                        let fence_disks = commit_disks.clone();
-                        let fence_tokens = quota_fence_tokens.clone();
-                        let fence_bucket = commit_bucket.clone();
-                        let fence_object = commit_object.clone();
+                        let tail_quota_fences = quota_mutation_fence.then(|| {
+                            (
+                                commit_disks.clone(),
+                                quota_fence_tokens.clone(),
+                                commit_bucket.clone(),
+                                commit_object.clone(),
+                            )
+                        });
                         let (guard_release_tx, guard_release_rx) = tokio::sync::oneshot::channel();
                         rename_guard_release = Some(guard_release_tx);
                         let cleanup_reservation = commit_cleanup_reservation.clone();
@@ -6351,7 +6354,7 @@ impl SetDisks {
                             ),
                             request,
                             move || async move {
-                                if quota_mutation_fence {
+                                if let Some((fence_disks, fence_tokens, fence_bucket, fence_object)) = tail_quota_fences {
                                     let _ = SetDisks::release_quota_mutation_fences(
                                         &fence_disks,
                                         &fence_tokens,
