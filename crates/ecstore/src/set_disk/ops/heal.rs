@@ -3849,6 +3849,7 @@ impl SetDisks {
                 || transaction_guard.as_ref().is_some_and(|guard| guard.is_lock_lost())
         };
         let mut recovery_removed_version = false;
+        let mut superseded_write_backups = false;
         if !opts.read_repair
             && _write_lock_guard.is_some()
             && let Some(scope) = crate::store::bucket_heal_scope_for_object(bucket, object)
@@ -3870,6 +3871,7 @@ impl SetDisks {
                         explicit_delete,
                         classify_generation_conflicts: true,
                         repair_marker_source: true,
+                        discard_superseded_write_backups: true,
                         transaction_guard: transaction_guard.clone(),
                         namespace_owner: (!opts.dry_run).then(|| {
                             Arc::new((
@@ -3917,13 +3919,28 @@ impl SetDisks {
                 ));
             }
             if let Some(error) = recovery.unresolved_heal_error(bucket, object) {
-                return Err(error);
+                if !recovery.blocked_only_by_superseded_write_backups() {
+                    return Err(error);
+                }
+                superseded_write_backups = true;
             }
         }
 
         // The inner heal and missing-object report read the registry again;
         // release this snapshot guard before a topology writer can queue between reads.
         let disks = self.get_disks_internal().await;
+        if superseded_write_backups {
+            // The backup may be the only remaining copy of the generation this
+            // heal would have to restore. It stops blocking only once the
+            // generation that replaced it is committed.
+            let (metadata, errs, _) = Self::read_metadata(&disks, "", bucket, object, version_id, false, true, false)
+                .await
+                .map_err(|e| to_object_err(e.into(), vec![bucket, object]))?
+                .into_legacy();
+            if !Self::newest_unversioned_generation_is_committed(&metadata, &errs, self.default_parity_count) {
+                return Err(Error::DeleteRecoveryLegacyAmbiguous);
+            }
+        }
         let (_, errs, _) = Self::read_metadata(&disks, "", bucket, object, version_id, false, false, false)
             .await
             .map_err(|e| to_object_err(e.into(), vec![bucket, object]))?
@@ -4033,6 +4050,14 @@ impl SetDisks {
                     })
                     .await
                     .map_err(|e| to_object_err(e.into(), vec![bucket, object]))?;
+                    if superseded_write_backups
+                        && !opts.dry_run
+                        && err.is_none()
+                        && let Some(guard) = transaction_guard.clone()
+                    {
+                        self.discard_superseded_write_backups(bucket, object, guard, namespace_owner.clone(), &commit_fence)
+                            .await;
+                    }
                     return Ok(finalize_object_heal_result(
                         result,
                         err.map(Into::into),
@@ -4044,6 +4069,14 @@ impl SetDisks {
                 }
                 _ => {}
             }
+        }
+        if superseded_write_backups
+            && !opts.dry_run
+            && err.is_none()
+            && let Some(guard) = transaction_guard.clone()
+        {
+            self.discard_superseded_write_backups(bucket, object, guard, namespace_owner.clone(), &commit_fence)
+                .await;
         }
         Ok(finalize_object_heal_result(
             result,
@@ -4057,6 +4090,97 @@ impl SetDisks {
 }
 
 impl SetDisks {
+    /// Whether the newest generation any drive holds is an unversioned object
+    /// whose metadata reached write quorum. Older generations, and the backups
+    /// taken of them, can then no longer be the committed state of the key.
+    fn newest_unversioned_generation_is_committed(
+        metadata: &[FileInfo],
+        errs: &[Option<DiskError>],
+        default_parity_count: usize,
+    ) -> bool {
+        let Ok((_, write_quorum)) = Self::object_quorum_from_meta(metadata, errs, default_parity_count) else {
+            return false;
+        };
+        let Ok(write_quorum) = usize::try_from(write_quorum) else {
+            return false;
+        };
+        let readable = || {
+            metadata
+                .iter()
+                .zip(errs)
+                .filter_map(|(info, err)| err.is_none().then_some(info))
+        };
+        let Some(newest) = readable().max_by_key(|info| info.mod_time) else {
+            return false;
+        };
+        if newest.mod_time.is_none() || newest.deleted || newest.version_id.is_some_and(|id| !id.is_nil()) {
+            return false;
+        }
+        let Ok(generation) = crate::disk::DeleteRecoveryVersionIdentity::from_file_info(newest.clone()) else {
+            return false;
+        };
+        readable()
+            .filter(|info| {
+                crate::disk::DeleteRecoveryVersionIdentity::from_file_info((*info).clone())
+                    .is_ok_and(|identity| identity == generation)
+            })
+            .count()
+            >= write_quorum
+    }
+
+    /// Once a heal has converged the live generation onto every drive, the
+    /// backups of the generation it replaced are no longer ambiguous. Best
+    /// effort: the heal already succeeded, and a later heal retries.
+    async fn discard_superseded_write_backups(
+        &self,
+        bucket: &str,
+        object: &str,
+        transaction_guard: Arc<rustfs_lock::NamespaceLockGuard>,
+        namespace_owner: Option<Arc<dyn Send + Sync>>,
+        can_commit: &(dyn Fn() -> bool + Sync),
+    ) {
+        let Some(scope) = crate::store::bucket_heal_scope_for_object(bucket, object) else {
+            return;
+        };
+        let recovery = self
+            .recover_delete_key(
+                bucket,
+                object,
+                crate::set_disk::DeleteRecoveryContext {
+                    discard_superseded_write_backups: true,
+                    transaction_guard: Some(transaction_guard),
+                    namespace_owner: Some(Arc::new((
+                        scope.clone(),
+                        self.ctx.begin_namespace_commit_for_bucket(bucket),
+                        namespace_owner,
+                    ))),
+                    ..crate::set_disk::DeleteRecoveryContext::new(Some(scope.incarnation), &|| {
+                        scope.check().is_ok() && can_commit()
+                    })
+                },
+            )
+            .await;
+        match recovery {
+            // The replaced generation's parts are plain orphans from here on.
+            Ok(summary) if summary.discarded_write_backups > 0 => {
+                self.reclaim_orphan_data_dirs_best_effort(bucket, object).await;
+            }
+            Ok(_) => {}
+            Err(error) => {
+                warn!(
+                    event = EVENT_SET_DISK_HEAL,
+                    component = LOG_COMPONENT_ECSTORE,
+                    subsystem = LOG_SUBSYSTEM_SET_DISK,
+                    bucket,
+                    object,
+                    error = %error,
+                    state = "superseded_write_backup_discard_failed",
+                    "Set disk superseded write backup discard failed"
+                );
+            }
+        }
+    }
+
     async fn dangling_heal_result(
         &self,
         metadata: FileInfo,

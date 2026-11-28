@@ -128,6 +128,13 @@ pub(crate) struct DeleteRecoverySummary {
     /// Groups blocked by a `LegacyAmbiguous` residue. Unlike other blocks this
     /// is deterministic: the residue cannot be classified by retrying.
     pub legacy_ambiguous: usize,
+    /// The subset of `legacy_ambiguous` groups that are only backups of an
+    /// overwritten generation whose successor is not yet on every drive. Heal
+    /// can converge the successor and then discard them.
+    pub superseded_write_backups: usize,
+    /// Superseded write backups discarded because every drive holds the same
+    /// live generation.
+    pub discarded_write_backups: usize,
     /// First committed transaction with a confirmed live generation conflict.
     pub conflicting_transaction: Option<Uuid>,
     pub pending: usize,
@@ -151,6 +158,9 @@ pub(crate) struct DeleteRecoveryContext<'a> {
     pub classify_generation_conflicts: bool,
     /// Only the locked heal path may repair a live marker-creation source.
     pub repair_marker_source: bool,
+    /// Only the locked heal path may discard the backup of an overwritten
+    /// generation; every other caller keeps treating it as ambiguous residue.
+    pub discard_superseded_write_backups: bool,
     pub namespace_owner: Option<Arc<dyn Send + Sync>>,
     pub transaction_guard: Option<Arc<rustfs_lock::NamespaceLockGuard>>,
     pub recovery_ticket: Option<crate::store::delete_recovery_runtime::DeleteRecoveryTicket>,
@@ -167,6 +177,7 @@ impl<'a> DeleteRecoveryContext<'a> {
             explicit_delete: false,
             classify_generation_conflicts: false,
             repair_marker_source: false,
+            discard_superseded_write_backups: false,
             namespace_owner: None,
             transaction_guard: None,
             recovery_ticket: None,
@@ -183,6 +194,8 @@ impl DeleteRecoverySummary {
         self.rolled_back += other.rolled_back;
         self.blocked += other.blocked;
         self.legacy_ambiguous += other.legacy_ambiguous;
+        self.superseded_write_backups += other.superseded_write_backups;
+        self.discarded_write_backups += other.discarded_write_backups;
         self.conflicting_transaction = self.conflicting_transaction.or(other.conflicting_transaction);
         self.pending += other.pending;
         self.failed += other.failed;
@@ -212,6 +225,37 @@ impl DeleteRecoverySummary {
             None
         }
     }
+
+    /// Every unresolved group is the backup of an overwritten generation, so
+    /// healing the live generation onto the remaining drives can resolve it.
+    pub(crate) fn blocked_only_by_superseded_write_backups(&self) -> bool {
+        self.superseded_write_backups > 0
+            && self.superseded_write_backups == self.legacy_ambiguous
+            && self.legacy_ambiguous == self.blocked
+            && self.pending == 0
+    }
+}
+
+/// Every drive holding this residue reports it as the backup of an overwritten
+/// generation, and no drive holds delete evidence for the transaction.
+fn superseded_write_backup_group(copies: &[DeleteRecoveryInspection]) -> bool {
+    copies.iter().all(|copy| match copy.state {
+        DeleteRecoveryState::Absent => true,
+        DeleteRecoveryState::LegacyAmbiguous => copy.journal.is_none() && copy.commit_data_safe,
+        _ => false,
+    })
+}
+
+/// Each drive judged its backup against its own live metadata. Only identical
+/// live metadata on every drive of the set proves that the successor, rather
+/// than the backed-up generation, is the committed one.
+fn live_generation_is_unanimous(copies: &[DeleteRecoveryInspection]) -> bool {
+    copies.split_first().is_some_and(|(first, rest)| {
+        first.current_digest.is_some()
+            && rest
+                .iter()
+                .all(|copy| copy.current_digest.is_some() && copy.current_versions == first.current_versions)
+    })
 }
 
 pub(in crate::set_disk) fn unsupported_recovery(error: &DiskError) -> bool {
@@ -904,6 +948,7 @@ impl SetDisks {
             explicit_delete,
             classify_generation_conflicts,
             repair_marker_source,
+            discard_superseded_write_backups,
             namespace_owner,
             published_hint,
             can_commit,
@@ -1156,9 +1201,42 @@ impl SetDisks {
                     } else {
                         summary.reclaimed += 1;
                     }
+                } else if discard_superseded_write_backups
+                    && superseded_write_backup_group(copies)
+                    && live_generation_is_unanimous(copies)
+                {
+                    if dry_run {
+                        summary.discarded_write_backups += 1;
+                        continue;
+                    }
+                    mutated = true;
+                    if settle_group(
+                        &disks,
+                        bucket,
+                        copies,
+                        |copy| {
+                            (copy.state == DeleteRecoveryState::LegacyAmbiguous).then_some(DeleteRecoveryAction::DiscardLegacy)
+                        },
+                        can_commit,
+                        RecoveryWorkScope {
+                            namespace_owner: namespace_owner.as_ref(),
+                            budget: work_budget.as_deref(),
+                        },
+                        &mut summary.removed_versions,
+                    )
+                    .await?
+                    {
+                        summary.pending += 1;
+                        unresolved = true;
+                    } else {
+                        summary.discarded_write_backups += 1;
+                    }
                 } else {
                     summary.blocked += 1;
                     summary.legacy_ambiguous += 1;
+                    if superseded_write_backup_group(copies) {
+                        summary.superseded_write_backups += 1;
+                    }
                     unresolved = true;
                 }
                 continue;
@@ -2672,6 +2750,109 @@ mod tests {
             .delete_bucket(bucket, &DeleteBucketOptions::default())
             .await
             .expect("non-force bucket deletion must succeed after proof GC");
+    }
+
+    /// rustfs/rustfs#9671: an overwrite interrupted after publishing leaves the
+    /// replaced generation's backup on the drives it reached. Heal converges
+    /// the remaining drives past that residue once the successor is committed,
+    /// and keeps failing closed while the backup may still be needed.
+    #[tokio::test]
+    async fn heal_converges_past_superseded_overwrite_backups() {
+        for stale in [0, 1, 2] {
+            let bucket = format!("heal-superseded-backup-{stale}");
+            let bucket = bucket.as_str();
+            let (dirs, store, disks) = fixture(bucket).await;
+            put(&store, bucket, &vec![71; 1024 * 1024], false).await;
+            let previous: Vec<_> = dirs
+                .iter()
+                .map(|dir| snapshot(&dir.path().join(bucket).join("object")))
+                .collect();
+            let old_data_dir = rustfs_filemeta::FileMeta::load(&previous[0][std::path::Path::new(STORAGE_FORMAT_FILE)])
+                .expect("decode replaced generation")
+                .get_data_dirs()
+                .expect("replaced data directory")
+                .into_iter()
+                .flatten()
+                .next()
+                .expect("external payload data directory")
+                .to_string();
+            let latest = vec![72; 1024 * 1024];
+            put(&store, bucket, &latest, false).await;
+            // The last `stale` drives never saw the overwrite. The others kept
+            // the replaced parts and their backup beside the new metadata.
+            let reached = disks.len() - stale;
+            for (index, dir) in dirs.iter().enumerate() {
+                let root = dir.path().join(bucket).join("object");
+                if index >= reached {
+                    tokio::fs::remove_dir_all(&root)
+                        .await
+                        .expect("return the drive to the replaced generation");
+                }
+                for (relative, bytes) in &previous[index] {
+                    if index < reached && !relative.starts_with(&old_data_dir) {
+                        continue;
+                    }
+                    let path = root.join(relative);
+                    tokio::fs::create_dir_all(path.parent().expect("replaced file parent"))
+                        .await
+                        .expect("replaced generation directory");
+                    tokio::fs::write(path, bytes).await.expect("replaced generation bytes");
+                }
+                if index < reached {
+                    tokio::fs::write(
+                        root.join(&old_data_dir).join("xl.meta.bkp"),
+                        &previous[index][std::path::Path::new(STORAGE_FORMAT_FILE)],
+                    )
+                    .await
+                    .expect("retained overwrite backup");
+                }
+            }
+            let seeded: Vec<_> = dirs
+                .iter()
+                .map(|dir| snapshot(&dir.path().join(bucket).join("object")))
+                .collect();
+            let incarnation = store.bucket_incarnation_id_from_disk(bucket).await.expect("bucket identity");
+            let failure = match store
+                .heal_object_at_incarnation(bucket, "object", "", incarnation, &HealOpts::default())
+                .await
+            {
+                Ok(result) => result.error,
+                Err(error) => Some(error),
+            };
+            if reached < store.pools[0].disk_set[0].default_write_quorum() {
+                assert!(
+                    matches!(failure, Some(StorageError::DeleteRecoveryLegacyAmbiguous)),
+                    "stale={stale}: an uncommitted successor cannot retire the backup: {failure:?}"
+                );
+                for (index, dir) in dirs.iter().enumerate() {
+                    assert_eq!(
+                        snapshot(&dir.path().join(bucket).join("object")),
+                        seeded[index],
+                        "stale={stale}: member {index} keeps both generations"
+                    );
+                }
+                continue;
+            }
+            assert!(failure.is_none(), "stale={stale}: heal must converge: {failure:?}");
+            for (index, dir) in dirs.iter().enumerate() {
+                let files = snapshot(&dir.path().join(bucket).join("object"));
+                assert!(
+                    files.contains_key(std::path::Path::new(STORAGE_FORMAT_FILE)),
+                    "stale={stale}: member {index} holds live metadata"
+                );
+                assert!(
+                    files.keys().all(|path| !path.starts_with(&old_data_dir)),
+                    "stale={stale}: member {index} retains replaced generation residue: {:?}",
+                    files.keys().collect::<Vec<_>>()
+                );
+                assert_eq!(
+                    files.keys().filter(|path| path.ends_with("part.1")).count(),
+                    1,
+                    "stale={stale}: member {index} holds exactly the live shard"
+                );
+            }
+            assert_eq!(body(&store, bucket, None).await, latest, "stale={stale}");
+        }
     }
 
     #[tokio::test]
