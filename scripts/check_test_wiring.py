@@ -756,15 +756,40 @@ def check_fuzz_targets(root: Path) -> list[str]:
         errors.append(f"scripts/fuzz/run.sh targets {sorted(runner_targets)} != manifest {sorted(expected)}")
 
     workflow = (root / ".github/workflows/fuzz.yml").read_text()
-    matrices = [words(value) for value in re.findall(r"^\s*target:\s*\[([^]]+)]", workflow, re.MULTILINE)]
-    if len(matrices) != 2:
-        errors.append(f".github/workflows/fuzz.yml: expected smoke and nightly target matrices, found {len(matrices)}")
-    for index, matrix in enumerate(matrices, start=1):
-        if matrix != expected:
-            errors.append(f".github/workflows/fuzz.yml matrix {index} {sorted(matrix)} != manifest {sorted(expected)}")
+    selector_path = root / "scripts/fuzz/select_targets.py"
+    selector_text = selector_path.read_text() if selector_path.is_file() else ""
+
+    if "workflow_call:" in workflow:
+        if re.search(r"^  pull_request:", workflow, re.MULTILINE):
+            errors.append(".github/workflows/fuzz.yml must not keep a duplicate pull_request trigger alongside workflow_call")
+        matrices = [words(value) for value in re.findall(r"^\s*target:\s*\[([^]]+)]", workflow, re.MULTILINE)]
+        if len(matrices) != 1:
+            errors.append(f".github/workflows/fuzz.yml: expected nightly full target matrix, found {len(matrices)}")
+        elif matrices[0] != expected:
+            errors.append(f".github/workflows/fuzz.yml nightly matrix {sorted(matrices[0])} != manifest {sorted(expected)}")
+        if "target: ${{ fromJSON(needs.select-targets.outputs.targets_json) }}" not in workflow:
+            errors.append(".github/workflows/fuzz.yml: smoke job must consume selected targets_json matrix")
+        if not selector_text:
+            errors.append("scripts/fuzz/select_targets.py: missing trusted fuzz target selector")
+        else:
+            sel_match = re.search(r"ALL_TARGETS\s*=\s*\(([^)]+)\)", selector_text, re.DOTALL)
+            sel_targets = set(re.findall(r'"([a-z0-9_]+)"', sel_match.group(1))) if sel_match else set()
+            if sel_targets != expected:
+                errors.append(f"scripts/fuzz/select_targets.py ALL_TARGETS {sorted(sel_targets)} != manifest {sorted(expected)}")
+    else:
+        matrices = [words(value) for value in re.findall(r"^\s*target:\s*\[([^]]+)]", workflow, re.MULTILINE)]
+        if len(matrices) != 2:
+            errors.append(f".github/workflows/fuzz.yml: expected smoke and nightly target matrices, found {len(matrices)}")
+        for index, matrix in enumerate(matrices, start=1):
+            if matrix != expected:
+                errors.append(f".github/workflows/fuzz.yml matrix {index} {sorted(matrix)} != manifest {sorted(expected)}")
 
     runtime_targets = re.findall(r"^\s*FUZZ_TARGET:\s*(\S.*?)\s*$", workflow, re.MULTILINE)
-    if runtime_targets != ["${{ matrix.target }}", "${{ matrix.target }}"]:
+    matrix_runtime_targets = [value for value in runtime_targets if value == "${{ matrix.target }}"]
+    non_selector_runtime_targets = [
+        value for value in runtime_targets if value != "${{ needs.select-targets.outputs.targets_csv }}"
+    ]
+    if non_selector_runtime_targets != ["${{ matrix.target }}", "${{ matrix.target }}"] or len(matrix_runtime_targets) != 2:
         errors.append(".github/workflows/fuzz.yml: smoke and nightly jobs must pass matrix.target to FUZZ_TARGET")
 
     dependency_paths = {
@@ -774,14 +799,23 @@ def check_fuzz_targets(root: Path) -> list[str]:
         and isinstance(path := dependency.get("path"), str)
         and path.startswith("../crates/")
     }
-    missing_paths = sorted(path for path in dependency_paths if f'"{path}"' not in workflow)
+    path_coverage_source = selector_text if selector_text else workflow
+    missing_paths = sorted(path for path in dependency_paths if f'"{path}"' not in path_coverage_source)
     if missing_paths:
-        errors.append(f".github/workflows/fuzz.yml missing direct dependency paths: {', '.join(missing_paths)}")
+        errors.append(f"fuzz path coverage missing direct dependency paths: {', '.join(missing_paths)}")
 
     staged_matches = re.findall(r"^\s*for target in ([^;]+); do", workflow, re.MULTILINE)
     staged = set(staged_matches[0].split()) if staged_matches else set()
     if staged != expected:
         errors.append(f".github/workflows/fuzz.yml staged binaries {sorted(staged)} != manifest {sorted(expected)}")
+
+    mutants_config = root / ".config/security-rejection-mutants.toml"
+    mutants_script = root / "scripts/security/check_rejection_mutants.py"
+    if "rejection-mutants:" in workflow:
+        if not mutants_config.is_file():
+            errors.append(".config/security-rejection-mutants.toml: missing rejection-mutant registry")
+        if not mutants_script.is_file():
+            errors.append("scripts/security/check_rejection_mutants.py: missing rejection-mutant checker")
 
     return errors
 
@@ -1213,11 +1247,14 @@ def check_scheduled_alerts(root: Path) -> list[str]:
         checkout_ref = SCHEDULED_ALERT_CHECKOUT_OVERRIDES.get(
             relative, "actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0"
         )
+        # A read-only caller can still alert the backlog using the required separate token.
+        reusable = yaml_block(on_block or [], "workflow_call", 2) is not None
+        source_permission = "actions: read" if reusable and "issues: write" not in job else "issues: write"
         required = (
             "always()",
             "github.event_name == 'schedule'",
             "contains(needs.*.result, 'failure')",
-            "issues: write",
+            source_permission,
             f"uses: {checkout_ref}",
             "uses: ./.github/actions/schedule-failure-issue",
             "github-token: ${{ secrets.BACKLOG_ISSUE_TOKEN }}",
@@ -1229,7 +1266,7 @@ def check_scheduled_alerts(root: Path) -> list[str]:
             errors.extend(
                 f"{relative}: {error}"
                 for error in alert_step_errors(
-                    job_lines, None, ("issues: write",),
+                    job_lines, None, (source_permission,),
                     ("github-token: ${{ secrets.BACKLOG_ISSUE_TOKEN }}",), checkout_ref=checkout_ref,
                 )
             )
@@ -5790,6 +5827,26 @@ class SelfTests(unittest.TestCase):
             )
             self.assertEqual(len(check_fuzz_targets(root)), 1)
 
+            # Dropping a target from the nightly matrix or staging loop must fail.
+            (root / "fuzz/Cargo.toml").write_text(
+                'dep = { path = "../crates/dep" }\n[[bin]]\nname = "one"\n[[bin]]\nname = "two"\n'
+            )
+            (root / "scripts/fuzz/run.sh").write_text('targets="one two"\n')
+            (root / "scripts/fuzz/select_targets.py").write_text(
+                'ALL_TARGETS = ("one", "two")\nTARGET_PATH_RULES = {"one": ("crates/dep/**",)}\n'
+            )
+            (root / ".github/workflows/fuzz.yml").write_text(
+                "on:\n  workflow_call:\n"
+                "    target: ${{ fromJSON(needs.select-targets.outputs.targets_json) }}\n"
+                "    FUZZ_TARGET: ${{ matrix.target }}\n"
+                "    target: [one]\n"
+                "    FUZZ_TARGET: ${{ matrix.target }}\n"
+                "    for target in one; do\n"
+            )
+            errors = check_fuzz_targets(root)
+            self.assertTrue(any("nightly matrix" in err for err in errors), errors)
+            self.assertTrue(any("staged binaries" in err for err in errors), errors)
+
     def test_s3_runner_rejects_unbounded_failure_locals(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -6082,6 +6139,16 @@ class SelfTests(unittest.TestCase):
             checker.parent.mkdir()
             checker.write_text("")
             self.assertEqual(check_scheduled_alerts(root), [])
+
+            reusable = root / ".github/workflows/fuzz.yml"
+            original = reusable.read_text()
+            read_only = original.replace("on:\n", "on:\n  workflow_call:\n").replace("issues: write", "actions: read")
+            reusable.write_text(read_only)
+            self.assertEqual(check_scheduled_alerts(root), [])
+            for required in ("actions: read", "github-token: ${{ secrets.BACKLOG_ISSUE_TOKEN }}"):
+                reusable.write_text(read_only.replace(required, "missing"))
+                self.assertEqual(len(check_scheduled_alerts(root)), 1)
+            reusable.write_text(original)
 
             # Reverting a migrated workflow must fail, just as independently
             # upgrading an unmigrated one must fail: no shared two-pin allowlist.

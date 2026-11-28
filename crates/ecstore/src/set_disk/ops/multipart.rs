@@ -8612,6 +8612,8 @@ mod tests {
                 source_object,
                 &mut source,
                 &ObjectOptions {
+                    // The fixture reads disk 0 directly after the PUT.
+                    write_completion: crate::object_api::WriteCompletion::TailDrained,
                     shard_integrity_write_mode: Some(crate::object_api::ShardIntegrityWriteMode::Legacy),
                     ..Default::default()
                 },
@@ -20079,9 +20081,13 @@ mod same_name_object_namespace_lock_tests {
     use crate::storage_api_contracts::object::ObjectIO;
     use serial_test::serial;
 
-    async fn setup_store_with_bucket(quota: Option<u64>) -> (Vec<tempfile::TempDir>, Arc<crate::store::ECStore>, String) {
+    async fn setup_store() -> (Vec<tempfile::TempDir>, Arc<crate::store::ECStore>) {
         let (dirs, store) = crate::bucket::metadata_sys::test_support::isolated_store_over_temp_disks().await;
         crate::bucket::metadata_sys::init_bucket_metadata_sys(store.clone(), Vec::new()).await;
+        (dirs, store)
+    }
+
+    async fn create_test_bucket(store: &Arc<crate::store::ECStore>, quota: Option<u64>) -> String {
         let bucket = format!("same-name-ns-{}", Uuid::new_v4().simple());
         store
             .make_bucket(&bucket, &MakeBucketOptions::default())
@@ -20101,7 +20107,7 @@ mod same_name_object_namespace_lock_tests {
                 .await
                 .expect("initialize durable quota ledger");
         }
-        (dirs, store, bucket)
+        bucket
     }
 
     async fn verify_same_name_put_copy_and_multipart(store: &Arc<crate::store::ECStore>, bucket: &str, versioned: bool) {
@@ -20181,21 +20187,23 @@ mod same_name_object_namespace_lock_tests {
     #[tokio::test]
     #[serial]
     async fn same_name_key_writes_succeed_on_unversioned_versioned_and_hard_quota_buckets() {
-        let (_dirs1, store1, unversioned_bucket) = setup_store_with_bucket(None).await;
-        verify_same_name_put_copy_and_multipart(&store1, &unversioned_bucket, false).await;
+        let (_dirs, store) = setup_store().await;
+        let unversioned_bucket = create_test_bucket(&store, None).await;
+        verify_same_name_put_copy_and_multipart(&store, &unversioned_bucket, false).await;
 
-        let (_dirs2, store2, versioned_bucket) = setup_store_with_bucket(None).await;
-        verify_same_name_put_copy_and_multipart(&store2, &versioned_bucket, true).await;
+        let versioned_bucket = create_test_bucket(&store, None).await;
+        verify_same_name_put_copy_and_multipart(&store, &versioned_bucket, true).await;
 
-        let (_dirs3, store3, quota_bucket) = setup_store_with_bucket(Some(64 * 1024)).await;
-        verify_same_name_put_copy_and_multipart(&store3, &quota_bucket, false).await;
-        verify_same_name_put_copy_and_multipart(&store3, &quota_bucket, true).await;
+        let quota_bucket = create_test_bucket(&store, Some(64 * 1024)).await;
+        verify_same_name_put_copy_and_multipart(&store, &quota_bucket, false).await;
+        verify_same_name_put_copy_and_multipart(&store, &quota_bucket, true).await;
     }
 
     #[tokio::test]
     #[serial]
     async fn same_name_object_write_lock_does_not_block_other_keys_on_versioned_bucket() {
-        let (_dirs, store, bucket) = setup_store_with_bucket(Some(64 * 1024)).await;
+        let (_dirs, store) = setup_store().await;
+        let bucket = create_test_bucket(&store, Some(64 * 1024)).await;
         let budget = crate::set_disk::get_lock_acquire_timeout() / 2;
         let versioned_opts = ObjectOptions {
             versioned: true,

@@ -1,0 +1,3 @@
+GET https://bucket.example.com/object?k=v
+host: bucket.example.com
+x-amz-meta-bin: rawÿþvalue

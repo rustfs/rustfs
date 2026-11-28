@@ -1,0 +1,1 @@
+<NotificationConfiguration><QueueConfiguration><Id>truncated</Id><Queue>arn:rustfs:sqs:us-east-1:1:webhook

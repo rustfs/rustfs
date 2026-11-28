@@ -1004,12 +1004,12 @@
       "workflow": ".github/workflows/fuzz.yml",
       "name": "Fuzz",
       "roles": [
-        "pr",
+        "reusable",
         "periodic",
         "manual"
       ],
       "events": [
-        "pull_request",
+        "workflow_call",
         "schedule",
         "workflow_dispatch"
       ],
