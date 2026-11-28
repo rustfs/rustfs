@@ -2590,6 +2590,25 @@ fn detached_delete_failed(operation: &'static str, err: tokio::task::JoinError) 
     }
 }
 
+// Keep the namespace and late-I/O owner small enough that unrelated keys can make
+// progress during a large delete. Every occurrence of a key belongs to one window.
+const BULK_DELETE_KEYS_PER_WINDOW: usize = 16;
+const BULK_DELETE_CONCURRENT_WINDOWS: usize = 2;
+
+fn delete_lock_windows(objects: Vec<ObjectToDelete>) -> Vec<Vec<(usize, ObjectToDelete)>> {
+    let mut first_window = HashMap::new();
+    let mut windows: Vec<Vec<_>> = Vec::new();
+    for (index, object) in objects.into_iter().enumerate() {
+        let next = first_window.len() / BULK_DELETE_KEYS_PER_WINDOW;
+        let window = *first_window.entry(object.object_name.clone()).or_insert(next);
+        if window == windows.len() {
+            windows.push(Vec::new());
+        }
+        windows[window].push((index, object));
+    }
+    windows
+}
+
 fn sorted_unique_delete_object_names(objects: &[ObjectToDelete]) -> Vec<&str> {
     let mut object_names: Vec<&str> = objects.iter().map(|object| object.object_name.as_str()).collect();
     object_names.sort_unstable();
@@ -6461,7 +6480,41 @@ impl ECStore {
         if current_bucket_incarnation_id.is_some() {
             pause_delete_after_object_lock_snapshot(bucket).await;
         }
-        self.delete_batch_under_bucket_guards(bucket, objects, opts).await
+        // A conditional request preflights all relevant peers before its first mutation.
+        // Multi-pool marker creation also admits all selected destinations together.
+        // Keep those request-wide decisions and caller-owned lock scopes intact.
+        let config = opts.delete_replication_config_snapshot.as_deref().expect("delete config installed");
+        if objects.len() <= BULK_DELETE_KEYS_PER_WINDOW
+            || opts.no_lock
+            || objects.iter().any(|object| object.delete_condition.is_some())
+            || (!self.single_pool() && objects.iter().any(|object| batch_delete_creates_latest_marker(object, config)))
+        {
+            return self.delete_batch_under_bucket_guards(bucket, objects, opts).await;
+        }
+
+        let len = objects.len();
+        let mut deleted = vec![DeletedObject::default(); len];
+        let mut errors = vec![None; len];
+        let mut accounting = vec![None; len];
+        // Bucket lifecycle/configuration fences, the recovery work budget and the tier
+        // receipt sink are shared by the request. Each window adds its own key guards.
+        let mut windows = futures::stream::iter(delete_lock_windows(objects))
+            .map(|window| {
+                let opts = opts.clone();
+                async move {
+                    let (indices, entries): (Vec<_>, Vec<_>) = window.into_iter().unzip();
+                    (indices, self.delete_batch_under_bucket_guards(bucket, entries, opts).await)
+                }
+            })
+            .buffer_unordered(BULK_DELETE_CONCURRENT_WINDOWS);
+        while let Some((indices, (results, failures, receipts))) = windows.next().await {
+            for (i, ((result, failure), receipt)) in indices.into_iter().zip(results.into_iter().zip(failures).zip(receipts)) {
+                deleted[i] = result;
+                errors[i] = failure;
+                accounting[i] = receipt;
+            }
+        }
+        (deleted, errors, accounting)
     }
 
     async fn delete_batch_under_bucket_guards(
@@ -14496,15 +14549,16 @@ mod missing_key_delete_quorum_tests {
                 let _ = entered_tx.send(());
                 let _ = release_rx.recv();
             });
+            let mut entries = (0..BULK_DELETE_KEYS_PER_WINDOW)
+                .map(|i| ObjectToDelete { object_name: format!("completed-{i}"), ..Default::default() })
+                .collect::<Vec<_>>();
+            entries.push(ObjectToDelete { object_name: key.to_owned(), ..Default::default() });
             let deleting = store.clone();
             let delete = tokio::spawn(async move {
                 deleting
                     .delete_objects_with_tier_delete_journal_and_accounting(
                         bucket,
-                        vec![ObjectToDelete {
-                            object_name: key.to_owned(),
-                            ..Default::default()
-                        }],
+                        entries,
                         ObjectOptions::default(),
                     )
                     .await
@@ -14523,12 +14577,17 @@ mod missing_key_delete_quorum_tests {
                 store.ctx.namespace_commits_pending(),
                 "background physical operation must retain its owner"
             );
+            let completed = store.handle_new_ns_lock(bucket, "completed-0").await.expect("completed key lock");
+            let completed_guard = completed.get_write_lock(Duration::from_secs(1)).await;
+            let completed_available = completed_guard.is_ok();
+            drop(completed_guard);
             let ns = store.handle_new_ns_lock(bucket, key).await.expect("same production key lock");
             let probe = ns.get_write_lock(Duration::from_millis(300)).await;
             let acquired_while_pending = probe.is_ok();
             drop(probe);
             drop(release);
             drop(hook);
+            assert!(completed_available, "a settled window retained its key guards for unrelated physical I/O");
             assert!(
                 !acquired_while_pending,
                 "batch released the exact-key guard while physical cleanup was still paused after its real recovery timeout"
@@ -14584,6 +14643,21 @@ mod batch_delete_lock_tests {
                 ..Default::default()
             })
             .collect()
+    }
+
+    #[test]
+    fn lock_windows_keep_nonadjacent_versions_and_result_indices_together() {
+        let mut objects = (0..=BULK_DELETE_KEYS_PER_WINDOW)
+            .map(|i| ObjectToDelete { object_name: format!("key-{i}"), ..Default::default() })
+            .collect::<Vec<_>>();
+        let version = Uuid::new_v4();
+        objects.push(ObjectToDelete { object_name: "key-0".to_owned(), version_id: Some(version), ..Default::default() });
+        let windows = delete_lock_windows(objects);
+        assert_eq!(windows.len(), 2);
+        let (index, repeated) = windows[0].last().expect("nonadjacent version");
+        assert_eq!(*index, BULK_DELETE_KEYS_PER_WINDOW + 1);
+        assert_eq!(repeated.version_id, Some(version));
+        assert_eq!(windows[1][0].0, BULK_DELETE_KEYS_PER_WINDOW);
     }
 
     #[tokio::test]
