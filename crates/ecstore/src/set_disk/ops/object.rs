@@ -10324,7 +10324,9 @@ fn project_coalesced_marker_results(
             continue;
         }
         let mut committed = deleted[representative].clone();
-        committed.coalesced_delete_marker_key = Some(decode_dir_object(&committed.object_name));
+        if committed.coalesced_delete_marker_key.is_none() {
+            committed.coalesced_delete_marker_key = Some(decode_dir_object(&committed.object_name));
+        }
         committed.object_name = std::mem::take(&mut deleted[slot].object_name);
         deleted[slot] = committed;
         accounting[slot] = None;
@@ -10956,20 +10958,42 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
                 },
             }
         };
-        // Per-key read inputs are resolved exactly once; the pre-fetch and the
-        // admission loop below consume this table so the two cannot disagree
-        // on eligibility or read options.
+        // Identical, unguarded current-marker requests share one physical
+        // commit and one source lookup. Keep their wire slots for projection
+        // after the commit. Leave distinct versions and replication inputs
+        // in the normal admission path.
+        let mut marker_representatives = HashMap::new();
+        let mut duplicate_markers = Vec::new();
         let mut source_inputs: Vec<Option<BatchDeleteSourceInputs>> = Vec::with_capacity(objects.len());
-        for dobj in &objects {
+        for (index, dobj) in objects.iter().enumerate() {
+            if del_errs[index].is_some() {
+                source_inputs.push(None);
+                continue;
+            }
             let guarded = current_generations.is_some_and(|generations| generations.contains_key(&dobj.object_name));
-            source_inputs.push(Some(batch_delete_source_inputs(
-                bucket,
-                dobj,
-                &opts,
-                &delete_config_snapshot,
-                &object_lock_config,
-                guarded,
-            )));
+            let source = batch_delete_source_inputs(bucket, dobj, &opts, &delete_config_snapshot, &object_lock_config, guarded);
+            if set_disk_delete_creates_delete_marker(&source.check_opts)
+                && !guarded
+                && !dobj.synthetic_version_id
+                && dobj.expected_identity.is_none()
+                && !source.replicate_delete
+                && dobj.delete_marker_replication_status.is_none()
+                && dobj.version_purge_status.is_none()
+                && dobj.version_purge_statuses.is_none()
+                && dobj.replicate_decision_str.is_none()
+                && !opts.replication_request
+                && !opts.data_movement
+                && opts.http_preconditions.is_none()
+            {
+                let representative = *marker_representatives.entry(dobj.object_name.as_str()).or_insert(index);
+                if representative != index {
+                    duplicate_markers.push((index, representative));
+                    del_objects[index].object_name.clone_from(&dobj.object_name);
+                    source_inputs.push(None);
+                    continue;
+                }
+            }
+            source_inputs.push(Some(source));
         }
         // Bounded-parallel pre-fetch of the source metadata each admitted key
         // needs below. These reads are pure quorum lookups under the locks
@@ -11361,7 +11385,7 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
 
         let mut vers = Vec::with_capacity(vers_map.len());
         let mut group_generations = HashMap::new();
-        let mut coalesced_marker_aliases = Vec::new();
+        let mut coalesced_markers = Vec::new();
 
         for (identity, mut fi_vers) in vers_map {
             // Use one canonical journal for distinct wire spellings that share
@@ -11391,14 +11415,12 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
             fi_vers.versions.sort_by_key(|a| a.deleted);
 
             if let Some(index) = fi_vers.versions.iter().position(|fi| fi.deleted) {
-                if has_aliases {
-                    let representative = fi_vers.versions[index].idx;
-                    coalesced_marker_aliases.extend(
-                        fi_vers.versions[index + 1..]
-                            .iter()
-                            .map(|version| (version.idx, representative)),
-                    );
-                }
+                let representative = fi_vers.versions[index].idx;
+                coalesced_markers.extend(
+                    fi_vers.versions[index + 1..]
+                        .iter()
+                        .map(|version| (version.idx, representative)),
+                );
                 fi_vers.versions.truncate(index + 1);
             }
 
@@ -11995,8 +12017,10 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
             });
         let _ = join_all(purge_submissions).await;
 
-        // Only the representative's marker was committed for each mixed group.
-        project_coalesced_marker_results(&mut del_objects, &mut del_errs, &mut accounting, &coalesced_marker_aliases);
+        // Resolve physical groups before projecting slots skipped during
+        // admission, since their representative can itself share a marker.
+        project_coalesced_marker_results(&mut del_objects, &mut del_errs, &mut accounting, &coalesced_markers);
+        project_coalesced_marker_results(&mut del_objects, &mut del_errs, &mut accounting, &duplicate_markers);
         for (object, err) in objects.iter().zip(del_errs.iter()) {
             if err.is_none() {
                 self.invalidate_get_object_metadata_cache(bucket, &object.object_name).await;
@@ -30226,11 +30250,18 @@ mod batch_delete_marker_tests {
 
     #[test]
     fn coalesced_marker_slots_follow_the_commit_and_keep_their_own_errors() {
-        let mut deleted =
-            ["nested/object", r"nested\object", r"nested\object", "other/key", r"other\key"].map(|name| DeletedObject {
-                object_name: name.to_owned(),
-                ..Default::default()
-            });
+        let mut deleted = [
+            "nested/object",
+            r"nested\object",
+            r"nested\object",
+            "other/key",
+            r"other\key",
+            r"nested\object",
+        ]
+        .map(|name| DeletedObject {
+            object_name: name.to_owned(),
+            ..Default::default()
+        });
         let committed_version = Uuid::from_u128(1);
         deleted[0].delete_marker = true;
         deleted[0].delete_marker_version_id = Some(committed_version);
@@ -30242,10 +30273,12 @@ mod batch_delete_marker_tests {
             Some(StorageError::PreconditionFailed),
             Some(StorageError::ErasureWriteQuorum),
             None,
+            None,
         ];
-        let mut accounting = [None, Some(DeleteAccounting::default()), None, None, None];
+        let mut accounting = [None, Some(DeleteAccounting::default()), None, None, None, None];
 
         project_coalesced_marker_results(&mut deleted, &mut errors, &mut accounting, &[(1, 0), (2, 0), (4, 3)]);
+        project_coalesced_marker_results(&mut deleted, &mut errors, &mut accounting, &[(5, 1)]);
 
         assert_eq!(deleted[1].object_name, r"nested\object");
         assert_eq!(deleted[1].coalesced_delete_marker_key.as_deref(), Some("nested/object"));
@@ -30257,6 +30290,89 @@ mod batch_delete_marker_tests {
         assert!(!deleted[2].found);
         assert_eq!(errors[4], Some(StorageError::ErasureWriteQuorum));
         assert!(!deleted[4].found);
+        assert_eq!(deleted[5].coalesced_delete_marker_key.as_deref(), Some("nested/object"));
+        assert_eq!(deleted[5].delete_marker_version_id, Some(committed_version));
+    }
+
+    #[tokio::test]
+    async fn repeated_versionless_bulk_deletes_report_only_the_persisted_marker() {
+        let (_dirs, store) = isolated_store_over_temp_disks().await;
+        crate::bucket::metadata_sys::init_bucket_metadata_sys(store.clone(), Vec::new()).await;
+        let bucket = "batch-repeated-marker-slots";
+        let key = "target/key";
+        store
+            .make_bucket(
+                bucket,
+                &MakeBucketOptions {
+                    versioning_enabled: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("create versioned bucket");
+        let put_opts = ObjectOptions {
+            versioned: true,
+            write_completion: crate::object_api::WriteCompletion::TailDrained,
+            ..Default::default()
+        };
+        let mut versions = Vec::new();
+        for body in [b"remove this version".as_slice(), b"retain this version".as_slice()] {
+            let object = store
+                .put_object(bucket, key, &mut PutObjReader::from_vec(body.to_vec()), &put_opts)
+                .await
+                .expect("seed version");
+            versions.push(object.version_id.expect("version ID"));
+        }
+
+        let marker_request = ObjectToDelete {
+            object_name: key.to_owned(),
+            ..Default::default()
+        };
+        let mut requested = vec![marker_request; 16];
+        requested.insert(
+            1,
+            ObjectToDelete {
+                object_name: key.to_owned(),
+                version_id: Some(versions[0]),
+                ..Default::default()
+            },
+        );
+        let (deleted, errors, _) = store
+            .delete_objects_with_tier_delete_journal_and_accounting(bucket, requested, ObjectOptions::default())
+            .await;
+        assert_eq!(errors, vec![None; 17]);
+        assert_eq!(deleted.len(), 17);
+        assert_eq!(deleted[1].version_id, Some(versions[0]));
+        assert!(!deleted[1].delete_marker);
+        let marker = deleted[0].delete_marker_version_id.expect("committed marker ID");
+        assert!(!marker.is_nil());
+        for (slot, receipt) in deleted.iter().enumerate().filter(|(slot, _)| *slot != 1) {
+            assert_eq!(receipt.object_name, key);
+            assert!(receipt.delete_marker && receipt.found);
+            assert_eq!(receipt.delete_marker_version_id, Some(marker));
+            assert_eq!(receipt.coalesced_delete_marker_key.as_deref(), (slot != 0).then_some(key));
+        }
+
+        let listed = store
+            .clone()
+            .list_object_versions(bucket, "", None, None, None, 100)
+            .await
+            .expect("list committed versions");
+        assert!(!listed.is_truncated);
+        assert_eq!(listed.objects.len(), 2);
+        assert!(listed.objects.iter().all(|version| version.name == key));
+        assert!(
+            listed
+                .objects
+                .iter()
+                .any(|version| version.delete_marker && version.version_id == Some(marker))
+        );
+        assert!(
+            listed
+                .objects
+                .iter()
+                .any(|version| !version.delete_marker && version.version_id == Some(versions[1]))
+        );
     }
 
     #[cfg(windows)]
