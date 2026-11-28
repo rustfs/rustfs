@@ -209,6 +209,19 @@ mod delete_authorization_test;
 #[cfg(test)]
 mod table_location_authorization_test;
 
+// Table-bucket LIST isolation (ListObjectsV2, ListObjectVersions, ListMultipartUploads)
+// and opaque cursor-attack regression suite (rustfs/backlog#2675).
+#[cfg(test)]
+mod table_list_isolation_test;
+
+// OIDC AssumeRoleWithWebIdentity E2E matrix (rustfs/backlog#2724).
+#[cfg(test)]
+mod oidc_web_identity_e2e_test;
+
+// Authentication/authorization failure audit delivery E2E suite (rustfs/backlog#1151 sec-15).
+#[cfg(test)]
+mod auth_failure_audit_test;
+
 // Regression test for signed DELETE Object?versionId requests without Content-Length.
 #[cfg(test)]
 mod delete_object_no_content_length_test;

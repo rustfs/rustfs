@@ -16,13 +16,16 @@
 
 use crate::common::{
     AdminTransport, RustFSTestEnvironment, admin_add_canned_policy_via, admin_attach_user_policy_via, admin_create_user,
-    init_logging,
+    init_logging, local_http_client,
 };
+use crate::object_lock::common::{future_retain_until, put_object_with_legal_hold, put_object_with_retention};
 use aws_sdk_s3::Client;
 use aws_sdk_s3::error::{ProvideErrorMetadata, SdkError};
 use aws_sdk_s3::operation::delete_object::{DeleteObjectError, DeleteObjectOutput};
 use aws_sdk_s3::primitives::ByteStream;
-use aws_sdk_s3::types::{BucketVersioningStatus, Delete, ObjectIdentifier, VersioningConfiguration};
+use aws_sdk_s3::types::{
+    BucketVersioningStatus, Delete, ObjectIdentifier, ObjectLockLegalHoldStatus, ObjectLockRetentionMode, VersioningConfiguration,
+};
 use futures::{StreamExt, TryStreamExt, stream};
 use serde_json::{Value, json};
 use std::collections::BTreeSet;
@@ -778,6 +781,385 @@ async fn force_delete_checks_every_version_page_before_mutation() -> TestResult 
     assert!(
         versions(&root, bucket, "folder/").await?.is_empty(),
         "authorized recursive deletion must cover all pages"
+    );
+    Ok(())
+}
+
+async fn force_delete_with_bypass(
+    client: &Client,
+    bucket: &str,
+    prefix: &str,
+    bypass_governance: bool,
+) -> Result<DeleteObjectOutput, Box<SdkError<DeleteObjectError>>> {
+    let mut request = client.delete_object().bucket(bucket).key(prefix);
+    if bypass_governance {
+        request = request.bypass_governance_retention(true);
+    }
+    request
+        .customize()
+        .mutate_request(|req| {
+            req.headers_mut().insert("x-rustfs-force-delete", "true");
+        })
+        .send()
+        .await
+        .map_err(Box::new)
+}
+
+#[tokio::test]
+async fn anonymous_force_delete_and_spoofed_replica_headers_are_denied_despite_public_bucket_policy() -> TestResult {
+    init_logging();
+    let mut env = RustFSTestEnvironment::new().await?;
+    env.start_rustfs_server(vec![]).await?;
+    let root = env.create_s3_client();
+    let bucket = "force-anonymous-denial";
+    root.create_bucket().bucket(bucket).send().await?;
+    versioning(&root, bucket, BucketVersioningStatus::Enabled).await?;
+    for key in ["folder/a.txt", "folder/b.txt", "keep.txt"] {
+        put(&root, bucket, key).await?;
+    }
+    // Verify both a wildcard s3:* public policy AND a public policy granting explicit
+    // s3:ForceDeleteObject (without s3:ForceDeleteBucket / s3:ReplicateDelete) still
+    // reject every anonymous force-delete request (including spoofed REPLICA headers)
+    // with 403 AccessDenied.
+    for (policy_label, policy_actions) in [
+        ("wildcard s3:* public policy", json!(["s3:*"])),
+        (
+            "explicit force-delete-object public policy",
+            json!([
+                "s3:DeleteObject",
+                "s3:DeleteObjectVersion",
+                "s3:DeleteBucket",
+                "s3:ForceDeleteObject"
+            ]),
+        ),
+    ] {
+        root.put_bucket_policy()
+            .bucket(bucket)
+            .policy(
+                json!({
+                    "Version": "2012-10-17",
+                    "Statement": [{
+                        "Effect": "Allow",
+                        "Principal": "*",
+                        "Action": policy_actions,
+                        "Resource": [format!("arn:aws:s3:::{bucket}"), format!("arn:aws:s3:::{bucket}/*")]
+                    }]
+                })
+                .to_string(),
+            )
+            .send()
+            .await?;
+
+        let before = versions(&root, bucket, "").await?;
+        let http = local_http_client();
+        for (label, url, headers) in [
+            (
+                "anonymous rustfs force object delete",
+                format!("{}/{bucket}/folder/", env.url),
+                vec![("x-rustfs-force-delete", "true")],
+            ),
+            (
+                "anonymous minio force object delete",
+                format!("{}/{bucket}/folder/", env.url),
+                vec![("x-minio-force-delete", "true")],
+            ),
+            (
+                "anonymous spoofed REPLICA force object delete",
+                format!("{}/{bucket}/folder/", env.url),
+                vec![("x-rustfs-force-delete", "true"), ("x-amz-replication-status", "REPLICA")],
+            ),
+            (
+                "anonymous rustfs force bucket delete",
+                format!("{}/{bucket}", env.url),
+                vec![("x-rustfs-force-delete", "true")],
+            ),
+            (
+                "anonymous minio force bucket delete",
+                format!("{}/{bucket}", env.url),
+                vec![("x-minio-force-delete", "true")],
+            ),
+        ] {
+            let mut request = http.delete(&url);
+            for (name, value) in headers {
+                request = request.header(name, value);
+            }
+            let response = request.send().await?;
+            let status = response.status();
+            let body = response.text().await?;
+            assert_eq!(status.as_u16(), 403, "{policy_label} / {label} must return 403, body: {body}");
+            assert!(
+                body.contains("<Code>AccessDenied</Code>"),
+                "{policy_label} / {label} must return AccessDenied, body: {body}"
+            );
+            assert!(
+                !head_bucket_missing(&root, bucket).await?,
+                "{policy_label} / {label} must preserve the bucket"
+            );
+            assert_eq!(
+                versions(&root, bucket, "").await?,
+                before,
+                "{policy_label} / {label} must preserve every object version"
+            );
+        }
+    }
+
+    let before = versions(&root, bucket, "").await?;
+    // Remove public policy and verify an authenticated caller without s3:ReplicateDelete
+    // cannot spoof REPLICA on a recursive force-delete either.
+    root.delete_bucket_policy().bucket(bucket).send().await?;
+    let non_replica_user = policy_user(
+        &env,
+        "force-no-replica",
+        Some(json!({
+            "Version": "2012-10-17",
+            "Statement": [{
+                "Effect": "Allow",
+                "Action": ["s3:DeleteObject", "s3:DeleteObjectVersion", "s3:ForceDeleteObject"],
+                "Resource": format!("arn:aws:s3:::{bucket}/*")
+            }]
+        })),
+    )
+    .await?;
+    assert_boxed_denied(replica_force_delete(&non_replica_user, bucket, "folder/").await);
+    assert_eq!(
+        versions(&root, bucket, "").await?,
+        before,
+        "spoofed REPLICA force-delete without s3:ReplicateDelete must preserve every version"
+    );
+    Ok(())
+}
+
+fn assert_force_delete_forbidden_on_object_lock<T: std::fmt::Debug>(
+    result: Result<T, Box<SdkError<DeleteObjectError>>>,
+    context: &str,
+) {
+    let err = result.expect_err(&format!("{context}: expected InvalidArgument"));
+    assert_eq!(
+        err.raw_response().map(|r| r.status().as_u16()),
+        Some(400),
+        "{context}: expected HTTP 400, got {err:?}"
+    );
+    assert_eq!(
+        err.as_service_error().and_then(ProvideErrorMetadata::code),
+        Some("InvalidArgument"),
+        "{context}: expected InvalidArgument, got {err:?}"
+    );
+    let msg = err
+        .as_service_error()
+        .and_then(ProvideErrorMetadata::message)
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    assert!(
+        msg.contains("object lock"),
+        "{context}: expected Object Lock prohibition message, got {err:?}"
+    );
+}
+
+#[tokio::test]
+async fn force_delete_enforces_object_lock_governance_bypass_compliance_and_legal_hold() -> TestResult {
+    init_logging();
+    let mut env = RustFSTestEnvironment::new().await?;
+    env.start_rustfs_server(vec![]).await?;
+    let root = env.create_s3_client();
+    let bucket = "force-object-lock-authz";
+    root.create_bucket()
+        .bucket(bucket)
+        .object_lock_enabled_for_bucket(true)
+        .send()
+        .await?;
+
+    let retain_until = future_retain_until(7);
+    let gov_locked_vid = put_object_with_retention(
+        &root,
+        bucket,
+        "gov/locked.txt",
+        b"governance locked",
+        ObjectLockRetentionMode::Governance,
+        retain_until,
+    )
+    .await?;
+    put(&root, bucket, "gov/plain.txt").await?;
+
+    let comp_locked_vid = put_object_with_retention(
+        &root,
+        bucket,
+        "comp/locked.txt",
+        b"compliance locked",
+        ObjectLockRetentionMode::Compliance,
+        retain_until,
+    )
+    .await?;
+    put(&root, bucket, "comp/plain.txt").await?;
+
+    let hold_locked_vid =
+        put_object_with_legal_hold(&root, bucket, "hold/locked.txt", b"legal hold", ObjectLockLegalHoldStatus::On).await?;
+    put(&root, bucket, "hold/plain.txt").await?;
+
+    put(&root, bucket, "outside/keep.txt").await?;
+    let outside_before = versions(&root, bucket, "outside/").await?;
+
+    let no_bypass_user = policy_user(
+        &env,
+        "force-no-bypass",
+        Some(json!({
+            "Version": "2012-10-17",
+            "Statement": [{
+                "Effect": "Allow",
+                "Action": ["s3:DeleteObject", "s3:DeleteObjectVersion", "s3:ForceDeleteObject"],
+                "Resource": format!("arn:aws:s3:::{bucket}/*")
+            }]
+        })),
+    )
+    .await?;
+    let bypass_user = policy_user(
+        &env,
+        "force-with-bypass",
+        Some(json!({
+            "Version": "2012-10-17",
+            "Statement": [{
+                "Effect": "Allow",
+                "Action": [
+                    "s3:DeleteObject",
+                    "s3:DeleteObjectVersion",
+                    "s3:ForceDeleteObject",
+                    "s3:BypassGovernanceRetention"
+                ],
+                "Resource": format!("arn:aws:s3:::{bucket}/*")
+            }]
+        })),
+    )
+    .await?;
+
+    // 1. Authorization gate runs before storage: a caller lacking s3:BypassGovernanceRetention
+    // who requests bypass on a force-delete is denied with 403 AccessDenied.
+    let gov_before = versions(&root, bucket, "gov/").await?;
+    assert_boxed_denied(force_delete_with_bypass(&no_bypass_user, bucket, "gov/", true).await);
+    assert_eq!(
+        versions(&root, bucket, "gov/").await?,
+        gov_before,
+        "caller lacking s3:BypassGovernanceRetention must be rejected before touching gov/"
+    );
+
+    // 2. Storage Object Lock guard unconditionally forbids recursive force-delete on
+    // Object-Lock-enabled buckets with 400 InvalidArgument — even for callers with
+    // s3:ForceDeleteObject + s3:BypassGovernanceRetention (with or without bypass header)
+    // and even for root across GOVERNANCE, COMPLIANCE, and Legal Hold prefixes.
+    let comp_before = versions(&root, bucket, "comp/").await?;
+    let hold_before = versions(&root, bucket, "hold/").await?;
+    assert_force_delete_forbidden_on_object_lock(
+        force_delete_with_bypass(&bypass_user, bucket, "gov/", false).await,
+        "force-delete without bypass on Object Lock bucket",
+    );
+    assert_force_delete_forbidden_on_object_lock(
+        force_delete_with_bypass(&bypass_user, bucket, "gov/", true).await,
+        "force-delete with bypass on Object Lock bucket",
+    );
+    assert_force_delete_forbidden_on_object_lock(
+        force_delete_with_bypass(&root, bucket, "comp/", true).await,
+        "root force-delete on COMPLIANCE prefix",
+    );
+    assert_force_delete_forbidden_on_object_lock(
+        force_delete_with_bypass(&bypass_user, bucket, "hold/", true).await,
+        "force-delete on Legal Hold prefix",
+    );
+    assert_eq!(versions(&root, bucket, "gov/").await?, gov_before);
+    assert_eq!(versions(&root, bucket, "comp/").await?, comp_before);
+    assert_eq!(versions(&root, bucket, "hold/").await?, hold_before);
+
+    // 3. Version-specific DeleteObject enforces Object Lock bypass authorization:
+    //    - GOVERNANCE without bypass header -> 403 AccessDenied
+    //    - GOVERNANCE with bypass header but without s3:BypassGovernanceRetention -> 403 AccessDenied
+    //    - GOVERNANCE with bypass header AND s3:BypassGovernanceRetention -> succeeds
+    //    - COMPLIANCE with bypass header AND s3:BypassGovernanceRetention (and root) -> 403 AccessDenied
+    //    - Legal Hold ON with bypass header AND s3:BypassGovernanceRetention -> 403 AccessDenied
+    assert_denied(
+        bypass_user
+            .delete_object()
+            .bucket(bucket)
+            .key("gov/locked.txt")
+            .version_id(&gov_locked_vid)
+            .send()
+            .await,
+    );
+    assert_denied(
+        no_bypass_user
+            .delete_object()
+            .bucket(bucket)
+            .key("gov/locked.txt")
+            .version_id(&gov_locked_vid)
+            .bypass_governance_retention(true)
+            .send()
+            .await,
+    );
+    assert!(
+        versions(&root, bucket, "gov/")
+            .await?
+            .contains(&("gov/locked.txt".into(), gov_locked_vid.clone(), false)),
+        "GOVERNANCE-locked version must survive unauthorized bypass attempts"
+    );
+
+    bypass_user
+        .delete_object()
+        .bucket(bucket)
+        .key("gov/locked.txt")
+        .version_id(&gov_locked_vid)
+        .bypass_governance_retention(true)
+        .send()
+        .await?;
+    assert!(
+        !versions(&root, bucket, "gov/")
+            .await?
+            .contains(&("gov/locked.txt".into(), gov_locked_vid, false)),
+        "authorized governance bypass DeleteObject(versionId) must remove the GOVERNANCE version"
+    );
+
+    assert_denied(
+        bypass_user
+            .delete_object()
+            .bucket(bucket)
+            .key("comp/locked.txt")
+            .version_id(&comp_locked_vid)
+            .bypass_governance_retention(true)
+            .send()
+            .await,
+    );
+    assert_denied(
+        root.delete_object()
+            .bucket(bucket)
+            .key("comp/locked.txt")
+            .version_id(&comp_locked_vid)
+            .bypass_governance_retention(true)
+            .send()
+            .await,
+    );
+    assert!(
+        versions(&root, bucket, "comp/")
+            .await?
+            .contains(&("comp/locked.txt".into(), comp_locked_vid, false)),
+        "COMPLIANCE-locked version must survive bypass attempts even by root"
+    );
+
+    assert_denied(
+        bypass_user
+            .delete_object()
+            .bucket(bucket)
+            .key("hold/locked.txt")
+            .version_id(&hold_locked_vid)
+            .bypass_governance_retention(true)
+            .send()
+            .await,
+    );
+    assert!(
+        versions(&root, bucket, "hold/")
+            .await?
+            .contains(&("hold/locked.txt".into(), hold_locked_vid, false)),
+        "legal-hold-protected version must survive bypass delete attempts"
+    );
+
+    assert_eq!(
+        versions(&root, bucket, "outside/").await?,
+        outside_before,
+        "unrelated prefix must remain untouched across all object-lock delete attempts"
     );
     Ok(())
 }

@@ -416,12 +416,15 @@ threads-required = "num-test-threads"
 filter = 'package(rustfs-ecstore) & test(/^store::object::tests::(canceled_create_retains_usage_cleanup_namespace_owner|batch_delete_excludes_recovery_on_nonzero_pool|delete_excludes_recovery_with_(disjoint|identical|overlapping)_pool_lock_clients)$/)'
 threads-required = "num-test-threads"
 
-# Isolate the physical Apply barrier and same-name multipart lock probes from
+# Isolate the quota, physical Apply barrier and same-name multipart lock probes from
 # competing disk fixtures. Keep their deadlines and internal concurrency.
 [[profile.ci.overrides]]
 filter = """
 package(rustfs-ecstore) & (
-    test(=core::pools::native_recovery::integration_tests::pool_meta_native_physical_runtime_fork_after_apply_latches_original_gate)
+    test(=bucket::quota::checker::tests::concurrent_puts_across_protocol_migration_are_accounted_exactly_once)
+    | test(=bucket::quota::checker::tests::reporting_retirement::durable_quota_reporting_retires_degraded_floors_without_changing_ledger_admission)
+    | test(=bucket::quota::reservation::tests::quota_reconciliation_survives_waiter_cancellation_and_rechecks_configuration)
+    | test(=core::pools::native_recovery::integration_tests::pool_meta_native_physical_runtime_fork_after_apply_latches_original_gate)
     | test(=set_disk::ops::multipart::same_name_object_namespace_lock_tests::same_name_key_writes_succeed_on_unversioned_versioned_and_hard_quota_buckets)
     | test(=set_disk::ops::multipart::same_name_object_namespace_lock_tests::same_name_object_write_lock_does_not_block_other_keys_on_versioned_bucket)
 )
@@ -740,10 +743,20 @@ test-group = 'ecstore-serial-flaky'
 # comparator unit tests need no server. It meets the admission criteria
 # unchanged; the module clause admits a new differential test without another
 # filter edit.
+#
+# Force-delete authorization, table LIST isolation, OIDC web-identity, and
+# auth-failure audit (rustfs/backlog#2675, rustfs/backlog#2724,
+# rustfs/backlog#1151 sec-15): fast, single-node, random-port security
+# regressions using in-process mocks only.
+# Exact test names are pinned for `delete_authorization_test` and
+# `table_list_isolation_test` so the 1001-object / 1050-object large-page
+# fixtures remain in `e2e-full` without slowing the PR smoke lane.
 [profile.e2e-smoke]
 default-filter = """
     package(e2e_test) & (
-        test(/^(access_request_validation|delete_marker_migration_semantics|version_id_regression|list_objects_v2_pagination|list_object_versions_regression|list_objects_duplicates|list_buckets_double_slash|list_buckets_auth|list_buckets_iam_filter|leading_slash_key|special_chars|create_bucket_region|delete_objects_versioning|head_object_consistency|head_object_range|copy_object_metadata|copy_object_tagging|copy_source_invalid_date|content_encoding|compression|multipart_storage_class|multipart_upload_id|storage_class_capability|ssec_copy|anonymous_access|bucket_policy_check|presigned_negative|negative_sigv4|admin_auth|notification_webhook|tls_hot_reload|console_smoke|admin_iam_crud|admin_pools|sts_query_compat|data_usage)_test::|^fake_s3_target::/)
+        test(/^(access_request_validation|delete_marker_migration_semantics|version_id_regression|list_objects_v2_pagination|list_object_versions_regression|list_objects_duplicates|list_buckets_double_slash|list_buckets_auth|list_buckets_iam_filter|leading_slash_key|special_chars|create_bucket_region|delete_objects_versioning|head_object_consistency|head_object_range|copy_object_metadata|copy_object_tagging|copy_source_invalid_date|content_encoding|compression|multipart_storage_class|multipart_upload_id|storage_class_capability|ssec_copy|anonymous_access|bucket_policy_check|presigned_negative|negative_sigv4|admin_auth|auth_failure_audit|oidc_web_identity_e2e|notification_webhook|tls_hot_reload|console_smoke|admin_iam_crud|admin_pools|sts_query_compat|data_usage)_test::|^fake_s3_target::/)
+        | test(/^delete_authorization_test::(sdk_version_deletion_requires_only_delete_object_version|sdk_list_bucket_and_list_bucket_versions_permissions_are_independent|explicit_force_delete_permission_removes_prefix_versions_and_delete_markers|force_delete_header_requires_explicit_permission|force_delete_authorizes_only_its_path_scope_without_list_permissions|force_directory_delete_cannot_remove_an_unauthorized_colliding_parent|force_unversioned_directory_requires_only_delete_object|force_delete_denied_child_preserves_every_object_despite_bucket_allow|force_delete_denied_historical_version_preserves_versions_and_markers|sdk_ordinary_deletion_preserves_versions_and_directory_children|sdk_delete_objects_force_header_keeps_explicit_item_scope|anonymous_force_delete_and_spoofed_replica_headers_are_denied_despite_public_bucket_policy|force_delete_enforces_object_lock_governance_bypass_compliance_and_legal_hold)$/)
+        | test(/^table_list_isolation_test::table_list_isolation_covers_v2_versions_multipart_uploads_and_cursor_attacks$/)
         | test(/^replication_extension_test::(test_replication_check_succeeds_with_remote_target|test_replication_check_rejects_target_without_object_lock|test_set_remote_target_rejects_unversioned_source_bucket|test_replication_check_rejects_unversioned_source_bucket|test_replication_check_rejects_missing_replication_config|test_replication_check_rejects_invalid_bucket|test_set_remote_target_rejects_same_bucket_on_same_deployment|test_set_remote_target_rejects_unversioned_target_bucket|test_set_remote_target_update_requires_arn|test_set_remote_target_update_rejects_missing_target|test_set_remote_target_rejects_invalid_target_url|test_set_remote_target_rejects_self_signed_https_target_without_skip_tls_verify|test_set_remote_target_rejects_private_ca_https_target_without_ca_cert_pem|test_list_remote_targets_rejects_empty_bucket|test_list_remote_targets_rejects_invalid_bucket|test_remove_remote_target_rejects_missing_target|test_remove_remote_target_rejects_missing_arn|test_remove_remote_target_rejects_invalid_bucket|test_remove_remote_target_rejects_target_used_by_replication|test_delete_bucket_replication_removes_remote_target)$/)
         | test(/^reliant::lifecycle::/)
         | test(/^conditional_delete_objects_test::/)

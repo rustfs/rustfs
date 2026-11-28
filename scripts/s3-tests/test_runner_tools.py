@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import subprocess
 import tempfile
@@ -17,6 +18,9 @@ TOX_SETUP = SOURCE[
 PLUGIN_SETUP = SOURCE[SOURCE.index('XDIST_ARGS=""') : SOURCE.index("# Resolve config path (absolute path for tox)")]
 PATH_SETUP = SOURCE[SOURCE.index("# Ensure user-level Python scripts") : SOURCE.index("# Configuration")]
 INSTALLER = SOURCE[SOURCE.index("ensure_python_pip() {") : SOURCE.index('if ! command -v awscurl')]
+ALT_USER_PROVISIONING = SOURCE[
+    SOURCE.index("# Provision alt user (required by suite)") : SOURCE.index("# Step 8: Prepare s3-tests")
+]
 
 
 class RunnerToolsTests(unittest.TestCase):
@@ -113,6 +117,74 @@ log_error() { printf '%s\n' "$*" >&2; }
                 self.assertEqual(dependencies.count("pytest-timeout==2.4.0"), 1)
                 self.assertEqual(dependencies.count("pytest-xdist==3.8.0"), int(workers != "0"))
                 self.assertEqual(result.stdout, "" if workers == "0" else "-n 2 --dist=loadgroup")
+
+    def test_alt_user_provisioning_encodes_credentials_and_stops_on_errors(self) -> None:
+        stubs = r'''
+log_info() { printf 'INFO %s\n' "$*"; }
+log_error() { printf 'ERROR %s\n' "$*" >&2; }
+awscurl() {
+    printf 'CALL %s\n' "$*" >> "$PROVISION_LOG"
+    if [[ "$FAIL_STAGE" == "add-user" && "$*" == *"/rustfs/admin/v3/add-user"* ]]; then
+        printf '<Error xmlns="urn:s3"><Message>private-response</Message></Error>'
+        return 0
+    fi
+    if [[ "$FAIL_STAGE" == "set-policy" && "$*" == *"/set-user-or-group-policy"* ]]; then
+        printf '{"message":"private-response"}'
+        printf 'private-diagnostic' >&2
+        if [[ "$1" == "--fail-with-body" ]]; then return 22; fi
+        return 0
+    fi
+    if [[ "$FAIL_STAGE" == "list-buckets" && "$*" == *"-X GET"* ]]; then
+        printf '<Error><Code>InvalidAccessKeyId</Code><Message>missing</Message></Error>'
+        return 0
+    fi
+    return 0
+}
+'''
+        base_env = {
+            **os.environ,
+            "S3_HOST": "127.0.0.1",
+            "S3_PORT": "9000",
+            "S3_REGION": "us-east-1",
+            "S3_ACCESS_KEY": "rustfsadmin",
+            "S3_SECRET_KEY": "rustfsadmin",
+            "S3_ALT_ACCESS_KEY": "alt+user&x",
+            "S3_ALT_SECRET_KEY": r'alt"secret\tail',
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            call_log = Path(directory) / "calls.log"
+            ok = subprocess.run(
+                ["bash", "-euo", "pipefail", "-c", stubs + ALT_USER_PROVISIONING],
+                env={**base_env, "PROVISION_LOG": str(call_log), "FAIL_STAGE": "none"},
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(ok.returncode, 0, ok.stderr)
+            self.assertIn("Alt user provisioned successfully", ok.stdout)
+            calls = call_log.read_text().splitlines()
+            self.assertEqual(len(calls), 3)
+            self.assertIn('/rustfs/admin/v3/add-user?accessKey=alt%2Buser%26x', calls[0])
+            payload, _ = json.JSONDecoder().raw_decode(calls[0].split(" -d ", 1)[1])
+            self.assertEqual(payload, {"secretKey": base_env["S3_ALT_SECRET_KEY"], "status": "enabled"})
+            self.assertIn('policyName=readwrite&userOrGroup=alt%2Buser%26x&isGroup=false', calls[1])
+
+            for count, (stage, message) in enumerate((("add-user", "Failed to add alt user"),
+                                                       ("set-policy", "Failed to set user policy"),
+                                                       ("list-buckets", "Alt user cannot list buckets")), start=1):
+                with self.subTest(stage=stage):
+                    fail_log = Path(directory) / f"fail-{stage}.log"
+                    res = subprocess.run(
+                        ["bash", "-euo", "pipefail", "-c", stubs + ALT_USER_PROVISIONING],
+                        env={**base_env, "PROVISION_LOG": str(fail_log), "FAIL_STAGE": stage},
+                        capture_output=True,
+                        text=True,
+                    )
+                    self.assertNotEqual(res.returncode, 0)
+                    self.assertIn(message, res.stderr)
+                    self.assertNotIn("private-response", res.stderr + res.stdout)
+                    self.assertNotIn("private-diagnostic", res.stderr + res.stdout)
+                    self.assertEqual(len(fail_log.read_text().splitlines()), count)
+                    self.assertNotIn("Alt user provisioned successfully", res.stdout)
 
 
 if __name__ == "__main__":
