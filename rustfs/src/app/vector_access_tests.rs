@@ -232,8 +232,7 @@ fn vector_real_sts_session_policy_and_bucket_explicit_deny() {
                 json!(base64_simd::URL_SAFE_NO_PAD.encode_to_string(serde_json::to_vec(&session_policy).unwrap())),
             ),
         ]);
-        let signing_key = rustfs_iam::manager::get_token_signing_key().unwrap_or_else(|| root.secret_key.clone());
-        let mut session = get_new_credentials_with_metadata(&claims, &signing_key).unwrap();
+        let mut session = get_new_credentials_with_metadata(&claims, &root.secret_key).unwrap();
         session.parent_user = parent.access_key.clone();
         iam.set_temp_user_from_parent(&session, &parent).await.unwrap();
         let (verified, owner) =

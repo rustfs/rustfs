@@ -819,10 +819,13 @@ where
     }
     let _ = invalidate_object_data_cache_before_mutation(&context.cache_adapter, &context.bucket, &key).await;
 
-    let (obj_info, backfilled_old_current_size) = match context
-        .store
-        .put_object_with_old_current_size(&context.bucket, &key, &mut reader, &opts)
-        .await
+    let (obj_info, backfilled_old_current_size) = match Box::pin(context.store.put_object_with_old_current_size(
+        &context.bucket,
+        &key,
+        &mut reader,
+        &opts,
+    ))
+    .await
     {
         Ok(result) => result,
         Err(error) => {
@@ -876,7 +879,7 @@ where
             };
         }
     };
-    match commit_extract_member_inner(context, member, foreground_permit).await {
+    match Box::pin(commit_extract_member_inner(context, member, foreground_permit)).await {
         Ok(success) => ExtractCommitOutcome {
             archive_seq,
             event: Some(success.event),
@@ -2503,7 +2506,7 @@ impl DefaultObjectUsecase {
                 has_explicit_object_lock_retention,
             ));
             let mut opts = extract_try!(
-                put_opts_with_replication_authorization(
+                Box::pin(put_opts_with_replication_authorization(
                     &bucket,
                     &fpath,
                     // The DTO version is applied with any PAX override below, then
@@ -2513,7 +2516,7 @@ impl DefaultObjectUsecase {
                     &member_request_headers,
                     metadata.clone(),
                     replication_authorized,
-                )
+                ))
                 .await
                 .map_err(ApiError::from)
             );
@@ -2648,7 +2651,7 @@ impl DefaultObjectUsecase {
                 &mut opts,
             ));
             if let Some(material) = extract_try!(
-                sse_encryption(EncryptionRequest {
+                Box::pin(sse_encryption(EncryptionRequest {
                     bucket: &bucket,
                     key: &fpath,
                     server_side_encryption: effective_sse.clone(),
@@ -2659,7 +2662,7 @@ impl DefaultObjectUsecase {
                     sse_customer_key_md5: sse_customer_key_md5.clone(),
                     content_size: actual_size,
                     principal: extract_principal.as_ref(),
-                })
+                }))
                 .await
             ) {
                 effective_sse = Some(material.server_side_encryption.clone());
@@ -2687,14 +2690,14 @@ impl DefaultObjectUsecase {
 
             // One immutable decision drives both the pending metadata and the
             // post-commit schedule, matching the regular PUT contract.
-            let replication = must_replicate_object(
+            let replication = Box::pin(must_replicate_object(
                 &bucket,
                 &fpath,
                 &opts.user_defined,
                 "".to_string(),
                 opts.delete_marker_replication_status(),
                 opts.clone(),
-            )
+            ))
             .await;
             if replication.replicate_any() {
                 insert_str(&mut opts.user_defined, SUFFIX_REPLICATION_GENERATION, Uuid::new_v4().to_string());

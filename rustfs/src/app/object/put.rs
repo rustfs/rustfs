@@ -1661,7 +1661,17 @@ impl DefaultObjectUsecase {
     /// encrypting reader, the owned store commit, usage accounting,
     /// replication scheduling and the creation-event setup. The caller shapes
     /// the request before and builds its response after.
-    pub(super) async fn put_object_core(
+    pub(super) fn put_object_core<'a>(
+        &'a self,
+        write: PutObjectWriteRequest<'a>,
+        body: NativeBody,
+        frame_trailers: Option<Arc<super::native_body::FrameTrailers>>,
+        start_time: Instant,
+    ) -> futures::future::BoxFuture<'a, rustfs_s3_types::S3Result<PutObjectCommitted>> {
+        Box::pin(self.put_object_core_inner(write, body, frame_trailers, start_time))
+    }
+
+    async fn put_object_core_inner(
         &self,
         write: PutObjectWriteRequest<'_>,
         body: NativeBody,

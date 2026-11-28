@@ -123,8 +123,7 @@ pub(in crate::app) async fn issue_real_session(app: &AppContext, parent: &Creden
             json!(base64_simd::URL_SAFE_NO_PAD.encode_to_string(serde_json::to_vec(&policy).unwrap())),
         );
     }
-    let secret = rustfs_iam::manager::get_token_signing_key().unwrap_or_else(|| root.secret_key.clone());
-    let mut credentials = get_new_credentials_with_metadata(&claims, &secret).unwrap();
+    let mut credentials = get_new_credentials_with_metadata(&claims, &root.secret_key).unwrap();
     credentials.parent_user = parent.access_key.clone();
     app.iam()
         .handle()
