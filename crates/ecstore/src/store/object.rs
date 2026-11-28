@@ -2600,7 +2600,8 @@ fn delete_lock_windows(objects: Vec<ObjectToDelete>) -> Vec<Vec<(usize, ObjectTo
     let mut windows: Vec<Vec<_>> = Vec::new();
     for (index, object) in objects.into_iter().enumerate() {
         let next = first_window.len() / BULK_DELETE_KEYS_PER_WINDOW;
-        let window = *first_window.entry(object.object_name.clone()).or_insert(next);
+        let identity = rustfs_utils::path::object_name_disk_identity(&object.object_name).into_owned();
+        let window = *first_window.entry(identity).or_insert(next);
         if window == windows.len() {
             windows.push(Vec::new());
         }
@@ -14660,22 +14661,29 @@ mod batch_delete_lock_tests {
     fn lock_windows_keep_nonadjacent_versions_and_result_indices_together() {
         let mut objects = (0..=BULK_DELETE_KEYS_PER_WINDOW)
             .map(|i| ObjectToDelete {
-                object_name: format!("key-{i}"),
+                object_name: format!("key/{i}"),
                 ..Default::default()
             })
             .collect::<Vec<_>>();
         let version = Uuid::new_v4();
         objects.push(ObjectToDelete {
-            object_name: "key-0".to_owned(),
+            object_name: "key/0".to_owned(),
             version_id: Some(version),
+            ..Default::default()
+        });
+        objects.push(ObjectToDelete {
+            object_name: r"key\0".to_owned(),
             ..Default::default()
         });
         let windows = delete_lock_windows(objects);
         assert_eq!(windows.len(), 2);
-        let (index, repeated) = windows[0].last().expect("nonadjacent version");
+        let (index, repeated) = &windows[0][BULK_DELETE_KEYS_PER_WINDOW];
         assert_eq!(*index, BULK_DELETE_KEYS_PER_WINDOW + 1);
         assert_eq!(repeated.version_id, Some(version));
         assert_eq!(windows[1][0].0, BULK_DELETE_KEYS_PER_WINDOW);
+        // The backslash spelling aliases key/0 only on Windows.
+        let alias_window = if cfg!(windows) { 0 } else { 1 };
+        assert_eq!(windows[alias_window].last().unwrap().0, BULK_DELETE_KEYS_PER_WINDOW + 2);
     }
 
     #[tokio::test]
