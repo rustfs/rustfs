@@ -25,7 +25,7 @@
 //! check" row, or a remainder the handler still decides. A backend failure is indeterminate.
 //! An operation the table serves with no row is denied.
 
-use super::stack::OriginalS3Path;
+use super::stack::{OriginalS3Authority, OriginalS3Path};
 use crate::app::{RequestCredentials, RequestEnvelope, RequestHead};
 use crate::auth::{get_session_token, keystone_is_owner};
 use crate::runtime_sources::ServerContextSlot;
@@ -190,6 +190,12 @@ fn prepare_request(
     let mut headers = HeaderMap::new();
     for (name, value) in header_view.iter_raw() {
         headers.append(name.clone(), value.clone());
+    }
+    if !headers.contains_key(http::header::HOST)
+        && let Some(authority) = context.server_extensions().get::<OriginalS3Authority>()
+    {
+        let host = http::HeaderValue::from_str(authority.0.as_str()).map_err(|_| Decision::Indeterminate)?;
+        headers.insert(http::header::HOST, host);
     }
     let uri =
         request_uri(context.server_extensions().get::<OriginalS3Path>(), raw_query).map_err(|()| Decision::Indeterminate)?;
