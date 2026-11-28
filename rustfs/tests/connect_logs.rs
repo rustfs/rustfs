@@ -362,6 +362,306 @@ async fn local_export_is_private_no_clobber_and_cancel_safe() {
     ));
 }
 
+fn assert_archive_contains_no_sentinels(export: &logs::SignedLogExport, sentinels: &[&str]) {
+    let raw_lossy = String::from_utf8_lossy(&export.archive_bytes);
+    for sentinel in sentinels {
+        assert!(!raw_lossy.contains(sentinel), "raw zip archive leaked sentinel: {sentinel}");
+    }
+    let mut archive = ZipArchive::new(Cursor::new(export.archive_bytes.clone())).expect("signed logs archive");
+    for entry_name in ["envelope.json", "envelope.sig", "result.json"] {
+        let content = String::from_utf8(archive_entry(&mut archive, entry_name)).expect("UTF-8 archive entry");
+        for sentinel in sentinels {
+            assert!(!content.contains(sentinel), "{entry_name} leaked sentinel: {sentinel}");
+        }
+    }
+}
+
+#[tokio::test]
+async fn live_capture_handles_mid_read_truncate_and_drops_partial_prefix() {
+    let _guard = TEST_LOCK.lock().await;
+    let initial = format!("{}\n", "x".repeat(512));
+    let (directory, source) = source(&initial);
+    let log_path = directory.path().join("rustfs.log");
+    let key = connect::DeviceIdentity::generate();
+    let mut request = request(CaptureMode::Live);
+    request.duration = Duration::from_millis(260);
+
+    let sentinels = [
+        "SENTINEL_CONNECT_BEARER_TOKEN",
+        "SENTINEL_CONNECT_SESSION_TOKEN",
+        "SENTINEL_CONNECT_SSEC_KEY",
+        "SENTINEL_CONNECT_URL_PASS",
+        "SENTINEL_CONNECT_URL_QUERY",
+        "tenant-a/secret-object-key.bin",
+    ];
+    let sensitive_msg = format!(
+        "Authorization=Bearer {} session={} x-amz-server-side-encryption-customer-key={} \
+         url=https://otel:{}@collector.invalid/v1/logs?api_key={} key={}",
+        sentinels[0], sentinels[1], sentinels[2], sentinels[3], sentinels[4], sentinels[5]
+    );
+    let post_truncate_event = line("2026-09-12T12:00:01Z", "WARN", "drive_unavailable", &sensitive_msg);
+
+    let writer = async {
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        // Truncate the active log file below the collector's current offset, then
+        // write a partial first line followed by a valid reviewed event.
+        let mut file = OpenOptions::new()
+            .write(true)
+            .truncate(true)
+            .open(&log_path)
+            .expect("truncate active log file");
+        writeln!(file, "truncated-prefix-fragment-not-json").expect("write partial prefix");
+        writeln!(file, "{post_truncate_event}").expect("write post-truncate event");
+        file.flush().expect("flush truncated active log");
+    };
+
+    let cancel = CancellationToken::new();
+    let ((), export) = tokio::join!(writer, export_logs_from(&request, &key, &cancel, &source));
+    let export = export.expect("live capture should survive mid-read truncation");
+    assert_eq!(export.event_count, 1, "valid event after truncation must be captured");
+    assert!(
+        export.dropped_event_count >= 1,
+        "mid-read truncation must record dropped prefix accounting"
+    );
+    assert_archive_contains_no_sentinels(&export, &sentinels);
+}
+
+#[tokio::test]
+async fn batch_capture_truncates_oversized_source_without_leaking_secrets() {
+    let _guard = TEST_LOCK.lock().await;
+    let mut req = request(CaptureMode::Batch);
+    req.duration = Duration::from_secs(2);
+    let ts = timestamp(req.produced_at_unix - 1, 0);
+    let sentinels = [
+        "SENTINEL_OVERSIZED_BEARER",
+        "SENTINEL_OVERSIZED_SSEC",
+        "https://user:SENTINEL_OVERSIZED_PASS@otlp.invalid?token=SENTINEL_OVERSIZED_QUERY",
+    ];
+    let filler_line = format!("{}\n", "p".repeat(1_024));
+    let mut content = String::with_capacity(logs::MAX_SOURCE_BYTES + 4_096);
+    while content.len() <= logs::MAX_SOURCE_BYTES + 2_048 {
+        content.push_str(&filler_line);
+    }
+    content.push_str(&line(
+        &ts,
+        "ERROR",
+        "rpc_request_failed",
+        &format!("{} {} {}", sentinels[0], sentinels[1], sentinels[2]),
+    ));
+    content.push('\n');
+
+    let (_directory, source) = source(&content);
+    let key = connect::DeviceIdentity::generate();
+    let export = export_logs_from(&req, &key, &CancellationToken::new(), &source)
+        .await
+        .expect("oversized batch source should export bounded tail");
+    assert_eq!(export.event_count, 1);
+    assert!(
+        export.dropped_event_count >= 1,
+        "source larger than MAX_SOURCE_BYTES must account for truncated prefix and dropped lines"
+    );
+    assert_archive_contains_no_sentinels(&export, &sentinels);
+}
+
+#[tokio::test]
+async fn mid_flight_cancellation_and_concurrent_busy_release_collector_lease() {
+    let _guard = TEST_LOCK.lock().await;
+    let mut live_req = request(CaptureMode::Live);
+    live_req.duration = Duration::from_secs(5);
+    let mut batch_req = request(CaptureMode::Batch);
+    batch_req.duration = Duration::from_secs(2);
+    let ts = timestamp(batch_req.produced_at_unix - 1, 0);
+    let (_directory, source) = source(&format!("{}\n", line(&ts, "INFO", "http_startup_endpoints", "safe-recovery")));
+    let key = connect::DeviceIdentity::generate();
+
+    let live_cancel = CancellationToken::new();
+    let live_source = source.clone();
+    let live_cancel_clone = live_cancel.clone();
+    let live_key = connect::DeviceIdentity::generate();
+    let started = std::time::Instant::now();
+    let live_handle = tokio::spawn(async move { export_logs_from(&live_req, &live_key, &live_cancel_clone, &live_source).await });
+
+    // Yield once so the spawned live capture enters `export_logs_from`, acquires
+    // `CollectorLease`, and parks on `capture_live`'s `tokio::select!`.
+    tokio::task::yield_now().await;
+
+    // A concurrent capture must now fail closed with `LogCaptureError::Busy`.
+    let concurrent_err = export_logs_from(&batch_req, &key, &CancellationToken::new(), &source)
+        .await
+        .expect_err("concurrent capture must fail with LogCaptureError::Busy while live capture holds lease");
+    assert!(
+        matches!(concurrent_err, LogCaptureError::Busy),
+        "expected LogCaptureError::Busy while live capture holds lease, got {concurrent_err:?}"
+    );
+
+    live_cancel.cancel();
+    let live_result = live_handle.await.expect("live capture task should not panic");
+    assert!(matches!(live_result, Err(LogCaptureError::Cancelled)));
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "mid-flight cancellation must terminate promptly instead of waiting full 5s duration"
+    );
+
+    // After cancellation, the collector lease must be released so the next
+    // valid capture succeeds immediately.
+    let recovery = export_logs_from(&batch_req, &key, &CancellationToken::new(), &source)
+        .await
+        .expect("subsequent capture must succeed once cancelled capture releases collector lease");
+    assert_eq!(recovery.event_count, 1);
+}
+
+#[tokio::test]
+async fn source_io_failure_releases_lease_and_hides_raw_source_path() {
+    let _guard = TEST_LOCK.lock().await;
+    let dir = tempfile::Builder::new()
+        .prefix("SENTINEL_LOG_DIR_PATH_")
+        .tempdir()
+        .expect("temporary log directory with sentinel name");
+    let log_path = dir.path().join("rustfs.log");
+    let mut req = request(CaptureMode::Batch);
+    req.duration = Duration::from_secs(2);
+    let ts = timestamp(req.produced_at_unix - 1, 0);
+    let valid_line = format!("{}\n", line(&ts, "INFO", "http_startup_endpoints", "recovered"));
+    fs::write(&log_path, &valid_line).expect("write initial active log");
+    let source = ConfiguredLogSource::new(dir.path(), "rustfs.log").expect("configured log source");
+    let key = connect::DeviceIdentity::generate();
+
+    // Remove the file after source discovery to inject a real read I/O failure.
+    fs::remove_file(&log_path).expect("remove log file to inject I/O failure");
+    let io_err = export_logs_from(&req, &key, &CancellationToken::new(), &source)
+        .await
+        .expect_err("removed active log file must fail with LogCaptureError::Io");
+    assert!(matches!(io_err, LogCaptureError::Io(_)));
+    let err_display = io_err.to_string();
+    assert_eq!(err_display, "logs_io_failed");
+    assert!(
+        !err_display.contains("SENTINEL_LOG_DIR_PATH_"),
+        "error display must not leak raw filesystem path: {err_display}"
+    );
+
+    // On Unix, also prove replacing the file with a symlink fails closed via O_NOFOLLOW.
+    #[cfg(unix)]
+    {
+        let outside = tempfile::NamedTempFile::new().expect("outside target");
+        symlink(outside.path(), &log_path).expect("replace active log with symlink");
+        let symlink_err = export_logs_from(&req, &key, &CancellationToken::new(), &source)
+            .await
+            .expect_err("symlink replacement must fail closed via O_NOFOLLOW");
+        assert!(matches!(symlink_err, LogCaptureError::Io(_)));
+        fs::remove_file(&log_path).expect("remove injected symlink");
+    }
+
+    // Restore a regular log file and verify the collector lease was released
+    // across both I/O failures so the next valid capture succeeds.
+    fs::write(&log_path, &valid_line).expect("restore active log file");
+    let recovered = export_logs_from(&req, &key, &CancellationToken::new(), &source)
+        .await
+        .expect("capture after I/O failures must succeed once collector lease is released");
+    assert_eq!(recovered.event_count, 1);
+}
+
+#[tokio::test]
+async fn save_failure_preserves_existing_file_cleans_partial_and_recovers_after_readonly_dir() {
+    let _guard = TEST_LOCK.lock().await;
+    let mut req = request(CaptureMode::Batch);
+    req.duration = Duration::from_secs(2);
+    let ts = timestamp(req.produced_at_unix - 1, 0);
+    let (_directory, source) = source(&format!("{}\n", line(&ts, "INFO", "http_startup_endpoints", "save-recovery")));
+    let key = connect::DeviceIdentity::generate();
+
+    // Verify additional typed validation rejections leave the collector lease free.
+    let mut expired_consent = req.clone();
+    expired_consent.consent.expires_at_unix = req.produced_at_unix - 1;
+    assert!(matches!(
+        export_logs_from(&expired_consent, &key, &CancellationToken::new(), &source).await,
+        Err(LogCaptureError::ConsentExpired)
+    ));
+    let mut expired_request = req.clone();
+    expired_request.expires_at_unix = req.produced_at_unix - 1;
+    assert!(matches!(
+        export_logs_from(&expired_request, &key, &CancellationToken::new(), &source).await,
+        Err(LogCaptureError::Expired)
+    ));
+    let mut bad_version = req.clone();
+    bad_version.schema_version = 99;
+    assert!(matches!(
+        export_logs_from(&bad_version, &key, &CancellationToken::new(), &source).await,
+        Err(LogCaptureError::UnsupportedVersion)
+    ));
+    let mut bad_capability = req.clone();
+    bad_capability.capability = "logs.capture@99".to_string();
+    assert!(matches!(
+        export_logs_from(&bad_capability, &key, &CancellationToken::new(), &source).await,
+        Err(LogCaptureError::UnsupportedCapability)
+    ));
+
+    let export = export_logs_from(&req, &key, &CancellationToken::new(), &source)
+        .await
+        .expect("valid capture should succeed after rejected requests");
+
+    // 1. Existing target file must never be overwritten, and no `.partial` temp file may remain.
+    let output_dir = tempfile::tempdir().expect("output directory");
+    let existing = output_dir.path().join("existing.zip");
+    fs::write(&existing, b"pre-existing-operator-file").expect("seed existing destination");
+    assert!(matches!(
+        save_signed_log_export(&existing, &export, &CancellationToken::new()),
+        Err(LogCaptureError::AlreadyExists)
+    ));
+    assert_eq!(
+        fs::read(&existing).expect("read existing file"),
+        b"pre-existing-operator-file",
+        "no-clobber failure must preserve existing file bytes"
+    );
+    let leftovers: Vec<_> = fs::read_dir(output_dir.path())
+        .expect("list output directory")
+        .filter_map(Result::ok)
+        .filter(|entry| entry.file_name().to_string_lossy().ends_with(".partial"))
+        .collect();
+    assert!(
+        leftovers.is_empty(),
+        "failed no-clobber save must clean up partial temporary files: {leftovers:?}"
+    );
+
+    // 2. Missing parent directory fails with Io and leaves no partial artifact.
+    let missing_target = output_dir.path().join("missing-subdir").join("logs.zip");
+    assert!(matches!(
+        save_signed_log_export(&missing_target, &export, &CancellationToken::new()),
+        Err(LogCaptureError::Io(_))
+    ));
+    assert!(!missing_target.exists());
+
+    // 3. Read-only directory fails with Io, leaves no target/partial file, and
+    //    succeeds after restoring write permission (non-root Unix).
+    #[cfg(unix)]
+    {
+        let is_root = std::process::Command::new("id")
+            .arg("-u")
+            .output()
+            .ok()
+            .and_then(|output| String::from_utf8(output.stdout).ok())
+            .is_some_and(|uid| uid.trim() == "0");
+        if !is_root {
+            let ro_dir = output_dir.path().join("readonly");
+            fs::create_dir(&ro_dir).expect("create readonly test dir");
+            fs::set_permissions(&ro_dir, fs::Permissions::from_mode(0o500)).expect("make directory read-only");
+            let ro_target = ro_dir.join("logs.zip");
+            let ro_err = save_signed_log_export(&ro_target, &export, &CancellationToken::new());
+            // Restore permissions before assertions so tempdir cleanup always succeeds.
+            fs::set_permissions(&ro_dir, fs::Permissions::from_mode(0o700)).expect("restore writable directory");
+            assert!(
+                matches!(ro_err, Err(LogCaptureError::Io(_))),
+                "read-only destination directory must fail with LogCaptureError::Io, got {ro_err:?}"
+            );
+            assert!(!ro_target.exists(), "failed save must not leave an incomplete receipt file");
+
+            let recovered_receipt = save_signed_log_export(&ro_target, &export, &CancellationToken::new())
+                .expect("save must succeed after directory permissions are restored");
+            assert_eq!(recovered_receipt.archive_sha256, export.archive_sha256);
+            assert_eq!(fs::metadata(&ro_target).expect("metadata").permissions().mode() & 0o777, 0o600);
+        }
+    }
+}
+
 fn hex(bytes: &[u8]) -> String {
     let mut encoded = String::with_capacity(bytes.len() * 2);
     for byte in bytes {

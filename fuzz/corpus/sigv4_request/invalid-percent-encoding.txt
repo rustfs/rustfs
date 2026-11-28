@@ -1,0 +1,2 @@
+GET https://bucket.example.com/object?bad=%ZZ&truncated=%2&empty=%
+host: bucket.example.com

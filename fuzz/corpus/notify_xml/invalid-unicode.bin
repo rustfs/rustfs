@@ -1,0 +1,1 @@
+<NotificationConfiguration><QueueConfiguration><Id>ÿþý</Id><Queue>arn:rustfs:sqs:us-east-1:1:webhook</Queue><Event>s3:ObjectCreated:Put</Event></QueueConfiguration></NotificationConfiguration>

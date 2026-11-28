@@ -15,7 +15,7 @@ import tomllib
 import unittest
 
 ROOT = Path(__file__).resolve().parent.parent
-ALWAYS_JOBS = ("classify-changes", "typos", "quick-checks", "security-advisories")
+ALWAYS_JOBS = ("classify-changes", "typos", "quick-checks", "security-advisories", "security-input-gate")
 CODE_JOBS = (
     "workspace-clippy", "workspace-lint-and-build", "workspace-tests", "core-contract", "connect-feature-boundaries", "fips-provider",
     "test-and-lint-protocols", "build-rustfs-debug-binary", "uring-integration",
@@ -34,7 +34,7 @@ NIGHTLY_JOBS = ("connect-feature-boundaries", "fips-provider", "uring-integratio
 # against this revision's expected job contract. The workflow refuses a plan
 # that does not carry the current marker and falls back to the full matrix, so
 # a base planner predating the contract cannot authorize a narrower selection.
-PLAN_CONTRACT = "10"
+PLAN_CONTRACT = "11"
 # These jobs still exercise the server and its black-box harness when only E2E
 # Rust sources change. Production code, manifests and shared test configuration
 # always select the full matrix. No production package depends on e2e_test.
@@ -61,6 +61,9 @@ HIT_SKIP = "steps.setup.outputs.cache-hit != 'true'"
 LINT_COMMANDS = ("cargo clippy --all-targets -- -D warnings", "python3 scripts/ci_test_artifact.py cargo lint --configuration workspace")
 ADVISORIES_JOB = "security-advisories"
 ADVISORIES_COMMAND = "python3 scripts/security/check_advisories.py"
+SECURITY_INPUT_JOB = "security-input-gate"
+SECURITY_INPUT_WORKFLOW = "./.github/workflows/fuzz.yml"
+SECURITY_INPUT_REQUIRED_WITH = ("mode", "targets", "max_total_time", "base_sha", "head_sha", "event_name", "ref_name", "ci_mode")
 OPTIONAL_JOBS = ("e2e-full",)
 NON_VALIDATION_JOBS = {"required-checks", "cancel-closed-pr-runs", "alert-on-failure"}
 
@@ -703,6 +706,31 @@ def check_advisories_lane(jobs: dict) -> list[str]:
     return errors
 
 
+def check_security_input_gate_lane(jobs: dict) -> list[str]:
+    """Keep security-input-gate calling the reusable fuzz workflow with bounded inputs."""
+    errors = []
+    block = jobs.get(SECURITY_INPUT_JOB, {})
+    if block.get("name") != "Security Input Gate":
+        errors.append(f"{SECURITY_INPUT_JOB} must keep stable display name 'Security Input Gate'")
+    if block.get("uses") != SECURITY_INPUT_WORKFLOW:
+        errors.append(f"{SECURITY_INPUT_JOB} must call reusable workflow {SECURITY_INPUT_WORKFLOW}")
+    if "classify-changes" not in job_needs(jobs, SECURITY_INPUT_JOB):
+        errors.append(f"{SECURITY_INPUT_JOB} must depend on classify-changes for ci_mode")
+    inputs = block.get("with", {})
+    if not isinstance(inputs, dict):
+        errors.append(f"{SECURITY_INPUT_JOB} must pass typed with inputs")
+    else:
+        missing = [key for key in SECURITY_INPUT_REQUIRED_WITH if key not in inputs]
+        extra = sorted(set(inputs) - set(SECURITY_INPUT_REQUIRED_WITH))
+        if missing:
+            errors.append(f"{SECURITY_INPUT_JOB} missing required with inputs: {', '.join(missing)}")
+        if extra:
+            errors.append(f"{SECURITY_INPUT_JOB} has unexpected with inputs: {', '.join(extra)}")
+        if inputs.get("mode") != "smoke":
+            errors.append(f"{SECURITY_INPUT_JOB} must invoke fuzz.yml in smoke mode")
+    return errors
+
+
 def check_workflow(root: Path) -> list[str]:
     try:
         document = workflow_document((root / ".github/workflows/ci.yml").read_text())
@@ -739,6 +767,7 @@ def check_workflow(root: Path) -> list[str]:
         errors.append("required-checks must unconditionally verify actual needs and preserve its exit status")
     errors.extend(check_lint_lane(jobs))
     errors.extend(check_advisories_lane(jobs))
+    errors.extend(check_security_input_gate_lane(jobs))
     errors.extend(check_plan_contract_marker(jobs))
     matrix = jobs.get("test-and-lint-protocols", {}).get("strategy", {}).get("matrix", {})
     features = matrix.get("features", [])
