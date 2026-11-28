@@ -50,7 +50,7 @@ impl Injector for MetadataInjector<'_> {
     }
 }
 
-fn current_trace_id() -> Option<String> {
+pub(crate) fn current_trace_id() -> Option<String> {
     let current_context = Span::current().context();
     let current_span = current_context.span();
     let span_context = current_span.span_context();
