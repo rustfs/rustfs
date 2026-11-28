@@ -29,7 +29,7 @@ The value is unset by default, and a deployment that neither configures a KMS no
 
 > **Warning: default RustFS builds fail closed on objects that MinIO encrypted.** This applies to SSE-S3, SSE-KMS, and SSE-C, whichever KMS backend you configure; configuring `Static` with MinIO's key material does not make them readable. Such objects list and HEAD normally (their `xl.meta` parses), and only the payload read fails — with S3 `InvalidObjectState`, never plaintext. Read a sample of encrypted objects, not just their listings, before decommissioning the MinIO deployment.
 
-The read path exists behind the `rio-v2` feature as a migration-only build, the reverse direction (RustFS-written SSE objects read by MinIO) is unsupported, and the migration options are enumerated in [MinIO file-format interoperability, Part C](../architecture/minio-file-format-compat.md#part-c--server-side-encryption-sse). The AWS KMS and MinIO KES wire protocols are non-targets of that document and of this one.
+The read path exists behind the `m-compatible` feature as a migration-only build, the reverse direction (RustFS-written SSE objects read by MinIO) is unsupported, and the migration options are enumerated in [MinIO file-format interoperability, Part C](../architecture/minio-file-format-compat.md#part-c--server-side-encryption-sse). The AWS KMS and MinIO KES wire protocols are non-targets of that document and of this one.
 
 ## Vault KV2: what the backend does and does not do
 
@@ -192,7 +192,7 @@ Rollout and rollback constraints: reading `0x03` segments is unconditional and r
 
 Every SSE-S3 and SSE-KMS data key is wrapped under an encryption context that includes the entry `{"<bucket>": "<bucket>/<object>"}`. Only the client-supplied part of the context (`x-amz-server-side-encryption-context`) is stored with the object; the location entry is rebuilt from the object's current location on every read, so a data key does not open at another location. How strongly that is enforced depends on the backend, as described above.
 
-A client context entry whose key equals the bucket name would replace the location entry, so SSE-KMS writes refuse it with `400 InvalidArgument`. Other keys, including the names of other buckets, are accepted. Objects that an earlier release stored with such an entry remain readable. Builds with the `rio-v2` feature additionally bind each object key to its location when sealing it.
+A client context entry whose key equals the bucket name would replace the location entry, so SSE-KMS writes refuse it with `400 InvalidArgument`. Other keys, including the names of other buckets, are accepted. Objects that an earlier release stored with such an entry remain readable. Builds with the `m-compatible` feature additionally bind each object key to its location when sealing it.
 
 ### Guarantees that hold only once every node is upgraded
 

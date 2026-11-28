@@ -15,7 +15,7 @@
 //! The provider that wraps data keys with a node-local master key when no KMS is configured.
 
 use crate::error::SseError;
-#[cfg(feature = "rio-v2")]
+#[cfg(feature = "m-compatible")]
 use crate::kms::minio::{decrypt_minio_kms_data_key, minio_kms_associated_data};
 use crate::kms::provider::SseDekProvider;
 use aes_gcm::aead::{Aead, KeyInit};
@@ -61,7 +61,7 @@ pub(crate) fn local_master_key_configured() -> bool {
     local_master_key_env_value().is_some()
 }
 
-#[cfg(feature = "rio-v2")]
+#[cfg(feature = "m-compatible")]
 /// Returns true when a managed-SSE data key is one RustFS itself wrote.
 ///
 /// Both RustFS envelope shapes are strict JSON — the KMS envelope
@@ -189,6 +189,12 @@ impl LocalSseDekProvider {
         Ok(Self { master_key })
     }
 
+    /// The master key, for the MinIO builtin-KMS formats that seal with it directly.
+    #[cfg(feature = "m-compatible")]
+    pub(crate) fn master_key(&self) -> &[u8; 32] {
+        &self.master_key
+    }
+
     // Simple encryption of DEK
     pub fn encrypt_dek(dek: [u8; 32], cmk_value: [u8; 32]) -> Result<String, SseError> {
         // Use AES-256-GCM to encrypt DEK
@@ -310,7 +316,7 @@ impl SseDekProvider for LocalSseDekProvider {
         Ok(dek)
     }
 
-    #[cfg(feature = "rio-v2")]
+    #[cfg(feature = "m-compatible")]
     async fn decrypt_minio_sse_dek(
         &self,
         encrypted_dek: &[u8],

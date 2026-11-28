@@ -42,7 +42,14 @@ impl GetObjectReadCondition for ConditionalRead {
         if metadata.bucket != self.bucket || metadata.object != self.object || metadata.delete_marker {
             return false;
         }
-        evaluate_read_preconditions(&self.headers, metadata.etag, metadata.mod_time).is_err()
+        // A stored ETag in sealed form is not the one the client was answered
+        // with, and telling which one it was can need a key. Such a read is
+        // never ended here on an ETag condition: the request layer decides it
+        // against the ETag the response carries.
+        let etag_decided_later = (self.headers.contains_key(http::header::IF_MATCH)
+            || self.headers.contains_key(http::header::IF_NONE_MATCH))
+            && crate::storage::sse::stored_etag_may_be_sealed(metadata.etag);
+        (!etag_decided_later && evaluate_read_preconditions(&self.headers, metadata.etag, metadata.mod_time).is_err())
             || self
                 .part_number
                 .is_some_and(|number| number > 1 && !metadata.parts.iter().any(|part| part.number == number))
@@ -2608,7 +2615,17 @@ impl DefaultObjectUsecase {
                 input.version_id.as_deref(),
             ));
         }
-        let result = check_preconditions(envelope.headers(), info)
+        // An ETag condition is compared with the ETag the response carries,
+        // the only one a client has seen for this object. Resolving it can
+        // cost a key unwrap, so a request that names no ETag skips it.
+        let names_etag = envelope.headers().contains_key(http::header::IF_MATCH)
+            || envelope.headers().contains_key(http::header::IF_NONE_MATCH);
+        let response_etag = if names_etag {
+            crate::storage::sse::read_response_etag(bucket, key, &info.user_defined, info.etag.as_deref()).await
+        } else {
+            None
+        };
+        let result = check_preconditions_with_etag(envelope.headers(), info, response_etag.as_deref().or(info.etag.as_deref()))
             .map_err(|mut error| {
                 if error.message().is_none()
                     && let Some(message) = error.code().default_message()
@@ -4286,9 +4303,10 @@ impl DefaultObjectUsecase {
         record_get_object_s3_handler_stage_duration(GET_OBJECT_STAGE_METADATA_FILTER, metadata_filter_start);
         let output_struct_start = rustfs_io_metrics::get_stage_metrics_enabled().then(std::time::Instant::now);
         let parts_count = Self::get_object_parts_count(part_number, &info);
+        let response_etag = crate::storage::sse::read_response_etag(bucket, key, &info.user_defined, info.etag.as_deref()).await;
         let output = GetObjectOutputFacts {
             body: Some(body),
-            etag: info.etag.as_deref().map(ResponseEtag::from_stored),
+            etag: response_etag.as_deref().map(ResponseEtag::from_stored),
             dto: gateway_dto::GetObjectOutput {
                 content_length: Some(http_content_length),
                 last_modified: last_modified.map(timestamp),
@@ -6413,6 +6431,46 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// The storage layer ends a conditional read on the stored ETag before any
+    /// body is opened. A stored ETag in sealed form is not the one the client
+    /// holds, so a build that reads such ETags leaves the ETag conditions on
+    /// it to the request layer; ending the read there would answer a matching
+    /// `If-Match` with no body.
+    #[test]
+    fn storage_layer_leaves_etag_conditions_on_a_sealed_etag_to_the_request_layer() {
+        const SEALED: &str = "20000f00ae1b28a996b85ecef920fb8da6843e2838328dbfef3a9a266201f27ee3f8c64555ea36a2196275c2261d745d";
+        let terminal = |name: http::HeaderName, condition: &str, stored_etag: &str| {
+            let mut headers = HeaderMap::new();
+            headers.insert(name, HeaderValue::from_str(condition).expect("condition header"));
+            ConditionalRead {
+                bucket: "bucket".to_owned(),
+                object: "object".to_owned(),
+                headers,
+                part_number: None,
+            }
+            .is_terminal(GetObjectReadMetadata {
+                bucket: "bucket",
+                object: "object",
+                etag: Some(stored_etag),
+                mod_time: None,
+                parts: &[],
+                delete_marker: false,
+            })
+        };
+
+        assert!(terminal(http::header::IF_NONE_MATCH, "\"abc\"", "abc"));
+        assert!(terminal(http::header::IF_MATCH, "\"other\"", "abc"));
+        assert!(!terminal(http::header::IF_MATCH, "\"abc\"", "abc"));
+
+        let decided_by_storage = !cfg!(feature = "m-compatible");
+        let answered = format!("\"{}\"", &SEALED[SEALED.len() - 32..]);
+        assert_eq!(terminal(http::header::IF_MATCH, &answered, SEALED), decided_by_storage);
+        assert_eq!(
+            terminal(http::header::IF_NONE_MATCH, &format!("\"{SEALED}\""), SEALED),
+            decided_by_storage
+        );
     }
 
     #[tokio::test]

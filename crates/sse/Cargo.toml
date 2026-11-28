@@ -29,9 +29,9 @@ workspace = true
 
 [features]
 default = []
-# MinIO-compatible sealed object keys (DARE). Mirrors the `rio-v2` feature of
+# MinIO-compatible sealed object keys (DARE). Mirrors the `m-compatible` feature of
 # the server binary, which enables both together.
-rio-v2 = ["dep:chacha20poly1305", "dep:hmac", "dep:sha2"]
+m-compatible = ["dep:chacha20poly1305", "dep:hex-simd", "dep:hmac", "dep:sha2"]
 # Test seams for dependents: per-principal authorization overrides, DEK
 # provider injection and metadata fixtures. Never enable in a release build.
 test-util = []
@@ -50,6 +50,7 @@ aes-gcm = { workspace = true, features = ["rand_core", "zeroize"] }
 async-trait = { workspace = true }
 base64-simd = { workspace = true }
 chacha20poly1305 = { workspace = true, optional = true }
+hex-simd = { workspace = true, optional = true }
 hmac = { workspace = true, optional = true }
 http = { workspace = true }
 md-5 = { workspace = true }

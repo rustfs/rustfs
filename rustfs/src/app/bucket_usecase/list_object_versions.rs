@@ -121,7 +121,7 @@ fn list_object_versions_output(
             versions.push(gateway_dto::ObjectVersion {
                 key,
                 last_modified,
-                size: object.size,
+                size: object.get_actual_size_or_physical(),
                 version_id: listed_version_id(object.version_id),
                 is_latest: object.is_latest,
                 e_tag: listed_etag(object),
@@ -239,6 +239,49 @@ mod tests {
             .collect();
         assert_eq!(markers, [("obj-delete-marker", "null", false), ("obj-null-delete-marker", "null", true)]);
         assert_eq!(output.common_prefixes[0].prefix, "photos and more/");
+    }
+
+    #[test]
+    fn a_version_lists_its_logical_size_not_its_stored_size() {
+        let mut compressed = HashMap::new();
+        rustfs_utils::http::insert_str(
+            &mut compressed,
+            rustfs_utils::http::SUFFIX_COMPRESSION,
+            "klauspost/compress/s2".to_owned(),
+        );
+        rustfs_utils::http::insert_str(&mut compressed, rustfs_utils::http::SUFFIX_ACTUAL_SIZE, "307200".to_owned());
+        let encrypted = HashMap::from([
+            ("x-amz-server-side-encryption".to_owned(), "AES256".to_owned()),
+            ("x-rustfs-encryption-original-size".to_owned(), "4096".to_owned()),
+        ]);
+        let info = ListObjectVersionsInfo {
+            objects: vec![
+                ObjectInfo {
+                    size: 106,
+                    user_defined: Arc::new(compressed),
+                    ..entry("compressed")
+                },
+                ObjectInfo {
+                    size: 4128,
+                    user_defined: Arc::new(encrypted),
+                    ..entry("encrypted")
+                },
+                ObjectInfo {
+                    size: 7,
+                    ..entry("plain")
+                },
+            ],
+            ..Default::default()
+        };
+
+        let output = output(info, params(None, None, 10));
+
+        let sizes: Vec<_> = output
+            .versions
+            .iter()
+            .map(|version| (version.key.as_str(), version.size))
+            .collect();
+        assert_eq!(sizes, [("compressed", 307200), ("encrypted", 4096), ("plain", 7)]);
     }
 
     #[test]

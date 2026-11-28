@@ -29,4 +29,4 @@ The final partial block is part of the stream; the recorded totals are the Index
 | Historical index | 47 | `ff4fb74d14a8ddc0d3c31d565c30b62e142df02ac0d19fa270c666b98a8e7171` |
 | Current index | 51 | `8a819221f9bdaa2bd05e14eead2833746ea01cb1c68086bffa25a731c252174e` |
 
-Tests exercise the production read planner and GetObjectReader rather than decoding the expected bytes with a replacement implementation. Historical-body and fallback cases apply to both legacy and rio-v2 builds; the exact legacy indexed-offset control is feature-gated because each backend has its own index representation. No throughput or application-level release qualification is inferred from these fixtures.
+Tests exercise the production read planner and GetObjectReader rather than decoding the expected bytes with a replacement implementation. Historical-body and fallback cases apply to both legacy and m-compatible builds; the exact legacy indexed-offset control is feature-gated because each backend has its own index representation. No throughput or application-level release qualification is inferred from these fixtures.

@@ -22,7 +22,7 @@ use crate::core::keying::context::{build_object_encryption_context, decode_minio
 use crate::core::keying::direct::{read_stored_ssec_nonce, read_wrapped_data_key};
 use crate::core::keying::material::EncryptionKeyKind;
 use crate::core::keying::metadata::recode_minio_kms_context;
-#[cfg(feature = "rio-v2")]
+#[cfg(feature = "m-compatible")]
 use crate::core::keying::object::{
     infer_minio_managed_sse_type, is_legacy_rustfs_managed_metadata, parse_minio_managed_sealed_key, read_sealed_data_key,
     unseal_object_key,
@@ -31,9 +31,9 @@ use crate::core::keying::{StoredDataKey, StoredKeyMode};
 use crate::error::SseError;
 use crate::host::SseHost;
 use crate::kms::local::is_local_sse_dek;
-#[cfg(feature = "rio-v2")]
+#[cfg(feature = "m-compatible")]
 use crate::kms::local::is_rustfs_managed_data_key;
-#[cfg(feature = "rio-v2")]
+#[cfg(feature = "m-compatible")]
 use crate::kms::provider::decrypt_unenveloped_sealed_dek;
 use crate::kms::provider::{SseDekProvider, bare_data_key_kms_provider, get_local_sse_dek_provider, kms_sse_dek_provider};
 use rustfs_kms::is_data_key_envelope;
@@ -76,11 +76,11 @@ fn stored_managed_sse_type(metadata: &HashMap<String, String>) -> Option<SSEType
         // deliberately not through an error raised here: the read plan independently
         // classifies the object as encrypted from its markers and refuses to serve
         // it without material, so it never degrades into a plaintext read.
-        #[cfg(feature = "rio-v2")]
+        #[cfg(feature = "m-compatible")]
         None => infer_minio_managed_sse_type(metadata),
         // Without the rio-v2 reader there is no MinIO-format read path to serve
         // such an object with, so it stays on the fail-closed branch.
-        #[cfg(not(feature = "rio-v2"))]
+        #[cfg(not(feature = "m-compatible"))]
         None => None,
     }
 }
@@ -95,7 +95,7 @@ pub(crate) fn open_under_customer_key(
     bucket: &str,
     key: &str,
 ) -> Result<OpenedObjectKey, SseError> {
-    #[cfg(feature = "rio-v2")]
+    #[cfg(feature = "m-compatible")]
     if let Some(sealed_key) = parse_minio_managed_sealed_key(metadata, SSEType::SseC)? {
         return Ok(OpenedObjectKey {
             key_bytes: unseal_object_key(&sealed_key, customer_key, SSEType::SseC, bucket, key)?,
@@ -121,6 +121,28 @@ pub(crate) struct StoredManagedKey<'a> {
     pub(crate) sse_type: SSEType,
     /// The KMS key id the object recorded, if it recorded one.
     pub(crate) recorded_kms_key_id: Option<String>,
+}
+
+/// Prefix MinIO puts on the key id of every `aws:kms` response
+/// (`internal/crypto`, `ARNPrefix`).
+const MINIO_KMS_KEY_ARN_PREFIX: &str = "arn:aws:kms:";
+
+impl StoredManagedKey<'_> {
+    /// The key id an `aws:kms` response advertises for this object.
+    ///
+    /// An object that stores its public scheme header is answered with the key
+    /// id it recorded. One that stores none was written by MinIO, which
+    /// advertises its key ids in ARN form (`cmd/encryption-v1.go`,
+    /// `kmsKeyIDFromMetadata`); a client that recorded the id MinIO returned
+    /// must see the same value after the drives move to RustFS. `kms_key_id`
+    /// stays the bare id everywhere else: authorization and the unwrap name the
+    /// key itself.
+    pub(crate) fn response_kms_key_id(&self, kms_key_id: String) -> String {
+        if self.metadata.contains_key("x-amz-server-side-encryption") || kms_key_id.starts_with(MINIO_KMS_KEY_ARN_PREFIX) {
+            return kms_key_id;
+        }
+        format!("{MINIO_KMS_KEY_ARN_PREFIX}{kms_key_id}")
+    }
 }
 
 /// Recognize a stored managed-SSE object.
@@ -167,7 +189,7 @@ pub(crate) async fn open_under_stored_data_key(
             base_nonce,
             key_kind: EncryptionKeyKind::Direct,
         },
-        #[cfg(feature = "rio-v2")]
+        #[cfg(feature = "m-compatible")]
         StoredKeyMode::Object { sealed_key } => OpenedObjectKey {
             key_bytes: unseal_object_key(&sealed_key, data_key, stored.sse_type, bucket, key)?,
             base_nonce: [0u8; 12],
@@ -184,7 +206,7 @@ pub(crate) async fn open_under_stored_data_key(
 /// Direct takes whatever no other mode recognizes. A mode this build cannot read is
 /// not listed, so its objects fail in the Direct reader instead of being misread.
 async fn read_stored_data_key(host: &dyn SseHost, stored: &StoredManagedKey<'_>) -> Result<StoredDataKey, SseError> {
-    #[cfg(feature = "rio-v2")]
+    #[cfg(feature = "m-compatible")]
     if let Some(sealed_key) = parse_minio_managed_sealed_key(stored.metadata, stored.sse_type)? {
         return read_sealed_data_key(stored.metadata, &stored.normalized_metadata, sealed_key);
     }
@@ -230,7 +252,7 @@ async fn unwrap_stored_data_key(
     // JSON; MinIO's builtin-KMS ciphertext is opaque bytes that match neither, so
     // recognizing RustFS positively — and treating only the remainder as MinIO —
     // keeps a RustFS envelope from ever reaching MinIO's decoder.
-    #[cfg(feature = "rio-v2")]
+    #[cfg(feature = "m-compatible")]
     if matches!(record.mode, StoredKeyMode::Object { .. }) && !is_rustfs_managed_data_key(wrapped) {
         return decrypt_unenveloped_sealed_dek(bare_kms, get_local_sse_dek_provider(), wrapped, kms_key_id, &object_context)
             .await;
@@ -244,7 +266,7 @@ async fn unwrap_stored_data_key(
         get_local_sse_dek_provider()?
     };
 
-    #[cfg(feature = "rio-v2")]
+    #[cfg(feature = "m-compatible")]
     if is_legacy_rustfs_managed_metadata(&stored.normalized_metadata) {
         return provider.decrypt_legacy_sse_dek(wrapped, kms_key_id, &object_context).await;
     }

@@ -17,6 +17,15 @@
 use super::*;
 use std::sync::Arc;
 
+/// User metadata `key` as a client reads it back from stored `metadata`.
+///
+/// Tests assert on this rather than on a stored key: the key user metadata is
+/// stored under differs between build variants, the value a client reads back
+/// does not.
+pub(super) fn visible_user_metadata(metadata: &HashMap<String, String>, key: &str) -> Option<String> {
+    filter_object_metadata(metadata).and_then(|visible| visible.get(key).cloned())
+}
+
 pub(super) async fn real_cold_fill_test_context() -> (Arc<ECStore>, Arc<AppContext>) {
     let store = crate::app::gating_test_env::shared_gating_ecstore().await;
     if current_app_context().is_none() {

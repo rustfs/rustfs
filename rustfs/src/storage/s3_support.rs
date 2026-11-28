@@ -605,9 +605,19 @@ pub(crate) fn validate_bucket_object_lock_enabled_state(bucket: &str, state: &Ob
 /// has not changed), allowing the caller to translate this into the correct
 /// HTTP response.
 pub(crate) fn check_preconditions(headers: &HeaderMap, info: &ObjectInfo) -> S3Result<()> {
-    match evaluate_read_preconditions(headers, info.etag.as_deref(), info.mod_time) {
+    check_preconditions_with_etag(headers, info, info.etag.as_deref())
+}
+
+/// [`check_preconditions`] for a read that answers with `response_etag`
+/// instead of the stored ETag.
+///
+/// The ETag conditions are compared with `response_etag`, and a `304` carries
+/// it: the client holds the ETag it was answered with, never the stored form
+/// behind it.
+pub(crate) fn check_preconditions_with_etag(headers: &HeaderMap, info: &ObjectInfo, response_etag: Option<&str>) -> S3Result<()> {
+    match evaluate_read_preconditions(headers, response_etag, info.mod_time) {
         Ok(()) => Ok(()),
-        Err(S3ErrorCode::NotModified) => Err(not_modified_error(info)?),
+        Err(S3ErrorCode::NotModified) => Err(not_modified_error(info, response_etag)?),
         Err(code) => Err(S3Error::new(code)),
     }
 }
@@ -661,9 +671,9 @@ pub(crate) fn evaluate_read_preconditions(
     Ok(())
 }
 
-fn not_modified_error(info: &ObjectInfo) -> S3Result<S3Error> {
+fn not_modified_error(info: &ObjectInfo, response_etag: Option<&str>) -> S3Result<S3Error> {
     let mut headers = HeaderMap::new();
-    if let Some(etag) = info.etag.as_deref() {
+    if let Some(etag) = response_etag {
         headers.insert(http::header::ETAG, parse_etag(etag).map_err(S3Error::internal_error)?);
     }
     if let Some(mod_time) = info.mod_time {

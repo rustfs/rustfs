@@ -97,6 +97,15 @@ pub fn migration_startup_error(error: Error) -> std::io::Error {
 /// preserving the original plaintext-only behavior).
 pub type LegacyBlobDecryptFn = Arc<dyn Fn(&[u8]) -> Option<Vec<u8>> + Send + Sync>;
 
+/// [`LegacyBlobDecryptFn`] for IAM records, which also need to know where the
+/// blob was stored.
+///
+/// With a KMS configured, MinIO encrypts every `config/iam/*` object under a
+/// data key bound to the object's own location, so the bytes alone do not
+/// decrypt. The first argument is that location relative to the legacy meta
+/// bucket, for example `config/iam/format.json`.
+pub type LegacyIamBlobDecryptFn = Arc<dyn Fn(&str, &[u8]) -> Option<Vec<u8>> + Send + Sync>;
+
 #[derive(Debug, Serialize, Deserialize)]
 struct CompatIamFormat {
     #[serde(default)]
@@ -389,7 +398,7 @@ where
 /// Lists all objects under the IAM prefix in the source, copies each to the target if not present.
 /// Skips objects that already exist in RustFS (idempotent).
 /// An absent legacy bucket is a no-op; migration errors prevent startup readiness.
-pub async fn try_migrate_iam_config<S>(store: Arc<S>, decrypt_fn: Option<LegacyBlobDecryptFn>) -> Result<()>
+pub async fn try_migrate_iam_config<S>(store: Arc<S>, decrypt_fn: Option<LegacyIamBlobDecryptFn>) -> Result<()>
 where
     S: BucketOperations<Error = crate::error::Error>
         + ListOperations<
@@ -479,7 +488,7 @@ where
             // before normalizing; fall back to the raw bytes when no key applies
             // (plaintext blobs, or nothing to decrypt) so existing behavior holds.
             let data = match &decrypt_fn {
-                Some(decrypt) => decrypt(&data).unwrap_or(data),
+                Some(decrypt) => decrypt(path, &data).unwrap_or(data),
                 None => data,
             };
             let data = match normalize_iam_config_blob(path, &data) {
@@ -667,9 +676,9 @@ mod tests {
         );
 
         // With the decrypt callback recovering plaintext first: normalize succeeds.
-        let decrypt_fn: super::LegacyBlobDecryptFn =
-            std::sync::Arc::new(|data: &[u8]| rustfs_crypto::decrypt_data(b"root-secret-key", data).ok());
-        let recovered = decrypt_fn(&ciphertext).expect("callback should decrypt the identity blob");
+        let decrypt_fn: super::LegacyIamBlobDecryptFn =
+            std::sync::Arc::new(|_path: &str, data: &[u8]| rustfs_crypto::decrypt_data(b"root-secret-key", data).ok());
+        let recovered = decrypt_fn(path, &ciphertext).expect("callback should decrypt the identity blob");
         assert_eq!(recovered, plaintext);
 
         let normalized = normalize_iam_config_blob(path, &recovered)

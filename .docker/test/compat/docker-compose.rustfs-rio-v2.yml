@@ -39,7 +39,7 @@ x-rustfs-rio-v2-node: &rustfs-rio-v2-node
     context: ../..
     dockerfile: Dockerfile.source
     args:
-      RUSTFS_BUILD_FEATURES: "rio-v2"
+      RUSTFS_BUILD_FEATURES: "m-compatible"
   environment: *rustfs-rio-v2-env
   depends_on:
     rustfs-rio-v2-permission-helper:

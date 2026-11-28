@@ -74,7 +74,7 @@ Notes:
 - **RustFS KMS**: Vault (KV2 / Transit) and AWS KMS backends are supported for production. The `Local` and `Static` backends are for development and testing only. See [KMS backend security properties](docs/operations/kms-backend-security.md).
 - **Swift API / SFTP**: opt-in cargo features (`--features swift`, `--features sftp`, or `full`). FTPS and WebDAV are enabled in the default build.
 - **S3 Tables**: ships as an Iceberg REST Catalog with automated PyIceberg and DuckDB coverage; other engines and vendor profiles carry bounded claims listed in the [S3 Tables support matrix](docs/architecture/s3-tables-support-matrix.md).
-- **MinIO On-Disk Compatibility**: gated behind the `rio-v2` feature and not part of the default build. Objects MinIO encrypted are not readable by RustFS. See [MinIO file-format interoperability](docs/architecture/minio-file-format-compat.md).
+- **MinIO On-Disk Compatibility**: gated behind the `m-compatible` feature and not part of the default build. Objects MinIO encrypted are not readable by RustFS. See [MinIO file-format interoperability](docs/architecture/minio-file-format-compat.md).
 
 ## RustFS vs MinIO Performance
 

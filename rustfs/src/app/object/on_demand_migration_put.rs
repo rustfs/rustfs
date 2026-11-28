@@ -495,7 +495,7 @@ mod tests {
         assert_eq!(metadata.get("content-type").map(String::as_str), Some("text/plain; charset=utf-8"));
         assert_eq!(metadata.get("cache-control").map(String::as_str), Some("max-age=60"));
         assert_eq!(metadata.get("content-language").map(String::as_str), Some("en"));
-        assert_eq!(metadata.get("origin").map(String::as_str), Some("legacy"));
+        assert_eq!(visible_user_metadata(metadata, "origin").as_deref(), Some("legacy"));
         assert!(
             !metadata.keys().any(|key| key.eq_ignore_ascii_case("x-amz-storage-class")),
             "source storage class is not copied: {metadata:?}"

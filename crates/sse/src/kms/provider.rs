@@ -71,7 +71,7 @@ pub trait SseDekProvider: Send + Sync {
     }
 
     /// Decrypt a DEK from positively identified legacy managed metadata.
-    #[cfg(feature = "rio-v2")]
+    #[cfg(feature = "m-compatible")]
     async fn decrypt_legacy_sse_dek(
         &self,
         encrypted_dek: &[u8],
@@ -93,7 +93,7 @@ pub trait SseDekProvider: Send + Sync {
     /// Defaults to refusing: only a provider holding the MinIO master secret
     /// can serve these, and a provider that cannot must fail rather than fall
     /// back to a decoder that would misread the bytes.
-    #[cfg(feature = "rio-v2")]
+    #[cfg(feature = "m-compatible")]
     async fn decrypt_minio_sse_dek(
         &self,
         _encrypted_dek: &[u8],
@@ -111,13 +111,13 @@ pub trait SseDekProvider: Send + Sync {
 ///
 /// Two writers produce that shape, and nothing in the bytes tells them apart:
 /// MinIO, whose data key is sealed under the static master key, and a RustFS
-/// `rio-v2` build on a backend that persisted its native ciphertext bare.
+/// `m-compatible` build on a backend that persisted its native ciphertext bare.
 /// MinIO's sealing is authenticated, so opening it under the local master key
 /// is a proof rather than a guess: the bare blob is offered to the KMS only
 /// once that has failed, or when no local master key exists to try. Without a
 /// backend that reads bare ciphertext the MinIO route is the only one, exactly
 /// as before.
-#[cfg(feature = "rio-v2")]
+#[cfg(feature = "m-compatible")]
 pub(crate) async fn decrypt_unenveloped_sealed_dek(
     bare_kms: Option<Arc<dyn SseDekProvider + '_>>,
     local: Result<Arc<dyn SseDekProvider>, SseError>,

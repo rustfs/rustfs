@@ -327,10 +327,18 @@ impl DefaultMultipartUsecase {
 
         let resolved_src_version_id = format_copy_source_version_id(src_info.version_id, src_versioned, src_version_suspended);
 
+        // A source condition is compared with the ETag a read of the source
+        // answers with, the only one a client has seen for it. Resolving it
+        // can cost a key unwrap, so a request that names no ETag skips it.
+        let src_answered_etag = if copy_source_if_match.is_some() || copy_source_if_none_match.is_some() {
+            crate::storage::sse::read_response_etag(&src_bucket, &src_key, &src_info.user_defined, src_info.etag.as_deref()).await
+        } else {
+            None
+        };
         if !copy_source_dates.permits_copy(
             copy_source_if_match.as_ref(),
             copy_source_if_none_match.as_ref(),
-            src_info.etag.as_deref(),
+            src_answered_etag.as_deref().or(src_info.etag.as_deref()),
             src_info.mod_time,
         ) {
             return Err(s3_error!(PreconditionFailed));

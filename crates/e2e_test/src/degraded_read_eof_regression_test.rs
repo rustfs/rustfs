@@ -29,7 +29,7 @@
 //!     the legacy per-part decode in place, and surfaces reconstruction errors
 //!     instead of silently truncating
 //!     (`crates/ecstore/src/set_disk/read.rs`, `set_disk::read` tests ~:4379).
-//!   * rustfs#4585 — DARE (`rio-v2`) detects stream truncation at a package
+//!   * rustfs#4585 — DARE (`m-compatible`) detects stream truncation at a package
 //!     boundary (`crates/rio-v2/src/encrypt_reader.rs`).
 //!
 //! Those unit tests cover the reader layers in isolation. This suite covers the

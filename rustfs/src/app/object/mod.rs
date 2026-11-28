@@ -126,10 +126,10 @@ pub(crate) use super::storage_api::object_usecase::{
 };
 use super::storage_api::object_usecase::{ECStore, OldCurrentSize};
 use super::storage_api::object_usecase::{
-    RFC1123, check_preconditions, parse_object_lock_legal_hold_native, parse_object_lock_retention_native,
-    parse_part_number_i32_to_usize, remove_object_lock_metadata_for_copy, strip_managed_encryption_metadata,
-    validate_bucket_exists, validate_new_object_key, validate_object_key, validate_sse_headers_for_read,
-    validate_sse_headers_for_write, validate_ssec_for_read,
+    RFC1123, check_preconditions, check_preconditions_with_etag, parse_object_lock_legal_hold_native,
+    parse_object_lock_retention_native, parse_part_number_i32_to_usize, remove_object_lock_metadata_for_copy,
+    strip_managed_encryption_metadata, validate_bucket_exists, validate_new_object_key, validate_object_key,
+    validate_sse_headers_for_read, validate_sse_headers_for_write, validate_ssec_for_read,
 };
 use crate::app::runtime_sources::{
     AppContext, current_app_context, current_notify_interface_for_context, current_object_data_cache_for_context,

@@ -318,8 +318,35 @@ pub fn internal_key_strip_suffix_prefix(key: &str, suffix_prefix: &str) -> Optio
     .then(|| rest[suffix_prefix.len()..].to_string())
 }
 
+/// MinIO's reserved prefix in the casing MinIO itself persists for the keys
+/// listed in [`writes_canonical_case_twin`].
+const MINIO_INTERNAL_PREFIX_CANONICAL: &str = "X-Minio-Internal-";
+
+/// Keys MinIO looks up as `ReservedMetadataPrefix + suffix`, an exact-case map
+/// access (`cmd/object-api-utils.go`, `IsCompressed` / `GetActualSize`). The
+/// lowercase twin is invisible to it: a compressed object is then served as its
+/// raw stored stream and sized by its stored length.
+///
+/// Only an `m-compatible` build claims MinIO can read what it wrote, so only
+/// it spells these twins that way. This is the one place in this module that
+/// names the build.
+fn writes_canonical_case_twin(suffix: &str) -> bool {
+    cfg!(feature = "m-compatible") && matches!(suffix, SUFFIX_COMPRESSION | SUFFIX_ACTUAL_SIZE)
+}
+
+/// The MinIO-branded twin written for `suffix`.
+///
+/// Lowercase in every build except for the keys an `m-compatible` build must spell the
+/// way MinIO reads them. RustFS readers match either casing.
+fn minio_key(suffix: &str) -> String {
+    if writes_canonical_case_twin(suffix) {
+        return format!("{MINIO_INTERNAL_PREFIX_CANONICAL}{suffix}");
+    }
+    format!("{MINIO_INTERNAL_PREFIX}{suffix}")
+}
+
 fn both_keys(suffix: &str) -> (String, String) {
-    (format!("{RUSTFS_INTERNAL_PREFIX}{suffix}"), format!("{MINIO_INTERNAL_PREFIX}{suffix}"))
+    (format!("{RUSTFS_INTERNAL_PREFIX}{suffix}"), minio_key(suffix))
 }
 
 /// Longest known suffix ("objectlock-retention-timestamp", 30 bytes) plus the 18-byte prefix fits
@@ -451,6 +478,9 @@ pub fn contains_key_bytes(map: &HashMap<String, Vec<u8>>, suffix: &str) -> bool 
 pub fn remove_bytes(map: &mut HashMap<String, Vec<u8>>, suffix: &str) {
     with_internal_key(RUSTFS_INTERNAL_PREFIX, suffix, |k1| map.remove(k1));
     with_internal_key(MINIO_INTERNAL_PREFIX, suffix, |k2| map.remove(k2));
+    if writes_canonical_case_twin(suffix) {
+        map.remove(&minio_key(suffix));
+    }
 }
 
 /// Strips an internal metadata prefix while preserving the suffix casing.
@@ -579,6 +609,56 @@ mod tests {
         assert!(!contains_key_str(&metadata, SUFFIX_COMPRESSION));
         assert!(!metadata.contains_key("X-Minio-Internal-compression"));
         assert!(contains_key_str(&metadata, SUFFIX_ACTUAL_SIZE));
+    }
+
+    #[test]
+    fn insert_str_writes_both_internal_twins() {
+        let mut metadata = HashMap::new();
+        insert_str(&mut metadata, SUFFIX_COMPRESSION, "klauspost/compress/s2".to_string());
+        insert_str(&mut metadata, SUFFIX_ACTUAL_SIZE, "307200".to_string());
+        insert_str(&mut metadata, SUFFIX_TRANSITION_TIER, "tier-a".to_string());
+
+        assert_eq!(metadata.len(), 6, "each suffix is written under both brands");
+        assert_eq!(metadata["x-rustfs-internal-compression"], "klauspost/compress/s2");
+        assert_eq!(metadata["x-rustfs-internal-actual-size"], "307200");
+        assert_eq!(metadata["x-rustfs-internal-transition-tier"], "tier-a");
+        assert_eq!(metadata["x-minio-internal-transition-tier"], "tier-a");
+
+        // MinIO reads these two keys with an exact-case lookup; only an m-compatible
+        // build claims MinIO can read what it wrote, so only it changes casing.
+        let (compression, actual_size) = if cfg!(feature = "m-compatible") {
+            ("X-Minio-Internal-compression", "X-Minio-Internal-actual-size")
+        } else {
+            ("x-minio-internal-compression", "x-minio-internal-actual-size")
+        };
+        assert_eq!(metadata.get(compression).map(String::as_str), Some("klauspost/compress/s2"));
+        assert_eq!(metadata.get(actual_size).map(String::as_str), Some("307200"));
+
+        assert_eq!(get_str(&metadata, SUFFIX_COMPRESSION).as_deref(), Some("klauspost/compress/s2"));
+        assert_eq!(get_consistent_str(&metadata, SUFFIX_ACTUAL_SIZE), Some("307200"));
+        remove_str(&mut metadata, SUFFIX_COMPRESSION);
+        remove_str(&mut metadata, SUFFIX_ACTUAL_SIZE);
+        assert_eq!(metadata.len(), 2, "removal clears both twins in either casing");
+    }
+
+    #[test]
+    fn byte_valued_twins_follow_the_same_casing_and_are_removed_together() {
+        let mut metadata = HashMap::new();
+        insert_bytes(&mut metadata, SUFFIX_COMPRESSION, b"klauspost/compress/s2".to_vec());
+
+        let minio_twin = if cfg!(feature = "m-compatible") {
+            "X-Minio-Internal-compression"
+        } else {
+            "x-minio-internal-compression"
+        };
+        assert!(metadata.contains_key(minio_twin));
+        assert_eq!(
+            get_bytes(&metadata, SUFFIX_COMPRESSION).as_deref(),
+            Some(b"klauspost/compress/s2".as_slice())
+        );
+
+        remove_bytes(&mut metadata, SUFFIX_COMPRESSION);
+        assert!(metadata.is_empty());
     }
 
     #[test]

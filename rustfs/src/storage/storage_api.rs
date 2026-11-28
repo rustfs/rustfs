@@ -134,12 +134,13 @@ pub(crate) type StorageSelectObjectSnapshot = ecstore_object::SelectObjectSnapsh
 pub(crate) type StorageObjectToDelete = contract::object::ObjectToDelete;
 pub(crate) type StoragePutObjReader = super::PutObjReader;
 pub(crate) use super::s3_support::{
-    RFC1123, apply_bucket_default_lock_retention, apply_cors_headers, check_preconditions, evaluate_read_preconditions,
-    get_buffer_size_opt_in, get_validated_store, has_read_preconditions, load_bucket_object_lock_config_state,
-    parse_object_lock_legal_hold_native, parse_object_lock_retention_native, parse_object_version_id,
-    parse_part_number_i32_to_usize, process_lambda_configurations, process_queue_configurations, process_topic_configurations,
-    remove_object_lock_metadata_for_copy, validate_bucket_exists, validate_bucket_object_lock_enabled_state,
-    validate_list_object_unordered_with_delimiter, validate_new_object_key, validate_object_key,
+    RFC1123, apply_bucket_default_lock_retention, apply_cors_headers, check_preconditions, check_preconditions_with_etag,
+    evaluate_read_preconditions, get_buffer_size_opt_in, get_validated_store, has_read_preconditions,
+    load_bucket_object_lock_config_state, parse_object_lock_legal_hold_native, parse_object_lock_retention_native,
+    parse_object_version_id, parse_part_number_i32_to_usize, process_lambda_configurations, process_queue_configurations,
+    process_topic_configurations, remove_object_lock_metadata_for_copy, validate_bucket_exists,
+    validate_bucket_object_lock_enabled_state, validate_list_object_unordered_with_delimiter, validate_new_object_key,
+    validate_object_key,
 };
 pub(crate) use super::sse::{
     DecryptionRequest, EncryptionRequest, ObjectDekRewrapOutcome, PrepareEncryptionRequest, SseKmsPrincipal,
@@ -491,8 +492,8 @@ pub(crate) mod test_consumer {
         pub(crate) use super::super::super::sse::{RecordingKmsKeyAuthorizer, TestAuthorizationHooks, sse_kms_object_metadata};
     }
     pub(crate) use super::super::{
-        apply_cors_headers, apply_default_lock_retention_metadata, check_preconditions, decode_tags_to_map,
-        get_adaptive_buffer_size_with_profile, get_buffer_size_opt_in, matches_origin_pattern, parse_etag,
+        apply_cors_headers, apply_default_lock_retention_metadata, check_preconditions, check_preconditions_with_etag,
+        decode_tags_to_map, get_adaptive_buffer_size_with_profile, get_buffer_size_opt_in, matches_origin_pattern, parse_etag,
         process_lambda_configurations, process_queue_configurations, process_topic_configurations,
         remove_object_lock_metadata_for_copy, remove_object_lock_retention_metadata, validate_bucket_object_lock_enabled,
         validate_list_object_unordered_with_delimiter,
@@ -740,7 +741,7 @@ pub(crate) use ecstore_object::{
     EC_BLOCK_SIZE_HINT_STATUS_HEADER, EC_BLOCK_SIZE_RESPONSE_HEADER, EcBlockSizeHintOutcome, resolve_ec_block_size_hint,
 };
 
-#[cfg(all(test, feature = "rio-v2"))]
+#[cfg(all(test, feature = "m-compatible"))]
 pub(crate) mod ecstore_test_support {
     pub(crate) use rustfs_ecstore::api::bitrot::create_bitrot_reader;
     pub(crate) use rustfs_ecstore::api::disk::{DiskAPI, DiskOption, endpoint::Endpoint, new_disk};
@@ -1405,14 +1406,23 @@ pub(crate) async fn try_migrate_bucket_metadata(store: Arc<ECStore>, buckets: &[
 }
 
 pub(crate) async fn try_migrate_iam_config(store: Arc<ECStore>) -> std::io::Result<()> {
-    // MinIO encrypts IAM identity/service-account files at rest with a key derived
-    // from the root credentials. Inject the IAM crate's decryption so those blobs
-    // are decrypted before normalization instead of being skipped as "incompatible".
-    let decrypt_fn: ecstore_bucket::migration::LegacyBlobDecryptFn =
-        Arc::new(|data: &[u8]| rustfs_iam::try_decrypt_iam_blob(data));
+    let decrypt_fn: ecstore_bucket::migration::LegacyIamBlobDecryptFn = Arc::new(decrypt_legacy_iam_blob);
     ecstore_bucket::migration::try_migrate_iam_config(store, Some(decrypt_fn))
         .await
         .map_err(ecstore_bucket::migration::migration_startup_error)
+}
+
+/// Recover the plaintext of an IAM record a MinIO server encrypted at rest, so
+/// the migration normalizes it instead of rejecting it as incompatible.
+///
+/// MinIO has two at-rest forms. Without a KMS, identity and service-account
+/// files are encrypted with a key derived from the root credentials; the IAM
+/// crate reads that form, and returns plaintext records unchanged. With a KMS
+/// configured, every `config/iam/*` object — `format.json` included — is
+/// encrypted under a KMS data key bound to `path`, which only a build with the
+/// MinIO read path can open, and only for MinIO's builtin static-secret KMS.
+fn decrypt_legacy_iam_blob(path: &str, data: &[u8]) -> Option<Vec<u8>> {
+    rustfs_iam::try_decrypt_iam_blob(data).or_else(|| crate::storage::sse::decrypt_minio_kms_iam_config(data, path))
 }
 
 pub(crate) fn init_ecstore_config() {
@@ -2896,5 +2906,65 @@ mod tests {
             },
         );
         assert!(!apply_active_resync_intents("bucket-a", &mut targets, &only_orphan));
+    }
+}
+
+#[cfg(test)]
+mod legacy_iam_blob_tests {
+    use super::decrypt_legacy_iam_blob;
+
+    /// `config/iam/format.json` exactly as a MinIO server started with
+    /// `MINIO_KMS_SECRET_KEY=compat-key:<the key below>` wrote it, reassembled
+    /// from the drives of a 4-drive erasure set.
+    const MINIO_KMS_IAM_FORMAT_BLOB_HEX: &str = "01c10000007b226b65796964223a22636f6d7061742d6b6579222c226b6d736b6579223a22645a334538415a4d3148566c336148346e33706e74646c6f57366c4d536c66725465546a7070504d786f464e30454e32443373504e4a6c5371623678764c6e4c58384c516f715673723857624654625748537339576a71774a4339643569374157334d3241513d3d222c22616c676f726974686d223a2243686143686132302d506f6c7931333035222c226e6f6e6365223a224d586d54506668593950553d227d88ec07cab8d47f3d2df4055a77f3ed11c6c0e126236afcbfefcd80a0e5";
+
+    /// Base64 of `SHA-256("minio-compat-harness-static-kms-key")`.
+    const MINIO_KMS_SECRET_KEY_B64: &str = "Hv4qNy3f80ZMbV3zdfJDR4067OC1JUf2T/a8ZAS+CaY=";
+
+    const FORMAT_PATH: &str = "config/iam/format.json";
+
+    fn minio_kms_iam_format_blob() -> Vec<u8> {
+        hex_simd::decode_to_vec(MINIO_KMS_IAM_FORMAT_BLOB_HEX).expect("fixture is valid hex")
+    }
+
+    #[test]
+    fn plaintext_iam_records_pass_through_unchanged() {
+        let plaintext = br#"{"version":1}"#;
+        assert_eq!(decrypt_legacy_iam_blob(FORMAT_PATH, plaintext).as_deref(), Some(plaintext.as_slice()));
+    }
+
+    /// The record that kept an m-compatible build from starting on a MinIO drive set
+    /// whose server had a KMS configured: MinIO encrypts even `format.json`.
+    #[cfg(feature = "m-compatible")]
+    #[test]
+    fn minio_kms_encrypted_iam_record_decrypts_under_the_shared_master_key_and_its_path() {
+        let blob = minio_kms_iam_format_blob();
+
+        temp_env::with_var("RUSTFS_SSE_S3_MASTER_KEY", Some(MINIO_KMS_SECRET_KEY_B64), || {
+            assert_eq!(
+                decrypt_legacy_iam_blob(FORMAT_PATH, &blob).as_deref(),
+                Some(br#"{"version":1}"#.as_slice())
+            );
+            assert_eq!(
+                decrypt_legacy_iam_blob("config/iam/users/alice/identity.json", &blob),
+                None,
+                "a record is bound to the path it is stored under"
+            );
+        });
+        temp_env::with_var("RUSTFS_SSE_S3_MASTER_KEY", None::<&str>, || {
+            assert_eq!(decrypt_legacy_iam_blob(FORMAT_PATH, &blob), None, "no shared master key, no plaintext");
+        });
+    }
+
+    /// Without the MinIO read path there is no reader for MinIO's builtin-KMS
+    /// formats: the record stays undecrypted and the migration reports it.
+    #[cfg(not(feature = "m-compatible"))]
+    #[test]
+    fn minio_kms_encrypted_iam_record_stays_sealed_without_the_minio_read_path() {
+        let blob = minio_kms_iam_format_blob();
+
+        temp_env::with_var("RUSTFS_SSE_S3_MASTER_KEY", Some(MINIO_KMS_SECRET_KEY_B64), || {
+            assert_eq!(decrypt_legacy_iam_blob(FORMAT_PATH, &blob), None);
+        });
     }
 }

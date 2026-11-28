@@ -17,7 +17,7 @@
 use crate::core::keying::context::encode_minio_kms_context;
 use crate::core::keying::direct::{record_customer_key_nonce, record_wrapped_data_key};
 use crate::core::keying::material::{EncryptionKeyKind, EncryptionMaterial};
-#[cfg(feature = "rio-v2")]
+#[cfg(feature = "m-compatible")]
 use crate::core::keying::object::{record_data_key_in_minio_slots, record_sealed_customer_key};
 use crate::error::SseError;
 use base64_simd::STANDARD as BASE64_STANDARD;
@@ -118,12 +118,12 @@ pub fn encryption_material_to_metadata(material: &EncryptionMaterial) -> Result<
         SSEType::SseC => {
             record_ssec_scheme(&mut metadata, material);
 
-            // A `rio-v2` build seals an object key instead, so a Direct key there is a
+            // An `m-compatible` build seals an object key instead, so a Direct key there is a
             // multipart session created without its customer key.
             if material.key_kind == EncryptionKeyKind::Direct {
                 record_customer_key_nonce(&mut metadata, material.base_nonce);
             }
-            #[cfg(feature = "rio-v2")]
+            #[cfg(feature = "m-compatible")]
             if let Some(sealed) = &material.managed_sealed_key {
                 record_sealed_customer_key(&mut metadata, sealed);
             }
@@ -138,7 +138,7 @@ pub fn encryption_material_to_metadata(material: &EncryptionMaterial) -> Result<
             if material.key_kind == EncryptionKeyKind::Direct {
                 record_wrapped_data_key(&mut metadata, wrapped_data_key, material.base_nonce, material.algorithm.as_str());
             }
-            #[cfg(feature = "rio-v2")]
+            #[cfg(feature = "m-compatible")]
             record_data_key_in_minio_slots(&mut metadata, material, wrapped_data_key);
         }
     }
@@ -254,7 +254,7 @@ pub fn stored_ssec_metadata(metadata: &HashMap<String, String>) -> bool {
 /// stores no customer-key MD5 and proves the key through the AEAD unseal
 /// instead.
 pub(crate) fn minio_sealed_ssec_metadata(metadata: &HashMap<String, String>) -> bool {
-    cfg!(feature = "rio-v2") && metadata.contains_key(MINIO_INTERNAL_ENCRYPTION_SSEC_SEALED_KEY_HEADER)
+    cfg!(feature = "m-compatible") && metadata.contains_key(MINIO_INTERNAL_ENCRYPTION_SSEC_SEALED_KEY_HEADER)
 }
 
 /// Recodes a stored MinIO KMS context value (base64-wrapped JSON) into the

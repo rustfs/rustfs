@@ -506,7 +506,7 @@ class GateTests(unittest.TestCase):
         stale = self.plan()
         stale['jobs'] = dict(stale['jobs'], **{'connect-feature-boundaries': 'success',
                                               'uring-integration': 'success',
-                                              'test-and-lint-rio-v2': 'success',
+                                              'test-and-lint-m-compatible': 'success',
                                               'test-and-lint-protocols': 'success'})
         stale['not_applicable'] = {job: 'fixture' for job, state in stale['jobs'].items() if state == 'skipped'}
         expected = gate.expected_results('full', 'pull_request', 'refs/heads/main')

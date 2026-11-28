@@ -16,6 +16,23 @@
 
 pub(crate) mod kms_backed;
 pub(crate) mod local;
-#[cfg(feature = "rio-v2")]
+#[cfg(feature = "m-compatible")]
 pub(crate) mod minio;
 pub(crate) mod provider;
+
+/// Decrypt a config object that another server stored KMS-encrypted on this
+/// drive set, under the local master key and bound to `object_path`.
+///
+/// `None` when this build reads no such format, when no local master key is
+/// configured, or when `blob` does not decrypt under it for that path.
+pub fn decrypt_kms_sealed_config(blob: &[u8], object_path: &str) -> Option<Vec<u8>> {
+    #[cfg(feature = "m-compatible")]
+    {
+        minio::decrypt_minio_kms_config(blob, object_path)
+    }
+    #[cfg(not(feature = "m-compatible"))]
+    {
+        let _ = (blob, object_path);
+        None
+    }
+}

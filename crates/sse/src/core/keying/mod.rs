@@ -18,7 +18,7 @@ pub(crate) mod context;
 pub(crate) mod direct;
 pub(crate) mod material;
 pub(crate) mod metadata;
-#[cfg(feature = "rio-v2")]
+#[cfg(feature = "m-compatible")]
 pub(crate) mod object;
 pub(crate) mod stored;
 
@@ -51,17 +51,33 @@ pub(crate) enum StoredKeyMode {
     /// The data key is the object's key, under the nonce stored beside it.
     Direct { base_nonce: [u8; 12] },
     /// The data key unseals the object's key.
-    #[cfg(feature = "rio-v2")]
+    #[cfg(feature = "m-compatible")]
     Object { sealed_key: ManagedSealedKey },
+}
+
+/// A stored ETag that the object's key mode sealed, as a response can show it.
+#[cfg_attr(
+    not(feature = "m-compatible"),
+    allow(dead_code, reason = "only the mode that seals an object key seals the ETag with it")
+)]
+pub(crate) enum SealedEtag {
+    /// The value to show, which the stored form already contains.
+    Shown(String),
+    /// The sealed bytes; what they hold opens under the object's key.
+    UnderObjectKey(Vec<u8>),
 }
 
 // The mode new objects are written in. Every build reads every mode it can
 // recognize; writing picks exactly one, and this is the only place that says which.
-#[cfg(not(feature = "rio-v2"))]
+// The sealed-ETag functions follow the same selection: only the mode that seals
+// an object key seals the ETag with it.
+#[cfg(not(feature = "m-compatible"))]
 pub(crate) use direct::{
-    SESSION_KEY_NEEDS_CUSTOMER_KEY, new_key_under_customer_key, new_key_under_data_key, new_session_key_under_customer_key,
+    SESSION_KEY_NEEDS_CUSTOMER_KEY, has_sealed_etag_form, new_key_under_customer_key, new_key_under_data_key,
+    new_session_key_under_customer_key, open_sealed_etag, sealed_etag,
 };
-#[cfg(feature = "rio-v2")]
+#[cfg(feature = "m-compatible")]
 pub(crate) use object::{
-    SESSION_KEY_NEEDS_CUSTOMER_KEY, new_key_under_customer_key, new_key_under_data_key, new_session_key_under_customer_key,
+    SESSION_KEY_NEEDS_CUSTOMER_KEY, has_sealed_etag_form, new_key_under_customer_key, new_key_under_data_key,
+    new_session_key_under_customer_key, open_sealed_etag, sealed_etag,
 };

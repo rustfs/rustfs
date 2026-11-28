@@ -405,7 +405,7 @@ mod tests {
                 .expect("decrypt session one")
                 .expect("part one material");
                 let mut encrypted_one = Vec::new();
-                #[cfg(feature = "rio-v2")]
+                #[cfg(feature = "m-compatible")]
                 let mut part_one_reader = match part_one_material.key_kind {
                     EncryptionKeyKind::Object => EncryptReader::new_multipart_with_object_key(
                         Cursor::new(part_one_plaintext.clone()),
@@ -419,7 +419,7 @@ mod tests {
                         1,
                     ),
                 };
-                #[cfg(not(feature = "rio-v2"))]
+                #[cfg(not(feature = "m-compatible"))]
                 let mut part_one_reader = EncryptReader::new_multipart(
                     Cursor::new(part_one_plaintext.clone()),
                     part_one_material.key_bytes,
@@ -443,7 +443,7 @@ mod tests {
                 .expect("decrypt session two")
                 .expect("part two material");
                 let mut encrypted_two = Vec::new();
-                #[cfg(feature = "rio-v2")]
+                #[cfg(feature = "m-compatible")]
                 let mut part_two_reader = match part_two_material.key_kind {
                     EncryptionKeyKind::Object => EncryptReader::new_multipart_with_object_key(
                         Cursor::new(part_two_plaintext.clone()),
@@ -457,7 +457,7 @@ mod tests {
                         2,
                     ),
                 };
-                #[cfg(not(feature = "rio-v2"))]
+                #[cfg(not(feature = "m-compatible"))]
                 let mut part_two_reader = EncryptReader::new_multipart(
                     Cursor::new(part_two_plaintext.clone()),
                     part_two_material.key_bytes,
@@ -508,7 +508,7 @@ mod tests {
                 .expect("managed decryption material");
 
                 let plaintext_size = multipart_plaintext_size(&parts, -1);
-                #[cfg(feature = "rio-v2")]
+                #[cfg(feature = "m-compatible")]
                 let decrypted_stream = match decryption_material.key_kind {
                     EncryptionKeyKind::Object => boxed_reader(DecryptReader::new_multipart_with_object_key(
                         wrap_reader(Cursor::new(encrypted_stream)),
@@ -522,7 +522,7 @@ mod tests {
                         multipart_part_numbers(&parts),
                     )),
                 };
-                #[cfg(not(feature = "rio-v2"))]
+                #[cfg(not(feature = "m-compatible"))]
                 let decrypted_stream = boxed_reader(DecryptReader::new_multipart(
                     wrap_reader(Cursor::new(encrypted_stream)),
                     decryption_material.key_bytes,

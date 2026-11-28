@@ -35,7 +35,7 @@ Fixture rows:
 | Row | Profile | Fixture env |
 |---|---|---|
 | legacy bitrot read (`crates/ecstore/tests/legacy_bitrot_read_test.rs`) | `full` | `RUSTFS_LEGACY_TEST_ROOT`, `RUSTFS_LEGACY_TEST_DISK` |
-| MinIO generated encrypted read and negative restore (`storage::minio_generated_read_test` in `rustfs/src/storage/mod.rs`, `--features rio-v2`, `--ignored`) | `full` | `RUSTFS_MINIO_FIXTURE_ROOT`, `RUSTFS_MINIO_STATIC_KMS_KEY_B64` |
+| MinIO generated encrypted read and negative restore (`storage::minio_generated_read_test` in `rustfs/src/storage/mod.rs`, `--features m-compatible`, `--ignored`) | `full` | `RUSTFS_MINIO_FIXTURE_ROOT`, `RUSTFS_MINIO_STATIC_KMS_KEY_B64` |
 
 A missing fixture is recorded as a `missing-optional` skip. `--require-fixtures` turns it into an early `ecstore-fixture-gate` failure before the expensive black-box steps run.
 

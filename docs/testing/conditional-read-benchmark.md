@@ -41,7 +41,7 @@ In each worktree, format the adapter and build the same artifact:
 ```bash
 RUSTUP_TOOLCHAIN=stable cargo fmt --all
 RUSTUP_TOOLCHAIN=stable cargo test --locked -p rustfs --lib \
-  --no-default-features --features rio-v2 \
+  --no-default-features --features m-compatible \
   conditional_read_paired_benchmark --no-run
 ```
 

@@ -5293,7 +5293,7 @@ mod tests {
         assert!(err.to_string().contains("inconsistent read source shards"), "{context}: {err}");
     }
 
-    #[cfg(feature = "rio-v2")]
+    #[cfg(feature = "m-compatible")]
     #[tokio::test]
     async fn test_erasure_decode_preserves_compressed_stream_near_block_boundary() {
         const DATA_SHARDS: usize = 2;

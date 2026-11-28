@@ -97,7 +97,11 @@ pub fn mark_get_metadata_read_version_coalescing_service_ready() {
 mod rio_tests {
     #[test]
     fn uses_expected_rio_backend() {
-        let expected = if cfg!(feature = "rio-v2") { "rio-v2" } else { "legacy-rio" };
+        let expected = if cfg!(feature = "m-compatible") {
+            "rio-v2"
+        } else {
+            "legacy-rio"
+        };
         assert_eq!(crate::io_support::rio::backend_name(), expected);
     }
 }

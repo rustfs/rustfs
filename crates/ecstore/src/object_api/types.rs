@@ -2198,8 +2198,20 @@ impl ObjectInfo {
             && self.transitioned_object.tier.is_empty()
     }
 
+    /// The plaintext size of an encrypted object, when it can be known without
+    /// decrypting: recorded in metadata, or implied by a stored layout this
+    /// build reads.
+    ///
+    /// # Errors
+    ///
+    /// When the recorded size is malformed, or the stored sizes cannot belong
+    /// to the layout the metadata names.
     pub fn encryption_original_size(&self) -> std::io::Result<Option<i64>> {
-        rustfs_utils::http::get_object_encryption_original_size(&self.user_defined)
+        if let Some(size) = rustfs_utils::http::get_object_encryption_original_size(&self.user_defined)? {
+            return Ok(Some(size));
+        }
+
+        super::readers::unrecorded_plaintext_size(self)
     }
 
     pub fn decrypted_size(&self) -> std::io::Result<i64> {
@@ -2804,6 +2816,12 @@ fn versions_after_marker(file_infos: &rustfs_filemeta::FileInfoVersions, marker:
 mod tests {
     use super::*;
 
+    // Tests of code only one build variant compiles live in a module of their own.
+    #[cfg(feature = "m-compatible")]
+    mod m_compatible;
+    #[cfg(not(feature = "m-compatible"))]
+    mod native;
+
     #[test]
     fn replication_status_writeback_condition_remains_indirected() {
         fn assert_indirected(_: &Option<Box<ReplicationStatusWritebackCondition>>) {}
@@ -3324,6 +3342,25 @@ mod tests {
         };
 
         assert_eq!(info.get_actual_size().unwrap(), 77);
+    }
+
+    /// Metadata of an SSE object under MinIO's sealed object key, with nothing
+    /// that records a plaintext size.
+    fn minio_sealed_object_metadata(multipart: bool) -> Arc<HashMap<String, String>> {
+        let mut metadata = HashMap::from([
+            (
+                rustfs_utils::http::MINIO_INTERNAL_ENCRYPTION_ALGORITHM_HEADER.to_string(),
+                rustfs_utils::http::MINIO_INTERNAL_ENCRYPTION_SEAL_ALGORITHM.to_string(),
+            ),
+            (
+                rustfs_utils::http::MINIO_INTERNAL_ENCRYPTION_S3_SEALED_KEY_HEADER.to_string(),
+                "sealed-object-key".to_string(),
+            ),
+        ]);
+        if multipart {
+            metadata.insert(rustfs_utils::http::MINIO_INTERNAL_ENCRYPTION_MULTIPART_HEADER.to_string(), String::new());
+        }
+        Arc::new(metadata)
     }
 
     #[test]

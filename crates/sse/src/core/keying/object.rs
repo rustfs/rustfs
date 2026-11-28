@@ -15,7 +15,7 @@
 //! Object keying: a derived object key, sealed in the MinIO-compatible format.
 
 use crate::core::keying::material::{EncryptionKeyKind, EncryptionMaterial, ManagedSealedKey};
-use crate::core::keying::{NewObjectKey, StoredDataKey, StoredKeyMode};
+use crate::core::keying::{NewObjectKey, SealedEtag, StoredDataKey, StoredKeyMode};
 use crate::error::SseError;
 use aes_gcm::aead::{Aead, KeyInit, Payload};
 use aes_gcm::{Aes256Gcm, Nonce};
@@ -28,13 +28,13 @@ use rustfs_utils::http::object_encryption_keys::{
     INTERNAL_ENCRYPTION_ALGORITHM_HEADER, INTERNAL_ENCRYPTION_IV_HEADER, INTERNAL_ENCRYPTION_KEY_HEADER,
     MINIO_INTERNAL_ENCRYPTION_ALGORITHM_HEADER, MINIO_INTERNAL_ENCRYPTION_IV_HEADER,
     MINIO_INTERNAL_ENCRYPTION_KMS_DATA_KEY_HEADER, MINIO_INTERNAL_ENCRYPTION_KMS_KEY_ID_HEADER,
-    MINIO_INTERNAL_ENCRYPTION_KMS_SEALED_KEY_HEADER, MINIO_INTERNAL_ENCRYPTION_S3_SEALED_KEY_HEADER,
-    MINIO_INTERNAL_ENCRYPTION_SSEC_SEALED_KEY_HEADER, SSEType,
+    MINIO_INTERNAL_ENCRYPTION_KMS_SEALED_KEY_HEADER, MINIO_INTERNAL_ENCRYPTION_MULTIPART_HEADER,
+    MINIO_INTERNAL_ENCRYPTION_S3_SEALED_KEY_HEADER, MINIO_INTERNAL_ENCRYPTION_SSEC_SEALED_KEY_HEADER, SSEType,
 };
 use sha2::Sha256;
 use std::collections::HashMap;
 
-pub(crate) const MINIO_INTERNAL_ENCRYPTION_SEAL_ALGORITHM: &str = "DAREv2-HMAC-SHA256";
+pub(crate) use rustfs_utils::http::object_encryption_keys::MINIO_INTERNAL_ENCRYPTION_SEAL_ALGORITHM;
 
 const DARE_VERSION_20: u8 = 0x20;
 
@@ -198,6 +198,92 @@ pub(crate) fn unseal_object_key(
         .try_into()
         .map_err(|_| SseError::internal("Sealed object key must decrypt to 32 bytes"))?;
     Ok(object_key)
+}
+
+/// Domain string MinIO derives the ETag sealing key under (`internal/crypto/key.go`).
+const ETAG_SEALING_KEY_CONTEXT: &[u8] = b"SSE-etag";
+
+/// Shortest stored ETag MinIO treats as sealed rather than as a bare digest
+/// (`internal/etag`, `ETag.IsEncrypted`).
+pub(crate) const SEALED_ETAG_MIN_SIZE: usize = 32;
+
+/// Recover the content MD5 MinIO sealed as the stored ETag of a single-part SSE object.
+///
+/// The sealed ETag is one final DARE 2.0 package keyed by
+/// `HMAC-SHA256(object_key, "SSE-etag")`.
+///
+/// # Errors
+///
+/// When `sealed` is not exactly one final package, or does not authenticate
+/// under `object_key`.
+pub(crate) fn unseal_etag(object_key: [u8; 32], sealed: &[u8]) -> Result<Vec<u8>, SseError> {
+    let Some((header, ciphertext)) = sealed.split_at_checked(DARE_HEADER_SIZE) else {
+        return Err(SseError::internal("Sealed ETag is shorter than a DARE header"));
+    };
+    if header[0] != DARE_VERSION_20 || !is_supported_sealed_object_key_cipher(header[1]) {
+        return Err(SseError::internal("Unsupported sealed ETag DARE header"));
+    }
+    let payload_len = usize::from(u16::from_le_bytes([header[2], header[3]])) + 1;
+    if ciphertext.len() != payload_len + DARE_TAG_SIZE || header[4] & 0x80 == 0 {
+        return Err(SseError::internal("Sealed ETag is not a single final DARE package"));
+    }
+
+    let mut mac = HmacSha256::new_from_slice(&object_key)
+        .map_err(|err| SseError::internal(format!("Invalid HMAC key for ETag sealing-key derivation: {err}")))?;
+    mac.update(ETAG_SEALING_KEY_CONTEXT);
+    let sealing_key: [u8; 32] = mac.finalize().into_bytes().into();
+
+    decrypt_sealed_object_key_payload(sealing_key, header, sealed)
+}
+
+/// Whether a stored ETag has the form of a sealed one, whatever the object
+/// it belongs to: hex, and at least [`SEALED_ETAG_MIN_SIZE`] bytes of it. A
+/// bare digest is shorter and a multipart ETag is not hex.
+pub(crate) fn has_sealed_etag_form(stored_etag: &str) -> bool {
+    stored_etag.len() >= SEALED_ETAG_MIN_SIZE * 2
+        && stored_etag.len().is_multiple_of(2)
+        && stored_etag.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+/// The sealed form of a stored ETag, when the object carries a sealed object
+/// key and its ETag is sealed.
+///
+/// `None` means the stored ETag is what a response shows: the object is a
+/// multipart upload (its ETag is stored as shown), the ETag is not sealed, or
+/// the object carries no sealed object key. A customer-key or KMS object is
+/// shown the last 32 hex characters of the sealed value, which needs no key.
+pub(crate) fn sealed_etag(metadata: &HashMap<String, String>, stored_etag: &str) -> Option<SealedEtag> {
+    if metadata.contains_key(MINIO_INTERNAL_ENCRYPTION_MULTIPART_HEADER) {
+        return None;
+    }
+    // A multipart ETag carries a `-<parts>` suffix and is not hex, so it
+    // stops here together with every unsealed digest.
+    let sealed = hex_simd::decode_to_vec(stored_etag)
+        .ok()
+        .filter(|sealed| sealed.len() >= SEALED_ETAG_MIN_SIZE)?;
+
+    if metadata.contains_key(MINIO_INTERNAL_ENCRYPTION_SSEC_SEALED_KEY_HEADER)
+        || metadata.contains_key(MINIO_INTERNAL_ENCRYPTION_KMS_SEALED_KEY_HEADER)
+    {
+        return stored_etag
+            .get(stored_etag.len() - 32..)
+            .map(|shown| SealedEtag::Shown(shown.to_owned()));
+    }
+    metadata
+        .contains_key(MINIO_INTERNAL_ENCRYPTION_S3_SEALED_KEY_HEADER)
+        .then_some(SealedEtag::UnderObjectKey(sealed))
+}
+
+/// The content MD5 a sealed ETag holds, as lowercase hex.
+///
+/// `None` when `key_bytes` is not an object key, or the
+/// sealed bytes do not authenticate under it.
+pub(crate) fn open_sealed_etag(key_kind: EncryptionKeyKind, key_bytes: [u8; 32], sealed: &[u8]) -> Option<String> {
+    if key_kind != EncryptionKeyKind::Object {
+        return None;
+    }
+    let etag = unseal_etag(key_bytes, sealed).ok()?;
+    Some(hex_simd::encode_to_string(etag, hex_simd::AsciiCase::Lower))
 }
 
 fn try_decode_minio_sealed_key(bytes: &str) -> Result<Option<[u8; SEALED_KEY_SIZE]>, SseError> {

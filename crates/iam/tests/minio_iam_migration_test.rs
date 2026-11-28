@@ -86,6 +86,78 @@ async fn assert_identity_survives(
     );
 }
 
+/// A stand-in for MinIO's KMS-encrypted IAM records: bytes that open only for
+/// the location they were sealed for, and that never parse as JSON.
+fn seal_for_location(path: &str, plaintext: &[u8]) -> Vec<u8> {
+    [&[0xFF], path.as_bytes(), plaintext].concat()
+}
+
+fn open_for_location(path: &str, sealed: &[u8]) -> Option<Vec<u8>> {
+    sealed
+        .strip_prefix(&[0xFF])?
+        .strip_prefix(path.as_bytes())
+        .map(<[u8]>::to_vec)
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn location_bound_iam_records_are_decrypted_with_their_own_path() {
+    let temp_dir = tempfile::TempDir::with_prefix("rustfs_minio_iam_location_").expect("temp directory must be created");
+    let env = rustfs_test_utils::TestECStoreEnv::builder()
+        .base_dir(temp_dir.path())
+        .build()
+        .await;
+    env.make_bucket(LEGACY_META_BUCKET, false).await;
+
+    let format_path = "config/iam/format.json";
+    let mapping_path = format!("{}location-bound.json", IAM_CONFIG_POLICY_DB_USERS_PREFIX.as_str());
+    env.put_object_bytes(LEGACY_META_BUCKET, format_path, seal_for_location(format_path, br#"{"version":1}"#))
+        .await;
+    env.put_object_bytes(
+        LEGACY_META_BUCKET,
+        &mapping_path,
+        seal_for_location(&mapping_path, br#"{"version":1,"policy":"readonly"}"#),
+    )
+    .await;
+
+    let error = try_migrate_iam_config(env.ecstore.clone(), None)
+        .await
+        .expect_err("a sealed IAM record must not migrate as if it were plaintext");
+    assert!(
+        std::io::Error::from(error)
+            .to_string()
+            .contains("incompatible legacy metadata")
+    );
+
+    // A callback that ignores the location cannot open a location-bound record.
+    let error = try_migrate_iam_config(
+        env.ecstore.clone(),
+        Some(std::sync::Arc::new(|_, sealed| open_for_location("config/iam/elsewhere.json", sealed))),
+    )
+    .await
+    .expect_err("a record must not open for another object's location");
+    assert!(
+        std::io::Error::from(error)
+            .to_string()
+            .contains("incompatible legacy metadata")
+    );
+
+    try_migrate_iam_config(env.ecstore.clone(), Some(std::sync::Arc::new(open_for_location)))
+        .await
+        .expect("each record opens for the path it is stored under");
+
+    let migrated_store = ObjectStore::new(env.ecstore.clone());
+    let format: Value = migrated_store
+        .load_iam_config(format_path)
+        .await
+        .expect("read the migrated format");
+    assert_eq!(format["version"], 1);
+    let mapping: Value = migrated_store
+        .load_iam_config(&mapping_path)
+        .await
+        .expect("read the migrated policy mapping");
+    assert_eq!(mapping["policy"], "readonly");
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn minio_permanent_identities_survive_migration_and_repeated_iam_loads() {
     if get_global_action_cred().is_none() {
@@ -111,7 +183,7 @@ async fn minio_permanent_identities_survive_migration_and_repeated_iam_loads() {
     }
     try_migrate_iam_config(
         env.ecstore.clone(),
-        Some(std::sync::Arc::new(|_| panic!("unsupported IAM records must not be decrypted"))),
+        Some(std::sync::Arc::new(|_, _| panic!("unsupported IAM records must not be decrypted"))),
     )
     .await
     .expect("unsupported IAM records, including empty objects, must be skipped");

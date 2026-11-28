@@ -20,7 +20,7 @@
 # each run with Docker and then runs the `#[ignore]` reader tests in
 # rustfs/src/storage/minio_generated_read_test.rs.
 #
-# Scope: MinIO-to-RustFS SSE read interop is implemented behind the `rio-v2`
+# Scope: MinIO-to-RustFS SSE read interop is implemented behind the `m-compatible`
 # feature for MinIO's builtin static-KMS deployments — SSE-S3 and SSE-KMS
 # (single- and multipart) since rustfs/rustfs#6191, SSE-C detection since the
 # rustfs/backlog#1638 D2 close-out. This job is the standing evidence: it
@@ -78,7 +78,7 @@ jobs:
       # since (cargo-nextest 0.9.140 now rejects it outright: "operator didn't
       # match any binary names", exit 94).
       INTEROP_PACKAGE: rustfs
-      INTEROP_FEATURES: rio-v2
+      INTEROP_FEATURES: m-compatible
       INTEROP_FILTER: "test(minio_generated_read_test::)"
       INTEROP_REQUIRED_TESTS: '["reads_minio_generated_sse_s3_multipart_fixture", "reads_minio_generated_sse_kms_multipart_fixture", "rejects_minio_generated_sse_s3_fixture_with_wrong_kms_key", "rejects_minio_generated_sse_s3_fixture_with_truncated_ciphertext"]'
     steps:
