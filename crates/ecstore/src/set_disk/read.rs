@@ -619,11 +619,22 @@ impl SetDisks {
         };
 
         let key = GetObjectMetadataCacheKey::new(bucket, object, generation);
+        let shuffled_non_inline = (!fi.inline_data()
+            && fi.data.is_none()
+            && !parts_metadata.is_empty()
+            && online_disks.len() == parts_metadata.len()
+            && fi.erasure.distribution.len() == parts_metadata.len())
+        .then(|| {
+            let (shuffled_disks, shuffled_files) =
+                Self::shuffle_disks_and_parts_metadata_by_index(&online_disks, &parts_metadata, &fi);
+            (Arc::new(shuffled_files), Arc::new(shuffled_disks))
+        });
         let entry = Arc::new(GetObjectMetadataCacheEntry {
             created_at: Instant::now(),
             fi,
             parts_metadata,
             online_disks,
+            shuffled_non_inline,
             read_quorum,
             capability,
             verified_inline_body,
@@ -1454,6 +1465,7 @@ impl SetDisks {
         (oi, fi, write_quorum, None)
     }
 
+    #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
     pub(super) async fn try_get_object_direct_data_shards_with_fileinfo(
         bucket: &str,
@@ -1462,6 +1474,34 @@ impl SetDisks {
         fi: &FileInfo,
         files: &[FileInfo],
         disks: &[Option<DiskStore>],
+        skip_verify_bitrot: bool,
+        metrics_object_class: &'static str,
+        metrics_size_bucket: &'static str,
+    ) -> Result<Option<Bytes>> {
+        Self::try_get_object_direct_data_shards_with_fileinfo_and_shuffled(
+            bucket,
+            object,
+            erasure_cache,
+            fi,
+            files,
+            disks,
+            None,
+            skip_verify_bitrot,
+            metrics_object_class,
+            metrics_size_bucket,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(super) async fn try_get_object_direct_data_shards_with_fileinfo_and_shuffled(
+        bucket: &str,
+        object: &str,
+        erasure_cache: Arc<ErasureCache>,
+        fi: &FileInfo,
+        files: &[FileInfo],
+        disks: &[Option<DiskStore>],
+        pre_shuffled: Option<(&[FileInfo], &[Option<DiskStore>])>,
         skip_verify_bitrot: bool,
         metrics_object_class: &'static str,
         metrics_size_bucket: &'static str,
@@ -1552,13 +1592,19 @@ impl SetDisks {
             return Ok(body);
         }
 
-        let (disks, files) = Self::shuffle_disks_and_parts_metadata_by_index(disks, files, fi);
+        let owned_shuffled;
+        let (files_ref, disks_ref) = if let Some((shuffled_files, shuffled_disks)) = pre_shuffled {
+            (shuffled_files, shuffled_disks)
+        } else {
+            owned_shuffled = Self::shuffle_disks_and_parts_metadata_by_index(disks, files, fi);
+            (owned_shuffled.1.as_slice(), owned_shuffled.0.as_slice())
+        };
         let use_mmap_read = object_mmap_read_enabled();
 
         let reader_setup_stage_start = Instant::now();
         let mut reader_setup = create_data_block_bitrot_readers_with_frame_size(
-            &files,
-            &disks,
+            files_ref,
+            disks_ref,
             bucket,
             object,
             part.number,
@@ -1572,7 +1618,7 @@ impl SetDisks {
             erasure.data_shards,
         )
         .await;
-        reader_setup.bind_integrity(part.integrity.as_ref(), &files, &disks, bucket, object, 0)?;
+        reader_setup.bind_integrity(part.integrity.as_ref(), files_ref, disks_ref, bucket, object, 0)?;
         let reader_setup_elapsed = reader_setup_stage_start.elapsed();
         rustfs_io_metrics::record_get_object_shard_reader_setup_duration(reader_setup_elapsed.as_secs_f64());
         rustfs_io_metrics::record_get_object_stage_duration_by_size(
@@ -1639,12 +1685,60 @@ impl SetDisks {
     where
         W: AsyncWrite + Send + Sync + Unpin + 'static,
     {
-        let pipeline_started = Instant::now();
-        debug!(bucket, object, requested_length = length, offset, "get_object_with_fileinfo start");
         // Owned shuffle (backlog#873): `files` is consumed and its FileInfo
         // entries move into their shuffled slots, avoiding one deep clone per
         // disk; the disk handles are Arc clones and stay cheap.
         let (disks, files) = Self::shuffle_disks_and_parts_metadata_by_index_owned(disks.to_vec(), files, &fi);
+        Self::get_object_with_shuffled_fileinfo(
+            bucket,
+            object,
+            erasure_cache,
+            offset,
+            length,
+            writer,
+            &fi,
+            Arc::new(files),
+            Arc::new(disks),
+            set_index,
+            pool_index,
+            skip_verify_bitrot,
+            suppress_read_repair,
+            prefer_data_blocks_first_reader_setup,
+            require_reconstruction_surplus,
+            metrics_path,
+            metrics_object_class,
+            metrics_size_bucket,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    #[hotpath::measure(impl_type = "SetDisks")]
+    pub(super) async fn get_object_with_shuffled_fileinfo<W>(
+        bucket: &str,
+        object: &str,
+        erasure_cache: Arc<ErasureCache>,
+        offset: usize,
+        length: i64,
+        writer: &mut W,
+        fi: &FileInfo,
+        files: Arc<Vec<FileInfo>>,
+        disks: Arc<Vec<Option<DiskStore>>>,
+        set_index: usize,
+        pool_index: usize,
+        skip_verify_bitrot: bool,
+        suppress_read_repair: bool,
+        prefer_data_blocks_first_reader_setup: bool,
+        require_reconstruction_surplus: bool,
+        metrics_path: &'static str,
+        metrics_object_class: &'static str,
+        metrics_size_bucket: &'static str,
+    ) -> Result<()>
+    where
+        W: AsyncWrite + Send + Sync + Unpin + 'static,
+    {
+        let pipeline_started = Instant::now();
+        debug!(bucket, object, requested_length = length, offset, "get_object_with_fileinfo start");
 
         let total_size = fi.size as usize;
 
@@ -1716,8 +1810,8 @@ impl SetDisks {
             object, offset, length, end_offset, part_index, last_part_index, last_part_relative_offset, "Multipart read bounds"
         );
 
-        let erasure = erasure_cache.get_for_file_info(&fi)?;
-        let frame_size = read_frame_size_for_file_info(&fi, &erasure)?;
+        let erasure = erasure_cache.get_for_file_info(fi)?;
+        let frame_size = read_frame_size_for_file_info(fi, &erasure)?;
 
         let part_indices: Vec<usize> = (part_index..=last_part_index).collect();
         debug!(bucket, object, ?part_indices, "Multipart part indices to stream");
@@ -1728,8 +1822,6 @@ impl SetDisks {
         // reads no longer serialize setup latency between parts. Depth is one
         // part; shared inputs move behind Arc so the prefetch task is 'static.
         let use_mmap_read = object_mmap_read_enabled();
-        let files = Arc::new(files);
-        let disks = Arc::new(disks);
 
         // A small Range GET only needs the authenticated q-aligned slice that
         // contains each requested data-shard segment. Permit one complete
@@ -1741,7 +1833,7 @@ impl SetDisks {
                 bucket,
                 object,
                 writer,
-                &fi,
+                fi,
                 files.as_ref(),
                 disks.as_ref(),
                 &erasure,
@@ -1806,7 +1898,7 @@ impl SetDisks {
                 "Streaming multipart part"
             );
 
-            let checksum_algo = part_checksum_algorithm(&fi, part_number);
+            let checksum_algo = part_checksum_algorithm(fi, part_number);
             let read_length = till_offset.saturating_sub(read_offset);
 
             let read_costs = coding::decode::should_collect_shard_read_costs().then(|| shard_read_costs_for_disks(&disks));
@@ -1872,7 +1964,7 @@ impl SetDisks {
                     read_offset: 0,
                     read_length: erasure.shard_file_offset(0, next_length, next_size),
                     frame_size,
-                    checksum_algo: part_checksum_algorithm(&fi, next_number),
+                    checksum_algo: part_checksum_algorithm(fi, next_number),
                 };
                 let files = Arc::clone(&files);
                 let disks = Arc::clone(&disks);
@@ -2471,6 +2563,7 @@ impl SetDisks {
         Ok(())
     }
 
+    #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
     #[hotpath::measure(impl_type = "SetDisks")]
     pub(super) async fn get_object_decode_reader_with_fileinfo(
@@ -2488,6 +2581,43 @@ impl SetDisks {
         metrics_size_bucket: &'static str,
         prefer_data_blocks_first_reader_setup: bool,
     ) -> Result<GetCodecStreamingReaderBuildOutcome> {
+        Self::get_object_decode_reader_with_fileinfo_and_shuffled(
+            bucket,
+            object,
+            erasure_cache,
+            fi,
+            files,
+            disks,
+            None,
+            set_index,
+            pool_index,
+            skip_verify_bitrot,
+            suppress_read_repair,
+            metrics_object_class,
+            metrics_size_bucket,
+            prefer_data_blocks_first_reader_setup,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    #[hotpath::measure(impl_type = "SetDisks")]
+    pub(super) async fn get_object_decode_reader_with_fileinfo_and_shuffled(
+        bucket: &str,
+        object: &str,
+        erasure_cache: Arc<ErasureCache>,
+        fi: &FileInfo,
+        files: &[FileInfo],
+        disks: &[Option<DiskStore>],
+        pre_shuffled: Option<(&[FileInfo], &[Option<DiskStore>])>,
+        set_index: usize,
+        pool_index: usize,
+        skip_verify_bitrot: bool,
+        suppress_read_repair: bool,
+        metrics_object_class: &'static str,
+        metrics_size_bucket: &'static str,
+        prefer_data_blocks_first_reader_setup: bool,
+    ) -> Result<GetCodecStreamingReaderBuildOutcome> {
         Self::get_object_decode_reader_with_fileinfo_inner(
             bucket,
             object,
@@ -2495,6 +2625,7 @@ impl SetDisks {
             fi,
             files,
             disks,
+            pre_shuffled,
             set_index,
             pool_index,
             skip_verify_bitrot,
@@ -2513,6 +2644,7 @@ impl SetDisks {
     /// reuse the shard readers it just opened for an in-place legacy fallback.
     /// This avoids opening every shard twice when a healthy quorum requires
     /// reconstruction.
+    #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
     pub(super) async fn get_object_mid_size_reader_with_fileinfo(
         bucket: &str,
@@ -2529,6 +2661,42 @@ impl SetDisks {
         metrics_size_bucket: &'static str,
         prefer_data_blocks_first_reader_setup: bool,
     ) -> Result<GetCodecStreamingReaderBuildOutcome> {
+        Self::get_object_mid_size_reader_with_fileinfo_and_shuffled(
+            bucket,
+            object,
+            erasure_cache,
+            fi,
+            files,
+            disks,
+            None,
+            set_index,
+            pool_index,
+            skip_verify_bitrot,
+            suppress_read_repair,
+            metrics_object_class,
+            metrics_size_bucket,
+            prefer_data_blocks_first_reader_setup,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(super) async fn get_object_mid_size_reader_with_fileinfo_and_shuffled(
+        bucket: &str,
+        object: &str,
+        erasure_cache: Arc<ErasureCache>,
+        fi: &FileInfo,
+        files: &[FileInfo],
+        disks: &[Option<DiskStore>],
+        pre_shuffled: Option<(&[FileInfo], &[Option<DiskStore>])>,
+        set_index: usize,
+        pool_index: usize,
+        skip_verify_bitrot: bool,
+        suppress_read_repair: bool,
+        metrics_object_class: &'static str,
+        metrics_size_bucket: &'static str,
+        prefer_data_blocks_first_reader_setup: bool,
+    ) -> Result<GetCodecStreamingReaderBuildOutcome> {
         Self::get_object_decode_reader_with_fileinfo_inner(
             bucket,
             object,
@@ -2536,6 +2704,7 @@ impl SetDisks {
             fi,
             files,
             disks,
+            pre_shuffled,
             set_index,
             pool_index,
             skip_verify_bitrot,
@@ -2558,6 +2727,7 @@ impl SetDisks {
         fi: &FileInfo,
         files: &[FileInfo],
         disks: &[Option<DiskStore>],
+        pre_shuffled: Option<(&[FileInfo], &[Option<DiskStore>])>,
         set_index: usize,
         pool_index: usize,
         skip_verify_bitrot: bool,
@@ -2570,9 +2740,15 @@ impl SetDisks {
         single_inflight: bool,
     ) -> Result<GetCodecStreamingReaderBuildOutcome> {
         let erasure = erasure_cache.get_for_file_info(fi)?;
-        let (disks, files) = Self::shuffle_disks_and_parts_metadata_by_index(disks, files, fi);
 
         if fi.parts.len() == 1 {
+            let owned_shuffled;
+            let (files_ref, disks_ref) = if let Some((shuffled_files, shuffled_disks)) = pre_shuffled {
+                (shuffled_files, shuffled_disks)
+            } else {
+                owned_shuffled = Self::shuffle_disks_and_parts_metadata_by_index(disks, files, fi);
+                (owned_shuffled.1.as_slice(), owned_shuffled.0.as_slice())
+            };
             let part = &fi.parts[0];
             let part_length =
                 usize::try_from(fi.size).map_err(|_| Error::other("codec streaming reader object size is invalid"))?;
@@ -2582,8 +2758,8 @@ impl SetDisks {
                 fi,
                 pool_index,
                 set_index,
-                &files,
-                &disks,
+                files_ref,
+                disks_ref,
                 &erasure,
                 part.number,
                 0,
@@ -2612,6 +2788,8 @@ impl SetDisks {
                 GetCodecStreamingFallbackReason::MultipartPartLimit,
             ));
         }
+
+        let (disks, files) = Self::shuffle_disks_and_parts_metadata_by_index(disks, files, fi);
 
         let object_length =
             usize::try_from(fi.size).map_err(|_| Error::other("codec streaming reader object size is invalid"))?;
@@ -4886,6 +5064,7 @@ mod metadata_cache_tests {
                     fi: fi.clone(),
                     parts_metadata: vec![fi],
                     online_disks: vec![None],
+                    shuffled_non_inline: None,
                     read_quorum: 1,
                     verified_inline_body: None,
                     distributed_fence_proof: None,
@@ -5558,6 +5737,7 @@ mod metadata_cache_tests {
             parts_metadata: vec![fi.clone()],
             fi,
             online_disks: Vec::new(),
+            shuffled_non_inline: None,
             read_quorum: 0,
             capability,
             verified_inline_body: None,
@@ -6053,6 +6233,7 @@ mod metadata_cache_tests {
                     fi: fi.clone(),
                     parts_metadata: vec![fi],
                     online_disks: vec![None],
+                    shuffled_non_inline: None,
                     read_quorum: 1,
                     verified_inline_body: None,
                     distributed_fence_proof: None,
@@ -6173,6 +6354,7 @@ mod metadata_cache_tests {
             fi: fi.clone(),
             parts_metadata: vec![fi],
             online_disks: Vec::new(),
+            shuffled_non_inline: None,
             read_quorum: 0,
             verified_inline_body: None,
             distributed_fence_proof: None,
@@ -6472,6 +6654,7 @@ mod metadata_cache_tests {
                 parts_metadata: vec![fi.clone()],
                 fi,
                 online_disks: Vec::new(),
+                shuffled_non_inline: None,
                 read_quorum: 0,
                 verified_inline_body: None,
                 distributed_fence_proof: None,
@@ -6649,6 +6832,70 @@ mod metadata_cache_tests {
             set.cached_get_object_fileinfo("bucket", "fresh-object").await.is_some(),
             "freshly inserted entry should be retrievable"
         );
+    }
+
+    #[tokio::test]
+    async fn get_object_metadata_cache_precomputes_and_shares_shuffled_non_inline_parts() {
+        let (_dirs, set) = read_version_quorum_test_set("bucket", "non-inline-object", 1, 4).await;
+        assert_eq!(set.get_object_metadata_cache_generations.len(), 16_384);
+        let online_disks = set.get_disks_internal().await;
+
+        let mut fi = valid_test_fileinfo("non-inline-object");
+        fi.erasure.distribution = vec![3, 1, 4, 2];
+        let mut parts_metadata = Vec::with_capacity(4);
+        for &idx in &fi.erasure.distribution {
+            let mut slot_fi = fi.clone();
+            slot_fi.erasure.index = idx;
+            parts_metadata.push(slot_fi);
+        }
+
+        let generation = set.get_object_metadata_cache_generation("bucket", "non-inline-object");
+        set.cache_get_object_fileinfo(
+            ("bucket", "non-inline-object"),
+            generation,
+            (&fi, GetObjectMetadataCacheCapability::Full),
+            &parts_metadata,
+            &online_disks,
+            2,
+        )
+        .await;
+
+        let cached = set
+            .cached_get_object_fileinfo("bucket", "non-inline-object")
+            .await
+            .expect("cached non-inline entry");
+        let (expected_files, expected_disks) = cached
+            .shuffled_non_inline
+            .as_ref()
+            .expect("non-inline entry must precompute shuffled metadata");
+        let shuffled_indices: Vec<usize> = expected_files.iter().map(|part| part.erasure.index).collect();
+        assert_eq!(shuffled_indices, vec![1, 2, 3, 4]);
+
+        let snapshot = GetObjectFileInfo::shared(Arc::clone(&cached));
+        assert!(snapshot.shuffled_non_inline().is_some());
+        let (owner, shared_files, shared_disks, _) = snapshot.into_shuffled_read_parts();
+        assert_eq!(owner.name, "non-inline-object");
+        assert!(Arc::ptr_eq(&shared_files, expected_files));
+        assert!(Arc::ptr_eq(&shared_disks, expected_disks));
+
+        // Inline objects must not allocate shuffled_non_inline.
+        let mut inline_fi = valid_test_fileinfo("inline-object");
+        inline_fi.set_inline_data();
+        let inline_gen = set.get_object_metadata_cache_generation("bucket", "inline-object");
+        set.cache_get_object_fileinfo(
+            ("bucket", "inline-object"),
+            inline_gen,
+            (&inline_fi, GetObjectMetadataCacheCapability::Full),
+            std::slice::from_ref(&inline_fi),
+            &[],
+            0,
+        )
+        .await;
+        let cached_inline = set
+            .cached_get_object_fileinfo("bucket", "inline-object")
+            .await
+            .expect("cached inline entry");
+        assert!(cached_inline.shuffled_non_inline.is_none());
     }
 
     #[tokio::test]
