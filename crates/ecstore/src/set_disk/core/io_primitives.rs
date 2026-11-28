@@ -5361,6 +5361,9 @@ impl SetDisks {
 
         let disk_count = disks.len();
         let fanout_disks = Arc::new(disks.to_vec());
+        // Keep the reuse handle in the caller. A detached fanout does not
+        // retain it if the caller is cancelled while waiting for the join.
+        let disk_snapshot = Arc::clone(&fanout_disks);
         let fanout_file_infos = Arc::new(file_infos);
         let fanout_fence_tokens =
             Arc::new(Self::scanner_publication_lease_tokens_for_disks(disks, scanner_publication_lease_tokens)?);
@@ -5456,6 +5459,7 @@ impl SetDisks {
         let (results, file_infos) = match fanout_result {
             Ok(result) => result,
             Err(_) => {
+                drop(disk_snapshot);
                 record_indeterminate_rename(disks, (dst_bucket, dst_object), rollback_receipt).await;
                 return Err(DiskError::Unexpected);
             }
@@ -5570,6 +5574,7 @@ impl SetDisks {
         }
 
         if let Some(ret_err) = reduce_write_quorum_errs(&errs, OBJECT_OP_IGNORED_ERRS, write_quorum) {
+            drop(disk_snapshot);
             if issue3031_diag_enabled() {
                 warn!(
                     target: "rustfs_ecstore::set_disk",
@@ -5688,7 +5693,9 @@ impl SetDisks {
         } else {
             None
         };
-        let online_disks = Self::eval_disks(disks, &errs);
+        #[cfg(test)]
+        assert_eq!(Arc::strong_count(&disk_snapshot), 1, "joined producers must release the reuse snapshot");
+        let online_disks = Self::reuse_completed_rename_disks(disk_snapshot, &errs);
         let committed_slot = online_disks.iter().position(Option::is_some).ok_or(DiskError::Unexpected)?;
         let mut committed_file_info = std::mem::take(&mut file_infos[committed_slot]);
         if protected_multipart {
@@ -6653,6 +6660,22 @@ impl SetDisks {
         }
 
         online_disks
+    }
+
+    fn reuse_completed_rename_disks(disks: Arc<Vec<Option<DiskStore>>>, errs: &[Option<DiskError>]) -> Vec<Option<DiskStore>> {
+        let mut disks = match Arc::try_unwrap(disks) {
+            Ok(disks) => disks,
+            Err(shared) => return Self::eval_disks(&shared, errs),
+        };
+        if disks.len() != errs.len() {
+            return Vec::new();
+        }
+        for (disk, err) in disks.iter_mut().zip(errs) {
+            if err.is_some() {
+                *disk = None;
+            }
+        }
+        disks
     }
 
     #[tracing::instrument(skip(disks, files))]
@@ -8455,6 +8478,31 @@ mod tests {
     use std::io::Cursor;
     use tempfile::TempDir;
     use tokio::io::AsyncReadExt;
+
+    #[tokio::test]
+    async fn completed_rename_disk_snapshot_reuses_unique_ownership_and_copies_shared_ownership() {
+        let (_dir, disk) = read_multiple_test_disk("rename-disk-snapshot", &[]).await;
+        let errs = [None, None, Some(DiskError::Unexpected)];
+        let original = vec![Some(disk.clone()), None, Some(disk.clone())];
+        let expected = SetDisks::eval_disks(&original, &errs);
+        let unique = Arc::new(original.clone());
+        let allocation = unique.as_ptr();
+        let online = SetDisks::reuse_completed_rename_disks(unique, &errs);
+        assert_eq!(online.as_ptr(), allocation, "the unique Vec allocation must survive");
+        assert!(Arc::ptr_eq(
+            online[0].as_ref().expect("original successful disk"),
+            expected[0].as_ref().expect("expected successful disk"),
+        ));
+        assert!(online[1].is_none() && online[2].is_none(), "absent and failed slots stay in place");
+
+        let shared = Arc::new(original);
+        let online = SetDisks::reuse_completed_rename_disks(Arc::clone(&shared), &errs);
+        assert_ne!(online.as_ptr(), shared.as_ptr());
+        assert!(Arc::ptr_eq(online[0].as_ref().expect("copied successful disk"), &disk));
+        assert!(online[1].is_none() && online[2].is_none());
+        assert!(Arc::ptr_eq(shared[2].as_ref().expect("shared snapshot is intact"), &disk));
+        assert!(SetDisks::reuse_completed_rename_disks(Arc::new(vec![Some(disk)]), &errs).is_empty());
+    }
 
     #[tokio::test]
     #[serial_test::serial]
