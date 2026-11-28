@@ -15,10 +15,13 @@ use crate::{LOG_COMPONENT_IAM, LOG_SUBSYSTEM_OIDC};
 use openidconnect::AsyncHttpClient;
 use reqwest::{Certificate, Client};
 use rustfs_config::MAX_OIDC_RESPONSE_SIZE;
-use rustfs_utils::egress::{ENV_OUTBOUND_ALLOW_ORIGINS, OutboundPolicy, find_outbound_dns_policy_rejection};
+use rustfs_utils::egress::{
+    ENV_OUTBOUND_ALLOW_ORIGINS, OutboundClientError, OutboundPeerKind, OutboundPolicy, find_outbound_dns_policy_rejection,
+};
+#[cfg(test)]
+use rustfs_utils::egress::{OutboundDnsLookup, OutboundProxyMatcher};
 use std::collections::VecDeque;
 use std::future::Future;
-use std::net::IpAddr;
 use std::pin::Pin;
 use std::sync::{Arc, LazyLock, Mutex, MutexGuard, RwLock};
 use std::time::{Duration as StdDuration, Instant};
@@ -244,9 +247,9 @@ pub(super) enum OidcHttpError {
     Reqwest(reqwest::Error),
     Http(http::Error),
     ExtraRootCa(String),
-    /// The outbound destination was rejected by the shared egress policy before any
-    /// connection was attempted (invalid URL, loopback/link-local/metadata/private IP,
-    /// or a malformed allow-origins configuration).
+    /// The outbound destination or configured proxy was rejected by the shared egress policy
+    /// before a connection completed (invalid URL, forbidden IP literal or DNS answer, or a
+    /// malformed allow-origins/proxy configuration).
     ForbiddenOutbound(String),
     /// The provider response body exceeded [`MAX_OIDC_RESPONSE_SIZE`] and was abandoned
     /// instead of being buffered in full.
@@ -316,13 +319,32 @@ struct CachedOidcExtraRootCerts {
 #[derive(Clone)]
 pub(super) struct DiscoveryRequest;
 
+#[cfg(test)]
+#[derive(Clone, Default)]
+pub(super) struct OidcTransportTestOverrides {
+    pub(super) dns_resolver: Option<Arc<dyn reqwest::dns::Resolve>>,
+    pub(super) proxy_matcher: Option<OutboundProxyMatcher>,
+    pub(super) dns_lookup: Option<OutboundDnsLookup>,
+}
+
+#[cfg(test)]
+impl OidcTransportTestOverrides {
+    pub(super) fn with_proxy_matcher(proxy_matcher: OutboundProxyMatcher) -> Self {
+        Self {
+            proxy_matcher: Some(proxy_matcher),
+            ..Self::default()
+        }
+    }
+}
+
 /// HTTP client adapter bridging reqwest 0.13 to the `openidconnect` `AsyncHttpClient` trait.
 ///
-/// A fresh client is built for every request so the destination is re-validated and the
-/// resolved IP is re-classified at connection time. This closes the SSRF / DNS-rebinding
-/// gap where a one-shot URL string check is bypassed by a hostname that resolves to an
-/// internal address only at connection time, and it also covers endpoints discovered from
-/// the provider metadata (JWKS, token) rather than only the operator-configured `config_url`.
+/// A fresh client is built for every request so the destination URL is re-validated and
+/// direct or proxy connection endpoints are classified at connection time. This closes the
+/// SSRF / DNS-rebinding gap on direct connections (including `NO_PROXY` and loopback targets),
+/// permits operator-configured forward proxies while rejecting metadata/link-local/reserved
+/// proxy hops, and covers endpoints discovered from provider metadata (JWKS, token, userinfo)
+/// rather than only the operator-configured `config_url`.
 pub(super) struct ReqwestHttpClient {
     /// `None` in production: the process-cached outbound policy from the environment is used.
     /// `Some(..)` only in tests, to explicitly allow a loopback mock endpoint.
@@ -330,7 +352,7 @@ pub(super) struct ReqwestHttpClient {
     extra_root_certs: Arc<RwLock<CachedOidcExtraRootCerts>>,
     extra_root_ca_provider: Option<OidcExtraRootCaProvider>,
     #[cfg(test)]
-    dns_resolver_override: Option<Arc<dyn reqwest::dns::Resolve>>,
+    test_overrides: OidcTransportTestOverrides,
 }
 
 pub(super) fn parse_oidc_extra_root_certs(source: &str, pem: &[u8]) -> Result<Vec<Certificate>, String> {
@@ -349,50 +371,70 @@ pub(super) fn oidc_extra_root_certs(root_ca_pem: Option<&[u8]>) -> Result<Vec<Ce
 
 /// Build a reqwest client pinned to the shared outbound egress policy for a single request.
 ///
-/// [`OutboundPolicy::resolver_for`] validates the URL shape and rejects loopback,
-/// link-local, metadata, multicast and unauthorized private addresses up front, and the
-/// returned `OutboundDnsResolver` re-resolves and re-classifies the host on every new
-/// connection so DNS rebinding fails closed. Redirects are not followed: a redirect target
-/// would otherwise skip URL-shape re-validation. The timeouts bound how long a slow or
-/// stalled provider can pin the calling task.
+/// [`OutboundPolicy::configure_reqwest_client`] validates the target URL shape and literal host
+/// up front, bypasses proxies for loopback targets and `NO_PROXY` matches (attaching a target
+/// `OutboundDnsResolver` that re-resolves and re-classifies addresses on every connection), and
+/// resolves operator-configured HTTP(S) forward proxies through proxy-mode `OutboundDnsResolver`.
+/// Redirects are not followed so redirect targets cannot skip URL-shape re-validation.
 pub(super) fn build_oidc_http_client(
     uri: &str,
     policy_override: Option<&OutboundPolicy>,
     extra_root_certs: &[Certificate],
-    #[cfg(test)] dns_resolver_override: Option<Arc<dyn reqwest::dns::Resolve>>,
+    #[cfg(test)] test_overrides: Option<&OidcTransportTestOverrides>,
 ) -> Result<(Client, Url), OidcHttpError> {
     let url = Url::parse(uri).map_err(|_| OidcHttpError::ForbiddenOutbound("invalid outbound OIDC URL".to_string()))?;
-    let resolver = match policy_override {
-        Some(policy) => policy.resolver_for(&url),
-        None => OutboundPolicy::from_env_cached()
-            .map_err(|err| OidcHttpError::ForbiddenOutbound(err.to_string()))?
-            .resolver_for(&url),
-    }
-    .map_err(|err| {
-        let base = err.to_string();
-        let origin = url.origin().ascii_serialization();
-        let can_allow_origin =
-            OutboundPolicy::from_allowed_origins(&origin).is_ok_and(|allowlisted| allowlisted.validate_url(&url).is_ok());
-        oidc_forbidden_outbound_error(&url, base, can_allow_origin)
-    })?;
-    let bypass_proxy = should_bypass_proxy_for_oidc_uri(uri);
-    #[cfg(test)]
-    let bypass_proxy = bypass_proxy || dns_resolver_override.is_some();
-    #[cfg(test)]
-    let resolver: Arc<dyn reqwest::dns::Resolve> = dns_resolver_override.unwrap_or_else(|| Arc::new(resolver));
+    let policy = match policy_override {
+        Some(policy) => policy,
+        None => OutboundPolicy::from_env_cached().map_err(|err| OidcHttpError::ForbiddenOutbound(err.to_string()))?,
+    };
 
-    let mut builder = reqwest::Client::builder()
-        .dns_resolver(resolver)
+    let builder = reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
         .timeout(OIDC_HTTP_REQUEST_TIMEOUT)
         .connect_timeout(OIDC_HTTP_CONNECT_TIMEOUT);
-    if bypass_proxy {
-        builder = builder.no_proxy();
-    }
+
+    #[cfg(not(test))]
+    let mut builder = policy
+        .configure_reqwest_client(&url, builder)
+        .map_err(|err| map_outbound_client_error(&url, err))?;
+
+    #[cfg(test)]
+    let mut builder = {
+        let default_matcher;
+        let matcher = match test_overrides.and_then(|o| o.proxy_matcher.as_ref()) {
+            Some(matcher) => matcher,
+            None => {
+                default_matcher = if test_overrides.is_some_and(|o| o.dns_resolver.is_some()) {
+                    OutboundProxyMatcher::none()
+                } else {
+                    OutboundProxyMatcher::from_system()
+                };
+                &default_matcher
+            }
+        };
+        let dns_lookup = test_overrides.and_then(|o| o.dns_lookup.clone());
+        let builder = policy
+            .configure_reqwest_client_for_test(&url, matcher, dns_lookup, builder)
+            .map_err(|err| map_outbound_client_error(&url, err))?;
+        match test_overrides.and_then(|o| o.dns_resolver.clone()) {
+            Some(resolver) => builder.dns_resolver(resolver),
+            None => builder,
+        }
+    };
+
     if !extra_root_certs.is_empty() {
         builder = builder.tls_certs_merge(extra_root_certs.iter().cloned());
     }
     builder.build().map(|client| (client, url)).map_err(OidcHttpError::Reqwest)
+}
+
+fn map_outbound_client_error(url: &Url, err: OutboundClientError) -> OidcHttpError {
+    let base = err.to_string();
+    if err.is_proxy_error() {
+        oidc_forbidden_proxy_error(base)
+    } else {
+        oidc_forbidden_outbound_error(url, base, err.allow_origin_can_recover())
+    }
 }
 
 fn oidc_forbidden_outbound_error(url: &Url, base: String, can_allow_origin: bool) -> OidcHttpError {
@@ -407,10 +449,17 @@ fn oidc_forbidden_outbound_error(url: &Url, base: String, can_allow_origin: bool
     OidcHttpError::ForbiddenOutbound(reason)
 }
 
+fn oidc_forbidden_proxy_error(base: String) -> OidcHttpError {
+    OidcHttpError::ForbiddenOutbound(format!("{base}; check HTTP_PROXY/HTTPS_PROXY/ALL_PROXY/NO_PROXY configuration"))
+}
+
 fn oidc_http_error_from_reqwest(url: &Url, error: reqwest::Error) -> OidcHttpError {
     if let Some(rejection) = find_outbound_dns_policy_rejection(&error) {
         let base = rejection.to_string();
-        return oidc_forbidden_outbound_error(url, base, rejection.allow_origin_can_recover());
+        return match rejection.peer_kind() {
+            OutboundPeerKind::Proxy => oidc_forbidden_proxy_error(base),
+            OutboundPeerKind::Target => oidc_forbidden_outbound_error(url, base, rejection.allow_origin_can_recover()),
+        };
     }
     OidcHttpError::Reqwest(error)
 }
@@ -435,15 +484,6 @@ async fn read_bounded_response_body(response: reqwest::Response, limit: usize) -
     Ok(body)
 }
 
-pub(super) fn should_bypass_proxy_for_oidc_uri(uri: &str) -> bool {
-    let Some(host) = Url::parse(uri).ok().and_then(|url| url.host_str().map(str::to_owned)) else {
-        return false;
-    };
-    let host = host.trim_matches(['[', ']']);
-
-    host.eq_ignore_ascii_case("localhost") || host.parse::<IpAddr>().is_ok_and(|addr| addr.is_loopback())
-}
-
 impl ReqwestHttpClient {
     pub(super) fn new() -> Result<Self, String> {
         Self::new_with_extra_root_certs(Vec::new())
@@ -463,7 +503,7 @@ impl ReqwestHttpClient {
             extra_root_certs: Self::extra_root_cert_cache(extra_root_certs),
             extra_root_ca_provider: None,
             #[cfg(test)]
-            dns_resolver_override: None,
+            test_overrides: OidcTransportTestOverrides::default(),
         })
     }
 
@@ -473,7 +513,7 @@ impl ReqwestHttpClient {
             extra_root_certs: Arc::new(RwLock::new(CachedOidcExtraRootCerts::default())),
             extra_root_ca_provider: Some(extra_root_ca_provider),
             #[cfg(test)]
-            dns_resolver_override: None,
+            test_overrides: OidcTransportTestOverrides::default(),
         })
     }
 
@@ -513,18 +553,15 @@ impl ReqwestHttpClient {
             policy_override: Some(policy),
             extra_root_certs: Self::extra_root_cert_cache(Vec::new()),
             extra_root_ca_provider: None,
-            dns_resolver_override: None,
+            test_overrides: OidcTransportTestOverrides::default(),
         }
     }
 
     #[cfg(test)]
     pub(super) fn with_policy_and_extra_root_certs(policy: OutboundPolicy, extra_root_certs: Vec<Certificate>) -> Self {
-        Self {
-            policy_override: Some(policy),
-            extra_root_certs: Self::extra_root_cert_cache(extra_root_certs),
-            extra_root_ca_provider: None,
-            dns_resolver_override: None,
-        }
+        let mut client = Self::with_policy(policy);
+        client.extra_root_certs = Self::extra_root_cert_cache(extra_root_certs);
+        client
     }
 
     #[cfg(test)]
@@ -536,18 +573,27 @@ impl ReqwestHttpClient {
             policy_override: Some(policy),
             extra_root_certs: Arc::new(RwLock::new(CachedOidcExtraRootCerts::default())),
             extra_root_ca_provider: Some(extra_root_ca_provider),
-            dns_resolver_override: None,
+            test_overrides: OidcTransportTestOverrides::default(),
         }
     }
 
     #[cfg(test)]
     pub(super) fn with_policy_and_dns_resolver(policy: OutboundPolicy, resolver: Arc<dyn reqwest::dns::Resolve>) -> Self {
-        Self {
-            policy_override: Some(policy),
-            extra_root_certs: Self::extra_root_cert_cache(Vec::new()),
-            extra_root_ca_provider: None,
-            dns_resolver_override: Some(resolver),
-        }
+        let mut client = Self::with_policy(policy);
+        client.test_overrides.dns_resolver = Some(resolver);
+        client
+    }
+
+    #[cfg(test)]
+    pub(super) fn with_proxy_matcher(mut self, proxy_matcher: OutboundProxyMatcher) -> Self {
+        self.test_overrides.proxy_matcher = Some(proxy_matcher);
+        self
+    }
+
+    #[cfg(test)]
+    pub(super) fn with_dns_lookup(mut self, dns_lookup: OutboundDnsLookup) -> Self {
+        self.test_overrides.dns_lookup = Some(dns_lookup);
+        self
     }
 }
 
@@ -583,7 +629,7 @@ impl<'c> AsyncHttpClient<'c> for ReqwestHttpClient {
                 self.policy_override.as_ref(),
                 &extra_root_certs,
                 #[cfg(test)]
-                self.dns_resolver_override.clone(),
+                Some(&self.test_overrides),
             )?;
             let response = client
                 .request(parts.method, uri.clone())

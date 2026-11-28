@@ -17,9 +17,9 @@ use std::collections::HashSet;
 use std::collections::{HashMap, VecDeque};
 use std::fmt;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
-use std::sync::OnceLock;
 #[cfg(test)]
-use std::sync::{Arc, Mutex};
+use std::sync::Mutex;
+use std::sync::{Arc, OnceLock};
 use url::Url;
 
 /// Comma-separated exact HTTP(S) origins that may resolve to otherwise restricted addresses.
@@ -29,6 +29,15 @@ use url::Url;
 pub const ENV_OUTBOUND_ALLOW_ORIGINS: &str = "RUSTFS_OUTBOUND_ALLOW_ORIGINS";
 
 static OUTBOUND_POLICY: OnceLock<Result<OutboundPolicy, OutboundPolicyError>> = OnceLock::new();
+
+/// Identifies which outbound network hop an egress check or DNS resolution applies to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OutboundPeerKind {
+    /// Direct connection to the requested target origin.
+    Target,
+    /// Connection to an operator-configured forward or `CONNECT` proxy hop.
+    Proxy,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum OutboundUrlError {
@@ -59,6 +68,14 @@ pub enum OutboundPolicyError {
     ForbiddenHost { host: String, reason: &'static str },
 }
 
+impl OutboundPolicyError {
+    /// Whether adding the destination's exact origin to [`ENV_OUTBOUND_ALLOW_ORIGINS`]
+    /// could permit this request.
+    pub fn allow_origin_can_recover(&self) -> bool {
+        matches!(self, Self::ForbiddenHost { reason, .. } if restricted_reason_can_be_overridden(reason))
+    }
+}
+
 impl fmt::Display for OutboundPolicyError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -82,22 +99,101 @@ impl fmt::Display for OutboundPolicyError {
 
 impl std::error::Error for OutboundPolicyError {}
 
+/// Error returned when configuring an outbound HTTP client for a target URL and optional proxy.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OutboundClientError {
+    Policy(OutboundPolicyError),
+    InvalidProxyUrl,
+    UnsupportedProxyScheme { scheme: String },
+    ForbiddenProxyHost { host: String, reason: &'static str },
+}
+
+impl OutboundClientError {
+    /// Whether this error rejected an outbound proxy configuration rather than the target URL.
+    pub const fn is_proxy_error(&self) -> bool {
+        matches!(
+            self,
+            Self::InvalidProxyUrl | Self::UnsupportedProxyScheme { .. } | Self::ForbiddenProxyHost { .. }
+        )
+    }
+
+    /// Whether adding the destination's exact origin to [`ENV_OUTBOUND_ALLOW_ORIGINS`]
+    /// could permit this request.
+    pub fn allow_origin_can_recover(&self) -> bool {
+        match self {
+            Self::Policy(err) => err.allow_origin_can_recover(),
+            Self::InvalidProxyUrl | Self::UnsupportedProxyScheme { .. } | Self::ForbiddenProxyHost { .. } => false,
+        }
+    }
+}
+
+impl From<OutboundPolicyError> for OutboundClientError {
+    fn from(err: OutboundPolicyError) -> Self {
+        Self::Policy(err)
+    }
+}
+
+impl fmt::Display for OutboundClientError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Policy(err) => fmt::Display::fmt(err, f),
+            Self::InvalidProxyUrl => write!(f, "outbound proxy URL is invalid"),
+            Self::UnsupportedProxyScheme { scheme } => {
+                write!(f, "outbound proxy URL scheme '{scheme}' is not allowed")
+            }
+            Self::ForbiddenProxyHost { host, reason } => {
+                write!(f, "outbound proxy host '{host}' is not allowed: {reason}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for OutboundClientError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Policy(err) => Some(err),
+            Self::InvalidProxyUrl | Self::UnsupportedProxyScheme { .. } | Self::ForbiddenProxyHost { .. } => None,
+        }
+    }
+}
+
 /// A DNS answer was rejected at the connection boundary because every resolved
 /// address was forbidden by the outbound policy.
-#[derive(Debug)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OutboundDnsPolicyRejection {
     host: String,
+    peer_kind: OutboundPeerKind,
     allow_origin_can_recover: bool,
 }
 
 impl OutboundDnsPolicyRejection {
-    /// Records the rejected host and whether an exact operator allowlist origin
+    /// Records a rejected target host and whether an exact operator allowlist origin
     /// could permit at least one of its resolved addresses.
     pub fn new(host: String, allow_origin_can_recover: bool) -> Self {
         Self {
             host,
+            peer_kind: OutboundPeerKind::Target,
             allow_origin_can_recover,
         }
+    }
+
+    /// Records a rejected outbound proxy hostname; allowlisting target origins cannot recover this.
+    pub fn new_proxy(host: String) -> Self {
+        Self {
+            host,
+            peer_kind: OutboundPeerKind::Proxy,
+            allow_origin_can_recover: false,
+        }
+    }
+
+    /// The normalized hostname whose DNS answers were rejected.
+    pub fn host(&self) -> &str {
+        &self.host
+    }
+
+    /// Whether the rejected DNS lookup was for the direct target host or an outbound proxy hop.
+    pub fn peer_kind(&self) -> OutboundPeerKind {
+        self.peer_kind
     }
 
     /// Whether an exact allowlist origin could permit at least one rejected address.
@@ -108,7 +204,18 @@ impl OutboundDnsPolicyRejection {
 
 impl fmt::Display for OutboundDnsPolicyRejection {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "outbound DNS resolution for '{}' returned no allowed addresses", self.host)
+        match self.peer_kind {
+            OutboundPeerKind::Target => {
+                write!(f, "outbound DNS resolution for '{}' returned no allowed addresses", self.host)
+            }
+            OutboundPeerKind::Proxy => {
+                write!(
+                    f,
+                    "outbound DNS resolution for outbound proxy '{}' returned no allowed addresses",
+                    self.host
+                )
+            }
+        }
     }
 }
 
@@ -133,6 +240,170 @@ pub fn find_outbound_dns_policy_rejection<'a>(
         current = error.source();
     }
     None
+}
+
+/// Deterministic DNS lookup hook used by unit and cross-crate transport tests.
+#[doc(hidden)]
+pub type OutboundDnsLookup = Arc<dyn Fn(&str) -> Option<Vec<SocketAddr>> + Send + Sync>;
+
+/// Evaluates `HTTP_PROXY` / `HTTPS_PROXY` / `ALL_PROXY` / `NO_PROXY` (and optional OS proxy
+/// configuration) without exposing `hyper-util` types to downstream crates.
+///
+/// Proxy credentials are never formatted by [`fmt::Debug`] or error messages.
+#[derive(Clone)]
+pub struct OutboundProxyMatcher(Arc<hyper_util::client::proxy::matcher::Matcher>);
+
+impl fmt::Debug for OutboundProxyMatcher {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("OutboundProxyMatcher").finish_non_exhaustive()
+    }
+}
+
+impl Default for OutboundProxyMatcher {
+    fn default() -> Self {
+        Self::none()
+    }
+}
+
+struct ValidatedProxy {
+    canonical_url: Url,
+    basic_auth: Option<http::HeaderValue>,
+}
+
+impl OutboundProxyMatcher {
+    /// Returns a matcher that never routes requests through a proxy.
+    pub fn none() -> Self {
+        Self(Arc::new(hyper_util::client::proxy::matcher::Matcher::builder().build()))
+    }
+
+    /// Builds a matcher from process environment variables (`HTTP_PROXY`, `HTTPS_PROXY`,
+    /// `ALL_PROXY`, `NO_PROXY` and lowercase counterparts) plus OS system proxy settings.
+    pub fn from_system() -> Self {
+        Self(Arc::new(hyper_util::client::proxy::matcher::Matcher::from_system()))
+    }
+
+    /// Builds a matcher from process environment variables only, ignoring OS dynamic stores.
+    pub fn from_env() -> Self {
+        Self(Arc::new(hyper_util::client::proxy::matcher::Matcher::from_env()))
+    }
+
+    /// Builds a hermetic matcher from explicit `HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY`, and
+    /// `NO_PROXY` values without reading process environment or OS proxy stores.
+    pub fn from_env_values(
+        http_proxy: Option<&str>,
+        https_proxy: Option<&str>,
+        all_proxy: Option<&str>,
+        no_proxy: Option<&str>,
+    ) -> Self {
+        Self(Arc::new(
+            hyper_util::client::proxy::matcher::Matcher::builder()
+                .http(http_proxy.map(str::trim).unwrap_or_default())
+                .https(https_proxy.map(str::trim).unwrap_or_default())
+                .all(all_proxy.map(str::trim).unwrap_or_default())
+                .no(no_proxy.map(str::trim).unwrap_or_default())
+                .build(),
+        ))
+    }
+
+    /// Builds a hermetic matcher routing all non-loopback HTTP(S) traffic through `proxy`.
+    pub fn all(proxy: &str) -> Self {
+        Self::from_env_values(None, None, Some(proxy), None)
+    }
+
+    fn match_target(&self, target: &ValidatedTarget, url: &Url) -> Result<Option<ValidatedProxy>, OutboundClientError> {
+        let dst = target.proxy_target_uri(url)?;
+        let Some(intercept) = self.0.intercept(&dst) else {
+            return Ok(None);
+        };
+        let scheme = intercept.uri().scheme_str().unwrap_or_default();
+        if !matches!(scheme, "http" | "https") {
+            return Err(OutboundClientError::UnsupportedProxyScheme {
+                scheme: scheme.to_ascii_lowercase(),
+            });
+        }
+        if intercept.raw_auth().is_some() {
+            return Err(OutboundClientError::InvalidProxyUrl);
+        }
+        let canonical_url = Url::parse(&intercept.uri().to_string()).map_err(|_| OutboundClientError::InvalidProxyUrl)?;
+        validate_proxy_url(&canonical_url)?;
+        Ok(Some(ValidatedProxy {
+            canonical_url,
+            basic_auth: intercept.basic_auth().cloned(),
+        }))
+    }
+}
+
+fn validate_proxy_url(url: &Url) -> Result<(), OutboundClientError> {
+    if !matches!(url.scheme(), "http" | "https") {
+        return Err(OutboundClientError::UnsupportedProxyScheme {
+            scheme: url.scheme().to_string(),
+        });
+    }
+    if !url.username().is_empty()
+        || url.password().is_some()
+        || !matches!(url.path(), "" | "/")
+        || url.query().is_some()
+        || url.fragment().is_some()
+    {
+        return Err(OutboundClientError::InvalidProxyUrl);
+    }
+    let raw_host = url
+        .host_str()
+        .filter(|host| !host.is_empty())
+        .ok_or(OutboundClientError::InvalidProxyUrl)?;
+    let normalized = normalize_host_str(raw_host);
+    if normalized.is_empty() {
+        return Err(OutboundClientError::InvalidProxyUrl);
+    }
+    match classify_url_host(normalized) {
+        Ok(()) => Ok(()),
+        Err(reason) if proxy_restricted_reason_allowed(reason) => Ok(()),
+        Err(reason) => Err(OutboundClientError::ForbiddenProxyHost {
+            host: raw_host.to_string(),
+            reason,
+        }),
+    }
+}
+
+fn is_loopback_ip(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => v4.is_loopback(),
+        IpAddr::V6(v6) => v6.is_loopback() || embedded_ipv4(v6).is_some_and(|v4| v4.is_loopback()),
+    }
+}
+
+/// Returns `true` when `url` targets `localhost` (including `localhost.`) or any IPv4/IPv6
+/// loopback address (including IPv4-mapped/compatible IPv6 loopback) and must bypass proxies.
+pub fn should_bypass_proxy_for_url(url: &Url) -> bool {
+    let Some(raw_host) = url.host_str() else {
+        return false;
+    };
+    let host = normalize_host_str(raw_host);
+    host.eq_ignore_ascii_case("localhost") || host.parse::<IpAddr>().is_ok_and(is_loopback_ip)
+}
+
+struct ValidatedTarget {
+    host: String,
+    is_ipv6: bool,
+    allow_restricted: bool,
+    bypass_proxy: bool,
+}
+
+impl ValidatedTarget {
+    fn proxy_target_uri(&self, url: &Url) -> Result<http::Uri, OutboundPolicyError> {
+        let authority = match (self.is_ipv6, url.port()) {
+            (true, Some(port)) => format!("[{}]:{port}", self.host),
+            (true, None) => format!("[{}]", self.host),
+            (false, Some(port)) => format!("{}:{port}", self.host),
+            (false, None) => self.host.clone(),
+        };
+        http::Uri::builder()
+            .scheme(url.scheme())
+            .authority(authority.as_str())
+            .path_and_query("/")
+            .build()
+            .map_err(|_| OutboundPolicyError::MissingHost)
+    }
 }
 
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -179,95 +450,213 @@ impl OutboundPolicy {
     }
 
     pub fn validate_url(&self, url: &Url) -> Result<(), OutboundPolicyError> {
+        self.validate_target(url).map(|_| ())
+    }
+
+    pub fn resolver_for(&self, url: &Url) -> Result<OutboundDnsResolver, OutboundPolicyError> {
+        let target = self.validate_target(url)?;
+        Ok(OutboundDnsResolver::new(target.host, target.allow_restricted))
+    }
+
+    /// Configures `builder` for a single outbound request to `url` using system proxy settings.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`OutboundClientError`] if `url` violates the target outbound policy or if a
+    /// matched outbound proxy URL is invalid, uses a non-HTTP(S) scheme, or targets a forbidden
+    /// literal address (such as cloud metadata, link-local, unspecified, or reserved space).
+    pub fn configure_reqwest_client(
+        &self,
+        url: &Url,
+        builder: reqwest::ClientBuilder,
+    ) -> Result<reqwest::ClientBuilder, OutboundClientError> {
+        let proxy_matcher = OutboundProxyMatcher::from_system();
+        self.configure_reqwest_client_with_proxy_matcher(url, &proxy_matcher, builder)
+    }
+
+    /// Configures `builder` for a single outbound request to `url` using an explicit
+    /// [`OutboundProxyMatcher`].
+    ///
+    /// Target URL shape and IP-literal checks always run first. Loopback targets and targets
+    /// matched by `NO_PROXY` connect directly using target-mode [`OutboundDnsResolver`]. Requests
+    /// intercepted by an HTTP(S) proxy validate the canonicalized proxy URL, attach any proxy
+    /// `Basic` credentials without putting secrets in the URL, and resolve the proxy hostname
+    /// through [`OutboundDnsResolver::for_proxy`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`OutboundClientError`] when either `url` or the matched proxy URL is rejected.
+    pub fn configure_reqwest_client_with_proxy_matcher(
+        &self,
+        url: &Url,
+        proxy_matcher: &OutboundProxyMatcher,
+        builder: reqwest::ClientBuilder,
+    ) -> Result<reqwest::ClientBuilder, OutboundClientError> {
+        self.configure_reqwest_client_for_test(url, proxy_matcher, None, builder)
+    }
+
+    /// Configures `builder` like [`Self::configure_reqwest_client_with_proxy_matcher`] while
+    /// injecting an optional DNS lookup hook into whichever [`OutboundDnsResolver`] mode applies.
+    #[doc(hidden)]
+    pub fn configure_reqwest_client_for_test(
+        &self,
+        url: &Url,
+        proxy_matcher: &OutboundProxyMatcher,
+        dns_override: Option<OutboundDnsLookup>,
+        builder: reqwest::ClientBuilder,
+    ) -> Result<reqwest::ClientBuilder, OutboundClientError> {
+        let target = self.validate_target(url)?;
+
+        if !target.bypass_proxy
+            && let Some(matched_proxy) = proxy_matcher.match_target(&target, url)?
+        {
+            let mut reqwest_proxy =
+                reqwest::Proxy::all(matched_proxy.canonical_url).map_err(|_| OutboundClientError::InvalidProxyUrl)?;
+            if let Some(mut basic_auth) = matched_proxy.basic_auth {
+                basic_auth.set_sensitive(true);
+                reqwest_proxy = reqwest_proxy.custom_http_auth(basic_auth);
+            }
+            let mut proxy_resolver = OutboundDnsResolver::for_proxy();
+            if let Some(dns_override) = dns_override {
+                proxy_resolver = proxy_resolver.with_lookup_override(dns_override);
+            }
+            return Ok(builder.no_proxy().proxy(reqwest_proxy).dns_resolver(proxy_resolver));
+        }
+
+        let mut target_resolver = OutboundDnsResolver::new(target.host, target.allow_restricted);
+        if let Some(dns_override) = dns_override {
+            target_resolver = target_resolver.with_lookup_override(dns_override);
+        }
+        Ok(builder.no_proxy().dns_resolver(target_resolver))
+    }
+
+    fn validate_target(&self, url: &Url) -> Result<ValidatedTarget, OutboundPolicyError> {
         validate_http_url_shape(url)?;
         let raw_host = url.host_str().ok_or(OutboundPolicyError::MissingHost)?;
-        let normalized_host = raw_host.trim_end_matches('.').trim_matches(['[', ']']);
-        let result = if normalized_host.eq_ignore_ascii_case("localhost") {
+        let normalized = normalize_host_str(raw_host);
+        if normalized.is_empty() {
+            return Err(OutboundPolicyError::MissingHost);
+        }
+        let host = normalized.to_ascii_lowercase();
+        let parsed_ip = host.parse::<IpAddr>().ok();
+        let is_ipv6 = parsed_ip.is_some_and(|ip| ip.is_ipv6());
+        let bypass_proxy = host == "localhost" || parsed_ip.is_some_and(is_loopback_ip);
+        let classification = if host == "localhost" {
             Err("loopback host")
-        } else if let Ok(ip) = normalized_host.parse::<IpAddr>() {
+        } else if let Some(ip) = parsed_ip {
             validate_policy_ip(ip)
         } else {
             Ok(())
         };
-        match result {
-            Ok(()) => Ok(()),
-            Err(reason) if self.allows_restricted_origin(url) && restricted_reason_can_be_overridden(reason) => Ok(()),
-            Err(reason) => Err(OutboundPolicyError::ForbiddenHost {
-                host: raw_host.to_string(),
-                reason,
-            }),
+
+        let allow_restricted = !self.allowed_restricted_origins.is_empty()
+            && url
+                .port_or_known_default()
+                .map(|port| format_normalized_origin(url.scheme(), &host, is_ipv6, port))
+                .is_some_and(|origin| self.allowed_restricted_origins.contains(&origin));
+
+        match classification {
+            Ok(()) => {}
+            Err(reason) if allow_restricted && restricted_reason_can_be_overridden(reason) => {}
+            Err(reason) => {
+                return Err(OutboundPolicyError::ForbiddenHost {
+                    host: raw_host.to_string(),
+                    reason,
+                });
+            }
         }
-    }
 
-    pub fn resolver_for(&self, url: &Url) -> Result<OutboundDnsResolver, OutboundPolicyError> {
-        self.validate_url(url)?;
-        let host = normalized_host(url).ok_or(OutboundPolicyError::MissingHost)?;
-        Ok(OutboundDnsResolver::new(host, self.allows_restricted_origin(url)))
-    }
-
-    fn allows_restricted_origin(&self, url: &Url) -> bool {
-        normalized_origin(url).is_some_and(|origin| self.allowed_restricted_origins.contains(&origin))
+        Ok(ValidatedTarget {
+            host,
+            is_ipv6,
+            allow_restricted,
+            bypass_proxy,
+        })
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct OutboundDnsResolver {
+    peer_kind: OutboundPeerKind,
     allowed_restricted_host: Option<String>,
-    #[cfg(test)]
-    overrides: Option<DnsOverrideAnswers>,
+    lookup_override: Option<OutboundDnsLookup>,
 }
 
-#[cfg(test)]
-type DnsOverrideAnswers = Arc<Mutex<HashMap<String, VecDeque<Vec<SocketAddr>>>>>;
+impl fmt::Debug for OutboundDnsResolver {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("OutboundDnsResolver")
+            .field("peer_kind", &self.peer_kind)
+            .field("allowed_restricted_host", &self.allowed_restricted_host)
+            .field("has_lookup_override", &self.lookup_override.is_some())
+            .finish()
+    }
+}
 
 impl OutboundDnsResolver {
     fn new(host: String, allow_restricted: bool) -> Self {
         Self {
+            peer_kind: OutboundPeerKind::Target,
             allowed_restricted_host: allow_restricted.then_some(host),
-            #[cfg(test)]
-            overrides: None,
+            lookup_override: None,
         }
     }
 
-    #[cfg(test)]
-    fn with_overrides(mut self, overrides: HashMap<String, Vec<IpAddr>>) -> Self {
-        let overrides = overrides
-            .into_iter()
-            .map(|(host, ips)| {
-                let addresses = ips.into_iter().map(|ip| SocketAddr::new(ip, 0)).collect();
-                (host, VecDeque::from([addresses]))
-            })
-            .collect();
-        self.overrides = Some(Arc::new(Mutex::new(overrides)));
+    /// Creates a connection-time DNS resolver for an operator-configured outbound proxy hop.
+    ///
+    /// Permits public, private (RFC 1918 / IPv6 ULA excluding cloud metadata), shared (CGNAT),
+    /// and loopback addresses while rejecting metadata, link-local, unspecified, translation, and
+    /// reserved addresses on every new connection.
+    pub fn for_proxy() -> Self {
+        Self {
+            peer_kind: OutboundPeerKind::Proxy,
+            allowed_restricted_host: None,
+            lookup_override: None,
+        }
+    }
+
+    /// Attaches a deterministic DNS lookup callback for tests while retaining full policy filtering.
+    #[doc(hidden)]
+    pub fn with_lookup_override(mut self, lookup: OutboundDnsLookup) -> Self {
+        self.lookup_override = Some(lookup);
         self
     }
 
     #[cfg(test)]
-    fn with_override_sequence(mut self, host: &str, answers: Vec<Vec<SocketAddr>>) -> Self {
-        self.overrides = Some(Arc::new(Mutex::new(HashMap::from([(host.to_string(), VecDeque::from(answers))]))));
-        self
+    fn with_overrides(self, overrides: HashMap<String, Vec<IpAddr>>) -> Self {
+        let overrides: HashMap<String, Vec<SocketAddr>> = overrides
+            .into_iter()
+            .map(|(host, ips)| {
+                let addresses = ips.into_iter().map(|ip| SocketAddr::new(ip, 0)).collect();
+                (host, addresses)
+            })
+            .collect();
+        self.with_lookup_override(Arc::new(move |host| overrides.get(host).cloned()))
+    }
+
+    #[cfg(test)]
+    fn with_override_sequence(self, host: &str, answers: Vec<Vec<SocketAddr>>) -> Self {
+        let entries = Mutex::new(HashMap::from([(host.to_string(), VecDeque::from(answers))]));
+        self.with_lookup_override(Arc::new(move |lookup_host| {
+            let mut entries = entries.lock().expect("test DNS overrides must not be poisoned");
+            let answers = entries.get_mut(lookup_host)?;
+            if answers.len() > 1 {
+                answers.pop_front()
+            } else {
+                answers.front().cloned()
+            }
+        }))
     }
 }
 
 impl reqwest::dns::Resolve for OutboundDnsResolver {
     fn resolve(&self, name: reqwest::dns::Name) -> reqwest::dns::Resolving {
         let host = name.as_str().trim_end_matches('.').to_ascii_lowercase();
-        let allow_restricted = self.allowed_restricted_host.as_deref() == Some(host.as_str());
-        #[cfg(test)]
-        let overrides = self.overrides.clone();
+        let peer_kind = self.peer_kind;
+        let allow_restricted =
+            peer_kind == OutboundPeerKind::Target && self.allowed_restricted_host.as_deref() == Some(host.as_str());
+        let lookup_override = self.lookup_override.clone();
         Box::pin(async move {
-            #[cfg(test)]
-            let overridden = overrides.as_ref().and_then(|entries| {
-                let mut entries = entries.lock().expect("test DNS overrides must not be poisoned");
-                let answers = entries.get_mut(&host)?;
-                if answers.len() > 1 {
-                    answers.pop_front()
-                } else {
-                    answers.front().cloned()
-                }
-            });
-            #[cfg(not(test))]
-            let overridden: Option<Vec<SocketAddr>> = None;
+            let overridden = lookup_override.as_ref().and_then(|lookup| lookup(&host));
 
             let addresses = if let Some(addresses) = overridden {
                 addresses
@@ -291,19 +680,22 @@ impl reqwest::dns::Resolve for OutboundDnsResolver {
                 .into_iter()
                 .filter(|address| match validate_policy_ip(address.ip()) {
                     Ok(()) => true,
-                    Err(reason) => {
-                        let recoverable = restricted_reason_can_be_overridden(reason);
-                        allow_origin_can_recover |= recoverable;
-                        allow_restricted && recoverable
-                    }
+                    Err(reason) => match peer_kind {
+                        OutboundPeerKind::Target => {
+                            let recoverable = restricted_reason_can_be_overridden(reason);
+                            allow_origin_can_recover |= recoverable;
+                            allow_restricted && recoverable
+                        }
+                        OutboundPeerKind::Proxy => proxy_restricted_reason_allowed(reason),
+                    },
                 })
                 .collect::<Vec<_>>();
             if addrs.is_empty() {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::PermissionDenied,
-                    OutboundDnsPolicyRejection::new(host, allow_origin_can_recover),
-                )
-                .into());
+                let rejection = match peer_kind {
+                    OutboundPeerKind::Target => OutboundDnsPolicyRejection::new(host, allow_origin_can_recover),
+                    OutboundPeerKind::Proxy => OutboundDnsPolicyRejection::new_proxy(host),
+                };
+                return Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied, rejection).into());
             }
             Ok(Box::new(addrs.into_iter()) as reqwest::dns::Addrs)
         })
@@ -314,7 +706,7 @@ pub fn validate_outbound_url(url: &Url) -> Result<(), OutboundUrlError> {
     let Some(raw_host) = url.host_str() else {
         return Err(OutboundUrlError::MissingHost);
     };
-    let normalized_host = raw_host.trim_end_matches('.').trim_matches(['[', ']']);
+    let normalized_host = normalize_host_str(raw_host);
 
     if normalized_host.eq_ignore_ascii_case("localhost") {
         return Err(OutboundUrlError::ForbiddenHost {
@@ -368,22 +760,39 @@ fn validate_http_url_shape(url: &Url) -> Result<(), OutboundPolicyError> {
     Ok(())
 }
 
+fn normalize_host_str(host: &str) -> &str {
+    host.trim_end_matches('.').trim_matches(['[', ']'])
+}
+
+fn classify_url_host(normalized_host: &str) -> Result<(), &'static str> {
+    if normalized_host.eq_ignore_ascii_case("localhost") {
+        Err("loopback host")
+    } else if let Ok(ip) = normalized_host.parse::<IpAddr>() {
+        validate_policy_ip(ip)
+    } else {
+        Ok(())
+    }
+}
+
 fn normalized_host(url: &Url) -> Option<String> {
-    url.host_str()
-        .map(|host| host.trim_end_matches('.').trim_matches(&['[', ']'][..]).to_ascii_lowercase())
+    url.host_str().map(|host| normalize_host_str(host).to_ascii_lowercase())
+}
+
+fn format_normalized_origin(scheme: &str, host: &str, is_ipv6: bool, port: u16) -> String {
+    // `Url::origin()` preserves a trailing DNS dot, but the resolver treats dotted and undotted
+    // names as the same host. Normalize it here so policy matching follows connection semantics.
+    if is_ipv6 {
+        format!("{scheme}://[{host}]:{port}")
+    } else {
+        format!("{scheme}://{host}:{port}")
+    }
 }
 
 fn normalized_origin(url: &Url) -> Option<String> {
     validate_http_url_shape(url).ok()?;
-    let host = normalized_host(url)?;
+    let host = normalized_host(url).filter(|host| !host.is_empty())?;
     let port = url.port_or_known_default()?;
-    // `Url::origin()` preserves a trailing DNS dot, but the resolver treats dotted and undotted
-    // names as the same host. Normalize it here so policy matching follows connection semantics.
-    if host.parse::<Ipv6Addr>().is_ok() {
-        Some(format!("{}://[{host}]:{port}", url.scheme()))
-    } else {
-        Some(format!("{}://{host}:{port}", url.scheme()))
-    }
+    Some(format_normalized_origin(url.scheme(), &host, host.parse::<Ipv6Addr>().is_ok(), port))
 }
 
 fn restricted_reason_can_be_overridden(reason: &str) -> bool {
@@ -391,6 +800,10 @@ fn restricted_reason_can_be_overridden(reason: &str) -> bool {
         reason,
         "loopback host" | "loopback address" | "private address" | "shared address" | "reserved address"
     )
+}
+
+fn proxy_restricted_reason_allowed(reason: &str) -> bool {
+    matches!(reason, "loopback host" | "loopback address" | "private address" | "shared address")
 }
 
 fn validate_policy_ip(ip: IpAddr) -> Result<(), &'static str> {
@@ -573,11 +986,13 @@ fn embedded_ipv4(v6: Ipv6Addr) -> Option<Ipv4Addr> {
 #[cfg(test)]
 mod tests {
     use super::{
-        OutboundPolicy, OutboundUrlError, find_outbound_dns_policy_rejection, validate_outbound_url,
-        validate_outbound_url_allow_private,
+        OutboundClientError, OutboundDnsLookup, OutboundDnsResolver, OutboundPeerKind, OutboundPolicy, OutboundPolicyError,
+        OutboundProxyMatcher, OutboundUrlError, find_outbound_dns_policy_rejection, should_bypass_proxy_for_url,
+        validate_outbound_url, validate_outbound_url_allow_private,
     };
-    use std::collections::HashMap;
-    use std::net::SocketAddr;
+    use std::collections::{HashMap, VecDeque};
+    use std::net::{IpAddr, SocketAddr};
+    use std::sync::{Arc, Mutex};
     use url::Url;
 
     #[test]
@@ -1234,7 +1649,589 @@ mod tests {
             .expect_err("metadata DNS answer should be rejected before connecting");
         let rejection = find_outbound_dns_policy_rejection(&error).expect("typed DNS policy rejection should be preserved");
 
-        assert_eq!(rejection.host, "metadata.internal");
+        assert_eq!(rejection.host(), "metadata.internal");
+        assert_eq!(rejection.peer_kind(), OutboundPeerKind::Target);
         assert!(!rejection.allow_origin_can_recover());
+    }
+
+    #[test]
+    fn should_bypass_proxy_for_url_matches_loopback_hosts_and_literals() {
+        for loopback_url in [
+            "http://localhost:9000/.well-known/openid-configuration",
+            "https://LOCALHOST.:9000/.well-known/openid-configuration",
+            "http://127.0.0.1:9000/.well-known/openid-configuration",
+            "http://127.0.0.42:9000/.well-known/openid-configuration",
+            "http://0x7f000001:9000/.well-known/openid-configuration",
+            "http://[::1]:9000/.well-known/openid-configuration",
+            "http://[::ffff:127.0.0.1]:9000/.well-known/openid-configuration",
+            "http://[::127.0.0.1]:9000/.well-known/openid-configuration",
+        ] {
+            let url = Url::parse(loopback_url).expect("loopback URL should parse");
+            assert!(should_bypass_proxy_for_url(&url), "expected proxy bypass for {loopback_url}");
+        }
+
+        for non_loopback_url in [
+            "https://sso-sit.intra.kommunale.it/.well-known/openid-configuration",
+            "http://sub.localhost:9000/.well-known/openid-configuration",
+            "http://10.0.0.1:9000/.well-known/openid-configuration",
+            "http://100.64.0.1:9000/.well-known/openid-configuration",
+            "http://169.254.169.254/latest/meta-data",
+            "http://[::]:9000/",
+        ] {
+            let url = Url::parse(non_loopback_url).expect("non-loopback URL should parse");
+            assert!(!should_bypass_proxy_for_url(&url), "unexpected proxy bypass for {non_loopback_url}");
+        }
+    }
+
+    #[test]
+    fn proxy_policy_allows_private_shared_and_loopback_hops_while_still_validating_target_url() {
+        let policy = OutboundPolicy::default();
+        let target =
+            Url::parse("https://sso-sit.intra.kommunale.it/.well-known/openid-configuration").expect("target URL should parse");
+
+        for proxy_url in [
+            "http://bb-proxy.intra.kommunale.it:8080",
+            "http://bb-proxy.intra.kommunale.it:8080/",
+            "bb-proxy.intra.kommunale.it:8080",
+            "https://bb-proxy.intra.kommunale.it:8443",
+            "http://10.0.0.1:8080",
+            "http://172.16.0.1:8080",
+            "http://192.168.1.10:8080",
+            "http://100.64.0.10:8080",
+            "http://[fd12:3456::1]:8080",
+            "http://127.0.0.1:8080",
+            "http://[::1]:8080",
+            "http://localhost:8080",
+            "http://localhost.:8080",
+            "http://8.8.8.8:8080",
+        ] {
+            let matcher = OutboundProxyMatcher::all(proxy_url);
+            policy
+                .configure_reqwest_client_with_proxy_matcher(&target, &matcher, reqwest::Client::builder())
+                .unwrap_or_else(|err| panic!("proxy {proxy_url} should be accepted: {err}"))
+                .build()
+                .expect("accepted proxy client should build");
+        }
+
+        let valid_proxy = OutboundProxyMatcher::all("http://bb-proxy.intra.kommunale.it:8080");
+        for (forbidden_target, expected_recoverable) in [
+            ("http://169.254.169.254/latest/meta-data", false),
+            ("http://127.0.0.1:8080/.well-known/openid-configuration", true),
+            ("http://10.0.0.5:8080/.well-known/openid-configuration", true),
+            ("ftp://sso-sit.intra.kommunale.it/resource", false),
+            ("https://user:secret@sso-sit.intra.kommunale.it/.well-known/openid-configuration", false),
+        ] {
+            let url = Url::parse(forbidden_target).expect("forbidden target URL should parse");
+            let policy_err = policy.validate_url(&url).expect_err("target URL must fail policy");
+            assert_eq!(
+                policy_err.allow_origin_can_recover(),
+                expected_recoverable,
+                "unexpected allow_origin_can_recover for {forbidden_target}: {policy_err:?}"
+            );
+
+            let err = policy
+                .configure_reqwest_client_with_proxy_matcher(&url, &valid_proxy, reqwest::Client::builder())
+                .expect_err("target URL policy must run before proxy configuration");
+            assert!(!err.is_proxy_error(), "target rejection misclassified as proxy error: {err:?}");
+            assert_eq!(err.allow_origin_can_recover(), expected_recoverable);
+            assert_eq!(err, OutboundClientError::Policy(policy_err.clone()));
+            assert_eq!(
+                std::error::Error::source(&err).and_then(|src| src.downcast_ref::<OutboundPolicyError>()),
+                Some(&policy_err)
+            );
+        }
+    }
+
+    #[test]
+    fn proxy_policy_rejects_metadata_link_local_unspecified_reserved_and_invalid_proxy_urls() {
+        let policy = OutboundPolicy::default();
+        let target =
+            Url::parse("https://sso-sit.intra.kommunale.it/.well-known/openid-configuration").expect("target URL should parse");
+
+        for (proxy_url, expected_reason) in [
+            ("http://169.254.169.254:8080", "metadata endpoint"),
+            ("http://0xa9fea9fe:8080", "metadata endpoint"),
+            ("http://0251.0376.0251.0376:8080", "metadata endpoint"),
+            ("http://2852039166:8080", "metadata endpoint"),
+            ("http://[::ffff:169.254.169.254]:8080", "metadata endpoint"),
+            ("http://[::169.254.169.254]:8080", "metadata endpoint"),
+            ("http://100.100.100.200:8080", "metadata endpoint"),
+            ("http://168.63.129.16:8080", "metadata endpoint"),
+            ("http://[fd00:ec2::254]:8080", "metadata endpoint"),
+            ("http://[fd00:ec2::23]:8080", "metadata endpoint"),
+            ("http://[fd20:ce::254]:8080", "metadata endpoint"),
+            ("http://169.254.1.1:8080", "link-local address"),
+            ("http://[fe80::1]:8080", "link-local address"),
+            ("http://0.0.0.0:8080", "unspecified address"),
+            ("http://[::]:8080", "unspecified address"),
+            ("http://[64:ff9b:1::1]:8080", "translation address"),
+            ("http://224.0.0.1:8080", "reserved address"),
+            ("http://[ff02::1]:8080", "reserved address"),
+            ("http://192.0.2.1:8080", "reserved address"),
+            ("http://[2001:db8::1]:8080", "reserved address"),
+            ("http://0.0.0.1:8080", "reserved address"),
+        ] {
+            let matcher = OutboundProxyMatcher::all(proxy_url);
+            let err = policy
+                .configure_reqwest_client_with_proxy_matcher(&target, &matcher, reqwest::Client::builder())
+                .expect_err("forbidden proxy literal must be rejected");
+            assert!(err.is_proxy_error(), "expected proxy error for {proxy_url}: {err:?}");
+            assert!(!err.allow_origin_can_recover());
+            assert!(std::error::Error::source(&err).is_none());
+            assert!(
+                matches!(
+                    err,
+                    OutboundClientError::ForbiddenProxyHost { reason, .. } if reason == expected_reason
+                ),
+                "unexpected error for {proxy_url}: {err:?}"
+            );
+            assert!(
+                err.to_string().starts_with("outbound proxy host '"),
+                "unexpected display for {proxy_url}: {err}"
+            );
+        }
+
+        let unescaped_at = OutboundProxyMatcher::all("http://user:p@ss@proxy.internal:8080");
+        let err = policy
+            .configure_reqwest_client_with_proxy_matcher(&target, &unescaped_at, reqwest::Client::builder())
+            .expect_err("proxy URL leaving residual userinfo must be rejected");
+        assert_eq!(err, OutboundClientError::InvalidProxyUrl);
+        assert!(err.is_proxy_error());
+        assert!(!err.allow_origin_can_recover());
+        assert!(std::error::Error::source(&err).is_none());
+    }
+
+    #[test]
+    fn proxy_matcher_normalizes_http_paths_ignores_noise_and_rejects_matched_socks() {
+        let policy = OutboundPolicy::default();
+        let target =
+            Url::parse("https://sso-sit.intra.kommunale.it/.well-known/openid-configuration").expect("target URL should parse");
+
+        // HTTP(S) proxy URLs with trailing paths/queries are normalized by hyper-util like curl/reqwest.
+        for normalized_proxy in ["http://10.0.0.1:8080/ignored-path", "http://10.0.0.1:8080/ignored-path?pac=1"] {
+            let matcher = OutboundProxyMatcher::from_env_values(Some(normalized_proxy), Some(normalized_proxy), None, None);
+            policy
+                .configure_reqwest_client_with_proxy_matcher(&target, &matcher, reqwest::Client::builder())
+                .unwrap_or_else(|err| panic!("proxy with path {normalized_proxy} should be normalized: {err}"))
+                .build()
+                .expect("normalized proxy client should build");
+        }
+
+        // Unparseable or non-proxy-scheme env noise is ignored like standard reqwest rather than crashing requests.
+        for ignored_noise in [":::invalid", "://bad", "http://[::1", "ftp://proxy.internal:21"] {
+            let matcher = OutboundProxyMatcher::all(ignored_noise);
+            policy
+                .configure_reqwest_client_with_proxy_matcher(&target, &matcher, reqwest::Client::builder())
+                .unwrap_or_else(|err| panic!("noise proxy {ignored_noise} should fall back to direct mode: {err}"))
+                .build()
+                .expect("direct fallback client should build");
+        }
+
+        // SOCKS proxies fail closed when matched, and are ignored when bypassed by NO_PROXY.
+        for (socks_proxy, expected_scheme) in [
+            ("socks4://proxy.internal:1080", "socks4"),
+            ("socks4a://proxy.internal:1080", "socks4a"),
+            ("socks5://proxy.internal:1080", "socks5"),
+            ("socks5h://proxy.internal:1080", "socks5h"),
+        ] {
+            let matched = OutboundProxyMatcher::all(socks_proxy);
+            let err = policy
+                .configure_reqwest_client_with_proxy_matcher(&target, &matched, reqwest::Client::builder())
+                .expect_err("matched SOCKS proxy must fail closed");
+            assert_eq!(
+                err,
+                OutboundClientError::UnsupportedProxyScheme {
+                    scheme: expected_scheme.to_string(),
+                }
+            );
+            assert!(err.is_proxy_error());
+
+            let bypassed = OutboundProxyMatcher::from_env_values(None, None, Some(socks_proxy), Some(".intra.kommunale.it"));
+            policy
+                .configure_reqwest_client_with_proxy_matcher(&target, &bypassed, reqwest::Client::builder())
+                .expect("SOCKS proxy bypassed by NO_PROXY should connect directly")
+                .build()
+                .expect("bypassed direct client should build");
+        }
+    }
+
+    #[tokio::test]
+    async fn proxy_dns_resolver_allows_private_and_rejects_metadata_or_rebound_answers() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let mixed_resolver = OutboundDnsResolver::for_proxy().with_overrides(HashMap::from([(
+            "bb-proxy.intra.kommunale.it".to_string(),
+            vec![
+                "10.20.30.40".parse().expect("private IP"),
+                "100.64.1.2".parse().expect("CGNAT IP"),
+                "127.0.0.1".parse().expect("loopback IP"),
+                "169.254.169.254".parse().expect("metadata IP"),
+                "100.100.100.200".parse().expect("Alibaba metadata IP"),
+                "fd00:ec2::254".parse().expect("AWS IPv6 metadata IP"),
+                "fe80::1".parse().expect("link-local IPv6"),
+                "0.0.0.0".parse().expect("unspecified IP"),
+                "224.0.0.1".parse().expect("multicast IP"),
+            ],
+        )]));
+
+        let resolved =
+            reqwest::dns::Resolve::resolve(&mixed_resolver, "bb-proxy.intra.kommunale.it".parse().expect("proxy hostname"))
+                .await
+                .expect("private, shared, and loopback proxy addresses should remain")
+                .map(|addr| addr.ip())
+                .collect::<Vec<_>>();
+        assert_eq!(
+            resolved,
+            vec![
+                "10.20.30.40".parse::<IpAddr>().expect("private IP"),
+                "100.64.1.2".parse::<IpAddr>().expect("CGNAT IP"),
+                "127.0.0.1".parse::<IpAddr>().expect("loopback IP"),
+            ]
+        );
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind mock proxy listener");
+        let proxy_addr = listener.local_addr().expect("mock proxy local addr");
+        let proxy_server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("accept first proxied connection");
+            let mut buf = [0_u8; 1024];
+            let _ = stream.read(&mut buf).await.expect("read first proxied request");
+            stream
+                .write_all(b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                .await
+                .expect("write first proxied response");
+        });
+
+        let sequence = Mutex::new(VecDeque::from([
+            vec![SocketAddr::new(proxy_addr.ip(), 0)],
+            vec![SocketAddr::new("169.254.169.254".parse().expect("metadata IP"), 0)],
+        ]));
+        let dns_override: OutboundDnsLookup = Arc::new(move |host| {
+            if host != "bb-proxy.intra.kommunale.it" {
+                return None;
+            }
+            let mut guard = sequence.lock().expect("DNS sequence lock");
+            if guard.len() > 1 {
+                guard.pop_front()
+            } else {
+                guard.front().cloned()
+            }
+        });
+
+        let target = Url::parse("http://sso-sit.intra.kommunale.it/realms/rustfs").expect("target URL should parse");
+        let matcher = OutboundProxyMatcher::all(&format!("http://bb-proxy.intra.kommunale.it:{}", proxy_addr.port()));
+        let client = OutboundPolicy::default()
+            .configure_reqwest_client_for_test(
+                &target,
+                &matcher,
+                Some(dns_override),
+                reqwest::Client::builder().timeout(std::time::Duration::from_secs(2)),
+            )
+            .expect("proxy client configuration should succeed")
+            .build()
+            .expect("proxy client should build");
+
+        let first = client
+            .get(target.clone())
+            .send()
+            .await
+            .expect("first request through private/loopback proxy should succeed");
+        assert_eq!(first.status(), reqwest::StatusCode::NO_CONTENT);
+        proxy_server.await.expect("mock proxy task should finish");
+
+        let err = client
+            .get(target)
+            .send()
+            .await
+            .expect_err("rebound metadata DNS answer for proxy must fail closed");
+        let rejection = find_outbound_dns_policy_rejection(&err).expect("typed proxy DNS rejection must be preserved");
+        assert_eq!(rejection.host(), "bb-proxy.intra.kommunale.it");
+        assert_eq!(rejection.peer_kind(), OutboundPeerKind::Proxy);
+        assert!(!rejection.allow_origin_can_recover());
+        assert_eq!(
+            rejection.to_string(),
+            "outbound DNS resolution for outbound proxy 'bb-proxy.intra.kommunale.it' returned no allowed addresses"
+        );
+    }
+
+    #[tokio::test]
+    async fn no_proxy_falls_back_to_direct_mode_and_enforces_target_dns_policy() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let matcher = OutboundProxyMatcher::from_env_values(
+            None,
+            None,
+            Some("http://bb-proxy.intra.kommunale.it:8080"),
+            Some(".intra.kommunale.it"),
+        );
+        let private_dns: OutboundDnsLookup = Arc::new(|host| match host {
+            "sso-sit.intra.kommunale.it" => Some(vec![SocketAddr::new("10.96.0.20".parse().expect("private IP"), 0)]),
+            _ => None,
+        });
+
+        for raw_target in [
+            "https://sso-sit.intra.kommunale.it/.well-known/openid-configuration",
+            "https://sso-sit.intra.kommunale.it./.well-known/openid-configuration",
+        ] {
+            let target = Url::parse(raw_target).expect("target URL should parse");
+            let client = OutboundPolicy::default()
+                .configure_reqwest_client_for_test(
+                    &target,
+                    &matcher,
+                    Some(private_dns.clone()),
+                    reqwest::Client::builder().timeout(std::time::Duration::from_secs(2)),
+                )
+                .expect("NO_PROXY target should configure direct resolver")
+                .build()
+                .expect("direct client should build");
+
+            let err = client
+                .get(target)
+                .send()
+                .await
+                .expect_err("direct NO_PROXY fallback must reject unallowlisted private target DNS");
+            let rejection = find_outbound_dns_policy_rejection(&err).expect("target DNS rejection should be preserved");
+            assert_eq!(rejection.host(), "sso-sit.intra.kommunale.it");
+            assert_eq!(rejection.peer_kind(), OutboundPeerKind::Target);
+            assert!(rejection.allow_origin_can_recover());
+        }
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind direct target listener");
+        let target_addr = listener.local_addr().expect("direct target local addr");
+        let direct_server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("accept direct connection");
+            let mut buf = [0_u8; 1024];
+            let _ = stream.read(&mut buf).await.expect("read direct request");
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok")
+                .await
+                .expect("write direct response");
+        });
+
+        let allowlisted_target = Url::parse(&format!(
+            "http://sso-sit.intra.kommunale.it:{}/.well-known/openid-configuration",
+            target_addr.port()
+        ))
+        .expect("allowlisted target URL should parse");
+        let allowlisted_policy =
+            OutboundPolicy::from_allowed_origins(&format!("http://sso-sit.intra.kommunale.it:{}", target_addr.port()))
+                .expect("allowlisted policy should parse");
+        let direct_dns: OutboundDnsLookup = Arc::new(move |host| match host {
+            "sso-sit.intra.kommunale.it" => Some(vec![SocketAddr::new(target_addr.ip(), 0)]),
+            _ => None,
+        });
+        let client = allowlisted_policy
+            .configure_reqwest_client_for_test(
+                &allowlisted_target,
+                &matcher,
+                Some(direct_dns),
+                reqwest::Client::builder().timeout(std::time::Duration::from_secs(2)),
+            )
+            .expect("allowlisted NO_PROXY target should configure")
+            .build()
+            .expect("allowlisted client should build");
+
+        let response = client
+            .get(allowlisted_target)
+            .send()
+            .await
+            .expect("allowlisted NO_PROXY target should connect directly");
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+        direct_server.await.expect("direct target task should finish");
+    }
+
+    #[tokio::test]
+    async fn loopback_target_always_bypasses_configured_proxy() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind loopback target listener");
+        let addr = listener.local_addr().expect("loopback target local addr");
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("accept loopback connection");
+            let mut buf = [0_u8; 1024];
+            let _ = stream.read(&mut buf).await.expect("read loopback request");
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok")
+                .await
+                .expect("write loopback response");
+        });
+
+        let target = Url::parse(&format!("http://127.0.0.1:{}/.well-known/openid-configuration", addr.port()))
+            .expect("loopback target URL should parse");
+        let policy =
+            OutboundPolicy::from_allowed_origins(&format!("http://127.0.0.1:{}", addr.port())).expect("allow loopback origin");
+        // Even with a metadata proxy configured, loopback targets must bypass the proxy completely.
+        let matcher = OutboundProxyMatcher::all("http://169.254.169.254:8080");
+        let client = policy
+            .configure_reqwest_client_with_proxy_matcher(
+                &target,
+                &matcher,
+                reqwest::Client::builder().timeout(std::time::Duration::from_secs(2)),
+            )
+            .expect("loopback target should bypass forbidden proxy")
+            .build()
+            .expect("loopback client should build");
+
+        let response = client
+            .get(target)
+            .send()
+            .await
+            .expect("loopback request should connect directly");
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+        server.await.expect("loopback server should finish");
+    }
+
+    #[tokio::test]
+    async fn proxy_basic_auth_forwards_proxy_authorization_on_connect_and_http_without_leaking_secret() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        const SECRET_PASS: &str = "top-secret-pass-9611";
+        // base64("proxy-user:top-secret-pass-9611")
+        const EXPECTED_BASIC_TOKEN: &str = "cHJveHktdXNlcjp0b3Atc2VjcmV0LXBhc3MtOTYxMQ==";
+
+        async fn read_http_head(stream: &mut tokio::net::TcpStream) -> String {
+            let mut raw = Vec::new();
+            let mut chunk = [0_u8; 512];
+            while !raw.windows(4).any(|window| window == b"\r\n\r\n") {
+                let n = stream.read(&mut chunk).await.expect("read proxy request bytes");
+                if n == 0 {
+                    break;
+                }
+                raw.extend_from_slice(&chunk[..n]);
+            }
+            String::from_utf8_lossy(&raw).into_owned()
+        }
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind auth proxy listener");
+        let proxy_addr = listener.local_addr().expect("auth proxy local addr");
+        let proxy_server = tokio::spawn(async move {
+            let (mut connect_stream, _) = listener.accept().await.expect("accept CONNECT request");
+            let connect_head = read_http_head(&mut connect_stream).await;
+            connect_stream
+                .write_all(b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                .await
+                .expect("write CONNECT response");
+
+            let (mut forward_stream, _) = listener.accept().await.expect("accept HTTP forward request");
+            let forward_head = read_http_head(&mut forward_stream).await;
+            forward_stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok")
+                .await
+                .expect("write HTTP forward response");
+
+            (connect_head, forward_head)
+        });
+
+        let proxy_url = format!("http://proxy-user:{SECRET_PASS}@bb-proxy.intra.kommunale.it:{}", proxy_addr.port());
+        let matcher = OutboundProxyMatcher::all(&proxy_url);
+        let matcher_debug = format!("{matcher:?}");
+        assert!(!matcher_debug.contains(SECRET_PASS), "matcher Debug leaked secret: {matcher_debug}");
+        assert!(
+            !matcher_debug.contains(EXPECTED_BASIC_TOKEN),
+            "matcher Debug leaked encoded token: {matcher_debug}"
+        );
+
+        let dns_override: OutboundDnsLookup = Arc::new(move |host| match host {
+            "bb-proxy.intra.kommunale.it" => Some(vec![SocketAddr::new(proxy_addr.ip(), 0)]),
+            _ => None,
+        });
+
+        let https_target = Url::parse("https://sso-sit.intra.kommunale.it:8443/.well-known/openid-configuration")
+            .expect("HTTPS target should parse");
+        let https_builder = OutboundPolicy::default()
+            .configure_reqwest_client_for_test(
+                &https_target,
+                &matcher,
+                Some(dns_override.clone()),
+                reqwest::Client::builder().timeout(std::time::Duration::from_secs(2)),
+            )
+            .expect("HTTPS proxied client builder should configure");
+        let builder_debug = format!("{https_builder:?}");
+        assert!(!builder_debug.contains(SECRET_PASS), "builder Debug leaked secret: {builder_debug}");
+        assert!(
+            !builder_debug.contains(EXPECTED_BASIC_TOKEN),
+            "builder Debug leaked encoded token: {builder_debug}"
+        );
+
+        let https_client = https_builder.build().expect("HTTPS proxied client should build");
+        let client_debug = format!("{https_client:?}");
+        assert!(!client_debug.contains(SECRET_PASS), "client Debug leaked secret: {client_debug}");
+        assert!(
+            !client_debug.contains(EXPECTED_BASIC_TOKEN),
+            "client Debug leaked encoded token: {client_debug}"
+        );
+
+        let connect_err = https_client
+            .get(https_target.clone())
+            .send()
+            .await
+            .expect_err("mock 502 CONNECT response should fail tunnel setup");
+        let connect_err_text = format!("{connect_err} | {connect_err:?}");
+        assert!(
+            !connect_err_text.contains(SECRET_PASS) && !connect_err_text.contains(EXPECTED_BASIC_TOKEN),
+            "CONNECT error leaked proxy secret: {connect_err_text}"
+        );
+
+        let http_target = Url::parse("http://sso-sit.intra.kommunale.it:8080/.well-known/openid-configuration")
+            .expect("HTTP target should parse");
+        let http_client = OutboundPolicy::default()
+            .configure_reqwest_client_for_test(
+                &http_target,
+                &matcher,
+                Some(dns_override),
+                reqwest::Client::builder().timeout(std::time::Duration::from_secs(2)),
+            )
+            .expect("HTTP proxied client builder should configure")
+            .build()
+            .expect("HTTP proxied client should build");
+        let forward_resp = http_client
+            .get(http_target)
+            .send()
+            .await
+            .expect("HTTP forward proxy request should succeed");
+        assert_eq!(forward_resp.status(), reqwest::StatusCode::OK);
+
+        let (connect_head, forward_head) = proxy_server.await.expect("auth proxy server should finish");
+        assert!(
+            connect_head.starts_with("CONNECT sso-sit.intra.kommunale.it:8443 HTTP/1.1\r\n"),
+            "unexpected CONNECT request line: {connect_head}"
+        );
+        assert!(
+            connect_head
+                .to_ascii_lowercase()
+                .contains(&format!("proxy-authorization: basic {}", EXPECTED_BASIC_TOKEN.to_ascii_lowercase())),
+            "CONNECT request missing Proxy-Authorization header: {connect_head}"
+        );
+        assert!(
+            forward_head.starts_with("GET http://sso-sit.intra.kommunale.it:8080/.well-known/openid-configuration HTTP/1.1\r\n"),
+            "unexpected HTTP forward request line: {forward_head}"
+        );
+        assert!(
+            forward_head
+                .to_ascii_lowercase()
+                .contains(&format!("proxy-authorization: basic {}", EXPECTED_BASIC_TOKEN.to_ascii_lowercase())),
+            "HTTP forward request missing Proxy-Authorization header: {forward_head}"
+        );
+
+        for rejected_proxy in [
+            format!("http://proxy-user:{SECRET_PASS}@169.254.169.254:8080"),
+            format!("socks5://proxy-user:{SECRET_PASS}@proxy.internal:1080"),
+            format!("http://proxy-user:p@{SECRET_PASS}@proxy.internal:8080"),
+        ] {
+            let bad_matcher = OutboundProxyMatcher::all(&rejected_proxy);
+            let bad_matcher_debug = format!("{bad_matcher:?}");
+            assert!(!bad_matcher_debug.contains(SECRET_PASS) && !bad_matcher_debug.contains(EXPECTED_BASIC_TOKEN));
+            let err = OutboundPolicy::default()
+                .configure_reqwest_client_with_proxy_matcher(&https_target, &bad_matcher, reqwest::Client::builder())
+                .expect_err("credentialed invalid/forbidden proxy must fail");
+            let err_text = format!("{err} | {err:?}");
+            assert!(
+                !err_text.contains(SECRET_PASS) && !err_text.contains(EXPECTED_BASIC_TOKEN),
+                "proxy policy error leaked secret: {err_text}"
+            );
+        }
     }
 }

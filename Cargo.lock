@@ -11722,6 +11722,7 @@ dependencies = [
  "hmac 0.13.0",
  "http 1.5.0",
  "hyper",
+ "hyper-util",
  "local-ip-address",
  "lz4",
  "md-5",
