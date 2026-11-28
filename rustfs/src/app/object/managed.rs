@@ -530,28 +530,24 @@ impl DefaultObjectUsecase {
         &self,
         upload: &Arc<ManagedMultipartUpload>,
     ) -> Result<(), ManagedObjectError> {
-        let super::managed_maintenance::ManagedOperation {
-            request,
-            principal,
-            helper,
-        } = upload
+        let super::managed_maintenance::ManagedOperation { principal, helper, .. } = upload
             .context
             .admit(&upload.key, ManagedObjectOperation::AbortMultipart, S3Operation::AbortMultipartUpload)
             .await?;
         let result = async {
             self.managed_validate_upload(upload, ManagedObjectOperation::AbortMultipart)
                 .await?;
-            let target = crate::app::multipart_usecase::AbortMultipartUploadTarget::Gateway {
-                bucket: rustfs_gateway_types::BucketName::new(upload.context.access.bucket().storage_bucket_id().as_str())
-                    .map_err(ApiError::other)?,
-                key: rustfs_gateway_types::ObjectKey::new(upload.key.clone()).map_err(ApiError::other)?,
-                upload_id: rustfs_gateway_types::UploadIdClaim::from_wire(upload.upload_id.clone()),
-            };
+            let bucket = rustfs_gateway_types::BucketName::new(upload.context.access.bucket().storage_bucket_id().as_str())
+                .map_err(ApiError::other)?;
+            let key = rustfs_gateway_types::ObjectKey::new(upload.key.clone()).map_err(ApiError::other)?;
+            let upload_id = rustfs_gateway_types::UploadIdClaim::from_wire(upload.upload_id.clone());
             let owner = crate::app::multipart_usecase::DefaultMultipartUsecase::with_context(self.context.clone());
-            let request = request.fork_for_authorization();
-            let origin = upload.origin(principal, None);
+            let upload = Arc::clone(upload);
             run_owned_mutation(async move {
-                owner.abort_multipart_with_origin(request, target, origin).await?;
+                let _principal = principal;
+                owner
+                    .abort_managed_multipart_upload(&bucket, &key, &upload_id, &upload.context, &upload.lifecycle_guard)
+                    .await?;
                 Ok::<_, rustfs_s3_types::S3Error>(())
             })
             .await?;

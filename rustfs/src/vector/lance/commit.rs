@@ -752,7 +752,6 @@ impl<B: TableCatalogObjectBackend> DatasetSnapshot<B> {
         proof_digest.update(self.info.index.encryption_descriptor_sha256.as_bytes());
         let mut tracked_id = current_index.uuid;
         let mut source_version = None;
-        let mut lineage_found = false;
         for (reference, descriptor) in versions.iter().rev() {
             let version = self.owner.descriptor(descriptor)?.manifest_version();
             if version > self.info.manifest_version {
@@ -772,7 +771,6 @@ impl<B: TableCatalogObjectBackend> DatasetSnapshot<B> {
                     let created = super::files::decode_indices(create.new_indices.clone())?;
                     if created.iter().any(|index| index.uuid == tracked_id) {
                         source_version = Some(transaction.read_version);
-                        lineage_found = true;
                         break;
                     }
                 }
@@ -790,9 +788,6 @@ impl<B: TableCatalogObjectBackend> DatasetSnapshot<B> {
                 }
                 _ => {}
             }
-        }
-        if !lineage_found {
-            return Ok(None);
         }
         let Some(source_version) = source_version else {
             return Ok(None);

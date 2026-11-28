@@ -9,7 +9,7 @@ use crate::table_catalog::{
 };
 use crate::vector::fault_test::{self, FaultError, FaultEventKind, FaultPoint};
 use crate::vector::lance::ManagedManifestObjects;
-use crate::vector::protocol::{Request, dto};
+use crate::vector::protocol::{Request, Response, dto};
 use crate::vector::service::{ManagedDatasetAccess, VectorExecution, VectorRequestAccess, VectorRequestId, VectorServiceError};
 use std::time::Duration;
 use uuid::Uuid;
@@ -281,7 +281,7 @@ async fn sdk_candidate_failure_retains_real_uploaded_closure_without_catalog_pub
         return_data: Some(true),
         return_metadata: Some(true),
     });
-    let VectorExecution::GetVectors(get) = service.execute(&request).await.unwrap() else {
+    let VectorExecution::Complete(Response::GetVectors(get)) = service.execute(&request).await.unwrap() else {
         panic!("expected GetVectors");
     };
     assert!(get.vectors.is_empty());

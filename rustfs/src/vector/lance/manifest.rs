@@ -87,7 +87,7 @@ impl VectorManifestBindingV1 {
     }
 
     fn validate(&self, resource: &CatalogResourceIdentity, index: &VectorIndexManifestSpec) -> Result<(), LanceManifestError> {
-        if self != &Self::new(resource, index)? || self.non_filterable_metadata_keys.windows(2).any(|keys| keys[0] >= keys[1]) {
+        if self != &Self::new(resource, index)? {
             return Err(LanceManifestError::ResourceMismatch {
                 reason: "manifest binding differs from resource identity or Index configuration",
             });
@@ -340,17 +340,6 @@ impl ValidatedLanceManifest {
         let metadata = manifest_metadata(resource, index)?;
         let mut validated =
             Self::read_and_validate(bytes, &identity, index.dimension, version, &metadata, max_manifest_bytes).await?;
-        VectorManifestBindingV1::decode(
-            validated
-                .manifest
-                .table_metadata
-                .get(VECTOR_BINDING_KEY)
-                .ok_or(LanceManifestError::ResourceMismatch {
-                    reason: "manifest resource binding is absent",
-                })?,
-            resource,
-            index,
-        )?;
         super::files::manifest_objects(validated.manifest(), resource)?;
         super::files::validate_indices(&validated.indices, validated.manifest(), index)?;
         validated.bound_reference = Some(reference.clone());

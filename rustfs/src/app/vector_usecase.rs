@@ -280,9 +280,6 @@ impl DefaultVectorUsecase {
                     }
                     match execution.map_err(|error| service_error_for_operation(operation, error))? {
                         VectorExecution::Complete(response) => Ok(response),
-                        VectorExecution::GetVectors(prepared) => Ok(Response::GetVectors(dto::GetVectorsOutput {
-                            vectors: prepared.vectors,
-                        })),
                         VectorExecution::QueryVectors(prepared) => Ok(Response::QueryVectors(
                             prepared
                                 .into_output()

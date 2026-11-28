@@ -140,14 +140,7 @@ pub(crate) struct VectorService<B: TableCatalogObjectBackend> {
 
 pub(crate) enum VectorExecution<B: TableCatalogObjectBackend> {
     Complete(Response),
-    GetVectors(PreparedVectorGet),
     QueryVectors(PreparedVectorQuery<B>),
-}
-
-pub(crate) struct PreparedVectorGet {
-    #[cfg(test)]
-    pub requested_keys: Vec<String>,
-    pub vectors: Vec<dto::GetOutputVector>,
 }
 
 pub(crate) struct PreparedVectorQuery<B: TableCatalogObjectBackend> {
@@ -240,7 +233,7 @@ impl<B: TableCatalogObjectBackend> VectorService<B> {
                 self.delete_vectors(context, &input.keys).await?;
                 Response::DeleteVectors(dto::DeleteVectorsOutput {})
             }
-            Request::GetVectors(input) => return Ok(VectorExecution::GetVectors(self.get_vectors(context, input).await?)),
+            Request::GetVectors(input) => Response::GetVectors(self.get_vectors(context, input).await?),
             Request::ListVectors(input) => Response::ListVectors(self.list_vectors(context, input).await?),
             Request::QueryVectors(input) => return Ok(VectorExecution::QueryVectors(self.query_vectors(context, input).await?)),
             Request::ListTagsForResource(_) => {
@@ -644,7 +637,7 @@ impl<B: TableCatalogObjectBackend> VectorService<B> {
         &self,
         context: &dyn VectorRequestAccess,
         input: &dto::GetVectorsInput,
-    ) -> Result<PreparedVectorGet, VectorServiceError> {
+    ) -> Result<dto::GetVectorsOutput, VectorServiceError> {
         let bound = self.bind_index(context, None).await?;
         let snapshot = bound.adapter.open_catalog_entry(&bound.access, &bound.entry).await?;
         let records = snapshot
@@ -657,9 +650,7 @@ impl<B: TableCatalogObjectBackend> VectorService<B> {
             )
             .await?;
         bound.guard.check_held()?;
-        Ok(PreparedVectorGet {
-            #[cfg(test)]
-            requested_keys: input.keys.clone(),
+        Ok(dto::GetVectorsOutput {
             vectors: records
                 .into_iter()
                 .map(|record| dto::GetOutputVector {

@@ -59,37 +59,28 @@ pub(crate) fn reject_abort_capabilities(envelope: &RequestEnvelope) -> S3Result<
 }
 
 impl DefaultMultipartUsecase {
-    pub(crate) async fn abort_multipart_with_origin(
+    pub(crate) async fn abort_managed_multipart_upload(
         &self,
-        envelope: RequestEnvelope,
-        target: AbortMultipartUploadTarget,
-        origin: MultipartOrigin,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        upload_id: &UploadIdClaim,
+        context: &crate::app::object::ManagedObjectContext,
+        lifecycle_guard: &crate::app::storage_api::managed::BucketIncarnationFenceGuard,
     ) -> S3Result<()> {
-        if !origin.is_managed() {
-            reject_abort_capabilities(&envelope)?;
-        }
         rustfs_io_metrics::record_s3_op(S3Operation::AbortMultipartUpload);
-        let (bucket, key) = target.resource();
         let mut opts = ObjectOptions::default();
-        origin.apply_bucket_guard(&envelope, bucket, &mut opts)?;
-        if !origin.is_managed() {
-            reject_veeam_sosapi_mutation(|| self.object_store(), bucket, key).await?;
+        if context.access().bucket().storage_bucket_id().as_str() != bucket.as_str() || lifecycle_guard.is_lock_lost() {
+            return Err(ApiError::from(StorageError::PreconditionFailed).into());
         }
+        opts.expected_bucket_incarnation_id = Some(context.access().bucket().incarnation().as_uuid());
+        lifecycle_guard.attach_to_object_options(&mut opts);
         let Some(store) = self.object_store() else {
             return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init"));
         };
-        match &target {
-            AbortMultipartUploadTarget::Legacy { upload_id, .. } => store
-                .abort_multipart_upload(bucket, key, upload_id, &opts)
-                .await
-                .map_err(multipart_upload_api_error)?,
-            AbortMultipartUploadTarget::Gateway { bucket, key, upload_id } => {
-                abort_gateway(&store, bucket, key, upload_id, opts).await?
-            }
-        }
+        abort_gateway(&store, bucket, key, upload_id, opts).await?;
         rustfs_scanner::record_dirty_usage_object_from_producer(
-            bucket,
-            key,
+            bucket.as_str(),
+            key.as_str(),
             rustfs_scanner::SegmentInvalidationProducerIdentity::AbortMultipartUpload,
         );
         Ok(())

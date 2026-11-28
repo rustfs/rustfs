@@ -165,7 +165,6 @@ struct ResourcePolicyAuth {
     parent_account: Option<String>,
     boundaries: Vec<Policy>,
     groups: Option<Vec<String>>,
-    resource_grants_allowed: bool,
 }
 
 fn checked_resource_claim_policy_names(claims: &HashMap<String, Value>) -> Result<Vec<String>> {
@@ -2872,22 +2871,21 @@ impl<T: Store> IamSys<T> {
         if marked && !identity_allowed {
             return Err(IamError::IAMActionNotAllowed);
         }
-        let resource_allowed = if auth.resource_grants_allowed {
-            match resource_policy {
-                Some(policy) => {
-                    policy
-                        .is_allowed(&BucketPolicyArgs {
-                            is_owner: false,
-                            ..bucket_args
-                        })
-                        .await
-                }
-                None => false,
+        if identity_allowed {
+            return Ok(true);
+        }
+        let resource_allowed = match resource_policy {
+            Some(policy) => {
+                policy
+                    .is_allowed(&BucketPolicyArgs {
+                        is_owner: false,
+                        ..bucket_args
+                    })
+                    .await
             }
-        } else {
-            false
+            None => false,
         };
-        Ok(identity_allowed || resource_allowed)
+        Ok(resource_allowed)
     }
 
     async fn prepare_resource_policy_auth(&self, args: &Args<'_>, resolve_identity: bool) -> Result<ResourcePolicyAuth> {
@@ -2907,7 +2905,6 @@ impl<T: Store> IamSys<T> {
                 parent_account: None,
                 boundaries: Vec::new(),
                 groups: self.resource_policy_groups(args.groups, args.account),
-                resource_grants_allowed: true,
             });
         }
         let identity = self.resource_policy_identity(args.account).await?;
@@ -2940,7 +2937,6 @@ impl<T: Store> IamSys<T> {
                 parent_account: None,
                 boundaries: Vec::new(),
                 groups,
-                resource_grants_allowed: true,
             });
         }
 
@@ -3046,7 +3042,6 @@ impl<T: Store> IamSys<T> {
             parent_account: service_account.then(|| parent_user.to_owned()),
             boundaries,
             groups,
-            resource_grants_allowed: !marked,
         })
     }
 

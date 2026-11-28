@@ -2831,7 +2831,7 @@ async fn service_creation_publishes_real_initial_manifest_and_restores_reserved_
 #[tokio::test]
 async fn service_crud_and_prefilter_use_published_catalog_data() {
     use crate::vector::{
-        protocol::{Request, dto},
+        protocol::{Request, Response, dto},
         service::VectorExecution,
     };
     let fixture = catalog_fixture().await;
@@ -2904,8 +2904,8 @@ async fn service_crud_and_prefilter_use_published_catalog_data() {
         return_data: Some(true),
         return_metadata: Some(true),
     });
-    let VectorExecution::GetVectors(get) = service.execute(&context).await.unwrap() else {
-        panic!("expected prepared get");
+    let VectorExecution::Complete(Response::GetVectors(get)) = service.execute(&context).await.unwrap() else {
+        panic!("expected GetVectors response");
     };
     assert_eq!(get.vectors.len(), 1);
     assert_eq!(get.vectors[0].data.as_ref().unwrap().float32, vec![1.0, 0.0, 0.0]);
@@ -3531,10 +3531,11 @@ async fn service_query_output_retains_snapshot_metadata_and_cosine_metric() {
         return_data: Some(false),
         return_metadata: Some(true),
     });
-    let VectorExecution::GetVectors(get) = service.execute(&context).await.expect("read the current snapshot metadata") else {
-        panic!("expected the prepared current GetVectors result");
+    let VectorExecution::Complete(Response::GetVectors(get)) =
+        service.execute(&context).await.expect("read the current snapshot metadata")
+    else {
+        panic!("expected the current GetVectors response");
     };
-    assert_eq!(get.requested_keys, vec!["z-first".to_owned()]);
     assert_eq!(get.vectors.len(), 1);
     assert_eq!(get.vectors[0].key, "z-first");
     assert!(get.vectors[0].data.is_none());

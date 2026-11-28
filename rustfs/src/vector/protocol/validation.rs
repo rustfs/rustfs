@@ -56,13 +56,6 @@ fn validate_range(value: i64, min: i64, max: i64, path: &str) -> Result<(), Prot
     Err(ProtocolError::validation(path, format!("Value must be between {min} and {max}")))
 }
 
-fn validate_float(value: f32, path: &str) -> Result<(), ProtocolError> {
-    if value.is_finite() {
-        return Ok(());
-    }
-    Err(ProtocolError::validation(path, "Vector values must be finite float32 numbers"))
-}
-
 fn validate_mode(mode: IndexMode, path: &str) -> Result<(), ProtocolError> {
     if mode == IndexMode::Enhanced {
         return Ok(());
@@ -137,7 +130,6 @@ fn validate_string(shape: &str, value: &str, path: &str, region: &str) -> Result
         "KmsKeyArn" => (1, 2048),
         "TagKey" => (1, 128),
         "TagValue" => (0, 256),
-        "VectorBucketPolicy" => return Ok(()),
         _ => unreachable!("only pinned input string shapes call this validator"),
     };
     validate_length(value.chars().count(), min, max, path)?;
@@ -576,11 +568,6 @@ impl Validate for PutVectorBucketPolicyInput {
             let field_path = child_path(path, "vectorBucketArn");
             validate_string("VectorBucketArn", value, &field_path, region)?;
         }
-        {
-            let value = &self.policy;
-            let field_path = child_path(path, "policy");
-            validate_string("VectorBucketPolicy", value, &field_path, region)?;
-        }
         validate_bucket_selector(self.vector_bucket_name.as_deref(), self.vector_bucket_arn.as_deref())?;
         Ok(())
     }
@@ -720,9 +707,9 @@ impl Validate for VectorData {
             let value = &self.float32;
             let field_path = child_path(path, "float32");
             validate_length(value.len(), 1, 4096, &field_path)?;
-            if let Some((index, item)) = value.iter().enumerate().find(|(_, item)| !item.is_finite()) {
+            if let Some((index, _)) = value.iter().enumerate().find(|(_, item)| !item.is_finite()) {
                 let item_path = format!("{field_path}[{index}]");
-                validate_float(*item, &item_path)?;
+                return Err(ProtocolError::validation(&item_path, "Vector values must be finite float32 numbers"));
             }
         }
         Ok(())
