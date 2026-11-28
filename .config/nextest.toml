@@ -89,7 +89,8 @@ package(rustfs-ecstore) & (
 threads-required = "num-test-threads"
 
 [[profile.default.overrides]]
-filter = 'package(rustfs) & test(/^connect::diagnostics::schedule::tests::/)'
+# Both scheduler fixtures write receipts to disk under real retry deadlines.
+filter = 'package(rustfs) & (test(/^connect::diagnostics::schedule::tests::/) | (binary(=connect_diagnostic_schedule) & test(=missing_inventory_has_bounded_retries_and_durable_failure_receipt)))'
 threads-required = "num-test-threads"
 
 [[profile.default.overrides]]
@@ -401,7 +402,7 @@ package(rustfs-ecstore) & (
 threads-required = "num-test-threads"
 
 [[profile.ci.overrides]]
-filter = 'package(rustfs) & test(/^connect::diagnostics::schedule::tests::/)'
+filter = 'package(rustfs) & (test(/^connect::diagnostics::schedule::tests::/) | (binary(=connect_diagnostic_schedule) & test(=missing_inventory_has_bounded_retries_and_durable_failure_receipt)))'
 threads-required = "num-test-threads"
 
 [[profile.ci.overrides]]
