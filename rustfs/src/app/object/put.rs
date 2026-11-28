@@ -5177,26 +5177,33 @@ mod tests {
         }
     }
 
-    /// A client can only send back the ETag a read answered with. Where the
-    /// stored ETag is sealed that is not the stored one, and a conditional GET
-    /// or HEAD has to compare the one the client holds: the ETag from HEAD
-    /// must satisfy `If-Match` and turn `If-None-Match` into a 304.
+    /// The stored ETag form of a single-part customer-key object on an imported
+    /// drive set; a response shows its last 32 characters.
     #[cfg(feature = "m-compatible")]
-    #[tokio::test]
-    #[serial_test::serial]
-    async fn etag_answered_by_head_round_trips_through_conditional_reads_of_a_sealed_etag() {
-        use md5::{Digest as _, Md5};
+    const SEALED_ETAG: &str = "20000f00ae1b28a996b85ecef920fb8da6843e2838328dbfef3a9a266201f27ee3f8c64555ea36a2196275c2261d745d";
 
-        // The stored ETag form of a single-part customer-key object on an
-        // imported drive set; a response shows its last 32 characters.
-        const SEALED: &str = "20000f00ae1b28a996b85ecef920fb8da6843e2838328dbfef3a9a266201f27ee3f8c64555ea36a2196275c2261d745d";
+    #[cfg(feature = "m-compatible")]
+    struct SealedEtagObject {
+        store: Arc<ECStore>,
+        bucket: String,
+        encoded_key: String,
+        key_md5: String,
+        payload: Bytes,
+    }
+
+    /// Writes `ledger.csv` under a customer key and gives it [`SEALED_ETAG`]
+    /// as its stored ETag, the way such an object arrives on an imported
+    /// drive set.
+    #[cfg(feature = "m-compatible")]
+    async fn customer_key_object_with_sealed_etag(bucket_prefix: &str) -> SealedEtagObject {
+        use md5::{Digest as _, Md5};
 
         let context = crate::storage::storage_api::bootstrap_instance_ctx();
         assert!(
             context.object_encryption_resolver().is_some(),
             "real SSE-C reads need the production encryption resolver"
         );
-        let (store, bucket) = crate::app::gating_test_env::durable_quota_test_bucket("sealed-etag-round-trip", 1 << 20).await;
+        let (store, bucket) = crate::app::gating_test_env::durable_quota_test_bucket(bucket_prefix, 1 << 20).await;
         let object = "ledger.csv";
 
         let customer_key = [0x2a_u8; 32];
@@ -5207,8 +5214,7 @@ mod tests {
             base64_simd::STANDARD.encode_to_string(hasher.finalize())
         };
         let payload = Bytes::from_static(b"customer-key protected payload");
-        let usecase = DefaultObjectUsecase::from_global();
-        Box::pin(usecase.execute_put_object_owned(
+        Box::pin(DefaultObjectUsecase::from_global().execute_put_object_owned(
             method_only_put_envelope(),
             PutObjectWriteInput {
                 sse_customer_algorithm: Some("AES256".to_string()),
@@ -5224,7 +5230,7 @@ mod tests {
                 &bucket,
                 object,
                 &ObjectOptions {
-                    eval_metadata: Some(HashMap::from([("etag".to_owned(), SEALED.to_owned())])),
+                    eval_metadata: Some(HashMap::from([("etag".to_owned(), SEALED_ETAG.to_owned())])),
                     ..Default::default()
                 },
             )
@@ -5234,7 +5240,35 @@ mod tests {
             .get_object_info(&bucket, object, &ObjectOptions::default())
             .await
             .expect("stored object");
-        assert_eq!(stored.etag.as_deref(), Some(SEALED), "the fixture must reach the read path sealed");
+        assert_eq!(stored.etag.as_deref(), Some(SEALED_ETAG), "the fixture must reach the read path sealed");
+
+        SealedEtagObject {
+            store,
+            bucket,
+            encoded_key,
+            key_md5,
+            payload,
+        }
+    }
+
+    /// A client can only send back the ETag a read answered with. Where the
+    /// stored ETag is sealed that is not the stored one, and a conditional GET
+    /// or HEAD has to compare the one the client holds: the ETag from HEAD
+    /// must satisfy `If-Match` and turn `If-None-Match` into a 304.
+    #[cfg(feature = "m-compatible")]
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn etag_answered_by_head_round_trips_through_conditional_reads_of_a_sealed_etag() {
+        const SEALED: &str = SEALED_ETAG;
+        let SealedEtagObject {
+            bucket,
+            encoded_key,
+            key_md5,
+            payload,
+            ..
+        } = customer_key_object_with_sealed_etag("sealed-etag-round-trip").await;
+        let object = "ledger.csv";
+        let usecase = DefaultObjectUsecase::from_global();
 
         let read_headers = |condition: Option<(http::HeaderName, &str)>| {
             let mut headers = HeaderMap::new();
@@ -5326,6 +5360,109 @@ mod tests {
             .await
             .expect("If-None-Match with the stored form reads the object");
         assert_eq!(read_get_body(unmatched.output.body.expect("GET body")).await, payload);
+    }
+
+    /// The same holds for the source conditions of a copy: the ETag HEAD
+    /// answered with for the source satisfies `x-amz-copy-source-if-match` on
+    /// CopyObject and UploadPartCopy, and the stored form matches nothing.
+    #[cfg(feature = "m-compatible")]
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn etag_answered_by_head_satisfies_copy_source_conditions_on_a_sealed_etag() {
+        use super::super::{CopyObjectWriteInput, CopySourceCondition};
+        use crate::app::multipart_usecase::{DefaultMultipartUsecase, UploadPartCopyWriteInput, UploadPartTarget};
+        use crate::storage::storage_api::contract::multipart::MultipartOperations as _;
+        use rustfs_gateway_types::CopySourceValue;
+
+        let SealedEtagObject {
+            store,
+            bucket,
+            encoded_key,
+            key_md5,
+            payload,
+        } = customer_key_object_with_sealed_etag("sealed-etag-copy-source").await;
+        let answered = &SEALED_ETAG[SEALED_ETAG.len() - 32..];
+        let source = || CopySourceValue::Bucket {
+            bucket: bucket.clone(),
+            key: "ledger.csv".to_owned(),
+            version_id: None,
+        };
+        let strong = |etag: &str| Some(CopySourceCondition::Strong(etag.to_owned()));
+
+        let usecase = DefaultObjectUsecase::from_global();
+        let copy =
+            |destination: &'static str, if_match: Option<CopySourceCondition>, if_none_match: Option<CopySourceCondition>| {
+                let input = CopyObjectWriteInput {
+                    bucket: bucket.clone(),
+                    key: destination.to_owned(),
+                    copy_source: Some(source()),
+                    copy_source_sse_customer_algorithm: Some("AES256".to_owned()),
+                    copy_source_sse_customer_key: Some(encoded_key.clone()),
+                    copy_source_sse_customer_key_md5: Some(key_md5.clone()),
+                    copy_source_if_match: if_match,
+                    copy_source_if_none_match: if_none_match,
+                    ..Default::default()
+                };
+                usecase.execute_copy_object_owned(method_only_put_envelope(), input)
+            };
+        copy("copied.csv", strong(answered), None)
+            .await
+            .expect("CopyObject with the ETag HEAD answered with for the source");
+        let mut copied = store
+            .get_object_reader(&bucket, "copied.csv", None, HeaderMap::new(), &ObjectOptions::default())
+            .await
+            .expect("copied object");
+        let mut plaintext = Vec::new();
+        tokio::io::AsyncReadExt::read_to_end(&mut copied.stream, &mut plaintext)
+            .await
+            .expect("copied body");
+        assert_eq!(plaintext, payload, "the copy reads the source plaintext");
+        for (refused, why) in [
+            (copy("refused.csv", strong(SEALED_ETAG), None).await, "if-match with the stored form"),
+            (copy("refused.csv", None, strong(answered)).await, "if-none-match with the answered ETag"),
+        ] {
+            let error = refused.err().unwrap_or_else(|| panic!("CopyObject must refuse {why}"));
+            assert_eq!(error.code(), &OwnedS3ErrorCode::PreconditionFailed, "{why}");
+        }
+
+        let multipart = DefaultMultipartUsecase::from_global();
+        let upload = store
+            .new_multipart_upload(&bucket, "assembled.csv", &ObjectOptions::default())
+            .await
+            .expect("multipart upload");
+        let copy_part = |if_match: Option<CopySourceCondition>, if_none_match: Option<CopySourceCondition>| {
+            let input = UploadPartCopyWriteInput {
+                target: UploadPartTarget::Legacy {
+                    bucket: bucket.clone(),
+                    key: "assembled.csv".to_owned(),
+                    upload_id: upload.upload_id.clone(),
+                },
+                part_number: 1,
+                copy_source: source(),
+                copy_source_range: None,
+                copy_source_if_match: if_match,
+                copy_source_if_none_match: if_none_match,
+                copy_source_dates: Default::default(),
+                sse_customer_algorithm: None,
+                sse_customer_key: None,
+                sse_customer_key_md5: None,
+                copy_source_sse_customer_algorithm: Some("AES256".to_owned()),
+                copy_source_sse_customer_key: Some(encoded_key.clone()),
+                copy_source_sse_customer_key_md5: Some(key_md5.clone()),
+            };
+            let multipart = &multipart;
+            async move { Box::pin(multipart.execute_upload_part_copy_owned(method_only_put_envelope(), input)).await }
+        };
+        copy_part(strong(answered), None)
+            .await
+            .expect("UploadPartCopy with the ETag HEAD answered with for the source");
+        for (refused, why) in [
+            (copy_part(strong(SEALED_ETAG), None).await, "if-match with the stored form"),
+            (copy_part(None, strong(answered)).await, "if-none-match with the answered ETag"),
+        ] {
+            let error = refused.err().unwrap_or_else(|| panic!("UploadPartCopy must refuse {why}"));
+            assert_eq!(error.code(), &OwnedS3ErrorCode::PreconditionFailed, "{why}");
+        }
     }
 
     #[tokio::test]
