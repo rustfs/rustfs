@@ -5709,7 +5709,7 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
                 }
             }
         } else {
-            (shuffle_disks.clone(), vec![None; shuffle_disks.len()])
+            (shuffle_disks, Vec::new())
         };
         let commit_set = self.clone();
         let commit_bucket = bucket.to_owned();
