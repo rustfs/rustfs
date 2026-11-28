@@ -383,13 +383,14 @@ impl CapacityShutdownReport {
 struct CatalogShutdownFailure {
     timed_out: bool,
     joined: bool,
-    join_error: Option<tokio::task::JoinError>,
+    join_error: Option<crate::table_catalog::CatalogBackgroundTaskError>,
 }
 
 impl std::fmt::Display for CatalogShutdownFailure {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let reason = match &self.join_error {
-            Some(error) => join_failure_reason(error),
+            Some(crate::table_catalog::CatalogBackgroundTaskError::Join(error)) => join_failure_reason(error),
+            Some(crate::table_catalog::CatalogBackgroundTaskError::Worker(_)) => "owned worker returned an error",
             None if self.joined => "owned task joined",
             None => "actual join unconfirmed",
         };
@@ -403,7 +404,10 @@ impl std::fmt::Display for CatalogShutdownFailure {
 
 impl std::error::Error for CatalogShutdownFailure {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        self.join_error.as_ref().map(|error| error as _)
+        match self.join_error.as_ref()? {
+            crate::table_catalog::CatalogBackgroundTaskError::Join(error) => Some(error),
+            crate::table_catalog::CatalogBackgroundTaskError::Worker(error) => Some(error.as_ref()),
+        }
     }
 }
 
@@ -414,7 +418,7 @@ pub(crate) async fn stop_catalog_background_task(
         return Ok(());
     };
     runtime.request_stop();
-    let join = runtime.join();
+    let join = runtime.join_result();
     tokio::pin!(join);
     let deadline = tokio::time::Instant::now() + SHUTDOWN_TIMEOUT;
     let observed = tokio::time::timeout_at(deadline, join.as_mut()).await;
@@ -626,6 +630,7 @@ pub(crate) async fn join_startup_fronts(
 }
 
 pub(crate) struct StartupShutdownServices {
+    pub(crate) vector_maintenance: Option<crate::table_catalog::CatalogBackgroundTask>,
     #[cfg(feature = "internode-transport")]
     pub(crate) peer_control: Option<std::sync::Arc<crate::storage_api::startup::storage::InstalledControlService>>,
     pub(crate) capacity: Option<CapacityBackgroundTasks>,
@@ -645,6 +650,7 @@ pub(crate) async fn run_startup_shutdown_sequence(
     ctx: CancellationToken,
 ) -> (CapacityShutdownReport, std::io::Result<()>, FrontShutdownReport) {
     let StartupShutdownServices {
+        vector_maintenance,
         #[cfg(feature = "internode-transport")]
         peer_control,
         capacity: capacity_tasks,
@@ -853,11 +859,12 @@ pub(crate) async fn run_startup_shutdown_sequence(
     )
     .await;
     let front_result = front_failures;
-    let (maintenance_result, recovery_result) = tokio::join!(
+    let (maintenance_result, recovery_result, vector_result) = tokio::join!(
         stop_catalog_background_task(table_maintenance),
         stop_catalog_background_task(table_rename_recovery),
+        stop_catalog_background_task(vector_maintenance),
     );
-    let maintenance_result = maintenance_result.and(recovery_result);
+    let maintenance_result = maintenance_result.and(recovery_result).and(vector_result);
     let scanner_stopped = match scanner_cleanup {
         Some(cleanup) => crate::startup_lifecycle::wait_for_scanner_cleanup(cleanup).await,
         None => true,
@@ -972,10 +979,15 @@ pub(crate) fn signal_embedded_startup_shutdown(shutdown_handle: &ShutdownHandle,
 async fn release_embedded_runtime_after_drain(
     mut runtime_owner: Option<EmbeddedRuntimeOwner>,
     table_rename_recovery: Option<crate::table_catalog::CatalogBackgroundTask>,
+    vector_maintenance: Option<crate::table_catalog::CatalogBackgroundTask>,
 ) {
-    if let Err(error) = stop_catalog_background_task(table_rename_recovery).await {
+    let (rename_result, vector_result) = tokio::join!(
+        stop_catalog_background_task(table_rename_recovery),
+        stop_catalog_background_task(vector_maintenance),
+    );
+    if let Err(error) = rename_result.and(vector_result) {
         warn!(component = LOG_COMPONENT_EMBEDDED, subsystem = LOG_SUBSYSTEM_EMBEDDED,
-            event = EVENT_EMBEDDED_SHUTDOWN_CLEANUP_FAILED, service = "table_rename_recovery", error = %error,
+            event = EVENT_EMBEDDED_SHUTDOWN_CLEANUP_FAILED, service = "catalog_background_tasks", error = %error,
             "Embedded shutdown cleanup failed");
     }
     if let Some(runtime_owner) = runtime_owner.as_mut()
@@ -992,6 +1004,7 @@ pub(crate) fn run_embedded_server_drop_cleanup(
     temp_dir: &mut Option<PathBuf>,
     runtime_owner: Option<EmbeddedRuntimeOwner>,
     table_rename_recovery: Option<crate::table_catalog::CatalogBackgroundTask>,
+    vector_maintenance: Option<crate::table_catalog::CatalogBackgroundTask>,
 ) {
     ctx.cancel();
     if let Some(shutdown_handle) = shutdown_handle.as_ref() {
@@ -1003,7 +1016,7 @@ pub(crate) fn run_embedded_server_drop_cleanup(
     runtime.spawn(finish_embedded_server_cleanup(
         shutdown_handle,
         temp_dir,
-        release_embedded_runtime_after_drain(runtime_owner, table_rename_recovery),
+        release_embedded_runtime_after_drain(runtime_owner, table_rename_recovery, vector_maintenance),
     ));
 }
 
@@ -1039,6 +1052,7 @@ pub(crate) async fn run_embedded_server_shutdown(
     temp_dir: &mut Option<PathBuf>,
     runtime_owner: Option<EmbeddedRuntimeOwner>,
     table_rename_recovery: Option<crate::table_catalog::CatalogBackgroundTask>,
+    vector_maintenance: Option<crate::table_catalog::CatalogBackgroundTask>,
 ) {
     info!(
         target: "rustfs::embedded",
@@ -1058,7 +1072,7 @@ pub(crate) async fn run_embedded_server_shutdown(
     let cleanup_task = runtime.spawn(finish_embedded_server_cleanup(
         shutdown_handle.take(),
         temp_dir.take(),
-        release_embedded_runtime_after_drain(runtime_owner, table_rename_recovery),
+        release_embedded_runtime_after_drain(runtime_owner, table_rename_recovery, vector_maintenance),
     ));
     if let Err(err) = cleanup_task.await {
         warn!(
@@ -1381,7 +1395,7 @@ mod tests {
             super::CatalogShutdownFailure {
                 timed_out: false,
                 joined: true,
-                join_error: Some(join_error),
+                join_error: Some(crate::table_catalog::CatalogBackgroundTaskError::Join(join_error)),
             },
         ] {
             let retired = failure.joined;
@@ -1540,6 +1554,7 @@ mod tests {
             &mut owned_temp_path,
             None,
             Some(recovery),
+            None,
         );
 
         tokio::time::timeout(Duration::from_secs(1), observed_rx)

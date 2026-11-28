@@ -14,7 +14,7 @@
 
 //! The data-key provider interface and the per-request choice between the KMS and the local master key.
 
-use crate::error::SseError;
+use crate::error::{SseError, sse_kms_unavailable_error};
 use crate::host::SseHost;
 use crate::kms::kms_backed::KmsSseDekProvider;
 use crate::kms::local::LocalSseDekProvider;
@@ -150,11 +150,25 @@ pub(crate) async fn kms_sse_dek_provider<'a>(host: &'a dyn SseHost) -> Result<Ar
     Ok(Arc::new(KmsSseDekProvider::new(host).await?))
 }
 
+/// A maintenance unwrap uses only the service captured by its owning host.
+pub(crate) async fn kms_sse_dek_provider_for_operation(
+    host: &dyn SseHost,
+    bound: bool,
+) -> Result<Arc<dyn SseDekProvider + '_>, SseError> {
+    if !bound {
+        return kms_sse_dek_provider(host).await;
+    }
+    if host.encryption_service().await.is_none() {
+        return Err(sse_kms_unavailable_error(host.kms_configured_but_unavailable().await));
+    }
+    Ok(Arc::new(KmsSseDekProvider::new(host).await?))
+}
+
 /// The KMS provider, when its backend may own a stored data key that is not a
 /// RustFS envelope. `None` without a running KMS, which leaves such a key to
 /// the local provider exactly as before.
-pub(crate) async fn bare_data_key_kms_provider<'a>(host: &'a dyn SseHost) -> Option<Arc<dyn SseDekProvider + 'a>> {
-    let provider = kms_sse_dek_provider(host).await.ok()?;
+pub(crate) async fn bare_data_key_kms_provider(host: &dyn SseHost, bound: bool) -> Option<Arc<dyn SseDekProvider + '_>> {
+    let provider = kms_sse_dek_provider_for_operation(host, bound).await.ok()?;
     provider.reads_bare_data_key_ciphertext().await.then_some(provider)
 }
 
@@ -197,7 +211,7 @@ pub(crate) async fn get_sse_dek_provider<'a>(host: &'a dyn SseHost) -> Result<Ar
         return Ok(Arc::new(KmsSseDekProvider::new(host).await?));
     }
 
-    get_local_sse_dek_provider()
+    host.local_sse_dek_provider()
 }
 
 /// Get the local data-key provider, loading and caching it on first use.

@@ -40,6 +40,7 @@ mod select_object;
 pub(crate) mod select_request;
 pub(crate) mod storage_api;
 pub(crate) mod table_list_isolation;
+pub(crate) mod vector_usecase;
 pub(crate) mod website;
 
 // Request-scoped facts are not AppContext resolution, so consumers import them
@@ -67,3 +68,5 @@ mod owned_authorization_test;
 mod put_prelookup_gating_test;
 #[cfg(test)]
 pub(crate) mod test_seams;
+#[cfg(test)]
+mod vector_access_tests;

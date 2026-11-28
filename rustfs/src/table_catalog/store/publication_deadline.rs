@@ -140,7 +140,7 @@ impl Drop for PreparationReadCleanup<'_> {
     }
 }
 
-pub(super) async fn publication_preparation<T>(
+pub(in crate::table_catalog) async fn publication_preparation<T>(
     publication: &(dyn TableCommitPublication + Sync),
     future: impl Future<Output = TableCatalogStoreResult<T>>,
 ) -> TableCatalogStoreResult<T> {

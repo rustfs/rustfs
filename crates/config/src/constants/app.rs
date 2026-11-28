@@ -21,6 +21,11 @@ pub const APP_NAME: &str = "RustFS";
 /// Cargo package version for this workspace member.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
+/// Restart-required configuration for resource-scoped Vector maintenance.
+pub const S3VECTORS_MAINTENANCE_SUB_SYS: &str = "s3vectors_maintenance";
+/// Existing ordinary IAM account selected to execute Vector maintenance.
+pub const S3VECTORS_MAINTENANCE_EXECUTION_ACCOUNT: &str = "execution_account";
+
 /// Opt in to scanner checkpoint continuity across verified read-only restarts.
 /// Defaults to false. Enable only after all possible writers support receipt
 /// consumption; disable and restart before rolling back to an older writer.

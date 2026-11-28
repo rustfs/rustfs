@@ -137,6 +137,95 @@ pub(crate) use upload_part_copy::{UploadPartCopyWriteInput, UploadPartCopyWriteO
 mod upload_values;
 pub(crate) use upload_values::{UploadPartTarget, UploadPartWriteInput, UploadPartWriteOutput};
 
+pub(crate) enum MultipartOrigin {
+    Request,
+    Managed {
+        context: Box<crate::app::object::ManagedObjectContext>,
+        principal: Box<SseKmsPrincipal>,
+        completion: Option<OperationHelper>,
+        lifecycle_guard: Arc<crate::app::storage_api::managed::BucketIncarnationFenceGuard>,
+    },
+}
+
+impl MultipartOrigin {
+    fn take_completion(&mut self) -> Option<OperationHelper> {
+        match self {
+            Self::Request => None,
+            Self::Managed { completion, .. } => completion.take(),
+        }
+    }
+
+    fn principal(&self, request: &crate::app::RequestEnvelope) -> Option<SseKmsPrincipal> {
+        match self {
+            Self::Request => SseKmsPrincipal::from_request(request),
+            Self::Managed { principal, .. } => Some(principal.as_ref().clone()),
+        }
+    }
+
+    fn is_managed(&self) -> bool {
+        match self {
+            Self::Request => false,
+            Self::Managed { .. } => true,
+        }
+    }
+
+    fn headers(&self, request: &crate::app::RequestEnvelope) -> HeaderMap {
+        if self.is_managed() {
+            HeaderMap::new()
+        } else {
+            request.headers().clone()
+        }
+    }
+
+    fn apply_bucket_guard(
+        &self,
+        request: &crate::app::RequestEnvelope,
+        bucket: &str,
+        opts: &mut ObjectOptions,
+    ) -> rustfs_s3_types::S3Result<()> {
+        match self {
+            Self::Request => apply_bucket_generation_guard(request, bucket, opts),
+            Self::Managed {
+                context,
+                lifecycle_guard,
+                ..
+            } => {
+                if context.access().bucket().storage_bucket_id().as_str() != bucket || lifecycle_guard.is_lock_lost() {
+                    return Err(ApiError::from(StorageError::PreconditionFailed).into());
+                }
+                opts.expected_bucket_incarnation_id = Some(context.access().bucket().incarnation().as_uuid());
+                lifecycle_guard.attach_to_object_options(opts);
+                Ok(())
+            }
+        }
+    }
+
+    fn unencrypted(&self) -> bool {
+        match self {
+            Self::Request => false,
+            Self::Managed { context, .. } => context.encryption() == &crate::app::object::ManagedEncryption::Unencrypted,
+        }
+    }
+
+    async fn validate_encryption(
+        &self,
+        _key: &str,
+        _metadata: &HashMap<String, String>,
+        _principal: Option<&SseKmsPrincipal>,
+    ) -> Result<(), ApiError> {
+        match self {
+            Self::Request => Ok(()),
+            Self::Managed { context, .. } => context
+                .validate_encryption_metadata(_key, _metadata, _principal.ok_or_else(ApiError::access_denied)?)
+                .await
+                .map_err(|error| match error {
+                    crate::app::object::ManagedObjectError::Api(error) => error,
+                    other => ApiError::other(other),
+                }),
+        }
+    }
+}
+
 #[cfg(test)]
 fn merge_part_encryption_metadata(
     metadata: &HashMap<String, String>,

@@ -382,6 +382,12 @@ async fn restored_receipts_replay_and_completed_restore_never_rolls_back_a_later
     let (source, _, _) = backup_fixture().await;
     let source_store = ObjectTableCatalogStore::new(source.clone());
     let request = backup_recovery_commit_request(&source, &source_store, "portable-receipt", "00002.metadata.json").await;
+    let base_key = (request.table_bucket.clone(), request.expected_metadata_location.clone());
+    let base_metadata = source
+        .read_object(&base_key.0, &base_key.1)
+        .await
+        .unwrap()
+        .expect("the original request has persisted base metadata");
     let original = source_store.commit_table(request.clone()).await.unwrap();
     let backup = source_store.create_object_catalog_backup("analytics", None).await.unwrap();
     let bytes = source_store
@@ -400,10 +406,37 @@ async fn restored_receipts_replay_and_completed_restore_never_rolls_back_a_later
         target_store.load_table("analytics", "sales", "orders").await.unwrap(),
         Some(original.table.clone())
     );
+    target.seed_object(&base_key.0, &base_key.1, base_metadata.data).await;
+    assert!(target.object_exists(&base_key.0, &base_key.1).await.unwrap());
+    target.delete_object(&base_key.0, &base_key.1).await.unwrap();
+    assert!(
+        !target.object_exists(&base_key.0, &base_key.1).await.unwrap(),
+        "the historical base must be absent before direct Catalog receipt replay"
+    );
+    let base_reads_before = target
+        .state
+        .lock()
+        .await
+        .read_attempts
+        .get(&base_key)
+        .copied()
+        .unwrap_or_default();
     let replay = target_store
         .commit_table(request)
         .await
         .expect("restored same-id request returns its committed result");
+    assert_eq!(
+        target
+            .state
+            .lock()
+            .await
+            .read_attempts
+            .get(&base_key)
+            .copied()
+            .unwrap_or_default(),
+        base_reads_before,
+        "direct Catalog receipt replay must not read the deleted base metadata"
+    );
     assert_eq!(replay.table, original.table);
     assert_eq!(replay.commit_log, original.commit_log);
     assert_eq!(

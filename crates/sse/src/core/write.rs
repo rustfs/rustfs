@@ -20,18 +20,17 @@ use crate::core::keying::material::EncryptionMaterial;
 use crate::core::keying::{
     SESSION_KEY_NEEDS_CUSTOMER_KEY, new_key_under_customer_key, new_key_under_data_key, new_session_key_under_customer_key,
 };
-use crate::core::request::SseKmsPrincipal;
+use crate::core::request::{SseKmsPrincipal, operation_host};
 use crate::core::s3::authorization::authorize_sse_kms_key;
 use crate::core::s3::headers::reject_kms_context_location_override;
 use crate::core::s3::scheme::{
     DEFAULT_SSE_ALGORITHM, WriteScheme, WriteSchemeHeaders, is_managed_sse, managed_sse_type, resolve_write_scheme,
 };
 use crate::core::s3::ssec::{SsecParams, ssec_invalid_request, validate_ssec_params, verify_ssec_key_match};
-use crate::error::SseError;
+use crate::error::{SseError, sse_kms_unavailable_error};
 use crate::host::SseHost;
 use crate::kms::provider::get_sse_dek_provider;
 use base64_simd::STANDARD as BASE64_STANDARD;
-use rustfs_kms::KmsUnavailableError;
 use rustfs_policy::policy::action::KmsAction;
 use rustfs_s3_types::S3ErrorCode;
 use rustfs_utils::http::headers::{AMZ_ENCRYPTION_AES, AMZ_ENCRYPTION_KMS};
@@ -178,6 +177,7 @@ impl EncryptionRequest<'_> {
 /// }
 /// ```
 pub async fn sse_encryption(host: &dyn SseHost, request: EncryptionRequest<'_>) -> Result<Option<EncryptionMaterial>, SseError> {
+    let host = operation_host(host, request.principal);
     let scheme = resolve_write_scheme(
         host,
         request.bucket,
@@ -251,6 +251,7 @@ pub async fn sse_prepare_encryption(
     host: &dyn SseHost,
     request: PrepareEncryptionRequest<'_>,
 ) -> Result<Option<EncryptionMaterial>, SseError> {
+    let host = operation_host(host, request.principal);
     let scheme = resolve_write_scheme(
         host,
         request.bucket,
@@ -420,6 +421,7 @@ pub(crate) async fn apply_managed_encryption_material_inner(
         content_size,
         principal,
     } = request;
+    let host = operation_host(host, principal);
     if !is_managed_sse(&server_side_encryption) {
         return Err(SseError::internal(format!(
             "Unsupported server-side encryption: {}",
@@ -463,7 +465,7 @@ pub(crate) async fn apply_managed_encryption_material_inner(
             // internal error; with a running service that has no default key
             // the caller simply has to name one.
             if host.encryption_service().await.is_none() {
-                return Err(sse_kms_unavailable_error(kms_configured_but_unavailable(host).await));
+                return Err(sse_kms_unavailable_error(host.kms_configured_but_unavailable().await));
             }
             return Err(SseError {
                 code: S3ErrorCode::InvalidRequest,
@@ -491,7 +493,7 @@ pub(crate) async fn apply_managed_encryption_material_inner(
     let provider = match get_sse_dek_provider(host).await {
         Ok(provider) => {
             if matches!(encryption_type, SSEType::SseKms) && provider.wraps_dek_with_local_master_key() {
-                return Err(sse_kms_unavailable_error(kms_configured_but_unavailable(host).await));
+                return Err(sse_kms_unavailable_error(host.kms_configured_but_unavailable().await));
             }
             provider
         }
@@ -501,7 +503,7 @@ pub(crate) async fn apply_managed_encryption_material_inner(
         // scheme.
         Err(err) => {
             if matches!(encryption_type, SSEType::SseKms) && host.encryption_service().await.is_none() {
-                return Err(sse_kms_unavailable_error(kms_configured_but_unavailable(host).await));
+                return Err(sse_kms_unavailable_error(host.kms_configured_but_unavailable().await));
             }
             return Err(err);
         }
@@ -526,25 +528,4 @@ pub(crate) async fn apply_managed_encryption_material_inner(
         managed_kms_context: matches!(encryption_type, SSEType::SseKms).then_some(ssekms_context.unwrap_or_default()),
         managed_sealed_key: object_key.sealed_key,
     })
-}
-
-/// Whether this node has a KMS configured that is not currently serving, which
-/// separates a transient outage (retryable, 503) from a deployment that never
-/// configured KMS at all (a client-side configuration error, 400).
-async fn kms_configured_but_unavailable(host: &dyn SseHost) -> bool {
-    match host.kms_service_manager() {
-        Some(manager) => !matches!(manager.get_status().await, rustfs_kms::KmsServiceStatus::NotConfigured),
-        None => false,
-    }
-}
-
-pub(crate) fn sse_kms_unavailable_error(configured_but_unavailable: bool) -> SseError {
-    if configured_but_unavailable {
-        return SseError::internal(KmsUnavailableError);
-    }
-    SseError {
-        code: S3ErrorCode::InvalidRequest,
-        message: "SSE-KMS requires a configured and running KMS service".to_string(),
-        source: None,
-    }
 }

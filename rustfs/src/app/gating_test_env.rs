@@ -200,6 +200,13 @@ pub(crate) async fn shared_gating_ecstore_and_disk_paths() -> (Vec<PathBuf>, Arc
 /// Build an isolated two-pool store for tests that move object data between
 /// pools while a production read is in flight.
 pub(crate) async fn isolated_multi_pool_ecstore() -> (TempDir, Vec<Vec<PathBuf>>, Arc<ECStore>) {
+    let (temp_dir, paths, store, _) = isolated_multi_pool_ecstore_with_context().await;
+    (temp_dir, paths, store)
+}
+
+/// Retain the actual store context for tests that observe its lock waiters.
+pub(crate) async fn isolated_multi_pool_ecstore_with_context()
+-> (TempDir, Vec<Vec<PathBuf>>, Arc<ECStore>, Arc<super::storage_api::test::InstanceContext>) {
     let temp_dir = TempDir::new().expect("create temp dir for multi-pool gating test");
     let mut pool_disk_paths = Vec::with_capacity(2);
     let mut pools = Vec::with_capacity(2);
@@ -239,11 +246,11 @@ pub(crate) async fn isolated_multi_pool_ecstore() -> (TempDir, Vec<Vec<PathBuf>>
         "127.0.0.1:0".parse().expect("multi-pool test address must parse"),
         endpoint_pools,
         CancellationToken::new(),
-        instance_ctx,
+        instance_ctx.clone(),
     )
     .await
     .expect("initialize isolated multi-pool store");
     metadata_sys::init_bucket_metadata_sys(store.clone(), Vec::new()).await;
 
-    (temp_dir, pool_disk_paths, store)
+    (temp_dir, pool_disk_paths, store, instance_ctx)
 }

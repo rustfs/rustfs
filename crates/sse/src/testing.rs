@@ -68,3 +68,18 @@ pub fn sse_kms_object_metadata() -> HashMap<String, String> {
         (INTERNAL_ENCRYPTION_ALGORITHM_HEADER.to_string(), "aws:kms".to_string()),
     ])
 }
+
+/// Build a real KMS-backed provider from the manager owned by a test fixture.
+///
+/// The provider resolves the manager's current encryption service on each operation.
+///
+/// # Errors
+///
+/// Returns an error when the manager has no active encryption service.
+pub async fn kms_sse_dek_provider_for_test(
+    manager: Arc<rustfs_kms::KmsServiceManager>,
+) -> Result<Arc<dyn crate::SseDekProvider>, SseError> {
+    Ok(Arc::new(
+        crate::kms::kms_backed::KmsSseDekProvider::new_with_service_manager(manager).await?,
+    ))
+}

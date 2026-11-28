@@ -158,6 +158,69 @@ pub struct IamSys<T> {
     roles_map: HashMap<ARN, String>,
 }
 
+struct ResourcePolicyAuth {
+    identity_policy: Policy,
+    owner: bool,
+    direct_owner: bool,
+    parent_account: Option<String>,
+    boundaries: Vec<Policy>,
+    groups: Option<Vec<String>>,
+}
+
+fn checked_resource_claim_policy_names(claims: &HashMap<String, Value>) -> Result<Vec<String>> {
+    let Some(value) = claims.get(POLICYNAME) else {
+        return Ok(Vec::new());
+    };
+    let value = value.as_str().ok_or(IamError::InvalidArgument)?;
+    if value.trim().is_empty() {
+        return Ok(Vec::new());
+    }
+    value
+        .split(',')
+        .map(str::trim)
+        .map(|name| {
+            if is_safe_claim_policy_name(name) {
+                Ok(name.to_owned())
+            } else {
+                Err(IamError::InvalidArgument)
+            }
+        })
+        .collect()
+}
+
+fn checked_resource_session_policy(claims: &HashMap<String, Value>) -> Result<Option<Policy>> {
+    let encoded = claims
+        .get(SESSION_POLICY_NAME)
+        .map(|value| {
+            value
+                .as_str()
+                .ok_or(IamError::InvalidArgument)
+                .and_then(decode_session_policy)
+        })
+        .transpose()?;
+    let extracted = claims
+        .get(SESSION_POLICY_NAME_EXTRACTED)
+        .map(|value| {
+            let text = value.as_str().ok_or(IamError::InvalidArgument)?;
+            if text.len() > MAX_SVCSESSION_POLICY_SIZE {
+                return Err(IamError::PolicyTooLarge);
+            }
+            let policy = Policy::parse_config(text.as_bytes())?;
+            policy.validate()?;
+            if policy.version.is_empty() {
+                return Err(IamError::InvalidArgument);
+            }
+            Ok(policy)
+        })
+        .transpose()?;
+    if let (Some(encoded), Some(extracted)) = (&encoded, &extracted)
+        && serde_json::to_value(encoded)? != serde_json::to_value(extracted)?
+    {
+        return Err(IamError::InvalidArgument);
+    }
+    Ok(encoded.or(extracted))
+}
+
 #[derive(Clone)]
 enum PreparedSessionPolicy {
     None,
@@ -2720,6 +2783,319 @@ impl<T: Store> IamSys<T> {
         }
     }
 
+    /// Authorize one concrete S3 Vectors action using identity and resource policies.
+    ///
+    /// The caller supplies a verified access key and claims, current Vector resource
+    /// conditions, and a successfully loaded bucket policy. `None` means the resource
+    /// has no policy. Each additional action must be authorized separately.
+    /// For this entry point, `args.is_owner` is a trusted fact from the owning
+    /// server: the verified identity or its verified parent is that server's root.
+    /// A derived identity still requires its current IAM record and all boundaries.
+    /// Direct root requests have no token claims. Ordinary S3 entry points retain
+    /// their existing interpretation of `Args::is_owner`.
+    /// Explicit denials and applicable session/federation boundaries take precedence
+    /// over either grant. OPA decisions and restricted plugin credentials cannot be
+    /// supplemented by a resource grant. This method does not query ordinary S3 tags.
+    ///
+    /// # Errors
+    /// Returns an error for invalid request shapes, inactive identities or parents,
+    /// unreadable attached policies, malformed claims, and unavailable policy plugins.
+    /// Provider request failures retain the existing OPA `Ok(false)` behavior.
+    pub async fn is_allowed_with_resource_policy(
+        &self,
+        args: &Args<'_>,
+        resource_policy: Option<&rustfs_policy::policy::BucketPolicy>,
+    ) -> Result<bool> {
+        use rustfs_policy::policy::action::{Action, S3VectorsAction};
+        use rustfs_policy::policy::{BucketPolicyArgs, Validator};
+
+        if args.account.is_empty()
+            || args.deny_only
+            || !matches!(args.action, Action::S3VectorsAction(action) if action != S3VectorsAction::AllActions)
+        {
+            return Err(IamError::InvalidArgument);
+        }
+        let shape_args = Args {
+            is_owner: false,
+            deny_only: true,
+            ..args.clone()
+        };
+        if !Policy::default().is_allowed(&shape_args).await {
+            return Err(IamError::InvalidArgument);
+        }
+        if let Some(policy) = resource_policy {
+            policy.is_valid()?;
+        }
+
+        let plugin = Self::policy_plugin_state().await;
+        let marked = args.claims.contains_key(PLUGIN_ATTEMPT_CREDENTIAL_CLAIM);
+        if marked && !matches!(plugin, PolicyPluginState::Disabled) {
+            return Err(IamError::IAMActionNotAllowed);
+        }
+        let auth = self
+            .prepare_resource_policy_auth(args, matches!(plugin, PolicyPluginState::Disabled))
+            .await?;
+        if !auth.direct_owner && matches!(plugin, PolicyPluginState::Initializing | PolicyPluginState::Failed) {
+            return Err(IamError::IamSysNotInitialized);
+        }
+        let effective_args = Args {
+            groups: &auth.groups,
+            is_owner: false,
+            ..args.clone()
+        };
+        let bucket_args = BucketPolicyArgs {
+            account: effective_args.account,
+            groups: effective_args.groups,
+            action: effective_args.action,
+            bucket: effective_args.bucket,
+            object: effective_args.object,
+            conditions: effective_args.conditions,
+            is_owner: true,
+        };
+        if let Some(policy) = resource_policy
+            && !policy.is_allowed(&bucket_args).await
+        {
+            return Ok(false);
+        }
+        for boundary in &auth.boundaries {
+            if !boundary.is_allowed(&effective_args).await {
+                return if marked {
+                    Err(IamError::IAMActionNotAllowed)
+                } else {
+                    Ok(false)
+                };
+            }
+        }
+
+        if !auth.direct_owner {
+            match plugin {
+                PolicyPluginState::Ready(client) => return Ok(client.is_allowed(&effective_args).await),
+                PolicyPluginState::Initializing | PolicyPluginState::Failed => return Err(IamError::IamSysNotInitialized),
+                PolicyPluginState::Disabled => {}
+            }
+        }
+
+        let identity_args = Args {
+            account: auth.parent_account.as_deref().unwrap_or(effective_args.account),
+            ..effective_args
+        };
+        if !auth
+            .identity_policy
+            .is_allowed(&Args {
+                deny_only: true,
+                ..identity_args.clone()
+            })
+            .await
+        {
+            return if marked {
+                Err(IamError::IAMActionNotAllowed)
+            } else {
+                Ok(false)
+            };
+        }
+        let identity_allowed = auth.owner || auth.identity_policy.is_allowed(&identity_args).await;
+        if marked && !identity_allowed {
+            return Err(IamError::IAMActionNotAllowed);
+        }
+        if identity_allowed {
+            return Ok(true);
+        }
+        let resource_allowed = match resource_policy {
+            Some(policy) => {
+                policy
+                    .is_allowed(&BucketPolicyArgs {
+                        is_owner: false,
+                        ..bucket_args
+                    })
+                    .await
+            }
+            None => false,
+        };
+        Ok(resource_allowed)
+    }
+
+    async fn prepare_resource_policy_auth(&self, args: &Args<'_>, resolve_identity: bool) -> Result<ResourcePolicyAuth> {
+        let current_identity = self.store.get_user(args.account).await;
+        let direct_owner = args.is_owner
+            && args.claims.is_empty()
+            && current_identity.as_ref().is_none_or(|identity| {
+                identity.credentials.parent_user.is_empty()
+                    && !identity.credentials.is_service_account()
+                    && identity.credentials.session_token.is_empty()
+            });
+        if direct_owner {
+            return Ok(ResourcePolicyAuth {
+                identity_policy: Policy::default(),
+                owner: true,
+                direct_owner: true,
+                parent_account: None,
+                boundaries: Vec::new(),
+                groups: self.resource_policy_groups(args.groups, args.account),
+            });
+        }
+        let identity = self.resource_policy_identity(args.account).await?;
+        let credential = identity.credentials;
+        let service_account = credential.is_service_account();
+        let temporary = credential.is_temp() && !service_account;
+        let marked = args.claims.contains_key(PLUGIN_ATTEMPT_CREDENTIAL_CLAIM);
+        if marked && (!temporary || args.claims.get(PLUGIN_ATTEMPT_CREDENTIAL_CLAIM) != Some(&Value::Bool(true))) {
+            return Err(IamError::IAMActionNotAllowed);
+        }
+
+        if !service_account && !temporary {
+            if !credential.parent_user.is_empty() || args.claims.contains_key("parent") {
+                return Err(IamError::InvalidArgument);
+            }
+            if args.is_owner {
+                return Err(IamError::InvalidArgument);
+            }
+            let groups = self.resource_policy_groups(&credential.groups, args.account);
+            let identity_policy = if resolve_identity {
+                let names = self.store.policy_db_get_checked(args.account, &groups).await?;
+                self.store.merge_policies_checked(&names).await?
+            } else {
+                Policy::default()
+            };
+            return Ok(ResourcePolicyAuth {
+                identity_policy,
+                owner: false,
+                direct_owner: false,
+                parent_account: None,
+                boundaries: Vec::new(),
+                groups,
+            });
+        }
+
+        let parent_user = credential.parent_user.as_str();
+        if parent_user.is_empty() || args.claims.get("parent").and_then(Value::as_str) != Some(parent_user) {
+            return Err(IamError::InvalidArgument);
+        }
+        let oidc = is_rustfs_oidc_claims(args.claims);
+        if args.claims.get("iss").and_then(Value::as_str) == Some("rustfs-oidc") && !oidc {
+            return Err(IamError::InvalidArgument);
+        }
+        if !service_account && args.claims.contains_key(VERIFIED_FEDERATED_POLICY_CLAIM) && !oidc {
+            return Err(IamError::InvalidArgument);
+        }
+        let federated = if service_account {
+            if args.claims.contains_key(VERIFIED_FEDERATED_POLICY_CLAIM) || oidc {
+                if !is_valid_verified_federated_policy(args.claims, parent_user) {
+                    return Err(IamError::InvalidArgument);
+                }
+                true
+            } else {
+                false
+            }
+        } else if oidc {
+            if !is_verified_or_legacy_federated_session(args.claims, parent_user) {
+                return Err(IamError::InvalidArgument);
+            }
+            true
+        } else {
+            false
+        };
+        let owner = args.is_owner && !federated;
+        let parent = if federated || owner {
+            None
+        } else {
+            Some(self.resource_policy_identity(parent_user).await?)
+        };
+        let claim_groups = parent
+            .as_ref()
+            .map_or(&credential.groups, |parent| &parent.credentials.groups);
+        let groups = self.resource_policy_groups(claim_groups, parent_user);
+        let mut boundaries = Vec::new();
+        let session_bound = if service_account {
+            match args.claims.get(&iam_policy_claim_name_sa()).and_then(Value::as_str) {
+                Some(INHERITED_POLICY_TYPE) => false,
+                Some(EMBEDDED_POLICY_TYPE) => true,
+                _ => return Err(IamError::InvalidArgument),
+            }
+        } else {
+            true
+        };
+        if session_bound {
+            let session = checked_resource_session_policy(args.claims)?;
+            if (service_account || marked) && session.is_none() {
+                return Err(IamError::InvalidArgument);
+            }
+            boundaries.extend(session);
+        }
+        if service_account && federated {
+            boundaries.extend(federated_policy_boundary(args.claims)?);
+        }
+        let bypass_parent_policy = service_account
+            && args.account == SITE_REPLICATOR_SERVICE_ACCOUNT
+            && args.claims.get(SITE_REPLICATOR_CLAIM).and_then(Value::as_bool) == Some(true)
+            && session_bound;
+        let claim_names = checked_resource_claim_policy_names(args.claims)?;
+        if federated && (service_account || is_verified_federated_session(args.claims, parent_user)) && claim_names.is_empty() {
+            return Err(IamError::InvalidArgument);
+        }
+        let role_arn = match args.claims.get("roleArn") {
+            Some(Value::String(value)) => Some(ARN::parse(value).map_err(|_| IamError::InvalidArgument)?),
+            Some(_) => return Err(IamError::InvalidArgument),
+            None => None,
+        };
+        let identity_policy = if !resolve_identity || owner || bypass_parent_policy {
+            Policy::default()
+        } else {
+            let names = if federated {
+                let names = if service_account || is_verified_federated_session(args.claims, parent_user) {
+                    claim_names
+                } else {
+                    let mapped = self.store.policy_db_get_checked(parent_user, &groups).await?;
+                    if mapped.is_empty() { claim_names } else { mapped }
+                };
+                if names.is_empty() {
+                    return Err(IamError::InvalidArgument);
+                }
+                names
+            } else if let Some(arn) = role_arn {
+                let mapped = self.roles_map.get(&arn).ok_or(IamError::IAMActionNotAllowed)?;
+                let names = MappedPolicy::new(mapped).to_slice();
+                if temporary && names.is_empty() { claim_names } else { names }
+            } else {
+                let mapped = self.store.policy_db_get_checked(parent_user, &groups).await?;
+                if temporary && mapped.is_empty() { claim_names } else { mapped }
+            };
+            self.store.merge_policies_checked(&names).await?
+        };
+        Ok(ResourcePolicyAuth {
+            identity_policy,
+            owner: owner || bypass_parent_policy,
+            direct_owner: false,
+            parent_account: service_account.then(|| parent_user.to_owned()),
+            boundaries,
+            groups,
+        })
+    }
+
+    async fn resource_policy_identity(&self, access_key: &str) -> Result<UserIdentity> {
+        let identity = match self.store.get_user(access_key).await {
+            Some(identity) => identity,
+            None => {
+                self.store.load_user(access_key).await?;
+                self.store.get_user(access_key).await.ok_or(IamError::IAMActionNotAllowed)?
+            }
+        };
+        if !identity.credentials.is_valid() {
+            return Err(IamError::IAMActionNotAllowed);
+        }
+        Ok(identity)
+    }
+
+    fn resource_policy_groups(&self, credential_groups: &Option<Vec<String>>, membership_user: &str) -> Option<Vec<String>> {
+        // Local membership is maintained independently of persisted credential claims.
+        // Derived local identities call this with their current parent, so a group
+        // removed after session issuance does not survive through copied STS groups.
+        let mut groups = credential_groups.clone().unwrap_or_default();
+        groups.extend(self.user_group_memberships(membership_user));
+        groups.sort_unstable();
+        groups.dedup();
+        (!groups.is_empty()).then_some(groups)
+    }
+
     pub async fn is_allowed(&self, args: &Args<'_>) -> bool {
         let prepared = self.prepare_auth(args).await;
         self.eval_prepared(&prepared, args).await
@@ -3099,6 +3475,1007 @@ mod tests {
     use time::OffsetDateTime;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
+
+    mod vector_resource_policy {
+        use super::*;
+        use futures::FutureExt;
+        use rustfs_policy::policy::BucketPolicy;
+        use rustfs_policy::policy::action::S3VectorsAction;
+        use serde_json::json;
+
+        const ACCOUNT: &str = "sts-empty-parent-policy-test";
+        const POLICY: &str = "vector-resource-policy-test";
+
+        async fn fixture<F, Fut>(run: F)
+        where
+            F: FnOnce(IamSys<StsTestMockStore>) -> Fut,
+            Fut: std::future::Future<Output = ()>,
+        {
+            temp_env::async_with_vars(
+                [
+                    ("RUSTFS_SKIP_BACKGROUND_TASK", Some("1")),
+                    ("NO_PROXY", Some("127.0.0.1,localhost")),
+                    ("no_proxy", Some("127.0.0.1,localhost")),
+                ],
+                async {
+                    let previous = IamSys::<StsTestMockStore>::policy_plugin_state().await;
+                    *get_policy_plugin_state().write().await = PolicyPluginState::Disabled;
+                    let result = std::panic::AssertUnwindSafe(async {
+                        let store = StsTestMockStore::new(true);
+                        let iam = IamSys::new(IamCache::new(store).await.expect("initialize Vector IAM fixture"));
+                        run(iam).await;
+                    })
+                    .catch_unwind()
+                    .await;
+                    *get_policy_plugin_state().write().await = previous;
+                    if let Err(payload) = result {
+                        std::panic::resume_unwind(payload);
+                    }
+                },
+            )
+            .await;
+        }
+
+        fn policy(effect: &str, action: &str) -> Policy {
+            Policy::parse_config(
+                &serde_json::to_vec(&json!({
+                    "Version":"2012-10-17",
+                    "Statement":[{"Effect":effect,"Action":action,"Resource":"*"}]
+                }))
+                .expect("serialize fixture policy"),
+            )
+            .expect("parse fixture policy")
+        }
+
+        fn resource_policy(account: &str, effect: &str) -> BucketPolicy {
+            serde_json::from_value(json!({
+                "Version":"2012-10-17",
+                "Statement":[{"Effect":effect,"Principal":{"AWS":account},
+                    "Action":"s3vectors:*","Resource":"*"}]
+            }))
+            .expect("parse resource policy")
+        }
+
+        fn attach(iam: &IamSys<StsTestMockStore>, account: &str, document: Option<Policy>) {
+            let now = OffsetDateTime::now_utc();
+            if let Some(document) = document {
+                iam.store
+                    .cache
+                    .add_or_update_policy_doc(POLICY, &PolicyDoc::new(document), now);
+                iam.store
+                    .cache
+                    .add_or_update_user_policy(account, &MappedPolicy::new(POLICY), now);
+            } else {
+                iam.store
+                    .cache
+                    .add_or_update_user_policy(account, &MappedPolicy::default(), now);
+            }
+        }
+
+        fn conditions() -> HashMap<String, Vec<String>> {
+            HashMap::from([("RequestedRegion".to_owned(), vec!["us-east-1".to_owned()])])
+        }
+
+        fn args<'a>(
+            account: &'a str,
+            claims: &'a HashMap<String, Value>,
+            conditions: &'a HashMap<String, Vec<String>>,
+        ) -> Args<'a> {
+            Args {
+                account,
+                groups: &None,
+                action: Action::S3VectorsAction(S3VectorsAction::GetVectorsAction),
+                bucket: "vector-bucket",
+                object: "vector-index",
+                conditions,
+                is_owner: false,
+                claims,
+                deny_only: false,
+            }
+        }
+
+        async fn issue_credential(
+            iam: &IamSys<StsTestMockStore>,
+            parent: &str,
+            session: Option<Policy>,
+            service_account: bool,
+            additional_claims: HashMap<String, Value>,
+        ) -> Credentials {
+            let secret = "vector-fixture-signing-secret";
+            let mut metadata = HashMap::from([
+                ("parent".to_owned(), json!(parent)),
+                (
+                    "exp".to_owned(),
+                    json!((OffsetDateTime::now_utc() + time::Duration::hours(1)).unix_timestamp()),
+                ),
+            ]);
+            if service_account {
+                metadata.insert(
+                    iam_policy_claim_name_sa(),
+                    json!(if session.is_some() {
+                        EMBEDDED_POLICY_TYPE
+                    } else {
+                        INHERITED_POLICY_TYPE
+                    }),
+                );
+            }
+            if let Some(session) = session {
+                metadata.insert(
+                    SESSION_POLICY_NAME.to_owned(),
+                    json!(
+                        base64_simd::URL_SAFE_NO_PAD
+                            .encode_to_string(serde_json::to_vec(&session).expect("serialize signed session policy"))
+                    ),
+                );
+            }
+            metadata.extend(additional_claims);
+            let mut credential = get_new_credentials_with_metadata(&metadata, secret).expect("issue signed test credential");
+            credential.parent_user = parent.to_owned();
+            credential.claims = Some(
+                get_claims_from_token_with_secret(&credential.session_token, secret).expect("verify signed test credential"),
+            );
+            store_credential(iam, &credential).await;
+            credential
+        }
+
+        async fn store_credential(iam: &IamSys<StsTestMockStore>, credential: &Credentials) {
+            let identity = UserIdentity::from(credential.clone());
+            let user_type = if credential.is_service_account() {
+                UserType::Svc
+            } else {
+                UserType::Sts
+            };
+            iam.store
+                .api
+                .save_user_identity(&credential.access_key, user_type, identity.clone(), None)
+                .await
+                .expect("persist test credential");
+            if user_type == UserType::Svc {
+                iam.store
+                    .cache
+                    .add_or_update_user(&credential.access_key, &identity, OffsetDateTime::now_utc());
+            } else {
+                iam.store
+                    .cache
+                    .add_or_update_sts_account(&credential.access_key, &identity, OffsetDateTime::now_utc());
+            }
+        }
+
+        #[tokio::test]
+        #[serial]
+        async fn identity_and_resource_matrix_includes_empty_attachments() {
+            fixture(|iam| async move {
+                let conditions = conditions();
+                let claims = HashMap::new();
+                let request = args(ACCOUNT, &claims, &conditions);
+                for (identity, resource, expected) in [
+                    (Some("Allow"), None, true),
+                    (None, Some("Allow"), true),
+                    (Some("Allow"), Some("Allow"), true),
+                    (None, None, false),
+                    (Some("Deny"), Some("Allow"), false),
+                    (Some("Deny"), None, false),
+                    (Some("Allow"), Some("Deny"), false),
+                    (None, Some("Deny"), false),
+                ] {
+                    attach(&iam, ACCOUNT, identity.map(|effect| policy(effect, "s3vectors:*")));
+                    let resource = resource.map(|effect| resource_policy(ACCOUNT, effect));
+                    let result = iam.is_allowed_with_resource_policy(&request, resource.as_ref()).await;
+                    assert!(
+                        matches!(result, Ok(value) if value == expected),
+                        "I={identity:?}, expected={expected}, got {result:?}"
+                    );
+                }
+            })
+            .await;
+        }
+
+        #[tokio::test]
+        #[serial]
+        async fn sts_requires_full_session_allow_with_parent_or_resource_grant() {
+            fixture(|iam| async move {
+                let conditions = conditions();
+                for parent_allow in [true, false] {
+                    attach(&iam, ACCOUNT, parent_allow.then(|| policy("Allow", "s3vectors:*")));
+                    for (session, expected) in [
+                        (None, true),
+                        (Some(policy("Allow", "s3vectors:GetVectors")), true),
+                        (Some(policy("Deny", "s3vectors:GetVectors")), false),
+                        (Some(policy("Allow", "s3vectors:GetIndex")), false),
+                    ] {
+                        let credential = issue_credential(&iam, ACCOUNT, session, false, HashMap::new()).await;
+                        let request =
+                            args(&credential.access_key, credential.claims.as_ref().expect("verified claims"), &conditions);
+                        let resource = resource_policy(&credential.access_key, "Allow");
+                        let result = iam.is_allowed_with_resource_policy(&request, Some(&resource)).await;
+                        assert!(
+                            matches!(result, Ok(value) if value == expected),
+                            "parent_allow={parent_allow}, expected={expected}, got {result:?}"
+                        );
+                    }
+                }
+            })
+            .await;
+        }
+
+        #[tokio::test]
+        #[serial]
+        async fn service_account_inherited_and_embedded_boundaries() {
+            fixture(|iam| async move {
+                let conditions = conditions();
+                for parent_allow in [true, false] {
+                    attach(&iam, ACCOUNT, parent_allow.then(|| policy("Allow", "s3vectors:*")));
+                    for (session, expected) in [
+                        (None, true),
+                        (Some(policy("Allow", "s3vectors:GetVectors")), true),
+                        (Some(policy("Deny", "s3vectors:GetVectors")), false),
+                        (Some(policy("Allow", "s3vectors:GetIndex")), false),
+                    ] {
+                        let credential = issue_credential(&iam, ACCOUNT, session, true, HashMap::new()).await;
+                        let request =
+                            args(&credential.access_key, credential.claims.as_ref().expect("verified claims"), &conditions);
+                        let resource = resource_policy(&credential.access_key, "Allow");
+                        let result = iam.is_allowed_with_resource_policy(&request, Some(&resource)).await;
+                        assert!(
+                            matches!(result, Ok(value) if value == expected),
+                            "service parent_allow={parent_allow}, expected={expected}, got {result:?}"
+                        );
+                    }
+                }
+                let inherited = issue_credential(&iam, ACCOUNT, None, true, HashMap::new()).await;
+                let mut claims = inherited.claims.clone().expect("verified inherited claims");
+                claims.insert(SESSION_POLICY_NAME.to_owned(), json!("unused-inherited-field"));
+                let request = args(&inherited.access_key, &claims, &conditions);
+                let resource = resource_policy(&inherited.access_key, "Allow");
+                assert!(matches!(iam.is_allowed_with_resource_policy(&request, Some(&resource)).await, Ok(true)));
+            })
+            .await;
+        }
+
+        #[tokio::test]
+        #[serial]
+        async fn federation_boundary_remains_an_intersection() {
+            fixture(|iam| async move {
+                let conditions = conditions();
+                attach(&iam, ACCOUNT, Some(policy("Allow", "s3vectors:*")));
+                for (action, expected) in [("s3vectors:GetVectors", true), ("s3vectors:GetIndex", false)] {
+                    let boundary = policy("Allow", action);
+                    let claims = HashMap::from([
+                        ("iss".to_owned(), json!("rustfs-oidc")),
+                        ("oidc_provider".to_owned(), json!("fixture-provider")),
+                        ("sub".to_owned(), json!("fixture-subject")),
+                        (OIDC_VIRTUAL_PARENT_CLAIM.to_owned(), json!("virtual-vector-parent")),
+                        (VERIFIED_FEDERATED_POLICY_CLAIM.to_owned(), json!(true)),
+                        (POLICYNAME.to_owned(), json!(POLICY)),
+                        (
+                            FEDERATED_POLICY_BOUNDARY_CLAIM.to_owned(),
+                            json!(
+                                base64_simd::URL_SAFE_NO_PAD
+                                    .encode_to_string(serde_json::to_vec(&boundary).expect("serialize federation boundary"))
+                            ),
+                        ),
+                    ]);
+                    let credential = issue_credential(&iam, "virtual-vector-parent", None, true, claims).await;
+                    let request = args(&credential.access_key, credential.claims.as_ref().expect("verified claims"), &conditions);
+                    let resource = resource_policy(&credential.access_key, "Allow");
+                    let result = iam.is_allowed_with_resource_policy(&request, Some(&resource)).await;
+                    assert!(matches!(result, Ok(value) if value == expected), "federation {action}, got {result:?}");
+                    let root_hint_request = Args {
+                        is_owner: true,
+                        ..request.clone()
+                    };
+                    let root_hint_result = iam.is_allowed_with_resource_policy(&root_hint_request, Some(&resource)).await;
+                    assert!(
+                        matches!(root_hint_result, Ok(value) if value == expected),
+                        "federation root hint must retain the boundary: {root_hint_result:?}"
+                    );
+                    let mut malformed = credential.claims.clone().expect("verified claims");
+                    malformed.insert(FEDERATED_POLICY_BOUNDARY_CLAIM.to_owned(), json!(42));
+                    assert!(
+                        iam.is_allowed_with_resource_policy(
+                            &args(&credential.access_key, &malformed, &conditions),
+                            Some(&resource)
+                        )
+                        .await
+                        .is_err()
+                    );
+                }
+            })
+            .await;
+        }
+
+        #[tokio::test]
+        #[serial]
+        async fn malformed_session_and_missing_embedded_policy_return_errors() {
+            fixture(|iam| async move {
+                let conditions = conditions();
+                attach(&iam, ACCOUNT, Some(policy("Allow", "s3vectors:*")));
+                let credential = issue_credential(&iam, ACCOUNT, None, false, HashMap::new()).await;
+                let resource = resource_policy(&credential.access_key, "Allow");
+                for (key, value) in [
+                    (SESSION_POLICY_NAME, json!("%%%")),
+                    (SESSION_POLICY_NAME, json!(42)),
+                    (SESSION_POLICY_NAME_EXTRACTED, json!(false)),
+                    (SESSION_POLICY_NAME_EXTRACTED, json!("{invalid}")),
+                    (SESSION_POLICY_NAME_EXTRACTED, json!(r#"{"Statement":[]}"#)),
+                ] {
+                    let mut claims = credential.claims.clone().expect("verified claims");
+                    claims.insert(key.to_owned(), value);
+                    let result = iam
+                        .is_allowed_with_resource_policy(&args(&credential.access_key, &claims, &conditions), Some(&resource))
+                        .await;
+                    assert!(result.is_err(), "present invalid {key} must return an error, got {result:?}");
+                }
+                let service = issue_credential(&iam, ACCOUNT, Some(policy("Allow", "s3vectors:*")), true, HashMap::new()).await;
+                let mut claims = service.claims.clone().expect("verified service claims");
+                claims.remove(SESSION_POLICY_NAME);
+                claims.remove(SESSION_POLICY_NAME_EXTRACTED);
+                assert!(
+                    iam.is_allowed_with_resource_policy(
+                        &args(&service.access_key, &claims, &conditions),
+                        Some(&resource_policy(&service.access_key, "Allow"))
+                    )
+                    .await
+                    .is_err()
+                );
+            })
+            .await;
+        }
+
+        #[tokio::test]
+        #[serial]
+        async fn attached_policy_and_mapping_read_errors_cannot_be_supplemented() {
+            fixture(|iam| async move {
+                let conditions = conditions();
+                let claims = HashMap::new();
+                let request = args(ACCOUNT, &claims, &conditions);
+                let resource = resource_policy(ACCOUNT, "Allow");
+                attach(&iam, ACCOUNT, Some(policy("Allow", "s3vectors:*")));
+                iam.store.cache.add_or_update_user_policy(
+                    ACCOUNT,
+                    &MappedPolicy::new(&format!("{POLICY},unreadable-vector-policy")),
+                    OffsetDateTime::now_utc(),
+                );
+                iam.store
+                    .api
+                    .fail_vector_policy_read
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
+                let result = iam.is_allowed_with_resource_policy(&request, Some(&resource)).await;
+                assert!(
+                    matches!(result, Err(Error::Io(_))),
+                    "attached document failure must retain its error, got {result:?}"
+                );
+
+                iam.store
+                    .api
+                    .fail_vector_policy_read
+                    .store(false, std::sync::atomic::Ordering::SeqCst);
+                iam.store.cache.add_or_update_user_policy(
+                    ACCOUNT,
+                    &MappedPolicy::new(&format!("{POLICY},missing-vector-policy")),
+                    OffsetDateTime::now_utc(),
+                );
+                let missing = iam.is_allowed_with_resource_policy(&request, Some(&resource)).await;
+                assert!(
+                    matches!(missing, Err(Error::NoSuchPolicy)),
+                    "missing attached policy must return its error: {missing:?}"
+                );
+                attach(&iam, ACCOUNT, None);
+                iam.store.cache.delete_user_policy(ACCOUNT, OffsetDateTime::now_utc());
+                iam.store
+                    .api
+                    .fail_vector_mapping_read
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
+                let result = iam.is_allowed_with_resource_policy(&request, Some(&resource)).await;
+                assert!(
+                    matches!(result, Err(Error::Io(_))),
+                    "mapping failure must retain its error, got {result:?}"
+                );
+            })
+            .await;
+        }
+
+        #[tokio::test]
+        #[serial]
+        async fn current_group_and_role_policies_are_evaluated_on_every_request() {
+            fixture(|mut iam| async move {
+                let conditions = conditions();
+                let claims = HashMap::new();
+                let request = args(ACCOUNT, &claims, &conditions);
+                let now = OffsetDateTime::now_utc();
+                iam.store
+                    .cache
+                    .add_or_update_group("vector-group", &GroupInfo::new(vec![ACCOUNT.to_owned()]), now);
+                iam.store
+                    .cache
+                    .add_or_update_user_group_membership(ACCOUNT, &HashSet::from(["vector-group".to_owned()]), now);
+                iam.store
+                    .cache
+                    .add_or_update_policy_doc(POLICY, &PolicyDoc::new(policy("Allow", "s3vectors:GetVectors")), now);
+                iam.store
+                    .cache
+                    .add_or_update_group_policy("vector-group", &MappedPolicy::new(POLICY), now);
+                assert!(matches!(iam.is_allowed_with_resource_policy(&request, None).await, Ok(true)));
+                iam.store.cache.add_or_update_policy_doc(
+                    POLICY,
+                    &PolicyDoc::new(policy("Deny", "s3vectors:GetVectors")),
+                    OffsetDateTime::now_utc(),
+                );
+                assert!(matches!(
+                    iam.is_allowed_with_resource_policy(&request, Some(&resource_policy(ACCOUNT, "Allow")))
+                        .await,
+                    Ok(false)
+                ));
+                iam.store
+                    .cache
+                    .add_or_update_user_group_membership(ACCOUNT, &HashSet::new(), OffsetDateTime::now_utc());
+                assert!(matches!(iam.is_allowed_with_resource_policy(&request, None).await, Ok(false)));
+
+                iam.store.cache.add_or_update_policy_doc(
+                    POLICY,
+                    &PolicyDoc::new(policy("Allow", "s3vectors:GetVectors")),
+                    OffsetDateTime::now_utc(),
+                );
+                let role = "arn:rustfs:iam:us-east-1::role/vector-test";
+                iam.roles_map
+                    .insert(ARN::parse(role).expect("valid role ARN"), POLICY.to_owned());
+                let session =
+                    issue_credential(&iam, ACCOUNT, None, false, HashMap::from([("roleArn".to_owned(), json!(role))])).await;
+                let request = args(&session.access_key, session.claims.as_ref().expect("verified role claims"), &conditions);
+                assert!(matches!(iam.is_allowed_with_resource_policy(&request, None).await, Ok(true)));
+                iam.store.cache.add_or_update_policy_doc(
+                    POLICY,
+                    &PolicyDoc::new(policy("Deny", "s3vectors:GetVectors")),
+                    OffsetDateTime::now_utc(),
+                );
+                assert!(matches!(
+                    iam.is_allowed_with_resource_policy(&request, Some(&resource_policy(&session.access_key, "Allow")))
+                        .await,
+                    Ok(false)
+                ));
+            })
+            .await;
+        }
+
+        #[tokio::test]
+        #[serial]
+        async fn policy_read_cannot_overwrite_a_completed_policy_update() {
+            fixture(|iam| async move {
+                let iam = Arc::new(iam);
+                let gate = Arc::new(tokio::sync::Barrier::new(2));
+                *iam.store.api.vector_policy_load_gate.lock().expect("policy load gate") = Some(Arc::clone(&gate));
+                {
+                    let mut documents = iam.store.api.vector_policy_documents.lock().expect("fixture policy storage");
+                    documents.insert("vector-loaded-policy".to_owned(), PolicyDoc::new(policy("Allow", "s3vectors:GetVectors")));
+                    documents.insert("vector-pending-policy".to_owned(), PolicyDoc::new(policy("Allow", "s3:GetObject")));
+                }
+                iam.store.cache.add_or_update_user_policy(
+                    ACCOUNT,
+                    &MappedPolicy::new("vector-loaded-policy,vector-pending-policy"),
+                    OffsetDateTime::now_utc(),
+                );
+                let pending_iam = Arc::clone(&iam);
+                let pending = tokio::spawn(async move {
+                    let conditions = conditions();
+                    let claims = HashMap::new();
+                    pending_iam
+                        .is_allowed_with_resource_policy(&args(ACCOUNT, &claims, &conditions), None)
+                        .await
+                });
+                tokio::time::timeout(std::time::Duration::from_secs(10), gate.wait())
+                    .await
+                    .expect("second document read started after the first Allow was read");
+                iam.store
+                    .set_policy_at("vector-loaded-policy", policy("Deny", "s3vectors:GetVectors"), OffsetDateTime::now_utc())
+                    .await
+                    .expect("persist and publish the replacement Deny policy");
+                *iam.store.api.vector_policy_load_gate.lock().expect("policy load gate") = None;
+                tokio::time::timeout(std::time::Duration::from_secs(10), gate.wait())
+                    .await
+                    .expect("release the pending read after policy publication");
+                let initial = tokio::time::timeout(std::time::Duration::from_secs(10), pending)
+                    .await
+                    .expect("initial request finishes")
+                    .expect("initial request task");
+                assert!(matches!(initial, Ok(true)), "the initial request read the previous policy: {initial:?}");
+                let conditions = conditions();
+                let claims = HashMap::new();
+                let next = iam
+                    .is_allowed_with_resource_policy(&args(ACCOUNT, &claims, &conditions), None)
+                    .await;
+                assert!(
+                    matches!(next, Ok(false)),
+                    "the next request must retain the completed Deny update: {next:?}"
+                );
+            })
+            .await;
+        }
+
+        #[tokio::test]
+        #[serial]
+        async fn current_identity_and_parent_state_cannot_be_supplemented() {
+            fixture(|iam| async move {
+                let conditions = conditions();
+                attach(&iam, ACCOUNT, Some(policy("Allow", "s3vectors:*")));
+                let credential =
+                    issue_credential(&iam, ACCOUNT, Some(policy("Allow", "s3vectors:*")), false, HashMap::new()).await;
+                let resource = resource_policy(&credential.access_key, "Allow");
+                let request = args(&credential.access_key, credential.claims.as_ref().expect("verified claims"), &conditions);
+                assert!(matches!(iam.is_allowed_with_resource_policy(&request, Some(&resource)).await, Ok(true)));
+                let mut parent = iam.store.get_user(ACCOUNT).await.expect("current parent exists");
+                parent.credentials.status = "off".to_owned();
+                iam.store
+                    .cache
+                    .add_or_update_user(ACCOUNT, &parent, OffsetDateTime::now_utc());
+                assert!(iam.is_allowed_with_resource_policy(&request, Some(&resource)).await.is_err());
+                parent.credentials.status = ACCOUNT_ON.to_owned();
+                iam.store
+                    .cache
+                    .add_or_update_user(ACCOUNT, &parent, OffsetDateTime::now_utc());
+                let mut expired = UserIdentity::from(credential.clone());
+                expired.credentials.expiration = Some(OffsetDateTime::now_utc() - time::Duration::hours(1));
+                iam.store
+                    .cache
+                    .add_or_update_sts_account(&credential.access_key, &expired, OffsetDateTime::now_utc());
+                assert!(iam.is_allowed_with_resource_policy(&request, Some(&resource)).await.is_err());
+                assert!(
+                    iam.is_allowed_with_resource_policy(
+                        &args("missing-vector-user", &HashMap::new(), &conditions),
+                        Some(&resource_policy("missing-vector-user", "Allow"))
+                    )
+                    .await
+                    .is_err()
+                );
+            })
+            .await;
+        }
+
+        #[tokio::test]
+        #[serial]
+        async fn owner_and_root_sessions_preserve_resource_denials_and_request_shape() {
+            fixture(|iam| async move {
+                ensure_test_global_credentials();
+                let root = crate::root_credentials::credentials().expect("test root credentials");
+                let conditions = conditions();
+                let claims = HashMap::new();
+                let mut request = args(&root.access_key, &claims, &conditions);
+                request.is_owner = true;
+                assert!(matches!(iam.is_allowed_with_resource_policy(&request, None).await, Ok(true)));
+                let deny = resource_policy(&root.access_key, "Deny");
+                for action in [
+                    S3VectorsAction::GetVectorBucketPolicyAction,
+                    S3VectorsAction::PutVectorBucketPolicyAction,
+                    S3VectorsAction::DeleteVectorBucketPolicyAction,
+                ] {
+                    request.action = Action::S3VectorsAction(action);
+                    request.object = "";
+                    assert!(matches!(iam.is_allowed_with_resource_policy(&request, Some(&deny)).await, Ok(false)));
+                }
+                request.bucket = "";
+                assert!(matches!(
+                    iam.is_allowed_with_resource_policy(&request, None).await,
+                    Err(Error::InvalidArgument)
+                ));
+                let session =
+                    issue_credential(&iam, &root.access_key, Some(policy("Allow", "s3vectors:GetIndex")), false, HashMap::new())
+                        .await;
+                let mut request = args(&session.access_key, session.claims.as_ref().expect("verified root session"), &conditions);
+                request.is_owner = true;
+                let resource = resource_policy(&session.access_key, "Allow");
+                assert!(matches!(iam.is_allowed_with_resource_policy(&request, Some(&resource)).await, Ok(false)));
+            })
+            .await;
+        }
+
+        #[tokio::test]
+        #[serial]
+        async fn server_root_identity_uses_the_verified_owner_fact() {
+            fixture(|iam| async move {
+                ensure_test_global_credentials();
+                let global = crate::root_credentials::credentials().expect("global test root");
+                let server_root = "context-b-vector-root";
+                assert_ne!(global.access_key, server_root);
+                let conditions = conditions();
+                let claims = HashMap::new();
+                let mut request = args(server_root, &claims, &conditions);
+                request.is_owner = true;
+                assert!(iam.store.get_user(server_root).await.is_none());
+                assert!(matches!(iam.is_allowed_with_resource_policy(&request, None).await, Ok(true)));
+                assert!(matches!(
+                    iam.is_allowed_with_resource_policy(&request, Some(&resource_policy(server_root, "Deny")))
+                        .await,
+                    Ok(false)
+                ));
+                *get_policy_plugin_state().write().await = PolicyPluginState::Failed;
+                assert!(matches!(iam.is_allowed_with_resource_policy(&request, None).await, Ok(true)));
+                *get_policy_plugin_state().write().await = PolicyPluginState::Disabled;
+                request.is_owner = false;
+                assert!(iam.is_allowed_with_resource_policy(&request, None).await.is_err());
+
+                iam.store.cache.add_or_update_user(
+                    &global.access_key,
+                    &UserIdentity::from(global.clone()),
+                    OffsetDateTime::now_utc(),
+                );
+                attach(&iam, &global.access_key, Some(policy("Deny", "s3vectors:GetVectors")));
+                let request = args(&global.access_key, &claims, &conditions);
+                let resource = resource_policy(&global.access_key, "Allow");
+                assert!(matches!(iam.is_allowed_with_resource_policy(&request, Some(&resource)).await, Ok(false)));
+                let (plugin, receiver) = opa_response("200 OK", r#"{"result":false}"#).await;
+                IamSys::<StsTestMockStore>::set_policy_plugin_client(plugin).await;
+                let result = iam.is_allowed_with_resource_policy(&request, Some(&resource)).await;
+                let input = receiver.await.expect("non-owner global name still reaches OPA");
+                assert!(matches!(result, Ok(false)));
+                assert_eq!(input["input"]["identity"]["account"], global.access_key);
+                assert_eq!(input["input"]["identity"]["is_owner"], false);
+            })
+            .await;
+        }
+
+        #[tokio::test]
+        #[serial]
+        async fn server_root_derived_identities_retain_session_and_current_state() {
+            fixture(|iam| async move {
+                let conditions = conditions();
+                let parent = "context-b-vector-root";
+                assert!(iam.store.get_user(parent).await.is_none());
+                for service in [false, true] {
+                    for (session, expected) in [
+                        (None, true),
+                        (Some(policy("Allow", "s3vectors:GetVectors")), true),
+                        (Some(policy("Allow", "s3vectors:GetIndex")), false),
+                        (Some(policy("Deny", "s3vectors:GetVectors")), false),
+                    ] {
+                        let credential = issue_credential(&iam, parent, session, service, HashMap::new()).await;
+                        let mut request = args(
+                            &credential.access_key,
+                            credential.claims.as_ref().expect("verified root-derived claims"),
+                            &conditions,
+                        );
+                        request.is_owner = true;
+                        let resource = resource_policy(&credential.access_key, "Allow");
+                        let result = iam.is_allowed_with_resource_policy(&request, Some(&resource)).await;
+                        assert!(
+                            matches!(result, Ok(value) if value == expected),
+                            "service={service}, expected={expected}, result={result:?}"
+                        );
+                        if expected {
+                            assert!(matches!(iam.is_allowed_with_resource_policy(&request, None).await, Ok(true)));
+                        }
+                        let missing_claims = HashMap::new();
+                        let missing_claims_request = Args {
+                            claims: &missing_claims,
+                            ..request.clone()
+                        };
+                        assert!(
+                            iam.is_allowed_with_resource_policy(&missing_claims_request, Some(&resource))
+                                .await
+                                .is_err()
+                        );
+                        assert!(matches!(
+                            iam.is_allowed_with_resource_policy(&request, Some(&resource_policy(&credential.access_key, "Deny")))
+                                .await,
+                            Ok(false)
+                        ));
+                        let mut disabled = credential.clone();
+                        disabled.status = "off".to_owned();
+                        store_credential(&iam, &disabled).await;
+                        assert!(iam.is_allowed_with_resource_policy(&request, Some(&resource)).await.is_err());
+                    }
+                }
+                let marked = HashMap::from([(PLUGIN_ATTEMPT_CREDENTIAL_CLAIM.to_owned(), json!(true))]);
+                for (session, expected) in [
+                    (None, false),
+                    (Some(policy("Allow", "s3vectors:GetVectors")), true),
+                    (Some(policy("Allow", "s3vectors:GetIndex")), false),
+                ] {
+                    let credential = issue_credential(&iam, parent, session, false, marked.clone()).await;
+                    let mut request = args(
+                        &credential.access_key,
+                        credential.claims.as_ref().expect("verified marked root claims"),
+                        &conditions,
+                    );
+                    request.is_owner = true;
+                    let result = iam
+                        .is_allowed_with_resource_policy(&request, Some(&resource_policy(&credential.access_key, "Allow")))
+                        .await;
+                    if expected {
+                        assert!(matches!(result, Ok(true)));
+                    } else {
+                        assert!(result.is_err(), "a root hint cannot replace the mandatory session policy: {result:?}");
+                    }
+                }
+                let malformed_federation = HashMap::from([(VERIFIED_FEDERATED_POLICY_CLAIM.to_owned(), json!(true))]);
+                let credential = issue_credential(&iam, parent, None, false, malformed_federation).await;
+                let mut request = args(
+                    &credential.access_key,
+                    credential.claims.as_ref().expect("signed malformed federation claims"),
+                    &conditions,
+                );
+                request.is_owner = true;
+                assert!(
+                    iam.is_allowed_with_resource_policy(&request, Some(&resource_policy(&credential.access_key, "Allow")))
+                        .await
+                        .is_err()
+                );
+            })
+            .await;
+        }
+
+        #[tokio::test]
+        #[serial]
+        async fn server_root_derived_identities_still_require_opa() {
+            fixture(|iam| async move {
+                let conditions = conditions();
+                let parent = "context-b-vector-root";
+                for service in [false, true] {
+                    let credential =
+                        issue_credential(&iam, parent, Some(policy("Allow", "s3vectors:GetVectors")), service, HashMap::new())
+                            .await;
+                    let mut request = args(
+                        &credential.access_key,
+                        credential.claims.as_ref().expect("verified root-derived claims"),
+                        &conditions,
+                    );
+                    request.is_owner = true;
+                    for expected in [false, true] {
+                        let body = if expected {
+                            r#"{"result":true}"#
+                        } else {
+                            r#"{"result":false}"#
+                        };
+                        let (plugin, receiver) = opa_response("200 OK", body).await;
+                        IamSys::<StsTestMockStore>::set_policy_plugin_client(plugin).await;
+                        let result = iam
+                            .is_allowed_with_resource_policy(&request, Some(&resource_policy(&credential.access_key, "Allow")))
+                            .await;
+                        let input = receiver.await.expect("derived root always reaches OPA");
+                        assert!(matches!(result, Ok(value) if value == expected));
+                        assert_eq!(input["input"]["identity"]["account"], credential.access_key);
+                        assert_eq!(input["input"]["identity"]["is_owner"], false);
+                    }
+                    *get_policy_plugin_state().write().await = PolicyPluginState::Failed;
+                    assert!(matches!(
+                        iam.is_allowed_with_resource_policy(&request, None).await,
+                        Err(Error::IamSysNotInitialized)
+                    ));
+                    *get_policy_plugin_state().write().await = PolicyPluginState::Disabled;
+                }
+            })
+            .await;
+        }
+
+        #[tokio::test]
+        #[serial]
+        async fn restricted_plugin_credentials_require_their_identity_and_session() {
+            fixture(|iam| async move {
+                let conditions = conditions();
+                let marked = HashMap::from([(PLUGIN_ATTEMPT_CREDENTIAL_CLAIM.to_owned(), json!(true))]);
+                let credential =
+                    issue_credential(&iam, ACCOUNT, Some(policy("Allow", "s3vectors:GetVectors")), false, marked).await;
+                let request = args(
+                    &credential.access_key,
+                    credential.claims.as_ref().expect("verified marked credential"),
+                    &conditions,
+                );
+                let resource = resource_policy(&credential.access_key, "Allow");
+                assert!(matches!(
+                    iam.is_allowed_with_resource_policy(&request, Some(&resource)).await,
+                    Err(Error::IAMActionNotAllowed)
+                ));
+                attach(&iam, ACCOUNT, Some(policy("Allow", "s3vectors:GetVectors")));
+                assert!(matches!(iam.is_allowed_with_resource_policy(&request, Some(&resource)).await, Ok(true)));
+                *get_policy_plugin_state().write().await = PolicyPluginState::Failed;
+                assert!(matches!(
+                    iam.is_allowed_with_resource_policy(&request, Some(&resource)).await,
+                    Err(Error::IAMActionNotAllowed)
+                ));
+            })
+            .await;
+        }
+
+        #[tokio::test]
+        #[serial]
+        async fn vector_and_s3_actions_remain_independent() {
+            fixture(|iam| async move {
+                let conditions = conditions();
+                let claims = HashMap::new();
+                let request = args(ACCOUNT, &claims, &conditions);
+                attach(&iam, ACCOUNT, Some(policy("Allow", "s3:*")));
+                assert!(matches!(iam.is_allowed_with_resource_policy(&request, None).await, Ok(false)));
+                attach(&iam, ACCOUNT, Some(policy("Allow", "s3vectors:*")));
+                assert!(matches!(iam.is_allowed_with_resource_policy(&request, None).await, Ok(true)));
+                for action in [S3Action::GetObjectAction, S3Action::PutObjectAction] {
+                    let ordinary = Args {
+                        action: Action::S3Action(action),
+                        ..request.clone()
+                    };
+                    assert!(!iam.is_allowed(&ordinary).await, "Vector grant must not authorize {action:?}");
+                    assert!(matches!(
+                        iam.is_allowed_with_resource_policy(&ordinary, None).await,
+                        Err(Error::InvalidArgument)
+                    ));
+                }
+                let wildcard = Args {
+                    action: Action::S3VectorsAction(S3VectorsAction::AllActions),
+                    ..request.clone()
+                };
+                assert!(matches!(
+                    iam.is_allowed_with_resource_policy(&wildcard, None).await,
+                    Err(Error::InvalidArgument)
+                ));
+                let deny_only = Args {
+                    deny_only: true,
+                    ..request
+                };
+                assert!(matches!(
+                    iam.is_allowed_with_resource_policy(&deny_only, None).await,
+                    Err(Error::InvalidArgument)
+                ));
+            })
+            .await;
+        }
+
+        async fn opa_response(status: &str, body: &str) -> (opa::AuthZPlugin, tokio::task::JoinHandle<Value>) {
+            use tokio::io::{AsyncBufReadExt, BufReader};
+            let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind Vector OPA fixture");
+            let url = format!("http://{}/decision", listener.local_addr().expect("fixture address"));
+            let response = format!("HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
+            let receiver = tokio::spawn(async move {
+                tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                    let (stream, _) = listener.accept().await.expect("accept Vector OPA request");
+                    let mut stream = BufReader::new(stream);
+                    let mut length = None;
+                    loop {
+                        let mut line = String::new();
+                        assert!(stream.read_line(&mut line).await.expect("read OPA header") > 0);
+                        if line == "\r\n" {
+                            break;
+                        }
+                        if let Some((name, value)) = line.split_once(':')
+                            && name.eq_ignore_ascii_case("content-length")
+                        {
+                            length = Some(value.trim().parse::<usize>().expect("OPA content length"));
+                        }
+                    }
+                    let mut bytes = vec![0; length.expect("OPA body length")];
+                    stream.read_exact(&mut bytes).await.expect("read OPA body");
+                    stream
+                        .get_mut()
+                        .write_all(response.as_bytes())
+                        .await
+                        .expect("send OPA response");
+                    serde_json::from_slice(&bytes).expect("OPA JSON input")
+                })
+                .await
+                .expect("OPA fixture request completed")
+            });
+            (
+                opa::AuthZPlugin::new(opa::Args {
+                    url,
+                    auth_token: String::new(),
+                }),
+                receiver,
+            )
+        }
+
+        #[tokio::test]
+        #[serial]
+        async fn opa_uses_vector_facts_and_its_denials_cannot_be_supplemented() {
+            fixture(|iam| async move {
+                let mut conditions = conditions();
+                conditions.insert("VectorBucketTag/team".to_owned(), vec!["science".to_owned()]);
+                conditions.insert("ResourceTag/project".to_owned(), vec!["search".to_owned()]);
+                let claims = HashMap::new();
+                let request = args(ACCOUNT, &claims, &conditions);
+                let resource = resource_policy(ACCOUNT, "Allow");
+                for (status, body, expected) in [
+                    ("200 OK", r#"{"result":true}"#, true),
+                    ("200 OK", r#"{"result":false}"#, false),
+                    ("503 Service Unavailable", "unavailable", false),
+                    ("200 OK", "invalid-json", false),
+                ] {
+                    let (plugin, receiver) = opa_response(status, body).await;
+                    IamSys::<StsTestMockStore>::set_policy_plugin_client(plugin).await;
+                    let result = iam.is_allowed_with_resource_policy(&request, Some(&resource)).await;
+                    assert!(matches!(result, Ok(value) if value == expected), "OPA {status}/{body}: {result:?}");
+                    let input = receiver.await.expect("join OPA fixture");
+                    assert_eq!(input["input"]["resource"]["bucket"], "vector-bucket");
+                    assert_eq!(
+                        input["input"]["resource"]["arn"],
+                        "arn:aws:s3vectors:us-east-1::bucket/vector-bucket/index/vector-index"
+                    );
+                    assert_eq!(input["input"]["action"], "s3vectors:GetVectors");
+                    assert_eq!(input["input"]["context"]["conditions"]["VectorBucketTag/team"], json!(["science"]));
+                    assert_eq!(input["input"]["context"]["conditions"]["ResourceTag/project"], json!(["search"]));
+                }
+                for state in [PolicyPluginState::Initializing, PolicyPluginState::Failed] {
+                    *get_policy_plugin_state().write().await = state;
+                    assert!(matches!(
+                        iam.is_allowed_with_resource_policy(&request, Some(&resource)).await,
+                        Err(Error::IamSysNotInitialized)
+                    ));
+                }
+            })
+            .await;
+        }
+
+        #[tokio::test]
+        #[serial]
+        async fn opa_group_inputs_follow_current_membership_for_users_and_sessions() {
+            fixture(|iam| async move {
+                let conditions = conditions();
+                let mut parent = iam.store.get_user(ACCOUNT).await.expect("fixture parent");
+                parent.credentials.groups = Some(vec!["claim-group".to_owned()]);
+                iam.store
+                    .cache
+                    .add_or_update_user(ACCOUNT, &parent, OffsetDateTime::now_utc());
+                iam.store.cache.add_or_update_group(
+                    "current-group",
+                    &GroupInfo::new(vec![ACCOUNT.to_owned()]),
+                    OffsetDateTime::now_utc(),
+                );
+                let mut session = issue_credential(&iam, ACCOUNT, None, false, HashMap::new()).await;
+                session.groups = Some(vec!["stale-issued-group".to_owned()]);
+                store_credential(&iam, &session).await;
+                let empty_claims = HashMap::new();
+                for (members, expected) in [
+                    (HashSet::from(["current-group".to_owned()]), vec!["claim-group", "current-group"]),
+                    (HashSet::new(), vec!["claim-group"]),
+                ] {
+                    iam.store
+                        .cache
+                        .add_or_update_user_group_membership(ACCOUNT, &members, OffsetDateTime::now_utc());
+                    for credential in [&parent.credentials, &session] {
+                        let request = Args {
+                            groups: &credential.groups,
+                            ..args(&credential.access_key, credential.claims.as_ref().unwrap_or(&empty_claims), &conditions)
+                        };
+                        let (plugin, receiver) = opa_response("200 OK", r#"{"result":true}"#).await;
+                        IamSys::<StsTestMockStore>::set_policy_plugin_client(plugin).await;
+                        let result = iam.is_allowed_with_resource_policy(&request, None).await;
+                        let input = receiver.await.expect("OPA group input receiver");
+                        assert!(matches!(result, Ok(true)), "OPA group request must be allowed: {result:?}");
+                        assert_eq!(input["input"]["identity"]["account"], credential.access_key);
+                        assert_eq!(input["input"]["identity"]["groups"], json!(expected));
+                    }
+                }
+            })
+            .await;
+        }
+
+        #[tokio::test]
+        #[serial]
+        async fn opa_allow_still_requires_session_and_resource_boundaries() {
+            fixture(|iam| async move {
+                let conditions = conditions();
+                let session =
+                    issue_credential(&iam, ACCOUNT, Some(policy("Allow", "s3vectors:GetIndex")), false, HashMap::new()).await;
+                let resource = resource_policy(&session.access_key, "Allow");
+                let request = args(&session.access_key, session.claims.as_ref().expect("verified claims"), &conditions);
+                let (plugin, receiver) = opa_response("200 OK", r#"{"result":true}"#).await;
+                IamSys::<StsTestMockStore>::set_policy_plugin_client(plugin).await;
+                let denied_session = iam.is_allowed_with_resource_policy(&request, Some(&resource)).await;
+                let claims = HashMap::new();
+                let request = args(ACCOUNT, &claims, &conditions);
+                let denied_resource = iam
+                    .is_allowed_with_resource_policy(&request, Some(&resource_policy(ACCOUNT, "Deny")))
+                    .await;
+                let allowed = iam.is_allowed_with_resource_policy(&request, None).await;
+                receiver.await.expect("OPA fixture only receives the unrestricted request");
+                assert!(
+                    matches!(denied_session, Ok(false)),
+                    "OPA allow must retain session boundary: {denied_session:?}"
+                );
+                assert!(
+                    matches!(denied_resource, Ok(false)),
+                    "OPA allow must retain resource deny: {denied_resource:?}"
+                );
+                assert!(matches!(allowed, Ok(true)), "OPA remains the identity authority: {allowed:?}");
+            })
+            .await;
+        }
+    }
 
     #[test]
     fn test_combined_policy_for_view_returns_regular_policy() {
@@ -3957,6 +5334,10 @@ mod tests {
         empty_policies: bool,
         bucket_tags: Arc<Mutex<Result<HashMap<String, String>>>>,
         policy_load_barrier: Option<Arc<tokio::sync::Barrier>>,
+        fail_vector_policy_read: Arc<std::sync::atomic::AtomicBool>,
+        fail_vector_mapping_read: Arc<std::sync::atomic::AtomicBool>,
+        vector_policy_documents: Arc<Mutex<HashMap<String, PolicyDoc>>>,
+        vector_policy_load_gate: Arc<Mutex<Option<Arc<tokio::sync::Barrier>>>>,
         saved_sts_users: Arc<Mutex<HashMap<String, UserIdentity>>>,
         saved_svc_policies: Arc<Mutex<HashMap<String, MappedPolicy>>>,
         svc_revisions: Arc<Mutex<HashMap<String, u64>>>,
@@ -4019,6 +5400,10 @@ mod tests {
             Self {
                 empty_policies,
                 policy_load_barrier: None,
+                fail_vector_policy_read: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                fail_vector_mapping_read: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                vector_policy_documents: Arc::new(Mutex::new(HashMap::new())),
+                vector_policy_load_gate: Arc::new(Mutex::new(None)),
                 bucket_tags: Arc::new(Mutex::new(Err(Error::other("bucket metadata unavailable")))),
                 saved_sts_users: Arc::new(Mutex::new({
                     let name = if empty_policies {
@@ -4310,8 +5695,14 @@ mod tests {
             Err(Error::InvalidArgument)
         }
 
-        async fn save_policy_doc(&self, _name: &str, _item: rustfs_policy::policy::PolicyDoc) -> Result<()> {
-            Err(Error::InvalidArgument)
+        async fn save_policy_doc(&self, name: &str, item: rustfs_policy::policy::PolicyDoc) -> Result<()> {
+            let mut documents = self.vector_policy_documents.lock().expect("Vector policy storage");
+            if let Some(stored) = documents.get_mut(name) {
+                *stored = item;
+                Ok(())
+            } else {
+                Err(Error::InvalidArgument)
+            }
         }
 
         async fn delete_policy_doc(&self, _name: &str) -> Result<()> {
@@ -4323,6 +5714,31 @@ mod tests {
         }
 
         async fn load_policy_doc(&self, name: &str, docs: &mut HashMap<String, PolicyDoc>) -> Result<()> {
+            if self.fail_vector_policy_read.load(std::sync::atomic::Ordering::SeqCst) {
+                return Err(Error::Io(std::io::Error::other("Vector policy read failed")));
+            }
+            if name == "missing-vector-policy" {
+                return Err(Error::NoSuchPolicy);
+            }
+            let document = self
+                .vector_policy_documents
+                .lock()
+                .expect("Vector policy storage")
+                .get(name)
+                .cloned();
+            if let Some(document) = document {
+                let gate = if name == "vector-pending-policy" {
+                    self.vector_policy_load_gate.lock().expect("Vector policy gate").clone()
+                } else {
+                    None
+                };
+                if let Some(gate) = gate {
+                    gate.wait().await;
+                    gate.wait().await;
+                }
+                docs.insert(name.to_owned(), document);
+                return Ok(());
+            }
             if let Some(barrier) = &self.policy_load_barrier {
                 // merge_policies has already captured the cached policy documents.
                 barrier.wait().await;
@@ -4380,6 +5796,9 @@ mod tests {
             is_group: bool,
             m: &mut HashMap<String, MappedPolicy>,
         ) -> Result<()> {
+            if self.fail_vector_mapping_read.load(std::sync::atomic::Ordering::SeqCst) {
+                return Err(Error::Io(std::io::Error::other("Vector mapping read failed")));
+            }
             if user_type == UserType::Svc && !is_group {
                 if let Some(policy) = self
                     .saved_svc_policies

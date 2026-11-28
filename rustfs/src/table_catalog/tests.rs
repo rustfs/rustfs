@@ -22,6 +22,9 @@ mod dropped_table_history;
 #[path = "tests/superseded_commit_recovery.rs"]
 mod superseded_commit_recovery;
 
+#[path = "tests/prepared_commit.rs"]
+pub(in crate::table_catalog) mod prepared_commit;
+
 const TABLE_CATALOG_TEST_TIMEOUT: StdDuration = StdDuration::from_secs(30);
 
 #[path = "tests/object_backup_validation.rs"]
@@ -1137,19 +1140,10 @@ async fn catalog_backings_persist_table_format_upgrade_and_replay() {
             .expect("namespace should be created");
         let mut entry = test_table_entry(&bucket, &namespace, &table, current_metadata.clone());
         entry.format_version = 1;
-        store.create_table(entry).await.expect("v1 table should be created");
-        backend
-            .seed_object(
-                &bucket,
-                &next_metadata,
-                serde_json::to_vec(&serde_json::json!({
-                    "format-version": 2,
-                    "table-uuid": "table-uuid",
-                    "location": format!("s3://{bucket}/tables/table-id")
-                }))
-                .expect("target metadata should encode"),
-            )
-            .await;
+        store.create_table(entry.clone()).await.expect("v1 table should be created");
+        backend.seed_table_metadata(&entry, &[&current_metadata]).await;
+        entry.format_version = 2;
+        backend.seed_table_metadata(&entry, &[&next_metadata]).await;
         let request = TableCommitRequest {
             table_bucket: bucket.clone(),
             namespace: namespace.public_name(),
@@ -2049,6 +2043,7 @@ fn catalog_entry_structures_serialize_stable_fields() {
     use std::collections::BTreeMap;
 
     let bucket = TableBucketEntry {
+        vector_bucket_binding: None,
         version: TABLE_CATALOG_ENTRY_VERSION,
         table_bucket: "analytics".to_string(),
         catalog_type: TABLE_BUCKET_CATALOG_TYPE.to_string(),
@@ -2070,6 +2065,9 @@ fn catalog_entry_structures_serialize_stable_fields() {
         updated_at: Some("2026-05-23T00:00:00Z".to_string()),
     };
     let table = TableEntry {
+        vector_maintenance_binding: None,
+        vector_index_definition: None,
+        vector_head_binding: None,
         version: TABLE_CATALOG_ENTRY_VERSION,
         table_bucket: "analytics".to_string(),
         namespace: "sales".to_string(),
@@ -2088,6 +2086,8 @@ fn catalog_entry_structures_serialize_stable_fields() {
         updated_at: Some("2026-05-23T00:00:00Z".to_string()),
     };
     let commit = CommitLogEntry {
+        vector_resource_mutation: None,
+        vector_commit_binding: None,
         version: TABLE_CATALOG_ENTRY_VERSION,
         commit_id: "commit-id".to_string(),
         idempotency_key: Some("client-request-id".to_string()),
@@ -2124,6 +2124,9 @@ fn catalog_entry_deserialization_rejects_unknown_fields() {
     use std::collections::BTreeMap;
 
     let table = TableEntry {
+        vector_maintenance_binding: None,
+        vector_index_definition: None,
+        vector_head_binding: None,
         version: TABLE_CATALOG_ENTRY_VERSION,
         table_bucket: "analytics".to_string(),
         namespace: "sales".to_string(),
@@ -2218,7 +2221,7 @@ async fn table_catalog_store_trait_covers_entry_read_write_shapes() {
 
 #[tokio::test]
 async fn table_catalog_store_trait_has_atomic_commit_shape() {
-    let store: &dyn TableCatalogStore = &NoopTableCatalogStore;
+    let store: &dyn IcebergCatalogCommit = &NoopTableCatalogStore;
     let request = TableCommitRequest {
         table_bucket: "analytics".to_string(),
         namespace: "sales".to_string(),
@@ -2242,7 +2245,7 @@ async fn table_catalog_store_trait_has_atomic_commit_shape() {
 
 async fn assert_direct_commit_uses_publication_lock<S>(store: &S, backend: &TestCatalogObjectBackend)
 where
-    S: TableCatalogStore + ?Sized,
+    S: TableCatalogStore + IcebergCatalogCommit + ?Sized,
 {
     let bucket = "analytics";
     let namespace = Namespace::parse("sales").expect("namespace should parse");
@@ -2263,7 +2266,12 @@ where
         .create_table(test_table_entry(bucket, &namespace, &table, current_metadata.clone()))
         .await
         .expect("table should be created");
-    backend.seed_object(bucket, &new_metadata, b"{}".to_vec()).await;
+    backend
+        .seed_table_metadata(
+            &test_table_entry(bucket, &namespace, &table, current_metadata.clone()),
+            &[&current_metadata, &new_metadata],
+        )
+        .await;
     let acquisitions_before = backend.write_lock_acquisition_count(bucket, &publication_lock).await;
 
     store
@@ -2325,7 +2333,7 @@ impl TableCommitPublication for LosingTestPublication {
 
 async fn assert_view_replacement_rechecks_publication_fence<S>(store: &S, backend: &TestCatalogObjectBackend)
 where
-    S: TableCatalogStore,
+    S: TableCatalogStore + IcebergCatalogCommit,
 {
     let bucket = "analytics";
     let namespace = Namespace::parse("sales").expect("namespace should parse");
@@ -3415,6 +3423,9 @@ async fn snapshot_validation_bounds_changed_statistics_object_fanout() {
             .collect(),
     );
     let entry = TableEntry {
+        vector_maintenance_binding: None,
+        vector_index_definition: None,
+        vector_head_binding: None,
         version: TABLE_CATALOG_ENTRY_VERSION,
         table_bucket: "warehouse".to_string(),
         namespace: "analytics".to_string(),
@@ -3476,6 +3487,9 @@ async fn snapshot_validation_bounds_changed_statistics_object_bytes() {
             .collect(),
     );
     let entry = TableEntry {
+        vector_maintenance_binding: None,
+        vector_index_definition: None,
+        vector_head_binding: None,
         version: TABLE_CATALOG_ENTRY_VERSION,
         table_bucket: "warehouse".to_string(),
         namespace: "analytics".to_string(),
@@ -3878,6 +3892,9 @@ async fn iceberg_snapshot_graph_rejects_unknown_partition_specs() {
     let namespace = Namespace::parse("analytics").expect("namespace should parse");
     let table = IdentifierSegment::parse("events").expect("table should parse");
     let entry = TableEntry {
+        vector_maintenance_binding: None,
+        vector_index_definition: None,
+        vector_head_binding: None,
         version: TABLE_CATALOG_ENTRY_VERSION,
         table_bucket: "warehouse".to_string(),
         namespace: namespace.public_name(),
@@ -4895,6 +4912,7 @@ fn parquet_i32_values(data: Vec<u8>) -> Vec<i32> {
 
 pub(super) fn test_bucket_entry(bucket: &str) -> TableBucketEntry {
     TableBucketEntry {
+        vector_bucket_binding: None,
         version: TABLE_CATALOG_ENTRY_VERSION,
         table_bucket: bucket.to_string(),
         catalog_type: TABLE_BUCKET_CATALOG_TYPE.to_string(),
@@ -4927,6 +4945,9 @@ pub(super) fn test_table_entry(
     metadata_location: String,
 ) -> TableEntry {
     TableEntry {
+        vector_maintenance_binding: None,
+        vector_index_definition: None,
+        vector_head_binding: None,
         version: TABLE_CATALOG_ENTRY_VERSION,
         table_bucket: bucket.to_string(),
         namespace: namespace.public_name(),
@@ -5982,11 +6003,7 @@ async fn object_catalog_registration_cache_observes_pointer_commits_and_rename()
         .0;
     let next_metadata = format!("{metadata_directory}/00002.metadata.json");
     backend
-        .seed_object(
-            "analytics",
-            &next_metadata,
-            serde_json::to_vec(&serde_json::json!({"location": entry.warehouse_location})).unwrap(),
-        )
+        .seed_table_metadata(&entry, &[&entry.metadata_location, &next_metadata])
         .await;
     store
         .commit_table(TableCommitRequest {
@@ -11902,6 +11919,16 @@ async fn compaction_commit_rewrites_small_data_files_and_advances_pointer() {
                 "location": "s3://analytics/tables/table-id",
                 "last-sequence-number": 7,
                 "last-updated-ms": 2000,
+                "last-column-id": 1,
+                "schemas": [{"schema-id": 0, "type": "struct", "fields": [
+                    {"id": 1, "name": "id", "required": true, "type": "int"}
+                ]}],
+                "current-schema-id": 0,
+                "partition-specs": [{"spec-id": 0, "fields": []}],
+                "default-spec-id": 0,
+                "last-partition-id": 999,
+                "sort-orders": [{"order-id": 0, "fields": []}],
+                "default-sort-order-id": 0,
                 "metadata-log": [],
                 "snapshots": [
                     {
@@ -12082,6 +12109,10 @@ async fn compaction_commit_keeps_partition_rewrite_groups_isolated() {
                 "location": "s3://analytics/tables/table-id",
                 "last-sequence-number": 7,
                 "last-updated-ms": 2000,
+                "last-column-id": 2,
+                "last-partition-id": 1000,
+                "sort-orders": [{"order-id": 0, "fields": []}],
+                "default-sort-order-id": 0,
                 "schemas": [
                     {
                         "schema-id": 0,
@@ -12258,9 +12289,17 @@ async fn compaction_commit_preserves_sort_order_and_keeps_groups_isolated() {
                 "location": "s3://analytics/tables/table-id",
                 "last-sequence-number": 7,
                 "last-updated-ms": 2000,
+                "last-column-id": 1,
+                "schemas": [{"schema-id": 0, "type": "struct", "fields": [
+                    {"id": 1, "name": "id", "required": true, "type": "int"}
+                ]}],
+                "current-schema-id": 0,
+                "partition-specs": [{"spec-id": 0, "fields": []}],
+                "default-spec-id": 0,
+                "last-partition-id": 999,
                 "sort-orders": [
-                    {"order-id": 7, "fields": []},
-                    {"order-id": 8, "fields": []}
+                    {"order-id": 7, "fields": [{"source-id": 1, "transform": "identity", "direction": "asc", "null-order": "nulls-first"}]},
+                    {"order-id": 8, "fields": [{"source-id": 1, "transform": "identity", "direction": "desc", "null-order": "nulls-last"}]}
                 ],
                 "default-sort-order-id": 7,
                 "metadata-log": [],
@@ -12684,7 +12723,7 @@ async fn maintenance_delete_conflicts_when_current_pointer_changes_before_delete
     seed_table_for_metadata_maintenance(&store, bucket, &namespace, &table, current.clone()).await;
     backend.seed_object(bucket, &old, b"{}".to_vec()).await;
     backend
-        .seed_object(bucket, &current, br#"{"metadata-log":[]}"#.to_vec())
+        .seed_table_metadata(&test_table_entry(bucket, &namespace, &table, current.clone()), &[&current])
         .await;
 
     let report = store
@@ -12693,7 +12732,9 @@ async fn maintenance_delete_conflicts_when_current_pointer_changes_before_delete
         .unwrap();
     assert_eq!(report.cleanup_candidate_locations, vec![old.clone()]);
 
-    backend.seed_object(bucket, &next, br#"{"metadata-log":[]}"#.to_vec()).await;
+    backend
+        .seed_table_metadata(&test_table_entry(bucket, &namespace, &table, current.clone()), &[&next])
+        .await;
     store
         .commit_table(TableCommitRequest {
             table_bucket: bucket.to_string(),
@@ -13150,7 +13191,12 @@ async fn object_table_catalog_store_commits_with_token_match_and_writes_log() {
         .create_table(test_table_entry(bucket, &namespace, &table, current_metadata.clone()))
         .await
         .unwrap();
-    backend.seed_object(bucket, &new_metadata, b"{}".to_vec()).await;
+    backend
+        .seed_table_metadata(
+            &test_table_entry(bucket, &namespace, &table, current_metadata.clone()),
+            &[&current_metadata, &new_metadata],
+        )
+        .await;
 
     backend.reset_call_counts().await;
     let result = store
@@ -13201,7 +13247,7 @@ async fn object_table_catalog_store_commits_with_token_match_and_writes_log() {
 
 async fn assert_catalog_rejects_metadata_changed_after_validation<S>(store: &S, backend: &TestCatalogObjectBackend, bucket: &str)
 where
-    S: TableCatalogStore + ?Sized,
+    S: TableCatalogStore + IcebergCatalogCommit + ?Sized,
 {
     let namespace = Namespace::parse("sales").expect("namespace should parse");
     let table = IdentifierSegment::parse("orders").expect("table should parse");
@@ -13219,8 +13265,17 @@ where
         .create_table(test_table_entry(bucket, &namespace, &table, current_metadata.clone()))
         .await
         .expect("table should be created");
-    let validated_metadata = serde_json::json!({"format-version": 2, "properties": {"owner": "validated"}});
-    let changed_metadata = serde_json::json!({"format-version": 2, "properties": {"owner": "replaced"}});
+    backend
+        .seed_table_metadata(
+            &test_table_entry(bucket, &namespace, &table, current_metadata.clone()),
+            &[&current_metadata],
+        )
+        .await;
+    let mut validated_metadata =
+        super::test_support::table_metadata_json("table-uuid", &format!("s3://{bucket}/tables/table-id"));
+    validated_metadata["properties"] = serde_json::json!({"owner": "validated"});
+    let mut changed_metadata = validated_metadata.clone();
+    changed_metadata["properties"] = serde_json::json!({"owner": "replaced"});
     backend
         .seed_object(
             bucket,
@@ -13285,13 +13340,19 @@ async fn object_table_catalog_store_syncs_warehouse_location_from_committed_meta
     store.backfill_table_warehouse_index(bucket).await.unwrap();
     backend.reset_call_counts().await;
     backend
+        .seed_table_metadata(
+            &test_table_entry(bucket, &namespace, &table, current_metadata.clone()),
+            &[&current_metadata],
+        )
+        .await;
+    backend
         .seed_object(
             bucket,
             &new_metadata,
-            serde_json::to_vec(&serde_json::json!({
-                "location": "s3://analytics/tables/relocated-table-id",
-                "table-uuid": "table-uuid"
-            }))
+            serde_json::to_vec(&super::test_support::table_metadata_json(
+                "table-uuid",
+                "s3://analytics/tables/relocated-table-id",
+            ))
             .unwrap(),
         )
         .await;
@@ -13351,13 +13412,19 @@ async fn object_table_catalog_store_reuses_old_prefix_after_failed_relocation_in
         .await
         .expect("old table should be created");
     backend
+        .seed_table_metadata(
+            &test_table_entry(bucket, &namespace, &table, current_metadata.clone()),
+            &[&current_metadata],
+        )
+        .await;
+    backend
         .seed_object(
             bucket,
             &new_metadata,
-            serde_json::to_vec(&serde_json::json!({
-                "location": "s3://analytics/tables/relocated-table-id",
-                "table-uuid": "table-uuid"
-            }))
+            serde_json::to_vec(&super::test_support::table_metadata_json(
+                "table-uuid",
+                "s3://analytics/tables/relocated-table-id",
+            ))
             .unwrap(),
         )
         .await;
@@ -13429,7 +13496,12 @@ async fn object_table_catalog_store_does_not_advance_table_when_idempotency_stag
         .create_table(test_table_entry(bucket, &namespace, &table, current_metadata.clone()))
         .await
         .unwrap();
-    backend.seed_object(bucket, &new_metadata, b"{}".to_vec()).await;
+    backend
+        .seed_table_metadata(
+            &test_table_entry(bucket, &namespace, &table, current_metadata.clone()),
+            &[&current_metadata, &new_metadata],
+        )
+        .await;
     backend.fail_put_attempt(RUSTFS_META_BUCKET, &idempotency_path, 1).await;
 
     let err = store
@@ -13477,7 +13549,12 @@ async fn object_table_catalog_store_recovers_staged_commit_after_post_cas_finali
         .create_table(test_table_entry(bucket, &namespace, &table, current_metadata.clone()))
         .await
         .unwrap();
-    backend.seed_object(bucket, &new_metadata, b"{}".to_vec()).await;
+    backend
+        .seed_table_metadata(
+            &test_table_entry(bucket, &namespace, &table, current_metadata.clone()),
+            &[&current_metadata, &new_metadata],
+        )
+        .await;
     backend.fail_put_attempt(RUSTFS_META_BUCKET, &commit_path, 2).await;
 
     let request = TableCommitRequest {
@@ -13523,6 +13600,8 @@ fn failed_commit_does_not_prove_historical_staged_commit() {
     table.version_token = "token-v3".to_string();
     table.generation = 3;
     let target = CommitLogEntry {
+        vector_resource_mutation: None,
+        vector_commit_binding: None,
         version: TABLE_CATALOG_ENTRY_VERSION,
         commit_id: "commit-1".to_string(),
         idempotency_key: None,
@@ -13539,6 +13618,8 @@ fn failed_commit_does_not_prove_historical_staged_commit() {
         updated_at: None,
     };
     let failed = CommitLogEntry {
+        vector_resource_mutation: None,
+        vector_commit_binding: None,
         version: TABLE_CATALOG_ENTRY_VERSION,
         commit_id: "commit-2".to_string(),
         idempotency_key: None,
@@ -13572,6 +13653,8 @@ fn committed_commit_outside_current_history_requires_manual_review() {
         default_table_metadata_file_path(&namespace, &table_name, "00001.metadata.json"),
     );
     let commit = CommitLogEntry {
+        vector_resource_mutation: None,
+        vector_commit_binding: None,
         version: TABLE_CATALOG_ENTRY_VERSION,
         commit_id: "commit-1".to_string(),
         idempotency_key: None,
@@ -13602,6 +13685,8 @@ fn commit_history_index_scales_across_a_long_table_history() {
     let commit_count = 10_000;
     let commits = (0..commit_count)
         .map(|index| CommitLogEntry {
+            vector_resource_mutation: None,
+            vector_commit_binding: None,
             version: TABLE_CATALOG_ENTRY_VERSION,
             commit_id: format!("commit-{index:05}"),
             idempotency_key: None,
@@ -13632,6 +13717,8 @@ fn commit_history_index_rejects_ambiguous_states_and_cycles() {
     let table_name = IdentifierSegment::parse("orders").expect("table should parse");
     let metadata = |version| default_table_metadata_file_path(&namespace, &table_name, &format!("{version:05}.metadata.json"));
     let commit = |commit_id: &str, previous: u8, next: u8| CommitLogEntry {
+        vector_resource_mutation: None,
+        vector_commit_binding: None,
         version: TABLE_CATALOG_ENTRY_VERSION,
         commit_id: commit_id.to_string(),
         idempotency_key: None,
@@ -13689,8 +13776,12 @@ async fn object_table_catalog_store_recovers_historical_staged_commit_after_late
         .create_table(test_table_entry(bucket, &namespace, &table, current_metadata.clone()))
         .await
         .expect("table should be created");
-    backend.seed_object(bucket, &first_metadata, b"{}".to_vec()).await;
-    backend.seed_object(bucket, &second_metadata, b"{}".to_vec()).await;
+    backend
+        .seed_table_metadata(
+            &test_table_entry(bucket, &namespace, &table, current_metadata.clone()),
+            &[&current_metadata, &first_metadata, &second_metadata],
+        )
+        .await;
     backend.fail_put_attempt(RUSTFS_META_BUCKET, &first_commit_path, 2).await;
 
     let first_request = TableCommitRequest {
@@ -13791,7 +13882,12 @@ async fn table_commit_recovery_reports_post_cas_staged_commit() {
         .create_table(test_table_entry(bucket, &namespace, &table, current_metadata.clone()))
         .await
         .unwrap();
-    backend.seed_object(bucket, &new_metadata, b"{}".to_vec()).await;
+    backend
+        .seed_table_metadata(
+            &test_table_entry(bucket, &namespace, &table, current_metadata.clone()),
+            &[&current_metadata, &new_metadata],
+        )
+        .await;
     backend.fail_put_attempt(RUSTFS_META_BUCKET, &commit_path, 2).await;
 
     let result = store
@@ -13843,7 +13939,12 @@ async fn diagnostics_report_includes_table_commit_recovery_state() {
         .create_table(test_table_entry(bucket, &namespace, &table, current_metadata.clone()))
         .await
         .unwrap();
-    backend.seed_object(bucket, &new_metadata, b"{}".to_vec()).await;
+    backend
+        .seed_table_metadata(
+            &test_table_entry(bucket, &namespace, &table, current_metadata.clone()),
+            &[&current_metadata, &new_metadata],
+        )
+        .await;
     backend.fail_put_attempt(RUSTFS_META_BUCKET, &commit_path, 2).await;
 
     store
@@ -13895,7 +13996,12 @@ async fn table_commit_recovery_finalizes_post_cas_staged_commit() {
         .create_table(test_table_entry(bucket, &namespace, &table, current_metadata.clone()))
         .await
         .unwrap();
-    backend.seed_object(bucket, &new_metadata, b"{}".to_vec()).await;
+    backend
+        .seed_table_metadata(
+            &test_table_entry(bucket, &namespace, &table, current_metadata.clone()),
+            &[&current_metadata, &new_metadata],
+        )
+        .await;
     backend.fail_put_attempt(RUSTFS_META_BUCKET, &commit_path, 2).await;
 
     store
@@ -13943,8 +14049,12 @@ async fn table_commit_recovery_reports_staged_commit_after_table_cas_failure() {
         .create_table(test_table_entry(bucket, &namespace, &table, current_metadata.clone()))
         .await
         .unwrap();
-    backend.seed_object(bucket, &current_metadata, b"{}".to_vec()).await;
-    backend.seed_object(bucket, &new_metadata, b"{}".to_vec()).await;
+    backend
+        .seed_table_metadata(
+            &test_table_entry(bucket, &namespace, &table, current_metadata.clone()),
+            &[&current_metadata, &new_metadata],
+        )
+        .await;
     backend.fail_put_attempt(RUSTFS_META_BUCKET, &table_path, 2).await;
 
     let err = store
@@ -13999,7 +14109,12 @@ async fn table_commit_recovery_repairs_stale_idempotency_index_after_partial_fin
         .create_table(test_table_entry(bucket, &namespace, &table, current_metadata.clone()))
         .await
         .unwrap();
-    backend.seed_object(bucket, &new_metadata, b"{}".to_vec()).await;
+    backend
+        .seed_table_metadata(
+            &test_table_entry(bucket, &namespace, &table, current_metadata.clone()),
+            &[&current_metadata, &new_metadata],
+        )
+        .await;
     backend.fail_put_attempt(RUSTFS_META_BUCKET, &idempotency_path, 2).await;
 
     let result = store
@@ -14069,7 +14184,12 @@ async fn table_commit_recovery_does_not_overwrite_conflicting_idempotency_index(
         .create_table(test_table_entry(bucket, &namespace, &table, current_metadata.clone()))
         .await
         .expect("table should be created");
-    backend.seed_object(bucket, &new_metadata, b"{}".to_vec()).await;
+    backend
+        .seed_table_metadata(
+            &test_table_entry(bucket, &namespace, &table, current_metadata.clone()),
+            &[&current_metadata, &new_metadata],
+        )
+        .await;
     let request = TableCommitRequest {
         table_bucket: bucket.to_string(),
         namespace: namespace.public_name(),
@@ -14166,7 +14286,12 @@ async fn object_table_catalog_store_rejects_stale_commit_token() {
         .create_table(test_table_entry(bucket, &namespace, &table, current_metadata.clone()))
         .await
         .unwrap();
-    backend.seed_object(bucket, &new_metadata, b"{}".to_vec()).await;
+    backend
+        .seed_table_metadata(
+            &test_table_entry(bucket, &namespace, &table, current_metadata.clone()),
+            &[&current_metadata, &new_metadata],
+        )
+        .await;
 
     let err = store
         .commit_table(TableCommitRequest {

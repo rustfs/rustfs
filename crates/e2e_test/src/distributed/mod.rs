@@ -18,6 +18,10 @@
 //! `.github/workflows/e2e-distributed.yml`. Excluded from `e2e-full` because
 //! each case starts four real `rustfs` processes.
 
+#[cfg(all(feature = "catalog-fault-worker", unix))]
+mod catalog_fault_acceptance_test;
+#[cfg(all(feature = "catalog-fault-worker", unix))]
+mod catalog_fault_worker;
 mod chaos_test;
 mod concurrency_stability_test;
 mod concurrent_data_movement_test;

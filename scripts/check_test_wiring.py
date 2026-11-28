@@ -590,47 +590,228 @@ def rust_code_only(source: str) -> str:
     return "".join(code)
 
 
-def declared(parent: Path, module: str) -> bool:
-    source = parent.read_text()
-    code = rust_code_only(source)
-    pattern = re.compile(rf"^\s*(?:pub(?:\([^)]*\))?\s+)?mod\s+{re.escape(module)}\s*;", re.MULTILINE)
+
+CATALOG_FAULT_FEATURE = "catalog-fault-worker"
+CATALOG_FAULT_MODULE = "distributed::catalog_fault_acceptance_test"
+CATALOG_FAULT_SOURCE = "crates/e2e_test/src/distributed/catalog_fault_acceptance_test.rs"
+CATALOG_FAULT_LISTING = "target/catalog-fault-listing.json"
+CATALOG_FAULT_JUNIT = "target/nextest/e2e-distributed/junit.xml"
+
+
+def catalog_fault_workflow_run() -> str:
+    selection = ("--locked -p e2e_test --features catalog-fault-worker --profile e2e-distributed "
+                 "-E 'test(distributed::catalog_fault_acceptance_test::)'")
+    verify = f"python3 scripts/check_test_wiring.py --check-catalog-fault {CATALOG_FAULT_LISTING}"
+    commands = [
+        f"rm -f {CATALOG_FAULT_JUNIT}",
+        f"cargo nextest list {selection} --message-format json > {CATALOG_FAULT_LISTING}",
+        verify,
+        ("python3 scripts/e2e_catalog_worker.py run -- cargo nextest run " + selection
+         + " --test-threads 1 --retries 0 --no-tests fail"),
+        f"{verify} {CATALOG_FAULT_JUNIT}",
+    ]
+    return "\n".join(["env -u MAKEFLAGS -u MFLAGS -u GNUMAKEFLAGS -u MAKEFILES -u MAKEOVERRIDES -u BASH_ENV -u ENV make -j4 -f - <<'MAKE'", ".PHONY: catalog-fault",
+                      "catalog-fault: ; " + " && ".join(commands), "MAKE"])
+
+
+def check_catalog_fault_wiring(root: Path) -> list[str]:
+    """Accept this conditional module only with an executable, feature-bound CI lane."""
+    try:
+        manifest = tomllib.loads((root / "crates/e2e_test/Cargo.toml").read_text())
+        require(manifest.get("package", {}).get("name") == "e2e_test", "wrong Catalog test package")
+        features = manifest.get("features", {})
+        require(CATALOG_FAULT_FEATURE in features, "missing Catalog test Cargo feature")
+        require(isinstance(features[CATALOG_FAULT_FEATURE], list)
+                and all(isinstance(item, str) for item in features[CATALOG_FAULT_FEATURE]), "invalid Catalog Cargo feature")
+        registry = json.loads((root / ".github/scheduled-validations.json").read_text())
+        entries = [entry for entry in registry["workflows"]
+                   if entry.get("workflow") == ".github/workflows/e2e-catalog-fault.yml"]
+        require(len(entries) == 1 and entries[0].get("policy") == "active"
+                and "workflow_dispatch" in entries[0].get("events", []), "inactive Catalog fault workflow")
+        lines = (root / ".github/workflows/e2e-catalog-fault.yml").read_text().splitlines()
+        require(not any("GITHUB_ENV" in line and not line.lstrip().startswith("#") for line in lines),
+                "unsupported Catalog workflow environment-file mutation")
+        require(yaml_block(yaml_block(lines, "on", 0) or [], "workflow_dispatch", 2) is not None,
+                "missing Catalog workflow dispatch trigger")
+        require(not any(re.search(r"\b(?:defaults|shell|MAKEFLAGS|MFLAGS|GNUMAKEFLAGS|MAKEFILES|BASH_ENV|ENV)\s*['\"]?:", line)
+                        for line in lines),
+                "unsupported Catalog workflow shell override")
+        jobs = yaml_block(lines, "jobs", 0) or []
+        job = yaml_block(jobs, "catalog-fault", 2)
+        require(job is not None, "missing Catalog fault job")
+        require(not any(re.match(r"    ['\"]?(?:if|continue-on-error)['\"]?\s*:", line) for line in job),
+                "conditional or failure-suppressing Catalog fault job")
+        step = workflow_step_block(job, "Run native Catalog fault scenarios", key="name")
+        require(step is not None, "missing Catalog fault execution step")
+        body = step[1]
+        require(not any(re.match(r"        ['\"]?(?:if|continue-on-error)['\"]?\s*:", line) for line in body),
+                "conditional or failure-suppressing Catalog fault step")
+        run = body.index("        run: |")
+        source = []
+        for line in body[run + 1:]:
+            if line.strip():
+                require(line.startswith("          "), "unexpected field after Catalog run script")
+                source.append(line[10:])
+        require("\n".join(source) == catalog_fault_workflow_run(),
+                "Catalog list/verify/run commands must bind the feature, selector, and no-tests fail")
+        return []
+    except (OSError, ValueError, TypeError, KeyError) as error:
+        return [f"Catalog feature test wiring: {error}"]
+
+
+def catalog_fault_test_names(root: Path) -> set[str]:
+    """Inventory tests from the registered canonical Catalog module graph."""
+    src = root / "crates/e2e_test/src"
+    source = root / CATALOG_FAULT_SOURCE
+    parent = module_source(src, Path("distributed"))
+    require(parent is not None and declared(src / "lib.rs", "distributed", root)
+            and declared(parent, source.stem, root), "Catalog source ancestors are not registered")
+    require(module_source(src, source.relative_to(src).with_suffix("")) == source,
+            "Catalog root source is missing or ambiguous")
+    attribute = r"#\[(?:tokio::)?test(?:\([^]\n]*\))?\]"
+    test = (attribute + r"\s*(?:#\[[^]\n]*\]\s*)*"
+            r"(?:pub(?:\([^)]*\))?\s+)?(?:async\s+)?fn\s+(?P<test>\w+)\s*\(")
+    module = r"(?:\bpub(?:\([^)]*\))?\s+)?\bmod\s+(?P<module>\w+)\s*(?P<module_end>[;{])"
+    tokens = re.compile(f"{test}|{module}|[{{}}]")
+    names: set[str] = set()
+    modules = {CATALOG_FAULT_MODULE}
+    visited: set[Path] = set()
+
+    def visit(path: Path, module_path: list[str]) -> None:
+        identity = path.resolve()
+        require(identity not in visited, f"Catalog source has multiple module owners: {path}")
+        visited.add(identity)
+        original = path.read_text()
+        code = rust_code_only(original)
+        directory = path.parent if path.name == "mod.rs" else path.with_suffix("")
+        scopes: list[str | None] = []
+        test_count = 0
+        for token in tokens.finditer(code):
+            if token.group("module"):
+                require(all(scope is not None for scope in scopes), "Catalog module nested outside a module")
+                child = token.group("module")
+                components = [*module_path, *scopes, child]
+                require(len(components) <= 64, "Catalog module nesting exceeds 64 levels")
+                name = "::".join(components)
+                require(name not in modules, f"duplicate Catalog module identity: {name}")
+                require(module_preamble_allowed(original, code, token.start(), path, child, root),
+                        f"unsupported Catalog module declaration: {name}")
+                modules.add(name)
+                if token.group("module_end") == "{":
+                    scopes.append(child)
+                else:
+                    owner = directory.joinpath(*scopes)
+                    candidates = [candidate for candidate in (owner / f"{child}.rs", owner / child / "mod.rs")
+                                  if candidate.is_file()]
+                    require(len(candidates) == 1, f"missing or ambiguous Catalog module source: {name}")
+                    visit(candidates[0], components)
+            elif token.group("test"):
+                test_count += 1
+                require(all(scope is not None for scope in scopes), "Catalog test nested outside a module")
+                prefix = code[:token.start()]
+                boundary = max(prefix.rfind(";"), prefix.rfind("{"), prefix.rfind("}"))
+                attributes = code[boundary + 1:token.end()]
+                conditions = re.findall(r"#\[\s*(?:ignore|cfg(?:_attr)?)\b[^]]*\]", attributes)
+                require(all(re.sub(r"\s+", "", condition) == "#[cfg(test)]" for condition in conditions),
+                        "Catalog tests must be unconditional and non-ignored")
+                name = "::".join([*module_path, *scopes, token.group("test")])
+                require(name not in names, f"duplicate Catalog test identity: {name}")
+                names.add(name)
+            elif token.group() == "{":
+                scopes.append(None)
+            else:
+                require(bool(scopes), "unbalanced Catalog source braces")
+                scopes.pop()
+        require(not scopes, "unbalanced Catalog source braces")
+        require(test_count == len(re.findall(attribute, code)), f"unrecognized Catalog test declaration: {path}")
+
+    visit(source, [CATALOG_FAULT_MODULE])
+    for path in source.with_suffix("").rglob("*.rs"):
+        if re.search(attribute, rust_code_only(path.read_text())):
+            require(path.resolve() in visited, f"Catalog test source has no module owner: {path}")
+    require(bool(names), "Catalog source graph has no tests")
+    return names
+
+
+def check_catalog_fault_listing(root: Path, listing: Path, junit: Path | None = None) -> list[str]:
+    """Require every source test to be selected, non-ignored, and optionally executed."""
+    try:
+        require(os.name == "posix", "Catalog fault tests require a Unix runner")
+        require(not check_catalog_fault_wiring(root), "Catalog feature workflow is not bound")
+        expected = catalog_fault_test_names(root)
+        suites = json.loads(listing.read_text())["rust-suites"]
+        require(isinstance(suites, dict) and all(isinstance(suite, dict)
+                and isinstance(suite.get("testcases"), dict)
+                and all(isinstance(case, dict) for case in suite["testcases"].values())
+                for suite in suites.values()), "invalid Catalog listing suites")
+        tests = suites.get("e2e_test", {}).get("testcases", {})
+        selected = [name for suite in suites.values() for name, case in suite["testcases"].items()
+                    if case.get("filter-match", {}).get("status") == "matches"]
+        require(len(selected) == len(expected) and set(selected) == expected,
+                "Catalog listing has missing, extra, duplicate, or zero selected tests")
+        require(all(tests.get(name, {}).get("ignored") is False
+                    and tests[name].get("filter-match", {}).get("status") == "matches" for name in expected),
+                "Catalog required test is ignored, absent, or filtered out")
+        if junit is not None:
+            cases = list(ET.parse(junit).getroot().iter("testcase"))
+            require(len(cases) == len(expected) and {case.get("name") for case in cases} == expected,
+                    "Catalog JUnit has missing, duplicate, or unexpected tests")
+            require(all(not any(case.find(tag) is not None for tag in ("skipped", "failure", "error"))
+                        for case in cases), "Catalog JUnit contains a skipped or failed test")
+        return []
+    except (OSError, ValueError, TypeError, KeyError, ET.ParseError) as error:
+        return [f"Catalog feature test evidence: {error}"]
+
+
+def module_preamble_allowed(source: str, code: str, offset: int, parent: Path,
+                            module: str, root: Path | None) -> bool:
+    prefix = code[:offset]
+    boundary = max(prefix.rfind(";"), prefix.rfind("{"), prefix.rfind("}"))
+    code_preamble = re.sub(r"\s+", "", prefix[boundary + 1:])
     allowed_preambles = {
         "#[cfg(test)]": "#[cfg(test)]",
         "#[cfg(all(test,target_os=))]": '#[cfg(all(test,target_os="linux"))]',
     }
+    if not code_preamble:
+        return True
+    attr_start = prefix.rfind("#[cfg", boundary + 1)
+    preamble = re.sub(r"\s+", "", source[attr_start:offset]) if attr_start >= 0 else ""
+    if code_preamble in allowed_preambles:
+        return preamble == allowed_preambles[code_preamble]
+    if (root is not None
+            and parent == root / "crates/e2e_test/src/distributed/mod.rs"
+            and module == "catalog_fault_acceptance_test"
+            and code_preamble == "#[cfg(all(feature=,unix))]"
+            and preamble == '#[cfg(all(feature="catalog-fault-worker",unix))]'):
+        return not check_catalog_fault_wiring(root)
+    return False
+
+
+def declared(parent: Path, module: str, root: Path | None = None) -> bool:
+    source = parent.read_text()
+    code = rust_code_only(source)
+    pattern = re.compile(rf"^\s*(?:pub(?:\([^)]*\))?\s+)?mod\s+{re.escape(module)}\s*;", re.MULTILINE)
+    declarations = []
     for match in pattern.finditer(code):
-        prefix = code[: match.start()]
         depths = {"(": 0, "[": 0, "{": 0}
         pairs = {")": "(", "]": "[", "}": "{"}
-        for char in prefix:
+        for char in code[:match.start()]:
             if char in depths:
                 depths[char] += 1
             elif char in pairs:
                 depths[pairs[char]] -= 1
-        if any(depths.values()):
-            continue
-
-        boundary = max(prefix.rfind(";"), prefix.rfind("{"), prefix.rfind("}"))
-        code_preamble = re.sub(r"\s+", "", prefix[boundary + 1 :])
-        if not code_preamble:
-            return True
-        if code_preamble in allowed_preambles:
-            attr_start = prefix.rfind("#[cfg", boundary + 1)
-            if attr_start >= 0 and re.sub(r"\s+", "", source[attr_start : match.start()]) == allowed_preambles[code_preamble]:
-                return True
-    return False
+        if not any(depths.values()):
+            declarations.append(match)
+    return (len(declarations) == 1
+            and module_preamble_allowed(source, code, declarations[0].start(), parent, module, root))
 
 
 def module_source(src: Path, directory: Path) -> Path | None:
     if not directory.parts:
         return src / "lib.rs"
-
-    mod_file = src / directory / "mod.rs"
-    if mod_file.is_file():
-        return mod_file
-
-    sibling = src.joinpath(*directory.parts[:-1], f"{directory.name}.rs")
-    return sibling if sibling.is_file() else None
+    candidates = [path for path in (src / directory / "mod.rs",
+                                    src.joinpath(*directory.parts[:-1], f"{directory.name}.rs")) if path.is_file()]
+    return candidates[0] if len(candidates) == 1 else None
 
 
 def check_e2e_modules(root: Path) -> list[str]:
@@ -644,8 +825,10 @@ def check_e2e_modules(root: Path) -> list[str]:
             errors.append(f"{relative}: no canonical parent module")
             continue
 
-        if not declared(parent, test_file.stem):
+        if not declared(parent, test_file.stem, root):
             errors.append(f"{relative}: not declared by {parent.relative_to(root).as_posix()}")
+            if relative == CATALOG_FAULT_SOURCE:
+                errors.extend(check_catalog_fault_wiring(root))
         while directory.parts:
             module = directory.name
             directory = directory.parent
@@ -653,7 +836,7 @@ def check_e2e_modules(root: Path) -> list[str]:
             if parent is None:
                 errors.append(f"{relative}: module {module} has no canonical parent")
                 break
-            if not declared(parent, module):
+            if not declared(parent, module, root):
                 errors.append(f"{relative}: module {module} not declared by {parent.relative_to(root).as_posix()}")
     return errors
 
@@ -5763,6 +5946,349 @@ class SelfTests(unittest.TestCase):
             )
             self.assertEqual(len(check_runner_selection(root)), 1)
 
+
+    def catalog_feature_fixture(self, root: Path) -> tuple[Path, Path]:
+        files = {
+            "crates/e2e_test/Cargo.toml": '[package]\nname="e2e_test"\n[features]\ncatalog-fault-worker=[]\n',
+            "crates/e2e_test/src/lib.rs": '#[cfg(test)]\nmod distributed;\n',
+            "crates/e2e_test/src/distributed/mod.rs": '#[cfg(all(feature="catalog-fault-worker", unix))]\nmod catalog_fault_acceptance_test;\n',
+            CATALOG_FAULT_SOURCE: ('#[tokio::test]\nasync fn fault_observed() {}\n'
+                                  '#[test]\nfn record_checked() {}\n'
+                                  '#[cfg(test)]\nmod oracle { #[test]\nfn invalid_record_rejected() {} }\n'),
+            ".github/scheduled-validations.json": json.dumps({"workflows": [{
+                "workflow": ".github/workflows/e2e-catalog-fault.yml", "policy": "active",
+                "events": ["workflow_dispatch"]}]}),
+            ".github/workflows/e2e-catalog-fault.yml": (
+                'name: e2e-catalog-fault\non:\n  workflow_dispatch:\njobs:\n  catalog-fault:\n'
+                '    runs-on: sm-standard-4\n    steps:\n      - name: Run native Catalog fault scenarios\n'
+                '        run: |\n' + '\n'.join('          ' + line for line in catalog_fault_workflow_run().splitlines()) + '\n'),
+        }
+        for path, content in files.items():
+            target = root / path
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(content)
+        names = catalog_fault_test_names(root)
+        listing = root / "listing.json"
+        listing.write_text(json.dumps({"rust-suites": {"e2e_test": {"testcases": {
+            name: {"ignored": False, "filter-match": {"status": "matches"}} for name in names}}}}))
+        junit = root / "junit.xml"
+        suite = ET.Element("testsuite")
+        for name in sorted(names):
+            ET.SubElement(suite, "testcase", {"name": name})
+        ET.ElementTree(suite).write(junit)
+        return listing, junit
+
+    def test_catalog_make_propagates_failure_with_inherited_flags(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            command = catalog_fault_workflow_run().splitlines()[0].split(" <<", 1)[0]
+            environment = dict(os.environ, MAKEFLAGS="-i", MFLAGS="-i", GNUMAKEFLAGS="-i")
+            result = subprocess.run(
+                shlex.split(command),
+                input=".PHONY: verify\nverify: ; false && touch accepted\n",
+                text=True, capture_output=True, cwd=tmp, env=environment, timeout=10,
+            )
+            self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertFalse((Path(tmp) / "accepted").exists())
+
+    def test_catalog_feature_requires_cargo_and_active_execution(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self.catalog_feature_fixture(root)
+            self.assertEqual(check_e2e_modules(root), [])
+            self.assertEqual(check_catalog_fault_wiring(root), [])
+            mutations = [
+                ("missing feature", "crates/e2e_test/Cargo.toml", "catalog-fault-worker=[]", "other=[]"),
+                ("wrong package", "crates/e2e_test/Cargo.toml", 'name="e2e_test"', 'name="other"'),
+                ("invalid feature declaration", "crates/e2e_test/Cargo.toml", 'catalog-fault-worker=[]', 'catalog-fault-worker="invalid"'),
+                ("paused workflow", ".github/scheduled-validations.json", '"active"', '"paused"'),
+                ("wrong workflow", ".github/scheduled-validations.json", "e2e-catalog-fault.yml", "other.yml"),
+                ("missing trigger", ".github/workflows/e2e-catalog-fault.yml", "  workflow_dispatch:", "  push:"),
+                ("disabled job", ".github/workflows/e2e-catalog-fault.yml", "    runs-on:", "    if: false\n    runs-on:"),
+                ("disabled step", ".github/workflows/e2e-catalog-fault.yml", "        run: |", "        if: false\n        run: |"),
+                ("quoted disabled step", ".github/workflows/e2e-catalog-fault.yml", "        run: |", "        'if' : false\n        run: |"),
+                ("ignored failure", ".github/workflows/e2e-catalog-fault.yml", "        run: |", "        continue-on-error: true\n        run: |"),
+                ("feature not enabled", ".github/workflows/e2e-catalog-fault.yml", "--features catalog-fault-worker", "--features other"),
+                ("selector mismatch", ".github/workflows/e2e-catalog-fault.yml", "test(distributed::catalog_fault_acceptance_test::)", "test(distributed::other::)"),
+                ("no zero-test refusal", ".github/workflows/e2e-catalog-fault.yml", "--no-tests fail", "--no-tests pass"),
+                ("list-run mismatch", ".github/workflows/e2e-catalog-fault.yml", "cargo nextest run --locked", "cargo nextest run --no-default-features --locked"),
+                ("missing verifier", ".github/workflows/e2e-catalog-fault.yml", "python3 scripts/check_test_wiring.py", "echo scripts/check_test_wiring.py"),
+                ("swallowed failure", ".github/workflows/e2e-catalog-fault.yml", "--no-tests fail &&", "--no-tests fail || true &&"),
+                ("commented recipe", ".github/workflows/e2e-catalog-fault.yml", "          catalog-fault: ;", "          # catalog-fault: ;"),
+                ("failure-ignoring make", ".github/workflows/e2e-catalog-fault.yml", "    steps:", "    env: {MAKEFLAGS: '-i'}\n    steps:"),
+                ("inherited failure-ignoring make", ".github/workflows/e2e-catalog-fault.yml", "    steps:",
+                 '    steps:\n      - run: echo "MAKEFLAGS=-i" >> "$GITHUB_ENV"'),
+                ("stale JUnit", ".github/workflows/e2e-catalog-fault.yml", "rm -f target/nextest/e2e-distributed/junit.xml", "true"),
+            ]
+            for label, path, before, after in mutations:
+                with self.subTest(label=label):
+                    target = root / path
+                    original = target.read_text()
+                    self.assertIn(before, original)
+                    target.write_text(original.replace(before, after))
+                    self.assertTrue(check_catalog_fault_wiring(root))
+                    self.assertTrue(check_e2e_modules(root))
+                    target.write_text(original)
+
+    def test_catalog_feature_keeps_strict_declarations(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self.catalog_feature_fixture(root)
+            parent = root / "crates/e2e_test/src/distributed/mod.rs"
+            for source in [
+                '#[cfg(any())]\nmod catalog_fault_acceptance_test;',
+                '#[cfg(any())]\n#[cfg(all(feature="catalog-fault-worker", unix))]\nmod catalog_fault_acceptance_test;',
+                '#[cfg(not(feature="catalog-fault-worker"))]\nmod catalog_fault_acceptance_test;',
+                '#[cfg(all(feature="catalog-fault-worker", windows))]\nmod catalog_fault_acceptance_test;',
+                '#[cfg(all(feature="catalog-fault-worker", unix))]\n#[cfg(any())]\nmod catalog_fault_acceptance_test;',
+                '// #[cfg(all(feature="catalog-fault-worker", unix))]\n// mod catalog_fault_acceptance_test;',
+                'const X: &str = "mod catalog_fault_acceptance_test;";',
+                'phantom! { mod catalog_fault_acceptance_test; }',
+            ]:
+                with self.subTest(source=source):
+                    parent.write_text(source)
+                    self.assertTrue(check_e2e_modules(root))
+
+    def test_catalog_feature_evidence_cli_rejects_ignored_and_empty_selection(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            listing, junit = self.catalog_feature_fixture(root)
+            with mock.patch(__name__ + ".ROOT", root), mock.patch.object(sys, "argv", [
+                "check_test_wiring.py", "--check-catalog-fault", str(listing), str(junit)
+            ]), mock.patch("builtins.print"):
+                self.assertEqual(main(), 0)
+                data = json.loads(listing.read_text())
+                cases = data["rust-suites"]["e2e_test"]["testcases"]
+                cases[next(iter(cases))]["ignored"] = True
+                listing.write_text(json.dumps(data))
+                self.assertEqual(main(), 1)
+                cases.clear()
+                listing.write_text(json.dumps(data))
+                self.assertEqual(main(), 1)
+
+    def test_catalog_feature_listing_and_junit_require_every_test(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            listing, junit = self.catalog_feature_fixture(root)
+            self.assertEqual(len(catalog_fault_test_names(root)), 3)
+            self.assertEqual(check_catalog_fault_listing(root, listing), [])
+            self.assertEqual(check_catalog_fault_listing(root, listing, junit), [])
+            original_listing = listing.read_text()
+            original_junit = junit.read_text()
+            for mode in ("missing", "ignored", "filtered", "zero", "extra", "wrong-suite"):
+                with self.subTest(mode=mode):
+                    data = json.loads(original_listing)
+                    cases = data["rust-suites"]["e2e_test"]["testcases"]
+                    name = next(iter(cases))
+                    if mode == "missing":
+                        del cases[name]
+                    elif mode == "ignored":
+                        cases[name]["ignored"] = True
+                    elif mode == "filtered":
+                        cases[name]["filter-match"]["status"] = "mismatch"
+                    elif mode == "zero":
+                        cases.clear()
+                    elif mode == "extra":
+                        cases["other::extra"] = {"ignored": False, "filter-match": {"status": "matches"}}
+                    else:
+                        data["rust-suites"]["other"] = data["rust-suites"].pop("e2e_test")
+                    listing.write_text(json.dumps(data))
+                    self.assertTrue(check_catalog_fault_listing(root, listing))
+            listing.write_text(original_listing)
+            for mode in ("missing", "duplicate", "skipped", "failure", "error", "zero"):
+                with self.subTest(junit=mode):
+                    tree = ET.fromstring(original_junit)
+                    case = tree.find("testcase")
+                    if mode == "missing":
+                        tree.remove(case)
+                    elif mode == "duplicate":
+                        ET.SubElement(tree, "testcase", dict(case.attrib))
+                    elif mode == "zero":
+                        tree.clear()
+                    else:
+                        ET.SubElement(case, mode)
+                    ET.ElementTree(tree).write(junit)
+                    self.assertTrue(check_catalog_fault_listing(root, listing, junit))
+            junit.write_text(original_junit)
+            with mock.patch.object(os, "name", "nt"):
+                self.assertTrue(check_catalog_fault_listing(root, listing, junit))
+            source = root / CATALOG_FAULT_SOURCE
+            source.write_text(source.read_text() + '\n#[test]\nfn new_fault_case() {}\n')
+            self.assertTrue(check_catalog_fault_listing(root, listing, junit))
+
+    def catalog_nested_feature_fixture(self, root: Path) -> tuple[Path, Path, set[str]]:
+        listing, junit = self.catalog_feature_fixture(root)
+        source = root / CATALOG_FAULT_SOURCE
+        source.write_text(source.read_text() + "mod branch_test;\n")
+        directory = source.with_suffix("")
+        files = {
+            "branch_test.rs": ('#[test]\nfn external_case() {}\n'
+                               'mod inline { mod deeper { #[test]\nfn inline_case() {} } }\n'
+                               'mod child_test;\nmod folder;\n'),
+            "branch_test/child_test.rs": '#[tokio::test]\nasync fn child_case() {}\n',
+            "branch_test/folder/mod.rs": 'mod nested { #[test]\nfn folder_case() {} }\n',
+        }
+        for path, content in files.items():
+            target = directory / path
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(content)
+        names = {CATALOG_FAULT_MODULE + "::" + name for name in (
+            "fault_observed", "record_checked", "oracle::invalid_record_rejected",
+            "branch_test::external_case", "branch_test::inline::deeper::inline_case",
+            "branch_test::child_test::child_case", "branch_test::folder::nested::folder_case",
+        )}
+        listing.write_text(json.dumps({"rust-suites": {"e2e_test": {"testcases": {
+            name: {"ignored": False, "filter-match": {"status": "matches"}} for name in names}}}}))
+        suite = ET.Element("testsuite")
+        for name in sorted(names):
+            ET.SubElement(suite, "testcase", {"name": name})
+        ET.ElementTree(suite).write(junit)
+        return listing, junit, names
+
+    def test_catalog_canonical_descendants_keep_feature_gate(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self.catalog_nested_feature_fixture(root)
+            self.assertEqual(check_e2e_modules(root), [])
+            mutations = (
+                ("crates/e2e_test/src/distributed/mod.rs", 'feature="catalog-fault-worker"', 'feature="other"'),
+                ("crates/e2e_test/Cargo.toml", "catalog-fault-worker=[]", "other=[]"),
+                (".github/workflows/e2e-catalog-fault.yml", "--no-tests fail", "--no-tests pass"),
+            )
+            for path, before, after in mutations:
+                with self.subTest(path=path):
+                    target = root / path
+                    original = target.read_text()
+                    target.write_text(original.replace(before, after))
+                    errors = check_e2e_modules(root)
+                    self.assertTrue(any("branch_test.rs:" in error for error in errors), errors)
+                    self.assertTrue(any("child_test.rs:" in error for error in errors), errors)
+                    target.write_text(original)
+
+    def test_catalog_recursive_inventory_includes_canonical_and_inline_modules(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            listing, junit, names = self.catalog_nested_feature_fixture(root)
+            self.assertEqual(catalog_fault_test_names(root), names)
+            self.assertEqual(check_catalog_fault_listing(root, listing, junit), [])
+
+    def test_catalog_recursive_inventory_rejects_invalid_source_graphs(self) -> None:
+        for mode in ("missing-source", "ambiguous-source", "missing-declaration", "wrong-owner",
+                     "path-override", "duplicate-declaration", "duplicate-inline", "duplicate-test",
+                     "disabled-module", "disabled-inline", "ignored-test", "ignored-before-test",
+                     "disabled-test", "nonmodule-test", "unrecognized-test"):
+            with self.subTest(mode=mode), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                listing, junit, _ = self.catalog_nested_feature_fixture(root)
+                source = root / CATALOG_FAULT_SOURCE
+                directory = source.with_suffix("")
+                branch = directory / "branch_test.rs"
+                if mode == "missing-source":
+                    branch.unlink()
+                elif mode == "ambiguous-source":
+                    (directory / "branch_test/mod.rs").write_text("#[test]\nfn another_case() {}\n")
+                elif mode == "missing-declaration":
+                    source.write_text(source.read_text().replace("mod branch_test;", ""))
+                elif mode == "wrong-owner":
+                    branch.rename(directory / "wrong_test.rs")
+                elif mode == "path-override":
+                    source.write_text(source.read_text().replace("mod branch_test;", '#[path="elsewhere.rs"]\nmod branch_test;'))
+                elif mode == "duplicate-declaration":
+                    source.write_text(source.read_text() + "mod branch_test;\n")
+                elif mode == "duplicate-inline":
+                    branch.write_text(branch.read_text() + "mod inline {}\n")
+                elif mode == "duplicate-test":
+                    branch.write_text(branch.read_text() + "#[test]\nfn external_case() {}\n")
+                elif mode == "disabled-module":
+                    source.write_text(source.read_text().replace("mod branch_test;", "#[cfg(any())]\nmod branch_test;"))
+                elif mode == "disabled-inline":
+                    branch.write_text(branch.read_text().replace("mod inline", "#[cfg(any())]\nmod inline"))
+                elif mode == "ignored-test":
+                    branch.write_text(branch.read_text().replace("#[test]", "#[test]\n#[ignore]", 1))
+                elif mode == "ignored-before-test":
+                    branch.write_text(branch.read_text().replace("#[test]", "#[ignore]\n#[test]", 1))
+                elif mode == "disabled-test":
+                    branch.write_text(branch.read_text().replace("#[test]", "#[cfg(any())]\n#[test]", 1))
+                elif mode == "nonmodule-test":
+                    branch.write_text(branch.read_text() + "fn hidden() { #[test]\nfn unreachable() {} }\n")
+                else:
+                    branch.write_text(branch.read_text() + "#[test]\nconst HIDDEN: bool = true;\n")
+                with self.assertRaises((OSError, ValueError)):
+                    catalog_fault_test_names(root)
+                self.assertTrue(check_catalog_fault_listing(root, listing, junit))
+
+    def test_catalog_recursive_inventory_checks_registered_ancestors(self) -> None:
+        for path, before, after in (
+            ("crates/e2e_test/src/lib.rs", "#[cfg(test)]", "#[cfg(any())]"),
+            ("crates/e2e_test/src/distributed/mod.rs", 'feature="catalog-fault-worker"', 'feature="other"'),
+            ("crates/e2e_test/src/distributed/mod.rs", "mod catalog_fault_acceptance_test;", ""),
+        ):
+            with self.subTest(path=path, after=after), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                self.catalog_nested_feature_fixture(root)
+                target = root / path
+                target.write_text(target.read_text().replace(before, after))
+                with self.assertRaises(ValueError):
+                    catalog_fault_test_names(root)
+
+    def test_catalog_recursive_evidence_requires_every_descendant(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            listing, junit, names = self.catalog_nested_feature_fixture(root)
+            self.assertEqual(check_catalog_fault_listing(root, listing, junit), [])
+            original_listing, original_junit = listing.read_text(), junit.read_text()
+            descendant = CATALOG_FAULT_MODULE + "::branch_test::child_test::child_case"
+            for mode in ("missing", "extra", "ignored", "filtered", "wrong-owner", "duplicate-suite"):
+                with self.subTest(listing=mode):
+                    data = json.loads(original_listing)
+                    cases = data["rust-suites"]["e2e_test"]["testcases"]
+                    if mode == "missing":
+                        del cases[descendant]
+                    elif mode == "extra":
+                        cases[descendant + "_extra"] = dict(cases[descendant])
+                    elif mode == "ignored":
+                        cases[descendant]["ignored"] = True
+                    elif mode == "filtered":
+                        cases[descendant]["filter-match"]["status"] = "mismatch"
+                    elif mode == "wrong-owner":
+                        cases[descendant.replace("::branch_test::", "::another::")] = cases.pop(descendant)
+                    else:
+                        data["rust-suites"]["duplicate"] = {"testcases": {descendant: dict(cases[descendant])}}
+                    listing.write_text(json.dumps(data))
+                    self.assertTrue(check_catalog_fault_listing(root, listing, junit))
+            listing.write_text(original_listing)
+            for mode in ("missing", "extra", "duplicate", "skipped", "failure", "error", "missing-file"):
+                with self.subTest(junit=mode):
+                    tree = ET.fromstring(original_junit)
+                    case = next(case for case in tree if case.get("name") == descendant)
+                    if mode == "missing":
+                        tree.remove(case)
+                    elif mode in ("extra", "duplicate"):
+                        ET.SubElement(tree, "testcase", {"name": descendant if mode == "duplicate" else descendant + "_extra"})
+                    elif mode != "missing-file":
+                        ET.SubElement(case, mode)
+                    ET.ElementTree(tree).write(junit)
+                    if mode == "missing-file":
+                        junit.unlink()
+                    self.assertTrue(check_catalog_fault_listing(root, listing, junit))
+            junit.write_text(original_junit)
+            self.assertEqual(catalog_fault_test_names(root), names)
+            self.assertEqual(check_catalog_fault_listing(root, listing, junit), [])
+
+    def test_catalog_canonical_parents_reject_ambiguous_sources_and_declarations(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self.catalog_nested_feature_fixture(root)
+            src = root / "crates/e2e_test/src"
+            directory = Path("distributed/catalog_fault_acceptance_test/branch_test")
+            (src / directory / "mod.rs").write_text("mod child_test;\n")
+            self.assertIsNone(module_source(src, directory))
+            self.assertTrue(check_e2e_modules(root))
+            (src / directory / "mod.rs").unlink()
+            parent = root / CATALOG_FAULT_SOURCE
+            parent.write_text(parent.read_text() + "mod branch_test;\n")
+            self.assertFalse(declared(parent, "branch_test", root))
+            self.assertTrue(check_e2e_modules(root))
+
     def test_e2e_requires_registration(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -6435,6 +6961,13 @@ def main() -> int:
         except (OSError, KeyError, TypeError, ValueError, subprocess.SubprocessError) as error:
             print(f"ERROR: {error}", file=sys.stderr)
             return 1
+    if len(sys.argv) in (3, 4) and sys.argv[1] == "--check-catalog-fault":
+        errors = check_catalog_fault_listing(ROOT, Path(sys.argv[2]), Path(sys.argv[3]) if len(sys.argv) == 4 else None)
+        for error in errors:
+            print(f"ERROR: {error}", file=sys.stderr)
+        if not errors:
+            print("OK: Catalog feature tests are selected" + (" and executed" if len(sys.argv) == 4 else ""))
+        return 1 if errors else 0
     if len(sys.argv) == 3 and sys.argv[1] == "--check-core":
         errors = check_core_listing(ROOT, Path(sys.argv[2]))
         for error in errors:
@@ -6457,7 +6990,7 @@ def main() -> int:
         return 0
     if sys.argv[1:]:
         print(
-            "usage: check_test_wiring.py [--self-test | --check-core LISTING | --check-profile PROFILE LISTING | "
+            "usage: check_test_wiring.py [--self-test | --check-catalog-fault LISTING [JUNIT] | --check-core LISTING | --check-profile PROFILE LISTING | "
             "--update-profile PROFILE LISTING PLATFORM | --check-scanner-heal-release-bundle FILE | "
             "--check-scanner-heal-release-bundle-gate FILE GATE | "
             "--assemble-scanner-heal-release-bundle DESCRIPTOR [DESCRIPTOR ...] DIR | "

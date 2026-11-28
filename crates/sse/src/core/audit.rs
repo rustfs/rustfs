@@ -15,7 +15,7 @@
 //! Per-request summary of data-plane KMS use, attached to the request's audit entry.
 
 use crate::core::request::SseKmsPrincipal;
-use crate::error::SseError;
+use crate::error::{KmsDataPlaneFailure, SseError};
 use base64_simd::STANDARD as BASE64_STANDARD;
 use rustfs_kms::is_data_key_envelope;
 use rustfs_s3_types::S3ErrorCode;
@@ -207,33 +207,6 @@ pub(crate) fn kms_data_plane_error_class(error: &SseError) -> &'static str {
         S3ErrorCode::AccessDenied => "access_denied",
         S3ErrorCode::InvalidArgument | S3ErrorCode::InvalidRequest => "invalid_argument",
         _ => "sse_internal",
-    }
-}
-
-/// Carries a KMS failure class across the conversion to an S3-facing error.
-///
-/// The class is decided while the `KmsError` is still typed; re-deriving it from
-/// a rendered message downstream would be guesswork.
-#[derive(Debug)]
-pub(crate) struct KmsDataPlaneFailure {
-    pub(crate) class: &'static str,
-    pub(crate) source: Option<Box<dyn std::error::Error + Send + Sync>>,
-}
-
-impl std::fmt::Display for KmsDataPlaneFailure {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match &self.source {
-            Some(source) => source.fmt(formatter),
-            None => formatter.write_str(self.class),
-        }
-    }
-}
-
-impl std::error::Error for KmsDataPlaneFailure {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        self.source
-            .as_ref()
-            .map(|source| source.as_ref() as &(dyn std::error::Error + 'static))
     }
 }
 

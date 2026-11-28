@@ -23,6 +23,9 @@ use crate::disk::BUCKET_META_PREFIX;
 use crate::error::{Error, Result};
 use crate::object_api::WriteCompletion;
 use crate::runtime::sources as runtime_sources;
+use crate::storage_api_contracts::bucket::{
+    AccountNamespaceId, BucketHandle, BucketIncarnation, BucketKind, BucketPublicName, StorageBucketId,
+};
 use crate::store::ECStore;
 use byteorder::{BigEndian, ByteOrder, LittleEndian};
 use rustfs_gateway_types::cors_tagging::{PersistedCorsConfiguration as CORSConfiguration, PersistedTagging as Tagging};
@@ -551,6 +554,42 @@ pub fn table_bucket_catalog_metadata_prefix(bucket: &str) -> String {
     )
 }
 
+/// Internal physical names are reserved even if their identity record is missing.
+pub const BUCKET_VECTOR_STORAGE_PREFIX: &str = "rustfs-v-";
+
+#[derive(Debug)]
+struct BucketIdentityConfigError(&'static str);
+
+impl std::fmt::Display for BucketIdentityConfigError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.0)
+    }
+}
+impl std::error::Error for BucketIdentityConfigError {}
+
+fn identity_config_error(message: &'static str) -> Error {
+    Error::other(BucketIdentityConfigError(message))
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BucketIdentityRecordV1 {
+    version: u16,
+    kind: BucketKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    binding: Option<VectorBucketIdentityBindingV1>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct VectorBucketIdentityBindingV1 {
+    account_namespace_id: String,
+    region: String,
+    public_name: String,
+    storage_bucket_id: String,
+    bucket_incarnation_id: Uuid,
+}
+
 #[derive(Debug, Clone)]
 pub struct BucketMetadata {
     pub name: String,
@@ -580,6 +619,7 @@ pub struct BucketMetadata {
     pub public_access_block_config_xml: Vec<u8>,
     pub bucket_acl_config_json: Vec<u8>,
     pub table_bucket_config_json: Vec<u8>,
+    pub bucket_identity_config_json: Vec<u8>,
     pub durability_config_json: Vec<u8>,
     pub on_demand_migration_config_json: Vec<u8>,
     pub etag_config_json: Vec<u8>,
@@ -658,6 +698,7 @@ impl Default for BucketMetadata {
             public_access_block_config_xml: Default::default(),
             bucket_acl_config_json: Default::default(),
             table_bucket_config_json: Default::default(),
+            bucket_identity_config_json: Default::default(),
             durability_config_json: Default::default(),
             on_demand_migration_config_json: Default::default(),
             etag_config_json: Default::default(),
@@ -721,6 +762,7 @@ impl BucketMetadata {
     pub fn new_with_default_durability(name: &str) -> Self {
         let mut metadata = Self::new(name);
         metadata.durability_config_json = super::durability::new_bucket_durability_config_json(name);
+        metadata.bucket_identity_config_json = br#"{"version":1,"kind":"general"}"#.to_vec();
         metadata
     }
 
@@ -734,7 +776,7 @@ impl BucketMetadata {
     /// legacy migration path, which mints the sidecar first; it must not be
     /// rewritten by this migration.
     pub(crate) fn needs_bucket_creation_commit(&self) -> bool {
-        self.lock_enabled
+        (self.lock_enabled || self.name.starts_with(BUCKET_VECTOR_STORAGE_PREFIX))
             && !self.bucket_creation_committed
             && self.bucket_incarnation_sidecar
             && !self.bucket_incarnation_id.is_nil()
@@ -759,6 +801,286 @@ impl BucketMetadata {
     /// which must not be read as "no Object Lock".
     pub fn object_lock_checks_required(&self) -> bool {
         self.object_locking() || self.xml_config_unreadable(OBJECT_LOCK_CONFIG)
+    }
+
+    fn identity_record(&self) -> Result<Option<BucketIdentityRecordV1>> {
+        if self.bucket_identity_config_json.is_empty() {
+            return Ok(None);
+        }
+        let record: BucketIdentityRecordV1 = serde_json::from_slice(&self.bucket_identity_config_json).map_err(Error::other)?;
+        if record.version != 1 {
+            return Err(identity_config_error("unsupported bucket identity version"));
+        }
+        Ok(Some(record))
+    }
+
+    /// Resolve the persisted family without treating corrupt or missing managed identity as General.
+    /// # Errors
+    /// Rejects unsupported records, conflicting family markers and incomplete bindings.
+    pub fn bucket_kind(&self) -> Result<BucketKind> {
+        let reserved = self.name.starts_with(BUCKET_VECTOR_STORAGE_PREFIX);
+        let Some(record) = self.identity_record()? else {
+            if reserved {
+                return Err(identity_config_error("managed bucket identity is missing"));
+            }
+            return Ok(if self.table_bucket_enabled() {
+                BucketKind::Table
+            } else {
+                BucketKind::General
+            });
+        };
+        match record.kind {
+            BucketKind::Vector => {
+                let binding = record
+                    .binding
+                    .ok_or_else(|| identity_config_error("vector bucket binding is missing"))?;
+                if !reserved
+                    || self.table_bucket_enabled()
+                    || binding.storage_bucket_id != self.name
+                    || binding.bucket_incarnation_id != self.bucket_incarnation_id
+                {
+                    return Err(identity_config_error("vector bucket identity conflicts with metadata"));
+                }
+                let account = AccountNamespaceId::try_new(binding.account_namespace_id).map_err(Error::other)?;
+                BucketHandle::try_from_parts(
+                    BucketKind::Vector,
+                    account,
+                    binding.region,
+                    BucketPublicName::try_new(binding.public_name).map_err(Error::other)?,
+                    StorageBucketId::try_new(binding.storage_bucket_id).map_err(Error::other)?,
+                    BucketIncarnation::try_new(binding.bucket_incarnation_id).map_err(Error::other)?,
+                )
+                .map_err(Error::other)?;
+            }
+            BucketKind::General | BucketKind::Table => {
+                if reserved || record.binding.is_some() || (record.kind == BucketKind::Table) != self.table_bucket_enabled() {
+                    return Err(identity_config_error("bucket kind conflicts with existing configuration"));
+                }
+            }
+        }
+        Ok(record.kind)
+    }
+
+    /// Read an identity using deployment authority for legacy General/Table records.
+    /// # Errors
+    /// Rejects incomplete creation, stale account/region bindings, and missing incarnations.
+    pub fn bucket_handle(&self, account: &AccountNamespaceId, region: &str) -> Result<BucketHandle> {
+        let kind = self.bucket_kind()?;
+        if !self.bucket_incarnation_sidecar || self.bucket_incarnation_id.is_nil() {
+            return Err(identity_config_error("bucket incarnation has not been persisted"));
+        }
+        let (public_name, storage_id) = if kind == BucketKind::Vector {
+            if !self.bucket_creation_commit_record_present || !self.bucket_creation_committed {
+                return Err(identity_config_error("managed bucket creation is incomplete"));
+            }
+            self.validate_managed_configuration()?;
+            let binding = self
+                .identity_record()?
+                .and_then(|r| r.binding)
+                .ok_or_else(|| identity_config_error("vector bucket binding is missing"))?;
+            if binding.account_namespace_id != account.as_str() || binding.region != region {
+                return Err(identity_config_error("bucket deployment binding mismatch"));
+            }
+            (binding.public_name, binding.storage_bucket_id)
+        } else {
+            (self.name.clone(), self.name.clone())
+        };
+        BucketHandle::try_from_parts(
+            kind,
+            account.clone(),
+            region.to_owned(),
+            BucketPublicName::try_new(public_name).map_err(Error::other)?,
+            StorageBucketId::try_new(storage_id).map_err(Error::other)?,
+            BucketIncarnation::try_new(self.bucket_incarnation_id).map_err(Error::other)?,
+        )
+        .map_err(Error::other)
+    }
+
+    pub(crate) fn validate_managed_bucket_delete_identity(&self, expected: &BucketHandle) -> Result<()> {
+        if self.bucket_kind()? != BucketKind::Vector {
+            return Err(Error::PreconditionFailed);
+        }
+        let binding = self
+            .identity_record()?
+            .and_then(|record| record.binding)
+            .ok_or_else(|| identity_config_error("vector bucket binding is missing"))?;
+        let account = AccountNamespaceId::try_new(binding.account_namespace_id).map_err(Error::other)?;
+        let current = self.bucket_handle(&account, &binding.region)?;
+        if current != *expected {
+            return Err(Error::PreconditionFailed);
+        }
+        Ok(())
+    }
+
+    /// Compare the complete current binding with a previously resolved identity.
+    /// # Errors
+    /// Rejects changed identities, incomplete creation, and unsupported managed configuration.
+    pub fn validate_bucket_handle(&self, expected: &BucketHandle) -> Result<()> {
+        let current = self.bucket_handle(expected.account_namespace_id(), expected.region())?;
+        if current != *expected {
+            return Err(identity_config_error("bucket identity changed"));
+        }
+        Ok(())
+    }
+
+    /// Returns `true` when this metadata is a `BucketKind::Vector` creation intent
+    /// whose commit record has not yet been finalized (`!bucket_creation_committed`).
+    ///
+    /// # Errors
+    /// Fails closed when the persisted bucket kind / identity JSON is corrupt.
+    pub fn is_uncommitted_vector_creation_intent(&self) -> Result<bool> {
+        Ok(self.bucket_kind()? == BucketKind::Vector
+            && !self.bucket_incarnation_id.is_nil()
+            && (!self.bucket_creation_commit_record_present || !self.bucket_creation_committed))
+    }
+
+    #[cfg(any(test, feature = "test-util"))]
+    /// Simulates an in-flight uncommitted creation intent for concurrency regression tests.
+    #[doc(hidden)]
+    pub fn mark_creation_uncommitted_for_test(&mut self) {
+        self.bucket_creation_committed = false;
+        self.bucket_creation_commit_record_present = true;
+    }
+
+    /// Ensure authorization-relevant sub-configurations (`policy_config`,
+    /// `sse_config`, and `tagging_config`) decoded cleanly from disk bytes
+    /// rather than degrading unreadable bytes to `None`.
+    pub(crate) fn validate_managed_authoritative_configs(&self) -> Result<()> {
+        use rustfs_policy::policy::Validator as _;
+
+        if let Some(policy) =
+            ConfigState::of(&self.policy_config_json, &self.policy_config).require(&self.name, BUCKET_POLICY_CONFIG)?
+        {
+            policy.is_valid().map_err(Error::other)?;
+        }
+        ConfigState::of(&self.encryption_config_xml, &self.sse_config).require(&self.name, BUCKET_SSECONFIG)?;
+        ConfigState::of(&self.tagging_config_xml, &self.tagging_config).require(&self.name, BUCKET_TAGGING_CONFIG)?;
+        Ok(())
+    }
+
+    pub(crate) fn set_vector_identity(&mut self, identity: &BucketHandle) -> Result<()> {
+        if identity.kind() != BucketKind::Vector
+            || identity.storage_bucket_id().as_str() != self.name
+            || !self.name.starts_with(BUCKET_VECTOR_STORAGE_PREFIX)
+        {
+            return Err(identity_config_error("invalid managed bucket creation identity"));
+        }
+        self.bucket_incarnation_id = identity.incarnation().as_uuid();
+        self.bucket_identity_config_json = serde_json::to_vec(&BucketIdentityRecordV1 {
+            version: 1,
+            kind: BucketKind::Vector,
+            binding: Some(VectorBucketIdentityBindingV1 {
+                account_namespace_id: identity.account_namespace_id().as_str().to_owned(),
+                region: identity.region().to_owned(),
+                public_name: identity.public_name().as_str().to_owned(),
+                storage_bucket_id: self.name.clone(),
+                bucket_incarnation_id: self.bucket_incarnation_id,
+            }),
+        })
+        .map_err(Error::other)?;
+        Ok(())
+    }
+
+    pub(crate) fn managed_config_mutation_data(
+        &self,
+        mutation: crate::storage_api_contracts::bucket::ManagedBucketConfigMutation,
+    ) -> Result<Vec<u8>> {
+        use crate::storage_api_contracts::bucket::ManagedBucketConfigMutation;
+        use rustfs_gateway_types::cors_tagging::PersistedTag;
+        use rustfs_policy::policy::Validator as _;
+
+        let invalid = |message: &str| Error::InvalidArgument(self.name.clone(), String::new(), message.to_owned());
+        let tagging = match mutation {
+            ManagedBucketConfigMutation::PutPolicy { policy_json } => {
+                let policy: BucketPolicy =
+                    serde_json::from_slice(&policy_json).map_err(|_| invalid("Invalid bucket policy JSON"))?;
+                policy.is_valid().map_err(|error| invalid(&error.to_string()))?;
+                return Ok(policy_json);
+            }
+            ManagedBucketConfigMutation::DeletePolicy => return Ok(Vec::new()),
+            ManagedBucketConfigMutation::Tag { tags } => {
+                let mut merged = ConfigState::of(&self.tagging_config_xml, &self.tagging_config)
+                    .require(&self.name, BUCKET_TAGGING_CONFIG)?
+                    .cloned()
+                    .unwrap_or_default();
+                merged
+                    .tag_set
+                    .retain(|tag| !tag.key.as_ref().is_some_and(|key| tags.contains_key(key)));
+                merged.tag_set.extend(tags.into_iter().map(|(key, value)| PersistedTag {
+                    key: Some(key),
+                    value: Some(value),
+                }));
+                merged
+            }
+            ManagedBucketConfigMutation::Untag { keys } => {
+                let removed = keys
+                    .iter()
+                    .map(|key| PersistedTag {
+                        key: Some(key.clone()),
+                        value: Some(String::new()),
+                    })
+                    .collect::<Vec<_>>();
+                validate_tag_set_entries(&removed).map_err(invalid)?;
+                let mut merged = ConfigState::of(&self.tagging_config_xml, &self.tagging_config)
+                    .require(&self.name, BUCKET_TAGGING_CONFIG)?
+                    .cloned()
+                    .unwrap_or_default();
+                merged
+                    .tag_set
+                    .retain(|tag| !tag.key.as_ref().is_some_and(|key| keys.contains(key)));
+                merged
+            }
+        };
+        if tagging.tag_set.len() > MAX_BUCKET_TAGS {
+            return Err(invalid("Cannot have more than 50 tags per bucket"));
+        }
+        validate_tag_set_entries(&tagging.tag_set).map_err(invalid)?;
+        if tagging.tag_set.is_empty() {
+            Ok(Vec::new())
+        } else {
+            super::utils::serialize(&tagging).map_err(Error::other)
+        }
+    }
+
+    pub(crate) fn validate_managed_configuration(&self) -> Result<()> {
+        if !self.tagging_config_xml.is_empty() {
+            let tagging: Tagging = deserialize(&self.tagging_config_xml)?;
+            if tagging.tag_set.len() > MAX_BUCKET_TAGS {
+                return Err(identity_config_error("managed bucket tag count exceeds the limit"));
+            }
+            validate_tag_set_entries(&tagging.tag_set).map_err(identity_config_error)?;
+        }
+        if self.lock_enabled
+            || !self.object_lock_config_xml.is_empty()
+            || !self.versioning_config_xml.is_empty()
+            || !self.on_demand_migration_config_json.is_empty()
+            || !self.replication_config_xml.is_empty()
+            || !self.lifecycle_config_xml.is_empty()
+            || !self.bucket_targets_config_json.is_empty()
+        {
+            return Err(identity_config_error("unsupported managed bucket configuration"));
+        }
+        if !self.encryption_config_xml.is_empty() {
+            let encryption: ServerSideEncryptionConfiguration = deserialize(&self.encryption_config_xml)?;
+            if encryption.rules.len() != 1
+                || encryption.rules.iter().any(|rule| {
+                    rule.apply_server_side_encryption_by_default
+                        .as_ref()
+                        .is_none_or(|defaults| !matches!(defaults.sse_algorithm.as_str(), "AES256" | "aws:kms"))
+                })
+            {
+                return Err(identity_config_error("managed bucket encryption configuration is unsupported"));
+            }
+        }
+        let public_access: PublicAccessBlockConfiguration = deserialize(&self.public_access_block_config_xml)?;
+        if public_access.block_public_acls != Some(true)
+            || public_access.ignore_public_acls != Some(true)
+            || public_access.block_public_policy != Some(true)
+            || public_access.restrict_public_buckets != Some(true)
+        {
+            return Err(identity_config_error("managed bucket requires block public access"));
+        }
+        Ok(())
     }
 
     pub fn table_bucket_enabled(&self) -> bool {
@@ -836,6 +1158,7 @@ impl BucketMetadata {
     pub fn decode_from<R: Read>(&mut self, rd: &mut R) -> Result<()> {
         let mut fields = rmp::decode::read_map_len(rd)?;
         *self = Self::default();
+        let mut identity_record_present = false;
 
         while fields > 0 {
             fields -= 1;
@@ -849,6 +1172,16 @@ impl BucketMetadata {
                 "Name" => self.name = read_msgp_str(rd)?,
                 "Created" => self.created = read_msgp_time_value(rd)?,
                 "LockEnabled" => self.lock_enabled = read_msgp_bool(rd)?,
+                "BucketIdentityConfigJSON" => {
+                    if identity_record_present {
+                        return Err(identity_config_error("duplicate bucket identity field"));
+                    }
+                    identity_record_present = true;
+                    self.bucket_identity_config_json = read_msgp_bin(rd)?;
+                    if self.bucket_identity_config_json.is_empty() {
+                        return Err(identity_config_error("empty bucket identity field"));
+                    }
+                }
                 "BucketIncarnationID" => {
                     let bytes = read_msgp_bin(rd)?;
                     self.bucket_incarnation_id =
@@ -923,7 +1256,7 @@ impl BucketMetadata {
         // Preserve the absence of a legacy commit record across config rewrites.
         let commit_record_present = self.bucket_creation_commit_record_present || self.bucket_creation_committed;
         // Map size: MinIO fields (25) + RustFS extensions (23) + optional commit record.
-        let map_len: u32 = 48 + u32::from(commit_record_present);
+        let map_len: u32 = 48 + u32::from(commit_record_present) + u32::from(!self.bucket_identity_config_json.is_empty());
         rmp::encode::write_map_len(wr, map_len)?;
 
         // MinIO field order (same as Go struct)
@@ -937,6 +1270,9 @@ impl BucketMetadata {
         rmp::encode::write_bool(wr, self.lock_enabled)?;
 
         write_bin_field(wr, "BucketIncarnationID", self.bucket_incarnation_id.as_bytes())?;
+        if !self.bucket_identity_config_json.is_empty() {
+            write_bin_field(wr, "BucketIdentityConfigJSON", &self.bucket_identity_config_json)?;
+        }
 
         write_bin_field(wr, "PolicyConfigJSON", &self.policy_config_json)?;
         write_bin_field(wr, "NotificationConfigXML", &self.notification_config_xml)?;
@@ -1025,6 +1361,7 @@ impl BucketMetadata {
         let mut bm = Self::default();
         let mut cur = std::io::Cursor::new(buf);
         bm.decode_from(&mut cur)?;
+        bm.bucket_kind()?;
         Ok(bm)
     }
 
@@ -1144,6 +1481,24 @@ impl BucketMetadata {
                 "bucket configuration exceeds 2 MiB".to_owned(),
             ));
         }
+
+        if self.bucket_kind()? == BucketKind::Vector
+            && matches!(
+                config_file,
+                BUCKET_SSECONFIG
+                    | BUCKET_PUBLIC_ACCESS_BLOCK_CONFIG
+                    | BUCKET_TABLE_CONFIG
+                    | BUCKET_ON_DEMAND_MIGRATION_CONFIG
+                    | BUCKET_REPLICATION_CONFIG
+                    | BUCKET_TARGETS_FILE
+                    | BUCKET_LIFECYCLE_CONFIG
+                    | BUCKET_VERSIONING_CONFIG
+                    | OBJECT_LOCK_CONFIG
+            )
+        {
+            return Err(identity_config_error("managed bucket configuration is immutable or unsupported"));
+        }
+
         match config_file {
             BUCKET_POLICY_CONFIG => {
                 self.policy_config_json = data;
@@ -1261,6 +1616,14 @@ impl BucketMetadata {
                 self.bucket_acl_config_updated_at = updated;
             }
             BUCKET_TABLE_CONFIG => {
+                if self.bucket_kind()? == BucketKind::Vector {
+                    return Err(identity_config_error("vector bucket cannot become a table bucket"));
+                }
+                self.bucket_identity_config_json = if data.is_empty() {
+                    br#"{"version":1,"kind":"general"}"#.to_vec()
+                } else {
+                    br#"{"version":1,"kind":"table"}"#.to_vec()
+                };
                 self.table_bucket_config_json = data;
                 self.table_bucket_config_updated_at = updated;
             }
@@ -1418,6 +1781,7 @@ impl BucketMetadata {
     /// `rustfs_bucket_metadata_parse_failed_total`, reflected in
     /// `rustfs_bucket_metadata_unparsable_current`, and logged at error level.
     pub(super) fn parse_all_configs(&mut self) -> Result<()> {
+        self.bucket_kind()?;
         if let Err(e) = self.parse_policy_config() {
             tracing::warn!(
                 event = "bucket_metadata_parse_failed",
@@ -1738,7 +2102,9 @@ pub(crate) async fn load_bucket_metadata_parse_with_presence(
 
     bm.default_timestamps();
 
-    if parse {
+    // An absent reserved name carries only a presence result. A fabricated
+    // default cannot establish a managed identity or be interpreted as General.
+    if parse && (persisted || !bucket.starts_with(BUCKET_VECTOR_STORAGE_PREFIX)) {
         bm.parse_all_configs()?;
     }
 
@@ -2868,5 +3234,155 @@ mod test {
             bm.policy_config.is_none(),
             "policy_config should be None after JSON cleared (e.g. policy deleted)"
         );
+    }
+}
+
+#[cfg(test)]
+mod bucket_identity_tests {
+    use super::*;
+
+    fn vector_identity() -> BucketHandle {
+        BucketHandle::try_from_parts(
+            BucketKind::Vector,
+            AccountNamespaceId::empty(),
+            "us-east-1".to_owned(),
+            BucketPublicName::try_new("vectors".to_owned()).expect("valid name"),
+            StorageBucketId::try_new("rustfs-v-012345678901234567890123456789012345678901234567".to_owned()).expect("valid ID"),
+            BucketIncarnation::try_new(Uuid::new_v4()).expect("non-nil incarnation"),
+        )
+        .expect("valid identity")
+    }
+
+    fn committed_metadata(identity: &BucketHandle) -> BucketMetadata {
+        let mut metadata = BucketMetadata::new(identity.storage_bucket_id().as_str());
+        metadata.set_vector_identity(identity).expect("install identity");
+        metadata.bucket_incarnation_sidecar = true;
+        metadata.bucket_creation_committed = true;
+        metadata.bucket_creation_commit_record_present = true;
+        metadata.encryption_config_xml = b"<ServerSideEncryptionConfiguration><Rule><ApplyServerSideEncryptionByDefault><SSEAlgorithm>AES256</SSEAlgorithm></ApplyServerSideEncryptionByDefault></Rule></ServerSideEncryptionConfiguration>".to_vec();
+        metadata.public_access_block_config_xml = b"<PublicAccessBlockConfiguration><BlockPublicAcls>true</BlockPublicAcls><IgnorePublicAcls>true</IgnorePublicAcls><BlockPublicPolicy>true</BlockPublicPolicy><RestrictPublicBuckets>true</RestrictPublicBuckets></PublicAccessBlockConfiguration>".to_vec();
+        metadata
+    }
+
+    #[test]
+    fn bucket_identity_msgpack_json_roundtrip() {
+        let identity = vector_identity();
+        let metadata = committed_metadata(&identity);
+        metadata.validate_bucket_handle(&identity).expect("valid committed binding");
+        let bytes = metadata.marshal_msg().expect("encode metadata");
+        let mut decoded = BucketMetadata::unmarshal(&bytes).expect("decode metadata");
+        assert_eq!(decoded.bucket_identity_config_json, metadata.bucket_identity_config_json);
+        assert_eq!(decoded.bucket_incarnation_id, identity.incarnation().as_uuid());
+        assert!(decoded.bucket_creation_committed);
+        assert!(
+            decoded.validate_bucket_handle(&identity).is_err(),
+            "wire bytes do not prove the sidecar exists"
+        );
+        decoded.bucket_incarnation_sidecar = true;
+        assert_eq!(
+            decoded
+                .bucket_handle(identity.account_namespace_id(), identity.region())
+                .expect("validated handle"),
+            identity
+        );
+    }
+
+    #[test]
+    fn bucket_identity_unencrypted_roundtrip_preserves_empty_configuration() {
+        let identity = vector_identity();
+        let mut metadata = committed_metadata(&identity);
+        metadata.encryption_config_xml.clear();
+        metadata
+            .validate_bucket_handle(&identity)
+            .expect("unencrypted committed identity");
+        let bytes = metadata.marshal_msg().expect("encode unencrypted metadata");
+        let mut decoded = BucketMetadata::unmarshal(&bytes).expect("decode unencrypted metadata");
+        decoded.bucket_incarnation_sidecar = true;
+        decoded
+            .validate_bucket_handle(&identity)
+            .expect("unencrypted decoded identity");
+        assert!(decoded.encryption_config_xml.is_empty());
+        assert!(decoded.sse_config.is_none());
+        assert!(
+            decoded
+                .update_config(BUCKET_SSECONFIG, metadata.encryption_config_xml)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn bucket_identity_legacy_general_and_table_remain_readable() {
+        let mut metadata = BucketMetadata::new("legacy-bucket");
+        assert_eq!(metadata.bucket_kind().expect("legacy general"), BucketKind::General);
+        metadata.table_bucket_config_json = b"legacy-marker".to_vec();
+        assert_eq!(metadata.bucket_kind().expect("legacy table"), BucketKind::Table);
+        let decoded = BucketMetadata::unmarshal(&metadata.marshal_msg().expect("encode legacy")).expect("read legacy");
+        assert_eq!(decoded.bucket_kind().expect("legacy table kind"), BucketKind::Table);
+        assert!(decoded.bucket_identity_config_json.is_empty());
+        let fresh = BucketMetadata::new_with_default_durability("new-bucket");
+        assert_eq!(fresh.bucket_kind().expect("explicit general kind"), BucketKind::General);
+        assert!(!fresh.bucket_identity_config_json.is_empty());
+    }
+
+    #[test]
+    fn bucket_identity_rejects_corruption_and_conflicts() {
+        let identity = vector_identity();
+        let metadata = committed_metadata(&identity);
+        for bytes in [
+            b"".as_slice(),
+            b"{}",
+            b"not-json",
+            br#"{"version":2,"kind":"vector"}"#,
+            br#"{"version":1,"kind":"unknown"}"#,
+            br#"{"version":1,"kind":"vector"}"#,
+            br#"{"version":1,"kind":"general"}"#,
+        ] {
+            let mut invalid = metadata.clone();
+            invalid.bucket_identity_config_json = bytes.to_vec();
+            assert!(invalid.bucket_kind().is_err(), "invalid identity bytes must fail closed");
+        }
+        let mut invalid = metadata.clone();
+        invalid.name = "different-bucket".into();
+        assert!(invalid.bucket_kind().is_err());
+        let mut invalid = metadata.clone();
+        invalid.bucket_incarnation_id = Uuid::new_v4();
+        assert!(invalid.validate_bucket_handle(&identity).is_err());
+        let mut invalid = metadata.clone();
+        invalid.bucket_creation_committed = false;
+        assert!(invalid.validate_bucket_handle(&identity).is_err());
+        let mut invalid = metadata.clone();
+        invalid.bucket_incarnation_sidecar = false;
+        assert!(invalid.validate_bucket_handle(&identity).is_err());
+        let mut record: serde_json::Value = serde_json::from_slice(&metadata.bucket_identity_config_json).expect("identity JSON");
+        record["binding"]["bucket_incarnation_id"] = serde_json::json!(Uuid::nil());
+        invalid.bucket_identity_config_json = serde_json::to_vec(&record).expect("invalid binding JSON");
+        invalid.bucket_incarnation_id = Uuid::nil();
+        assert!(invalid.bucket_kind().is_err());
+    }
+
+    #[test]
+    fn bucket_identity_rejects_duplicate_messagepack_fields() {
+        let mut bytes = Vec::new();
+        rmp::encode::write_map_len(&mut bytes, 2).expect("map header");
+        for _ in 0..2 {
+            write_bin_field(&mut bytes, "BucketIdentityConfigJSON", br#"{"version":1,"kind":"general"}"#)
+                .expect("identity field");
+        }
+        assert!(BucketMetadata::unmarshal(&bytes).is_err());
+    }
+
+    #[test]
+    fn bucket_identity_rejects_unsupported_managed_configuration() {
+        let identity = vector_identity();
+        let metadata = committed_metadata(&identity);
+        let mut invalid = metadata.clone();
+        invalid.on_demand_migration_config_json = b"{}".to_vec();
+        assert!(invalid.validate_bucket_handle(&identity).is_err());
+        let mut invalid = metadata.clone();
+        invalid.public_access_block_config_xml.clear();
+        assert!(invalid.validate_bucket_handle(&identity).is_err());
+        let mut invalid = metadata;
+        assert!(invalid.update_config(BUCKET_SSECONFIG, Vec::new()).is_err());
+        assert!(invalid.update_config(BUCKET_TABLE_CONFIG, b"marker".to_vec()).is_err());
     }
 }

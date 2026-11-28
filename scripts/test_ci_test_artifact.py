@@ -343,10 +343,20 @@ class NextestSetupScriptTests(unittest.TestCase):
 
         workflow = workflow_document((artifact.ROOT / ".github/workflows/ci.yml").read_text())
 
-        def commands(job):
+        def commands(job, environment):
             result = []
             for step in workflow["jobs"][job]["steps"]:
+                variables = {
+                    name: str(value).replace("${{ runner.temp }}", environment["RUNNER_TEMP"])
+                                    .replace("${{ github.workspace }}", environment["GITHUB_WORKSPACE"])
+                    for name, value in step.get("env", {}).items()
+                }
                 for line in step.get("run", "").replace("\\\n", " ").splitlines():
+                    name, separator, _ = line.strip().partition("=")
+                    if separator and name.isidentifier():
+                        words = shlex.split(line)
+                        if len(words) == 1:
+                            variables[name] = words[0].split("=", 1)[1]
                     if "cargo nextest " not in line:
                         continue
                     words = shlex.split(line)
@@ -354,7 +364,12 @@ class NextestSetupScriptTests(unittest.TestCase):
                         if words[start:start + 2] == ["cargo", "nextest"]:
                             end = next((index for index in range(start, len(words))
                                         if words[index] in ("|", ">", "2>&1")), len(words))
-                            result.append(words[start:end])
+                            command_variables = variables.copy()
+                            for word in words[:start]:
+                                name, separator, value = word.partition("=")
+                                if separator and name.isidentifier():
+                                    command_variables[name] = value
+                            result.append((words[start:end], command_variables))
                             break
             return result
 
@@ -368,8 +383,10 @@ class NextestSetupScriptTests(unittest.TestCase):
             )
             (root / "rust-toolchain.toml").write_text((artifact.ROOT / "rust-toolchain.toml").read_text())
             (root / "src/lib.rs").write_text(
+                'mod app { mod vector_usecase { mod tests { mod sdk_acceptance { mod encryption {\n'
                 '#[test]\nfn setup_is_applied() {\n'
                 '    assert_eq!(std::env::var("EVIDENCE_SETUP").unwrap(), "ready");\n}\n'
+                '} } } } }\n'
                 'mod lifecycle_transition_api_test {\n'
                 '    #[test]\n    #[ignore]\n    fn ignored_case() {}\n}\n'
             )
@@ -379,7 +396,7 @@ class NextestSetupScriptTests(unittest.TestCase):
                 '[scripts.setup.prepare]\ncommand = ["sh", "prepare.sh"]\n'
                 '[[profile.default.scripts]]\nfilter = "all()"\nsetup = "prepare"\n'
                 + ''.join(f'[profile.{profile}.junit]\npath = "junit.xml"\n'
-                          for profile in ("default", "ci", "e2e-smoke", "e2e-full", "core-contract"))
+                          for profile in ("default", "ci", "e2e-smoke", "e2e-full", "core-contract", "vector-kms"))
             )
             script = root / "prepare.sh"
             script.write_text('echo EVIDENCE_SETUP=ready >> "$NEXTEST_ENV"\n')
@@ -387,8 +404,9 @@ class NextestSetupScriptTests(unittest.TestCase):
                            "GITHUB_WORKSPACE": str(root), "RUNNER_TEMP": str(root),
                            "NEXTEST_ARCHIVE": str(root / "e2e-tests.tar.zst")}
 
-            def nextest(*arguments):
-                return subprocess.run(["cargo", "nextest", *arguments], cwd=root, env=environment,
+            def nextest(*arguments, variables=None):
+                return subprocess.run(["cargo", "nextest", *arguments], cwd=root,
+                                      env={**environment, **(variables or {})},
                                       capture_output=True, text=True, timeout=120)
 
             archive = root / "built-tests.tar.zst"
@@ -402,19 +420,27 @@ class NextestSetupScriptTests(unittest.TestCase):
                     shutil.rmtree(root / "target")
                     consumer_archive = root / ("workspace-tests.tar.zst" if job == "workspace-tests" else "e2e-tests.tar.zst")
                     shutil.copyfile(archive, consumer_archive)
-                    selected = [[Template(word).substitute(environment) for word in command] for command in commands(job)]
-                    self.assertEqual(len(selected), 3 if job == "workspace-tests" else 2)
-                    self.assertEqual(selected[0][:3], ["cargo", "nextest", "list"])
-                    listed = nextest(*selected[0][2:])
+                    selected = [([Template(word).substitute({**environment, **variables}) for word in command], variables)
+                                for command, variables in commands(job, environment)]
+                    self.assertEqual(len(selected), 5 if job == "workspace-tests" else 2)
+                    self.assertEqual(selected[0][0][:3], ["cargo", "nextest", "list"])
+                    listed = nextest(*selected[0][0][2:], variables=selected[0][1])
                     self.assertEqual(listed.returncode, 0, listed.stderr)
                     listing_file.write_text(listed.stdout)
                     self.assertTrue((root / "target/nextest/binaries-metadata.json").is_file())
                     # The remaining commands cannot extract again, even for ignored tests.
                     consumer_archive.unlink()
-                    for command in selected[1:]:
-                        executed = nextest(*command[2:])
+                    for command, variables in selected[1:]:
+                        executed = nextest(*command[2:], variables=variables)
                         self.assertEqual(executed.returncode, 0, executed.stderr)
                         profile = command[command.index("--profile") + 1]
+                        if profile == "vector-kms":
+                            self.assertEqual(variables["RUSTFS_KMS_ENFORCE_SSE_KEY_POLICY"], "true")
+                            self.assertIn("-E", command)
+                        if command[2] == "list":
+                            self.assertEqual(profile, "vector-kms")
+                            listing_file.write_text(executed.stdout)
+                            continue
                         report = root / f"target/nextest/{profile}/junit.xml"
                         suites = ET.parse(report).getroot().findall("testsuite")
                         self.assertIn("@setup-script:prepare", [suite.get("name") for suite in suites])

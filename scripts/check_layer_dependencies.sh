@@ -175,10 +175,13 @@ run_layer_model_self_tests() {
   assert_dependency_direction 'reverse' "$storage_source" "$(classify_target_layer storage::legacy_edge)"
   assert_dedicated_test_file 'yes' rustfs/src/app/lifecycle_transition_api_test.rs
   assert_dedicated_test_file 'yes' rustfs/src/app/lifecycle_transition_api_test/put.rs
+  assert_dedicated_test_file 'yes' rustfs/src/app/vector_access_tests.rs
+  assert_dedicated_test_file 'yes' rustfs/src/app/vector_usecase/tests.rs
   assert_dedicated_test_file 'no' rustfs/src/app/lifecycle_transition_api_test_support.rs
   assert_dedicated_test_file 'no' rustfs/src/app/lifecycle_transition_api.rs
   assert_dedicated_test_file 'no' rustfs/src/app/bucket_usecase/cors.rs
   assert_dedicated_test_file 'no' rustfs/src/storage/legacy_edge/bucket_core.rs
+  run_inline_crate_path_self_tests
 }
 
 assert_source_layer() {
@@ -326,22 +329,39 @@ normalize_import_path() {
 }
 
 # The guard is file-scoped: dedicated test modules are excluded, while inline
-# #[cfg(test)] imports remain subject to the source file's layer. The
-# lifecycle_transition_api_test/ directory is where a mechanical split of
-# lifecycle_transition_api_test.rs moves its tests (rustfs/backlog#2765).
+# #[cfg(test)] imports remain subject to the source file's layer. Production
+# inline `crate::<module>::...` path scanning strips comments, string literals,
+# and unconditional `#[cfg(test)]` items. The lifecycle_transition_api_test/
+# directory is where a mechanical split of lifecycle_transition_api_test.rs
+# moves its tests (rustfs/backlog#2765).
 is_dedicated_test_file() {
   local file="$1"
 
-  [[ "$file" == *_test.rs ]] || [[ "$file" == */tests/* ]] ||
+  [[ "$file" == *_test.rs ]] || [[ "$file" == *_tests.rs ]] ||
+    [[ "$file" == */tests.rs ]] || [[ "$file" == */tests/* ]] ||
     [[ "$file" == rustfs/src/app/lifecycle_transition_api_test/* ]]
 }
 
+list_rust_sources() {
+  if command -v rg >/dev/null 2>&1; then
+    (cd "$ROOT_DIR" && rg --files -g '*.rs' rustfs/src | LC_ALL=C sort)
+  else
+    (cd "$ROOT_DIR" && find rustfs/src -type f -name '*.rs' | sed 's#^\./##' | LC_ALL=C sort)
+  fi
+}
+
 emit_crate_use_statements() {
-  (cd "$ROOT_DIR" && rg --files -g '*.rs' rustfs/src | while IFS= read -r file; do
+  local -a files=()
+  local file
+  while IFS= read -r file; do
     if is_dedicated_test_file "$file"; then
       continue
     fi
-    perl -0777 -ne '
+    files+=("$file")
+  done < <(list_rust_sources)
+
+  if (( ${#files[@]} > 0 )); then
+    (cd "$ROOT_DIR" && perl -0777 -ne '
       while (/\buse\s+crate::.*?;/sg) {
         my $statement = $&;
         my $line = substr($_, 0, $-[0]) =~ tr/\n//;
@@ -349,8 +369,249 @@ emit_crate_use_statements() {
         $statement =~ s/\s+/ /g;
         print "$ARGV:$line:$statement\n";
       }
-    ' "$file"
-  done)
+    ' "${files[@]}")
+  fi
+}
+
+extract_inline_crate_paths() {
+  perl - "$@" <<'PERL'
+use strict;
+use warnings;
+
+sub is_test_cfg {
+    my ($cond) = @_;
+    $cond =~ s/^\s+|\s+$//g;
+    return 1 if $cond eq 'test';
+    if ($cond =~ /^all\s*\(([\s\S]*)\)$/) {
+        my $inner = $1;
+        my ($depth, $part) = (0, '');
+        my @parts;
+        for my $ch (split //, $inner) {
+            if ($ch eq '(') {
+                $depth++;
+                $part .= $ch;
+            } elsif ($ch eq ')') {
+                $depth--;
+                $part .= $ch;
+            } elsif ($ch eq ',' && $depth == 0) {
+                $part =~ s/^\s+|\s+$//g;
+                push @parts, $part;
+                $part = '';
+            } else {
+                $part .= $ch;
+            }
+        }
+        $part =~ s/^\s+|\s+$//g;
+        push @parts, $part if length $part;
+        return 1 if grep { $_ eq 'test' } @parts;
+    }
+    return 0;
+}
+
+sub strip_comments_and_strings {
+    my ($src) = @_;
+    $src =~ s{
+        //[^\n]*
+      | /\*[\s\S]*?\*/
+      | (?:br|rb|cr|rc|r)(\#*)"[\s\S]*?"\1
+      | (?:b|c)?"(?:\\[\s\S]|[^"\\])*"
+      | ('[A-Za-z_][A-Za-z0-9_]*)(?!')
+      | b?'(?:\\[^'\n]+|[^'\\\n])'
+    }{
+        if (defined $2) {
+            $2;
+        } else {
+            my $matched = $&;
+            $matched =~ s/[^\n]/ /g;
+            $matched;
+        }
+    }gex;
+    return $src;
+}
+
+sub strip_cfg_test_items {
+    my ($src) = @_;
+    my $len = length($src);
+    my $pos = 0;
+    my $out = '';
+    while ($pos < $len) {
+        pos($src) = $pos;
+        if ($src !~ /\#\s*\[\s*cfg\s*\(([^)\]]*(?:\([^)\]]*\)[^)\]]*)*)\)\s*\]/g) {
+            $out .= substr($src, $pos);
+            last;
+        }
+        my ($m_start, $m_end, $cond) = ($-[0], $+[0], $1);
+        if (!is_test_cfg($cond)) {
+            $out .= substr($src, $pos, $m_end - $pos);
+            $pos = $m_end;
+            next;
+        }
+        $out .= substr($src, $pos, $m_start - $pos);
+        my $attr = substr($src, $m_start, $m_end - $m_start);
+        $attr =~ s/[^\n]/ /g;
+        $out .= $attr;
+        my $j = $m_end;
+        while ($j < $len) {
+            while ($j < $len && substr($src, $j, 1) =~ /\s/) {
+                my $ws = substr($src, $j, 1);
+                $out .= ($ws eq "\n" ? "\n" : ' ');
+                $j++;
+            }
+            if ($j + 1 < $len && substr($src, $j, 2) eq '#[') {
+                my $b_depth = 0;
+                while ($j < $len) {
+                    my $c = substr($src, $j, 1);
+                    $out .= ($c eq "\n" ? "\n" : ' ');
+                    $j++;
+                    if ($c eq '[') {
+                        $b_depth++;
+                    } elsif ($c eq ']') {
+                        $b_depth--;
+                        last if $b_depth <= 0;
+                    }
+                }
+                next;
+            }
+            last;
+        }
+        my ($p_d, $b_d, $c_d, $saw_brace) = (0, 0, 0, 0);
+        while ($j < $len) {
+            my $c = substr($src, $j, 1);
+            $out .= ($c eq "\n" ? "\n" : ' ');
+            $j++;
+            if ($c eq '(') {
+                $p_d++;
+            } elsif ($c eq ')') {
+                $p_d-- if $p_d > 0;
+            } elsif ($c eq '[') {
+                $b_d++;
+            } elsif ($c eq ']') {
+                $b_d-- if $b_d > 0;
+            } elsif ($c eq '{') {
+                $c_d++;
+                $saw_brace = 1;
+            } elsif ($c eq '}') {
+                $c_d--;
+                last if $saw_brace && $c_d <= 0 && $p_d == 0 && $b_d == 0;
+            } elsif (($c eq ';' || $c eq ',') && !$saw_brace && $c_d == 0 && $p_d == 0 && $b_d == 0) {
+                last;
+            }
+        }
+        $pos = $j;
+    }
+    return $out;
+}
+
+for my $file (@ARGV) {
+    open my $fh, '<', $file or die "failed to read $file: $!";
+    my $raw = do { local $/; <$fh> };
+    close $fh;
+
+    my $clean = strip_comments_and_strings($raw);
+    my $prod  = strip_cfg_test_items($clean);
+    $prod =~ s{\buse\s+crate::[^;]*;}{
+        my $u = $&;
+        $u =~ s/[^\n]/ /g;
+        $u;
+    }ges;
+
+    while ($prod =~ /(?<![A-Za-z0-9_:])crate::([A-Za-z_][A-Za-z0-9_]*(?:::[A-Za-z_][A-Za-z0-9_]*)*)/g) {
+        my $symbol = $1;
+        my $line = (substr($prod, 0, $-[0]) =~ tr/\n//) + 1;
+        print "$file:$line:$symbol\n";
+    }
+}
+PERL
+}
+
+emit_crate_inline_paths() {
+  local -a files=()
+  local file
+  while IFS= read -r file; do
+    if is_dedicated_test_file "$file"; then
+      continue
+    fi
+    files+=("$file")
+  done < <(list_rust_sources)
+
+  if (( ${#files[@]} > 0 )); then
+    (cd "$ROOT_DIR" && extract_inline_crate_paths "${files[@]}")
+  fi
+}
+
+run_inline_crate_path_self_tests() {
+  local probe_dir probe_file output app_layer target_layer
+  probe_dir="$(mktemp -d)"
+  probe_file="${probe_dir}/probe.rs"
+  cat >"$probe_file" <<'EOF'
+use crate::startup_services::ImportedOnly;
+// crate::startup_services::CommentIgnored
+const LITERAL: &str = "crate::startup_services::StringIgnored";
+const RAW_LITERAL: &str = r#"crate::startup_background::RawStringIgnored"#;
+
+struct Holder<'a> {
+    #[cfg(test)]
+    test_only_field: &'a crate::startup_services::TestFieldIgnored,
+    live_ref: &'a crate::startup_services::ManagedLanceObjects,
+}
+
+fn call_inline<'a>(_input: &'a str) {
+    let _ = crate::startup_background::background_node_admission();
+    let _ = crate::table_catalog::Namespace::parse("indexes");
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn linux_prod_item() {
+    let _ = crate::server::http::active_requests();
+}
+
+#[cfg(test)]
+fn unit_test_helper() {
+    let _ = crate::startup_services::TestHelperIgnored::run();
+}
+
+#[cfg(all(test, unix))]
+mod unix_tests {
+    pub(super) fn helper() {
+        let _ = crate::startup_background::UnixTestIgnored::run();
+    }
+}
+EOF
+  output="$(extract_inline_crate_paths "$probe_file")"
+  rm -rf "$probe_dir"
+
+  for expected in \
+    "startup_services::ManagedLanceObjects" \
+    "startup_background::background_node_admission" \
+    "table_catalog::Namespace::parse" \
+    "server::http::active_requests"
+  do
+    if ! grep -Fq ":${expected}" <<<"$output"; then
+      printf 'Layer dependency guard inline self-test failed: missing %s in:\n%s\n' "$expected" "$output" >&2
+      exit 1
+    fi
+  done
+
+  for forbidden in \
+    "ImportedOnly" \
+    "CommentIgnored" \
+    "StringIgnored" \
+    "RawStringIgnored" \
+    "TestFieldIgnored" \
+    "TestHelperIgnored" \
+    "UnixTestIgnored"
+  do
+    if grep -Fq "$forbidden" <<<"$output"; then
+      printf 'Layer dependency guard inline self-test failed: unexpectedly matched %s in:\n%s\n' "$forbidden" "$output" >&2
+      exit 1
+    fi
+  done
+
+  app_layer="$(classify_source_layer rustfs/src/app/vector_usecase/dataset.rs)"
+  target_layer="$(classify_target_layer startup_services::ManagedLanceObjects)"
+  assert_dependency_direction 'reverse' "$app_layer" "$target_layer"
+  assert_dependency_direction 'reverse' "$app_layer" "$(classify_target_layer startup_background::background_node_admission)"
+  assert_dependency_direction 'allowed' "$app_layer" "$(classify_target_layer table_catalog::Namespace::parse)"
 }
 
 write_baseline_file() {
@@ -547,6 +808,33 @@ while IFS= read -r line; do
     fi
   done < <(normalize_import_path "$text")
 done < <(emit_crate_use_statements)
+
+while IFS= read -r line; do
+  file="${line%%:*}"
+  rest="${line#*:}"
+  lineno="${rest%%:*}"
+  import_path="${rest#*:}"
+
+  [[ -z "$import_path" ]] && continue
+
+  source_layer="$(classify_source_layer "$file")"
+  if [[ "$source_layer" == "unknown" ]]; then
+    continue
+  fi
+
+  target_layer="$(classify_target_layer "$import_path")"
+  if [[ "$target_layer" == "unknown" ]]; then
+    continue
+  fi
+
+  if [[ "$source_layer" != "$target_layer" ]]; then
+    printf '%s->%s\n' "$source_layer" "$target_layer" >>"$EDGES_RAW"
+  fi
+
+  if is_reverse_dependency "$source_layer" "$target_layer"; then
+    printf 'dep|%s|%s->%s|crate::%s\n' "$file" "$source_layer" "$target_layer" "$import_path" >>"$VIOLATIONS_RAW"
+  fi
+done < <(emit_crate_inline_paths)
 
 sort -u "$VIOLATIONS_RAW" >"${TMP_DIR}/violations_sorted.txt"
 

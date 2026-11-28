@@ -316,6 +316,18 @@ fn validate_identity_openid_config(config: &ServerConfig) -> S3Result<()> {
     Ok(())
 }
 
+async fn validate_vector_maintenance_config(context: Option<&AppContext>, config: &ServerConfig) -> S3Result<()> {
+    let config = crate::table_catalog::VectorMaintenanceRuntimeConfig::from_server_config(config)
+        .map_err(|error| invalid_request(format!("invalid Vector maintenance config: {error}")))?;
+    if config.enabled {
+        let context = context.ok_or_else(|| invalid_request("Vector maintenance requires an initialized IAM instance"))?;
+        crate::app::vector_usecase::maintenance::resolve_identity(context, &config.execution_account)
+            .await
+            .map_err(S3Error::from)?;
+    }
+    Ok(())
+}
+
 pub(crate) async fn prepare_server_config_for_context(
     context: Option<&AppContext>,
     config: &ServerConfig,
@@ -333,8 +345,12 @@ pub(crate) async fn prepare_server_config_for_context(
         Some(IDENTITY_OPENID_SUB_SYS) => validate_identity_openid_config(config)?,
         Some(SCANNER_SUB_SYS | HEAL_SUB_SYS) => rustfs_scanner::validate_scanner_runtime_config(config)
             .map_err(|err| invalid_request(format!("invalid scanner config: {err}")))?,
+        Some(rustfs_config::S3VECTORS_MAINTENANCE_SUB_SYS) => {
+            validate_vector_maintenance_config(context, config).await?;
+        }
         Some(_) => {}
         None => {
+            validate_vector_maintenance_config(context, config).await?;
             prepared.storage_class = Some(prepare_storage_class_runtime_config_for_context(context, config).await?);
             for sub_system in NOTIFY_SUB_SYSTEMS {
                 validate_notify_subsystem_config(config, sub_system)?;
@@ -760,6 +776,56 @@ pub async fn signal_config_snapshot_reload_checked() -> S3Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn vector_maintenance_config_preflight_is_restart_required_and_instance_bound() {
+        use rustfs_config::server_config::KV;
+        use rustfs_config::{S3VECTORS_MAINTENANCE_EXECUTION_ACCOUNT, S3VECTORS_MAINTENANCE_SUB_SYS};
+        let mut config = ServerConfig::new();
+        let values = KVS(vec![
+            KV {
+                key: ENABLE_KEY.into(),
+                value: "off".into(),
+                hidden_if_empty: false,
+            },
+            KV {
+                key: S3VECTORS_MAINTENANCE_EXECUTION_ACCOUNT.into(),
+                value: "maintenance-user".into(),
+                hidden_if_empty: false,
+            },
+        ]);
+        config
+            .0
+            .insert(S3VECTORS_MAINTENANCE_SUB_SYS.into(), HashMap::from([(DEFAULT_DELIMITER.into(), values)]));
+        validate_vector_maintenance_config(None, &config)
+            .await
+            .expect("disabled maintenance has no IAM dependency");
+        assert!(!is_dynamic_config_subsystem(S3VECTORS_MAINTENANCE_SUB_SYS));
+        assert!(dynamic_config_reload_plan(S3VECTORS_MAINTENANCE_SUB_SYS).is_none());
+        config
+            .0
+            .get_mut(S3VECTORS_MAINTENANCE_SUB_SYS)
+            .expect("subsystem")
+            .get_mut(DEFAULT_DELIMITER)
+            .expect("target")
+            .insert(ENABLE_KEY.into(), "on".into());
+        assert!(
+            validate_vector_maintenance_config(None, &config).await.is_err(),
+            "enabled maintenance requires its actual IAM instance"
+        );
+        config
+            .0
+            .get_mut(S3VECTORS_MAINTENANCE_SUB_SYS)
+            .expect("subsystem")
+            .get_mut(DEFAULT_DELIMITER)
+            .expect("target")
+            .insert(ENABLE_KEY.into(), "true".into());
+        assert!(
+            validate_vector_maintenance_config(None, &config).await.is_err(),
+            "only explicit on/off values are accepted"
+        );
+    }
+
     use crate::admin::runtime_sources::{
         IamInterface, KmsInterface, NotificationSystemInterface, ServerConfigInterface, StorageClassInterface,
     };

@@ -76,6 +76,7 @@ pub struct AppContext {
     object_data_cache: Arc<ObjectDataCacheAdapter>,
     object_traffic_health: Arc<ObjectTrafficHealth>,
     table_catalog_registration_cache: crate::table_catalog::TableCatalogRegistrationCache,
+    vector_numeric_proof_cache: Arc<crate::vector::lance::LanceNumericProofCache>,
 }
 
 impl AppContext {
@@ -127,6 +128,7 @@ impl AppContext {
             object_data_cache,
             object_traffic_health: Arc::new(ObjectTrafficHealth::from_env()),
             table_catalog_registration_cache: crate::table_catalog::TableCatalogRegistrationCache::default(),
+            vector_numeric_proof_cache: Arc::default(),
         }
     }
 
@@ -144,6 +146,10 @@ impl AppContext {
 
     pub(crate) fn object_traffic_health(&self) -> Arc<ObjectTrafficHealth> {
         Arc::clone(&self.object_traffic_health)
+    }
+
+    pub(crate) fn vector_numeric_proof_cache(&self) -> Arc<crate::vector::lance::LanceNumericProofCache> {
+        self.vector_numeric_proof_cache.clone()
     }
 
     pub(crate) fn table_catalog_registration_cache(&self) -> crate::table_catalog::TableCatalogRegistrationCache {
@@ -359,6 +365,7 @@ impl AppContext {
             object_data_cache: ObjectDataCacheAdapter::disabled_arc(),
             object_traffic_health: Arc::new(ObjectTrafficHealth::from_env()),
             table_catalog_registration_cache: crate::table_catalog::TableCatalogRegistrationCache::default(),
+            vector_numeric_proof_cache: Arc::default(),
         }
     }
 

@@ -20,7 +20,7 @@ use crate::core::keying::metadata::stored_ssec_metadata;
 use crate::core::keying::stored::{
     StoredManagedKey, open_under_customer_key, open_under_stored_data_key, recognize_stored_managed_key,
 };
-use crate::core::request::SseKmsPrincipal;
+use crate::core::request::{SseKmsPrincipal, operation_host};
 use crate::core::s3::authorization::authorize_sse_kms_key;
 use crate::core::s3::headers::{SseReadResponseHeaders, managed_sse_public_header};
 use crate::core::s3::scheme::resolve_stored_kms_key_id;
@@ -84,6 +84,7 @@ pub struct DecryptionRequest<'a> {
 /// }
 /// ```
 pub async fn sse_decryption(host: &dyn SseHost, request: DecryptionRequest<'_>) -> Result<Option<DecryptionMaterial>, SseError> {
+    let host = operation_host(host, request.principal);
     // Check for SSE-C encryption
     if stored_ssec_metadata(request.metadata) {
         let (key, key_md5) = require_matching_ssec_key(request.metadata, request.sse_customer_key, request.sse_customer_key_md5)?;
@@ -127,6 +128,7 @@ pub async fn classify_sse_read_response(
     host: &dyn SseHost,
     request: DecryptionRequest<'_>,
 ) -> Result<Option<SseReadResponseHeaders>, SseError> {
+    let host = operation_host(host, request.principal);
     if stored_ssec_metadata(request.metadata) {
         let (key, key_md5) = require_matching_ssec_key(request.metadata, request.sse_customer_key, request.sse_customer_key_md5)?;
 
@@ -275,6 +277,7 @@ async fn apply_managed_decryption_material_inner(
     metadata: &HashMap<String, String>,
     principal: Option<&SseKmsPrincipal>,
 ) -> Result<Option<DecryptionMaterial>, SseError> {
+    let host = operation_host(host, principal);
     let Some((stored, kms_key_id)) = resolve_stored_managed_key(host, metadata).await else {
         return Ok(None);
     };
@@ -283,7 +286,8 @@ async fn apply_managed_decryption_material_inner(
     // key beyond "not yours" — not whether it is disabled, pending deletion, or unreadable.
     authorize_sse_kms_key(host, principal, stored.sse_type, KmsAction::DecryptAction, &kms_key_id).await?;
 
-    let (opened, algorithm) = open_under_stored_data_key(host, bucket, key, &stored, &kms_key_id).await?;
+    let bound = principal.is_some_and(|principal| principal.maintenance.is_some());
+    let (opened, algorithm) = open_under_stored_data_key(host, bucket, key, &stored, &kms_key_id, bound).await?;
 
     Ok(Some(DecryptionMaterial {
         sse_type: stored.sse_type,

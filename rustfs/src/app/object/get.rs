@@ -2375,7 +2375,106 @@ fn should_buffer_get_object_in_memory_with_threshold(
     response_content_length <= effective_threshold
 }
 
+pub(super) struct ManagedReadInput<'a> {
+    pub context: &'a super::managed::ManagedObjectContext,
+    pub key: &'a str,
+    pub opts: &'a ObjectOptions,
+    pub range: Option<HTTPRangeSpec>,
+    pub expected: &'a ObjectInfo,
+    pub max_bytes: usize,
+    pub principal: &'a SseKmsPrincipal,
+    pub request_id: &'a str,
+}
+
 impl DefaultObjectUsecase {
+    /// Bounded managed reads use local storage, the ordinary read admission, and SSE checks.
+    /// There is no missing-object fallback to an external source.
+    pub(super) async fn managed_read_bytes_core(
+        &self,
+        input: ManagedReadInput<'_>,
+    ) -> Result<(ObjectInfo, Bytes), super::managed::ManagedObjectError> {
+        use super::managed::ManagedObjectError;
+        use tokio::io::AsyncReadExt as _;
+        let ManagedReadInput {
+            context,
+            key,
+            opts,
+            range,
+            expected,
+            max_bytes,
+            principal,
+            request_id,
+        } = input;
+        let bucket = context.access.bucket().storage_bucket_id().as_str();
+        let mut opts = opts.clone();
+        if principal.is_managed_maintenance() {
+            opts.read_encryption_resolver = Some(crate::app::storage_api::object_usecase::sse::managed_read_encryption_resolver(
+                bucket.to_owned(),
+                key.to_owned(),
+                principal.clone(),
+            ));
+        }
+        let bootstrap = self.init_get_object_bootstrap(bucket, key, request_id)?;
+        let manager = get_concurrency_manager();
+        let _admission = Self::acquire_get_object_io_planning(
+            manager,
+            Some(GetObjectRequestTimeout {
+                wrapper: &bootstrap.wrapper,
+                policy: &bootstrap.timeout_config,
+            }),
+            bucket,
+            key,
+        )
+        .await?;
+        let store = self
+            .object_store()
+            .ok_or_else(|| ApiError::invalid_request("object store is not initialized"))?;
+        let read = async {
+            let reader = store
+                .get_object_reader(bucket, key, range.clone(), HeaderMap::new(), &opts)
+                .await
+                .map_err(ApiError::from)?;
+            context
+                .validate_object(&reader.object_info, key, expected.data_dir, principal)
+                .await?;
+            let full_size = reader.object_info.get_actual_size().map_err(ApiError::from)?;
+            let selected_size = match range.as_ref() {
+                Some(range) => range.get_offset_length(full_size).map_err(ApiError::from)?.1,
+                None => full_size,
+            };
+            let selected_size = usize::try_from(selected_size).map_err(|_| ManagedObjectError::SizeLimitExceeded)?;
+            if selected_size > max_bytes {
+                return Err(ManagedObjectError::SizeLimitExceeded);
+            }
+            let bytes = if let Some(bytes) = reader.buffered_body {
+                bytes
+            } else {
+                let limit = u64::try_from(selected_size)
+                    .map_err(|_| ManagedObjectError::SizeLimitExceeded)?
+                    .checked_add(1)
+                    .ok_or(ManagedObjectError::SizeLimitExceeded)?;
+                let mut bytes = Vec::with_capacity(selected_size);
+                let mut stream = reader.stream.take(limit);
+                tokio::time::timeout(get_object_disk_read_timeout(), stream.read_to_end(&mut bytes))
+                    .await
+                    .map_err(|_| ApiError::from(io::Error::new(io::ErrorKind::TimedOut, "managed object read timed out")))?
+                    .map_err(ApiError::from)?;
+                Bytes::from(bytes)
+            };
+            if bytes.len() != selected_size {
+                return Err(ApiError::from(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "managed object length differs from metadata",
+                ))
+                .into());
+            }
+            Ok((reader.object_info, bytes))
+        };
+        tokio::time::timeout(bootstrap.timeout_config.get_object_timeout, read)
+            .await
+            .map_err(|_| ApiError::from(io::Error::new(io::ErrorKind::TimedOut, "managed object read budget expired")))?
+    }
+
     fn with_get_object_conditions<F: std::future::Future>(
         envelope: &RequestEnvelope,
         input: &GetObjectFields,

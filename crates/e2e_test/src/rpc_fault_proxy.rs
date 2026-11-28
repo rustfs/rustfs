@@ -50,6 +50,11 @@ use tokio::{
 type ProxyBody = BoxBody<Bytes, io::Error>;
 type ProxyClient = Client<HttpConnector, ProxyBody>;
 
+mod catalog;
+pub(crate) use catalog::{CatalogRenameScope, CatalogRpcEvidence, CatalogRpcGate};
+#[cfg(test)]
+mod catalog_tests;
+
 mod scoped_ack;
 pub(crate) use scoped_ack::{ScopedAckFault, ScopedAckQueue, ScopedAckScope};
 
@@ -239,6 +244,7 @@ pub(crate) struct RpcFaultProxy {
     slot: PauseSlot,
     lock_slot: PauseSlot,
     scoped_ack: scoped_ack::QueueSlot,
+    catalog: Arc<catalog::CatalogRules>,
     task: JoinHandle<()>,
     late_requests: LateRequests,
 }
@@ -253,6 +259,8 @@ impl RpcFaultProxy {
         let active_lock = lock_slot.clone();
         let scoped_ack = scoped_ack::empty_slot();
         let active_ack = scoped_ack.clone();
+        let catalog = Arc::new(catalog::CatalogRules::default());
+        let active_catalog = catalog.clone();
         let late_requests: LateRequests = Arc::new(Mutex::new(Some(Vec::new())));
         let late = late_requests.clone();
         let task = tokio::spawn(async move {
@@ -268,6 +276,7 @@ impl RpcFaultProxy {
                         let active = active.clone();
                         let active_lock = active_lock.clone();
                         let active_ack = active_ack.clone();
+                        let active_catalog = active_catalog.clone();
                         let late = late.clone();
                         connections.spawn(async move {
                             let service = service_fn(move |request: Request<Incoming>| {
@@ -288,13 +297,14 @@ impl RpcFaultProxy {
                                             .is_some_and(|method| pause.methods.contains(&method))
                                 });
                                 let late = late.clone();
+                                let catalog = active_catalog.clone();
                                 async move {
                                     if !retain {
-                                        return forward_request(request, client, target, pause, ack).await;
+                                        return forward_request(request, client, target, pause, ack, catalog, late.clone()).await;
                                     }
                                     // This opt-in fault owns the packet after client cancellation.
                                     // Proxy teardown still aborts every retained request.
-                                    let task = tokio::spawn(forward_request(request, client, target, pause, ack));
+                                    let task = tokio::spawn(forward_request(request, client, target, pause, ack, catalog, late.clone()));
                                     {
                                         let mut requests = late.lock().expect("late RPC ownership");
                                         if let Some(requests) = requests.as_mut() {
@@ -320,6 +330,7 @@ impl RpcFaultProxy {
             slot,
             lock_slot,
             scoped_ack,
+            catalog,
             task,
             late_requests,
         })
@@ -572,8 +583,14 @@ async fn forward_request(
     target: SocketAddr,
     pause: Option<Arc<PauseState>>,
     ack: Option<Arc<scoped_ack::QueueState>>,
+    catalog: Arc<catalog::CatalogRules>,
+    late: LateRequests,
 ) -> io::Result<hyper::Response<ProxyBody>> {
     let request = request.map(|body| body.map_err(io::Error::other).boxed());
+    let request = match catalog::intercept(request, client.clone(), target, catalog, late).await? {
+        catalog::Interception::Pass(request) => request,
+        catalog::Interception::Handled(response) => return Ok(response),
+    };
     let request = if let Some(ack) = ack
         && request.uri().path() == "/node_service.ScannerControlService/ScannerScopedDirtyUsageAck"
     {

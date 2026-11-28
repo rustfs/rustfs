@@ -331,6 +331,7 @@ impl RustFSServer {
             temp_dir: started.temp_dir,
             runtime_owner: Some(runtime_owner),
             table_rename_recovery: Some(started.table_rename_recovery),
+            vector_maintenance: Some(started.vector_maintenance),
         }
     }
 }
@@ -352,6 +353,7 @@ pub struct RustFSServer {
     temp_dir: Option<PathBuf>,
     runtime_owner: Option<EmbeddedRuntimeOwner>,
     table_rename_recovery: Option<crate::table_catalog::CatalogBackgroundTask>,
+    vector_maintenance: Option<crate::table_catalog::CatalogBackgroundTask>,
 }
 
 impl RustFSServer {
@@ -403,6 +405,7 @@ impl RustFSServer {
             &mut self.temp_dir,
             Some(runtime_owner),
             self.table_rename_recovery.take(),
+            self.vector_maintenance.take(),
         )
         .await;
     }
@@ -421,6 +424,7 @@ impl Drop for RustFSServer {
             &mut self.temp_dir,
             Some(runtime_owner),
             self.table_rename_recovery.take(),
+            self.vector_maintenance.take(),
         );
     }
 }

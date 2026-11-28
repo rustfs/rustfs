@@ -460,6 +460,7 @@ pub(crate) mod sse_consumer {
         encryption_material_to_metadata, extract_ssec_params_from_headers, extract_ssekms_context_from_headers, init_sse_startup,
         map_get_object_reader_error, mark_encrypted_multipart_metadata, multipart_completion_authorization, stored_ssec_metadata,
     };
+    pub(crate) use super::super::sse::{KmsKeyAuthorizer, ManagedSseRuntime, managed_read_encryption_resolver, sse_error};
     pub(crate) use super::{
         DecryptionRequest, EncryptionRequest, PrepareEncryptionRequest, SseKmsPrincipal, apply_bucket_default_lock_retention,
         authorize_sse_kms_multipart_write, authorize_sse_kms_object_read, classify_sse_read_response,
@@ -488,7 +489,10 @@ pub(crate) mod test_consumer {
     pub(crate) use super::super::access_owned::object_read::authorize_head_object;
     pub(crate) use rustfs_ecstore::api::object::test_util::DeleteAfterObjectLockSnapshotBarrier;
     pub(crate) mod sse {
-        pub(crate) use super::super::super::sse::{RecordingKmsKeyAuthorizer, TestAuthorizationHooks, sse_kms_object_metadata};
+        pub(crate) use super::super::super::sse::{
+            KmsKeyAuthorizer, LocalSseDekProvider, RecordingKmsKeyAuthorizer, TestAuthorizationHooks,
+            kms_sse_dek_provider_for_test, reset_sse_dek_provider, set_sse_dek_provider_for_test, sse_kms_object_metadata,
+        };
     }
     pub(crate) use super::super::{
         apply_cors_headers, apply_default_lock_retention_metadata, check_preconditions, decode_tags_to_map,
@@ -512,8 +516,8 @@ pub(crate) mod ecstore_bucket {
     #[cfg(test)]
     pub(crate) use rustfs_ecstore::api::bucket::lifecycle::tier_delete_journal::test_util::install_all_v6_fleet_capability_proof;
     pub(crate) use rustfs_ecstore::api::bucket::{
-        bandwidth, bucket_target_sys, durability, etag, lifecycle, lockless_cache, metadata, metadata_sys, migration,
-        object_lock, policy_sys, remote_s3_client, replication, tagging, target, utils,
+        BucketIncarnationFenceGuard, bandwidth, bucket_target_sys, durability, etag, lifecycle, lockless_cache, metadata,
+        metadata_sys, migration, object_lock, policy_sys, remote_s3_client, replication, tagging, target, utils,
     };
     pub(crate) use rustfs_ecstore::api::bucket::{config_parse_mode, quota, versioning, versioning_sys};
 }
@@ -2116,6 +2120,112 @@ pub(crate) async fn delete_bucket_metadata_config_if_incarnation(
 
 pub(crate) async fn get_bucket_metadata(bucket: &str) -> Result<Arc<BucketMetadata>> {
     ecstore_bucket::metadata_sys::get(bucket).await
+}
+
+pub(crate) mod managed {
+    pub(crate) use super::BucketMetadata;
+    pub(crate) use super::ecstore_bucket::metadata::BUCKET_VECTOR_STORAGE_PREFIX;
+    pub(crate) use super::ecstore_bucket::metadata::{BUCKET_TAGGING_CONFIG, ConfigState};
+    pub(crate) use super::storage_contracts::DeleteAccounting;
+    use super::storage_contracts::MakeBucketOptions;
+    pub(crate) use super::storage_contracts::bucket::{
+        AccountNamespaceId, BucketHandle, BucketIncarnation, BucketKind, BucketPublicName, ManagedTableId, StorageBucketId,
+    };
+    pub(crate) use super::storage_contracts::bucket::{
+        BucketIdentityError, ManagedBucketConfigMutation, ManagedBucketPrecheckError, ManagedObjectAccess, ManagedObjectOperation,
+    };
+    use super::{Arc, ECStore, Result, StorageError, ecstore_bucket};
+    pub(crate) use rustfs_heal_contracts::heal_channel::HealOpts;
+
+    pub(crate) type BucketIncarnationFenceGuard = ecstore_bucket::BucketIncarnationFenceGuard;
+
+    #[async_trait::async_trait]
+    pub(crate) trait ManagedBucketStorage: Send + Sync {
+        async fn get_managed_bucket_metadata(&self, bucket: &str) -> Result<Arc<BucketMetadata>>;
+
+        async fn acquire_managed_bucket_fence(&self, bucket: &str, expected: uuid::Uuid) -> Result<BucketIncarnationFenceGuard>;
+
+        fn validate_managed_bucket_fence(&self, guard: &BucketIncarnationFenceGuard, bucket: &str) -> Result<()>;
+    }
+
+    #[async_trait::async_trait]
+    impl ManagedBucketStorage for ECStore {
+        async fn get_managed_bucket_metadata(&self, bucket: &str) -> Result<Arc<BucketMetadata>> {
+            get_bucket_metadata(self, bucket).await
+        }
+
+        async fn acquire_managed_bucket_fence(&self, bucket: &str, expected: uuid::Uuid) -> Result<BucketIncarnationFenceGuard> {
+            acquire_bucket_incarnation_fence(self, bucket, expected).await
+        }
+
+        fn validate_managed_bucket_fence(&self, guard: &BucketIncarnationFenceGuard, bucket: &str) -> Result<()> {
+            self.validate_bucket_incarnation_fence(guard, bucket)
+        }
+    }
+
+    pub(crate) async fn get_bucket_metadata(store: &ECStore, bucket: &str) -> Result<Arc<BucketMetadata>> {
+        store.get_bucket_metadata_from_disk(bucket).await
+    }
+
+    pub(crate) async fn acquire_bucket_incarnation_fence(
+        store: &ECStore,
+        bucket: &str,
+        expected: uuid::Uuid,
+    ) -> Result<BucketIncarnationFenceGuard> {
+        store.acquire_bucket_incarnation_fence(bucket, expected).await
+    }
+
+    pub(crate) fn validate_bucket_incarnation_fence(
+        store: &ECStore,
+        guard: &BucketIncarnationFenceGuard,
+        bucket: &str,
+    ) -> Result<()> {
+        store.validate_bucket_incarnation_fence(guard, bucket)
+    }
+
+    pub(crate) async fn make_managed_bucket(
+        store: &ECStore,
+        identity: &BucketHandle,
+        encryption_config_xml: &[u8],
+        tagging_config_xml: &[u8],
+        opts: &MakeBucketOptions,
+    ) -> Result<()> {
+        store
+            .make_managed_bucket(identity, encryption_config_xml, tagging_config_xml, opts)
+            .await
+    }
+
+    pub(crate) async fn mutate_managed_bucket_config_with_precheck<P, PFut, E>(
+        store: &ECStore,
+        identity: &BucketHandle,
+        mutation: ManagedBucketConfigMutation,
+        precheck: P,
+    ) -> core::result::Result<time::OffsetDateTime, ManagedBucketPrecheckError<E, StorageError>>
+    where
+        P: FnOnce(&BucketMetadata) -> PFut + Send,
+        PFut: std::future::Future<Output = core::result::Result<(), E>> + Send,
+    {
+        store
+            .mutate_managed_bucket_config_with_precheck(identity, mutation, precheck)
+            .await
+    }
+
+    pub(crate) async fn delete_managed_bucket_with_precheck_and_preparation<P, PFut, F, Fut, E>(
+        store: &Arc<ECStore>,
+        identity: &BucketHandle,
+        precheck: P,
+        prepare: F,
+    ) -> core::result::Result<(), ManagedBucketPrecheckError<E, StorageError>>
+    where
+        P: FnOnce(&BucketMetadata) -> PFut + Send,
+        PFut: std::future::Future<Output = core::result::Result<(), E>> + Send,
+        F: FnOnce(Arc<BucketIncarnationFenceGuard>) -> Fut + Send,
+        Fut: std::future::Future<Output = Result<()>> + Send,
+    {
+        store
+            .delete_managed_bucket_with_precheck_and_preparation(identity, precheck, prepare)
+            .await
+    }
 }
 
 pub(crate) async fn get_bucket_cors_config(

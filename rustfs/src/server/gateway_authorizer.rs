@@ -322,67 +322,73 @@ fn arm(route: &mut RouteRequest<'_>, action: Action) {
     route.evaluate_table = !table_data_plane_content_mutation(action);
 }
 
-async fn evaluate(route: &mut RouteRequest<'_>, eval: Eval, bucket: &str, key: &str, version: Option<&str>) -> S3Result<()> {
+fn evaluate<'a>(
+    route: &'a mut RouteRequest<'_>,
+    eval: Eval,
+    bucket: &'a str,
+    key: &'a str,
+    version: Option<&'a str>,
+) -> BoxFuture<'a, S3Result<()>> {
     match eval {
-        Eval::Bucket(action) => {
+        Eval::Bucket(action) => Box::pin(async move {
             let action = Action::S3Action(action);
             arm(route, action);
             authorize_bucket_request(route, bucket, action).await
-        }
-        Eval::DeleteBucket => {
+        }),
+        Eval::DeleteBucket => Box::pin(async move {
             route.evaluate_table = true;
             authorize_delete_bucket(route, bucket).await
-        }
-        Eval::DeleteBucketTagging => {
+        }),
+        Eval::DeleteBucketTagging => Box::pin(async move {
             let action = Action::S3Action(S3Action::PutBucketTaggingAction);
             arm(route, action);
             rustfs_iam::sys::with_bucket_tag_deletion(authorize_bucket_request(route, bucket, action)).await
-        }
-        Eval::Listing(action) => evaluate_listing(route, bucket, action).await,
-        Eval::PutObject => evaluate_put_object(route, bucket, key, version).await,
-        Eval::CreateMultipartUpload => evaluate_create_multipart(route, bucket, key, version).await,
-        Eval::CompleteMultipartUpload => evaluate_complete_multipart(route, bucket, key).await,
-        Eval::DeleteObject => evaluate_delete_object(route, bucket, key, version).await,
-        Eval::RestoreObject => {
+        }),
+        Eval::Listing(action) => Box::pin(evaluate_listing(route, bucket, action)),
+        Eval::PutObject => Box::pin(evaluate_put_object(route, bucket, key, version)),
+        Eval::CreateMultipartUpload => Box::pin(evaluate_create_multipart(route, bucket, key, version)),
+        Eval::CompleteMultipartUpload => Box::pin(evaluate_complete_multipart(route, bucket, key)),
+        Eval::DeleteObject => Box::pin(evaluate_delete_object(route, bucket, key, version)),
+        Eval::RestoreObject => Box::pin(async move {
             let action = Action::S3Action(S3Action::RestoreObjectAction);
             arm(route, action);
             authorize_object_request(route, bucket, key, version, action).await
-        }
-        Eval::HeadObject => evaluate_head_object(route, bucket, key, version).await,
-        Eval::GetObject => authorize_versioned_read(route, bucket, key, version).await,
-        Eval::GetObjectAttributes => {
+        }),
+        Eval::HeadObject => Box::pin(evaluate_head_object(route, bucket, key, version)),
+        Eval::GetObject => Box::pin(authorize_versioned_read(route, bucket, key, version)),
+        Eval::GetObjectAttributes => Box::pin(async move {
             route.evaluate_table = true;
             authorize_get_object_attributes(route, bucket, key, version).await
-        }
-        Eval::SelectObjectContent => {
+        }),
+        Eval::SelectObjectContent => Box::pin(async move {
             route.evaluate_table = true;
             authorize_select_object_content(route, bucket, key).await
-        }
-        Eval::FixedObject(action) => {
+        }),
+        Eval::FixedObject(action) => Box::pin(async move {
             let action = Action::S3Action(action);
             arm(route, action);
             authorize_object_request(route, bucket, key, version, action).await
-        }
-        Eval::Tagging(action) => {
+        }),
+        Eval::Tagging(action) => Box::pin(async move {
             let action = versioned_tagging_action(action, version);
             arm(route, action);
             authorize_object_request(route, bucket, key, version, action).await
-        }
-        Eval::AbortMultipartUpload => {
+        }),
+        Eval::AbortMultipartUpload => Box::pin(async move {
             let action = Action::S3Action(S3Action::AbortMultipartUploadAction);
             arm(route, action);
             authorize_object_request(route, bucket, key, None, action).await
-        }
-        Eval::UploadPart => {
+        }),
+        Eval::UploadPart => Box::pin(async move {
             bind_target(route, bucket, Some(key), None)?;
             route.evaluate_table = true;
             authorize_staged_multipart_part(route).await
-        }
-        Eval::ListParts => {
+        }),
+        Eval::ListParts => Box::pin(async move {
             let action = Action::S3Action(S3Action::ListMultipartUploadPartsAction);
             arm(route, action);
             authorize_object_request(route, bucket, key, None, action).await
-        }
+        }),
     }
 }
 

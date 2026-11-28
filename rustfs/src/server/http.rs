@@ -1501,14 +1501,14 @@ where
 }
 
 /// The error of the S3 service under the middleware.
-type EdgeError = Box<dyn std::error::Error + Send + Sync>;
+pub(crate) type EdgeError = Box<dyn std::error::Error + Send + Sync>;
 
 /// The body of the S3 service under the middleware: whatever the gateway, the native console or a
 /// refusal written in this file answers, behind one type the middleware is written against.
 pub(crate) struct EdgeBody(http_body_util::combinators::UnsyncBoxBody<Bytes, EdgeError>);
 
 impl EdgeBody {
-    fn new<B>(body: B) -> Self
+    pub(super) fn new<B>(body: B) -> Self
     where
         B: http_body::Body<Data = Bytes> + Send + 'static,
         B::Error: Into<EdgeError>,
@@ -1567,7 +1567,8 @@ type S3Gateway = GatewayEdgeService;
 
 /// The S3 service mounted under the middleware: the gateway stack with its claimed-route hosts
 /// (`server/stack.rs`).
-type S3EdgeService = S3StackService<S3Gateway, NativeConsoleEdgeService, NativeWebsiteEdgeService>;
+type GatewayS3Service = S3StackService<S3Gateway, NativeConsoleEdgeService, NativeWebsiteEdgeService>;
+type S3EdgeService = super::vector::VectorDispatch<GatewayS3Service>;
 
 /// The gateway stack under the middleware, answering in the middleware's body and error types.
 #[derive(Clone)]
@@ -1679,7 +1680,7 @@ fn assemble_s3_stack(
     config: &config::Config,
     website: Option<crate::app::website::WebsiteHost>,
     assembly: GatewayAssembly,
-) -> Result<S3EdgeService> {
+) -> Result<GatewayS3Service> {
     let server_ctx = Arc::clone(&assembly.server_ctx);
     let native_admin = GatewayEdgeService(GatewayStack::assemble_admin(assembly.clone()).map_err(Error::other)?);
     let router = admin::make_admin_router(config.console_enable, Arc::clone(&server_ctx))?;
@@ -2392,6 +2393,21 @@ async fn start_http_server_inner(
             keystone_auth: keystone_provider_in_configuration().map_err(Error::other)?,
         },
     )?;
+    let vector_service = super::vector::assemble(
+        super::vector::VectorAssembly {
+            server_ctx: Arc::clone(&server_ctx),
+            root_access_key: config.access_key.clone(),
+            root_secret_key: config.secret_key.clone(),
+            region: config.region.clone(),
+            body_read_timeout: http_request_body_read_timeout,
+        },
+        crate::vector::lance::ManifestIoLimits {
+            max_manifest_bytes: std::num::NonZeroU64::new(64 * 1024 * 1024).expect("positive manifest read limit"),
+            max_concurrent_reads: std::num::NonZeroUsize::new(4).expect("positive manifest concurrency"),
+        },
+        std::num::NonZeroUsize::new(3).expect("positive Vector write attempt limit"),
+    );
+    let s3_service = super::vector::VectorDispatch::new(s3_service, vector_service);
     #[cfg(feature = "http3")]
     let http3_server = if let Some(server_config) = http3_server_config {
         let h3_s3_service = s3_service.clone();
@@ -3873,6 +3889,219 @@ mod tests {
             drop(stalled_guard);
         })
         .await;
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn production_http_server_serves_ordinary_s3_and_keeps_vector_route_closed() {
+        crate::app::gating_test_env::run_large_stack_test("production-http-s3-and-closed-vector", || async {
+            use aws_sdk_s3::primitives::ByteStream;
+            use aws_sdk_s3vectors::error::ProvideErrorMetadata as _;
+
+            const ROOT_AK: &str = "prodhttpvectorroot";
+            const ROOT_SK: &str = "prod-http-vector-root-secret";
+            const REGION: &str = "us-east-1";
+
+            let ambient = crate::app::gating_test_env::shared_gating_ambient().await;
+            let store = crate::app::gating_test_env::shared_gating_ecstore().await;
+            let context = Arc::new(crate::runtime_sources::AppContext::new(Arc::clone(&store), ambient.iam(), ambient.kms()));
+            assert!(context.publish_action_credentials(rustfs_credentials::Credentials {
+                access_key: ROOT_AK.to_owned(),
+                secret_key: ROOT_SK.to_owned(),
+                status: "on".to_owned(),
+                ..Default::default()
+            }));
+            let slot = ServerContextSlot::new();
+            assert!(slot.install(Arc::clone(&context)));
+
+            let mut cfg = config::Config::new("127.0.0.1:0", Vec::new());
+            cfg.console_enable = false;
+            cfg.access_key = ROOT_AK.to_owned();
+            cfg.secret_key = ROOT_SK.to_owned();
+            cfg.region = Some(REGION.to_owned());
+
+            let readiness = Arc::new(GlobalReadiness::new());
+            readiness.mark_stage(rustfs_common::SystemStage::FullReady);
+            let (mut shutdown, address) = start_http_server(&cfg, readiness, slot)
+                .await
+                .expect("start reconciled production HTTP listener");
+            let endpoint = format!("http://{address}");
+
+            let no_proxy_client = || {
+                aws_smithy_http_client::Builder::new().build_with_connector_fn(|settings, components| {
+                    let mut builder = aws_smithy_http_client::Connector::builder()
+                        .proxy_config(aws_smithy_http_client::proxy::ProxyConfig::disabled());
+                    builder.set_connector_settings(settings.cloned());
+                    builder.set_sleep_impl(components.and_then(|runtime| runtime.sleep_impl()));
+                    builder.build_http()
+                })
+            };
+
+            let s3_cfg = aws_sdk_s3::Config::builder()
+                .behavior_version(aws_sdk_s3::config::BehaviorVersion::latest())
+                .region(aws_sdk_s3::config::Region::new(REGION))
+                .endpoint_url(&endpoint)
+                .force_path_style(true)
+                .credentials_provider(aws_sdk_s3::config::Credentials::new(ROOT_AK, ROOT_SK, None, None, "prod-http-s3"))
+                .http_client(no_proxy_client())
+                .retry_config(aws_smithy_types::retry::RetryConfig::disabled())
+                .build();
+            let s3 = aws_sdk_s3::Client::from_conf(s3_cfg);
+
+            let vector_cfg = aws_sdk_s3vectors::Config::builder()
+                .behavior_version(aws_sdk_s3vectors::config::BehaviorVersion::latest())
+                .region(aws_sdk_s3vectors::config::Region::new(REGION))
+                .endpoint_url(&endpoint)
+                .credentials_provider(aws_sdk_s3vectors::config::Credentials::new(
+                    ROOT_AK,
+                    ROOT_SK,
+                    None,
+                    None,
+                    "prod-http-s3vectors",
+                ))
+                .http_client(no_proxy_client())
+                .retry_config(aws_smithy_types::retry::RetryConfig::disabled())
+                .build();
+            let vectors = aws_sdk_s3vectors::Client::from_conf(vector_cfg);
+
+            let bucket = format!("prod-http-s3-{}", uuid::Uuid::new_v4());
+            let vector_bucket = format!("prod-http-vec-{}", uuid::Uuid::new_v4());
+
+            // (a) Ordinary S3 routes succeed on the reconciled GatewayStack + outer HTTP stack,
+            // including keys shaped like Vector action names and `/tags/...` paths.
+            s3.create_bucket()
+                .bucket(&bucket)
+                .send()
+                .await
+                .expect("CreateBucket over production HTTP stack");
+            let keys = [
+                ("ordinary.txt", b"integrated-s3-payload".as_slice()),
+                ("CreateVectorBucket", b"s3-action-named-key".as_slice()),
+                ("tags/arn:aws:s3vectors:us-east-1::bucket/probe", b"s3-tags-key".as_slice()),
+            ];
+            for (key, payload) in keys {
+                let put = s3
+                    .put_object()
+                    .bucket(&bucket)
+                    .key(key)
+                    .body(ByteStream::from(payload.to_vec()))
+                    .send()
+                    .await
+                    .expect("PutObject over production HTTP stack");
+                assert!(put.e_tag().is_some(), "PutObject must return ETag for {key}");
+                let got = s3
+                    .get_object()
+                    .bucket(&bucket)
+                    .key(key)
+                    .send()
+                    .await
+                    .expect("GetObject over production HTTP stack");
+                let body = got.body.collect().await.expect("collect GetObject body").into_bytes();
+                assert_eq!(body.as_ref(), payload, "GetObject payload mismatch for {key}");
+            }
+
+            // (b) External `s3vectors` routes fail closed with 503 ServiceUnavailableException
+            // via VectorDispatch::new (`enabled: false`) while preserving outer middleware headers.
+            let list_err = vectors
+                .list_vector_buckets()
+                .send()
+                .await
+                .expect_err("production VectorDispatch must reject ListVectorBuckets while disabled");
+            let list_raw = list_err.raw_response().expect("raw HTTP response on ListVectorBuckets");
+            assert_eq!(list_raw.status().as_u16(), 503);
+            assert_eq!(list_raw.headers().get("content-type"), Some("application/json"));
+            assert_eq!(list_raw.headers().get("x-amzn-errortype"), Some("ServiceUnavailableException"));
+            assert!(
+                list_raw.headers().get("x-amz-request-id").is_some_and(|id| !id.is_empty()),
+                "outer ExternalRequestContextLayer must still stamp x-amz-request-id"
+            );
+            assert_eq!(list_err.code(), Some("ServiceUnavailableException"));
+            assert_eq!(list_err.message(), Some("Vector service is unavailable"));
+
+            let create_err = vectors
+                .create_vector_bucket()
+                .vector_bucket_name(&vector_bucket)
+                .send()
+                .await
+                .expect_err("production VectorDispatch must reject CreateVectorBucket while disabled");
+            assert_eq!(create_err.raw_response().map(|r| r.status().as_u16()), Some(503));
+            assert_eq!(create_err.code(), Some("ServiceUnavailableException"));
+            assert_eq!(create_err.message(), Some("Vector service is unavailable"));
+            let absent_bucket = s3
+                .head_bucket()
+                .bucket(&vector_bucket)
+                .send()
+                .await
+                .expect_err("closed CreateVectorBucket must not create an underlying bucket");
+            assert_eq!(absent_bucket.raw_response().map(|r| r.status().as_u16()), Some(404));
+
+            let tags_err = vectors
+                .list_tags_for_resource()
+                .resource_arn(format!("arn:aws:s3vectors:{REGION}::bucket/{vector_bucket}"))
+                .send()
+                .await
+                .expect_err("production VectorDispatch must reject s3vectors /tags route while disabled");
+            assert_eq!(tags_err.raw_response().map(|r| r.status().as_u16()), Some(503));
+            assert_eq!(tags_err.code(), Some("ServiceUnavailableException"));
+
+            let raw_http = reqwest::Client::builder().no_proxy().build().expect("no-proxy client");
+            let presigned_vector = raw_http
+                .get(format!(
+                    "{endpoint}/tags/object?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential={ROOT_AK}%2F20261128%2F{REGION}%2Fs3vectors%2Faws4_request&X-Amz-Date=20261128T000000Z&X-Amz-Expires=60&X-Amz-SignedHeaders=host&X-Amz-Signature=00"
+                ))
+                .send()
+                .await
+                .expect("send presigned s3vectors probe");
+            assert_eq!(presigned_vector.status(), StatusCode::SERVICE_UNAVAILABLE);
+            assert_eq!(
+                presigned_vector
+                    .headers()
+                    .get(http::header::CONTENT_TYPE)
+                    .and_then(|v| v.to_str().ok()),
+                Some("application/json")
+            );
+            assert_eq!(
+                presigned_vector
+                    .headers()
+                    .get("x-amzn-errortype")
+                    .and_then(|v| v.to_str().ok()),
+                Some("ServiceUnavailableException")
+            );
+            let presigned_json: serde_json::Value = presigned_vector.json().await.expect("JSON error payload");
+            assert_eq!(presigned_json["message"], "Vector service is unavailable");
+
+            // (c) Ordinary S3 continues serving cleanly on the same server after closed Vector rejections.
+            let after = s3
+                .get_object()
+                .bucket(&bucket)
+                .key("ordinary.txt")
+                .send()
+                .await
+                .expect("GetObject after closed Vector route rejections");
+            let after_bytes = after
+                .body
+                .collect()
+                .await
+                .expect("collect post-vector GetObject")
+                .into_bytes();
+            assert_eq!(after_bytes.as_ref(), b"integrated-s3-payload");
+
+            for (key, _) in keys {
+                s3.delete_object()
+                    .bucket(&bucket)
+                    .key(key)
+                    .send()
+                    .await
+                    .expect("cleanup test object");
+            }
+            s3.delete_bucket().bucket(&bucket).send().await.expect("cleanup test bucket");
+
+            shutdown.signal();
+            tokio::time::timeout(Duration::from_secs(5), shutdown.wait_checked())
+                .await
+                .expect("production HTTP listener shutdown deadline")
+                .expect("production HTTP listener clean join");
+        });
     }
 
     mod native_admin_tests {

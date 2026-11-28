@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use super::key_name::KeyName;
+use super::key_name::{AwsKeyName, KeyName, S3VectorsKeyName};
 use crate::error::Error;
 use crate::policy::{Error as PolicyError, Validator};
 use serde::{Deserialize, Serialize};
@@ -27,6 +27,20 @@ pub struct Key {
 
 impl Validator for Key {
     type Error = Error;
+
+    fn is_valid(&self) -> Result<(), Error> {
+        let valid = match self.name {
+            KeyName::Aws(AwsKeyName::AWSRequestTag | AwsKeyName::AWSResourceTag)
+            | KeyName::S3Vectors(S3VectorsKeyName::VectorBucketTag) => self.variable.as_ref().is_some_and(|key| !key.is_empty()),
+            KeyName::Aws(AwsKeyName::AWSTagKeys | AwsKeyName::AWSRequestedRegion)
+            | KeyName::S3Vectors(S3VectorsKeyName::KmsKeyArn | S3VectorsKeyName::SseType) => self.variable.is_none(),
+            _ => true,
+        };
+        if !valid {
+            return Err(PolicyError::InvalidKey(String::from(self.clone())).into());
+        }
+        Ok(())
+    }
 }
 
 impl Key {
@@ -66,10 +80,12 @@ impl TryFrom<&str> for Key {
         let name = iter.next().ok_or_else(|| PolicyError::InvalidKey(value.to_string()))?;
         let variable = iter.next().map(Into::into);
 
-        Ok(Self {
+        let key = Self {
             name: KeyName::try_from(name)?,
             variable,
-        })
+        };
+        key.is_valid()?;
+        Ok(key)
     }
 }
 

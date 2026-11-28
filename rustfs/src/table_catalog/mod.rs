@@ -35,16 +35,13 @@ use crate::storage_api::table::contract::multipart::MultipartUploadInspection as
 use crate::storage_api::table::contract::namespace::NamespaceLocking as StorageNamespaceLocking;
 use crate::storage_api::table::contract::object::{ObjectIO as StorageObjectIO, ObjectOperations as StorageObjectOperations};
 use crate::storage_api::table::contract::range::HTTPRangeSpec;
+use crate::storage_api::table::managed::{BucketHandle, BucketIncarnationFenceGuard, BucketKind, ManagedBucketStorage};
 use crate::storage_api::table::{
     BUCKET_TABLE_CATALOG_META_PREFIX, BUCKET_TABLE_CATALOG_TABLE_BUCKETS_PREFIX, BUCKET_TABLE_CONFIG,
     BUCKET_TABLE_RESERVED_PREFIX, Error as EcstoreError, RUSTFS_META_BUCKET, StorageError, get_bucket_metadata,
     get_lock_acquire_timeout, table_catalog_path_hash,
 };
 use bytes::Bytes;
-use datafusion::{
-    arrow::datatypes::SchemaRef,
-    parquet::arrow::{ArrowWriter, arrow_reader::ParquetRecordBatchReaderBuilder},
-};
 use http::HeaderMap;
 use metrics::{counter, histogram};
 use rustfs_filemeta::FileInfo;
@@ -60,7 +57,7 @@ use crate::storage_api::table::{
 };
 
 mod background;
-mod cleanup_metadata;
+mod commit;
 mod error;
 mod iceberg;
 mod identifier;
@@ -68,25 +65,35 @@ mod maintenance;
 mod model;
 mod rename_recovery;
 mod store;
+mod vector_bucket_retirement_model;
+mod vector_maintenance_model;
 
-pub(crate) use background::CatalogBackgroundTask;
+pub(crate) use background::{CatalogBackgroundTask, CatalogBackgroundTaskError};
+
+#[cfg(test)]
+#[path = "store/vector_retirement_app_tests.rs"]
+mod retirement_app_tests;
+pub(crate) use commit::*;
+pub(crate) use error::CatalogIoErrorKind;
 pub use error::{CatalogIdentifierError, TableObjectMutationError};
 pub(crate) use error::{TableCatalogStoreError, TableCatalogStoreResult};
 pub(crate) use iceberg::*;
 #[cfg(test)]
 use identifier::metadata_location_from_metadata_file_path;
-pub use identifier::{IdentifierSegment, Namespace, is_reserved_table_object_key};
 pub(crate) use identifier::{
-    default_table_bucket_publication_lock_path, default_table_data_dir_path, default_table_delete_dir_path,
+    CatalogName, default_table_bucket_publication_lock_path, default_table_data_dir_path, default_table_delete_dir_path,
     default_table_metadata_dir_path, default_table_metadata_file_path, default_table_publication_lock_path,
     default_view_metadata_file_path, is_valid_table_metadata_location, is_valid_table_metadata_location_for_entry,
-    is_valid_view_metadata_location, table_identity_from_metadata_object_key, table_metadata_dir_path_for_entry,
-    table_metadata_file_path_for_entry, validate_bucket_object_mutation,
+    is_valid_view_metadata_location, table_catalog_object_key_from_location, table_identity_from_metadata_object_key,
+    table_metadata_dir_path_for_entry, table_metadata_file_path_for_entry, validate_bucket_object_mutation,
 };
+pub use identifier::{IdentifierSegment, Namespace, is_reserved_table_object_key};
 pub(crate) use maintenance::*;
 pub(crate) use model::*;
 pub(crate) use rename_recovery::spawn_table_rename_recovery;
 pub(crate) use store::*;
+pub(crate) use vector_bucket_retirement_model::*;
+pub(crate) use vector_maintenance_model::*;
 
 pub(crate) const TABLE_BUCKET_MARKER_CONFIG: &str = BUCKET_TABLE_CONFIG;
 pub(crate) const RESERVED_CATALOG_OBJECT_MESSAGE: &str = "Object key is reserved for the table catalog";
@@ -127,23 +134,6 @@ pub(crate) const MAX_TABLE_CATALOG_PUBLICATION_PREPARATION_TIMEOUT_SECS: u64 = 8
 pub(crate) const ENV_TABLE_CATALOG_PUBLICATION_FENCE_FLEET_CONFIRMED: &str =
     "RUSTFS_TABLE_CATALOG_PUBLICATION_FENCE_FLEET_CONFIRMED";
 pub(crate) const TABLE_CATALOG_BACKING_OBJECT: &str = "object";
-pub(crate) const TABLE_METADATA_DIGEST_REQUIREMENT_TYPE: &str = "assert-rustfs-metadata-sha256";
-pub(crate) const TABLE_METADATA_FILE_NAME_MAX_LEN: usize = 128;
-pub(crate) const TABLE_METADATA_JSON_MAX_SIZE: usize = 50 * 1024 * 1024;
-pub(crate) const TABLE_MANIFEST_AVRO_MAX_SIZE: usize = 128 * 1024 * 1024;
-const TABLE_MANIFEST_AVRO_MAX_DECODED_SIZE: usize = 128 * 1024 * 1024;
-const TABLE_MANIFEST_AVRO_MAX_RECORDS: usize = 1_000_000;
-const TABLE_MANIFEST_AVRO_MAX_HEADER_ENTRIES: usize = 1_024;
-const TABLE_COMMIT_MAX_MANIFESTS: usize = 10_000;
-const TABLE_COMMIT_MAX_MANIFEST_TRAVERSALS: usize = 20_000;
-const TABLE_COMMIT_MAX_AVRO_BYTES: usize = 512 * 1024 * 1024;
-const TABLE_COMMIT_MAX_FILE_REFERENCES: usize = 1_000_000;
-const TABLE_COMMIT_MAX_STATISTICS_OBJECTS: usize = 1_024;
-const TABLE_COMMIT_MAX_STATISTICS_BYTES: usize = 512 * 1024 * 1024;
-const TABLE_COMPACTION_MAX_STORED_BYTES: usize = 512 * 1024 * 1024;
-const TABLE_COMPACTION_MAX_DECODED_BYTES: usize = 512 * 1024 * 1024;
-const TABLE_STATISTICS_FILE_MAX_SIZE: usize = 128 * 1024 * 1024;
-pub(crate) const TABLE_COMMIT_OBJECT_VALIDATION_CONCURRENCY: usize = 16;
 pub const TABLE_RESERVED_PREFIX: &str = BUCKET_TABLE_RESERVED_PREFIX;
 const WAREHOUSE_ROOT: &str = "warehouses";
 const NAMESPACE_ROOT: &str = "namespaces";
@@ -203,13 +193,6 @@ const TABLE_MAINTENANCE_WORKER_LEASE_TIMEOUT_MAX_SECONDS: u64 = 24 * 60 * 60;
 const TABLE_MAINTENANCE_SCHEDULER_AUDIT_LIMIT: usize = 10;
 const TABLE_MAINTENANCE_DELETE_DISABLED_REASON: &str = "metadata delete is disabled by maintenance config";
 const TABLE_COMMIT_SLOW_LOG_THRESHOLD: StdDuration = StdDuration::from_secs(2);
-const ICEBERG_MAIN_REF: &str = "main";
-const ICEBERG_MIN_SNAPSHOTS_TO_KEEP_PROPERTY: &str = "history.expire.min-snapshots-to-keep";
-const ICEBERG_MAX_SNAPSHOT_AGE_MS_PROPERTY: &str = "history.expire.max-snapshot-age-ms";
-const ICEBERG_MAX_REF_AGE_MS_PROPERTY: &str = "history.expire.max-ref-age-ms";
-const ICEBERG_REF_MIN_SNAPSHOTS_TO_KEEP_FIELD: &str = "min-snapshots-to-keep";
-const ICEBERG_REF_MAX_SNAPSHOT_AGE_MS_FIELD: &str = "max-snapshot-age-ms";
-const ICEBERG_REF_MAX_REF_AGE_MS_FIELD: &str = "max-ref-age-ms";
 const TABLE_CATALOG_BACKUP_ROOT: &str = "backups";
 const TABLE_CATALOG_BACKUP_MAX_SIZE: usize = 64 * 1024 * 1024;
 const TABLE_CATALOG_BACKUP_MAX_MAINTENANCE_OBJECT_SIZE: usize = 4 * 1024 * 1024;
@@ -247,6 +230,7 @@ pub(crate) trait TableCatalogStorage:
     > + StorageAuthoritativeListOperations
     + StorageNamespaceLocking<Error = EcstoreError, NamespaceLock = rustfs_lock::NamespaceLockWrapper>
     + StorageMultipartUploadInspection<Error = EcstoreError>
+    + ManagedBucketStorage
 {
 }
 
@@ -277,6 +261,7 @@ impl<T> TableCatalogStorage for T where
         > + StorageAuthoritativeListOperations
         + StorageNamespaceLocking<Error = EcstoreError, NamespaceLock = rustfs_lock::NamespaceLockWrapper>
         + StorageMultipartUploadInspection<Error = EcstoreError>
+        + ManagedBucketStorage
 {
 }
 
@@ -401,6 +386,9 @@ fn storage_error_to_catalog(action: &str, err: StorageError) -> TableCatalogStor
         StorageError::Lock(lock_err) => store::catalog_lock_acquisition_error(action, lock_err),
         StorageError::ObjectNotFound(bucket, object) => TableCatalogStoreError::NotFound(format!("{action}: {bucket}/{object}")),
         StorageError::BucketNotFound(bucket) => TableCatalogStoreError::NotFound(format!("{action}: bucket {bucket}")),
+        StorageError::ConfigNotFound | StorageError::VolumeNotFound => {
+            TableCatalogStoreError::NotFound(format!("{action}: {err}"))
+        }
         StorageError::PreconditionFailed => TableCatalogStoreError::Conflict(format!("{action}: precondition failed")),
         other => TableCatalogStoreError::Internal(format!("{action}: {other}")),
     }

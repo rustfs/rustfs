@@ -174,3 +174,51 @@ mod tests {
         assert_eq!(damaged.message, INTERNAL_ERROR_MESSAGE);
     }
 }
+
+pub(crate) fn kms_operation_error(error: rustfs_kms::KmsError) -> SseError {
+    let class = rustfs_kms::audit::error_class(&error);
+    let mut api_error = SseError::internal(error);
+    // Wrap rather than replace the source so the original chain stays intact for
+    // logging; the wrapper only adds the class the audit attachment needs.
+    let source = api_error.source.take();
+    api_error.source = Some(Box::new(KmsDataPlaneFailure { class, source }));
+    api_error
+}
+
+/// Carries a KMS failure class across the conversion to an S3-facing error.
+///
+/// The class is decided while the `KmsError` is still typed; re-deriving it from
+/// a rendered message downstream would be guesswork.
+#[derive(Debug)]
+pub(crate) struct KmsDataPlaneFailure {
+    pub(crate) class: &'static str,
+    pub(crate) source: Option<Box<dyn std::error::Error + Send + Sync>>,
+}
+
+impl std::fmt::Display for KmsDataPlaneFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match &self.source {
+            Some(source) => source.fmt(formatter),
+            None => formatter.write_str(self.class),
+        }
+    }
+}
+
+impl std::error::Error for KmsDataPlaneFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        self.source
+            .as_ref()
+            .map(|source| source.as_ref() as &(dyn std::error::Error + 'static))
+    }
+}
+
+pub(crate) fn sse_kms_unavailable_error(configured_but_unavailable: bool) -> SseError {
+    if configured_but_unavailable {
+        return SseError::internal(KmsUnavailableError);
+    }
+    SseError {
+        code: S3ErrorCode::InvalidRequest,
+        message: "SSE-KMS requires a configured and running KMS service".to_string(),
+        source: None,
+    }
+}

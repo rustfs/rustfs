@@ -33,12 +33,33 @@ impl crate::storage_api_contracts::multipart::MultipartUploadInspection for ECSt
         let (_, lifecycle_guard) = self
             .guard_multipart_bucket_incarnation(bucket, &ObjectOptions::default())
             .await?;
+        self.ensure_no_multipart_uploads_on_sets(bucket).await?;
+        ensure_multipart_bucket_lifecycle_guard_held(lifecycle_guard.as_ref(), bucket, "")
+    }
+}
+
+impl ECStore {
+    async fn ensure_no_multipart_uploads_on_sets(&self, bucket: &str) -> Result<()> {
         for pool in &self.pools {
             for set in &pool.disk_set {
                 set.ensure_no_multipart_uploads(bucket).await?;
             }
         }
-        ensure_multipart_bucket_lifecycle_guard_held(lifecycle_guard.as_ref(), bucket, "")
+        Ok(())
+    }
+
+    pub(super) async fn ensure_no_multipart_uploads_under_lifecycle(
+        &self,
+        bucket: &str,
+        lifecycle: &rustfs_lock::NamespaceLockGuard,
+    ) -> Result<()> {
+        super::bucket::await_bucket_namespace_operation(
+            Some(lifecycle),
+            bucket,
+            "managed bucket multipart inspection",
+            self.ensure_no_multipart_uploads_on_sets(bucket),
+        )
+        .await
     }
 }
 

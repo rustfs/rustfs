@@ -231,14 +231,16 @@ pub(crate) fn map_quota_check_outcome(
     outcome: Result<QuotaCheckResult, QuotaError>,
 ) -> rustfs_s3_types::S3Result<QuotaCheckResult> {
     match outcome {
-        Ok(result) if !result.allowed => Err(S3Error::with_message(
-            S3ErrorCode::InvalidRequest,
-            format!(
-                "Bucket quota exceeded. Current usage: {} bytes, limit: {} bytes",
-                result.current_usage.unwrap_or(0),
-                result.quota_limit.unwrap_or(0)
-            ),
-        )),
+        Ok(result) if !result.allowed => {
+            let current = result.current_usage.unwrap_or(0);
+            let limit = result.quota_limit.unwrap_or(0);
+            let mut error = S3Error::with_message(
+                S3ErrorCode::InvalidRequest,
+                format!("Bucket quota exceeded. Current usage: {current} bytes, limit: {limit} bytes"),
+            );
+            error.set_source(Box::new(StorageError::QuotaExceeded { current, limit }));
+            Err(error)
+        }
         Err(e) => {
             counter!("rustfs_bucket_quota_check_failed_total").increment(1);
             if matches!(&e, QuotaError::UsageUnavailable { .. }) {
@@ -266,10 +268,15 @@ pub(crate) fn apply_quota_admission(opts: &mut ObjectOptions, result: &QuotaChec
         return Err(s3_error!(ServiceUnavailable, "Bucket quota check temporarily unavailable, please retry"));
     };
     if current_usage > quota_limit {
-        return Err(s3_error!(
-            InvalidRequest,
-            "Bucket quota exceeded. Current usage: {current_usage} bytes, limit: {quota_limit} bytes"
-        ));
+        let mut error = S3Error::with_message(
+            S3ErrorCode::InvalidRequest,
+            format!("Bucket quota exceeded. Current usage: {current_usage} bytes, limit: {quota_limit} bytes"),
+        );
+        error.set_source(Box::new(StorageError::QuotaExceeded {
+            current: current_usage,
+            limit: quota_limit,
+        }));
+        return Err(error);
     }
     let _ = opts.set_quota_admission(current_usage, quota_limit);
     Ok(())
@@ -280,10 +287,15 @@ pub(super) fn ensure_object_size_within_quota(result: &QuotaCheckResult, new_siz
         return Ok(());
     };
     if new_size > quota_limit {
-        return Err(s3_error!(
-            InvalidRequest,
-            "Bucket quota exceeded. Current usage: {current_usage} bytes, limit: {quota_limit} bytes"
-        ));
+        let mut error = S3Error::with_message(
+            S3ErrorCode::InvalidRequest,
+            format!("Bucket quota exceeded. Current usage: {current_usage} bytes, limit: {quota_limit} bytes"),
+        );
+        error.set_source(Box::new(StorageError::QuotaExceeded {
+            current: current_usage,
+            limit: quota_limit,
+        }));
+        return Err(error);
     }
     Ok(())
 }
@@ -2395,8 +2407,16 @@ mod tests {
     #[test]
     fn quota_admission_rejects_over_limit() {
         let err = map_quota_check_outcome("bucket", Ok(quota_result(false))).expect_err("an over-limit result rejects the write");
-        assert_eq!(err.code(), &rustfs_s3_types::S3ErrorCode::InvalidRequest);
+        assert_eq!(err.code(), &S3ErrorCode::InvalidRequest);
+        assert_eq!(err.status_code(), Some(StatusCode::BAD_REQUEST));
         assert_eq!(err.message(), Some("Bucket quota exceeded. Current usage: 1024 bytes, limit: 2048 bytes"));
+        assert!(matches!(
+            err.source().and_then(|source| source.downcast_ref::<StorageError>()),
+            Some(StorageError::QuotaExceeded {
+                current: 1024,
+                limit: 2048
+            })
+        ));
     }
 
     #[test]
@@ -2412,9 +2432,13 @@ mod tests {
         let mut opts = ObjectOptions::default();
         let err =
             apply_quota_admission(&mut opts, &result).expect_err("legacy completion must not bypass an already exceeded quota");
-        assert_eq!(err.code(), &rustfs_s3_types::S3ErrorCode::InvalidRequest);
-        assert_eq!(err.status_code(), Some(http::StatusCode::BAD_REQUEST));
+        assert_eq!(err.code(), &S3ErrorCode::InvalidRequest);
+        assert_eq!(err.status_code(), Some(StatusCode::BAD_REQUEST));
         assert_eq!(err.message(), Some("Bucket quota exceeded. Current usage: 6 bytes, limit: 5 bytes"));
+        assert!(matches!(
+            err.source().and_then(|source| source.downcast_ref::<StorageError>()),
+            Some(StorageError::QuotaExceeded { current: 6, limit: 5 })
+        ));
     }
 
     #[test]
@@ -2428,6 +2452,7 @@ mod tests {
         )
         .expect_err("a checker fault must fail closed");
         assert_eq!(err.code(), &rustfs_s3_types::S3ErrorCode::ServiceUnavailable);
+        assert!(err.source().is_none());
         assert_eq!(err.message(), Some("Bucket quota check temporarily unavailable, please retry"));
     }
 
@@ -2446,9 +2471,16 @@ mod tests {
             .expect("commit-time ledger must decide whether stale usage was reclaimed");
         let err = ensure_object_size_within_quota(&stale_full_usage, 4097)
             .expect_err("an object larger than the whole quota can never fit");
-        assert_eq!(err.code(), &rustfs_s3_types::S3ErrorCode::InvalidRequest);
-        assert_eq!(err.status_code(), Some(http::StatusCode::BAD_REQUEST));
+        assert_eq!(err.code(), &S3ErrorCode::InvalidRequest);
+        assert_eq!(err.status_code(), Some(StatusCode::BAD_REQUEST));
         assert_eq!(err.message(), Some("Bucket quota exceeded. Current usage: 4096 bytes, limit: 4096 bytes"));
+        assert!(matches!(
+            err.source().and_then(|source| source.downcast_ref::<StorageError>()),
+            Some(StorageError::QuotaExceeded {
+                current: 4096,
+                limit: 4096
+            })
+        ));
     }
 
     #[test]
@@ -2463,6 +2495,7 @@ mod tests {
         )
         .expect_err("unknown authoritative usage must not admit a snapshot-protocol write");
         assert_eq!(err.code(), &rustfs_s3_types::S3ErrorCode::ServiceUnavailable);
+        assert!(err.source().is_none());
         assert_eq!(err.message(), Some("Bucket quota check temporarily unavailable, please retry"));
 
         let result = QuotaCheckResult {

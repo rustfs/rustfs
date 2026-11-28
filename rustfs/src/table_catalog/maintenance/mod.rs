@@ -12,19 +12,26 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-mod compaction;
 mod config;
+#[cfg(test)]
+pub(in crate::table_catalog) mod fault_observation;
 mod periodic;
 mod periodic_runtime;
-mod planner;
-mod recovery;
 mod worker;
 
-pub(crate) use compaction::{
-    compaction_stored_input_ceiling_error, run_compaction_output, run_compaction_worker, try_admit_compaction,
-};
 pub(crate) use config::*;
-pub(crate) use periodic_runtime::{PeriodicMaintenanceConfig, PeriodicMaintenanceRuntime};
-pub(crate) use planner::*;
-pub(crate) use recovery::*;
+pub(crate) use periodic::{
+    VectorMaintenanceActiveBucketCursor, VectorMaintenanceDiscoveryCursor, VectorMaintenanceDiscoveryFailure,
+    VectorMaintenancePreparationKind, VectorMaintenanceResourceStage, VectorMaintenanceSource, VectorMaintenanceTarget,
+    VectorMaintenanceTargetPage,
+};
+#[cfg(test)]
+pub(crate) use periodic::{VectorMaintenancePassReport, VectorMaintenanceScheduler};
+pub(crate) use periodic_runtime::{PeriodicMaintenanceConfig, PeriodicMaintenanceRuntime, spawn_vector_maintenance};
 pub(crate) use worker::*;
+
+#[cfg(test)]
+pub(crate) use fault_observation::{
+    VectorMaintenanceCompletionObserver, VectorMaintenanceCompletionSnapshot, VectorMaintenanceGcLockSnapshot,
+    VectorMaintenanceObservedSourceKind,
+};

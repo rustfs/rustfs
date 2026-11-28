@@ -91,6 +91,7 @@ impl Fixture {
         let catalog = ObjectTableCatalogStore::new(backend);
         catalog
             .put_table_bucket(TableBucketEntry {
+                vector_bucket_binding: None,
                 version: TABLE_CATALOG_ENTRY_VERSION,
                 table_bucket: bucket.clone(),
                 catalog_type: TABLE_BUCKET_CATALOG_TYPE.into(),
@@ -111,6 +112,9 @@ impl Fixture {
             .expect("create catalog namespace");
         catalog
             .create_table(TableEntry {
+                vector_head_binding: None,
+                vector_index_definition: None,
+                vector_maintenance_binding: None,
                 version: TABLE_CATALOG_ENTRY_VERSION,
                 table_bucket: bucket.clone(),
                 namespace: namespace.public_name(),

@@ -604,6 +604,67 @@ async fn valid_header_sigv4_request_succeeds() -> Result<(), Box<dyn std::error:
     assert_eq!(resp.status().as_u16(), 200, "correctly signed GET should succeed");
     let bytes = resp.bytes().await?;
     assert_eq!(bytes.as_ref(), expected, "GET body must match stored object");
+
+    let no_proxy_http = aws_smithy_http_client::Builder::new().build_with_connector_fn(|settings, components| {
+        let mut builder =
+            aws_smithy_http_client::Connector::builder().proxy_config(aws_smithy_http_client::proxy::ProxyConfig::disabled());
+        builder.set_connector_settings(settings.cloned());
+        builder.set_sleep_impl(components.and_then(|runtime| runtime.sleep_impl()));
+        builder.build_http()
+    });
+    let vector_client = aws_sdk_s3vectors::Client::from_conf(
+        aws_sdk_s3vectors::Config::builder()
+            .behavior_version(aws_sdk_s3vectors::config::BehaviorVersion::latest())
+            .region(aws_sdk_s3vectors::config::Region::new(REGION))
+            .endpoint_url(&env.url)
+            .credentials_provider(aws_sdk_s3vectors::config::Credentials::new(
+                &env.access_key,
+                &env.secret_key,
+                None,
+                None,
+                "live-e2e-closed-vector",
+            ))
+            .http_client(no_proxy_http)
+            .retry_config(aws_smithy_types::retry::RetryConfig::disabled())
+            .build(),
+    );
+    let vector_err = vector_client
+        .list_vector_buckets()
+        .send()
+        .await
+        .expect_err("external s3vectors route must remain closed on live production binary");
+    let vector_raw = vector_err.raw_response().expect("raw response from closed Vector route");
+    assert_eq!(vector_raw.status().as_u16(), 503);
+    assert_eq!(vector_raw.headers().get("content-type"), Some("application/json"));
+    assert_eq!(vector_raw.headers().get("x-amzn-errortype"), Some("ServiceUnavailableException"));
+    assert_eq!(
+        vector_err
+            .as_service_error()
+            .and_then(aws_sdk_s3vectors::error::ProvideErrorMetadata::code),
+        Some("ServiceUnavailableException")
+    );
+    assert_eq!(
+        vector_err
+            .as_service_error()
+            .and_then(aws_sdk_s3vectors::error::ProvideErrorMetadata::message),
+        Some("Vector service is unavailable")
+    );
+    let create_vec_err = vector_client
+        .create_vector_bucket()
+        .vector_bucket_name("closed-vector-probe")
+        .send()
+        .await
+        .expect_err("external CreateVectorBucket must remain closed on live production binary");
+    assert_eq!(create_vec_err.raw_response().map(|r| r.status().as_u16()), Some(503));
+
+    let post_vector_resp = send_signed(&env, reqwest::Method::GET, &path, &headers, None).await?;
+    assert_eq!(
+        post_vector_resp.status().as_u16(),
+        200,
+        "ordinary S3 GET must remain healthy after closed Vector calls"
+    );
+    assert_eq!(post_vector_resp.bytes().await?.as_ref(), expected);
+
     info!("valid header SigV4 control passed");
     Ok(())
 }

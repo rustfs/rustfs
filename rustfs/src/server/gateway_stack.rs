@@ -545,7 +545,7 @@ fn early_gate(table: OperationTable, server_ctx: Arc<ServerContextSlot>) -> impl
 /// large transfer must not be cut off for its duration. A committed answer is not bounded either.
 /// The request body keeps RustFS's own idle bound and no throughput floor, and at most
 /// `max_buffered_body_bytes` of it is held.
-fn service_config(body_read_timeout: Duration, max_buffered_body_bytes: u64) -> ServiceConfig {
+pub(super) fn service_config(body_read_timeout: Duration, max_buffered_body_bytes: u64) -> ServiceConfig {
     let handlers = HandlerDeadlineConfig::default()
         .without_deadline(HandlerDeadlineClass::Standard)
         .without_deadline(HandlerDeadlineClass::Extended)
@@ -592,7 +592,7 @@ fn is_plaintext_ssec_refusal_response(response: &Response<rustfs_gateway::Body>)
 /// Attaches what the gateway reads about a request from its host: whether the transport was
 /// secure, the client address after RustFS's trusted-proxy correction, and RustFS's request
 /// identifier. Each is derived from what RustFS's own layers already attached; no header is read.
-fn attach_host_facts(extensions: &mut Extensions) -> bool {
+pub(super) fn attach_host_facts(extensions: &mut Extensions) -> bool {
     let client_info = extensions.get::<ClientInfo>();
     let native_tls = extensions.get::<NativeTlsTransport>().is_some_and(|transport| transport.0);
     let secure = is_secure_transport(native_tls, client_info);
@@ -630,7 +630,7 @@ impl RequestIdCarrier for RequestContext {
 /// `AppContext` (never falling back to process-global credentials or token-signing keys). `None`
 /// while this server context is uninstalled, lacks root credentials, or cannot verify a signature,
 /// which the adapters answer as unavailable.
-fn live_root(server_ctx: Arc<ServerContextSlot>) -> impl Fn() -> Option<Arc<RootCredentials>> + Send + Sync + 'static {
+pub(super) fn live_root(server_ctx: Arc<ServerContextSlot>) -> impl Fn() -> Option<Arc<RootCredentials>> + Send + Sync + 'static {
     move || {
         let root = server_ctx.installed_app_context()?.action_credentials().get()?;
         // Match `check_claims_from_token_with_context`: STS session tokens are signed with this
@@ -653,8 +653,8 @@ impl BucketOwnerSource for ReportedOwner {
 
 /// The IAM system of one server, looked up when a credential is: IAM is installed after the
 /// listener starts, so the assembly cannot hold a handle.
-struct ServerIam {
-    server_ctx: Arc<ServerContextSlot>,
+pub(super) struct ServerIam {
+    pub(super) server_ctx: Arc<ServerContextSlot>,
 }
 
 impl ServerIam {

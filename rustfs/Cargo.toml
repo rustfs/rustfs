@@ -247,6 +247,14 @@ hotpath-cpu = [
 workspace = true
 
 [dependencies]
+lance = { workspace = true }
+lance-arrow = { workspace = true }
+lance-core = { workspace = true }
+lance-file = { workspace = true }
+lance-index = { workspace = true }
+lance-io = { workspace = true }
+lance-table = { workspace = true }
+object_store_lance = { workspace = true }
 hotpath.workspace = true
 # RustFS Internal Crates
 rustfs-heal = { workspace = true }
@@ -424,6 +432,8 @@ symbolic-demangle = { version = "=13.9.0", default-features = false, features = 
 
 [dev-dependencies]
 h2.workspace = true
+aws-sdk-s3vectors = { workspace = true, features = ["rt-tokio"] }
+aws-smithy-http-client = { workspace = true, features = ["default-client", "rt-tokio"] }
 rustfs-targets = { workspace = true, features = ["test-support"] }
 uuid = { workspace = true, features = ["v4", "v5", "fast-rng", "macro-diagnostics"] }
 rustfs-iam = { workspace = true, features = ["test-util"] }

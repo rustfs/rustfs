@@ -41,6 +41,10 @@ unknown-registry = "deny"
 unknown-git = "deny"
 allow-registry = ["https://github.com/rust-lang/crates.io-index"]
 allow-git = [
+    # Release-based maintained macro backports; each workspace patch uses a full revision.
+    # owner: GatewayJ  review: 2026-12
+    "https://github.com/GatewayJ/lance",
+    "https://github.com/GatewayJ/simba",
     # The reviewed test oracles compare protocol behavior with this pinned s3s source.
     # owner: GatewayJ  review: 2026-10
     "https://github.com/s3s-project/s3s",

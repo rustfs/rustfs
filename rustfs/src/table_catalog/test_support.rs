@@ -22,6 +22,39 @@
 //! fixed values (sequence 7 / snapshot 20), which keeps every produced byte
 //! identical to the pre-extraction fixtures.
 
+#[cfg(test)]
+pub(crate) mod real_maintenance;
+
+pub(crate) mod real_catalog_backend;
+
+#[cfg(test)]
+pub(crate) mod catalog_write_faults;
+
+#[cfg(unix)]
+pub(crate) fn vector_catalog_paths() -> TableCatalogObjectPaths {
+    TableCatalogObjectPaths::for_vector()
+}
+
+#[cfg(unix)]
+pub(crate) fn vector_publication_lock_resources(
+    bucket: &str,
+    namespace: &Namespace,
+    name: &CatalogName,
+) -> Vec<(String, String)> {
+    let paths = TableCatalogObjectPaths::for_vector();
+    vec![
+        (
+            RUSTFS_META_BUCKET.into(),
+            format!("{}publication.lock", paths.table_bucket_root_prefix(bucket)),
+        ),
+        (
+            RUSTFS_META_BUCKET.into(),
+            format!("{}.publication.lock", paths.table_entry_path(bucket, namespace, name)),
+        ),
+        (RUSTFS_META_BUCKET.into(), paths.table_entry_path(bucket, namespace, name)),
+    ]
+}
+
 use rustfs_lock::{LockClient, LockId, LockInfo, LockRequest, LockResponse, LockStats};
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex};
@@ -461,6 +494,7 @@ pub(crate) struct TestCatalogWorkerContext {
 
 #[derive(Default)]
 pub(crate) struct TestCatalogObjectState {
+    pub(crate) bucket_handles: BTreeMap<String, BucketHandle>,
     pub(crate) observed_worker_contexts: Option<Vec<TestCatalogWorkerContext>>,
     pub(crate) objects: BTreeMap<(String, String), TestCatalogObjectRecord>,
     pub(crate) etagless_objects: BTreeSet<(String, String)>,
@@ -529,6 +563,19 @@ impl TestCatalogObjectBackend {
             })),
             ..self.clone()
         })
+    }
+
+    pub(crate) async fn seed_table_metadata(&self, entry: &TableEntry, locations: &[&str]) {
+        let mut metadata = table_metadata_json(&entry.table_uuid, &entry.warehouse_location);
+        metadata["format-version"] = serde_json::json!(entry.format_version);
+        if entry.format_version == 1 {
+            metadata["schema"] = metadata["schemas"][0].clone();
+            metadata["partition-spec"] = serde_json::json!([]);
+        }
+        let bytes = serde_json::to_vec(&metadata).expect("test metadata should serialize");
+        for location in locations {
+            self.seed_object(&entry.table_bucket, location, bytes.clone()).await;
+        }
     }
 
     pub(crate) async fn seed_object(&self, bucket: &str, object: &str, data: Vec<u8>) {
@@ -973,6 +1020,44 @@ impl TestCatalogObjectState {
 
 #[async_trait::async_trait]
 impl TableCatalogObjectBackend for TestCatalogObjectBackend {
+    async fn revalidate_bucket_handle(&self, expected: &BucketHandle) -> TableCatalogStoreResult<()> {
+        if self
+            .state
+            .lock()
+            .await
+            .bucket_handles
+            .get(expected.storage_bucket_id().as_str())
+            != Some(expected)
+        {
+            return Err(TableCatalogStoreError::Conflict("test bucket identity changed".to_string()));
+        }
+        Ok(())
+    }
+
+    async fn acquire_bucket_lifecycle_read(&self, expected: &BucketHandle) -> TableCatalogStoreResult<TableCatalogLockGuard> {
+        let guard = self.acquire_read_lock(expected.storage_bucket_id().as_str(), "").await?;
+        self.revalidate_bucket_handle(expected).await?;
+        Ok(guard)
+    }
+
+    async fn read_managed_candidate(
+        &self,
+        bucket: &BucketHandle,
+        metadata: &CatalogMetadataRef,
+        max_size: usize,
+        lifecycle: &mut TableCatalogLockGuard,
+    ) -> TableCatalogStoreResult<Option<TableCatalogObject>> {
+        self.revalidate_bucket_handle(bucket).await?;
+        if lifecycle.is_lock_lost() {
+            return Err(TableCatalogStoreError::Unavailable("test lifecycle guard was lost".to_string()));
+        }
+        self.read_object_limited(bucket.storage_bucket_id().as_str(), metadata.object_key().as_str(), max_size)
+            .await
+    }
+
+    async fn read_table_bucket_incarnation(&self, _bucket: &str) -> TableCatalogStoreResult<Uuid> {
+        Ok(Uuid::from_u128(0x8b35cb4c5b7640babb83112be429b79c))
+    }
     fn registration_cache(&self) -> Option<TableCatalogRegistrationCache> {
         Some(self.registration_cache.clone())
     }
@@ -1519,6 +1604,18 @@ pub(crate) struct NoopTableCatalogStore;
 
 #[async_trait::async_trait]
 impl TableCatalogStore for NoopTableCatalogStore {
+    async fn commit_prepared(&self, prepared: PreparedCatalogCommit) -> TableCatalogStoreResult<TableCommitResult> {
+        self.commit_table(prepared.legacy_request()?).await
+    }
+    async fn commit_prepared_with_publication(
+        &self,
+        prepared: PreparedCatalogCommit,
+        publication: &(dyn TableCommitPublication + Sync),
+    ) -> TableCatalogStoreResult<TableCommitResult> {
+        self.commit_table_with_publication(prepared.legacy_request()?, publication)
+            .await
+    }
+
     async fn get_table_bucket(&self, _table_bucket: &str) -> TableCatalogStoreResult<Option<TableBucketEntry>> {
         Ok(None)
     }
@@ -1591,62 +1688,6 @@ impl TableCatalogStore for NoopTableCatalogStore {
         Ok(None)
     }
 
-    async fn commit_table(&self, request: TableCommitRequest) -> TableCatalogStoreResult<TableCommitResult> {
-        let table = TableEntry {
-            version: TABLE_CATALOG_ENTRY_VERSION,
-            table_bucket: request.table_bucket,
-            namespace: request.namespace,
-            table: request.table,
-            table_id: "table-id".to_string(),
-            table_uuid: "table-uuid".to_string(),
-            format: "ICEBERG".to_string(),
-            format_version: 2,
-            warehouse_location: "s3://analytics/tables/table-id".to_string(),
-            metadata_location: request.new_metadata_location.clone(),
-            version_token: "token-v2".to_string(),
-            generation: 2,
-            state: TableCatalogEntryState::Active,
-            properties: BTreeMap::new(),
-            created_at: None,
-            updated_at: None,
-        };
-        let commit_log = CommitLogEntry {
-            version: TABLE_CATALOG_ENTRY_VERSION,
-            commit_id: request.commit_id,
-            idempotency_key: request.idempotency_key,
-            table_id: table.table_id.clone(),
-            operation: request.operation,
-            expected_version_token: request.expected_version_token,
-            new_version_token: table.version_token.clone(),
-            previous_metadata_location: request.expected_metadata_location,
-            new_metadata_location: table.metadata_location.clone(),
-            requirements: request.requirements,
-            status: CommitLogStatus::Committed,
-            writer: request.writer,
-            created_at: None,
-            updated_at: None,
-        };
-
-        Ok(TableCommitResult { table, commit_log })
-    }
-
-    async fn commit_table_with_publication(
-        &self,
-        request: TableCommitRequest,
-        publication: &(dyn TableCommitPublication + Sync),
-    ) -> TableCatalogStoreResult<TableCommitResult> {
-        publication
-            .prepare(&request.table_bucket, &request.namespace, &request.table)
-            .await?;
-        if !publication.holds_table(&request.table_bucket, &request.namespace, &request.table) {
-            return Err(TableCatalogStoreError::Internal(
-                "table commit requires a table publication fence".to_string(),
-            ));
-        }
-        let _publication_completion = TableCommitPublicationCompletion::new(publication);
-        self.commit_table(request).await
-    }
-
     async fn drop_table(&self, _table_bucket: &str, _namespace: &str, _table: &str) -> TableCatalogStoreResult<()> {
         Ok(())
     }
@@ -1661,29 +1702,6 @@ impl TableCatalogStore for NoopTableCatalogStore {
 
     async fn load_view(&self, _table_bucket: &str, _namespace: &str, _view: &str) -> TableCatalogStoreResult<Option<ViewEntry>> {
         Ok(None)
-    }
-
-    async fn replace_view(&self, request: ViewCommitRequest) -> TableCatalogStoreResult<ViewCommitResult> {
-        Ok(ViewCommitResult {
-            view: ViewEntry {
-                version: TABLE_CATALOG_ENTRY_VERSION,
-                table_bucket: request.table_bucket,
-                namespace: request.namespace,
-                view: request.view,
-                view_id: "view-id".to_string(),
-                view_uuid: "view-uuid".to_string(),
-                format: "ICEBERG_VIEW".to_string(),
-                format_version: 1,
-                warehouse_location: "s3://analytics/views/view-id".to_string(),
-                metadata_location: request.new_metadata_location,
-                version_token: "token-v2".to_string(),
-                generation: 2,
-                state: TableCatalogEntryState::Active,
-                properties: BTreeMap::new(),
-                created_at: None,
-                updated_at: None,
-            },
-        })
     }
 
     async fn drop_view(&self, _table_bucket: &str, _namespace: &str, _view: &str) -> TableCatalogStoreResult<()> {
@@ -1725,6 +1743,18 @@ pub(crate) struct TestTableCatalogStore {
 
 #[async_trait::async_trait]
 impl crate::table_catalog::TableCatalogStore for TestTableCatalogStore {
+    async fn commit_prepared(&self, prepared: PreparedCatalogCommit) -> TableCatalogStoreResult<TableCommitResult> {
+        self.commit_table(prepared.legacy_request()?).await
+    }
+    async fn commit_prepared_with_publication(
+        &self,
+        prepared: PreparedCatalogCommit,
+        publication: &(dyn TableCommitPublication + Sync),
+    ) -> TableCatalogStoreResult<TableCommitResult> {
+        self.commit_table_with_publication(prepared.legacy_request()?, publication)
+            .await
+    }
+
     async fn ensure_table_bucket(&self, entry: TableBucketEntry) -> TableCatalogStoreResult<()> {
         if self.get_table_bucket(&entry.table_bucket).await?.is_some() {
             return Ok(());
@@ -1935,81 +1965,6 @@ impl crate::table_catalog::TableCatalogStore for TestTableCatalogStore {
             .cloned())
     }
 
-    async fn commit_table(
-        &self,
-        request: crate::table_catalog::TableCommitRequest,
-    ) -> crate::table_catalog::TableCatalogStoreResult<crate::table_catalog::TableCommitResult> {
-        let mut tables = self.tables.lock().await;
-        let Some(index) = tables.iter().position(|entry| {
-            entry.table_bucket == request.table_bucket && entry.namespace == request.namespace && entry.table == request.table
-        }) else {
-            return Err(crate::table_catalog::TableCatalogStoreError::NotFound(format!(
-                "table {}/{}/{}",
-                request.table_bucket, request.namespace, request.table
-            )));
-        };
-
-        let current = tables[index].clone();
-        if current.version_token != request.expected_version_token {
-            return Err(crate::table_catalog::TableCatalogStoreError::Conflict(
-                "current table version token does not match expected token".to_string(),
-            ));
-        }
-        if current.metadata_location != request.expected_metadata_location {
-            return Err(crate::table_catalog::TableCatalogStoreError::Conflict(
-                "current table metadata location does not match expected location".to_string(),
-            ));
-        }
-        if let Some(pause) = &self.commit_table_pause {
-            pause.started.notify_one();
-            pause.release.notified().await;
-        }
-
-        let mut next = current.clone();
-        next.metadata_location = request.new_metadata_location.clone();
-        next.version_token = "token-committed".to_string();
-        next.generation = next.generation.saturating_add(1);
-        tables[index] = next.clone();
-        drop(tables);
-
-        let commit_log = crate::table_catalog::CommitLogEntry {
-            version: crate::table_catalog::TABLE_CATALOG_ENTRY_VERSION,
-            commit_id: request.commit_id,
-            idempotency_key: request.idempotency_key,
-            table_id: current.table_id,
-            operation: request.operation,
-            expected_version_token: request.expected_version_token,
-            new_version_token: next.version_token.clone(),
-            previous_metadata_location: request.expected_metadata_location,
-            new_metadata_location: request.new_metadata_location,
-            requirements: request.requirements,
-            status: crate::table_catalog::CommitLogStatus::Committed,
-            writer: request.writer,
-            created_at: None,
-            updated_at: None,
-        };
-        self.commits.lock().await.push(commit_log.clone());
-
-        Ok(crate::table_catalog::TableCommitResult { table: next, commit_log })
-    }
-
-    async fn commit_table_with_publication(
-        &self,
-        request: crate::table_catalog::TableCommitRequest,
-        publication: &(dyn crate::table_catalog::TableCommitPublication + Sync),
-    ) -> crate::table_catalog::TableCatalogStoreResult<crate::table_catalog::TableCommitResult> {
-        publication
-            .prepare(&request.table_bucket, &request.namespace, &request.table)
-            .await?;
-        if !publication.holds_table(&request.table_bucket, &request.namespace, &request.table) {
-            return Err(crate::table_catalog::TableCatalogStoreError::Internal(
-                "table commit requires a table publication fence".to_string(),
-            ));
-        }
-        let _publication_completion = crate::table_catalog::TableCommitPublicationCompletion::new(publication);
-        self.commit_table(request).await
-    }
-
     async fn drop_table(
         &self,
         table_bucket: &str,
@@ -2074,6 +2029,254 @@ impl crate::table_catalog::TableCatalogStore for TestTableCatalogStore {
             .cloned())
     }
 
+    async fn drop_view(
+        &self,
+        table_bucket: &str,
+        namespace: &str,
+        view: &str,
+    ) -> crate::table_catalog::TableCatalogStoreResult<()> {
+        self.views
+            .lock()
+            .await
+            .retain(|entry| !(entry.table_bucket == table_bucket && entry.namespace == namespace && entry.view == view));
+        Ok(())
+    }
+
+    async fn get_commit_by_id(
+        &self,
+        _table_bucket: &str,
+        _table_id: &str,
+        _commit_id: &str,
+    ) -> crate::table_catalog::TableCatalogStoreResult<Option<crate::table_catalog::CommitLogEntry>> {
+        Ok(None)
+    }
+
+    async fn get_commit_by_idempotency_key(
+        &self,
+        _table_bucket: &str,
+        _table_id: &str,
+        _idempotency_key: &str,
+    ) -> crate::table_catalog::TableCatalogStoreResult<Option<crate::table_catalog::CommitLogEntry>> {
+        Ok(None)
+    }
+}
+
+#[async_trait::async_trait]
+impl IcebergCatalogCommit for NoopTableCatalogStore {
+    async fn commit_table(&self, request: TableCommitRequest) -> TableCatalogStoreResult<TableCommitResult> {
+        let table = TableEntry {
+            vector_maintenance_binding: None,
+            vector_index_definition: None,
+            vector_head_binding: None,
+            version: TABLE_CATALOG_ENTRY_VERSION,
+            table_bucket: request.table_bucket,
+            namespace: request.namespace,
+            table: request.table,
+            table_id: "table-id".to_string(),
+            table_uuid: "table-uuid".to_string(),
+            format: "ICEBERG".to_string(),
+            format_version: 2,
+            warehouse_location: "s3://analytics/tables/table-id".to_string(),
+            metadata_location: request.new_metadata_location.clone(),
+            version_token: "token-v2".to_string(),
+            generation: 2,
+            state: TableCatalogEntryState::Active,
+            properties: BTreeMap::new(),
+            created_at: None,
+            updated_at: None,
+        };
+        let commit_log = CommitLogEntry {
+            vector_resource_mutation: None,
+            vector_commit_binding: None,
+            version: TABLE_CATALOG_ENTRY_VERSION,
+            commit_id: request.commit_id,
+            idempotency_key: request.idempotency_key,
+            table_id: table.table_id.clone(),
+            operation: request.operation,
+            expected_version_token: request.expected_version_token,
+            new_version_token: table.version_token.clone(),
+            previous_metadata_location: request.expected_metadata_location,
+            new_metadata_location: table.metadata_location.clone(),
+            requirements: request.requirements,
+            status: CommitLogStatus::Committed,
+            writer: request.writer,
+            created_at: None,
+            updated_at: None,
+        };
+
+        Ok(TableCommitResult { table, commit_log })
+    }
+    async fn commit_table_with_publication(
+        &self,
+        request: TableCommitRequest,
+        publication: &(dyn TableCommitPublication + Sync),
+    ) -> TableCatalogStoreResult<TableCommitResult> {
+        publication
+            .prepare(&request.table_bucket, &request.namespace, &request.table)
+            .await?;
+        if !publication.holds_table(&request.table_bucket, &request.namespace, &request.table) {
+            return Err(TableCatalogStoreError::Internal(
+                "table commit requires a table publication fence".to_string(),
+            ));
+        }
+        let _publication_completion = TableCommitPublicationCompletion::new(publication);
+        self.commit_table(request).await
+    }
+    async fn commit_table_with_validated_graph(
+        &self,
+        _request: TableCommitRequest,
+        _graph: ValidatedIcebergSnapshotGraph,
+        _publication: &(dyn IcebergGraphPublication + Sync),
+    ) -> TableCatalogStoreResult<TableCommitResult> {
+        Err(TableCatalogStoreError::Unsupported(
+            "noop catalog does not publish validated graphs".into(),
+        ))
+    }
+    async fn replace_view(&self, request: ViewCommitRequest) -> TableCatalogStoreResult<ViewCommitResult> {
+        Ok(ViewCommitResult {
+            view: ViewEntry {
+                version: TABLE_CATALOG_ENTRY_VERSION,
+                table_bucket: request.table_bucket,
+                namespace: request.namespace,
+                view: request.view,
+                view_id: "view-id".to_string(),
+                view_uuid: "view-uuid".to_string(),
+                format: "ICEBERG_VIEW".to_string(),
+                format_version: 1,
+                warehouse_location: "s3://analytics/views/view-id".to_string(),
+                metadata_location: request.new_metadata_location,
+                version_token: "token-v2".to_string(),
+                generation: 2,
+                state: TableCatalogEntryState::Active,
+                properties: BTreeMap::new(),
+                created_at: None,
+                updated_at: None,
+            },
+        })
+    }
+}
+
+#[async_trait::async_trait]
+impl IcebergCatalogCommit for TestTableCatalogStore {
+    async fn commit_table(
+        &self,
+        request: crate::table_catalog::TableCommitRequest,
+    ) -> crate::table_catalog::TableCatalogStoreResult<crate::table_catalog::TableCommitResult> {
+        let mut tables = self.tables.lock().await;
+        let Some(index) = tables.iter().position(|entry| {
+            entry.table_bucket == request.table_bucket && entry.namespace == request.namespace && entry.table == request.table
+        }) else {
+            return Err(crate::table_catalog::TableCatalogStoreError::NotFound(format!(
+                "table {}/{}/{}",
+                request.table_bucket, request.namespace, request.table
+            )));
+        };
+
+        let current = tables[index].clone();
+        if current.version_token != request.expected_version_token {
+            return Err(crate::table_catalog::TableCatalogStoreError::Conflict(
+                "current table version token does not match expected token".to_string(),
+            ));
+        }
+        if current.metadata_location != request.expected_metadata_location {
+            return Err(crate::table_catalog::TableCatalogStoreError::Conflict(
+                "current table metadata location does not match expected location".to_string(),
+            ));
+        }
+        if let Some(pause) = &self.commit_table_pause {
+            pause.started.notify_one();
+            pause.release.notified().await;
+        }
+
+        let mut next = current.clone();
+        next.metadata_location = request.new_metadata_location.clone();
+        next.version_token = "token-committed".to_string();
+        next.generation = next.generation.saturating_add(1);
+        tables[index] = next.clone();
+        drop(tables);
+
+        let commit_log = crate::table_catalog::CommitLogEntry {
+            vector_resource_mutation: None,
+            vector_commit_binding: None,
+            version: crate::table_catalog::TABLE_CATALOG_ENTRY_VERSION,
+            commit_id: request.commit_id,
+            idempotency_key: request.idempotency_key,
+            table_id: current.table_id,
+            operation: request.operation,
+            expected_version_token: request.expected_version_token,
+            new_version_token: next.version_token.clone(),
+            previous_metadata_location: request.expected_metadata_location,
+            new_metadata_location: request.new_metadata_location,
+            requirements: request.requirements,
+            status: crate::table_catalog::CommitLogStatus::Committed,
+            writer: request.writer,
+            created_at: None,
+            updated_at: None,
+        };
+        self.commits.lock().await.push(commit_log.clone());
+
+        Ok(crate::table_catalog::TableCommitResult { table: next, commit_log })
+    }
+    async fn commit_table_with_publication(
+        &self,
+        request: crate::table_catalog::TableCommitRequest,
+        publication: &(dyn crate::table_catalog::TableCommitPublication + Sync),
+    ) -> crate::table_catalog::TableCatalogStoreResult<crate::table_catalog::TableCommitResult> {
+        publication
+            .prepare(&request.table_bucket, &request.namespace, &request.table)
+            .await?;
+        if !publication.holds_table(&request.table_bucket, &request.namespace, &request.table) {
+            return Err(crate::table_catalog::TableCatalogStoreError::Internal(
+                "table commit requires a table publication fence".to_string(),
+            ));
+        }
+        let _publication_completion = crate::table_catalog::TableCommitPublicationCompletion::new(publication);
+        self.commit_table(request).await
+    }
+    async fn commit_table_with_validated_graph(
+        &self,
+        request: TableCommitRequest,
+        graph: ValidatedIcebergSnapshotGraph,
+        publication: &(dyn IcebergGraphPublication + Sync),
+    ) -> TableCatalogStoreResult<TableCommitResult> {
+        let _completion = TableCommitPublicationCompletion::new(publication);
+        publication.begin_table_bucket(&request.table_bucket).await?;
+        if !publication.holds_table_bucket(&request.table_bucket) {
+            return Err(TableCatalogStoreError::Internal(
+                "table commit requires a table-bucket publication fence".into(),
+            ));
+        }
+        publication
+            .prepare(&request.table_bucket, &request.namespace, &request.table)
+            .await?;
+        if !publication.holds_table(&request.table_bucket, &request.namespace, &request.table) {
+            return Err(TableCatalogStoreError::Internal("table commit requires a table publication fence".into()));
+        }
+        let reader = publication.prepared_object_reader()?;
+        let object = reader
+            .read_object_limited(&request.table_bucket, &request.new_metadata_location, TABLE_METADATA_JSON_MAX_SIZE)
+            .await?
+            .ok_or_else(|| TableCatalogStoreError::NotFound("candidate metadata".into()))?;
+        let candidate = decode_table_metadata_json(&request.new_metadata_location, &object.data)?;
+        let base = if request.expected_metadata_location.is_empty() {
+            None
+        } else {
+            let object = reader
+                .read_object_limited(&request.table_bucket, &request.expected_metadata_location, TABLE_METADATA_JSON_MAX_SIZE)
+                .await?
+                .ok_or_else(|| TableCatalogStoreError::NotFound("base metadata".into()))?;
+            Some(decode_table_metadata_json(&request.expected_metadata_location, &object.data)?)
+        };
+        let mut target = self
+            .load_table(&request.table_bucket, &request.namespace, &request.table)
+            .await?
+            .ok_or_else(|| TableCatalogStoreError::NotFound("table".into()))?;
+        if let Some(location) = candidate.get("location").and_then(serde_json::Value::as_str) {
+            target.warehouse_location = location.to_owned();
+        }
+        graph.validate_test_commit(&target, base.as_ref(), &candidate, publication)?;
+        self.commit_table(request).await
+    }
     async fn replace_view(
         &self,
         request: crate::table_catalog::ViewCommitRequest,
@@ -2108,36 +2311,5 @@ impl crate::table_catalog::TableCatalogStore for TestTableCatalogStore {
         next.generation = next.generation.saturating_add(1);
         views[index] = next.clone();
         Ok(crate::table_catalog::ViewCommitResult { view: next })
-    }
-
-    async fn drop_view(
-        &self,
-        table_bucket: &str,
-        namespace: &str,
-        view: &str,
-    ) -> crate::table_catalog::TableCatalogStoreResult<()> {
-        self.views
-            .lock()
-            .await
-            .retain(|entry| !(entry.table_bucket == table_bucket && entry.namespace == namespace && entry.view == view));
-        Ok(())
-    }
-
-    async fn get_commit_by_id(
-        &self,
-        _table_bucket: &str,
-        _table_id: &str,
-        _commit_id: &str,
-    ) -> crate::table_catalog::TableCatalogStoreResult<Option<crate::table_catalog::CommitLogEntry>> {
-        Ok(None)
-    }
-
-    async fn get_commit_by_idempotency_key(
-        &self,
-        _table_bucket: &str,
-        _table_id: &str,
-        _idempotency_key: &str,
-    ) -> crate::table_catalog::TableCatalogStoreResult<Option<crate::table_catalog::CommitLogEntry>> {
-        Ok(None)
     }
 }

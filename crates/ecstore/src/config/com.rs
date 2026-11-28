@@ -1284,7 +1284,11 @@ fn apply_external_storage_class_map(cfg: &mut Config, root: &Map<String, Value>)
 }
 
 fn decode_server_config_blob(data: &[u8]) -> Result<Config> {
-    if let Ok(cfg) = Config::unmarshal(data) {
+    let maintenance = super::vector_maintenance::decode(data)?;
+    if let Ok(mut cfg) = Config::unmarshal(data) {
+        if let Some(values) = maintenance {
+            super::vector_maintenance::install(&mut cfg, values);
+        }
         return Ok(cfg);
     }
 
@@ -1295,6 +1299,10 @@ fn decode_server_config_blob(data: &[u8]) -> Result<Config> {
 
     let mut cfg = Config::new();
     let mut diagnostics = CompatibilityDiagnostics::default();
+    let has_maintenance = maintenance.is_some();
+    if let Some(values) = maintenance {
+        super::vector_maintenance::install(&mut cfg, values);
+    }
     let has_storage = apply_external_storage_class_map(&mut cfg, &root)?;
     let has_scanner = apply_external_scalar_config_map(&mut cfg, &root, scanner_config_descriptor(), &mut diagnostics)?;
     let has_heal = apply_external_scalar_config_map(&mut cfg, &root, heal_config_descriptor(), &mut diagnostics)?;
@@ -1302,7 +1310,7 @@ fn decode_server_config_blob(data: &[u8]) -> Result<Config> {
     let has_notify = apply_external_notify_map(&mut cfg, &root);
     let has_audit = apply_external_audit_map(&mut cfg, &root);
     let has_header = root.contains_key("version") || root.contains_key("region") || root.contains_key("credential");
-    if !has_storage && !has_scanner && !has_heal && !has_oidc && !has_notify && !has_audit && !has_header {
+    if !has_storage && !has_scanner && !has_heal && !has_oidc && !has_notify && !has_audit && !has_header && !has_maintenance {
         return Err(Error::other("unrecognized external server config shape"));
     }
     diagnostics.report();
@@ -2000,6 +2008,10 @@ fn sync_rendered_target_section(
 
 fn encode_server_config_blob(cfg: &Config, seed: Option<&[u8]>) -> Result<Vec<u8>> {
     let mut root = seed.and_then(parse_object_seed).unwrap_or_default();
+    root.insert(
+        rustfs_config::S3VECTORS_MAINTENANCE_SUB_SYS.into(),
+        super::vector_maintenance::encode(cfg)?,
+    );
 
     if !matches!(root.get("version"), Some(Value::String(v)) if !v.trim().is_empty()) {
         root.insert("version".to_string(), Value::String("33".to_string()));
@@ -2134,7 +2146,8 @@ fn has_nested_config_aliases(root: &Map<String, Value>) -> bool {
 }
 
 fn configs_semantically_equal(lhs: &Config, rhs: &Config) -> bool {
-    build_storageclass_object(lhs) == build_storageclass_object(rhs)
+    super::vector_maintenance::equivalent(lhs, rhs)
+        && build_storageclass_object(lhs) == build_storageclass_object(rhs)
         && build_scalar_config_object(lhs, scanner_config_descriptor())
             == build_scalar_config_object(rhs, scanner_config_descriptor())
         && build_scalar_config_object(lhs, heal_config_descriptor()) == build_scalar_config_object(rhs, heal_config_descriptor())
@@ -2966,6 +2979,82 @@ mod tests {
         MYSQL_MAX_OPEN_CONNECTIONS, MYSQL_QUEUE_DIR, MYSQL_TABLE, SCANNER_CYCLE, SCANNER_IDLE_MODE, SCANNER_KEYS, SCANNER_SPEED,
         SCANNER_SUB_SYS, SCANNER_WALKERS_PER_DISK,
     };
+
+    #[test]
+    fn vector_maintenance_config_roundtrips_without_losing_account() {
+        let input = br#"{"version":"1","s3vectors_maintenance":{"enable":"on","execution_account":"maintenance-worker"}}"#;
+        let config = decode_server_config_blob(input).expect("maintenance config must decode");
+        let kvs = config
+            .get_value("s3vectors_maintenance", "_")
+            .expect("maintenance config must survive decoding");
+        assert_eq!(kvs.get("enable"), "on");
+        assert_eq!(kvs.get("execution_account"), "maintenance-worker");
+        let encoded = encode_server_config_blob(&config, Some(input)).expect("maintenance config must encode");
+        let decoded = decode_server_config_blob(&encoded).expect("saved maintenance config must decode");
+        assert_eq!(decoded.get_value("s3vectors_maintenance", "_"), Some(kvs));
+
+        let mut changed = config.clone();
+        changed
+            .0
+            .get_mut("s3vectors_maintenance")
+            .expect("subsystem")
+            .get_mut("_")
+            .expect("target")
+            .insert("execution_account".into(), "another-maintenance-worker".into());
+        assert!(!configs_semantically_equal(&config, &changed));
+        let encoded = encode_server_config_blob(&changed, Some(&encoded)).expect("changed account must encode");
+        let decoded = decode_server_config_blob(&encoded).expect("changed config must decode");
+        assert_eq!(
+            decoded
+                .get_value("s3vectors_maintenance", "_")
+                .expect("maintenance target")
+                .get("execution_account"),
+            "another-maintenance-worker"
+        );
+    }
+
+    #[test]
+    fn vector_maintenance_config_rejects_ambiguous_and_invalid_records() {
+        for input in [
+            r#"{"version":"1","s3vectors_maintenance":null}"#,
+            r#"{"version":"1","s3vectors_maintenance":{"enable":true}}"#,
+            r#"{"version":"1","s3vectors_maintenance":{"enable":"ON"}}"#,
+            r#"{"version":"1","s3vectors_maintenance":{"enable":"on","execution_account":""}}"#,
+            r#"{"version":"1","s3vectors_maintenance":{"enable":"off","comment":"ignored"}}"#,
+            r#"{"version":"1","s3vectors_maintenance":{"other":{"enable":"off"}}}"#,
+            r#"{"version":"1","s3vectors_maintenance":{"enable":"off","enable":"on","execution_account":"worker"}}"#,
+            r#"{"version":"1","s3vectors_maintenance":{"_":[],"enable":"off"}}"#,
+            r#"{"version":"1","s3vectors_maintenance":{"enable":"off"},"s3vectors_maintenance":{"enable":"off"}}"#,
+            r#"{"s3vectors_maintenance":{"_":[{"key":"enable","value":"off"},{"key":"enable","value":"on"}]}}"#,
+            r#"{"s3vectors_maintenance":{"_":[{"key":"enable","value":"off","unknown":"value"}]}}"#,
+        ] {
+            assert!(
+                decode_server_config_blob(input.as_bytes()).is_err(),
+                "invalid maintenance record accepted: {input}"
+            );
+        }
+    }
+
+    #[test]
+    fn vector_maintenance_config_accepts_canonical_kvs_and_disabled_defaults() {
+        let input =
+            br#"{"s3vectors_maintenance":{"_":[{"key":"enable","value":"on"},{"key":"execution_account","value":"worker"}]}}"#;
+        let config = decode_server_config_blob(input).expect("canonical KVS must decode");
+        assert_eq!(
+            config
+                .get_value("s3vectors_maintenance", "_")
+                .expect("target")
+                .get("execution_account"),
+            "worker"
+        );
+        crate::config::init();
+        let config = Config::new();
+        let defaults = config
+            .get_value("s3vectors_maintenance", "_")
+            .expect("maintenance defaults must be registered");
+        assert_eq!(defaults.get("enable"), "off");
+        assert_eq!(defaults.get("execution_account"), "");
+    }
 
     #[tokio::test]
     async fn config_task_join_error_does_not_expose_panic_payload() {

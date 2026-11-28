@@ -40,15 +40,13 @@ use rustfs_policy::policy::Args;
 use rustfs_policy::policy::action::{Action, KmsAction};
 use rustfs_s3_types::S3ErrorCode;
 use rustfs_sse::{
-    BucketDefaultEncryption, BucketEncryption, DEFAULT_SSE_ALGORITHM, KMS_KEY_NOT_FOUND_ERROR_CODE, KmsKeyAuthorizer, SseError,
-    SseHost, normalize_encryption_metadata_case, ssec_invalid_request,
+    BucketDefaultEncryption, BucketEncryption, DEFAULT_SSE_ALGORITHM, KMS_KEY_NOT_FOUND_ERROR_CODE, SseError, SseHost,
+    normalize_encryption_metadata_case, ssec_invalid_request,
 };
 use std::borrow::Cow;
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
-#[cfg(all(test, feature = "rio-v2"))]
-pub(crate) use rustfs_sse::reset_sse_dek_provider;
 pub(crate) use rustfs_sse::startup::init as init_sse_startup;
 #[cfg(test)]
 pub(crate) use rustfs_sse::testing::{RecordingKmsKeyAuthorizer, sse_kms_object_metadata};
@@ -58,8 +56,9 @@ pub(crate) use rustfs_sse::{
     build_ssec_read_headers, contains_managed_encryption_metadata, mark_encrypted_multipart_metadata, stored_ssec_metadata,
     strip_managed_encryption_metadata,
 };
+pub(crate) use rustfs_sse::{KmsKeyAuthorizer, LocalSseDekProvider, SseDekProvider};
 #[cfg(test)]
-pub(crate) use rustfs_sse::{SseDekProvider, TestAuthorizationHooks, TestSseDekProvider};
+pub(crate) use rustfs_sse::{TestAuthorizationHooks, TestSseDekProvider, reset_sse_dek_provider, set_sse_dek_provider_for_test};
 
 // ============================================================================
 // The server `rustfs-sse` runs in
@@ -107,7 +106,7 @@ impl SseHost for RustfsSseHost {
 }
 
 /// Hand a storage failure this server already classified to `rustfs-sse` unchanged.
-fn sse_error(error: ApiError) -> SseError {
+pub(crate) fn sse_error(error: ApiError) -> SseError {
     SseError {
         code: error.code,
         message: error.message,
@@ -141,6 +140,87 @@ impl KmsKeyAuthorizer for IamKmsKeyAuthorizer {
     }
 }
 
+/// Instance-local encryption services retained by maintenance operations.
+pub(crate) struct ManagedSseRuntime {
+    service_manager: Option<Arc<rustfs_kms::KmsServiceManager>>,
+    local_provider: OnceLock<Arc<dyn SseDekProvider>>,
+}
+
+pub(crate) struct ManagedSseOperation {
+    runtime: Arc<ManagedSseRuntime>,
+    service: Option<Arc<rustfs_kms::service::ObjectEncryptionService>>,
+    configured_but_unavailable: bool,
+    operation_context: rustfs_kms::types::OperationContext,
+}
+
+impl ManagedSseRuntime {
+    pub(crate) fn new(service_manager: Option<Arc<rustfs_kms::KmsServiceManager>>) -> Self {
+        Self {
+            service_manager,
+            local_provider: OnceLock::new(),
+        }
+    }
+
+    pub(crate) async fn begin_operation(self: &Arc<Self>, context: rustfs_kms::types::OperationContext) -> ManagedSseOperation {
+        let service = match &self.service_manager {
+            Some(manager) => manager.get_encryption_service().await,
+            None => None,
+        };
+        let configured_but_unavailable = if service.is_none() {
+            match &self.service_manager {
+                Some(manager) => !matches!(manager.get_status().await, rustfs_kms::KmsServiceStatus::NotConfigured),
+                None => false,
+            }
+        } else {
+            false
+        };
+        ManagedSseOperation {
+            runtime: self.clone(),
+            service,
+            configured_but_unavailable,
+            operation_context: context,
+        }
+    }
+}
+
+struct ManagedSseHost {
+    operation: Arc<ManagedSseOperation>,
+    authorizer: Arc<dyn KmsKeyAuthorizer>,
+}
+
+#[async_trait]
+impl SseHost for ManagedSseHost {
+    async fn encryption_service(&self) -> Option<Arc<ObjectEncryptionService>> {
+        self.operation.service.clone()
+    }
+
+    fn kms_service_manager(&self) -> Option<Arc<KmsServiceManager>> {
+        self.operation.runtime.service_manager.clone()
+    }
+
+    async fn kms_configured_but_unavailable(&self) -> bool {
+        self.operation.configured_but_unavailable
+    }
+
+    fn local_sse_dek_provider(&self) -> Result<Arc<dyn SseDekProvider>, SseError> {
+        let cache = &self.operation.runtime.local_provider;
+        if let Some(provider) = cache.get() {
+            return Ok(provider.clone());
+        }
+        let provider: Arc<dyn SseDekProvider> = Arc::new(LocalSseDekProvider::new_from_env()?);
+        let _ = cache.set(provider.clone());
+        Ok(cache.get().cloned().unwrap_or(provider))
+    }
+
+    async fn bucket_encryption(&self, bucket: &str) -> Result<Option<BucketEncryption>, SseError> {
+        HOST.bucket_encryption(bucket).await
+    }
+
+    fn kms_key_authorizer(&self) -> &dyn KmsKeyAuthorizer {
+        self.authorizer.as_ref()
+    }
+}
+
 // ============================================================================
 // `rustfs-sse` entry points, bound to this server
 // ============================================================================
@@ -153,9 +233,67 @@ pub(crate) trait SseKmsPrincipalExt: Sized {
     /// path. This keeps every request that crossed the S3 boundary distinct from trusted
     /// internal callers, which are represented by `None`.
     fn from_request<R: AuthorizationRequest + ?Sized>(req: &R) -> Option<Self>;
+
+    fn for_managed_maintenance(
+        credential: &rustfs_credentials::Credentials,
+        conditions: HashMap<String, Vec<String>>,
+        request_id: &str,
+        authorizer: Arc<dyn KmsKeyAuthorizer>,
+        operation: Arc<ManagedSseOperation>,
+    ) -> Self;
+
+    fn kms_policy_args<'a>(&'a self, action: KmsAction, key_id: &'a str) -> Args<'a>;
+    fn matches_managed_operation(&self, account: &str, operation_id: uuid::Uuid) -> bool;
+    fn is_managed_maintenance(&self) -> bool;
 }
 
 impl SseKmsPrincipalExt for SseKmsPrincipal {
+    fn for_managed_maintenance(
+        credential: &rustfs_credentials::Credentials,
+        conditions: HashMap<String, Vec<String>>,
+        request_id: &str,
+        authorizer: Arc<dyn KmsKeyAuthorizer>,
+        operation: Arc<ManagedSseOperation>,
+    ) -> Self {
+        SseKmsPrincipal::new(
+            credential.access_key.clone(),
+            credential.groups.clone(),
+            false,
+            credential.claims_or_empty().clone(),
+            conditions,
+        )
+        .with_managed_operation(
+            request_id,
+            operation.operation_context.clone(),
+            Arc::new(ManagedSseHost { operation, authorizer }),
+        )
+    }
+
+    fn kms_policy_args<'a>(&'a self, action: KmsAction, key_id: &'a str) -> Args<'a> {
+        Args {
+            account: self.account(),
+            groups: self.groups(),
+            action: Action::KmsAction(action),
+            bucket: "",
+            object: key_id,
+            conditions: self.conditions(),
+            is_owner: false,
+            claims: self.claims(),
+            deny_only: false,
+        }
+    }
+
+    fn matches_managed_operation(&self, account: &str, operation_id: uuid::Uuid) -> bool {
+        self.account() == account
+            && self.managed_operation_context().is_some_and(|(request_id, context)| {
+                context.principal == account && context.operation_id == operation_id && request_id == operation_id.to_string()
+            })
+    }
+
+    fn is_managed_maintenance(&self) -> bool {
+        self.managed_operation_context().is_some()
+    }
+
     fn from_request<R: AuthorizationRequest + ?Sized>(req: &R) -> Option<Self> {
         let req_info = req.req_info()?;
         let cred = req_info.cred.as_ref();
@@ -456,68 +594,103 @@ impl ObjectEncryptionResolver for SseObjectEncryptionResolver {
         &self,
         request: ReadEncryptionRequest<'_>,
     ) -> Result<Option<ReadEncryptionMaterial>, EncryptionResolutionError> {
-        let metadata = normalize_metadata_for_resolution(request.metadata)?;
-        let (customer_algorithm, customer_key, customer_key_md5) =
-            extract_ssec_params_from_headers(request.headers).map_err(map_encryption_resolution_error)?;
-        if let Some(stored_algorithm) = metadata.get("x-amz-server-side-encryption-customer-algorithm") {
-            let request_algorithm = customer_algorithm.as_ref().ok_or_else(|| {
-                map_encryption_resolution_error(ssec_invalid_request(
-                    "The object was stored using a form of Server Side Encryption. \
-                     The correct parameters must be provided to retrieve the object.",
-                ))
-            })?;
-            if stored_algorithm != request_algorithm.as_str() {
-                return Err(map_encryption_resolution_error(ssec_invalid_request(
-                    "The provided encryption parameters did not match the ones used originally to encrypt the object.",
-                )));
-            }
-        }
-        let material = sse_decryption(DecryptionRequest {
-            bucket: request.bucket,
-            key: request.object,
-            metadata: &metadata,
-            sse_customer_key: customer_key.as_ref(),
-            sse_customer_key_md5: customer_key_md5.as_ref(),
-            // The object layer resolves read material for internal readers too (replication,
-            // lifecycle transition, heal, scanner) and carries no request identity, so this hook
-            // never authorizes. Callers that cross the S3 boundary are authorized by the S3 layer
-            // before their bytes are served.
-            principal: None,
-        })
-        .await
-        .map_err(map_encryption_resolution_error)?;
-        let Some(material) = material else {
-            // Fail closed with a diagnosis instead of a bare `None`: the read
-            // plan classifies the object as encrypted from these same markers
-            // and would refuse to serve it anyway, but its generic error names
-            // neither the object's format nor what the operator can do about it.
-            if metadata
-                .keys()
-                .any(|key| rustfs_utils::http::is_object_encryption_marker(key))
-            {
-                #[cfg(not(feature = "rio-v2"))]
-                let message = "object is stored encrypted, but its decryption material could not be resolved: the \
-                               encryption metadata is incomplete, or it is in the MinIO-compatible sealed format, \
-                               which this server build has no read path for (reading it requires a build with the \
-                               `rio-v2` feature)";
-                #[cfg(feature = "rio-v2")]
-                let message = "object is stored encrypted, but its decryption material could not be resolved: the \
-                               encryption metadata is incomplete or in an unrecognized sealed format";
-                return Err(EncryptionResolutionError::new(EncryptionResolutionErrorKind::InvalidMetadata, message));
-            }
-            return Ok(None);
-        };
-
-        Ok(Some(ReadEncryptionMaterial {
-            key_bytes: material.key_bytes,
-            mode: match material.key_kind {
-                EncryptionKeyKind::Direct => ReadEncryptionMode::Direct {
-                    base_nonce: material.base_nonce,
-                },
-                EncryptionKeyKind::Object => ReadEncryptionMode::Object,
-            },
-        }))
+        // Internal readers have no request identity; S3 callers authorize before
+        // entering this resolver. Maintenance uses its operation-bound resolver.
+        resolve_sse_read_material(request, None).await
     }
+}
+
+struct ManagedReadEncryptionResolver {
+    bucket: String,
+    key: String,
+    principal: SseKmsPrincipal,
+}
+
+pub(crate) fn managed_read_encryption_resolver(
+    bucket: String,
+    key: String,
+    principal: SseKmsPrincipal,
+) -> Arc<dyn ObjectEncryptionResolver> {
+    Arc::new(ManagedReadEncryptionResolver { bucket, key, principal })
+}
+
+#[async_trait]
+impl ObjectEncryptionResolver for ManagedReadEncryptionResolver {
+    async fn resolve_read_material(
+        &self,
+        request: ReadEncryptionRequest<'_>,
+    ) -> Result<Option<ReadEncryptionMaterial>, EncryptionResolutionError> {
+        if request.bucket != self.bucket || request.object != self.key {
+            return Err(EncryptionResolutionError::new(
+                EncryptionResolutionErrorKind::InvalidMetadata,
+                "read resolver resource mismatch",
+            ));
+        }
+        resolve_sse_read_material(request, Some(&self.principal)).await
+    }
+}
+
+async fn resolve_sse_read_material(
+    request: ReadEncryptionRequest<'_>,
+    principal: Option<&SseKmsPrincipal>,
+) -> Result<Option<ReadEncryptionMaterial>, EncryptionResolutionError> {
+    let metadata = normalize_metadata_for_resolution(request.metadata)?;
+    let (customer_algorithm, customer_key, customer_key_md5) =
+        extract_ssec_params_from_headers(request.headers).map_err(map_encryption_resolution_error)?;
+    if let Some(stored_algorithm) = metadata.get("x-amz-server-side-encryption-customer-algorithm") {
+        let request_algorithm = customer_algorithm.as_ref().ok_or_else(|| {
+            map_encryption_resolution_error(ssec_invalid_request(
+                "The object was stored using a form of Server Side Encryption. \
+                 The correct parameters must be provided to retrieve the object.",
+            ))
+        })?;
+        if stored_algorithm != request_algorithm.as_str() {
+            return Err(map_encryption_resolution_error(ssec_invalid_request(
+                "The provided encryption parameters did not match the ones used originally to encrypt the object.",
+            )));
+        }
+    }
+    let material = sse_decryption(DecryptionRequest {
+        bucket: request.bucket,
+        key: request.object,
+        metadata: &metadata,
+        sse_customer_key: customer_key.as_ref(),
+        sse_customer_key_md5: customer_key_md5.as_ref(),
+        principal,
+    })
+    .await
+    .map_err(map_encryption_resolution_error)?;
+    let Some(material) = material else {
+        // Fail closed with a diagnosis instead of a bare `None`: the read
+        // plan classifies the object as encrypted from these same markers
+        // and would refuse to serve it anyway, but its generic error names
+        // neither the object's format nor what the operator can do about it.
+        if metadata
+            .keys()
+            .any(|key| rustfs_utils::http::is_object_encryption_marker(key))
+        {
+            #[cfg(not(feature = "rio-v2"))]
+            let message = "object is stored encrypted, but its decryption material could not be resolved: the \
+                           encryption metadata is incomplete, or it is in the MinIO-compatible sealed format, \
+                           which this server build has no read path for (reading it requires a build with the \
+                           `rio-v2` feature)";
+            #[cfg(feature = "rio-v2")]
+            let message = "object is stored encrypted, but its decryption material could not be resolved: the \
+                           encryption metadata is incomplete or in an unrecognized sealed format";
+            return Err(EncryptionResolutionError::new(EncryptionResolutionErrorKind::InvalidMetadata, message));
+        }
+        return Ok(None);
+    };
+
+    Ok(Some(ReadEncryptionMaterial {
+        key_bytes: material.key_bytes,
+        mode: match material.key_kind {
+            EncryptionKeyKind::Direct => ReadEncryptionMode::Direct {
+                base_nonce: material.base_nonce,
+            },
+            EncryptionKeyKind::Object => ReadEncryptionMode::Object,
+        },
+    }))
 }
 
 // ============================================================================
@@ -581,6 +754,13 @@ impl super::storage_api::contract::multipart::MultipartCompletionAuthorization f
         }
         Ok(())
     }
+}
+
+#[cfg(test)]
+pub(crate) async fn kms_sse_dek_provider_for_test(
+    manager: Arc<rustfs_kms::KmsServiceManager>,
+) -> Result<Arc<dyn SseDekProvider>, ApiError> {
+    Ok(rustfs_sse::testing::kms_sse_dek_provider_for_test(manager).await?)
 }
 
 #[cfg(test)]
@@ -1200,5 +1380,319 @@ mod tests {
             assert_eq!(resolved.mode, ReadEncryptionMode::Object);
             assert_eq!(resolved.key_bytes, material.key_bytes);
         }
+    }
+}
+
+#[cfg(test)]
+mod managed_instance_tests {
+    use super::{
+        ApiError, DecryptionMaterial, DecryptionRequest, EncryptionMaterial, EncryptionRequest, KmsKeyAuthorizer, ManagedSseHost,
+        ManagedSseOperation, ManagedSseRuntime, ReadEncryptionRequest, SseError, SseHost, SseKmsPrincipal, SseKmsPrincipalExt,
+        TestAuthorizationHooks, kms_sse_dek_provider_for_test, managed_read_encryption_resolver, sse_decryption, sse_encryption,
+    };
+    use async_trait::async_trait;
+    use http::HeaderMap;
+    use rustfs_kms::types::{CreateKeyRequest, KeyUsage, OperationContext};
+    use rustfs_policy::policy::action::KmsAction;
+    use rustfs_s3_types::S3ErrorCode;
+    use rustfs_sse::encryption_material_to_metadata;
+    use std::{collections::HashMap, sync::Arc};
+
+    struct AllowKey;
+    #[async_trait]
+    impl KmsKeyAuthorizer for AllowKey {
+        async fn is_allowed(&self, _: &SseKmsPrincipal, _: KmsAction, _: &str) -> Result<bool, SseError> {
+            Ok(true)
+        }
+    }
+
+    async fn runtime() -> (tempfile::TempDir, Arc<ManagedSseRuntime>) {
+        let directory = tempfile::tempdir().expect("instance key directory");
+        let manager = Arc::new(rustfs_kms::KmsServiceManager::new());
+        manager
+            .reconfigure(rustfs_kms::KmsConfig::local(directory.path().to_path_buf()).with_insecure_development_defaults())
+            .await
+            .expect("configure instance KMS");
+        manager
+            .get_encryption_service()
+            .await
+            .expect("instance service")
+            .create_key(CreateKeyRequest {
+                key_name: Some("maintenance-key".to_owned()),
+                key_usage: KeyUsage::EncryptDecrypt,
+                description: None,
+                policy: None,
+                tags: HashMap::new(),
+                origin: None,
+            })
+            .await
+            .expect("create instance key");
+        (directory, Arc::new(ManagedSseRuntime::new(Some(manager))))
+    }
+
+    fn principal_for_operation(operation: &Arc<ManagedSseOperation>, authorizer: Arc<dyn KmsKeyAuthorizer>) -> SseKmsPrincipal {
+        SseKmsPrincipal::for_managed_maintenance(
+            &rustfs_credentials::Credentials {
+                access_key: "maintenance-account".to_owned(),
+                ..Default::default()
+            },
+            HashMap::new(),
+            &operation.operation_context.operation_id.to_string(),
+            authorizer,
+            operation.clone(),
+        )
+    }
+
+    async fn admit(runtime: &Arc<ManagedSseRuntime>) -> (Arc<ManagedSseOperation>, SseKmsPrincipal) {
+        let operation = Arc::new(
+            runtime
+                .begin_operation(OperationContext::new("maintenance-account".to_owned()))
+                .await,
+        );
+        let principal = principal_for_operation(&operation, Arc::new(AllowKey));
+        (operation, principal)
+    }
+
+    async fn principal(runtime: &Arc<ManagedSseRuntime>) -> SseKmsPrincipal {
+        admit(runtime).await.1
+    }
+
+    async fn encrypt(
+        bucket: &str,
+        key: &str,
+        algorithm: String,
+        kms_key: Option<String>,
+        kms_context: Option<HashMap<String, String>>,
+        content_size: i64,
+        principal: Option<&SseKmsPrincipal>,
+    ) -> Result<EncryptionMaterial, ApiError> {
+        sse_encryption(EncryptionRequest {
+            bucket,
+            key,
+            server_side_encryption: Some(algorithm),
+            ssekms_key_id: kms_key,
+            ssekms_context: kms_context,
+            content_size,
+            principal,
+            sse_customer_algorithm: None,
+            sse_customer_key: None,
+            sse_customer_key_md5: None,
+        })
+        .await?
+        .ok_or_else(|| ApiError::invalid_request("encrypted material is required"))
+    }
+
+    async fn decrypt(
+        bucket: &str,
+        key: &str,
+        metadata: &HashMap<String, String>,
+        principal: Option<&SseKmsPrincipal>,
+    ) -> Result<Option<DecryptionMaterial>, ApiError> {
+        sse_decryption(DecryptionRequest {
+            bucket,
+            key,
+            metadata,
+            principal,
+            sse_customer_key: None,
+            sse_customer_key_md5: None,
+        })
+        .await
+    }
+
+    #[tokio::test]
+    async fn managed_service_binding_decrypts_only_its_own_ciphertext() {
+        let (_a_directory, a) = runtime().await;
+        let (_b_directory, b) = runtime().await;
+        let a_principal = principal(&a).await;
+        let b_principal = principal(&b).await;
+        let material = encrypt(
+            "bucket",
+            "object",
+            "aws:kms".to_owned(),
+            Some("maintenance-key".to_owned()),
+            None,
+            32,
+            Some(&b_principal),
+        )
+        .await
+        .expect("B generates actual DEK");
+        let metadata = encryption_material_to_metadata(&material).expect("persist B encryption metadata");
+        let resolved = decrypt("bucket", "object", &metadata, Some(&b_principal))
+            .await
+            .expect("B decrypts B ciphertext")
+            .expect("encrypted material");
+        assert_eq!(resolved.key_bytes, material.key_bytes);
+        assert!(
+            decrypt("bucket", "object", &metadata, Some(&a_principal)).await.is_err(),
+            "A must reject B ciphertext even when both name the same key"
+        );
+        let resolver = managed_read_encryption_resolver("bucket".to_owned(), "object".to_owned(), b_principal);
+        let headers = HeaderMap::new();
+        assert!(
+            resolver
+                .resolve_read_material(ReadEncryptionRequest {
+                    bucket: "bucket",
+                    object: "other",
+                    metadata: &metadata,
+                    headers: &headers
+                })
+                .await
+                .is_err(),
+            "bound resolver must reject another object before resolving material"
+        );
+        let read = resolver
+            .resolve_read_material(ReadEncryptionRequest {
+                bucket: "bucket",
+                object: "object",
+                metadata: &metadata,
+                headers: &headers,
+            })
+            .await
+            .expect("actual bound resolver")
+            .expect("read material");
+        assert_eq!(read.key_bytes, material.key_bytes);
+    }
+
+    struct DenyKey;
+    #[async_trait]
+    impl KmsKeyAuthorizer for DenyKey {
+        async fn is_allowed(&self, _: &SseKmsPrincipal, _: KmsAction, _: &str) -> Result<bool, SseError> {
+            Ok(false)
+        }
+    }
+
+    #[tokio::test]
+    async fn managed_key_permissions_remain_mandatory_when_ordinary_enforcement_is_disabled() {
+        let (_directory, runtime) = runtime().await;
+        let (operation, allowed) = admit(&runtime).await;
+        let material = encrypt(
+            "bucket",
+            "object",
+            "aws:kms".to_owned(),
+            Some("maintenance-key".to_owned()),
+            None,
+            32,
+            Some(&allowed),
+        )
+        .await
+        .expect("authorized encrypted body");
+        let metadata = encryption_material_to_metadata(&material).expect("stored metadata");
+        let denied = principal_for_operation(&operation, Arc::new(DenyKey)).with_test_hooks(Some(TestAuthorizationHooks {
+            enforced: false,
+            authorizer: Arc::new(AllowKey),
+        }));
+        let write = encrypt(
+            "bucket",
+            "object",
+            "aws:kms".to_owned(),
+            Some("maintenance-key".to_owned()),
+            None,
+            32,
+            Some(&denied),
+        )
+        .await
+        .expect_err("GenerateDataKey remains mandatory");
+        assert_eq!(write.code, S3ErrorCode::AccessDenied);
+        let read = decrypt("bucket", "object", &metadata, Some(&denied))
+            .await
+            .expect_err("Decrypt remains mandatory");
+        assert_eq!(read.code, S3ErrorCode::AccessDenied);
+        let service = operation.service.as_ref().expect("service");
+        let host = ManagedSseHost {
+            operation: operation.clone(),
+            authorizer: Arc::new(AllowKey),
+        };
+        assert!(Arc::ptr_eq(&host.encryption_service().await.expect("retained service"), service));
+        let manager = runtime.service_manager.clone().expect("instance manager");
+        assert!(Arc::ptr_eq(&manager.get_encryption_service().await.expect("provider service"), service));
+        let provider = kms_sse_dek_provider_for_test(manager).await.expect("actual KMS provider");
+        assert!(!provider.reads_bare_data_key_ciphertext().await, "Local capability remains unchanged");
+        let context = rustfs_kms::types::ObjectEncryptionContext::new("bucket".to_owned(), "object".to_owned())
+            .with_encryption_context("bucket".to_owned(), "bucket/object".to_owned());
+        let error = provider
+            .rewrap_sse_dek(material.encrypted_data_key.as_ref().expect("encrypted DEK"), &context)
+            .await
+            .expect_err("Local backend keeps its explicit rewrap capability refusal");
+        assert!(error.to_string().contains("rewrap") || format!("{:?}", error.source).contains("rewrap_data_key"));
+    }
+
+    #[tokio::test]
+    async fn managed_admitted_service_survives_instance_reconfiguration() {
+        let config = |fill: u8| {
+            rustfs_kms::KmsConfig::static_kms("maintenance-key".to_owned(), base64_simd::STANDARD.encode_to_string([fill; 32]))
+        };
+        let manager = Arc::new(rustfs_kms::KmsServiceManager::new());
+        manager.reconfigure(config(0x11)).await.expect("configure instance KMS");
+        let runtime = Arc::new(ManagedSseRuntime::new(Some(manager.clone())));
+        let (admitted_operation, admitted) = admit(&runtime).await;
+        let admitted_service = admitted_operation.service.as_ref().expect("admitted service");
+        let material = encrypt(
+            "bucket",
+            "object",
+            "aws:kms".to_owned(),
+            Some("maintenance-key".to_owned()),
+            None,
+            32,
+            Some(&admitted),
+        )
+        .await
+        .expect("admitted encryption");
+        let metadata = encryption_material_to_metadata(&material).expect("old service metadata");
+        manager
+            .reconfigure(config(0x22))
+            .await
+            .expect("replace this instance service");
+        let replacement = manager.get_encryption_service().await.expect("replacement service");
+        assert!(!Arc::ptr_eq(admitted_service, &replacement));
+        let result = decrypt("bucket", "object", &metadata, Some(&admitted))
+            .await
+            .expect("admitted operation retains actual service Arc")
+            .expect("old material");
+        assert_eq!(result.key_bytes, material.key_bytes);
+        let (next_operation, next) = admit(&runtime).await;
+        let next_service = next_operation.service.as_ref().expect("next service");
+        assert!(Arc::ptr_eq(next_service, &replacement));
+        assert!(
+            decrypt("bucket", "object", &metadata, Some(&next)).await.is_err(),
+            "next operation must sample this instance's replacement service"
+        );
+    }
+
+    #[tokio::test]
+    async fn managed_unavailable_service_never_uses_another_instance() {
+        let (_directory, configured) = runtime().await;
+        let configured_principal = principal(&configured).await;
+        let material = encrypt(
+            "bucket",
+            "object",
+            "aws:kms".to_owned(),
+            Some("maintenance-key".to_owned()),
+            None,
+            32,
+            Some(&configured_principal),
+        )
+        .await
+        .expect("configured encryption");
+        let metadata = encryption_material_to_metadata(&material).expect("encryption metadata");
+        let missing = Arc::new(ManagedSseRuntime::new(None));
+        let missing_principal = principal(&missing).await;
+        assert!(
+            decrypt("bucket", "object", &metadata, Some(&missing_principal))
+                .await
+                .is_err()
+        );
+        assert!(
+            encrypt(
+                "bucket",
+                "object",
+                "aws:kms".to_owned(),
+                Some("maintenance-key".to_owned()),
+                None,
+                32,
+                Some(&missing_principal)
+            )
+            .await
+            .is_err()
+        );
     }
 }

@@ -289,7 +289,6 @@ pub(crate) mod runtime_sources {
 pub(crate) mod access {
     #[cfg(test)]
     pub(crate) use crate::storage::storage_api::access_consumer::PostObjectRequestMarker;
-    #[cfg(test)]
     pub(crate) use crate::storage::storage_api::access_consumer::ReqInfo;
     pub(crate) use crate::storage::storage_api::access_consumer::requested_bucket_force_delete;
     pub(crate) use crate::storage::storage_api::access_consumer::{
@@ -1569,6 +1568,9 @@ pub(crate) mod sse {
         encryption_material_to_metadata, extract_ssec_params_from_headers, extract_ssekms_context_from_headers,
         map_get_object_reader_error, mark_encrypted_multipart_metadata, multipart_completion_authorization, stored_ssec_metadata,
     };
+    pub(crate) use crate::storage::storage_api::sse_consumer::{
+        KmsKeyAuthorizer, ManagedSseRuntime, managed_read_encryption_resolver, sse_error,
+    };
 }
 
 pub(crate) mod set_disk {
@@ -1621,6 +1623,32 @@ pub(crate) mod admin_usecase {
 
     pub(crate) use super::{admin, capacity, data_usage};
     pub(crate) use crate::storage::storage_api::{ECStore, EndpointServerPools};
+}
+
+pub(crate) mod managed {
+    pub(crate) use crate::storage::storage_api::managed::BUCKET_VECTOR_STORAGE_PREFIX;
+    #[cfg(test)]
+    pub(crate) use crate::storage::storage_api::managed::ManagedTableId;
+    pub(crate) use crate::storage::storage_api::managed::delete_managed_bucket_with_precheck_and_preparation;
+    pub(crate) use crate::storage::storage_api::managed::{
+        AccountNamespaceId, BUCKET_TAGGING_CONFIG, BucketHandle, BucketIdentityError, BucketIncarnation,
+        BucketIncarnationFenceGuard, BucketKind, BucketMetadata, BucketPublicName, ConfigState, ManagedBucketConfigMutation,
+        ManagedBucketPrecheckError, ManagedObjectAccess, ManagedObjectOperation, StorageBucketId,
+        acquire_bucket_incarnation_fence, get_bucket_metadata, make_managed_bucket, mutate_managed_bucket_config_with_precheck,
+        validate_bucket_incarnation_fence,
+    };
+    pub(crate) use crate::storage::storage_api::managed::{DeleteAccounting, HealOpts};
+}
+
+pub(crate) mod vector_usecase {
+    pub(crate) use super::access::ReqInfo;
+    pub(crate) use super::bucket::utils::serialize;
+    pub(crate) use super::helper::{OperationHelper, run_owned_mutation};
+    #[cfg(test)]
+    pub(crate) use super::request_context::RequestContext;
+    #[cfg(test)]
+    pub(crate) use super::storage_contracts::NamespaceLocking;
+    pub(crate) use crate::storage::storage_api::StorageError;
 }
 
 pub(crate) mod bucket_usecase {
@@ -1688,7 +1716,6 @@ pub(crate) mod object_usecase {
     }
 
     pub(crate) mod contract {
-        #[cfg(test)]
         pub(crate) mod http {
             pub(crate) use super::super::super::storage_contracts::HTTPPreconditions;
         }
@@ -1779,8 +1806,8 @@ pub(crate) mod multipart_usecase {
     pub(crate) use crate::storage::storage_api::{
         DEFAULT_EC_BLOCK_SIZE, EC_BLOCK_SIZE_HINT_INTERNAL_SUFFIX, EC_BLOCK_SIZE_HINT_METADATA_KEY,
         EC_BLOCK_SIZE_HINT_REASON_HEADER, EC_BLOCK_SIZE_HINT_STATUS_HEADER, EC_BLOCK_SIZE_RESPONSE_HEADER, ECStore,
-        EcBlockSizeHintOutcome, StorageObjectOptions, StoragePutObjReader, resolve_ec_block_size_hint, validate_new_object_key,
-        validate_object_key,
+        EcBlockSizeHintOutcome, StorageObjectInfo, StorageObjectOptions, StoragePutObjReader, resolve_ec_block_size_hint,
+        validate_new_object_key, validate_object_key,
     };
 }
 
@@ -1837,6 +1864,7 @@ pub(crate) mod context {
 #[cfg(test)]
 pub(crate) mod test {
     pub(crate) use super::EndpointServerPools;
+    pub(crate) use crate::storage::storage_api::RUSTFS_META_BUCKET;
     pub(crate) mod contract {
         pub(crate) mod bucket {
             pub(crate) use super::super::super::storage_contracts::{
@@ -1867,10 +1895,18 @@ pub(crate) mod test {
 
     pub(crate) use super::access::ReqInfo;
     pub(crate) use super::options::VERSIONING_CONFIG_LOOKUPS;
+    #[cfg(not(windows))]
+    pub(crate) use crate::storage::storage_api::ecstore_disk::RUSTFS_META_MULTIPART_BUCKET;
     pub(crate) use crate::storage::storage_api::test_consumer::authorize_head_object;
+    #[cfg(not(windows))]
+    pub(crate) use crate::storage::storage_api::{
+        LocalPublicationPause, LocalPublicationStage, ReadOptions, StorageDiskRpcExt, all_local_disk_path, find_local_disk_by_ref,
+    };
     pub(crate) mod sse {
+        pub(crate) use crate::storage::storage_api::ecstore_object::{EncryptionResolutionError, EncryptionResolutionErrorKind};
         pub(crate) use crate::storage::storage_api::test_consumer::sse::{
-            RecordingKmsKeyAuthorizer, TestAuthorizationHooks, sse_kms_object_metadata,
+            KmsKeyAuthorizer, LocalSseDekProvider, RecordingKmsKeyAuthorizer, TestAuthorizationHooks,
+            kms_sse_dek_provider_for_test, reset_sse_dek_provider, set_sse_dek_provider_for_test, sse_kms_object_metadata,
         };
     }
     pub(crate) use super::{bucket, runtime};
@@ -1883,7 +1919,8 @@ pub(crate) mod test {
         DeleteAfterObjectLockSnapshotBarrier, get_global_bucket_metadata_sys, set_bucket_metadata,
     };
     pub(crate) use crate::storage::storage_api::{
-        ECStore, Endpoint, Endpoints, PoolEndpoints, StorageObjectInfo, StorageObjectOptions, StoragePutObjReader,
+        ECStore, Endpoint, Endpoints, InstanceContext, PoolEndpoints, StorageObjectInfo, StorageObjectOptions,
+        StoragePutObjReader,
     };
     pub(crate) mod set_disk {
         pub(crate) use crate::storage::storage_api::ecstore_set_disk::{
@@ -1891,6 +1928,40 @@ pub(crate) mod test {
             PutObjectCommitPause, fail_next_quota_ledger_save_for_test, initialize_quota_ledger_for_test,
             retry_quota_reconciliation_for_test,
         };
+    }
+
+    pub(crate) mod quota_observation {
+        use std::sync::Arc;
+
+        pub(crate) use super::super::error::is_err_object_not_found;
+
+        pub(crate) type IdentityReadGuard =
+            crate::storage::storage_api::ecstore_bucket::metadata_sys::ScannerBucketIncarnationReadGuard;
+        pub(crate) use crate::storage::storage_api::{ECStore, StorageError};
+
+        pub(crate) async fn identity_read_guard(
+            bucket: &str,
+            incarnation: uuid::Uuid,
+            instance_id: uuid::Uuid,
+        ) -> Result<IdentityReadGuard, StorageError> {
+            crate::storage::storage_api::ecstore_bucket::metadata_sys::acquire_scanner_bucket_incarnation_read_fence(
+                bucket,
+                incarnation,
+                instance_id,
+            )
+            .await
+        }
+
+        pub(crate) async fn persisted_bucket_metadata(
+            store: &ECStore,
+            bucket: &str,
+        ) -> Result<Arc<super::super::managed::BucketMetadata>, StorageError> {
+            store.get_bucket_metadata_from_disk(bucket).await
+        }
+
+        pub(crate) fn lock_timeout() -> std::time::Duration {
+            crate::storage::storage_api::get_lock_acquire_timeout()
+        }
     }
 
     pub(crate) mod metadata_sys {

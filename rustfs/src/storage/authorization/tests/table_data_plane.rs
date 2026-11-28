@@ -297,6 +297,7 @@ async fn table_data_plane_cold_lookup_does_not_wait_for_backup_while_holding_pub
     );
     catalog
         .put_table_bucket(crate::table_catalog::TableBucketEntry {
+            vector_bucket_binding: None,
             version: crate::table_catalog::TABLE_CATALOG_ENTRY_VERSION,
             table_bucket: bucket.to_string(),
             catalog_type: crate::table_catalog::TABLE_BUCKET_CATALOG_TYPE.to_string(),

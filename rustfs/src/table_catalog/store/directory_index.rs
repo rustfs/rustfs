@@ -33,7 +33,7 @@ pub(crate) enum TableDirectoryPhase {
 // unknown fields and cannot publish an entry without its directory candidate.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub(super) struct TableDirectoryState {
+pub(in crate::table_catalog) struct TableDirectoryState {
     kind: String,
     version: u16,
     table_bucket: String,
@@ -61,13 +61,13 @@ pub(super) struct TableDirectoryScan {
 }
 
 impl TableCatalogObjectPaths {
-    pub(super) fn table_directory_prefix(&self, table_bucket: &str) -> String {
+    pub(in crate::table_catalog) fn table_directory_prefix(&self, table_bucket: &str) -> String {
         format!("{}table-entry-directory/v1/", self.table_bucket_root_prefix(table_bucket))
     }
 
     fn table_directory_candidate(&self, entry: &TableEntry) -> TableCatalogStoreResult<String> {
         let namespace = parse_namespace_for_store(&entry.namespace)?;
-        let table = parse_table_for_store(&entry.table)?;
+        let table = self.parse_name(&entry.table)?;
         Ok(format!(
             "{}{}/tables/{}/{}",
             self.table_directory_prefix(&entry.table_bucket),
@@ -99,7 +99,7 @@ where
 }
 
 impl<B: TableCatalogObjectBackend> ObjectTableCatalogStore<B> {
-    pub(super) async fn read_table_directory_state(
+    pub(in crate::table_catalog) async fn read_table_directory_state(
         &self,
         table_bucket: &str,
     ) -> TableCatalogStoreResult<Option<TableDirectoryState>> {
@@ -485,7 +485,7 @@ impl<B: TableCatalogObjectBackend> ObjectTableCatalogStore<B> {
         })
     }
 
-    pub(super) async fn directory_candidate_target(
+    pub(in crate::table_catalog) async fn directory_candidate_target(
         &self,
         table_bucket: &str,
         candidate: &str,

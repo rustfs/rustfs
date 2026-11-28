@@ -14,7 +14,7 @@
 
 use super::{
     ClaimLookup, Effect, Error as IamError, Functions, ID, Statement, action::Action, get_claim_case_insensitive,
-    statement::BPStatement, statement::variable_resolver_for_policy_args,
+    statement::BPStatement, statement::s3vectors_request_is_valid, statement::variable_resolver_for_policy_args,
 };
 use crate::error::{Error, Result};
 use serde::{Deserialize, Serialize};
@@ -67,6 +67,9 @@ pub struct Policy {
 
 impl Policy {
     pub async fn is_allowed(&self, args: &Args<'_>) -> bool {
+        if !s3vectors_request_is_valid(&args.action, args.bucket, args.object, args.conditions) {
+            return false;
+        }
         // First, check all Deny statements - if any Deny matches, deny the request
         for statement in self.statements.iter().filter(|s| matches!(s.effect, Effect::Deny)) {
             if !statement.is_allowed(args).await {
@@ -234,6 +237,9 @@ pub struct BucketPolicy {
 
 impl BucketPolicy {
     pub async fn is_allowed(&self, args: &BucketPolicyArgs<'_>) -> bool {
+        if !s3vectors_request_is_valid(&args.action, args.bucket, args.object, args.conditions) {
+            return false;
+        }
         for statement in self.statements.iter().filter(|s| matches!(s.effect, Effect::Deny)) {
             if !statement.is_allowed(args).await {
                 return false;
@@ -4625,6 +4631,129 @@ mod test {
         let empty = crate::policy::ActionSet::default();
         assert!(!empty.statement_covers(&empty, &Action::S3Action(S3Action::GetObjectAction), false));
         assert!(!empty.statement_covers(&empty, &Action::S3Action(S3Action::GetObjectAction), true));
+    }
+
+    #[tokio::test]
+    async fn s3vectors_not_action_allow_grants_only_unexcluded_vector_actions() {
+        let policy = Policy::parse_config(
+            br#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","NotAction":["s3vectors:DeleteVectors"],"Resource":["arn:aws:s3vectors:us-east-1::bucket/media/index/embeddings.v1"]}]}"#,
+        )
+        .expect("Vector NotAction policy parses");
+        assert!(allows_with_vector_context(&policy, "s3vectors:GetVectors").await);
+        assert!(!allows_with_vector_context(&policy, "s3vectors:DeleteVectors").await);
+    }
+
+    #[tokio::test]
+    async fn s3vectors_not_action_allow_rejects_cross_family_grants() {
+        let vector_allow = Policy::parse_config(
+            br#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":["s3vectors:GetVectors"],"Resource":["*"]}]}"#,
+        )
+        .expect("explicit Vector Allow parses");
+        assert!(allows_with_vector_context(&vector_allow, "s3vectors:GetVectors").await);
+        for excluded in ["s3:DeleteObject", "admin:DeleteUser", "sts:AssumeRole", "kms:Decrypt"] {
+            let policy = Policy::parse_config(
+                format!(
+                    r#"{{"Version":"2012-10-17","Statement":[{{"Effect":"Allow","NotAction":["{excluded}"],"Resource":["*"]}}]}}"#
+                )
+                .as_bytes(),
+            )
+            .expect("foreign-family NotAction policy parses");
+            assert!(
+                !allows_with_vector_context(&policy, "s3vectors:GetVectors").await,
+                "NotAction {excluded} must not grant Vector access"
+            );
+        }
+
+        let vector_not_delete = Policy::parse_config(
+            br#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","NotAction":["s3vectors:DeleteVectors"],"Resource":["*"]}]}"#,
+        )
+        .expect("Vector NotAction policy parses");
+        for action in ["s3:GetObject", "admin:CreateUser", "sts:AssumeRole", "kms:Decrypt"] {
+            let explicit_allow = Policy::parse_config(
+                format!(
+                    r#"{{"Version":"2012-10-17","Statement":[{{"Effect":"Allow","Action":["{action}"],"Resource":["*"]}}]}}"#
+                )
+                .as_bytes(),
+            )
+            .expect("explicit foreign-family Allow parses");
+            assert!(
+                allows_with_vector_context(&explicit_allow, action).await,
+                "the same request for {action} must be valid under its explicit Allow"
+            );
+            assert!(
+                !allows_with_vector_context(&vector_not_delete, action).await,
+                "Vector NotAction must not grant {action}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn s3vectors_not_action_deny_preserves_exclusion_and_cross_family_scope() {
+        let mut policy = Policy::parse_config(
+            br#"{"Version":"2012-10-17","Statement":[
+                {"Effect":"Allow","Action":["s3vectors:*"],"Resource":["*"]},
+                {"Effect":"Allow","Action":["s3:GetObject"],"Resource":["*"]},
+                {"Effect":"Allow","Action":["admin:CreateUser"],"Resource":["*"]},
+                {"Effect":"Allow","Action":["sts:AssumeRole"],"Resource":["*"]},
+                {"Effect":"Allow","Action":["kms:Decrypt"],"Resource":["*"]}
+            ]}"#,
+        )
+        .expect("explicit Allow statements parse");
+        let denied_actions = [
+            "s3vectors:GetVectors",
+            "s3:GetObject",
+            "admin:CreateUser",
+            "sts:AssumeRole",
+            "kms:Decrypt",
+        ];
+        for action in denied_actions {
+            assert!(allows_with_vector_context(&policy, action).await, "explicit Allow covers {action}");
+        }
+        assert!(allows_with_vector_context(&policy, "s3vectors:DeleteVectors").await);
+        let deny = Policy::parse_config(
+            br#"{"Version":"2012-10-17","Statement":[{"Effect":"Deny","NotAction":["s3vectors:DeleteVectors"],"Resource":["*"]}]}"#,
+        )
+        .expect("Vector Deny NotAction parses");
+        policy.statements.extend(deny.statements);
+        policy.is_valid().expect("combined policy validates");
+        assert!(allows_with_vector_context(&policy, "s3vectors:DeleteVectors").await);
+        for action in denied_actions {
+            assert!(
+                !allows_with_vector_context(&policy, action).await,
+                "Vector Deny NotAction must retain its cross-family denial of {action}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn s3vectors_not_action_allow_respects_explicit_deny() {
+        let policy = Policy::parse_config(
+            br#"{"Version":"2012-10-17","Statement":[
+                {"Effect":"Allow","NotAction":["s3vectors:DeleteVectors"],"Resource":["arn:aws:s3vectors:us-east-1::bucket/media/index/embeddings.v1"]},
+                {"Effect":"Deny","Action":["s3vectors:GetVectors"],"Resource":["arn:aws:s3vectors:us-east-1::bucket/media/index/embeddings.v1"]}
+            ]}"#,
+        )
+        .expect("Vector NotAction Allow with explicit Deny parses");
+        assert!(!allows_with_vector_context(&policy, "s3vectors:GetVectors").await);
+        assert!(!allows_with_vector_context(&policy, "s3vectors:DeleteVectors").await);
+        assert!(allows_with_vector_context(&policy, "s3vectors:QueryVectors").await);
+    }
+
+    async fn allows_with_vector_context(policy: &Policy, action: &str) -> bool {
+        let conditions = HashMap::from([("RequestedRegion".to_owned(), vec!["us-east-1".to_owned()])]);
+        policy
+            .is_allowed(&Args {
+                account: "user",
+                groups: &None,
+                action: Action::try_from(action).expect("action parses"),
+                bucket: "media",
+                conditions: &conditions,
+                is_owner: false,
+                object: "embeddings.v1",
+                claims: &HashMap::new(),
+                deny_only: false,
+            })
+            .await
     }
 
     async fn bucket_allows(policy: &BucketPolicy, action: &str) -> bool {

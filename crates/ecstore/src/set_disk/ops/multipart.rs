@@ -5970,7 +5970,7 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
 
             drop(_object_lock_guard.take()); // release the object lock before multipart cleanup IO.
 
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-util"))]
             pause_multipart_commit(&commit_bucket, &commit_object, MultipartCommitPause::AfterObjectPublication).await;
 
             // backlog#946: reclaim the stale per-part metadata (and any superfluous

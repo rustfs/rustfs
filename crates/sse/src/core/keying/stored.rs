@@ -35,7 +35,7 @@ use crate::kms::local::is_local_sse_dek;
 use crate::kms::local::is_rustfs_managed_data_key;
 #[cfg(feature = "rio-v2")]
 use crate::kms::provider::decrypt_unenveloped_sealed_dek;
-use crate::kms::provider::{SseDekProvider, bare_data_key_kms_provider, get_local_sse_dek_provider, kms_sse_dek_provider};
+use crate::kms::provider::{SseDekProvider, bare_data_key_kms_provider, kms_sse_dek_provider_for_operation};
 use rustfs_kms::is_data_key_envelope;
 use rustfs_utils::http::headers::AMZ_ENCRYPTION_KMS;
 use rustfs_utils::http::object_encryption_keys::{
@@ -157,9 +157,10 @@ pub(crate) async fn open_under_stored_data_key(
     key: &str,
     stored: &StoredManagedKey<'_>,
     kms_key_id: &str,
+    bound: bool,
 ) -> Result<(OpenedObjectKey, String), SseError> {
     let record = read_stored_data_key(host, stored).await?;
-    let data_key = unwrap_stored_data_key(host, bucket, key, stored, &record, kms_key_id).await?;
+    let data_key = unwrap_stored_data_key(host, bucket, key, stored, &record, kms_key_id, bound).await?;
 
     let opened = match record.mode {
         StoredKeyMode::Direct { base_nonce } => OpenedObjectKey {
@@ -200,6 +201,7 @@ async fn unwrap_stored_data_key(
     stored: &StoredManagedKey<'_>,
     record: &StoredDataKey,
     kms_key_id: &str,
+    bound: bool,
 ) -> Result<[u8; 32], SseError> {
     let kms_context = if matches!(stored.sse_type, SSEType::SseKms) {
         decode_minio_kms_context(stored.metadata)?
@@ -220,7 +222,7 @@ async fn unwrap_stored_data_key(
     let bare_kms = if is_data_key_envelope(wrapped) || is_local_sse_dek(wrapped) {
         None
     } else {
-        bare_data_key_kms_provider(host).await
+        bare_data_key_kms_provider(host, bound).await
     };
 
     // A MinIO sealed key alone does not mean MinIO wrote the object: RustFS's own
@@ -232,16 +234,16 @@ async fn unwrap_stored_data_key(
     // keeps a RustFS envelope from ever reaching MinIO's decoder.
     #[cfg(feature = "rio-v2")]
     if matches!(record.mode, StoredKeyMode::Object { .. }) && !is_rustfs_managed_data_key(wrapped) {
-        return decrypt_unenveloped_sealed_dek(bare_kms, get_local_sse_dek_provider(), wrapped, kms_key_id, &object_context)
+        return decrypt_unenveloped_sealed_dek(bare_kms, host.local_sse_dek_provider(), wrapped, kms_key_id, &object_context)
             .await;
     }
 
     let provider: Arc<dyn SseDekProvider> = if is_data_key_envelope(wrapped) {
-        kms_sse_dek_provider(host).await?
+        kms_sse_dek_provider_for_operation(host, bound).await?
     } else if let Some(kms_provider) = bare_kms {
         kms_provider
     } else {
-        get_local_sse_dek_provider()?
+        host.local_sse_dek_provider()?
     };
 
     #[cfg(feature = "rio-v2")]

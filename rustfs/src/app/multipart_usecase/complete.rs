@@ -18,7 +18,7 @@ use super::*;
 use crate::app::RequestEnvelope;
 use crate::app::dto_values::stored_etag;
 use crate::app::object::quota_accounting_object_size;
-use crate::app::storage_api::multipart_usecase::EC_BLOCK_SIZE_RESPONSE_HEADER;
+use crate::app::storage_api::multipart_usecase::{EC_BLOCK_SIZE_RESPONSE_HEADER, StorageObjectInfo};
 use http::HeaderValue;
 use http::StatusCode;
 use rustfs_gateway_types::dto::{
@@ -234,9 +234,21 @@ impl DefaultMultipartUsecase {
         input: CompleteMultipartUploadInput,
         multipart_upload: Option<rustfs_gateway_types::dto::CompletedMultipartUpload>,
     ) -> S3Result<CompleteMultipartUploadOutput> {
+        self.complete_multipart_with_origin(envelope, input, multipart_upload, MultipartOrigin::Request)
+            .await
+            .map(|(output, _)| output)
+    }
+
+    pub(crate) async fn complete_multipart_with_origin(
+        &self,
+        envelope: RequestEnvelope,
+        input: CompleteMultipartUploadInput,
+        multipart_upload: Option<rustfs_gateway_types::dto::CompletedMultipartUpload>,
+        origin: MultipartOrigin,
+    ) -> S3Result<(CompleteMultipartUploadOutput, StorageObjectInfo)> {
         let owner = self.clone();
         run_owned_mutation(async move {
-            Box::pin(owner.execute_complete_multipart_upload_owned(envelope, input, multipart_upload)).await
+            Box::pin(owner.execute_complete_multipart_upload_owned(envelope, input, multipart_upload, origin)).await
         })
         .await
     }
@@ -246,25 +258,34 @@ impl DefaultMultipartUsecase {
         envelope: RequestEnvelope,
         input: CompleteMultipartUploadInput,
         multipart_upload: Option<rustfs_gateway_types::dto::CompletedMultipartUpload>,
-    ) -> S3Result<CompleteMultipartUploadOutput> {
-        let headers = envelope.headers();
+        mut origin: MultipartOrigin,
+    ) -> S3Result<(CompleteMultipartUploadOutput, StorageObjectInfo)> {
+        let mut owned_headers = origin.headers(&envelope);
+        if origin.is_managed() {
+            owned_headers.insert(http::header::IF_NONE_MATCH, HeaderValue::from_static("*"));
+        }
+        let headers = &owned_headers;
         validate_new_object_key(input.key.as_str(), "CompleteMultipartUpload")?;
-        reject_presigned_multipart_max_total_object_size_for_other_operation(
-            headers,
-            envelope.uri().query(),
-            envelope.verified_sigv4().is_some(),
-        )?;
-        reject_presigned_put_max_content_length_for_other_operation(
-            headers,
-            envelope.uri().query(),
-            envelope.verified_presigned().is_some(),
-        )?;
-        let mut helper = OperationHelper::from_view(
-            &envelope.audit_view(),
-            EventName::ObjectCreatedCompleteMultipartUpload,
-            S3Operation::CompleteMultipartUpload,
-        );
-        let replication_authorized = replication_request_authorized(&envelope);
+        if !origin.is_managed() {
+            reject_presigned_multipart_max_total_object_size_for_other_operation(
+                headers,
+                envelope.uri().query(),
+                envelope.verified_sigv4().is_some(),
+            )?;
+            reject_presigned_put_max_content_length_for_other_operation(
+                headers,
+                envelope.uri().query(),
+                envelope.verified_presigned().is_some(),
+            )?;
+        }
+        let mut helper = origin.take_completion().unwrap_or_else(|| {
+            OperationHelper::from_view(
+                &envelope.audit_view(),
+                EventName::ObjectCreatedCompleteMultipartUpload,
+                S3Operation::CompleteMultipartUpload,
+            )
+        });
+        let replication_authorized = !origin.is_managed() && replication_request_authorized(&envelope);
         let CompleteMultipartUploadInput {
             bucket: bucket_name,
             key: object_key,
@@ -282,14 +303,18 @@ impl DefaultMultipartUsecase {
         let sse_customer_key = sse_customer_key.map(|key| key.expose_secret().to_owned());
 
         let customer_key_provided = sse_customer_key.is_some();
-        reject_veeam_sosapi_mutation(|| self.object_store(), &bucket, &key).await?;
+        if !origin.is_managed() {
+            reject_veeam_sosapi_mutation(|| self.object_store(), &bucket, &key).await?;
+        }
         // The input member and the header are one value on the wire; both are checked, as the
         // legacy guard checks both.
         let specific_if_none_match = if_none_match.as_deref().is_some_and(|condition| condition.trim() != "*");
         reject_non_wildcard_write_if_none_match(specific_if_none_match, headers)?;
-        validate_table_catalog_object_mutation(&bucket, &key).await?;
+        if !origin.is_managed() {
+            validate_table_catalog_object_mutation(&bucket, &key).await?;
+        }
 
-        if if_match.is_some() || if_none_match.is_some() {
+        if !origin.is_managed() && (if_match.is_some() || if_none_match.is_some()) {
             let Some(store) = self.object_store() else {
                 return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
             };
@@ -334,10 +359,18 @@ impl DefaultMultipartUsecase {
 
         let mut opts = get_complete_multipart_upload_opts_with_replication_authorization(headers, replication_authorized)
             .map_err(ApiError::from)?;
-        apply_bucket_generation_guard(&envelope, &bucket, &mut opts)?;
-        let (versioned, version_suspended) = BucketVersioningSys::write_state(&bucket, &key)
-            .await
-            .map_err(ApiError::from)?;
+        origin.apply_bucket_guard(&envelope, &bucket, &mut opts)?;
+        if origin.is_managed() {
+            opts.preserve_delete_marker = true;
+            opts.write_completion = crate::app::storage_api::object_usecase::WriteCompletion::TailDrained;
+        }
+        let (versioned, version_suspended) = if origin.is_managed() {
+            (false, false)
+        } else {
+            BucketVersioningSys::write_state(&bucket, &key)
+                .await
+                .map_err(ApiError::from)?
+        };
         opts.versioned = versioned;
         opts.version_suspended = version_suspended;
         let capacity_scope_token = Uuid::new_v4();
@@ -396,7 +429,7 @@ impl DefaultMultipartUsecase {
             },
         };
 
-        let completion_principal = SseKmsPrincipal::from_request(&envelope);
+        let completion_principal = origin.principal(&envelope);
         let completion_authorization = multipart_completion_authorization(
             EncryptionRequest {
                 bucket: &bucket,
@@ -414,6 +447,9 @@ impl DefaultMultipartUsecase {
         );
         opts.multipart_completion_authorization = Some(completion_authorization.clone());
         if let Some(user_defined) = upload_user_defined.as_ref() {
+            origin
+                .validate_encryption(&key, user_defined, completion_principal.as_ref())
+                .await?;
             completion_authorization
                 .authorize(user_defined)
                 .await
@@ -432,13 +468,21 @@ impl DefaultMultipartUsecase {
             apply_quota_admission(&mut opts, &check_result)?;
         }
 
-        let object_lock_config_state = Box::pin(load_bucket_object_lock_config_state(&bucket)).await?;
+        let object_lock_config_state = if origin.is_managed() {
+            metadata_sys::ObjectLockConfigState::ConfirmedAbsent
+        } else {
+            Box::pin(load_bucket_object_lock_config_state(&bucket)).await?
+        };
         let prelookup_required = quota_enabled
             || (!super::super::object::shared::put_like_write_creates_new_version(&opts)
                 && super::super::object::shared::object_lock_checks_required_for_state(&object_lock_config_state));
         let prelookup_previous_current_size: Option<Option<u64>> = if prelookup_required {
-            let current_opts =
-                internal_object_info_lookup_opts(get_opts(&bucket, &key, None, None, headers).await.map_err(ApiError::from)?);
+            let mut current_opts = if origin.is_managed() {
+                ObjectOptions::default()
+            } else {
+                internal_object_info_lookup_opts(get_opts(&bucket, &key, None, None, headers).await.map_err(ApiError::from)?)
+            };
+            origin.apply_bucket_guard(&envelope, &bucket, &mut current_opts)?;
             match store.get_object_info(&bucket, &key, &current_opts).await {
                 Ok(existing_obj_info) => {
                     validate_existing_object_lock_for_write(&object_lock_config_state, &existing_obj_info, &current_opts)?;
@@ -470,42 +514,43 @@ impl DefaultMultipartUsecase {
         // generation and PENDING set atomically with the completed object and
         // reuse the same decision for scheduling below. A retry whose upload
         // is already gone must not re-evaluate or rewrite that decision.
-        let completion_replication_decision = if let Some(user_defined) = upload_user_defined.as_ref() {
-            let completion_replication_decision = must_replicate_object(
-                &bucket,
-                &key,
-                user_defined,
-                "".to_string(),
-                opts.delete_marker_replication_status(),
-                opts.clone(),
-            )
-            .await;
-            let mut completion_replication_metadata = HashMap::new();
-            if completion_replication_decision.replicate_any() {
-                insert_str(
-                    &mut completion_replication_metadata,
-                    SUFFIX_REPLICATION_GENERATION,
-                    Uuid::new_v4().to_string(),
-                );
-                insert_str(
-                    &mut completion_replication_metadata,
-                    SUFFIX_REPLICATION_TIMESTAMP,
-                    jiff::ZonedDateTime::now().to_string(),
-                );
-                insert_str(
-                    &mut completion_replication_metadata,
-                    SUFFIX_REPLICATION_STATUS,
-                    completion_replication_decision.pending_status().unwrap_or_default(),
-                );
-            }
-            // `Some(empty)` deliberately means that completion re-evaluated the
-            // session as not admitted; storage removes stale Create-MPU admission
-            // metadata in the same final-object commit.
-            opts.eval_metadata = Some(completion_replication_metadata);
-            Some(completion_replication_decision)
-        } else {
-            None
-        };
+        let completion_replication_decision =
+            if let Some(user_defined) = upload_user_defined.as_ref().filter(|_| !origin.is_managed()) {
+                let completion_replication_decision = must_replicate_object(
+                    &bucket,
+                    &key,
+                    user_defined,
+                    "".to_string(),
+                    opts.delete_marker_replication_status(),
+                    opts.clone(),
+                )
+                .await;
+                let mut completion_replication_metadata = HashMap::new();
+                if completion_replication_decision.replicate_any() {
+                    insert_str(
+                        &mut completion_replication_metadata,
+                        SUFFIX_REPLICATION_GENERATION,
+                        Uuid::new_v4().to_string(),
+                    );
+                    insert_str(
+                        &mut completion_replication_metadata,
+                        SUFFIX_REPLICATION_TIMESTAMP,
+                        jiff::ZonedDateTime::now().to_string(),
+                    );
+                    insert_str(
+                        &mut completion_replication_metadata,
+                        SUFFIX_REPLICATION_STATUS,
+                        completion_replication_decision.pending_status().unwrap_or_default(),
+                    );
+                }
+                // `Some(empty)` deliberately means that completion re-evaluated the
+                // session as not admitted; storage removes stale Create-MPU admission
+                // metadata in the same final-object commit.
+                opts.eval_metadata = Some(completion_replication_metadata);
+                Some(completion_replication_decision)
+            } else {
+                None
+            };
 
         let complete_commit = spawn_traced_join({
             let store = Arc::clone(&store);
@@ -515,6 +560,7 @@ impl DefaultMultipartUsecase {
             let opts = opts.clone();
             let table_data_plane_publication_guards = table_data_plane_publication_guards;
             async move {
+                let _origin = origin;
                 let _table_data_plane_publication_guards = table_data_plane_publication_guards;
                 let obj_info = store
                     .clone()
@@ -719,7 +765,7 @@ impl DefaultMultipartUsecase {
             ..Default::default()
         };
         // Set object info for event notification
-        helper = helper.object(obj_info);
+        helper = helper.object(obj_info.clone());
         if let Some(version_id) = &mpu_version_for_event {
             helper = helper.version_id(version_id.clone());
         }
@@ -730,7 +776,7 @@ impl DefaultMultipartUsecase {
         }
         let result = Ok(output);
         let _ = helper.complete_owned(&result, StatusCode::OK, &answer_headers);
-        result
+        result.map(|output| (output, obj_info))
     }
 }
 
@@ -2178,7 +2224,7 @@ mod tests {
                         S3ErrorCode::InvalidRequest,
                         400,
                         "Bucket quota exceeded. Current usage: 2 bytes, limit: 1 bytes",
-                        false,
+                        true,
                     )
                 } else if locked {
                     (
@@ -2206,6 +2252,14 @@ mod tests {
                     storage_cause,
                     "{label}"
                 );
+                let quota_cause = error
+                    .source()
+                    .and_then(|cause| cause.downcast_ref::<StorageError>())
+                    .and_then(|cause| match cause {
+                        StorageError::QuotaExceeded { current, limit } => Some((*current, *limit)),
+                        _ => None,
+                    });
+                assert_eq!(quota_cause, (raw_id.is_none() && full_quota).then_some((2, 1)), "{shape}/{label}");
             }
         }
     }

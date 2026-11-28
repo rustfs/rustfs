@@ -137,6 +137,7 @@ pub(crate) mod storage_api;
 pub(crate) mod table_catalog;
 pub mod tls;
 pub mod update;
+pub(crate) mod vector;
 pub mod version;
 pub mod workload_admission;
 

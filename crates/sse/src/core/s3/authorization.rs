@@ -15,8 +15,8 @@
 //! Per-key KMS authorization on the SSE-KMS data path.
 
 use crate::core::audit::{record_managed_kms_outcome, stored_envelope_master_key_version};
-use crate::core::request::SseKmsPrincipal;
-use crate::error::SseError;
+use crate::core::request::{SseKmsPrincipal, operation_host};
+use crate::error::{SseError, kms_operation_error, sse_kms_unavailable_error};
 use crate::host::SseHost;
 use crate::{LOG_COMPONENT_STORAGE, LOG_SUBSYSTEM_SSE};
 use rustfs_config::ENV_RUSTFS_KMS_ENFORCE_SSE_KEY_POLICY;
@@ -33,6 +33,9 @@ async fn is_kms_key_allowed(
     action: KmsAction,
     key_id: &str,
 ) -> Result<bool, SseError> {
+    if principal.maintenance.is_some() {
+        return host.kms_key_authorizer().is_allowed(principal, action, key_id).await;
+    }
     #[cfg(any(test, feature = "test-util"))]
     if let Some(hooks) = principal.test_hooks.as_ref() {
         return hooks.authorizer.is_allowed(principal, action, key_id).await;
@@ -43,6 +46,9 @@ async fn is_kms_key_allowed(
 
 /// Whether per-key KMS authorization is enforced on the SSE-KMS data path.
 fn sse_kms_key_policy_enforced(principal: Option<&SseKmsPrincipal>) -> bool {
+    if principal.is_some_and(|principal| principal.maintenance.is_some()) {
+        return true;
+    }
     #[cfg(any(test, feature = "test-util"))]
     if let Some(hooks) = principal.and_then(|candidate| candidate.test_hooks.as_ref()) {
         return hooks.enforced;
@@ -80,11 +86,37 @@ pub(crate) async fn authorize_sse_kms_key(
     action: KmsAction,
     key_id: &str,
 ) -> Result<(), SseError> {
+    let host = operation_host(host, principal);
     let Some(principal) = kms_authorization_subject(sse_kms_key_policy_enforced(principal), principal, sse_type) else {
         return Ok(());
     };
 
     if is_kms_key_allowed(host, principal, action, key_id).await? {
+        if let Some(binding) = &principal.maintenance {
+            let service = match host.encryption_service().await {
+                Some(service) => service,
+                None => return Err(sse_kms_unavailable_error(host.kms_configured_but_unavailable().await)),
+            };
+            let key = service
+                .describe_key_with_context(
+                    rustfs_kms::types::DescribeKeyRequest {
+                        key_id: key_id.to_owned(),
+                    },
+                    &binding.context,
+                )
+                .await
+                .map_err(kms_operation_error)?
+                .key_metadata;
+            if key.key_state != rustfs_kms::types::KeyState::Enabled
+                || key.key_usage != rustfs_kms::types::KeyUsage::EncryptDecrypt
+            {
+                return Err(SseError {
+                    code: S3ErrorCode::InvalidRequest,
+                    message: "KMS key is unavailable for encryption operations".to_owned(),
+                    source: None,
+                });
+            }
+        }
         return Ok(());
     }
 
@@ -133,6 +165,7 @@ pub async fn authorize_sse_kms_object_read(
     principal: Option<&SseKmsPrincipal>,
     metadata: &HashMap<String, String>,
 ) -> Result<(), SseError> {
+    let host = operation_host(host, principal);
     let Some((sse_type, key_id)) = stored_managed_encryption_key(metadata) else {
         return Ok(());
     };
@@ -160,6 +193,7 @@ pub async fn authorize_sse_kms_multipart_write(
     principal: Option<&SseKmsPrincipal>,
     metadata: &HashMap<String, String>,
 ) -> Result<(), SseError> {
+    let host = operation_host(host, principal);
     let Some((sse_type, key_id)) = stored_managed_encryption_key(metadata) else {
         return Ok(());
     };

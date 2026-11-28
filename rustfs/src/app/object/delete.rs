@@ -437,6 +437,17 @@ async fn apply_delete_memory_update(bucket: &str, update: Option<DeleteMemoryUpd
     }
 }
 
+pub(super) async fn apply_managed_delete_accounting(
+    bucket: &str,
+    accounting: &crate::app::storage_api::managed::DeleteAccounting,
+) {
+    apply_delete_memory_update(
+        bucket,
+        delete_memory_update(false, false, true, accounting.size, accounting.removed_current_object),
+    )
+    .await;
+}
+
 /// `DeleteObjects` is idempotent. A raw filesystem `NotFound` can cross the
 /// distributed delete path instead of its usual typed missing-object error.
 fn is_delete_objects_not_found(error: &EcstoreError) -> bool {

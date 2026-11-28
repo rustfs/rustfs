@@ -12,24 +12,30 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use super::identifier::is_valid_table_metadata_file_name;
 use super::*;
 use crate::storage_api::table::{WriteCommitGuard, WriteCompletion};
 
-mod backup_types;
-mod cleanup;
+pub(in crate::table_catalog) mod backup_types;
+pub(in crate::table_catalog) mod cleanup;
 mod directory_index;
 mod manifest;
-mod object;
-mod object_backup;
+pub(in crate::table_catalog) mod object;
+pub(in crate::table_catalog) mod object_backup;
+pub(in crate::table_catalog) use object_backup::{
+    OBJECT_CATALOG_BACKUP_MAX_SIZE, OBJECT_CATALOG_BACKUP_REFERENCE_MAX_OBJECTS, ObjectCatalogBackup, ObjectCatalogBackupObject,
+    ObjectCatalogBackupReference, ObjectCatalogBackupReferenceKind, append_backup_object, backup_sha256, safe_object_key,
+};
 mod publication_deadline;
+mod reader;
+mod vector_maintenance;
+pub(crate) use vector_maintenance::*;
 mod registration_cache;
 pub(crate) use publication_deadline::TablePublicationPreparation;
+pub(in crate::table_catalog) use publication_deadline::publication_preparation;
 #[cfg(test)]
 pub(crate) use publication_deadline::publication_preparation_timeout;
-use publication_deadline::{
-    begin_publication_mutation, publication_preparation, publication_recovery, retain_publication_preparation_fence,
-};
+use publication_deadline::{begin_publication_mutation, publication_recovery, retain_publication_preparation_fence};
+pub(crate) use reader::CatalogObjectReader;
 #[cfg(test)]
 mod registration_cache_tests;
 pub(crate) use registration_cache::TableCatalogRegistrationCache;
@@ -37,7 +43,7 @@ pub(crate) use registration_cache::TableCatalogRegistrationCache;
 pub(crate) use backup_types::{TableCatalogBackupObjectPreparationReport, TableCatalogBackupReport, TableCatalogRestoreReport};
 #[cfg(test)]
 pub(super) use backup_types::{TableCatalogBackupStatus, TableCatalogRestoreStatus};
-use manifest::table_catalog_backing_manifest;
+pub(in crate::table_catalog) use manifest::table_catalog_backing_manifest;
 pub(crate) use object::ObjectTableCatalogStore;
 #[cfg(test)]
 pub(super) use object::bounded_table_entry_objects_for_data_plane_scan;
@@ -73,6 +79,9 @@ pub(in crate::table_catalog) fn catalog_lock_acquisition_error(
 
 fn validate_table_bucket_entry(entry: &TableBucketEntry) -> TableCatalogStoreResult<()> {
     validate_catalog_entry_version("table bucket", entry.version)?;
+    if entry.vector_bucket_binding.is_some() {
+        return Err(TableCatalogStoreError::Invalid("Table scope rejects Vector bucket binding".to_string()));
+    }
     if entry.table_bucket.is_empty() {
         return Err(TableCatalogStoreError::Invalid("table bucket name cannot be empty".to_string()));
     }
@@ -87,6 +96,14 @@ fn validate_table_bucket_entry(entry: &TableBucketEntry) -> TableCatalogStoreRes
 
 fn validate_table_entry_version_and_id(entry: &TableEntry) -> TableCatalogStoreResult<()> {
     validate_catalog_entry_version("table", entry.version)?;
+    if entry.vector_head_binding.is_some()
+        || entry.vector_index_definition.is_some()
+        || !entry.format.eq_ignore_ascii_case("iceberg")
+    {
+        return Err(TableCatalogStoreError::Invalid(
+            "Table scope requires Iceberg without Vector binding".to_string(),
+        ));
+    }
     if entry.table_id.is_empty() {
         return Err(TableCatalogStoreError::Invalid("table id cannot be empty".to_string()));
     }
@@ -356,19 +373,11 @@ pub(crate) trait TableCatalogStore: Send + Sync {
         table_metadata_data_plane_resource_from_entries(&entries, table_bucket, object)
     }
 
-    /// Atomically advances a validated table metadata pointer.
-    ///
-    /// Callers publishing client-supplied Iceberg metadata must validate its logical shape and the physical graph of
-    /// newly introduced or changed snapshots before invoking this persistence boundary.
-    #[allow(
-        dead_code,
-        reason = "declared trait method: implementors provide it but no caller dispatches through the trait yet (backlog#1823)"
-    )]
-    async fn commit_table(&self, request: TableCommitRequest) -> TableCatalogStoreResult<TableCommitResult>;
+    async fn commit_prepared(&self, prepared: PreparedCatalogCommit) -> TableCatalogStoreResult<TableCommitResult>;
 
-    async fn commit_table_with_publication(
+    async fn commit_prepared_with_publication(
         &self,
-        request: TableCommitRequest,
+        prepared: PreparedCatalogCommit,
         publication: &(dyn TableCommitPublication + Sync),
     ) -> TableCatalogStoreResult<TableCommitResult>;
 
@@ -418,34 +427,6 @@ pub(crate) trait TableCatalogStore: Send + Sync {
 
     async fn load_view(&self, table_bucket: &str, namespace: &str, view: &str) -> TableCatalogStoreResult<Option<ViewEntry>>;
 
-    async fn replace_view(&self, request: ViewCommitRequest) -> TableCatalogStoreResult<ViewCommitResult>;
-
-    async fn replace_view_with_publication(
-        &self,
-        request: ViewCommitRequest,
-        table_bucket_fence_required: bool,
-        publication: &(dyn TableCommitPublication + Sync),
-    ) -> TableCatalogStoreResult<ViewCommitResult> {
-        if table_bucket_fence_required {
-            publication.begin_table_bucket(&request.table_bucket).await?;
-            if !publication.holds_table_bucket(&request.table_bucket) {
-                return Err(TableCatalogStoreError::Internal(
-                    "view replacement requires a table-bucket publication fence".to_string(),
-                ));
-            }
-        }
-        publication
-            .prepare(&request.table_bucket, &request.namespace, &request.view)
-            .await?;
-        if !publication.holds_table(&request.table_bucket, &request.namespace, &request.view) {
-            return Err(TableCatalogStoreError::Internal(
-                "view replacement requires a view publication fence".to_string(),
-            ));
-        }
-        let _publication_completion = TableCommitPublicationCompletion::new(publication);
-        self.replace_view(request).await
-    }
-
     async fn drop_view(&self, table_bucket: &str, namespace: &str, view: &str) -> TableCatalogStoreResult<()>;
 
     async fn get_commit_by_id(
@@ -465,6 +446,12 @@ pub(crate) trait TableCatalogStore: Send + Sync {
 
 #[async_trait::async_trait]
 pub(crate) trait TableCommitPublication: Send + Sync {
+    fn prepared_object_reader(&self) -> TableCatalogStoreResult<&dyn CatalogObjectReader> {
+        Err(TableCatalogStoreError::Unsupported(
+            "prepared catalog object reader is unavailable".into(),
+        ))
+    }
+
     fn preparation_budget(&self) -> Arc<TablePublicationPreparation> {
         Arc::new(TablePublicationPreparation::default())
     }
@@ -505,7 +492,8 @@ impl Drop for TableCommitPublicationCompletion<'_> {
     }
 }
 
-struct TableCommitLockPublication<'a, B> {
+pub(in crate::table_catalog) struct TableCommitLockPublication<'a, B> {
+    paths: TableCatalogObjectPaths,
     backend: &'a B,
     preparation: Arc<TablePublicationPreparation>,
     state: parking_lot::Mutex<TableCommitLockPublicationState>,
@@ -513,15 +501,17 @@ struct TableCommitLockPublication<'a, B> {
 
 #[derive(Default)]
 struct TableCommitLockPublicationState {
+    prepared: bool,
     table_bucket: Option<String>,
     table: Option<(String, String, String)>,
-    migration_read_guard: Option<TableCatalogLockGuard>,
-    guards: Vec<TableCatalogLockGuard>,
+    migration_read_guard: Option<Arc<parking_lot::Mutex<TableCatalogLockGuard>>>,
+    guards: Vec<Arc<parking_lot::Mutex<TableCatalogLockGuard>>>,
 }
 
 impl<'a, B> TableCommitLockPublication<'a, B> {
-    fn new(backend: &'a B) -> Self {
+    pub(in crate::table_catalog) fn new(backend: &'a B, paths: &TableCatalogObjectPaths) -> Self {
         Self {
+            paths: paths.clone(),
             backend,
             preparation: Arc::new(TablePublicationPreparation::default()),
             state: parking_lot::Mutex::new(TableCommitLockPublicationState::default()),
@@ -540,7 +530,7 @@ impl<'a, B> TableCommitLockPublication<'a, B> {
                 "catalog migration read permit must be attached before publication".to_string(),
             ));
         }
-        state.migration_read_guard = Some(guard);
+        state.migration_read_guard = Some(Arc::new(parking_lot::Mutex::new(guard)));
         Ok(())
     }
 
@@ -559,11 +549,14 @@ impl<'a, B> TableCommitLockPublication<'a, B> {
             ));
         }
         state.table_bucket = Some(table_bucket.to_string());
-        state.guards.push(guard);
+        state.guards.push(Arc::new(parking_lot::Mutex::new(guard)));
         Ok(())
     }
 
-    fn attach_catalog_write_guard(&self, guard: TableCatalogLockGuard) -> TableCatalogStoreResult<()> {
+    pub(in crate::table_catalog) fn attach_catalog_write_guard(
+        &self,
+        guard: TableCatalogLockGuard,
+    ) -> TableCatalogStoreResult<()> {
         if guard.is_lock_lost() {
             return Err(TableCatalogStoreError::Conflict("table catalog write lock was lost".to_string()));
         }
@@ -573,7 +566,7 @@ impl<'a, B> TableCommitLockPublication<'a, B> {
                 "catalog write guard must be attached between bucket and table publication locks".to_string(),
             ));
         }
-        state.guards.push(guard);
+        state.guards.push(Arc::new(parking_lot::Mutex::new(guard)));
         Ok(())
     }
 }
@@ -583,6 +576,11 @@ impl<'a, B> TableCommitPublication for TableCommitLockPublication<'a, B>
 where
     B: TableCatalogObjectBackend,
 {
+    fn prepared_object_reader(&self) -> TableCatalogStoreResult<&dyn CatalogObjectReader> {
+        self.reader_lease(None)?;
+        Ok(self)
+    }
+
     fn preparation_budget(&self) -> Arc<TablePublicationPreparation> {
         self.preparation.clone()
     }
@@ -595,7 +593,7 @@ where
             if state
                 .migration_read_guard
                 .as_ref()
-                .is_some_and(TableCatalogLockGuard::is_lock_lost)
+                .is_some_and(|guard| guard.lock().is_lock_lost())
             {
                 return Err(TableCatalogStoreError::Conflict(
                     "table-bucket catalog migration read permit was lost".to_string(),
@@ -611,25 +609,31 @@ where
             }
             state.table_bucket = Some(table_bucket.to_string());
         }
-        let publication_lock = default_table_bucket_publication_lock_path();
-        let guard = match self.backend.acquire_write_lock(table_bucket, &publication_lock).await {
+        let (lock_bucket, publication_lock) = match self.paths.scope {
+            CatalogScope::Table => (table_bucket, default_table_bucket_publication_lock_path()),
+            CatalogScope::Vector => (
+                RUSTFS_META_BUCKET,
+                format!("{}publication.lock", self.paths.table_bucket_root_prefix(table_bucket)),
+            ),
+        };
+        let guard = match self.backend.acquire_write_lock(lock_bucket, &publication_lock).await {
             Ok(guard) => guard,
             Err(err) => {
                 self.state.lock().table_bucket = None;
                 return Err(err);
             }
         };
-        self.state.lock().guards.push(guard);
+        self.state.lock().guards.push(Arc::new(parking_lot::Mutex::new(guard)));
         Ok(())
     }
 
     async fn prepare(&self, table_bucket: &str, namespace: &str, table: &str) -> TableCatalogStoreResult<()> {
         let namespace = parse_namespace_for_store(namespace)?;
-        let table = parse_table_for_store(table)?;
+        let table = self.paths.parse_name(table)?;
         let table_key = (table_bucket.to_string(), namespace.public_name(), table.as_str().to_string());
         {
             let mut state = self.state.lock();
-            if state.table.as_ref() == Some(&table_key) {
+            if state.prepared && state.table.as_ref() == Some(&table_key) {
                 return Ok(());
             }
             if state.table.is_some() {
@@ -639,33 +643,51 @@ where
             }
             state.table = Some(table_key);
         }
-        let publication_lock = default_table_publication_lock_path(&namespace, &table);
-        let guard = match self.backend.acquire_write_lock(table_bucket, &publication_lock).await {
+        let (lock_bucket, publication_lock) = match self.paths.scope {
+            CatalogScope::Table => (
+                table_bucket,
+                default_table_publication_lock_path(&namespace, &parse_table_for_store(table.as_str())?),
+            ),
+            CatalogScope::Vector => (
+                RUSTFS_META_BUCKET,
+                format!("{}.publication.lock", self.paths.table_entry_path(table_bucket, &namespace, &table)),
+            ),
+        };
+        let guard = match self.backend.acquire_write_lock(lock_bucket, &publication_lock).await {
             Ok(guard) => guard,
             Err(err) => {
                 self.state.lock().table = None;
                 return Err(err);
             }
         };
-        self.state.lock().guards.push(guard);
+        let mut state = self.state.lock();
+        state.guards.push(Arc::new(parking_lot::Mutex::new(guard)));
+        state.prepared = true;
         Ok(())
     }
 
     fn holds_table_bucket(&self, table_bucket: &str) -> bool {
         let state = self.state.lock();
         state.table_bucket.as_deref() == Some(table_bucket)
-            && state.migration_read_guard.as_ref().is_none_or(|guard| !guard.is_lock_lost())
-            && state.guards.iter().all(|guard| !guard.is_lock_lost())
+            && state
+                .migration_read_guard
+                .as_ref()
+                .is_none_or(|guard| !guard.lock().is_lock_lost())
+            && state.guards.iter().all(|guard| !guard.lock().is_lock_lost())
     }
 
     fn holds_table(&self, table_bucket: &str, namespace: &str, table: &str) -> bool {
         let state = self.state.lock();
-        state
-            .table
-            .as_ref()
-            .is_some_and(|held| held.0 == table_bucket && held.1 == namespace && held.2 == table)
-            && state.migration_read_guard.as_ref().is_none_or(|guard| !guard.is_lock_lost())
-            && state.guards.iter().all(|guard| !guard.is_lock_lost())
+        state.prepared
+            && state
+                .table
+                .as_ref()
+                .is_some_and(|held| held.0 == table_bucket && held.1 == namespace && held.2 == table)
+            && state
+                .migration_read_guard
+                .as_ref()
+                .is_none_or(|guard| !guard.lock().is_lock_lost())
+            && state.guards.iter().all(|guard| !guard.lock().is_lock_lost())
     }
 
     fn catalog_migration_read_permit_status(&self) -> Option<bool> {
@@ -673,7 +695,7 @@ where
             .lock()
             .migration_read_guard
             .as_ref()
-            .map(|guard| !guard.is_lock_lost())
+            .map(|guard| !guard.lock().is_lock_lost())
     }
 
     fn object_mutation_fence(&self) -> Option<TableCatalogObjectMutationFence> {
@@ -683,7 +705,7 @@ where
                 .migration_read_guard
                 .iter()
                 .chain(state.guards.iter())
-                .map(TableCatalogLockGuard::lock_lost_signal),
+                .map(|guard| guard.lock().lock_lost_signal()),
         ))
     }
 
@@ -711,6 +733,8 @@ pub(crate) struct TableCatalogObjectMetadata {
 
 pub(crate) struct TableCatalogLockGuard {
     _guard: Box<dyn Send>,
+    lifecycle_guard: Option<Arc<BucketIncarnationFenceGuard>>,
+    namespace_read_guard: Option<Arc<rustfs_lock::NamespaceLockGuard>>,
     lock_lost: Option<Arc<rustfs_lock::distributed_lock::LockLostSignal>>,
     write_commit_guard: Option<WriteCommitGuard>,
 }
@@ -723,6 +747,8 @@ impl TableCatalogLockGuard {
     pub(crate) fn stable(guard: impl Send + 'static) -> Self {
         Self {
             _guard: Box::new(guard),
+            lifecycle_guard: None,
+            namespace_read_guard: None,
             lock_lost: None,
             write_commit_guard: None,
         }
@@ -731,7 +757,9 @@ impl TableCatalogLockGuard {
     fn namespace(guard: rustfs_lock::NamespaceLockGuard) -> Self {
         let lock_lost = guard.lock_lost_signal();
         Self {
-            _guard: Box::new(guard),
+            _guard: Box::new(()),
+            lifecycle_guard: None,
+            namespace_read_guard: Some(Arc::new(guard)),
             lock_lost,
             write_commit_guard: None,
         }
@@ -746,13 +774,21 @@ impl TableCatalogLockGuard {
         let lock_lost = guard.lock_lost_signal();
         Self {
             _guard: Box::new(()),
+            lifecycle_guard: None,
+            namespace_read_guard: None,
             lock_lost,
             write_commit_guard: Some(guard),
         }
     }
 
-    fn write_commit_guards(&self) -> Vec<WriteCommitGuard> {
+    pub(in crate::table_catalog) fn write_commit_guards(&self) -> Vec<WriteCommitGuard> {
         self.write_commit_guard.iter().cloned().collect()
+    }
+
+    pub(crate) fn bucket_lifecycle_guard(&self) -> TableCatalogStoreResult<&BucketIncarnationFenceGuard> {
+        self.lifecycle_guard.as_deref().ok_or_else(|| {
+            TableCatalogStoreError::Unsupported("managed candidate read requires a bucket lifecycle guard".to_string())
+        })
     }
 
     pub(crate) fn is_lock_lost(&self) -> bool {
@@ -777,6 +813,10 @@ impl TableCatalogObjectMutationFence {
         Self {
             signals: signals.into_iter().flatten().collect(),
         }
+    }
+
+    fn extend_signals(&mut self, signals: impl IntoIterator<Item = Option<Arc<rustfs_lock::distributed_lock::LockLostSignal>>>) {
+        self.signals.extend(signals.into_iter().flatten());
     }
 
     pub(crate) fn ensure_held(&self) -> TableCatalogStoreResult<()> {
@@ -842,6 +882,49 @@ pub(in crate::table_catalog) fn catalog_list_next_continuation(
 
 #[async_trait::async_trait]
 pub(crate) trait TableCatalogObjectBackend: Clone + Send + Sync + 'static {
+    fn prepared_catalog_object_reader(&self) -> TableCatalogStoreResult<&dyn CatalogObjectReader> {
+        Err(TableCatalogStoreError::Unsupported(
+            "prepared catalog object reader is unavailable".into(),
+        ))
+    }
+
+    async fn read_table_bucket_incarnation(&self, _bucket: &str) -> TableCatalogStoreResult<Uuid> {
+        Err(TableCatalogStoreError::Unsupported(
+            "table bucket identity validation is unavailable".to_string(),
+        ))
+    }
+    async fn revalidate_bucket_handle(&self, _expected: &BucketHandle) -> TableCatalogStoreResult<()> {
+        Err(TableCatalogStoreError::Unsupported(
+            "bucket identity validation is unavailable".to_string(),
+        ))
+    }
+
+    async fn acquire_bucket_lifecycle_read(&self, _expected: &BucketHandle) -> TableCatalogStoreResult<TableCatalogLockGuard> {
+        Err(TableCatalogStoreError::Unsupported(
+            "bucket lifecycle validation is unavailable".to_string(),
+        ))
+    }
+    async fn reuse_bucket_lifecycle_read(
+        &self,
+        _expected: &BucketHandle,
+        _guard: Arc<BucketIncarnationFenceGuard>,
+    ) -> TableCatalogStoreResult<TableCatalogLockGuard> {
+        Err(TableCatalogStoreError::Unsupported(
+            "shared bucket lifecycle validation is unavailable".into(),
+        ))
+    }
+    async fn read_managed_candidate(
+        &self,
+        _bucket: &BucketHandle,
+        _metadata: &CatalogMetadataRef,
+        _max_size: usize,
+        _lifecycle: &mut TableCatalogLockGuard,
+    ) -> TableCatalogStoreResult<Option<TableCatalogObject>> {
+        Err(TableCatalogStoreError::Unsupported(
+            "managed candidate reading is unavailable".to_string(),
+        ))
+    }
+
     fn registration_cache(&self) -> Option<TableCatalogRegistrationCache> {
         None
     }
@@ -1151,105 +1234,15 @@ pub(crate) trait TableCatalogObjectBackend: Clone + Send + Sync + 'static {
     fn complete_table_commit_publication(&self) {}
 }
 
-pub(super) async fn diagnose_table_catalog_from_export<B>(
-    backend: &B,
-    catalog: TableCatalogExport,
-    commit_recovery: TableCommitRecoveryReport,
-    retain_recent_metadata_files: usize,
-) -> TableCatalogStoreResult<TableCatalogDiagnosticsReport>
-where
-    B: TableCatalogObjectBackend,
-{
-    let current_metadata_location =
-        table_catalog_object_key_from_location(&catalog.table.table_bucket, &catalog.table.metadata_location);
-    let backing_manifest = catalog.backing_manifest.clone();
-    let metadata_prefix = table_metadata_dir_path_for_entry(&catalog.table)
-        .ok()
-        .map(|directory| format!("{directory}/"));
-    let is_valid_location = |location: &str| {
-        metadata_prefix.as_ref().is_some_and(|prefix| {
-            location
-                .strip_prefix(prefix.as_str())
-                .is_some_and(is_valid_table_metadata_file_name)
-        })
-    };
-    let mut retained = BTreeSet::new();
-    let mut current_metadata_for_refs = None;
-    let current_metadata_status =
-        if let Some(current_metadata_location) = current_metadata_location.filter(|location| is_valid_location(location)) {
-            retained.insert(current_metadata_location.clone());
-            match read_table_metadata_value(backend, &catalog.table_bucket.table_bucket, &current_metadata_location).await {
-                Ok(Some(current_metadata)) => {
-                    retained.extend(metadata_log_locations_matching(
-                        &current_metadata,
-                        &catalog.table_bucket.table_bucket,
-                        is_valid_location,
-                    ));
-                    current_metadata_for_refs = Some(current_metadata);
-                    TableMetadataPointerStatus::Valid
-                }
-                Ok(None) => TableMetadataPointerStatus::MissingObject,
-                Err(TableCatalogStoreError::Invalid(_)) => TableMetadataPointerStatus::InvalidJson,
-                Err(err) => return Err(err),
-            }
-        } else {
-            TableMetadataPointerStatus::InvalidLocation
-        };
-
-    let mut metadata_locations = Vec::new();
-    // A renamed or registered table can keep a metadata directory unrelated to its current name.
-    // If the pointer is invalid, no directory can safely be treated as owned by this table.
-    if let Some(metadata_prefix) = metadata_prefix.as_ref() {
-        for object in backend
-            .list_objects(&catalog.table_bucket.table_bucket, metadata_prefix)
-            .await?
-        {
-            if is_valid_location(&object) {
-                metadata_locations.push(object);
-            }
-        }
-    }
-    metadata_locations.sort();
-    metadata_locations.dedup();
-
-    for metadata_location in metadata_locations.iter().rev().take(retain_recent_metadata_files) {
-        retained.insert(metadata_location.clone());
-    }
-    if let Some(current_metadata) = current_metadata_for_refs.as_ref() {
-        retained.extend(
-            metadata_locations_for_protected_snapshot_refs_matching(
-                backend,
-                &catalog.table_bucket.table_bucket,
-                current_metadata,
-                &metadata_locations,
-                is_valid_location,
-            )
-            .await?,
-        );
-    }
-
-    let orphan_metadata_candidate_locations = metadata_locations
-        .into_iter()
-        .filter(|metadata_location| !retained.contains(metadata_location))
-        .collect();
-    let (recovery_status, recommended_actions) = table_catalog_recovery_summary(&current_metadata_status, &commit_recovery);
-
-    Ok(TableCatalogDiagnosticsReport {
-        catalog,
-        current_metadata_status,
-        recovery_status,
-        recommended_actions,
-        commit_recovery,
-        backing_manifest,
-        orphan_metadata_candidate_locations,
-    })
-}
-
 #[async_trait::async_trait]
 impl<B> TableCommitPublication for B
 where
     B: TableCatalogObjectBackend,
 {
+    fn prepared_object_reader(&self) -> TableCatalogStoreResult<&dyn CatalogObjectReader> {
+        self.prepared_catalog_object_reader()
+    }
+
     fn preparation_budget(&self) -> Arc<TablePublicationPreparation> {
         self.table_publication_preparation_budget()
     }
@@ -1283,22 +1276,99 @@ where
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::table_catalog) enum CatalogScope {
+    Table,
+    Vector,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct TableCatalogObjectPaths {
-    catalog_root: &'static str,
+    scope: CatalogScope,
 }
 
 impl Default for TableCatalogObjectPaths {
     fn default() -> Self {
         Self {
-            catalog_root: INTERNAL_CATALOG_ROOT,
+            scope: CatalogScope::Table,
         }
     }
 }
 
 impl TableCatalogObjectPaths {
+    pub(in crate::table_catalog) fn for_vector() -> Self {
+        Self {
+            scope: CatalogScope::Vector,
+        }
+    }
+
+    fn catalog_root(&self) -> &'static str {
+        match self.scope {
+            CatalogScope::Table => INTERNAL_CATALOG_ROOT,
+            CatalogScope::Vector => "s3vectors/catalog",
+        }
+    }
+
+    pub(in crate::table_catalog) fn parse_name(&self, name: &str) -> TableCatalogStoreResult<CatalogName> {
+        match self.scope {
+            CatalogScope::Table => IdentifierSegment::parse(name).map(|name| CatalogName::from(&name)),
+            CatalogScope::Vector => CatalogName::parse(name),
+        }
+        .map_err(|err| TableCatalogStoreError::Invalid(err.to_string()))
+    }
+    fn validate_bucket_entry(&self, entry: &TableBucketEntry) -> TableCatalogStoreResult<()> {
+        if self.scope == CatalogScope::Table {
+            return validate_table_bucket_entry(entry);
+        }
+        let binding = entry
+            .vector_bucket_binding
+            .as_ref()
+            .ok_or_else(|| TableCatalogStoreError::Invalid("Vector bucket binding is required".to_string()))?;
+        let handle = binding.to_handle()?;
+        if entry.version != 2
+            || entry.catalog_type != "s3vectors"
+            || entry.table_bucket != handle.storage_bucket_id().as_str()
+            || entry.active_rename_id.is_some()
+        {
+            return Err(TableCatalogStoreError::Invalid(
+                "Vector bucket entry contradicts scope or identity".to_string(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn validate_table_entry(&self, entry: &TableEntry) -> TableCatalogStoreResult<()> {
+        if self.scope == CatalogScope::Table {
+            return validate_table_entry_version_and_id(entry);
+        }
+        CatalogHead::from_vector_entry(entry).map(|_| ())
+    }
+
+    fn validate_commit_entry(&self, entry: &CommitLogEntry, bucket: &str, table_id: &str) -> TableCatalogStoreResult<()> {
+        if self.scope == CatalogScope::Table {
+            validate_catalog_entry_version("commit", entry.version)?;
+            if entry.vector_commit_binding.is_some() || entry.vector_resource_mutation.is_some() {
+                return Err(TableCatalogStoreError::Invalid("Table scope rejects Vector commit binding".to_string()));
+            }
+            return Ok(());
+        }
+        let binding = entry
+            .vector_commit_binding
+            .as_ref()
+            .ok_or_else(|| TableCatalogStoreError::Invalid("Vector commit binding is required".to_string()))?;
+        binding.validate_log(entry, bucket, table_id)
+    }
+
+    pub(crate) fn vector_gc_lock_path(&self, bucket: &str, table_id: &str) -> String {
+        format!(
+            "{}resources/{}/gc.lock",
+            self.table_bucket_root_prefix(bucket),
+            table_catalog_path_hash(table_id)
+        )
+    }
+
     pub fn table_bucket_entries_prefix(&self) -> String {
-        format!("{}/{}/", self.catalog_root, TABLE_BUCKET_ROOT)
+        format!("{}/{}/", self.catalog_root(), TABLE_BUCKET_ROOT)
     }
 
     pub fn table_bucket_entry_path(&self, table_bucket: &str) -> String {
@@ -1334,11 +1404,11 @@ impl TableCatalogObjectPaths {
         )
     }
 
-    pub fn table_entry_path(&self, table_bucket: &str, namespace: &Namespace, table: &IdentifierSegment) -> String {
+    pub fn table_entry_path(&self, table_bucket: &str, namespace: &Namespace, table: &impl AsRef<str>) -> String {
         format!(
             "{}{}/{}",
             self.table_entries_prefix(table_bucket, namespace),
-            table.as_str(),
+            table.as_ref(),
             TABLE_ENTRY_FILE
         )
     }
@@ -1380,7 +1450,11 @@ impl TableCatalogObjectPaths {
     }
 
     /// Returns the table maintenance directory and record name for a canonical catalog path.
-    fn historical_table_maintenance_path<'a>(&self, table_bucket: &str, object: &'a str) -> Option<(&'a str, &'a str)> {
+    pub(in crate::table_catalog) fn historical_table_maintenance_path<'a>(
+        &self,
+        table_bucket: &str,
+        object: &'a str,
+    ) -> Option<(&'a str, &'a str)> {
         let namespace_prefix = self.namespace_entries_prefix(table_bucket);
         let relative = object.strip_prefix(&namespace_prefix)?;
         let (head, tail) = relative.rsplit_once(&format!("/{MAINTENANCE_ROOT}/"))?;
@@ -1548,7 +1622,7 @@ impl TableCatalogObjectPaths {
     pub fn catalog_backup_path(&self, table_bucket: &str, backup_id: &str) -> String {
         format!(
             "{}/{}/{}/{}.json",
-            self.catalog_root,
+            self.catalog_root(),
             TABLE_CATALOG_BACKUP_ROOT,
             table_catalog_path_hash(table_bucket),
             table_catalog_path_hash(backup_id)
@@ -1563,7 +1637,7 @@ impl TableCatalogObjectPaths {
     pub fn catalog_restore_state_path(&self, table_bucket: &str) -> String {
         format!(
             "{}/{}/{}/restore-state.json",
-            self.catalog_root,
+            self.catalog_root(),
             TABLE_CATALOG_BACKUP_ROOT,
             table_catalog_path_hash(table_bucket)
         )
@@ -1572,7 +1646,7 @@ impl TableCatalogObjectPaths {
     pub fn catalog_restore_intent_path(&self, table_bucket: &str, restore_id: &str) -> String {
         format!(
             "{}/{}/{}/restores/{}.json",
-            self.catalog_root,
+            self.catalog_root(),
             TABLE_CATALOG_BACKUP_ROOT,
             table_catalog_path_hash(table_bucket),
             table_catalog_path_hash(restore_id)
@@ -1605,28 +1679,28 @@ impl TableCatalogObjectPaths {
     }
 
     pub fn legacy_backing_migration_global_fence_path(&self) -> String {
-        format!("{}/{}/{}", self.catalog_root, "backing-migration", "durable-strong-global-fence.json")
+        format!("{}/{}/{}", self.catalog_root(), "backing-migration", "durable-strong-global-fence.json")
     }
 
     pub fn legacy_catalog_restore_intent_path(&self, table_bucket: &str) -> String {
         format!(
             "{}/{}/{}/intent.json",
-            self.catalog_root,
+            self.catalog_root(),
             "restore-intents",
             table_catalog_path_hash(table_bucket)
         )
     }
 
     pub fn legacy_catalog_snapshot_path(&self) -> String {
-        format!("{}/{}/{}", self.catalog_root, "strong-backing", "snapshot.json")
+        format!("{}/{}/{}", self.catalog_root(), "strong-backing", "snapshot.json")
     }
 
     pub fn catalog_backup_global_fence_lock_path(&self) -> String {
         // Older object-backed registry writers use this lock during a rolling upgrade.
-        format!("{}/{}/{}", self.catalog_root, "backing-migration", "durable-strong-global-fence.lock")
+        format!("{}/{}/{}", self.catalog_root(), "backing-migration", "durable-strong-global-fence.lock")
     }
 
-    fn table_bucket_root_prefix(&self, table_bucket: &str) -> String {
+    pub(in crate::table_catalog) fn table_bucket_root_prefix(&self, table_bucket: &str) -> String {
         format!("{}{}/", self.table_bucket_entries_prefix(), table_catalog_path_hash(table_bucket))
     }
 }
@@ -1883,19 +1957,19 @@ where
         }
     }
 
-    async fn commit_table(&self, request: TableCommitRequest) -> TableCatalogStoreResult<TableCommitResult> {
+    async fn commit_prepared(&self, prepared: PreparedCatalogCommit) -> TableCatalogStoreResult<TableCommitResult> {
         match self {
-            Self::ObjectBacked(store) => store.commit_table(request).await,
+            Self::ObjectBacked(store) => store.commit_prepared(prepared).await,
         }
     }
 
-    async fn commit_table_with_publication(
+    async fn commit_prepared_with_publication(
         &self,
-        request: TableCommitRequest,
+        prepared: PreparedCatalogCommit,
         publication: &(dyn TableCommitPublication + Sync),
     ) -> TableCatalogStoreResult<TableCommitResult> {
         match self {
-            Self::ObjectBacked(store) => store.commit_table_with_publication(request, publication).await,
+            Self::ObjectBacked(store) => store.commit_prepared_with_publication(prepared, publication).await,
         }
     }
 
@@ -1942,27 +2016,6 @@ where
     async fn load_view(&self, table_bucket: &str, namespace: &str, view: &str) -> TableCatalogStoreResult<Option<ViewEntry>> {
         match self {
             Self::ObjectBacked(store) => store.load_view(table_bucket, namespace, view).await,
-        }
-    }
-
-    async fn replace_view(&self, request: ViewCommitRequest) -> TableCatalogStoreResult<ViewCommitResult> {
-        match self {
-            Self::ObjectBacked(store) => store.replace_view(request).await,
-        }
-    }
-
-    async fn replace_view_with_publication(
-        &self,
-        request: ViewCommitRequest,
-        table_bucket_fence_required: bool,
-        publication: &(dyn TableCommitPublication + Sync),
-    ) -> TableCatalogStoreResult<ViewCommitResult> {
-        match self {
-            Self::ObjectBacked(store) => {
-                store
-                    .replace_view_with_publication(request, table_bucket_fence_required, publication)
-                    .await
-            }
         }
     }
 
@@ -2242,76 +2295,23 @@ where
             Self::ObjectBacked(store) => store.put_external_catalog_bridge(entry).await,
         }
     }
+}
 
-    pub(crate) async fn create_catalog_backup(
+#[async_trait::async_trait]
+pub(crate) trait CatalogManagedCandidateReader: Send + Sync {
+    async fn read_managed_candidate(
         &self,
-        table_bucket: &str,
-        expected_snapshot_etag: Option<&str>,
-    ) -> TableCatalogStoreResult<TableCatalogBackupReport> {
-        match self {
-            Self::ObjectBacked(store) => store.create_object_catalog_backup(table_bucket, expected_snapshot_etag).await,
-        }
-    }
-
-    pub(crate) async fn export_catalog_backup(&self, table_bucket: &str, backup_id: &str) -> TableCatalogStoreResult<Vec<u8>> {
-        match self {
-            Self::ObjectBacked(store) => store.export_object_catalog_backup(table_bucket, backup_id).await,
-        }
-    }
-
-    pub(crate) async fn import_catalog_backup(
-        &self,
-        table_bucket: &str,
-        data: Vec<u8>,
-    ) -> TableCatalogStoreResult<TableCatalogBackupReport> {
-        match self {
-            Self::ObjectBacked(store) => store.import_object_catalog_backup(table_bucket, data).await,
-        }
-    }
-
-    pub(crate) async fn prepare_catalog_backup_object(
-        &self,
-        table_bucket: &str,
-        backup_id: &str,
-        object: &str,
-        data: Vec<u8>,
-    ) -> TableCatalogStoreResult<TableCatalogBackupObjectPreparationReport> {
-        match self {
-            Self::ObjectBacked(store) => {
-                store
-                    .prepare_object_catalog_backup_object(table_bucket, backup_id, object, data)
-                    .await
-            }
-        }
-    }
-
-    pub(crate) async fn restore_catalog_backup_with_id(
-        &self,
-        table_bucket: &str,
-        backup_id: &str,
-        expected_snapshot_etag: Option<&str>,
-        allow_replace: bool,
-        restore_id: Option<&str>,
-    ) -> TableCatalogStoreResult<TableCatalogRestoreReport> {
-        match self {
-            Self::ObjectBacked(store) => {
-                store
-                    .restore_object_catalog_backup_with_id(
-                        table_bucket,
-                        backup_id,
-                        expected_snapshot_etag,
-                        allow_replace,
-                        restore_id,
-                    )
-                    .await
-            }
-        }
-    }
+        bucket: &BucketHandle,
+        metadata: &CatalogMetadataRef,
+        max_size: usize,
+        lifecycle: &BucketIncarnationFenceGuard,
+    ) -> TableCatalogStoreResult<Option<TableCatalogObject>>;
 }
 
 pub(crate) struct EcStoreTableCatalogObjectBackend<S> {
     store: Arc<S>,
     registration_cache: TableCatalogRegistrationCache,
+    managed_candidate_reader: Option<Arc<dyn CatalogManagedCandidateReader>>,
 }
 
 impl<S> Clone for EcStoreTableCatalogObjectBackend<S> {
@@ -2319,6 +2319,7 @@ impl<S> Clone for EcStoreTableCatalogObjectBackend<S> {
         Self {
             store: self.store.clone(),
             registration_cache: self.registration_cache.clone(),
+            managed_candidate_reader: self.managed_candidate_reader.clone(),
         }
     }
 }
@@ -2335,6 +2336,15 @@ where
         Self {
             store,
             registration_cache,
+            managed_candidate_reader: None,
+        }
+    }
+
+    pub(crate) fn new_with_managed_candidate_reader(store: Arc<S>, reader: Arc<dyn CatalogManagedCandidateReader>) -> Self {
+        Self {
+            store,
+            registration_cache: TableCatalogRegistrationCache::default(),
+            managed_candidate_reader: Some(reader),
         }
     }
 }
@@ -2346,6 +2356,108 @@ impl<S> TableCatalogObjectBackend for EcStoreTableCatalogObjectBackend<S>
 where
     S: TableCatalogStorage,
 {
+    async fn read_table_bucket_incarnation(&self, bucket: &str) -> TableCatalogStoreResult<Uuid> {
+        let metadata = self
+            .store
+            .get_managed_bucket_metadata(bucket)
+            .await
+            .map_err(|err| storage_error_to_catalog("read table bucket identity", err))?;
+        if metadata
+            .bucket_kind()
+            .map_err(|err| storage_error_to_catalog("validate table bucket kind", err))?
+            != BucketKind::Table
+        {
+            return Err(TableCatalogStoreError::Invalid("catalog requires a Table bucket".to_string()));
+        }
+        if metadata.bucket_incarnation_id.is_nil() {
+            return Err(TableCatalogStoreError::Invalid("table bucket has no persistent incarnation".to_string()));
+        }
+        Ok(metadata.bucket_incarnation_id)
+    }
+
+    async fn revalidate_bucket_handle(&self, expected: &BucketHandle) -> TableCatalogStoreResult<()> {
+        let metadata = self
+            .store
+            .get_managed_bucket_metadata(expected.storage_bucket_id().as_str())
+            .await
+            .map_err(|err| storage_error_to_catalog("read managed bucket identity", err))?;
+        metadata
+            .validate_bucket_handle(expected)
+            .map_err(|err| storage_error_to_catalog("validate managed bucket identity", err))
+    }
+
+    async fn acquire_bucket_lifecycle_read(&self, expected: &BucketHandle) -> TableCatalogStoreResult<TableCatalogLockGuard> {
+        let bucket_id = expected.storage_bucket_id().as_str();
+        let guard = match self
+            .store
+            .acquire_managed_bucket_fence(bucket_id, expected.incarnation().as_uuid())
+            .await
+        {
+            Ok(guard) => guard,
+            Err(err) => {
+                if matches!(
+                    &err,
+                    StorageError::Io(io_err)
+                        if io_err
+                            .to_string()
+                            .contains("bucket incarnation metadata is not authoritative")
+                ) && matches!(
+                    self.store.get_managed_bucket_metadata(bucket_id).await,
+                    Err(StorageError::BucketNotFound(_) | StorageError::ConfigNotFound | StorageError::VolumeNotFound)
+                ) {
+                    return Err(TableCatalogStoreError::NotFound(format!(
+                        "acquire managed bucket lifecycle guard: bucket {bucket_id}"
+                    )));
+                }
+                return Err(storage_error_to_catalog("acquire managed bucket lifecycle guard", err));
+            }
+        };
+        self.revalidate_bucket_handle(expected).await?;
+        if guard.is_lock_lost() {
+            return Err(TableCatalogStoreError::Unavailable("managed bucket lifecycle guard was lost".to_string()));
+        }
+        let lock_lost = guard.lock_lost_signal();
+        Ok(TableCatalogLockGuard {
+            _guard: Box::new(()),
+            lifecycle_guard: Some(Arc::new(guard)),
+            namespace_read_guard: None,
+            lock_lost,
+            write_commit_guard: None,
+        })
+    }
+    async fn reuse_bucket_lifecycle_read(
+        &self,
+        expected: &BucketHandle,
+        guard: Arc<BucketIncarnationFenceGuard>,
+    ) -> TableCatalogStoreResult<TableCatalogLockGuard> {
+        self.reuse_vector_bucket_lifecycle(expected, guard).await
+    }
+    async fn read_managed_candidate(
+        &self,
+        bucket: &BucketHandle,
+        metadata: &CatalogMetadataRef,
+        max_size: usize,
+        lifecycle: &mut TableCatalogLockGuard,
+    ) -> TableCatalogStoreResult<Option<TableCatalogObject>> {
+        let reader = self
+            .managed_candidate_reader
+            .as_ref()
+            .ok_or_else(|| TableCatalogStoreError::Unsupported("managed candidate reader is not configured".to_string()))?;
+        if lifecycle.is_lock_lost() {
+            return Err(TableCatalogStoreError::Unavailable(
+                "managed candidate lifecycle guard was lost".to_string(),
+            ));
+        }
+        let result = reader
+            .read_managed_candidate(bucket, metadata, max_size, lifecycle.bucket_lifecycle_guard()?)
+            .await?;
+        if lifecycle.is_lock_lost() {
+            return Err(TableCatalogStoreError::Unavailable(
+                "managed candidate lifecycle guard was lost".to_string(),
+            ));
+        }
+        Ok(result)
+    }
     fn registration_cache(&self) -> Option<TableCatalogRegistrationCache> {
         Some(self.registration_cache.clone())
     }
@@ -2782,7 +2894,16 @@ where
             .new_ns_lock(bucket, object)
             .await
             .map_err(|err| storage_error_to_catalog("create catalog table lock", err))?;
-        let guard = WriteCommitGuard::acquire(&lock, get_lock_acquire_timeout())
+        let timeout = get_lock_acquire_timeout();
+        let acquire = WriteCommitGuard::acquire(&lock, timeout);
+        #[cfg(test)]
+        let acquire = crate::table_catalog::maintenance::fault_observation::observe_native_gc_write_lock(
+            lock.resource(),
+            lock.owner(),
+            timeout,
+            acquire,
+        );
+        let guard = acquire
             .await
             .map_err(|err| catalog_lock_acquisition_error("acquire catalog table lock", err))?;
         Ok(TableCatalogLockGuard::write_namespace(guard))
@@ -2900,6 +3021,7 @@ where
         write_guards: Option<Vec<WriteCommitGuard>>,
         fence: Option<&TableCatalogObjectMutationFence>,
     ) -> TableCatalogStoreResult<()> {
+        #[cfg(not(test))]
         let mut reader = PutObjReader::from_vec(data);
         let mut opts = ObjectOptions {
             http_preconditions: http_preconditions_for_catalog_put(precondition),
@@ -2907,6 +3029,7 @@ where
         };
         if let Some(fence) = fence {
             fence.add_to_object_options(&mut opts);
+            opts.write_completion = WriteCompletion::TailDrained;
         }
         if let Some(write_guards) = write_guards {
             if write_guards.is_empty() {
@@ -2917,17 +3040,279 @@ where
             }
             opts.write_completion = WriteCompletion::TailDrained;
         }
+        #[cfg(test)]
+        let fault_observation = crate::table_catalog::test_support::catalog_write_faults::CatalogWriteObservation::begin(
+            Arc::as_ptr(&self.store) as usize,
+            bucket,
+            object,
+            &data,
+            matches!(&opts.write_completion, WriteCompletion::TailDrained),
+        );
+        #[cfg(test)]
+        let mut reader = PutObjReader::from_vec(data);
+        #[cfg(test)]
+        if let Err(error) = fault_observation
+            .checkpoint(crate::table_catalog::test_support::catalog_write_faults::CatalogWriteFaultPhase::Before)
+            .await
+        {
+            fault_observation.response_ready(false);
+            return Err(error);
+        }
+        #[cfg(test)]
+        fault_observation.native_started();
         let result = self
             .store
             .put_object(bucket, object, &mut reader, &opts)
             .await
             .map(|_| ())
             .map_err(|err| storage_error_to_catalog("write catalog object", err));
-        if result.is_ok()
-            && let Some(fence) = fence
+        #[cfg(test)]
         {
-            fence.ensure_held()?;
+            use crate::table_catalog::test_support::catalog_write_faults::{CatalogWriteFaultPhase, CatalogWriteFenceOutcome};
+            fault_observation.native_returned(result.is_ok());
+            let after_native = fault_observation.checkpoint(CatalogWriteFaultPhase::AfterNative).await;
+            let (result, fence_outcome) = if result.is_err() {
+                (result, CatalogWriteFenceOutcome::NativeError)
+            } else if let Some(fence) = fence {
+                let checked = fence.ensure_held();
+                let outcome = if checked.is_ok() {
+                    CatalogWriteFenceOutcome::Held
+                } else {
+                    CatalogWriteFenceOutcome::Lost
+                };
+                (checked, outcome)
+            } else {
+                (result, CatalogWriteFenceOutcome::NotProvided)
+            };
+            fault_observation.fence_checked(fence_outcome);
+            let after_fence = fault_observation.checkpoint(CatalogWriteFaultPhase::AfterFence).await;
+            let before_response = fault_observation.checkpoint(CatalogWriteFaultPhase::BeforeResponse).await;
+            let result = result.and(after_native).and(after_fence).and(before_response);
+            fault_observation.response_ready(result.is_ok());
+            result
         }
-        result
+        #[cfg(not(test))]
+        {
+            if result.is_ok()
+                && let Some(fence) = fence
+            {
+                fence.ensure_held()?;
+            }
+            result
+        }
+    }
+}
+
+#[derive(Clone)]
+pub(crate) struct VectorCatalogOperationGuard {
+    inner: Arc<VectorCatalogOperationState>,
+}
+
+struct VectorCatalogOperationState {
+    owner: Arc<()>,
+    retirement_validation_owner: Arc<()>,
+    resource_identity: CatalogResourceIdentity,
+    namespace: Namespace,
+    name: CatalogName,
+    lifecycle: tokio::sync::Mutex<TableCatalogLockGuard>,
+    native_lifecycle: Option<Arc<BucketIncarnationFenceGuard>>,
+    gc: parking_lot::Mutex<TableCatalogLockGuard>,
+    gc_exclusive: bool,
+    fence: TableCatalogObjectMutationFence,
+}
+
+impl std::fmt::Debug for VectorCatalogOperationGuard {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("VectorCatalogOperationGuard")
+            .field("resource_identity", self.resource_identity())
+            .field("namespace", self.namespace())
+            .field("name", self.name())
+            .finish_non_exhaustive()
+    }
+}
+
+impl VectorCatalogOperationGuard {
+    pub(crate) fn resource_identity(&self) -> &CatalogResourceIdentity {
+        &self.inner.resource_identity
+    }
+    pub(crate) fn namespace(&self) -> &Namespace {
+        &self.inner.namespace
+    }
+    pub(crate) fn name(&self) -> &CatalogName {
+        &self.inner.name
+    }
+    pub(crate) fn check_held(&self) -> TableCatalogStoreResult<()> {
+        self.inner.fence.ensure_held()?;
+        if self.inner.gc.lock().is_lock_lost() || self.inner.native_lifecycle.as_ref().is_some_and(|guard| guard.is_lock_lost()) {
+            return Err(TableCatalogStoreError::Unavailable("Vector operation protection was lost".into()));
+        }
+        Ok(())
+    }
+    pub(crate) fn lifecycle_guard(&self) -> TableCatalogStoreResult<Arc<BucketIncarnationFenceGuard>> {
+        self.check_held()?;
+        self.inner
+            .native_lifecycle
+            .clone()
+            .ok_or_else(|| TableCatalogStoreError::Unsupported("Vector operation has no Managed lifecycle guard".into()))
+    }
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct VectorCatalogEntry {
+    head: CatalogHead,
+    definition: VectorIndexDefinitionV1,
+    entry: TableEntry,
+}
+
+impl VectorCatalogEntry {
+    pub(in crate::table_catalog) fn from_entry(entry: TableEntry) -> TableCatalogStoreResult<Self> {
+        if !matches!(entry.version, 3 | 4) {
+            return Err(TableCatalogStoreError::Unsupported(
+                "formal Vector operations require Catalog v3 or v4".into(),
+            ));
+        }
+        let head = CatalogHead::from_vector_entry(&entry)?;
+        let definition = entry
+            .vector_index_definition
+            .clone()
+            .ok_or_else(|| TableCatalogStoreError::Invalid("Vector v3 entry has no Index definition".into()))?;
+        Ok(Self { head, definition, entry })
+    }
+    pub(crate) fn head(&self) -> &CatalogHead {
+        &self.head
+    }
+    pub(crate) fn definition(&self) -> &VectorIndexDefinitionV1 {
+        &self.definition
+    }
+    pub(crate) fn created_at(&self) -> TableCatalogStoreResult<OffsetDateTime> {
+        let value = self
+            .entry
+            .created_at
+            .as_deref()
+            .ok_or_else(|| TableCatalogStoreError::Invalid("Vector entry has no creation time".into()))?;
+        let timestamp = OffsetDateTime::parse(value, &time::format_description::well_known::Rfc3339)
+            .map_err(|_| TableCatalogStoreError::Invalid("Vector entry creation time is invalid".into()))?;
+        if timestamp.offset() != time::UtcOffset::UTC {
+            return Err(TableCatalogStoreError::Invalid("Vector entry creation time is not UTC".into()));
+        }
+        Ok(timestamp)
+    }
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct VectorIndexCreateReservation {
+    intent: VectorIndexCreateIntentV1,
+    expected_head: CatalogExpectedHead,
+    resource_identity: CatalogResourceIdentity,
+    namespace: Namespace,
+    name: CatalogName,
+    create_id: CatalogCommitId,
+    planned_manifest: CatalogMetadataRef,
+    initialization_payload: Vec<u8>,
+    published_entry: Option<VectorCatalogEntry>,
+}
+
+impl VectorIndexCreateReservation {
+    fn from_intent(intent: VectorIndexCreateIntentV1) -> TableCatalogStoreResult<Self> {
+        intent.validate()?;
+        let resource_identity = intent.resource_identity()?;
+        let namespace =
+            Namespace::parse(&intent.namespace).map_err(|error| TableCatalogStoreError::Invalid(error.to_string()))?;
+        let name = CatalogName::parse(&intent.name).map_err(|error| TableCatalogStoreError::Invalid(error.to_string()))?;
+        let create_id = CatalogCommitId::try_new(intent.create_id.clone())?;
+        let expected_head = CatalogExpectedHead::for_vector_creation(&intent.create_id)?;
+        let planned_manifest = CatalogMetadataRef::try_from(&intent.planned_manifest)?;
+        let initialization_payload = base64_simd::STANDARD
+            .decode_to_vec(intent.initialization_payload_base64.as_bytes())
+            .map_err(|_| TableCatalogStoreError::Invalid("invalid reserved initialization payload".into()))?;
+        Ok(Self {
+            intent,
+            expected_head,
+            resource_identity,
+            namespace,
+            name,
+            create_id,
+            planned_manifest,
+            initialization_payload,
+            published_entry: None,
+        })
+    }
+    pub(crate) fn resource_identity(&self) -> &CatalogResourceIdentity {
+        &self.resource_identity
+    }
+    pub(crate) fn namespace(&self) -> &Namespace {
+        &self.namespace
+    }
+    pub(crate) fn name(&self) -> &CatalogName {
+        &self.name
+    }
+    pub(crate) fn create_id(&self) -> &CatalogCommitId {
+        &self.create_id
+    }
+    pub(crate) fn expected_head(&self) -> &CatalogExpectedHead {
+        &self.expected_head
+    }
+    pub(crate) fn planned_manifest(&self) -> &CatalogMetadataRef {
+        &self.planned_manifest
+    }
+    pub(crate) fn definition(&self) -> &VectorIndexDefinitionV1 {
+        &self.intent.definition
+    }
+    pub(crate) fn initialization_payload(&self) -> &[u8] {
+        &self.initialization_payload
+    }
+    #[cfg(test)]
+    pub(crate) fn phase(&self) -> VectorIndexCreatePhase {
+        self.intent.phase
+    }
+    pub(crate) fn published_entry(&self) -> Option<&VectorCatalogEntry> {
+        self.published_entry.as_ref()
+    }
+}
+
+impl TableCatalogObjectPaths {
+    fn vector_create_intent_path(&self, bucket: &str, namespace: &Namespace, name: &CatalogName) -> String {
+        let head = self.table_entry_path(bucket, namespace, name);
+        format!("{}create-intent.json", head.trim_end_matches(TABLE_ENTRY_FILE))
+    }
+    pub(in crate::table_catalog) fn vector_delete_intent_path(&self, bucket: &str, table_id: &str) -> String {
+        format!(
+            "{}resources/{}/delete-intent.json",
+            self.table_bucket_root_prefix(bucket),
+            table_catalog_path_hash(table_id)
+        )
+    }
+}
+
+#[derive(Debug, Clone)]
+pub(crate) enum VectorTagUpdate {
+    Set(BTreeMap<String, String>),
+    Remove(BTreeSet<String>),
+}
+
+impl<S: TableCatalogStorage> EcStoreTableCatalogObjectBackend<S> {
+    async fn reuse_vector_bucket_lifecycle(
+        &self,
+        expected: &BucketHandle,
+        guard: Arc<BucketIncarnationFenceGuard>,
+    ) -> TableCatalogStoreResult<TableCatalogLockGuard> {
+        self.store
+            .validate_managed_bucket_fence(&guard, expected.storage_bucket_id().as_str())
+            .map_err(|error| storage_error_to_catalog("validate shared managed bucket lifecycle", error))?;
+        self.revalidate_bucket_handle(expected).await?;
+        if guard.is_lock_lost() {
+            return Err(TableCatalogStoreError::Unavailable(
+                "shared managed bucket lifecycle guard was lost".into(),
+            ));
+        }
+        let lock_lost = guard.lock_lost_signal();
+        Ok(TableCatalogLockGuard {
+            _guard: Box::new(()),
+            lifecycle_guard: Some(guard),
+            namespace_read_guard: None,
+            lock_lost,
+            write_commit_guard: None,
+        })
     }
 }

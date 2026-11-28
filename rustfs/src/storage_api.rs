@@ -470,6 +470,29 @@ pub(crate) mod startup {
 
     pub(crate) mod services {
         pub(crate) use super::super::storage_contracts::StorageAdminApi;
+        #[cfg(test)]
+        pub(crate) use crate::storage::storage_api::StorageError;
+        #[cfg(all(test, unix))]
+        pub(crate) use crate::storage::storage_api::access_consumer::ReqInfo;
+        #[cfg(all(test, unix))]
+        pub(crate) use crate::storage::storage_api::contract::bucket::MakeBucketOptions;
+        #[cfg(test)]
+        pub(crate) use crate::storage::storage_api::contract::bucket::{BucketOperations, DeleteBucketOptions};
+        #[cfg(test)]
+        pub(crate) use crate::storage::storage_api::managed::ManagedObjectAccess;
+        #[cfg(test)]
+        pub(crate) use crate::storage::storage_api::managed::ManagedObjectOperation;
+        #[cfg(all(test, unix))]
+        pub(crate) use crate::storage::storage_api::managed::{
+            AccountNamespaceId, BucketHandle, BucketIncarnation, BucketKind, BucketPublicName, ManagedTableId,
+            make_managed_bucket,
+        };
+        #[cfg(all(test, unix))]
+        pub(crate) use crate::storage::storage_api::request_context_consumer::RequestContext;
+        #[cfg(test)]
+        pub(crate) use crate::storage::storage_api::test_consumer::sse::{
+            RecordingKmsKeyAuthorizer, TestAuthorizationHooks, kms_sse_dek_provider_for_test, set_sse_dek_provider_for_test,
+        };
         pub(crate) use crate::storage::storage_api::{ECStore, EndpointServerPools, ServerContextSlot};
     }
 
@@ -510,7 +533,24 @@ pub(crate) mod workload {
     }
 }
 
+pub(crate) mod vector {
+    #[cfg(test)]
+    pub(crate) use crate::storage::storage_api::managed::{
+        AccountNamespaceId, BucketIncarnation, BucketPublicName, StorageBucketId,
+    };
+    pub(crate) use crate::storage::storage_api::managed::{
+        BucketHandle, BucketIdentityError, BucketKind, ManagedObjectAccess, ManagedObjectOperation, ManagedTableId,
+    };
+}
+
 pub(crate) mod table {
+    pub(crate) mod managed {
+        pub(crate) use crate::storage::storage_api::managed::{
+            AccountNamespaceId, BucketHandle, BucketIncarnation, BucketIncarnationFenceGuard, BucketKind, BucketPublicName,
+            ManagedBucketStorage, ManagedTableId, StorageBucketId,
+        };
+    }
+
     pub(crate) use crate::storage::storage_api::ecstore_bucket::utils::check_valid_bucket_name_strict;
     pub(crate) use crate::storage::storage_api::ecstore_object::{WriteCommitGuard, WriteCompletion};
     pub(crate) use crate::storage::storage_api::request_context_consumer::spawn_traced_join;
@@ -552,7 +592,10 @@ pub(crate) mod table {
 
     #[cfg(test)]
     pub(crate) mod test_support {
-        pub(crate) use crate::storage::storage_api::contract::bucket::{BucketOperations, MakeBucketOptions};
+        pub(crate) use crate::storage::storage_api::contract::bucket::{
+            BUCKET_LIFECYCLE_LOCK_OBJECT, BucketOperations, MakeBucketOptions,
+        };
+        pub(crate) use crate::storage::storage_api::managed::HealOpts;
     }
 }
 

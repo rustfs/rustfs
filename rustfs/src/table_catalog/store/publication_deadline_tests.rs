@@ -17,6 +17,41 @@ use crate::table_catalog::store::registration_cache_tests::{cache_fixture, regis
 use crate::table_catalog::test_support::TestCatalogObjectBackend;
 use crate::table_catalog::tests::{test_bucket_entry, test_namespace_entry, test_table_entry};
 
+#[tokio::test]
+async fn catalog_registration_futures_remain_bounded_with_ecstore_backend() {
+    let directory = tempfile::TempDir::new().expect("Catalog future test directory");
+    let shutdown = tokio_util::sync::CancellationToken::new();
+    let env = rustfs_test_utils::TestECStoreEnv::builder()
+        .disk_count(1)
+        .base_dir(directory.path())
+        .init_bucket_metadata(false)
+        .shutdown_token(shutdown.clone())
+        .build()
+        .await;
+    let backend = EcStoreTableCatalogObjectBackend::new(env.ecstore);
+    let store = ObjectTableCatalogStore::new(backend.clone());
+    let paths = TableCatalogObjectPaths::default();
+    let publication = TableCommitLockPublication::new(&backend, &paths);
+    let namespace = Namespace::parse("sales").expect("Catalog namespace");
+    let entry = registration_entry(&namespace, "orders");
+    for (operation, future) in [
+        ("create_table", store.create_table(entry.clone())),
+        ("register_table", store.register_table(entry.clone())),
+        (
+            "register_table_with_publication",
+            store.register_table_with_publication(entry, &publication),
+        ),
+    ] {
+        // Measure the async-trait state through its vtable.
+        let future_size = std::mem::size_of_val(future.as_ref().get_ref());
+        assert!(
+            future_size <= 16 * 1024,
+            "{operation} future must remain bounded; measured {future_size} bytes"
+        );
+    }
+    shutdown.cancel();
+}
+
 fn is_preparation_timeout<T>(result: &TableCatalogStoreResult<T>) -> bool {
     matches!(result, Err(TableCatalogStoreError::Unavailable(message)) if message.contains("preparation deadline"))
 }
@@ -72,9 +107,13 @@ async fn publication_deadline_registration_inventory_releases_fence_without_writ
         .unwrap();
 }
 
-async fn commit_fixture() -> (TestCatalogObjectBackend, Arc<dyn TableCatalogStore>, TableCommitRequest) {
+async fn commit_fixture() -> (
+    TestCatalogObjectBackend,
+    Arc<ObjectTableCatalogStore<TestCatalogObjectBackend>>,
+    TableCommitRequest,
+) {
     let backend = TestCatalogObjectBackend::default();
-    let store: Arc<dyn TableCatalogStore> = Arc::new(ObjectTableCatalogStore::new(backend.clone()));
+    let store: Arc<ObjectTableCatalogStore<TestCatalogObjectBackend>> = Arc::new(ObjectTableCatalogStore::new(backend.clone()));
     let namespace = Namespace::parse("sales").unwrap();
     let table = IdentifierSegment::parse("orders").unwrap();
     let current = default_table_metadata_file_path(&namespace, &table, "00001.metadata.json");
@@ -88,7 +127,9 @@ async fn commit_fixture() -> (TestCatalogObjectBackend, Arc<dyn TableCatalogStor
         .create_table(test_table_entry("analytics", &namespace, &table, current.clone()))
         .await
         .unwrap();
-    backend.seed_object("analytics", &next, b"{}".to_vec()).await;
+    backend
+        .seed_table_metadata(&test_table_entry("analytics", &namespace, &table, current.clone()), &[&current, &next])
+        .await;
     (
         backend,
         store,
@@ -137,12 +178,11 @@ async fn publication_deadline_commit_metadata_read_does_not_publish_object_backi
     );
     pause.release();
     // Positive retry exercises parsing a nontrivial valid metadata body.
+    let current = store.load_table("analytics", "sales", "orders").await.unwrap().unwrap();
+    let mut metadata = crate::table_catalog::test_support::table_metadata_json(&current.table_uuid, &current.warehouse_location);
+    metadata["properties"]["padding"] = serde_json::json!("x".repeat(1024 * 1024));
     backend
-        .seed_object(
-            "analytics",
-            &request.new_metadata_location,
-            serde_json::to_vec(&serde_json::json!({"properties": {"padding": "x".repeat(1024 * 1024)}})).unwrap(),
-        )
+        .seed_object("analytics", &request.new_metadata_location, serde_json::to_vec(&metadata).unwrap())
         .await;
     tokio::time::resume();
     let committed = store.commit_table(request.clone()).await.unwrap();
@@ -178,7 +218,7 @@ async fn publication_deadline_create_finishes_after_first_write_on_object_backin
 #[tokio::test(start_paused = true)]
 async fn publication_deadline_queueing_and_repeated_prepare_share_one_budget() {
     let backend = TestCatalogObjectBackend::default();
-    let publication = TableCommitLockPublication::new(&backend);
+    let publication = TableCommitLockPublication::new(&backend, &TableCatalogObjectPaths::default());
     let budget = publication.preparation_budget();
     let first_deadline = budget.deadline();
     tokio::time::advance(publication_preparation_timeout() - StdDuration::from_millis(1)).await;
@@ -199,7 +239,7 @@ async fn publication_deadline_queueing_and_repeated_prepare_share_one_budget() {
 #[tokio::test(start_paused = true)]
 async fn publication_deadline_completed_recovery_cannot_exempt_a_new_transaction() {
     let backend = TestCatalogObjectBackend::default();
-    let publication = TableCommitLockPublication::new(&backend);
+    let publication = TableCommitLockPublication::new(&backend, &TableCatalogObjectPaths::default());
     let result = publication_preparation(&publication, async {
         publication.begin_table_bucket("analytics").await?;
         publication_recovery(async {

@@ -26,12 +26,74 @@ use crate::error::is_err_bucket_not_found;
 use crate::runtime::sources as runtime_sources;
 use crate::set_disk::{BucketInfoQuorum, SetDisks, get_lock_acquire_timeout};
 use crate::storage_api_contracts::admin::DiskSetSelector;
-use crate::storage_api_contracts::bucket::{BUCKET_LIFECYCLE_LOCK_OBJECT, SRBucketDeleteOp};
+use crate::storage_api_contracts::bucket::{BUCKET_LIFECYCLE_LOCK_OBJECT, BucketHandle, BucketKind, SRBucketDeleteOp};
 use crate::storage_api_contracts::namespace::NamespaceLocking as _;
 use futures::stream::{self, StreamExt};
 use rustfs_policy::policy::BucketPolicy;
 use std::collections::BTreeMap;
 use std::future::Future;
+
+struct ManagedBucketDeleteState {
+    store: Arc<ECStore>,
+    metadata: metadata_sys::BucketMetadataSys,
+    publication: rustfs_lock::NamespaceLockGuard,
+    lifecycle: Arc<super::BucketIncarnationFenceGuard>,
+    transaction: rustfs_lock::NamespaceLockGuard,
+    namespace: Arc<rustfs_lock::NamespaceLockGuard>,
+}
+
+#[cfg(test)]
+type ManagedDeleteCleanupPause = (tokio::sync::oneshot::Sender<()>, tokio::sync::oneshot::Receiver<()>);
+
+#[cfg(test)]
+static MANAGED_DELETE_CLEANUP_PAUSES: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<String, ManagedDeleteCleanupPause>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+
+#[cfg(test)]
+struct ManagedDeleteCleanupPauseGuard(String);
+
+#[cfg(test)]
+impl Drop for ManagedDeleteCleanupPauseGuard {
+    fn drop(&mut self) {
+        MANAGED_DELETE_CLEANUP_PAUSES
+            .lock()
+            .expect("managed delete pause mutex")
+            .remove(&self.0);
+    }
+}
+
+#[cfg(test)]
+fn pause_managed_delete_cleanup(
+    bucket: &str,
+) -> (
+    ManagedDeleteCleanupPauseGuard,
+    tokio::sync::oneshot::Receiver<()>,
+    tokio::sync::oneshot::Sender<()>,
+) {
+    let (arrived_tx, arrived_rx) = tokio::sync::oneshot::channel();
+    let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+    assert!(
+        MANAGED_DELETE_CLEANUP_PAUSES
+            .lock()
+            .expect("managed delete pause mutex")
+            .insert(bucket.to_owned(), (arrived_tx, release_rx))
+            .is_none()
+    );
+    (ManagedDeleteCleanupPauseGuard(bucket.to_owned()), arrived_rx, release_tx)
+}
+
+#[cfg(test)]
+async fn await_managed_delete_cleanup_pause(bucket: &str) {
+    let pause = MANAGED_DELETE_CLEANUP_PAUSES
+        .lock()
+        .expect("managed delete pause mutex")
+        .remove(bucket);
+    if let Some((arrived, release)) = pause {
+        let _ = arrived.send(());
+        let _ = release.await;
+    }
+}
 
 const DELETED_BUCKETS_PREFIX: &str = ".deleted";
 const SCANNER_BUCKET_LIST_SET_CONCURRENCY: usize = 4;
@@ -770,6 +832,20 @@ impl ECStore {
         metadata_sys::get_quota_config_and_incarnation_from_disk_in(&self.ctx, bucket).await
     }
 
+    /// Read persisted metadata and its incarnation sidecar from this instance.
+    /// # Errors
+    /// Returns ConfigNotFound for absent metadata, preserving corruption and quorum failures.
+    pub async fn get_bucket_metadata_from_disk(&self, bucket: &str) -> Result<Arc<BucketMetadata>> {
+        let sys = metadata_sys::require_bucket_metadata_sys_in(&self.ctx)?;
+        let store = sys.read().await.object_store();
+        let (metadata, persisted) =
+            crate::bucket::metadata::load_bucket_metadata_parse_with_presence(store, bucket, true).await?;
+        if !persisted {
+            return Err(Error::ConfigNotFound);
+        }
+        Ok(Arc::new(metadata))
+    }
+
     pub async fn get_bucket_metadata(&self, bucket: &str) -> Result<Arc<BucketMetadata>> {
         let sys = metadata_sys::require_bucket_metadata_sys_in(&self.ctx)?;
         sys.read().await.get(bucket).await
@@ -872,6 +948,284 @@ impl ECStore {
         metadata_sys::update_validated_in(&self.ctx, bucket, config_file, data, Some(expected_incarnation_id), validate).await
     }
 
+    #[cfg(test)]
+    /// Update policy or tags for one committed Vector bucket identity.
+    ///
+    /// The caller authorizes the operation and owns cancellation through completion.
+    /// Each mutation holds lifecycle and metadata transaction locks through persistence.
+    /// Callers must not retain another lifecycle guard for this bucket.
+    ///
+    /// # Errors
+    /// Rejects a different instance, identity, incarnation, malformed configuration,
+    /// or a lost metadata fence. Preserves storage and quorum failures.
+    pub async fn mutate_managed_bucket_config(
+        &self,
+        identity: &BucketHandle,
+        mutation: crate::storage_api_contracts::bucket::ManagedBucketConfigMutation,
+    ) -> Result<time::OffsetDateTime> {
+        metadata_sys::mutate_managed_bucket_config_in(&self.ctx, self.id, identity, mutation).await
+    }
+
+    /// Update a resolved Vector bucket configuration after verifying an application
+    /// precheck/authorization callback against the latest persisted [`BucketMetadata`]
+    /// under the bucket lifecycle read lock and metadata transaction write lock.
+    ///
+    /// # Errors
+    /// Returns [`crate::storage_api_contracts::bucket::ManagedBucketPrecheckError::Precheck`]
+    /// when `precheck` rejects the operation under held locks, or
+    /// [`crate::storage_api_contracts::bucket::ManagedBucketPrecheckError::Storage`] when
+    /// lock acquisition, identity/config validation, or persistence fails.
+    pub async fn mutate_managed_bucket_config_with_precheck<P, PFut, E>(
+        &self,
+        identity: &BucketHandle,
+        mutation: crate::storage_api_contracts::bucket::ManagedBucketConfigMutation,
+        precheck: P,
+    ) -> std::result::Result<time::OffsetDateTime, crate::storage_api_contracts::bucket::ManagedBucketPrecheckError<E, Error>>
+    where
+        P: FnOnce(&BucketMetadata) -> PFut + Send,
+        PFut: Future<Output = std::result::Result<(), E>> + Send,
+    {
+        metadata_sys::mutate_managed_bucket_config_in_with_precheck(&self.ctx, self.id, identity, mutation, precheck).await
+    }
+
+    #[cfg(any(test, feature = "test-util"))]
+    /// Delete an empty Vector bucket using its complete persisted identity.
+    ///
+    /// The required preparation runs under the bucket lifecycle writer and must
+    /// use the supplied guard without acquiring another lifecycle lock. The caller
+    /// authorizes the operation and owns this future through storage and audit
+    /// completion. Partial completion uses existing bucket retirement and orphan
+    /// recovery; a cancelled arbitrary caller does not gain independent execution.
+    /// Release any earlier lifecycle guard before entering this method.
+    ///
+    /// # Errors
+    /// Rejects stale identity, changed instance, nonempty data or multipart state,
+    /// preparation failure and lost guards. Persistence and cleanup errors remain
+    /// errors even when physical deletion already completed.
+    pub async fn delete_managed_bucket_with_preparation<F, Fut>(&self, identity: &BucketHandle, prepare: F) -> Result<()>
+    where
+        F: FnOnce(Arc<super::BucketIncarnationFenceGuard>) -> Fut + Send,
+        Fut: Future<Output = Result<()>> + Send,
+    {
+        match self
+            .delete_managed_bucket_with_precheck_and_preparation(
+                identity,
+                |_| async { Ok::<(), std::convert::Infallible>(()) },
+                prepare,
+            )
+            .await
+        {
+            Ok(()) => Ok(()),
+            Err(crate::storage_api_contracts::bucket::ManagedBucketPrecheckError::Precheck(never)) => match never {},
+            Err(crate::storage_api_contracts::bucket::ManagedBucketPrecheckError::Storage(error)) => Err(error),
+        }
+    }
+
+    /// Delete an empty Vector bucket after verifying `precheck` under the bucket
+    /// publication, lifecycle, metadata-transaction, and exact-namespace write locks
+    /// against the latest authoritative [`BucketMetadata`], before inspecting data
+    /// emptiness or running Catalog retirement preparation.
+    ///
+    /// # Errors
+    /// Returns [`crate::storage_api_contracts::bucket::ManagedBucketPrecheckError::Precheck`]
+    /// when `precheck` rejects the operation under held locks, or
+    /// [`crate::storage_api_contracts::bucket::ManagedBucketPrecheckError::Storage`] on
+    /// lock, identity, emptiness, preparation, or persistence failures.
+    pub async fn delete_managed_bucket_with_precheck_and_preparation<P, PFut, F, Fut, E>(
+        &self,
+        identity: &BucketHandle,
+        precheck: P,
+        prepare: F,
+    ) -> std::result::Result<(), crate::storage_api_contracts::bucket::ManagedBucketPrecheckError<E, Error>>
+    where
+        P: FnOnce(&BucketMetadata) -> PFut + Send,
+        PFut: Future<Output = std::result::Result<(), E>> + Send,
+        F: FnOnce(Arc<super::BucketIncarnationFenceGuard>) -> Fut + Send,
+        Fut: Future<Output = Result<()>> + Send,
+    {
+        use crate::storage_api_contracts::bucket::ManagedBucketPrecheckError;
+
+        if identity.kind() != BucketKind::Vector || self.ctx.lock_manager().is_disabled() {
+            return Err(ManagedBucketPrecheckError::Storage(Error::PreconditionFailed));
+        }
+        let sys = metadata_sys::require_bucket_metadata_sys_in(&self.ctx).map_err(ManagedBucketPrecheckError::Storage)?;
+        let metadata = sys.read().await.clone();
+        let store = metadata
+            .object_store_if_live()
+            .ok_or(ManagedBucketPrecheckError::Storage(Error::PreconditionFailed))?;
+        if store.id != self.id {
+            return Err(ManagedBucketPrecheckError::Storage(Error::PreconditionFailed));
+        }
+        let bucket = identity.storage_bucket_id().as_str();
+        // Lock order: physical publication -> lifecycle -> metadata transaction
+        // -> exact bucket namespace. Every acquisition uses the captured instance.
+        let publication = store
+            .acquire_bucket_publication_write_lock(bucket)
+            .await
+            .map_err(ManagedBucketPrecheckError::Storage)?;
+        let lifecycle = store
+            .acquire_bucket_lifecycle_write_lock(bucket)
+            .await
+            .map_err(ManagedBucketPrecheckError::Storage)?;
+        let transaction = metadata_sys::acquire_transaction_lock_for_store(store.clone(), bucket, "managed_bucket_delete")
+            .await
+            .map_err(ManagedBucketPrecheckError::Storage)?;
+        let lock = store
+            .new_ns_lock(bucket, bucket)
+            .await
+            .map_err(ManagedBucketPrecheckError::Storage)?;
+        let namespace = Arc::new(
+            lock.get_write_lock(get_lock_acquire_timeout())
+                .await
+                .map_err(|error| match error {
+                    rustfs_lock::LockError::QuorumNotReached { required, achieved } => {
+                        StorageError::NamespaceLockQuorumUnavailable {
+                            mode: "write",
+                            bucket: bucket.to_owned(),
+                            object: bucket.to_owned(),
+                            required,
+                            achieved,
+                        }
+                    }
+                    other => StorageError::Lock(other),
+                })
+                .map_err(ManagedBucketPrecheckError::Storage)?,
+        );
+        let lifecycle = Arc::new(super::BucketIncarnationFenceGuard::new(
+            Arc::clone(&self.bucket_fence_registry),
+            bucket,
+            lifecycle,
+            false,
+        ));
+        let state = ManagedBucketDeleteState {
+            store,
+            metadata,
+            publication,
+            lifecycle,
+            transaction,
+            namespace,
+        };
+        Box::pin(self.delete_managed_bucket_under_guards(identity, &state, precheck, prepare)).await
+    }
+
+    async fn delete_managed_bucket_under_guards<P, PFut, F, Fut, E>(
+        &self,
+        identity: &BucketHandle,
+        state: &ManagedBucketDeleteState,
+        precheck: P,
+        prepare: F,
+    ) -> std::result::Result<(), crate::storage_api_contracts::bucket::ManagedBucketPrecheckError<E, Error>>
+    where
+        P: FnOnce(&BucketMetadata) -> PFut + Send,
+        PFut: Future<Output = std::result::Result<(), E>> + Send,
+        F: FnOnce(Arc<super::BucketIncarnationFenceGuard>) -> Fut + Send,
+        Fut: Future<Output = Result<()>> + Send,
+    {
+        use crate::storage_api_contracts::bucket::ManagedBucketPrecheckError;
+
+        let bucket = identity.storage_bucket_id().as_str();
+        let lifecycle = state
+            .lifecycle
+            .namespace_lock_guard()
+            .ok_or(ManagedBucketPrecheckError::Storage(Error::PreconditionFailed))?;
+        let deletion = Box::pin(async {
+            self.validate_bucket_incarnation_fence(&state.lifecycle, bucket)?;
+            let metadata = self.validate_managed_bucket_delete_identity(identity, &state.store).await?;
+            metadata.validate_managed_authoritative_configs()?;
+            if let Err(error) = precheck(&metadata).await {
+                self.validate_bucket_incarnation_fence(&state.lifecycle, bucket)?;
+                return Ok(Err(error));
+            }
+            self.validate_bucket_incarnation_fence(&state.lifecycle, bucket)?;
+
+            let mut diagnostic_budget = BucketDeleteDiagnosticBudget::new();
+            if let Some(blocker) = bucket_delete_local_blocker(&self.ctx, bucket, &mut diagnostic_budget).await? {
+                return Err(blocker);
+            }
+            self.ensure_no_multipart_uploads_under_lifecycle(bucket, lifecycle).await?;
+
+            prepare(state.lifecycle.clone()).await?;
+
+            self.validate_bucket_incarnation_fence(&state.lifecycle, bucket)?;
+            self.validate_managed_bucket_delete_identity(identity, &state.store).await?;
+            let delete_opts = DeleteBucketOptions {
+                force_if_empty: true,
+                ..Default::default()
+            };
+            run_physical_bucket_deletion(Some(&state.namespace), bucket, async {
+                self.delete_bucket_on_sets(bucket, &delete_opts)
+                    .await
+                    .map_err(|error| to_object_err(error, vec![bucket]))
+            })
+            .await?;
+
+            let incarnation = identity.incarnation().as_uuid();
+            let mut record_opts = ObjectOptions {
+                max_parity: true,
+                ..Default::default()
+            };
+            state.lifecycle.attach_to_object_options(&mut record_opts);
+            record_opts.add_namespace_lock_guard(&state.transaction);
+            record_opts.add_namespace_lock_guard(&state.namespace);
+            crate::bucket::retirement::commit_retirement(state.store.clone(), bucket, incarnation, &record_opts).await?;
+            crate::bucket::quota::reservation::cleanup_retired_bucket_ledger(state.store.clone(), bucket, incarnation).await?;
+            self.cleanup_bucket_usage(bucket, Some(&state.namespace)).await?;
+            #[cfg(test)]
+            await_managed_delete_cleanup_pause(bucket).await;
+            let mut cleanup_options = ObjectOptions {
+                delete_prefix_object: true,
+                ..Default::default()
+            };
+            state.lifecycle.attach_to_object_options(&mut cleanup_options);
+            cleanup_options.add_namespace_lock_guard(&state.transaction);
+            cleanup_options.add_namespace_lock_guard(&state.namespace);
+            self.delete_bucket_metadata_prefixes_strict(bucket, false, &cleanup_options)
+                .await?;
+            // Keep the captured cache owner even if the runtime swaps its store.
+            state.metadata.remove(bucket).await;
+            runtime_sources::delete_bucket_monitor_entry(bucket);
+            crate::store::list_objects::observe_scanner_namespace_mutations(bucket, 1);
+            Ok(Ok(()))
+        });
+        let outcome =
+            await_orphan_bucket_recovery(bucket, &state.publication, lifecycle, &state.transaction, &state.namespace, deletion)
+                .await
+                .map_err(ManagedBucketPrecheckError::Storage)?;
+        outcome.map_err(ManagedBucketPrecheckError::Precheck)
+    }
+
+    async fn validate_managed_bucket_delete_identity(
+        &self,
+        identity: &BucketHandle,
+        store: &Arc<ECStore>,
+    ) -> Result<BucketMetadata> {
+        let current = metadata_sys::object_store_if_initialized_in(&self.ctx)
+            .await
+            .ok_or(Error::PreconditionFailed)?;
+        if identity.kind() != BucketKind::Vector || store.id != self.id || current.id != self.id {
+            return Err(Error::PreconditionFailed);
+        }
+        let bucket = identity.storage_bucket_id().as_str();
+        self.get_bucket_info_from_sets(bucket, &BucketOptions::default())
+            .await
+            .map_err(|error| {
+                if is_err_strict_volume_not_found(&error) {
+                    Error::BucketNotFound(bucket.to_owned())
+                } else {
+                    to_object_err(error, vec![bucket])
+                }
+            })?;
+        // Read the persisted metadata and sidecar together; no identity memo or
+        // fabricated cache entry can authorize physical deletion.
+        let (metadata, persisted) =
+            crate::bucket::metadata::load_bucket_metadata_parse_with_presence(store.clone(), bucket, true).await?;
+        if !persisted {
+            return Err(Error::ConfigNotFound);
+        }
+        metadata.validate_managed_bucket_delete_identity(identity)?;
+        Ok(metadata)
+    }
+
     pub async fn bucket_incarnation_id(&self, bucket: &str) -> Result<Uuid> {
         metadata_sys::get_cached_bucket_incarnation_id_in(&self.ctx, bucket).await
     }
@@ -916,6 +1270,14 @@ impl ECStore {
     ) -> Result<super::BucketIncarnationFenceGuard> {
         self.acquire_bucket_incarnation_fence_with_options(bucket, expected, None)
             .await
+    }
+
+    /// Verify that a borrowed lifecycle guard belongs to this store and bucket.
+    /// The caller must retain the guard and validate the current persisted identity before I/O.
+    /// # Errors
+    /// Rejects a different store/bucket or a guard that has lost lifecycle coverage.
+    pub fn validate_bucket_incarnation_fence(&self, guard: &super::BucketIncarnationFenceGuard, bucket: &str) -> Result<()> {
+        guard.validate_for(&self.bucket_fence_registry, bucket)
     }
 
     pub(crate) async fn acquire_bucket_incarnation_fence_with_options(
@@ -1198,20 +1560,31 @@ impl ECStore {
         Ok(())
     }
 
+    async fn delete_bucket_metadata_prefixes_strict(
+        &self,
+        bucket: &str,
+        include_deleted_marker: bool,
+        options: &ObjectOptions,
+    ) -> Result<()> {
+        for prefix in bucket_delete_metadata_cleanup_prefixes(bucket) {
+            self.delete_prefix(RUSTFS_META_BUCKET, &prefix, options).await?;
+        }
+
+        if include_deleted_marker {
+            let marker_prefix = bucket_deleted_marker_prefix(bucket);
+            self.delete_prefix(RUSTFS_META_BUCKET, &marker_prefix, options).await?;
+        }
+
+        Ok(())
+    }
+
     async fn cleanup_deleted_bucket_metadata_strict(&self, bucket: &str, include_deleted_marker: bool) -> Result<()> {
         let options = ObjectOptions {
             delete_prefix_object: true,
             ..Default::default()
         };
-        for prefix in bucket_delete_metadata_cleanup_prefixes(bucket) {
-            self.delete_prefix(RUSTFS_META_BUCKET, &prefix, &options).await?;
-        }
-
-        if include_deleted_marker {
-            let marker_prefix = bucket_deleted_marker_prefix(bucket);
-            self.delete_prefix(RUSTFS_META_BUCKET, &marker_prefix, &options).await?;
-        }
-
+        self.delete_bucket_metadata_prefixes_strict(bucket, include_deleted_marker, &options)
+            .await?;
         metadata_sys::remove_bucket_metadata_in(&self.ctx, bucket).await?;
         runtime_sources::delete_bucket_monitor_entry(bucket);
         Ok(())
@@ -1310,10 +1683,46 @@ impl ECStore {
     pub(super) async fn handle_make_bucket(&self, bucket: &str, opts: &MakeBucketOptions) -> Result<()> {
         // Metadata persistence re-enters native PUT/GET. Keep its full state
         // out of the tracing wrapper's poll frame on bounded runtime stacks.
-        Box::pin(self.handle_make_bucket_inner(bucket, opts)).await
+        Box::pin(self.handle_make_bucket_inner(bucket, opts, None)).await
     }
 
-    async fn handle_make_bucket_inner(&self, bucket: &str, opts: &MakeBucketOptions) -> Result<()> {
+    /// Create a managed bucket with its complete identity and encryption in the creation intent.
+    /// # Errors
+    /// Rejects unsupported creation options and conflicting persisted identities.
+    /// Cancellation and partial completion follow the ordinary bucket creation recovery path.
+    pub async fn make_managed_bucket(
+        &self,
+        identity: &BucketHandle,
+        encryption_config_xml: &[u8],
+        tagging_config_xml: &[u8],
+        opts: &MakeBucketOptions,
+    ) -> Result<()> {
+        if identity.kind() != BucketKind::Vector
+            || opts.force_create
+            || opts.no_lock
+            || opts.lock_enabled
+            || opts.versioning_enabled
+        {
+            return Err(Error::PreconditionFailed);
+        }
+        Box::pin(self.handle_make_bucket_inner(
+            identity.storage_bucket_id().as_str(),
+            opts,
+            Some((identity, encryption_config_xml, tagging_config_xml)),
+        ))
+        .await
+    }
+
+    async fn handle_make_bucket_inner(
+        &self,
+        bucket: &str,
+        opts: &MakeBucketOptions,
+        managed: Option<(&BucketHandle, &[u8], &[u8])>,
+    ) -> Result<()> {
+        if managed.is_none() && bucket.starts_with(crate::bucket::metadata::BUCKET_VECTOR_STORAGE_PREFIX) {
+            return Err(Error::PreconditionFailed);
+        }
+
         if !is_meta_bucketname(bucket)
             && let Err(err) = check_valid_bucket_name_strict(bucket)
         {
@@ -1401,8 +1810,8 @@ impl ECStore {
                 || !metadata.bucket_creation_commit_record_present
                 || !metadata.needs_bucket_creation_commit()
                 || metadata.bucket_incarnation_id != old_incarnation
-                || !metadata.lock_enabled
-                || !opts.lock_enabled
+                || (!metadata.lock_enabled && managed.is_none())
+                || (!opts.lock_enabled && managed.is_none())
                 || opts.created_at.is_some_and(|created| created != metadata.created)
                 || crate::bucket::retirement::is_retired(metadata_store, bucket, old_incarnation).await?
                 || !match proof {
@@ -1455,9 +1864,31 @@ impl ECStore {
                 BucketMetadata::new(bucket)
             }
         });
+        if let Some((identity, encryption, tagging)) = managed {
+            let mut expected = meta.clone();
+            expected.set_vector_identity(identity)?;
+            if continuing_creation || !confirmed_missing {
+                if expected.bucket_identity_config_json != meta.bucket_identity_config_json
+                    || meta.bucket_incarnation_id != identity.incarnation().as_uuid()
+                    || meta.encryption_config_xml != encryption
+                    || meta.tagging_config_xml != tagging
+                {
+                    return Err(Error::PreconditionFailed);
+                }
+            } else {
+                meta.set_vector_identity(identity)?;
+                meta.encryption_config_xml = encryption.to_vec();
+                meta.tagging_config_xml = tagging.to_vec();
+                meta.public_access_block_config_xml = b"<PublicAccessBlockConfiguration><BlockPublicAcls>true</BlockPublicAcls><IgnorePublicAcls>true</IgnorePublicAcls><BlockPublicPolicy>true</BlockPublicPolicy><RestrictPublicBuckets>true</RestrictPublicBuckets></PublicAccessBlockConfiguration>".to_vec();
+            }
+            meta.validate_managed_configuration()?;
+        }
         let existing_incarnation_is_authoritative = meta.bucket_incarnation_sidecar;
         if (confirmed_missing || is_meta_bucketname(bucket)) && !continuing_creation {
             meta.set_created(opts.created_at);
+            if managed.is_some() && !meta.tagging_config_xml.is_empty() {
+                meta.tagging_config_updated_at = meta.created;
+            }
 
             if opts.versioning_enabled {
                 meta.versioning_config_xml =
@@ -1478,7 +1909,8 @@ impl ECStore {
             meta.versioning_config_xml = crate::bucket::utils::serialize::<VersioningConfiguration>(&ENABLED_VERSIONING_CONFIG)?;
         }
 
-        let metadata_persisted_before_physical = confirmed_missing && !is_meta_bucketname(bucket) && opts.lock_enabled;
+        let metadata_persisted_before_physical =
+            confirmed_missing && !is_meta_bucketname(bucket) && (opts.lock_enabled || managed.is_some());
         if metadata_persisted_before_physical {
             if !continuing_creation {
                 // Only the fenced producer that saw neither authoritative
@@ -1773,7 +2205,7 @@ impl ECStore {
                 // permission to serve degraded reads.
                 return Err(Error::ErasureReadQuorum);
             }
-            if metadata.lock_enabled && !metadata.bucket_creation_committed {
+            if (metadata.lock_enabled || metadata.bucket_kind()? == BucketKind::Vector) && !metadata.bucket_creation_committed {
                 return Err(Error::ErasureWriteQuorum);
             }
             if metadata.name != bucket {
@@ -2233,6 +2665,1310 @@ impl ECStore {
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    #[serial]
+    async fn managed_bucket_delete_removes_identity_and_allows_recreation() {
+        let (_dirs, store) = setup_bucket_quorum_test_env(&[4], Some(2)).await;
+        metadata_sys::init_bucket_metadata_sys(store.clone(), Vec::new()).await;
+        let identity = managed_bucket_identity();
+        let bucket = identity.storage_bucket_id().as_str();
+        store
+            .make_managed_bucket(&identity, MANAGED_AES_CONFIG, &[], &MakeBucketOptions::default())
+            .await
+            .expect("managed bucket");
+        let called = Arc::new(AtomicBool::new(false));
+        let observed = called.clone();
+        let callback_store = store.clone();
+        let callback_identity = identity.clone();
+        store
+            .delete_managed_bucket_with_preparation(&identity, move |guard| async move {
+                callback_store.validate_bucket_incarnation_fence(&guard, callback_identity.storage_bucket_id().as_str())?;
+                observed.store(true, Ordering::SeqCst);
+                Ok(())
+            })
+            .await
+            .expect("delete exact empty bucket");
+        assert!(called.load(Ordering::SeqCst), "preparation must execute");
+        store
+            .ensure_bucket_volume_absent_on_all_sets(bucket)
+            .await
+            .expect("every physical volume removed");
+        assert!(matches!(
+            store.get_bucket_metadata_from_disk(bucket).await,
+            Err(StorageError::ConfigNotFound)
+        ));
+        assert!(
+            crate::bucket::retirement::is_retired(store.clone(), bucket, identity.incarnation().as_uuid())
+                .await
+                .expect("retirement")
+        );
+        let replacement = replacement_managed_identity(&identity);
+        store
+            .make_managed_bucket(&replacement, &[], &[], &MakeBucketOptions::default())
+            .await
+            .expect("same-name recreation");
+        store
+            .get_bucket_metadata_from_disk(bucket)
+            .await
+            .expect("replacement metadata")
+            .validate_bucket_handle(&replacement)
+            .expect("new incarnation");
+        let result = store
+            .delete_managed_bucket_with_preparation(&identity, |_| async { panic!("stale callback") })
+            .await;
+        assert!(matches!(result, Err(StorageError::PreconditionFailed)), "stale delete: {result:?}");
+        store
+            .get_bucket_metadata_from_disk(bucket)
+            .await
+            .expect("replacement preserved")
+            .validate_bucket_handle(&replacement)
+            .expect("identity unchanged");
+    }
+
+    fn replacement_managed_identity(identity: &BucketHandle) -> BucketHandle {
+        BucketHandle::try_from_parts(
+            identity.kind(),
+            identity.account_namespace_id().clone(),
+            identity.region().to_owned(),
+            identity.public_name().clone(),
+            identity.storage_bucket_id().clone(),
+            crate::storage_api_contracts::bucket::BucketIncarnation::try_new(Uuid::new_v4()).expect("new incarnation"),
+        )
+        .expect("replacement handle")
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn managed_bucket_delete_rejects_changed_identity_before_preparation() {
+        use crate::storage_api_contracts::bucket::{AccountNamespaceId, BucketKind, BucketPublicName};
+        let (_dirs, store) = setup_bucket_quorum_test_env(&[4], Some(2)).await;
+        metadata_sys::init_bucket_metadata_sys(store.clone(), Vec::new()).await;
+        let identity = managed_bucket_identity();
+        store
+            .make_managed_bucket(&identity, &[], &[], &MakeBucketOptions::default())
+            .await
+            .expect("managed bucket");
+        let variants = [
+            (
+                BucketKind::General,
+                identity.account_namespace_id().clone(),
+                identity.region().to_owned(),
+                identity.public_name().clone(),
+            ),
+            (
+                BucketKind::Vector,
+                identity.account_namespace_id().clone(),
+                "us-west-2".into(),
+                identity.public_name().clone(),
+            ),
+            (
+                BucketKind::Vector,
+                identity.account_namespace_id().clone(),
+                identity.region().to_owned(),
+                BucketPublicName::try_new("another-name".into()).expect("name"),
+            ),
+        ];
+        assert!(
+            AccountNamespaceId::try_new("another-account".into()).is_err(),
+            "account identity rejects unsupported values before handle construction"
+        );
+        for (kind, account, region, name) in variants {
+            let wrong = BucketHandle::try_from_parts(
+                kind,
+                account,
+                region,
+                name,
+                identity.storage_bucket_id().clone(),
+                identity.incarnation(),
+            )
+            .expect("changed handle");
+            let result = store
+                .delete_managed_bucket_with_preparation(&wrong, |_| async { panic!("wrong identity callback") })
+                .await;
+            assert!(matches!(result, Err(StorageError::PreconditionFailed)), "identity mismatch: {result:?}");
+        }
+        store
+            .get_bucket_metadata_from_disk(identity.storage_bucket_id().as_str())
+            .await
+            .expect("preserved metadata")
+            .validate_bucket_handle(&identity)
+            .expect("preserved identity");
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn managed_bucket_delete_preserves_objects_and_multipart_uploads() {
+        use crate::storage_api_contracts::multipart::MultipartOperations as _;
+        for multipart in [false, true] {
+            let (_dirs, store) = setup_bucket_quorum_test_env(&[4], Some(2)).await;
+            metadata_sys::init_bucket_metadata_sys(store.clone(), Vec::new()).await;
+            let identity = managed_bucket_identity();
+            let bucket = identity.storage_bucket_id().as_str();
+            store
+                .make_managed_bucket(&identity, &[], &[], &MakeBucketOptions::default())
+                .await
+                .expect("managed bucket");
+            let upload = if multipart {
+                Some(
+                    store
+                        .new_multipart_upload(bucket, "candidate", &ObjectOptions::default())
+                        .await
+                        .expect("incomplete upload"),
+                )
+            } else {
+                store
+                    .put_object(
+                        bucket,
+                        "candidate",
+                        &mut PutObjReader::from_vec(b"retained".to_vec()),
+                        &ObjectOptions::default(),
+                    )
+                    .await
+                    .expect("stored object");
+                None
+            };
+            let result = store
+                .delete_managed_bucket_with_preparation(&identity, |_| async { panic!("nonempty callback") })
+                .await;
+            assert!(
+                matches!(
+                    result,
+                    Err(StorageError::BucketNotEmpty(_)) | Err(StorageError::BucketNotEmptyWithDetails { .. })
+                ),
+                "nonempty delete: {result:?}"
+            );
+            store
+                .get_bucket_metadata_from_disk(bucket)
+                .await
+                .expect("metadata preserved")
+                .validate_bucket_handle(&identity)
+                .expect("identity preserved");
+            if let Some(upload) = upload {
+                store
+                    .abort_multipart_upload(bucket, "candidate", &upload.upload_id, &ObjectOptions::default())
+                    .await
+                    .expect("upload remained addressable");
+            } else {
+                assert_eq!(
+                    store
+                        .get_object_info(bucket, "candidate", &ObjectOptions::default())
+                        .await
+                        .expect("retained object")
+                        .size,
+                    8
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn managed_bucket_delete_preserves_bucket_after_preparation_failure() {
+        let (_dirs, store) = setup_bucket_quorum_test_env(&[4], Some(2)).await;
+        metadata_sys::init_bucket_metadata_sys(store.clone(), Vec::new()).await;
+        let identity = managed_bucket_identity();
+        let bucket = identity.storage_bucket_id().as_str();
+        store
+            .make_managed_bucket(&identity, &[], &[], &MakeBucketOptions::default())
+            .await
+            .expect("managed bucket");
+        let called = Arc::new(AtomicBool::new(false));
+        let observed = called.clone();
+        let result = store
+            .delete_managed_bucket_with_preparation(&identity, move |_| async move {
+                observed.store(true, Ordering::SeqCst);
+                Err(StorageError::PreconditionFailed)
+            })
+            .await;
+        assert!(called.load(Ordering::SeqCst), "callback must supply the failure");
+        assert!(matches!(result, Err(StorageError::PreconditionFailed)));
+        store
+            .get_bucket_info(bucket, &BucketOptions::default())
+            .await
+            .expect("physical bucket preserved");
+        store
+            .get_bucket_metadata_from_disk(bucket)
+            .await
+            .expect("metadata preserved")
+            .validate_bucket_handle(&identity)
+            .expect("identity preserved");
+        assert!(
+            !crate::bucket::retirement::is_retired(store.clone(), bucket, identity.incarnation().as_uuid())
+                .await
+                .expect("not retired")
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn managed_bucket_delete_serializes_readers_and_queued_writer() {
+        let (_dirs, store) = setup_bucket_quorum_test_env(&[4], Some(2)).await;
+        metadata_sys::init_bucket_metadata_sys(store.clone(), Vec::new()).await;
+        let identity = managed_bucket_identity();
+        let bucket = identity.storage_bucket_id().as_str();
+        store
+            .make_managed_bucket(&identity, &[], &[], &MakeBucketOptions::default())
+            .await
+            .expect("managed bucket");
+        let first_reader = store
+            .acquire_bucket_incarnation_fence(bucket, identity.incarnation().as_uuid())
+            .await
+            .expect("existing reader");
+        let called = Arc::new(AtomicBool::new(false));
+        let observed = called.clone();
+        let deletion = store.delete_managed_bucket_with_preparation(&identity, move |_| async move {
+            observed.store(true, Ordering::SeqCst);
+            Ok(())
+        });
+        tokio::pin!(deletion);
+        let manager = store.ctx.lock_manager();
+        let manager = manager.as_fast_lock_manager().expect("local manager");
+        let initial_waiters = manager.current_lock_counts().1;
+        std::future::poll_fn(|cx| match std::future::Future::poll(deletion.as_mut(), cx) {
+            std::task::Poll::Pending => std::task::Poll::Ready(()),
+            std::task::Poll::Ready(result) => panic!("delete must wait for existing reader: {result:?}"),
+        })
+        .await;
+        assert!(manager.current_lock_counts().1 > initial_waiters, "actual lifecycle writer queue");
+        assert!(!called.load(Ordering::SeqCst), "preparation waits for readers");
+        let later_reader = store.acquire_bucket_incarnation_fence(bucket, identity.incarnation().as_uuid());
+        tokio::pin!(later_reader);
+        assert!(futures::poll!(&mut later_reader).is_pending(), "reader cannot pass queued writer");
+        drop(first_reader);
+        tokio::time::timeout(Duration::from_secs(5), &mut deletion)
+            .await
+            .expect("delete deadline")
+            .expect("empty deletion");
+        assert!(called.load(Ordering::SeqCst));
+        assert!(
+            tokio::time::timeout(Duration::from_secs(5), &mut later_reader)
+                .await
+                .expect("reader deadline")
+                .is_err(),
+            "old reader cannot bind deleted identity"
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn managed_bucket_delete_rejects_store_replacement_while_queued() {
+        let (_first_dirs, first) = setup_bucket_quorum_test_env(&[4], Some(2)).await;
+        metadata_sys::init_bucket_metadata_sys(first.clone(), Vec::new()).await;
+        let (_second_dirs, second) = setup_bucket_quorum_test_env(&[4], Some(2)).await;
+        metadata_sys::init_bucket_metadata_sys(second.clone(), Vec::new()).await;
+        let identity = managed_bucket_identity();
+        let bucket = identity.storage_bucket_id().as_str();
+        for store in [&first, &second] {
+            store
+                .make_managed_bucket(&identity, &[], &[], &MakeBucketOptions::default())
+                .await
+                .expect("independent bucket");
+        }
+        let lock = first.new_ns_lock(bucket, bucket).await.expect("namespace blocker");
+        let blocker = lock.get_read_lock(Duration::from_secs(5)).await.expect("namespace reader");
+        let deletion = first.delete_managed_bucket_with_preparation(&identity, |_| async { panic!("replaced store callback") });
+        tokio::pin!(deletion);
+        let manager = first.ctx.lock_manager();
+        let manager = manager.as_fast_lock_manager().expect("local manager");
+        let before = manager.current_lock_counts().1;
+        std::future::poll_fn(|cx| match std::future::Future::poll(deletion.as_mut(), cx) {
+            std::task::Poll::Pending => std::task::Poll::Ready(()),
+            std::task::Poll::Ready(result) => panic!("delete must wait for namespace: {result:?}"),
+        })
+        .await;
+        assert!(manager.current_lock_counts().1 > before, "exact namespace writer queued");
+        let sys = first.ctx.bucket_metadata_sys().expect("first metadata system");
+        *sys.write().await = metadata_sys::BucketMetadataSys::new(second.clone());
+        drop(blocker);
+        let result = deletion.await;
+        assert!(matches!(result, Err(StorageError::PreconditionFailed)), "changed store: {result:?}");
+        for store in [&first, &second] {
+            store
+                .get_bucket_info(bucket, &BucketOptions::default())
+                .await
+                .expect("both volumes preserved");
+            crate::bucket::metadata::load_bucket_metadata_parse(store.clone(), bucket, true)
+                .await
+                .expect("physical metadata")
+                .validate_bucket_handle(&identity)
+                .expect("identity preserved");
+        }
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn managed_bucket_delete_uses_the_captured_instance() {
+        let (_first_dirs, first) = setup_bucket_quorum_test_env(&[4], Some(2)).await;
+        metadata_sys::init_bucket_metadata_sys(first.clone(), Vec::new()).await;
+        let (_second_dirs, second) = setup_bucket_quorum_test_env(&[4], Some(2)).await;
+        metadata_sys::init_bucket_metadata_sys(second.clone(), Vec::new()).await;
+        let identity = managed_bucket_identity();
+        let bucket = identity.storage_bucket_id().as_str();
+        for store in [&first, &second] {
+            store
+                .make_managed_bucket(&identity, &[], &[], &MakeBucketOptions::default())
+                .await
+                .expect("independent bucket");
+        }
+        first
+            .delete_managed_bucket_with_preparation(&identity, |_| async { Ok(()) })
+            .await
+            .expect("selected instance deleted");
+        first
+            .ensure_bucket_volume_absent_on_all_sets(bucket)
+            .await
+            .expect("first absent");
+        second
+            .get_bucket_info(bucket, &BucketOptions::default())
+            .await
+            .expect("second volume remains");
+        second
+            .get_bucket_metadata_from_disk(bucket)
+            .await
+            .expect("second metadata")
+            .validate_bucket_handle(&identity)
+            .expect("second identity");
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn managed_bucket_delete_reports_strict_cleanup_failure() {
+        let (_dirs, store) = setup_bucket_quorum_test_env(&[4], Some(2)).await;
+        metadata_sys::init_bucket_metadata_sys(store.clone(), Vec::new()).await;
+        let identity = managed_bucket_identity();
+        let bucket = identity.storage_bucket_id().as_str();
+        store
+            .make_managed_bucket(&identity, &[], &[], &MakeBucketOptions::default())
+            .await
+            .expect("managed bucket");
+        let (_pause, entered, release) = super::pause_managed_delete_cleanup(bucket);
+        let delete_store = store.clone();
+        let delete_identity = identity.clone();
+        let mut deletion = tokio::spawn(async move {
+            delete_store
+                .delete_managed_bucket_with_preparation(&delete_identity, |_| async { Ok(()) })
+                .await
+        });
+        tokio::select! {
+            result = entered => result.expect("reached strict cleanup"),
+            result = &mut deletion => panic!("must pause after physical deletion and retirement: {result:?}"),
+        }
+        store
+            .ensure_bucket_volume_absent_on_all_sets(bucket)
+            .await
+            .expect("physical removal completed");
+        assert!(
+            crate::bucket::retirement::is_retired(store.clone(), bucket, identity.incarnation().as_uuid())
+                .await
+                .expect("retirement committed")
+        );
+        let set = &store.pools[0].disk_set[0];
+        let offline = take_set_disks_offline(&store, set, &[0, 1, 2]).await;
+        release.send(()).expect("release native cleanup");
+        let result = deletion.await.expect("delete task");
+        assert!(result.is_err(), "strict cleanup cannot report success with three disks unavailable");
+        restore_set_disks(&store, set, offline).await;
+        let replacement = replacement_managed_identity(&identity);
+        assert!(
+            store
+                .make_managed_bucket(&replacement, &[], &[], &MakeBucketOptions::default())
+                .await
+                .is_err(),
+            "failed cleanup retains old incarnation authority"
+        );
+        store
+            .recover_orphaned_bucket(bucket, identity.incarnation().as_uuid())
+            .await
+            .expect("recover captured old incarnation");
+        store
+            .make_managed_bucket(&replacement, &[], &[], &MakeBucketOptions::default())
+            .await
+            .expect("recreate after recovery");
+        store
+            .get_bucket_metadata_from_disk(bucket)
+            .await
+            .expect("recreated metadata")
+            .validate_bucket_handle(&replacement)
+            .expect("new identity");
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn managed_bucket_delete_rejects_each_expired_guard_before_preparation() {
+        let (_dirs, store) = setup_bucket_quorum_test_env(&[4], Some(2)).await;
+        metadata_sys::init_bucket_metadata_sys(store.clone(), Vec::new()).await;
+        let identity = managed_bucket_identity();
+        let bucket = identity.storage_bucket_id().as_str();
+        store
+            .make_managed_bucket(&identity, &[], &[], &MakeBucketOptions::default())
+            .await
+            .expect("managed bucket");
+        for expired in 0..4 {
+            tokio::time::pause();
+            let lock = NamespaceLock::new("managed-delete-guard-test".to_owned(), Arc::new(LocalClient::new()));
+            let keys = [
+                ObjectKey::new(bucket, rustfs_common::table_catalog::TABLE_BUCKET_PUBLICATION_LOCK_PATH),
+                ObjectKey::new(bucket, crate::storage_api_contracts::bucket::BUCKET_LIFECYCLE_LOCK_OBJECT),
+                ObjectKey::new(RUSTFS_META_BUCKET, metadata_sys::bucket_metadata_transaction_lock_key(bucket)),
+                ObjectKey::new(bucket, bucket),
+            ];
+            let mut guards = Vec::new();
+            for (index, key) in keys.into_iter().enumerate() {
+                let ttl = if index == expired {
+                    Duration::from_millis(20)
+                } else {
+                    Duration::from_secs(3600)
+                };
+                let request = LockRequest::new(key, LockType::Exclusive, "delete-test-owner")
+                    .with_ttl(ttl)
+                    .with_refresh_interval(ttl);
+                guards.push(lock.acquire_guard(&request).await.expect("guard acquisition").expect("guard"));
+            }
+            tokio::time::advance(Duration::from_millis(21)).await;
+            for (index, guard) in guards.iter().enumerate() {
+                assert_eq!(guard.is_lock_lost(), index == expired, "actual guard expiry");
+            }
+            let namespace = Arc::new(guards.pop().expect("namespace"));
+            let transaction = guards.pop().expect("metadata transaction");
+            let lifecycle = Arc::new(crate::store::BucketIncarnationFenceGuard::new(
+                Arc::clone(&store.bucket_fence_registry),
+                bucket,
+                guards.pop().expect("lifecycle"),
+                false,
+            ));
+            let publication = guards.pop().expect("publication");
+            let metadata = store.ctx.bucket_metadata_sys().expect("metadata system").read().await.clone();
+            let state = super::ManagedBucketDeleteState {
+                store: store.clone(),
+                metadata,
+                publication,
+                lifecycle,
+                transaction,
+                namespace,
+            };
+            let result = store
+                .delete_managed_bucket_under_guards(
+                    &identity,
+                    &state,
+                    |_| async { Ok::<(), std::convert::Infallible>(()) },
+                    |_| async { panic!("expired guard callback") },
+                )
+                .await;
+            assert!(
+                matches!(
+                    result,
+                    Err(crate::storage_api_contracts::bucket::ManagedBucketPrecheckError::Storage(
+                        StorageError::NamespaceLockQuorumUnavailable { .. }
+                    ))
+                ),
+                "expired guard: {result:?}"
+            );
+            tokio::time::resume();
+        }
+        store
+            .get_bucket_info(bucket, &BucketOptions::default())
+            .await
+            .expect("physical bucket preserved");
+        store
+            .get_bucket_metadata_from_disk(bucket)
+            .await
+            .expect("metadata preserved")
+            .validate_bucket_handle(&identity)
+            .expect("identity preserved");
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn managed_bucket_config_mutation_waits_for_persisting_writer() {
+        use crate::set_disk::{PutObjectCommitBarrier, PutObjectCommitPause};
+        use crate::storage_api_contracts::bucket::ManagedBucketConfigMutation;
+
+        let (_dirs, store) = setup_bucket_quorum_test_env(&[4], Some(2)).await;
+        metadata_sys::init_bucket_metadata_sys(store.clone(), Vec::new()).await;
+        let identity = managed_bucket_identity();
+        let bucket = identity.storage_bucket_id().as_str();
+        store
+            .make_managed_bucket(&identity, MANAGED_AES_CONFIG, &[], &MakeBucketOptions::default())
+            .await
+            .expect("managed bucket");
+        let original = store.get_bucket_metadata_from_disk(bucket).await.expect("original metadata");
+        let barrier = PutObjectCommitBarrier::install(
+            RUSTFS_META_BUCKET,
+            &original.save_file_path(),
+            PutObjectCommitPause::AfterRenameQuorum,
+        );
+        let policy = br#"{"Version":"2012-10-17","Statement":[]}"#.to_vec();
+        let first_store = store.clone();
+        let first_identity = identity.clone();
+        let first_policy = policy.clone();
+        let mut first = tokio::spawn(async move {
+            first_store
+                .mutate_managed_bucket_config(
+                    &first_identity,
+                    ManagedBucketConfigMutation::PutPolicy {
+                        policy_json: first_policy,
+                    },
+                )
+                .await
+        });
+        tokio::select! {
+            () = barrier.wait_until_paused() => {}
+            result = &mut first => panic!("policy mutation must reach its persistence barrier: {result:?}"),
+        }
+        let probe = metadata_sys::ConfigWriteLockProbe::install(bucket);
+        let second_store = store.clone();
+        let second_identity = identity.clone();
+        let mut second = tokio::spawn(async move {
+            second_store
+                .mutate_managed_bucket_config(
+                    &second_identity,
+                    ManagedBucketConfigMutation::Tag {
+                        tags: BTreeMap::from([("queued".into(), "writer".into())]),
+                    },
+                )
+                .await
+        });
+        tokio::select! {
+            () = probe.wait_until_attempted() => {}
+            result = &mut second => panic!("tag mutation must wait for the metadata transaction: {result:?}"),
+        }
+        assert!(!first.is_finished(), "the policy writer remains paused during persistence");
+        assert!(!second.is_finished(), "the tag writer is queued behind the policy writer");
+        drop(barrier);
+        first.await.expect("policy task").expect("policy persisted");
+        second.await.expect("tag task").expect("tag persisted after policy");
+        let final_metadata = store.get_bucket_metadata_from_disk(bucket).await.expect("final metadata");
+        assert_eq!(final_metadata.policy_config_json, policy);
+        assert_eq!(final_metadata.bucket_identity_config_json, original.bucket_identity_config_json);
+        assert_eq!(final_metadata.encryption_config_xml, original.encryption_config_xml);
+        assert_eq!(
+            store.get_bucket_tags_for_policy(bucket).await.expect("merged tags"),
+            HashMap::from([("queued".into(), "writer".into())])
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn managed_bucket_config_mutation_rejects_recreated_bucket() {
+        use crate::storage_api_contracts::bucket::{BucketIncarnation, ManagedBucketConfigMutation};
+
+        let (_dirs, store) = setup_bucket_quorum_test_env(&[4], Some(2)).await;
+        metadata_sys::init_bucket_metadata_sys(store.clone(), Vec::new()).await;
+        let old = managed_bucket_identity();
+        let bucket = old.storage_bucket_id().as_str();
+        store
+            .make_managed_bucket(&old, &[], &[], &MakeBucketOptions::default())
+            .await
+            .expect("old bucket");
+        store
+            .delete_bucket(bucket, &DeleteBucketOptions::default())
+            .await
+            .expect("delete old bucket");
+        let replacement = BucketHandle::try_from_parts(
+            old.kind(),
+            old.account_namespace_id().clone(),
+            old.region().to_owned(),
+            old.public_name().clone(),
+            old.storage_bucket_id().clone(),
+            BucketIncarnation::try_new(Uuid::new_v4()).expect("new incarnation"),
+        )
+        .expect("replacement identity");
+        store
+            .make_managed_bucket(&replacement, MANAGED_AES_CONFIG, &[], &MakeBucketOptions::default())
+            .await
+            .expect("replacement bucket");
+        let before = store
+            .get_bucket_metadata_from_disk(bucket)
+            .await
+            .expect("replacement metadata");
+        assert!(
+            store
+                .mutate_managed_bucket_config(
+                    &old,
+                    ManagedBucketConfigMutation::Tag {
+                        tags: BTreeMap::from([("old".into(), "request".into())])
+                    }
+                )
+                .await
+                .is_err()
+        );
+        let after = store
+            .get_bucket_metadata_from_disk(bucket)
+            .await
+            .expect("preserved replacement");
+        after
+            .validate_bucket_handle(&replacement)
+            .expect("replacement identity preserved");
+        assert_eq!(after.policy_config_json, before.policy_config_json);
+        assert_eq!(after.tagging_config_xml, before.tagging_config_xml);
+        assert_eq!(after.encryption_config_xml, before.encryption_config_xml);
+        assert_eq!(after.bucket_identity_config_json, before.bucket_identity_config_json);
+        assert_eq!(after.tagging_config_updated_at, before.tagging_config_updated_at);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn managed_bucket_config_mutation_rejects_replaced_metadata_store() {
+        use crate::storage_api_contracts::bucket::ManagedBucketConfigMutation;
+
+        let (_first_dirs, first) = setup_bucket_quorum_test_env(&[4], Some(2)).await;
+        metadata_sys::init_bucket_metadata_sys(first.clone(), Vec::new()).await;
+        let (_second_dirs, second) = setup_bucket_quorum_test_env(&[4], Some(2)).await;
+        metadata_sys::init_bucket_metadata_sys(second.clone(), Vec::new()).await;
+        let identity = managed_bucket_identity();
+        for store in [&first, &second] {
+            store
+                .make_managed_bucket(&identity, &[], &[], &MakeBucketOptions::default())
+                .await
+                .expect("independent bucket");
+        }
+        let sys = first.ctx.bucket_metadata_sys().expect("first metadata system");
+        *sys.write().await = metadata_sys::BucketMetadataSys::new(second.clone());
+        assert!(
+            first
+                .mutate_managed_bucket_config(
+                    &identity,
+                    ManagedBucketConfigMutation::Tag {
+                        tags: BTreeMap::from([("unexpected".into(), "write".into())])
+                    }
+                )
+                .await
+                .is_err()
+        );
+        for store in [first, second] {
+            let metadata =
+                crate::bucket::metadata::load_bucket_metadata_parse(store, identity.storage_bucket_id().as_str(), true)
+                    .await
+                    .expect("physical metadata remains readable");
+            metadata.validate_bucket_handle(&identity).expect("identity preserved");
+            assert!(metadata.tagging_config_xml.is_empty(), "neither instance accepts the misbound operation");
+        }
+    }
+
+    use crate::storage_api_contracts::bucket::BucketHandle;
+    use std::collections::BTreeMap;
+
+    #[tokio::test]
+    #[serial]
+    async fn managed_bucket_config_mutation_preserves_identity_and_encryption() {
+        use crate::storage_api_contracts::bucket::ManagedBucketConfigMutation;
+        let (_dirs, store) = setup_bucket_quorum_test_env(&[4], Some(2)).await;
+        metadata_sys::init_bucket_metadata_sys(store.clone(), Vec::new()).await;
+        let identity = managed_bucket_identity();
+        let bucket = identity.storage_bucket_id().as_str();
+        store
+            .make_managed_bucket(&identity, MANAGED_AES_CONFIG, &[], &MakeBucketOptions::default())
+            .await
+            .expect("managed bucket");
+        let original = store.get_bucket_metadata_from_disk(bucket).await.expect("original metadata");
+        let policy = br#"{"Version":"2012-10-17","Statement":[]}"#.to_vec();
+        let policy_updated = store
+            .mutate_managed_bucket_config(
+                &identity,
+                ManagedBucketConfigMutation::PutPolicy {
+                    policy_json: policy.clone(),
+                },
+            )
+            .await
+            .expect("put policy");
+        store
+            .mutate_managed_bucket_config(
+                &identity,
+                ManagedBucketConfigMutation::Tag {
+                    tags: BTreeMap::from([("team".into(), "search".into()), ("keep".into(), "original".into())]),
+                },
+            )
+            .await
+            .expect("add initial tags");
+        store
+            .mutate_managed_bucket_config(
+                &identity,
+                ManagedBucketConfigMutation::Tag {
+                    tags: BTreeMap::from([("team".into(), "analytics".into()), ("remove".into(), "temporary".into())]),
+                },
+            )
+            .await
+            .expect("merge tags");
+        let tag_updated = store
+            .mutate_managed_bucket_config(
+                &identity,
+                ManagedBucketConfigMutation::Untag {
+                    keys: ["remove".to_owned(), "absent".to_owned()].into_iter().collect(),
+                },
+            )
+            .await
+            .expect("remove requested tags");
+        let metadata = store.get_bucket_metadata_from_disk(bucket).await.expect("updated metadata");
+        metadata.validate_bucket_handle(&identity).expect("complete identity");
+        assert_eq!(metadata.bucket_identity_config_json, original.bucket_identity_config_json);
+        assert_eq!(metadata.encryption_config_xml, MANAGED_AES_CONFIG);
+        assert_eq!(metadata.encryption_config_updated_at, original.encryption_config_updated_at);
+        assert_eq!(metadata.policy_config_json, policy);
+        assert_eq!(metadata.policy_config_updated_at, policy_updated);
+        assert_eq!(metadata.tagging_config_updated_at, tag_updated);
+        assert_eq!(
+            store.get_bucket_tags_for_policy(bucket).await.expect("merged tags"),
+            HashMap::from([("team".into(), "analytics".into()), ("keep".into(), "original".into())])
+        );
+        store
+            .mutate_managed_bucket_config(&identity, ManagedBucketConfigMutation::DeletePolicy)
+            .await
+            .expect("delete policy");
+        let deleted = store.get_bucket_metadata_from_disk(bucket).await.expect("deleted policy");
+        assert!(deleted.policy_config_json.is_empty());
+        assert_eq!(deleted.tagging_config_xml, metadata.tagging_config_xml);
+        assert_eq!(deleted.encryption_config_xml, metadata.encryption_config_xml);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn managed_bucket_config_mutation_targets_its_store_instance() {
+        use crate::storage_api_contracts::bucket::ManagedBucketConfigMutation;
+        let (_first_dirs, first) = setup_bucket_quorum_test_env(&[4], Some(2)).await;
+        metadata_sys::init_bucket_metadata_sys(first.clone(), Vec::new()).await;
+        let (_second_dirs, second) = setup_bucket_quorum_test_env(&[4], Some(2)).await;
+        metadata_sys::init_bucket_metadata_sys(second.clone(), Vec::new()).await;
+        assert_ne!(first.id, second.id);
+        let identity = managed_bucket_identity();
+        for store in [&first, &second] {
+            store
+                .make_managed_bucket(&identity, &[], &[], &MakeBucketOptions::default())
+                .await
+                .expect("same identity in independent stores");
+        }
+        let bucket = identity.storage_bucket_id().as_str();
+        let first_before = first.get_bucket_metadata_from_disk(bucket).await.expect("first metadata");
+        second
+            .mutate_managed_bucket_config(
+                &identity,
+                ManagedBucketConfigMutation::Tag {
+                    tags: BTreeMap::from([("instance".into(), "second".into())]),
+                },
+            )
+            .await
+            .expect("mutate the exact second store");
+        let first_after = first.get_bucket_metadata_from_disk(bucket).await.expect("first unchanged");
+        assert_eq!(first_after.tagging_config_xml, first_before.tagging_config_xml);
+        assert_eq!(first_after.tagging_config_updated_at, first_before.tagging_config_updated_at);
+        assert_eq!(
+            second.get_bucket_tags_for_policy(bucket).await.expect("second tags"),
+            HashMap::from([("instance".into(), "second".into())])
+        );
+        let (_uninitialized_dirs, uninitialized) = setup_bucket_quorum_test_env(&[4], Some(2)).await;
+        assert!(
+            uninitialized
+                .mutate_managed_bucket_config(&identity, ManagedBucketConfigMutation::DeletePolicy)
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn managed_bucket_config_mutation_serializes_policy_and_tag_merges() {
+        use crate::storage_api_contracts::bucket::ManagedBucketConfigMutation;
+        let (_dirs, store) = setup_bucket_quorum_test_env(&[4], Some(2)).await;
+        metadata_sys::init_bucket_metadata_sys(store.clone(), Vec::new()).await;
+        let identity = managed_bucket_identity();
+        store
+            .make_managed_bucket(&identity, &[], &[], &MakeBucketOptions::default())
+            .await
+            .expect("managed bucket");
+        let policy = br#"{"Version":"2012-10-17","Statement":[]}"#.to_vec();
+        let (policy_result, first_tag_result, second_tag_result) = tokio::join!(
+            store.mutate_managed_bucket_config(
+                &identity,
+                ManagedBucketConfigMutation::PutPolicy {
+                    policy_json: policy.clone()
+                }
+            ),
+            store.mutate_managed_bucket_config(
+                &identity,
+                ManagedBucketConfigMutation::Tag {
+                    tags: BTreeMap::from([("first".into(), "one".into())])
+                }
+            ),
+            store.mutate_managed_bucket_config(
+                &identity,
+                ManagedBucketConfigMutation::Tag {
+                    tags: BTreeMap::from([("second".into(), "two".into())])
+                }
+            ),
+        );
+        policy_result.expect("concurrent policy update");
+        first_tag_result.expect("first concurrent tag merge");
+        second_tag_result.expect("second concurrent tag merge");
+        let bucket = identity.storage_bucket_id().as_str();
+        let metadata = store
+            .get_bucket_metadata_from_disk(bucket)
+            .await
+            .expect("concurrent metadata result");
+        assert_eq!(metadata.policy_config_json, policy);
+        assert_eq!(
+            store.get_bucket_tags_for_policy(bucket).await.expect("both tag merges"),
+            HashMap::from([("first".into(), "one".into()), ("second".into(), "two".into())])
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn managed_bucket_config_mutation_rejects_changed_identity_and_invalid_input() {
+        use crate::storage_api_contracts::bucket::{BucketIncarnation, BucketPublicName, ManagedBucketConfigMutation};
+        let (_dirs, store) = setup_bucket_quorum_test_env(&[4], Some(2)).await;
+        metadata_sys::init_bucket_metadata_sys(store.clone(), Vec::new()).await;
+        let identity = managed_bucket_identity();
+        store
+            .make_managed_bucket(&identity, &[], &[], &MakeBucketOptions::default())
+            .await
+            .expect("managed bucket");
+        let original = store
+            .get_bucket_metadata_from_disk(identity.storage_bucket_id().as_str())
+            .await
+            .expect("original metadata");
+        for (kind, region, name, storage, incarnation) in [
+            (
+                identity.kind(),
+                identity.region(),
+                BucketPublicName::try_new("other-name".into()).expect("other public name"),
+                identity.storage_bucket_id().clone(),
+                identity.incarnation(),
+            ),
+            (
+                identity.kind(),
+                identity.region(),
+                identity.public_name().clone(),
+                identity.storage_bucket_id().clone(),
+                BucketIncarnation::try_new(Uuid::new_v4()).expect("other incarnation"),
+            ),
+            (
+                identity.kind(),
+                "us-west-2",
+                identity.public_name().clone(),
+                identity.storage_bucket_id().clone(),
+                identity.incarnation(),
+            ),
+            (
+                crate::storage_api_contracts::bucket::BucketKind::General,
+                identity.region(),
+                identity.public_name().clone(),
+                identity.storage_bucket_id().clone(),
+                identity.incarnation(),
+            ),
+            (
+                crate::storage_api_contracts::bucket::BucketKind::Table,
+                identity.region(),
+                identity.public_name().clone(),
+                identity.storage_bucket_id().clone(),
+                identity.incarnation(),
+            ),
+            (
+                identity.kind(),
+                identity.region(),
+                identity.public_name().clone(),
+                crate::storage_api_contracts::bucket::StorageBucketId::try_new("rustfs-v-other-storage".into())
+                    .expect("other storage ID"),
+                identity.incarnation(),
+            ),
+        ] {
+            let wrong = BucketHandle::try_from_parts(
+                kind,
+                identity.account_namespace_id().clone(),
+                region.into(),
+                name,
+                storage,
+                incarnation,
+            )
+            .expect("syntactically valid different binding");
+            assert!(
+                store
+                    .mutate_managed_bucket_config(
+                        &wrong,
+                        ManagedBucketConfigMutation::Tag {
+                            tags: BTreeMap::from([("unexpected".into(), "write".into())])
+                        }
+                    )
+                    .await
+                    .is_err()
+            );
+        }
+        for mutation in [
+            ManagedBucketConfigMutation::PutPolicy {
+                policy_json: b"invalid-json".to_vec(),
+            },
+            ManagedBucketConfigMutation::PutPolicy {
+                policy_json: br#"{"Version":"invalid","Statement":[]}"#.to_vec(),
+            },
+            ManagedBucketConfigMutation::Untag {
+                keys: [String::new()].into_iter().collect(),
+            },
+            ManagedBucketConfigMutation::Tag {
+                tags: BTreeMap::from([("".into(), "invalid".into())]),
+            },
+            ManagedBucketConfigMutation::Tag {
+                tags: (0..51).map(|number| (format!("tag-{number}"), "value".to_owned())).collect(),
+            },
+        ] {
+            assert!(store.mutate_managed_bucket_config(&identity, mutation).await.is_err());
+        }
+        let after = store
+            .get_bucket_metadata_from_disk(identity.storage_bucket_id().as_str())
+            .await
+            .expect("metadata after rejected updates");
+        assert_eq!(after.policy_config_json, original.policy_config_json);
+        assert_eq!(after.tagging_config_xml, original.tagging_config_xml);
+        assert_eq!(after.bucket_identity_config_json, original.bucket_identity_config_json);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn managed_bucket_config_mutation_preserves_unreadable_tags() {
+        use crate::storage_api_contracts::bucket::ManagedBucketConfigMutation;
+        let (_dirs, store) = setup_bucket_quorum_test_env(&[4], Some(2)).await;
+        metadata_sys::init_bucket_metadata_sys(store.clone(), Vec::new()).await;
+        let identity = managed_bucket_identity();
+        let bucket = identity.storage_bucket_id().as_str();
+        store
+            .make_managed_bucket(&identity, &[], &[], &MakeBucketOptions::default())
+            .await
+            .expect("managed bucket");
+        let mut damaged = (*store.get_bucket_metadata_from_disk(bucket).await.expect("committed metadata")).clone();
+        damaged.tagging_config_xml = b"<Tagging><TagSet><Tag>".to_vec();
+        damaged
+            .save_with_store(store.clone())
+            .await
+            .expect("persist unreadable tag bytes");
+        for mutation in [
+            ManagedBucketConfigMutation::Tag {
+                tags: BTreeMap::from([("replacement".into(), "value".into())]),
+            },
+            ManagedBucketConfigMutation::Untag {
+                keys: ["replacement".to_owned()].into_iter().collect(),
+            },
+        ] {
+            assert!(store.mutate_managed_bucket_config(&identity, mutation).await.is_err());
+        }
+        let preserved = store
+            .get_bucket_metadata_from_disk(bucket)
+            .await
+            .expect("unreadable source remains available");
+        assert_eq!(preserved.tagging_config_xml, damaged.tagging_config_xml);
+        assert_eq!(preserved.tagging_config_updated_at, damaged.tagging_config_updated_at);
+        assert_eq!(preserved.bucket_identity_config_json, damaged.bucket_identity_config_json);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn managed_bucket_precheck_evaluates_latest_metadata_under_locks_and_aborts_before_prepare_or_save() {
+        use crate::storage_api_contracts::bucket::{ManagedBucketConfigMutation, ManagedBucketPrecheckError};
+
+        let (_dirs, store) = setup_bucket_quorum_test_env(&[4], Some(2)).await;
+        metadata_sys::init_bucket_metadata_sys(store.clone(), Vec::new()).await;
+        let identity = managed_bucket_identity();
+        let bucket = identity.storage_bucket_id().as_str();
+        store
+            .make_managed_bucket(&identity, &[], &[], &MakeBucketOptions::default())
+            .await
+            .expect("managed bucket");
+        let deny_policy =
+            br#"{"Version":"2012-10-17","Statement":[{"Effect":"Deny","Principal":"*","Action":"s3:*","Resource":"*"}]}"#
+                .to_vec();
+        store
+            .mutate_managed_bucket_config(
+                &identity,
+                ManagedBucketConfigMutation::PutPolicy {
+                    policy_json: deny_policy.clone(),
+                },
+            )
+            .await
+            .expect("install policy before prechecked operations");
+
+        let err = store
+            .mutate_managed_bucket_config_with_precheck(&identity, ManagedBucketConfigMutation::DeletePolicy, |metadata| {
+                let observed = metadata.policy_config_json.clone();
+                async move {
+                    if !observed.is_empty() {
+                        return Err("denied-by-current-policy");
+                    }
+                    Ok(())
+                }
+            })
+            .await
+            .expect_err("precheck rejection must abort config mutation");
+        assert!(matches!(err, ManagedBucketPrecheckError::Precheck("denied-by-current-policy")));
+        let after_mutation = store
+            .get_bucket_metadata_from_disk(bucket)
+            .await
+            .expect("metadata after rejected mutation");
+        assert_eq!(after_mutation.policy_config_json, deny_policy);
+
+        let err = store
+            .delete_managed_bucket_with_precheck_and_preparation(
+                &identity,
+                |metadata| {
+                    let observed = metadata.policy_config_json.clone();
+                    async move {
+                        if !observed.is_empty() {
+                            return Err("denied-delete");
+                        }
+                        Ok(())
+                    }
+                },
+                |_| async { panic!("prepare callback must not run when precheck denies deletion") },
+            )
+            .await
+            .expect_err("precheck rejection must abort bucket deletion before preparation");
+        assert!(matches!(err, ManagedBucketPrecheckError::Precheck("denied-delete")));
+        let after_delete = store
+            .get_bucket_metadata_from_disk(bucket)
+            .await
+            .expect("bucket must still exist after rejected deletion");
+        assert_eq!(after_delete.policy_config_json, deny_policy);
+    }
+
+    fn managed_bucket_identity() -> crate::storage_api_contracts::bucket::BucketHandle {
+        use crate::storage_api_contracts::bucket::{
+            AccountNamespaceId, BucketHandle, BucketIncarnation, BucketKind, BucketPublicName, StorageBucketId,
+        };
+        let name = format!("rustfs-v-{}", Uuid::new_v4().simple());
+        BucketHandle::try_from_parts(
+            BucketKind::Vector,
+            AccountNamespaceId::empty(),
+            "us-east-1".into(),
+            BucketPublicName::try_new("managed-vectors".into()).expect("public name"),
+            StorageBucketId::try_new(name).expect("storage ID"),
+            BucketIncarnation::try_new(Uuid::new_v4()).expect("incarnation"),
+        )
+        .expect("identity")
+    }
+
+    const MANAGED_AES_CONFIG: &[u8] = b"<ServerSideEncryptionConfiguration><Rule><ApplyServerSideEncryptionByDefault><SSEAlgorithm>AES256</SSEAlgorithm></ApplyServerSideEncryptionByDefault></Rule></ServerSideEncryptionConfiguration>";
+
+    #[tokio::test]
+    #[serial]
+    async fn managed_bucket_creation_commits_tags_with_identity() {
+        let (_dirs, store) = setup_bucket_quorum_test_env(&[4], Some(2)).await;
+        metadata_sys::init_bucket_metadata_sys(store.clone(), Vec::new()).await;
+        let identity = managed_bucket_identity();
+        let bucket = identity.storage_bucket_id().as_str();
+        let tags = b"<Tagging><TagSet><Tag><Key>project</Key><Value>vectors</Value></Tag></TagSet></Tagging>";
+        super::fail_next_bucket_creation_after_intent(bucket);
+        store
+            .make_managed_bucket(&identity, &[], tags, &MakeBucketOptions::default())
+            .await
+            .expect_err("interrupt after the initial metadata intent");
+        let pending = store
+            .get_bucket_metadata_from_disk(bucket)
+            .await
+            .expect("persisted creation intent");
+        assert!(!pending.bucket_creation_committed);
+        assert_eq!(pending.tagging_config_xml, tags, "tags are part of the original intent");
+        assert_eq!(pending.bucket_incarnation_id, identity.incarnation().as_uuid());
+        assert!(pending.encryption_config_xml.is_empty());
+        let conflicting_tags = b"<Tagging><TagSet><Tag><Key>project</Key><Value>changed</Value></Tag></TagSet></Tagging>";
+        store
+            .make_managed_bucket(&identity, &[], conflicting_tags, &MakeBucketOptions::default())
+            .await
+            .expect_err("pending creation rejects a different initial tag set");
+        store
+            .make_managed_bucket(&identity, &[], tags, &MakeBucketOptions::default())
+            .await
+            .expect("resume the exact initial configuration");
+        let committed = store.get_bucket_metadata_from_disk(bucket).await.expect("committed metadata");
+        committed.validate_bucket_handle(&identity).expect("full committed identity");
+        assert_eq!(committed.tagging_config_xml, tags);
+        assert_eq!(committed.tagging_config_updated_at, committed.created);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn managed_bucket_creation_retries_exact_pending_identity() {
+        let (_dirs, store) = setup_bucket_quorum_test_env(&[4], Some(2)).await;
+        metadata_sys::init_bucket_metadata_sys(store.clone(), Vec::new()).await;
+        let identity = managed_bucket_identity();
+        let bucket = identity.storage_bucket_id().as_str();
+        assert!(matches!(
+            store.get_bucket_metadata_from_disk(bucket).await,
+            Err(StorageError::ConfigNotFound)
+        ));
+        let (absent, persisted) = metadata_sys::get_config_from_disk_with_presence_in(&store.ctx, bucket)
+            .await
+            .expect("confirmed metadata absence");
+        assert!(!persisted);
+        assert!(absent.bucket_kind().is_err(), "absence cannot become a General identity");
+        super::fail_next_bucket_creation_after_intent(bucket);
+        store
+            .make_managed_bucket(&identity, MANAGED_AES_CONFIG, &[], &MakeBucketOptions::default())
+            .await
+            .expect_err("interrupt after the persisted intent and continuation witness");
+        let pending = store.get_bucket_metadata_from_disk(bucket).await.expect("pending intent");
+        assert!(!pending.bucket_creation_committed);
+        assert_eq!(pending.bucket_incarnation_id, identity.incarnation().as_uuid());
+        store
+            .make_managed_bucket(&identity, MANAGED_AES_CONFIG, &[], &MakeBucketOptions::default())
+            .await
+            .expect("same identity resumes its pending creation");
+        store
+            .get_bucket_metadata_from_disk(bucket)
+            .await
+            .expect("committed metadata")
+            .validate_bucket_handle(&identity)
+            .expect("same identity committed with its original incarnation");
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn managed_bucket_metadata_read_rejects_uninitialized_instance_with_ambient_store() {
+        let (_paths, initialized) = setup_bucket_delete_test_env().await;
+        let ambient_context = crate::runtime::global::current_ctx();
+        if ambient_context.bucket_metadata_sys().is_none() {
+            assert!(
+                ambient_context.init_bucket_metadata_sys(initialized.ctx.bucket_metadata_sys().expect("initialized metadata"))
+            );
+        }
+        let ambient = metadata_sys::get_global_bucket_metadata_sys()
+            .expect("ambient metadata system")
+            .read()
+            .await
+            .object_store();
+        let identity = managed_bucket_identity();
+        ambient
+            .make_managed_bucket(&identity, MANAGED_AES_CONFIG, &[], &MakeBucketOptions::default())
+            .await
+            .expect("ambient managed bucket");
+        ambient
+            .get_bucket_metadata_from_disk(identity.storage_bucket_id().as_str())
+            .await
+            .expect("the ambient store contains the identity");
+        let (_other_dirs, uninitialized) = setup_bucket_quorum_test_env(&[4], Some(2)).await;
+        assert!(uninitialized.ctx.bucket_metadata_sys().is_none());
+        let error = uninitialized
+            .get_bucket_metadata_from_disk(identity.storage_bucket_id().as_str())
+            .await
+            .expect_err("a different instance must not inherit ambient metadata");
+        assert_eq!(error.to_string(), "Io error: bucket metadata sys not initialized for this instance");
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn managed_bucket_creation_persists_identity_before_visibility() {
+        let (_temp_dir, store) = setup_bucket_quorum_test_env(&[4], Some(2)).await;
+        metadata_sys::init_bucket_metadata_sys(store.clone(), Vec::new()).await;
+        let identity = managed_bucket_identity();
+        let bucket = identity.storage_bucket_id().as_str();
+        let (_pause, entered, release) =
+            super::pause_next_bucket_creation(bucket, super::BucketCreationPausePoint::AfterIntentPersistence);
+        let create_store = store.clone();
+        let create_identity = identity.clone();
+        let create = tokio::spawn(async move {
+            create_store
+                .make_managed_bucket(&create_identity, MANAGED_AES_CONFIG, &[], &MakeBucketOptions::default())
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(10), entered)
+            .await
+            .expect("intent pause reached")
+            .expect("creation entered pause");
+        let pending = store
+            .get_bucket_metadata_from_disk(bucket)
+            .await
+            .expect("persisted creation intent");
+        assert_eq!(
+            pending.bucket_kind().expect("vector kind"),
+            crate::storage_api_contracts::bucket::BucketKind::Vector
+        );
+        assert_eq!(pending.bucket_incarnation_id, identity.incarnation().as_uuid());
+        assert!(!pending.bucket_creation_committed);
+        assert!(pending.validate_bucket_handle(&identity).is_err());
+        release.send(()).expect("resume creation");
+        tokio::time::timeout(Duration::from_secs(10), create)
+            .await
+            .expect("creation bounded")
+            .expect("creation task")
+            .expect("creation commits");
+        let committed = store.get_bucket_metadata_from_disk(bucket).await.expect("committed metadata");
+        committed
+            .validate_bucket_handle(&identity)
+            .expect("complete identity and sidecar");
+        assert!(committed.bucket_creation_committed);
+        assert!(committed.bucket_incarnation_sidecar);
+        assert!(!committed.lock_enabled);
+        assert!(!committed.versioning());
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn managed_bucket_creation_preserves_unencrypted_configuration() {
+        let (_temp_dir, store) = setup_bucket_quorum_test_env(&[4], Some(2)).await;
+        metadata_sys::init_bucket_metadata_sys(store.clone(), Vec::new()).await;
+        let identity = managed_bucket_identity();
+        let bucket = identity.storage_bucket_id().as_str();
+        store
+            .make_managed_bucket(&identity, &[], &[], &MakeBucketOptions::default())
+            .await
+            .expect("unencrypted managed creation");
+        let metadata = store.get_bucket_metadata_from_disk(bucket).await.expect("persisted metadata");
+        metadata
+            .validate_bucket_handle(&identity)
+            .expect("committed identity and sidecar");
+        assert!(metadata.encryption_config_xml.is_empty());
+        assert!(metadata.sse_config.is_none());
+        let mut modified = metadata.as_ref().clone();
+        assert!(
+            modified
+                .update_config(crate::bucket::metadata::BUCKET_SSECONFIG, MANAGED_AES_CONFIG.to_vec())
+                .is_err()
+        );
+        assert_eq!(
+            store
+                .make_managed_bucket(&identity, MANAGED_AES_CONFIG, &[], &MakeBucketOptions::default())
+                .await
+                .expect_err("existing encryption configuration is immutable"),
+            StorageError::PreconditionFailed
+        );
+        let retained = store.get_bucket_metadata_from_disk(bucket).await.expect("retained metadata");
+        assert!(retained.encryption_config_xml.is_empty());
+        retained
+            .validate_bucket_handle(&identity)
+            .expect("identity remains unchanged");
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn managed_bucket_creation_rejects_conflicting_identity_and_ordinary_create() {
+        use crate::storage_api_contracts::bucket::{BucketHandle, BucketPublicName};
+        let (_temp_dir, store) = setup_bucket_quorum_test_env(&[4], Some(2)).await;
+        metadata_sys::init_bucket_metadata_sys(store.clone(), Vec::new()).await;
+        let identity = managed_bucket_identity();
+        let bucket = identity.storage_bucket_id().as_str();
+        assert!(store.make_bucket(bucket, &MakeBucketOptions::default()).await.is_err());
+        store
+            .make_managed_bucket(&identity, MANAGED_AES_CONFIG, &[], &MakeBucketOptions::default())
+            .await
+            .expect("managed creation");
+        let other = BucketHandle::try_from_parts(
+            identity.kind(),
+            identity.account_namespace_id().clone(),
+            identity.region().to_owned(),
+            BucketPublicName::try_new("other-public-name".into()).expect("other name"),
+            identity.storage_bucket_id().clone(),
+            identity.incarnation(),
+        )
+        .expect("conflicting identity");
+        assert_eq!(
+            store
+                .make_managed_bucket(&other, MANAGED_AES_CONFIG, &[], &MakeBucketOptions::default())
+                .await
+                .expect_err("collision rejected"),
+            StorageError::PreconditionFailed
+        );
+        store
+            .get_bucket_metadata_from_disk(bucket)
+            .await
+            .expect("metadata retained")
+            .validate_bucket_handle(&identity)
+            .expect("original binding retained");
+    }
+
     use super::{
         BUCKET_DELETE_DIAGNOSTIC_MAX_ELAPSED, BUCKET_DELETE_DIAGNOSTIC_MAX_ENTRIES, BUCKET_DELETE_XLMETA_DIAGNOSTIC_MAX_BYTES,
         BucketDeleteBlockerKind, BucketDeleteDiagnosticBudget, BucketMetadataLessResidue, SCANNER_BUCKET_LIST_SET_CONCURRENCY,

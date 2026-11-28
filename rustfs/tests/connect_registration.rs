@@ -83,6 +83,7 @@ struct TestPki {
 
 impl TestPki {
     fn new() -> Self {
+        rustfs_tls_runtime::ensure_crypto_provider().expect("install the configured TLS crypto provider");
         let now = OffsetDateTime::now_utc();
         let root_key = KeyPair::generate().expect("generate root key");
         let mut root_params = CertificateParams::default();

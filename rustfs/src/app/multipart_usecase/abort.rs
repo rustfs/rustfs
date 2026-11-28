@@ -59,6 +59,33 @@ pub(crate) fn reject_abort_capabilities(envelope: &RequestEnvelope) -> S3Result<
 }
 
 impl DefaultMultipartUsecase {
+    pub(crate) async fn abort_managed_multipart_upload(
+        &self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        upload_id: &UploadIdClaim,
+        context: &crate::app::object::ManagedObjectContext,
+        lifecycle_guard: &crate::app::storage_api::managed::BucketIncarnationFenceGuard,
+    ) -> S3Result<()> {
+        rustfs_io_metrics::record_s3_op(S3Operation::AbortMultipartUpload);
+        let mut opts = ObjectOptions::default();
+        if context.access().bucket().storage_bucket_id().as_str() != bucket.as_str() || lifecycle_guard.is_lock_lost() {
+            return Err(ApiError::from(StorageError::PreconditionFailed).into());
+        }
+        opts.expected_bucket_incarnation_id = Some(context.access().bucket().incarnation().as_uuid());
+        lifecycle_guard.attach_to_object_options(&mut opts);
+        let Some(store) = self.object_store() else {
+            return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init"));
+        };
+        abort_gateway(&store, bucket, key, upload_id, opts).await?;
+        rustfs_scanner::record_dirty_usage_object_from_producer(
+            bucket.as_str(),
+            key.as_str(),
+            rustfs_scanner::SegmentInvalidationProducerIdentity::AbortMultipartUpload,
+        );
+        Ok(())
+    }
+
     #[instrument(level = "debug", skip(self, envelope, target))]
     pub(crate) async fn execute_abort_multipart_upload(
         &self,

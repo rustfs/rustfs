@@ -300,6 +300,8 @@ fn history_fixture() -> (TableEntry, CommitLogEntry, CommitLogEntry) {
     table.version_token = "winner-token".to_string();
     table.generation = 2;
     let loser = CommitLogEntry {
+        vector_resource_mutation: None,
+        vector_commit_binding: None,
         version: TABLE_CATALOG_ENTRY_VERSION,
         commit_id: "loser".to_string(),
         idempotency_key: None,

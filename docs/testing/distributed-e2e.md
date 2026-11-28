@@ -106,6 +106,33 @@ have measured artifacts.
 
 Membership is pinned by `.config/e2e-distributed-selection.txt`. Update the Linux and Darwin entries with `python3 ./scripts/check_test_wiring.py --update-profile e2e-distributed <listing.json> <platform>` after adding or renaming a case.
 
+## Native Catalog fault acceptance
+
+The `catalog-fault-worker` feature of `e2e_test` enables the Catalog-specific four-process suite. It uses a RustFS library test executable, so each process runs the normal startup and ECStore with the test-only Lance preparation and Catalog driver available. The dedicated [workflow](../../.github/workflows/e2e-catalog-fault.yml) builds and runs this executable through [e2e_catalog_worker.py](../../scripts/e2e_catalog_worker.py). Ordinary production builds retain their existing E2E identity and entry point.
+
+```bash
+CARGO_BUILD_JOBS=4 CARGO_INCREMENTAL=0 make -j4 -f - <<'MAKE'
+.PHONY: catalog-worker
+catalog-worker:
+	python3 scripts/e2e_catalog_worker.py build
+MAKE
+
+export RUSTFS_CATALOG_FAULT_ARTIFACT_DIR="${PWD}/target/catalog-fault-artifacts"
+CARGO_BUILD_JOBS=4 CARGO_INCREMENTAL=0 make -j4 -f - <<'MAKE'
+.PHONY: catalog-fault
+catalog-fault:
+	python3 scripts/e2e_catalog_worker.py run -- cargo nextest run --locked -p e2e_test --features catalog-fault-worker --profile e2e-distributed -E 'test(distributed::catalog_fault_acceptance_test::)' --test-threads 1 --retries 0 --no-tests fail
+MAKE
+```
+
+The build manifest binds the source inventory, embedded assets, compiler, resolved features and executable SHA-256. The run verifies this identity before and after the command; every node launcher verifies it again before executing the selected worker test. A missing receipt, modified input, wrong executable, unobserved fault or failed command fails the run. The worker communicates through a process-private Unix socket in a `0700` directory with `0600` socket permissions and an invocation nonce. The ordinary worker unit test starts a real isolated child process and verifies a Lance commit and accurate read.
+
+The build uses the executable selected by `RUSTC`, or the `rustc` on `PATH`, directly with compiler wrappers disabled and checks that compiler's version before and after compilation. The run removes inherited `RUSTFS_*`, `MINIO_*` and `OTEL_*` settings, preserving only the explicitly selected artifact directory before adding its private receipt. The harness supplies the node configuration; the launcher rejects additional server or telemetry settings.
+
+The Catalog topology uses four processes with one independent data directory each and `EC:2`. Scenarios observe lease loss before a head write, retained disk requests after lease loss, process termination at persisted commit boundaries, lost responses, empty or old data directories, and corrupt Catalog objects. Evidence includes actual fault hits, process and boot identities, response status, exact head and manifest bytes, and per-directory inventories. The harness preserves its owned data directories and records their paths alongside the first failure. These local directory faults verify process recovery and EC behavior; physical media and whole-host power loss require the hardware environment.
+
+The assertions follow the existing lock and EC quorum behavior. A delayed request that overwrites an acknowledged head or produces an incorrect success fails acceptance. Recovery inspects the recorded commit identity and history, preserves uncertain candidates and rejects corrupt records. The suite does not infer a durable consensus guarantee from lease acquisition or a successful restart.
+
 ## Multipart fence fault acceptance
 
 The EC:2 metadata-delay case also holds the three scoped `ListDir` RPCs only after the upload metadata has been read, while the coordinator's part directory is unavailable. It requires the ListParts response to be HTTP 503 `SlowDownRead`, then restores the exact directory, verifies the part ETag and completes the original bytes through every reader. The same case signs a ten-byte multipart limit and races two six-byte parts through different coordinators; exactly one must succeed, and the final object must match that part.

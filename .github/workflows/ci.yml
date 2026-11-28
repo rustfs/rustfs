@@ -482,6 +482,26 @@ jobs:
           } > artifacts/ilm-integration/diagnostics.txt
           exit "${status}"
 
+      - name: Verify Vector encryption and sessions with KMS key policy enforcement
+        if: needs.classify-changes.outputs.mode == 'full'
+        env:
+          RUSTFS_KMS_ENFORCE_SSE_KEY_POLICY: "true"
+          NO_PROXY: 127.0.0.1,localhost,::1
+        run: |
+          export no_proxy="$NO_PROXY"
+          mkdir -p artifacts/vector-kms
+          filter='test(app::vector_usecase::tests::sdk_acceptance::encryption::) | test(app::vector_usecase::tests::sdk_acceptance::authorization::)'
+          cargo nextest list --profile vector-kms \
+            --cargo-metadata target/nextest/cargo-metadata.json --binaries-metadata target/nextest/binaries-metadata.json \
+            --workspace-remap "$GITHUB_WORKSPACE" --target-dir-remap "$GITHUB_WORKSPACE/target" \
+            -E "$filter" --message-format json > artifacts/vector-kms/test-listing.json
+          cargo nextest run --profile vector-kms --no-tests fail \
+            --cargo-metadata target/nextest/cargo-metadata.json --binaries-metadata target/nextest/binaries-metadata.json \
+            --workspace-remap "$GITHUB_WORKSPACE" --target-dir-remap "$GITHUB_WORKSPACE/target" \
+            -E "$filter" --status-level all --final-status-level all \
+            2>&1 | tee artifacts/vector-kms/nextest.log
+          python3 scripts/ci_test_artifact.py evidence artifacts/vector-kms/test-listing.json target/nextest/vector-kms/junit.xml
+
       - name: Upload workspace test evidence
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
@@ -491,6 +511,8 @@ jobs:
             target/nextest/ci/junit.xml
             artifacts/workspace
             artifacts/ilm-integration
+            artifacts/vector-kms
+            target/nextest/vector-kms/junit.xml
           retention-days: 3
           if-no-files-found: error
 

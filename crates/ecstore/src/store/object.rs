@@ -3350,7 +3350,7 @@ impl ECStore {
         Ok(Arc::new(snapshot))
     }
 
-    pub(super) async fn object_lock_config_snapshot_under_lifecycle_fence(
+    pub(crate) async fn object_lock_config_snapshot_under_lifecycle_fence(
         &self,
         bucket: &str,
         lifecycle_fence: &NamespaceLockFence,
@@ -5577,13 +5577,113 @@ impl ECStore {
         objects: Vec<ObjectToDelete>,
         opts: ObjectOptions,
     ) -> (Vec<DeletedObject>, Vec<Option<Error>>, Vec<Option<DeleteAccounting>>) {
+        self.delete_objects_with_journal_owned(bucket, objects, opts, None).await
+    }
+
+    /// Delete exact unversioned bodies while retaining a previously acquired lifecycle owner.
+    ///
+    /// Cancellation detaches the waiter; the owned mutation retains the supplied guard
+    /// through its native transaction tail. Retry uncertain outcomes through exact journal
+    /// recovery. Receipts describe committed deletion only and do not prove missing bodies.
+    ///
+    /// # Errors
+    /// Returns per-target errors for invalid exact identities, unsupported delete modes,
+    /// mismatched store/bucket owners, lost protection, or ordinary delete failures.
+    pub async fn delete_objects_with_tier_delete_journal_and_accounting_under_bucket_fence(
+        self: &Arc<Self>,
+        bucket: &str,
+        objects: Vec<ObjectToDelete>,
+        opts: ObjectOptions,
+        lifecycle_owner: Arc<BucketIncarnationFenceGuard>,
+    ) -> (Vec<DeletedObject>, Vec<Option<Error>>, Vec<Option<DeleteAccounting>>) {
+        let exact_targets = !objects.is_empty()
+            && objects.iter().all(|target| {
+                target.version_id.is_none()
+                    && !target.synthetic_version_id
+                    && target.delete_condition.is_none()
+                    && target.delete_marker_replication_status.is_none()
+                    && target.version_purge_status.is_none()
+                    && target.version_purge_statuses.is_none()
+                    && target.replicate_decision_str.is_none()
+                    && target
+                        .expected_identity
+                        .as_ref()
+                        .is_some_and(|identity| identity.data_dir.is_some_and(|id| !id.is_nil()) && !identity.delete_marker)
+            });
+        if !exact_targets
+            || !opts.expected_bucket_incarnation_id.is_some_and(|id| !id.is_nil())
+            || opts.version_id.is_some()
+            || opts.versioned
+            || opts.version_suspended
+            || opts.no_lock
+            || opts.delete_prefix
+            || opts.delete_prefix_object
+            || opts.recursive_delete_targets.is_some()
+            || opts.lifecycle_delete_all.is_some()
+            || opts.lifecycle_expiry_policy.is_some()
+            || opts.expiration.expire
+            || opts
+                .object_lock_delete
+                .as_ref()
+                .is_some_and(|options| options.bypass_governance)
+            || opts.replication_request
+            || opts.delete_replication.is_some()
+            || opts.data_movement
+            || opts.data_movement_transferred_tier_versions.is_some()
+            || opts.delete_marker
+            || opts.synthetic_version_id
+            || opts.tier_delete_dispatch_authorization.is_some()
+        {
+            return return_batch_delete_lock_error_with_accounting(
+                &objects,
+                StorageError::InvalidArgument(
+                    bucket.to_owned(),
+                    String::new(),
+                    "guarded deletion requires exact unversioned object identities".to_owned(),
+                ),
+            );
+        }
+        if let Err(error) = self.validate_bucket_incarnation_fence(&lifecycle_owner, bucket) {
+            return return_batch_delete_lock_error_with_accounting(&objects, error);
+        }
+        let (deleted, errors, mut accounting) = self
+            .delete_objects_with_journal_owned(bucket, objects, opts, Some(lifecycle_owner))
+            .await;
+        // The ordinary idempotent path can return an empty accounting projection
+        // for a missing source. Only an observed current-body removal proves this
+        // exact unversioned mutation committed.
+        for (receipt, error) in accounting.iter_mut().zip(&errors) {
+            if error.is_some()
+                || receipt
+                    .as_ref()
+                    .is_some_and(|value| !value.removed_current_object || value.version_id.is_some())
+            {
+                *receipt = None;
+            }
+        }
+        (deleted, errors, accounting)
+    }
+
+    async fn delete_objects_with_journal_owned(
+        self: &Arc<Self>,
+        bucket: &str,
+        objects: Vec<ObjectToDelete>,
+        opts: ObjectOptions,
+        lifecycle_owner: Option<Arc<BucketIncarnationFenceGuard>>,
+    ) -> (Vec<DeletedObject>, Vec<Option<Error>>, Vec<Option<DeleteAccounting>>) {
         let store = Arc::clone(self);
         let bucket = bucket.to_owned();
         let object_count = objects.len();
         self.ctx
             .run_detached_mutation(async move {
                 let result = store
-                    .handle_delete_objects_with_journal_and_accounting(&bucket, objects, opts, Some(Arc::clone(&store)))
+                    .handle_delete_objects_with_journal_and_accounting_with_guard(
+                        &bucket,
+                        objects,
+                        opts,
+                        Some(Arc::clone(&store)),
+                        lifecycle_owner,
+                    )
                     .await;
                 let success_count = result.1.iter().filter(|err| err.is_none()).count();
                 if success_count > 0 {
@@ -6159,6 +6259,19 @@ impl ECStore {
         opts: ObjectOptions,
         tier_journal_api: Option<Arc<ECStore>>,
     ) -> (Vec<DeletedObject>, Vec<Option<Error>>, Vec<Option<DeleteAccounting>>) {
+        self.handle_delete_objects_with_journal_and_accounting_with_guard(bucket, objects, opts, tier_journal_api, None)
+            .await
+    }
+
+    fn handle_delete_objects_with_journal_and_accounting_with_guard<'a>(
+        &'a self,
+        bucket: &'a str,
+        objects: Vec<ObjectToDelete>,
+        opts: ObjectOptions,
+        tier_journal_api: Option<Arc<ECStore>>,
+        lifecycle_owner: Option<Arc<BucketIncarnationFenceGuard>>,
+    ) -> impl std::future::Future<Output = (Vec<DeletedObject>, Vec<Option<Error>>, Vec<Option<DeleteAccounting>>)> + Send + 'a
+    {
         Box::pin(async move {
             let count = objects.len();
             let mut deleted = vec![DeletedObject::default(); count];
@@ -6189,7 +6302,13 @@ impl ECStore {
             }
             let receipt_sink = install_tier_free_version_receipt_sink(&mut opts);
             let (valid_deleted, valid_errors, valid_accounting) = self
-                .handle_delete_objects_with_journal_and_accounting_inner(bucket, valid_objects, opts, tier_journal_api)
+                .handle_delete_objects_with_journal_and_accounting_inner(
+                    bucket,
+                    valid_objects,
+                    opts,
+                    tier_journal_api,
+                    lifecycle_owner,
+                )
                 .await;
             enqueue_recorded_tier_free_versions(self, receipt_sink).await;
             for (index, ((object, error), receipt)) in valid_indices
@@ -6202,7 +6321,6 @@ impl ECStore {
             }
             (deleted, errors, accounting)
         })
-        .await
     }
 
     /// Each phase owns separate disk transactions, receipts, and rollback.
@@ -6374,6 +6492,7 @@ impl ECStore {
         objects: Vec<ObjectToDelete>,
         opts: ObjectOptions,
         tier_journal_api: Option<Arc<ECStore>>,
+        lifecycle_owner: Option<Arc<BucketIncarnationFenceGuard>>,
     ) -> (Vec<DeletedObject>, Vec<Option<Error>>, Vec<Option<DeleteAccounting>>) {
         // encode object name
         let objects: Vec<ObjectToDelete> = objects
@@ -6387,7 +6506,16 @@ impl ECStore {
         let mut opts = opts;
         opts.conditional_delete_generations = None;
         opts.tier_delete_journal_api = tier_journal_api;
-        let _bucket_lifecycle_guard = if is_meta_bucketname(bucket) {
+        // Lock order: lifecycle (owned or borrowed), metadata, then data objects.
+        // A borrowed guard must not queue another reader behind a lifecycle writer.
+        let _bucket_lifecycle_guard = if let Some(guard) = lifecycle_owner {
+            if let Err(error) = self.validate_bucket_incarnation_fence(&guard, bucket) {
+                return return_batch_delete_lock_error_with_accounting(&objects, error);
+            }
+            guard.attach_to_object_options(&mut opts);
+            opts.delete_mutation_owner = Some(Arc::new((opts.delete_mutation_owner.take(), guard)));
+            None
+        } else if is_meta_bucketname(bucket) {
             None
         } else {
             match self.acquire_bucket_lifecycle_read_lock(bucket).await {
@@ -14540,6 +14668,125 @@ mod missing_key_delete_quorum_tests {
         })
         .await;
     }
+
+    #[cfg(not(windows))]
+    #[tokio::test]
+    async fn guarded_exact_delete_cancellation_retains_actual_lifecycle_and_dispatch_owners() {
+        use crate::disk::os::prepared_publication_test_hooks as hooks;
+        use crate::disk::{DiskAPI, ReadOptions};
+        let (_dirs, store) = isolated_store_over_temp_disks().await;
+        init_bucket_metadata_sys(store.clone(), Vec::new()).await;
+        let bucket = "guarded-delete-cancel-owner";
+        let key = "object";
+        store
+            .make_bucket(bucket, &MakeBucketOptions::default())
+            .await
+            .expect("fixture bucket");
+        let mut reader = PutObjReader::from_vec(vec![0x56; 1024 * 1024]);
+        let info = store
+            .put_object(
+                bucket,
+                key,
+                &mut reader,
+                &ObjectOptions {
+                    write_completion: crate::object_api::WriteCompletion::TailDrained,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("external body");
+        let incarnation = get_cached_bucket_incarnation_id_in(&store.ctx, bucket)
+            .await
+            .expect("incarnation");
+        let lifecycle = Arc::new(
+            store
+                .acquire_bucket_incarnation_fence(bucket, incarnation)
+                .await
+                .expect("lifecycle guard"),
+        );
+        let dispatch_lock = store
+            .handle_new_ns_lock(bucket, "job-dispatch")
+            .await
+            .expect("dispatch namespace");
+        let dispatch = Arc::new(
+            dispatch_lock
+                .get_read_lock(Duration::from_secs(10))
+                .await
+                .expect("dispatch owner"),
+        );
+        let owner = Arc::new((lifecycle.clone(), dispatch.clone()));
+        let observed_owner = Arc::downgrade(&owner);
+        let mut options = ObjectOptions {
+            expected_bucket_incarnation_id: Some(incarnation),
+            delete_mutation_owner: Some(owner),
+            ..Default::default()
+        };
+        options.add_namespace_lock_guard(&dispatch);
+        drop(dispatch);
+        let disks = store.pools[0].disk_set[0].disk_inventory().await;
+        let disk = disks[0].as_ref().expect("online disk");
+        let native = disk
+            .read_version("", bucket, key, "", &ReadOptions::default())
+            .await
+            .expect("physical metadata");
+        assert!(!native.inline_data(), "pause must target a real external payload");
+        let crate::disk::Disk::Local(local) = disk.as_ref() else { panic!("local disk fixture") };
+        let part = local
+            .get_disk()
+            .get_object_path_for_io(bucket, key)
+            .expect("exact object path")
+            .join(native.data_dir.expect("data directory").to_string())
+            .join("part.1");
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release, release_rx) = std::sync::mpsc::channel::<()>();
+        let hook = hooks::install_at(hooks::Stage::Remove, &part, move || {
+            let _ = entered_tx.send(());
+            let _ = release_rx.recv();
+        });
+        let deleting = store.clone();
+        let delete = tokio::spawn(async move {
+            deleting
+                .delete_objects_with_tier_delete_journal_and_accounting_under_bucket_fence(
+                    bucket,
+                    vec![
+                        ObjectToDelete {
+                            object_name: key.to_owned(),
+                            ..Default::default()
+                        }
+                        .with_expected_identity(info.data_dir, info.mod_time, false),
+                    ],
+                    options,
+                    lifecycle,
+                )
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(10), entered_rx)
+            .await
+            .expect("native cleanup reached")
+            .expect("pause observed");
+        delete.abort();
+        assert!(delete.await.expect_err("cancelled outer waiter").is_cancelled());
+        assert!(observed_owner.upgrade().is_some(), "physical tail must retain actual supplied owners");
+        let dispatch_result = dispatch_lock.get_write_lock(Duration::from_millis(100)).await;
+        assert!(dispatch_result.is_err(), "dispatch writer remains excluded after cancellation");
+        let lifecycle_lock = store
+            .handle_new_ns_lock(bucket, crate::storage_api_contracts::bucket::BUCKET_LIFECYCLE_LOCK_OBJECT)
+            .await
+            .expect("lifecycle namespace");
+        let lifecycle_result = lifecycle_lock.get_write_lock(Duration::from_millis(100)).await;
+        assert!(lifecycle_result.is_err(), "lifecycle writer remains excluded after cancellation");
+        drop(release);
+        drop(hook);
+        let _dispatch = dispatch_lock
+            .get_write_lock(Duration::from_secs(10))
+            .await
+            .expect("native tail releases dispatch owner");
+        let _lifecycle = lifecycle_lock
+            .get_write_lock(Duration::from_secs(10))
+            .await
+            .expect("native tail releases lifecycle owner");
+        assert!(observed_owner.upgrade().is_none(), "complete owner drains with physical work");
+    }
 }
 
 /// The bulk-delete lock rounds are batched and per key: one `lock_batch` wave
@@ -14584,6 +14831,163 @@ mod batch_delete_lock_tests {
                 ..Default::default()
             })
             .collect()
+    }
+
+    #[tokio::test]
+    async fn guarded_exact_delete_rejects_changed_body_and_missing_identity() {
+        let bucket = "guarded-delete-identity";
+        let (_dirs, store) = seeded_store(bucket).await;
+        let incarnation = get_cached_bucket_incarnation_id_in(&store.ctx, bucket)
+            .await
+            .expect("bucket incarnation");
+        let guard = Arc::new(
+            store
+                .acquire_bucket_incarnation_fence(bucket, incarnation)
+                .await
+                .expect("lifecycle fence"),
+        );
+        for expected in [None, Some(Uuid::new_v4())] {
+            let target = ObjectToDelete {
+                object_name: "a-object".to_owned(),
+                ..Default::default()
+            }
+            .with_expected_identity(expected, None, false);
+            let (_, errors, receipts) = store
+                .delete_objects_with_tier_delete_journal_and_accounting_under_bucket_fence(
+                    bucket,
+                    vec![target],
+                    ObjectOptions {
+                        expected_bucket_incarnation_id: Some(incarnation),
+                        ..Default::default()
+                    },
+                    guard.clone(),
+                )
+                .await;
+            assert!(errors[0].is_some(), "missing or changed body identity must refuse deletion");
+            assert!(receipts[0].is_none(), "refused delete cannot release accounting");
+            store
+                .get_object_info_for_delete(bucket, "a-object", &ObjectOptions::default())
+                .await
+                .expect("replacement remains readable");
+        }
+    }
+
+    #[tokio::test]
+    async fn guarded_exact_delete_rejects_foreign_owner_and_changed_timestamp() {
+        let bucket = "guarded-delete-foreign-owner";
+        let (_dirs, store) = seeded_store(bucket).await;
+        let (_other_dirs, other) = seeded_store("guarded-delete-other-store").await;
+        let incarnation = get_cached_bucket_incarnation_id_in(&store.ctx, bucket)
+            .await
+            .expect("bucket incarnation");
+        let other_incarnation = get_cached_bucket_incarnation_id_in(&other.ctx, "guarded-delete-other-store")
+            .await
+            .expect("other incarnation");
+        let foreign = Arc::new(
+            other
+                .acquire_bucket_incarnation_fence("guarded-delete-other-store", other_incarnation)
+                .await
+                .expect("foreign guard"),
+        );
+        let info = store
+            .get_object_info_for_delete(bucket, "a-object", &ObjectOptions::default())
+            .await
+            .expect("exact object");
+        let target = ObjectToDelete {
+            object_name: "a-object".to_owned(),
+            ..Default::default()
+        }
+        .with_expected_identity(info.data_dir, info.mod_time, false);
+        let options = ObjectOptions {
+            expected_bucket_incarnation_id: Some(incarnation),
+            ..Default::default()
+        };
+        let (_, errors, receipts) = store
+            .delete_objects_with_tier_delete_journal_and_accounting_under_bucket_fence(
+                bucket,
+                vec![target.clone()],
+                options.clone(),
+                foreign,
+            )
+            .await;
+        assert!(
+            matches!(errors[0], Some(StorageError::PreconditionFailed)),
+            "a real foreign guard grants no access"
+        );
+        assert!(receipts[0].is_none());
+        let guard = Arc::new(
+            store
+                .acquire_bucket_incarnation_fence(bucket, incarnation)
+                .await
+                .expect("current guard"),
+        );
+        let changed_time =
+            target.with_expected_identity(info.data_dir, info.mod_time.map(|time| time + time::Duration::nanoseconds(1)), false);
+        let (_, errors, receipts) = store
+            .delete_objects_with_tier_delete_journal_and_accounting_under_bucket_fence(bucket, vec![changed_time], options, guard)
+            .await;
+        assert!(
+            matches!(errors[0], Some(StorageError::PreconditionFailed)),
+            "timestamp is part of exact identity"
+        );
+        assert!(receipts[0].is_none());
+        let remaining = store
+            .get_object_info_for_delete(bucket, "a-object", &ObjectOptions::default())
+            .await
+            .expect("original body remains");
+        assert_eq!((remaining.data_dir, remaining.mod_time), (info.data_dir, info.mod_time));
+    }
+
+    #[tokio::test]
+    async fn guarded_exact_delete_borrows_lifecycle_with_queued_writer() {
+        let bucket = "guarded-delete-order";
+        let (_dirs, store) = seeded_store(bucket).await;
+        let incarnation = get_cached_bucket_incarnation_id_in(&store.ctx, bucket)
+            .await
+            .expect("bucket incarnation");
+        let guard = Arc::new(
+            store
+                .acquire_bucket_incarnation_fence(bucket, incarnation)
+                .await
+                .expect("lifecycle fence"),
+        );
+        let info = store
+            .get_object_info_for_delete(bucket, "a-object", &ObjectOptions::default())
+            .await
+            .expect("exact metadata");
+        let target = ObjectToDelete {
+            object_name: "a-object".to_owned(),
+            ..Default::default()
+        }
+        .with_expected_identity(info.data_dir, info.mod_time, false);
+        let writer = store.acquire_bucket_lifecycle_write_lock(bucket);
+        tokio::pin!(writer);
+        assert!(
+            futures::poll!(&mut writer).is_pending(),
+            "writer must queue behind actual lifecycle owner"
+        );
+        let (_, errors, receipts) = tokio::time::timeout(
+            Duration::from_secs(10),
+            store.delete_objects_with_tier_delete_journal_and_accounting_under_bucket_fence(
+                bucket,
+                vec![target],
+                ObjectOptions {
+                    expected_bucket_incarnation_id: Some(incarnation),
+                    ..Default::default()
+                },
+                guard.clone(),
+            ),
+        )
+        .await
+        .expect("borrowed guard must not reacquire behind writer");
+        assert!(errors[0].is_none(), "exact deletion outcome: {errors:?}");
+        assert!(receipts[0].is_some(), "committed body has accounting receipt");
+        assert!(futures::poll!(&mut writer).is_pending(), "caller still owns lifecycle guard");
+        drop(guard);
+        tokio::time::timeout(Duration::from_secs(10), &mut writer)
+            .await
+            .expect("writer resumes after owner release")
+            .expect("lifecycle writer");
     }
 
     #[tokio::test]

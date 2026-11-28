@@ -40,9 +40,10 @@ use crate::core::write::{
     sse_encryption, sse_prepare_encryption,
 };
 use crate::error::INTERNAL_ERROR_MESSAGE;
+use crate::error::kms_operation_error;
 use crate::error::{KMS_KEY_NOT_FOUND_ERROR_CODE, SseError};
 use crate::host::KmsKeyAuthorizer;
-use crate::kms::kms_backed::{KmsSseDekProvider, kms_operation_error};
+use crate::kms::kms_backed::KmsSseDekProvider;
 use crate::kms::local::TestSseDekProvider;
 use crate::kms::provider::{SseDekProvider, reset_sse_dek_provider};
 use crate::testing::{RecordingKmsKeyAuthorizer, sse_kms_object_metadata};
@@ -186,11 +187,11 @@ fn kms_unwrap_error_keeps_500_but_names_the_envelope_mismatch() {
 
 #[test]
 fn sse_kms_never_falls_back_to_the_local_sse_s3_provider() {
-    let unconfigured = crate::core::write::sse_kms_unavailable_error(false);
+    let unconfigured = crate::error::sse_kms_unavailable_error(false);
     assert_eq!(unconfigured.code, S3ErrorCode::InvalidRequest);
     assert!(unconfigured.message.contains("SSE-KMS requires"));
 
-    let stopped = crate::core::write::sse_kms_unavailable_error(true);
+    let stopped = crate::error::sse_kms_unavailable_error(true);
     assert_eq!(stopped.code, S3ErrorCode::ServiceUnavailable);
 }
 

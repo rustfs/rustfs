@@ -207,6 +207,7 @@ pub(crate) async fn run_startup_runtime_lifecycle(
         readiness,
     } = lifecycle;
     let StartupServiceRuntime {
+        vector_maintenance,
         table_maintenance,
         table_rename_recovery,
         oidc_recovery,
@@ -243,6 +244,7 @@ pub(crate) async fn run_startup_runtime_lifecycle(
         console_shutdown_tx,
         optional_runtimes,
         StartupShutdownServices {
+            vector_maintenance: Some(vector_maintenance),
             capacity: capacity_tasks,
             table_maintenance,
             scanner_cleanup,

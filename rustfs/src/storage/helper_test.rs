@@ -293,6 +293,44 @@ fn request(_method: Method, uri: Uri, configure: impl FnOnce(&mut HeaderMap, &mu
     }
 }
 
+#[tokio::test]
+async fn trusted_operation_audit_tags_survive_completion_and_early_drop() {
+    use super::MutationCompletionProbe;
+    use std::collections::HashMap;
+
+    let probe = MutationCompletionProbe::install("maintenance-audit");
+    for completed in [false, true] {
+        let request = request(Method::GET, Uri::from_static("/maintenance-audit/file"), |_, extensions| {
+            extensions.insert(RequestContext {
+                request_id: "maintenance-operation".into(),
+                x_amz_request_id: "maintenance-operation".into(),
+                trace_id: Some("original-trace".into()),
+                span_id: None,
+                start_time: std::time::Instant::now(),
+            });
+        });
+        let mut helper = OperationHelper::from_view(&request.audit_view(), EventName::ObjectAccessedGet, S3Operation::GetObject)
+            .with_audit_tags(HashMap::from([("maintenanceJobId".into(), serde_json::json!("job"))]))
+            .with_audit_tags(HashMap::from([
+                ("maintenanceAttempt".into(), serde_json::json!(2)),
+                ("traceId".into(), serde_json::json!("cannot-replace-request-trace")),
+            ]));
+        if completed {
+            helper = helper.complete_owned(&Ok(()), StatusCode::OK, &HeaderMap::new());
+        }
+        drop(helper);
+    }
+    let audits = probe.audits.lock().expect("captured operation audits");
+    assert_eq!(audits.len(), 2);
+    for entry in audits.iter() {
+        let tags = entry.tags.as_ref().expect("maintenance identity survives every outcome");
+        assert_eq!(tags["maintenanceJobId"], "job");
+        assert_eq!(tags["maintenanceAttempt"], 2);
+    }
+    assert_eq!(audits[1].tags.as_ref().expect("completed tags")["traceId"], "original-trace");
+    assert!(audits[0].error.is_some(), "unfinished operation must retain its failure outcome");
+}
+
 #[test]
 fn operation_helper_uses_req_info_for_notification_context() {
     with_vars(
