@@ -3446,6 +3446,57 @@ struct RenameOutcomeProducerArgs {
     dispatch_deadline: Option<disk::RenameDispatchDeadline>,
 }
 
+impl RenameOutcomeProducerArgs {
+    fn plan(&self) -> RenameFanoutPlan {
+        debug_assert!(!self.allow_batch || self.publication_scope.is_none());
+        if self.allow_batch {
+            SetDisks::plan_rename_fanout(
+                &self.disks,
+                &self.file_infos,
+                &self.fence_tokens,
+                &self.paths.src_bucket,
+                &self.paths.dst_bucket,
+                &self.paths.dst_object,
+            )
+        } else {
+            RenameFanoutPlan::default()
+        }
+    }
+
+    fn unary_slots<'a>(
+        &'a self,
+        batch_slot_mask: u16,
+        completion_rank: &'a Option<Arc<AtomicUsize>>,
+    ) -> impl Iterator<Item = RenameSlotContext> + 'a {
+        self.disks
+            .iter()
+            .zip(self.fence_tokens.iter().copied())
+            .enumerate()
+            .filter_map(move |(slot, (disk, scanner_token))| {
+                if batch_slot_mask != 0 && batch_slot_mask & (1_u16 << slot) != 0 {
+                    return None;
+                }
+                let dispatch_deadline = self
+                    .dispatch_deadline
+                    .as_ref()
+                    .filter(|_| disk.as_ref().is_some_and(|disk| !disk.is_local()))
+                    .cloned();
+                Some(RenameSlotContext {
+                    slot,
+                    disk: disk.clone(),
+                    file_infos: self.file_infos.clone(),
+                    scanner_token,
+                    namespace_owner: self.namespace_owner.clone(),
+                    publication_scope: self.publication_scope.clone(),
+                    paths: self.paths.clone(),
+                    successful_completion_rank: completion_rank.clone(),
+                    write_quorum: self.write_quorum,
+                    dispatch_deadline,
+                })
+            })
+    }
+}
+
 struct RenameOutcomeProducers {
     outcomes: mpsc::Receiver<SlotRenameOutcome>,
     tasks: JoinSet<()>,
@@ -4710,64 +4761,30 @@ impl SetDisks {
         }
     }
 
-    fn spawn_rename_outcome_producers(args: RenameOutcomeProducerArgs) -> RenameOutcomeProducers {
+    fn spawn_rename_outcome_producers(args: RenameOutcomeProducerArgs, fanout_plan: RenameFanoutPlan) -> RenameOutcomeProducers {
+        let disk_count = args.disks.len();
+        let successful_completion_rank = rustfs_io_metrics::put_stage_metrics_enabled().then(|| Arc::new(AtomicUsize::new(0)));
+        let resource_unit = crate::disk::current_resource_unit();
+        let mut tasks = JoinSet::new();
+        let (outcome_tx, outcome_rx) = mpsc::channel(disk_count.max(1));
+        for context in args.unary_slots(fanout_plan.batch_slot_mask, &successful_completion_rank) {
+            let outcome_tx = outcome_tx.clone();
+            let producer = crate::disk::with_optional_resource_unit(resource_unit.clone(), async move {
+                let outcome = Self::run_unary_rename_slot(context).await;
+                let _ = outcome_tx.send(outcome).await;
+            });
+            tasks.spawn(crate::disk::with_detached_disk_io_context(producer));
+        }
         let RenameOutcomeProducerArgs {
             disks,
             file_infos,
             fence_tokens,
             paths,
             namespace_owner,
-            publication_scope,
             write_quorum,
-            allow_batch,
             dispatch_deadline,
+            ..
         } = args;
-        debug_assert!(!allow_batch || publication_scope.is_none());
-        let disk_count = disks.len();
-        let fanout_plan = if allow_batch {
-            Self::plan_rename_fanout(
-                disks.as_slice(),
-                file_infos.as_slice(),
-                fence_tokens.as_slice(),
-                &paths.src_bucket,
-                &paths.dst_bucket,
-                &paths.dst_object,
-            )
-        } else {
-            RenameFanoutPlan::default()
-        };
-        let successful_completion_rank = rustfs_io_metrics::put_stage_metrics_enabled().then(|| Arc::new(AtomicUsize::new(0)));
-        let resource_unit = crate::disk::current_resource_unit();
-        let mut tasks = JoinSet::new();
-        let (outcome_tx, outcome_rx) = mpsc::channel(disk_count.max(1));
-        for (slot, (disk, scanner_token)) in disks.iter().cloned().zip(fence_tokens.iter().copied()).enumerate() {
-            if fanout_plan.batch_slot_mask & (1_u16 << slot) != 0 {
-                continue;
-            }
-            let outcome_tx = outcome_tx.clone();
-            let dispatch_deadline = dispatch_deadline
-                .as_ref()
-                .filter(|_| disk.as_ref().is_some_and(|disk| !disk.is_local()))
-                .cloned();
-            let context = RenameSlotContext {
-                slot,
-                disk,
-                file_infos: file_infos.clone(),
-                scanner_token,
-                namespace_owner: namespace_owner.clone(),
-                publication_scope: publication_scope.clone(),
-                paths: paths.clone(),
-                successful_completion_rank: successful_completion_rank.clone(),
-                write_quorum,
-                dispatch_deadline,
-            };
-            let resource_unit = resource_unit.clone();
-            let producer = crate::disk::with_optional_resource_unit(resource_unit, async move {
-                let outcome = Self::run_unary_rename_slot(context).await;
-                let _ = outcome_tx.send(outcome).await;
-            });
-            tasks.spawn(crate::disk::with_detached_disk_io_context(producer));
-        }
         for group in fanout_plan.batch_groups {
             let outcome_tx = outcome_tx.clone();
             let paths = paths.clone();
@@ -5001,10 +5018,7 @@ impl SetDisks {
             let paths = paths.clone();
             async move {
                 let allow_batch = scanner_publication_commit_scope.is_none();
-                let RenameOutcomeProducers {
-                    outcomes: mut outcome_rx,
-                    mut tasks,
-                } = Self::spawn_rename_outcome_producers(RenameOutcomeProducerArgs {
+                let producers = RenameOutcomeProducerArgs {
                     disks: fanout_disks.clone(),
                     file_infos: file_infos.clone(),
                     fence_tokens: fanout_fence_tokens.clone(),
@@ -5014,7 +5028,12 @@ impl SetDisks {
                     write_quorum,
                     allow_batch,
                     dispatch_deadline: None,
-                });
+                };
+                let plan = producers.plan();
+                let RenameOutcomeProducers {
+                    outcomes: mut outcome_rx,
+                    mut tasks,
+                } = Self::spawn_rename_outcome_producers(producers, plan);
 
                 let mut commit_tx = Some(commit_tx);
                 let mut sent_commit = false;
@@ -5393,10 +5412,7 @@ impl SetDisks {
             } else {
                 (None, None)
             };
-            let RenameOutcomeProducers {
-                outcomes: mut outcome_rx,
-                mut tasks,
-            } = Self::spawn_rename_outcome_producers(RenameOutcomeProducerArgs {
+            let producers = RenameOutcomeProducerArgs {
                 disks: fanout_disks,
                 file_infos: fanout_file_infos.clone(),
                 fence_tokens: fanout_fence_tokens,
@@ -5406,10 +5422,11 @@ impl SetDisks {
                 write_quorum,
                 allow_batch,
                 dispatch_deadline,
-            });
+            };
+            let plan = producers.plan();
             let mut results = Vec::with_capacity(disk_count);
             let mut successful = 0;
-            while let Some(outcome) = outcome_rx.recv().await {
+            let mut accept = |outcome: SlotRenameOutcome| {
                 if let Some(tx) = dispatch_deadline_tx.as_ref()
                     && matches!(&outcome.completion, Ok(Ok(_)))
                 {
@@ -5419,8 +5436,44 @@ impl SetDisks {
                     }
                 }
                 results.push(outcome);
+            };
+            // Publication-scoped and protected multipart renames retain the
+            // streamed path. A pure unary plan returns one outcome per task.
+            if allow_batch && plan.batch_groups.is_empty() {
+                let successful_completion_rank =
+                    rustfs_io_metrics::put_stage_metrics_enabled().then(|| Arc::new(AtomicUsize::new(0)));
+                let resource_unit = crate::disk::current_resource_unit();
+                let mut tasks = JoinSet::new();
+                for context in producers.unary_slots(0, &successful_completion_rank) {
+                    #[cfg(test)]
+                    let (paths, slot) = (context.paths.clone(), context.slot);
+                    let producer = Self::run_unary_rename_slot(context);
+                    #[cfg(test)]
+                    let producer = async move {
+                        let outcome = producer.await;
+                        rollback_fault_injection::before_joined_slot_outcome(&paths.dst_object, slot);
+                        outcome
+                    };
+                    let producer = crate::disk::with_optional_resource_unit(resource_unit.clone(), producer);
+                    tasks.spawn(crate::disk::with_detached_disk_io_context(producer));
+                }
+                drop((producers, resource_unit, successful_completion_rank));
+                while let Some(joined) = tasks.join_next().await {
+                    // A missing outcome still has the original conservative rollback state.
+                    if let Ok(outcome) = joined {
+                        accept(outcome);
+                    }
+                }
+            } else {
+                let RenameOutcomeProducers {
+                    outcomes: mut outcome_rx,
+                    mut tasks,
+                } = Self::spawn_rename_outcome_producers(producers, plan);
+                while let Some(outcome) = outcome_rx.recv().await {
+                    accept(outcome);
+                }
+                while tasks.join_next().await.is_some() {}
             }
-            while tasks.join_next().await.is_some() {}
             #[cfg(test)]
             rollback_fault_injection::after_fanout(&fanout_paths.dst_object);
             (results, fanout_file_infos)
@@ -7896,6 +7949,7 @@ pub(in crate::set_disk) mod rollback_fault_injection {
         IoAfterRename,
         VolumeNotFoundAfterRename,
         PanicAfterRename,
+        SlotOutcomePanic,
         CoordinatorPanic,
         RollbackCoordinatorPanic,
     }
@@ -7958,6 +8012,17 @@ pub(in crate::set_disk) mod rollback_fault_injection {
             .copied();
         if matches!(fault, Some((_, Fault::CoordinatorPanic))) {
             panic!("injected rename coordinator panic");
+        }
+    }
+
+    pub(super) fn before_joined_slot_outcome(object: &str, disk_index: usize) {
+        let fault = registry()
+            .lock()
+            .expect("rollback registry should not poison")
+            .get(object)
+            .copied();
+        if matches!(fault, Some((target, Fault::SlotOutcomePanic)) if target == disk_index) {
+            panic!("injected panic before delivering the rename slot outcome");
         }
     }
 
@@ -14772,6 +14837,54 @@ mod tests {
                 "disk {idx} must not expose a fresh object after strict quorum rollback and reopen: {read:?}"
             );
         }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(capacity_dirty_scope)]
+    async fn rename_data_missing_join_outcome_retains_indeterminate_slot() {
+        let _mode = durability_mode_override::set(DurabilityMode::Strict);
+        let bucket = "rename-missing-join-bucket";
+        let object = "rename-missing-join-object";
+        let disk_count = 4;
+        let (dirs, disks) = call_counter_local_disks(bucket, disk_count).await;
+        prepare_rename_source_dirs(&dirs, &disks, "source").await;
+        let file_infos = rename_commit_fileinfos(object, disk_count, "missing-join-etag");
+        let _fault = rollback_fault_injection::arm(object, 3, rollback_fault_injection::Fault::SlotOutcomePanic);
+        let receipt = RenameRollbackReceipt::default();
+
+        let result = tokio::time::timeout(
+            BARRIER_PAUSE_GUARD,
+            SetDisks::rename_data_owned_with_fence(
+                &disks,
+                (RUSTFS_META_TMP_BUCKET, "source"),
+                file_infos,
+                (bucket, object),
+                false,
+                RenameDataFenceOptions::new(disk_count, None).with_rollback_receipt(receipt.clone()),
+            ),
+        )
+        .await
+        .expect("the missing outcome must not prevent draining the fanout");
+        assert_eq!(result.err(), Some(DiskError::ErasureWriteQuorum));
+        let report = receipt.0.get().expect("rollback evidence must be recorded");
+        assert!(
+            report.disks[..3]
+                .iter()
+                .all(|disk| disk.outcome == RenameRollbackOutcome::Succeeded)
+        );
+        assert_eq!(report.disks[3].outcome, RenameRollbackOutcome::Indeterminate(DiskError::Unexpected));
+
+        for dir in dirs.iter().take(3) {
+            let reopened = reopen_local_disk(dir).await;
+            let result = reopened.read_version("", bucket, object, "", &ReadOptions::default()).await;
+            assert!(matches!(result, Err(DiskError::FileNotFound | DiskError::FileVersionNotFound)));
+        }
+        let unknown = reopen_local_disk(&dirs[3]).await;
+        let retained = unknown
+            .read_version("", bucket, object, "", &ReadOptions::default())
+            .await
+            .expect("an unobserved mutation retains its recovery material");
+        assert_eq!(retained.metadata.get("etag").map(String::as_str), Some("missing-join-etag"));
     }
 
     #[tokio::test]
