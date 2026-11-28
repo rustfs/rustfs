@@ -59,6 +59,10 @@ pub(crate) struct S3StackService<G, C = G, W = G> {
 #[derive(Clone)]
 pub(super) struct OriginalS3Path(pub(super) PathAndQuery);
 
+/// The URI authority selected for S3, used to synthesize `Host` when HTTP/2 or HTTP/3 omits it.
+#[derive(Clone)]
+pub(super) struct OriginalS3Authority(pub(super) http::uri::Authority);
+
 impl OriginalS3Path {
     fn from_uri(uri: &http::Uri) -> Option<Self> {
         let target = uri.path_and_query()?;
@@ -199,6 +203,9 @@ impl<G, C, W> GatewayServices<G, C, W> {
             let mut request = request;
             if let Some(path) = OriginalS3Path::from_uri(request.uri()) {
                 request.extensions_mut().insert(path);
+            }
+            if let Some(authority) = request.uri().authority().cloned() {
+                request.extensions_mut().insert(OriginalS3Authority(authority));
             }
             return Box::pin(self.s3.call(request));
         }

@@ -14,7 +14,7 @@
 
 //! Gateway registrations for object copy and multipart completion.
 
-use super::object_write::{request_version_id, retain_until};
+use super::object_write::{request_version_id, retain_until_with_offset};
 use super::{OpRow, Served, row};
 use crate::app::multipart_usecase::{UploadPartCopyWriteInput, UploadPartTarget};
 use crate::app::object_usecase::{
@@ -85,7 +85,7 @@ impl Served for dto::CopyObject {
             query_version: version_id.as_deref(),
             tagging: input.tagging.as_deref(),
             tagging_directive: input.tagging_directive.as_ref().map(|value| value.as_str()),
-            retain_until: retain_until(input.object_lock_retain_until_date.as_ref())?,
+            retain_until: retain_until_with_offset(input.object_lock_retain_until_date.as_ref(), request.context().object_lock_retain_until_offset_seconds())?,
             legal_hold: input.object_lock_legal_hold_status.is_some(),
             retention: input.object_lock_mode.is_some() || input.object_lock_retain_until_date.is_some(),
         };
@@ -94,7 +94,8 @@ impl Served for dto::CopyObject {
 
     async fn execute(context: Option<Arc<AppContext>>, envelope: RequestEnvelope, request: Req<Self>) -> S3Result<Resp<Self>> {
         let source = copy_source(&request)?;
-        let input = copy_input(request.into_input(), source, request_version_id(&envelope))?;
+        let retain_until_offset = request.context().object_lock_retain_until_offset_seconds();
+        let input = copy_input(request.into_input(), source, request_version_id(&envelope), retain_until_offset)?;
         let output = DefaultObjectUsecase::with_context(context)
             .execute_copy_object_owned(envelope, input)
             .await?;
@@ -211,6 +212,7 @@ fn copy_input(
     input: dto::CopyObjectInput,
     copy_source: Option<CopySourceValue>,
     version_id: Option<String>,
+    retain_until_offset: Option<i32>,
 ) -> S3Result<CopyObjectWriteInput> {
     Ok(CopyObjectWriteInput {
         copy_source,
@@ -244,7 +246,7 @@ fn copy_input(
         website_redirect_location: input.website_redirect_location,
         object_lock_legal_hold_status: input.object_lock_legal_hold_status.map(|value| value.as_str().to_owned()),
         object_lock_mode: input.object_lock_mode.map(|value| value.as_str().to_owned()),
-        object_lock_retain_until_date: retain_until(input.object_lock_retain_until_date.as_ref())?,
+        object_lock_retain_until_date: retain_until_with_offset(input.object_lock_retain_until_date.as_ref()), retain_until_offset?,
         storage_class: input.storage_class.map(|value| value.as_str().to_owned()),
         checksum_algorithm: input.checksum_algorithm.map(|value| value.as_str().to_owned()),
     })

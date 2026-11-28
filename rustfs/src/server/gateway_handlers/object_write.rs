@@ -195,10 +195,6 @@ fn put_object_retain_until(request: &Req<dto::PutObject>) -> S3Result<Option<tim
     )
 }
 
-pub(super) fn retain_until(value: Option<&Timestamp>) -> S3Result<Option<time::OffsetDateTime>> {
-    retain_until_with_offset(value, None)
-}
-
 pub(super) fn retain_until_with_offset(
     value: Option<&Timestamp>,
     offset_seconds: Option<i32>,
