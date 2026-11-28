@@ -8,6 +8,7 @@ from pathlib import Path
 import subprocess
 import sys
 import tempfile
+import tomllib
 import unittest
 from unittest.mock import patch
 
@@ -560,6 +561,22 @@ class GateTests(unittest.TestCase):
         jobs[gate.LINT_JOB]['steps'] = [{'run': 'cargo clippy --all-targets -- -D warnings'}]
         jobs[gate.ADVISORIES_JOB]['runs-on'] = 'ubuntu-latest'
         jobs[gate.ADVISORIES_JOB]['steps'] = [{'run': 'python3 scripts/security/check_advisories.py --output artifacts/advisories/advisories-gate.json'}]
+        jobs[gate.SECURITY_INPUT_JOB] = {
+            'name': 'Security Input Gate',
+            'needs': ['classify-changes'],
+            'if': "github.event_name != 'pull_request' || github.event.action != 'closed'",
+            'uses': gate.SECURITY_INPUT_WORKFLOW,
+            'with': {
+                'mode': 'smoke',
+                'targets': 'auto',
+                'max_total_time': '60',
+                'base_sha': '${{ github.event.pull_request.base.sha }}',
+                'head_sha': '${{ github.sha }}',
+                'event_name': '${{ github.event_name }}',
+                'ref_name': '${{ github.ref }}',
+                'ci_mode': '${{ needs.classify-changes.outputs.mode }}',
+            },
+        }
         jobs['workspace-tests']['needs'] = [gate.ARCHIVE_PRODUCER]
         jobs['classify-changes']['steps'] = [{'id': 'scope', 'run': f"grep -q '^plan_contract={gate.PLAN_CONTRACT}$' \"$GITHUB_OUTPUT\""}]
         jobs['test-and-lint-protocols']['strategy'] = {'matrix': {'features': [
@@ -779,6 +796,95 @@ class GateTests(unittest.TestCase):
             changed = copy.deepcopy(workflow)
             mutate(changed)
             self.assertIn(message, self.check(changed), case)
+
+    def test_security_input_gate_lane_gates_every_event_and_validates_contract(self):
+        job = gate.SECURITY_INPUT_JOB
+        self.assertIn(job, gate.ALWAYS_JOBS)
+        for event, mode in (('pull_request', 'docs'), ('pull_request', 'e2e'), ('pull_request', 'full'),
+                            ('push', 'full'), ('push', 'proven'), ('merge_group', 'full'),
+                            ('schedule', 'full'), ('workflow_dispatch', 'full')):
+            plan = self.plan(event, mode)
+            self.assertEqual(plan['jobs'][job], 'success', (event, mode))
+            self.assertEqual(gate.verify_results(self.needs(plan), event, plan['ref']), [])
+            for bad in ('failure', 'cancelled', 'skipped', None):
+                needs = self.needs(plan)
+                needs[job]['result'] = bad
+                errors = gate.verify_results(needs, event, plan['ref'])
+                self.assertTrue(any(error.startswith(f'{job}: expected success') for error in errors), (event, mode, bad, errors))
+        workflow = self.workflow()
+        self.assertEqual(self.check(workflow), [])
+        for case, (mutate, message) in enumerate((
+            (lambda w: w['jobs']['required-checks']['needs'].remove(job), 'required-checks must directly depend on every verification job exactly once'),
+            (lambda w: w['jobs'][job].update({'name': 'Dynamic ${{ github.ref }}'}), f"{job} must keep stable display name 'Security Input Gate'"),
+            (lambda w: w['jobs'][job].update({'uses': './.github/workflows/other.yml'}), f'{job} must call reusable workflow {gate.SECURITY_INPUT_WORKFLOW}'),
+            (lambda w: w['jobs'][job].update({'needs': []}), f'{job} must depend on classify-changes for ci_mode'),
+            (lambda w: w['jobs'][job]['with'].pop('base_sha'), f'{job} missing required with inputs: base_sha'),
+            (lambda w: w['jobs'][job]['with'].update({'shell_cmd': 'id'}), f'{job} has unexpected with inputs: shell_cmd'),
+            (lambda w: w['jobs'][job]['with'].update({'mode': 'nightly'}), f'{job} must invoke fuzz.yml in smoke mode'),
+            (lambda w: w['jobs'][job].update({'continue-on-error': 'true'}), f'{job} cannot convert a validation failure into success'),
+        )):
+            changed = copy.deepcopy(workflow)
+            mutate(changed)
+            self.assertIn(message, self.check(changed), case)
+
+    def test_pull_request_cannot_use_a_changed_scope_selector_to_skip_checks(self):
+        root = Path(gate.__file__).resolve().parent.parent
+        workflow = gate.workflow_document((root / '.github/workflows/fuzz.yml').read_text())
+        step = next(step for step in workflow['jobs']['select-targets']['steps'] if step.get('id') == 'select')
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Repository(Path(directory))
+            selector = 'scripts/fuzz/select_targets.py'
+            for name in (selector, 'fuzz/Cargo.toml'):
+                repo.write(name, (root / name).read_text())
+            base = repo.commit()
+            repo.write('README.md', 'docs only')
+            benign_head = repo.commit()
+            environment = dict(os.environ, CALLER_EVENT='pull_request', CALLER_MODE='smoke', CALLER_TARGETS='auto',
+                               CALLER_BUDGET='60', CALLER_BASE_SHA=base, CALLER_CI_MODE='full',
+                               GITHUB_OUTPUT=str(repo.root / 'outputs'))
+
+            def select(head):
+                subprocess.run(['bash', '-eo', 'pipefail', '-c', step['run']], cwd=repo.root, capture_output=True,
+                               env=dict(environment, CALLER_HEAD_SHA=head), check=True)
+                return json.loads((repo.root / 'artifacts/security-input-gate/selection-manifest.json').read_text())
+
+            self.assertFalse(select(benign_head)['applicable'])
+            repo.write(selector, 'raise RuntimeError("candidate policy executed")')
+            selection = select(repo.commit())
+            self.assertTrue(selection['applicable'])
+            self.assertTrue(selection['run_mutants'])
+            self.assertEqual(selection['reason'], 'unverified_scope_policy')
+            manifest = tomllib.loads((root / 'fuzz/Cargo.toml').read_text())
+            self.assertEqual(selection['targets'], sorted(item['name'] for item in manifest['bin']))
+
+    def test_security_input_jobs_use_the_callers_event(self):
+        root = Path(gate.__file__).resolve().parent.parent
+        caller = gate.workflow_document((root / '.github/workflows/ci.yml').read_text())
+        workflow = gate.workflow_document((root / '.github/workflows/fuzz.yml').read_text())
+        jobs = workflow['jobs']
+        caller_job = caller['jobs'][gate.SECURITY_INPUT_JOB]
+        self.assertNotEqual(caller['concurrency']['group'], workflow['concurrency']['group'])
+        for scope, access in jobs['alert-on-failure']['permissions'].items():
+            self.assertEqual(access, 'read')
+            self.assertEqual(caller_job['permissions'][scope], access)
+        for event, mode, profile, expected in (
+            ('pull_request', 'smoke', '', (True, False, True)),
+            ('merge_group', 'smoke', '', (True, False, True)),
+            ('push', 'smoke', '', (True, False, True)),
+            ('schedule', 'smoke', '', (True, False, True)),
+            ('workflow_dispatch', 'smoke', '', (True, False, True)),
+            ('schedule', '', '', (False, True, False)),
+            ('workflow_dispatch', '', 'both', (True, True, False)),
+            ('workflow_dispatch', '', 'nightly', (False, True, False)),
+            ('workflow_dispatch', '', 'smoke', (True, False, False)),
+        ):
+            context = {'github.repository': 'rustfs/rustfs', 'github.event_name': event, 'inputs.mode': mode,
+                       'github.event.inputs.profile': profile, 'needs.select-targets.outputs.applicable': 'true',
+                       'needs.select-targets.outputs.has_targets': 'true'}
+            with self.subTest(event=event, mode=mode, profile=profile):
+                actual = tuple(gate.condition(jobs[job]['if'], context)
+                               for job in ('pr-fuzz-smoke', 'nightly-fuzz-corpus', 'security-input-gate-verdict'))
+                self.assertEqual(actual, expected)
 
     def test_semantic_yaml_equivalence_and_wiring_boundaries(self):
         workflow = self.workflow()

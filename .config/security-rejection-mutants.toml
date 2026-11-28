@@ -1,0 +1,80 @@
+# Fixed critical security rejection-branch mutation registry (rustfs/backlog#2677).
+#
+# Each entry defines one controlled mutation to a security-critical rejection branch
+# and the exact test(s) that must pass on the baseline tree and fail with an
+# assertion failure when the mutation is applied in an isolated temporary workspace.
+#
+# If a source refactor changes `original_snippet`, update the snippet and its
+# `original_snippet_sha256` explicitly after re-verifying the branch semantics;
+# the checker fails closed on any drift and never skips a case silently.
+
+schema_version = 1
+
+[[cases]]
+id = "presigned_allow_unsigned_amz_header"
+source_file = "rustfs/src/auth.rs"
+symbol = "reject_unsigned_presigned_headers_matching"
+original_snippet_sha256 = "f9734b9cdb2beb647c1bb5f57f94ab0997dce76857b4b9a5bd29a60ec947328f"
+original_snippet = '''
+            "Presigned request rejected"
+        );
+        return Err(owned_error!(AccessDenied, "{UNSIGNED_HEADERS_MESSAGE}"));'''
+mutated_snippet = '''
+            "Presigned request rejected"
+        );
+        continue;'''
+mutation_description = "Bypass AccessDenied rejection for unsigned x-amz-* headers on SigV4 presigned requests"
+package = "rustfs"
+target_kind = "lib"
+selected_tests = [
+  "auth::tests::ghsa_g8w9_presigned_request_rejects_unsigned_x_amz_headers",
+]
+expected_rejection = "Unsigned x-amz-* headers on presigned requests must fail with S3ErrorCode::AccessDenied"
+timeout_seconds = 120
+compile_timeout_seconds = 1800
+
+[[cases]]
+id = "presigned_allow_duplicate_signed_headers"
+source_file = "rustfs/src/auth.rs"
+symbol = "reject_unsigned_presigned_headers_matching"
+original_snippet_sha256 = "672115b42636dab7dbc99afb88781172053ac6d089459ef74d36facd6b9d9a2e"
+original_snippet = '''
+    if duplicate_signed_headers {
+        signed_headers = None;
+    }'''
+mutated_snippet = '''
+    if duplicate_signed_headers {
+        let _ = &signed_headers;
+    }'''
+mutation_description = "Allow duplicate X-Amz-SignedHeaders query parameter to widen the signed header set instead of failing closed"
+package = "rustfs"
+target_kind = "lib"
+selected_tests = [
+  "auth::tests::ghsa_g8w9_presigned_request_rejects_unsigned_x_amz_headers",
+]
+expected_rejection = "Duplicate X-Amz-SignedHeaders query parameters must sign nothing and reject unsigned x-amz-* headers with AccessDenied"
+timeout_seconds = 120
+compile_timeout_seconds = 1800
+
+[[cases]]
+id = "notify_xml_allow_duplicate_queue"
+source_file = "crates/notify/src/rules/xml_config.rs"
+symbol = "NotificationConfiguration::validate"
+original_snippet_sha256 = "080d5abdb2c69e013480d7b83c89d1af070ad2d376668ee8d55265805c93106b"
+original_snippet = '''
+            if !unique_queues.insert(queue_key.clone()) {
+                return Err(ParseConfigError::DuplicateQueueConfiguration(queue_key.0, queue_key.1));
+            }'''
+mutated_snippet = '''
+            if !unique_queues.insert(queue_key.clone()) {
+                let _ = queue_key;
+            }'''
+mutation_description = "Remove DuplicateQueueConfiguration rejection when two QueueConfiguration entries share the same (id, arn)"
+package = "rustfs-notify"
+target_kind = "lib"
+selected_tests = [
+  "rules::xml_config::notification_xml_validation_tests::duplicate_queue_configuration_is_rejected",
+]
+expected_rejection = "Duplicate (id, arn) QueueConfiguration entries must fail validation with ParseConfigError::DuplicateQueueConfiguration"
+timeout_seconds = 120
+compile_timeout_seconds = 1800

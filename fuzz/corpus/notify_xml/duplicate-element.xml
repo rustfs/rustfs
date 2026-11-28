@@ -1,0 +1,9 @@
+<NotificationConfiguration>
+  <QueueConfiguration>
+    <Id>dup-elem</Id>
+    <Id>dup-elem-2</Id>
+    <Queue>arn:rustfs:sqs:us-east-1:1:webhook</Queue>
+    <Event>s3:ObjectCreated:Put</Event>
+    <Event>s3:ObjectCreated:Put</Event>
+  </QueueConfiguration>
+</NotificationConfiguration>

@@ -1399,4 +1399,94 @@ mod tests {
         let sent = collect_in_memory_body(signed.into_body());
         assert_eq!(hex_sha256(&sent, str::to_owned), committed);
     }
+
+    #[test]
+    fn try_sign_and_presign_v4_handle_corpus_valid_duplicate_and_malformed_inputs() {
+        let fixed_time = datetime!(2026-09-01 00:00:00 UTC);
+        let access_key = "FUZZTESTACCESSKEY0001";
+        let secret_key = "FUZZTESTSECRETKEY_DO_NOT_LEAK_0001";
+
+        // Valid minimal + duplicate/encoding-equivalent query parameters.
+        let req = request::Request::builder()
+            .method(http::Method::GET)
+            .uri("https://bucket.example.com/object?a=1&a=2&space=hello+world&space2=hello%20world")
+            .header("host", "bucket.example.com")
+            .header("x-amz-content-sha256", UNSIGNED_PAYLOAD)
+            .body(())
+            .expect("valid request should build");
+        let presigned = try_pre_sign_v4(req, access_key, secret_key, "", "us-east-1", 900, fixed_time)
+            .expect("valid request with duplicate query keys should presign");
+        let query = presigned.uri().query().expect("presigned URI must have query");
+        assert!(query.contains("X-Amz-Algorithm=AWS4-HMAC-SHA256"));
+        assert!(query.contains("X-Amz-Signature="));
+        assert!(!query.contains(secret_key), "presigned URI must never leak secret key");
+
+        // Invalid percent-encoding in query must not panic and must not leak secret key.
+        let bad_pct = request::Request::builder()
+            .method(http::Method::GET)
+            .uri("https://bucket.example.com/object?bad=%ZZ&truncated=%2")
+            .header("host", "bucket.example.com")
+            .body(())
+            .expect("bad percent-encoding URI builds in http::Uri");
+        let bad_pct_signed = try_pre_sign_v4(bad_pct, access_key, secret_key, "", "us-east-1", 900, fixed_time)
+            .expect("presign handles malformed query encoding without panicking");
+        assert!(!bad_pct_signed.uri().to_string().contains(secret_key));
+
+        // Oversized header value stays well-behaved without panicking.
+        let oversized = request::Request::builder()
+            .method(http::Method::GET)
+            .uri("https://bucket.example.com/object?k=v")
+            .header("host", "bucket.example.com")
+            .header("x-amz-meta-large", "a".repeat(4096))
+            .body(())
+            .expect("oversized header request should build");
+        let signed_oversized = try_sign_v4(oversized, 0, access_key, secret_key, "", "us-east-1")
+            .expect("oversized ASCII header should sign cleanly");
+        let auth = signed_oversized.headers()["authorization"]
+            .to_str()
+            .expect("authorization header is ASCII");
+        assert!(auth.starts_with("AWS4-HMAC-SHA256 "));
+        assert!(!auth.contains(secret_key));
+    }
+
+    #[test]
+    fn try_sign_and_presign_v4_reject_missing_host_and_invalid_header_bytes() {
+        let fixed_time = datetime!(2026-09-01 00:00:00 UTC);
+        let access_key = "FUZZTESTACCESSKEY0001";
+        let secret_key = "FUZZTESTSECRETKEY_DO_NOT_LEAK_0001";
+
+        let missing_host_presign = request::Request::builder()
+            .method(http::Method::GET)
+            .uri("/relative/no-host?prefix=logs")
+            .body(())
+            .expect("relative URI request should build");
+        assert!(matches!(
+            try_pre_sign_v4(missing_host_presign, access_key, secret_key, "", "us-east-1", 900, fixed_time),
+            Err(SignV4Error::InvalidUri { .. })
+        ));
+
+        let missing_host_sign = request::Request::builder()
+            .method(http::Method::GET)
+            .uri("/relative/no-host?prefix=logs")
+            .body(())
+            .expect("relative URI request should build");
+        assert!(matches!(
+            try_sign_v4(missing_host_sign, 0, access_key, secret_key, "", "us-east-1"),
+            Err(SignV4Error::InvalidUri { .. })
+        ));
+
+        let mut bad_header_req = request::Request::builder()
+            .method(http::Method::GET)
+            .uri("https://bucket.example.com/object")
+            .header("host", "bucket.example.com")
+            .body(())
+            .expect("request should build");
+        bad_header_req
+            .headers_mut()
+            .insert("x-amz-meta-bin", HeaderValue::from_bytes(b"val\xff\xfe").expect("opaque bytes"));
+        assert!(matches!(
+            try_sign_v4(bad_header_req, 0, access_key, secret_key, "", "us-east-1"),
+            Err(SignV4Error::InvalidHeaderValue { ref name }) if name == "x-amz-meta-bin"
+        ));
+    }
 }

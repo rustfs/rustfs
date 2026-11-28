@@ -15,20 +15,48 @@
 name: Fuzz
 
 on:
-  pull_request:
-    types: [ opened, synchronize, reopened, closed ]
-    # Run when the harness or any directly fuzzed production crate changes.
-    paths:
-      - "fuzz/**"
-      - "scripts/fuzz/**"
-      - "crates/ecstore/**"
-      - "crates/filemeta/**"
-      - "crates/policy/**"
-      - "crates/security-governance/**"
-      - "crates/utils/**"
-      - "Cargo.toml"
-      - "Cargo.lock"
-      - ".github/workflows/fuzz.yml"
+  workflow_call:
+    inputs:
+      mode:
+        description: "Fuzz execution mode (smoke or nightly)"
+        required: false
+        default: "smoke"
+        type: string
+      targets:
+        description: "Registered target selector: auto, all, or comma-separated target names"
+        required: false
+        default: "auto"
+        type: string
+      max_total_time:
+        description: "Per-target libFuzzer time budget in seconds"
+        required: false
+        default: "60"
+        type: string
+      base_sha:
+        description: "Base commit SHA for trusted changed-path target selection"
+        required: false
+        default: ""
+        type: string
+      head_sha:
+        description: "Candidate head commit SHA"
+        required: false
+        default: ""
+        type: string
+      event_name:
+        description: "Calling GitHub event name"
+        required: false
+        default: ""
+        type: string
+      ref_name:
+        description: "Calling Git ref"
+        required: false
+        default: ""
+        type: string
+      ci_mode:
+        description: "CI scope mode from caller classify-changes"
+        required: false
+        default: ""
+        type: string
   schedule:
     - cron: "17 2 * * *"
   workflow_dispatch:
@@ -42,43 +70,250 @@ on:
           - smoke
           - nightly
           - both
+      targets:
+        description: "Registered target selector: auto, all, or comma-separated target names"
+        required: false
+        default: "all"
+        type: string
 
 permissions:
   contents: read
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
-  cancel-in-progress: true
+  # The caller owns cancellation for its run, including main pushes and merge groups.
+  group: fuzz-${{ github.workflow }}-${{ github.event_name }}-${{ inputs.mode && github.run_id || github.ref }}
+  cancel-in-progress: ${{ github.event_name != 'schedule' }}
 
 env:
   CARGO_TERM_COLOR: always
-  CARGO_BUILD_TARGET: x86_64-unknown-linux-gnu
-  # Fuzz targets build without the dial9 feature, so tokio_unstable is not needed.
-  RUSTFLAGS: "-C target-feature=-crt-static"
+  RUST_BACKTRACE: 1
 
 jobs:
-  cancel-closed-pr-runs:
-    name: Cancel Closed PR Runs
-    if: github.event_name == 'pull_request' && github.event.action == 'closed'
+  # ──────────────────────────────────────────────────────────────
+  # Phase 0: Trusted target & mutant selection (fail-closed).
+  # ──────────────────────────────────────────────────────────────
+  select-targets:
+    name: Select Fuzz and Mutant Scope
+    if: github.repository == 'rustfs/rustfs'
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    outputs:
+      applicable: ${{ steps.select.outputs.applicable }}
+      reason: ${{ steps.select.outputs.reason }}
+      mode: ${{ steps.select.outputs.mode }}
+      max_total_time: ${{ steps.select.outputs.max_total_time }}
+      targets_json: ${{ steps.select.outputs.targets_json }}
+      targets_csv: ${{ steps.select.outputs.targets_csv }}
+      has_targets: ${{ steps.select.outputs.has_targets }}
+      run_mutants: ${{ steps.select.outputs.run_mutants }}
     steps:
-      - name: Explain cancellation run
-        run: echo "PR closed; this run only cancels older runs in the same concurrency group."
+      - name: Checkout repository
+        uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7
+        with:
+          fetch-depth: 2
+          persist-credentials: false
+
+      - name: Compute trusted target selection
+        id: select
+        env:
+          CALLER_EVENT: ${{ inputs.event_name || github.event_name }}
+          CALLER_MODE: ${{ inputs.mode || ((github.event_name == 'schedule' || inputs.profile == 'nightly') && 'nightly' || 'smoke') }}
+          CALLER_TARGETS: ${{ (inputs.mode == '' && (github.event_name == 'schedule' || inputs.profile == 'nightly' || inputs.profile == 'both')) && 'all' || inputs.targets || 'auto' }}
+          CALLER_BUDGET: ${{ inputs.max_total_time || (github.event_name == 'schedule' && '300' || '60') }}
+          CALLER_BASE_SHA: ${{ inputs.base_sha || '' }}
+          CALLER_HEAD_SHA: ${{ inputs.head_sha || github.sha }}
+          CALLER_CI_MODE: ${{ inputs.ci_mode || '' }}
+        run: |
+          if [[ "$CALLER_BASE_SHA" =~ ^[0-9a-f]{40}$ ]] && [[ "$CALLER_BASE_SHA" != "0000000000000000000000000000000000000000" ]]; then
+            git cat-file -e "${CALLER_BASE_SHA}^{commit}" 2>/dev/null || git fetch --no-tags --depth=1 origin "$CALLER_BASE_SHA" || true
+          fi
+          mkdir -p artifacts/security-input-gate
+          # A PR may change the selector itself. In that case derive the full matrix
+          # from the manifest as data, without running the candidate's policy.
+          if [[ "$CALLER_EVENT" == pull_request ]] && ! git diff --quiet "$CALLER_BASE_SHA" HEAD -- scripts/fuzz/select_targets.py fuzz/Cargo.toml; then
+            python3 -I - <<'PY'
+          import hashlib, json, os, re, tomllib
+          from pathlib import Path
+
+          targets = sorted(item["name"] for item in tomllib.loads(Path("fuzz/Cargo.toml").read_text())["bin"])
+          if not targets or len(set(targets)) != len(targets) or not all(re.fullmatch(r"[a-z0-9_]+", name) for name in targets):
+              raise SystemExit("Invalid fuzz target manifest")
+          budget = int(os.environ["CALLER_BUDGET"])
+          mode = os.environ["CALLER_MODE"]
+          if not 1 <= budget <= 3600 or mode not in ("smoke", "nightly"):
+              raise SystemExit("Invalid fuzz execution parameters")
+          selection = dict(schema_version=1, applicable=True, reason="unverified_scope_policy", event_name="pull_request",
+                           mode=mode, max_total_time=budget, targets=targets, run_mutants=True, changed_files_count=None,
+                           base_sha=os.environ["CALLER_BASE_SHA"], head_sha=os.environ["CALLER_HEAD_SHA"])
+          selection["manifest_sha256"] = hashlib.sha256(json.dumps(selection, sort_keys=True).encode()).hexdigest()
+          Path("artifacts/security-input-gate/selection-manifest.json").write_text(json.dumps(selection, indent=2) + "\n")
+          with open(os.environ["GITHUB_OUTPUT"], "a") as output:
+              print("applicable=true", "reason=unverified_scope_policy", f"mode={mode}", f"max_total_time={budget}",
+                    f"targets_json={json.dumps(targets)}", f"targets_csv={','.join(targets)}", "has_targets=true",
+                    "run_mutants=true", sep="\n", file=output)
+          PY
+            exit 0
+          fi
+          python3 -I scripts/fuzz/select_targets.py \
+            --event-name "$CALLER_EVENT" \
+            --mode "$CALLER_MODE" \
+            --max-total-time "$CALLER_BUDGET" \
+            --targets "$CALLER_TARGETS" \
+            --base-sha "$CALLER_BASE_SHA" \
+            --head-sha "$CALLER_HEAD_SHA" \
+            --ci-mode "$CALLER_CI_MODE" \
+            --output artifacts/security-input-gate/selection-manifest.json
+
+      - name: Upload selection manifest
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: fuzz-selection-manifest-${{ github.run_id }}-${{ github.run_attempt }}
+          path: artifacts/security-input-gate/selection-manifest.json
+          if-no-files-found: error
+          retention-days: 7
 
   # ──────────────────────────────────────────────────────────────
-  # Phase 1: Build all fuzz harness binaries once.
+  # Phase 1: Build selected fuzz harness binaries once.
   # ──────────────────────────────────────────────────────────────
   fuzz-build:
     name: Build Fuzz Harness
+    needs: [select-targets]
     if: >
-      github.repository == 'rustfs/rustfs' && (
-        (github.event_name == 'pull_request' && github.event.action != 'closed') ||
-        github.event_name == 'schedule' ||
-        github.event_name == 'workflow_dispatch'
-      )
+      github.repository == 'rustfs/rustfs' &&
+      needs.select-targets.outputs.applicable == 'true' &&
+      needs.select-targets.outputs.has_targets == 'true'
+    # Self-hosted runner required: nightly libFuzzer builds exceed hosted disk budget.
     runs-on: sm-standard-4
-    timeout-minutes: 60
+    # A cold build links seven instrumented binaries, about 13 minutes each.
+    timeout-minutes: 120
+    env:
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+      CARGO_BUILD_TARGET: x86_64-unknown-linux-gnu
+      # Fuzz targets build without the dial9 feature, so tokio_unstable is not needed.
+      RUSTFLAGS: "-C target-feature=-crt-static"
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7
+        with:
+          persist-credentials: false
+
+      - name: Setup Rust environment
+        uses: ./.github/actions/setup
+        with:
+          rust-version: nightly
+          cache-shared-key: fuzz-nightly-${{ env.CARGO_BUILD_TARGET }}-${{ hashFiles('fuzz/Cargo.lock', 'fuzz/Cargo.toml', 'fuzz/fuzz_targets/**') }}
+          cache-save-if: ${{ github.ref == 'refs/heads/main' || github.event_name == 'schedule' }}
+
+      - name: Install cargo-fuzz
+        uses: taiki-e/install-action@7623a79cdfecb99d681017af368ca353d9f49bb5 # v2
+        with:
+          tool: cargo-fuzz
+
+      - name: Build selected fuzz targets
+        env:
+          FUZZ_TARGET: ${{ needs.select-targets.outputs.targets_csv }}
+        run: BUILD_ONLY=1 ./scripts/fuzz/run.sh
+
+      - name: Stage prebuilt fuzz binaries
+        env:
+          SELECTED_TARGETS_CSV: ${{ needs.select-targets.outputs.targets_csv }}
+        run: |
+          binary_root="fuzz/prebuilt/${CARGO_BUILD_TARGET}/release"
+          mkdir -p "${binary_root}"
+          # Keep this list in sync with fuzz/Cargo.toml, scripts/fuzz/run.sh,
+          # scripts/fuzz/select_targets.py, and the nightly matrix below (all 7
+          # buildable bins). The *_storage_api.rs files are `mod` submodules.
+          for target in archive_extract bucket_validation local_metadata notify_xml path_containment policy_ingress sigv4_request; do
+            case ",${SELECTED_TARGETS_CSV}," in
+              *",${target},"*)
+                install -Dm755 "fuzz/target/${CARGO_BUILD_TARGET}/release/${target}" "${binary_root}/${target}"
+                ;;
+            esac
+          done
+
+      - name: Upload prebuilt fuzz binaries
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: fuzz-prebuilt-binaries-${{ github.run_id }}-${{ github.run_attempt }}
+          path: fuzz/prebuilt/${{ env.CARGO_BUILD_TARGET }}/release/
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 0
+
+  # ──────────────────────────────────────────────────────────────
+  # Phase 2 (Smoke / PR / Merge Queue): Run selected targets in parallel.
+  # ──────────────────────────────────────────────────────────────
+  pr-fuzz-smoke:
+    name: "Smoke / ${{ matrix.target }}"
+    needs: [select-targets, fuzz-build]
+    if: >
+      needs.select-targets.outputs.applicable == 'true' &&
+      needs.select-targets.outputs.has_targets == 'true' && (
+        inputs.mode != '' ||
+        (github.event_name == 'workflow_dispatch' &&
+          (github.event.inputs.profile == 'smoke' || github.event.inputs.profile == 'both'))
+      )
+    # Runs prebuilt binary on matching self-hosted runner architecture.
+    runs-on: sm-standard-4
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        target: ${{ fromJSON(needs.select-targets.outputs.targets_json) }}
+    env:
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+      CARGO_BUILD_TARGET: x86_64-unknown-linux-gnu
+      # Fuzz targets build without the dial9 feature, so tokio_unstable is not needed.
+      RUSTFLAGS: "-C target-feature=-crt-static"
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7
+        with:
+          persist-credentials: false
+
+      - name: Download prebuilt fuzz binaries
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: fuzz-prebuilt-binaries-${{ github.run_id }}-${{ github.run_attempt }}
+          path: fuzz/prebuilt/${{ env.CARGO_BUILD_TARGET }}/release
+
+      - name: Restore executable bit
+        run: chmod +x "fuzz/prebuilt/${CARGO_BUILD_TARGET}/release/${{ matrix.target }}"
+
+      - name: Run ${{ matrix.target }}
+        env:
+          FUZZ_TARGET: ${{ matrix.target }}
+          MAX_TOTAL_TIME: ${{ needs.select-targets.outputs.max_total_time }}
+          SKIP_BUILD: 1
+          USE_PREBUILT_BINARY: 1
+          PREBUILT_BINARY_DIR: ${{ github.workspace }}/fuzz/prebuilt/${{ env.CARGO_BUILD_TARGET }}/release
+        run: ./scripts/fuzz/run.sh
+
+      - name: Upload fuzz smoke artifacts
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: fuzz-smoke-${{ matrix.target }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            fuzz/artifacts/**
+            fuzz/corpus/${{ matrix.target }}/**
+          if-no-files-found: error
+          retention-days: 7
+
+  # ──────────────────────────────────────────────────────────────
+  # Phase 2b: Fixed critical rejection-branch mutation verification.
+  # ──────────────────────────────────────────────────────────────
+  rejection-mutants:
+    name: Security Rejection Mutants
+    needs: [select-targets]
+    if: >
+      github.repository == 'rustfs/rustfs' &&
+      needs.select-targets.outputs.applicable == 'true' &&
+      needs.select-targets.outputs.run_mutants == 'true'
+    # Self-hosted runner required: builds rustfs + rustfs-notify test targets.
+    runs-on: sm-standard-4
+    # Allow for the baseline and the isolated rebuilds, each with its own compile deadline.
+    timeout-minutes: 150
     env:
       FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
     steps:
@@ -90,113 +325,55 @@ jobs:
       - name: Setup Rust environment
         uses: ./.github/actions/setup
         with:
-          rust-version: nightly
-          cache-shared-key: fuzz-${{ hashFiles('fuzz/Cargo.lock') }}
-          cache-save-if: ${{ github.ref == 'refs/heads/main' || github.event_name == 'schedule' }}
+          rust-version: stable
+          cache-shared-key: ci-dev-ea7eec74fe14
+          cache-save-if: 'false'
+          install-build-packaging-tools: 'false'
 
-      - name: Install cargo-fuzz
-        uses: taiki-e/install-action@7623a79cdfecb99d681017af368ca353d9f49bb5 # v2
-        with:
-          tool: cargo-fuzz
-
-      - name: Build all fuzz targets
-        run: BUILD_ONLY=1 ./scripts/fuzz/run.sh
-
-      - name: Stage prebuilt fuzz binaries
-        run: |
-          binary_root="fuzz/prebuilt/${CARGO_BUILD_TARGET}/release"
-          mkdir -p "${binary_root}"
-          # Keep this list in sync with the smoke/nightly matrices and
-          # scripts/fuzz/run.sh default target set (all 5 buildable bins in
-          # fuzz/Cargo.toml). The *_storage_api.rs files are `mod` submodules
-          # of their parent targets, not standalone bins.
-          for target in archive_extract bucket_validation local_metadata path_containment policy_ingress; do
-            install -Dm755 "fuzz/target/${CARGO_BUILD_TARGET}/release/${target}" "${binary_root}/${target}"
-          done
-
-      - name: Upload prebuilt fuzz binaries
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        with:
-          name: fuzz-prebuilt-binaries-${{ github.run_number }}
-          path: fuzz/prebuilt/${{ env.CARGO_BUILD_TARGET }}/release/
-          if-no-files-found: error
-          retention-days: 1
-          compression-level: 0
-
-  # ──────────────────────────────────────────────────────────────
-  # Phase 2 (PR): Run smoke targets in parallel via matrix.
-  # ──────────────────────────────────────────────────────────────
-  pr-fuzz-smoke:
-    name: "Smoke / ${{ matrix.target }}"
-    needs: fuzz-build
-    if: >
-      (github.event_name == 'pull_request' && github.event.action != 'closed') ||
-      (github.event_name == 'workflow_dispatch' &&
-        (github.event.inputs.profile == 'smoke' || github.event.inputs.profile == 'both'))
-    runs-on: sm-standard-4
-    timeout-minutes: 30
-    strategy:
-      fail-fast: false
-      # One job per target runs in parallel, so wall-clock time is per-target
-      # (~60s fuzz + download/chmod overhead), not the sum across the matrix.
-      matrix:
-        target: [archive_extract, bucket_validation, local_metadata, path_containment, policy_ingress]
-    env:
-      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7
-        with:
-          persist-credentials: false
-
-      - name: Download prebuilt fuzz binaries
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
-        with:
-          name: fuzz-prebuilt-binaries-${{ github.run_number }}
-          path: fuzz/prebuilt/${{ env.CARGO_BUILD_TARGET }}/release
-
-      - name: Restore executable bit
-        run: chmod +x "fuzz/prebuilt/${CARGO_BUILD_TARGET}/release/${{ matrix.target }}"
-
-      - name: Run ${{ matrix.target }}
+      - name: Verify rejection-branch mutants
         env:
-          FUZZ_TARGET: ${{ matrix.target }}
-          MAX_TOTAL_TIME: 60
-          SKIP_BUILD: 1
-          USE_PREBUILT_BINARY: 1
-          PREBUILT_BINARY_DIR: ${{ github.workspace }}/fuzz/prebuilt/${{ env.CARGO_BUILD_TARGET }}/release
-        run: ./scripts/fuzz/run.sh
+          CARGO_TARGET_DIR: ${{ github.workspace }}/target
+          CARGO_INCREMENTAL: "0"
+          CARGO_BUILD_JOBS: "2"
+        run: |
+          mkdir -p artifacts/rejection-mutants
+          python3 scripts/security/check_rejection_mutants.py --self-test
+          python3 scripts/security/check_rejection_mutants.py \
+            --cases .config/security-rejection-mutants.toml \
+            --output artifacts/rejection-mutants/report.json
 
-      - name: Upload fuzz smoke artifacts
+      - name: Upload rejection-mutant evidence
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: fuzz-smoke-${{ matrix.target }}-${{ github.run_number }}
-          path: |
-            fuzz/artifacts/**
-            fuzz/corpus/${{ matrix.target }}/**
+          name: rejection-mutants-${{ github.run_id }}-${{ github.run_attempt }}
+          path: artifacts/rejection-mutants
           if-no-files-found: error
           retention-days: 7
 
   # ──────────────────────────────────────────────────────────────
-  # Phase 2 (Nightly): Run all targets in parallel via matrix.
+  # Phase 2 (Nightly): Run all 7 targets in parallel via matrix.
   # ──────────────────────────────────────────────────────────────
   nightly-fuzz-corpus:
     name: "Nightly / ${{ matrix.target }}"
-    needs: fuzz-build
+    needs: [select-targets, fuzz-build]
     # Scheduled failures are handled by alert-on-failure below.
     if: >
-      github.event_name == 'schedule' ||
+      inputs.mode == '' && (github.event_name == 'schedule' ||
       (github.event_name == 'workflow_dispatch' &&
-        (github.event.inputs.profile == 'nightly' || github.event.inputs.profile == 'both'))
+        (github.event.inputs.profile == 'nightly' || github.event.inputs.profile == 'both')))
+    # Runs prebuilt binary on matching self-hosted runner architecture.
     runs-on: sm-standard-4
     timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
-        target: [archive_extract, bucket_validation, local_metadata, path_containment, policy_ingress]
+        target: [archive_extract, bucket_validation, local_metadata, notify_xml, path_containment, policy_ingress, sigv4_request]
     env:
       FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+      CARGO_BUILD_TARGET: x86_64-unknown-linux-gnu
+      # Fuzz targets build without the dial9 feature, so tokio_unstable is not needed.
+      RUSTFLAGS: "-C target-feature=-crt-static"
     steps:
       - name: Checkout repository
         uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7
@@ -206,7 +383,7 @@ jobs:
       - name: Download prebuilt fuzz binaries
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
-          name: fuzz-prebuilt-binaries-${{ github.run_number }}
+          name: fuzz-prebuilt-binaries-${{ github.run_id }}-${{ github.run_attempt }}
           path: fuzz/prebuilt/${{ env.CARGO_BUILD_TARGET }}/release
 
       - name: Restore executable bit
@@ -225,7 +402,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: fuzz-nightly-${{ matrix.target }}-${{ github.run_number }}
+          name: fuzz-nightly-${{ matrix.target }}-${{ github.run_id }}-${{ github.run_attempt }}
           path: |
             fuzz/artifacts/**
             fuzz/corpus/${{ matrix.target }}/**
@@ -233,20 +410,77 @@ jobs:
           retention-days: 30
 
   # ──────────────────────────────────────────────────────────────
+  # Phase 3 (workflow_call): Fail-closed verdict over selected sub-jobs.
+  # ──────────────────────────────────────────────────────────────
+  security-input-gate-verdict:
+    name: Security Input Gate Verdict
+    needs: [select-targets, fuzz-build, pr-fuzz-smoke, rejection-mutants]
+    if: github.repository == 'rustfs/rustfs' && always() && inputs.mode != ''
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Verify selected jobs succeeded without cancellation or skip
+        env:
+          SELECT_RESULT: ${{ needs.select-targets.result }}
+          APPLICABLE: ${{ needs.select-targets.outputs.applicable }}
+          REASON: ${{ needs.select-targets.outputs.reason }}
+          HAS_TARGETS: ${{ needs.select-targets.outputs.has_targets }}
+          RUN_MUTANTS: ${{ needs.select-targets.outputs.run_mutants }}
+          TARGETS_CSV: ${{ needs.select-targets.outputs.targets_csv }}
+          BUILD_RESULT: ${{ needs.fuzz-build.result }}
+          SMOKE_RESULT: ${{ needs.pr-fuzz-smoke.result }}
+          MUTANTS_RESULT: ${{ needs.rejection-mutants.result }}
+        run: |
+          if [ "${SELECT_RESULT}" != "success" ]; then
+            echo "ERROR: select-targets did not succeed (result=${SELECT_RESULT})" >&2
+            exit 1
+          fi
+          if [ "${APPLICABLE}" = "false" ]; then
+            echo "Security Input Gate: N/A (reason=${REASON})"
+            {
+              echo "### Security Input Gate: N/A"
+              echo "- Reason: \`${REASON}\`"
+              echo "- Fuzz targets: none"
+              echo "- Rejection mutants: not applicable"
+            } >> "${GITHUB_STEP_SUMMARY}"
+            exit 0
+          fi
+          if [ "${APPLICABLE}" != "true" ]; then
+            echo "ERROR: invalid applicable flag '${APPLICABLE}'" >&2
+            exit 1
+          fi
+          if [ "${HAS_TARGETS}" = "true" ]; then
+            if [ "${BUILD_RESULT}" != "success" ] || [ "${SMOKE_RESULT}" != "success" ]; then
+              echo "ERROR: fuzz smoke failed (build=${BUILD_RESULT}, smoke=${SMOKE_RESULT}, targets=${TARGETS_CSV})" >&2
+              exit 1
+            fi
+          fi
+          if [ "${RUN_MUTANTS}" = "true" ] && [ "${MUTANTS_RESULT}" != "success" ]; then
+            echo "ERROR: rejection-mutants did not succeed (result=${MUTANTS_RESULT})" >&2
+            exit 1
+          fi
+          {
+            echo "### Security Input Gate: PASS"
+            echo "- Reason: \`${REASON}\`"
+            echo "- Fuzz targets: \`${TARGETS_CSV:-none}\` (build=${BUILD_RESULT}, smoke=${SMOKE_RESULT})"
+            echo "- Rejection mutants: run=${RUN_MUTANTS} (result=${MUTANTS_RESULT})"
+          } >> "${GITHUB_STEP_SUMMARY}"
+
+  # ──────────────────────────────────────────────────────────────
   # Nightly alerting: open/update a tracking issue on failure.
   # ──────────────────────────────────────────────────────────────
   alert-on-failure:
     name: Alert on scheduled failure
-    needs: [fuzz-build, nightly-fuzz-corpus]
+    needs: [select-targets, fuzz-build, nightly-fuzz-corpus]
     # `always()` is required: without it this job is skipped when a needed
     # job fails. Alerts only for scheduled (nightly) runs (backlog#1149
     # ci-8); PR and manual dispatch failures are already watched by a human.
-    if: github.repository == 'rustfs/rustfs' && (always() && github.event_name == 'schedule' && contains(needs.*.result, 'failure'))
+    if: github.repository == 'rustfs/rustfs' && always() && inputs.mode == '' && github.event_name == 'schedule' && (contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled'))
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
       contents: read
-      issues: write
+      actions: read
     steps:
       - uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7
         with:

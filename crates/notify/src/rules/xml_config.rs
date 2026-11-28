@@ -419,3 +419,148 @@ mod filter_rule_length_tests {
         ));
     }
 }
+
+#[cfg(test)]
+mod notification_xml_validation_tests {
+    use super::{NotificationConfiguration, ParseConfigError};
+    use std::io::Cursor;
+
+    const REGION: &str = "us-east-1";
+    const KNOWN_ARN: &str = "arn:rustfs:sqs:us-east-1:1:webhook";
+
+    fn known_arns() -> Vec<String> {
+        vec![KNOWN_ARN.to_string()]
+    }
+
+    #[test]
+    fn valid_minimal_notification_xml_passes_validation() {
+        let xml = r#"<NotificationConfiguration xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
+            <QueueConfiguration>
+                <Id>notify-1</Id>
+                <Queue>arn:rustfs:sqs:us-east-1:1:webhook</Queue>
+                <Event>s3:ObjectCreated:Put</Event>
+                <Filter>
+                    <S3Key>
+                        <FilterRule><Name>prefix</Name><Value>logs/</Value></FilterRule>
+                        <FilterRule><Name>suffix</Name><Value>.json</Value></FilterRule>
+                    </S3Key>
+                </Filter>
+            </QueueConfiguration>
+        </NotificationConfiguration>"#;
+        let config = NotificationConfiguration::from_reader(Cursor::new(xml.as_bytes()))
+            .expect("valid notification XML should deserialize");
+        config
+            .validate(REGION, &known_arns())
+            .expect("valid notification configuration should pass validation");
+    }
+
+    #[test]
+    fn duplicate_queue_configuration_is_rejected() {
+        let xml = r#"<NotificationConfiguration>
+            <QueueConfiguration>
+                <Id>dup-queue</Id>
+                <Queue>arn:rustfs:sqs:us-east-1:1:webhook</Queue>
+                <Event>s3:ObjectCreated:Put</Event>
+            </QueueConfiguration>
+            <QueueConfiguration>
+                <Id>dup-queue</Id>
+                <Queue>arn:rustfs:sqs:us-east-1:1:webhook</Queue>
+                <Event>s3:ObjectRemoved:Delete</Event>
+            </QueueConfiguration>
+        </NotificationConfiguration>"#;
+        let config = NotificationConfiguration::from_reader(Cursor::new(xml.as_bytes()))
+            .expect("duplicate-queue XML should parse before semantic validation");
+        let err = config
+            .validate(REGION, &known_arns())
+            .expect_err("duplicate (id, arn) queue configuration must be rejected");
+        assert!(
+            matches!(err, ParseConfigError::DuplicateQueueConfiguration(Some(ref id), ref arn) if id == "dup-queue" && arn == KNOWN_ARN),
+            "expected DuplicateQueueConfiguration for dup-queue, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn unsupported_topic_and_lambda_configurations_are_rejected() {
+        for xml in [
+            r#"<NotificationConfiguration>
+                <TopicConfiguration><Topic>arn:aws:sns:us-east-1:123456789012:topic</Topic></TopicConfiguration>
+            </NotificationConfiguration>"#,
+            r#"<NotificationConfiguration>
+                <CloudFunctionConfiguration><CloudFunction>arn:aws:lambda:us-east-1:123456789012:function:fn</CloudFunction></CloudFunctionConfiguration>
+            </NotificationConfiguration>"#,
+        ] {
+            let config = NotificationConfiguration::from_reader(Cursor::new(xml.as_bytes()))
+                .expect("unsupported configuration XML should deserialize");
+            assert!(
+                matches!(config.validate(REGION, &known_arns()), Err(ParseConfigError::UnsupportedConfiguration)),
+                "TopicConfiguration and CloudFunctionConfiguration must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn invalid_and_duplicate_filter_rules_are_rejected() {
+        let invalid_name = r#"<NotificationConfiguration>
+            <QueueConfiguration>
+                <Id>bad-name</Id>
+                <Queue>arn:rustfs:sqs:us-east-1:1:webhook</Queue>
+                <Event>s3:ObjectCreated:Put</Event>
+                <Filter><S3Key><FilterRule><Name>regex</Name><Value>.*</Value></FilterRule></S3Key></Filter>
+            </QueueConfiguration>
+        </NotificationConfiguration>"#;
+        let config = NotificationConfiguration::from_reader(Cursor::new(invalid_name.as_bytes()))
+            .expect("invalid filter name XML should parse");
+        assert!(matches!(
+            config.validate(REGION, &known_arns()),
+            Err(ParseConfigError::InvalidFilterName(_))
+        ));
+
+        let parent_segment = r#"<NotificationConfiguration>
+            <QueueConfiguration>
+                <Id>bad-value</Id>
+                <Queue>arn:rustfs:sqs:us-east-1:1:webhook</Queue>
+                <Event>s3:ObjectCreated:Put</Event>
+                <Filter><S3Key><FilterRule><Name>prefix</Name><Value>a/../b</Value></FilterRule></S3Key></Filter>
+            </QueueConfiguration>
+        </NotificationConfiguration>"#;
+        let config = NotificationConfiguration::from_reader(Cursor::new(parent_segment.as_bytes()))
+            .expect("parent-segment filter XML should parse");
+        assert!(matches!(
+            config.validate(REGION, &known_arns()),
+            Err(ParseConfigError::InvalidFilterValue(_))
+        ));
+
+        let duplicate_prefix = r#"<NotificationConfiguration>
+            <QueueConfiguration>
+                <Id>dup-prefix</Id>
+                <Queue>arn:rustfs:sqs:us-east-1:1:webhook</Queue>
+                <Event>s3:ObjectCreated:Put</Event>
+                <Filter><S3Key>
+                    <FilterRule><Name>prefix</Name><Value>a/</Value></FilterRule>
+                    <FilterRule><Name>PREFIX</Name><Value>b/</Value></FilterRule>
+                </S3Key></Filter>
+            </QueueConfiguration>
+        </NotificationConfiguration>"#;
+        let config = NotificationConfiguration::from_reader(Cursor::new(duplicate_prefix.as_bytes()))
+            .expect("duplicate prefix filter XML should parse");
+        assert!(matches!(
+            config.validate(REGION, &known_arns()),
+            Err(ParseConfigError::DuplicatePrefixFilter)
+        ));
+    }
+
+    #[test]
+    fn malformed_truncated_and_invalid_unicode_xml_return_err_without_panicking() {
+        let cases: &[&[u8]] = &[
+            b"<NotificationConfiguration><QueueConfiguration><Id>trunc",
+            b"<NotificationConfiguration><QueueConfiguration><Id>\xff\xfe</Id></QueueConfiguration></NotificationConfiguration>",
+            b"not xml at all",
+        ];
+        for bytes in cases {
+            assert!(
+                NotificationConfiguration::from_reader(Cursor::new(*bytes)).is_err(),
+                "malformed XML input must return Err rather than succeeding or panicking"
+            );
+        }
+    }
+}
