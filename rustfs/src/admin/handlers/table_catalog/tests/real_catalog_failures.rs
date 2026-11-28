@@ -874,11 +874,6 @@ async fn capture_backup(scenario: &RealScenario) -> RealBackup {
         scenario.fixture.bucket,
         scenario.fixture._data_root.path().display()
     );
-    eprintln!(
-        "I6 source fixture bucket={} directory={}",
-        scenario.fixture.bucket,
-        scenario.fixture._data_root.path().display()
-    );
     let backup = scenario
         .fixture
         .catalog

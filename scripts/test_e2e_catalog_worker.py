@@ -181,7 +181,7 @@ subprocess.run([os.environ["RUSTFS_CATALOG_WORKER_LAUNCHER"]], env=env, check=Tr
         for field in ("worker_test", "worker_sha256", "launcher"):
             with self.subTest(field=field):
                 self.build()
-                result = self.run_code('''import json, os, pathlib, subprocess, sys
+                result = self.run_code('''import json, os, pathlib, subprocess
 p = pathlib.Path(os.environ["RUSTFS_CATALOG_WORKER_RECEIPT"])
 r = json.loads(p.read_text())
 field = ''' + repr(field) + '''

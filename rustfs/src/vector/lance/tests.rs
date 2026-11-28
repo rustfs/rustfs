@@ -1849,11 +1849,6 @@ async fn initial_manifest_plan_is_repeatable_without_object_io() {
         .unwrap();
     assert_eq!(first.reference.body_revision(), None);
     assert_eq!(first.reference.etag(), None);
-    println!(
-        "initial-manifest-fixture-v1 length={} sha256={}",
-        first.reference.content_length(),
-        first.reference.content_sha256().to_hex()
-    );
     for _ in 0..32 {
         let repeated = super::initial::plan_initial_manifest(&resource_identity(), &index, &create_id)
             .await

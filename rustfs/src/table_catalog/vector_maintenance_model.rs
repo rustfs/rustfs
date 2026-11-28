@@ -1486,10 +1486,9 @@ impl VectorMaintenanceRecord for VectorRetirementProgressV1 {
 #[path = "vector_maintenance_model_tests.rs"]
 mod tests;
 
-pub(crate) type VectorResourceMutationKindV2 = VectorResourceMutationKind;
 maintenance_record! { VectorResourceMutationBindingV2 {
     version: u16,
-    kind: VectorResourceMutationKindV2,
+    kind: VectorResourceMutationKind,
     expected_definition: VectorIndexDefinitionV1,
     next_definition: VectorIndexDefinitionV1,
     expected_state: TableCatalogEntryState,

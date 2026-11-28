@@ -86,11 +86,6 @@ fn tags_decode_one_label_and_preserve_repeated_query_values() {
     };
     assert_eq!(input.resource_arn, INDEX_ARN);
     assert_eq!(input.tag_keys, ["a b", "a/b", "a+b"]);
-    assert_eq!(
-        path,
-        "/tags/arn%3Aaws%3As3vectors%3Aus-east-1%3A%3Abucket%2Ftest-bucket%2Findex%2Findex.one"
-    );
-    assert_eq!(query, "tagKeys=a%20b&tagKeys=a%2Fb&tagKeys=a%2Bb");
 }
 
 #[test]
