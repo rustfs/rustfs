@@ -2262,9 +2262,11 @@ fn warehouse_from_config_query(uri: &http::Uri) -> S3Result<Option<String>> {
         if value.is_empty() {
             return Err(s3_error!(InvalidRequest, "warehouse query parameter must not be empty"));
         }
-        crate::admin::storage_api::bucket::utils::check_valid_bucket_name_strict(&value)
-            .map_err(|_| s3_error!(InvalidArgument, "invalid warehouse bucket name"))?;
         warehouse = Some(value.into_owned());
+    }
+    if let Some(name) = warehouse.as_deref() {
+        crate::admin::storage_api::bucket::utils::check_valid_bucket_name_strict(name)
+            .map_err(|_| s3_error!(InvalidArgument, "invalid warehouse bucket name"))?;
     }
     Ok(warehouse)
 }
