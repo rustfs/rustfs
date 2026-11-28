@@ -81,7 +81,12 @@ impl<'de> Deserialize<'de> for NumberFuncValue {
             where
                 E: Error,
             {
-                Ok(NumberFuncValue(value as i64))
+                // Every comparison operand is an `i64`, so a value above `i64::MAX` has no
+                // representation here. Casting it would wrap the bound to a negative
+                // number and invert the comparison, so reject it through the same parse
+                // the string spelling uses: `{"s3:max-keys": 18446744073709551615}` and
+                // `{"s3:max-keys": "18446744073709551615"}` must agree.
+                self.visit_str(&value.to_string())
             }
 
             fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
@@ -176,5 +181,34 @@ mod tests {
         let v = serde_json::to_string(&input)?;
         assert_eq!(v, expect);
         Ok(())
+    }
+
+    /// A numeric condition value above `i64::MAX` must be rejected, not wrapped.
+    ///
+    /// `deserialize_any` hands an unsigned JSON integer to `visit_u64`, and the
+    /// comparison operand is an `i64`, so `value as i64` turned `18446744073709551615`
+    /// into `-1`. That inverted the bound instead of rejecting it: a `NumericGreaterThan`
+    /// bound of `u64::MAX` matched every request, and a `NumericLessThanEquals` Deny over
+    /// the same bound matched none. The string spelling of the identical value already
+    /// failed with `PosOverflow`, so the two spellings of one policy disagreed.
+    #[test]
+    fn numeric_values_above_i64_max_are_rejected_in_both_spellings() {
+        for raw in ["9223372036854775808", "18446744073709551615"] {
+            for spelling in [raw.to_owned(), format!("\"{raw}\"")] {
+                let document = format!(r#"{{"s3:max-keys":{spelling}}}"#);
+                let result = serde_json::from_str::<NumberFunc>(&document);
+                assert!(result.is_err(), "{raw} spelled as {spelling} must not parse: {result:?}");
+            }
+        }
+
+        // The i64 boundary itself stays accepted and keeps its exact value.
+        for raw in ["9223372036854775807", "-9223372036854775808"] {
+            let document = format!(r#"{{"s3:max-keys":{raw}}}"#);
+            let parsed: NumberFunc = serde_json::from_str(&document).expect("i64 boundary must parse");
+            assert_eq!(
+                serde_json::to_string(&parsed).expect("boundary value serializes"),
+                format!(r#"{{"s3:max-keys":"{raw}"}}"#)
+            );
+        }
     }
 }
