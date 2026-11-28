@@ -2595,26 +2595,59 @@ const BULK_DELETE_MAX_WINDOWS: usize = 4;
 
 fn delete_lock_windows(objects: Vec<ObjectToDelete>, distributed: bool) -> Vec<Vec<(usize, ObjectToDelete)>> {
     let mut identities = HashMap::new();
+    let mut key_slots = Vec::new();
     let mut ordinals = Vec::with_capacity(objects.len());
     for object in &objects {
-        let next = identities.len();
         let identity = rustfs_utils::path::object_name_disk_identity(&object.object_name);
-        ordinals.push(*identities.entry(identity).or_insert(next));
+        let ordinal = *identities.entry(identity).or_insert_with(|| {
+            key_slots.push(0);
+            key_slots.len() - 1
+        });
+        key_slots[ordinal] += 1;
+        ordinals.push(ordinal);
     }
-    let key_count = identities.len();
-    let window_keys = if distributed {
-        // Start every distributed batch in one wave. A new wave would add
-        // another quorum acquisition budget for its contended keys.
-        key_count.div_ceil(BULK_DELETE_MAX_WINDOWS).max(BULK_DELETE_MIN_WINDOW_KEYS)
+
+    let key_count = key_slots.len();
+    let repeated = key_slots.iter().filter(|&&slots| slots > 1).count();
+    let mut assignments = Vec::with_capacity(key_count);
+    if distributed && repeated > 0 && repeated < key_count {
+        // Repeated keys share a single physical transaction. Let those guards
+        // go when their transactions finish, independently of the distinct
+        // keys in this request. Both classes share the four quorum windows.
+        let repeated_lanes = (repeated * BULK_DELETE_MAX_WINDOWS)
+            .div_ceil(key_count)
+            .min(BULK_DELETE_MAX_WINDOWS - 1);
+        let repeated_width = repeated.div_ceil(repeated_lanes);
+        let repeated_windows = repeated.div_ceil(repeated_width);
+        let single_width = (key_count - repeated)
+            .div_ceil(BULK_DELETE_MAX_WINDOWS - repeated_windows)
+            .max(BULK_DELETE_MIN_WINDOW_KEYS);
+        let (mut next_repeated, mut next_single) = (0, 0);
+        for slots in key_slots {
+            let window = if slots > 1 {
+                let index = next_repeated / repeated_width;
+                next_repeated += 1;
+                index
+            } else {
+                let index = repeated_windows + next_single / single_width;
+                next_single += 1;
+                index
+            };
+            assignments.push(window);
+        }
     } else {
-        // The local best-effort lock manager already waits per key, so the
-        // acquisition work is bounded by the key count in either layout.
-        // Smaller windows release earlier once their disk work has finished.
-        BULK_DELETE_MIN_WINDOW_KEYS
-    };
-    let mut windows: Vec<Vec<_>> = (0..key_count.div_ceil(window_keys)).map(|_| Vec::new()).collect();
+        let width = if distributed {
+            key_count.div_ceil(BULK_DELETE_MAX_WINDOWS).max(BULK_DELETE_MIN_WINDOW_KEYS)
+        } else {
+            BULK_DELETE_MIN_WINDOW_KEYS
+        };
+        assignments.extend((0..key_count).map(|i| i / width));
+    }
+    let mut windows: Vec<Vec<_>> = (0..assignments.iter().max().map_or(0, |n| n + 1))
+        .map(|_| Vec::new())
+        .collect();
     for (index, (object, ordinal)) in objects.into_iter().zip(ordinals).enumerate() {
-        windows[ordinal / window_keys].push((index, object));
+        windows[assignments[ordinal]].push((index, object));
     }
     windows
 }
@@ -14715,6 +14748,28 @@ mod batch_delete_lock_tests {
     }
 
     #[test]
+    fn distributed_repeated_key_can_complete_independently_of_unrelated_keys() {
+        let mut objects: Vec<_> = (0..985)
+            .map(|i| ObjectToDelete {
+                object_name: format!("key-{i}"),
+                ..Default::default()
+            })
+            .collect();
+        for _ in 0..15 {
+            objects.push(objects[800].clone());
+        }
+        let windows = delete_lock_windows(objects, true);
+        assert_eq!(windows.len(), BULK_DELETE_MAX_WINDOWS);
+        let repeated = windows
+            .iter()
+            .find(|window| window.iter().any(|(index, _)| *index == 800))
+            .unwrap();
+        assert_eq!(repeated.len(), 16);
+        assert!(repeated.iter().all(|(_, object)| object.object_name == "key-800"));
+        assert_eq!(windows.iter().map(Vec::len).sum::<usize>(), 1000);
+    }
+
+    #[test]
     fn full_size_local_bulk_delete_covers_each_key_in_small_ordered_windows() {
         let objects = (0..1000)
             .map(|i| ObjectToDelete {
@@ -14752,14 +14807,20 @@ mod batch_delete_lock_tests {
                 ..Default::default()
             });
             let windows = delete_lock_windows(objects, distributed);
-            assert_eq!(windows.len(), 2);
-            let (index, repeated) = &windows[0][width];
-            assert_eq!(*index, width + 1);
-            assert_eq!(repeated.version_id, Some(version));
-            assert_eq!(windows[1][0].0, width);
-            // The backslash spelling aliases key/0 only on Windows.
-            let alias_window = if cfg!(windows) { 0 } else { 1 };
-            assert_eq!(windows[alias_window].last().unwrap().0, width + 2);
+            let window = windows
+                .iter()
+                .find(|window| window.iter().any(|(index, _)| *index == 0))
+                .unwrap();
+            assert!(
+                window
+                    .iter()
+                    .any(|(index, object)| *index == width + 1 && object.version_id == Some(version))
+            );
+            let alias_in_same_window = window.iter().any(|(index, _)| *index == width + 2);
+            assert_eq!(alias_in_same_window, cfg!(windows));
+            let mut indices: Vec<_> = windows.into_iter().flatten().map(|(index, _)| index).collect();
+            indices.sort_unstable();
+            assert_eq!(indices, (0..width + 3).collect::<Vec<_>>());
         }
     }
 
