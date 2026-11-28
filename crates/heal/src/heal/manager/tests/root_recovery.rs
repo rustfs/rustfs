@@ -943,19 +943,30 @@ async fn root_recovery_shutdown_restart_replays_same_id_and_success_retires_inte
     assert_eq!(restored.retry_attempts, request.retry_attempts);
     assert_eq!(restored.created_at, request.created_at);
 
+    let hook = Arc::new(CompletedRetentionHook::default());
+    COMPLETED_RETENTION_HOOKS
+        .lock()
+        .await
+        .insert(request.id.clone(), hook.clone());
     process_manager_queue_once(&restarted).await;
-    tokio::time::timeout(Duration::from_secs(5), async {
-        loop {
-            if matches!(restarted.get_task_status(&request.id).await, Ok(HealTaskStatus::Completed))
-                && !restarted.active_heals.lock().await.contains_key(&request.id)
-            {
-                break;
-            }
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .expect("restored root executes successfully");
+    // The handoff follows the terminal persistence attempt and active-task removal.
+    let handoff = tokio::time::timeout(Duration::from_secs(30), hook.handoff.notified()).await;
+    COMPLETED_RETENTION_HOOKS.lock().await.remove(&request.id);
+    hook.finish.notify_one();
+    handoff.expect("restored root reaches completion handoff");
+
+    assert_eq!(
+        restarted.get_task_status(&request.id).await.expect("restored root status"),
+        HealTaskStatus::Completed
+    );
+    assert!(!restarted.active_heals.lock().await.contains_key(&request.id));
+    let receipt = restarted
+        .root_recovery
+        .completed(&request.id)
+        .await
+        .expect("read durable terminal receipt")
+        .expect("durable terminal receipt exists");
+    assert_eq!(receipt.status, HealTaskStatus::Completed);
     assert!(restarted.root_recovery.pending().await.expect("read completion").is_empty());
 }
 
