@@ -1008,6 +1008,7 @@ impl OpenedDstDirFsyncGroup {
 
 struct DstDirFsyncWaiter {
     owner: DstDirFsyncOwner,
+    enqueued_at: Option<std::time::Instant>,
     result_tx: oneshot::Sender<SharedDstDirFsyncResult>,
 }
 
@@ -1079,6 +1080,8 @@ impl DstDirFsyncGroupCommit {
         let (result_tx, result_rx) = oneshot::channel();
         let mut registry = self.inner.lock();
         if registry.total_waiters >= MAX_DST_DIR_FSYNC_WAITERS {
+            drop(registry);
+            rustfs_io_metrics::record_put_rename_dst_dir_fsync_group_enqueue("waiter_limit");
             return Err(io::Error::new(
                 io::ErrorKind::WouldBlock,
                 "dst dir fsync group commit waiter limit reached",
@@ -1088,6 +1091,8 @@ impl DstDirFsyncGroupCommit {
             group.clone()
         } else {
             if registry.groups.len() >= MAX_DST_DIR_FSYNC_GROUPS {
+                drop(registry);
+                rustfs_io_metrics::record_put_rename_dst_dir_fsync_group_enqueue("group_limit");
                 return Err(io::Error::new(
                     io::ErrorKind::WouldBlock,
                     "dst dir fsync group commit active group limit reached",
@@ -1107,6 +1112,7 @@ impl DstDirFsyncGroupCommit {
         let mut group_state = group.inner.lock();
         group_state.pending.push_back(DstDirFsyncWaiter {
             result_tx,
+            enqueued_at: rustfs_io_metrics::put_stage_timer(),
             owner: DstDirFsyncOwner {
                 _namespace: namespace_owner,
                 _resource: super::io_admission::current_resource_unit(),
@@ -1120,6 +1126,7 @@ impl DstDirFsyncGroupCommit {
         registry.total_waiters += 1;
         drop(group_state);
         drop(registry);
+        rustfs_io_metrics::record_put_rename_dst_dir_fsync_group_enqueue("accepted");
         #[cfg(test)]
         fsync_dir_recorder::run_after_group_enqueue(&group.dir);
 
@@ -1184,7 +1191,9 @@ async fn fsync_open_dst_dir_group(group: &DstDirFsyncGroup, namespace_owners: Ve
             }
             fsync_dir_recorder::record(&dir);
         }
-        dir_file.sync_all()
+        let result = dir_file.sync_all();
+        rustfs_io_metrics::record_put_rename_dst_dir_fsync_group_physical_sync(result.is_ok());
+        result
     })
     .await
     .map_err(|err| io::Error::other(format!("blocking dst dir group fsync failed: {err}")))?
@@ -1245,9 +1254,10 @@ fn run_dst_dir_fsync_group_worker(
             #[cfg(test)]
             fsync_dir_recorder::run_before_group_batch(&group.dir);
             tokio::task::yield_now().await;
-            let mut batch: Vec<DstDirFsyncWaiter> = {
+            let (mut batch, drained_at) = {
                 let mut group_state = group.inner.lock();
-                group_state.pending.drain(..).collect()
+                let drained_at = rustfs_io_metrics::put_stage_timer();
+                (group_state.pending.drain(..).collect::<Vec<_>>(), drained_at)
             };
             if batch.is_empty() {
                 let mut group_state = group.inner.lock();
@@ -1258,6 +1268,16 @@ fn run_dst_dir_fsync_group_worker(
                 return;
             }
             worker_guard.in_flight = batch.len();
+            rustfs_io_metrics::record_put_rename_dst_dir_fsync_group_batch(batch.len());
+            if let Some(drained_at) = drained_at {
+                for waiter in &batch {
+                    if let Some(enqueued_at) = waiter.enqueued_at {
+                        rustfs_io_metrics::record_put_rename_dst_dir_fsync_group_queue_wait(
+                            drained_at.saturating_duration_since(enqueued_at),
+                        );
+                    }
+                }
+            }
 
             #[cfg(test)]
             fsync_dir_recorder::record_grouped(&group.dir, batch.len());
