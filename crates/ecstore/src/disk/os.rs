@@ -5175,7 +5175,7 @@ pub(crate) fn read_destination_file_with_commit_guard(
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(all(test, target_os = "linux"))]
 pub(crate) fn stage_inline_rollback_backup_with_commit_guard_std(
     dst_file_path: &Path,
     backup_parent: &Path,

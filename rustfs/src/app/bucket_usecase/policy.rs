@@ -171,73 +171,78 @@ impl DefaultBucketUsecase {
         bucket: &str,
         policy: &str,
     ) -> rustfs_s3_types::S3Result<()> {
-        RequestEnvelope::audit_only_operation(envelope, S3Operation::PutBucketPolicy, StatusCode::OK, |envelope| async move {
-            let expected_incarnation_id = bucket_config_mutation_incarnation(&envelope, bucket)?;
-            let request_context = envelope.request_context().cloned();
+        RequestEnvelope::audit_only_operation(
+            envelope,
+            S3Operation::PutBucketPolicy,
+            StatusCode::NO_CONTENT,
+            |envelope| async move {
+                let expected_incarnation_id = bucket_config_mutation_incarnation(&envelope, bucket)?;
+                let request_context = envelope.request_context().cloned();
 
-            let Some(store) = self.object_store() else {
-                return Err(s3_error!(InternalError, "Not init"));
-            };
+                let Some(store) = self.object_store() else {
+                    return Err(s3_error!(InternalError, "Not init"));
+                };
 
-            store
-                .get_bucket_info(bucket, &BucketOptions::default())
-                .await
-                .map_err(ApiError::from)?;
+                store
+                    .get_bucket_info(bucket, &BucketOptions::default())
+                    .await
+                    .map_err(ApiError::from)?;
 
-            let cfg: BucketPolicy = serde_json::from_str(policy).map_err(|_| s3_error!(MalformedPolicy))?;
+                let cfg: BucketPolicy = serde_json::from_str(policy).map_err(|_| s3_error!(MalformedPolicy))?;
 
-            if cfg.is_valid().is_err() {
-                return Err(s3_error!(MalformedPolicy));
-            }
+                if cfg.is_valid().is_err() {
+                    return Err(s3_error!(MalformedPolicy));
+                }
 
-            let replication_policy = serde_json::from_str(policy)
-                .map(serde_json::Value::Object)
-                .map_err(|_| s3_error!(MalformedPolicy))?;
+                let replication_policy = serde_json::from_str(policy)
+                    .map(serde_json::Value::Object)
+                    .map_err(|_| s3_error!(MalformedPolicy))?;
 
-            let is_public_policy = cfg
-                .statements
-                .iter()
-                .any(|statement| matches!(statement.effect, Effect::Allow) && statement.principal.is_public());
+                let is_public_policy = cfg
+                    .statements
+                    .iter()
+                    .any(|statement| matches!(statement.effect, Effect::Allow) && statement.principal.is_public());
 
-            if is_public_policy {
-                match metadata_sys::get_public_access_block_config(bucket).await {
-                    Ok((config, _)) => {
-                        if config.block_public_policy.unwrap_or(false) {
-                            return Err(s3_error!(AccessDenied, "Access Denied"));
+                if is_public_policy {
+                    match metadata_sys::get_public_access_block_config(bucket).await {
+                        Ok((config, _)) => {
+                            if config.block_public_policy.unwrap_or(false) {
+                                return Err(s3_error!(AccessDenied, "Access Denied"));
+                            }
                         }
-                    }
-                    Err(err) => {
-                        if err != StorageError::ConfigNotFound {
-                            warn!(
-                                component = LOG_COMPONENT_APP,
-                                subsystem = LOG_SUBSYSTEM_BUCKET,
-                                event = "bucket_public_access_block_load_failed",
-                                bucket = %bucket,
-                                error = ?err,
-                                "Failed to load bucket public access block configuration"
-                            );
-                            return Err(ApiError::from(err).into());
+                        Err(err) => {
+                            if err != StorageError::ConfigNotFound {
+                                warn!(
+                                    component = LOG_COMPONENT_APP,
+                                    subsystem = LOG_SUBSYSTEM_BUCKET,
+                                    event = "bucket_public_access_block_load_failed",
+                                    bucket = %bucket,
+                                    error = ?err,
+                                    "Failed to load bucket public access block configuration"
+                                );
+                                return Err(ApiError::from(err).into());
+                            }
                         }
                     }
                 }
-            }
 
-            let data = policy.as_bytes().to_vec();
+                let data = policy.as_bytes().to_vec();
 
-            update_bucket_config_for_incarnation(bucket, BUCKET_POLICY_CONFIG, data, expected_incarnation_id)
-                .await
-                .map_err(ApiError::from)?;
+                update_bucket_config_for_incarnation(bucket, BUCKET_POLICY_CONFIG, data, expected_incarnation_id)
+                    .await
+                    .map_err(ApiError::from)?;
 
-            notify_bucket_metadata_reload(bucket.to_owned(), "put bucket policy", request_context, false).await;
+                notify_bucket_metadata_reload(bucket.to_owned(), "put bucket policy", request_context, false).await;
 
-            let mut item = sr_bucket_meta_item(bucket.to_owned(), "policy");
-            item.policy = Some(replication_policy);
-            if let Err(err) = site_replication_bucket_meta_hook(item).await {
-                warn!(bucket = %bucket, error = ?err, "site replication bucket policy hook failed");
-            }
+                let mut item = sr_bucket_meta_item(bucket.to_owned(), "policy");
+                item.policy = Some(replication_policy);
+                if let Err(err) = site_replication_bucket_meta_hook(item).await {
+                    warn!(bucket = %bucket, error = ?err, "site replication bucket policy hook failed");
+                }
 
-            Ok(())
-        })
+                Ok(())
+            },
+        )
         .await
     }
 }

@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::admin::auth::authorize_admin_envelope;
+use crate::admin::auth::{AdminResourceScope, authorize_admin_envelope, authorize_admin_envelope_with_scope};
 use crate::admin::handlers::site_replication::site_replication_peer_deployment_id_for_endpoint;
 use crate::admin::operation::{AdminRequest, AdminResponse, Operation};
 use crate::admin::router::{AdminOperation, S3Router};
@@ -634,6 +634,15 @@ pub fn register_replication_route(r: &mut S3Router<AdminOperation>) -> std::io::
 async fn validate_replication_admin_request(req: &AdminRequest, action: AdminAction) -> S3Result<Credentials> {
     authorize_admin_envelope(req.envelope(), vec![Action::AdminAction(action)]).await
 }
+
+async fn validate_replication_admin_request_with_bucket(
+    req: &AdminRequest,
+    action: AdminAction,
+    bucket: &str,
+) -> S3Result<Credentials> {
+    authorize_admin_envelope_with_scope(req.envelope(), vec![Action::AdminAction(action)], AdminResourceScope::bucket(bucket))
+        .await
+}
 pub(crate) async fn cluster_replication_stats(bucket: &str, context: Option<Arc<AppContext>>) -> BucketStats {
     let Some(stats) = current_replication_stats_handle_for_context(context.clone()) else {
         return BucketStats::default();
@@ -752,10 +761,14 @@ pub struct SetRemoteTargetHandler {}
 #[async_trait::async_trait]
 impl Operation for SetRemoteTargetHandler {
     async fn call(&self, mut req: AdminRequest, _params: Params<'_, '_>) -> S3Result<AdminResponse> {
-        let cred = validate_replication_admin_request(&req, AdminAction::SetBucketTargetAction).await?;
-        let app_context = app_context_from_envelope(req.envelope());
-
         let queries = extract_query_params(req.uri());
+        let cred = validate_replication_admin_request_with_bucket(
+            &req,
+            AdminAction::SetBucketTargetAction,
+            queries.get("bucket").map(String::as_str).unwrap_or(""),
+        )
+        .await?;
+        let app_context = app_context_from_envelope(req.envelope());
 
         let Some(bucket) = queries.get("bucket") else {
             return Err(s3_error!(InvalidRequest, "bucket is required"));
@@ -998,9 +1011,13 @@ pub struct ListRemoteTargetHandler {}
 #[async_trait::async_trait]
 impl Operation for ListRemoteTargetHandler {
     async fn call(&self, req: AdminRequest, _params: Params<'_, '_>) -> S3Result<AdminResponse> {
-        validate_replication_admin_request(&req, AdminAction::GetBucketTargetAction).await?;
-
         let queries = extract_query_params(req.uri());
+        validate_replication_admin_request_with_bucket(
+            &req,
+            AdminAction::GetBucketTargetAction,
+            queries.get("bucket").map(String::as_str).unwrap_or(""),
+        )
+        .await?;
 
         if let Some(bucket) = queries.get("bucket") {
             if bucket.is_empty() {
@@ -1063,11 +1080,16 @@ pub struct RemoveRemoteTargetHandler {}
 #[async_trait::async_trait]
 impl Operation for RemoveRemoteTargetHandler {
     async fn call(&self, req: AdminRequest, _params: Params<'_, '_>) -> S3Result<AdminResponse> {
-        validate_replication_admin_request(&req, AdminAction::SetBucketTargetAction).await?;
+        let queries = extract_query_params(req.uri());
+        validate_replication_admin_request_with_bucket(
+            &req,
+            AdminAction::SetBucketTargetAction,
+            queries.get("bucket").map(String::as_str).unwrap_or(""),
+        )
+        .await?;
         let app_context = app_context_from_envelope(req.envelope());
 
         debug!("remove remote target called");
-        let queries = extract_query_params(req.uri());
         let Some(bucket) = queries.get("bucket") else {
             return Err(s3_error!(InvalidRequest, "bucket is required"));
         };
@@ -4050,5 +4072,171 @@ mod target_repair_tests {
     #[serial_test::serial]
     async fn ordinary_target_remove_rejects_malformed_persisted_replication_rules() {
         assert_target_remove_checks_persisted_rules(true).await;
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn remote_target_handlers_enforce_query_bucket_scope() {
+        crate::app::gating_test_env::run_large_stack_test("remote-target-bucket-scope", || async {
+            use crate::admin::operation::test_support::TestRequest;
+            use crate::admin::runtime_sources::{AppContext, IamInterface, KmsInterface, publish_test_app_context};
+            use crate::admin::storage_api::contract::bucket::{BucketOperations as _, MakeBucketOptions};
+            use rustfs_iam::store::{Store as _, UserType};
+            use rustfs_madmin::{AccountStatus, AddOrUpdateUserReq};
+            use rustfs_policy::policy::Policy;
+            use std::sync::Arc;
+
+            struct ReadyIam(Arc<rustfs_iam::sys::IamSys<rustfs_iam::store::object::ObjectStore>>);
+            impl IamInterface for ReadyIam {
+                fn handle(&self) -> Arc<rustfs_iam::sys::IamSys<rustfs_iam::store::object::ObjectStore>> {
+                    Arc::clone(&self.0)
+                }
+                fn is_ready(&self) -> bool {
+                    true
+                }
+            }
+            struct TestKms;
+            impl KmsInterface for TestKms {
+                fn handle(&self) -> Arc<rustfs_kms::KmsServiceManager> {
+                    Arc::new(rustfs_kms::KmsServiceManager::new())
+                }
+            }
+
+            let previous = crate::runtime_sources::current_app_context();
+            let (_dir, _paths, store) = crate::app::gating_test_env::isolated_multi_pool_ecstore().await;
+            rustfs_iam::store::object::ObjectStore::new(Arc::clone(&store))
+                .save_iam_config(
+                    serde_json::json!({"version": 1}),
+                    format!("{}/format.json", *rustfs_iam::store::object::IAM_CONFIG_PREFIX),
+                )
+                .await
+                .expect("seed IAM format");
+            store
+                .make_bucket("allowed-bucket", &MakeBucketOptions::default())
+                .await
+                .expect("create allowed bucket");
+
+            let iam = rustfs_iam::build_iam_sys(Arc::clone(&store)).await.expect("init IAM");
+            for (user, secret, doc) in [
+                (
+                    "target-scoped",
+                    "target-secret-1234",
+                    r#"{
+                        "Version": "2012-10-17",
+                        "Statement": [{
+                            "Effect": "Allow",
+                            "Action": ["admin:GetBucketTarget", "admin:SetBucketTarget"],
+                            "Resource": ["arn:aws:s3:::allowed-bucket"]
+                        }]
+                    }"#,
+                ),
+                (
+                    "target-unscoped",
+                    "target-secret-1234",
+                    r#"{
+                        "Version": "2012-10-17",
+                        "Statement": [{"Effect": "Allow", "Action": ["admin:GetBucketTarget"]}]
+                    }"#,
+                ),
+            ] {
+                iam.create_user(
+                    user,
+                    &AddOrUpdateUserReq {
+                        secret_key: secret.to_owned(),
+                        policy: None,
+                        status: AccountStatus::Enabled,
+                    },
+                )
+                .await
+                .expect("create test user");
+                iam.set_policy(user, Policy::parse_config(doc.as_bytes()).expect("parse policy"))
+                    .await
+                    .expect("store policy");
+                iam.policy_db_set(user, UserType::Reg, false, user)
+                    .await
+                    .expect("attach policy");
+            }
+
+            let context = Arc::new(AppContext::new(store, Arc::new(ReadyIam(iam)), Arc::new(TestKms)));
+            assert!(context.publish_action_credentials(Credentials {
+                access_key: "repl-scope-root".to_owned(),
+                secret_key: "repl-scope-secret".to_owned(),
+                status: "on".to_owned(),
+                ..Default::default()
+            }));
+            publish_test_app_context(context);
+
+            // Bucket-scoped caller is denied for another bucket and for unscoped listing.
+            for uri in [
+                "/rustfs/admin/v3/list-remote-targets?bucket=forbidden-bucket",
+                "/rustfs/admin/v3/list-remote-targets",
+            ] {
+                let err = ListRemoteTargetHandler {}
+                    .call(
+                        TestRequest::new(Method::GET, uri)
+                            .credentials("target-scoped", "target-secret-1234", None)
+                            .build(),
+                        Params::new(),
+                    )
+                    .await
+                    .expect_err("scoped list-remote-targets must reject out-of-scope bucket");
+                assert_eq!(err.code(), &S3ErrorCode::AccessDenied, "{uri}");
+            }
+
+            // Set and remove target handlers also reject out-of-scope buckets.
+            let set_err = SetRemoteTargetHandler {}
+                .call(
+                    TestRequest::new(Method::PUT, "/rustfs/admin/v3/set-remote-target?bucket=forbidden-bucket")
+                        .credentials("target-scoped", "target-secret-1234", None)
+                        .build(),
+                    Params::new(),
+                )
+                .await
+                .expect_err("set-remote-target must deny forbidden-bucket");
+            assert_eq!(set_err.code(), &S3ErrorCode::AccessDenied);
+
+            let remove_err = RemoveRemoteTargetHandler {}
+                .call(
+                    TestRequest::new(
+                        Method::DELETE,
+                        "/rustfs/admin/v3/remove-remote-target?bucket=forbidden-bucket&arn=arn:rustfs:replication:us-east-1:dep:target",
+                    )
+                    .credentials("target-scoped", "target-secret-1234", None)
+                    .build(),
+                    Params::new(),
+                )
+                .await
+                .expect_err("remove-remote-target must deny forbidden-bucket");
+            assert_eq!(remove_err.code(), &S3ErrorCode::AccessDenied);
+
+            // The granted bucket passes authorization on list-remote-targets.
+            let allowed_res = ListRemoteTargetHandler {}
+                .call(
+                    TestRequest::new(Method::GET, "/rustfs/admin/v3/list-remote-targets?bucket=allowed-bucket")
+                        .credentials("target-scoped", "target-secret-1234", None)
+                        .build(),
+                    Params::new(),
+                )
+                .await;
+            if let Err(err) = allowed_res {
+                assert_ne!(err.code(), &S3ErrorCode::AccessDenied, "allowed-bucket must clear the authorization gate");
+            }
+
+            // Unscoped policy still allows bucket-less list-remote-targets (returns []).
+            let unscoped_resp = ListRemoteTargetHandler {}
+                .call(
+                    TestRequest::new(Method::GET, "/rustfs/admin/v3/list-remote-targets")
+                        .credentials("target-unscoped", "target-secret-1234", None)
+                        .build(),
+                    Params::new(),
+                )
+                .await
+                .expect("unscoped GetBucketTarget must still succeed without bucket query");
+            assert_eq!(unscoped_resp.into_parts().0, StatusCode::OK);
+
+            if let Some(previous) = previous {
+                publish_test_app_context(previous);
+            }
+        });
     }
 }

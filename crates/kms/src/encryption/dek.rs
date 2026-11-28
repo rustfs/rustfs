@@ -134,6 +134,7 @@ pub fn desired_context_binding(existing: Option<u8>) -> Option<u8> {
 /// opened by a node that predates it (the unwrap fails authentication), so the
 /// switch must only be enabled once every node in the cluster runs a release
 /// that understands `context_binding`. Reading bound envelopes needs no switch.
+// RUSTFS_COMPAT_TODO(backlog-1667-kms-envelope-aad): keep Local and Vault KV2 DEK envelope AAD writes off by default during rolling upgrades while older nodes lack context_binding support. Remove after the minimum supported release understands CONTEXT_BINDING_AAD_V1 and the default flips to true.
 pub fn envelope_aad_write_enabled() -> bool {
     use crate::config::ENV_KMS_ENVELOPE_AAD;
     use rustfs_utils::get_env_bool;

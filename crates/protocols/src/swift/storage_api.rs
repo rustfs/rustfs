@@ -15,17 +15,26 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use axum::http::HeaderMap;
 pub(crate) use rustfs_ecstore::api::bucket::metadata::BucketMetadata as SwiftBucketMetadata;
 use rustfs_ecstore::api::bucket::metadata::SWIFT_TAGGING_MARKER;
 use rustfs_ecstore::api::bucket::metadata::{BUCKET_TAGGING_CONFIG, is_unreadable_config_error};
-use rustfs_ecstore::api::bucket::metadata_sys::{get as get_swift_bucket_metadata_from_backend, update_config_with};
+use rustfs_ecstore::api::bucket::metadata_sys::{
+    get as get_swift_bucket_metadata_from_backend, get_sse_config as get_swift_bucket_sse_config_from_backend, update_config_with,
+};
 use rustfs_ecstore::api::bucket::utils::serialize as serialize_bucket_config;
-use rustfs_ecstore::api::error::Error as SwiftStorageError;
+pub(crate) use rustfs_ecstore::api::error::Error as SwiftStorageError;
 pub(crate) use rustfs_ecstore::api::error::Result as SwiftStorageResult;
 use rustfs_ecstore::api::notification::get_global_notification_sys;
+pub(crate) use rustfs_ecstore::api::object::{
+    PreparedGetObjectReader as SwiftPreparedGetObjectReader, WriteCommitGuard as SwiftWriteCommitGuard,
+    WriteCompletion as SwiftWriteCompletion,
+};
+pub(crate) use rustfs_ecstore::api::rio::{WriteEncryption as SwiftWriteEncryption, WritePlan as SwiftWritePlan};
 pub(crate) use rustfs_ecstore::api::runtime::object_store_handle as resolve_swift_object_store_handle;
 use rustfs_ecstore::api::storage::ECStore as SwiftStore;
 use rustfs_gateway_types::cors_tagging::{PersistedTag as Tag, PersistedTagging as Tagging};
+pub(crate) use rustfs_gateway_types::persistence::PersistedBucketEncryptionConfiguration as SwiftBucketEncryptionConfig;
 use rustfs_storage_api as storage_contracts;
 
 use super::{SwiftError, SwiftResult};
@@ -51,7 +60,10 @@ pub(crate) mod object {
 pub(crate) mod public_api {
     pub use super::{SwiftGetObjectReader, SwiftObjectInfo, SwiftObjectOptions, SwiftPutObjReader};
     pub(crate) use super::{
-        get_swift_bucket_metadata, get_swift_bucket_usage, resolve_swift_object_store_handle, update_swift_bucket_tagging,
+        SwiftWriteCommitGuard, SwiftWriteCompletion, SwiftWritePlan, acquire_swift_self_copy_lock, get_swift_bucket_metadata,
+        get_swift_bucket_sse_config, get_swift_bucket_usage, prepare_swift_get_object_reader,
+        record_swift_bucket_object_delete_memory, record_swift_bucket_object_write_memory, resolve_swift_object_store_handle,
+        update_swift_bucket_tagging,
     };
 }
 
@@ -194,4 +206,46 @@ pub(crate) async fn get_swift_bucket_usage() -> SwiftStorageResult<Option<HashMa
             .map(|(bucket, usage)| (bucket, (usage.objects_count, usage.size)))
             .collect(),
     ))
+}
+
+pub(crate) async fn get_swift_bucket_sse_config(bucket: &str) -> SwiftStorageResult<Option<SwiftBucketEncryptionConfig>> {
+    match get_swift_bucket_sse_config_from_backend(bucket).await {
+        Ok((config, _updated_at)) => Ok(Some(config)),
+        Err(SwiftStorageError::ConfigNotFound) => Ok(None),
+        Err(err) => Err(err),
+    }
+}
+
+pub(crate) async fn prepare_swift_get_object_reader(
+    store: &SwiftStore,
+    bucket: &str,
+    key: &str,
+    range: Option<storage_contracts::HTTPRangeSpec>,
+    headers: HeaderMap,
+    opts: &SwiftObjectOptions,
+) -> SwiftStorageResult<SwiftPreparedGetObjectReader> {
+    store.prepare_get_object_reader(bucket, key, range, headers, opts).await
+}
+
+pub(crate) async fn acquire_swift_self_copy_lock(
+    store: &SwiftStore,
+    bucket: &str,
+    key: &str,
+) -> SwiftStorageResult<SwiftWriteCommitGuard> {
+    use storage_contracts::NamespaceLocking as _;
+
+    let encoded = rustfs_utils::path::encode_dir_object(key);
+    let lock = store.new_ns_lock(bucket, &encoded).await?;
+    let timeout = rustfs_ecstore::api::set_disk::get_lock_acquire_timeout();
+    SwiftWriteCommitGuard::acquire(&lock, timeout)
+        .await
+        .map_err(|err| SwiftStorageError::other(format!("failed to acquire self-copy write lock: {err}")))
+}
+
+pub(crate) async fn record_swift_bucket_object_write_memory(bucket: &str, previous_current_size: Option<u64>, new_size: u64) {
+    rustfs_ecstore::api::data_usage::record_bucket_object_write_memory(bucket, previous_current_size, new_size).await;
+}
+
+pub(crate) async fn record_swift_bucket_object_delete_memory(bucket: &str, deleted_size: u64, removed_current_object: bool) {
+    rustfs_ecstore::api::data_usage::record_bucket_object_delete_memory(bucket, deleted_size, removed_current_object).await;
 }

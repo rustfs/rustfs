@@ -37,16 +37,17 @@ use crate::cleaner::types::{CompressionAlgorithm, FileMatchMode};
 use crate::config::OtelConfig;
 use crate::global::{METRIC_LOG_CLEANER_RUN_FAILURES_TOTAL, METRIC_LOG_CLEANER_RUNS_TOTAL, set_observability_metric_enabled};
 use crate::telemetry::filter::{build_env_filter, effective_verbose_logging, pyroscope_log_filter, s3_dependency_log_filter};
+use crate::telemetry::rate_limit::{FileSinkRateLimitFilter, RateLimitedLayer};
 use crate::telemetry::rolling::{RollingAppender, Rotation};
 use metrics::counter;
 use rustfs_config::observability::{
     DEFAULT_OBS_LOG_ACTIVE_FILE_ROLL_SIZE_BYTES, DEFAULT_OBS_LOG_CLEANUP_INTERVAL_SECONDS, DEFAULT_OBS_LOG_COMPRESS_OLD_FILES,
     DEFAULT_OBS_LOG_COMPRESSED_FILE_RETENTION_DAYS, DEFAULT_OBS_LOG_COMPRESSION_ALGORITHM, DEFAULT_OBS_LOG_DELETE_EMPTY_FILES,
     DEFAULT_OBS_LOG_DRY_RUN, DEFAULT_OBS_LOG_GZIP_COMPRESSION_LEVEL, DEFAULT_OBS_LOG_MATCH_MODE,
-    DEFAULT_OBS_LOG_MAX_SINGLE_FILE_SIZE_BYTES, DEFAULT_OBS_LOG_MAX_TOTAL_SIZE_BYTES, DEFAULT_OBS_LOG_MIN_FILE_AGE_SECONDS,
-    DEFAULT_OBS_LOG_PARALLEL_COMPRESS, DEFAULT_OBS_LOG_PARALLEL_WORKERS, DEFAULT_OBS_LOG_SPAN_EVENTS,
-    DEFAULT_OBS_LOG_ZSTD_COMPRESSION_LEVEL, DEFAULT_OBS_LOG_ZSTD_FALLBACK_TO_GZIP, DEFAULT_OBS_LOG_ZSTD_WORKERS,
-    ENV_OBS_LOG_SPAN_EVENTS,
+    DEFAULT_OBS_LOG_MAX_COMPRESS_FILES_PER_PASS, DEFAULT_OBS_LOG_MAX_SINGLE_FILE_SIZE_BYTES,
+    DEFAULT_OBS_LOG_MAX_TOTAL_SIZE_BYTES, DEFAULT_OBS_LOG_MIN_FILE_AGE_SECONDS, DEFAULT_OBS_LOG_PARALLEL_COMPRESS,
+    DEFAULT_OBS_LOG_PARALLEL_WORKERS, DEFAULT_OBS_LOG_SPAN_EVENTS, DEFAULT_OBS_LOG_ZSTD_COMPRESSION_LEVEL,
+    DEFAULT_OBS_LOG_ZSTD_FALLBACK_TO_GZIP, DEFAULT_OBS_LOG_ZSTD_WORKERS, ENV_OBS_LOG_SPAN_EVENTS,
 };
 use rustfs_config::{APP_NAME, DEFAULT_LOG_KEEP_FILES, DEFAULT_LOG_ROTATION_TIME};
 use rustfs_utils::get_env_str;
@@ -516,8 +517,12 @@ fn init_file_logging_internal(
     let span_list = resolve_span_list(logger_level);
 
     // File output stays machine-readable and free of ANSI sequences so the
-    // resulting files are safe to parse or ship to log processors.
-    let file_layer = build_json_log_layer(non_blocking, false, span_events.clone(), span_list);
+    // resulting files are safe to parse or ship to log processors, guarded by
+    // the sink-side rate limiter against unthrottled log storms.
+    let file_layer = RateLimitedLayer::new(
+        build_json_log_layer(non_blocking, false, span_events.clone(), span_list),
+        FileSinkRateLimitFilter::from_config(config),
+    );
 
     // Optional stdout mirror: enabled explicitly via `log_stdout_enabled`, or
     // unconditionally in non-production environments so developers still see
@@ -703,7 +708,11 @@ pub fn spawn_cleanup_task(
     let max_total_size = config
         .log_max_total_size_bytes
         .unwrap_or(DEFAULT_OBS_LOG_MAX_TOTAL_SIZE_BYTES);
+    let max_archive_size = config.log_max_archive_size_bytes;
     let max_single_file_size = resolve_cleanup_single_file_limit(config);
+    let max_compress_files_per_pass = config
+        .log_max_compress_files_per_pass
+        .unwrap_or(DEFAULT_OBS_LOG_MAX_COMPRESS_FILES_PER_PASS);
     let compress = config.log_compress_old_files.unwrap_or(DEFAULT_OBS_LOG_COMPRESS_OLD_FILES);
     let gzip_level = config
         .log_gzip_compression_level
@@ -743,7 +752,9 @@ pub fn spawn_cleanup_task(
             .match_mode(match_mode)
             .keep_files(keep_files)
             .max_total_size_bytes(max_total_size)
+            .max_archive_size_bytes(max_archive_size)
             .max_single_file_size_bytes(max_single_file_size)
+            .max_compress_files_per_pass(max_compress_files_per_pass)
             .compress_old_files(compress)
             .gzip_compression_level(gzip_level)
             // Compression behavior stays fully config-driven, but the builder

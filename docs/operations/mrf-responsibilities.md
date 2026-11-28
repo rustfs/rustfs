@@ -23,6 +23,10 @@ An action body has a topology-derived `nodeId` and a `request` object. Refresh n
 
 Read the returned per-node outcome before treating an action as acknowledged. Successful action replies retain the durable responsibility and explicitly report `dataVerified: false`. A timeout is ambiguous: observe the same ID on the same node before retrying, and retain the original risk-acceptance request ID. Disappearance from a parked list can mean the entry became `active`; disappearance from a single-ID lookup is not a verification receipt.
 
+## Blocked delete generation
+
+The status `blocked_delete_generation_conflict` means repeated inspection found a live object generation that the committed delete cannot remove. The responsibility lists the bucket, object, and `deleteTransactionId`. RustFS retains the receipts, the live generation, and the partial-write responsibility. Automatic dispatch pauses on the owning node. After resolving the generation conflict, use `recheck` with the responsibility ID and bucket incarnation. On restart, the owner reads the retained receipts again before deciding whether to resume or block.
+
 ## Relating MRF to integrity audit
 
 Use [bounded integrity audit](shard-integrity-audit.md) when independent expected SHA256 evidence exists for supported object versions. Preserve the audit job ID and per-item result alongside the node/responsibility ID and bucket incarnation. A stored checksum supports consistency with that metadata; it does not establish external historical provenance. An audit does not remove MRF responsibility or authorize risk acceptance automatically.

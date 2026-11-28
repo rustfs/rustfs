@@ -75,7 +75,26 @@ pub const ENV_OBS_LOG_SPAN_EVENTS: &str = "RUSTFS_OBS_LOG_SPAN_EVENTS";
 
 /// Log cleanup related configurations
 pub const ENV_OBS_LOG_MAX_TOTAL_SIZE_BYTES: &str = "RUSTFS_OBS_LOG_MAX_TOTAL_SIZE_BYTES";
+/// Dedicated byte budget for compressed log archives (`.gz` / `.zst`).
+/// When unset, compressed archives share the remaining
+/// `RUSTFS_OBS_LOG_MAX_TOTAL_SIZE_BYTES` budget with surviving rolled logs.
+/// Setting an explicit non-zero value enforces an independent archive budget;
+/// `0` removes the byte cap on archives (retention days still apply).
+pub const ENV_OBS_LOG_MAX_ARCHIVE_SIZE_BYTES: &str = "RUSTFS_OBS_LOG_MAX_ARCHIVE_SIZE_BYTES";
 pub const ENV_OBS_LOG_MAX_SINGLE_FILE_SIZE_BYTES: &str = "RUSTFS_OBS_LOG_MAX_SINGLE_FILE_SIZE_BYTES";
+/// Maximum number of rolled log files compressed in a single cleanup pass.
+/// Bounds per-pass CPU spikes on large backlogs; `0` means unlimited.
+/// Over-budget files beyond this cap are deleted directly without compression
+/// so the disk budget still holds in one pass.
+pub const ENV_OBS_LOG_MAX_COMPRESS_FILES_PER_PASS: &str = "RUSTFS_OBS_LOG_MAX_COMPRESS_FILES_PER_PASS";
+/// Maximum number of log events per second admitted to the file sink across all
+/// callsites. `0` disables sink-side rate limiting.
+pub const ENV_OBS_LOG_SINK_MAX_EVENTS_PER_SEC: &str = "RUSTFS_OBS_LOG_SINK_MAX_EVENTS_PER_SEC";
+/// Maximum number of log events per second admitted to the file sink from any
+/// single callsite bucket so one noisy site cannot starve other log sites.
+/// When unset, derived as `(sink_max_events_per_sec / 4).max(1)`; `0` disables
+/// per-callsite isolation while keeping the global sink ceiling.
+pub const ENV_OBS_LOG_SINK_PER_CALLSITE_MAX_EVENTS_PER_SEC: &str = "RUSTFS_OBS_LOG_SINK_PER_CALLSITE_MAX_EVENTS_PER_SEC";
 pub const ENV_OBS_LOG_COMPRESS_OLD_FILES: &str = "RUSTFS_OBS_LOG_COMPRESS_OLD_FILES";
 pub const ENV_OBS_LOG_GZIP_COMPRESSION_LEVEL: &str = "RUSTFS_OBS_LOG_GZIP_COMPRESSION_LEVEL";
 pub const ENV_OBS_LOG_COMPRESSION_ALGORITHM: &str = "RUSTFS_OBS_LOG_COMPRESSION_ALGORITHM";
@@ -100,6 +119,10 @@ pub const DEFAULT_OBS_LOG_MAX_SINGLE_FILE_SIZE_BYTES: u64 = 0; // No per-file tr
 /// the active file is bounded only by the rotation period, and the cleaner
 /// never touches the active file. An explicit `0` keeps size rolling off.
 pub const DEFAULT_OBS_LOG_ACTIVE_FILE_ROLL_SIZE_BYTES: u64 = 256 * 1024 * 1024; // 256 MiB
+/// Default maximum rolled log files compressed in a single cleanup pass.
+pub const DEFAULT_OBS_LOG_MAX_COMPRESS_FILES_PER_PASS: usize = 32;
+/// Default global file-sink event rate ceiling (events/second).
+pub const DEFAULT_OBS_LOG_SINK_MAX_EVENTS_PER_SEC: u64 = 10_000;
 pub const DEFAULT_OBS_LOG_COMPRESS_OLD_FILES: bool = true;
 pub const DEFAULT_OBS_LOG_GZIP_COMPRESSION_LEVEL: u32 = 6;
 pub const DEFAULT_OBS_LOG_COMPRESSION_ALGORITHM_GZIP: &str = "gzip";
@@ -184,7 +207,14 @@ mod tests {
         assert_eq!(ENV_OBS_GET_STAGE_LOCAL_SUMMARY_FILE, "RUSTFS_OBS_GET_STAGE_LOCAL_SUMMARY_FILE");
         // Test log cleanup related env keys
         assert_eq!(ENV_OBS_LOG_MAX_TOTAL_SIZE_BYTES, "RUSTFS_OBS_LOG_MAX_TOTAL_SIZE_BYTES");
+        assert_eq!(ENV_OBS_LOG_MAX_ARCHIVE_SIZE_BYTES, "RUSTFS_OBS_LOG_MAX_ARCHIVE_SIZE_BYTES");
         assert_eq!(ENV_OBS_LOG_MAX_SINGLE_FILE_SIZE_BYTES, "RUSTFS_OBS_LOG_MAX_SINGLE_FILE_SIZE_BYTES");
+        assert_eq!(ENV_OBS_LOG_MAX_COMPRESS_FILES_PER_PASS, "RUSTFS_OBS_LOG_MAX_COMPRESS_FILES_PER_PASS");
+        assert_eq!(ENV_OBS_LOG_SINK_MAX_EVENTS_PER_SEC, "RUSTFS_OBS_LOG_SINK_MAX_EVENTS_PER_SEC");
+        assert_eq!(
+            ENV_OBS_LOG_SINK_PER_CALLSITE_MAX_EVENTS_PER_SEC,
+            "RUSTFS_OBS_LOG_SINK_PER_CALLSITE_MAX_EVENTS_PER_SEC"
+        );
         assert_eq!(ENV_OBS_LOG_COMPRESS_OLD_FILES, "RUSTFS_OBS_LOG_COMPRESS_OLD_FILES");
         assert_eq!(ENV_OBS_LOG_GZIP_COMPRESSION_LEVEL, "RUSTFS_OBS_LOG_GZIP_COMPRESSION_LEVEL");
         assert_eq!(ENV_OBS_LOG_COMPRESSION_ALGORITHM, "RUSTFS_OBS_LOG_COMPRESSION_ALGORITHM");

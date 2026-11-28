@@ -313,7 +313,7 @@ fn protocol_copy_request_head_matches_legacy() {
             ..Default::default()
         };
         let uri = build_object_uri("copy-target", "a ?&/%é", &[]).expect("request URI");
-        let envelope = ProtocolStorageClient::create_envelope(
+        let envelope = ProtocolStorageClient::new(crate::runtime_sources::ServerContextSlot::new()).create_envelope(
             Method::PUT,
             uri,
             RequestParams {

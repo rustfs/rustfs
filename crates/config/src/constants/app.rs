@@ -276,6 +276,7 @@ pub const ENV_RUSTFS_ENCRYPTION_MULTIPART_SEGMENT_NONCE: &str = "RUSTFS_ENCRYPTI
 ///
 /// Default value: false
 /// Environment variable: RUSTFS_ENCRYPTION_MULTIPART_SEGMENT_NONCE
+// RUSTFS_COMPAT_TODO(backlog-2703-multipart-segment-nonce): keep 0x03 multipart segment-nonce writes off by default during rolling upgrades while older nodes or ciphertext-passthrough targets lack 0x03 read support. Remove after the minimum supported release (and warm/replication passthrough targets) reads 0x03 frames and the default flips to true.
 pub const DEFAULT_RUSTFS_ENCRYPTION_MULTIPART_SEGMENT_NONCE: bool = false;
 
 /// Environment variable for server KMS backend.

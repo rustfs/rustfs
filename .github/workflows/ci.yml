@@ -113,7 +113,7 @@ jobs:
             printf '%s\n' 'mode=full' >> "$GITHUB_OUTPUT"
             echo "Base CI policy unavailable; running the full matrix."
           fi
-          if ! grep -q '^plan=' "$GITHUB_OUTPUT" || ! grep -q '^plan_contract=9$' "$GITHUB_OUTPUT"; then
+          if ! grep -q '^plan=' "$GITHUB_OUTPUT" || ! grep -q '^plan_contract=10$' "$GITHUB_OUTPUT"; then
             printf '%s\n' 'mode=full' 'connect=true' 'full_validation=true' 'packages=' 'plan=' >> "$GITHUB_OUTPUT"
             echo "Base policy does not cover this workflow contract; retaining the full matrix."
           fi
@@ -167,6 +167,60 @@ jobs:
 
       - name: Run shared quick checks
         uses: ./.github/actions/quick-checks
+
+  # Required dependency advisory and time-bounded exception gate (rustfs/backlog#2668).
+  # Runs on every non-closed event, including documentation-only PRs, because a
+  # RustSec advisory can be published or an exception can expire without lockfile edits.
+  security-advisories:
+    name: Security Advisories
+    if: github.event_name != 'pull_request' || github.event.action != 'closed'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7
+        with:
+          fetch-depth: 2
+          persist-credentials: false
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+
+      - name: Setup Rust cache
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          cache-all-crates: false
+          cache-on-failure: true
+          shared-key: rustfs-cargo-deny
+          save-if: 'false'
+
+      - name: Install cargo-deny
+        id: install-cargo-deny
+        uses: taiki-e/install-action@7623a79cdfecb99d681017af368ca353d9f49bb5 # v2
+        with:
+          tool: cargo-deny@0.20.2
+
+      - name: Run security advisories gate
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CI_BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha }}
+        run: |
+          if [[ -n "$CI_BASE_SHA" ]]; then
+            git cat-file -e "${CI_BASE_SHA}^{commit}" 2>/dev/null || git fetch --no-tags --depth=1 origin "$CI_BASE_SHA"
+          fi
+          mkdir -p artifacts/advisories
+          python3 scripts/security/check_advisories.py \
+            --output artifacts/advisories/advisories-gate.json \
+            --raw-log artifacts/advisories/cargo-deny.log
+
+      - name: Upload security advisories evidence
+        if: "!cancelled() && steps.install-cargo-deny.outcome == 'success'"
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: security-advisories-${{ github.run_number }}-${{ github.run_attempt }}
+          path: artifacts/advisories
+          if-no-files-found: error
+          retention-days: 7
 
   # Clippy runs beside the test-binary build instead of in front of it. The two
   # share no compiler output: Clippy writes check-mode metadata, the archive
@@ -950,7 +1004,7 @@ jobs:
         run: sudo apt-get install -y build-essential cmake pkg-config
 
       - name: Install s3s-e2e test tool
-        uses: taiki-e/cache-cargo-install-action@7447f04c51f2ba27ca35e7f1e28fab848c5b3ba7 # v2
+        uses: taiki-e/cache-cargo-install-action@9ee83daaa7b96a6fab930949ecf1122bba04a389 # v3.0.8
         with:
           tool: s3s-e2e
           git: https://github.com/s3s-project/s3s.git
@@ -1292,6 +1346,7 @@ jobs:
       - classify-changes
       - typos
       - quick-checks
+      - security-advisories
       - workspace-clippy
       - workspace-lint-and-build
       - workspace-tests
@@ -1326,6 +1381,7 @@ jobs:
       - required-checks
       - typos
       - quick-checks
+      - security-advisories
       - workspace-clippy
       - workspace-lint-and-build
       - workspace-tests

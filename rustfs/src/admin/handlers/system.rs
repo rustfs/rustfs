@@ -13,7 +13,10 @@
 // limitations under the License.
 
 use super::{cluster_snapshot, realtime};
-use crate::admin::auth::{authorize_admin_envelope, resolve_admin_object_read_sse_kms_principal};
+use crate::admin::auth::{
+    AdminResourceScope, authorize_admin_envelope, authorize_admin_envelope_with_context_and_scope,
+    resolve_admin_object_read_sse_kms_principal,
+};
 use crate::admin::handlers::account::{ACCOUNT_INFO_ROUTE, ACCOUNT_PASSWORD_ROUTE};
 use crate::admin::handlers::mfa::{ACCOUNT_MFA_ROUTE, MFA_CHALLENGE_ROUTE, USER_MFA_ROUTE};
 use crate::admin::operation::{AdminRequest, AdminResponse, Operation};
@@ -560,7 +563,6 @@ impl Operation for InspectDataHandler {
             log_system_request_rejected!("inspect_data", "missing_credentials");
             return Err(s3_error!(InvalidRequest, "get cred failed"));
         }
-        authorize_admin_envelope(req.envelope(), vec![Action::AdminAction(AdminAction::InspectDataAction)]).await?;
 
         // MinIO's inspect-data exports a signed archive of raw drive files for a
         // `volume`/`file` glob. RustFS erasure-codes and (optionally) encrypts
@@ -568,7 +570,19 @@ impl Operation for InspectDataHandler {
         // back; instead we return the reconstructed raw object bytes for the
         // requested `volume` (bucket) + `file` (object), which is the honest,
         // usable form of "inspect this object's data" against an EC store.
-        let Some((bucket, object)) = inspect_data_target(req.uri()) else {
+        let target = inspect_data_target(req.uri());
+        let scope = match target.as_ref() {
+            Some((bucket, object)) => AdminResourceScope::bucket_object(bucket, object),
+            None => AdminResourceScope::bucket_object("", ""),
+        };
+        authorize_admin_envelope_with_context_and_scope(
+            req.envelope(),
+            vec![Action::AdminAction(AdminAction::InspectDataAction)],
+            scope,
+        )
+        .await?;
+
+        let Some((bucket, object)) = target else {
             return Err(s3_error!(
                 InvalidRequest,
                 "inspect-data requires `volume` (bucket) and `file` (object) query parameters"
@@ -2485,20 +2499,30 @@ mod tests {
         let runtime_capabilities_tokens = ["runtime_capabilities_gate_actions()"];
         let data_usage_info_tokens = ["data_usage_info_gate_actions()"];
 
-        for (handler, inline_admin_actions, tokens) in [
-            ("ServiceHandle", 1usize, service_tokens.as_slice()),
-            ("UpdateHandler", 1, update_tokens.as_slice()),
-            ("ServerInfoHandler", 1, server_info_tokens.as_slice()),
-            ("InspectDataHandler", 1, inspect_data_tokens.as_slice()),
-            ("StorageInfoHandler", 1, storage_info_tokens.as_slice()),
-            ("RuntimeCapabilitiesHandler", 0, runtime_capabilities_tokens.as_slice()),
-            ("DataUsageInfoHandler", 0, data_usage_info_tokens.as_slice()),
+        for (handler, gate_fn, inline_admin_actions, tokens) in [
+            ("ServiceHandle", "authorize_admin_envelope(", 1usize, service_tokens.as_slice()),
+            ("UpdateHandler", "authorize_admin_envelope(", 1, update_tokens.as_slice()),
+            ("ServerInfoHandler", "authorize_admin_envelope(", 1, server_info_tokens.as_slice()),
+            (
+                "InspectDataHandler",
+                "authorize_admin_envelope_with_context_and_scope(",
+                1,
+                inspect_data_tokens.as_slice(),
+            ),
+            ("StorageInfoHandler", "authorize_admin_envelope(", 1, storage_info_tokens.as_slice()),
+            (
+                "RuntimeCapabilitiesHandler",
+                "authorize_admin_envelope(",
+                0,
+                runtime_capabilities_tokens.as_slice(),
+            ),
+            ("DataUsageInfoHandler", "authorize_admin_envelope(", 0, data_usage_info_tokens.as_slice()),
         ] {
             let block = source_block(production, &format!("impl Operation for {handler}"));
             assert_eq!(
-                block.matches("authorize_admin_envelope(").count(),
+                block.matches(gate_fn).count(),
                 1,
-                "{handler} must use exactly one shared gate"
+                "{handler} must use exactly one shared gate ({gate_fn})"
             );
             assert_eq!(
                 block.matches("Action::AdminAction(").count(),
@@ -2509,10 +2533,16 @@ mod tests {
                 assert!(block.contains(token), "{handler} must authorize with {token}");
             }
             assert!(
-                !block.contains("let cred = authorize_admin_envelope("),
+                !block.contains("let cred = authorize_admin_envelope"),
                 "{handler} does not consume the authenticated credentials"
             );
         }
+
+        let inspect_data = source_block(production, "impl Operation for InspectDataHandler");
+        assert!(
+            inspect_data.contains("AdminResourceScope::bucket_object(bucket, object)"),
+            "InspectDataHandler must scope InspectDataAction to the requested bucket and object"
+        );
 
         assert!(!production.contains("check_key_valid(get_session_token"));
         assert!(!production.contains("validate_admin_request("));
@@ -2527,5 +2557,137 @@ mod tests {
                 .contains("authorize_sse_kms_object_read(Some(&read_principal), &reader.object_info.user_defined).await?;"),
             "InspectDataHandler must authorize kms:Decrypt on the opened reader before returning bytes"
         );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn inspect_data_handler_enforces_bucket_and_object_resource_scope() {
+        crate::app::gating_test_env::run_large_stack_test("inspect-data-resource-scope", || async {
+            use crate::admin::operation::test_support::TestRequest;
+            use crate::admin::runtime_sources::{AppContext, IamInterface, KmsInterface, publish_test_app_context};
+            use crate::admin::storage_api::contract::bucket::{BucketOperations as _, MakeBucketOptions};
+            use crate::admin::storage_api::contract::object::ObjectIO as _;
+            use crate::admin::storage_api::object::{StorageObjectOptions, StoragePutObjReader};
+            use rustfs_iam::store::{Store as _, UserType};
+            use rustfs_madmin::{AccountStatus, AddOrUpdateUserReq};
+            use rustfs_policy::policy::Policy;
+            use std::sync::Arc;
+
+            struct ReadyIam(Arc<rustfs_iam::sys::IamSys<rustfs_iam::store::object::ObjectStore>>);
+            impl IamInterface for ReadyIam {
+                fn handle(&self) -> Arc<rustfs_iam::sys::IamSys<rustfs_iam::store::object::ObjectStore>> {
+                    Arc::clone(&self.0)
+                }
+                fn is_ready(&self) -> bool {
+                    true
+                }
+            }
+            struct TestKms;
+            impl KmsInterface for TestKms {
+                fn handle(&self) -> Arc<rustfs_kms::KmsServiceManager> {
+                    Arc::new(rustfs_kms::KmsServiceManager::new())
+                }
+            }
+
+            let previous = crate::runtime_sources::current_app_context();
+            let (_dir, _paths, store) = crate::app::gating_test_env::isolated_multi_pool_ecstore().await;
+            rustfs_iam::store::object::ObjectStore::new(Arc::clone(&store))
+                .save_iam_config(
+                    serde_json::json!({"version": 1}),
+                    format!("{}/format.json", *rustfs_iam::store::object::IAM_CONFIG_PREFIX),
+                )
+                .await
+                .expect("seed IAM format");
+            for (bucket, key, payload) in [
+                ("app-data", "public/ok.txt", b"public bytes".as_slice()),
+                ("app-data", "private/secret.txt", b"private bytes".as_slice()),
+                ("other-bucket", "public/ok.txt", b"other bytes".as_slice()),
+            ] {
+                let _ = store.make_bucket(bucket, &MakeBucketOptions::default()).await;
+                store
+                    .put_object(
+                        bucket,
+                        key,
+                        &mut StoragePutObjReader::from_vec(payload.to_vec()),
+                        &StorageObjectOptions::default(),
+                    )
+                    .await
+                    .expect("seed test object");
+            }
+
+            let iam = rustfs_iam::build_iam_sys(Arc::clone(&store)).await.expect("init IAM");
+            let user = "scoped-inspector";
+            let secret = "inspector-secret-1234";
+            iam.create_user(
+                user,
+                &AddOrUpdateUserReq {
+                    secret_key: secret.to_owned(),
+                    policy: None,
+                    status: AccountStatus::Enabled,
+                },
+            )
+            .await
+            .expect("create inspector user");
+            iam.set_policy(
+                "inspect-public-only",
+                Policy::parse_config(
+                    br#"{
+                        "Version": "2012-10-17",
+                        "Statement": [{
+                            "Effect": "Allow",
+                            "Action": ["admin:InspectData"],
+                            "Resource": ["arn:aws:s3:::app-data/public/*"]
+                        }]
+                    }"#,
+                )
+                .expect("parse policy"),
+            )
+            .await
+            .expect("store policy");
+            iam.policy_db_set(user, UserType::Reg, false, "inspect-public-only")
+                .await
+                .expect("attach policy");
+
+            let context = Arc::new(AppContext::new(store, Arc::new(ReadyIam(iam)), Arc::new(TestKms)));
+            assert!(context.publish_action_credentials(rustfs_credentials::Credentials {
+                access_key: "inspect-scope-root".to_owned(),
+                secret_key: "inspect-scope-secret".to_owned(),
+                status: "on".to_owned(),
+                ..Default::default()
+            }));
+            publish_test_app_context(context);
+
+            // In-scope bucket + prefix succeeds.
+            let ok_resp = InspectDataHandler {}
+                .call(
+                    TestRequest::new(Method::GET, "/rustfs/admin/v3/inspect-data?volume=app-data&file=public/ok.txt")
+                        .credentials(user, secret, None)
+                        .build(),
+                    Params::new(),
+                )
+                .await
+                .expect("in-scope object must be readable");
+            let (status, _headers, mut body) = ok_resp.into_parts();
+            assert_eq!(status, http::StatusCode::OK);
+            assert_eq!(body.store_all_limited(4096).await.expect("read body").as_ref(), b"public bytes");
+
+            // Out-of-scope prefix, out-of-scope bucket, reserved bucket, and missing query params are denied.
+            for uri in [
+                "/rustfs/admin/v3/inspect-data?volume=app-data&file=private/secret.txt",
+                "/rustfs/admin/v3/inspect-data?volume=other-bucket&file=public/ok.txt",
+                "/rustfs/admin/v3/inspect-data?volume=.rustfs.sys&file=config/iam/format.json",
+                "/rustfs/admin/v3/inspect-data",
+            ] {
+                let err = InspectDataHandler {}
+                    .call(TestRequest::new(Method::GET, uri).credentials(user, secret, None).build(), Params::new())
+                    .await
+                    .expect_err("out-of-scope inspect-data must be denied");
+                assert_eq!(err.code(), &S3ErrorCode::AccessDenied, "{uri}");
+            }
+
+            if let Some(previous) = previous {
+                publish_test_app_context(previous);
+            }
+        });
     }
 }

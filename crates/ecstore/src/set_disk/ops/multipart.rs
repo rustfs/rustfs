@@ -580,6 +580,67 @@ impl Drop for CappedMultipartStagingGuard {
     }
 }
 
+/// Interim local pre-commit RAII cleanup owner for staged multipart part
+/// artifacts under `.rustfs.sys/tmp/<tmp_part>`.
+///
+/// Armed right before opening part writers and transferred/disarmed once commit
+/// takes ownership. If a `put_object_part` future is dropped or cancelled
+/// before commit handoff (for example on client disconnect), `Drop` runs after
+/// the inner future's writers have already dropped (LIFO order) and schedules
+/// prompt cleanup of `.rustfs.sys/tmp/<tmp_part>` instead of leaving orphans
+/// until the 24h stale-tmp sweep.
+struct PreCommitPartStagingCleanupGuard {
+    state: Option<(SetDisks, String)>,
+}
+
+impl PreCommitPartStagingCleanupGuard {
+    fn disarmed() -> Self {
+        Self { state: None }
+    }
+
+    fn arm(&mut self, set: SetDisks, tmp_part: String) {
+        self.state = Some((set, tmp_part));
+    }
+
+    fn disarm(&mut self) {
+        self.state = None;
+    }
+
+    fn take_for_transfer(&mut self) -> Option<(SetDisks, String)> {
+        self.state.take()
+    }
+
+    fn armed_target(&self) -> Option<(&SetDisks, &str)> {
+        self.state.as_ref().map(|(set, tmp)| (set, tmp.as_str()))
+    }
+}
+
+impl Drop for PreCommitPartStagingCleanupGuard {
+    fn drop(&mut self) {
+        let Some((set, tmp_part)) = self.state.take() else {
+            return;
+        };
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            handle.spawn(async move {
+                // Yield once so any just-dropped local file writer handles finish
+                // unwinding before recursive staging deletion runs.
+                tokio::task::yield_now().await;
+                if let Err(err) = set.delete_all(RUSTFS_META_TMP_BUCKET, &tmp_part).await {
+                    warn!(
+                        event = EVENT_SET_DISK_MULTIPART,
+                        component = LOG_COMPONENT_ECSTORE,
+                        subsystem = LOG_SUBSYSTEM_SET_DISK,
+                        result = "drop_cleanup_failed",
+                        tmp_part = %tmp_part,
+                        error = ?err,
+                        "Set disk multipart staging drop cleanup failed"
+                    );
+                }
+            });
+        }
+    }
+}
+
 fn capped_multipart_staging_semaphore(upload_id_path: &str) -> Arc<tokio::sync::Semaphore> {
     CAPPED_MULTIPART_STAGING
         .get_or_init(|| Mutex::new(HashMap::new()))
@@ -3383,6 +3444,9 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
         }
 
         let mut commit_owns_cleanup = false;
+        // Declared before the inner async block so LIFO drop order closes all
+        // opened part writers first before `Drop` schedules tmp reclamation.
+        let mut staging_cleanup = PreCommitPartStagingCleanupGuard::disarmed();
         let result: Result<PartInfo> = async {
             let erasure =
                 Arc::new(coding::Erasure::try_new(fi.erasure.data_blocks, fi.erasure.parity_blocks, fi.erasure.block_size)
@@ -3397,6 +3461,7 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
             .unwrap_or_else(|| erasure.shard_size());
             let writer_setup_stage_start = rustfs_io_metrics::put_stage_metrics_enabled().then(Instant::now);
 
+            staging_cleanup.arm(self.clone(), tmp_part.clone());
             let (mut writers, errors) = create_part_writers(
                 &shuffle_disks,
                 &tmp_part_path,
@@ -3635,6 +3700,21 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
             let commit_opts = opts.clone();
             let commit_staged_quota_reservation = staged_quota_reservation.take();
             commit_owns_cleanup = true;
+            // Transfer pre-commit cleanup ownership exactly once at commit handoff:
+            // - Detached commit runs to completion and owns tmp cleanup exclusively.
+            // - Inline commit (`!detach_commit_owner`) retains the guard only until
+            //   `rename_part` begins so pre-rename cancellation still cleans tmp
+            //   while post-rename/committed artifacts can never be touched.
+            let mut commit_staging_cleanup = if detach_commit_owner {
+                staging_cleanup.disarm();
+                PreCommitPartStagingCleanupGuard::disarmed()
+            } else {
+                let mut transferred = PreCommitPartStagingCleanupGuard::disarmed();
+                if let Some((set, tmp)) = staging_cleanup.take_for_transfer() {
+                    transferred.arm(set, tmp);
+                }
+                transferred
+            };
             // The body is already staged. Keep every commit guard through the
             // prepare, publish, settlement/rollback and temporary cleanup I/O,
             // even when the HTTP request stops awaiting this task.
@@ -3743,6 +3823,9 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
                             achieved: 0,
                         });
                     }
+                    // Disarm before rename_part so a Drop guard can never race
+                    // with rename or touch committed multipart staging.
+                    commit_staging_cleanup.disarm();
                     let rename_started = rustfs_io_metrics::put_stage_timer();
                     let rename_result = commit_set
                         .rename_part(
@@ -3801,6 +3884,9 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
                         "failed to clean multipart commit staging"
                     );
                 }
+                // Disarm only after inline error cleanup completes so dropping
+                // mid-cleanup still triggers Drop-backed reclamation.
+                commit_staging_cleanup.disarm();
                 result
             };
             if detach_commit_owner {
@@ -3813,11 +3899,21 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
         }
         .await;
 
-        if !commit_owns_cleanup
-            && result.is_err()
-            && let Err(err) = self.delete_all(RUSTFS_META_TMP_BUCKET, &tmp_part).await
-        {
-            warn!(tmp_part = %tmp_part, error = ?err, "failed to cleanup multipart temporary data");
+        if !commit_owns_cleanup && result.is_err() {
+            if let Some((set, tmp)) = staging_cleanup.armed_target()
+                && let Err(err) = set.delete_all(RUSTFS_META_TMP_BUCKET, tmp).await
+            {
+                warn!(
+                    event = EVENT_SET_DISK_MULTIPART,
+                    component = LOG_COMPONENT_ECSTORE,
+                    subsystem = LOG_SUBSYSTEM_SET_DISK,
+                    result = "cleanup_failed",
+                    tmp_part = %tmp,
+                    error = ?err,
+                    "failed to cleanup multipart temporary data"
+                );
+            }
+            staging_cleanup.disarm();
         }
 
         result
@@ -9957,6 +10053,167 @@ mod tests {
             leftovers.is_empty(),
             "failed multipart upload part must not leave tmp shards behind, leftovers: {leftovers:?}, err: {err}"
         );
+    }
+
+    #[tokio::test]
+    async fn cancelled_put_object_part_mid_upload_cleans_tmp_staging_via_drop_guard() {
+        let (temp_dirs, disk_stores, set_disks) = hermetic_set_disks(4).await;
+        let bucket = "multipart-cancel-mid-upload-bucket";
+        let object = "object";
+        make_bucket_on_all(&disk_stores, bucket).await;
+
+        let upload = set_disks
+            .new_multipart_upload(bucket, object, &ObjectOptions::default())
+            .await
+            .expect("multipart upload should be created");
+
+        // Exceed the 1 MiB erasure block size so the streaming encoder writes
+        // the first full block to staged tmp shard files before stalling on the
+        // remaining body bytes.
+        let declared_size = 2 * 1024 * 1024;
+        let stalled_entered = Arc::new(tokio::sync::Notify::new());
+        let stalled_entered_clone = Arc::clone(&stalled_entered);
+        let stream = futures::stream::unfold(0u8, move |step| {
+            let stalled_entered = Arc::clone(&stalled_entered_clone);
+            async move {
+                match step {
+                    0 => Some((Ok::<Bytes, std::io::Error>(Bytes::from(vec![0x33; 1024 * 1024])), 1)),
+                    _ => {
+                        stalled_entered.notify_one();
+                        std::future::pending::<()>().await;
+                        None
+                    }
+                }
+            }
+        });
+        let input = tokio_util::io::StreamReader::new(Box::pin(stream));
+        let mut reader = PutObjReader::new(
+            HashReader::from_stream(input, declared_size, declared_size, None, None, false)
+                .expect("hash reader should be constructed"),
+        );
+
+        let put_store = set_disks.clone();
+        let put_upload_id = upload.upload_id.clone();
+        let put = tokio::spawn(async move {
+            put_store
+                .put_object_part(bucket, object, &put_upload_id, 1, &mut reader, &ObjectOptions::default())
+                .await
+        });
+
+        tokio::time::timeout(Duration::from_secs(10), stalled_entered.notified())
+            .await
+            .expect("upload should open part writers and stall mid-stream");
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while non_trash_tmp_entries(&temp_dirs).await.is_empty() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("in-flight upload must have created staged tmp artifacts before cancellation");
+
+        put.abort();
+        assert!(
+            put.await
+                .expect_err("aborted put_object_part task should be cancelled")
+                .is_cancelled()
+        );
+
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while !non_trash_tmp_entries(&temp_dirs).await.is_empty() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("pre-commit Drop guard must promptly reclaim staged tmp artifacts on cancellation");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    #[serial]
+    async fn cancelled_put_object_part_before_commit_cleans_tmp_and_committed_part_survives() {
+        use tokio::io::AsyncReadExt as _;
+
+        let (temp_dirs, disk_stores, set_disks) = hermetic_set_disks(4).await;
+        let bucket = "multipart-cancel-precommit-and-committed-bucket";
+        let object = "object";
+        make_bucket_on_all(&disk_stores, bucket).await;
+
+        let upload = set_disks
+            .new_multipart_upload(bucket, object, &ObjectOptions::default())
+            .await
+            .expect("multipart upload should be created");
+
+        // 1. Cancel after full encode/writer-close but BEFORE commit_owns_cleanup handoff.
+        let precommit_barrier = MultipartCommitBarrier::install(bucket, object, MultipartCommitPause::PutPartBeforeLockAcquire);
+        let put_store = set_disks.clone();
+        let put_upload_id = upload.upload_id.clone();
+        let cancelled_put = tokio::spawn(async move {
+            let mut reader = PutObjReader::from_vec(vec![0x61; 8192]);
+            put_store
+                .put_object_part(bucket, object, &put_upload_id, 1, &mut reader, &ObjectOptions::default())
+                .await
+        });
+        precommit_barrier.wait_until_paused().await;
+        assert!(
+            !non_trash_tmp_entries(&temp_dirs).await.is_empty(),
+            "staged tmp part must exist while paused before commit lock"
+        );
+
+        cancelled_put.abort();
+        assert!(
+            cancelled_put
+                .await
+                .expect_err("cancelled pre-commit put should be aborted")
+                .is_cancelled()
+        );
+        drop(precommit_barrier);
+
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while !non_trash_tmp_entries(&temp_dirs).await.is_empty() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("Drop guard must reclaim tmp staging cancelled before commit lock");
+
+        // 2. Upload part 1 to completion and verify Drop guard does NOT delete committed data.
+        let payload = vec![0x77; 8192];
+        let mut reader = PutObjReader::from_vec(payload.clone());
+        let part = set_disks
+            .put_object_part(bucket, object, &upload.upload_id, 1, &mut reader, &ObjectOptions::default())
+            .await
+            .expect("committed part upload should succeed");
+        assert!(
+            non_trash_tmp_entries(&temp_dirs).await.is_empty(),
+            "successful commit must leave no tmp entries"
+        );
+
+        set_disks
+            .clone()
+            .complete_multipart_upload(
+                bucket,
+                object,
+                &upload.upload_id,
+                vec![CompletePart {
+                    part_num: part.part_num,
+                    etag: part.etag,
+                    ..Default::default()
+                }],
+                &ObjectOptions::default(),
+            )
+            .await
+            .expect("completing multipart upload with committed part must succeed");
+
+        let mut object_reader = set_disks
+            .get_object_reader(bucket, object, None, HeaderMap::new(), &ObjectOptions::default())
+            .await
+            .expect("completed object must remain readable");
+        let mut restored = Vec::new();
+        object_reader
+            .stream
+            .read_to_end(&mut restored)
+            .await
+            .expect("completed object must read intact");
+        assert_eq!(restored, payload, "Drop guard must never delete committed part data");
     }
 
     #[tokio::test]

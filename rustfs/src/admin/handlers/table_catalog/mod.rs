@@ -20,11 +20,11 @@ use crate::admin::storage_api::bucket::metadata::table_catalog_path_hash;
 use crate::admin::storage_api::runtime::ECStore;
 use crate::admin::utils::owned_empty_response;
 use crate::admin::{
-    auth::{AdminResourceScope, validate_admin_action_with_bucket_object_for_iam},
+    auth::{AdminResourceScope, check_admin_key_valid_with_context, validate_admin_action_with_bucket_object_for_iam},
     router::{AdminOperation, S3Router},
 };
 use crate::app::RequestEnvelope;
-use crate::auth::{check_key_valid_with_context, get_session_token};
+use crate::auth::get_session_token;
 use crate::error::ApiError;
 use crate::server::{TABLE_CATALOG_COMPAT_PREFIX, TABLE_CATALOG_PREFIX};
 use crate::table_catalog::{
@@ -1160,7 +1160,7 @@ async fn authorize_table_catalog_request(req: &AdminRequest, action: AdminAction
         &principal.credentials,
         principal.owner,
         Action::AdminAction(action),
-        req.policy_source_addr(),
+        req.envelope(),
         AdminResourceScope::bucket(""),
     )
     .await
@@ -1274,7 +1274,7 @@ async fn authorize_table_catalog_object_for_principal(
         &principal.credentials,
         principal.owner,
         Action::AdminAction(action),
-        req.policy_source_addr(),
+        req.envelope(),
         AdminResourceScope::bucket_object(bucket, object),
     )
     .await
@@ -1341,7 +1341,7 @@ async fn table_catalog_request_principal(req: &AdminRequest) -> S3Result<TableCa
     };
     let context = runtime_sources::app_context_from_envelope(req.envelope())
         .ok_or_else(|| table_catalog_internal_error("request application context is not initialized"))?;
-    let (credentials, owner) = check_key_valid_with_context(
+    let (credentials, owner) = check_admin_key_valid_with_context(
         get_session_token(req.uri(), req.headers()).unwrap_or_default(),
         input_cred.access_key(),
         Some(context.as_ref()),
@@ -2504,6 +2504,8 @@ fn warehouse_from_params(params: &Params<'_, '_>) -> S3Result<String> {
     if warehouse.is_empty() {
         return Err(S3Error::from(ApiError::invalid_request("warehouse is required")));
     }
+    crate::admin::storage_api::bucket::utils::check_valid_bucket_name_strict(warehouse)
+        .map_err(|_| s3_error!(InvalidArgument, "invalid warehouse bucket name"))?;
     Ok(warehouse.to_string())
 }
 
@@ -2523,6 +2525,10 @@ fn warehouse_from_config_query(uri: &http::Uri) -> S3Result<Option<String>> {
             return Err(s3_error!(InvalidRequest, "warehouse query parameter must not be empty"));
         }
         warehouse = Some(value.into_owned());
+    }
+    if let Some(name) = warehouse.as_deref() {
+        crate::admin::storage_api::bucket::utils::check_valid_bucket_name_strict(name)
+            .map_err(|_| s3_error!(InvalidArgument, "invalid warehouse bucket name"))?;
     }
     Ok(warehouse)
 }

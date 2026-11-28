@@ -493,7 +493,7 @@ impl rustfs_protocols::common::client::s3::StorageBackend for ProtocolStorageCli
         }
 
         let input = owned::put_input(input)?;
-        let envelope = Self::create_envelope_with_headers(
+        let envelope = self.create_envelope_with_headers(
             Method::PUT,
             uri,
             RequestParams {
@@ -520,7 +520,7 @@ impl rustfs_protocols::common::client::s3::StorageBackend for ProtocolStorageCli
         trace_protocol_request("delete_object", Some(bucket), Some(key));
 
         let uri = build_object_uri(bucket, key, &[])?;
-        let envelope = Self::create_envelope(
+        let envelope = self.create_envelope(
             Method::DELETE,
             uri,
             RequestParams {
@@ -544,7 +544,7 @@ impl rustfs_protocols::common::client::s3::StorageBackend for ProtocolStorageCli
         trace_protocol_request("head_object", Some(bucket), Some(key));
 
         let uri = build_object_uri(bucket, key, &[])?;
-        let envelope = Self::create_envelope(
+        let envelope = self.create_envelope(
             Method::HEAD,
             uri,
             RequestParams {
@@ -634,15 +634,7 @@ impl rustfs_protocols::common::client::s3::StorageBackend for ProtocolStorageCli
             "Protocol storage client request"
         );
 
-        let envelope = Self::create_envelope(
-            Method::GET,
-            http::Uri::from_static("/"),
-            RequestParams {
-                bucket: None,
-                object: None,
-                credentials,
-            },
-        );
+        let envelope = self.create_list_buckets_envelope(credentials);
         rustfs_io_metrics::record_s3_op(rustfs_s3_ops::S3Operation::ListBuckets);
         self.owned_bucket_usecase()
             .execute_list_buckets(envelope, gateway_dto::ListBucketsInput::default())
@@ -762,7 +754,7 @@ impl rustfs_protocols::common::client::s3::StorageBackend for ProtocolStorageCli
         trace_protocol_request("create_bucket", Some(bucket), None);
 
         let uri = build_bucket_uri(bucket, &[])?;
-        let envelope = Self::create_envelope(
+        let envelope = self.create_envelope(
             Method::PUT,
             uri,
             RequestParams {
@@ -828,7 +820,7 @@ impl rustfs_protocols::common::client::s3::StorageBackend for ProtocolStorageCli
         let key = input.key.as_str().to_owned();
         let uri = build_object_uri(&bucket, &key, &[])?;
         let input = owned::copy_input(input)?;
-        let envelope = Self::create_envelope(
+        let envelope = self.create_envelope(
             Method::PUT,
             uri,
             RequestParams {
@@ -857,7 +849,7 @@ impl rustfs_protocols::common::client::s3::StorageBackend for ProtocolStorageCli
                 .map_err(|e| conversion_error("DeleteBucket bucket", e))?,
             expected_bucket_owner: None,
         };
-        let envelope = Self::create_envelope(
+        let envelope = self.create_envelope(
             Method::DELETE,
             uri,
             RequestParams {
@@ -889,7 +881,7 @@ impl rustfs_protocols::common::client::s3::StorageBackend for ProtocolStorageCli
         let key = input.key.as_str().to_owned();
         let uri = build_object_uri(&bucket, &key, &[("uploads", None)])?;
         let input = multipart::create_multipart_input(input)?;
-        let envelope = Self::create_envelope(
+        let envelope = self.create_envelope(
             Method::POST,
             uri,
             RequestParams {
@@ -939,7 +931,7 @@ impl rustfs_protocols::common::client::s3::StorageBackend for ProtocolStorageCli
         if let Ok(value) = content_length.to_string().parse() {
             headers.insert("content-length", value);
         }
-        let envelope = Self::create_envelope_with_headers(
+        let envelope = self.create_envelope_with_headers(
             Method::PUT,
             uri,
             RequestParams {
@@ -985,7 +977,7 @@ impl rustfs_protocols::common::client::s3::StorageBackend for ProtocolStorageCli
         let key = input.key.as_str().to_owned();
         let input = multipart::complete_multipart_input(input)?;
         let uri = build_object_uri(&bucket, &key, &[("uploadId", Some(upload_id.as_str()))])?;
-        let envelope = Self::create_envelope(
+        let envelope = self.create_envelope(
             Method::POST,
             uri,
             RequestParams {
@@ -1022,7 +1014,7 @@ impl rustfs_protocols::common::client::s3::StorageBackend for ProtocolStorageCli
         let key = input.key.as_str().to_owned();
         multipart::abort_multipart_input(&input)?;
         let uri = build_object_uri(&bucket, &key, &[("uploadId", Some(upload_id.as_str()))])?;
-        let envelope = Self::create_envelope(
+        let envelope = self.create_envelope(
             Method::DELETE,
             uri,
             RequestParams {
@@ -1062,7 +1054,7 @@ impl rustfs_protocols::common::client::s3::StorageBackend for ProtocolStorageCli
         let key = input.key.as_str().to_owned();
         let (uri, input) = multipart::prepare_upload_part_copy(request)?;
 
-        let envelope = Self::create_envelope(
+        let envelope = self.create_envelope(
             Method::PUT,
             uri,
             RequestParams {
@@ -1253,7 +1245,7 @@ mod tests {
             ..Default::default()
         };
 
-        let envelope = ProtocolStorageClient::create_envelope(
+        let envelope = ProtocolStorageClient::new(crate::runtime_sources::ServerContextSlot::new()).create_envelope(
             Method::GET,
             http::Uri::from_static("/bucket?list-type=2"),
             RequestParams {
@@ -2678,6 +2670,135 @@ mod listing_tests {
                     .collect::<Vec<_>>(),
                 [bucket]
             );
+        });
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn protocol_list_buckets_scopes_non_root_iam_and_is_owner_to_bound_server_context() {
+        crate::app::gating_test_env::run_large_stack_test("protocol-list-buckets-isolation", || async {
+            let (_temp, ambient_root, ambient_backend) = listing_client().await;
+            let other_root = rustfs_credentials::Credentials {
+                access_key: "other-server-root".to_owned(),
+                secret_key: "other-server-root-secret".to_owned(),
+                status: "on".to_owned(),
+                ..Default::default()
+            };
+            let (_other_temp, other_context, other_iam) =
+                crate::protocols::policy_test::protocol_test_context(other_root.clone()).await;
+            for bucket in ["bound-allowed", "bound-denied"] {
+                other_context
+                    .object_store()
+                    .make_bucket(bucket, &MakeBucketOptions::default())
+                    .await
+                    .expect("create bound server bucket");
+            }
+            let user_key = "bound-nonroot-user";
+            let user_secret = "bound-nonroot-secret";
+            let policy_name = "bound-list-only";
+            let policy_doc = rustfs_policy::policy::Policy::parse_config(
+                br#"{
+                "Version":"2012-10-17",
+                "Statement":[{"Effect":"Allow","Action":["s3:ListBucket"],"Resource":["arn:aws:s3:::bound-allowed"]}]
+            }"#,
+            )
+            .expect("parse bound user policy");
+            other_iam
+                .set_policy(policy_name, policy_doc)
+                .await
+                .expect("install policy on bound server IAM");
+            other_iam
+                .create_user(
+                    user_key,
+                    &rustfs_madmin::AddOrUpdateUserReq {
+                        secret_key: user_secret.to_owned(),
+                        policy: None,
+                        status: rustfs_madmin::AccountStatus::Enabled,
+                    },
+                )
+                .await
+                .expect("create non-root user on bound server IAM");
+            other_iam
+                .policy_db_set(user_key, rustfs_iam::store::UserType::Reg, false, policy_name)
+                .await
+                .expect("attach policy on bound server IAM");
+
+            let other_slot = ServerContextSlot::new();
+            assert!(other_slot.install(other_context));
+            let other = ProtocolStorageClient::new(other_slot);
+
+            // `is_owner` must reflect the bound server's root credentials, never the ambient/global root.
+            let ambient_root_envelope = other.create_envelope(
+                Method::GET,
+                http::Uri::from_static("/"),
+                RequestParams {
+                    bucket: None,
+                    object: None,
+                    credentials: &ambient_root,
+                },
+            );
+            assert!(
+                !ambient_root_envelope.req_info().expect("req info").is_owner,
+                "ambient root must not be treated as owner on another server context"
+            );
+            let other_root_envelope = other.create_envelope(
+                Method::GET,
+                http::Uri::from_static("/"),
+                RequestParams {
+                    bucket: None,
+                    object: None,
+                    credentials: &other_root,
+                },
+            );
+            assert!(
+                other_root_envelope.req_info().expect("req info").is_owner,
+                "bound server's own root must be treated as owner"
+            );
+            assert!(
+                other_root_envelope.server_context().is_none(),
+                "direct-write create_envelope keeps server_context unbound for BucketGenerationGuard compatibility"
+            );
+
+            // Ambient root has no IAM identity or policy on `other` and is not its owner -> AccessDenied.
+            let ambient_err = other
+                .list_buckets(&ambient_root)
+                .await
+                .expect_err("ambient root must not list buckets on another server");
+            assert_eq!(ambient_err.code(), &rustfs_s3_types::S3ErrorCode::AccessDenied);
+
+            // Non-root user defined ONLY in `other_iam` must see only `bound-allowed`.
+            let non_root_creds = rustfs_credentials::Credentials {
+                access_key: user_key.to_owned(),
+                secret_key: user_secret.to_owned(),
+                status: "on".to_owned(),
+                ..Default::default()
+            };
+            let listed = other
+                .list_buckets(&non_root_creds)
+                .await
+                .expect("non-root user in bound server IAM should list its allowed bucket");
+            let names: Vec<_> = listed.buckets.iter().map(|b| b.name.as_str()).collect();
+            assert_eq!(names, ["bound-allowed"]);
+
+            // Bound server's own root lists both bound buckets.
+            let root_listed = other.list_buckets(&other_root).await.expect("bound root lists all buckets");
+            let mut root_names: Vec<_> = root_listed.buckets.iter().map(|b| b.name.as_str()).collect();
+            root_names.sort_unstable();
+            assert_eq!(root_names, ["bound-allowed", "bound-denied"]);
+
+            // Direct protocol writes remain unaffected by `list_buckets` context binding (no
+            // missing BucketGenerationGuard refusal on a bound ProtocolStorageClient).
+            let put_input = gateway_dto::PutObjectInput {
+                bucket: rustfs_gateway_types::BucketName::new("listing-runtime".to_owned()).expect("bucket"),
+                key: rustfs_gateway_types::ObjectKey::new("direct-write.txt".to_owned()).expect("key"),
+                content_length: 4,
+                body: Some(rustfs_gateway_stream::ByteStream::from_bytes(bytes::Bytes::from_static(b"data"))),
+                ..Default::default()
+            };
+            ambient_backend
+                .put_object(put_input, &ambient_root)
+                .await
+                .expect("direct protocol write must remain unaffected by list_buckets context binding");
         });
     }
 

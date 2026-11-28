@@ -726,6 +726,17 @@ pub enum AdminAction {
 }
 
 impl AdminAction {
+    pub(crate) fn is_resource_scoped(&self) -> bool {
+        self.is_table_resource_scoped()
+            || matches!(
+                self,
+                AdminAction::SetBucketQuotaAdminAction
+                    | AdminAction::SetBucketTargetAction
+                    | AdminAction::GetBucketTargetAction
+                    | AdminAction::InspectDataAction
+            )
+    }
+
     pub(crate) fn is_table_resource_scoped(&self) -> bool {
         matches!(
             self,

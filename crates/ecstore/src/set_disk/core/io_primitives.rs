@@ -1307,12 +1307,21 @@ pub(in crate::set_disk) fn record_bitrot_reader_setup_strategy(
     }
 }
 
+#[cfg(unix)]
+enum BatchPreadOutcome {
+    Selected(Box<BitrotReaderSetup>),
+    BudgetExhausted,
+    NotEligible,
+}
+
 /// When all online shards are local and mmap-read is enabled, materialize
-/// shard bytes through `batch_shard_pread` instead of the per-shard
-/// `open_disk_reader` path. Demand-bound reads add parity batches only as needed.
+/// shard bytes through `batch_shard_pread_with_permits` instead of the
+/// per-shard `open_disk_reader` path. Demand-bound reads add parity batches
+/// only as needed, and every batch reserves its full in-flight byte budget
+/// before allocating buffers.
 #[cfg(unix)]
 #[allow(clippy::too_many_arguments)]
-async fn try_create_bitrot_readers_via_batch_pread(
+async fn try_create_bitrot_readers_via_batch_pread_with_outcome(
     files: &[FileInfo],
     disks: &[Option<DiskStore>],
     bucket: &str,
@@ -1328,15 +1337,16 @@ async fn try_create_bitrot_readers_via_batch_pread(
     parity_shards: usize,
     mode: BitrotReaderSetupMode,
     strategy: BitrotReaderSetupStrategy,
-) -> Option<BitrotReaderSetup> {
-    use crate::disk::local::batch_shard_pread;
+) -> BatchPreadOutcome {
+    use crate::disk::local::batch_shard_pread_with_permits;
+    use crate::set_disk::core::read_budget::global_in_flight_read_budget;
     use rustfs_io_metrics::{LocalBatchReadDecision, record_local_batch_read_decision};
     use std::io::Cursor;
 
     // Scoped q reads retain the normal source's disk admission and memory
     // receipts; the foreground batch worker does not carry resource units.
     if frame_size != shard_size && crate::disk::has_resource_io_scope() {
-        return None;
+        return BatchPreadOutcome::NotEligible;
     }
 
     let prepare_started = rustfs_io_metrics::get_stage_metrics_enabled().then(std::time::Instant::now);
@@ -1347,14 +1357,14 @@ async fn try_create_bitrot_readers_via_batch_pread(
         bitrot_encoded_range_with_frame_size(read_offset, read_length, shard_size, frame_size, checksum_algo.clone());
     if adj_len > object_mmap_read_max_length() {
         record_decision(LocalBatchReadDecision::ReadCapExceeded);
-        return None;
+        return BatchPreadOutcome::NotEligible;
     }
 
     let mut batch_items: Vec<(usize, std::path::PathBuf, usize, usize)> = Vec::new();
     for (idx, disk_op) in disks.iter().enumerate() {
         if files.get(idx).is_some_and(|fi| fi.data.is_some()) {
             record_decision(LocalBatchReadDecision::InlineData);
-            return None;
+            return BatchPreadOutcome::NotEligible;
         }
         if let Some(disk) = disk_op.as_ref() {
             let data_dir = files[idx].data_dir.unwrap_or_default();
@@ -1363,11 +1373,11 @@ async fn try_create_bitrot_readers_via_batch_pread(
                 Some(Ok(p)) => batch_items.push((idx, p, adj_off, adj_len)),
                 Some(Err(_)) => {
                     record_decision(LocalBatchReadDecision::InvalidPath);
-                    return None;
+                    return BatchPreadOutcome::NotEligible;
                 }
                 None => {
                     record_decision(LocalBatchReadDecision::NonLocalShard);
-                    return None;
+                    return BatchPreadOutcome::NotEligible;
                 }
             }
         }
@@ -1375,7 +1385,7 @@ async fn try_create_bitrot_readers_via_batch_pread(
 
     if batch_items.is_empty() {
         record_decision(LocalBatchReadDecision::NoLocalShards);
-        return None;
+        return BatchPreadOutcome::NotEligible;
     }
 
     // Legacy lockstep consumes every shard, so retain its coalesced batch for
@@ -1398,22 +1408,38 @@ async fn try_create_bitrot_readers_via_batch_pread(
         batch_items.len()
     };
     let mut pending = batch_items.into_iter();
-    record_decision(LocalBatchReadDecision::Selected);
+    let mut selected_recorded = false;
     loop {
-        let mut indices = Vec::with_capacity(batch_size.min(pending.len()));
-        let requests: Vec<_> = pending
-            .by_ref()
-            .take(batch_size)
-            .map(|(idx, path, offset, length)| {
-                setup.mark_scheduled(idx);
-                indices.push(idx);
-                #[cfg(test)]
-                disk_call_counters::record(object, disk_call_counters::KIND_DISK_SHARD_OPEN, idx);
-                (path, offset, length)
-            })
-            .collect();
-        if !requests.is_empty() {
-            for (idx, result) in indices.into_iter().zip(batch_shard_pread(requests).await) {
+        let batch_slice: Vec<_> = pending.by_ref().take(batch_size).collect();
+        if !batch_slice.is_empty() {
+            let lengths: Vec<usize> = batch_slice.iter().map(|(_, _, _, length)| *length).collect();
+            let Some(permits) = global_in_flight_read_budget().try_reserve_batch(&lengths) else {
+                // Drop any shard readers materialized in earlier loop rounds so
+                // their permits return to the global budget before falling back
+                // to the streaming path.
+                drop(setup);
+                if !selected_recorded {
+                    record_decision(LocalBatchReadDecision::ReadCapExceeded);
+                }
+                return BatchPreadOutcome::BudgetExhausted;
+            };
+            if !selected_recorded {
+                record_decision(LocalBatchReadDecision::Selected);
+                selected_recorded = true;
+            }
+            let mut indices = Vec::with_capacity(batch_slice.len());
+            let requests: Vec<_> = batch_slice
+                .into_iter()
+                .zip(permits)
+                .map(|((idx, path, offset, length), permit)| {
+                    setup.mark_scheduled(idx);
+                    indices.push(idx);
+                    #[cfg(test)]
+                    disk_call_counters::record(object, disk_call_counters::KIND_DISK_SHARD_OPEN, idx);
+                    (path, offset, length, permit)
+                })
+                .collect();
+            for (idx, result) in indices.into_iter().zip(batch_shard_pread_with_permits(requests).await) {
                 let result = result.map(|bytes| {
                     Some(BitrotReader::new_with_frame_size(
                         ShardReader::InMemory(Cursor::new(bytes)),
@@ -1437,10 +1463,19 @@ async fn try_create_bitrot_readers_via_batch_pread(
             .saturating_sub(setup.available_shards());
     }
 
-    Some(setup)
+    if !selected_recorded {
+        record_decision(LocalBatchReadDecision::Selected);
+    }
+    BatchPreadOutcome::Selected(Box::new(setup))
 }
 
 #[cfg(not(unix))]
+#[allow(clippy::too_many_arguments)]
+async fn try_create_bitrot_readers_via_batch_pread_unsupported() {
+    rustfs_io_metrics::record_local_batch_read_decision(rustfs_io_metrics::LocalBatchReadDecision::UnsupportedPlatform, None);
+}
+
+#[cfg(all(test, not(unix)))]
 #[allow(clippy::too_many_arguments)]
 async fn try_create_bitrot_readers_via_batch_pread(
     _files: &[FileInfo],
@@ -1459,8 +1494,51 @@ async fn try_create_bitrot_readers_via_batch_pread(
     _mode: BitrotReaderSetupMode,
     _strategy: BitrotReaderSetupStrategy,
 ) -> Option<BitrotReaderSetup> {
-    rustfs_io_metrics::record_local_batch_read_decision(rustfs_io_metrics::LocalBatchReadDecision::UnsupportedPlatform, None);
+    try_create_bitrot_readers_via_batch_pread_unsupported().await;
     None
+}
+
+#[cfg(all(test, unix))]
+#[allow(clippy::too_many_arguments)]
+async fn try_create_bitrot_readers_via_batch_pread(
+    files: &[FileInfo],
+    disks: &[Option<DiskStore>],
+    bucket: &str,
+    object: &str,
+    part_number: usize,
+    read_offset: usize,
+    read_length: usize,
+    shard_size: usize,
+    frame_size: usize,
+    checksum_algo: HashAlgorithm,
+    skip_verify_bitrot: bool,
+    data_shards: usize,
+    parity_shards: usize,
+    mode: BitrotReaderSetupMode,
+    strategy: BitrotReaderSetupStrategy,
+) -> Option<BitrotReaderSetup> {
+    match try_create_bitrot_readers_via_batch_pread_with_outcome(
+        files,
+        disks,
+        bucket,
+        object,
+        part_number,
+        read_offset,
+        read_length,
+        shard_size,
+        frame_size,
+        checksum_algo,
+        skip_verify_bitrot,
+        data_shards,
+        parity_shards,
+        mode,
+        strategy,
+    )
+    .await
+    {
+        BatchPreadOutcome::Selected(setup) => Some(*setup),
+        BatchPreadOutcome::BudgetExhausted | BatchPreadOutcome::NotEligible => None,
+    }
 }
 
 #[allow(dead_code, reason = "compatibility wrapper for the legacy shard geometry")]
@@ -1726,48 +1804,67 @@ pub(in crate::set_disk) async fn create_bitrot_readers_until_quorum_with_prefere
     } else {
         true
     };
-    if batch_read_enabled
-        && let Some(mut setup) = try_create_bitrot_readers_via_batch_pread(
-            files,
-            disks,
-            bucket,
-            object,
-            part_number,
-            read_offset,
-            read_length,
-            shard_size,
-            frame_size,
-            checksum_algo.clone(),
-            skip_verify_bitrot,
-            data_shards,
-            parity_shards,
-            mode,
-            strategy,
-        )
-        .await
-    {
-        record_bitrot_reader_setup_strategy(strategy, mode, attribution);
-        fill_deferred_bitrot_readers_with_frame_size(
-            &mut setup,
-            files,
-            disks,
-            bucket,
-            object,
-            part_number,
-            read_offset,
-            read_length,
-            shard_size,
-            frame_size,
-            checksum_algo,
-            skip_verify_bitrot,
-            use_mmap_read,
-            data_shards,
-            parity_shards,
-            mode,
-        );
-        record_bitrot_reader_setup_fanout(strategy, mode, &setup, attribution);
-        return setup;
-    }
+    let use_mmap_read = if batch_read_enabled {
+        #[cfg(unix)]
+        {
+            match try_create_bitrot_readers_via_batch_pread_with_outcome(
+                files,
+                disks,
+                bucket,
+                object,
+                part_number,
+                read_offset,
+                read_length,
+                shard_size,
+                frame_size,
+                checksum_algo.clone(),
+                skip_verify_bitrot,
+                data_shards,
+                parity_shards,
+                mode,
+                strategy,
+            )
+            .await
+            {
+                BatchPreadOutcome::Selected(mut setup) => {
+                    record_bitrot_reader_setup_strategy(strategy, mode, attribution);
+                    fill_deferred_bitrot_readers_with_frame_size(
+                        &mut setup,
+                        files,
+                        disks,
+                        bucket,
+                        object,
+                        part_number,
+                        read_offset,
+                        read_length,
+                        shard_size,
+                        frame_size,
+                        checksum_algo,
+                        skip_verify_bitrot,
+                        use_mmap_read,
+                        data_shards,
+                        parity_shards,
+                        mode,
+                    );
+                    record_bitrot_reader_setup_fanout(strategy, mode, &setup, attribution);
+                    return *setup;
+                }
+                BatchPreadOutcome::BudgetExhausted => {
+                    // Fall straight through to the bounded streaming reader path
+                    // instead of re-attempting per-shard in-memory mmap copies.
+                    false
+                }
+                BatchPreadOutcome::NotEligible => use_mmap_read,
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            try_create_bitrot_readers_via_batch_pread_unsupported().await;
+            use_mmap_read
+        }
+    } else {
+        use_mmap_read
+    };
 
     if strategy == BitrotReaderSetupStrategy::AllShards {
         return create_bitrot_readers_until_quorum_all_shards_with_frame_size(
@@ -10021,6 +10118,228 @@ mod tests {
         );
         assert_eq!(recorder.counter_value("rustfs_io_get_object_local_batch_read_bytes_total", &[]), 7);
         assert_eq!(recorder.histogram_sample_count("rustfs_io_get_object_local_batch_prepare_seconds"), 8);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[serial_test::serial]
+    fn in_flight_read_budget_falls_back_to_streaming_and_reclaims_on_drop() {
+        use crate::set_disk::core::read_budget::global_in_flight_read_budget;
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("in-flight read budget test runtime");
+
+        runtime.block_on(temp_env::async_with_vars(
+            [
+                (rustfs_config::ENV_OBJECT_MMAP_READ_MAX_LENGTH, Some("65536")),
+                (rustfs_config::ENV_OBJECT_MMAP_READ_MAX_INFLIGHT_BYTES, Some("4096")),
+                (rustfs_config::ENV_INTERNODE_PREWARM, Some("false")),
+            ],
+            async {
+                let budget = global_in_flight_read_budget();
+                assert_eq!(budget.in_flight_bytes(), 0, "budget must start clean");
+
+                let bucket = "in-flight-read-budget";
+                let object = "object";
+                let (_dirs, disks) = call_counter_local_disks(bucket, 2).await;
+                let data_dir = Uuid::new_v4();
+                let payload = vec![0x5a_u8; 4096];
+                let mut files = vec![FileInfo::new(object, 1, 1); 2];
+                for (file, disk) in files.iter_mut().zip(&disks) {
+                    file.data_dir = Some(data_dir);
+                    disk.as_ref()
+                        .expect("local disk")
+                        .write_all(bucket, &format!("{object}/{data_dir}/part.1"), Bytes::from(payload.clone()))
+                        .await
+                        .expect("write shard fixture");
+                }
+
+                // First read consumes the 4096-byte data shard via batch pread
+                // (parity shard stays deferred), filling the exact 4096-byte budget.
+                let first = create_bitrot_readers_until_quorum_with_preference(
+                    &files,
+                    &disks,
+                    bucket,
+                    object,
+                    1,
+                    0,
+                    payload.len(),
+                    payload.len(),
+                    HashAlgorithm::None,
+                    false,
+                    true,
+                    1,
+                    1,
+                    BitrotReaderSetupMode::ReadQuorum,
+                    false,
+                    None,
+                    None,
+                )
+                .await;
+                assert!(
+                    matches!(
+                        first.readers[0].as_ref().expect("data shard reader").inner_ref(),
+                        ShardReader::InMemory(_)
+                    ),
+                    "first read under budget must keep the batch pread InMemory fast path"
+                );
+                assert_eq!(
+                    budget.in_flight_bytes(),
+                    4096,
+                    "unread in-memory shard reader must charge the process-wide budget"
+                );
+
+                // Second concurrent unread read exceeds budget -> must fall back to streaming
+                // without overshooting the budget and still return intact shard bytes.
+                let mut second = create_bitrot_readers_until_quorum_with_preference(
+                    &files,
+                    &disks,
+                    bucket,
+                    object,
+                    1,
+                    0,
+                    payload.len(),
+                    payload.len(),
+                    HashAlgorithm::None,
+                    false,
+                    true,
+                    1,
+                    1,
+                    BitrotReaderSetupMode::ReadQuorum,
+                    false,
+                    None,
+                    None,
+                )
+                .await;
+                assert_eq!(budget.in_flight_bytes(), 4096, "exhausted budget must never overshoot");
+                assert!(
+                    second
+                        .readers
+                        .iter()
+                        .flatten()
+                        .all(|reader| !matches!(reader.inner_ref(), ShardReader::InMemory(_))),
+                    "concurrent read when budget is exhausted must fall back to streaming readers"
+                );
+                let mut streamed = vec![0u8; payload.len()];
+                let read_n = second.readers[0]
+                    .as_mut()
+                    .expect("streaming reader must be present")
+                    .read(&mut streamed)
+                    .await
+                    .expect("fallback streaming reader must serve exact bytes");
+                assert_eq!(read_n, payload.len());
+                assert_eq!(streamed, payload);
+                drop(second);
+
+                // Dropping/cancelling the unread first reader must immediately reclaim all bytes.
+                drop(first);
+                assert_eq!(
+                    budget.in_flight_bytes(),
+                    0,
+                    "dropping unread readers must immediately release reserved budget"
+                );
+
+                // After reclamation, subsequent reads resume the InMemory batch fast path.
+                let third = create_bitrot_readers_until_quorum_with_preference(
+                    &files,
+                    &disks,
+                    bucket,
+                    object,
+                    1,
+                    0,
+                    payload.len(),
+                    payload.len(),
+                    HashAlgorithm::None,
+                    false,
+                    true,
+                    1,
+                    1,
+                    BitrotReaderSetupMode::ReadQuorum,
+                    false,
+                    None,
+                    None,
+                )
+                .await;
+                assert!(
+                    matches!(
+                        third.readers[0].as_ref().expect("data shard reader").inner_ref(),
+                        ShardReader::InMemory(_)
+                    ),
+                    "after drop reclamation, batch pread fast path must be re-admitted"
+                );
+                assert_eq!(budget.in_flight_bytes(), 4096);
+                drop(third);
+                assert_eq!(budget.in_flight_bytes(), 0);
+            },
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[serial_test::serial]
+    fn zero_in_flight_read_budget_forces_streaming_fallback() {
+        use crate::set_disk::core::read_budget::global_in_flight_read_budget;
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("zero budget test runtime");
+
+        runtime.block_on(temp_env::async_with_vars(
+            [
+                (rustfs_config::ENV_OBJECT_MMAP_READ_MAX_LENGTH, Some("65536")),
+                (rustfs_config::ENV_OBJECT_MMAP_READ_MAX_INFLIGHT_BYTES, Some("0")),
+                (rustfs_config::ENV_INTERNODE_PREWARM, Some("false")),
+            ],
+            async {
+                let budget = global_in_flight_read_budget();
+                let bucket = "zero-in-flight-budget";
+                let object = "object";
+                let (_dirs, disks) = call_counter_local_disks(bucket, 2).await;
+                let data_dir = Uuid::new_v4();
+                let mut files = vec![FileInfo::new(object, 1, 1); 2];
+                for (file, disk) in files.iter_mut().zip(&disks) {
+                    file.data_dir = Some(data_dir);
+                    disk.as_ref()
+                        .expect("local disk")
+                        .write_all(bucket, &format!("{object}/{data_dir}/part.1"), Bytes::from_static(b"abcd"))
+                        .await
+                        .expect("write shard fixture");
+                }
+
+                let setup = create_bitrot_readers_until_quorum_with_preference(
+                    &files,
+                    &disks,
+                    bucket,
+                    object,
+                    1,
+                    0,
+                    4,
+                    4,
+                    HashAlgorithm::None,
+                    false,
+                    true,
+                    1,
+                    1,
+                    BitrotReaderSetupMode::ReadQuorum,
+                    false,
+                    None,
+                    None,
+                )
+                .await;
+                assert_eq!(budget.in_flight_bytes(), 0);
+                assert!(
+                    setup
+                        .readers
+                        .iter()
+                        .flatten()
+                        .all(|reader| !matches!(reader.inner_ref(), ShardReader::InMemory(_))),
+                    "zero in-flight budget must force streaming readers"
+                );
+            },
+        ));
     }
 
     async fn reopen_local_disk(dir: &TempDir) -> DiskStore {

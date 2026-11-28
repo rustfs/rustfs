@@ -2254,6 +2254,44 @@ fn warehouse_config_query_rejects_empty_and_repeated_values() {
 }
 
 #[test]
+fn warehouse_parsers_enforce_strict_s3_bucket_naming() {
+    let mut router = matchit::Router::new();
+    router.insert("/iceberg/v1/{warehouse}", ()).expect("warehouse test route");
+
+    for valid in ["analytics", "warehouse-2026", "data.lake"] {
+        let path = format!("/iceberg/v1/{valid}");
+        let matched = router.at(&path).expect("valid route match");
+        assert_eq!(
+            warehouse_from_params(&matched.params).expect("valid S3 bucket name must pass params check"),
+            valid
+        );
+
+        let uri = format!("/iceberg/v1/config?warehouse={valid}").parse().expect("valid URI");
+        assert_eq!(
+            warehouse_from_config_query(&uri).expect("valid S3 bucket name must pass query check"),
+            Some(valid.to_string())
+        );
+    }
+
+    for invalid in [".rustfs.sys", ".minio.sys", "UPPERCASE", "bad_warehouse", "ab", "192.168.1.1"] {
+        let path = format!("/iceberg/v1/{invalid}");
+        let matched = router.at(&path).expect("invalid route match");
+        let err = warehouse_from_params(&matched.params).expect_err("invalid S3 bucket name must be rejected in params");
+        assert_eq!(err.code(), &S3ErrorCode::InvalidArgument, "params rejected `{invalid}`");
+
+        let uri = format!("/iceberg/v1/config?warehouse={invalid}")
+            .parse()
+            .expect("invalid URI");
+        let err = warehouse_from_config_query(&uri).expect_err("invalid S3 bucket name must be rejected in query");
+        assert_eq!(err.code(), &S3ErrorCode::InvalidArgument, "query rejected `{invalid}`");
+    }
+
+    let traversal_uri = "/iceberg/v1/config?warehouse=..%2Fescape".parse().expect("traversal URI");
+    let err = warehouse_from_config_query(&traversal_uri).expect_err("path traversal warehouse must be rejected");
+    assert_eq!(err.code(), &S3ErrorCode::InvalidArgument);
+}
+
+#[test]
 fn drop_table_purge_query_is_explicit_and_strict() {
     for (uri, expected) in [
         ("/iceberg/v1/analytics/namespaces/sales/tables/orders", false),
