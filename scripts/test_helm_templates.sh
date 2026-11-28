@@ -411,6 +411,41 @@ assert_extra_volumes_wired "$distributed_extra_output" "distributed StatefulSet"
 distributed_default_output=$(render_distributed_statefulset)
 assert_extra_volumes_absent "$distributed_default_output" "distributed StatefulSet"
 
+assert_tmp_empty_dir() {
+  local manifest="$1" size_limit="${2:-}"
+  if ! EXPECTED_LIMIT="$size_limit" yq -e '
+    .spec.template.spec as $pod | $pod.containers[0] as $app |
+    [$app.volumeMounts[] | select(.mountPath == "/tmp")] as $mounts |
+    [$pod.volumes[] | select(.name == $mounts[0].name)] as $volumes |
+    (
+      ($app.securityContext.readOnlyRootFilesystem == true) and
+      (($mounts | length) == 1) and (($mounts[0].readOnly // false) == false) and
+      (($volumes | length) == 1) and ($volumes[0] | has("emptyDir")) and
+      (($volumes[0].emptyDir.medium // "") == "") and
+      (($volumes[0].emptyDir.sizeLimit // "") == strenv(EXPECTED_LIMIT))
+    )
+  ' - <<<"$manifest" >/dev/null; then
+    echo "$(yq '.kind' - <<<"$manifest") needs one writable /tmp emptyDir with sizeLimit '$size_limit'" >&2
+    exit 1
+  fi
+}
+
+assert_tmp_empty_dir "$standalone_default_output"
+assert_tmp_empty_dir "$distributed_default_output"
+for render in render_standalone_deployment render_distributed_statefulset; do
+  custom_tmp=$("$render" --set-json 'extraVolumes=[{"name":"tmp","emptyDir":{"sizeLimit":"2Gi"}}]' \
+    --set-json 'extraVolumeMounts=[{"name":"tmp","mountPath":"/tmp"}]')
+  assert_tmp_empty_dir "$custom_tmp" 2Gi
+
+  name_in_use=$("$render" --set 'extraVolumes[0].name=rustfs-tmp,extraVolumes[0].configMap.name=settings' \
+    --set 'extraVolumeMounts[0].name=rustfs-tmp,extraVolumeMounts[0].mountPath=/etc/settings')
+  assert_tmp_empty_dir "$name_in_use"
+
+  logs_at_tmp=$("$render" --set config.rustfs.obs_log_directory=/tmp)
+  yq -e '[.spec.template.spec.containers[0].volumeMounts[] | select(.mountPath == "/tmp") | .name] | join(",") == "logs"' \
+    - <<<"$logs_at_tmp" >/dev/null
+done
+
 # clusterDomain (issue #3857): a custom Kubernetes cluster domain must flow into
 # the RUSTFS_VOLUMES FQDN and mTLS server cert SANs, defaulting to cluster.local.
 volumes_default=$(render_distributed_configmap | grep 'RUSTFS_VOLUMES:' || true)

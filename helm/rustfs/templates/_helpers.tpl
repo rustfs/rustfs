@@ -210,6 +210,29 @@ falling back to cluster.local when the value is empty or only dots.
 {{- .Values.clusterDomain | default "cluster.local" | trimAll "." | default "cluster.local" -}}
 {{- end -}}
 
+{{/* Return a free emptyDir name unless the RustFS container already mounts /tmp. */}}
+{{- define "rustfs.tmpVolumeName" -}}
+{{- $mounted := eq (clean (default "" .Values.config.rustfs.obs_log_directory)) "/tmp" -}}
+{{- range .Values.extraVolumeMounts -}}
+{{- if eq (clean .mountPath) "/tmp" -}}
+{{- $mounted = true -}}
+{{- end -}}
+{{- end -}}
+{{- if not $mounted -}}
+{{- $used := dict -}}
+{{- range .Values.extraVolumes -}}
+{{- $_ := set $used .name true -}}
+{{- end -}}
+{{- $name := "rustfs-tmp" -}}
+{{- range $i := until (len $used) -}}
+{{- if hasKey $used $name -}}
+{{- $name = printf "rustfs-tmp-%d" (add1 $i) -}}
+{{- end -}}
+{{- end -}}
+{{- $name -}}
+{{- end -}}
+{{- end -}}
+
 {{/*
 Return the fully qualified name of a server pool.
 Pool 0 keeps the legacy single-pool name so that existing deployments can be

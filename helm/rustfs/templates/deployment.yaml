@@ -7,6 +7,7 @@
 {{- $dataVolumeEnabled := or .Values.mode.standalone.existingClaim.dataClaim (not (empty .Values.storageclass.dataStorageSize)) }}
 
 {{- if .Values.mode.standalone.enabled }}
+{{- $tmpVolumeName := include "rustfs.tmpVolumeName" . }}
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -136,6 +137,10 @@ spec:
             {{- toYaml .Values.resources | nindent 12 }}
           {{- include "rustfs.probes" . | nindent 10 }}
           volumeMounts:
+            {{- with $tmpVolumeName }}
+            - name: {{ . }}
+              mountPath: /tmp
+            {{- end }}
             {{- if or .Values.mtls.enabled $tlsEnabled }}
             - name: tls-material
               mountPath: /opt/tls
@@ -154,6 +159,10 @@ spec:
               mountPath: /data
             {{- end }}
       volumes:
+      {{- with $tmpVolumeName }}
+        - name: {{ . }}
+          emptyDir: {}
+      {{- end }}
       {{- with .Values.extraVolumes }}
       {{- toYaml . | nindent 8 }}
       {{- end }}
