@@ -38,6 +38,7 @@ highway = { workspace = true, optional = true }
 hmac = { workspace = true, optional = true }
 http = { workspace = true, optional = true }
 hyper = { workspace = true, optional = true, features = ["http2", "http1", "server"] }
+hyper-util = { workspace = true, optional = true, features = ["client-proxy", "client-proxy-system"] }
 local-ip-address = { workspace = true, optional = true }
 lz4 = { workspace = true, optional = true }
 netif = { workspace = true, optional = true }
@@ -82,7 +83,7 @@ hotpath-alloc = ["hotpath"]
 hotpath-cpu = ["hotpath"]
 ip = ["dep:local-ip-address"]  # ip characteristics and their dependencies
 net = ["ip", "dep:url", "dep:netif", "dep:futures", "dep:transform-stream", "dep:bytes", "dep:hyper", "dep:tokio"]  # network features with DNS resolver
-egress = ["ip", "dep:reqwest", "dep:tokio", "dep:url"]
+egress = ["ip", "dep:http", "dep:hyper-util", "dep:reqwest", "dep:tokio", "dep:url"]
 io = ["dep:tokio"]
 path = []  # path manipulation features
 compress = ["dep:flate2", "dep:brotli", "dep:snap", "dep:lz4", "dep:zstd"]
