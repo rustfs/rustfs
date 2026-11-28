@@ -30184,6 +30184,7 @@ mod batch_delete_marker_tests {
                     ..Default::default()
                 })
                 .collect(),
+            ..Default::default()
         };
         let present = CurrentDeleteGeneration::Present {
             version_id: Some(Uuid::from_u128(1)),
