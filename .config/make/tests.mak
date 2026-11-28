@@ -63,6 +63,8 @@ script-tests: ## Run shell script tests
 	./scripts/test_pinned_paired_abba_bench.sh
 	./scripts/test_manual_transition_runbooks.sh
 	./scripts/test_fuzz_runner.sh
+	$(RUSTFS_PYTHON_BIN) ./scripts/fuzz/select_targets.py --self-test
+	$(RUSTFS_PYTHON_BIN) ./scripts/security/check_rejection_mutants.py --self-test
 	./scripts/test_python_bin.sh
 	$(RUSTFS_PYTHON_BIN) ./scripts/test_check_doc_paths.py
 	$(RUSTFS_PYTHON_BIN) ./scripts/test_check_kms_format_versions.py
@@ -93,6 +95,7 @@ script-tests: ## Run shell script tests
 	$(RUSTFS_PYTHON_BIN) ./scripts/test_ci_merge_group_proof.py
 	$(RUSTFS_PYTHON_BIN) ./scripts/test_ci_merge_queue.py
 	$(RUSTFS_PYTHON_BIN) -m unittest discover -s scripts/ci -p 'test_*.py'
+	$(RUSTFS_PYTHON_BIN) ./scripts/coverage_per_crate.py --self-test
 	$(RUSTFS_PYTHON_BIN) ./scripts/check_security_coverage.py --self-test
 	$(RUSTFS_PYTHON_BIN) ./scripts/security/check_advisories.py --self-test
 	$(RUSTFS_PYTHON_BIN) ./scripts/check_scheduled_validation_freshness.py --self-test

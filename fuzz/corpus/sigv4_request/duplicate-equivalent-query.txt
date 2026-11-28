@@ -1,0 +1,4 @@
+GET https://bucket.example.com/object?a=1&a=2&space=hello+world&space2=hello%20world&z=0
+host: bucket.example.com
+x-amz-meta-dup: first
+x-amz-meta-dup: second

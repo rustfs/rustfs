@@ -285,7 +285,9 @@ pub(crate) fn classify_storage_error(error: &EcstoreError) -> HealErrorClass {
         EcstoreError::NoHealRequired => HealErrorClass::NoHealRequired,
         // An ambiguous legacy delete residue needs operator inspection;
         // retrying the same heal cannot resolve it (backlog#2902).
-        EcstoreError::DeleteRecoveryLegacyAmbiguous => HealErrorClass::Permanent,
+        EcstoreError::DeleteRecoveryLegacyAmbiguous | EcstoreError::DeleteRecoveryGenerationConflict { .. } => {
+            HealErrorClass::Permanent
+        }
         EcstoreError::Timeout => HealErrorClass::LockContention,
         EcstoreError::DiskNotFound
         | EcstoreError::VolumeNotFound
