@@ -2910,6 +2910,41 @@ fn put_stage_count_value(value: usize) -> f64 {
     }
 }
 
+/// Record an accepted destination-directory waiter or the capacity limit it reached.
+#[inline(always)]
+pub fn record_put_rename_dst_dir_fsync_group_enqueue(outcome: &'static str) {
+    if put_stage_metrics_enabled() {
+        counter!("rustfs_s3_put_object_rename_dst_dir_fsync_group_enqueue_total", "outcome" => outcome).increment(1);
+    }
+}
+
+/// Record one nonempty drained batch before waiting for its physical sync.
+#[inline(always)]
+pub fn record_put_rename_dst_dir_fsync_group_batch(waiters: usize) {
+    if put_stage_metrics_enabled() {
+        let kind = if waiters == 1 { "single" } else { "multi" };
+        histogram!("rustfs_s3_put_object_rename_dst_dir_fsync_group_batch_waiters", "kind" => kind)
+            .record(put_stage_count_value(waiters));
+    }
+}
+
+/// Record one waiter's time from enqueue until its batch was drained.
+#[inline(always)]
+pub fn record_put_rename_dst_dir_fsync_group_queue_wait(wait: std::time::Duration) {
+    if put_stage_metrics_enabled() {
+        histogram!("rustfs_s3_put_object_rename_dst_dir_fsync_group_queue_wait_ms").record(wait.as_secs_f64() * 1000.0);
+    }
+}
+
+/// Record one completed native directory sync, including a returned error.
+#[inline(always)]
+pub fn record_put_rename_dst_dir_fsync_group_physical_sync(succeeded: bool) {
+    if put_stage_metrics_enabled() {
+        let outcome = if succeeded { "success" } else { "error" };
+        counter!("rustfs_s3_put_object_rename_dst_dir_fsync_group_physical_sync_total", "outcome" => outcome).increment(1);
+    }
+}
+
 #[inline(always)]
 pub fn record_put_rename_fdatasync_batch(mode: &'static str, files: usize) {
     if !put_stage_metrics_enabled() {
@@ -4973,6 +5008,68 @@ mod tests {
             .flat_map(|(composite, _, _, _)| composite.key().labels().map(|label| label.value().to_string()))
             .collect::<HashSet<_>>();
         assert_eq!(durations, HashSet::from([duration_stage.to_string(), pending_stage.to_string()]));
+    }
+
+    #[test]
+    fn put_rename_dst_dir_fsync_group_metrics_are_static_and_gated() {
+        let _guard = METRICS_FLAG_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let wait = std::time::Duration::from_millis(2);
+        metrics::with_local_recorder(&recorder, || {
+            set_put_stage_metrics_enabled(false);
+            record_put_rename_dst_dir_fsync_group_enqueue("accepted");
+            record_put_rename_dst_dir_fsync_group_batch(3);
+            record_put_rename_dst_dir_fsync_group_queue_wait(wait);
+            record_put_rename_dst_dir_fsync_group_physical_sync(true);
+
+            assert!(snapshotter.snapshot().into_vec().is_empty());
+            set_put_stage_metrics_enabled(true);
+            record_put_rename_dst_dir_fsync_group_enqueue("accepted");
+            record_put_rename_dst_dir_fsync_group_enqueue("group_limit");
+            record_put_rename_dst_dir_fsync_group_enqueue("group_limit");
+            record_put_rename_dst_dir_fsync_group_enqueue("waiter_limit");
+            record_put_rename_dst_dir_fsync_group_batch(1);
+            record_put_rename_dst_dir_fsync_group_batch(2);
+            record_put_rename_dst_dir_fsync_group_queue_wait(wait);
+            record_put_rename_dst_dir_fsync_group_physical_sync(true);
+            record_put_rename_dst_dir_fsync_group_physical_sync(true);
+            record_put_rename_dst_dir_fsync_group_physical_sync(false);
+            set_put_stage_metrics_enabled(false);
+        });
+
+        let rows = snapshotter.snapshot().into_vec();
+        assert_eq!(rows.len(), 8);
+        let enqueue = "rustfs_s3_put_object_rename_dst_dir_fsync_group_enqueue_total";
+        let batch = "rustfs_s3_put_object_rename_dst_dir_fsync_group_batch_waiters";
+        let queue_wait = "rustfs_s3_put_object_rename_dst_dir_fsync_group_queue_wait_ms";
+        let physical = "rustfs_s3_put_object_rename_dst_dir_fsync_group_physical_sync_total";
+        let value = |name: &str, label: Option<(&str, &str)>| {
+            rows.iter()
+                .find(|(key, _, _, _)| {
+                    key.key().name() == name && key.key().labels().map(|item| (item.key(), item.value())).eq(label)
+                })
+                .map(|(_, _, _, value)| value)
+                .expect("metric with the expected label set")
+        };
+
+        assert!(matches!(value(enqueue, Some(("outcome", "accepted"))), DebugValue::Counter(1)));
+        assert!(matches!(value(enqueue, Some(("outcome", "group_limit"))), DebugValue::Counter(2)));
+        assert!(matches!(value(enqueue, Some(("outcome", "waiter_limit"))), DebugValue::Counter(1)));
+        assert!(matches!(value(physical, Some(("outcome", "success"))), DebugValue::Counter(2)));
+        assert!(matches!(value(physical, Some(("outcome", "error"))), DebugValue::Counter(1)));
+        assert!(matches!(
+            value(batch, Some(("kind", "single"))),
+            DebugValue::Histogram(samples) if samples.len() == 1 && samples[0].0 == 1.0
+        ));
+        assert!(matches!(
+            value(batch, Some(("kind", "multi"))),
+            DebugValue::Histogram(samples) if samples.len() == 1 && samples[0].0 == 2.0
+        ));
+        assert!(matches!(
+            value(queue_wait, None),
+            DebugValue::Histogram(samples) if samples.len() == 1 && samples[0].0 == 2.0
+        ));
     }
 
     #[test]

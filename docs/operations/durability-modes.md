@@ -118,6 +118,19 @@ On Linux, an instrumented run can use `strace -f -c -p <pid> -e trace=openat,ope
 
 Server-side packing of multiple S3 keys into shared containers requires a persistent index, atomic publication, per-key version/delete semantics, garbage collection, and heal/recovery support. These requirements also apply when compacting historical objects. Current inline storage keeps each object's directory and metadata entry independently addressable.
 
+## Destination-directory group commit metrics
+
+The experimental destination-directory group commit path emits these metrics when `RUSTFS_OBS_PUT_STAGE_METRICS_ENABLED` and metrics export are enabled.
+
+| Metric | Meaning |
+| --- | --- |
+| `rustfs_s3_put_object_rename_dst_dir_fsync_group_enqueue_total` | Waiters accepted into the group queue, or rejected at its active-group or waiter limit. The fixed `outcome` labels are `accepted`, `group_limit`, and `waiter_limit`. |
+| `rustfs_s3_put_object_rename_dst_dir_fsync_group_batch_waiters` | Waiters drained per batch, split by `kind=single` or `kind=multi`. Histogram count is the number of drained batches and sum is the number of drained waiters. |
+| `rustfs_s3_put_object_rename_dst_dir_fsync_group_queue_wait_ms` | Time from enqueue to drain, one sample per drained waiter. It excludes directory opening, the subsequent global permit wait, and the sync itself. |
+| `rustfs_s3_put_object_rename_dst_dir_fsync_group_physical_sync_total` | Returned grouped directory `sync_all()` calls on Unix, labeled `outcome=success` or `outcome=error`. |
+
+Batch and queue metrics describe the coordinator's work. Canceling a caller does not remove its waiter from the queue. A worker that shuts down before draining can discard queued waiters, while a drained batch can end before reaching the native sync. Use the physical counter for completed sync calls. These metrics cover the grouped destination-directory path, so comparisons with grouping disabled still require scoped syscall counts.
+
 ## Recovery from corrupt object metadata
 
 A zero-length or unreadable `xl.meta` is corruption, not an absent object.
