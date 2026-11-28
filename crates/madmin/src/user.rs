@@ -99,6 +99,10 @@ pub struct AddOrUpdateUserReq {
     #[serde(rename = "secretKey")]
     pub secret_key: String,
 
+    /// Deprecated legacy field from older admin payloads. `/admin/v3/add-user`
+    /// manages user credentials and status only and rejects non-empty values
+    /// with `InvalidArgument`; callers must attach policies via the dedicated
+    /// policy-attachment endpoints.
     #[serde(rename = "policy", skip_serializing_if = "Option::is_none")]
     pub policy: Option<String>,
 

@@ -348,7 +348,11 @@ fn multipart_envelopes_preserve_original_request_facts() {
             object: Some("a ?#+%.txt".into()),
             credentials: &credentials,
         };
-        let envelope = ProtocolStorageClient::create_envelope(method.clone(), uri.clone(), params);
+        let envelope = ProtocolStorageClient::new(crate::runtime_sources::ServerContextSlot::new()).create_envelope(
+            method.clone(),
+            uri.clone(),
+            params,
+        );
         assert_eq!((envelope.method(), envelope.uri(), envelope.headers().is_empty()), (&method, &uri, true));
         let owned = envelope.req_info().expect("owned facts");
         assert_eq!(

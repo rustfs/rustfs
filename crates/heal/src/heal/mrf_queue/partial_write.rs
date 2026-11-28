@@ -69,6 +69,14 @@ impl PartialWriteKey {
 #[serde(tag = "state", rename_all = "snake_case", deny_unknown_fields)]
 pub(super) enum ResponsibilityState {
     Active {},
+    // The receipts are the durable evidence. Replay the active obligation and
+    // re-inspect them on restart, including when rolling back to a V1 reader.
+    #[serde(skip)]
+    BlockedDeleteGenerationConflict {
+        bucket_incarnation_id: Uuid,
+        transaction: Uuid,
+        since_ms: u64,
+    },
     SourceAndCurrentGenerationUnknown {
         since_ms: u64,
         next_probe_at_ms: u64,
@@ -106,7 +114,7 @@ impl ResponsibilityState {
 
     fn estimated_bytes(&self) -> usize {
         match self {
-            Self::Active {} => 0,
+            Self::Active {} | Self::BlockedDeleteGenerationConflict { .. } => 0,
             Self::SourceAndCurrentGenerationUnknown { .. } => 2 * std::mem::size_of::<u64>() + std::mem::size_of::<u32>(),
             Self::HeldUnverifiedLegacy { .. } => std::mem::size_of::<Uuid>() + std::mem::size_of::<u64>(),
             Self::LegacyGenerationUnknown { .. } => std::mem::size_of::<Uuid>() + std::mem::size_of::<u64>(),
@@ -123,7 +131,10 @@ impl ResponsibilityState {
     pub(super) fn bucket_incarnation_id(&self) -> Option<Uuid> {
         match self {
             Self::Active {} | Self::SourceAndCurrentGenerationUnknown { .. } => None,
-            Self::HeldUnverifiedLegacy {
+            Self::BlockedDeleteGenerationConflict {
+                bucket_incarnation_id, ..
+            }
+            | Self::HeldUnverifiedLegacy {
                 bucket_incarnation_id, ..
             }
             | Self::OperatorAcceptedUnverified {
@@ -164,6 +175,7 @@ impl ResponsibilityCheckpoint {
         }
         match &self.state {
             ResponsibilityState::Active {} => true,
+            ResponsibilityState::BlockedDeleteGenerationConflict { .. } => false,
             ResponsibilityState::SourceAndCurrentGenerationUnknown { .. } => self.source_bucket_incarnation_id.is_none(),
             ResponsibilityState::HeldUnverifiedLegacy {
                 bucket_incarnation_id, ..
@@ -256,6 +268,7 @@ impl Responsibility {
 #[derive(Debug, Default, PartialEq, Eq)]
 pub(super) struct PartialWriteLifecycleSummary {
     pub held_count: usize,
+    pub blocked_delete_generation_count: usize,
     pub legacy_generation_unknown_count: usize,
     pub bucket_incarnation_changed_count: usize,
     pub operator_accepted_count: usize,
@@ -463,6 +476,27 @@ impl PartialWrites {
     }
 
     pub(super) fn park_unverified_legacy(&mut self, anchor: &MrfDurableRepairAnchor) -> bool {
+        self.park(
+            anchor,
+            ResponsibilityState::HeldUnverifiedLegacy {
+                bucket_incarnation_id: anchor.bucket_incarnation_id,
+                since_ms: unix_now_ms(),
+            },
+        )
+    }
+
+    pub(super) fn park_delete_generation_conflict(&mut self, anchor: &MrfDurableRepairAnchor, transaction: Uuid) -> bool {
+        self.park(
+            anchor,
+            ResponsibilityState::BlockedDeleteGenerationConflict {
+                bucket_incarnation_id: anchor.bucket_incarnation_id,
+                transaction,
+                since_ms: unix_now_ms(),
+            },
+        )
+    }
+
+    fn park(&mut self, anchor: &MrfDurableRepairAnchor, state: ResponsibilityState) -> bool {
         let key = PartialWriteKey::from_anchor(anchor);
         let Some(entry) = self.entries.get_mut(&key) else {
             return false;
@@ -475,10 +509,7 @@ impl PartialWrites {
             return false;
         }
         let old_cost = Self::entry_cost(entry);
-        entry.state = ResponsibilityState::HeldUnverifiedLegacy {
-            bucket_incarnation_id: anchor.bucket_incarnation_id,
-            since_ms: unix_now_ms(),
-        };
+        entry.state = state;
         self.bytes = self.bytes.saturating_sub(old_cost).saturating_add(Self::entry_cost(entry));
         true
     }
@@ -492,6 +523,7 @@ impl PartialWrites {
                         summary.legacy_generation_unknown_count += 1;
                     }
                 }
+                ResponsibilityState::BlockedDeleteGenerationConflict { .. } => summary.blocked_delete_generation_count += 1,
                 ResponsibilityState::HeldUnverifiedLegacy { since_ms, .. } => {
                     summary.held_count += 1;
                     summary.oldest_unverified_legacy_enqueued_at_ms = Some(
@@ -528,7 +560,10 @@ impl PartialWrites {
                     responsibility_id: entry.responsibility_id,
                     source_bucket_incarnation_id: entry.source_bucket_incarnation_id,
                     last_operator_acceptance: entry.last_operator_acceptance.clone(),
-                    state: entry.state.clone(),
+                    state: match entry.state {
+                        ResponsibilityState::BlockedDeleteGenerationConflict { .. } => ResponsibilityState::Active {},
+                        _ => entry.state.clone(),
+                    },
                 })
             })
             .collect()
@@ -649,6 +684,9 @@ impl PartialWrites {
                 return Err("a different operator disposition already exists");
             }
             ResponsibilityState::Active {} => return Err("responsibility is not held as unverified legacy"),
+            ResponsibilityState::BlockedDeleteGenerationConflict { .. } => {
+                return Err("delete generation conflict requires recheck");
+            }
             ResponsibilityState::SourceAndCurrentGenerationUnknown { .. } => {
                 return Err("current bucket incarnation is unresolved");
             }
@@ -817,6 +855,11 @@ impl PartialWrites {
         let (status, bucket_incarnation_id, held_since_ms) = match &entry.state {
             ResponsibilityState::Active {} if entry.generation_unobserved() => ("legacy_generation_unobserved", None, None),
             ResponsibilityState::Active {} => ("active", None, None),
+            ResponsibilityState::BlockedDeleteGenerationConflict {
+                bucket_incarnation_id,
+                since_ms,
+                ..
+            } => ("blocked_delete_generation_conflict", Some(*bucket_incarnation_id), Some(*since_ms)),
             ResponsibilityState::SourceAndCurrentGenerationUnknown { since_ms, .. } => {
                 ("source_and_current_generation_unknown", None, Some(*since_ms))
             }
@@ -854,6 +897,10 @@ impl PartialWrites {
             enqueued_at_ms: entry.intent.enqueued_at_ms,
             status: status.to_string(),
             held_since_ms,
+            delete_transaction_id: match entry.state {
+                ResponsibilityState::BlockedDeleteGenerationConflict { transaction, .. } => Some(transaction),
+                _ => None,
+            },
             accepted: entry.last_operator_acceptance.clone(),
             last_identity_probe_result: entry.last_identity_probe_result.map(str::to_string),
             last_identity_probe_at_ms: entry.last_identity_probe_at_ms,
@@ -1181,6 +1228,8 @@ pub struct MrfLegacyResponsibility {
     pub enqueued_at_ms: u64,
     pub status: String,
     pub held_since_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub delete_transaction_id: Option<Uuid>,
     pub accepted: Option<MrfOperatorAcceptance>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_identity_probe_result: Option<String>,
@@ -1460,6 +1509,7 @@ mod tests {
         let scheduling = schedule();
         let expected = PartialWriteLifecycleSummary {
             held_count: 2,
+            blocked_delete_generation_count: 0,
             legacy_generation_unknown_count: 3,
             bucket_incarnation_changed_count: 1,
             operator_accepted_count: 2,
@@ -1908,6 +1958,45 @@ mod tests {
             "c",
             "the old prefix becoming due again cannot starve the next member"
         );
+    }
+
+    #[test]
+    fn delete_generation_conflict_stops_dispatch_and_rechecks_the_same_responsibility_on_replay() {
+        let original = intent("delete-generation");
+        let source = Uuid::new_v4();
+        let anchor = MrfDurableRepairAnchor::from_intent(&original, source).expect("source-bound responsibility");
+        let mut writes = PartialWrites::default();
+        writes
+            .admit_with_source_incarnation(original.clone(), Some(source), 1, 8192)
+            .expect("admit responsibility");
+        writes.mark_persisted();
+        writes
+            .entries
+            .get_mut(&PartialWriteKey::from_anchor(&anchor))
+            .expect("admitted entry")
+            .anchor = Some(anchor.clone());
+        let before = writes.checkpoint_records(super::super::intent_digest);
+        let transaction = Uuid::new_v4();
+        let stale = MrfDurableRepairAnchor::from_intent(&intent("delete-generation"), source).expect("another lease");
+        assert!(!writes.park_delete_generation_conflict(&stale, transaction));
+        assert!(writes.park_delete_generation_conflict(&anchor, transaction));
+        assert!(writes.ready_keys(Instant::now() + Duration::from_secs(3600), 1).is_empty());
+        let checkpoint = writes.checkpoint_records(super::super::intent_digest);
+        assert_eq!(checkpoint, before, "the original obligation remains readable by older peers");
+        let record = checkpoint.first().expect("retained responsibility");
+        let row = writes
+            .responsibility(record.responsibility_id)
+            .expect("inspect blocked responsibility");
+        assert_eq!(row.status, "blocked_delete_generation_conflict");
+        assert_eq!(row.delete_transaction_id, Some(transaction));
+
+        let mut replay = PartialWrites::default();
+        replay
+            .admit_with_source_incarnation(original.clone(), Some(source), 1, 8192)
+            .expect("replay durable intent");
+        assert!(replay.restore_state(&original, record));
+        replay.mark_persisted();
+        assert_eq!(replay.ready_keys(Instant::now(), 1), [PartialWriteKey::from_anchor(&anchor)]);
     }
 
     #[test]

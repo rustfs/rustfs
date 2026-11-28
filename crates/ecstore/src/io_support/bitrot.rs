@@ -432,18 +432,24 @@ async fn open_disk_reader(
     // request the entire part span in one call. Over-cap reads (e.g. a huge
     // single-part object, rustfs#5123) take the bounded streaming path below.
     let use_mmap_copy = if use_mmap_read && disk.is_local() {
-        let mmap_read_cap = object_mmap_read_max_length();
-        let within_cap = length <= mmap_read_cap;
-        if !within_cap {
-            rustfs_io_metrics::record_zero_copy_fallback("read_length_exceeds_cap");
-            debug!(
-                length,
-                mmap_read_cap,
-                path = %path,
-                "zero_copy_read_skipped_over_cap"
-            );
+        let inflight_budget = crate::set_disk::read_budget::object_mmap_read_max_inflight_bytes();
+        if inflight_budget == 0 || length > inflight_budget {
+            rustfs_io_metrics::record_zero_copy_fallback("in_flight_read_budget_exceeded");
+            false
+        } else {
+            let mmap_read_cap = object_mmap_read_max_length();
+            let within_cap = length <= mmap_read_cap;
+            if !within_cap {
+                rustfs_io_metrics::record_zero_copy_fallback("read_length_exceeds_cap");
+                debug!(
+                    length,
+                    mmap_read_cap,
+                    path = %path,
+                    "zero_copy_read_skipped_over_cap"
+                );
+            }
+            within_cap
         }
-        within_cap
     } else {
         false
     };
@@ -524,6 +530,7 @@ async fn open_disk_reader(
                         let reader = instrument_raw_shard_reader(reader, disk.is_local());
                         Ok(wrap_first_read_metrics(reader, metrics_path))
                     }
+                    Err(stream_err) if crate::set_disk::read_budget::is_in_flight_read_budget_exhausted(&err) => Err(stream_err),
                     Err(_) => Err(err),
                 };
             }
@@ -1843,6 +1850,95 @@ mod tests {
             assert!(
                 matches!(disabled, ShardReader::Stream(_)),
                 "cap 0 must route every non-empty read to the streaming path"
+            );
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn open_disk_reader_preserves_disk_errors_and_streams_under_inflight_budget() {
+        use crate::set_disk::read_budget::global_in_flight_read_budget;
+        use rustfs_config::ENV_OBJECT_MMAP_READ_MAX_INFLIGHT_BYTES;
+        use tokio::io::AsyncReadExt;
+
+        let (disk, _dir) = local_test_disk().await;
+        let payload = vec![0x5Au8; 2048];
+        disk.make_volume("test-bucket").await.expect("volume should be created");
+        disk.write_all("test-bucket", "obj/part.1", Bytes::from(payload.clone()))
+            .await
+            .expect("shard file should be written");
+
+        // 1. Exhausted non-zero budget: existing shard falls back to streaming,
+        //    missing shard preserves DiskError::FileNotFound instead of WouldBlock.
+        temp_env::async_with_vars([(ENV_OBJECT_MMAP_READ_MAX_INFLIGHT_BYTES, Some("2048"))], async {
+            let held_permit = global_in_flight_read_budget()
+                .try_reserve(2048)
+                .expect("initial permit should reserve full test budget");
+
+            let existing = open_disk_reader(&disk, "test-bucket", "obj/part.1", 0, payload.len(), true, None)
+                .await
+                .expect("existing shard must fall back to streaming when budget is exhausted");
+            assert!(
+                matches!(existing, ShardReader::Stream(_)),
+                "budget exhaustion must route open_disk_reader to ShardReader::Stream"
+            );
+            let mut existing = existing;
+            let mut streamed = Vec::new();
+            existing
+                .read_to_end(&mut streamed)
+                .await
+                .expect("streamed fallback read should succeed");
+            assert_eq!(streamed, payload);
+
+            let missing_err = open_disk_reader(&disk, "test-bucket", "obj/missing.1", 0, payload.len(), true, None)
+                .await
+                .err()
+                .expect("missing shard must return an error");
+            assert!(
+                matches!(missing_err, DiskError::FileNotFound),
+                "budget exhaustion must preserve DiskError::FileNotFound on missing shard, got: {missing_err:?}"
+            );
+
+            // Releasing the held permit restores the in-memory fast path and reclaims on drop.
+            drop(held_permit);
+            let fast = open_disk_reader(&disk, "test-bucket", "obj/part.1", 0, payload.len(), true, None)
+                .await
+                .expect("read under reclaimed budget should succeed");
+            assert!(
+                matches!(fast, ShardReader::InMemory(_)),
+                "read after permit reclamation must resume InMemory fast path"
+            );
+            assert_eq!(global_in_flight_read_budget().in_flight_bytes(), payload.len());
+            drop(fast);
+            assert_eq!(global_in_flight_read_budget().in_flight_bytes(), 0);
+        })
+        .await;
+
+        // 2. Zero budget disables mmap-copy upfront: existing shard streams and
+        //    missing shard preserves DiskError::FileNotFound.
+        temp_env::async_with_vars([(ENV_OBJECT_MMAP_READ_MAX_INFLIGHT_BYTES, Some("0"))], async {
+            let existing = open_disk_reader(&disk, "test-bucket", "obj/part.1", 0, payload.len(), true, None)
+                .await
+                .expect("existing shard with zero budget must stream");
+            assert!(
+                matches!(existing, ShardReader::Stream(_)),
+                "zero budget must route existing shard to ShardReader::Stream"
+            );
+            let mut existing = existing;
+            let mut streamed = Vec::new();
+            existing
+                .read_to_end(&mut streamed)
+                .await
+                .expect("streamed read with zero budget should succeed");
+            assert_eq!(streamed, payload);
+
+            let missing_err = open_disk_reader(&disk, "test-bucket", "obj/missing.1", 0, payload.len(), true, None)
+                .await
+                .err()
+                .expect("missing shard with zero budget must return an error");
+            assert!(
+                matches!(missing_err, DiskError::FileNotFound),
+                "zero budget must preserve DiskError::FileNotFound on missing shard, got: {missing_err:?}"
             );
         })
         .await;

@@ -19,7 +19,7 @@ use super::*;
 use crate::admin::operation::AdminResponse;
 use crate::server::gateway_handlers::handler_error;
 use crate::server::gateway_handlers::test_support::{CLIENT, PEER, REQUEST_ID, Signed, request_context, signed_request};
-use crate::server::gateway_stack::admin::{assemble, complete_response, dialect, envelope};
+use crate::server::gateway_stack::admin::{assemble, complete_response, configure_authenticator, dialect, envelope};
 use crate::server::stack::claims_native_admin_read;
 use crate::shared_types::RemoteAddr;
 use crate::storage_api::server::http::access::ReqInfo;
@@ -129,7 +129,7 @@ fn capturing_stack(captured: &Arc<Mutex<Vec<serde_json::Value>>>) -> GatewayStac
         Arc::new(ScriptedIam { ready: true }),
         root().source(),
         decide_with(|_| Decision::Allow),
-        std::convert::identity,
+        configure_authenticator,
     )
     .unwrap();
     GatewayStack {
@@ -278,4 +278,103 @@ async fn native_admin_refuses_an_unsigned_amz_header_before_any_handler() {
         assert!(body.contains("not signed"), "{name}: {body}");
     }
     assert_eq!(captured.lock().unwrap().len(), 1, "a refused request reached a handler");
+}
+
+#[tokio::test]
+async fn native_admin_verifies_double_encoded_paths_under_table_catalog_prefixes() {
+    use rustfs_gateway_dialect_rustfs_admin::ops::get_iceberg_by_warehouse_namespaces_by_namespace_tables_by_table::GetIcebergByWarehouseNamespacesByNamespaceTablesByTable as LoadTable;
+    use rustfs_gateway_dialect_rustfs_admin::rustfs_admin_dialect;
+
+    struct NamespaceCapture(Arc<Mutex<Vec<String>>>);
+    impl Handler<LoadTable> for NamespaceCapture {
+        async fn call(&self, request: Req<LoadTable>) -> HandlerResult<LoadTable> {
+            let namespace = request
+                .context()
+                .path_params()
+                .iter()
+                .find_map(|(name, value)| (name == "namespace").then(|| value.to_owned()))
+                .unwrap_or_default();
+            self.0.lock().unwrap().push(namespace);
+            Ok(Resp::new(WireResponse::json("{}")))
+        }
+    }
+
+    let build_stack = |captured: Arc<Mutex<Vec<String>>>, with_admin_auth: bool| {
+        let customizer: fn(rustfs_gateway::SigV4Authenticator) -> rustfs_gateway::SigV4Authenticator = if with_admin_auth {
+            configure_authenticator
+        } else {
+            std::convert::identity
+        };
+        let builder = GatewayStack::configured_builder(
+            &assembly(),
+            Arc::new(ScriptedIam { ready: true }),
+            root().source(),
+            decide_with(|_| Decision::Allow),
+            customizer,
+        )
+        .unwrap();
+        GatewayStack {
+            keystone_auth: None,
+            control_plane: false,
+            object_lambda_fallback: None,
+            service: builder
+                .dialect(&rustfs_admin_dialect().unwrap())
+                .register::<LoadTable, _>(Arc::new(NamespaceCapture(captured)))
+                .build()
+                .unwrap(),
+        }
+    };
+
+    let captured = Arc::new(Mutex::new(Vec::new()));
+    let configured = build_stack(Arc::clone(&captured), true);
+    let unconfigured = build_stack(Arc::clone(&captured), false);
+
+    // Botocore's generic SigV4 signer double-encodes percent-encoded segments under `/iceberg/v1`
+    // and `/_iceberg/v1`: a wire path containing `ods%1Fkfk_log_order` is signed over
+    // `ods%251Fkfk_log_order`. `admin::configure_authenticator` must accept the double-encoded
+    // signature and reject the single-encoded S3 spelling; without it, double-encoded fails auth.
+    for prefix in ["/iceberg/v1", "/_iceberg/v1"] {
+        let wire_path = format!("{prefix}/warehouse/namespaces/ods%1Fkfk_log_order/tables/files");
+        let double_encoded_path = format!("{prefix}/warehouse/namespaces/ods%251Fkfk_log_order/tables/files");
+        let wire_uri: http::Uri = wire_path.parse().expect("valid wire URI");
+
+        let mut double_signed =
+            signed_request(Signed::Header, Method::GET, &double_encoded_path, "", ROOT_ACCESS_KEY, ROOT_SECRET_KEY);
+        *double_signed.uri_mut() = wire_uri.clone();
+        let response = configured.call(double_signed).await;
+        let status = response.status();
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(status, StatusCode::OK, "{prefix}: {}", String::from_utf8_lossy(&body));
+
+        let single_signed = signed_request(Signed::Header, Method::GET, &wire_path, "", ROOT_ACCESS_KEY, ROOT_SECRET_KEY);
+        let rejected = configured.call(single_signed).await;
+        let rejected_status = rejected.status();
+        let rejected_body = rejected.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(
+            rejected_status,
+            StatusCode::FORBIDDEN,
+            "{prefix}: {}",
+            String::from_utf8_lossy(&rejected_body)
+        );
+        assert!(
+            String::from_utf8_lossy(&rejected_body).contains("<Code>SignatureDoesNotMatch</Code>"),
+            "{prefix}: {}",
+            String::from_utf8_lossy(&rejected_body)
+        );
+
+        let mut without_switch =
+            signed_request(Signed::Header, Method::GET, &double_encoded_path, "", ROOT_ACCESS_KEY, ROOT_SECRET_KEY);
+        *without_switch.uri_mut() = wire_uri;
+        let unconfigured_resp = unconfigured.call(without_switch).await;
+        assert_eq!(
+            unconfigured_resp.status(),
+            StatusCode::FORBIDDEN,
+            "{prefix}: control must fail without switch"
+        );
+    }
+
+    assert_eq!(
+        *captured.lock().unwrap(),
+        vec!["ods\u{1f}kfk_log_order".to_owned(), "ods\u{1f}kfk_log_order".to_owned()]
+    );
 }

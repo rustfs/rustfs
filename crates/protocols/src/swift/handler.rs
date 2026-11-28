@@ -57,6 +57,48 @@ fn trusted_client_ip<B>(req: &Request<B>) -> Option<IpAddr> {
 /// never pass it on.
 pub type SwiftRequestBody = UnsyncBoxBody<bytes::Bytes, StdError>;
 
+/// Fast-fail when a declared `Content-Length` header already exceeds `max_bytes`.
+///
+/// This is an optimization only; [`collect_limited_body`] enforces the actual
+/// byte ceiling frame-by-frame so chunked or absent-length requests cannot bypass it.
+pub(super) fn check_declared_body_limit(headers: &http::HeaderMap, max_bytes: usize, label: &str) -> Result<(), SwiftError> {
+    if let Some(len) = object::parse_content_length(headers)?
+        && len > max_bytes as u64
+    {
+        return Err(SwiftError::RequestEntityTooLarge(format!(
+            "{label} exceeds maximum size of {max_bytes} bytes"
+        )));
+    }
+    Ok(())
+}
+
+/// Collect an HTTP request body while enforcing a hard streaming byte cap.
+///
+/// Fails closed with `413 Payload Too Large` as soon as incoming frames exceed
+/// `max_bytes`, covering chunked and unknown-length transfer encodings.
+pub(super) async fn collect_limited_body(
+    mut body: SwiftRequestBody,
+    max_bytes: usize,
+    label: &str,
+) -> Result<bytes::Bytes, SwiftError> {
+    use http_body_util::BodyExt;
+
+    let mut out = bytes::BytesMut::new();
+    while let Some(frame_result) = body.frame().await {
+        let frame = frame_result.map_err(|err| SwiftError::BadRequest(format!("Failed to read {label}: {err}")))?;
+        if let Ok(data) = frame.into_data() {
+            let new_len = out.len().saturating_add(data.len());
+            if new_len > max_bytes {
+                return Err(SwiftError::RequestEntityTooLarge(format!(
+                    "{label} exceeds maximum size of {max_bytes} bytes"
+                )));
+            }
+            out.extend_from_slice(&data);
+        }
+    }
+    Ok(out.freeze())
+}
+
 /// Swift-aware service that routes to Swift handlers or S3 service.
 ///
 /// Swift responses are built as [`Body`] and converted into the wrapped S3
@@ -295,15 +337,12 @@ async fn handle_authenticated_request(
                 && let Some(query) = uri_query
                 && query.contains("bulk-delete")
             {
-                // Bulk delete operation
-                use http_body_util::BodyExt;
-                let body_bytes = body
-                    .collect()
-                    .await
-                    .map_err(|e| SwiftError::BadRequest(format!("Failed to read body: {}", e)))?
-                    .to_bytes();
+                // Bulk delete operation — bound request body at the streaming boundary
+                check_declared_body_limit(&headers, super::bulk::MAX_BULK_DELETE_BODY_SIZE, "Bulk delete request body")?;
+                let body_bytes =
+                    collect_limited_body(body, super::bulk::MAX_BULK_DELETE_BODY_SIZE, "Bulk delete request body").await?;
 
-                let body_str = String::from_utf8(body_bytes.to_vec())
+                let body_str = String::from_utf8(Vec::from(body_bytes))
                     .map_err(|e| SwiftError::BadRequest(format!("Invalid UTF-8 in body: {}", e)))?;
 
                 return super::bulk::handle_bulk_delete(&account, body_str, &credentials).await;
@@ -366,18 +405,21 @@ async fn handle_authenticated_request(
                     if let Some(query) = uri_query
                         && let Some(format_str) = query.strip_prefix("extract-archive=")
                     {
-                        // Bulk extract operation
-                        use http_body_util::BodyExt;
+                        // Bulk extract operation — bound compressed archive body at the streaming boundary
                         let format = super::bulk::ArchiveFormat::from_query(format_str)?;
+                        check_declared_body_limit(&headers, super::bulk::MAX_BULK_EXTRACT_ARCHIVE_BYTES, "Bulk extract archive")?;
+                        let body_bytes =
+                            collect_limited_body(body, super::bulk::MAX_BULK_EXTRACT_ARCHIVE_BYTES, "Bulk extract archive")
+                                .await?;
 
-                        let body_bytes = body
-                            .collect()
-                            .await
-                            .map_err(|e| SwiftError::BadRequest(format!("Failed to read body: {}", e)))?
-                            .to_bytes()
-                            .to_vec();
-
-                        return super::bulk::handle_bulk_extract(&account, &container, format, body_bytes, &credentials).await;
+                        return super::bulk::handle_bulk_extract(
+                            &account,
+                            &container,
+                            format,
+                            Vec::from(body_bytes),
+                            &credentials,
+                        )
+                        .await;
                     }
 
                     // Check for versioning header
@@ -518,20 +560,29 @@ async fn handle_authenticated_request(
                         let tempurl_key = super::account::get_tempurl_key(&account, &Some(credentials.clone())).await?;
 
                         return if let Some(key) = tempurl_key {
-                            // Collect body for multipart parsing
-                            use http_body_util::BodyExt;
-                            let body_bytes = body
-                                .collect()
-                                .await
-                                .map_err(|e| SwiftError::BadRequest(format!("Failed to read body: {}", e)))?
-                                .to_bytes()
-                                .to_vec();
+                            // Collect body for multipart parsing under a hard streaming cap
+                            check_declared_body_limit(
+                                &headers,
+                                super::formpost::MAX_FORMPOST_BODY_SIZE,
+                                "FormPost request body",
+                            )?;
+                            let body_bytes =
+                                collect_limited_body(body, super::formpost::MAX_FORMPOST_BODY_SIZE, "FormPost request body")
+                                    .await?;
 
                             // Build path for signature validation
                             let path = format!("/v1/{}/{}", account, container);
 
-                            super::formpost::handle_formpost(&account, &container, &path, ct_str, body_bytes, &key, &credentials)
-                                .await
+                            super::formpost::handle_formpost(
+                                &account,
+                                &container,
+                                &path,
+                                ct_str,
+                                Vec::from(body_bytes),
+                                &key,
+                                &credentials,
+                            )
+                            .await
                         } else {
                             Err(SwiftError::Unauthorized("TempURL key not configured for FormPost".to_string()))
                         };
@@ -644,11 +695,9 @@ async fn handle_authenticated_request(
                             .await;
                     }
 
-                    let object_size = headers
-                        .get("content-length")
-                        .and_then(|value| value.to_str().ok())
-                        .and_then(|value| value.parse::<u64>().ok());
-                    super::quota::check_upload_quota(&account, &container, object_size, &credentials).await?;
+                    let object_size = object::parse_content_length(&headers)?;
+                    let quota_guard =
+                        super::quota::reserve_upload_quota(&account, &container, object_size, 1, &credentials).await?;
 
                     // Check if versioning is enabled for this container
                     if let Some(archive_container) = container::get_versions_location(&account, &container, &credentials).await? {
@@ -684,7 +733,16 @@ async fn handle_authenticated_request(
                     // This provides backpressure handling and reduces syscall overhead
                     let buffered_reader = tokio::io::BufReader::with_capacity(65536, reader);
 
-                    let etag = object::put_object(&account, &container, &object, &credentials, buffered_reader, &headers).await?;
+                    let etag = object::put_object_with_reservation(
+                        &account,
+                        &container,
+                        &object,
+                        &credentials,
+                        buffered_reader,
+                        &headers,
+                        quota_guard,
+                    )
+                    .await?;
 
                     let trans_id = generate_trans_id();
                     Response::builder()
@@ -737,6 +795,7 @@ async fn handle_authenticated_request(
                     // 3. Accept this extra HEAD call as the cost of proper Range validation
                     // Currently using option 3 for correctness over performance.
                     let info = object::head_object(&account, &container, &object, &credentials).await?;
+                    let object_size = info.get_actual_size().unwrap_or(info.size);
 
                     // Parse and validate Range header, returning 416 for invalid ranges
                     let parsed_range = if let Some(rh) = range_header {
@@ -752,7 +811,7 @@ async fn handle_authenticated_request(
                                     .header("x-trans-id", trans_id.clone())
                                     .header("x-openstack-request-id", trans_id)
                                     .header("accept-ranges", "bytes")
-                                    .header("content-range", format!("bytes */{}", info.size));
+                                    .header("content-range", format!("bytes */{}", object_size));
 
                                 if let Some(etag) = info.etag {
                                     response = response.header("etag", etag);
@@ -799,27 +858,27 @@ async fn handle_authenticated_request(
                         response = response.header("accept-ranges", "bytes");
                         if let Some(rh) = range_header {
                             // Parse Range header and calculate actual byte range
-                            if let Some((start, end)) = parse_range_header(rh, info.size as u64) {
+                            if let Some((start, end)) = parse_range_header(rh, u64::try_from(object_size).unwrap_or(0)) {
                                 let length = end - start + 1;
                                 response = response
-                                    .header("content-range", format!("bytes {}-{}/{}", start, end, info.size))
+                                    .header("content-range", format!("bytes {}-{}/{}", start, end, object_size))
                                     .header("content-length", length.to_string());
                             } else {
                                 // Invalid range - return full object with 200 OK
                                 response = response
                                     .status(StatusCode::OK)
-                                    .header("content-length", info.size.to_string());
+                                    .header("content-length", object_size.to_string());
                             }
                         } else {
                             // No valid range - should not happen since we set is_range_request
                             // But be defensive
-                            response = response.header("content-length", info.size.to_string());
+                            response = response.header("content-length", object_size.to_string());
                         }
                     } else {
                         // For full responses, set full length and advertise range support
                         response = response
                             .header("accept-ranges", "bytes")
-                            .header("content-length", info.size.to_string());
+                            .header("content-length", object_size.to_string());
                     }
 
                     // Add ETag if available
@@ -849,12 +908,13 @@ async fn handle_authenticated_request(
 
                     // Get object metadata
                     let info = object::head_object(&account, &container, &object, &credentials).await?;
+                    let object_size = info.get_actual_size().unwrap_or(info.size);
 
                     let trans_id = generate_trans_id();
                     let mut response = Response::builder()
                         .status(StatusCode::OK)
                         .header("content-type", info.content_type.as_deref().unwrap_or("application/octet-stream"))
-                        .header("content-length", info.size.to_string())
+                        .header("content-length", object_size.to_string())
                         .header("x-trans-id", trans_id.clone())
                         .header("x-openstack-request-id", trans_id);
 
@@ -1156,6 +1216,7 @@ async fn handle_object_get(
         // In production, we'd need a special path for TempURL access
         return Err(SwiftError::InternalServerError("TempURL object access not fully implemented".to_string()));
     };
+    let object_size = info.get_actual_size().unwrap_or(info.size);
 
     // Parse and validate Range header, returning 416 for invalid ranges
     let parsed_range = if let Some(rh) = range_header {
@@ -1171,7 +1232,7 @@ async fn handle_object_get(
                     .header("x-trans-id", trans_id.clone())
                     .header("x-openstack-request-id", trans_id)
                     .header("accept-ranges", "bytes")
-                    .header("content-range", format!("bytes */{}", info.size));
+                    .header("content-range", format!("bytes */{}", object_size));
 
                 if let Some(etag) = info.etag {
                     response = response.header("etag", etag);
@@ -1231,12 +1292,12 @@ async fn handle_object_get(
             let end = range_spec.end;
             let length = end - start + 1;
             response = response
-                .header("content-range", format!("bytes {}-{}/{}", start, end, info.size))
+                .header("content-range", format!("bytes {}-{}/{}", start, end, object_size))
                 .header("content-length", length.to_string());
         }
     } else {
         response = response
-            .header("content-length", info.size.to_string())
+            .header("content-length", object_size.to_string())
             .header("accept-ranges", "bytes");
     }
 
@@ -1279,12 +1340,13 @@ async fn handle_object_head(
     } else {
         return Err(SwiftError::InternalServerError("TempURL object access not fully implemented".to_string()));
     };
+    let object_size = info.get_actual_size().unwrap_or(info.size);
 
     let trans_id = generate_trans_id();
     let mut response = Response::builder()
         .status(StatusCode::OK)
         .header("content-type", info.content_type.as_deref().unwrap_or("application/octet-stream"))
-        .header("content-length", info.size.to_string())
+        .header("content-length", object_size.to_string())
         .header("x-trans-id", trans_id.clone())
         .header("x-openstack-request-id", trans_id)
         .header("accept-ranges", "bytes");
@@ -1718,5 +1780,79 @@ mod tests {
             .expect("the S3 service answers");
         assert_eq!(text(response).await, "payload");
         assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn check_declared_body_limit_enforces_bounds_and_rejects_malformed() {
+        use super::SwiftError;
+        use super::check_declared_body_limit;
+
+        let empty = http::HeaderMap::new();
+        assert!(check_declared_body_limit(&empty, 1024, "Test body").is_ok());
+
+        let mut at_limit = http::HeaderMap::new();
+        at_limit.insert("content-length", "1024".parse().expect("valid header"));
+        assert!(check_declared_body_limit(&at_limit, 1024, "Test body").is_ok());
+
+        let mut over_limit = http::HeaderMap::new();
+        over_limit.insert("content-length", "1025".parse().expect("valid header"));
+        assert!(matches!(
+            check_declared_body_limit(&over_limit, 1024, "Test body"),
+            Err(SwiftError::RequestEntityTooLarge(_))
+        ));
+
+        let mut negative = http::HeaderMap::new();
+        negative.insert("content-length", "-1".parse().expect("valid header"));
+        assert!(matches!(
+            check_declared_body_limit(&negative, 1024, "Test body"),
+            Err(SwiftError::BadRequest(_))
+        ));
+
+        let mut invalid = http::HeaderMap::new();
+        invalid.insert("content-length", "not-a-number".parse().expect("valid header"));
+        assert!(matches!(
+            check_declared_body_limit(&invalid, 1024, "Test body"),
+            Err(SwiftError::BadRequest(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn collect_limited_body_accepts_payload_at_exact_limit() {
+        use super::{SwiftRequestBody, collect_limited_body};
+        use futures::stream;
+
+        let chunks: Vec<Result<Bytes, std::io::Error>> = vec![Ok(Bytes::from(vec![b'a'; 512])), Ok(Bytes::from(vec![b'b'; 512]))];
+        let body: SwiftRequestBody = UnsyncBoxBody::new(Body::from_stream(stream::iter(chunks)).map_err(super::StdError::from));
+        let collected = collect_limited_body(body, 1024, "Test body")
+            .await
+            .expect("body at exact limit must succeed");
+        assert_eq!(collected.len(), 1024);
+    }
+
+    #[tokio::test]
+    async fn collect_limited_body_aborts_oversized_chunked_stream_without_draining() {
+        use super::{SwiftError, SwiftRequestBody, collect_limited_body};
+        use futures::{StreamExt, stream};
+
+        let yielded = Arc::new(AtomicUsize::new(0));
+        let yielded_clone = Arc::clone(&yielded);
+        let chunk_stream = stream::iter(0..20usize).map(move |_| {
+            yielded_clone.fetch_add(1, Ordering::SeqCst);
+            Ok::<_, std::io::Error>(Bytes::from(vec![b'x'; 1024]))
+        });
+        let body: SwiftRequestBody = UnsyncBoxBody::new(Body::from_stream(chunk_stream).map_err(super::StdError::from));
+
+        let err = collect_limited_body(body, 2048, "Test body")
+            .await
+            .expect_err("oversized stream must fail closed");
+        assert!(
+            matches!(err, SwiftError::RequestEntityTooLarge(_)),
+            "expected RequestEntityTooLarge, got {err:?}"
+        );
+        assert!(
+            yielded.load(Ordering::SeqCst) <= 4,
+            "stream must stop promptly at the limit, yielded {} chunks",
+            yielded.load(Ordering::SeqCst)
+        );
     }
 }

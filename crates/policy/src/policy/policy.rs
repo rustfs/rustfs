@@ -2337,6 +2337,107 @@ mod test {
         Ok(())
     }
 
+    #[tokio::test]
+    async fn test_bucket_and_object_scoped_admin_actions_enforce_resource_bounds() -> Result<()> {
+        use crate::policy::action::{Action, AdminAction};
+
+        let conditions = HashMap::new();
+        let claims = HashMap::new();
+        let groups = None;
+
+        for (action_name, action) in [
+            ("admin:SetBucketQuota", AdminAction::SetBucketQuotaAdminAction),
+            ("admin:GetBucketTarget", AdminAction::GetBucketTargetAction),
+            ("admin:SetBucketTarget", AdminAction::SetBucketTargetAction),
+        ] {
+            let scoped_doc = format!(
+                r#"{{"Version":"2012-10-17","Statement":[{{"Effect":"Allow","Action":["{action_name}"],"Resource":["arn:aws:s3:::allowed-bucket"]}}]}}"#
+            );
+            let scoped = Policy::parse_config(scoped_doc.as_bytes())?;
+            let allowed_args = Args {
+                account: "testuser",
+                groups: &groups,
+                action: Action::AdminAction(action),
+                bucket: "allowed-bucket",
+                conditions: &conditions,
+                is_owner: false,
+                object: "",
+                claims: &claims,
+                deny_only: false,
+            };
+            assert!(
+                scoped.is_allowed(&allowed_args).await,
+                "{action_name} must allow the bucket named in Resource"
+            );
+
+            for denied_bucket in ["other-bucket", ""] {
+                let denied_args = Args {
+                    bucket: denied_bucket,
+                    ..allowed_args
+                };
+                assert!(
+                    !scoped.is_allowed(&denied_args).await,
+                    "{action_name} scoped to allowed-bucket must deny bucket `{denied_bucket}`"
+                );
+            }
+
+            let unscoped_doc =
+                format!(r#"{{"Version":"2012-10-17","Statement":[{{"Effect":"Allow","Action":["{action_name}"]}}]}}"#);
+            let unscoped = Policy::parse_config(unscoped_doc.as_bytes())?;
+            for bucket in ["allowed-bucket", "other-bucket", ""] {
+                let args = Args { bucket, ..allowed_args };
+                assert!(
+                    unscoped.is_allowed(&args).await,
+                    "resource-less {action_name} statement must keep authorizing `{bucket}`"
+                );
+            }
+        }
+
+        let inspect_doc = r#"{
+            "Version": "2012-10-17",
+            "Statement": [
+                {
+                    "Effect": "Allow",
+                    "Action": ["admin:InspectData"],
+                    "Resource": ["arn:aws:s3:::allowed-bucket/public/*"]
+                }
+            ]
+        }"#;
+        let inspect_policy = Policy::parse_config(inspect_doc.as_bytes())?;
+        let base_inspect = Args {
+            account: "testuser",
+            groups: &groups,
+            action: Action::AdminAction(AdminAction::InspectDataAction),
+            bucket: "allowed-bucket",
+            conditions: &conditions,
+            is_owner: false,
+            object: "public/report.txt",
+            claims: &claims,
+            deny_only: false,
+        };
+        assert!(
+            inspect_policy.is_allowed(&base_inspect).await,
+            "InspectData must allow objects under the granted prefix"
+        );
+        for (bucket, object) in [
+            ("allowed-bucket", "private/secret.txt"),
+            ("other-bucket", "public/report.txt"),
+            ("", ""),
+        ] {
+            let denied = Args {
+                bucket,
+                object,
+                ..base_inspect
+            };
+            assert!(
+                !inspect_policy.is_allowed(&denied).await,
+                "InspectData must deny `{bucket}/{object}` outside the granted resource"
+            );
+        }
+
+        Ok(())
+    }
+
     #[test]
     fn test_sts_statement_without_resource_is_valid() {
         let data = r#"

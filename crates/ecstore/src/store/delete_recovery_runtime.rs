@@ -809,6 +809,9 @@ async fn recover_hint(
     let mut failures = RecoveryFailures::default();
     match outcome {
         Some(Ok(_)) => {}
+        // The receipts remain discoverable by the inventory sweep. A new foreground
+        // ticket can also recheck them after the operator changes the evidence.
+        Some(Err(crate::error::StorageError::DeleteRecoveryGenerationConflict { .. })) => failures.blocked = 1,
         Some(Err(error)) => {
             let (count, reason) = match error {
                 crate::error::StorageError::ErasureReadQuorum => (&mut failures.pending, FailureReason::MissingQuorum),

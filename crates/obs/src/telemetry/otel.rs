@@ -42,6 +42,7 @@ use crate::global::set_observability_metric_enabled;
 use crate::telemetry::filter::{build_env_filter, pyroscope_log_filter, s3_dependency_log_filter};
 use crate::telemetry::guard::{OtelGuard, ProfilingAgent};
 use crate::telemetry::local::{build_json_log_layer, open_rolling_appender, spawn_cleanup_task};
+use crate::telemetry::rate_limit::{FileSinkRateLimitFilter, RateLimitedLayer};
 use crate::telemetry::recorder::{Recorder, install_process_global_recorder};
 use crate::telemetry::resource::build_resource;
 use crate::telemetry::rolling::Rotation;
@@ -264,7 +265,10 @@ pub(super) fn init_observability_http(
             crate::telemetry::local::validate_stdout_sink(&file_appender)?;
 
             let (non_blocking, guard) = tracing_appender::non_blocking(file_appender);
-            let file_layer = build_json_log_layer(non_blocking, false, span_events.clone(), span_list);
+            let file_layer = RateLimitedLayer::new(
+                build_json_log_layer(non_blocking, false, span_events.clone(), span_list),
+                FileSinkRateLimitFilter::from_config(config),
+            );
             let cleanup_handle = spawn_cleanup_task(config, log_directory, log_filename, keep_files, roll_signal);
             Ok((file_layer, guard, cleanup_handle, rotation_str))
         })();

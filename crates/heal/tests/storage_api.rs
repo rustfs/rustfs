@@ -21,6 +21,7 @@ pub(crate) mod endpoint_index {
 // still touch directly.
 #[allow(unused_imports)]
 pub(crate) mod integration {
+    pub(crate) use rustfs_ecstore::api::config::storageclass::lookup_config_for_pools;
     pub(crate) use rustfs_ecstore::api::disk::{
         DeleteOptions, DeleteRecoveryAction, DeleteRecoveryState, DiskAPI, DiskError, DiskOption, DiskStore, Endpoint,
         RUSTFS_META_BUCKET, ReadOptions, new_disk,

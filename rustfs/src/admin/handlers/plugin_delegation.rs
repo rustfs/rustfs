@@ -4,16 +4,13 @@
 //! Restriction registration only. These endpoints do not vend credentials.
 use crate::admin::operation::{AdminRequest, AdminResponse, Operation};
 use crate::admin::{
-    auth::{AdminResourceScope, validate_admin_action_with_bucket_object_for_iam},
+    auth::{AdminResourceScope, check_admin_key_valid_with_context, validate_admin_action_with_bucket_object_for_iam},
     plugin_runner::{self, ObjectReference, SubmitRequest},
     router::{AdminOperation, S3Router},
     runtime_sources,
     storage_api::s3::{self, S3Error, S3ErrorCode, S3Result},
 };
-use crate::{
-    auth::{check_key_valid_with_context, get_session_token},
-    server::ADMIN_PREFIX,
-};
+use crate::{auth::get_session_token, server::ADMIN_PREFIX};
 use http::{HeaderMap, HeaderValue, Method, StatusCode};
 use matchit::Params;
 use rustfs_iam::delegation::{DelegationError, Restrictions};
@@ -84,7 +81,7 @@ pub(super) async fn owner(
     }
     let context = runtime_sources::app_context_from_envelope(req.envelope())
         .ok_or_else(|| s3::error(S3ErrorCode::InternalError, "application context unavailable"))?;
-    let (credentials, root) = check_key_valid_with_context("", signed.access_key(), Some(context.as_ref())).await?;
+    let (credentials, root) = check_admin_key_valid_with_context("", signed.access_key(), Some(context.as_ref())).await?;
     if root || credentials.is_temp() || credentials.is_service_account() {
         return Err(s3::error(S3ErrorCode::AccessDenied, "original user required"));
     }
@@ -98,7 +95,7 @@ pub(super) async fn owner(
         &credentials,
         false,
         Action::AdminAction(action),
-        req.policy_source_addr(),
+        req.envelope(),
         AdminResourceScope::bucket_object("", ""),
     )
     .await?;

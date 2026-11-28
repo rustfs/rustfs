@@ -704,12 +704,12 @@ async fn the_console_listener_isolates_its_routes_in_front_of_the_control_plane_
     let reached = Arc::new(AtomicUsize::new(0));
     let counted = {
         let reached = Arc::clone(&reached);
-        tower::service_fn(move |request: HttpRequest<ControlRequestBody>| {
+        tower::service_fn(move |request: HttpRequest<Full<Bytes>>| {
             reached.fetch_add(1, Ordering::SeqCst);
             edge.clone().oneshot(request)
         })
     };
-    let console = ControlBodyDigestService::new(counted, Duration::from_secs(1)).with_console_listener(true);
+    let console = ConsoleListenerRouteService::new(counted, true);
     let to_full = |request: HttpRequest<Empty<Bytes>>| request.map(|_| Full::new(Bytes::new()));
     let signed = |path: &str, query: &str| to_full(signed_as(Method::GET, path, query, ROOT, ROOT_SECRET, Signed::Header));
     for (label, request) in [

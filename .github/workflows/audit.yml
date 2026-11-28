@@ -21,6 +21,9 @@ on:
       - '**/Cargo.toml'
       - '**/Cargo.lock'
       - 'deny.toml'
+      - '.config/advisory-exceptions.toml'
+      - 'scripts/security/check_advisories.py'
+      - 'scripts/security/test_check_advisories.py'
       - '.github/actions/**'
       - '.github/workflows/**'
       - 'scripts/release/**'
@@ -46,6 +49,9 @@ on:
       - '**/Cargo.toml'
       - '**/Cargo.lock'
       - 'deny.toml'
+      - '.config/advisory-exceptions.toml'
+      - 'scripts/security/check_advisories.py'
+      - 'scripts/security/test_check_advisories.py'
       - '.github/actions/**'
       - '.github/workflows/**'
       - 'scripts/release/**'
@@ -107,6 +113,7 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7
         with:
+          fetch-depth: 2
           persist-credentials: false
 
       # cargo-deny compiles nothing, so the full setup composite (apt packages,
@@ -134,12 +141,36 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Install cargo-deny
+        id: install-cargo-deny
         uses: taiki-e/install-action@7623a79cdfecb99d681017af368ca353d9f49bb5 # v2
         with:
-          tool: cargo-deny
+          tool: cargo-deny@0.20.2
 
       - name: Run cargo-deny
-        run: cargo deny check --hide-inclusion-graph advisories sources bans licenses
+        run: cargo deny --locked check --hide-inclusion-graph advisories sources bans licenses
+
+      - name: Enforce time-bounded advisory exception registry
+        if: "!cancelled() && steps.install-cargo-deny.outcome == 'success'"
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CI_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          if [[ -n "$CI_BASE_SHA" ]]; then
+            git cat-file -e "${CI_BASE_SHA}^{commit}" 2>/dev/null || git fetch --no-tags --depth=1 origin "$CI_BASE_SHA"
+          fi
+          mkdir -p artifacts/advisories
+          python3 scripts/security/check_advisories.py \
+            --output artifacts/advisories/advisories-gate.json \
+            --raw-log artifacts/advisories/cargo-deny.log
+
+      - name: Upload advisory audit evidence
+        if: "!cancelled() && steps.install-cargo-deny.outcome == 'success'"
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: audit-advisories-${{ github.run_number }}-${{ github.run_attempt }}
+          path: artifacts/advisories
+          if-no-files-found: error
+          retention-days: 7
 
   workflow-pin-report:
     name: Workflow Pin Report

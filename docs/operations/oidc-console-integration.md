@@ -31,7 +31,7 @@ Every provider key can be set as `RUSTFS_IDENTITY_OPENID_<KEY>` in the process e
 | `issuer` | `RUSTFS_IDENTITY_OPENID_ISSUER` | Expected `iss` when it differs from `config_url` (internal discovery URL, public token issuer). |
 | `client_id`, `client_secret` | `RUSTFS_IDENTITY_OPENID_CLIENT_ID`, `RUSTFS_IDENTITY_OPENID_CLIENT_SECRET` | Confidential client credentials. |
 | `scopes` | `RUSTFS_IDENTITY_OPENID_SCOPES` | Comma-separated; `openid` is required. |
-| `other_audiences` | `RUSTFS_IDENTITY_OPENID_OTHER_AUDIENCES` | Additional accepted `aud` values. |
+| `other_audiences` | `RUSTFS_IDENTITY_OPENID_OTHER_AUDIENCES` | Additional `aud` values allowed alongside `client_id` in multi-audience tokens (`client_id` is still required). |
 | `redirect_uri` | `RUSTFS_IDENTITY_OPENID_REDIRECT_URI` | Callback URL sent to the IdP; must equal the URL registered there. |
 | `redirect_uri_dynamic` | `RUSTFS_IDENTITY_OPENID_REDIRECT_URI_DYNAMIC` | `on` derives the callback from request headers. Keep `off` behind proxies. |
 | `claim_name`, `claim_prefix` | `RUSTFS_IDENTITY_OPENID_CLAIM_NAME`, `RUSTFS_IDENTITY_OPENID_CLAIM_PREFIX` | Policy claim name and a fixed string prepended to each value. `claim_prefix` is not a mapping table. |

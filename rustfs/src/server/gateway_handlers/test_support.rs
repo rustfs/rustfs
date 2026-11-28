@@ -70,6 +70,74 @@ pub(crate) fn signed_request_with_headers(
     signed_session_request(form, method, path, query, access_key, secret_key, None, headers)
 }
 
+/// Signs an `aws-chunked` request using `STREAMING-UNSIGNED-PAYLOAD-TRAILER` and `trailer_name`.
+pub(crate) fn signed_streaming_trailer_request(
+    method: Method,
+    path: &str,
+    query: &str,
+    access_key: &str,
+    secret_key: &str,
+    decoded_content_length: u64,
+    trailer_name: &str,
+) -> Request<Empty<Bytes>> {
+    use hmac::{Hmac, KeyInit as _, Mac as _};
+    use sha2::{Digest as _, Sha256};
+    use std::collections::BTreeMap;
+
+    const PAYLOAD_TOKEN: &str = "STREAMING-UNSIGNED-PAYLOAD-TRAILER";
+    let mac = |key: &[u8], data: &str| -> Vec<u8> {
+        let mut h = Hmac::<Sha256>::new_from_slice(key).expect("HMAC key");
+        h.update(data.as_bytes());
+        h.finalize().into_bytes().to_vec()
+    };
+    let hex = |bytes: &[u8]| bytes.iter().map(|byte| format!("{byte:02x}")).collect::<String>();
+
+    let now = chrono::Utc::now();
+    let amz_date = now.format("%Y%m%dT%H%M%SZ").to_string();
+    let day = now.format("%Y%m%d").to_string();
+    let scope = format!("{day}/us-east-1/s3/aws4_request");
+
+    let mut headers = BTreeMap::new();
+    headers.insert("content-encoding", "aws-chunked".to_owned());
+    headers.insert("host", "localhost".to_owned());
+    headers.insert("x-amz-content-sha256", PAYLOAD_TOKEN.to_owned());
+    headers.insert("x-amz-date", amz_date.clone());
+    headers.insert("x-amz-decoded-content-length", decoded_content_length.to_string());
+    headers.insert("x-amz-trailer", trailer_name.to_owned());
+
+    let canonical_headers = headers.iter().map(|(k, v)| format!("{k}:{v}\n")).collect::<String>();
+    let signed_headers = headers.keys().copied().collect::<Vec<_>>().join(";");
+    let canonical_request = format!(
+        "{}\n{path}\n{query}\n{canonical_headers}\n{signed_headers}\n{PAYLOAD_TOKEN}",
+        method.as_str()
+    );
+    let string_to_sign = format!(
+        "AWS4-HMAC-SHA256\n{amz_date}\n{scope}\n{}",
+        hex(&Sha256::digest(canonical_request.as_bytes()))
+    );
+    let mut key = format!("AWS4{secret_key}").into_bytes();
+    for part in [day.as_str(), "us-east-1", "s3", "aws4_request"] {
+        key = mac(&key, part);
+    }
+    let signature = hex(&mac(&key, &string_to_sign));
+    let authorization =
+        format!("AWS4-HMAC-SHA256 Credential={access_key}/{scope}, SignedHeaders={signed_headers}, Signature={signature}");
+
+    let target = if query.is_empty() {
+        path.to_owned()
+    } else {
+        format!("{path}?{query}")
+    };
+    let mut builder = Request::builder().method(method).uri(target);
+    for (name, value) in headers {
+        builder = builder.header(name, value);
+    }
+    builder
+        .header(http::header::AUTHORIZATION, authorization)
+        .body(Empty::new())
+        .expect("signed streaming trailer request")
+}
+
 /// As [`signed_request_with_headers`], for a session whose token the signer places where the
 /// signature travels: the `X-Amz-Security-Token` header or query parameter.
 #[allow(clippy::too_many_arguments)] // A test fixture naming every signing input.

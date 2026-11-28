@@ -269,6 +269,12 @@ pub enum StorageError {
     /// retained for operator inspection.
     #[error("delete recovery found an ambiguous legacy residue; operator inspection is required")]
     DeleteRecoveryLegacyAmbiguous,
+    #[error("delete recovery blocked for {bucket}/{object}: transaction {transaction} conflicts with the live object generation")]
+    DeleteRecoveryGenerationConflict {
+        bucket: String,
+        object: String,
+        transaction: uuid::Uuid,
+    },
     /// Delete recovery exhausted the per-request work budget before it could
     /// classify every residue. Retrying later makes progress, so callers treat
     /// it like `SlowDown`; it stays distinct so the disk error round-trips.
@@ -717,6 +723,15 @@ impl Clone for StorageError {
             StorageError::StorageFull => StorageError::StorageFull,
             StorageError::SlowDown => StorageError::SlowDown,
             StorageError::DeleteRecoveryLegacyAmbiguous => StorageError::DeleteRecoveryLegacyAmbiguous,
+            StorageError::DeleteRecoveryGenerationConflict {
+                bucket,
+                object,
+                transaction,
+            } => StorageError::DeleteRecoveryGenerationConflict {
+                bucket: bucket.clone(),
+                object: object.clone(),
+                transaction: *transaction,
+            },
             StorageError::DeleteRecoveryWorkLimit => StorageError::DeleteRecoveryWorkLimit,
             StorageError::PrefixAccessDenied(a, b) => StorageError::PrefixAccessDenied(a.clone(), b.clone()),
             StorageError::InvalidUploadIDKeyCombination(a, b) => {
@@ -860,6 +875,8 @@ impl StorageError {
             StorageError::StorageFull => StorageErrorCode::StorageFull,
             StorageError::SlowDown => StorageErrorCode::SlowDown,
             StorageError::DeleteRecoveryLegacyAmbiguous => StorageErrorCode::DeleteRecoveryLegacyAmbiguous,
+            // Only the inspecting coordinator has the evidence to park a specific responsibility.
+            StorageError::DeleteRecoveryGenerationConflict { .. } => StorageErrorCode::OutdatedXLMeta,
             StorageError::DeleteRecoveryWorkLimit => StorageErrorCode::DeleteRecoveryWorkLimit,
             StorageError::PrefixAccessDenied(_, _) => StorageErrorCode::PrefixAccessDenied,
             StorageError::InvalidUploadIDKeyCombination(_, _) => StorageErrorCode::InvalidUploadIDKeyCombination,
