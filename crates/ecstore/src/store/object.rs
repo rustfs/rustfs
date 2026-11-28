@@ -2610,8 +2610,11 @@ fn delete_lock_windows(objects: Vec<ObjectToDelete>) -> Vec<Vec<(usize, ObjectTo
     windows
 }
 
-fn sorted_unique_delete_object_names(objects: &[ObjectToDelete]) -> Vec<&str> {
-    let mut object_names: Vec<&str> = objects.iter().map(|object| object.object_name.as_str()).collect();
+fn sorted_unique_delete_object_names(objects: &[ObjectToDelete]) -> Vec<std::borrow::Cow<'_, str>> {
+    let mut object_names: Vec<_> = objects
+        .iter()
+        .map(|object| rustfs_utils::path::object_name_disk_identity(&object.object_name))
+        .collect();
     object_names.sort_unstable();
     object_names.dedup();
     object_names
@@ -3684,7 +3687,8 @@ impl ECStore {
             return Ok((Vec::new(), HashMap::new()));
         }
 
-        let object_names = sorted_unique_delete_object_names(objects);
+        let identities = sorted_unique_delete_object_names(objects);
+        let object_names: Vec<&str> = identities.iter().map(AsRef::as_ref).collect();
         let acquire_started = Instant::now();
         let acquired = self.pools[0].disk_set[0]
             .acquire_object_write_locks_batch(bucket, &object_names, get_lock_acquire_timeout())
@@ -6542,7 +6546,8 @@ impl ECStore {
         // of the batch proceeds, matching the set layer's per-key lock errors.
         if !object_lock_failures.is_empty() {
             for (index, object) in objects.iter().enumerate() {
-                if let Some(error) = object_lock_failures.get(&object.object_name) {
+                let identity = rustfs_utils::path::object_name_disk_identity(&object.object_name);
+                if let Some(error) = object_lock_failures.get(identity.as_ref()) {
                     del_errs[index] = Some(error.clone());
                 }
             }
@@ -14726,6 +14731,47 @@ mod batch_delete_lock_tests {
         assert!(errors[0].is_none(), "b-object must proceed: {errors:?}");
         assert!(deleted[1].object_name.is_empty(), "failed key must not report success");
         assert_eq!(deleted[0].object_name, "b-object");
+        drop(held);
+    }
+
+    #[tokio::test]
+    async fn windows_bulk_delete_acquires_each_physical_lock_once_and_reports_alias_errors() {
+        let bucket = "lock-batch-physical-identity";
+        let (_dirs, store) = seeded_store(bucket).await;
+        let entries = ["alias/key", "b-object", r"alias\key"].map(|name| ObjectToDelete {
+            object_name: name.to_owned(),
+            ..Default::default()
+        });
+
+        let mut opts = ObjectOptions::default();
+        let (guards, failures) = store
+            .acquire_delete_objects_write_locks(bucket, &entries, &mut opts)
+            .await
+            .expect("acquire real namespace locks");
+        assert!(failures.is_empty(), "uncontended aliases must share an acquisition: {failures:?}");
+        assert_eq!(guards.len(), if cfg!(windows) { 2 } else { 3 });
+        drop(guards);
+
+        let held = store
+            .acquire_object_write_lock("delete_objects", bucket, "alias/key")
+            .await
+            .expect("hold the physical namespace lock");
+        let (deleted, errors, _) = tokio::time::timeout(
+            Duration::from_secs(30),
+            store.delete_objects_with_tier_delete_journal_and_accounting(bucket, entries.to_vec(), ObjectOptions::default()),
+        )
+        .await
+        .expect("return per-entry outcomes while the physical lock is held");
+
+        assert!(matches!(errors[0], Some(StorageError::Lock(_))), "{errors:?}");
+        assert!(errors[1].is_none(), "independent key must delete: {errors:?}");
+        assert_eq!(deleted[1].object_name, "b-object");
+        if cfg!(windows) {
+            assert!(matches!(errors[2], Some(StorageError::Lock(_))), "{errors:?}");
+            assert!(deleted[2].object_name.is_empty(), "the contended alias must not report success");
+        } else {
+            assert!(errors[2].is_none(), "the backslash is a literal key byte: {errors:?}");
+        }
         drop(held);
     }
 
