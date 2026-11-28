@@ -935,13 +935,16 @@ fn extract_request_scheme(req: &AdminRequest) -> S3Result<String> {
         .filter(|info| info.is_from_trusted_proxy)
         .and_then(|info| info.forwarded_proto.as_deref())
         .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(ToOwned::to_owned);
+        .filter(|value| !value.is_empty());
 
-    let raw_scheme = trusted_proto
-        .or_else(|| req.uri().scheme_str().map(str::to_owned))
-        .unwrap_or_else(|| "http".to_owned())
-        .to_ascii_lowercase();
+    let scheme = if let Some(proto) = trusted_proto {
+        proto
+    } else if req.envelope().native_tls_transport() == Some(true) {
+        "https"
+    } else {
+        req.uri().scheme_str().unwrap_or("http")
+    };
+    let raw_scheme = scheme.to_ascii_lowercase();
 
     if !is_valid_scheme(&raw_scheme) {
         return Err(s3_error!(InvalidRequest, "invalid scheme in request"));
@@ -1056,7 +1059,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[serial_test::serial]
     async fn validate_handler_preserves_workload_null_and_console_endpoints() {
         use crate::admin::runtime_sources::{AppContext, publish_test_app_context};
         use http_body_util::BodyExt as _;
@@ -1064,24 +1066,32 @@ mod tests {
         use std::sync::Arc;
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
+        // The outbound policy and IAM are initialized once per process.
+        const CHILD_ENV: &str = "RUSTFS_TEST_OIDC_VALIDATE_HANDLER_CHILD";
+        if std::env::var_os(CHILD_ENV).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "admin::handlers::oidc::tests::validate_handler_preserves_workload_null_and_console_endpoints",
+                    "--nocapture",
+                ])
+                .env(CHILD_ENV, "1")
+                .output()
+                .unwrap();
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            assert!(
+                output.status.success() && stdout.contains("1 passed"),
+                "{stdout}{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        // The admin URL boundary rejects literal loopback hosts. A local proxy
-        // serves the public-shaped test origin without external DNS or traffic.
-        let proxy = format!("http://{}", listener.local_addr().unwrap());
-        let base = "http://oidc-handler.example.invalid".to_string();
+        let address = listener.local_addr().unwrap();
+        let base = format!("http://{address}");
         temp_env::async_with_vars(
-            [
-                ("RUSTFS_OUTBOUND_ALLOW_ORIGINS", Some(base.as_str())),
-                (rustfs_config::oidc::ENV_IDENTITY_OPENID_ALLOW_INSECURE_TRANSPORT, Some("true")),
-                ("HTTP_PROXY", Some(proxy.as_str())),
-                ("http_proxy", Some(proxy.as_str())),
-                ("HTTPS_PROXY", None),
-                ("https_proxy", None),
-                ("ALL_PROXY", None),
-                ("all_proxy", None),
-                ("NO_PROXY", Some("")),
-                ("no_proxy", Some("")),
-            ],
+            [(rustfs_utils::egress::ENV_OUTBOUND_ALLOW_ORIGINS, Some(base.as_str()))],
             async {
                 let _ = rustfs_credentials::init_global_action_credentials(Some("OIDCVALIDATEROOT".into()), Some("oidcValidateRootSecret123".into()));
                 let env = rustfs_test_utils::TestECStoreEnv::builder().prefix("oidc_validate_handler")
@@ -1094,6 +1104,7 @@ mod tests {
                 )));
                 let server_base = base.clone();
                 let server = tokio::spawn(async move {
+                    let host = format!("host: {address}");
                     for path in ["/.well-known/openid-configuration", "/jwks", "/.well-known/openid-configuration", "/complete/.well-known/openid-configuration", "/complete/jwks"] {
                         let (mut stream, _) = tokio::time::timeout(std::time::Duration::from_secs(15), listener.accept()).await.unwrap().unwrap();
                         let mut request = Vec::new();
@@ -1102,9 +1113,8 @@ mod tests {
                             assert!(request.len() < 8192);
                         }
                         let request = String::from_utf8(request).unwrap();
-                        let target = Url::parse(request.lines().next().unwrap().split_whitespace().nth(1).unwrap()).unwrap();
-                        assert_eq!(target.origin().ascii_serialization(), server_base);
-                        assert_eq!(target.path(), path);
+                        assert_eq!(request.lines().next().unwrap(), format!("GET {path} HTTP/1.1"));
+                        assert!(request.lines().any(|line| line.eq_ignore_ascii_case(&host)));
                         let mut body = if path.ends_with("/jwks") { serde_json::json!({"keys": []}) } else {
                             serde_json::json!({"issuer": server_base, "jwks_uri": format!("{server_base}/jwks"), "id_token_signing_alg_values_supported": ["RS256"]})
                         };
@@ -1480,6 +1490,50 @@ mod tests {
                 .expect("trusted proxy headers should be honored for dynamic provider")
         });
         assert_eq!(trusted_callback, "https://public.example.com/rustfs/admin/v3/oidc/callback/default");
+    }
+
+    #[tokio::test]
+    async fn dynamic_callback_uses_the_listener_scheme_unless_the_trusted_proxy_supplies_one() {
+        use crate::admin::operation::test_support::TestRequest;
+        use crate::shared_types::NativeTlsTransport;
+        use rustfs_trusted_proxies::{TrustedProxy, TrustedProxyLayer};
+        use std::net::SocketAddr;
+        use tower::{Layer, ServiceExt, service_fn};
+
+        let trusted_peer = SocketAddr::from(([10, 0, 0, 5], 9000));
+        let direct_peer = SocketAddr::from(([10, 0, 0, 6], 9000));
+        let layer = TrustedProxyLayer::with_trusted_proxies(vec![TrustedProxy::Single(trusted_peer.ip())]);
+        let service = layer.layer(service_fn(|request: http::Request<()>| async move {
+            let (parts, ()) = request.into_parts();
+            let req = TestRequest::new(parts.method, parts.uri)
+                .headers(parts.headers)
+                .extensions(parts.extensions)
+                .build();
+            let policy = test_redirect_policy(None, true);
+            let callback = with_var(ENV_RUSTFS_BROWSER_REDIRECT_URL, None::<&str>, || {
+                derive_callback_uri_with_redirect_policy(&req, "default", Some(&policy)).unwrap()
+            });
+            Ok::<_, std::convert::Infallible>(http::Response::new(callback))
+        }));
+
+        for (peer, tls, proto, expected_origin) in [
+            (direct_peer, false, Some("https"), "http://console.example:9000"),
+            (direct_peer, true, Some("http"), "https://console.example:9000"),
+            (trusted_peer, true, None, "https://public.example"),
+            (trusted_peer, true, Some("http"), "http://public.example"),
+            (trusted_peer, false, Some("https"), "https://public.example"),
+        ] {
+            let mut request = http::Request::get("/rustfs/admin/v3/oidc/authorize/default")
+                .extension(peer)
+                .extension(NativeTlsTransport(tls))
+                .header("host", "console.example:9000")
+                .header("x-forwarded-host", "public.example");
+            if let Some(proto) = proto {
+                request = request.header("x-forwarded-proto", proto);
+            }
+            let response = service.clone().oneshot(request.body(()).unwrap()).await.unwrap();
+            assert_eq!(response.into_body(), format!("{expected_origin}/rustfs/admin/v3/oidc/callback/default"));
+        }
     }
 
     #[test]
