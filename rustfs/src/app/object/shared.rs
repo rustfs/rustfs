@@ -367,12 +367,20 @@ pub(super) fn has_put_sse_request_headers(headers: &HeaderMap) -> bool {
 ///
 /// Callers layering further overrides (PUT's `ciphertext_passthrough`) apply
 /// them to the returned pair.
+///
+/// A requested key id is returned as the key it names: `arn:aws:kms:<name>` comes
+/// back as `<name>` (see [`requested_sse_kms_key_id`] for the rule and its limits).
+/// This is the one place PutObject, CopyObject and archive extraction still hold the
+/// request's value apart from the bucket default, and it runs before the KMS
+/// authorization check, so the write is authorized, sealed and recorded under one key
+/// id. The bucket default's key id is returned as configured, never reduced.
 pub(super) fn resolve_bucket_default_sse(
     bucket_sse_config: Option<&ServerSideEncryptionConfiguration>,
     requested_sse: Option<String>,
     requested_kms_key_id: Option<String>,
     has_explicit_ssec: bool,
 ) -> (Option<String>, Option<String>) {
+    let requested_kms_key_id = requested_kms_key_id.map(requested_sse_kms_key_id);
     let bucket_default = || {
         if has_explicit_ssec {
             return None;
@@ -1705,6 +1713,40 @@ mod tests {
 
         assert_eq!(sse.as_deref(), Some(AMZ_ENCRYPTION_AES));
         assert_eq!(kms_key_id.as_deref(), Some("request-key"));
+    }
+
+    #[test]
+    fn resolve_bucket_default_sse_reduces_an_arn_prefixed_key_name_in_the_request() {
+        let config = bucket_sse_config_with(AMZ_ENCRYPTION_KMS, Some("bucket-key"));
+        let aws_key_arn = "arn:aws:kms:eu-north-1:111122223333:key/74e5921e-107a-4584-bfda-a5dadeb3e13e";
+
+        for (requested, resolved) in [
+            ("arn:aws:kms:request-key", "request-key"),
+            ("request-key", "request-key"),
+            (aws_key_arn, aws_key_arn),
+        ] {
+            for bucket_sse_config in [None, Some(&config)] {
+                let (sse, kms_key_id) = resolve_bucket_default_sse(
+                    bucket_sse_config,
+                    Some(String::from(AMZ_ENCRYPTION_KMS)),
+                    Some(requested.to_string()),
+                    false,
+                );
+
+                assert_eq!(sse.as_deref(), Some(AMZ_ENCRYPTION_KMS));
+                assert_eq!(kms_key_id.as_deref(), Some(resolved), "requested {requested}");
+            }
+        }
+    }
+
+    #[test]
+    fn resolve_bucket_default_sse_returns_the_bucket_default_key_id_as_configured() {
+        let config = bucket_sse_config_with(AMZ_ENCRYPTION_KMS, Some("arn:aws:kms:bucket-key"));
+
+        let (sse, kms_key_id) = resolve_bucket_default_sse(Some(&config), None, None, false);
+
+        assert_eq!(sse.as_deref(), Some(AMZ_ENCRYPTION_KMS));
+        assert_eq!(kms_key_id.as_deref(), Some("arn:aws:kms:bucket-key"));
     }
 
     #[test]

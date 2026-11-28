@@ -1567,7 +1567,8 @@ pub(crate) mod sse {
     pub(crate) use crate::storage::storage_api::sse_consumer::{
         EncryptionKeyKind, EncryptionMaterialExt, SseKmsPrincipalExt, bucket_default_write_sse, build_ssec_read_headers,
         encryption_material_to_metadata, extract_ssec_params_from_headers, extract_ssekms_context_from_headers,
-        map_get_object_reader_error, mark_encrypted_multipart_metadata, multipart_completion_authorization, stored_ssec_metadata,
+        map_get_object_reader_error, mark_encrypted_multipart_metadata, multipart_completion_authorization,
+        requested_sse_kms_key_id, stored_ssec_metadata,
     };
 }
 

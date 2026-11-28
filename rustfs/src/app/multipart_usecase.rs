@@ -65,7 +65,7 @@ use super::storage_api::multipart_usecase::sse::{
     build_ssec_read_headers, encryption_material_to_metadata, extract_server_side_encryption_from_headers,
     extract_ssec_params_from_headers, extract_ssekms_context_from_headers, get_buffer_size_opt_in,
     load_bucket_object_lock_config_state, map_get_object_reader_error, mark_encrypted_multipart_metadata,
-    multipart_completion_authorization, sse_decryption, sse_prepare_encryption,
+    multipart_completion_authorization, requested_sse_kms_key_id, sse_decryption, sse_prepare_encryption,
 };
 use super::storage_api::multipart_usecase::{
     StorageObjectOptions as ObjectOptions, StoragePutObjReader as PutObjReader, validate_new_object_key,
@@ -1102,6 +1102,25 @@ mod tests {
             assert_eq!(
                 sse_kms_completion_headers,
                 ["x-amz-server-side-encryption", "x-amz-server-side-encryption-aws-kms-key-id"]
+            );
+
+            // A plain key name sent behind an AWS-style ARN prefix opens a session under
+            // that key, and every later response names the key by its id.
+            let (arn_prefixed, _) = multipart_sse_responses(
+                &bucket,
+                "sse-kms-arn-prefixed-key-name",
+                Some(ServerSideEncryption::AWS_KMS.as_str()),
+                Some(&format!("arn:aws:kms:{}", kms_key.key_id)),
+                None,
+            )
+            .await;
+            assert_eq!(
+                arn_prefixed,
+                every_multipart_response(|| SseResponseFields {
+                    server_side_encryption: Some("aws:kms".to_string()),
+                    ssekms_key_id: Some(kms_key.key_id.clone()),
+                    ..Default::default()
+                })
             );
             manager.stop().await.expect("stop local KMS");
         });
