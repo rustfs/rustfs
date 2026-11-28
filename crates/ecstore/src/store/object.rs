@@ -2593,6 +2593,33 @@ fn detached_delete_failed(operation: &'static str, err: tokio::task::JoinError) 
 const BULK_DELETE_MIN_WINDOW_KEYS: usize = 8;
 const BULK_DELETE_MAX_WINDOWS: usize = 4;
 
+fn delete_paths_are_independent<'a>(names: impl Iterator<Item = &'a str>, fold_case: bool) -> bool {
+    let mut paths = HashSet::new();
+    for name in names {
+        if name.split('/').any(|segment| {
+            matches!(segment, "" | "." | "..")
+                || (fold_case
+                    && (!segment
+                        .bytes()
+                        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+                        || rustfs_utils::check_windows_file_name(segment).is_err()))
+        }) {
+            return false;
+        }
+        let path = if fold_case {
+            std::borrow::Cow::Owned(name.to_ascii_lowercase())
+        } else {
+            std::borrow::Cow::Borrowed(name)
+        };
+        if !paths.insert(path) {
+            return false;
+        }
+    }
+    paths
+        .iter()
+        .all(|path| path.match_indices('/').all(|(end, _)| !paths.contains(&path[..end])))
+}
+
 fn delete_lock_windows(objects: Vec<ObjectToDelete>, distributed: bool) -> Vec<Vec<(usize, ObjectToDelete)>> {
     let mut identities = HashMap::new();
     let mut key_slots = Vec::new();
@@ -2605,6 +2632,13 @@ fn delete_lock_windows(objects: Vec<ObjectToDelete>, distributed: bool) -> Vec<V
         });
         key_slots[ordinal] += 1;
         ordinals.push(ordinal);
+    }
+
+    // Check the already encoded disk names for the entire request before
+    // splitting. Overlaps must reach one disk batch so its ordering rules
+    // also cover keys that would otherwise land in separate windows.
+    if !delete_paths_are_independent(identities.keys().map(AsRef::as_ref), cfg!(any(windows, target_os = "macos"))) {
+        return vec![objects.into_iter().enumerate().collect()];
     }
 
     let key_count = key_slots.len();
@@ -14787,6 +14821,80 @@ mod batch_delete_lock_tests {
     }
 
     #[test]
+    fn bulk_delete_keeps_cross_window_path_overlaps_in_one_batch() {
+        let mut overlapping = vec![
+            ("parent", "parent/child"),
+            ("parent/child", "parent"),
+            ("name/child", "name//child"),
+            ("name/child", "name/./child"),
+            ("child", "name/../child"),
+        ];
+        if cfg!(any(windows, target_os = "macos")) {
+            overlapping.extend([
+                ("Parent", "parent/child"),
+                ("Name", "name"),
+                ("a", "unknown/é"),
+                ("a", "special~1"),
+            ]);
+        }
+        if cfg!(target_os = "macos") {
+            overlapping.push(("a", r"literal\name"));
+        }
+        for (first, last) in overlapping {
+            let objects: Vec<_> = std::iter::once(first.to_owned())
+                .chain((0..BULK_DELETE_MIN_WINDOW_KEYS).map(|i| format!("separate/{i}")))
+                .chain([last.to_owned(), first.to_owned()])
+                .map(|object_name| ObjectToDelete {
+                    object_name,
+                    ..Default::default()
+                })
+                .collect();
+            for distributed in [false, true] {
+                let windows = delete_lock_windows(objects.clone(), distributed);
+                assert_eq!(windows.len(), 1, "{first:?} and {last:?}");
+                assert!(windows[0].iter().enumerate().all(|(index, (original, object))| {
+                    index == *original && object.object_name == objects[index].object_name
+                }));
+            }
+        }
+    }
+
+    #[test]
+    fn bulk_delete_path_safety_accounts_for_case_and_special_names() {
+        for names in [
+            ["Object", "object"],
+            ["PARENT", "parent/child"],
+            ["object", "NUL"],
+            ["object", "name."],
+            ["object", "longna~1"],
+            ["object", "café"],
+        ] {
+            assert!(!delete_paths_are_independent(names.into_iter(), true), "{names:?}");
+        }
+        assert!(delete_paths_are_independent(["Object", "object"].into_iter(), false));
+        assert!(delete_paths_are_independent(["prefix/first.txt", "PREFIX/second"].into_iter(), true));
+    }
+
+    #[test]
+    fn bulk_delete_can_split_unrelated_encoded_directory_objects() {
+        let mut objects: Vec<_> = (0..BULK_DELETE_MIN_WINDOW_KEYS)
+            .map(|i| ObjectToDelete {
+                object_name: format!("prefix/item-{i}.txt"),
+                ..Default::default()
+            })
+            .collect();
+        objects.push(ObjectToDelete {
+            object_name: encode_dir_object("prefix/"),
+            ..Default::default()
+        });
+        for distributed in [false, true] {
+            let windows = delete_lock_windows(objects.clone(), distributed);
+            assert_eq!(windows.len(), 2);
+            assert_eq!(windows[1][0].1.object_name, encode_dir_object("prefix/"));
+        }
+    }
+
+    #[test]
     fn lock_windows_keep_nonadjacent_versions_and_result_indices_together() {
         let width = BULK_DELETE_MIN_WINDOW_KEYS;
         for distributed in [false, true] {
@@ -14802,11 +14910,15 @@ mod batch_delete_lock_tests {
                 version_id: Some(version),
                 ..Default::default()
             });
-            objects.push(ObjectToDelete {
-                object_name: r"key\0".to_owned(),
-                ..Default::default()
-            });
+            if !cfg!(target_os = "macos") {
+                objects.push(ObjectToDelete {
+                    object_name: r"key\0".to_owned(),
+                    ..Default::default()
+                });
+            }
+            let count = objects.len();
             let windows = delete_lock_windows(objects, distributed);
+            assert!(windows.len() > 1);
             let window = windows
                 .iter()
                 .find(|window| window.iter().any(|(index, _)| *index == 0))
@@ -14820,7 +14932,7 @@ mod batch_delete_lock_tests {
             assert_eq!(alias_in_same_window, cfg!(windows));
             let mut indices: Vec<_> = windows.into_iter().flatten().map(|(index, _)| index).collect();
             indices.sort_unstable();
-            assert_eq!(indices, (0..width + 3).collect::<Vec<_>>());
+            assert_eq!(indices, (0..count).collect::<Vec<_>>());
         }
     }
 
