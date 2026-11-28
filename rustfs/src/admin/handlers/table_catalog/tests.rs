@@ -2094,10 +2094,18 @@ fn warehouse_config_query_rejects_empty_and_repeated_values() {
     assert_eq!(warehouse_from_config_query(&uri).expect("warehouse query"), Some("analytics".to_string()));
 
     let uri = "/iceberg/v1/config?warehouse=".parse().expect("URI");
-    assert!(warehouse_from_config_query(&uri).is_err());
+    let error = warehouse_from_config_query(&uri).expect_err("empty warehouse must be rejected");
+    assert_eq!(error.code(), &S3ErrorCode::InvalidRequest);
+    assert_eq!(error.message(), Some("warehouse query parameter must not be empty"));
 
-    let uri = "/iceberg/v1/config?warehouse=one&warehouse=two".parse().expect("URI");
-    assert!(warehouse_from_config_query(&uri).is_err());
+    for first in ["one", "a"] {
+        let uri = format!("/iceberg/v1/config?warehouse={first}&warehouse=two")
+            .parse()
+            .expect("URI");
+        let error = warehouse_from_config_query(&uri).expect_err("repeated warehouse must be rejected");
+        assert_eq!(error.code(), &S3ErrorCode::InvalidRequest);
+        assert_eq!(error.message(), Some("warehouse query parameter must not be repeated"));
+    }
 }
 
 #[test]
