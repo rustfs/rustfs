@@ -4722,11 +4722,7 @@ impl SetDisks {
             rustfs_utils::http::metadata_compat::remove_str(&mut user_defined, SUFFIX_RESTORE_OPERATION_ID);
             rustfs_utils::http::metadata_compat::remove_str(&mut user_defined, SUFFIX_RESTORE_WORKER_LOCK);
         }
-        let WriteLayout {
-            data_drives,
-            parity_drives,
-            write_quorum,
-        } = resolve_write_layout(
+        let layout = resolve_write_layout(
             &storage_class_config,
             self.pool_index,
             disks.len(),
@@ -4734,14 +4730,22 @@ impl SetDisks {
             user_defined.get(metadata_keys::STORAGE_CLASS).map(String::as_str),
             opts.max_parity,
         )?;
-
-        // if filtered_online < write_quorum {
-        //     warn!(
-        //         "online disk snapshot {} below write quorum {} for {}/{}; returning erasure write quorum error",
-        //         filtered_online, write_quorum, bucket, object
-        //     );
-        //     return Err(to_object_err(Error::ErasureWriteQuorum, vec![bucket, object]));
-        // }
+        // A zero-parity pool's metadata paths always require every slot.
+        let WriteLayout {
+            data_drives,
+            parity_drives,
+            write_quorum,
+        } = if storage_class_config.degraded_put_parity_enabled()
+            && self.default_parity_count > 0
+            && !is_meta_bucketname(bucket)
+            && !opts.data_movement
+            && !opts.restore_copyback
+            && expected_restore_operation_id.is_none()
+        {
+            layout.with_degraded_put_parity(&disks)
+        } else {
+            layout
+        };
 
         let mut fi = FileInfo::new([bucket, object].join("/").as_str(), data_drives, parity_drives);
         if let Some(block_size) = requested_ec_block_size {
@@ -4760,7 +4764,8 @@ impl SetDisks {
             fi.version_id = Some(Uuid::new_v4());
         }
 
-        fi.data_dir = Some(Uuid::new_v4());
+        let data_dir = Uuid::new_v4();
+        fi.data_dir = Some(data_dir);
 
         // Never inherit a frame-layout marker: an incoming one (replication
         // passthrough, data movement) describes some other object identity and
@@ -4787,9 +4792,6 @@ impl SetDisks {
         let mut shuffle_disks = Self::shuffle_disks_owned(disks, &fi.erasure.distribution);
 
         let tmp_dir = Uuid::new_v4().to_string();
-
-        let tmp_data_dir = format!("{}/{}", tmp_dir, fi.data_dir.ok_or(Error::FileCorrupt)?);
-        let tmp_object = format!("{tmp_data_dir}/part.1");
 
         let (operation_cancellation, mut commit_cancellation_handoff_tx, cancellation_wait) =
             if let Some(cancellation) = opts.put_object_cancellation.clone() {
@@ -4851,6 +4853,17 @@ impl SetDisks {
             }
             let write_path = classify_put_write_path(is_inline_buffer, put_object_size, fi.erasure.block_size);
             let direct_inline_commit = matches!(write_path, SmallWritePath::Inline);
+            // Buffered writers keep their shards in memory. Disk writers and
+            // verification share the staged part path and its parent.
+            let part_suffix = "/part.1";
+            let tmp_object = if is_inline_buffer {
+                String::new()
+            } else {
+                let mut uuid_buffer = Uuid::encode_buffer();
+                let data_dir = data_dir.as_hyphenated().encode_lower(&mut uuid_buffer);
+                [tmp_dir.as_str(), "/", data_dir, part_suffix].concat()
+            };
+            let tmp_data_dir = tmp_object.strip_suffix(part_suffix).unwrap_or_default();
             rustfs_io_metrics::record_put_object_path(write_path.metric_label());
             let writer_setup_stage_start = collect_stage_timing.then(Instant::now);
             let (mut writers, errors) = if direct_inline_commit {
@@ -4873,47 +4886,42 @@ impl SetDisks {
                 }
                 (std::iter::repeat_with(|| None).take(shuffle_disks.len()).collect(), errors)
             } else {
-                let writer_futs: Vec<_> = shuffle_disks
-                    .iter()
-                    .map(|disk_op| {
-                        let tmp_obj = tmp_object.clone();
-                        async move {
-                            if let Some(disk) = disk_op
-                                && disk.is_online().await
-                            {
-                                match create_bitrot_writer_with_orig_volume(
-                                    is_inline_buffer,
-                                    Some(disk),
-                                    bucket,
-                                    RUSTFS_META_TMP_BUCKET,
-                                    &tmp_obj,
-                                    shard_file_size,
-                                    frame_size,
-                                    HashAlgorithm::HighwayHash256S,
-                                )
-                                .await
-                                {
-                                    Ok(writer) => (Some(writer), None),
-                                    Err(err) => {
-                                        warn!(
-                                            event = EVENT_SET_DISK_WRITE,
-                                            component = LOG_COMPONENT_ECSTORE,
-                                            subsystem = LOG_SUBSYSTEM_SET_DISK,
-                                            disk = ?disk,
-                                            state = "bitrot_writer_skipped",
-                                            error = ?err,
-                                            "Set disk bitrot writer skipped"
-                                        );
-                                        (None, Some(err))
-                                    }
-                                }
-                            } else {
-                                (None, Some(DiskError::DiskNotFound))
+                let tmp_object = tmp_object.as_str();
+                let writer_results = join_all(shuffle_disks.iter().map(|disk_op| async move {
+                    if let Some(disk) = disk_op
+                        && disk.is_online().await
+                    {
+                        match create_bitrot_writer_with_orig_volume(
+                            is_inline_buffer,
+                            Some(disk),
+                            bucket,
+                            RUSTFS_META_TMP_BUCKET,
+                            tmp_object,
+                            shard_file_size,
+                            frame_size,
+                            HashAlgorithm::HighwayHash256S,
+                        )
+                        .await
+                        {
+                            Ok(writer) => (Some(writer), None),
+                            Err(err) => {
+                                warn!(
+                                    event = EVENT_SET_DISK_WRITE,
+                                    component = LOG_COMPONENT_ECSTORE,
+                                    subsystem = LOG_SUBSYSTEM_SET_DISK,
+                                    disk = ?disk,
+                                    state = "bitrot_writer_skipped",
+                                    error = ?err,
+                                    "Set disk bitrot writer skipped"
+                                );
+                                (None, Some(err))
                             }
                         }
-                    })
-                    .collect();
-                let writer_results = join_all(writer_futs).await;
+                    } else {
+                        (None, Some(DiskError::DiskNotFound))
+                    }
+                }))
+                .await;
                 let mut writers = Vec::with_capacity(writer_results.len());
                 let mut errors = Vec::with_capacity(writer_results.len());
                 for (writer, error) in writer_results {
@@ -5096,15 +5104,13 @@ impl SetDisks {
             // drop it below reconstructable quorum (backlog#852 / #799 B3).
             // `rename_data` re-checks write quorum over the surviving disks and
             // rolls back if too few remain.
-            let committed_shards = if matches!(write_path, SmallWritePath::Inline) {
-                shuffle_disks.iter().filter(|disk| disk.is_some()).count()
-            } else {
-                drop_failed_writer_disks(&mut shuffle_disks, &writers)
-            };
-            if committed_shards < write_quorum {
-                return Err(Error::other(format!(
-                    "put_object write quorum unavailable after encode: {committed_shards} shard(s) committed, need {write_quorum}"
-                )));
+            if !direct_inline_commit {
+                let committed_shards = drop_failed_writer_disks(&mut shuffle_disks, &writers);
+                if committed_shards < write_quorum {
+                    return Err(Error::other(format!(
+                        "put_object write quorum unavailable after encode: {committed_shards} shard(s) committed, need {write_quorum}"
+                    )));
+                }
             }
 
             let part_integrity = if let Some(integrity) = integrity {
@@ -5112,16 +5118,17 @@ impl SetDisks {
                     integrity.set_inline_metadata(&mut fi)?;
                     integrity.part
                 } else {
-                    integrity
-                        .write(&mut shuffle_disks, bucket, RUSTFS_META_TMP_BUCKET, &tmp_data_dir)
-                        .await?
+                    let part = integrity
+                        .write(&mut shuffle_disks, bucket, RUSTFS_META_TMP_BUCKET, tmp_data_dir)
+                        .await?;
+                    if shuffle_disks.iter().filter(|disk| disk.is_some()).count() < write_quorum {
+                        return Err(Error::ErasureWriteQuorum);
+                    }
+                    part
                 })
             } else {
                 None
             };
-            if shuffle_disks.iter().filter(|disk| disk.is_some()).count() < write_quorum {
-                return Err(Error::ErasureWriteQuorum);
-            }
             if let Some(inline_proof) =
                 rustfs_utils::http::get_consistent_str(&fi.metadata, rustfs_filemeta::shard_integrity::SUFFIX_INLINE_INTEGRITY)
             {
@@ -5223,7 +5230,7 @@ impl SetDisks {
                         WrittenBitrotShards::Inline(&parts_metadatas)
                     } else {
                         WrittenBitrotShards::Staged {
-                            directory: &tmp_data_dir,
+                            directory: tmp_data_dir,
                             layout: &parts_metadatas[response_metadata_slot].erasure,
                             part_size: w_size,
                         }
@@ -23183,8 +23190,9 @@ mod heterogeneous_pool_put_tests {
         hermetic_set_disks_isolated as hermetic_set_disks,
     };
     use super::*;
-    use crate::config::storageclass::lookup_config_for_pools_without_env;
+    use crate::config::storageclass::{OPTIMIZE_ENV, lookup_config_for_pools, lookup_config_for_pools_without_env};
     use crate::disk::ReadOptions;
+    use crate::disk::health_state::RuntimeDriveHealthState;
     use crate::services::notification_sys::install_remote_version_state_fleet_proof_for_test;
     use rustfs_config::server_config::KVS;
     use serial_test::serial;
@@ -23232,6 +23240,141 @@ mod heterogeneous_pool_put_tests {
 
     fn large_payload(fill: u8) -> Vec<u8> {
         vec![fill; 1024 * 1024]
+    }
+
+    #[tokio::test]
+    #[serial(storage_class_env)]
+    async fn degraded_put_parity_persists_layout_and_preserves_commit_floor() {
+        let (_temp_dirs, disk_stores, set_disks) = hermetic_set_disks_for_pool_with_default_parity(12, 0, 4).await;
+        let bucket = "degraded-put-layout";
+        make_bucket(&disk_stores, bucket).await;
+        let kvs = KVS::new();
+        let fixed = lookup_config_for_pools_without_env(&kvs, &[12]).expect("default storage class should resolve");
+        let upgraded = temp_env::with_vars(
+            [
+                (OPTIMIZE_ENV, Some("degraded_put_parity")),
+                (crate::config::storageclass::STANDARD_ENV, None),
+                (crate::config::storageclass::RRS_ENV, None),
+                (crate::config::storageclass::INLINE_BLOCK_ENV, None),
+            ],
+            || lookup_config_for_pools(&kvs, &[12]).expect("opt-in storage class should resolve"),
+        );
+        let opts = ObjectOptions {
+            write_completion: WriteCompletion::TailDrained,
+            ..Default::default()
+        };
+        let payload = [large_payload(0x3c), large_payload(0xa7)].concat();
+        let put = |object| {
+            let mut reader = PutObjReader::from_vec(payload.clone());
+            let set = &set_disks;
+            let opts = &opts;
+            async move { set.put_object(bucket, object, &mut reader, opts).await }
+        };
+        let check_layout = |object, data, parity, first_missing| {
+            let disks = &disk_stores;
+            async move {
+                for (index, disk) in disks.iter().enumerate() {
+                    let stored = disk.read_version("", bucket, object, "", &ReadOptions::default()).await;
+                    if index < first_missing {
+                        let fi = stored.expect("participating drive should persist object metadata");
+                        assert_eq!(
+                            (fi.erasure.data_blocks, fi.erasure.parity_blocks),
+                            (data, parity),
+                            "{object}, slot {index}"
+                        );
+                        let data_dir = fi.data_dir.expect("test object should be stored out-of-line");
+                        assert!(data_dir_exists(disk, bucket, object, data_dir).await, "{object}, slot {index}");
+                    } else {
+                        assert!(matches!(stored, Err(DiskError::FileNotFound)), "{object}, slot {index}: {stored:?}");
+                    }
+                }
+            }
+        };
+
+        set_disks.set_test_storage_class_config(upgraded.clone());
+        put("healthy").await.expect("healthy PUT should commit");
+        check_layout("healthy", 8, 4, 12).await;
+
+        let barrier = PutObjectCommitBarrier::install(bucket, "late-failure", PutObjectCommitPause::AfterNamespace);
+        let late_put = put("late-failure");
+        let (_, result) = tokio::join!(
+            async {
+                barrier.wait_until_paused().await;
+                disk_stores[11].force_runtime_state_for_test(RuntimeDriveHealthState::Offline);
+                barrier.release();
+            },
+            late_put,
+        );
+        result.expect("the remaining drives should commit after a late failure");
+        disk_stores[11].force_runtime_state_for_test(RuntimeDriveHealthState::Online);
+        check_layout("late-failure", 8, 4, 11).await;
+
+        set_disks.set_test_storage_class_config(fixed.clone());
+        set_disks.disks.write().await[11] = None;
+        put("fixed").await.expect("fixed-layout PUT should commit with 11 drives");
+        check_layout("fixed", 8, 4, 11).await;
+
+        set_disks.set_test_storage_class_config(upgraded);
+        set_disks.disks.write().await[11] = Some(disk_stores[11].clone());
+        let disk = &disk_stores[11];
+        disk.force_runtime_state_for_test(RuntimeDriveHealthState::Offline);
+        put("upgraded-while-offline")
+            .await
+            .expect("a known offline handle should raise parity");
+        let crate::disk::Disk::Local(local) = disk.as_ref() else {
+            panic!("the hermetic disk must be local");
+        };
+        assert!(!local.mark_recovery_success_for_test());
+        assert_eq!(disk.runtime_state(), RuntimeDriveHealthState::Returning);
+        assert!(!disk.is_online().await);
+        put("upgraded")
+            .await
+            .expect("a recovering handle still blocked for I/O should raise parity");
+        disk_stores[11].force_runtime_state_for_test(RuntimeDriveHealthState::Online);
+        check_layout("upgraded-while-offline", 7, 5, 11).await;
+        check_layout("upgraded", 7, 5, 11).await;
+
+        set_disks.disks.write().await[8..].fill(None);
+        put("capped").await.expect("eight commits should satisfy the original quorum");
+        check_layout("capped", 6, 6, 8).await;
+
+        let barrier = PutObjectCommitBarrier::install(bucket, "commit-below-floor", PutObjectCommitPause::AfterNamespace);
+        let (_, result) = tokio::join!(
+            async {
+                barrier.wait_until_paused().await;
+                disk_stores[7].force_runtime_state_for_test(RuntimeDriveHealthState::Offline);
+                barrier.release();
+            },
+            put("commit-below-floor"),
+        );
+        result.expect_err("losing the eighth drive after encoding must abort the commit");
+        disk_stores[7].force_runtime_state_for_test(RuntimeDriveHealthState::Online);
+        check_layout("commit-below-floor", 0, 0, 0).await;
+
+        set_disks.disks.write().await[7] = None;
+        put("below-floor")
+            .await
+            .expect_err("seven commits must not satisfy the original eight-drive quorum");
+        check_layout("below-floor", 0, 0, 0).await;
+
+        set_disks.set_test_storage_class_config(fixed);
+        let mut object_reader = set_disks
+            .get_object_reader(bucket, "upgraded", None, HeaderMap::new(), &opts)
+            .await
+            .expect("seven remaining shards should serve the upgraded object after disabling the option");
+        let mut restored = Vec::new();
+        object_reader
+            .stream
+            .read_to_end(&mut restored)
+            .await
+            .expect("upgraded object should stream");
+        assert_eq!(restored, payload);
+        assert!(
+            set_disks
+                .get_object_reader(bucket, "fixed", None, HeaderMap::new(), &opts)
+                .await
+                .is_err()
+        );
     }
 
     #[tokio::test]

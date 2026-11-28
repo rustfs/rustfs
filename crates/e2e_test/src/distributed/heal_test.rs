@@ -13,11 +13,11 @@
 // limitations under the License.
 
 use super::harness::{
-    DistCluster, DistLayout, TestResult, assert_inventory, get_object_bytes, payload_for, put_object, sha256_hex, unique_bucket,
-    wait_until,
+    DistCluster, DistLayout, TestResult, assert_inventory, assert_object_bytes, get_object_bytes, payload_for, put_object,
+    s3_probe_client, s3_probe_error_code, sha256_hex, unique_bucket, wait_until,
 };
 use crate::chaos::{VersionShardCensus, census_object_version_on_disk, start_root_heal_when_control_ready};
-use crate::common::init_logging;
+use crate::common::{init_logging, local_http_client};
 use aws_sdk_s3::Client;
 use aws_sdk_s3::primitives::ByteStream;
 use serde_json::Value;
@@ -34,6 +34,186 @@ const EC84_PARITY_BLOCKS: usize = 4;
 const EC84_ERASURE_SET_DRIVE_COUNT: usize = EC84_DATA_BLOCKS + EC84_PARITY_BLOCKS;
 const EC84_TARGET_DRIVE_RESTART_CASE: &str = "ec84-target-drive-restart";
 const EC84_TARGET_DRIVE_RESTART_ORACLE: &str = "ec84-target-drive-restart.json";
+
+#[tokio::test]
+async fn degraded_put_parity_survives_node_loss_and_heals() -> TestResult {
+    init_logging();
+    let mut dist = DistCluster::start_with_env(
+        DistLayout::ThreeByFourEc84,
+        &[
+            ("RUSTFS_STORAGE_CLASS_STANDARD", "EC:4"),
+            ("RUSTFS_STORAGE_CLASS_OPTIMIZE", "capacity"),
+            ("RUSTFS_HEAL_ENABLED", "true"),
+            ("RUSTFS_HEAL_AUTO_HEAL_ENABLE", "true"),
+            ("RUSTFS_HEAL_MRF_ENABLE", "true"),
+            ("RUSTFS_HEAL_OBJECT_SELECT_PROB", "1"),
+            ("RUSTFS_SCANNER_ENABLED", "true"),
+            ("RUSTFS_SCANNER_CYCLE", "1"),
+            ("RUSTFS_SCANNER_START_DELAY_SECS", "0"),
+        ],
+    )
+    .await?;
+    let bucket = unique_bucket("degraded-parity");
+    dist.create_bucket(&bucket).await?;
+    let writer = s3_probe_client(&dist.client(0)?);
+    let control_url = format!("{}/health/ready", dist.cluster.nodes[0].url);
+    let drive_paths: Vec<PathBuf> = dist
+        .cluster
+        .nodes
+        .iter()
+        .flat_map(|node| node.data_dirs.iter().map(PathBuf::from))
+        .collect();
+    // The harness uses a node's first drive as its process working directory.
+    let missing = &drive_paths[1];
+    let present: Vec<_> = drive_paths.iter().filter(|drive| *drive != missing).collect();
+    let detached = missing.with_extension("detached");
+    let http = local_http_client();
+    let wait_for_slots = |missing_count: usize, unavailable_count: usize, phase: &'static str| {
+        let http = &http;
+        let control_url = &control_url;
+        async move {
+            wait_until(
+                Duration::from_secs(60),
+                || async {
+                    let response = match http.get(control_url).timeout(Duration::from_secs(3)).send().await {
+                        Ok(response) => response,
+                        Err(error) if error.is_connect() || error.is_timeout() => return Ok(false),
+                        Err(error) => return Err(error.into()),
+                    };
+                    let ready = response.status().is_success();
+                    let body: Value = response.json().await?;
+                    let storage = &body["details"]["storage"];
+                    Ok((ready || unavailable_count > 0)
+                        && storage["source"] == "local_runtime"
+                        && storage["missingDrives"]
+                            .as_array()
+                            .is_some_and(|drives| drives.len() == missing_count)
+                        && storage["unavailableDrives"]
+                            .as_array()
+                            .is_some_and(|drives| drives.len() == unavailable_count))
+                },
+                phase,
+            )
+            .await
+        }
+    };
+
+    dist.cluster.stop_node_gracefully(0).await?;
+    std::fs::rename(missing, &detached)?;
+    // The missing drive prevents full peer re-admission. Exercise the normal
+    // bounded startup fallback without spending the production wait twice.
+    dist.cluster.set_node_env(0, "RUSTFS_STARTUP_READINESS_MAX_WAIT_SECS", "30")?;
+    dist.cluster.start_node(0).await?;
+    wait_for_slots(1, 0, "fixed writer sees exactly one missing drive").await?;
+    let payload = payload_for("degraded-parity-streamed", 2 * 1024 * 1024);
+    put_object(&writer, &bucket, "fixed.bin", payload.clone()).await?;
+
+    dist.cluster.stop_node_gracefully(0).await?;
+    dist.cluster
+        .set_node_env(0, "RUSTFS_STORAGE_CLASS_OPTIMIZE", "degraded_put_parity")?;
+    dist.cluster.start_node(0).await?;
+    wait_for_slots(1, 0, "opt-in writer sees exactly one missing drive").await?;
+    let small = payload_for("degraded-parity-inline", 4096);
+    put_object(&writer, &bucket, "adaptive.bin", payload.clone()).await?;
+    put_object(&writer, &bucket, "inline.bin", small.clone()).await?;
+
+    let mut manifests = Vec::new();
+    for (key, data, parity, inline) in [
+        ("fixed.bin", 8, 4, false),
+        ("adaptive.bin", 7, 5, false),
+        ("inline.bin", 7, 5, true),
+    ] {
+        assert!(
+            !census_object_version_on_disk(missing, &bucket, key, None)?.has_xl_meta,
+            "{key} must omit the missing slot"
+        );
+        let mut shards = Vec::new();
+        for drive in &present {
+            let shard = census_object_version_on_disk(drive, &bucket, key, None)?;
+            assert!(shard.is_complete(), "{key} must have a complete shard on each available drive");
+            assert_eq!((shard.data_blocks, shard.parity_blocks), (Some(data), Some(parity)), "{key}");
+            assert_eq!(shard.inline_data_fingerprint.is_some(), inline, "{key}");
+            assert_eq!(shard.present_part_fingerprints.contains_key(&1), !inline, "{key}");
+            shards.push(shard);
+        }
+        manifests.push((key, shards));
+    }
+
+    dist.cluster.stop_node(2)?;
+    wait_for_slots(1, 4, "writer sees the missing drive and a four-drive peer outage").await?;
+    let fixed_error = get_object_bytes(&writer, &bucket, "fixed.bin")
+        .await
+        .expect_err("seven shards cannot read 8+4");
+    assert!(matches!(
+        s3_probe_error_code(fixed_error.as_ref()),
+        Some("SlowDown" | "SlowDownRead" | "ServiceUnavailable")
+    ));
+    assert_object_bytes(&writer, &bucket, "adaptive.bin", &payload).await?;
+    assert_object_bytes(&writer, &bucket, "inline.bin", &small).await?;
+    let midpoint = 1024 * 1024;
+    let range = writer
+        .get_object()
+        .bucket(&bucket)
+        .key("adaptive.bin")
+        .range(format!("bytes={}-{}", midpoint - 9, midpoint + 9))
+        .send()
+        .await?;
+    assert_eq!(range.body.collect().await?.into_bytes().as_ref(), &payload[midpoint - 9..=midpoint + 9]);
+    let rejected = put_object(&writer, &bucket, "rejected.bin", payload.clone())
+        .await
+        .expect_err("seven drives cannot satisfy the original PUT commit floor");
+    assert!(matches!(s3_probe_error_code(rejected.as_ref()), Some("SlowDown" | "ServiceUnavailable")));
+
+    std::fs::rename(&detached, missing)?;
+    dist.cluster.start_node(2).await?;
+    wait_for_slots(0, 0, "all twelve drives return to the writer").await?;
+    wait_until(
+        Duration::from_secs(120),
+        || async {
+            for (key, shards) in &manifests {
+                let rebuilt = census_object_version_on_disk(missing, &bucket, key, None)?;
+                if !rebuilt.is_complete() {
+                    return Ok(false);
+                }
+                let reference = &shards[0];
+                assert_eq!(rebuilt.data_blocks, reference.data_blocks, "{key}");
+                assert_eq!(rebuilt.parity_blocks, reference.parity_blocks, "{key}");
+                assert_eq!(rebuilt.data_dir, reference.data_dir, "{key}");
+                assert_eq!(rebuilt.erasure_distribution, reference.erasure_distribution, "{key}");
+                assert_eq!(
+                    rebuilt.inline_data_fingerprint.is_some(),
+                    reference.inline_data_fingerprint.is_some(),
+                    "{key}"
+                );
+                assert_eq!(rebuilt.expected_part_numbers, reference.expected_part_numbers, "{key}");
+                let indices = shards
+                    .iter()
+                    .chain(std::iter::once(&rebuilt))
+                    .map(|shard| shard.erasure_index)
+                    .collect::<HashSet<_>>();
+                assert_eq!(indices, (1..=12).map(Some).collect(), "{key} must have all twelve distinct shard indices");
+            }
+            Ok(true)
+        },
+        "automatic heal rebuilds the missing shard at its original geometry",
+    )
+    .await?;
+    for (key, shards) in &manifests {
+        for (drive, original) in present.iter().zip(shards) {
+            assert!(
+                census_object_version_on_disk(drive, &bucket, key, None)?.matches_manifest(original),
+                "{key} changed an original shard"
+            );
+        }
+    }
+    for drive in &drive_paths {
+        assert!(!census_object_version_on_disk(drive, &bucket, "rejected.bin", None)?.has_xl_meta);
+    }
+    assert_object_bytes(&writer, &bucket, "fixed.bin", &payload).await?;
+    assert_object_bytes(&writer, &bucket, "adaptive.bin", &payload).await?;
+    assert_object_bytes(&writer, &bucket, "inline.bin", &small).await?;
+    Ok(())
+}
 
 #[derive(Clone)]
 struct ExpectedShard {

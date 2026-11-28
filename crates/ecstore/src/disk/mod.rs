@@ -1486,6 +1486,13 @@ impl Disk {
         }
     }
 
+    pub(crate) fn is_faulty(&self) -> bool {
+        match self {
+            Disk::Local(local_disk) => local_disk.is_faulty(),
+            Disk::Remote(remote_disk) => remote_disk.is_faulty(),
+        }
+    }
+
     /// Observe a local wrapper's retirement. Remote handles have their own RPC lifecycle.
     /// Cancelling the returned child token does not retire the underlying wrapper.
     pub fn local_retirement_token(&self) -> Option<CancellationToken> {

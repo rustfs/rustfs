@@ -85,7 +85,7 @@ Two storage classes: `STANDARD` (SC) and `REDUCED_REDUNDANCY` (RRS) ([storagecla
 - **INVARIANT — per-pool validity.** Each pool's resolved parity must be valid for **that pool's own drive count**. A heterogeneous deployment (pools of different widths) must resolve parity per pool; applying one pool's parity to a narrower pool can drive `data_blocks = N − parity` to `0` and make encoding impossible.
   - Implemented by `resolve_write_layout` ([set_disk/mod.rs](../../crates/ecstore/src/set_disk/mod.rs)), which takes the pool index and resolves parity against that pool's own drive count; the default parity for a pool without explicit config comes from `ec_drives_no_config` ([store/init_format.rs](../../crates/ecstore/src/store/init_format.rs)).
 
-Per-write layout (the numbers that go into `xl.meta`), from the storage class or `default_parity_count`, with `opts.max_parity` forcing `N/2` for internal writes ([set_disk/ops/object.rs](../../crates/ecstore/src/set_disk/ops/object.rs)):
+The baseline write layout comes from the storage class or `default_parity_count`, with `opts.max_parity` forcing `N/2` for internal writes ([set_disk/ops/object.rs](../../crates/ecstore/src/set_disk/ops/object.rs)):
 
 ```
 parity_drives = storage_class_parity(x-amz-storage-class) or set default_parity_count
@@ -94,7 +94,9 @@ data_drives  = N − parity_drives
 write_quorum = data_drives ; if data_drives == parity_drives: write_quorum += 1
 ```
 
-- **INVARIANT — layout arithmetic.** `data_blocks = N − parity`; `read_quorum = data_blocks`; `write_quorum = data_blocks`, bumped to `data_blocks + 1` iff `data_blocks == parity_blocks` (so a symmetric split cannot commit on a bare data-quorum). See [core/io_primitives.rs](../../crates/ecstore/src/set_disk/core/io_primitives.rs) (`default_read_quorum`, `default_write_quorum`).
+- **INVARIANT — layout arithmetic.** `data_blocks = N − parity`. The layout read quorum is `data_blocks` and the layout write quorum is `data_blocks + 1` for a symmetric split, or `data_blocks` otherwise. See [core/io_primitives.rs](../../crates/ecstore/src/set_disk/core/io_primitives.rs) (`default_read_quorum`, `default_write_quorum`).
+
+With [degraded PUT parity enabled](../operations/cluster-lifecycle-operations.md#3-startup-configuration), eligible PUTs may select higher parity before encoding. They persist the selected geometry in `xl.meta` and require at least the baseline write quorum to acknowledge the PUT.
 
 ---
 
@@ -389,7 +391,7 @@ Version-aware heal ([set_disk/ops/heal.rs](../../crates/ecstore/src/set_disk/ops
 |-----------|--------|--------|
 | Read (payload) | `data_blocks = N − parity` | [set_disk/metadata.rs](../../crates/ecstore/src/set_disk/metadata.rs) |
 | Decode (shards needed) | `≥ data_blocks` | [set_disk/read.rs](../../crates/ecstore/src/set_disk/read.rs) |
-| Write (payload) | `data_blocks`, `+1` iff `data == parity` | [set_disk/core/io_primitives.rs](../../crates/ecstore/src/set_disk/core/io_primitives.rs) |
+| Write (payload) | `data_blocks`, `+1` iff `data == parity`. Degraded PUT parity retains the baseline PUT commit floor. | [Parity selection](#22-parity-selection) |
 | Delete marker (write + metadata vote) | `N/2 + 1` (majority) | [set_disk/ops/object.rs](../../crates/ecstore/src/set_disk/ops/object.rs), [set_disk/metadata.rs](../../crates/ecstore/src/set_disk/metadata.rs) |
 | `opts.max_parity` internal writes | parity `= N/2` | [set_disk/ops/object.rs](../../crates/ecstore/src/set_disk/ops/object.rs) |
 
@@ -425,8 +427,8 @@ Do not change any of the following without a format-version bump, a read path fo
 
 Geometry & math
 - Set size `N ∈ 2..=16` for multi-drive layouts (single-drive deployments run at `N = 1`, parity 0); `N = data_blocks + parity_blocks`.
-- `parity ≤ N/2`; `STANDARD parity ≥ RRS parity`; parity resolved **per pool** for its own `N`.
-- `read_quorum = data_blocks`; `write_quorum = data_blocks` (`+1` iff `data == parity`); delete-marker quorum `N/2 + 1`.
+- `parity ≤ N/2`; configured `STANDARD parity ≥ RRS parity` when both are non-zero; baseline parity resolved **per pool** for its own `N`.
+- `read_quorum = data_blocks`; layout write quorum `data_blocks` (`+1` iff `data == parity`); delete-marker quorum `N/2 + 1`. A new PUT that raises parity retains the baseline write quorum as its commit floor.
 - Decode requires `≥ data_blocks` shards; below that, fail closed. Writes missing quorum roll back (best-effort — see §7).
 
 Algorithm

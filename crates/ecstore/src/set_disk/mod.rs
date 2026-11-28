@@ -4353,6 +4353,28 @@ pub(super) struct WriteLayout {
 }
 
 impl WriteLayout {
+    fn with_degraded_put_parity(self, disks: &[Option<DiskStore>]) -> Self {
+        let drive_count = self.data_drives + self.parity_drives;
+        debug_assert_eq!(disks.len(), drive_count);
+        let parity_budget = drive_count / 2 - self.parity_drives;
+        if self.parity_drives == 0 || parity_budget == 0 {
+            return self;
+        }
+
+        let extra_parity = disks
+            .iter()
+            .filter(|slot| slot.as_ref().is_none_or(|disk| disk.is_faulty()))
+            .take(parity_budget)
+            .count();
+        // More parity never increases the layout quorum, including the tie
+        // at an even split. Keep the baseline PUT commit floor.
+        Self {
+            data_drives: self.data_drives - extra_parity,
+            parity_drives: self.parity_drives + extra_parity,
+            ..self
+        }
+    }
+
     fn from_parity(drive_count: usize, parity_drives: usize) -> Result<Self> {
         let max_parity = drive_count / 2;
         if parity_drives > max_parity {
@@ -4361,19 +4383,15 @@ impl WriteLayout {
             )));
         }
 
-        let data_drives = drive_count
-            .checked_sub(parity_drives)
-            .filter(|&data_drives| data_drives > 0 && parity_drives <= data_drives)
-            .ok_or_else(|| Error::other(format!("invalid write layout with {drive_count} drives and parity {parity_drives}")))?;
-        let write_quorum = data_drives
-            .checked_add(usize::from(data_drives == parity_drives))
-            .filter(|&write_quorum| write_quorum <= drive_count)
-            .ok_or_else(|| Error::other(format!("invalid write quorum for {drive_count} drives and parity {parity_drives}")))?;
+        if drive_count == 0 {
+            return Err(Error::other("invalid write layout with 0 drives and parity 0"));
+        }
 
+        let data_drives = drive_count - parity_drives;
         Ok(Self {
             data_drives,
             parity_drives,
-            write_quorum,
+            write_quorum: data_drives + usize::from(data_drives == parity_drives),
         })
     }
 }
@@ -4410,6 +4428,23 @@ mod write_layout_tests {
     use arc_swap::ArcSwap;
     use rustfs_config::server_config::KVS;
     use std::sync::Arc;
+
+    #[test]
+    fn degraded_put_parity_caps_odd_and_even_sets_at_the_baseline_commit_floor() {
+        for (drive_count, baseline, data, parity, quorum) in
+            [(11, 4, 6, 5, 7), (12, 4, 6, 6, 8), (12, 6, 6, 6, 7), (12, 0, 12, 0, 12)]
+        {
+            let layout = WriteLayout::from_parity(drive_count, baseline).expect("baseline layout should resolve");
+            assert_eq!(
+                layout.with_degraded_put_parity(&vec![None; drive_count]),
+                WriteLayout {
+                    data_drives: data,
+                    parity_drives: parity,
+                    write_quorum: quorum,
+                }
+            );
+        }
+    }
 
     #[test]
     fn automatic_standard_layout_is_resolved_per_pool() {

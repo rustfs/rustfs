@@ -86,6 +86,7 @@ pub const RRS_ENV: &str = "RUSTFS_STORAGE_CLASS_RRS";
 pub const STANDARD_ENV: &str = "RUSTFS_STORAGE_CLASS_STANDARD";
 // Optimize storage class environment variable
 pub const OPTIMIZE_ENV: &str = "RUSTFS_STORAGE_CLASS_OPTIMIZE";
+const DEGRADED_PUT_PARITY: &str = "degraded_put_parity";
 // Inline block indicates the size of the shard that is considered for inlining
 pub const INLINE_BLOCK_ENV: &str = "RUSTFS_STORAGE_CLASS_INLINE_BLOCK";
 
@@ -272,6 +273,10 @@ impl Config {
         } else {
             self.optimize.as_ref().is_some_and(|v| v.as_str() == "capacity")
         }
+    }
+
+    pub(crate) fn degraded_put_parity_enabled(&self) -> bool {
+        self.initialized && self.optimize.as_deref() == Some(DEGRADED_PUT_PARITY)
     }
 }
 
@@ -546,6 +551,27 @@ mod tests {
 
     fn no_env_overrides() -> StorageClassEnvOverrides {
         StorageClassEnvOverrides::default()
+    }
+
+    #[test]
+    fn degraded_put_parity_requires_explicit_environment_mode() {
+        for (mode, enabled) in [
+            (None, false),
+            (Some("availability"), false),
+            (Some("capacity"), false),
+            (Some(DEGRADED_PUT_PARITY), true),
+        ] {
+            let config = lookup_config_for_pools_with_env(
+                &DEFAULT_KVS,
+                &[12],
+                StorageClassEnvOverrides {
+                    optimize: mode.map(str::to_owned),
+                    ..Default::default()
+                },
+            )
+            .expect("storage class should resolve");
+            assert_eq!(config.degraded_put_parity_enabled(), enabled, "{mode:?}");
+        }
     }
 
     #[test]

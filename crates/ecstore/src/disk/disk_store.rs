@@ -1902,6 +1902,15 @@ impl LocalDiskWrapper {
         self.health.runtime_state()
     }
 
+    pub(crate) fn is_faulty(&self) -> bool {
+        self.health.is_faulty()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn mark_recovery_success_for_test(&self) -> bool {
+        self.health.mark_recovery_success(&self.disk.endpoint(), "test_probe")
+    }
+
     pub fn offline_duration_secs(&self) -> Option<u64> {
         self.health.offline_duration().map(|duration| duration.as_secs())
     }
@@ -2976,7 +2985,7 @@ impl DiskAPI for LocalDiskWrapper {
     async fn is_online(&self) -> bool {
         // A matching format does not make a handle usable while its I/O gate is faulty.
         // Reconnect must renew it even if its old recovery monitor has stopped.
-        if self.health.is_faulty() {
+        if self.is_faulty() {
             return false;
         }
         let Ok(Some(disk_id)) = self.get_disk_id().await else {

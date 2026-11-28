@@ -1879,6 +1879,10 @@ impl RemoteDisk {
         self.health.runtime_state()
     }
 
+    pub(crate) fn is_faulty(&self) -> bool {
+        self.health.is_faulty()
+    }
+
     #[cfg(test)]
     fn recovery_monitor_is_active(&self) -> bool {
         self.recovery_monitor_active.load(Ordering::Acquire)
@@ -3913,8 +3917,7 @@ impl DiskAPI for RemoteDisk {
 
     #[tracing::instrument(level = "trace", skip_all)]
     async fn is_online(&self) -> bool {
-        // If disk is marked as faulty, consider it offline
-        !self.health.is_faulty()
+        !self.is_faulty()
     }
 
     #[tracing::instrument(level = "trace", skip_all)]
