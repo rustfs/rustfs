@@ -10224,10 +10224,13 @@ mod tests {
             -1,
         );
 
+        // Use the boxed callback that the streaming reader polls on its worker stack.
+        let mut reopen = get_object_resume_control(ctx).reopen;
+
         // Positive control: the same version reopens and streams the body.
         let manager = get_concurrency_manager();
         let permits_before = manager.io_queue_status().permits_in_use;
-        let mut reader = ctx.reopen(0).await.expect("reopening the same version must succeed");
+        let mut reader = reopen(0).await.expect("reopening the same version must succeed");
         assert_eq!(
             manager.io_queue_status().permits_in_use,
             permits_before + 1,
@@ -10249,7 +10252,7 @@ mod tests {
         );
 
         // A nonzero-offset reopen must splice the remaining bytes exactly.
-        let mut reader = ctx.reopen(1024).await.expect("reopening at a nonzero offset must succeed");
+        let mut reader = reopen(1024).await.expect("reopening at a nonzero offset must succeed");
         let mut tail = Vec::new();
         reader
             .read_to_end(&mut tail)
@@ -10266,7 +10269,7 @@ mod tests {
             .expect("delete the original object");
         let replacement_body = vec![0xBB; 2 * 1024 * 1024];
         put_real_cold_fill_object(&store, &bucket, object, &replacement_body).await;
-        let result = ctx.reopen(0).await;
+        let result = reopen(0).await;
         assert!(
             matches!(result, Err(GetObjectResumeFailure::Fatal)),
             "reopening a replaced version must fail closed"
