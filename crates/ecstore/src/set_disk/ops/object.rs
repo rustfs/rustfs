@@ -10309,6 +10309,28 @@ fn batch_delete_group_generation<'a>(
     Ok(expected)
 }
 
+fn project_coalesced_marker_results(
+    deleted: &mut [DeletedObject],
+    errors: &mut [Option<Error>],
+    accounting: &mut [Option<DeleteAccounting>],
+    coalesced_slots: &[(usize, usize)],
+) {
+    for &(slot, representative) in coalesced_slots {
+        if errors[slot].is_some() {
+            continue;
+        }
+        if let Some(error) = errors[representative].clone() {
+            errors[slot] = Some(error);
+            continue;
+        }
+        let mut committed = deleted[representative].clone();
+        committed.coalesced_delete_marker_key = Some(decode_dir_object(&committed.object_name));
+        committed.object_name = std::mem::take(&mut deleted[slot].object_name);
+        deleted[slot] = committed;
+        accounting[slot] = None;
+    }
+}
+
 /// Per-key source-read inputs for the bulk-delete admission loop. The bounded
 /// metadata pre-fetch and the loop itself must resolve these identically, so
 /// both sides derive them here.
@@ -11371,10 +11393,11 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
             if let Some(index) = fi_vers.versions.iter().position(|fi| fi.deleted) {
                 if has_aliases {
                     let representative = fi_vers.versions[index].idx;
-                    coalesced_marker_aliases.extend(fi_vers.versions[index + 1..].iter().filter_map(|version| {
-                        (objects[version.idx].object_name != objects[representative].object_name)
-                            .then_some((version.idx, representative))
-                    }));
+                    coalesced_marker_aliases.extend(
+                        fi_vers.versions[index + 1..]
+                            .iter()
+                            .map(|version| (version.idx, representative)),
+                    );
                 }
                 fi_vers.versions.truncate(index + 1);
             }
@@ -11972,13 +11995,8 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
             });
         let _ = join_all(purge_submissions).await;
 
-        // Aliased marker overrides share the retained marker's mutation. An
-        // excluded alias keeps its own admission error or gets the commit error.
-        for (alias, representative) in coalesced_marker_aliases {
-            if del_errs[alias].is_none() {
-                del_errs[alias] = del_errs[representative].clone();
-            }
-        }
+        // Only the representative's marker was committed for each mixed group.
+        project_coalesced_marker_results(&mut del_objects, &mut del_errs, &mut accounting, &coalesced_marker_aliases);
         for (object, err) in objects.iter().zip(del_errs.iter()) {
             if err.is_none() {
                 self.invalidate_get_object_metadata_cache(bucket, &object.object_name).await;
@@ -30204,6 +30222,122 @@ mod batch_delete_marker_tests {
         );
         generations.insert(objects[0].object_name.clone(), present.clone());
         assert_eq!(batch_delete_group_generation(&group, &objects, &generations).unwrap(), Some(&present));
+    }
+
+    #[test]
+    fn coalesced_marker_slots_follow_the_commit_and_keep_their_own_errors() {
+        let mut deleted =
+            ["nested/object", r"nested\object", r"nested\object", "other/key", r"other\key"].map(|name| DeletedObject {
+                object_name: name.to_owned(),
+                ..Default::default()
+            });
+        let committed_version = Uuid::from_u128(1);
+        deleted[0].delete_marker = true;
+        deleted[0].delete_marker_version_id = Some(committed_version);
+        deleted[0].delete_marker_mtime = Some(OffsetDateTime::UNIX_EPOCH);
+        deleted[0].found = true;
+        let mut errors = [
+            None,
+            None,
+            Some(StorageError::PreconditionFailed),
+            Some(StorageError::ErasureWriteQuorum),
+            None,
+        ];
+        let mut accounting = [None, Some(DeleteAccounting::default()), None, None, None];
+
+        project_coalesced_marker_results(&mut deleted, &mut errors, &mut accounting, &[(1, 0), (2, 0), (4, 3)]);
+
+        assert_eq!(deleted[1].object_name, r"nested\object");
+        assert_eq!(deleted[1].coalesced_delete_marker_key.as_deref(), Some("nested/object"));
+        assert!(deleted[1].delete_marker && deleted[1].found);
+        assert_eq!(deleted[1].delete_marker_version_id, Some(committed_version));
+        assert_eq!(deleted[1].delete_marker_mtime, deleted[0].delete_marker_mtime);
+        assert!(accounting[1].is_none());
+        assert_eq!(errors[2], Some(StorageError::PreconditionFailed));
+        assert!(!deleted[2].found);
+        assert_eq!(errors[4], Some(StorageError::ErasureWriteQuorum));
+        assert!(!deleted[4].found);
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn windows_batch_delete_mixed_marker_aliases_return_the_listed_marker() {
+        let (_dirs, store) = isolated_store_over_temp_disks().await;
+        crate::bucket::metadata_sys::init_bucket_metadata_sys(store.clone(), Vec::new()).await;
+        let bucket = "batch-alias-marker-slots";
+        let key = "nested/object";
+        store
+            .make_bucket(
+                bucket,
+                &MakeBucketOptions {
+                    versioning_enabled: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("create versioned bucket");
+        let uploaded = store
+            .put_object(
+                bucket,
+                key,
+                &mut PutObjReader::from_vec(b"retained data version".to_vec()),
+                &ObjectOptions {
+                    versioned: true,
+                    write_completion: crate::object_api::WriteCompletion::TailDrained,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("seed a version behind the marker");
+        let data_version = uploaded.version_id.expect("versioned PUT returns an ID");
+
+        let requested = [key, r"nested\object", key];
+        let (deleted, errors, accounting) = store
+            .delete_objects_with_tier_delete_journal_and_accounting(
+                bucket,
+                requested
+                    .iter()
+                    .map(|&name| ObjectToDelete {
+                        object_name: name.to_owned(),
+                        ..Default::default()
+                    })
+                    .collect(),
+                ObjectOptions::default(),
+            )
+            .await;
+        assert_eq!(errors, [None, None, None]);
+        assert_eq!(deleted.len(), requested.len());
+        assert_eq!(accounting, [None, None, None]);
+        let marker = deleted[0].delete_marker_version_id.expect("committed marker ID");
+        assert!(!marker.is_nil());
+        for (slot, (result, requested_key)) in deleted.iter().zip(requested).enumerate() {
+            assert_eq!(result.object_name, requested_key);
+            assert_eq!(result.coalesced_delete_marker_key.as_deref(), (slot != 0).then_some(key));
+            assert!(result.delete_marker && result.found);
+            assert_eq!(result.delete_marker_version_id, Some(marker));
+            assert_eq!(result.delete_marker_mtime, deleted[0].delete_marker_mtime);
+        }
+
+        let listed = store
+            .clone()
+            .list_object_versions(bucket, "", None, None, None, 100)
+            .await
+            .expect("list committed versions");
+        assert!(!listed.is_truncated);
+        assert_eq!(listed.objects.len(), 2);
+        assert!(listed.objects.iter().all(|version| version.name == key));
+        assert!(
+            listed
+                .objects
+                .iter()
+                .any(|version| version.delete_marker && version.version_id == Some(marker))
+        );
+        assert!(
+            listed
+                .objects
+                .iter()
+                .any(|version| !version.delete_marker && version.version_id == Some(data_version))
+        );
     }
 
     #[cfg(windows)]
