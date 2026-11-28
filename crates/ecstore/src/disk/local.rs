@@ -9832,13 +9832,16 @@ impl LocalDisk {
 
         pool_meta_native::reject_raw_path(&self.root, volume, path)?;
         crate::hp_guard!("LocalDisk::write_metadata");
+        let mut validated_multipart_recovery = None;
         if volume == super::RUSTFS_META_MULTIPART_BUCKET {
-            let recovery = self.io_get_object_path(volume, &format!("{path}/{}", super::MULTIPART_RECOVERY_DIR))?;
-            match std::fs::symlink_metadata(recovery) {
+            let (volume_dir, recovery) =
+                self.io_get_bucket_and_object_path(volume, &format!("{path}/{}", super::MULTIPART_RECOVERY_DIR))?;
+            match std::fs::symlink_metadata(&recovery) {
                 Ok(_) => return Err(DiskError::FileNotFound),
                 Err(error) if error.kind() == ErrorKind::NotFound => {}
                 Err(error) => return Err(to_file_error(error).into()),
             }
+            validated_multipart_recovery = Some((volume_dir, recovery));
         }
         fi.validate_for_metadata_read()?;
         let initial_source = if volume == RUSTFS_META_MULTIPART_BUCKET {
@@ -9853,13 +9856,31 @@ impl LocalDisk {
         } else {
             false
         };
-        let source_admission = self.multipart_source_admission(volume, path, false, initial_source)?;
-        if volume == super::RUSTFS_META_MULTIPART_BUCKET
-            && let Some(ref admission) = source_admission
-        {
-            multipart_source_state::invalidate_active_multipart_source_head(admission.source());
-        }
-        let p = self.io_get_object_path(volume, format!("{path}/{STORAGE_FORMAT_FILE}").as_str())?;
+        let xl_rel_path = format!("{path}/{STORAGE_FORMAT_FILE}");
+        let (source_admission, volume_dir, p) = if let Some((volume_dir, recovery)) = validated_multipart_recovery {
+            let Some(upload_dir) = recovery.parent() else {
+                return Err(DiskError::InvalidPath);
+            };
+            let admission =
+                self.multipart_source_admission_with_validated_dir(volume, path, false, initial_source, upload_dir)?;
+            if let Some(ref admission) = admission {
+                multipart_source_state::invalidate_active_multipart_source_head(admission.source());
+            }
+            let p = recovery.with_file_name(STORAGE_FORMAT_FILE);
+            if std::fs::symlink_metadata(&p).is_ok_and(|meta| meta.file_type().is_symlink()) {
+                return Err(DiskError::InvalidPath);
+            }
+            #[cfg(debug_assertions)]
+            if let Ok((expected_vol, expected_p)) = self.io_get_bucket_and_object_path(volume, &xl_rel_path) {
+                debug_assert_eq!(volume_dir, expected_vol);
+                debug_assert_eq!(p, expected_p);
+            }
+            (admission, volume_dir, p)
+        } else {
+            let admission = self.multipart_source_admission(volume, path, false, initial_source)?;
+            let (volume_dir, p) = self.io_get_bucket_and_object_path(volume, &xl_rel_path)?;
+            (admission, volume_dir, p)
+        };
 
         let mut meta = FileMeta::new();
         if !fi.fresh {
@@ -9877,15 +9898,18 @@ impl LocalDisk {
 
         // Atomic temp+rename: this path also rewrites live xl.meta (delete markers,
         // decommission), where an in-place truncate would expose torn metadata.
-        self.write_all_meta_with_source_admission(
-            volume,
-            format!("{path}/{STORAGE_FORMAT_FILE}").as_str(),
-            fm_bytes.clone(),
-            true,
-            namespace_owner.clone(),
-            source_admission.clone(),
-        )
-        .await?;
+        let precomputed_stamp = self
+            .write_all_meta_with_source_admission_and_paths(
+                volume,
+                xl_rel_path.as_str(),
+                fm_bytes.clone(),
+                true,
+                namespace_owner.clone(),
+                source_admission.clone(),
+                Some((volume_dir, p)),
+                initial_source,
+            )
+            .await?;
 
         if initial_source
             && let Some(admission) = source_admission
@@ -9901,7 +9925,12 @@ impl LocalDisk {
                 },
             )
         {
-            multipart_source_state::put_active_multipart_source_head(admission.source(), fm_bytes, cached_fi);
+            multipart_source_state::put_active_multipart_source_head_with_stamp(
+                admission.source(),
+                fm_bytes,
+                cached_fi,
+                precomputed_stamp,
+            );
         }
         drop(namespace_owner);
 
@@ -12514,6 +12543,23 @@ impl LocalDisk {
         namespace_owner: Option<Arc<dyn Send + Sync>>,
         admission: Option<multipart_staging::MultipartSourceAdmission>,
     ) -> Result<()> {
+        self.write_all_meta_with_source_admission_and_paths(volume, path, buf, sync, namespace_owner, admission, None, false)
+            .await
+            .map(|_| ())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn write_all_meta_with_source_admission_and_paths(
+        &self,
+        volume: &str,
+        path: &str,
+        buf: Bytes,
+        sync: bool,
+        namespace_owner: Option<Arc<dyn Send + Sync>>,
+        admission: Option<multipart_staging::MultipartSourceAdmission>,
+        prevalidated_dst: Option<(PathBuf, PathBuf)>,
+        capture_initial_stamp: bool,
+    ) -> Result<Option<multipart_source_state::FileStamp>> {
         multipart_staging::reject_reserved_anchor(path)?;
         let fuse_with_admission = admission.is_some() && !crash_inject::is_armed(CrashPoint::MetaWriteAfterTmpBeforeRename, path);
         // Held until the staging root is published, by the filesystem work
@@ -12529,12 +12575,14 @@ impl LocalDisk {
         } else {
             None
         };
-        let volume_dir = self.io_get_bucket_path(volume)?;
-        let file_path = self.io_get_object_path(volume, path)?;
+        let (volume_dir, file_path) = match prevalidated_dst {
+            Some(paths) => paths,
+            None => self.io_get_bucket_and_object_path(volume, path)?,
+        };
         check_path_length(file_path.to_string_lossy().as_ref())?;
 
-        let tmp_volume_dir = self.io_get_bucket_path(RUSTFS_META_TMP_BUCKET)?;
-        let tmp_file_path = self.io_get_object_path(RUSTFS_META_TMP_BUCKET, Uuid::new_v4().to_string().as_str())?;
+        let (tmp_volume_dir, tmp_file_path) =
+            self.io_get_bucket_and_object_path(RUSTFS_META_TMP_BUCKET, Uuid::new_v4().to_string().as_str())?;
 
         let durability = effective_durability(volume);
 
@@ -12550,7 +12598,7 @@ impl LocalDisk {
             let precondition = admission.as_ref().map(|a| a.precondition());
             let root = self.publication_root.clone();
             let lease = os::acquire_namespace_mutation_lease_with_owner(&file_path, namespace_owner).await;
-            os::run_blocking_namespace_operation_with_sync(lease, uses_sync_lane, move || {
+            let precomputed_stamp = os::run_blocking_namespace_operation_with_sync(lease, uses_sync_lane, move || {
                 let _index_pin = prepared_index.map(|record| record.run_std()).transpose()?;
                 #[cfg(test)]
                 if let Some(pin) = &_index_pin {
@@ -12564,6 +12612,19 @@ impl LocalDisk {
                 if sync_file {
                     file.sync_data()?;
                 }
+                #[cfg(all(unix, any(test, feature = "test-util"), not(windows)))]
+                let hooks_active = os::prepared_publication_test_hooks::has_any_hooks();
+                #[cfg(not(all(unix, any(test, feature = "test-util"), not(windows))))]
+                let hooks_active = false;
+                #[cfg(unix)]
+                let stamp = (capture_initial_stamp && !hooks_active)
+                    .then(|| multipart_source_state::FileStamp::from_file(&file))
+                    .flatten();
+                #[cfg(not(unix))]
+                let stamp = {
+                    let _ = (capture_initial_stamp, hooks_active);
+                    None
+                };
                 drop(file);
                 os::rename_all_with_precondition_and_parent_sync_std(
                     &tmp_file_path,
@@ -12572,11 +12633,12 @@ impl LocalDisk {
                     &root,
                     precondition.as_deref(),
                     sync_directory,
-                )
+                )?;
+                Ok(stamp)
             })
             .await
             .map_err(to_file_error)?;
-            return Ok(());
+            return Ok(precomputed_stamp);
         }
 
         // The tmp file is renamed to its final location right below, so only
@@ -12623,7 +12685,7 @@ impl LocalDisk {
                 .map_err(to_file_error)?;
         }
 
-        Ok(())
+        Ok(None)
     }
 
     // write_all_public for trail
@@ -15795,37 +15857,43 @@ impl DiskAPI for LocalDisk {
 
     #[tracing::instrument(level = "trace", skip_all)]
     async fn read_parts(&self, bucket: &str, paths: &[String]) -> Result<Vec<ObjectPartInfo>> {
-        if bucket == RUSTFS_META_MULTIPART_BUCKET && !paths.is_empty() {
-            let permit = acquire_context_disk_io_permit().await.map_err(DiskError::Io)?;
-            let resolve = self.part_path_resolver();
-            let keys = paths.to_owned();
-            let cached = spawn_blocking_with_disk_io_permit(permit, move || {
-                let mut parts = Vec::with_capacity(keys.len());
-                let mut verified = None;
-                for key in &keys {
-                    let num = Path::new(key)
-                        .file_name()?
-                        .to_str()?
-                        .strip_prefix("part.")?
-                        .strip_suffix(".meta")?
-                        .parse()
-                        .ok()?;
-                    let scope = multipart_staging::upload_scope_root(key, true);
-                    let same_head = verified.as_ref().is_some_and(|(prev, _)| *prev == scope);
-                    if !same_head {
-                        verified = Some((scope, resolve(RUSTFS_META_MULTIPART_BUCKET, scope).ok()?));
+        if bucket == RUSTFS_META_MULTIPART_BUCKET
+            && let Some(first_key) = paths.first()
+            && let Some((first_scope, first_dir, first_num)) = multipart_staging::parse_canonical_part_meta_key(first_key)
+        {
+            let (_, first_source) = build_local_disk_object_path(self.io_root(), RUSTFS_META_MULTIPART_BUCKET, first_scope);
+            if multipart_source_state::has_cached_active_multipart_source_part(&first_source, first_dir, first_num) {
+                let permit = acquire_context_disk_io_permit().await.map_err(DiskError::Io)?;
+                let resolve = self.part_path_resolver();
+                let keys = paths.to_owned();
+                let cached = spawn_blocking_with_disk_io_permit(permit, move || {
+                    let mut parts = Vec::with_capacity(keys.len());
+                    let mut verified: Option<(&str, &str, PathBuf)> = None;
+                    for key in &keys {
+                        let (scope, dir_str, num) = multipart_staging::parse_canonical_part_meta_key(key)?;
+                        let same_head = verified
+                            .as_ref()
+                            .is_some_and(|(prev_scope, prev_dir, _)| *prev_scope == scope && *prev_dir == dir_str);
+                        if !same_head {
+                            let resolved_data_dir = resolve(RUSTFS_META_MULTIPART_BUCKET, &format!("{scope}/{dir_str}")).ok()?;
+                            let source = resolved_data_dir.parent()?.to_path_buf();
+                            verified = Some((scope, dir_str, source));
+                        }
+                        let (_, expected_dir, source) = verified.as_ref()?;
+                        parts.push(multipart_source_state::get_active_multipart_source_part_with_head_in_dir(
+                            source,
+                            Some(*expected_dir),
+                            num,
+                            same_head,
+                        )?);
                     }
-                    let (_, source) = verified.as_ref()?;
-                    parts.push(multipart_source_state::get_active_multipart_source_part_with_head(
-                        source, num, same_head,
-                    )?);
+                    Some(parts)
+                })
+                .await
+                .map_err(DiskError::from)?;
+                if let Some(parts) = cached {
+                    return Ok(parts);
                 }
-                Some(parts)
-            })
-            .await
-            .map_err(DiskError::from)?;
-            if let Some(parts) = cached {
-                return Ok(parts);
             }
         }
         let volume_dir = self.io_get_bucket_path(bucket)?;

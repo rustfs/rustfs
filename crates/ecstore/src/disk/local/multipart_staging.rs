@@ -161,6 +161,27 @@ fn part_file_name(path: &str) -> bool {
             && Uuid::parse_str(&suffix[10..]).is_ok_and(|generation| !generation.is_nil()))
 }
 
+pub(super) fn parse_canonical_part_meta_key(key: &str) -> Option<(&str, &str, usize)> {
+    if key.is_empty() || key.ends_with('/') || !canonical_relative_path(key) {
+        return None;
+    }
+    let scope = upload_scope_root(key, true);
+    if scope.is_empty() {
+        return None;
+    }
+    let rest = key.strip_prefix(scope)?.strip_prefix('/')?;
+    let (dir_str, file_name) = rest.split_once('/')?;
+    if dir_str.is_empty() || file_name.contains('/') {
+        return None;
+    }
+    let digits = file_name.strip_prefix("part.")?.strip_suffix(".meta")?;
+    if digits.is_empty() || digits.starts_with('0') || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let num = digits.parse::<usize>().ok().filter(|&n| n > 0)?;
+    Some((scope, dir_str, num))
+}
+
 pub(super) fn upload_scope_root(path: &str, part_path: bool) -> &str {
     let path = path.trim_end_matches('/');
     let mut prior_hash = false;
@@ -351,6 +372,47 @@ impl LocalDisk {
         }
         Ok(Some(MultipartSourceAdmission {
             source: self.io_get_object_path(volume, upload_scope_root(path, part_path))?,
+            base: self.io_root().to_path_buf(),
+            publication_root: self.publication_root.clone(),
+            initial,
+        }))
+    }
+
+    /// Constructs `MultipartSourceAdmission` when the caller has already
+    /// validated `(volume, path)` via `io_get_bucket_and_object_path` and holds `validated_dir`.
+    pub(super) fn multipart_source_admission_with_validated_dir(
+        &self,
+        volume: &str,
+        path: &str,
+        part_path: bool,
+        initial: bool,
+        validated_dir: &Path,
+    ) -> Result<Option<MultipartSourceAdmission>> {
+        reject_noncanonical_scope(&self.root, self.io_root(), volume, path)?;
+        if volume != RUSTFS_META_MULTIPART_BUCKET {
+            return Ok(None);
+        }
+        let scope = upload_scope_root(path, part_path);
+        let trimmed = path.trim_end_matches('/');
+        let source = if !scope.is_empty() && trimmed == scope {
+            let direct = validated_dir.to_path_buf();
+            #[cfg(debug_assertions)]
+            if let Ok(full_path) = self.io_get_object_path(volume, scope) {
+                debug_assert_eq!(direct, full_path);
+            }
+            direct
+        } else if !scope.is_empty() && trimmed.strip_prefix(scope).is_some_and(|rest| rest.starts_with('/')) {
+            let open_path = self.io_get_object_open_path(volume, scope)?;
+            #[cfg(debug_assertions)]
+            if let Ok(full_path) = self.io_get_object_path(volume, scope) {
+                debug_assert_eq!(open_path, full_path);
+            }
+            open_path
+        } else {
+            self.io_get_object_path(volume, scope)?
+        };
+        Ok(Some(MultipartSourceAdmission {
+            source,
             base: self.io_root().to_path_buf(),
             publication_root: self.publication_root.clone(),
             initial,
@@ -1545,6 +1607,182 @@ mod tests {
                 disk.multipart_source_admission_after_validated_part_path(RUSTFS_META_MULTIPART_BUCKET, noncanonical),
                 Err(DiskError::ConditionalDeleteConflict)
             ));
+        }
+    }
+
+    #[tokio::test]
+    async fn multipart_head_stamp_from_file_and_read_parts_data_dir_binding() {
+        use crate::disk::{DiskAPI as _, PartTransactionAction};
+
+        let (root, disk, completed, _) = fixture().await;
+        std::fs::create_dir_all(disk.io_get_bucket_path(RUSTFS_META_TMP_BUCKET).expect("TMP path")).expect("TMP bucket");
+
+        // 1. Verify FileStamp::from_file before rename matches FileStamp::from_path after rename on Unix.
+        #[cfg(unix)]
+        {
+            let tmp_path = root.path().join("stamp-pre-rename.tmp");
+            let dst_path = root.path().join("stamp-post-rename.meta");
+            let mut f = std::fs::File::create(&tmp_path).expect("create temp stamp file");
+            std::io::Write::write_all(&mut f, b"stamp-payload").expect("write temp stamp file");
+            f.sync_data().expect("sync temp stamp file");
+            let from_file_stamp = super::super::multipart_source_state::FileStamp::from_file(&f).expect("FileStamp::from_file");
+            drop(f);
+            std::fs::rename(&tmp_path, &dst_path).expect("rename temp stamp file");
+            let from_path_stamp =
+                super::super::multipart_source_state::FileStamp::from_path(&dst_path).expect("FileStamp::from_path");
+            assert_eq!(
+                from_file_stamp, from_path_stamp,
+                "FileStamp::from_file before rename must equal FileStamp::from_path after rename"
+            );
+        }
+
+        // 2. Verify multipart_source_admission_with_validated_dir matches multipart_source_admission.
+        let sha_root = format!("{}/{}", "b".repeat(64), Uuid::new_v4());
+        let sha_root_slash = format!("{sha_root}/");
+        let sub_path = format!("{sha_root}/{}", Uuid::new_v4());
+        for candidate in [&sha_root, &sha_root_slash, &sub_path] {
+            let (_, recovery) = disk
+                .io_get_bucket_and_object_path(
+                    RUSTFS_META_MULTIPART_BUCKET,
+                    &format!("{candidate}/{}", crate::disk::MULTIPART_RECOVERY_DIR),
+                )
+                .expect("validated recovery path");
+            let upload_dir = recovery.parent().expect("upload dir");
+            let fast = disk
+                .multipart_source_admission_with_validated_dir(RUSTFS_META_MULTIPART_BUCKET, candidate, false, true, upload_dir)
+                .expect("fast admission with validated dir")
+                .expect("multipart admission");
+            let full = disk
+                .multipart_source_admission(RUSTFS_META_MULTIPART_BUCKET, candidate, false, true)
+                .expect("full admission")
+                .expect("multipart admission");
+            assert_eq!(fast.source(), full.source());
+        }
+
+        // 3. Verify parse_canonical_part_meta_key and read_parts data_dir binding.
+        let upload = format!("{}/{}", "e".repeat(64), Uuid::new_v4());
+        let data_dir = Uuid::new_v4();
+        let mut init_fi = FileInfo::new(&upload, 2, 2);
+        init_fi.erasure.index = 1;
+        init_fi.data_dir = Some(data_dir);
+        init_fi.fresh = true;
+        init_fi.mod_time = Some(time::OffsetDateTime::now_utc());
+        disk.write_metadata("", RUSTFS_META_MULTIPART_BUCKET, &upload, init_fi.clone())
+            .await
+            .expect("initial write_metadata");
+
+        let destination = format!("{upload}/{data_dir}/part.1");
+        let part_meta = bytes::Bytes::from(completed.parts[0].marshal_msg().expect("part 1 meta"));
+        disk.write_all(
+            RUSTFS_META_TMP_BUCKET,
+            "binding-test/part.1",
+            bytes::Bytes::from_static(b"immutable shard"),
+        )
+        .await
+        .expect("stage tmp part");
+        disk.prepare_part_transaction(
+            RUSTFS_META_TMP_BUCKET,
+            "binding-test/part.1",
+            RUSTFS_META_MULTIPART_BUCKET,
+            &destination,
+            part_meta.clone(),
+        )
+        .await
+        .expect("prepare part transaction");
+        disk.rename_part(
+            RUSTFS_META_TMP_BUCKET,
+            "binding-test/part.1",
+            RUSTFS_META_MULTIPART_BUCKET,
+            &destination,
+            part_meta,
+        )
+        .await
+        .expect("rename part");
+        disk.settle_part_transaction(RUSTFS_META_MULTIPART_BUCKET, &destination, PartTransactionAction::Commit)
+            .await
+            .expect("settle part transaction");
+
+        let source_open = disk
+            .io_get_object_open_path(RUSTFS_META_MULTIPART_BUCKET, &upload)
+            .expect("source open path");
+        let data_dir_str = data_dir.to_string();
+        let canonical_meta_key = format!("{destination}.meta");
+        assert_eq!(
+            parse_canonical_part_meta_key(&canonical_meta_key),
+            Some((upload.as_str(), data_dir_str.as_str(), 1))
+        );
+        assert!(super::super::multipart_source_state::has_cached_active_multipart_source_part(
+            &source_open,
+            &data_dir_str,
+            1
+        ));
+        let wrong_dir_str = Uuid::new_v4().to_string();
+        assert!(
+            !super::super::multipart_source_state::has_cached_active_multipart_source_part(&source_open, &wrong_dir_str, 1),
+            "mismatched data_dir must miss has_cached_active_multipart_source_part"
+        );
+        assert!(
+            super::super::multipart_source_state::get_active_multipart_source_part_with_head_in_dir(
+                &source_open,
+                Some(&wrong_dir_str),
+                1,
+                false,
+            )
+            .is_none(),
+            "consumption-time data_dir mismatch must reject cached part entry"
+        );
+        let mut sentinel_part = completed.parts[0].clone();
+        sentinel_part.etag = "sentinel-cached-etag".to_string();
+        let part_meta_disk_path = source_open.join(&data_dir_str).join("part.1.meta");
+        let stamp = super::super::multipart_source_state::FileStamp::from_path(&part_meta_disk_path).expect("part.1.meta stamp");
+        super::super::multipart_source_state::record_active_multipart_part_committed(&source_open, sentinel_part, Some(stamp));
+        let hit_parts = disk
+            .read_parts(RUSTFS_META_MULTIPART_BUCKET, std::slice::from_ref(&canonical_meta_key))
+            .await
+            .expect("cached read_parts hit");
+        assert_eq!(hit_parts.len(), 1);
+        assert_eq!(
+            hit_parts[0].etag, "sentinel-cached-etag",
+            "read_parts must serve from ACTIVE_MULTIPART_SOURCE_HEADS when scope and data_dir match"
+        );
+        let miss_key = format!("{upload}/{wrong_dir_str}/part.1.meta");
+        let miss_parts = disk
+            .read_parts(RUSTFS_META_MULTIPART_BUCKET, &[miss_key])
+            .await
+            .expect("mismatched data_dir read_parts falls back to disk");
+        assert_eq!(miss_parts.len(), 1);
+        assert_ne!(miss_parts[0].etag, "sentinel-cached-etag");
+        assert!(miss_parts[0].error.is_some());
+        for non_canonical in [
+            format!("{upload}/{data_dir}/part.0.meta"),
+            format!("{upload}/{data_dir}/part.01.meta"),
+            format!("{upload}/{data_dir}/part.+1.meta"),
+            format!("{upload}/{data_dir}/part.1.meta/"),
+        ] {
+            assert!(
+                parse_canonical_part_meta_key(&non_canonical).is_none(),
+                "non-canonical key {non_canonical} must not parse as canonical part meta key"
+            );
+        }
+
+        // 4. Symlinked xl.meta leaf on write_metadata must return DiskError::InvalidPath.
+        #[cfg(unix)]
+        {
+            let sym_upload = format!("{}/{}", "f".repeat(64), Uuid::new_v4());
+            let sym_dir = disk
+                .io_get_bucket_path(RUSTFS_META_MULTIPART_BUCKET)
+                .expect("mp bucket")
+                .join(&sym_upload);
+            std::fs::create_dir_all(&sym_dir).expect("create sym upload dir");
+            std::os::unix::fs::symlink(root.path(), sym_dir.join("xl.meta")).expect("plant xl.meta symlink");
+            let mut sym_fi = init_fi.clone();
+            sym_fi.name = sym_upload.clone();
+            assert_eq!(
+                disk.write_metadata("", RUSTFS_META_MULTIPART_BUCKET, &sym_upload, sym_fi)
+                    .await
+                    .expect_err("symlinked xl.meta must fail"),
+                DiskError::InvalidPath
+            );
         }
     }
 
