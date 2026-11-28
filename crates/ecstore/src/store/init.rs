@@ -7403,6 +7403,340 @@ mod tests {
         shutdown.cancel();
     }
 
+    #[tokio::test]
+    #[serial_test::serial(storage_class_env)]
+    async fn delete_object_worm_locked_version_on_rebalancing_pool_returns_access_denied() {
+        let temp_dir = tempfile::tempdir().expect("create single-delete WORM rebalance store dir");
+        let (_ctx, store, shutdown) =
+            without_storage_class_env(build_isolated_test_store(temp_dir.path(), "single-delete-worm-rebalance", &[4, 4])).await;
+        crate::bucket::metadata_sys::init_bucket_metadata_sys(store.clone(), Vec::new()).await;
+
+        let bucket = format!("worm-del-rebal-{}", uuid::Uuid::new_v4());
+        let locked_object = "worm-locked.bin";
+        let unlocked_object = "unlocked-source.bin";
+        store
+            .make_bucket(
+                &bucket,
+                &MakeBucketOptions {
+                    lock_enabled: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("create Object-Lock-enabled bucket");
+
+        let retain_until = (OffsetDateTime::now_utc() + time::Duration::days(7))
+            .format(&time::format_description::well_known::Rfc3339)
+            .expect("format RFC3339 retain-until timestamp");
+        let compliance_version_id = uuid::Uuid::new_v4();
+        let mut locked_reader = PutObjReader::from_vec(b"immutable-worm-payload".to_vec());
+        store.pools[0]
+            .put_object(
+                &bucket,
+                locked_object,
+                &mut locked_reader,
+                &ObjectOptions {
+                    versioned: true,
+                    version_id: Some(compliance_version_id.to_string()),
+                    user_defined: HashMap::from([
+                        (rustfs_filemeta::metadata_keys::OBJECT_LOCK_MODE.to_string(), "COMPLIANCE".to_string()),
+                        (rustfs_filemeta::metadata_keys::OBJECT_LOCK_RETAIN_UNTIL_DATE.to_string(), retain_until),
+                        (rustfs_filemeta::metadata_keys::OBJECT_LOCK_LEGAL_HOLD.to_string(), "ON".to_string()),
+                    ]),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("write WORM-locked version on source pool 0");
+
+        let unlocked_version_id = uuid::Uuid::new_v4();
+        let mut unlocked_reader = PutObjReader::from_vec(b"unlocked-payload".to_vec());
+        store.pools[0]
+            .put_object(
+                &bucket,
+                unlocked_object,
+                &mut unlocked_reader,
+                &ObjectOptions {
+                    versioned: true,
+                    version_id: Some(unlocked_version_id.to_string()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("write unlocked version on source pool 0");
+
+        let mut pool_stats = vec![RebalanceStats::default(); store.pools.len()];
+        pool_stats[0] = RebalanceStats {
+            participating: true,
+            info: RebalanceInfo {
+                start_time: Some(OffsetDateTime::now_utc()),
+                status: RebalStatus::Started,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        *store.rebalance_meta.write().await = Some(RebalanceMeta {
+            id: uuid::Uuid::new_v4().to_string(),
+            pool_stats,
+            ..Default::default()
+        });
+        assert!(store.is_pool_rebalancing(0).await, "pool 0 must be marked as actively rebalancing");
+
+        for replication_request in [false, true] {
+            let err = store
+                .delete_object(
+                    &bucket,
+                    locked_object,
+                    ObjectOptions {
+                        versioned: true,
+                        version_id: Some(compliance_version_id.to_string()),
+                        replication_request,
+                        object_lock_delete: Some(crate::storage_api_contracts::object::ObjectLockDeleteOptions {
+                            bypass_governance: true,
+                        }),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect_err("deleting a WORM-locked version on a rebalancing pool must fail");
+            assert!(
+                matches!(err, StorageError::PrefixAccessDenied(_, _)),
+                "expected PrefixAccessDenied (403 AccessDenied) for replication_request={replication_request}, got {err:?}"
+            );
+        }
+
+        let unlocked_err = store
+            .delete_object(
+                &bucket,
+                unlocked_object,
+                ObjectOptions {
+                    versioned: true,
+                    version_id: Some(unlocked_version_id.to_string()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect_err("unlocked version delete on an active rebalance source pool must still fence with SlowDown");
+        assert!(
+            matches!(unlocked_err, StorageError::SlowDown),
+            "expected SlowDown for unlocked version on rebalancing pool, got {unlocked_err:?}"
+        );
+
+        let preserved = store.pools[0]
+            .get_object_info(
+                &bucket,
+                locked_object,
+                &ObjectOptions {
+                    versioned: true,
+                    version_id: Some(compliance_version_id.to_string()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("WORM-locked version must remain intact on source pool 0");
+        assert_eq!(preserved.version_id, Some(compliance_version_id));
+
+        shutdown.cancel();
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(storage_class_env)]
+    async fn delete_objects_worm_locked_version_on_rebalancing_pool_returns_access_denied() {
+        let temp_dir = tempfile::tempdir().expect("create batch-delete WORM rebalance store dir");
+        let (_ctx, store, shutdown) =
+            without_storage_class_env(build_isolated_test_store(temp_dir.path(), "batch-delete-worm-rebalance", &[4, 4])).await;
+        crate::bucket::metadata_sys::init_bucket_metadata_sys(store.clone(), Vec::new()).await;
+
+        let bucket = format!("worm-bdel-rebal-{}", uuid::Uuid::new_v4());
+        let compliance_object = "compliance-source.bin";
+        let governance_object = "governance-source.bin";
+        let target_object = "unlocked-target.bin";
+        store
+            .make_bucket(
+                &bucket,
+                &MakeBucketOptions {
+                    lock_enabled: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("create Object-Lock-enabled bucket");
+
+        let retain_until = (OffsetDateTime::now_utc() + time::Duration::days(7))
+            .format(&time::format_description::well_known::Rfc3339)
+            .expect("format RFC3339 retain-until timestamp");
+        let compliance_vid = uuid::Uuid::new_v4();
+        let mut compliance_reader = PutObjReader::from_vec(b"compliance-body".to_vec());
+        store.pools[0]
+            .put_object(
+                &bucket,
+                compliance_object,
+                &mut compliance_reader,
+                &ObjectOptions {
+                    versioned: true,
+                    version_id: Some(compliance_vid.to_string()),
+                    user_defined: HashMap::from([
+                        (rustfs_filemeta::metadata_keys::OBJECT_LOCK_MODE.to_string(), "COMPLIANCE".to_string()),
+                        (
+                            rustfs_filemeta::metadata_keys::OBJECT_LOCK_RETAIN_UNTIL_DATE.to_string(),
+                            retain_until.clone(),
+                        ),
+                    ]),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("write COMPLIANCE version on source pool 0");
+
+        let governance_vid = uuid::Uuid::new_v4();
+        let mut governance_reader = PutObjReader::from_vec(b"governance-body".to_vec());
+        store.pools[0]
+            .put_object(
+                &bucket,
+                governance_object,
+                &mut governance_reader,
+                &ObjectOptions {
+                    versioned: true,
+                    version_id: Some(governance_vid.to_string()),
+                    user_defined: HashMap::from([
+                        (rustfs_filemeta::metadata_keys::OBJECT_LOCK_MODE.to_string(), "GOVERNANCE".to_string()),
+                        (rustfs_filemeta::metadata_keys::OBJECT_LOCK_RETAIN_UNTIL_DATE.to_string(), retain_until),
+                    ]),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("write GOVERNANCE version on source pool 0");
+
+        let target_vid = uuid::Uuid::new_v4();
+        let mut target_reader = PutObjReader::from_vec(b"target-body".to_vec());
+        store.pools[1]
+            .put_object(
+                &bucket,
+                target_object,
+                &mut target_reader,
+                &ObjectOptions {
+                    versioned: true,
+                    version_id: Some(target_vid.to_string()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("write unlocked version on target pool 1");
+
+        let mut pool_stats = vec![RebalanceStats::default(); store.pools.len()];
+        pool_stats[0] = RebalanceStats {
+            participating: true,
+            info: RebalanceInfo {
+                start_time: Some(OffsetDateTime::now_utc()),
+                status: RebalStatus::Started,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        *store.rebalance_meta.write().await = Some(RebalanceMeta {
+            id: uuid::Uuid::new_v4().to_string(),
+            pool_stats,
+            ..Default::default()
+        });
+        assert!(store.is_pool_rebalancing(0).await, "pool 0 must be marked as actively rebalancing");
+
+        let (deleted, errs) = store
+            .delete_objects(
+                &bucket,
+                vec![
+                    crate::storage_api_contracts::object::ObjectToDelete {
+                        object_name: compliance_object.to_string(),
+                        version_id: Some(compliance_vid),
+                        ..Default::default()
+                    },
+                    crate::storage_api_contracts::object::ObjectToDelete {
+                        object_name: governance_object.to_string(),
+                        version_id: Some(governance_vid),
+                        ..Default::default()
+                    },
+                    crate::storage_api_contracts::object::ObjectToDelete {
+                        object_name: target_object.to_string(),
+                        version_id: Some(target_vid),
+                        ..Default::default()
+                    },
+                ],
+                ObjectOptions {
+                    versioned: true,
+                    object_lock_delete: Some(crate::storage_api_contracts::object::ObjectLockDeleteOptions {
+                        bypass_governance: false,
+                    }),
+                    ..Default::default()
+                },
+            )
+            .await;
+        assert!(
+            matches!(errs[0], Some(StorageError::PrefixAccessDenied(_, _))),
+            "COMPLIANCE version on rebalancing pool must fail with PrefixAccessDenied, got {:?}",
+            errs[0]
+        );
+        assert!(
+            matches!(errs[1], Some(StorageError::PrefixAccessDenied(_, _))),
+            "GOVERNANCE version without bypass on rebalancing pool must fail with PrefixAccessDenied, got {:?}",
+            errs[1]
+        );
+        assert!(
+            errs[2].is_none() && deleted[2].found && deleted[2].object_name == target_object,
+            "unlocked version on non-rebalancing pool 1 must still be deleted: deleted={:?}, err={:?}",
+            deleted[2],
+            errs[2]
+        );
+
+        let (_deleted_bypass, errs_bypass) = store
+            .delete_objects(
+                &bucket,
+                vec![
+                    crate::storage_api_contracts::object::ObjectToDelete {
+                        object_name: compliance_object.to_string(),
+                        version_id: Some(compliance_vid),
+                        ..Default::default()
+                    },
+                    crate::storage_api_contracts::object::ObjectToDelete {
+                        object_name: governance_object.to_string(),
+                        version_id: Some(governance_vid),
+                        ..Default::default()
+                    },
+                ],
+                ObjectOptions {
+                    versioned: true,
+                    object_lock_delete: Some(crate::storage_api_contracts::object::ObjectLockDeleteOptions {
+                        bypass_governance: true,
+                    }),
+                    ..Default::default()
+                },
+            )
+            .await;
+        assert!(
+            matches!(errs_bypass[0], Some(StorageError::PrefixAccessDenied(_, _))),
+            "COMPLIANCE version must remain PrefixAccessDenied even with bypass_governance=true, got {:?}",
+            errs_bypass[0]
+        );
+        assert!(
+            !matches!(errs_bypass[1], Some(StorageError::PrefixAccessDenied(_, _))),
+            "GOVERNANCE version with bypass_governance=true must not fail Object Lock check, got {:?}",
+            errs_bypass[1]
+        );
+        store.pools[0]
+            .get_object_info(
+                &bucket,
+                governance_object,
+                &ObjectOptions {
+                    versioned: true,
+                    version_id: Some(governance_vid.to_string()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("active rebalance source pool object must still not be physically mutated by DeleteObjects");
+
+        shutdown.cancel();
+    }
+
     #[test]
     #[serial_test::serial(storage_class_env)]
     fn decommission_listing_accepts_committed_inline_layout_change() {

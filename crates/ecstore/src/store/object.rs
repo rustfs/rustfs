@@ -2096,6 +2096,24 @@ fn delete_only_releases_capacity(opts: &ObjectOptions) -> bool {
     !opts.versioned && !opts.version_suspended || opts.version_id.is_some()
 }
 
+fn store_delete_object_lock_state<'a>(
+    bucket: &str,
+    opts: &'a ObjectOptions,
+) -> Option<&'a crate::bucket::metadata_sys::ObjectLockConfigState> {
+    if is_meta_bucketname(bucket)
+        || opts.transition.expire_restored
+        || (opts.version_id.is_none() && opts.versioned && !opts.version_suspended)
+    {
+        return None;
+    }
+    let state = opts.object_lock_config_snapshot.as_deref()?.state();
+    match state {
+        crate::bucket::metadata_sys::ObjectLockConfigState::ConfirmedAbsent => None,
+        crate::bucket::metadata_sys::ObjectLockConfigState::Configured { .. }
+        | crate::bucket::metadata_sys::ObjectLockConfigState::Fabricated => Some(state),
+    }
+}
+
 fn batch_delete_creates_latest_marker(object: &ObjectToDelete, delete_config_snapshot: &DeleteReplicationConfigSnapshot) -> bool {
     if object.version_id.is_some() {
         return false;
@@ -5632,6 +5650,63 @@ impl ECStore {
         .await
     }
 
+    /// Read-only Object Lock admission check against a single pool that writer
+    /// lookup or batch deletion would otherwise skip (for example, an active
+    /// rebalance source pool). WORM immutability (`PrefixAccessDenied`) must take
+    /// precedence over rebalance/suspension `SlowDown` or skipped-pool `NotFound`.
+    async fn check_pool_object_lock_for_delete(
+        &self,
+        pool: &Sets,
+        bucket: &str,
+        object: &str,
+        opts: &ObjectOptions,
+        state: &crate::bucket::metadata_sys::ObjectLockConfigState,
+        no_lock: bool,
+    ) -> Result<()> {
+        let bypass_governance = opts
+            .object_lock_delete
+            .as_ref()
+            .is_some_and(|delete_opts| delete_opts.bypass_governance);
+        let mut lookup_opts = version_aware_lookup_opts(opts, no_lock);
+        lookup_opts.metadata_cache_safe = false;
+        lookup_opts.http_preconditions = None;
+        lookup_opts.skip_decommissioned = false;
+        lookup_opts.skip_rebalancing = false;
+
+        let check_null_slot = match pool.get_object_info(bucket, object, &lookup_opts).await {
+            Ok(obj_info) => {
+                opts.precondition_check(&obj_info)?;
+                if check_object_lock_for_deletion_with_state(state, &obj_info, bypass_governance)?.is_some() {
+                    return Err(StorageError::PrefixAccessDenied(bucket.to_owned(), object.to_owned()));
+                }
+                opts.version_id.is_none() && obj_info.version_id.is_some_and(|version| !version.is_nil())
+            }
+            Err(StorageError::MethodNotAllowed) => opts.version_id.is_none(),
+            Err(err) if is_err_object_not_found(&err) || is_err_version_not_found(&err) => opts.version_id.is_none(),
+            Err(err) if is_err_read_quorum(&err) => return Err(StorageError::ErasureWriteQuorum),
+            Err(err) => return Err(err),
+        };
+
+        if check_null_slot {
+            let mut null_opts = lookup_opts;
+            null_opts.version_id = Some(Uuid::nil().to_string());
+            null_opts.metadata_chg = true;
+            match pool.get_object_info(bucket, object, &null_opts).await {
+                Ok(existing) => {
+                    if check_object_lock_for_deletion_with_state(state, &existing, bypass_governance)?.is_some() {
+                        return Err(StorageError::PrefixAccessDenied(bucket.to_owned(), object.to_owned()));
+                    }
+                }
+                Err(StorageError::MethodNotAllowed) => {}
+                Err(err) if is_err_object_not_found(&err) || is_err_version_not_found(&err) => {}
+                Err(err) if is_err_read_quorum(&err) => return Err(StorageError::ErasureWriteQuorum),
+                Err(err) => return Err(err),
+            }
+        }
+
+        Ok(())
+    }
+
     fn handle_delete_object_with_journal_inner_boxed<'a>(
         &'a self,
         bucket: &'a str,
@@ -5974,6 +6049,15 @@ impl ECStore {
             }
         }
 
+        if !creates_latest_marker && let Some(lock_state) = store_delete_object_lock_state(bucket, &opts) {
+            for pool in &self.pools {
+                if self.is_suspended(pool.pool_idx).await || self.is_pool_rebalancing(pool.pool_idx).await {
+                    self.check_pool_object_lock_for_delete(pool, bucket, object, &opts, lock_state, opts.no_lock)
+                        .await?;
+                }
+            }
+        }
+
         // Determine which pool contains it
         let existing_pool_info = if creates_latest_marker {
             self.get_pool_info_for_delete_marker(bucket, object, &gopts).await
@@ -6295,6 +6379,57 @@ impl ECStore {
             None
         };
 
+        let batch_lock_state = if is_meta_bucketname(bucket) || opts.transition.expire_restored {
+            None
+        } else {
+            opts.object_lock_config_snapshot.as_deref().and_then(|snapshot| {
+                let state = snapshot.state();
+                match state {
+                    crate::bucket::metadata_sys::ObjectLockConfigState::ConfirmedAbsent => None,
+                    crate::bucket::metadata_sys::ObjectLockConfigState::Configured { .. }
+                    | crate::bucket::metadata_sys::ObjectLockConfigState::Fabricated => Some(state),
+                }
+            })
+        };
+        if let Some(lock_state) = batch_lock_state {
+            for pool in self.pools.iter() {
+                if !self.is_pool_rebalancing(pool.pool_idx).await {
+                    continue;
+                }
+                let guarded_generations = pool_generations.get(&pool.pool_idx);
+                for &idx in indices {
+                    if del_errs[idx].is_some() {
+                        continue;
+                    }
+                    let object = &objects[idx];
+                    if guarded_generations.is_some_and(|generations| generations.contains_key(&object.object_name)) {
+                        continue;
+                    }
+                    let decoded_name = decode_dir_object(&object.object_name);
+                    let (versioned, version_suspended) = delete_config_snapshot.versioning_config().delete_state(&decoded_name);
+                    if object.version_id.is_none() && versioned && !version_suspended {
+                        continue;
+                    }
+                    let mut item_opts = (*opts).clone();
+                    item_opts.versioned = versioned;
+                    item_opts.version_suspended = version_suspended;
+                    item_opts.version_id = object.version_id.map(|version| version.to_string());
+                    item_opts.http_preconditions = None;
+                    if let Err(err) = self
+                        .check_pool_object_lock_for_delete(pool, bucket, &object.object_name, &item_opts, lock_state, true)
+                        .await
+                    {
+                        del_objects[idx] = DeletedObject {
+                            object_name: object.object_name.clone(),
+                            version_id: object.version_id,
+                            ..Default::default()
+                        };
+                        del_errs[idx] = Some(err);
+                    }
+                }
+            }
+        }
+
         let mut futures = Vec::with_capacity(self.pools.len());
         for pool in self.pools.iter() {
             let rebalancing = self.is_pool_rebalancing(pool.pool_idx).await;
@@ -6307,7 +6442,8 @@ impl ECStore {
                 .iter()
                 .map(|&idx| (idx, &objects[idx]))
                 .filter(|(idx, object)| {
-                    routes[*idx].targets(pool.pool_idx)
+                    del_errs[*idx].is_none()
+                        && routes[*idx].targets(pool.pool_idx)
                         // A newly rebalancing pool still owes every admitted
                         // conditional key its guarded mutation. Ordinary keys
                         // retain the existing rebalance skip behavior.
