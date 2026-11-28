@@ -367,10 +367,14 @@ pub(super) fn has_active_multipart_source_head(source: &Path) -> bool {
     true
 }
 
-pub(super) fn has_clean_active_multipart_source(source: &Path) -> bool {
-    let Some((head_stamp, clean)) =
-        ACTIVE_MULTIPART_SOURCE_HEADS.with_get(source, |entry| (entry.head_stamp, entry.unsettled_parts.is_empty()))
-    else {
+pub(super) fn has_clean_active_multipart_source(source: &Path, part_number: Option<usize>) -> bool {
+    let Some((head_stamp, clean)) = ACTIVE_MULTIPART_SOURCE_HEADS.with_get(source, |entry| {
+        let clean = match part_number {
+            Some(num) => !entry.unsettled_parts.contains(&num),
+            None => entry.unsettled_parts.is_empty(),
+        };
+        (entry.head_stamp, clean)
+    }) else {
         return false;
     };
     if !stamp_matches_active_disk(source, head_stamp) {
@@ -378,6 +382,27 @@ pub(super) fn has_clean_active_multipart_source(source: &Path) -> bool {
         return false;
     }
     clean
+}
+
+pub(super) fn has_active_multipart_source_matching(
+    source: &Path,
+    expected_data_dir: Option<Uuid>,
+    expected_mod_time: Option<time::OffsetDateTime>,
+) -> bool {
+    if expected_data_dir.is_none_or(|dir| dir.is_nil()) || expected_mod_time.is_none() {
+        return false;
+    }
+    let Some((head_stamp, matches)) = ACTIVE_MULTIPART_SOURCE_HEADS.with_get(source, |entry| {
+        let matches = !entry.fi.deleted && entry.fi.data_dir == expected_data_dir && entry.fi.mod_time == expected_mod_time;
+        (entry.head_stamp, matches)
+    }) else {
+        return false;
+    };
+    if !stamp_matches_active_disk(source, head_stamp) {
+        ACTIVE_MULTIPART_SOURCE_HEADS.remove(source);
+        return false;
+    }
+    matches
 }
 
 pub(super) fn begin_active_multipart_part_transaction(source: &Path, part_number: usize) {
@@ -998,6 +1023,7 @@ impl SourceStore {
         if certificate.round.round != round || round.is_nil() {
             return Err(DiskError::FileCorrupt);
         }
+        invalidate_active_multipart_source_head(&self.source);
         let raw = encode(certificate)?;
         let digest = raw_sha(&raw);
         let path = certificate_path(&self.source, round, ready);

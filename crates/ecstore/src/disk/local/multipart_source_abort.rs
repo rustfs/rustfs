@@ -170,6 +170,7 @@ impl SourceStore {
         certificate: &MultipartAbortCertificate,
     ) -> Result<AbortCertificateRef> {
         self.verify_abort_cohort(certificate)?;
+        super::multipart_source_state::invalidate_active_multipart_source_head(&self.source);
         let raw = encode(certificate)?;
         let digest = raw_sha(&raw);
         let slot = state
@@ -201,6 +202,7 @@ impl SourceStore {
     }
     async fn retire_abort_head(&self, state: &SourceState) -> Result<()> {
         let abort = state.abort.as_ref().ok_or(DiskError::FileCorrupt)?;
+        super::multipart_source_state::invalidate_active_multipart_source_head(&self.source);
         let source = self.source.clone();
         let base = self.base.clone();
         let root = self.publication_root.clone();
@@ -682,6 +684,61 @@ impl LocalDisk {
         let source = self.io_get_object_path(RUSTFS_META_MULTIPART_BUCKET, upload)?;
         // Only a production hash/upload root owns a recursive upload scope.
         // Empty SHA rmdir remains nonrecursive and unchanged.
+        let canonical = Path::new(upload)
+            .file_name()
+            .and_then(|name| name.to_str())
+            .and_then(|name| name.split(['x', 'X']).next())
+            .and_then(|name| Uuid::parse_str(name).ok())
+            .is_some_and(|id| !id.is_nil());
+        let hashed_parent = Path::new(upload)
+            .parent()
+            .and_then(Path::file_name)
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.len() == 64 && name.bytes().all(|byte| byte.is_ascii_hexdigit()));
+        if recursive && !(canonical && hashed_parent) {
+            return Err(DiskError::ConditionalDeleteConflict);
+        }
+        Ok(Some(OrdinaryMultipartDeleteCheck {
+            source,
+            base: self.io_root().to_path_buf(),
+            root: self.publication_root.clone(),
+        }))
+    }
+
+    /// Constructs `OrdinaryMultipartDeleteCheck` when `path` has already been
+    /// confinement-validated under `self.io_root()` by `io_get_bucket_and_object_path`.
+    pub(super) fn multipart_delete_check_prevalidated(
+        &self,
+        path: &Path,
+        recursive: bool,
+    ) -> Result<Option<OrdinaryMultipartDeleteCheck>> {
+        let Ok(relative) = path.strip_prefix(self.io_root()) else {
+            return Ok(None);
+        };
+        let mut components = relative.components();
+        if !components
+            .next()
+            .and_then(|component| component.as_os_str().to_str())
+            .is_some_and(|component| component.eq_ignore_ascii_case(crate::disk::RUSTFS_META_BUCKET))
+        {
+            return Ok(None);
+        }
+        match components.next().and_then(|component| component.as_os_str().to_str()) {
+            Some(component) if component.eq_ignore_ascii_case("multipart") => {}
+            None if recursive => return Err(DiskError::ConditionalDeleteConflict),
+            _ => return Ok(None),
+        }
+        let relative = components.as_path();
+        let relative = relative.to_str().ok_or(DiskError::InvalidPath)?;
+        let upload = super::multipart_staging::upload_scope_root(relative, true);
+        let trimmed = relative.trim_end_matches('/');
+        let source = if !upload.is_empty()
+            && (trimmed == upload || trimmed.strip_prefix(upload).is_some_and(|rest| rest.starts_with('/')))
+        {
+            self.io_get_object_open_path(RUSTFS_META_MULTIPART_BUCKET, upload)?
+        } else {
+            self.io_get_object_path(RUSTFS_META_MULTIPART_BUCKET, upload)?
+        };
         let canonical = Path::new(upload)
             .file_name()
             .and_then(|name| name.to_str())

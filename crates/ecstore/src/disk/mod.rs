@@ -465,6 +465,18 @@ impl Disk {
         }
     }
 
+    pub(crate) fn has_active_multipart_source_matching(
+        &self,
+        upload_path: &str,
+        expected_data_dir: Option<Uuid>,
+        expected_mod_time: Option<time::OffsetDateTime>,
+    ) -> bool {
+        match self {
+            Self::Local(disk) => disk.has_active_multipart_source_matching(upload_path, expected_data_dir, expected_mod_time),
+            Self::Remote(_) => false,
+        }
+    }
+
     pub(crate) async fn try_publish_prepared_delete_local(
         &self,
         volume: &str,

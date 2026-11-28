@@ -329,13 +329,42 @@ impl UploadLockHandle {
 
 impl LocalDisk {
     pub(crate) fn has_clean_active_multipart_source(&self, upload_or_part_path: &str, part_path: bool) -> bool {
+        let part_number = if part_path {
+            let Some(name) = Path::new(upload_or_part_path).file_name().and_then(|n| n.to_str()) else {
+                return false;
+            };
+            let Some(num) = name
+                .strip_prefix("part.")
+                .filter(|s| !s.starts_with('0') && s.bytes().all(|b| b.is_ascii_digit()))
+                .and_then(|s| s.parse::<usize>().ok())
+                .filter(|&n| n > 0)
+            else {
+                return false;
+            };
+            Some(num)
+        } else {
+            None
+        };
         let root = upload_scope_root(upload_or_part_path, part_path);
         // Advisory skip-recovery probe: only keys ACTIVE_MULTIPART_SOURCE_HEADS and
         // checks the cached xl.meta stamp; mutating stages re-validate via multipart_source_admission.
         let Ok(source) = self.io_get_object_open_path(RUSTFS_META_MULTIPART_BUCKET, root) else {
             return false;
         };
-        super::multipart_source_state::has_clean_active_multipart_source(&source)
+        super::multipart_source_state::has_clean_active_multipart_source(&source, part_number)
+    }
+
+    pub(crate) fn has_active_multipart_source_matching(
+        &self,
+        upload_path: &str,
+        expected_data_dir: Option<Uuid>,
+        expected_mod_time: Option<time::OffsetDateTime>,
+    ) -> bool {
+        let root = upload_scope_root(upload_path, false);
+        let Ok(source) = self.io_get_object_open_path(RUSTFS_META_MULTIPART_BUCKET, root) else {
+            return false;
+        };
+        super::multipart_source_state::has_active_multipart_source_matching(&source, expected_data_dir, expected_mod_time)
     }
 
     pub(super) fn multipart_source_admission(
@@ -1404,6 +1433,10 @@ mod tests {
             .await
             .expect("fresh multipart upload metadata");
         assert!(disk.has_clean_active_multipart_source(&upload, false));
+        assert!(disk.has_active_multipart_source_matching(&upload, Some(data_dir), init_fi.mod_time));
+        assert!(!disk.has_active_multipart_source_matching(&upload, Some(Uuid::new_v4()), init_fi.mod_time));
+        assert!(!disk.has_active_multipart_source_matching(&upload, Some(Uuid::nil()), init_fi.mod_time));
+        assert!(!disk.has_active_multipart_source_matching(&upload, Some(data_dir), None));
 
         let read_fi = disk
             .read_version("", RUSTFS_META_MULTIPART_BUCKET, &upload, "", &ReadOptions::default())
@@ -1479,6 +1512,24 @@ mod tests {
         .await
         .expect("prepare part 2 transaction");
         assert!(!disk.has_clean_active_multipart_source(&upload, false));
+        assert!(
+            disk.has_clean_active_multipart_source(&destination, true),
+            "settled part 1 must remain clean while part 2 is in-flight"
+        );
+        assert!(
+            !disk.has_clean_active_multipart_source(&destination2, true),
+            "in-flight part 2 must report not clean for part 2"
+        );
+        for non_canonical in [
+            format!("{upload}/{data_dir}/part.0"),
+            format!("{upload}/{data_dir}/part.01"),
+            format!("{upload}/{data_dir}/part.+1"),
+        ] {
+            assert!(
+                !disk.has_clean_active_multipart_source(&non_canonical, true),
+                "non-canonical part path {non_canonical} must not report clean"
+            );
+        }
         disk.settle_part_transaction(RUSTFS_META_MULTIPART_BUCKET, &destination, PartTransactionAction::Commit)
             .await
             .expect("replayed part 1 commit settlement");
