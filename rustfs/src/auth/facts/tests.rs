@@ -396,8 +396,20 @@ fn cases() -> Vec<Case> {
             .sigv4()
             .header("Content-Type", "multipart/form-data; boundary=facts"),
         Case::new("sts_action_header", Anonymous).header("Action", "AssumeRoleWithWebIdentity"),
+        Case::new("sigv4a_header", User)
+            .header(
+                "Authorization",
+                "AWS4-ECDSA-P256-SHA256 Credential=facts-user/20261009/s3/aws4_request, SignedHeaders=host;x-amz-date;x-amz-region-set, Signature=30440220",
+            )
+            .header("X-Amz-Date", "20261009T101500Z")
+            .header("X-Amz-Region-Set", "*"),
+        Case::new("sigv4a_presigned_query", User).query(
+            "X-Amz-Algorithm=AWS4-ECDSA-P256-SHA256&X-Amz-Credential=facts-user%2F20261009%2Fs3%2Faws4_request\
+             &X-Amz-Date=20261009T101500Z&X-Amz-Expires=300&X-Amz-Region-Set=%2A&X-Amz-SignedHeaders=host\
+             &X-Amz-Signature=30440220",
+        ),
         Case::new("unknown_authorization_scheme", User)
-            .header("Authorization", "AWS4-ECDSA-P256-SHA256 Credential=facts-user/20261009/s3/aws4_request"),
+            .header("Authorization", "AWS4-UNKNOWN-SCHEME Credential=facts-user/20261009/s3/aws4_request"),
         // Who is asking: `aws:userid`, `aws:username`, `aws:principaltype` and claims.
         Case::new("sts_principal_with_token_header", Sts)
             .sigv4()
@@ -716,8 +728,8 @@ fn version_id_matches_legacy() {
 
 #[test]
 fn signature_version_matches_legacy() {
-    assert_key_matches_legacy("signatureversion", 2, 1);
-    assert_legacy_values_seen("signatureversion", &["AWS2", "AWS4-HMAC-SHA256"]);
+    assert_key_matches_legacy("signatureversion", 3, 1);
+    assert_legacy_values_seen("signatureversion", &["AWS2", "AWS4-ECDSA-P256-SHA256", "AWS4-HMAC-SHA256"]);
 }
 
 #[test]
@@ -894,7 +906,7 @@ fn absent_request_facts_leave_their_keys_absent() {
     let conditions = build_conditions(
         &AuthzPrincipal::new(&credentials(Who::User), ""),
         &Case::new("bare", Who::User)
-            .header("Authorization", "AWS4-ECDSA-P256-SHA256 Credential=unknown")
+            .header("Authorization", "AWS4-UNKNOWN-SCHEME Credential=unknown")
             .facts(OffsetDateTime::now_utc()),
     );
     for key in [

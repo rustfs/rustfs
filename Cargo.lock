@@ -10371,8 +10371,8 @@ dependencies = [
 
 [[package]]
 name = "rustfs-gateway"
-version = "0.67.0"
-source = "git+https://github.com/rustfs/gateway.git?rev=b4ea5ca3638dfbb0e3f34a6db99db534433dfe1b#b4ea5ca3638dfbb0e3f34a6db99db534433dfe1b"
+version = "0.70.0"
+source = "git+https://github.com/rustfs/gateway.git?rev=b6007d135c4b4285c9b2bccd915cb9a5814d8f24#b6007d135c4b4285c9b2bccd915cb9a5814d8f24"
 dependencies = [
  "arc-swap",
  "bytes",
@@ -10418,8 +10418,8 @@ dependencies = [
 
 [[package]]
 name = "rustfs-gateway-core"
-version = "0.64.0"
-source = "git+https://github.com/rustfs/gateway.git?rev=b4ea5ca3638dfbb0e3f34a6db99db534433dfe1b#b4ea5ca3638dfbb0e3f34a6db99db534433dfe1b"
+version = "0.67.0"
+source = "git+https://github.com/rustfs/gateway.git?rev=b6007d135c4b4285c9b2bccd915cb9a5814d8f24#b6007d135c4b4285c9b2bccd915cb9a5814d8f24"
 dependencies = [
  "bytes",
  "futures-core",
@@ -10439,8 +10439,8 @@ dependencies = [
 
 [[package]]
 name = "rustfs-gateway-corpus"
-version = "0.1.0"
-source = "git+https://github.com/rustfs/gateway.git?rev=b4ea5ca3638dfbb0e3f34a6db99db534433dfe1b#b4ea5ca3638dfbb0e3f34a6db99db534433dfe1b"
+version = "0.2.0"
+source = "git+https://github.com/rustfs/gateway.git?rev=b6007d135c4b4285c9b2bccd915cb9a5814d8f24#b6007d135c4b4285c9b2bccd915cb9a5814d8f24"
 dependencies = [
  "serde",
  "serde_json",
@@ -10450,7 +10450,7 @@ dependencies = [
 [[package]]
 name = "rustfs-gateway-corpus-recorder"
 version = "0.1.0"
-source = "git+https://github.com/rustfs/gateway.git?rev=b4ea5ca3638dfbb0e3f34a6db99db534433dfe1b#b4ea5ca3638dfbb0e3f34a6db99db534433dfe1b"
+source = "git+https://github.com/rustfs/gateway.git?rev=b6007d135c4b4285c9b2bccd915cb9a5814d8f24#b6007d135c4b4285c9b2bccd915cb9a5814d8f24"
 dependencies = [
  "bytes",
  "http 1.5.0",
@@ -10464,8 +10464,8 @@ dependencies = [
 
 [[package]]
 name = "rustfs-gateway-dialect-rustfs-admin"
-version = "0.13.0"
-source = "git+https://github.com/rustfs/gateway.git?rev=b4ea5ca3638dfbb0e3f34a6db99db534433dfe1b#b4ea5ca3638dfbb0e3f34a6db99db534433dfe1b"
+version = "0.15.0"
+source = "git+https://github.com/rustfs/gateway.git?rev=b6007d135c4b4285c9b2bccd915cb9a5814d8f24#b6007d135c4b4285c9b2bccd915cb9a5814d8f24"
 dependencies = [
  "bytes",
  "form_urlencoded",
@@ -10479,12 +10479,13 @@ dependencies = [
 [[package]]
 name = "rustfs-gateway-http"
 version = "0.1.4"
-source = "git+https://github.com/rustfs/gateway.git?rev=b4ea5ca3638dfbb0e3f34a6db99db534433dfe1b#b4ea5ca3638dfbb0e3f34a6db99db534433dfe1b"
+source = "git+https://github.com/rustfs/gateway.git?rev=b6007d135c4b4285c9b2bccd915cb9a5814d8f24#b6007d135c4b4285c9b2bccd915cb9a5814d8f24"
 dependencies = [
  "hmac 0.13.0",
  "http 1.5.0",
  "httparse",
  "memchr",
+ "p256",
  "phf 0.14.0",
  "rustfs-gateway-stream",
  "rustfs-gateway-types",
@@ -10497,7 +10498,7 @@ dependencies = [
 [[package]]
 name = "rustfs-gateway-macros"
 version = "0.1.4"
-source = "git+https://github.com/rustfs/gateway.git?rev=b4ea5ca3638dfbb0e3f34a6db99db534433dfe1b#b4ea5ca3638dfbb0e3f34a6db99db534433dfe1b"
+source = "git+https://github.com/rustfs/gateway.git?rev=b6007d135c4b4285c9b2bccd915cb9a5814d8f24#b6007d135c4b4285c9b2bccd915cb9a5814d8f24"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -10506,11 +10507,12 @@ dependencies = [
 
 [[package]]
 name = "rustfs-gateway-sig"
-version = "0.16.0"
-source = "git+https://github.com/rustfs/gateway.git?rev=b4ea5ca3638dfbb0e3f34a6db99db534433dfe1b#b4ea5ca3638dfbb0e3f34a6db99db534433dfe1b"
+version = "0.18.0"
+source = "git+https://github.com/rustfs/gateway.git?rev=b6007d135c4b4285c9b2bccd915cb9a5814d8f24#b6007d135c4b4285c9b2bccd915cb9a5814d8f24"
 dependencies = [
  "hmac 0.13.0",
  "http 1.5.0",
+ "p256",
  "rustfs-gateway-http",
  "sha1 0.11.0",
  "sha2 0.11.1",
@@ -10522,7 +10524,7 @@ dependencies = [
 [[package]]
 name = "rustfs-gateway-stream"
 version = "0.2.0"
-source = "git+https://github.com/rustfs/gateway.git?rev=b4ea5ca3638dfbb0e3f34a6db99db534433dfe1b#b4ea5ca3638dfbb0e3f34a6db99db534433dfe1b"
+source = "git+https://github.com/rustfs/gateway.git?rev=b6007d135c4b4285c9b2bccd915cb9a5814d8f24#b6007d135c4b4285c9b2bccd915cb9a5814d8f24"
 dependencies = [
  "bitflags 2.13.2",
  "bytes",
@@ -10532,8 +10534,8 @@ dependencies = [
 
 [[package]]
 name = "rustfs-gateway-types"
-version = "0.42.0+aws.2026-10-02"
-source = "git+https://github.com/rustfs/gateway.git?rev=b4ea5ca3638dfbb0e3f34a6db99db534433dfe1b#b4ea5ca3638dfbb0e3f34a6db99db534433dfe1b"
+version = "0.44.0+aws.2026-10-02"
+source = "git+https://github.com/rustfs/gateway.git?rev=b6007d135c4b4285c9b2bccd915cb9a5814d8f24#b6007d135c4b4285c9b2bccd915cb9a5814d8f24"
 dependencies = [
  "bytes",
  "crc-fast",
@@ -10555,7 +10557,7 @@ dependencies = [
 [[package]]
 name = "rustfs-gateway-xml"
 version = "0.4.0"
-source = "git+https://github.com/rustfs/gateway.git?rev=b4ea5ca3638dfbb0e3f34a6db99db534433dfe1b#b4ea5ca3638dfbb0e3f34a6db99db534433dfe1b"
+source = "git+https://github.com/rustfs/gateway.git?rev=b6007d135c4b4285c9b2bccd915cb9a5814d8f24#b6007d135c4b4285c9b2bccd915cb9a5814d8f24"
 dependencies = [
  "quick-xml 0.41.0",
 ]

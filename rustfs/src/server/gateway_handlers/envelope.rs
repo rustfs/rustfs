@@ -385,6 +385,78 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn sigv4a_header_and_query_signatures_mark_verified_and_emit_v4a_conditions() {
+        use crate::app::storage_api::owned_parity::parity_test_support::request_authz_facts;
+        use crate::auth::facts::{AuthzPrincipal, AuthzTarget, build_conditions};
+        use rustfs_gateway::sig::{AmzDate, PayloadMode, SigService, SigV4aSigner, SigningCredentials, SigningRequest};
+        use rustfs_gateway::{Limits, WireRequest};
+        use rustfs_policy::policy::action::{Action, S3Action};
+
+        let sign_v4a = |form: Signed| {
+            let mut headers = HeaderMap::new();
+            headers.insert(http::header::HOST, HeaderValue::from_static("localhost"));
+            let probe = Request::builder()
+                .method(Method::GET)
+                .uri("/")
+                .header(http::header::HOST, "localhost")
+                .body(Bytes::new())
+                .expect("probe");
+            let accepted = WireRequest::accept(probe, &Limits::default()).expect("host");
+            let stamp = AmzDate::parse(&chrono::Utc::now().format("%Y%m%dT%H%M%SZ").to_string()).expect("stamp");
+            let creds = SigningCredentials::new(SIGNER_ACCESS_KEY, SIGNER_SECRET_KEY.as_bytes()).expect("creds");
+            let signer = SigV4aSigner::new(creds, stamp.day(), SigService::S3, "*").expect("signer");
+            let req = SigningRequest::new(
+                &Method::GET,
+                "/",
+                "",
+                &headers,
+                accepted.host().raw_for_signing(),
+                PayloadMode::Unsigned,
+                stamp,
+            );
+            let signed = match form {
+                Signed::Header => signer.sign_headers(&req),
+                Signed::Query => signer.presign(&req, 300),
+            }
+            .expect("signed SigV4a");
+            let mut builder = Request::builder().method(Method::GET).uri(signed.target());
+            for (name, value) in signed.headers() {
+                builder = builder.header(name, value);
+            }
+            builder.body(Empty::new()).expect("request")
+        };
+
+        let cred = rustfs_credentials::Credentials {
+            access_key: SIGNER_ACCESS_KEY.to_owned(),
+            ..Default::default()
+        };
+        let target = || AuthzTarget {
+            action: Action::S3Action(S3Action::ListAllMyBucketsAction),
+            bucket: "",
+            object: "",
+            version_id: None,
+            location_constraint: None,
+        };
+
+        let header_env = envelope_of::<dto::ListBuckets>(sign_v4a(Signed::Header), &ServerContextSlot::new()).await;
+        assert!(header_env.verified_sigv4().is_some(), "header SigV4a verified_sigv4");
+        assert!(header_env.verified_presigned().is_none(), "header SigV4a verified_presigned");
+        let header_conditions = build_conditions(&AuthzPrincipal::new(&cred, ""), &request_authz_facts(&header_env, target()));
+        assert_eq!(header_conditions.get("authType"), Some(&vec!["REST-HEADER".to_owned()]));
+        assert_eq!(
+            header_conditions.get("signatureversion"),
+            Some(&vec!["AWS4-ECDSA-P256-SHA256".to_owned()])
+        );
+
+        let query_env = envelope_of::<dto::ListBuckets>(sign_v4a(Signed::Query), &ServerContextSlot::new()).await;
+        assert!(query_env.verified_sigv4().is_some(), "presigned SigV4a verified_sigv4");
+        assert!(query_env.verified_presigned().is_some(), "presigned SigV4a verified_presigned");
+        let query_conditions = build_conditions(&AuthzPrincipal::new(&cred, ""), &request_authz_facts(&query_env, target()));
+        assert_eq!(query_conditions.get("authType"), Some(&vec!["REST-QUERY-STRING".to_owned()]));
+        assert_eq!(query_conditions.get("signatureversion"), Some(&vec!["AWS4-ECDSA-P256-SHA256".to_owned()]));
+    }
+
+    #[tokio::test]
     async fn presigned_and_anonymous_gateway_envelopes_ignore_unsigned_auth_type_headers() {
         use crate::app::storage_api::owned_parity::parity_test_support::request_authz_facts;
         use crate::auth::facts::{AuthzPrincipal, AuthzTarget, build_conditions};

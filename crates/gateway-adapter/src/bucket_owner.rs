@@ -15,8 +15,9 @@
 //! The gateway's [`BucketOwnerSource`]: the one owner RustFS reports, for a bucket that exists.
 //!
 //! Responsible for: confirming through a [`BucketLookup`] that a bucket exists, answering the
-//! single owner id the deployment reports ([`RustfsBucketOwners::new`]) for it, and turning every
-//! outcome that is not a usable owner into the gateway's one refusal, [`BucketOwnerError`].
+//! single owner id the deployment reports ([`RustfsBucketOwners::new`]) for it, and translating
+//! missing buckets, metadata backend faults, and unusable owner configuration into the matching
+//! [`BucketOwnerError`] classes.
 //! NOT responsible for: choosing the owner id (the binary passes the constant it already reports
 //! as the owner in listings), comparing it with `x-amz-expected-bucket-owner` (the gateway does,
 //! byte for byte), or authorizing anything.
@@ -37,10 +38,11 @@
 //!
 //! Legacy RustFS ignores `x-amz-expected-bucket-owner` entirely. On the gateway stack a request
 //! carrying it is served only when the value equals the reported owner id; otherwise it is `403
-//! AccessDenied`. A missing bucket and a backend failure with the header present are also `403`
-//! at the pinned gateway, where legacy answers `404` and `5xx`: [`BucketOwnerError`] has one value,
-//! so it cannot express either. [`RustfsBucketOwners::resolve`] keeps the two apart at this
-//! adapter's boundary so the gateway can surface them once it grows the classes.
+//! AccessDenied`. Once authorized, a missing bucket yields [`BucketOwnerError::not_found`] (`404
+//! NoSuchBucket`, or bodyless `404` on `HEAD`), a metadata lookup fault yields
+//! [`BucketOwnerError::backend_failure`] (retryable `500 InternalError`), and an empty configured
+//! owner fails closed with [`BucketOwnerError::unavailable`] (`403 AccessDenied`) without probing
+//! bucket existence.
 
 use std::sync::Arc;
 
@@ -91,10 +93,10 @@ impl<L: BucketLookup> RustfsBucketOwners<L> {
     /// [`OwnerLookupError::NoSuchBucket`] when the bucket does not exist;
     /// [`OwnerLookupError::Backend`] on any lookup failure or when the configured owner is empty.
     pub async fn resolve(&self, bucket: &str) -> Result<Arc<str>, OwnerLookupError> {
-        self.lookup.check(bucket).await?;
         if self.owner.is_empty() {
             return Err(OwnerLookupError::Backend);
         }
+        self.lookup.check(bucket).await?;
         Ok(Arc::clone(&self.owner))
     }
 }
@@ -102,10 +104,14 @@ impl<L: BucketLookup> RustfsBucketOwners<L> {
 impl<L: BucketLookup> BucketOwnerSource for RustfsBucketOwners<L> {
     fn owner<'a>(&'a self, bucket: &'a BucketName) -> BoxFuture<'a, Result<Arc<str>, BucketOwnerError>> {
         Box::pin(async move {
-            // The pinned gateway collapses both classes (R-071), so both are the one refusal.
-            self.resolve(bucket.as_str())
-                .await
-                .map_err(|_: OwnerLookupError| BucketOwnerError::unavailable())
+            if self.owner.is_empty() {
+                return Err(BucketOwnerError::unavailable());
+            }
+            match self.lookup.check(bucket.as_str()).await {
+                Ok(()) => Ok(Arc::clone(&self.owner)),
+                Err(OwnerLookupError::NoSuchBucket) => Err(BucketOwnerError::not_found()),
+                Err(OwnerLookupError::Backend) => Err(BucketOwnerError::backend_failure()),
+            }
         })
     }
 }
@@ -192,24 +198,111 @@ mod tests {
         );
     }
 
-    /// Negative: the pinned gateway sees one refusal for both, and never an owner.
+    /// Negative: the gateway distinguishes a missing bucket (`404 NoSuchBucket`) from a metadata
+    /// backend failure (`500 InternalError`), and never treats either as an owner.
     #[tokio::test]
-    async fn the_gateway_is_refused_in_both_cases() {
+    async fn the_gateway_distinguishes_missing_bucket_from_backend_failure() {
         assert_eq!(
             gateway_answer(Err(OwnerLookupError::NoSuchBucket)).await,
-            Err(BucketOwnerError::unavailable())
+            Err(BucketOwnerError::not_found())
         );
-        assert_eq!(gateway_answer(Err(OwnerLookupError::Backend)).await, Err(BucketOwnerError::unavailable()));
+        assert_eq!(
+            gateway_answer(Err(OwnerLookupError::Backend)).await,
+            Err(BucketOwnerError::backend_failure())
+        );
     }
 
-    /// Negative: an empty configured owner is no owner; it must not equal an empty assertion.
+    /// Negative: an empty configured owner is no owner; it must fail closed as `unavailable`
+    /// without probing bucket existence, even when the lookup would report `NoSuchBucket`.
     #[tokio::test]
     async fn an_empty_owner_is_refused() {
-        let source = RustfsBucketOwners::new(Fake::answering(Ok(())), "");
-        assert_eq!(source.resolve("photos").await, Err(OwnerLookupError::Backend));
-        assert_eq!(
-            source.owner(&BucketName::new("photos").expect("a bucket name")).await,
-            Err(BucketOwnerError::unavailable())
-        );
+        for answer in [Ok(()), Err(OwnerLookupError::NoSuchBucket), Err(OwnerLookupError::Backend)] {
+            let source = RustfsBucketOwners::new(Fake::answering(answer), "");
+            assert_eq!(source.resolve("photos").await, Err(OwnerLookupError::Backend));
+            assert_eq!(
+                source.owner(&BucketName::new("photos").expect("a bucket name")).await,
+                Err(BucketOwnerError::unavailable())
+            );
+            assert!(
+                source.lookup.asked.lock().expect("lock").is_empty(),
+                "empty configured owner must not probe bucket existence"
+            );
+        }
+    }
+
+    /// Assembled service: `RustfsBucketOwners` surfaces `200`, `403 AccessDenied`,
+    /// `404 NoSuchBucket` (and bodyless `404` on `HEAD`), `500 InternalError`, and empty-owner
+    /// fail-closed `403 AccessDenied` through the real gateway pipeline.
+    #[tokio::test]
+    async fn assembled_service_surfaces_distinct_bucket_owner_outcomes() {
+        use bytes::Bytes;
+        use rustfs_gateway::dto::{GetBucketLocation, GetBucketLocationOutput, HeadBucket, HeadBucketOutput};
+        use rustfs_gateway::{
+            Decision, Handler, HandlerResult, RegionSet, Req, Resp, SecurityFloor, ServiceBuilder, SigV4Authenticator,
+            StaticCredentials, decide_with,
+        };
+
+        struct OkHandler;
+        impl Handler<HeadBucket> for OkHandler {
+            async fn call(&self, _request: Req<HeadBucket>) -> HandlerResult<HeadBucket> {
+                Ok(Resp::new(HeadBucketOutput::default()))
+            }
+        }
+        impl Handler<GetBucketLocation> for OkHandler {
+            async fn call(&self, _request: Req<GetBucketLocation>) -> HandlerResult<GetBucketLocation> {
+                Ok(Resp::new(GetBucketLocationOutput::default()))
+            }
+        }
+
+        let build = |answer: Result<(), OwnerLookupError>, owner: &'static str| {
+            let handler = Arc::new(OkHandler);
+            let regions = RegionSet::new(["us-east-1"]).expect("a region");
+            ServiceBuilder::new()
+                .authenticator(SigV4Authenticator::new(Arc::new(StaticCredentials::new()), regions))
+                .security_floor(SecurityFloor::new().delegate_anonymous_to_authorizer_after_listing_in_the_posture_report())
+                .authorizer(decide_with(|_| Decision::Allow))
+                .bucket_owner_source(RustfsBucketOwners::new(Fake::answering(answer), owner))
+                .register::<HeadBucket, _>(Arc::clone(&handler))
+                .register::<GetBucketLocation, _>(handler)
+                .build()
+                .expect("assemble gateway service")
+        };
+        let send = async |service: &rustfs_gateway::S3Service, method: http::Method, uri: &str, expected_owner: &str| {
+            let req = http::Request::builder()
+                .method(method)
+                .uri(uri)
+                .header(http::header::HOST, "s3.example.com")
+                .header("x-amz-expected-bucket-owner", expected_owner)
+                .body(Bytes::new())
+                .expect("request");
+            rustfs_gateway::collect(service.call_bytes(req).await)
+                .await
+                .expect("collect response")
+        };
+
+        let existing = build(Ok(()), OWNER);
+        let ok = send(&existing, http::Method::GET, "/photos?location", OWNER).await;
+        assert_eq!(ok.status(), http::StatusCode::OK);
+        let wrong = send(&existing, http::Method::GET, "/photos?location", "wrong-owner").await;
+        assert_eq!(wrong.status(), http::StatusCode::FORBIDDEN);
+        assert!(String::from_utf8_lossy(wrong.body()).contains("<Code>AccessDenied</Code>"));
+
+        let missing = build(Err(OwnerLookupError::NoSuchBucket), OWNER);
+        let missing_get = send(&missing, http::Method::GET, "/photos?location", OWNER).await;
+        assert_eq!(missing_get.status(), http::StatusCode::NOT_FOUND);
+        assert!(String::from_utf8_lossy(missing_get.body()).contains("<Code>NoSuchBucket</Code>"));
+        let missing_head = send(&missing, http::Method::HEAD, "/photos", OWNER).await;
+        assert_eq!(missing_head.status(), http::StatusCode::NOT_FOUND);
+        assert!(missing_head.body().is_empty(), "HEAD 404 must be bodyless");
+
+        let fault = build(Err(OwnerLookupError::Backend), OWNER);
+        let backend_err = send(&fault, http::Method::GET, "/photos?location", OWNER).await;
+        assert_eq!(backend_err.status(), http::StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(String::from_utf8_lossy(backend_err.body()).contains("<Code>InternalError</Code>"));
+
+        let unconfigured = build(Err(OwnerLookupError::NoSuchBucket), "");
+        let refused = send(&unconfigured, http::Method::GET, "/photos?location", OWNER).await;
+        assert_eq!(refused.status(), http::StatusCode::FORBIDDEN);
+        assert!(String::from_utf8_lossy(refused.body()).contains("<Code>AccessDenied</Code>"));
     }
 }

@@ -1151,3 +1151,223 @@ fn assemble_initializes_s3_and_list_objects_metrics() {
         "GatewayStack::assemble must initialize ListObjects metrics"
     );
 }
+
+/// Signs `method path?query` for `access_key`/`secret_key` with AWS SigV4a
+/// (`AWS4-ECDSA-P256-SHA256`), either in the `Authorization` header or as a presigned query string.
+fn sigv4a_request(
+    form: Signed,
+    method: Method,
+    path: &str,
+    query: &str,
+    headers: HeaderMap,
+    access_key: &str,
+    secret_key: &str,
+) -> Request<Empty<Bytes>> {
+    use rustfs_gateway::sig::{AmzDate, PayloadMode, SigService, SigV4aSigner, SigningCredentials, SigningRequest};
+    use rustfs_gateway::{Limits, WireRequest};
+
+    let mut headers = headers;
+    headers
+        .entry(http::header::HOST)
+        .or_insert(http::HeaderValue::from_static("localhost"));
+    let probe = Request::builder()
+        .method(method.clone())
+        .uri(path)
+        .header(http::header::HOST, headers.get(http::header::HOST).expect("a host"))
+        .body(Bytes::new())
+        .expect("static request");
+    let accepted = WireRequest::accept(probe, &Limits::default()).expect("an acceptable host");
+    let stamp = AmzDate::parse(&chrono::Utc::now().format("%Y%m%dT%H%M%SZ").to_string()).expect("a stamp");
+    let credentials = SigningCredentials::new(access_key, secret_key.as_bytes()).expect("credentials");
+    let signer = SigV4aSigner::new(credentials, stamp.day(), SigService::S3, "*").expect("a SigV4a signer");
+    let signing = SigningRequest::new(
+        &method,
+        path,
+        query,
+        &headers,
+        accepted.host().raw_for_signing(),
+        PayloadMode::Unsigned,
+        stamp,
+    );
+    let signed = match form {
+        Signed::Header => signer.sign_headers(&signing),
+        Signed::Query => signer.presign(&signing, 300),
+    }
+    .expect("a signable SigV4a request");
+    let mut builder = Request::builder().method(method).uri(signed.target());
+    for (name, value) in signed.headers() {
+        builder = builder.header(name, value);
+    }
+    builder.body(Empty::new()).expect("a built SigV4a request")
+}
+
+struct SigV4aProbe(std::sync::atomic::AtomicUsize);
+
+impl rustfs_gateway::Handler<rustfs_gateway::dto::ListBuckets> for SigV4aProbe {
+    async fn call(
+        &self,
+        request: rustfs_gateway::Req<rustfs_gateway::dto::ListBuckets>,
+    ) -> rustfs_gateway::HandlerResult<rustfs_gateway::dto::ListBuckets> {
+        assert_eq!(
+            request.context().principal().map(|principal| principal.access_key_id()),
+            Some(ROOT_ACCESS_KEY)
+        );
+        self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Ok(rustfs_gateway::Resp::new(rustfs_gateway::dto::ListBucketsOutput::default()))
+    }
+}
+
+/// SigV4a header and presigned requests verify through `GatewayStack`, enforce signed
+/// `x-rustfs-*` extension headers before reaching handlers, and reject tampered signatures.
+#[tokio::test]
+async fn sigv4a_requests_verify_and_enforce_signed_extension_headers() {
+    let probe = Arc::new(SigV4aProbe(std::sync::atomic::AtomicUsize::new(0)));
+    let a = assembly();
+    let builder = GatewayStack::configured_builder(
+        &a,
+        Arc::new(ScriptedIam { ready: true }),
+        root().source(),
+        decide_with(|request| {
+            if request.operation == "ListBuckets" && request.identity.is_some() {
+                Decision::Allow
+            } else {
+                Decision::Deny
+            }
+        }),
+        std::convert::identity,
+    )
+    .expect("the production builder assembles");
+    let stack = GatewayStack {
+        service: builder
+            .register::<rustfs_gateway::dto::ListBuckets, _>(Arc::clone(&probe))
+            .build()
+            .expect("probe registration"),
+        keystone_auth: None,
+        control_plane: false,
+        object_lambda_fallback: None,
+    };
+
+    for form in [Signed::Header, Signed::Query] {
+        let req = sigv4a_request(form, Method::GET, "/", "", HeaderMap::new(), ROOT_ACCESS_KEY, ROOT_SECRET_KEY);
+        let (status, _, body) = answer_request(&stack, req).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+
+        let mut signed_ext = HeaderMap::new();
+        signed_ext.insert("x-rustfs-meta-probe", http::HeaderValue::from_static("ok"));
+        let req = sigv4a_request(form, Method::GET, "/", "", signed_ext, ROOT_ACCESS_KEY, ROOT_SECRET_KEY);
+        let (status, _, body) = answer_request(&stack, req).await;
+        assert_eq!(status, StatusCode::OK, "signed extension header must pass: {body}");
+
+        let mut unsigned_ext = sigv4a_request(form, Method::GET, "/", "", HeaderMap::new(), ROOT_ACCESS_KEY, ROOT_SECRET_KEY);
+        unsigned_ext
+            .headers_mut()
+            .insert("x-rustfs-force-delete", http::HeaderValue::from_static("true"));
+        let before = probe.0.load(std::sync::atomic::Ordering::SeqCst);
+        let (status, _, body) = answer_request(&stack, unsigned_ext).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "unsigned extension header must fail: {body}");
+        assert!(body.contains("<Code>AccessDenied</Code>"), "{body}");
+        assert_eq!(
+            probe.0.load(std::sync::atomic::Ordering::SeqCst),
+            before,
+            "unsigned extension header must never reach the handler"
+        );
+    }
+
+    let mut tampered = sigv4a_request(Signed::Header, Method::GET, "/", "", HeaderMap::new(), ROOT_ACCESS_KEY, ROOT_SECRET_KEY);
+    let auth = tampered
+        .headers()
+        .get(http::header::AUTHORIZATION)
+        .expect("authorization")
+        .to_str()
+        .expect("utf-8")
+        .to_owned();
+    let last = auth.as_bytes().last().copied().expect("non-empty signature");
+    let flipped = if last == b'0' { '1' } else { '0' };
+    let mut broken = auth[..auth.len() - 1].to_owned();
+    broken.push(flipped);
+    tampered
+        .headers_mut()
+        .insert(http::header::AUTHORIZATION, broken.parse().expect("header value"));
+    let before = probe.0.load(std::sync::atomic::Ordering::SeqCst);
+    let (status, _, body) = answer_request(&stack, tampered).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    assert!(body.contains("<Code>SignatureDoesNotMatch</Code>"), "{body}");
+    assert_eq!(probe.0.load(std::sync::atomic::Ordering::SeqCst), before);
+    assert_eq!(probe.0.load(std::sync::atomic::Ordering::SeqCst), 4);
+}
+
+/// Real `GatewayStack::assemble` (real `EarlyAuthorizer` + real `GatewayBackend` handlers) serves
+/// header SigV4a `ListBuckets`, allows a clean presigned SigV4a `UploadPart` to reach storage
+/// (`404 NoSuchUpload`), and denies a presigned SigV4a `UploadPart` carrying a signed
+/// `x-rustfs-replication-part-actual-size` header (`403 AccessDenied`).
+#[tokio::test]
+#[serial_test::serial]
+async fn production_gateway_stack_blocks_presigned_sigv4a_upload_part_replication_headers() {
+    use crate::app::storage_api::test::contract::bucket::{BucketOperations as _, MakeBucketOptions};
+
+    let store = crate::app::gating_test_env::shared_gating_ecstore().await;
+    if crate::runtime_sources::current_app_context().is_none() {
+        crate::runtime_sources::install_test_app_context(Arc::clone(&store)).await;
+    }
+    let ambient = crate::runtime_sources::current_app_context().expect("ambient AppContext");
+    let context = Arc::new(crate::runtime_sources::AppContext::new(Arc::clone(&store), ambient.iam(), ambient.kms()));
+    let bucket = format!("sigv4a-upload-part-{}", uuid::Uuid::new_v4());
+    store
+        .make_bucket(&bucket, &MakeBucketOptions::default())
+        .await
+        .expect("create SigV4a test bucket");
+    let slot = ServerContextSlot::new();
+    assert!(slot.install(Arc::clone(&context)));
+    let gateway = TestGateway::over(&context, slot);
+
+    // Header SigV4a passes real EarlyAuthorizer and ListBuckets handler.
+    let list_req = sigv4a_request(
+        Signed::Header,
+        Method::GET,
+        "/",
+        "",
+        HeaderMap::new(),
+        TestGateway::ACCESS_KEY,
+        TestGateway::SECRET_KEY,
+    );
+    let (status, _, body) = answer_request(&gateway.0, list_req).await;
+    assert_eq!(status, StatusCode::OK, "header SigV4a ListBuckets must succeed: {body}");
+
+    // Positive control: presigned SigV4a UploadPart without replication headers passes auth,
+    // EarlyAuthorizer, and admit_operation, reaching storage (404 NoSuchUpload).
+    let path = format!("/{bucket}/obj");
+    let query = "partNumber=1&uploadId=nonexistent-upload";
+    let control_req = sigv4a_request(
+        Signed::Query,
+        Method::PUT,
+        &path,
+        query,
+        HeaderMap::new(),
+        TestGateway::ACCESS_KEY,
+        TestGateway::SECRET_KEY,
+    );
+    let (status, _, body) = answer_request(&gateway.0, control_req).await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "control UploadPart must reach storage: {body}");
+    assert!(body.contains("<Code>NoSuchUpload</Code>"), "{body}");
+
+    // Negative regression: the identical presigned SigV4a UploadPart carrying a *signed*
+    // `x-rustfs-replication-part-actual-size` header must be denied 403 AccessDenied.
+    let mut repl_headers = HeaderMap::new();
+    repl_headers.insert("x-rustfs-replication-part-actual-size", http::HeaderValue::from_static("128"));
+    let repl_req = sigv4a_request(
+        Signed::Query,
+        Method::PUT,
+        &path,
+        query,
+        repl_headers,
+        TestGateway::ACCESS_KEY,
+        TestGateway::SECRET_KEY,
+    );
+    let (status, _, body) = answer_request(&gateway.0, repl_req).await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "presigned SigV4a UploadPart with signed replication header must be denied: {body}"
+    );
+    assert!(body.contains("<Code>AccessDenied</Code>"), "{body}");
+}

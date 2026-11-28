@@ -208,7 +208,8 @@ fn prepare_request(
     copy_extension::<NativeTlsTransport>(context, &mut extensions);
     copy_extension::<RequestContext>(context, &mut extensions);
     extensions.insert(Arc::clone(server_ctx));
-    AccessMarkers::new(request.operation, verified_signature(context.auth_scheme())).install(&mut extensions);
+    AccessMarkers::new(request.operation, verified_signature(context.auth_scheme(), &headers, raw_query))
+        .install(&mut extensions);
     let scope = context.verified_scope();
     let head = RequestHead {
         method: Method::GET,
@@ -284,7 +285,7 @@ async fn install_caller(prepared: &mut PreparedRequest, server_ctx: &Arc<ServerC
     Ok(())
 }
 
-fn verified_signature(scheme: AuthSchemeRef) -> VerifiedSignature {
+fn verified_signature(scheme: AuthSchemeRef, headers: &HeaderMap, raw_query: &str) -> VerifiedSignature {
     match scheme {
         AuthSchemeRef::SigV4Header => VerifiedSignature {
             sigv4: true,
@@ -294,6 +295,23 @@ fn verified_signature(scheme: AuthSchemeRef) -> VerifiedSignature {
             sigv4: true,
             presigned: true,
         },
+        AuthSchemeRef::OtherSigned => {
+            let query = (!raw_query.is_empty()).then_some(raw_query);
+            match crate::auth::get_request_auth_type_with_query(headers, query) {
+                crate::auth::AuthType::PresignedV4a => VerifiedSignature {
+                    sigv4: true,
+                    presigned: true,
+                },
+                crate::auth::AuthType::SignedV4a
+                | crate::auth::AuthType::StreamingSignedV4a
+                | crate::auth::AuthType::StreamingSignedTrailerV4a
+                | crate::auth::AuthType::StreamingUnsignedTrailerV4a => VerifiedSignature {
+                    sigv4: true,
+                    presigned: false,
+                },
+                _ => VerifiedSignature::default(),
+            }
+        }
         _ => VerifiedSignature::default(),
     }
 }
