@@ -1163,6 +1163,12 @@ impl SetDisks {
                 }
                 continue;
             }
+            if finished_marker_already_present(copies, incarnation, self.set_drive_count) {
+                // Retain the witness until the normal key-wide finalization
+                // barrier has verified that every other transaction settled.
+                summary.committed += 1;
+                continue;
+            }
             let authority = copies
                 .iter()
                 .filter(|state| receipt(state.state))
@@ -1431,6 +1437,81 @@ impl SetDisks {
         }
         Ok(summary)
     }
+}
+
+/// An interrupted finalization can retain one finished witness even though
+/// every drive already contains the exact marker. Replaying the original
+/// creation against a newer history would fail its source-generation check.
+fn finished_marker_already_present(
+    copies: &[DeleteRecoveryInspection],
+    incarnation: Option<Uuid>,
+    expected_drives: usize,
+) -> bool {
+    let Some(incarnation) = incarnation.filter(|id| !id.is_nil()) else {
+        return false;
+    };
+    if copies.len() != expected_drives || !copies.iter().any(|copy| copy.state == DeleteRecoveryState::Absent) {
+        return false;
+    }
+    let Some(authority) = copies
+        .iter()
+        .find(|copy| copy.state == DeleteRecoveryState::CommitFinished)
+        .and_then(|copy| copy.journal.as_ref())
+    else {
+        return false;
+    };
+    let [request] = authority.requests.as_slice() else {
+        return false;
+    };
+    let Some(marker_id) = request.version_id.filter(|id| !id.is_nil()) else {
+        return false;
+    };
+    if authority.bucket_incarnation != Some(incarnation)
+        || !request.deleted
+        || !request.mark_deleted
+        || request.tier_free_version()
+        || request.mod_time.is_none()
+        || !authority.data_dirs.is_empty()
+        || !authority.deleted_versions.is_empty()
+        || authority.target_digest.is_none()
+        || authority
+            .original_versions
+            .iter()
+            .any(|version| version.version_id == Some(marker_id))
+    {
+        return false;
+    }
+    let mut marker_meta = rustfs_filemeta::FileMeta::new();
+    if !matches!(marker_meta.delete_version(request), Ok(None)) {
+        return false;
+    }
+    let [marker] = marker_meta.versions.as_slice() else {
+        return false;
+    };
+    let Ok(expected) = marker
+        .into_fileinfo(&authority.volume, &authority.object, true)
+        .map_err(DiskError::from)
+        .and_then(crate::disk::DeleteRecoveryVersionIdentity::from_file_info)
+    else {
+        return false;
+    };
+    copies.iter().all(|copy| {
+        let settled = match copy.state {
+            DeleteRecoveryState::Absent => copy.journal.is_none(),
+            DeleteRecoveryState::CommitFinished => {
+                copy.commit_data_safe
+                    && copy.journal.as_ref().is_some_and(|local| {
+                        local.matches_prepared_authority(authority) && local.target_digest.is_some() && local.data_dirs.is_empty()
+                    })
+            }
+            _ => false,
+        };
+        let mut marker_versions = copy
+            .current_versions
+            .iter()
+            .filter(|version| version.version_id == Some(marker_id));
+        settled && copy.current_digest.is_some() && marker_versions.next() == Some(&expected) && marker_versions.next().is_none()
+    })
 }
 
 // A lagging member may have the complete older suffix of a marker creation's
@@ -2885,6 +2966,187 @@ mod tests {
             .delete_bucket(bucket, &DeleteBucketOptions::default())
             .await
             .expect("returning old replica must not leave bucket residue");
+    }
+
+    #[tokio::test]
+    async fn delete_recovery_finishes_marker_gc_after_all_drives_applied_it() {
+        let bucket = "recover-applied-marker";
+        let (dirs, store, disks) = fixture(bucket).await;
+        let version = put(&store, bucket, &[42; 4096], true)
+            .await
+            .expect("write a version before creating the marker");
+        let incarnation = store
+            .bucket_incarnation_id_from_disk(bucket)
+            .await
+            .expect("read the fixture bucket incarnation");
+        let transaction = Uuid::new_v4();
+        let marker_id = Uuid::new_v4();
+        let request = FileInfo {
+            name: "object".into(),
+            version_id: Some(marker_id),
+            mod_time: Some(time::OffsetDateTime::now_utc()),
+            deleted: true,
+            mark_deleted: true,
+            ..Default::default()
+        };
+        let metadata_paths: Vec<_> = dirs.iter().map(|d| d.path().join(bucket).join("object/xl.meta")).collect();
+        let old = tokio::fs::read(&metadata_paths[1])
+            .await
+            .expect("read the original xl.meta on the second disk");
+        for disk in &disks {
+            disk.delete_version_recoverable(
+                bucket,
+                "object",
+                request.clone(),
+                false,
+                DeleteOptions {
+                    old_data_dir: Some(transaction),
+                    delete_recovery_bucket_incarnation: Some(incarnation),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("prepare marker creation");
+        }
+        for disk in &disks {
+            publish(disk, bucket, transaction).await;
+        }
+        for (index, disk) in disks.iter().enumerate() {
+            let state = disk
+                .inspect_delete_transaction(bucket, "object", transaction)
+                .await
+                .expect("inspect the first marker before commit");
+            let finished = disk
+                .settle_delete_transaction(bucket, "object", transaction, state.fingerprint, DeleteRecoveryAction::FinishCommit)
+                .await
+                .expect("finish the first marker commit");
+            assert_eq!(finished.state, DeleteRecoveryState::CommitFinished);
+            if index > 0 {
+                disk.settle_delete_transaction(
+                    bucket,
+                    "object",
+                    transaction,
+                    finished.fingerprint,
+                    DeleteRecoveryAction::FinalizeCommit,
+                )
+                .await
+                .expect("remove the finished receipt on this disk");
+            }
+        }
+        let applied = join_all(metadata_paths.iter().map(tokio::fs::read))
+            .await
+            .into_iter()
+            .collect::<std::io::Result<Vec<_>>>()
+            .expect("read xl.meta after applying the first marker");
+        let copy = disks[1]
+            .inspect_delete_transaction(bucket, "object", transaction)
+            .await
+            .expect("inspect the second drive after finalization");
+        let mut conflicting = copy.clone();
+        let marker = conflicting
+            .current_versions
+            .iter_mut()
+            .find(|entry| entry.version_id == Some(marker_id))
+            .expect("find the applied marker by version ID");
+        marker.metadata_digest[0] ^= 1;
+        let states = join_all(
+            disks
+                .iter()
+                .map(|disk| disk.inspect_delete_transaction(bucket, "object", transaction)),
+        )
+        .await
+        .into_iter()
+        .collect::<Result<Vec<_>>>()
+        .expect("read all states before varying the evidence");
+        assert!(finished_marker_already_present(&states, Some(incarnation), disks.len()));
+        let mut duplicate_marker = states.clone();
+        duplicate_marker[1].current_versions.extend(
+            conflicting
+                .current_versions
+                .iter()
+                .filter(|entry| entry.version_id == Some(marker_id))
+                .cloned(),
+        );
+        assert!(!finished_marker_already_present(&duplicate_marker, Some(incarnation), disks.len()));
+        let mut different_marker = states.clone();
+        different_marker[1] = conflicting;
+        assert!(!finished_marker_already_present(&different_marker, Some(incarnation), disks.len()));
+        assert!(!finished_marker_already_present(
+            &states[..states.len() - 1],
+            Some(incarnation),
+            disks.len()
+        ));
+        assert!(!finished_marker_already_present(&states, Some(Uuid::new_v4()), disks.len()));
+
+        // If one drive really is behind, it still needs ordinary adoption.
+        tokio::fs::write(&metadata_paths[1], old)
+            .await
+            .expect("restore old xl.meta for the negative case");
+        let stale = disks[1]
+            .inspect_delete_transaction(bucket, "object", transaction)
+            .await
+            .expect("inspect the disk missing the marker");
+        let mut missing_marker = states;
+        missing_marker[1] = stale;
+        assert!(!finished_marker_already_present(&missing_marker, Some(incarnation), disks.len()));
+        tokio::fs::write(&metadata_paths[1], &applied[1])
+            .await
+            .expect("restore the applied marker on the second disk");
+
+        // A later decision can retain the first witness as a predecessor on
+        // its owning drive even after other participants removed that proof.
+        let later = Uuid::new_v4();
+        let later_request = FileInfo {
+            version_id: Some(Uuid::new_v4()),
+            mod_time: request.mod_time.map(|time| time + time::Duration::seconds(1)),
+            ..request
+        };
+        for disk in &disks {
+            disk.delete_version_recoverable(
+                bucket,
+                "object",
+                later_request.clone(),
+                false,
+                DeleteOptions {
+                    old_data_dir: Some(later),
+                    delete_recovery_bucket_incarnation: Some(incarnation),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("prepare the later marker");
+            publish(disk, bucket, later).await;
+        }
+        let predecessor = disks[0]
+            .inspect_delete_transaction(bucket, "object", later)
+            .await
+            .expect("inspect the later marker on the witness disk");
+        assert!(
+            predecessor
+                .journal
+                .expect("read the later marker journal")
+                .predecessors
+                .contains(&transaction)
+        );
+        let applied = join_all(metadata_paths.iter().map(tokio::fs::read))
+            .await
+            .into_iter()
+            .collect::<std::io::Result<Vec<_>>>()
+            .expect("snapshot xl.meta before recovery");
+        store
+            .recover_delete_transactions(bucket, &HealOpts::default())
+            .await
+            .expect("a finished witness must be finalized without replaying the marker creation");
+        for (disk, (path, expected)) in disks.iter().zip(metadata_paths.iter().zip(applied)) {
+            assert!(
+                discover(disk, bucket, Some("object"))
+                    .await
+                    .expect("list remaining receipts")
+                    .is_empty()
+            );
+            assert_eq!(tokio::fs::read(path).await.expect("read xl.meta after recovery"), expected);
+        }
+        assert_eq!(body(&store, bucket, Some(version)).await, vec![42; 4096]);
     }
 
     #[tokio::test]
