@@ -25,6 +25,7 @@ Rules worth knowing before writing a policy:
 - `PutBucketPolicy` rejects any statement carrying a `kms:` action or a KMS resource. KMS grants belong to identities. Bucket policies stored before this check still load; evaluation skips their pure-KMS statements and warns.
 - `Deny` wins, as everywhere else: a `Deny` on `arn:aws:kms:::key/payroll-*` overrides an `Allow` on `arn:aws:kms:::*`.
 - Write a key pattern with the **key id**. A request may name an AWS key by its id or by its ARN (`arn:<partition>:kms:<region>:<account>:key/<key_id>`); both are matched as that key id, so one statement covers either spelling. An ARN cannot be written as a pattern, because a key pattern may not contain `/`.
+- An SSE-KMS write may send a plain key name behind an AWS-style ARN prefix, `x-amz-server-side-encryption-aws-kms-key-id: arn:aws:kms:<name>`. The header is reduced to `<name>` before the write is authorized, so it is matched, used and recorded as the key id `<name>` and a statement on `key/<name>` covers it. Only the request header is read this way; a bucket default `KMSMasterKeyID` and the key id of the per-key admin endpoints are taken as written.
 - A request that names a key by **alias** (`alias/<name>` or an alias ARN) names a key only the backend can resolve, so it fails closed against key-scoped statements: every `Deny` that carries a KMS resource applies to it, and only an `Allow` on every key (`arn:aws:kms:::*`, or a statement with no resource) covers it. Name keys by id or ARN wherever a key-scoped policy is in force.
 
 ## Built-in role templates
