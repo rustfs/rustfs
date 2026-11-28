@@ -3324,21 +3324,21 @@ impl crate::storage_api_contracts::object::ObjectIO for SetDisks {
                 let object_size = usize::try_from(object_info.size)
                     .map_err(|_| to_object_err(Error::other("two-phase GET object size is invalid"), vec![bucket, object]))?;
                 let mut output = Vec::with_capacity(object_size);
-                let (fi, files, disks, late_metadata_fanout) = snapshot.into_owned_with_late_metadata_fanout();
+                let (fi, files, disks, late_metadata_fanout) = snapshot.into_shuffled_read_parts();
                 let expected_identity = super::super::read::LateMetadataIdentity::from_file_info(&fi);
                 let late_metadata_fanout = late_metadata_fanout.ok_or_else(|| {
                     to_object_err(Error::other("two-phase GET fallback context is missing"), vec![bucket, object])
                 })?;
-                let initial_result = Self::get_object_with_fileinfo(
+                let initial_result = Self::get_object_with_shuffled_fileinfo(
                     bucket,
                     object,
                     Arc::clone(&self.erasure_cache),
                     0,
                     object_info.size,
                     &mut output,
-                    fi,
+                    &fi,
                     files,
-                    &disks,
+                    disks,
                     self.set_index,
                     self.pool_index,
                     opts.skip_verify_bitrot,
@@ -3423,13 +3423,14 @@ impl crate::storage_api_contracts::object::ObjectIO for SetDisks {
         );
         record_get_direct_memory_decision(object_class, direct_memory_decision, size_bucket);
         if let GetDirectMemoryDecision::Use { object_size } = direct_memory_decision {
-            if let Some(body) = Self::try_get_object_direct_data_shards_with_fileinfo(
+            if let Some(body) = Self::try_get_object_direct_data_shards_with_fileinfo_and_shuffled(
                 bucket,
                 object,
                 Arc::clone(&self.erasure_cache),
                 fi,
                 files,
                 disks,
+                snapshot.shuffled_non_inline(),
                 opts.skip_verify_bitrot,
                 object_class.as_str(),
                 size_bucket,
@@ -3458,17 +3459,17 @@ impl crate::storage_api_contracts::object::ObjectIO for SetDisks {
             }
 
             let mut output = Vec::with_capacity(object_size);
-            let (fi, files, disks) = snapshot.into_owned();
-            Self::get_object_with_fileinfo(
+            let (fi, files, disks, _) = snapshot.into_shuffled_read_parts();
+            Self::get_object_with_shuffled_fileinfo(
                 bucket,
                 object,
                 Arc::clone(&self.erasure_cache),
                 0,
                 object_info.size,
                 &mut output,
-                fi,
+                &fi,
                 files,
-                &disks,
+                disks,
                 self.set_index,
                 self.pool_index,
                 opts.skip_verify_bitrot,
@@ -3519,13 +3520,14 @@ impl crate::storage_api_contracts::object::ObjectIO for SetDisks {
         )
         .is_some()
         {
-            match Self::get_object_mid_size_reader_with_fileinfo(
+            match Self::get_object_mid_size_reader_with_fileinfo_and_shuffled(
                 bucket,
                 object,
                 Arc::clone(&self.erasure_cache),
                 fi,
                 files,
                 disks,
+                snapshot.shuffled_non_inline(),
                 self.set_index,
                 self.pool_index,
                 opts.skip_verify_bitrot,
@@ -3566,13 +3568,14 @@ impl crate::storage_api_contracts::object::ObjectIO for SetDisks {
 
         match codec_streaming_gate.decision {
             GetCodecStreamingDecision::Use => {
-                match Self::get_object_decode_reader_with_fileinfo(
+                match Self::get_object_decode_reader_with_fileinfo_and_shuffled(
                     bucket,
                     object,
                     Arc::clone(&self.erasure_cache),
                     fi,
                     files,
                     disks,
+                    snapshot.shuffled_non_inline(),
                     self.set_index,
                     self.pool_index,
                     opts.skip_verify_bitrot,
@@ -3681,7 +3684,7 @@ impl crate::storage_api_contracts::object::ObjectIO for SetDisks {
         // The producer runs in a separate Tokio task, so carry the caller's
         // read policy across the task boundary explicitly. Tokio task-local
         // values are not inherited by spawned tasks.
-        let (fi, files, disks) = snapshot.into_owned();
+        let (fi, files, disks, _) = snapshot.into_shuffled_read_parts();
         let context = Arc::new(LegacyProducerContext {
             bucket: bucket.to_owned(),
             object: object.to_owned(),
@@ -3764,9 +3767,9 @@ struct LegacyProducerContext {
     bucket: String,
     object: String,
     erasure_cache: Arc<super::super::ErasureCache>,
-    fi: FileInfo,
-    files: Vec<FileInfo>,
-    disks: Vec<Option<DiskStore>>,
+    fi: super::super::ReadFileInfoOwner,
+    files: Arc<Vec<FileInfo>>,
+    disks: Arc<Vec<Option<DiskStore>>>,
     set_index: usize,
     pool_index: usize,
     skip_verify: bool,
@@ -3799,16 +3802,16 @@ async fn run_legacy_producer_segment(
     // embedding the whole read pipeline inline there overflows a 2 MiB stack.
     let read = Box::pin(crate::set_disk::with_get_object_read_policy(
         context.read_policy,
-        SetDisks::get_object_with_fileinfo(
+        SetDisks::get_object_with_shuffled_fileinfo(
             &context.bucket,
             &context.object,
             Arc::clone(&context.erasure_cache),
             offset,
             length,
             &mut writer,
-            context.fi.clone(),
-            context.files.clone(),
-            &context.disks,
+            &context.fi,
+            Arc::clone(&context.files),
+            Arc::clone(&context.disks),
             context.set_index,
             context.pool_index,
             context.skip_verify,
@@ -4009,9 +4012,9 @@ mod legacy_producer_stack_tests {
             bucket: "bucket".to_owned(),
             object: "object".to_owned(),
             erasure_cache: Arc::new(super::super::super::ErasureCache::new()),
-            fi: FileInfo::default(),
-            files: Vec::new(),
-            disks: Vec::new(),
+            fi: crate::set_disk::ReadFileInfoOwner::Direct(Box::default()),
+            files: Arc::new(Vec::new()),
+            disks: Arc::new(Vec::new()),
             set_index: 0,
             pool_index: 0,
             skip_verify: false,
@@ -5157,6 +5160,26 @@ impl SetDisks {
             fi.mod_time = mod_time;
             fi.size = w_size as i64;
             fi.versioned = opts.versioned || opts.version_suspended;
+            let actual_size_prepopulated = if !opts.replication_request && actual_size >= 0 {
+                let observed_size = u64::try_from(actual_size).map_err(|_| Error::PartMissingOrCorrupt)?;
+                let transformed =
+                    contains_key_str(&fi.metadata, SUFFIX_COMPRESSION) || should_persist_encryption_original_size(&fi.metadata);
+                let server_observed_size = if transformed {
+                    observed_size
+                } else {
+                    observed_size.max(u64::try_from(w_size).map_err(|_| Error::PartMissingOrCorrupt)?)
+                };
+                actual_size = i64::try_from(server_observed_size).map_err(|_| Error::PartMissingOrCorrupt)?;
+                let size_str = server_observed_size.to_string();
+                if should_persist_encryption_original_size(&fi.metadata) {
+                    fi.metadata
+                        .insert("x-rustfs-encryption-original-size".to_string(), size_str.clone());
+                }
+                insert_str(&mut fi.metadata, SUFFIX_ACTUAL_SIZE, size_str);
+                true
+            } else {
+                false
+            };
             fi.add_object_part(1, etag, w_size, mod_time, actual_size, index_op, None);
             fi.parts[0].integrity = part_integrity;
             fi.persist_shard_integrity()?;
@@ -5823,7 +5846,7 @@ impl SetDisks {
                         }
                     }
                 }
-            } else if actual_size >= 0 {
+            } else if actual_size >= 0 && !actual_size_prepopulated {
                 let observed_size = u64::try_from(actual_size).map_err(|_| Error::PartMissingOrCorrupt)?;
                 let persisted_metadata = &parts_metadatas[response_metadata_slot].metadata;
                 let transformed = contains_key_str(persisted_metadata, SUFFIX_COMPRESSION)
@@ -5834,12 +5857,13 @@ impl SetDisks {
                     observed_size.max(u64::try_from(w_size).map_err(|_| Error::PartMissingOrCorrupt)?)
                 };
                 actual_size = i64::try_from(server_observed_size).map_err(|_| Error::PartMissingOrCorrupt)?;
+                let size_str = server_observed_size.to_string();
                 for metadata in &mut parts_metadatas {
-                    insert_str(&mut metadata.metadata, SUFFIX_ACTUAL_SIZE, server_observed_size.to_string());
+                    insert_str(&mut metadata.metadata, SUFFIX_ACTUAL_SIZE, size_str.clone());
                     if should_persist_encryption_original_size(&metadata.metadata) {
                         metadata
                             .metadata
-                            .insert("x-rustfs-encryption-original-size".to_string(), server_observed_size.to_string());
+                            .insert("x-rustfs-encryption-original-size".to_string(), size_str.clone());
                     }
                     if let Some(part) = metadata.parts.first_mut() {
                         part.actual_size = actual_size;
@@ -19454,6 +19478,7 @@ mod transition_commit_failure_tests {
                     fi,
                     parts_metadata,
                     online_disks,
+                    shuffled_non_inline: None,
                     read_quorum: 2,
                     verified_inline_body: None,
                     distributed_fence_proof: None,

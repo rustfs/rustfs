@@ -726,14 +726,14 @@ const DISK_ONLINE_TIMEOUT: Duration = Duration::from_secs(1);
 #[allow(dead_code, reason = "asserted by this file's tests (backlog#1823)")]
 const DISK_HEALTH_CACHE_TTL: Duration = Duration::from_millis(750);
 const GET_OBJECT_METADATA_CACHE_TTL: Duration = Duration::from_secs(2); // Increased from 250ms to 2s
-const DEFAULT_GET_OBJECT_METADATA_CACHE_MAX_ENTRIES: usize = 4096; // Increased from 1024 to 4096
+const DEFAULT_GET_OBJECT_METADATA_CACHE_MAX_ENTRIES: usize = 32768; // Increased from 4096 to 32768
 const ENV_RUSTFS_GET_OBJECT_METADATA_CACHE_MAX_ENTRIES: &str = "RUSTFS_GET_OBJECT_METADATA_CACHE_MAX_ENTRIES";
 #[cfg(any(test, feature = "e2e-test-hooks"))]
 const ENV_RUSTFS_EXPERIMENTAL_GET_OBJECT_METADATA_CACHE_DISTRIBUTED_PROOF_ENABLE: &str =
     "RUSTFS_EXPERIMENTAL_GET_OBJECT_METADATA_CACHE_DISTRIBUTED_PROOF_ENABLE";
 #[cfg(any(test, feature = "e2e-test-hooks"))]
 const DEFAULT_RUSTFS_EXPERIMENTAL_GET_OBJECT_METADATA_CACHE_DISTRIBUTED_PROOF_ENABLE: bool = false;
-const GET_OBJECT_METADATA_CACHE_FENCE_SHARDS: u16 = 4096;
+const GET_OBJECT_METADATA_CACHE_FENCE_SHARDS: u16 = 16384;
 
 // --- Codec Streaming Configuration ---
 
@@ -995,6 +995,29 @@ enum LateMetadataFanout {
 
 type OwnedGetObjectFileInfoParts = (FileInfo, Vec<FileInfo>, Vec<Option<DiskStore>>, Option<LateMetadataFanout>);
 
+pub(in crate::set_disk) enum ReadFileInfoOwner {
+    Direct(Box<FileInfo>),
+    Published(Arc<GetObjectMetadataCacheEntry>),
+}
+
+impl std::ops::Deref for ReadFileInfoOwner {
+    type Target = FileInfo;
+
+    fn deref(&self) -> &Self::Target {
+        match self {
+            Self::Direct(fi) => fi,
+            Self::Published(entry) => &entry.fi,
+        }
+    }
+}
+
+type ShuffledGetObjectFileInfoParts = (
+    ReadFileInfoOwner,
+    Arc<Vec<FileInfo>>,
+    Arc<Vec<Option<DiskStore>>>,
+    Option<LateMetadataFanout>,
+);
+
 impl GetObjectFileInfo {
     fn owned(fi: FileInfo, parts_metadata: Vec<FileInfo>, online_disks: Vec<Option<DiskStore>>) -> Self {
         Self {
@@ -1085,6 +1108,24 @@ impl GetObjectFileInfo {
         self.as_parts().2
     }
 
+    fn shuffled_non_inline(&self) -> Option<(&[FileInfo], &[Option<DiskStore>])> {
+        let entry = match (&self.owned, &self.shared) {
+            (
+                Some(OwnedGetObjectFileInfo {
+                    payload: OwnedGetObjectFileInfoPayload::Published(entry),
+                    ..
+                }),
+                None,
+            ) => Some(entry),
+            (None, Some(entry)) => Some(entry),
+            _ => None,
+        }?;
+        entry
+            .shuffled_non_inline
+            .as_ref()
+            .map(|(files, disks)| (files.as_slice(), disks.as_slice()))
+    }
+
     fn has_late_metadata_fanout(&self) -> bool {
         self.late_metadata_fanout.is_some()
     }
@@ -1137,6 +1178,44 @@ impl GetObjectFileInfo {
             OwnedGetObjectFileInfoPayload::Published(entry) => {
                 let entry = Arc::unwrap_or_clone(entry);
                 (entry.fi, entry.parts_metadata, entry.online_disks, late_metadata_fanout)
+            }
+        }
+    }
+
+    fn into_shuffled_read_parts(self) -> ShuffledGetObjectFileInfoParts {
+        let (payload, late_metadata_fanout) = self.into_payload();
+        match payload {
+            OwnedGetObjectFileInfoPayload::Direct {
+                fi,
+                parts_metadata,
+                online_disks,
+            } => {
+                let (disks, files) = SetDisks::shuffle_disks_and_parts_metadata_by_index_owned(online_disks, parts_metadata, &fi);
+                (
+                    ReadFileInfoOwner::Direct(Box::new(fi)),
+                    Arc::new(files),
+                    Arc::new(disks),
+                    late_metadata_fanout,
+                )
+            }
+            OwnedGetObjectFileInfoPayload::Published(entry) => {
+                if let Some((ref files, ref disks)) = entry.shuffled_non_inline {
+                    let files = Arc::clone(files);
+                    let disks = Arc::clone(disks);
+                    return (ReadFileInfoOwner::Published(entry), files, disks, late_metadata_fanout);
+                }
+                let entry = Arc::unwrap_or_clone(entry);
+                let (disks, files) = SetDisks::shuffle_disks_and_parts_metadata_by_index_owned(
+                    entry.online_disks,
+                    entry.parts_metadata,
+                    &entry.fi,
+                );
+                (
+                    ReadFileInfoOwner::Direct(Box::new(entry.fi)),
+                    Arc::new(files),
+                    Arc::new(disks),
+                    late_metadata_fanout,
+                )
             }
         }
     }
@@ -1521,6 +1600,7 @@ mod prepared_get_object_metadata_tests {
             parts_metadata: vec![fi.clone()],
             fi,
             online_disks: vec![None],
+            shuffled_non_inline: None,
             read_quorum: 0,
             verified_inline_body: None,
             distributed_fence_proof: None,
@@ -5029,6 +5109,8 @@ enum GetObjectMetadataCacheCapability {
     ConditionOnly,
 }
 
+type ShuffledNonInlineMetadata = (Arc<Vec<FileInfo>>, Arc<Vec<Option<DiskStore>>>);
+
 #[derive(Clone, Debug)]
 struct GetObjectMetadataCacheEntry {
     #[allow(dead_code)] // Kept for debugging; moka handles TTL internally
@@ -5036,6 +5118,7 @@ struct GetObjectMetadataCacheEntry {
     fi: FileInfo,
     parts_metadata: Vec<FileInfo>,
     online_disks: Vec<Option<DiskStore>>,
+    shuffled_non_inline: Option<ShuffledNonInlineMetadata>,
     read_quorum: usize,
     capability: GetObjectMetadataCacheCapability,
     verified_inline_body: Option<Bytes>,
