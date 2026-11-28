@@ -230,6 +230,12 @@ mod tests {
         assert!(!is_simple_match("*🎉*🚀", "prefix🎉mid"));
     }
 
+    #[test]
+    fn test_question_mark_matches_bytes_not_unicode_scalars() {
+        assert!(!is_match("prefix?", "prefix界"));
+        assert!(is_match("prefix???", "prefix界"));
+    }
+
     /// Reference backtracking definition used only for small exhaustive equivalence checks.
     fn backtracking_match(pattern: &[u8], name: &[u8], simple: bool) -> bool {
         match pattern.split_first() {

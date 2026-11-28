@@ -1,0 +1,12 @@
+<NotificationConfiguration>
+  <QueueConfiguration>
+    <Id>dup-1</Id>
+    <Queue>arn:rustfs:sqs:us-east-1:1:webhook</Queue>
+    <Event>s3:ObjectCreated:Put</Event>
+  </QueueConfiguration>
+  <QueueConfiguration>
+    <Id>dup-1</Id>
+    <Queue>arn:rustfs:sqs:us-east-1:1:webhook</Queue>
+    <Event>s3:ObjectRemoved:Delete</Event>
+  </QueueConfiguration>
+</NotificationConfiguration>

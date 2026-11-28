@@ -1,0 +1,2 @@
+GET /bucket/relative-without-host?prefix=logs
+x-amz-meta-note: missing-host

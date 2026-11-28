@@ -436,4 +436,8 @@ mod distributed;
 #[cfg(test)]
 mod tier_transition_regression_test;
 
+// OTLP collector fault isolation and secret-redaction regressions (rustfs/backlog#2679).
+#[cfg(test)]
+mod observability_export_failure_test;
+
 pub mod tls_gen;

@@ -10,14 +10,18 @@ cargo-fuzz = true
 [workspace]
 
 [dependencies]
-arbitrary = "1"
+arbitrary = { version = "1", features = ["derive"] }
+http = "1.5.0"
 libfuzzer-sys = "0.4"
 rustfs-ecstore = { path = "../crates/ecstore" }
 rustfs-filemeta = { path = "../crates/filemeta" }
+rustfs-notify = { path = "../crates/notify" }
 rustfs-policy = { path = "../crates/policy" }
 rustfs-security-governance = { path = "../crates/security-governance" }
+rustfs-signer = { path = "../crates/signer" }
 rustfs-utils = { path = "../crates/utils", features = ["compress", "path"] }
 serde_json = "1"
+time = { version = "0.3.55", features = ["macros"] }
 
 [[bin]]
 name = "bucket_validation"
@@ -50,6 +54,20 @@ bench = false
 [[bin]]
 name = "path_containment"
 path = "fuzz_targets/path_containment.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "sigv4_request"
+path = "fuzz_targets/sigv4_request.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "notify_xml"
+path = "fuzz_targets/notify_xml.rs"
 test = false
 doc = false
 bench = false
