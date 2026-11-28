@@ -382,9 +382,7 @@ pub(crate) enum VectorMaintenanceOrigin {
 pub(crate) enum VectorMaintenanceFailureCode {
     ResourceChanged,
     IdentityDenied,
-    KeyDenied,
     CapacityExceeded,
-    BudgetUnsupported,
     StorageUnavailable,
     Conflict,
     CorruptRecord,
@@ -446,7 +444,6 @@ pub(crate) enum VectorMaintenanceResultEffect {
 pub(crate) enum VectorMaintenanceNoWorkReason {
     NotDue,
     NoCandidates,
-    AlreadyRecovered,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

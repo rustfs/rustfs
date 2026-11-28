@@ -117,7 +117,7 @@ catalog-worker:
 	python3 scripts/e2e_catalog_worker.py build
 MAKE
 
-export RUSTFS_CATALOG_FAULT_ARTIFACT_DIR="${PWD}/.codex/artifacts/m2/harness/runs"
+export RUSTFS_CATALOG_FAULT_ARTIFACT_DIR="${PWD}/target/catalog-fault-artifacts"
 CARGO_BUILD_JOBS=4 CARGO_INCREMENTAL=0 make -j4 -f - <<'MAKE'
 .PHONY: catalog-fault
 catalog-fault:

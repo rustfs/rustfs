@@ -202,14 +202,6 @@ pub(crate) struct MaintenanceDriver {
 impl MaintenanceDriver {
     /// Admit the current ordinary account without changing the persisted server configuration.
     pub(crate) async fn admit(app: Arc<AppContext>, execution_account: &str) -> Result<Self, VectorMaintenanceExecutionError> {
-        Self::admit_with_node_admission(app, execution_account, None).await
-    }
-
-    pub(crate) async fn admit_with_node_admission(
-        app: Arc<AppContext>,
-        execution_account: &str,
-        node_admission: Option<Arc<rustfs_concurrency::adaptive::NodeAdmission>>,
-    ) -> Result<Self, VectorMaintenanceExecutionError> {
         let config = VectorMaintenanceRuntimeConfig {
             enabled: true,
             execution_account: execution_account.into(),
@@ -250,15 +242,9 @@ impl MaintenanceDriver {
             source: source.clone(),
             executor: executor.clone(),
         };
-        let inspection_budgets = VectorMaintenanceBudgets::new(&config, node_admission.clone())?;
-        let mut scheduler = VectorMaintenanceScheduler::new(
-            config.clone(),
-            backend,
-            context.source,
-            context.executor,
-            context.identity,
-            node_admission,
-        )?;
+        let inspection_budgets = VectorMaintenanceBudgets::new(&config, None)?;
+        let mut scheduler =
+            VectorMaintenanceScheduler::new(config.clone(), backend, context.source, context.executor, context.identity, None)?;
         let completion_observer =
             VectorMaintenanceCompletionObserver::new_for_instance(classify_completion_source, app.object_store().id);
         scheduler.install_completion_observer(completion_observer.clone())?;

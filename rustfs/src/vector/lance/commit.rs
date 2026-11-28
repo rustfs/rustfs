@@ -44,17 +44,14 @@ use crate::table_catalog::{
     VectorIndexDefinitionV1,
 };
 
+#[cfg(test)]
+use super::manifest::{empty_manifest, manifest_metadata};
 use super::{
     LanceManifestError, ManagedManifestObjects, ManifestIoLimits, VectorIndexManifestSpec,
     dataset::{self, DatasetError, ProjectedVector, VectorProjection, VectorRecord},
     manifest::{LanceManifestDescriptorV1, ValidatedLanceManifest, encode_manifest},
     object_store::{ManagedObjectStore, ManagedStoreProvider},
     schema,
-};
-#[cfg(test)]
-use super::{
-    dataset::QueryCandidate,
-    manifest::{empty_manifest, manifest_metadata},
 };
 
 pub(crate) struct ManifestPrepareRequest {
@@ -858,17 +855,6 @@ impl<B: TableCatalogObjectBackend> DatasetSnapshot<B> {
         }
         cache.push_back((cache_key, partitions));
         Ok(Some(partitions))
-    }
-
-    #[cfg(test)]
-    pub(crate) async fn query_candidates(
-        &self,
-        query: &[f32],
-        top_k: std::num::NonZeroUsize,
-        filter: Option<crate::vector::filter::ValidatedFilter>,
-    ) -> Result<Vec<QueryCandidate>, DatasetError> {
-        self.owner.check_guard()?;
-        dataset::query_candidates(&self.dataset, query, &self.info.index, top_k, filter).await
     }
 
     pub(crate) async fn take_rows(

@@ -75,14 +75,6 @@ impl VectorProjection {
 }
 
 #[derive(Debug, Clone, PartialEq)]
-#[cfg(test)]
-pub(crate) struct QueryCandidate {
-    pub key: String,
-    pub row_id: u64,
-    pub engine_distance: f32,
-}
-
-#[derive(Debug, Clone, PartialEq)]
 pub(crate) struct QueryMatch {
     pub key: String,
     pub row_id: u64,
@@ -396,52 +388,6 @@ fn distance_f64(query: &[f32], vector: &[f32], metric: VectorDistanceMetric, que
         }
     };
     if distance == 0.0 { 0.0 } else { distance }
-}
-
-#[cfg(test)]
-pub(super) async fn query_candidates(
-    dataset: &Dataset,
-    query: &[f32],
-    index: &VectorIndexManifestSpec,
-    top_k: NonZeroUsize,
-    filter: Option<ValidatedFilter>,
-) -> Result<Vec<QueryCandidate>, DatasetError> {
-    validate_vector(query, index.dimension, index.distance_metric)?;
-    if top_k.get() > 10_000 {
-        return Err(DatasetError::InvalidQueryLimit);
-    }
-    let metric = match index.distance_metric {
-        VectorDistanceMetric::Cosine => "cosine",
-        VectorDistanceMetric::Euclidean => "l2",
-    };
-    let mut scanner = dataset.scan();
-    scanner
-        .project(&["key"])?
-        .with_row_id()
-        .nearest("vector", &Float32Array::from(query.to_vec()), top_k.get())?
-        .distance_metric(metric.try_into()?)
-        .prefilter(true);
-    if let Some(filter) = filter {
-        scanner.filter_expr(filter_expr(filter));
-    }
-    let batch = scanner.try_into_batch().await?;
-    let keys = required_array::<StringArray>(&batch, "key")?;
-    let row_ids = required_array::<UInt64Array>(&batch, "_rowid")?;
-    let distances = required_array::<Float32Array>(&batch, "_distance")?;
-    let mut matches = (0..batch.num_rows())
-        .map(|row| QueryCandidate {
-            key: keys.value(row).to_string(),
-            row_id: row_ids.value(row),
-            engine_distance: distances.value(row),
-        })
-        .collect::<Vec<_>>();
-    matches.sort_by(|left, right| {
-        left.engine_distance
-            .total_cmp(&right.engine_distance)
-            .then_with(|| left.key.cmp(&right.key))
-            .then(left.row_id.cmp(&right.row_id))
-    });
-    Ok(matches)
 }
 
 pub(super) async fn take_rows(

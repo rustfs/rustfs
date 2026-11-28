@@ -934,6 +934,7 @@ impl BucketMetadata {
             && (!self.bucket_creation_commit_record_present || !self.bucket_creation_committed))
     }
 
+    #[cfg(any(test, feature = "test-util"))]
     /// Simulates an in-flight uncommitted creation intent for concurrency regression tests.
     #[doc(hidden)]
     pub fn mark_creation_uncommitted_for_test(&mut self) {

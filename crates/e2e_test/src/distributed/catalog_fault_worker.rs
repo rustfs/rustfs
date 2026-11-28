@@ -556,7 +556,7 @@ impl CatalogCluster {
         check(label.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'-'), "unsafe case label")?;
         let artifact_root = std::env::var_os("RUSTFS_CATALOG_FAULT_ARTIFACT_DIR")
             .map(PathBuf::from)
-            .unwrap_or_else(|| receipt.workspace_root.join(".codex/artifacts/m2/harness/runs"));
+            .unwrap_or_else(|| receipt.workspace_root.join("target/catalog-fault-artifacts"));
         check(artifact_root.is_absolute(), "artifact directory must be absolute")?;
         let evidence = Arc::new(Evidence::new(
             artifact_root

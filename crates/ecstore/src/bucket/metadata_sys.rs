@@ -1321,6 +1321,7 @@ where
     update_config_with_expected(bucket, config_file, None, mutate).await
 }
 
+#[cfg(test)]
 pub(crate) async fn mutate_managed_bucket_config_in(
     ctx: &crate::runtime::instance::InstanceContext,
     expected_store_id: Uuid,

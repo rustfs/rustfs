@@ -370,13 +370,6 @@ fn assert_observation(server: &SdkServer, marker: &str, body: &[u8], status: u16
     // An early size rejection may consume only a prefix; verify precisely the bytes it consumed.
     let consumed = &body[..item.body_len];
     assert_eq!(item.body_sha256, <[u8; 32]>::from(Sha256::digest(consumed)));
-    eprintln!(
-        "SDK boundary marker={marker} sent_bytes={} sent_sha256={} consumed_bytes={} consumed_sha256={} status={status}",
-        body.len(),
-        hex_simd::encode_to_string(Sha256::digest(body), hex_simd::AsciiCase::Lower),
-        item.body_len,
-        hex_simd::encode_to_string(item.body_sha256, hex_simd::AsciiCase::Lower),
-    );
 }
 
 async fn json_boundaries(fixture: &Fixture, server: &SdkServer, arn: &str) {

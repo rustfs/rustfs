@@ -398,24 +398,6 @@ impl<B: TableCatalogObjectBackend> VectorService<B> {
         })
     }
 
-    #[cfg(test)]
-    pub(crate) async fn resume_index_creation(
-        &self,
-        context: &dyn VectorRequestAccess,
-    ) -> Result<dto::CreateIndexOutput, VectorServiceError> {
-        let (reservation, guard) = self
-            .catalog
-            .resume_vector_index_creation(context.bucket(), &index_namespace()?, context.index_name())
-            .await?;
-        context
-            .authorize_index(context.request(), reservation.resource_identity(), reservation.definition(), Some(&guard))
-            .await?;
-        self.publish_reserved_index(context, &reservation, Arc::new(guard)).await?;
-        Ok(dto::CreateIndexOutput {
-            index_arn: index_arn(context.bucket(), context.index_name()),
-        })
-    }
-
     async fn publish_reserved_index(
         &self,
         context: &dyn VectorRequestAccess,

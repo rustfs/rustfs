@@ -253,13 +253,6 @@ impl<B> RealCatalogBackend<B> {
             state.rules.len(),
             "every selected rule must reach its actual injection boundary"
         );
-        for rule in &state.rules {
-            eprintln!(
-                "I6 fault-rule {}",
-                serde_json::json!({"operation": rule.operation, "bucket": rule.bucket, "key": rule.object, "matching-sequence": rule.attempt, "phase": format!("{:?}", rule.phase), "actual-hit-count": rule.hits})
-            );
-        }
-        eprintln!("I6 fault-events {}", serde_json::to_string(&state.events).expect("fault evidence"));
     }
     fn record(&self, method: &str, bucket: &str, object: &str, phase: &str, length: usize, sha256: &str) {
         let mut state = self.state.lock().expect("fault state");

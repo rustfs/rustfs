@@ -1590,12 +1590,12 @@ async fn dataset_prefilter_applies_before_top_k_and_returns_unindexed_rows() {
     let filter =
         crate::vector::filter::ValidatedFilter::parse(&serde_json::json!({"genre":"comedy"}), &Default::default()).unwrap();
     let matches = snapshot
-        .query_candidates(&[1.0, 0.0, 0.0], NonZeroUsize::new(1).unwrap(), Some(filter))
+        .query_matches(&[1.0, 0.0, 0.0], NonZeroUsize::new(1).unwrap(), Some(filter))
         .await
         .unwrap();
     assert_eq!(matches.len(), 1);
     assert_eq!(matches[0].key, "far-allowed");
-    assert_eq!(matches[0].engine_distance, 1.0);
+    assert_eq!(matches[0].distance_f64, 1.0);
     let selected = snapshot.take_rows(&[matches[0].row_id], all_vector_fields()).await.unwrap();
     assert_eq!(selected[0].key, "far-allowed");
 }
@@ -2803,7 +2803,17 @@ async fn service_creation_publishes_real_initial_manifest_and_restores_reserved_
     let original_reference = entry.head().metadata().clone();
     drop(guard);
     let calls = context.managed_calls.load(std::sync::atomic::Ordering::SeqCst);
-    service.resume_index_creation(&context).await.unwrap();
+    let (reservation, _guard) = fixture
+        .store
+        .resume_vector_index_creation(
+            &context.bucket,
+            &crate::table_catalog::Namespace::parse("indexes").unwrap(),
+            &context.name,
+        )
+        .await
+        .unwrap();
+    assert!(reservation.published_entry().is_some());
+    assert_eq!(reservation.resource_identity(), &original_identity);
     assert_eq!(context.managed_calls.load(std::sync::atomic::Ordering::SeqCst), calls);
     let (guard, entry) = fixture
         .store

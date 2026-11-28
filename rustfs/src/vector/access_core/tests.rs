@@ -6,8 +6,18 @@
 use super::test_support::{REGION, ResourceFixture, request_for};
 use super::*;
 use crate::{storage_api::vector::ManagedTableId, table_catalog::CatalogFormat};
+use rustfs_policy::policy::BucketPolicyArgs;
 use serde_json::{Value, json};
 use uuid::Uuid;
+
+async fn bucket_policy_has_deny(policy: &BucketPolicy, args: &BucketPolicyArgs<'_>) -> bool {
+    for statement in policy.statements.iter().filter(|statement| statement.effect == Effect::Deny) {
+        if !statement.is_allowed(args).await {
+            return true;
+        }
+    }
+    false
+}
 
 #[test]
 fn vector_action_plan_covers_all_21_actions_and_additional_combinations() {

@@ -278,9 +278,6 @@ enum Action {
     D09GatePoll {
         fault_token: String,
     },
-    D09GateRelease {
-        fault_token: String,
-    },
     D09DeleteReplay {
         captured_token: String,
         runtime_token: String,
@@ -360,9 +357,6 @@ enum Action {
         content_sha256: String,
         content_length: u64,
     },
-    M4WriteFaultRelease {
-        fault_token: String,
-    },
     M4FaultArm {
         runtime_token: String,
         resource: VectorMaintenanceResourceV1,
@@ -372,10 +366,6 @@ enum Action {
     },
     M4FaultPoll {
         fault_token: String,
-    },
-    M4FaultWait {
-        fault_token: String,
-        wait_timeout_ms: u64,
     },
     M4FaultRelease {
         fault_token: String,
@@ -691,17 +681,6 @@ impl VectorFaultRecord {
             VectorFaultEvidence::Live(handle) => handle.release(),
             VectorFaultEvidence::Completed(snapshot) => snapshot.as_ref().clone(),
         })
-    }
-
-    async fn wait(&self, timeout: Duration) -> WorkerResult<FaultSnapshot> {
-        let handle = {
-            let state = self.state.lock().expect("fault record");
-            match &state.evidence {
-                VectorFaultEvidence::Live(handle) => handle.clone(),
-                VectorFaultEvidence::Completed(snapshot) => return Ok(snapshot.as_ref().clone()),
-            }
-        };
-        Ok(handle.wait_arrival(timeout).await?)
     }
 
     fn begin_receipt(self: &Arc<Self>, runtime_token: &str) -> WorkerResult<SdkReceiptMutation> {
@@ -1394,7 +1373,6 @@ impl Worker {
                 pause_timeout_ms,
             } => self.d09_gate_arm(captured_token, phase, occurrence, pause_timeout_ms),
             Action::D09GatePoll { fault_token } => self.d09_gate_poll(&fault_token),
-            Action::D09GateRelease { fault_token } => self.d09_gate_release(&fault_token),
             Action::D09DeleteReplay {
                 captured_token,
                 runtime_token,
@@ -1484,15 +1462,6 @@ impl Worker {
                     .ok_or_else(|| invalid("unknown Catalog write fault token"))?;
                 Ok(serde_json::to_value(handle.snapshot())?)
             }
-            Action::M4WriteFaultRelease { fault_token } => {
-                let state = self.state.lock().expect("worker state");
-                let handle = state
-                    .maintenance_write_faults
-                    .get(&fault_token)
-                    .ok_or_else(|| invalid("unknown Catalog write fault token"))?;
-                handle.release();
-                Ok(serde_json::to_value(handle.snapshot())?)
-            }
             Action::M4FaultArm {
                 runtime_token,
                 resource,
@@ -1522,16 +1491,6 @@ impl Worker {
                 Ok(json!({"fault_token":token,"observation":observation}))
             }
             Action::M4FaultPoll { fault_token } => Ok(serde_json::to_value(self.vector_fault(&fault_token)?.snapshot())?),
-            Action::M4FaultWait {
-                fault_token,
-                wait_timeout_ms,
-            } => {
-                if !(1..=30_000).contains(&wait_timeout_ms) {
-                    return Err(invalid("M4 fault observation timeout must be between 1 and 30000 milliseconds"));
-                }
-                let record = self.vector_fault(&fault_token)?;
-                Ok(serde_json::to_value(record.wait(Duration::from_millis(wait_timeout_ms)).await?)?)
-            }
             Action::M4FaultRelease { fault_token } => Ok(serde_json::to_value(self.vector_fault(&fault_token)?.release()?)?),
             Action::SdkCandidateRetain {
                 runtime_token,
@@ -2454,10 +2413,6 @@ mod tests {
             for action in [
                 Action::M4FaultPoll {
                     fault_token: token.clone(),
-                },
-                Action::M4FaultWait {
-                    fault_token: token.clone(),
-                    wait_timeout_ms: 1,
                 },
                 Action::M4FaultRelease {
                     fault_token: token.clone(),

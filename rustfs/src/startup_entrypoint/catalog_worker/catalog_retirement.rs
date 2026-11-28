@@ -416,10 +416,6 @@ impl Worker {
             .unwrap_or(Value::Null);
         Ok(value)
     }
-    pub(super) fn d09_gate_release(&self, fault_token: &str) -> WorkerResult<Value> {
-        self.d09_gate(fault_token)?.release(false);
-        self.d09_gate_poll(fault_token)
-    }
     pub(super) async fn d09_delete_replay(&self, captured_token: &str, runtime_token: &str) -> WorkerResult<Value> {
         let captured = self.d09_captured(captured_token)?;
         let driver = self.maintenance(runtime_token)?;

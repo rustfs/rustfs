@@ -1095,9 +1095,7 @@ pub(super) mod tests {
                 .await
                 .expect("paused part destination is readable")
         );
-        eprintln!("managed multipart cancellation: native rename entered; caller pending; destination={native_part_path:?}");
         let mut delete = queued_bucket_delete(Arc::clone(&store), bucket.clone()).await;
-        eprintln!("managed multipart cancellation: bucket writer entered the lock waiter queue before caller cancellation");
         part.abort();
         assert!(part.await.expect_err("part caller cancelled").is_cancelled());
         assert!(
@@ -1105,13 +1103,11 @@ pub(super) mod tests {
                 .await
                 .expect("cancelled caller leaves native rename paused")
         );
-        eprintln!("managed multipart cancellation: caller cancelled; native pause remains held; destination remains absent");
         let while_paused = tokio::time::timeout(Duration::from_millis(100), &mut delete).await;
         assert!(
             while_paused.is_err(),
             "bucket deletion must remain queued while the cancelled caller's native rename is paused: {while_paused:?}",
         );
-        eprintln!("managed multipart cancellation: caller cancelled; bucket writer remains queued; native pause remains held");
         drop(pause);
         let result = tokio::time::timeout(Duration::from_secs(10), delete)
             .await

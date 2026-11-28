@@ -513,7 +513,6 @@ fn ordinary_s3_gateway_copy_and_multipart_refuse_vector_storage_without_mutation
                 .await
                 .denied(case);
             assert_eq!(protected.snapshot().await, before, "{case} must preserve objects and uploads");
-            eprintln!("Vector ordinary S3 isolation: {case}: AccessDenied; objects and multipart state unchanged");
         }
         s3.send(Method::POST, &general_pending, &general_upload_query, None, completed_part(&copied.etag))
             .await

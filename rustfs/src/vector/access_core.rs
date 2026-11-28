@@ -7,8 +7,6 @@ use std::collections::{BTreeMap, HashMap};
 
 use rustfs_credentials::Credentials;
 use rustfs_iam::{store::Store, sys::IamSys};
-#[cfg(test)]
-use rustfs_policy::policy::BucketPolicyArgs;
 use rustfs_policy::policy::{
     Args, BucketPolicy, Effect, Validator,
     action::{Action, S3VectorsAction},
@@ -336,16 +334,6 @@ pub(crate) fn validate_private_bucket_policy(policy: &BucketPolicy) -> Result<()
         return Err(VectorAccessError::Denied);
     }
     Ok(())
-}
-
-#[cfg(test)]
-pub(crate) async fn bucket_policy_has_deny(policy: &BucketPolicy, args: &BucketPolicyArgs<'_>) -> bool {
-    for statement in policy.statements.iter().filter(|statement| statement.effect == Effect::Deny) {
-        if !statement.is_allowed(args).await {
-            return true;
-        }
-    }
-    false
 }
 
 /// Caller credentials must come from `resolve_req_info` for this verified Gateway request.

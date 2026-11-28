@@ -176,7 +176,6 @@ impl RealScenario {
             assert_eq!(&object.data, expected, "exact object bytes for {key}");
             assert!(object.etag.is_some(), "real ETag for {key}");
             assert!(object.body_revision.is_some(), "real body revision for {key}");
-            evidence("referenced-object", &self.fixture.bucket, key, &object);
             if key.ends_with(".avro") {
                 let values = apache_avro::Reader::new(object.data.as_slice())
                     .unwrap()
@@ -306,24 +305,11 @@ async fn read(backend: &impl TableCatalogObjectBackend, bucket: &str, key: &str)
         .unwrap()
         .unwrap_or_else(|| panic!("missing real object {bucket}/{key}"))
 }
-fn evidence(label: &str, bucket: &str, key: &str, object: &TableCatalogObject) {
-    eprintln!(
-        "I6 object {}",
-        serde_json::json!({
-            "label": label, "bucket": bucket, "key": key, "bytes-base64": base64_simd::STANDARD.encode_to_string(&object.data),
-            "length": object.data.len(), "sha256": hex_simd::encode_to_string(Sha256::digest(&object.data), hex_simd::AsciiCase::Lower),
-            "etag": object.etag, "body_revision": object.body_revision,
-        })
-    );
-}
 async fn inventory(backend: &impl TableCatalogObjectBackend, bucket: &str) -> Inventory {
     let mut result = BTreeMap::new();
     for bucket in [META, bucket] {
         for key in backend.list_objects(bucket, "").await.unwrap() {
             let object = read(backend, bucket, &key).await;
-            if bucket != META || key.starts_with("s3tables/catalog/") {
-                evidence("inventory", bucket, &key, &object);
-            }
             result.insert((bucket.to_string(), key), object);
         }
     }
@@ -353,18 +339,11 @@ fn rest_commit(base: &TableEntry, candidate: &str, id: &str) -> serde_json::Valu
         "new-metadata-location": candidate, "requirements": [], "updates": [], "writer": "i6-real-ecstore"})
 }
 async fn json_response(response: AdminResponse) -> serde_json::Value {
-    let (status, headers, body) = response_parts(response).await;
-    eprintln!("I6 response status={status} headers={headers:?} body={}", String::from_utf8_lossy(&body));
+    let (status, _headers, body) = response_parts(response).await;
     assert_eq!(status, StatusCode::OK);
     serde_json::from_slice(&body).unwrap()
 }
 fn assert_error(error: S3Error, status: StatusCode, reason: &str) {
-    eprintln!(
-        "I6 error status={:?} code={:?} message={:?}",
-        error.status_code(),
-        error.code(),
-        error.message()
-    );
     assert_eq!(error.status_code(), Some(status));
     assert!(error.message().unwrap_or_default().contains(reason), "unexpected error: {error:?}");
 }
@@ -428,10 +407,6 @@ fn assert_catalog_lock_mode(
         .map(|(_, count)| count)
         .sum::<u32>();
     assert_eq!(holders, 1, "one actual guard for {key:?}");
-    eprintln!(
-        "I6 object-lock {}",
-        serde_json::json!({"key": key, "mode": expected, "owner": info.owner.as_ref(), "holders": holders})
-    );
 }
 
 async fn wait_for_catalog_locks_released(
@@ -452,11 +427,6 @@ async fn wait_for_catalog_locks_released(
             catalog_lock_holders(manager)
         )
     });
-    eprintln!(
-        "I6 released-locks {}",
-        serde_json::json!({"stage": stage, "released-keys": keys,
-            "global-counts": manager.current_lock_counts(), "remaining-holders": catalog_lock_holders(manager)})
-    );
 }
 
 async fn object_mode(future: impl std::future::Future<Output = ()>) {
@@ -554,12 +524,6 @@ async fn stale_token_commit_conflict_and_concurrent_writers_preserve_all_rows() 
             .await
             .unwrap_err();
         assert_eq!(error.code(), &S3ErrorCode::AccessDenied);
-        eprintln!(
-            "I6 non-root denied status={:?} code={:?} message={:?}",
-            error.status_code(),
-            error.code(),
-            error.message()
-        );
         assert_eq!(inventory(&scenario.backend, &scenario.fixture.bucket).await, before);
     })
     .await;
@@ -869,11 +833,6 @@ struct RealBackup {
 }
 
 async fn capture_backup(scenario: &RealScenario) -> RealBackup {
-    eprintln!(
-        "I6 source fixture bucket={} directory={}",
-        scenario.fixture.bucket,
-        scenario.fixture._data_root.path().display()
-    );
     let backup = scenario
         .fixture
         .catalog
@@ -881,7 +840,6 @@ async fn capture_backup(scenario: &RealScenario) -> RealBackup {
         .await
         .unwrap();
     let artifact = read(&scenario.backend, META, &backup.backup_path).await;
-    evidence("source-artifact", META, &backup.backup_path, &artifact);
     let before = inventory(&scenario.backend, &scenario.fixture.bucket).await;
     let response = call_catalog_backup_export_handler(scenario.fixture.operator_request(
         TABLE_CATALOG_PREFIX,
@@ -931,11 +889,6 @@ async fn capture_backup(scenario: &RealScenario) -> RealBackup {
     }
 }
 async fn import_backup(target: &BackupTransferHandlerFixture, backup: &RealBackup) {
-    eprintln!(
-        "I6 target fixture bucket={} directory={}",
-        target.bucket,
-        target._data_root.path().display()
-    );
     let first = json_response(
         call_catalog_backup_import_handler(target.operator_request(TABLE_CATALOG_PREFIX, "import", backup.artifact.clone()))
             .await
@@ -974,7 +927,6 @@ async fn prepare_references(target: &BackupTransferHandlerFixture, backup: &Real
         assert_eq!(result["status"], "PREPARED");
         let copied = read(&target.backend, &target.bucket, key).await;
         assert_eq!(copied.data, source.data, "transferred source bytes for {key}");
-        evidence("target-reference", &target.bucket, key, &copied);
     }
     assert!(target.catalog.get_table_bucket(&target.bucket).await.unwrap().is_none());
 }
@@ -1009,13 +961,6 @@ async fn complete_controls(target: &BackupTransferHandlerFixture, backup: &RealB
         read(&target.backend, META, &backup.path).await.etag.as_deref()
     );
     assert_eq!(intent_json["object_count"], backup.embedded.len());
-    evidence("sealed-restore-state", META, &paths.catalog_restore_state_path(&target.bucket), &state);
-    evidence(
-        "sealed-restore-receipt",
-        META,
-        &paths.catalog_restore_intent_path(&target.bucket, restore_id),
-        &intent,
-    );
     state_json
 }
 async fn source_with_two_snapshots() -> RealScenario {
@@ -1290,7 +1235,6 @@ async fn backup_restore_rejects_missing_changed_references_and_corrupt_artifacts
                 .await
                 .unwrap_err();
                 assert_eq!(error.status_code(), Some(StatusCode::BAD_REQUEST), "{case}: {error:?}");
-                eprintln!("I6 rejected {case}: {error:?}");
                 assert_eq!(inventory(&target.backend, &target.bucket).await, before);
                 continue;
             }
@@ -1321,7 +1265,6 @@ async fn backup_restore_rejects_missing_changed_references_and_corrupt_artifacts
             }
             let before = inventory(&target.backend, &target.bucket).await;
             let error = restore_handler(&target, &backup.id, case).await.unwrap_err();
-            eprintln!("I6 rejected {case}: {error:?}");
             assert!(matches!(error.status_code(), Some(StatusCode::BAD_REQUEST | StatusCode::CONFLICT)));
             assert_eq!(
                 inventory(&target.backend, &target.bucket).await,
@@ -1372,8 +1315,7 @@ async fn backup_restore_corrupt_controls_reject_recovery_without_writes() {
             let fresh = ObjectTableCatalogStore::new(EcStoreTableCatalogObjectBackend::new(target.context.object_store()));
             assert!(fresh.load_table(&target.bucket, NAMESPACE, TABLE).await.is_err());
             assert!(fresh.list_namespaces(&target.bucket).await.is_err());
-            let error = restore_handler(&target, &backup.id, "corrupt-control").await.unwrap_err();
-            eprintln!("I6 corrupt {control} recovery rejected: {error:?}");
+            let _error = restore_handler(&target, &backup.id, "corrupt-control").await.unwrap_err();
             assert_eq!(inventory(&target.backend, &target.bucket).await, before);
         }
     })
@@ -1391,11 +1333,6 @@ async fn backup_restore_reads_fixed_v1_artifact_without_reencoding() {
             "932f8183fd2a57146ef3f9b14115cca101760032bd94bc47230516c54b9d5669"
         );
         let target = BackupTransferHandlerFixture::new("analytics").await;
-        eprintln!(
-            "I6 fixed-v1-artifact sha256={} bytes-base64={}",
-            hex_simd::encode_to_string(Sha256::digest(artifact), hex_simd::AsciiCase::Lower),
-            base64_simd::STANDARD.encode_to_string(artifact)
-        );
         json_response(
             call_catalog_backup_import_handler(target.operator_request(TABLE_CATALOG_PREFIX, "import", artifact.to_vec()))
                 .await
@@ -1484,7 +1421,6 @@ async fn prepared_reader_commits_while_candidate_writer_is_actually_queued() {
         // ECStore background services retain unrelated locks across idle waits.
         wait_for_catalog_locks_released(&manager, std::slice::from_ref(&candidate_lock), "before prepared-reader discovery")
             .await;
-        let counts_before = manager.current_lock_counts();
         let publication = TableCommitObjectBackend::trusted(scenario.backend.clone());
         let base_object = TableCatalogObjectBackend::read_object_limited(
             &publication,
@@ -1525,8 +1461,6 @@ async fn prepared_reader_commits_while_candidate_writer_is_actually_queued() {
                 .iter()
                 .any(|object| object.location().1.ends_with(".parquet"))
         );
-        evidence("queued-reader-base", &bucket, &base.metadata_location, &base_object);
-        evidence("queued-reader-candidate", &bucket, &candidate, &candidate_object);
         let paths = TableCatalogObjectPaths::default();
         let namespace = Namespace::parse(NAMESPACE).unwrap();
         let table = IdentifierSegment::parse(TABLE).unwrap();
@@ -1622,13 +1556,6 @@ async fn prepared_reader_commits_while_candidate_writer_is_actually_queued() {
         assert_catalog_lock_mode(&manager, &candidate_lock, rustfs_lock::LockMode::Shared);
         assert!(!writer.is_finished());
         assert!(!commit.is_finished());
-        eprintln!(
-            "I6 prepared-reader queue {}",
-            serde_json::json!({
-                "bucket": bucket, "candidate": candidate, "lock-counts-before": counts_before,
-                "waiters-before-writer": waiting_before, "queued-lock-counts": queued_counts,
-            })
-        );
 
         pause.release();
         let result = tokio::time::timeout(WAIT, commit)
@@ -1642,7 +1569,6 @@ async fn prepared_reader_commits_while_candidate_writer_is_actually_queued() {
             })
             .expect("commit task joined")
             .expect("prepared reads must complete with the candidate writer queued");
-        eprintln!("I6 prepared-reader commit-completed lock-counts={:?}", manager.current_lock_counts());
         tokio::time::timeout(WAIT, acquired_rx)
             .await
             .expect("candidate writer must acquire after publication completed")

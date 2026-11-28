@@ -948,6 +948,7 @@ impl ECStore {
         metadata_sys::update_validated_in(&self.ctx, bucket, config_file, data, Some(expected_incarnation_id), validate).await
     }
 
+    #[cfg(test)]
     /// Update policy or tags for one committed Vector bucket identity.
     ///
     /// The caller authorizes the operation and owns cancellation through completion.
@@ -987,6 +988,7 @@ impl ECStore {
         metadata_sys::mutate_managed_bucket_config_in_with_precheck(&self.ctx, self.id, identity, mutation, precheck).await
     }
 
+    #[cfg(any(test, feature = "test-util"))]
     /// Delete an empty Vector bucket using its complete persisted identity.
     ///
     /// The required preparation runs under the bucket lifecycle writer and must

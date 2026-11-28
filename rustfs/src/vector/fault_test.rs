@@ -48,8 +48,6 @@ pub(crate) enum FaultError {
     InvalidTimeout,
     #[error("fault registry is full or the exact selector is already armed")]
     Unavailable,
-    #[error("fault arrival was not observed within the requested deadline")]
-    ArrivalTimeout,
     #[error("fault evidence exceeded its bound")]
     Overflow,
     #[error("injected SDK candidate failure before Catalog publication: {observation_token}")]
@@ -578,40 +576,6 @@ impl FaultHandle {
         }
         self.gate.changed.notify_waiters();
         state.clone()
-    }
-
-    /// Wait for exact evidence. This does not release the operation.
-    ///
-    /// # Errors
-    /// Rejects invalid timeouts, missing arrivals and evidence overflow.
-    pub(crate) async fn wait_arrival(&self, timeout: Duration) -> Result<FaultSnapshot, FaultError> {
-        if timeout.is_zero() || timeout > MAX_TIMEOUT {
-            return Err(FaultError::InvalidTimeout);
-        }
-        let deadline = (Instant::now() + timeout).min(self.gate.deadline);
-        loop {
-            let notified = self.gate.changed.notified();
-            tokio::pin!(notified);
-            notified.as_mut().enable();
-            let snapshot = self.snapshot();
-            if snapshot.overflow {
-                return Err(FaultError::Overflow);
-            }
-            if snapshot.arrivals == 1 {
-                return Ok(snapshot);
-            }
-            if snapshot.timed_out
-                || snapshot.released
-                || snapshot.handle_dropped
-                || snapshot.cancelled
-                || snapshot.observation_failed
-            {
-                return Err(FaultError::ArrivalTimeout);
-            }
-            tokio::time::timeout_at(deadline, notified)
-                .await
-                .map_err(|_| FaultError::ArrivalTimeout)?;
-        }
     }
 }
 
