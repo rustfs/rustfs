@@ -2590,8 +2590,7 @@ fn detached_delete_failed(operation: &'static str, err: tokio::task::JoinError) 
     }
 }
 
-const BULK_DELETE_LOCAL_WINDOW_KEYS: usize = 8;
-const BULK_DELETE_MIN_WINDOW_KEYS: usize = 16;
+const BULK_DELETE_MIN_WINDOW_KEYS: usize = 8;
 const BULK_DELETE_MAX_WINDOWS: usize = 4;
 
 fn delete_lock_windows(objects: Vec<ObjectToDelete>, distributed: bool) -> Vec<Vec<(usize, ObjectToDelete)>> {
@@ -2611,7 +2610,7 @@ fn delete_lock_windows(objects: Vec<ObjectToDelete>, distributed: bool) -> Vec<V
         // The local best-effort lock manager already waits per key, so the
         // acquisition work is bounded by the key count in either layout.
         // Smaller windows release earlier once their disk work has finished.
-        BULK_DELETE_LOCAL_WINDOW_KEYS
+        BULK_DELETE_MIN_WINDOW_KEYS
     };
     let mut windows: Vec<Vec<_>> = (0..key_count.div_ceil(window_keys)).map(|_| Vec::new()).collect();
     for (index, (object, ordinal)) in objects.into_iter().zip(ordinals).enumerate() {
@@ -6503,12 +6502,7 @@ impl ECStore {
             .as_deref()
             .expect("delete config installed");
         let distributed = self.ctx.is_dist_erasure().await;
-        let small_batch_limit = if distributed {
-            BULK_DELETE_MIN_WINDOW_KEYS
-        } else {
-            BULK_DELETE_LOCAL_WINDOW_KEYS
-        };
-        if objects.len() <= small_batch_limit
+        if objects.len() <= BULK_DELETE_MIN_WINDOW_KEYS
             || opts.no_lock
             || objects.iter().any(|object| object.delete_condition.is_some())
             || (!self.single_pool()
@@ -14729,8 +14723,8 @@ mod batch_delete_lock_tests {
             })
             .collect();
         let windows = delete_lock_windows(objects, false);
-        assert_eq!(windows.len(), 1000_usize.div_ceil(BULK_DELETE_LOCAL_WINDOW_KEYS));
-        assert!(windows.iter().all(|window| window.len() <= BULK_DELETE_LOCAL_WINDOW_KEYS));
+        assert_eq!(windows.len(), 1000_usize.div_ceil(BULK_DELETE_MIN_WINDOW_KEYS));
+        assert!(windows.iter().all(|window| window.len() <= BULK_DELETE_MIN_WINDOW_KEYS));
         for (i, (index, object)) in windows.into_iter().flatten().enumerate() {
             assert_eq!(index, i);
             assert_eq!(object.object_name, format!("key-{i}"));
@@ -14739,7 +14733,8 @@ mod batch_delete_lock_tests {
 
     #[test]
     fn lock_windows_keep_nonadjacent_versions_and_result_indices_together() {
-        for (distributed, width) in [(false, BULK_DELETE_LOCAL_WINDOW_KEYS), (true, BULK_DELETE_MIN_WINDOW_KEYS)] {
+        let width = BULK_DELETE_MIN_WINDOW_KEYS;
+        for distributed in [false, true] {
             let mut objects = (0..=width)
                 .map(|i| ObjectToDelete {
                     object_name: format!("key/{i}"),
