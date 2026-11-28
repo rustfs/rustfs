@@ -2590,12 +2590,11 @@ fn detached_delete_failed(operation: &'static str, err: tokio::task::JoinError) 
     }
 }
 
-// All windows start together so a contended key in each window cannot multiply
-// the distributed acquisition timeout. Limit both disk fan-out and small batches' overhead.
+const BULK_DELETE_LOCAL_WINDOW_KEYS: usize = 8;
 const BULK_DELETE_MIN_WINDOW_KEYS: usize = 16;
 const BULK_DELETE_MAX_WINDOWS: usize = 4;
 
-fn delete_lock_windows(objects: Vec<ObjectToDelete>) -> Vec<Vec<(usize, ObjectToDelete)>> {
+fn delete_lock_windows(objects: Vec<ObjectToDelete>, distributed: bool) -> Vec<Vec<(usize, ObjectToDelete)>> {
     let mut identities = HashMap::new();
     let mut ordinals = Vec::with_capacity(objects.len());
     for object in &objects {
@@ -2604,7 +2603,16 @@ fn delete_lock_windows(objects: Vec<ObjectToDelete>) -> Vec<Vec<(usize, ObjectTo
         ordinals.push(*identities.entry(identity).or_insert(next));
     }
     let key_count = identities.len();
-    let window_keys = key_count.div_ceil(BULK_DELETE_MAX_WINDOWS).max(BULK_DELETE_MIN_WINDOW_KEYS);
+    let window_keys = if distributed {
+        // Start every distributed batch in one wave. A new wave would add
+        // another quorum acquisition budget for its contended keys.
+        key_count.div_ceil(BULK_DELETE_MAX_WINDOWS).max(BULK_DELETE_MIN_WINDOW_KEYS)
+    } else {
+        // The local best-effort lock manager already waits per key, so the
+        // acquisition work is bounded by the key count in either layout.
+        // Smaller windows release earlier once their disk work has finished.
+        BULK_DELETE_LOCAL_WINDOW_KEYS
+    };
     let mut windows: Vec<Vec<_>> = (0..key_count.div_ceil(window_keys)).map(|_| Vec::new()).collect();
     for (index, (object, ordinal)) in objects.into_iter().zip(ordinals).enumerate() {
         windows[ordinal / window_keys].push((index, object));
@@ -6494,7 +6502,13 @@ impl ECStore {
             .delete_replication_config_snapshot
             .as_deref()
             .expect("delete config installed");
-        if objects.len() <= BULK_DELETE_MIN_WINDOW_KEYS
+        let distributed = self.ctx.is_dist_erasure().await;
+        let small_batch_limit = if distributed {
+            BULK_DELETE_MIN_WINDOW_KEYS
+        } else {
+            BULK_DELETE_LOCAL_WINDOW_KEYS
+        };
+        if objects.len() <= small_batch_limit
             || opts.no_lock
             || objects.iter().any(|object| object.delete_condition.is_some())
             || (!self.single_pool()
@@ -6511,14 +6525,18 @@ impl ECStore {
         let mut accounting = vec![None; len];
         // Bucket lifecycle/configuration fences, the recovery work budget and the tier
         // receipt sink are shared by the request. Each window adds its own key guards.
-        let windows = delete_lock_windows(objects).into_iter().map(|window| {
-            let opts = opts.clone();
-            async move {
-                let (indices, entries): (Vec<_>, Vec<_>) = window.into_iter().unzip();
-                (indices, self.delete_batch_under_bucket_guards(bucket, entries, opts).await)
-            }
-        });
-        for (indices, (results, failures, receipts)) in join_all(windows).await {
+        // An inactive window owns no key locks. Refill local work only after
+        // an active window finishes; distributed planning fits in one wave.
+        let mut windows = futures::stream::iter(delete_lock_windows(objects, distributed))
+            .map(|window| {
+                let opts = opts.clone();
+                async move {
+                    let (indices, entries): (Vec<_>, Vec<_>) = window.into_iter().unzip();
+                    (indices, self.delete_batch_under_bucket_guards(bucket, entries, opts).await)
+                }
+            })
+            .buffer_unordered(BULK_DELETE_MAX_WINDOWS);
+        while let Some((indices, (results, failures, receipts))) = windows.next().await {
             for (i, ((result, failure), receipt)) in indices.into_iter().zip(results.into_iter().zip(failures).zip(receipts)) {
                 deleted[i] = result;
                 errors[i] = failure;
@@ -14697,38 +14715,57 @@ mod batch_delete_lock_tests {
                 ..Default::default()
             })
             .collect();
-        let windows = delete_lock_windows(objects);
+        let windows = delete_lock_windows(objects, true);
         assert_eq!(windows.len(), BULK_DELETE_MAX_WINDOWS);
         assert!(windows.iter().all(|window| window.len() == 250));
     }
 
     #[test]
-    fn lock_windows_keep_nonadjacent_versions_and_result_indices_together() {
-        let mut objects = (0..=BULK_DELETE_MIN_WINDOW_KEYS)
+    fn full_size_local_bulk_delete_covers_each_key_in_small_ordered_windows() {
+        let objects = (0..1000)
             .map(|i| ObjectToDelete {
-                object_name: format!("key/{i}"),
+                object_name: format!("key-{i}"),
                 ..Default::default()
             })
-            .collect::<Vec<_>>();
-        let version = Uuid::new_v4();
-        objects.push(ObjectToDelete {
-            object_name: "key/0".to_owned(),
-            version_id: Some(version),
-            ..Default::default()
-        });
-        objects.push(ObjectToDelete {
-            object_name: r"key\0".to_owned(),
-            ..Default::default()
-        });
-        let windows = delete_lock_windows(objects);
-        assert_eq!(windows.len(), 2);
-        let (index, repeated) = &windows[0][BULK_DELETE_MIN_WINDOW_KEYS];
-        assert_eq!(*index, BULK_DELETE_MIN_WINDOW_KEYS + 1);
-        assert_eq!(repeated.version_id, Some(version));
-        assert_eq!(windows[1][0].0, BULK_DELETE_MIN_WINDOW_KEYS);
-        // The backslash spelling aliases key/0 only on Windows.
-        let alias_window = if cfg!(windows) { 0 } else { 1 };
-        assert_eq!(windows[alias_window].last().unwrap().0, BULK_DELETE_MIN_WINDOW_KEYS + 2);
+            .collect();
+        let windows = delete_lock_windows(objects, false);
+        assert_eq!(windows.len(), 1000_usize.div_ceil(BULK_DELETE_LOCAL_WINDOW_KEYS));
+        assert!(windows.iter().all(|window| window.len() <= BULK_DELETE_LOCAL_WINDOW_KEYS));
+        for (i, (index, object)) in windows.into_iter().flatten().enumerate() {
+            assert_eq!(index, i);
+            assert_eq!(object.object_name, format!("key-{i}"));
+        }
+    }
+
+    #[test]
+    fn lock_windows_keep_nonadjacent_versions_and_result_indices_together() {
+        for (distributed, width) in [(false, BULK_DELETE_LOCAL_WINDOW_KEYS), (true, BULK_DELETE_MIN_WINDOW_KEYS)] {
+            let mut objects = (0..=width)
+                .map(|i| ObjectToDelete {
+                    object_name: format!("key/{i}"),
+                    ..Default::default()
+                })
+                .collect::<Vec<_>>();
+            let version = Uuid::new_v4();
+            objects.push(ObjectToDelete {
+                object_name: "key/0".to_owned(),
+                version_id: Some(version),
+                ..Default::default()
+            });
+            objects.push(ObjectToDelete {
+                object_name: r"key\0".to_owned(),
+                ..Default::default()
+            });
+            let windows = delete_lock_windows(objects, distributed);
+            assert_eq!(windows.len(), 2);
+            let (index, repeated) = &windows[0][width];
+            assert_eq!(*index, width + 1);
+            assert_eq!(repeated.version_id, Some(version));
+            assert_eq!(windows[1][0].0, width);
+            // The backslash spelling aliases key/0 only on Windows.
+            let alias_window = if cfg!(windows) { 0 } else { 1 };
+            assert_eq!(windows[alias_window].last().unwrap().0, width + 2);
+        }
     }
 
     #[tokio::test]
