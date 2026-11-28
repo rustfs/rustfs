@@ -392,9 +392,20 @@ pub(super) async fn lock_rename_commit_directories(
 #[cfg(target_os = "linux")]
 #[derive(Clone, Copy)]
 enum SourcePreparationMode {
-    CreateParent,
-    ExistingParent,
+    CreateParent { defer_dst_preflight: bool },
+    ExistingParent { defer_dst_preflight: bool },
     FlatInlineTmp { defer_dst_preflight: bool },
+}
+
+#[cfg(target_os = "linux")]
+impl SourcePreparationMode {
+    const fn defer_dst_preflight(self) -> bool {
+        match self {
+            Self::CreateParent { defer_dst_preflight }
+            | Self::ExistingParent { defer_dst_preflight }
+            | Self::FlatInlineTmp { defer_dst_preflight } => defer_dst_preflight,
+        }
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -412,15 +423,10 @@ fn prepare_rename_commit_and_destination_metadata_std(
     base_dir: &Path,
     publication_root: &os::PublicationRoot,
 ) -> core::result::Result<(os::RenameCommitGuard, Option<os::ReadDestinationFile>), PrepareCommitAndDestinationError> {
-    if matches!(mode, SourcePreparationMode::CreateParent) {
+    if matches!(mode, SourcePreparationMode::CreateParent { .. }) {
         std::fs::create_dir_all(source_parent).map_err(PrepareCommitAndDestinationError::Io)?;
     }
-    let defer_dst_preflight = matches!(
-        mode,
-        SourcePreparationMode::FlatInlineTmp {
-            defer_dst_preflight: true
-        }
-    );
+    let defer_dst_preflight = mode.defer_dst_preflight();
     let guard_res = if matches!(mode, SourcePreparationMode::FlatInlineTmp { .. }) {
         os::prepare_rename_commit_guard_flat_inline(source_parent, destination_parent, base_dir, publication_root)
     } else {
@@ -631,14 +637,15 @@ impl LocalDisk {
         // optimistic; this lease establishes the local commit/delete order and
         // remains owned by any blocking syscall that outlives async cancellation.
         let dst_dir_group_commit = os::dst_dir_fsync_group_commit_enabled();
-        let flat_inline_tmp = cfg!(target_os = "linux")
-            && (fi.data.is_some() || fi.size <= 0)
+        let can_defer_dst_preflight = cfg!(target_os = "linux")
             && src_volume == super::super::RUSTFS_META_TMP_BUCKET
             && pool_meta_condition.is_none()
             && !fi.is_healing()
             && !dst_dir_group_commit
+            && !file_fdatasync_grouping_requires_async_shard_sync(fi.data.is_none() && fi.size > 0)
             && !has_rename_data_test_failpoints(dst_path);
-        let defer_dst_preflight = flat_inline_tmp && !skip_access_checks(dst_volume);
+        let flat_inline_tmp = can_defer_dst_preflight && (fi.data.is_some() || fi.size <= 0);
+        let defer_dst_preflight = can_defer_dst_preflight && !skip_access_checks(dst_volume);
         let (dst_volume_dir, destination_object_path) = if defer_dst_preflight {
             self.io_get_bucket_and_object_open_path(dst_volume, dst_path)?
         } else {
@@ -754,7 +761,7 @@ impl LocalDisk {
         // are the descriptors a reader may hold for the version this call is about
         // to replace (backlog#1145); readers build the identical string in
         // `io_primitives`. An inline-data version has no parts and yields none.
-        let invalidate_part_paths: Vec<String> = {
+        let invalidate_part_paths: Vec<String> = if no_inline {
             let data_dir = fi.data_dir.unwrap_or_default();
             fi.parts
                 .iter()
@@ -766,6 +773,8 @@ impl LocalDisk {
                     )
                 })
                 .collect()
+        } else {
+            Vec::new()
         };
         let src_volume_dir = if cfg!(target_os = "linux")
             && src_volume == super::super::RUSTFS_META_TMP_BUCKET
@@ -850,7 +859,7 @@ impl LocalDisk {
                 .map(|dir| rustfs_utils::path::retain_slash(dir.to_string().as_str()))
             {
                 let src_rel = rustfs_utils::path::retain_slash(format!("{}/{}", src_path, data_dir).as_str());
-                let src_data_path = if cfg!(target_os = "linux") && multipart_publication.is_none() && !fi_healing {
+                let src_data_path = if cfg!(target_os = "linux") && !fi_healing {
                     self.io_get_object_open_path(src_volume, src_rel.as_str())?
                 } else {
                     self.io_get_object_path(src_volume, src_rel.as_str())?
@@ -960,9 +969,9 @@ impl LocalDisk {
                 let source_mode = if flat_inline_tmp {
                     SourcePreparationMode::FlatInlineTmp { defer_dst_preflight }
                 } else if !no_inline || remote_metadata_source {
-                    SourcePreparationMode::CreateParent
+                    SourcePreparationMode::CreateParent { defer_dst_preflight }
                 } else {
-                    SourcePreparationMode::ExistingParent
+                    SourcePreparationMode::ExistingParent { defer_dst_preflight }
                 };
                 let (guard, old_destination_file) = match prepare_rename_commit_and_destination_metadata_std(
                     source_mode,
@@ -1482,7 +1491,9 @@ impl LocalDisk {
                 true,
                 move || -> std::io::Result<MultipartFusedCommitOutcome> {
                     let (directory_guard_owned, has_dst_buf_owned) = match prepare_rename_commit_and_destination_metadata_std(
-                        SourcePreparationMode::ExistingParent,
+                        SourcePreparationMode::ExistingParent {
+                            defer_dst_preflight: false,
+                        },
                         &src_parent_owned,
                         &dst_parent_owned,
                         &dst_file_path_owned,
