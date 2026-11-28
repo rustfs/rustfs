@@ -33,7 +33,9 @@ use rustfs_gateway_dialect_rustfs_admin::ops::list_object_versions_with_metadata
 };
 use rustfs_gateway_dialect_rustfs_admin::ops::list_objects_v2_with_metadata::{self as objects, ListObjectsV2WithMetadata};
 use rustfs_gateway_dialect_rustfs_admin::{AdminResponse, ExtensionOperation};
-use rustfs_s3_types::{S3Result, s3_error};
+use rustfs_io_metrics::record_s3_op;
+use rustfs_s3_ops::S3Operation;
+use rustfs_s3_types::s3_error;
 use std::sync::Arc;
 
 /// The two operations, as the gateway names them.
@@ -68,14 +70,17 @@ pub(crate) fn register(builder: ServiceBuilder, server_ctx: &Arc<ServerContextSl
 /// One metadata listing operation and the listing it is.
 trait Listing: ExtensionOperation<Input = ()> {
     const LISTING: MetadataListing;
+    const METRIC: S3Operation;
 }
 
 impl Listing for ListObjectVersionsWithMetadata {
     const LISTING: MetadataListing = MetadataListing::ListObjectVersions;
+    const METRIC: S3Operation = S3Operation::ListObjectVersions;
 }
 
 impl Listing for ListObjectsV2WithMetadata {
     const LISTING: MetadataListing = MetadataListing::ListObjectsV2;
+    const METRIC: S3Operation = S3Operation::ListObjectsV2;
 }
 
 struct Listings {
@@ -83,23 +88,33 @@ struct Listings {
 }
 
 impl Listings {
-    /// The access phase every gateway operation runs, then the listing check and the listing.
-    async fn serve<O: Listing>(&self, request: Req<O>) -> S3Result<Resp<O>> {
-        let mut envelope = access::admit(&self.server_ctx, request.context()).await?;
+    /// The access phase every gateway operation runs, then the listing check, deferred SSE refusal,
+    /// metric count, and the listing.
+    async fn serve<O: Listing>(&self, request: Req<O>) -> HandlerResult<O> {
+        let mut envelope = access::admit(&self.server_ctx, request.context())
+                .await
+            .map_err(handler_error);?
         let bucket = request
             .context()
             .bucket()
-            .ok_or_else(|| s3_error!(InternalError, "the listing names no bucket"))?
+            .ok_or_else(|| handler_error( s3_error!(InternalError, "the listing names no bucket")))?
             .as_str()
             .to_owned();
-        metadata_listing::authorize(&mut envelope, O::LISTING, &bucket).await?;
-        let body = metadata_listing::answer(&envelope, O::LISTING, bucket).await?;
-        Ok(Resp::new(AdminResponse::bytes("application/xml", body)))
+        let authorized = metadata_listing::authorize(&mut envelope, O::LISTING, &bucket).await;
+        let deferred = request.sse().deferred_refusal().map(|refusal| refusal.error().clone());
+        super::authorized_then(authorized, deferred, || {
+           record_s3_op(O::METRIC);
+           async move { 
+                let body = metadata_listing::answer(&envelope, O::LISTING, bucket).await?;
+                Ok(Resp::new(AdminResponse::bytes("application/xml", body)))
+        }
+        })
+        .await
     }
 }
 
 impl<O: Listing> Handler<O> for Listings {
     async fn call(&self, request: Req<O>) -> HandlerResult<O> {
-        self.serve(request).await.map_err(handler_error)
+        self.serve(request).await
     }
 }
