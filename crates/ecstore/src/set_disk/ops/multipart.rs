@@ -8612,6 +8612,8 @@ mod tests {
                 source_object,
                 &mut source,
                 &ObjectOptions {
+                    // The fixture reads disk 0 directly after the PUT.
+                    write_completion: crate::object_api::WriteCompletion::TailDrained,
                     shard_integrity_write_mode: Some(crate::object_api::ShardIntegrityWriteMode::Legacy),
                     ..Default::default()
                 },
