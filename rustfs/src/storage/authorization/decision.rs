@@ -272,14 +272,14 @@ pub(crate) fn audit_request_denial<R: AuthorizationRequest + ?Sized>(
 
 /// Authorizes the request based on the action and credentials.
 pub(crate) async fn authorize_request<R: AuthorizationRequest + ?Sized>(req: &mut R, action: Action) -> S3Result<()> {
-    // Restore the `x-amz-meta-*` user metadata the SigV4 presigners hoist into
-    // the query string. This runs after s3s has verified the signature — its own
-    // verifier rejects an `x-amz-*` header outside `SignedHeaders`, which is
-    // exactly what a hoisted parameter becomes — and before policy evaluation and
-    // the handler read request properties, so every operation sees one request
-    // shape (rustfs/rustfs#9142).
-    let query = req.uri().query().map(str::to_owned);
-    crate::auth::hoist_signed_query_params(req.headers_mut(), query.as_deref())?;
+    // Restore allowlisted `x-amz-*` request properties that SigV4 presigners
+    // hoist into the query string. POST uploads authenticate multipart form
+    // fields only, never URL query parameters, so they must never hoist from
+    // the query string (rustfs/rustfs#9142, rustfs/backlog#3143).
+    if !req.is_post_object() {
+        let query = req.uri().query().map(str::to_owned);
+        crate::auth::hoist_signed_query_params(req.headers_mut(), query.as_deref())?;
+    }
     let internal_object_authorization = req.internal_object_authorization();
     authorize_request_core(req, action, None, internal_object_authorization).await
 }

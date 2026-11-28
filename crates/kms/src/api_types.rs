@@ -1436,6 +1436,89 @@ mod tests {
             })
         );
     }
+
+    #[test]
+    fn key_metadata_request_types_accept_valid_payloads_and_reject_unknown_fields() {
+        let update_valid = serde_json::json!({
+            "key_id": "key-a",
+            "description": "primary encryption key"
+        });
+        let update: UpdateKeyDescriptionRequest =
+            serde_json::from_value(update_valid).expect("valid UpdateKeyDescriptionRequest must deserialize");
+        assert_eq!(update.key_id, "key-a");
+        assert_eq!(update.description, "primary encryption key");
+
+        let update_unknown = serde_json::json!({
+            "key_id": "key-a",
+            "description": "primary encryption key",
+            "extra_field": true
+        });
+        let err = serde_json::from_value::<UpdateKeyDescriptionRequest>(update_unknown)
+            .expect_err("UpdateKeyDescriptionRequest must reject unknown fields");
+        assert!(err.to_string().contains("unknown field"), "unexpected error: {err}");
+
+        let tag_valid = serde_json::json!({
+            "key_id": "key-a",
+            "tags": { "env": "prod", "team": "storage" }
+        });
+        let tag: TagKeyRequest = serde_json::from_value(tag_valid).expect("valid TagKeyRequest must deserialize");
+        assert_eq!(tag.key_id, "key-a");
+        assert_eq!(tag.tags.get("env").map(String::as_str), Some("prod"));
+        assert_eq!(tag.tags.get("team").map(String::as_str), Some("storage"));
+
+        let tag_unknown = serde_json::json!({
+            "key_id": "key-a",
+            "tags": { "env": "prod" },
+            "unexpected": "value"
+        });
+        let err = serde_json::from_value::<TagKeyRequest>(tag_unknown).expect_err("TagKeyRequest must reject unknown fields");
+        assert!(err.to_string().contains("unknown field"), "unexpected error: {err}");
+
+        let untag_valid = serde_json::json!({
+            "key_id": "key-a",
+            "tag_keys": ["env", "team"]
+        });
+        let untag: UntagKeyRequest = serde_json::from_value(untag_valid).expect("valid UntagKeyRequest must deserialize");
+        assert_eq!(untag.key_id, "key-a");
+        assert_eq!(untag.tag_keys, vec!["env".to_string(), "team".to_string()]);
+
+        let untag_unknown = serde_json::json!({
+            "key_id": "key-a",
+            "tag_keys": ["env"],
+            "extra": 123
+        });
+        let err =
+            serde_json::from_value::<UntagKeyRequest>(untag_unknown).expect_err("UntagKeyRequest must reject unknown fields");
+        assert!(err.to_string().contains("unknown field"), "unexpected error: {err}");
+
+        // Response types remain forward-compatible with extra fields.
+        let update_resp: UpdateKeyDescriptionResponse = serde_json::from_value(serde_json::json!({
+            "success": true,
+            "message": "updated",
+            "key_id": "key-a",
+            "future_field": "ignored"
+        }))
+        .expect("UpdateKeyDescriptionResponse must ignore unknown fields");
+        assert!(update_resp.success);
+
+        let tag_resp: TagKeyResponse = serde_json::from_value(serde_json::json!({
+            "success": true,
+            "message": "tagged",
+            "key_id": "key-a",
+            "future_field": "ignored"
+        }))
+        .expect("TagKeyResponse must ignore unknown fields");
+        assert!(tag_resp.success);
+
+        let untag_resp: UntagKeyResponse = serde_json::from_value(serde_json::json!({
+            "success": true,
+            "message": "untagged",
+            "key_id": "key-a",
+            "future_field": "ignored"
+        }))
+        .expect("UntagKeyResponse must ignore unknown fields");
+        assert!(untag_resp.success);
+    }
 }
 
 // ========================================
@@ -1456,6 +1539,7 @@ mod tests {
 
 /// Request to update key description
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct UpdateKeyDescriptionRequest {
     /// Key ID to update
     pub key_id: String,
@@ -1476,6 +1560,7 @@ pub struct UpdateKeyDescriptionResponse {
 
 /// Request to add/update key tags
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct TagKeyRequest {
     /// Key ID to tag
     pub key_id: String,
@@ -1496,6 +1581,7 @@ pub struct TagKeyResponse {
 
 /// Request to remove key tags
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct UntagKeyRequest {
     /// Key ID to untag
     pub key_id: String,

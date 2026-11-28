@@ -134,7 +134,8 @@ pub(crate) async fn resolve_req_info(
 // Check before authorization can hoist query metadata into the wire headers.
 fn validate_post_object_metadata(headers: &HeaderMap, raw_query: Option<&str>) -> S3Result<()> {
     fn object_property(name: &str) -> bool {
-        name == "x-amz-storage-class"
+        crate::auth::is_hoistable_signed_query_param(name)
+            || name == "x-amz-storage-class"
             || name == "x-amz-snowball-auto-extract"
             || name == "x-amz-server-side-encryption"
             || [
@@ -147,11 +148,17 @@ fn validate_post_object_metadata(headers: &HeaderMap, raw_query: Option<&str>) -
             .iter()
             .any(|prefix| name.starts_with(prefix))
     }
-    if headers.keys().any(|name| object_property(name.as_str()))
-        || raw_query.is_some_and(|query| {
-            url::form_urlencoded::parse(query.as_bytes()).any(|(name, _)| object_property(&name.to_ascii_lowercase()))
-        })
-    {
+    // POST uses only form tags for policy and storage. Its checksum handler validates
+    // wire digests, including conflicts with form fields, before anything is written.
+    if headers.keys().any(|name| {
+        let name = name.as_str();
+        object_property(name)
+            && name != "x-amz-tagging"
+            && name != "x-amz-sdk-checksum-algorithm"
+            && !name.starts_with("x-amz-checksum-")
+    }) || raw_query.is_some_and(|query| {
+        url::form_urlencoded::parse(query.as_bytes()).any(|(name, _)| object_property(&name.to_ascii_lowercase()))
+    }) {
         return Err(s3_error!(AccessDenied, "POST object properties must be supplied as form fields"));
     }
     Ok(())
@@ -263,11 +270,21 @@ mod access_phase_tests {
             "x-amz-server-side-encryption-customer-algorithm",
             "x-amz-server-side-encryption-customer-key",
             "x-amz-server-side-encryption-customer-key-md5",
+            "x-amz-acl",
+            "x-amz-grant-read",
+            "x-amz-website-redirect-location",
+            "x-amz-copy-source",
+            "x-amz-metadata-directive",
         ] {
             headers.insert(name, "test".parse().unwrap());
             let err = super::admit_operation(&http::Method::POST, &headers, None, "PostObject", VerifiedSignature::default())
                 .expect_err("out-of-form POST wire property must be rejected");
             assert_eq!(err.code(), &rustfs_s3_types::S3ErrorCode::AccessDenied, "{name}");
+            headers.remove(name);
+        }
+        for name in ["x-amz-tagging", "x-amz-checksum-sha256", "x-amz-sdk-checksum-algorithm"] {
+            headers.insert(name, "test".parse().unwrap());
+            super::validate_post_object_metadata(&headers, None).expect("POST form and digest handlers own these wire fields");
             headers.remove(name);
         }
         for query in [
@@ -276,6 +293,14 @@ mod access_phase_tests {
             "x-amz-object-lock-retain-until-date=2099-01-01T00:00:00Z",
             "X-Amz-Server-Side-Encryption=AES256",
             "X%2DAmz%2DServer%2DSide%2DEncryption%2DCustomer%2DAlgorithm=AES256",
+            "X-Amz-Tagging=env%3Dprod",
+            "X-Amz-Acl=public-read",
+            "X-Amz-Grant-Read=id%3Dattacker",
+            "X-Amz-Website-Redirect-Location=https%3A%2F%2Fevil.example",
+            "X-Amz-Checksum-Sha256=deadbeef",
+            "X-Amz-Sdk-Checksum-Algorithm=SHA256",
+            "X-Amz-Copy-Source=%2Fsrc%2Fkey",
+            "X-Amz-Metadata-Directive=REPLACE",
         ] {
             let err =
                 super::admit_operation(&http::Method::POST, &headers, Some(query), "PostObject", VerifiedSignature::default())

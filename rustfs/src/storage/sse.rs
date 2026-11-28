@@ -47,8 +47,6 @@ use std::borrow::Cow;
 use std::collections::HashMap;
 use std::sync::Arc;
 
-#[cfg(all(test, feature = "rio-v2"))]
-pub(crate) use rustfs_sse::reset_sse_dek_provider;
 pub(crate) use rustfs_sse::startup::init as init_sse_startup;
 #[cfg(test)]
 pub(crate) use rustfs_sse::testing::{RecordingKmsKeyAuthorizer, sse_kms_object_metadata};
@@ -60,6 +58,8 @@ pub(crate) use rustfs_sse::{
 };
 #[cfg(test)]
 pub(crate) use rustfs_sse::{SseDekProvider, TestAuthorizationHooks, TestSseDekProvider};
+#[cfg(test)]
+pub(crate) use rustfs_sse::{reset_sse_dek_provider, set_sse_dek_provider_for_test};
 
 // ============================================================================
 // The server `rustfs-sse` runs in
@@ -249,7 +249,9 @@ pub async fn authorize_sse_kms_object_read(
     principal: Option<&SseKmsPrincipal>,
     metadata: &HashMap<String, String>,
 ) -> Result<(), ApiError> {
-    Ok(rustfs_sse::authorize_sse_kms_object_read(&HOST, principal, metadata).await?)
+    let metadata = normalize_metadata_for_resolution(metadata)
+        .map_err(|error| map_get_object_reader_error(StorageError::Io(std::io::Error::other(error))))?;
+    Ok(rustfs_sse::authorize_sse_kms_object_read(&HOST, principal, &metadata).await?)
 }
 
 pub async fn authorize_sse_kms_multipart_write(
@@ -480,8 +482,9 @@ impl ObjectEncryptionResolver for SseObjectEncryptionResolver {
             sse_customer_key_md5: customer_key_md5.as_ref(),
             // The object layer resolves read material for internal readers too (replication,
             // lifecycle transition, heal, scanner) and carries no request identity, so this hook
-            // never authorizes. Callers that cross the S3 boundary are authorized by the S3 layer
-            // before their bytes are served.
+            // never authorizes. Client-initiated S3 reads authorize `kms:Decrypt` via
+            // `authorize_sse_kms_object_read` on the prepared metadata snapshot before entering
+            // this resolver, so denied callers never drive KMS key unwrapping.
             principal: None,
         })
         .await

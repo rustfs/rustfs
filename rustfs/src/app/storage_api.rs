@@ -1698,7 +1698,9 @@ pub(crate) mod object_usecase {
         }
 
         pub(crate) mod object {
-            pub(crate) use super::super::super::storage_contracts::{ListOperations, ObjectIO, ObjectOperations};
+            #[cfg(test)]
+            pub(crate) use super::super::super::storage_contracts::ObjectIO;
+            pub(crate) use super::super::super::storage_contracts::{ListOperations, ObjectOperations};
         }
 
         pub(crate) mod range {
@@ -1870,7 +1872,8 @@ pub(crate) mod test {
     pub(crate) use crate::storage::storage_api::test_consumer::authorize_head_object;
     pub(crate) mod sse {
         pub(crate) use crate::storage::storage_api::test_consumer::sse::{
-            RecordingKmsKeyAuthorizer, TestAuthorizationHooks, sse_kms_object_metadata,
+            RecordingKmsKeyAuthorizer, SseDekProvider, SseError, TestAuthorizationHooks, reset_sse_dek_provider,
+            set_sse_dek_provider_for_test, sse_kms_object_metadata,
         };
     }
     pub(crate) use super::{bucket, runtime};

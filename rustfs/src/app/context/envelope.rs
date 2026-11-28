@@ -739,6 +739,9 @@ impl AuthorizationRequest for RequestEnvelope {
     fn policy_headers(&self) -> &HeaderMap {
         self.post_object_policy_headers().map_or(self.headers(), |headers| &headers.0)
     }
+    fn is_post_object(&self) -> bool {
+        self.post_object.is_some() || self.post_object_policy_headers.is_some() || self.gateway_post
+    }
     fn install_post_object_policy_headers(&mut self, headers: PostObjectPolicyHeaders) {
         self.post_object_policy_headers = Some(headers);
     }

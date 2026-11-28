@@ -853,6 +853,32 @@ pub(super) fn response_storage_class_for_object_attributes(
 pub(crate) const ERR_OBJECT_LOCK_RETENTION_HEADERS_MUST_BE_PAIRED: &str =
     "x-amz-object-lock-retain-until-date and x-amz-object-lock-mode must both be supplied";
 
+/// Returns a request header as UTF-8 text when present, rejecting non-UTF-8
+/// values with `InvalidArgument` so hoisted SigV4 query properties match wire
+/// header validation (rustfs/backlog#3143).
+pub(crate) fn optional_header_string(headers: &HeaderMap, name: &str) -> S3Result<Option<String>> {
+    headers
+        .get(name)
+        .map(|value| {
+            value
+                .to_str()
+                .map(str::to_owned)
+                .map_err(|_| S3Error::with_message(S3ErrorCode::InvalidArgument, format!("Invalid header value for {name}")))
+        })
+        .transpose()
+}
+
+/// Parses `x-amz-object-lock-retain-until-date` from `headers` as RFC3339 when
+/// present and not already decoded from the DTO.
+pub(crate) fn optional_object_lock_retain_until_from_headers(headers: &HeaderMap) -> S3Result<Option<time::OffsetDateTime>> {
+    let Some(raw) = optional_header_string(headers, AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE_LOWER)? else {
+        return Ok(None);
+    };
+    time::OffsetDateTime::parse(raw.trim(), &time::format_description::well_known::Rfc3339)
+        .map(Some)
+        .map_err(|_| S3Error::with_message(S3ErrorCode::InvalidArgument, "Invalid retain-until date"))
+}
+
 pub(crate) fn build_put_like_object_lock_metadata_native(
     bucket: &str,
     object_lock_config_state: &metadata_sys::ObjectLockConfigState,

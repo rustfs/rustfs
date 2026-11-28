@@ -123,36 +123,6 @@ pub(crate) async fn authorize_sse_kms_key(
     })
 }
 
-/// Authorize `kms:Decrypt` for an object whose stored encryption material is unwrapped
-/// outside [`sse_decryption`].
-///
-/// The copy-source read resolves its material inside the object layer, which has no
-/// request identity, so the S3 layer has to run the check itself.
-pub async fn authorize_sse_kms_object_read(
-    host: &dyn SseHost,
-    principal: Option<&SseKmsPrincipal>,
-    metadata: &HashMap<String, String>,
-) -> Result<(), SseError> {
-    let Some((sse_type, key_id)) = stored_managed_encryption_key(metadata) else {
-        return Ok(());
-    };
-
-    let result = authorize_sse_kms_key(host, principal, sse_type, KmsAction::DecryptAction, &key_id).await;
-    // Only a denial is recorded here: an allowed read goes on to unwrap the key,
-    // and that operation reports its own outcome.
-    if let Err(error) = &result {
-        record_managed_kms_outcome(
-            principal,
-            sse_type,
-            Some(&key_id),
-            || stored_envelope_master_key_version(metadata),
-            Err(error),
-        );
-    }
-
-    result
-}
-
 /// Authorize the current request to write under the upload's stored KMS key.
 /// Upload IDs do not confer the creator's KMS permissions on another caller.
 pub async fn authorize_sse_kms_multipart_write(

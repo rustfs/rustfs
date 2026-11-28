@@ -24,10 +24,10 @@ use crate::core::keying::object::{
     DARE_CIPHER_AES_256_GCM, DARE_CIPHER_CHACHA20_POLY1305, MINIO_INTERNAL_ENCRYPTION_SEAL_ALGORITHM, SEALED_KEY_IV_SIZE,
     SEALED_KEY_SIZE, is_legacy_rustfs_managed_metadata, is_supported_sealed_object_key_cipher,
 };
+use crate::core::read::authorize_sse_kms_object_read;
 use crate::core::read::{DecryptionRequest, apply_managed_decryption_material, classify_sse_read_response, sse_decryption};
 use crate::core::request::SseKmsPrincipal;
 use crate::core::rewrap::{ObjectDekRewrapOutcome, rewrap_object_encryption_metadata};
-use crate::core::s3::authorization::authorize_sse_kms_object_read;
 use crate::core::s3::headers::{
     extract_server_side_encryption_from_headers, extract_ssec_params_from_headers, extract_ssekms_context_from_headers,
     project_sse_read_response_headers, validate_sse_headers_for_read, validate_sse_headers_for_write,
@@ -3893,6 +3893,32 @@ async fn copy_source_read_authorization_skips_unencrypted_and_sse_s3_sources() {
         .expect("SSE-S3 sources are not gated");
 
     assert!(authorizer.calls().is_empty());
+}
+
+#[tokio::test]
+async fn object_read_authorization_rejects_corrupt_envelope_and_resolves_default_key() {
+    let (denied, denied_authorizer) = enforcing_principal(false);
+    let mut corrupt = sse_kms_object_metadata();
+    corrupt.insert(
+        rustfs_utils::http::object_encryption_keys::INTERNAL_ENCRYPTION_KEY_HEADER.to_string(),
+        "not-a-valid-envelope".to_string(),
+    );
+
+    let error = authorize_sse_kms_object_read(&HOST, Some(&denied), &corrupt)
+        .await
+        .expect_err("corrupt SSE-KMS envelope must still be authorized before unwrap");
+    assert_eq!(error.code, S3ErrorCode::AccessDenied);
+    assert_eq!(denied_authorizer.calls(), vec![(KmsAction::DecryptAction, "finance-key".to_string())]);
+
+    let mut keyless = sse_kms_object_metadata();
+    keyless.remove(rustfs_utils::http::object_encryption_keys::INTERNAL_ENCRYPTION_KEY_ID_HEADER);
+    keyless.remove("x-amz-server-side-encryption-aws-kms-key-id");
+    let (denied_default, default_authorizer) = enforcing_principal(false);
+    let error = authorize_sse_kms_object_read(&HOST, Some(&denied_default), &keyless)
+        .await
+        .expect_err("keyless SSE-KMS metadata must authorize against resolved default key");
+    assert_eq!(error.code, S3ErrorCode::AccessDenied);
+    assert_eq!(default_authorizer.calls(), vec![(KmsAction::DecryptAction, "default".to_string())]);
 }
 
 // ========================================================================

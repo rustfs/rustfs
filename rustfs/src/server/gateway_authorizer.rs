@@ -657,6 +657,9 @@ impl AuthorizationRequest for RouteRequest<'_> {
     fn policy_headers(&self) -> &HeaderMap {
         AuthorizationRequest::policy_headers(self.inner)
     }
+    fn is_post_object(&self) -> bool {
+        AuthorizationRequest::is_post_object(self.inner)
+    }
     fn install_post_object_policy_headers(&mut self, headers: PostObjectPolicyHeaders) {
         AuthorizationRequest::install_post_object_policy_headers(self.inner, headers);
     }

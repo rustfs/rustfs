@@ -34,7 +34,44 @@ use crate::storage::storage_api::runtime_sources_consumer::ServerContextSlot;
 use http::{HeaderName, HeaderValue};
 use rustfs_policy::policy::action::{Action, S3Action};
 use rustfs_s3_types::{S3Error, S3ErrorCode, S3Result};
+use rustfs_utils::http::{AMZ_OBJECT_LOCK_LEGAL_HOLD_LOWER, AMZ_OBJECT_LOCK_MODE_LOWER, AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE_LOWER};
 use time::OffsetDateTime;
+
+/// Resolves Object Lock authorization inputs from the decoded DTO plus any
+/// allowlisted `x-amz-object-lock-*` query parameters hoisted into `headers`
+/// for a SigV4 request (rustfs/backlog#3143).
+pub(super) fn resolve_hoisted_object_lock_authorization<R: AuthorizationRequest + ?Sized>(
+    req: &mut R,
+    post: bool,
+    retain_until: Option<OffsetDateTime>,
+    legal_hold: bool,
+    retention: bool,
+) -> S3Result<(Option<OffsetDateTime>, bool, bool)> {
+    if post || req.is_post_object() {
+        return Ok((retain_until, legal_hold, retention));
+    }
+    let query = req.uri().query().map(str::to_owned);
+    crate::auth::hoist_signed_query_params(req.headers_mut(), query.as_deref())?;
+    let retain_until = match retain_until {
+        Some(date) => Some(date),
+        None => match req.headers().get(AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE_LOWER) {
+            Some(raw) => {
+                let raw = raw
+                    .to_str()
+                    .map_err(|_| S3Error::with_message(S3ErrorCode::InvalidArgument, "Invalid retain-until date"))?;
+                let parsed = OffsetDateTime::parse(raw.trim(), &time::format_description::well_known::Rfc3339)
+                    .map_err(|_| S3Error::with_message(S3ErrorCode::InvalidArgument, "Invalid retain-until date"))?;
+                Some(parsed)
+            }
+            None => None,
+        },
+    };
+    let legal_hold = legal_hold || req.headers().contains_key(AMZ_OBJECT_LOCK_LEGAL_HOLD_LOWER);
+    let retention = retention
+        || req.headers().contains_key(AMZ_OBJECT_LOCK_MODE_LOWER)
+        || req.headers().contains_key(AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE_LOWER);
+    Ok((retain_until, legal_hold, retention))
+}
 
 pub(crate) async fn authorize_upload_part<R: AuthorizationRequest + ?Sized>(
     req: &mut R,
@@ -92,7 +129,9 @@ pub(crate) async fn authorize_put_object<R: AuthorizationRequest + ?Sized>(
     } else {
         generation
     };
-    set_requested_object_lock_retain_until(req, input.retain_until);
+    let (retain_until, legal_hold, retention) =
+        resolve_hoisted_object_lock_authorization(req, input.post, input.retain_until, input.legal_hold, input.retention)?;
+    set_requested_object_lock_retain_until(req, retain_until);
     prepare_policy(req)?;
     authorize_request(req, Action::S3Action(S3Action::PutObjectAction)).await?;
     authorize_write_etag_condition(req, input.specific_etag).await?;
@@ -101,10 +140,10 @@ pub(crate) async fn authorize_put_object<R: AuthorizationRequest + ?Sized>(
         authorize_replication_only_put_headers(req).await?;
     }
     super::object_commit::authorize_write_request_tagging(req, input.post).await?;
-    if input.legal_hold {
+    if legal_hold {
         authorize_request(req, Action::S3Action(S3Action::PutObjectLegalHoldAction)).await?;
     }
-    if input.retention {
+    if retention {
         authorize_request(req, Action::S3Action(S3Action::PutObjectRetentionAction)).await?;
     }
     Ok(())

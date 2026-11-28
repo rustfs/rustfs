@@ -160,7 +160,7 @@ impl DefaultMultipartUsecase {
             part_number,
             copy_source_if_match,
             copy_source_if_none_match,
-            copy_source_dates,
+            mut copy_source_dates,
             sse_customer_algorithm,
             sse_customer_key,
             sse_customer_key_md5,
@@ -183,11 +183,16 @@ impl DefaultMultipartUsecase {
         let src_version_id = normalize_copy_source_version_id(raw_src_version_id.as_deref())?;
         validate_upload_part_copy_source_key(&src_key)?;
 
-        let rs = if let Some(range_str) = copy_source_range {
-            Some(parse_copy_source_range(&range_str)?)
-        } else {
-            None
+        let headers = envelope.headers();
+        let copy_source_if_match = CopySourceCondition::with_header(copy_source_if_match, headers, "x-amz-copy-source-if-match")?;
+        let copy_source_if_none_match =
+            CopySourceCondition::with_header(copy_source_if_none_match, headers, "x-amz-copy-source-if-none-match")?;
+        copy_source_dates.merge_headers(headers)?;
+        let copy_source_range = match copy_source_range {
+            Some(range) => Some(range),
+            None => crate::app::object::shared::optional_header_string(headers, "x-amz-copy-source-range")?,
         };
+        let rs = copy_source_range.as_deref().map(parse_copy_source_range).transpose()?;
 
         let part_id = parse_upload_part_number(part_number)?;
 

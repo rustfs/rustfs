@@ -27,7 +27,7 @@ use crate::storage_api::server::http::access::access_owned::object_commit::{
     authorize_upload_part_copy, check_copy_source_owner,
 };
 use rustfs_gateway::{CopySourceForm, Req, Resp, dto};
-use rustfs_gateway_types::{CopySourceValue, ETag};
+use rustfs_gateway_types::CopySourceValue;
 use rustfs_s3_ops::S3Operation;
 use rustfs_s3_types::{S3Result, s3_error};
 use std::sync::Arc;
@@ -136,8 +136,16 @@ impl Served for dto::UploadPartCopy {
             part_number: input.part_number,
             copy_source: source,
             copy_source_range: input.copy_source_range,
-            copy_source_if_match: copy_condition(input.copy_source_if_match.as_deref())?,
-            copy_source_if_none_match: copy_condition(input.copy_source_if_none_match.as_deref())?,
+            copy_source_if_match: input
+                .copy_source_if_match
+                .as_deref()
+                .map(CopySourceCondition::parse)
+                .transpose()?,
+            copy_source_if_none_match: input
+                .copy_source_if_none_match
+                .as_deref()
+                .map(CopySourceCondition::parse)
+                .transpose()?,
             copy_source_dates: CopySourceDates::new(input.copy_source_if_modified_since, input.copy_source_if_unmodified_since),
             sse_customer_algorithm: input.sse_customer_algorithm,
             sse_customer_key: input.sse_customer_key.map(|key| key.expose_secret().to_owned()),
@@ -191,22 +199,6 @@ fn copy_source<O: rustfs_gateway::Operation<DerivedResources = rustfs_gateway::C
     }))
 }
 
-fn copy_condition(value: Option<&str>) -> S3Result<Option<CopySourceCondition>> {
-    value
-        .map(|value| {
-            let tag =
-                ETag::parse_http_header(value).map_err(|_| s3_error!(InvalidArgument, "Invalid copy source ETag condition"))?;
-            Ok(if tag.is_any() {
-                CopySourceCondition::Any
-            } else if tag.is_weak() {
-                CopySourceCondition::Weak
-            } else {
-                CopySourceCondition::Strong(tag.opaque_tag().to_owned())
-            })
-        })
-        .transpose()
-}
-
 fn copy_input(
     input: dto::CopyObjectInput,
     copy_source: Option<CopySourceValue>,
@@ -232,8 +224,16 @@ fn copy_input(
         metadata: Some(input.metadata.into_iter().collect()),
         tagging: input.tagging,
         tagging_directive: input.tagging_directive.map(|value| value.as_str().to_owned()),
-        copy_source_if_match: copy_condition(input.copy_source_if_match.as_deref())?,
-        copy_source_if_none_match: copy_condition(input.copy_source_if_none_match.as_deref())?,
+        copy_source_if_match: input
+            .copy_source_if_match
+            .as_deref()
+            .map(CopySourceCondition::parse)
+            .transpose()?,
+        copy_source_if_none_match: input
+            .copy_source_if_none_match
+            .as_deref()
+            .map(CopySourceCondition::parse)
+            .transpose()?,
         copy_source_dates: CopySourceDates::new(input.copy_source_if_modified_since, input.copy_source_if_unmodified_since),
         cache_control: input.cache_control,
         content_disposition: input.content_disposition,

@@ -190,6 +190,28 @@ impl DefaultMultipartUsecase {
                 .and_then(|value| value.to_str().ok())
                 .map(ToOwned::to_owned)
         });
+        let storage_class = match storage_class {
+            Some(value) => Some(value),
+            None => crate::app::object::shared::optional_header_string(headers, "x-amz-storage-class")?,
+        };
+        let tagging = match tagging {
+            Some(value) => Some(value),
+            None => crate::app::object::shared::optional_header_string(headers, "x-amz-tagging")?,
+        };
+        let object_lock_legal_hold_status = match object_lock_legal_hold_status {
+            Some(value) => Some(value),
+            None => {
+                crate::app::object::shared::optional_header_string(headers, rustfs_utils::http::AMZ_OBJECT_LOCK_LEGAL_HOLD_LOWER)?
+            }
+        };
+        let object_lock_mode = match object_lock_mode {
+            Some(value) => Some(value),
+            None => crate::app::object::shared::optional_header_string(headers, rustfs_utils::http::AMZ_OBJECT_LOCK_MODE_LOWER)?,
+        };
+        let object_lock_retain_until_date = match object_lock_retain_until_date {
+            Some(value) => Some(value),
+            None => crate::app::object::shared::optional_object_lock_retain_until_from_headers(headers)?,
+        };
 
         // Validate storage class if provided
         if let Some(storage_class) = storage_class.as_deref()
