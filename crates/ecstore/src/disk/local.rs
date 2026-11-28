@@ -34233,7 +34233,14 @@ mod test {
             }
             let path = dir.path().join("new-metadata");
             let mut write = std::pin::pin!(disk.write_all_internal(&path, Bytes::from_static(b"new"), sync, dir.path(),));
-            assert!(futures::FutureExt::now_or_never(&mut write).is_none());
+            if sync == SyncMode::None {
+                tokio::time::timeout(Duration::from_secs(5), &mut write)
+                    .await
+                    .expect("relaxed write must progress while fsync is blocked")
+                    .expect("relaxed write completed");
+            } else {
+                assert!(futures::FutureExt::now_or_never(&mut write).is_none());
+            }
             let read = tokio::time::timeout(
                 Duration::from_secs(5),
                 disk.run_metadata_read(None, metadata.clone(), |opened| {
@@ -34251,7 +34258,9 @@ mod test {
             for blocker in blockers {
                 blocker.await.expect("blocker joined").expect("blocker completed");
             }
-            write.await.expect("write completed");
+            if sync != SyncMode::None {
+                write.await.expect("durable write completed");
+            }
             assert_eq!(
                 read.expect("metadata read must progress")
                     .expect("queued read")
